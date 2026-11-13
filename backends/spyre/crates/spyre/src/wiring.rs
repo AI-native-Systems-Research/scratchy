@@ -1113,11 +1113,9 @@ pub struct ChainWiring {
 
 /// ⭐ THE BLOCK A SESSION'S CHAINED HEAD GATHERS — `width` columns at the origin of the rank `me`
 /// plays as; the whole table for a session that plays no rank of a sharded world (`None`, the
-/// executor's own [`RankSeat`] alone). Bound at load from the session's own seat, never baked: one
-/// bake serves every rank, and the rank lives only in the bytes each rank stages (its tables, its
-/// seeds).
-///
-/// [`RankSeat`]: crate::superdsc_exec::RankSeat
+/// executor's own `RankSeat` alone, in `scratchy_target_spyre_card::superdsc_exec`). Bound at load
+/// from the session's own seat, never baked: one bake serves every rank, and the rank lives only in
+/// the bytes each rank stages (its tables, its seeds).
 pub fn chain_block<T: crate::bundle_code::collective::World>(
     width: u32,
     me: Option<crate::bundle_code::collective::Rank<T>>,

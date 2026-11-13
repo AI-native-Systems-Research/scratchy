@@ -1,0 +1,7115 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The resident SuperDSC executor — the live on-silicon run path, in Rust.
+//!
+//! The SuperDSC emitter produces a dxp device bundle (one device program per launch group + the
+//! placement manifest). This module runs it DIRECTLY on the AIU through [`crate::runtime`]: the
+//! program, the packed weights and the paged KV pool are allocated ONCE in [`Executor::prepare`]
+//! and live on-card; each [`Executor::predict`] DMAs only the (small) activations in and the
+//! logits out — weights and KV are NEVER re-uploaded. That residency is the whole perf point.
+//!
+//! fp16 is the device-native SEN169 (`senfp169`), not IEEE fp16: every 2-byte element converts
+//! IEEE→sen on H2D and sen→IEEE on D2H ([`scratchy_target_spyre::sen_convert`]).
+//!
+//! ⛔ WHAT LIVES WHERE. Nothing here computes a KV address: which request an op touches, how many
+//! passes its group takes and what that shifts each segment base by are all [`scratchy_target_spyre::fold_plan`]'s,
+//! which owns the page maps and the write cursors. The bundle's own shape is
+//! [`scratchy_target_spyre::bundle_code`]'s, byte conversion is [`scratchy_target_spyre::sen_convert`]/[`scratchy_target_spyre::stage_weight`]'s, and the card
+//! surface is [`crate::runtime`]'s. This module is the sequencing: what to allocate, what to launch, in what
+//! order, with which base.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
+use std::time::Instant;
+
+use anyhow::{Result, anyhow, bail};
+use flex_rs::iommu::PfIommuMapper;
+use flex_rs::memory_region::MemoryType;
+use flex_rs::stream::RuntimeStreamError;
+use tracing::{debug, info};
+
+use crate::cb_plan;
+use crate::runtime::{
+    BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
+    H2dPin, HwError, PeerLink, Stream,
+};
+use scratchy_target_spyre::allocator::HostBytes;
+use scratchy_target_spyre::bundle_code::{
+    self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols,
+};
+use scratchy_target_spyre::fold_plan::{self, OpKv};
+use scratchy_target_spyre::sen_convert;
+use scratchy_target_spyre::stage_weight::{
+    Element, RetileWalk, WalkArm, stage_weight_per_element, stage_weight_permuted,
+    stage_weight_rows,
+};
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  Typed quantities. Every number below names WHICH number it is; the executor never takes a bare
+//  integer for a thing that has a unit, because the whole bug class this path has produced is one
+//  quantity standing in for another (a slot for a position, a page for a row, elements for bytes).
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A TENSOR-SEGMENT index, proven in range by construction. The segment COUNT is a property of the
+/// executor model (the hardware caps a launch at 7 tensor segments; seg7 is the program), so it is a
+/// CONST GENERIC — and a `Seg` therefore cannot name a segment the session has no region for.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Seg<const N: usize>(usize);
+
+impl<const N: usize> Seg<N> {
+    /// A segment named at COMPILE TIME. `I >= N` is a compile error at the const-eval of the call,
+    /// not a runtime check — which is what makes the named roles below unfalsifiable.
+    pub const fn known<const I: usize>() -> Self {
+        assert!(I < N, "segment index out of range for this executor model");
+        Seg(I)
+    }
+
+    /// A segment named at RUNTIME (a manifest placement, an FFI argument). `None` is a refusal:
+    /// the caller has an index this bundle has no region for.
+    pub fn checked(i: i64) -> Option<Self> {
+        (i >= 0 && (i as usize) < N).then_some(Seg(i as usize))
+    }
+
+    /// The index, for array subscripting. Named rather than `.0` so the sites are countable.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    /// Every segment of the model, in order — the positional `tensor_allocs` walk.
+    pub fn all() -> impl Iterator<Item = Seg<N>> {
+        (0..N).map(Seg)
+    }
+}
+
+/// This executor's segment type: `SegRole` order, 7 packed tensor segments.
+pub type SegIdx = Seg<NUM_SEGMENTS>;
+
+/// INTERMEDIATE (seg0) — activations and the online-softmax state. A row-batched fold pass shifts
+/// here to reach its own request's row block.
+pub const SEG_INTERMEDIATE: SegIdx = SegIdx::known::<0>();
+/// WEIGHT (seg1) — the per-layer resident weights; the rolled body advances by `weight_stride`.
+pub const SEG_WEIGHT: SegIdx = SegIdx::known::<1>();
+/// KV (seg2) — the resident cache/pool; carries the write slot, the page base and the slab shift.
+pub const SEG_KV: SegIdx = SegIdx::known::<2>();
+/// MASK (seg3) — the prefix-validity mask, in its own segment precisely so a fold can shift it
+/// without disturbing the running softmax state or any other activation.
+pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
+
+/// ⭐ THE HOST SHADOW'S OWN BUFFER — page-aligned, THP-advised anonymous memory.
+///
+/// Why not a `Vec`: prepare sends these bytes by the PRE-MAPPED door
+/// ([`Stream::pin_h2d`]), and that door's recipe — the vendor's own, stated where
+/// `DmaBuf::setup_dma_buf` skips its shadow copy for a caller-supplied iova — is an
+/// IOMMU-page-ALIGNED, fully-populated host buffer. A `Vec`'s pointer is the allocator's
+/// to place (glibc's huge blocks come back 16 B into their mapping), so alignment cannot be
+/// asked of one; `mmap` gives it by construction.
+///
+/// The huge-page advice is not decoration: the IOMMU pin that pre-mapped send rides walks
+/// the buffer's backing pages, and VFIO pins at the backing page's granularity — 4 KiB
+/// anonymous pages pin at 1.3-2.4 GB/s where THP-backed ones pin at 288 GB/s
+/// (card-measured, `h2d_streams_probe`, 2026-11-10), so a 2.5 GiB weight shadow pins in
+/// ~10 ms THP-backed or over a second not. The pod's THP defrag mode is `madvise`, so an
+/// un-advised mapping's huge pages are best-effort; [`advise_huge_pages`] is what makes
+/// them reliable. Population is [`fault_in`]'s job, at prepare, value-preserving — staged
+/// bytes are already faulted by the staging walk's writes, and the pad extents fault as
+/// born zeros without disturbing them.
+///
+/// `len` is the LOGICAL length (the byte count every reader sees through `Deref`); the
+/// mapping itself is [`pages_of`]` (len)` — the page-rounded extent, whose tail bytes past
+/// `len` read as zeros (anonymous `mmap` semantics) and are nobody's to write. The
+/// invariant `len == 0` ⟺ "never mapped" (a dangling pointer) is what [`Drop`] and
+/// [`HostBuf::resize`] both rest on.
+#[derive(Debug)]
+pub(crate) struct HostBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+/// A host buffer's page-rounded extent — the size actually mapped for `len` logical bytes.
+fn pages_of(len: usize) -> usize {
+    len.div_ceil(HOST_PAGE) * HOST_PAGE
+}
+
+/// Why a host shadow buffer could not be made: the kernel's errno, by stage.
+#[derive(Debug)]
+pub(crate) enum HostBufError {
+    /// `mmap` refused the allocation.
+    Map { errno: std::io::Error },
+    /// `mremap` refused the growth. Linux only: other targets grow by copy, which cannot fail
+    /// this way, so the variant does not exist there.
+    #[cfg(target_os = "linux")]
+    Remap { errno: std::io::Error },
+}
+
+impl std::fmt::Display for HostBufError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Map { errno } => write!(f, "mmap refused the host shadow: {errno}"),
+            #[cfg(target_os = "linux")]
+            Self::Remap { errno } => write!(f, "mremap refused the host shadow's growth: {errno}"),
+        }
+    }
+}
+
+impl std::error::Error for HostBufError {}
+
+/// `MADV_HUGEPAGE` over a mapping we own — see [`HostBuf`]'s doc for the pin-rate law that
+/// makes this load-bearing. Best-effort BY NATURE (it is an advice): a kernel without THP
+/// refuses it, and the buffer is still correct — only the pin's rate suffers, which the
+/// refusal line names when it happens.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(ptr: *mut std::ffi::c_void, mapped: usize) {
+    // SAFETY: `ptr`/`mapped` are our own live mapping (every caller passes a buffer this
+    // module mmap'd), and `madvise` reads only the VMA metadata.
+    unsafe {
+        if libc::madvise(ptr, mapped, libc::MADV_HUGEPAGE) != 0 {
+            let errno = std::io::Error::last_os_error();
+            debug!(
+                "MADV_HUGEPAGE refused ({errno}) — the shadow's pages will pin at 4 KiB \
+                    granularity"
+            );
+        }
+    }
+}
+
+/// Only Linux has `MADV_HUGEPAGE`, and only Linux drives a card — a shadow on any other
+/// target exists for cardless tests and is never pinned.
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_ptr: *mut std::ffi::c_void, _mapped: usize) {}
+
+// SAFETY (both): the buffer is plain anonymous memory with no thread affinity — the same
+// statement `RaiiBuffer` makes for the vendor's own aligned host buffers
+// (`flex_rs::host_interface`), and the reason a `Vec<u8>` payload was `Send` and `Sync`
+// too.
+unsafe impl Send for HostBuf {}
+unsafe impl Sync for HostBuf {}
+
+impl HostBuf {
+    /// The empty buffer — no mapping at all. [`Executor::stage_weights`] is what sizes a
+    /// shadow; every other construction site of an empty one is a slot awaiting that.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::dangling(),
+            len: 0,
+        }
+    }
+
+    /// A page-aligned, zero-filled buffer of `len` bytes. "Zero-filled" is the mapping's
+    /// own semantics (anonymous `mmap` reads as zeros until written), so nothing is memset:
+    /// the staging walk's writes fault the pages it touches and [`fault_in`] faults the
+    /// rest at prepare — the kernel zeroes each page exactly once, on first touch, either
+    /// way.
+    pub(crate) fn zeroed(len: usize) -> Result<Self, HostBufError> {
+        if len == 0 {
+            return Ok(Self::empty());
+        }
+        let mapped = pages_of(len);
+        // SAFETY: a nonzero page count, no file, no fixed address — `mmap` has no
+        // preconditions left to violate, and the return is checked against `MAP_FAILED`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(HostBufError::Map {
+                errno: std::io::Error::last_os_error(),
+            });
+        }
+        advise_huge_pages(ptr, mapped);
+        Ok(Self {
+            // SAFETY: `mmap` succeeded, so the pointer is non-null.
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr.cast()) },
+            len,
+        })
+    }
+
+    /// `Vec::resize(new_len, 0)`'s contract on this buffer: grow with born-zero tail bytes,
+    /// shrink by dropping them. Growth on Linux is `mremap` — the kernel moves the pages,
+    /// so a weight shadow grown by its region's alignment pad does not copy 2 GiB to add
+    /// 2 MiB (the allocator's own `realloc` plays the same trick for its mmap'd blocks);
+    /// other targets grow by copy, and never run on a card anyway.
+    pub(crate) fn resize(&mut self, new_len: usize) -> Result<(), HostBufError> {
+        if new_len == self.len {
+            return Ok(());
+        }
+        if self.len == 0 || new_len == 0 {
+            // An empty buffer holds no mapping to keep, and a resize to empty drops the
+            // mapping outright — either way the result is a fresh buffer carrying the old
+            // prefix where one exists.
+            let mut next = Self::zeroed(new_len)?;
+            let keep = self.len.min(new_len);
+            if keep > 0 {
+                next[..keep].copy_from_slice(&self[..keep]);
+            }
+            *self = next;
+            return Ok(());
+        }
+        let old_mapped = pages_of(self.len);
+        let new_mapped = pages_of(new_len);
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `ptr`/`old_mapped` are this buffer's own live mapping; `MREMAP_MAYMOVE`
+            // is the only flag, and the return is checked against `MAP_FAILED`.
+            let grown = unsafe {
+                libc::mremap(
+                    self.ptr.as_ptr().cast(),
+                    old_mapped,
+                    new_mapped,
+                    libc::MREMAP_MAYMOVE,
+                )
+            };
+            if grown == libc::MAP_FAILED {
+                return Err(HostBufError::Remap {
+                    errno: std::io::Error::last_os_error(),
+                });
+            }
+            // SAFETY: `mremap` succeeded, so the pointer is non-null.
+            self.ptr = unsafe { std::ptr::NonNull::new_unchecked(grown.cast()) };
+            // The moved mapping carries its VMA flags, but the grown tail is new — advise
+            // the whole range again so it is covered either way.
+            advise_huge_pages(grown, new_mapped);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut next = Self::zeroed(new_len)?;
+            let keep = self.len.min(new_len);
+            next[..keep].copy_from_slice(&self[..keep]);
+            *self = next;
+            let _ = (old_mapped, new_mapped);
+        }
+        self.len = new_len;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for HostBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: `ptr` names our own mapping of at least `len` bytes, uniquely held.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+}
+
+impl std::ops::DerefMut for HostBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            // SAFETY: as `Deref`, and uniquely held through `&mut self`.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
+}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // SAFETY: `ptr`/`pages_of(len)` are this buffer's own live mapping — the invariant
+        // `len == 0` ⟺ never-mapped is what makes the guard sufficient.
+        unsafe { libc::munmap(self.ptr.as_ptr().cast(), pages_of(self.len)) };
+    }
+}
+
+/// ⭐ ONE SLOT'S HOST SIDE — a real buffer, or the typed statement that the slot's bytes live
+/// only on the device.
+///
+/// A device-only slot (the KV pool, the intermediates) is not "a short shadow": `prepare`
+/// fills its region on the device and no forward ever touches its host side. Spelling that
+/// as a 128 B `Vec` made a forgotten reader a PANIC (an index past 128) or a silent
+/// truncation — this PR shipped one of each before the type existed. As a variant, a reader
+/// cannot get bytes out of a device-only slot without saying what to do about it: the
+/// read doors materialize through [`Executor::shadow_for_read`], and every other site
+/// refuses.
+#[derive(Debug)]
+enum HostShadow {
+    /// A real host buffer: staged weights, a per-step mirror (the activation and logits
+    /// segments), or one materialized on demand by a read. `Default` is the empty buffer —
+    /// the pre-staging state; [`Executor::stage_weights`] is what sizes it.
+    Host(HostBuf),
+    /// No host bytes, by the bundle's own statement (see [`Executor::host_owned_seg`]):
+    /// device-filled at boot, materialized only when a read asks.
+    DeviceOnly,
+}
+
+impl Default for HostShadow {
+    fn default() -> Self {
+        HostShadow::Host(HostBuf::empty())
+    }
+}
+
+impl HostShadow {
+    /// The buffer, or `None` on a device-only slot — the answer every reader must give a
+    /// reason for.
+    fn host(&self) -> Option<&[u8]> {
+        match self {
+            HostShadow::Host(v) => Some(v),
+            HostShadow::DeviceOnly => None,
+        }
+    }
+
+    /// The buffer mutably, same law as [`Self::host`].
+    fn host_buf_mut(&mut self) -> Option<&mut HostBuf> {
+        match self {
+            HostShadow::Host(v) => Some(v),
+            HostShadow::DeviceOnly => None,
+        }
+    }
+}
+
+/// ⭐ THE SEGMENTS A BORROWER ADOPTS INSTEAD OF FILLING — the resident ones. Three sites read this
+/// (host-shadow sizing, device sizing, H2D) and they MUST agree: a segment sized as a placeholder but
+/// then H2D'd from that placeholder writes 128 B of zeros over the owner's live data. Spelling the
+/// set once is what keeps the three in step, and it is the list to extend if the weights ever occupy
+/// more than one segment (see `scratchy_spyre_bundle::MAX_SEGMENT_BYTES`).
+pub const SEG_RESIDENT: [SegIdx; 2] = [SEG_WEIGHT, SEG_KV];
+
+/// Whether `i` names a resident segment (see [`SEG_RESIDENT`]).
+fn is_resident_seg(i: usize) -> bool {
+    SEG_RESIDENT.iter().any(|s| s.get() == i)
+}
+
+/// Logits column count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Vocab(pub usize);
+/// One resident K/V row width (= kv_heads·head_dim), in fp16 elements.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KvDim(pub usize);
+/// Physical pages in the resident pool.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PoolPages(pub i64);
+/// An ABSOLUTE sequence position — how many positions are already resident for this forward.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub struct SeqPos(pub i64);
+/// How many NEW positions one forward appends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NewTokens(pub i64);
+/// A layer index within the rolled body loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LayerIdx(pub i64);
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  Diagnostics — every env-gated instrument the C++ carried, read ONCE (a per-launch getenv is a
+//  linear environ scan on the critical path between compute submissions).
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The measurement switches, sampled once per process.
+/// WHERE a launch lands: the per-segment byte offsets it shifts by (the launch row's), which
+/// weight region fills the positional weight slot, and the request facts the relaunch law reads.
+/// Nothing about the step's position: a walk's body shifts by its own trip, and every other group
+/// launches where the bake placed it.
+#[derive(Clone, Copy)]
+pub(crate) struct LaunchWhere {
+    pub(crate) byte_off: [u64; NUM_SEGMENTS],
+    /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
+    pub(crate) weight_bank: usize,
+    /// ⭐ HOW MANY REQUESTS THIS LAUNCH SERVES, and the pitch their tables sit at — the request half
+    /// of `fold_plan`'s relaunch law (a walking bundle's span repeats once per request, its tables
+    /// `request · pitch` into the activation segment). ONE request at no pitch is every launch
+    /// today; a packed prefill launch is the one that states more, and it states the step's own
+    /// `card_request_pitch` with it.
+    pub(crate) requests: fold_plan::Requests,
+}
+
+/// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
+/// its whole (op, request, rep) loop and flushes once at the end
+/// ([`crate::runtime::Stream::submit_batch`] — the vendor's multi-CB branch). The site context
+/// rides alongside the item because the per-op `fault` closure dumps from loop locals
+/// (`ta`/`off`/the request and fold rep), which are gone by flush time: a refused flush rebuilds
+/// the offending entry's dump from these, and the flex-rs error names the entry index it refused.
+struct PendingLaunch {
+    item: BatchedCb,
+    /// Which op of the rung (`oi`), serving which request, at which fold rep produced this entry.
+    op_index: usize,
+    request: u32,
+    rep: i64,
+    /// The per-segment shifts this entry launched with — what `dump_launch_site` prints.
+    off: [u64; NUM_SEGMENTS],
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  #603 PR2 2c — the replay player's cached step images
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The immutable half of a cached image — `Arc`'d because TWO handles must
+/// share it: the cache keeps one, and every step's `ComputeWireBatch` carries
+/// the canvas (one more `Arc`, to the same allocation) plus a stamp closure
+/// holding this whole struct for the row table. All plain data, so the
+/// closure is `Send` for free.
+struct StepImageData {
+    canvas: std::sync::Arc<Vec<ControlBlockWire>>,
+    /// How many launch rows the canvas concatenates — reported by the derivation line.
+    rows: usize,
+}
+
+/// One cached step image — the whole forward (prefix + every body row +
+/// suffix) as ONE canvas, and the host fence the step's single submission carries (the walk's per-row ORs collapse
+/// into it; see the flush at the end of `launch_ops_inner`).
+#[derive(Clone)]
+struct StepImage {
+    data: std::sync::Arc<StepImageData>,
+    barrier: bool,
+}
+
+/// What an image is keyed by — WHICH body the ladder picks for this step. Nothing else a launch
+/// addresses varies with the step: a walk's body shifts by its own trip, and every other group
+/// launches where the bake placed it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StepImageKey {
+    sel: BodySel,
+}
+
+/// The image cache WITH its accounting. The counters live on the two arms
+/// that fire them — not inlined at the executor's lookup site — because the
+/// executor cannot be built without a card, and the accounting is exactly
+/// what a cardless test must reach: the cadence line's
+/// `% from cached` is `replay_hits` over `replay_steps`, and it read
+/// structurally zero from the day the player landed — the hit arm timed the
+/// lookup without counting the hit, so a card replaying 256 steps off 4
+/// derivations still printed `0.0% from cached`. The cache worked; the
+/// counter was the defect. Two methods rather than one lookup-or-derive
+/// closure because the derive path needs `&mut self`, which a closure over
+/// the cache's own borrow cannot capture.
+#[derive(Default)]
+struct StepImageCache {
+    map: std::collections::HashMap<StepImageKey, StepImage>,
+}
+
+impl StepImageCache {
+    /// ⭐ THE HIT ARM — lookup, timing, AND THE COUNT: `replay_hits` is the
+    /// numerator of the cadence line's `% from cached`, and the hit arm never
+    /// counted it — no line of code ever incremented it. Timed as the player
+    /// always timed a hit — around the get+clone, guard acquisition included.
+    fn lookup_cached(&mut self, key: &StepImageKey) -> Option<StepImage> {
+        let t0 = Instant::now();
+        let hit = self.map.get(key).cloned();
+        if hit.is_some() {
+            let mut t = timers();
+            t.replay_hits += 1;
+            t.replay_lookup_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
+        hit
+    }
+
+    /// The MISS arm — count the derivation and what it cost, then keep the
+    /// image for every later step on this key. The cost window is the derive
+    /// alone (`started` predates it, and the insert sits outside both the
+    /// window and the guard), matching the player's original accounting.
+    fn note_derived(&mut self, key: StepImageKey, image: StepImage, started: Instant) {
+        {
+            let mut t = timers();
+            t.replay_derives += 1;
+            t.replay_derive_ms += started.elapsed().as_secs_f64() * 1e3;
+        }
+        self.map.insert(key, image);
+    }
+}
+
+struct Diag {
+    /// `SCRATCHY_SDSC_PEROP_SYNC`: re-enable the per-group host drain. DEFAULT-OFF —
+    /// pipeline_barrier + the stream's STRICT_ORDERING guarantee the dataflow, and the drain cost
+    /// ~11% of decode (pod-confirmed coherent without it: 24.7 → 27.4 tok/s).
+    perop_sync: bool,
+    /// `SCRATCHY_SDSC_GROUP_TIME`: per-launch-group device time. Needs a drain to attribute anything,
+    /// so it costs what the per-op sync costs — a MEASUREMENT MODE, not something to leave on.
+    group_time: bool,
+    /// `SCRATCHY_SDSC_SUBMIT_TIME`: host enqueue cost per launch, with NO drain, so the pipeline is
+    /// left alone. The honest answer to "is a batch's launch count the cost".
+    submit_time: bool,
+    /// `SCRATCHY_SDSC_PREFIX_TIME`: one drain per call at a ROTATING group, giving a cumulative
+    /// ladder whose successive differences are the per-group device times.
+    prefix_time: bool,
+    /// `SCRATCHY_SDSC_RB_TIME`: per-op device CYCLES read out of the response blocks' own timestamp
+    /// section. The harvest itself is always on — the completion thread records every completed
+    /// CB's five cycle counts (`flex_rs::rb_telemetry`) — so this knob costs nothing but the
+    /// printing, and needs NO drain beyond the one `synchronize` a step already performs. It is
+    /// the drain-free answer to what `group_time`/`prefix_time` pay ~11% of decode to estimate.
+    rb_time: bool,
+    /// `SCRATCHY_SDSC_BODY_TRACE`: which body a step actually selected.
+    body_trace: bool,
+    /// `SCRATCHY_SDSC_SEGADDR_DIAG`: one-shot dump of every segment's resolved runtime base.
+    segaddr: bool,
+    /// `SCRATCHY_SDSC_PROG_VERIFY`: before every launch, D2H the program allocation and compare it
+    /// against the bytes the bake put there — printing ONLY when they differ.
+    ///
+    /// ⭐ IT ANSWERS A QUESTION THE FAULT PATH CANNOT. The unconditional readback on a failed launch
+    /// happens AFTER the hardware already faulted, on a stream the abend may have poisoned, so a
+    /// `rc != 0` there is ambiguous between "the image is fine" and "we could not look". Reading
+    /// before each launch is the same comparison on a healthy stream, and it dates the divergence:
+    /// a program that reads back wrong BEFORE it is ever launched was clobbered by the upload or by
+    /// an earlier launch, not by its own.
+    ///
+    /// A whole-image D2H plus a drain per launch is far too expensive to leave on, hence the knob.
+    prog_verify: bool,
+    /// `SCRATCHY_SDSC_PHASE_TIME`: preamble-H2D / compute / logits-D2H split of a predict.
+    phase_time: bool,
+    /// `SCRATCHY_SDSC_PREP_TIME`: sub-phase timing of prepare.
+    prep_time: bool,
+    /// `SCRATCHY_SDSC_STAGE_TIME`: per-mode timing of the LPT weight staging (which walk arm
+    /// and which transform each byte took, and the slowest items) — the instrument for the
+    /// boot layer that runs BEFORE prepare, off its laps.
+    stage_time: bool,
+    /// `SCRATCHY_SDSC_OPTRACE`: after each on-card op, D2H every segment and print nonzero-count +
+    /// max|.| — the op index where the signal collapses IS the divergence.
+    optrace: bool,
+    /// `SCRATCHY_SDSC_TENSORDUMP=<dir>`: after each on-card op, D2H the readable segments and write
+    /// every placement whose bytes MOVED since the last dump as LE-f32 files named to match the
+    /// emulator's `SCRATCHY_EMU_TENSORDUMP` (`prog{idx}_seg{seg}_t{tid}.bin` + `.n`, plus a
+    /// `op{op}_…` timeline copy and an `ops.txt` mapping op numbers to programs) — the bisection
+    /// instrument for a card-vs-emulator divergence. The prog index is a per-FINGERPRINT global in
+    /// first-dumped order, and `progs.txt` records the assignment so a diff never has to guess it.
+    tensordump: Option<std::path::PathBuf>,
+    /// `SCRATCHY_SDSC_LAUNCH_MARK`: one line BEFORE each submit naming the op and rep.
+    ///
+    /// ⭐ IT EXISTS FOR THE ONE FAULT NO OTHER PATH CAN ATTRIBUTE. `RAS::PCI::BusFence` (0xa35e) is
+    /// raised on senlib's OWN `PfMSIMonitor::PollingThread`, which `throw`s into a thread with no
+    /// handler — so the process `abort`s and EVERY host-side fault path (including `fault`'s
+    /// submit-refused dump above) never runs. The last line this printed is therefore the only
+    /// statement of which op the card was executing, and `aiuras.json` gives `BusFence` no `vars`,
+    /// so the fence itself names nothing at all.
+    launch_mark: bool,
+    /// `SCRATCHY_SDSC_RESET_PROBE=N`: after the N-th forward, tear the runtime down and measure the
+    /// RSS drop. BREAKS the session; a diagnostic to pick a fix, not a fix.
+    reset_probe: Option<i64>,
+}
+
+impl Diag {
+    fn get() -> &'static Diag {
+        static D: std::sync::OnceLock<Diag> = std::sync::OnceLock::new();
+        D.get_or_init(|| {
+            let on = |k: &str| std::env::var_os(k).is_some();
+            Diag {
+                perop_sync: on("SCRATCHY_SDSC_PEROP_SYNC"),
+                group_time: on("SCRATCHY_SDSC_GROUP_TIME"),
+                submit_time: on("SCRATCHY_SDSC_SUBMIT_TIME"),
+                prefix_time: on("SCRATCHY_SDSC_PREFIX_TIME"),
+                rb_time: on("SCRATCHY_SDSC_RB_TIME"),
+                body_trace: on("SCRATCHY_SDSC_BODY_TRACE"),
+                segaddr: on("SCRATCHY_SDSC_SEGADDR_DIAG"),
+                prog_verify: on("SCRATCHY_SDSC_PROG_VERIFY"),
+                phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
+                prep_time: on("SCRATCHY_SDSC_PREP_TIME"),
+                stage_time: on("SCRATCHY_SDSC_STAGE_TIME"),
+                optrace: on("SCRATCHY_SDSC_OPTRACE"),
+                tensordump: std::env::var_os("SCRATCHY_SDSC_TENSORDUMP")
+                    .map(std::path::PathBuf::from),
+                launch_mark: on("SCRATCHY_SDSC_LAUNCH_MARK"),
+                reset_probe: std::env::var("SCRATCHY_SDSC_RESET_PROBE")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+            }
+        })
+    }
+
+    /// Whether EVERY instrument is off — the production configuration. The replay player
+    /// (#603 PR2 2c) requires this: each knob above reads state the walk produces (per-op
+    /// marks, per-op readbacks, per-op rb_seq entries, per-op dump files, mid-rung drains),
+    /// so rather than reason per knob about which are batch-safe one level up, ANY instrument
+    /// falls back to the walk bit for bit — the same discipline the collect path already
+    /// applies to its five mid-rung knobs ("a drain between ops of an unflushed rung observes
+    /// nothing"), extended to the player's whole surface. A knob run therefore measures the
+    /// walk, never a half-player; the player's own phase timers (`Timers::replay_*`) carry
+    /// its decomposition instead.
+    fn is_quiet(&self) -> bool {
+        let Diag {
+            perop_sync,
+            group_time,
+            submit_time,
+            prefix_time,
+            rb_time,
+            body_trace,
+            segaddr,
+            prog_verify,
+            phase_time,
+            prep_time,
+            stage_time,
+            optrace,
+            tensordump,
+            launch_mark,
+            reset_probe,
+        } = self;
+        !(*perop_sync
+            || *group_time
+            || *submit_time
+            || *prefix_time
+            || *rb_time
+            || *body_trace
+            || *segaddr
+            || *prog_verify
+            || *phase_time
+            || *prep_time
+            || *stage_time
+            || *optrace
+            || *launch_mark)
+            && tensordump.is_none()
+            && reset_probe.is_none()
+    }
+}
+
+/// One pipeline's harvested TS-phase durations plus a CB count, NAMED per the card-measured slot
+/// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::dmai_cycles`] and siblings: the
+/// five TS words are event snapshots of one wrapping cycle counter, so a phase duration is the
+/// wrapping difference of its pair — never a raw sum, which is why this holds durations and not
+/// slot totals). `exec` is the headline — the compute engine's own time, which sums to a
+/// forward's device span; `prep` is the queue+prep wait behind earlier CBs on a pipelined
+/// stream; `tail` is the writeback tail on compute CBs and the D2H duration on D2H CBs.
+#[derive(Default)]
+struct RbCycles {
+    dmai: u64,
+    prep: u64,
+    exec: u64,
+    tail: u64,
+    cbs: u64,
+}
+
+impl RbCycles {
+    /// A compute CB: every phase is its own (`dmai` is exactly 0 — the card writes the same
+    /// snapshot to words 0 and 1 when there is no DMA-in).
+    fn add_compute(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.dmai += rb.dmai_cycles() as u64;
+        self.prep += rb.prep_cmpt_cycles() as u64;
+        self.exec += rb.exec_cmpt_cycles() as u64;
+        self.tail += rb.dmao_cycles() as u64;
+        self.cbs += 1;
+    }
+
+    /// An H2D CB: only its DMA-in pair is meaningful (words 3-4 read zero).
+    fn add_dmai(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.dmai += rb.dmai_cycles() as u64;
+        self.cbs += 1;
+    }
+
+    /// A D2H CB: only its DMA-out pair is meaningful (words 0-2 read zero).
+    fn add_dmao(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.tail += rb.dmao_cycles() as u64;
+        self.cbs += 1;
+    }
+}
+
+/// One op's harvested cycles plus the label the launch loop knew it by.
+#[derive(Default)]
+struct RbOpCycles {
+    cycles: RbCycles,
+    label: String,
+}
+
+/// Accumulators the timing modes write into. Process-wide, like the C++ statics.
+#[derive(Default)]
+struct Timers {
+    /// Per launch group, keyed by its LABEL (`bundle fp/group_i`, the launch mark's own name): (total
+    /// ms, launches). ⛔ NOT by group index — groups are cut at a fixed descriptor count, so index `i`
+    /// holds different ops in every chunk-width bundle (granite-8b's 36-page prompt bundle runs its
+    /// cache write in `group_9` and its MLP in `group_10`; a narrower rung's MLP lands lower), and a
+    /// per-index total summed across those bundles attributed the MLP's time to the cache write.
+    group_ms: BTreeMap<String, (f64, u64)>,
+    group_calls: u64,
+    submit_ms: f64,
+    prep_ms: f64,
+    submit_calls: u64,
+    /// Launches whose submission carried `pipeline_barrier` — a HOST fence call
+    /// (`issue_barrier` waits the OTHER pipelines' fences; a no-op for all-compute runs), NOT a
+    /// device barrier. Compute CBs are always built with the CTRL barrier bit clear
+    /// (`CtrlSection::new(tag, false)`); what orders the device is the ring FIFO
+    /// (STRICT_ORDERING) plus the always-set `cmpt.sync`. Pod-flex @ed96487 audit, 2026-10-17.
+    host_fence_launches: u64,
+    /// 🛑 KEYED BY (RUNG LENGTH, INDEX), NOT INDEX ALONE. A forward calls the launch loop once per
+    /// rung — the body, but also the prefix and suffix lists — and each restarts its numbering at 0,
+    /// so a map keyed on the index alone averages a 20-op body's group 2 with a 3-op prefix's.
+    prefix_ms: BTreeMap<(usize, usize), (f64, u64, String)>,
+    prefix_call: BTreeMap<usize, u64>,
+    /// Per-op harvested RB cycles — keyed like `prefix_ms` (same rung-numbering hazard).
+    rb_cycles: BTreeMap<(usize, usize), RbOpCycles>,
+    /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
+    /// Since #544 both ride the COMPUTE pipeline; `rb_attribute` routes them here by the
+    /// direction `RbTiming::dma` carries, so these totals keep their pre-#544 meaning.
+    rb_dmai: RbCycles,
+    rb_dmao: RbCycles,
+    rb_steps: u64,
+    rb_cbs: u64,
+    /// Cumulative `rb_cbs` at the last periodic report — the count jumps a whole forward at a
+    /// time (~162 CBs), so a plain `is_multiple_of` would skip its own thresholds and never fire.
+    rb_reported: u64,
+    /// `SCRATCHY_SDSC_RB_TIME`'s launch sequence: one entry per compute launch this forward, in
+    /// launch order — ((rung length, op index), label). Lives here, not on the executor, because
+    /// the launch loop holds `self` immutably across the stream reference. Cleared at the start of
+    /// every `predict` and zipped against the telemetry ring's id-sorted op entries (compute CBs
+    /// minus the DMA crossings) after the step's synchronize; see [`rb_attribute`].
+    rb_seq: Vec<((usize, usize), String)>,
+    forwards: i64,
+    // ── #603 PR2 2c — the replay player's own decomposition. Recorded
+    // UNCONDITIONALLY (a handful of Instants and counters per STEP, not per
+    // op) because every Diag knob forces the walk: these are the only
+    // numbers that describe the player, reported on the cadence in
+    // `report_replay` — they are also the player's liveness marker (a
+    // benchmark whose stderr never shows [sdsc-replay] did not replay).
+    /// Steps replayed from an image, and how many found their image already
+    /// derived (the rest paid a derivation, counted below).
+    replay_steps: u64,
+    replay_hits: u64,
+    /// Images derived (first use of a body's key) and what those
+    /// derivations cost — amortized over every step that reuses the image.
+    replay_derives: u64,
+    replay_derive_ms: f64,
+    /// CBs replayed per step — the player's per-step payload.
+    replay_cbs: u64,
+    /// The per-step host work: image lookup (key build + map hit) and the
+    /// submit call (canvas memcpy + tag stamps + ONE doorbell, all inside it).
+    replay_lookup_ms: f64,
+    replay_submit_ms: f64,
+}
+
+fn timers() -> std::sync::MutexGuard<'static, Timers> {
+    static T: std::sync::OnceLock<std::sync::Mutex<Timers>> = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  Programs
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ONE LAUNCH GROUP: a contiguous run of up to `group_size()` trips that dxp compiled into a single
+/// device program. A group size of `1` makes that one trip per program, which is the fault-isolation end
+/// of the same range — not a different mode. See `GroupSize`: a compile-time constant, not an env read.
+///
+/// Each is launched against the SHARED resident segments, so there is no ModuleStitcher (which
+/// orphaned the matmul in the fused bundle). A group that carries an address shift — a KV slot write,
+/// a Kᵀ slab restickify, a page fold — is a singleton at ANY group size, because the shift is applied
+/// once to the whole group.
+pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
+    /// The launch: its address shifts and the compiled program they apply to.
+    pub(crate) code: &'static bundle::LaunchGroup<'static, T>,
+    /// The bundle this launch belongs to, and its position in that bundle's launch order — together,
+    /// the whole of "which program is this".
+    fp: &'static str,
+    index: usize,
+    /// Its resident Program-segment allocation. `None` until [`Executor::alloc_ops`] — the split
+    /// ladder is allocated lazily, so an unallocated op is a real state, not an invariant break.
+    pub(crate) addr: Option<DevAddr>,
+    /// The KV facts `fold_plan` reads: whose KV, which pass shape, which strides.
+    pub(crate) kv: OpKv,
+    /// When this group is a collective's consume: the send its baked placements name and the
+    /// session's route — bound once, at [`bind_ops`].
+    pub(crate) collective: Option<cb_plan::BoundCollective<T>>,
+}
+
+/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE. Per-step windows
+/// (`shifted`, built per layer per launch) are NOT: they drop as owned values while the
+/// runtime is alive.
+///
+/// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
+/// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
+/// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
+/// today — every session borrows its card's `CardRuntime` (`&'c`), so the context outlives it, and
+/// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
+/// `CardRuntime::reset` (the leak probe) tears the context down MID-PROCESS, and a future
+/// `DevAddr` drop that learns to free must not find session handles betting on drop order
+/// versus that.
+///
+/// The law predates this Rust surface: in the C++ runtime, the allocator was torn down before
+/// these handles, and the throw out of a `noexcept` destructor turned perfect runs into
+/// `RUN_RC=255` (measured 2026-08-12 — every run ended 255 **after** `Batch complete:
+/// N succeeded, 0 failed`).
+///
+/// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step
+/// windows (`shifted`, built per layer per launch) must keep dying as owned values — at ~120
+/// per forward a leaked descriptor each grows without bound.
+impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
+    fn drop(&mut self) {
+        std::mem::forget(self.addr.take());
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
+    fn drop(&mut self) {
+        for a in &mut self.seg_addr {
+            std::mem::forget(a.take());
+        }
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
+    /// Pair one launch-index entry with the program it names. `per_request` is the bundle's own
+    /// verdict — whether ANY of its groups walks — stamped here at load onto every group of the
+    /// bundle alike (see `fold_plan`'s request law); it is never baked, so no record states it.
+    fn new(
+        code: &'static bundle::LaunchGroup<'static, T>,
+        fp: &'static str,
+        index: usize,
+        collective: Option<cb_plan::BoundCollective<T>>,
+        per_request: bool,
+    ) -> Self {
+        let kv = &code.kv;
+        OpProg {
+            code,
+            fp,
+            index,
+            addr: None,
+            collective,
+            kv: OpKv {
+                page_fold: kv.page_fold,
+                // What sends the group's KV shift to zero — a bake fact, carried on the group.
+                gathered: kv.gathered,
+                walk: kv.walk,
+                per_request,
+            },
+        }
+    }
+
+    /// How the timing modes name this program: its bundle's fingerprint and its launch order.
+    pub(crate) fn label(&self) -> String {
+        format!("{}/group_{}", self.fp, self.index)
+    }
+
+    /// What [`cb_plan::site_cbs`] needs to stage this group's control blocks.
+    pub(crate) fn site_tp(&self) -> cb_plan::SiteTp<T> {
+        cb_plan::SiteTp {
+            index: self.index,
+            consume: self.code.kv.tp,
+            bound: self.collective,
+        }
+    }
+}
+
+/// A launch sequence — a body rung, the prefix, the suffix, or a fold-fused twin.
+pub(crate) type Ops<T> = Vec<OpProg<T>>;
+
+/// The host-shadow slice covering the WHOLE of `addr` — the H2D source for a segment.
+///
+/// ⭐ RETURNING A SLICE IS THE POINT. [`Stream::h2d`] takes the transfer length FROM the slice, so
+/// the DMA cannot read past the shadow the way an independent `size: u64` argument could — which is
+/// exactly how `alloc_ops_at` came to pin past the end of a program binary. A shadow shorter than
+/// its region is a STAGING bug (`prepare` grows every shadow it sends to the region's extent), so it
+/// is reported here rather than becoming an out-of-bounds transfer.
+fn whole_shadow<'a>(shadow: &'a [u8], addr: &DevAddr, seg: usize) -> Result<&'a [u8]> {
+    let need = addr.total_size().as_u64() as usize;
+    shadow.get(..need).ok_or_else(|| {
+        anyhow!(
+            "seg{seg}: the host shadow is {} B but its device region is {need} B — this H2D would \
+             read past the shadow. `prepare` grows every shadow it sends to the region's extent; \
+             this one was not grown, so the segment was never meant to be sent from here.",
+            shadow.len()
+        )
+    })
+}
+
+/// ⭐ THE H2D WINDOW AN ACTIVATION AT `[offset, offset + len)` GOES OUT IN — `offset` down and the end
+/// up to [`H2D_ALIGN`]. Slicing to a bind's EXACT range was tried and tripped a DMA
+/// sub-address/alignment error; any alignment coarser than the hardware's is also legal, so this needs
+/// no knowledge of the exact requirement. The one law both refill sources take — a `bound` activation
+/// converted at the refill and one `bind_input_f32` converted at bind — so they go out alike.
+fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
+    (
+        (offset / H2D_ALIGN) * H2D_ALIGN,
+        (offset + len).div_ceil(H2D_ALIGN) * H2D_ALIGN,
+    )
+}
+
+/// The H2D window alignment [`h2d_run`] rounds to.
+const H2D_ALIGN: u64 = 4096;
+
+/// The fill window step — the walk step of EVERY device-side zero fill, so `zero_seg` and
+/// `prepare`'s fills submit the same single-chunk window shapes (the window size only
+/// sets how many fill control blocks the walk submits; no host buffer rides the fill).
+const FILL_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
+    Some(w) => w,
+    None => unreachable!(),
+};
+
+/// The window step of a pre-mapped whole-region send ([`send_premapped`]) — the same 64 MiB
+/// the #606 pool's own copies cut, so one window is one DMA control block on the wire and a
+/// multi-GiB region costs tens of submissions, not thousands.
+const H2D_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
+    Some(w) => w,
+    None => unreachable!(),
+};
+
+/// ⭐ THE ONE ZERO-FILL WALK: [`DevAddr::windows`] at [`FILL_WINDOW`], so a multi-chunk
+/// (interleaved) region is filled chunk by chunk — every byte the region owns, none it does
+/// not — and each window is the single-chunk shape the fill control block resolves. Every
+/// device-side fill goes through here (`zero_seg`, `prepare`'s segment and bank fills); a
+/// second copy would drift from this one's window shape.
+fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
+    for w in addr.windows(FILL_WINDOW) {
+        stream.fill_zero(&w).map_err(|e| anyhow!("{what}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// ⭐ THE PRE-MAPPED SEND OF ONE WHOLE SHADOW — the boot-weight door's consumer side. The
+/// shadow's pages are faulted (value-preserving, by prepare's grow loop); here the buffer
+/// is pinned ONCE for its whole extent ([`Stream::pin_h2d`], which refuses a mapping that
+/// does not cover the shadow BY NAME — `PremappedH2dRefusal::ShortPin`) and the transfer
+/// goes out window by window through [`H2dPin::send_window`], each window's host slice AND
+/// iova derived from the pin itself — the same linear arithmetic the #606 pool's slot
+/// resolution rides and the law the scheduler states by advancing a caller iova with its
+/// host address. One pin, one submit per window, and none of the plain door's per-call
+/// DmaBuf setup and pin: ~59 GB/s against its 6-7 (card-measured, `h2d_streams_probe`,
+/// 2026-11-10), which is the whole point — a 2b model's ~2.5 GiB of weights.
+///
+/// The pin is parked in `alive` until the caller's `synchronize` has retired the transfers
+/// — but that is the happy path only, and not where the safety lives: the guard's own
+/// [`Drop`] synchronizes the stream BEFORE it unpins, so an early return (a refused
+/// window, a failed sync, an unwind) retires the DMA too. The unpin never races a
+/// transfer, on any exit.
+fn send_premapped<'a>(
+    stream: &'a Stream,
+    src: &'a [u8],
+    addr: &DevAddr,
+    mapper: &std::sync::Arc<PfIommuMapper>,
+    alive: &mut Vec<H2dPin<'a>>,
+    what: &str,
+) -> Result<()> {
+    let pin = stream
+        .pin_h2d(mapper, src)
+        .map_err(|e| anyhow!("{what}: pinning the {} B shadow: {e}", src.len()))?;
+    let mut off = 0usize;
+    for w in addr.windows(H2D_WINDOW) {
+        let win = w.total_size().as_u64() as usize;
+        pin.send_window(&w, off..off + win)
+            .map_err(|e| anyhow!("{what}: pre-mapped window at byte {off}: {e}"))?;
+        off += win;
+    }
+    assert_eq!(
+        off,
+        src.len(),
+        "{what}: the window walk covered {off} of {} B — DevAddr::windows' \
+         cover-each-chunk-once law is broken",
+        src.len()
+    );
+    alive.push(pin);
+    Ok(())
+}
+
+/// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
+/// whatever page size the host actually uses.
+const HOST_PAGE: usize = 4096;
+
+/// ⭐ FAULT EVERY PAGE OF `buf` IN, LEAVING ITS BYTES AS THEY ARE: each page is written with the byte
+/// it already holds. A zeroed allocation is mapped on first WRITE (a read maps the shared zero page
+/// and commits nothing), so this is what moves those faults to the caller's moment. The value goes
+/// through `black_box`, so the store cannot be proven redundant and dropped.
+fn fault_in(buf: &mut [u8]) {
+    for b in buf.iter_mut().step_by(HOST_PAGE) {
+        *b = std::hint::black_box(*b);
+    }
+}
+
+/// One keyed activation's state: the [`CausalKey`] its staged bytes are a function of, and whether
+/// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
+/// this step). See [`Executor::keyed`].
+///
+/// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
+#[derive(Clone, Copy, Debug)]
+struct Keyed {
+    key: ktir_superdsc::sdsc_abstract::CausalKey,
+    fresh: bool,
+}
+
+/// Whether `refill_activations` sends bound activation `id` this step: every unkeyed activation, every
+/// step (today's re-upload, unchanged), and a keyed one only in the step that bound it. The one rule
+/// both refill loops ask, so they cannot disagree about which binds go out.
+fn refill_sends(keyed: &BTreeMap<bundle::PlaceId, Keyed>, id: &bundle::PlaceId) -> bool {
+    keyed.get(id).is_none_or(|k| k.fresh)
+}
+
+/// ⛔⛔⛔ EVERY WAY A SOURCE TENSOR'S BYTES CAN GET THERE — THE COMPLETE LIST.
+///
+/// The device cannot report an unfilled source: it reads whatever the segment happens to hold, or it
+/// waits. So `predict` refuses to launch when one is [`Self::Nobody`], and this enum is what makes
+/// that verdict auditable instead of accidental. Being a closed set is the point — a new fill
+/// mechanism cannot be introduced without adding a variant here, and adding a variant breaks every
+/// exhaustive match until each has said what it means.
+///
+/// See [`Executor::filler_of`] for why this exists as a type rather than as a chain of `&& !`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFiller {
+    /// This bundle has no placement for the id, so it is not a source of THIS session.
+    NotPlaced,
+    /// The generated weight loader bound it before `prepare`, and `stage_weights` wrote it into a
+    /// resident segment.
+    WeightLoader,
+    /// A forward-tape step bound it this step (`bind_input`) — activations, masks, block tables.
+    TapeStep,
+    /// Declared device-resident by the LOADER: a source BY ID that nothing binds per step, because
+    /// its bytes were put there once and persist. Two populations, and they arrive differently — the
+    /// paged KV cache, which the DEVICE wrote on a previous step, and the spilled weight tail, which
+    /// the host copied into this session's own region at load (`adopt_from_owner`) because its slot
+    /// cannot be aliased: the slot also carries an intermediate color, so no two bundles agree on that
+    /// segment's extent and [`Self::SegmentOwner`] is unavailable to it.
+    DeclaredResident,
+    /// ⭐ THE DEVICE'S OWN CHAINSTAGE WROTE IT — the chain's s/l sticks on a stable (`OnCard`)
+    /// decode seating, handed over by [`Executor::hand_to_card`]. Not [`SourceFiller::DeclaredResident`]:
+    /// that is a LOADER's permanent statement about a source no launch ever binds, while this is a
+    /// PER-SEATING hand-off — the host takes the stick back the moment a `Host`-seeded launch
+    /// re-binds it (a churned seating's re-seed), which is why [`Executor::bind_input_raw`]
+    /// clears it. Baking it resident instead would mask exactly the refusal that catches a
+    /// forgotten seed bind on the first step of a seating.
+    ChainStage,
+    /// Its segment is ALIASED onto another session's region, so the OWNER filled it. The prefill
+    /// ladder rungs and the batched-prefill session are entirely this case for seg1 (weights) and
+    /// seg2 (KV): they bind NOTHING, precisely so the 2.6 GB stage+H2D happens once.
+    /// `alias_seg_from` has already proven both bundles place the tensor at the same
+    /// `(segment, offset, size)`, so the owner's write landed where this session's read will look.
+    SegmentOwner,
+    /// ⛔ NOBODY. Not a condition to carry on from — see [`Executor::require_sources_filled`].
+    Nobody,
+}
+
+/// The re-rolled layer loop: ONE BODY PER ATTENTION CLASS, each re-launched for its own layers
+/// with the weight and KV segment bases shifted per layer, between a prefix (embed) and a suffix
+/// (lm_head). ⭐ THE LAUNCH TABLE IS DECLARED DATA — one row per layer, in true layer order, each
+/// naming its body and its segment shifts. There is no per-layer arithmetic left here: no
+/// `v·weight_stride`, no `v / layers_per_bank`, no `v·kv_stride`. A class-split model's classes
+/// have DIFFERENT per-layer strides and different layer counts, which is exactly why the shifts
+/// are a table the bake proved against the placements rather than formulae the runtime re-derives.
+struct Rolled {
+    /// How many attention classes there are (one body each). 1 for every single-class model.
+    n_bodies: usize,
+    /// ⭐ ONE ROW PER LAYER, IN TRUE LAYER ORDER — which body runs it and the segment shifts the
+    /// launch applies. `(body, w_bank, w_off, kv_off)`: the launch binds bank `w_bank` into
+    /// positional slot 1, shifts seg1's base by `w_off` and seg2's by `kv_off`.
+    launches: Vec<(usize, u8, u64, u64)>,
+    /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
+    /// proved each group's weights live in ONE bank, because a launch has one base per segment.
+    prefix_weight_bank: usize,
+    suffix_weight_bank: usize,
+    // ⛔ NO HIDDEN-STREAM FIELDS. reroll_meta names `hidden_in`/`hidden_out`/`suffix_in` tids, but
+    // the loop-carried residual and the body→suffix seam thread IN-PLACE via emitter placement
+    // aliasing (hidden_out and suffix_in are aliased onto hidden_in's resident buffer), so the host
+    // neither copies nor addresses them. They were carried here only for a tid-archaeology dump of
+    // a bug that is fixed.
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The session
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// One resident SuperDSC session: program + weights + KV resident on-card.
+pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
+    /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
+    /// binary.
+    code: &'static bundle::BundleCode<'static, T>,
+    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's. BORROWED:
+    /// the card's owner opened it once for the process, and `'c` is the proof, checked by the
+    /// compiler, that this session cannot outlive it.
+    card: &'c CardRuntime<T>,
+
+    pub vocab: Vocab,
+    pub kv_dim: KvDim,
+    /// The pool page count the caller asked for at create.
+    num_blocks: PoolPages,
+
+    // ── Parsed layout (bundle_layout.json) ──
+    /// Placement per tensor IDENTITY.
+    ///
+    /// ⛔ WAS KEYED BY `t{id}` — a string the emitter and the host each built independently and
+    /// joined on by convention. A miss was `continue` + an eprintln (a silently unstaged weight),
+    /// so a drift in that convention could not surface as a build break. The key is now the id.
+    places: BTreeMap<bundle::PlaceId, &'static Placement>,
+    segment_bytes: [u64; NUM_SEGMENTS],
+    /// Matmul KERNEL weights → their device-tile descriptor. The weight is staged into the device
+    /// TILE layout (not row-major flat) by [`stage_weight_tiled`].
+    kernel_weights: BTreeMap<bundle::PlaceId, &'static KernelWeight<'static>>,
+    /// The role-`Logits` tensor — read back each step.
+    logits_id: bundle::PlaceId,
+    /// Ids `0..num_sources` are CALLER-FILLED every forward, EXCEPT the device-resident ones in
+    /// [`Self::resident_sources`]. Set by [`Executor::declare_sources`]; `None` means nothing has
+    /// told this executor how many, and the pre-launch completeness check cannot run.
+    num_sources: Option<u32>,
+    /// ⛔ SOURCES THE HOST DOES NOT WRITE PER STEP. The prefix-KV cache lives in seg2 and is
+    /// filled by the pool and by the device's own cachewr — it is a caller-filled source by id,
+    /// but no `bind_input` ever names it, so a completeness check that does not know this refuses
+    /// EVERY launch.
+    resident_sources: std::collections::BTreeSet<u32>,
+    /// ⭐ THE STICKS A STABLE SEATING HANDED TO THE CARD ([`Executor::hand_to_card`]) — the chain's
+    /// s/l sources, written by the previous step's ChainStage on the device. A PER-SEATING set, not
+    /// a loader declaration: [`Executor::bind_input_raw`] clears an id from it the moment the host
+    /// binds that stick again.
+    card_owned: std::collections::BTreeSet<bundle::PlaceId>,
+
+    // ── Programs ──
+    rolled: Option<Rolled>,
+    prefix_ops: Ops<T>,
+    /// ONE LIST PER ATTENTION CLASS — `body_ops[c]` is class `c`'s body. A single-class model
+    /// (every model but the hybrid-attention ones) has exactly one.
+    body_ops: Vec<Ops<T>>,
+    suffix_ops: Ops<T>,
+    /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
+    /// is the full cap.
+    body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
+
+    // ── Device state ──
+    // ⛔ The `DevAddr`s below are leaked at shutdown by `impl Drop for Executor` — see the note on
+    // `impl Drop for OpProg` for the abort that forced it.
+    stream: Option<Stream>,
+    seg_addr: [Option<DevAddr>; NUM_SEGMENTS],
+    /// ⭐ THE WEIGHT SEGMENT'S EXTRA BANKS — regions, host shadows and extents for banks `1..N`,
+    /// index `b - 1`. Bank 0 IS `seg_addr[SEG_WEIGHT]` / `seg_host[SEG_WEIGHT]`, so these three are
+    /// EMPTY for every bundle whose weights fit one device region and every path below then behaves
+    /// exactly as it did before banking existed.
+    ///
+    /// A bank is not another segment (there is no free slot, and the SDSC addresses all of them as
+    /// segment 1); it is a different REGION bound into the same positional slot by the launch that
+    /// needs it. See [`bundle::Placement::bank`] and [`Executor::slot_of`].
+    weight_bank_addr: Vec<Option<DevAddr>>,
+    weight_bank_host: Vec<HostShadow>,
+    weight_bank_bytes: Vec<u64>,
+    /// Per extra bank: its region is BORROWED from an owner session, so never H2D this session's
+    /// shadow over it. Mirrors [`Self::seg_aliased`], which cannot cover banks because it is indexed
+    /// by segment.
+    weight_bank_aliased: Vec<bool>,
+    /// One slot's host side (see [`HostShadow`]): a real staging/mirror buffer, or the typed
+    /// statement that the slot is device-only. Sized by [`Executor::stage_weights`] from the
+    /// bundle's own role statement (see [`Executor::host_owned_seg`]).
+    seg_host: [HostShadow; NUM_SEGMENTS],
+    /// ⭐ #32 (C) — THE DEFERRED PICKS' LANDING RING: one slot per outstanding deferred
+    /// read, allocated ONCE at first use at the read's own length and reused forever.
+    /// The shadow slice a deferred read lands in today is the PLACEMENT's own window in
+    /// `seg_host`, so two outstanding reads for the same stick race — the later transfer
+    /// clobbers the earlier pick before the host slices it out. The ring gives every
+    /// in-flight step its own bytes; the slot returns to `read_ring_free` at the finish
+    /// half, so the ring's live size IS the number of reads in flight, bounded by the
+    /// pipeline's own depth.
+    read_ring: Vec<Vec<u8>>,
+    read_ring_free: Vec<usize>,
+    /// ⭐ #32 — THE LAST H2D A SUBMIT ENQUEUED, signaled: the shadow's quiet
+    /// point. An H2D reads the HOST SHADOW at device-execution time, so a host
+    /// thread may only overwrite the shadow once every in-flight H2D has
+    /// executed; FIFO retires the whole prefix behind the last-enqueued one, so
+    /// waiting IT is waiting them all. EVERY door that writes the shadow takes
+    /// this latch first through [`Executor::quiet_shadow`] — the drain
+    /// ([`Executor::finish_deferred_read_raw`]) beside the read's own signal,
+    /// and every bind/write door on its own — so no writer and no drain can
+    /// disagree about when the shadow went quiet. In the pipelined cadence the
+    /// drain took the latch one message ago and the next door's take is free;
+    /// at startup and between back-to-back submits it costs one H2D.
+    last_h2d: Option<crate::runtime::ReadSignal>,
+    /// This segment's device region is BORROWED from another session, so `seg_host` is NOT its
+    /// authoritative shadow and must never be H2D'd over it.
+    seg_aliased: [bool; NUM_SEGMENTS],
+    /// Declared BEFORE prepare: this session's own copy is dead on arrival (an alias will repoint
+    /// it), so prepare gives it a 128 B placeholder and skips its staging and its H2D.
+    seg_borrowed: [bool; NUM_SEGMENTS],
+
+    // ── Host binds ──
+    /// Bound host inputs. Ids bound BEFORE prepare are resident WEIGHTS (uploaded once); ids
+    /// bound per predict are ACTIVATIONS (uploaded each step).
+    ///
+    /// ⭐ BY PROVENANCE, NOT ALWAYS OWNED: a weight staged off the page cache holds a
+    /// [`HostBytes::View`] of its mmap (the load's zero-copy alias — see
+    /// [`scratchy_target_spyre::allocator::HostBytes`]); activations and built tables hold `Owned` buffers.
+    /// Staging is the weights' last reader and walks byte slices, so a view serves as directly
+    /// as a copy and drops its keepalive when the entry leaves this map.
+    bound: BTreeMap<bundle::PlaceId, HostBytes>,
+    weight_ids: BTreeSet<bundle::PlaceId>,
+    /// ⭐⭐⭐⭐⭐ IDS WHOSE BYTES ARE **NOT** IEEE-fp16 — copied into the shadow verbatim instead of
+    /// going through [`sen_convert::ieee_to_sen_bytes`].
+    ///
+    /// ⛔ WITHOUT THIS, A GATHER'S INDEX TABLE IS DESTROYED BY THE BIND LOOP. Every staging path in
+    /// this file ends in `ieee_to_sen_bytes(src, dst)` — unconditionally, for weights at prepare and
+    /// for activations at every predict — because until now every bound tensor genuinely WAS a
+    /// magnitude the card holds in SEN169 fp16. The KV block index is int32 addresses-in-waiting
+    /// (`Staged::I32`): running them through an fp16 re-encoding reads each 4-byte entry as two fp16
+    /// values and rewrites both mantissas. Block 37 does not become "roughly 37"; it becomes a
+    /// different, valid, arbitrary block — fluent output from another request's keys, with no fault.
+    ///
+    /// ⛔ NOT A FLAG ON THE BIND CALL, A SET KEYED BY ID, because there are TWO convert loops
+    /// (`stage_weights`, `predict`) and a per-call flag would have to be remembered by both anyway.
+    /// One set, consulted by both, is the only arrangement in which they cannot disagree.
+    raw_ids: BTreeSet<bundle::PlaceId>,
+    /// ⭐ ACTIVATIONS STAGED BY KEY — the key their bytes are a function of, and whether this
+    /// step re-bound them. Today exactly one: the new-block causal mask
+    /// ([`ktir_superdsc::sdsc_abstract::CausalKey`]).
+    ///
+    /// A keyed bind is written to the shadow and uploaded in the step that binds it, and NOT
+    /// re-uploaded by a step that does not: segment 3, where every activation lives, is written by
+    /// no device op (measured over every compute op of the 252 granite-2b bundles), so the device
+    /// keeps the bytes of the last bind. Every UNKEYED activation is re-uploaded every step exactly
+    /// as before. That arrangement is deliberate: an input someone forgets to re-bind must still be
+    /// caught by today's path, not hidden by this one.
+    keyed: BTreeMap<bundle::PlaceId, Keyed>,
+    /// ⭐ ACTIVATIONS ALREADY IN THE SHADOW — the byte length of each f32 activation that
+    /// [`Self::bind_input_f32`] converted straight into its placement's slot of `seg_host`. The
+    /// refill sends that range exactly as it sends a [`Self::bound`] one, without converting it a
+    /// second time: the bytes are already the device's.
+    ///
+    /// Disjoint from `bound` by construction: every bind door removes its id from the other map, so
+    /// one id has one source of bytes.
+    staged: BTreeMap<bundle::PlaceId, u64>,
+    /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
+    /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
+    /// no IEEE→SEN re-encode, no tile walk. The spliced argmax kernel's staged f32 constants
+    /// (the one-request rung's exactness island), and nothing else today.
+    ///
+    /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
+    /// flag remembered by the bind call alone is a flag the loop can forget.
+    const_fp32_ids: BTreeSet<bundle::PlaceId>,
+
+    prepared: bool,
+    staged_host: bool,
+    n_weights_staged: usize,
+    /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
+    /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
+    /// and its own op counter. `None` unless the env gate is set.
+    dump: Option<TensorDump>,
+
+    // ── #603 PR2 2c — the replay player ──
+    /// Cached step images, keyed by (body, resident page count, fold shape) —
+    /// [`StepImageKey`]. EMPTY until the first eligible decode step derives
+    /// one; every batched or instrumented step takes the walk instead, so
+    /// nothing here is consulted (or populated) off the player's own path.
+    step_images: StepImageCache,
+    /// ⭐ THE RANK THIS SESSION RUNS AS — [`RankSeat::Alone`] for a world of one. Bound once, at
+    /// load ([`Executor::load`] reads its card's link); every collective's send and wait names its
+    /// route, and every consume group this session binds was chosen by its identity.
+    seat: RankSeat<T>,
+}
+
+/// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
+struct TensorDump {
+    /// This fingerprint's program index, assigned from the process-global first-dumped registry.
+    prog: usize,
+    /// This session's op counter (one per launch group, prefix/body/suffix alike).
+    op: usize,
+    /// Last-seen device bytes per placement (sen format, exactly what D2H brought back).
+    snap: std::collections::HashMap<bundle::PlaceId, Vec<u8>>,
+}
+
+/// The process-global fingerprint → program-index registry for the tensordump, in first-dumped
+/// order. On the card the sessions are built prefill-first-then-decode, which is the emulator's
+/// program order (`new_multi`: prefill first, then the decode cap buckets), so the indices line up
+/// with an `SCRATCHY_EMU_TENSORDUMP` of the same run for the two sessions that actually run — the
+/// ladder rungs that never launch never claim an index.
+fn dump_prog_index(fp: &str) -> usize {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let reg = REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let n = reg.len();
+    *reg.entry(fp.to_string()).or_insert(n)
+}
+
+/// ⭐⭐⭐⭐⭐ A RAW (device-format) PAYLOAD **AND THE PLACEMENT IT FITS**, as one value — the only thing
+/// [`Executor::bind_input_raw`] accepts, and the reason a raw bind can no longer overrun its tensor.
+///
+/// 🛑 **IT WAS TWO ARGUMENTS SIDE BY SIDE.** `bind_input_raw(id, bytes)` took a byte vector with no
+/// relation to the tensor it would be written into; the relation was re-established far away and at
+/// RUNTIME, by `refill_activations`'s over-bind `bail!` and by its `let Some(p) = places.get(nm) else
+/// { continue }`. Those two arms are different failures wearing one shape:
+///
+/// * **Too long.** The shadow write is `seg_host[seg][offset..][..src.len()]`, so a payload past its
+///   own placement overwrites the tensors the layout put after it. For the gather's index table the
+///   tensor after it is read as BLOCK NUMBERS, and a block number is a valid address — a clean bake,
+///   no fault, another page's keys.
+/// * **Not placed at all.** `continue` — the bind was SKIPPED, in silence. An index table nobody
+///   staged reads as entry 0 on every row, which is page 0's first block: a real address, so the whole
+///   batch answers fluently from row 0's history. `assemble_attn` states this exact hazard ("a name no
+///   placement matches is a bind the launcher skips in silence") and had nothing to enforce it with.
+///
+/// ⛔ THERE IS NO PUBLIC CONSTRUCTOR AND NO PUBLIC FIELD. [`Executor::place_raw`] is the only way to
+/// make one, it consults the session's own placement table, and it returns `None` for either case
+/// above — so neither is expressible at the bind, which is what makes the runtime checks redundant
+/// rather than merely duplicated. The placement is CONSUMED by the constructor rather than carried:
+/// a value that exists has already been measured against it, and keeping a second copy here would be
+/// the same "one quantity, two declarations" the type removes.
+pub struct RawBind {
+    id: bundle::PlaceId,
+    bytes: Vec<u8>,
+}
+
+/// ⭐ #32 — ONE DEFERRED READ, IN FLIGHT: the enqueue half
+/// ([`Executor::defer_read_tensor_raw`] / [`Executor::defer_read_tensor_ring`]) hands this
+/// back instead of the bytes, and the finish half ([`Executor::finish_deferred_read_raw`])
+/// parks on `done` and slices the landed bytes out. The pipelined decode loop holds the
+/// enqueue across its prep-ahead and drains at the token's own deadline.
+pub struct DeferredRead {
+    id: bundle::PlaceId,
+    seg: SegIdx,
+    /// The placement's offset into its segment.
+    offset: u64,
+    /// The window's END — the placement's offset plus the transfer's flit-rounded length on the
+    /// own-window arm, the whole region's size on the fallback. The shadow read never needs it
+    /// (its slice indexes the placement offset into the whole segment); the RING read does (its
+    /// slot holds only the window, so the placement's bytes start `offset − win_start` into the
+    /// slot).
+    end: u64,
+    /// The window's start — the placement's offset on the own-window arm,
+    /// 0 on the whole-region fallback.
+    win_start: u64,
+    /// The placement's own size — the return clamp.
+    size: u64,
+    /// The caller's cap — the return clamp.
+    cap: usize,
+    /// ⭐ #32 (C) — THE LANDING SLOT, when this read was deferred into the ring
+    /// (the in-flight spelling; `None` for the shadow spelling). The finish
+    /// half slices the slot and returns it to the free list — one slot out
+    /// per outstanding read, one slot back per finish, so the two lists can
+    /// never disagree about what is in flight.
+    ring: Option<usize>,
+    /// ⭐ #32 — THE READ'S OWN COMPLETION, armed at the enqueue (the D2H op's
+    /// user callback — the per-op hook the seat's `d2h_on_compute_signaled`
+    /// arms). The finish half parks on THIS, not on a stream synchronize: the
+    /// whole-stream wait retired every op behind the read, including the step
+    /// the pipelined loop had just submitted for overlap.
+    done: crate::runtime::ReadSignal,
+}
+
+impl DeferredRead {
+    /// ⭐ #32 (E) — THE OVERLAP PROBE'S HANDLE: this read's completion
+    /// signal, AS A PEEK HANDLE ([`crate::runtime::ReadSignal::peek_handle`]
+    /// — `fired` is the whole of its surface, BY TYPE: the handle cannot
+    /// wait, so the drain's park on the read's own signal stays its one
+    /// waiter, and nothing here reads a byte of the slot). The submit side
+    /// holds it for the NEXT submit's non-blocking ask, so the "card busy
+    /// at submit" row measures the pipeline's real overlap. The ring law is
+    /// untouched: the slot's bytes are still read exactly once, by the drain
+    /// that owns the read.
+    pub fn signal(&self) -> crate::runtime::ReadPeek {
+        self.done.peek_handle()
+    }
+}
+
+/// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
+/// readback that [`Executor::predict`] (logits D2H) shares, held in one struct so the
+/// step's tails print from the
+/// SAME numbers and cannot drift on anything the step did before its readback.
+struct ForwardHalf {
+    t_stream0: Instant,
+    t0: Instant,
+    t0b: Instant,
+    t1: Instant,
+    t2: Instant,
+    h2d_note: String,
+    h2d_bytes: u64,
+}
+
+/// WHICH RANK A SESSION RUNS AS — the bundle's world and its card's link, agreed at load.
+#[derive(Clone, Copy, Debug)]
+pub enum RankSeat<T: ktir_superdsc::collective::Tp> {
+    /// A world of one: the bundle places no receive window and the card linked no peer.
+    Alone,
+    /// One rank of a sharded world: the bundle's window is the one whose slots the card's link
+    /// pointed its `XSEG` entries at.
+    Linked { me: bundle::collective::Rank<T> },
+}
+
+/// Why a bundle cannot run in this process's world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatRefusal<T: ktir_superdsc::collective::Tp> {
+    /// The bundle was baked for a sharded world, and its card linked no peer to send to.
+    Unlinked,
+    /// The card runs one rank of a sharded world, and the bundle was baked for a world of one.
+    UnshardedBundle,
+    /// The bundle's window is not the one the card's link programmed — the peer's sends would
+    /// land where this bundle's consumes do not read.
+    WindowMoved {
+        baked: bundle::collective::RecvWindow<T>,
+        linked: bundle::collective::RecvWindow<T>,
+    },
+    /// The bundle's window cuts are not one flit-aligned window in bank 0 of the weight segment.
+    Misplaced(bundle::collective::SendUnplaced),
+}
+
+impl<T: ktir_superdsc::collective::Tp> std::fmt::Display for SeatRefusal<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlinked => write!(
+                f,
+                "baked for a sharded world, but its card linked no peer (`runtime::link_peers`) — \
+                 a world-of-one session cannot run it"
+            ),
+            Self::UnshardedBundle => write!(
+                f,
+                "baked for a world of one, but its card runs one rank of a sharded world"
+            ),
+            Self::WindowMoved { baked, linked } => write!(
+                f,
+                "its receive window {baked:?} is not the {linked:?} this card's XSEG entries \
+                 point at — every bundle a rank runs must bake the same window"
+            ),
+            Self::Misplaced(why) => write!(
+                f,
+                "its receive window's cuts are not one flit-aligned window: {why:?}"
+            ),
+        }
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> std::error::Error for SeatRefusal<T> {}
+
+impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
+    /// The seat a session over `code` takes on a card holding `link`.
+    ///
+    /// # Errors
+    /// [`SeatRefusal`], by name.
+    pub fn of(
+        code: &bundle::BundleCode<'_, T>,
+        link: Option<&PeerLink<T>>,
+    ) -> Result<Self, SeatRefusal<T>> {
+        Self::agree(Self::baked_window(code)?, link.map(PeerLink::window))?;
+        Ok(link.map_or(Self::Alone, |l| Self::Linked { me: l.identity() }))
+    }
+
+    /// The receive window `code` bakes — `None` for a bundle baked for a world of one. What a
+    /// world's [`crate::runtime::link_peers`] programs, read off the bundle that will run.
+    ///
+    /// # Errors
+    /// [`SeatRefusal::Misplaced`] when the cuts are not one flit-aligned window
+    /// ([`bundle::collective::baked_window`]).
+    pub fn baked_window(
+        code: &bundle::BundleCode<'_, T>,
+    ) -> Result<Option<bundle::collective::RecvWindow<T>>, SeatRefusal<T>> {
+        bundle::collective::baked_window::<T>(&code.layout).map_err(SeatRefusal::Misplaced)
+    }
+
+    /// The seat law over the two windows: the bundle's and the link's, each present or not.
+    fn agree(
+        baked: Option<bundle::collective::RecvWindow<T>>,
+        linked: Option<bundle::collective::RecvWindow<T>>,
+    ) -> Result<(), SeatRefusal<T>> {
+        match (baked, linked) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(SeatRefusal::Unlinked),
+            (None, Some(_)) => Err(SeatRefusal::UnshardedBundle),
+            (Some(baked), Some(linked)) if baked == linked => Ok(()),
+            (Some(baked), Some(linked)) => Err(SeatRefusal::WindowMoved { baked, linked }),
+        }
+    }
+
+    /// The rank this seat runs as — `None` alone.
+    fn identity(self) -> Option<bundle::collective::Rank<T>> {
+        match self {
+            Self::Alone => None,
+            Self::Linked { me } => Some(me),
+        }
+    }
+}
+
+impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Create
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Open a session on the baked bundle `code`: index its memory plan, bind every launch group to its
+    /// compiled program, and latch the paged geometry the bundle declares. Allocates nothing on-device —
+    /// that is [`Executor::prepare`].
+    ///
+    /// Nothing is read from disk: `code` is `&'static` data in this binary.
+    pub fn load(
+        card: &'c CardRuntime<T>,
+        code: &'static bundle::BundleCode<'static, T>,
+        vocab: Vocab,
+        kv_dim: KvDim,
+        num_blocks: PoolPages,
+    ) -> Result<Executor<'c, T>> {
+        // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
+        // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
+        // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
+        // groups its rank plays.
+        let seat =
+            RankSeat::of(code, card.link()).map_err(|e| anyhow!("bundle {}: {e}", code.fp))?;
+        // ⛔ A SHARDED RANK'S STEP CANNOT DRAIN MID-SUBMIT: its collectives wait on peers that
+        // submit only after it returns, so an instrument that synchronizes between ops waits on a
+        // send never issued (measured: a 280 s stream timeout). Those instruments are a one-card
+        // tool; a sharded session refuses them at load, by name, rather than hang.
+        if <T as ktir_superdsc::collective::World>::SHARDED {
+            let d = Diag::get();
+            let drains = [
+                ("SCRATCHY_SDSC_PEROP_SYNC", d.perop_sync),
+                ("SCRATCHY_SDSC_GROUP_TIME", d.group_time),
+                ("SCRATCHY_SDSC_PREFIX_TIME", d.prefix_time),
+                ("SCRATCHY_SDSC_OPTRACE", d.optrace),
+                ("SCRATCHY_SDSC_TENSORDUMP", d.tensordump.is_some()),
+            ];
+            if let Some((name, _)) = drains.iter().find(|(_, on)| *on) {
+                bail!(
+                    "{name} drains the stream between a step's ops, and a sharded rank's step \
+                     cannot drain before its peers submit — run it on a one-card build"
+                );
+            }
+        }
+        let places: BTreeMap<bundle::PlaceId, &'static Placement> =
+            code.layout.places.iter().map(|p| (p.id, p)).collect();
+        // ⛔⛔⛔ THE MAP MUST NOT HAVE LOST A PLACEMENT. This was keyed by `p.name` (a String) and
+        // is now keyed by `p.id`; a `BTreeMap` silently keeps the LAST entry for a duplicate key,
+        // so two placements sharing an id would leave one tensor with NO placement at all. The
+        // host then never stages it and the device reads whatever that HBM held — which does not
+        // fault, it hangs or answers with confident garbage.
+        if places.len() != code.layout.places.len() {
+            let mut seen = std::collections::BTreeSet::new();
+            let dupes: Vec<String> = code
+                .layout
+                .places
+                .iter()
+                .filter(|p| !seen.insert(p.id))
+                .map(|p| p.id.to_string())
+                .collect();
+            bail!(
+                "bundle {}: {} placements collapse to {} distinct ids — {:?} appear more than \
+                 once. Two tensors share an identity, so one of them has no placement.",
+                code.fp,
+                code.layout.places.len(),
+                places.len(),
+                dupes
+            );
+        }
+        let logits_id = code
+            .layout
+            .logits()
+            .ok_or_else(|| anyhow!("bundle {} places no Logits tensor", code.fp))?
+            .id;
+        let kernel_weights = code
+            .layout
+            .kernel_weights
+            .iter()
+            .map(|k| (k.id, k))
+            .collect();
+
+        let mut ex = Executor {
+            code,
+            card,
+            vocab,
+            kv_dim,
+            num_blocks,
+            places,
+            segment_bytes: code.layout.segment_bytes,
+            kernel_weights,
+            logits_id,
+            num_sources: None,
+            resident_sources: std::collections::BTreeSet::new(),
+            card_owned: std::collections::BTreeSet::new(),
+            rolled: None,
+            prefix_ops: Vec::new(),
+            body_ops: Vec::new(),
+            suffix_ops: Vec::new(),
+            body_rungs: Vec::new(),
+            stream: None,
+            seg_addr: [const { None }; NUM_SEGMENTS],
+            // ⭐ THE WEIGHT BANKS, STRAIGHT FROM THE BAKED LAYOUT — the bundle decided how many
+            // regions its weights need at cargo-build; nothing here chooses. Empty (one bank) for
+            // every model whose weights fit one region.
+            weight_bank_addr: code.layout.weight_bank_bytes.iter().map(|_| None).collect(),
+            weight_bank_host: code
+                .layout
+                .weight_bank_bytes
+                .iter()
+                .map(|_| HostShadow::Host(HostBuf::empty()))
+                .collect(),
+            weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
+            weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
+            seg_host: [const { HostShadow::Host(HostBuf::empty()) }; NUM_SEGMENTS],
+            read_ring: Vec::new(),
+            read_ring_free: Vec::new(),
+            last_h2d: None,
+            seg_aliased: [false; NUM_SEGMENTS],
+            seg_borrowed: [false; NUM_SEGMENTS],
+            bound: BTreeMap::new(),
+            weight_ids: BTreeSet::new(),
+            raw_ids: BTreeSet::new(),
+            keyed: BTreeMap::new(),
+            staged: BTreeMap::new(),
+            const_fp32_ids: BTreeSet::new(),
+            prepared: false,
+            staged_host: false,
+            n_weights_staged: 0,
+            dump: None,
+            step_images: StepImageCache::default(),
+            seat,
+        };
+
+        // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
+        //    and suffix (lm_head) are SIBLING bundles it names by fingerprint. The layout above is the
+        //    FULL plan (every layer's weights/KV resident), shared by all three. ──
+        if let Some(m) = &code.reroll {
+            ex.load_rolled(m)?;
+        }
+        // The BODY's own launch groups (or the whole model's, unrolled).
+        ex.load_bodies()?;
+
+        debug!(
+            "[sdsc-superdsc] load OK — bundle={}, {} placements, seg_bytes={:?}, logits={}, \
+             vocab={} kv_dim={} num_blocks={}",
+            code.fp,
+            ex.places.len(),
+            ex.segment_bytes,
+            ex.logits_id,
+            ex.vocab.0,
+            ex.kv_dim.0,
+            ex.num_blocks.0,
+        );
+        Ok(ex)
+    }
+
+    /// Bind one sibling bundle's launch groups.
+    ///
+    /// ⛔ A SIBLING IS A FINGERPRINT THE REGISTRY RESOLVES. A rung this binary does not carry is a hard
+    /// load error naming it and listing what IS carried — the alternative, treating it as absent, runs
+    /// the batch on a bundle the ladder said was there.
+    fn sibling_ops(&self, what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops<T>> {
+        let code = bundle::sibling(fp).ok_or_else(|| {
+            anyhow!(
+                "{what} {} is not compiled into this binary — the emit either produced no such \
+                 bundle or ran for a different model. Registered: {:?}",
+                fp.as_str(),
+                bundle::registered_fps::<T>(),
+            )
+        })?;
+        bind_ops(code, self.session())
+    }
+
+    /// The rank this session runs as, when it runs one rank of a sharded world.
+    fn session(&self) -> Option<bundle::collective::Rank<T>> {
+        self.seat.identity()
+    }
+
+    /// The rank this executor plays as — `None` alone. What the host stages per rank reads it:
+    /// the chained head's tables and seeds are its rank's vocabulary block.
+    pub fn tp_identity(&self) -> Option<bundle::collective::Rank<T>> {
+        self.session()
+    }
+
+    fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
+        // A bank index the session has no region for would silently fall back to another bank's
+        // base, which is a whole program reading the wrong weights. Check every launch's bank and
+        // both seam groups at load.
+        let banks = self.weight_bank_bytes.len() + 1;
+        for (what, b) in [
+            ("prefix", m.prefix_weight_bank),
+            ("suffix", m.suffix_weight_bank),
+        ] {
+            if b as usize >= banks {
+                bail!(
+                    "load: reroll meta puts the {what}'s weights in bank {b}, but this bundle has \
+                     only {banks} weight bank(s)"
+                );
+            }
+        }
+        // ⛔ EVERY LAUNCH'S BANK AND BODY, CHECKED AT LOAD. A launch naming a body the meta does
+        // not carry, or a bank the bundle does not hold, is a bake/runtime disagreement that would
+        // otherwise surface as a wrong-base launch — fluent garbage or an unaddressable region.
+        // The launches' bodies also name the CLASS COUNT, which the rungs must agree with.
+        for l in m.launches.iter() {
+            if l.body as usize >= m.bodies.len() {
+                bail!(
+                    "load: reroll meta's launch table names body {} but the meta carries {} \
+                     body(ies)",
+                    l.body,
+                    m.bodies.len()
+                );
+            }
+            if l.w_bank as usize >= banks {
+                bail!(
+                    "load: reroll meta's launch table puts layer (body {}, iter {}) in bank {}, \
+                     but this bundle has only {banks} weight bank(s)",
+                    l.body,
+                    l.iter,
+                    l.w_bank
+                );
+            }
+        }
+        if m.launches.is_empty() {
+            bail!(
+                "load: reroll meta declares an EMPTY launch table — the layer sequence is the one \
+                 thing the executor cannot re-derive"
+            );
+        }
+        self.rolled = Some(Rolled {
+            n_bodies: m.bodies.len(),
+            launches: m
+                .launches
+                .iter()
+                .map(|l| (l.body as usize, l.w_bank, l.w_off, l.kv_off))
+                .collect(),
+            prefix_weight_bank: m.prefix_weight_bank as usize,
+            suffix_weight_bank: m.suffix_weight_bank as usize,
+        });
+        self.prefix_ops = self.sibling_ops("rolled prefix", &m.prefix)?;
+        self.suffix_ops = self.sibling_ops("rolled suffix", &m.suffix)?;
+        debug!(
+            "[sdsc-superdsc] load: RE-ROLLED — {} body class(es) + prefix({}) + suffix({}); {} \
+             launch(es), page_stride={} B",
+            m.bodies.len(),
+            m.prefix.as_str(),
+            m.suffix.as_str(),
+            m.launches.len(),
+            m.kv_page_stride
+        );
+        // The launch table verbatim — body/iter/w_bank/w_off/kv_off per layer, in true order. This
+        // is the arithmetic the card run's launch loop applies, so a card fault at a known device
+        // address is traced to its producing launch by reading this against the region bases the
+        // prepare-time seg-alloc debug prints.
+        debug!("[sdsc-superdsc] launch table: {:?}", m.launches);
+        Ok(())
+    }
+
+    /// Bind the body's launch groups: either the sk_bucket LADDER (one body per attention sweep
+    /// extent, ONE LIST PER CLASS per rung) or the single bodies (one per class), each with its
+    /// fold-fused twin where one was baked.
+    ///
+    /// ⭐ THE ANCHOR RULE: `bodies[0]` is THIS bundle, and every other class is a sibling the meta
+    /// names — the same rule the prefix/suffix follow. A single-class model's `bodies` is exactly
+    /// `[self.code]`.
+    fn load_bodies(&mut self) -> Result<()> {
+        // ⭐ A ROLLED BODY'S RUNGS COME OFF ITS LADDER (`RerollMeta::ladder`), the one reading the
+        // bake proves — never empty. Only an unrolled bundle, which carries no ladder, is ladderless.
+        let rungs: &[bundle::LadderRung<'static>] = match &self.code.reroll {
+            Some(m) => m
+                .ladder()
+                .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
+                .rungs(),
+            None => &[],
+        };
+        // An UNROLLED bundle is its one body; a rolled one is its ladder, and runs only its rungs.
+        if rungs.is_empty() {
+            self.body_ops = vec![bind_ops(self.code, self.session())?];
+        }
+        // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. Each rung's
+        // class 0 body IS this bundle's rung sibling — the registry resolves like any other.
+        for r in rungs {
+            let bodies = r
+                .bodies
+                .iter()
+                .map(|fp| self.sibling_ops("decode rung", fp))
+                .collect::<Result<Vec<_>>>()?;
+            self.body_rungs.push((r.active_cap, bodies));
+        }
+        // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
+        //
+        // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
+        // line reports ("session ready", placements, `decode caps`), so a bundle whose programs are
+        // MISSING loads clean and serves nothing: no launch, no error, a logits buffer that stays
+        // zero, a constant argmax, and `"text": ""` with `finish_reason: "length"`. It took a whole
+        // session to find because the only symptoms were an absurd 0.6 ms/token and a `cap` that came
+        // out as `num_blocks * 64`.
+        //
+        // So the counts go at INFO, always, next to the fingerprint: one line that says whether the
+        // thing that was loaded can run — the one body or every rung's — and zero says so in its own
+        // words rather than by arithmetic.
+        let n_body: usize = self.body_ops.iter().map(|o| o.len()).sum::<usize>()
+            + self
+                .body_rungs
+                .iter()
+                .flat_map(|(_, classes)| classes.iter())
+                .map(|o| o.len())
+                .sum::<usize>();
+        if n_body == 0 && self.prefix_ops.is_empty() && self.suffix_ops.is_empty() {
+            bail!(
+                "bundle {} has ZERO device programs (0 body / 0 prefix / 0 suffix launch groups). \
+                 Its memory plan is present, which is why every session line would otherwise report \
+                 itself ready — but NOTHING CAN BE LAUNCHED: forwards return in microseconds, the \
+                 logits buffer stays zero, argmax lands on a constant token id, and every completion \
+                 comes back EMPTY (`finish_reason: \"length\"`, ~0.6 ms/token) with no error anywhere. \
+                 REFUSING TO LOAD: serving this is strictly worse than not starting. The cause is a \
+                 BAKE that emitted placements without programs — set `DEEPTOOLS_PATH` (and the \
+                 deeptools `LD_LIBRARY_PATH`) in the stage that runs `cargo build`, not only at \
+                 runtime.",
+                self.code.fp,
+            );
+        }
+        let caps: Vec<u32> = self.body_rungs.iter().map(|(c, _)| c.get()).collect();
+        info!(
+            "[sdsc-superdsc] bundle {}: {n_body} body launch group(s) over {} rung(s) (active_cap \
+             {caps:?}) + {} prefix + {} suffix",
+            self.code.fp,
+            self.body_rungs.len().max(1),
+            self.prefix_ops.len(),
+            self.suffix_ops.len()
+        );
+        Ok(())
+    }
+
+    /// The CPUs this session's card's host threads run on (its NUMA node's): a thread that
+    /// submits this session's steps pins itself to them first.
+    pub fn card_cpus(&self) -> &flex_rs::numa::CardCpus {
+        self.card.cpus()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Binding
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// How many leading tensor ids are sources, and which of them the host does NOT write each
+    /// step (the prefix-KV cache). Both come from the generated wiring. Without them
+    /// [`Executor::require_sources_filled`] cannot run and `predict` says so.
+    pub fn declare_sources(&mut self, n: u32, resident: impl IntoIterator<Item = u32>) {
+        self.num_sources = Some(n);
+        self.resident_sources = resident.into_iter().collect();
+    }
+
+    /// ⛔⛔⛔ REFUSE TO LAUNCH WITH A SOURCE NOBODY FILLED.
+    ///
+    /// Ids `0..num_sources` are written by the host every forward — by the generated weight loader
+    /// before prepare, or by a forward-tape step each step. One that NEITHER wrote is not an error
+    /// the device reports: it reads whatever the segment holds, or it waits. The failure surfaces
+    /// as a HANG, or as fluent-but-wrong output, with nothing in any log.
+    ///
+    /// This is the runtime half of the bake-time completeness lock in the `#[forward]` macro. The
+    /// bake proves the WIRING names a filler for every source; this proves the filler actually
+    /// ran. Both exist because the gap between them is invisible: `superdsc_bake` refuses a plan
+    /// with no device programs for the same reason — a binary that links, serves, and does
+    /// nothing is worse than one that fails.
+    fn require_sources_filled(&self) -> Result<()> {
+        let Some(n) = self.num_sources else {
+            bail!(
+                "predict: no source count was declared, so the executor cannot check that every \
+                 caller-filled tensor was written. Call `declare_sources` from the generated \
+                 wiring at load — refusing to launch unchecked."
+            );
+        };
+        let missing: Vec<bundle::PlaceId> = (0..n)
+            .map(bundle::PlaceId::Act)
+            // ⛔ SPELLED OUT, NOT `== Nobody`. A sixth fill mechanism added to `SourceFiller` fails
+            // to compile HERE until someone says whether it counts as filled — which is the only
+            // reason the classification is a type instead of a boolean.
+            .filter(|id| match self.filler_of(id) {
+                SourceFiller::Nobody => true,
+                SourceFiller::NotPlaced
+                | SourceFiller::WeightLoader
+                | SourceFiller::TapeStep
+                | SourceFiller::DeclaredResident
+                | SourceFiller::ChainStage
+                | SourceFiller::SegmentOwner => false,
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "predict: {} caller-filled source(s) were never written this step — {}. The device \
+             does not report this: it reads memory the host never filled, which surfaces as a \
+             HANG or as confident garbage with no error anywhere. Refusing to launch.",
+            missing.len(),
+            missing
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// ⛔⛔⛔ WHO FILLED THIS SOURCE — ONE ANSWER, FROM ONE PLACE.
+    ///
+    /// This used to be an open-coded chain of negations inside `require_sources_filled`:
+    /// `places.contains && !weight_ids.contains && !bound.contains && !resident_sources.contains`.
+    /// The bug that shape produced: adding a FIFTH way to fill a source needs a fifth `&& !`, and
+    /// forgetting it does not fail to compile — it silently reads as "nobody filled this", so the
+    /// executor refuses a launch that was perfectly well fed. That is exactly what happened to the
+    /// prefill ladder, which fills its weights by ALIAS and was refused for 642 of them.
+    ///
+    /// A total function into [`SourceFiller`] fixes the shape, not just the instance: the mechanisms
+    /// are enumerated once, `Nobody` is one named case among them rather than the absence of all the
+    /// others, and every consumer matches EXHAUSTIVELY — so a new variant is a compile error at
+    /// every site that has to account for it.
+    fn filler_of(&self, id: &bundle::PlaceId) -> SourceFiller {
+        // Not in this bundle at all ⇒ not this session's source and not its problem.
+        if !self.places.contains_key(id) {
+            return SourceFiller::NotPlaced;
+        }
+        // ⭐ ORDER IS DELIBERATE: an id can be reachable by more than one mechanism (a weight is in
+        // both `weight_ids` and `bound`), and the FIRST match is the one that actually wrote the
+        // bytes. Any of them ⇒ filled, so the order changes only the label, never the verdict.
+        if self.weight_ids.contains(id) {
+            SourceFiller::WeightLoader
+        } else if self.bound.contains_key(id) || self.staged.contains_key(id) {
+            SourceFiller::TapeStep
+        } else if self.resident_sources.contains(&id.tid()) {
+            SourceFiller::DeclaredResident
+        } else if self.card_owned.contains(id) {
+            SourceFiller::ChainStage
+        } else if self.source_segment_is_aliased(id) {
+            SourceFiller::SegmentOwner
+        } else {
+            SourceFiller::Nobody
+        }
+    }
+
+    /// Does this source live in a segment this session has ALIASED onto an owner's region?
+    ///
+    /// Keyed on `seg_aliased`, not `seg_borrowed`: `mark_borrowed` only PROMISES an alias and
+    /// shrinks the segment to a 128 B placeholder. A session that marked and then failed to alias
+    /// reads that placeholder, which is precisely the fill-nobody-did this guard exists to refuse.
+    fn source_segment_is_aliased(&self, id: &bundle::PlaceId) -> bool {
+        self.places
+            .get(id)
+            .and_then(|p| SegIdx::checked(p.segment as i64))
+            .is_some_and(|seg| self.seg_aliased[seg.get()])
+    }
+
+    /// Does this session still owe an alias for a segment it declared borrowed? While
+    /// true, that segment holds its 128 B placeholder, so no CB may be rendered through
+    /// it — the parity gate waits (see [`Executor::prepare`]) and runs at the alias that
+    /// completes the set ([`Executor::alias_seg_from`]).
+    fn borrow_set_pending(&self) -> bool {
+        self.seg_borrowed
+            .iter()
+            .zip(self.seg_aliased.iter())
+            .any(|(borrowed, aliased)| *borrowed && !*aliased)
+    }
+
+    /// Bind a WEIGHT by name, taking ownership of its bytes. Weights are bound before
+    /// [`Executor::prepare`], staged once into the resident segments, and their host bytes are
+    /// reclaimed there.
+    ///
+    /// ⭐ MOVES, never copies. The C++ took a pointer to caller memory precisely to avoid
+    /// duplicating an 8.9 GB model across the FFI; owning the bytes gets the same zero copies
+    /// with no lifetime contract to violate. A staged weight arrives as a [`HostBytes::View`]
+    /// of its mmap — the move is a keepalive handle, so the page cache the staging walk is
+    /// about to read stays alive in `bound` and no private copy of the checkpoint ever exists.
+    pub fn bind_weight(&mut self, id: bundle::PlaceId, bytes: HostBytes) {
+        self.weight_ids.insert(id);
+        self.bound.insert(id, bytes);
+    }
+
+    /// Bind an ACTIVATION by name (IEEE-fp16 bytes) — re-bound every step. A name bound before
+    /// prepare is recorded as a weight instead, matching the C++ contract.
+    pub fn bind_input(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) {
+        if !self.prepared {
+            self.weight_ids.insert(id);
+        }
+        // A previously-raw id re-bound as fp16 must stop being raw, or the shadow would take an
+        // unconverted fp16 buffer. Cleared here rather than left to the caller.
+        self.raw_ids.remove(&id);
+        // An id re-bound UNKEYED goes back to the per-step re-upload, so a keyed bind can never
+        // shadow a later plain one.
+        self.keyed.remove(&id);
+        self.staged.remove(&id);
+        self.bound.insert(id, HostBytes::Owned(bytes));
+    }
+
+    /// ⭐ Bind an f32 ACTIVATION by converting it STRAIGHT INTO ITS SLOT OF THE SHADOW — f32 →
+    /// SEN169 in one pass ([`sen_convert::f32_to_sen_bytes`]), the same bytes
+    /// `bind_input(f32_to_f16_le(vals))` and the refill's `ieee_to_sen_bytes` produce between them,
+    /// without the IEEE-f16 buffer in between or the refill's second convert pass. Re-bound every
+    /// step, and the refill sends its range every step, exactly like [`Self::bind_input`]: only
+    /// WHERE the conversion happens moves.
+    ///
+    /// The placement checks the refill makes for a `bound` activation are made here instead, where
+    /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
+    /// bind longer than its own placement, or past its segment's shadow, is refused.
+    pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
+        if !self.prepared {
+            bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
+        }
+        // A RESIDENT WEIGHT is never re-sent by a step (the refill skips it), so a per-step bind of
+        // one writes nothing — as before, where the refill skipped its `bound` entry.
+        if self.weight_ids.contains(&id) {
+            return Ok(());
+        }
+        let Some(p) = self.places.get(&id) else {
+            return Ok(()); // no placement → not a program input, as the refill treats it
+        };
+        let Some(seg) = SegIdx::checked(p.segment as i64) else {
+            return Ok(());
+        };
+        let len = vals.len() as u64 * 2;
+        if len > p.size {
+            bail!(
+                "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
+                 REFUSING, this would corrupt the following tensors",
+                p.size,
+                p.segment,
+                p.offset
+            );
+        }
+        // The shadow's quiet point, at the door: this write can arrive with no
+        // drain behind it (a request switch's fresh binds, a k>1 iteration).
+        // `p`'s fields copy out FIRST — the placement's borrow of `self` cannot
+        // live across a `&mut self` call.
+        let (segi, off) = (seg.get(), p.offset);
+        self.quiet_shadow()?;
+        // An activation placement names the ACTIVATION segment, whose shadow is real by the
+        // role statement — a device-only slot here means the placement and the bundle's own
+        // role statement disagree, which is a refusal, never a write into nothing.
+        let dst = self.seg_host[segi]
+            .host_buf_mut()
+            .ok_or_else(|| {
+                anyhow!("bind: activation '{id}' names seg{segi}, which is DEVICE-ONLY")
+            })?
+            .get_mut(off as usize..(off + len) as usize)
+            .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
+        sen_convert::f32_to_sen_bytes(vals, dst);
+        self.raw_ids.remove(&id);
+        self.keyed.remove(&id);
+        self.bound.remove(&id);
+        self.staged.insert(id, len);
+        Ok(())
+    }
+
+    /// The key this session's KEYED activation `id` holds — the [`CausalKey`] the bytes on the
+    /// device are a function of — or `None` when `id` was never bound keyed. A launch whose key
+    /// equals this binds nothing for `id`.
+    ///
+    /// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
+    pub fn keyed_holds(
+        &self,
+        id: bundle::PlaceId,
+    ) -> Option<ktir_superdsc::sdsc_abstract::CausalKey> {
+        self.keyed.get(&id).map(|k| k.key)
+    }
+
+    /// ⭐ Bind an ACTIVATION whose bytes are a function of `key` alone (IEEE-fp16 bytes). It is
+    /// converted and uploaded by the NEXT predict and not again: until a launch re-binds it under a
+    /// different key, the device keeps these bytes (segment 3 is never written on card). Every
+    /// other activation stays on [`Self::bind_input`]'s per-step re-upload.
+    pub fn bind_input_keyed(
+        &mut self,
+        id: bundle::PlaceId,
+        key: ktir_superdsc::sdsc_abstract::CausalKey,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        if !self.prepared {
+            bail!(
+                "bind_input_keyed('{id}') before prepare — a keyed activation is a per-step bind"
+            );
+        }
+        self.raw_ids.remove(&id);
+        self.staged.remove(&id);
+        self.keyed.insert(id, Keyed { key, fresh: true });
+        self.bound.insert(id, HostBytes::Owned(bytes));
+        Ok(())
+    }
+
+    /// ⭐ [`Self::bind_input_keyed`], UPLOADED NOW — a session's load-time staging of the keyed
+    /// activation its first launch would otherwise bind. The upload is the refill a predict runs
+    /// first, so a launch under `key` then finds it held ([`Self::keyed_holds`]) and sends nothing for
+    /// `id`, and a launch under any other key re-binds over it exactly as it would over a key a
+    /// previous launch left.
+    ///
+    /// ⛔ A STAGED CONSTANT FILLS ITS PLACEMENT EXACTLY. The refill guard refuses only OVER-binds,
+    /// because several per-step activations bind less than they reserve; an under-bind of an ADDITIVE
+    /// mask leaves a tail the ops read as ZERO, i.e. as "no mask". Staging is done once, at load, for
+    /// a buffer whose size is a law of the rung, so a size that is not the placement's is a
+    /// wiring/layout desync, refused here rather than served.
+    ///
+    /// Returns the bytes the upload sent.
+    pub fn stage_keyed(
+        &mut self,
+        id: bundle::PlaceId,
+        key: ktir_superdsc::sdsc_abstract::CausalKey,
+        bytes: Vec<u8>,
+    ) -> Result<u64> {
+        let placed = self
+            .places
+            .get(&id)
+            .ok_or_else(|| anyhow!("stage_keyed('{id}'): this bundle places no such tensor"))?
+            .size;
+        if bytes.len() as u64 != placed {
+            bail!(
+                "stage_keyed('{id}', {key:?}): {} B staged into a {placed} B placement — a staged \
+                 constant must fill its placement exactly",
+                bytes.len()
+            );
+        }
+        self.bind_input_keyed(id, key, bytes)?;
+        let (_, sent) = self.refill_activations(Diag::get())?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
+        Ok(sent)
+    }
+
+    /// ⭐ MATERIALIZE THE ACTIVATION SEGMENT'S HOST SHADOW — fault every page of it in now, at load,
+    /// so a request's first bind into it does not.
+    ///
+    /// The ACTIVATION segment is the one segment the host writes on a step: the placement pass puts
+    /// every per-step input there (`SegRole::Activation` — embeddings, rotary tables, both masks, the
+    /// gather index, the constants), and the same law names it here. Prepare allocates its shadow
+    /// zeroed, which the allocator satisfies with pages mapped on first write, so before this the
+    /// first request faulted in every page its binds touched, inside its TTFT. The other segments'
+    /// shadows are left alone: the intermediates are device-written and the host never touches them,
+    /// so committing them would be RSS for nothing.
+    ///
+    /// Contents unchanged ([`fault_in`]): bytes already staged there, such as a causal mask
+    /// `stage_keyed` put in, stay exactly as they are, and the device is not touched. Only WHERE the
+    /// faults land moves. Returns the shadow's length — the RSS this commits.
+    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
+        if !self.prepared {
+            bail!("materialize_activation_shadow before prepare — the shadow is sized at prepare");
+        }
+        let seg =
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::SegRole::Activation.segment();
+        let shadow = self
+            .seg_host
+            .get_mut(seg)
+            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?
+            .host_buf_mut()
+            .ok_or_else(|| anyhow!("the activation segment {seg} is DEVICE-ONLY"))?;
+        fault_in(shadow);
+        Ok(shadow.len() as u64)
+    }
+
+    /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
+    /// the placement it will be written into, in one step, by the session that owns both.
+    ///
+    /// `None` on every shape a raw bind cannot have: a name this bundle never PLACED (a bind the
+    /// refill loop used to skip in silence — and a skipped index table reads as entry 0, which is a
+    /// REAL address: page 0's first block, i.e. the whole batch on row 0's keys), a payload LONGER
+    /// than its own placement (past it is the next tensor's bytes, and for the index table those
+    /// bytes are read as block numbers), or a byte count that is not a whole number of int32
+    /// entries (a partial trailing entry is a truncated address).
+    ///
+    /// ⛔ SHORT IS LEGITIMATE AND LONG IS NOT, which is why this is `>` and not `!=` — several
+    /// activations bind less than their placement on purpose (pmask reserves `[nqh*mq, cap]` and
+    /// binds one broadcast row; the index table's own pass block is the MASK's stride, of which one
+    /// pass fills the head).
+    pub fn place_raw(&self, id: bundle::PlaceId, bytes: Vec<u8>) -> Option<RawBind> {
+        let p = self.places.get(&id)?;
+        (bytes.len().is_multiple_of(4) && bytes.len() as u64 <= p.size)
+            .then_some(RawBind { id, bytes })
+    }
+
+    /// ⭐⭐⭐⭐⭐ Bind an ACTIVATION whose bytes are **ALREADY THE DEVICE'S** — copied into the shadow
+    /// verbatim, with no IEEE→SEN conversion. The gather's int32 index table, and nothing else today.
+    ///
+    /// ⛔ THIS IS NOT AN OPTIMISATION OF [`Self::bind_input`]. The f16 fast path
+    /// (`run_step_no_logits_f16`) also hands over device-format bytes, and it still routes them
+    /// through `bind_input` — which is sound only because `ieee_to_sen_bytes` is applied to them
+    /// too, so "already narrowed" means "already f16", not "already staged". An int32 tensor has no
+    /// fp16 encoding to survive that pass: see [`Self::raw_ids`] for what it does to a block number.
+    ///
+    /// ⛔⛔⛔ IT TAKES A [`RawBind`], NOT `(id, bytes)`, AND THAT IS THE WHOLE GUARD. The signature
+    /// used to be `(PlaceId, Vec<u8>)` — bytes with NO relation to the placement they land in — and
+    /// the relation was re-checked, far away and at runtime, by `refill_activations`'s over-bind
+    /// `bail!`. A length that exceeds its placement now has no value to arrive in: see
+    /// [`Self::place_raw`], the only constructor.
+    pub fn bind_input_raw(&mut self, b: RawBind) {
+        if !self.prepared {
+            self.weight_ids.insert(b.id);
+        }
+        self.raw_ids.insert(b.id);
+        self.staged.remove(&b.id);
+        self.bound.insert(b.id, HostBytes::Owned(b.bytes));
+        // ⭐ THE HOST TAKES THE STICK BACK. A bind is the opposite of [`Self::hand_to_card`]:
+        // a churned seating re-seeds from the collected picks, so the id leaves the card-owned
+        // set and counts as a `TapeStep` fill from here on.
+        self.card_owned.remove(&b.id);
+    }
+
+    /// ⭐⭐⭐ HAND AN ACTIVATION TO THE CARD — the sticks of a stable decode seating. The
+    /// previous step's ChainStage writes them on the device, and this step's gather reads
+    /// them there; a `Host`-seeded launch's raw seed bind sits in [`Self::bound`], and the
+    /// refill re-sends every unkeyed `bound` entry on EVERY submit — so without this door
+    /// each stable step's preamble H2D would overwrite the card's own pick with the last
+    /// host seed before the gather reads it (the stuck-seed repetition, pinned on card
+    /// 2026-10-27: every batched text from the third token on was the seed token
+    /// re-emitted). Removing the id from all three maps ends the re-send; a later `Host`
+    /// launch re-binds it (a churned seating re-seeds from the collected picks), which
+    /// re-inserts it exactly as a fresh bind would.
+    pub fn hand_to_card(&mut self, id: bundle::PlaceId) {
+        self.raw_ids.remove(&id);
+        self.staged.remove(&id);
+        self.bound.remove(&id);
+        // ⭐ AND THE COMPLETENESS WALK LEARNS THE NEW OWNER. Dropping the binds alone would
+        // leave `filler_of` reading the stick as `Nobody`-filled and refusing every stable
+        // launch (`predict: caller-filled source(s) were never written`); declaring it here,
+        // per seating, is what keeps the first step's refusal — the one that catches a
+        // forgotten `Host` seed bind — intact.
+        self.card_owned.insert(id);
+    }
+
+    /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
+    /// The spliced argmax kernel's staged f32 constants (the one-request rung's
+    /// exactness island), and nothing else today.
+    ///
+    /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
+    /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
+    /// the staging loop refuses); the weight channel re-encodes every byte through
+    /// `ieee_to_sen_bytes`, which reads a 4-byte fp32 as two fp16s and rewrites both mantissas.
+    /// A const bound here is a WEIGHT — resident, skipped by every per-step refill — whose bytes
+    /// need no conversion at all, because `Df::Fp32` IS IEEE fp32 and the host's LE bytes are
+    /// the device's own.
+    ///
+    /// Validated the way [`Self::place_raw`] validates its one product: a whole number of f32
+    /// entries, and no longer than the const's own placement (`>` not `!=` — the over-bind law;
+    /// a short bind leaves the placement's tail zero, which is a valid constant image).
+    pub fn bind_const_fp32(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_const_fp32({id}): session ALREADY PREPARED — a resident constant must be \
+                 bound before prepare, where staging copies it into the shadow the H2D ships \
+                 once at load"
+            );
+        }
+        let Some(p) = self.places.get(&id) else {
+            bail!(
+                "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
+                 this const, so the caller's bind and the bundle's layout disagree about the \
+                 staged constants. REFUSING"
+            );
+        };
+        if !bytes.len().is_multiple_of(4) {
+            bail!(
+                "bind_const_fp32({id}): {} B is not a whole number of fp32 entries",
+                bytes.len()
+            );
+        }
+        if bytes.len() as u64 > p.size {
+            bail!(
+                "bind_const_fp32({id}): {} B exceeds its own {} B placement (seg{} off {}) — \
+                 REFUSING, this would corrupt the following tensors",
+                bytes.len(),
+                p.size,
+                p.segment,
+                p.offset
+            );
+        }
+        self.weight_ids.insert(id);
+        self.const_fp32_ids.insert(id);
+        self.bound.insert(id, HostBytes::Owned(bytes));
+        Ok(())
+    }
+
+    /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
+    /// [`load_consts`](scratchy_target_spyre::wiring::Wiring::load_consts) list, bound ONCE at
+    /// load, before prepare (each is a function of the graph alone, so
+    /// re-binding per step would re-upload constants). Must be called before
+    /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
+    ///
+    /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
+    /// dtype, never off the op that minted it: a resident fp32 constant's LE
+    /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
+    /// [`Self::bind_const_fp32`]), and i32 rides the SAME verbatim channel
+    /// (`Df::SenUint32` shares IEEE_FP32's 4-byte/32-stick geometry, so the
+    /// LE words ARE the device encoding — the hash constants' own width),
+    /// while everything else rides the weight channel's IEEE→SEN convert
+    /// ([`Self::bind_weight`]), bit-exact for every value a staged table
+    /// states. An entry whose tid is a graph OUTPUT simply binds that
+    /// output's initial bytes into its own placement — the ops that
+    /// overwrite it per step do so over these bytes, exactly as the card
+    /// behaves.
+    ///
+    /// ⭐ THE BYTES ARE THE CARD FORM ([`LoadConst::card_bytes`]): the ten
+    /// UNIFORM `[rows, 1]` tables spread to each row's stick head — the seat's
+    /// own law — and every other table is verbatim. The emulator's gate legs
+    /// stage the dense value form instead; the two memory models are each
+    /// leg's own stated law, one value derivation.
+    ///
+    /// ⛔ AND A UNIFORM COL TABLE MUST EXACTLY FILL ITS PLACEMENT. The general
+    /// over-bind law permits a short bind (a placement's zero tail is a valid
+    /// constant image), but a `[rows, 1]` table short of its placement means
+    /// the KIND'S rows and the RUNG'S placement rows disagree — some row's
+    /// stick head was never staged and reads ZERO (Finding 1: a rows=1 kind
+    /// staged into a rows=N rung left every row past 0 with a zero hash
+    /// multiplier). Refuse it by name, both directions, never serve it.
+    pub fn bind_load_consts(
+        &mut self,
+        consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
+    ) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
+                 staged once at load"
+            );
+        }
+        for &(tid, kind) in consts {
+            // The chain's decompose tables are this rank's vocabulary block's (`chain_block`).
+            let (bytes, dt, _shape) = kind.card_bytes(self.session());
+            let id = bundle::PlaceId::Act(tid);
+            if kind.is_uniform_col() {
+                let placed = self.places.get(&id).map(|p| p.size);
+                match placed {
+                    Some(size) if bytes.len() as u64 != size => bail!(
+                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table stages {} B \
+                         against its own {} B placement — the kind's rows and the rung's \
+                         placement rows disagree, and the short side's rows read ZERO at their \
+                         stick heads (Finding 1). REFUSING",
+                        bytes.len(),
+                        size
+                    ),
+                    None => bail!(
+                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table has NO placement \
+                         in this bundle — the layout did not place the const the wiring stages. \
+                         REFUSING"
+                    ),
+                    _ => {}
+                }
+            }
+            if matches!(
+                dt,
+                scratchy_tensors::DType::F32 | scratchy_tensors::DType::I32
+            ) {
+                self.bind_const_fp32(id, bytes)?;
+            } else {
+                self.bind_weight(id, HostBytes::Owned(bytes));
+            }
+        }
+        Ok(())
+    }
+
+    /// Declare, BEFORE prepare, that `seg` will be BORROWED from another session via
+    /// [`Executor::alias_seg_from`]: prepare gives it a 128 B placeholder, skips its host staging
+    /// and skips its H2D, so the session never builds the copy the alias immediately discards.
+    ///
+    /// The caller MUST then alias it — a borrowed segment left un-aliased holds only the
+    /// placeholder, so a failed alias is fatal for that session.
+    ///
+    /// This is what makes the prefill WIDTH LADDER cheap. Measured per session (granite-3.1-2b,
+    /// 2.6 GB of weights): stage 1.70s + bind 0.40s + seg1 H2D 0.45s ≈ 2.6s, all of it producing a
+    /// duplicate the alias then throws away.
+    pub fn mark_borrowed(&mut self, seg: SegIdx) -> Result<()> {
+        // Must precede prepare: afterwards the full region is already allocated and H2D'd, so the
+        // flag would silently do nothing. Refuse instead of pretending it took effect.
+        if self.prepared {
+            bail!(
+                "mark_borrowed(seg{}): session ALREADY PREPARED — the segment is allocated and \
+                 H2D'd; mark it before prepare",
+                seg.get()
+            );
+        }
+        self.seg_borrowed[seg.get()] = true;
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Host staging
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Convert + stage the bound weights into host staging (IEEE→SEN / tile-retile), in PARALLEL.
+    /// Split out of prepare so the caller can run it WHILE the background device prewarm brings the
+    /// card up — the ~1s convert then costs nothing on the critical path. Idempotent; prepare falls
+    /// back to staging inline if this was never called.
+    /// ⭐ THE SHADOW/REGION SLOT a `(segment, bank)` pair names: the segments first, then the weight
+    /// segment's EXTRA banks, which is why staging can treat both as one flat list.
+    ///
+    /// ⛔ THE SEGMENT INDEX ALONE STOPPED BEING AN ADDRESS the moment one segment could be served by
+    /// several regions. Everything that reaches for a shadow or a region by segment goes through
+    /// here, so a banked weight cannot silently resolve to bank 0's bytes — which would be one whole
+    /// program (the suffix, i.e. the lm_head) reading another bank's weights: fluent, wrong output.
+    ///
+    /// `None` for a bank this session has no region for, which callers turn into a refusal rather
+    /// than a fallback.
+    fn slot_of(&self, seg: usize, bank: u32) -> Option<usize> {
+        match bank {
+            0 => (seg < NUM_SEGMENTS).then_some(seg),
+            b if seg == SEG_WEIGHT.get() && (b as usize) <= self.weight_bank_bytes.len() => {
+                Some(NUM_SEGMENTS + b as usize - 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// ⭐ WHETHER THIS SESSION BINDS ANYTHING INTO A RESIDENT SEGMENT — what "reserve only"
+    /// asks. NOT `bound.is_empty()`: a reserving or borrowing session still binds its own staged
+    /// constants (the sampler's tables, placed in the never-aliased activation segment), and
+    /// counting those made the prefill anchor stage and upload a full weight shadow it then
+    /// aliases away.
+    fn binds_resident(&self) -> bool {
+        self.bound.keys().any(|nm| {
+            self.places
+                .get(nm)
+                .is_some_and(|p| is_resident_seg(p.segment as usize))
+        })
+    }
+
+    /// ⭐ WHETHER THIS SESSION STAGES WEIGHTS AT ALL — the session rule every
+    /// weight-carrying slot follows (the weight segment's banks and the spilled tail).
+    /// A session that binds nothing resident (a reserving anchor) or whose weight
+    /// segment is aliased from an owner (a borrower) stages no weights: its tail
+    /// arrives later through [`Self::write_seg_prefix`], which materializes exactly
+    /// the prefix, and its banks are never staged — so those slots are device-filled
+    /// at boot rather than host-allocated and zero-pushed over the wire.
+    fn stages_weights(&self) -> bool {
+        self.binds_resident() && !self.seg_borrowed[SEG_WEIGHT.get()]
+    }
+
+    /// ⭐ WHETHER A SEGMENT'S HOST SIDE EXISTS AT ALL — the bundle's own statement, not a
+    /// measurement of what staging wrote. `SegRole` names each segment's job; `WeightTail`
+    /// names the one intermediate-colour slot that carries spilled weights (a bare role
+    /// table would device-fill the spilled lm_head, so the spill is part of the statement).
+    /// The spill slot carries WEIGHTS, so it also carries the weight-carrying slots' own
+    /// SESSION rule ([`Self::stages_weights`]): a borrower stages no tail, and its slot is
+    /// device-filled at boot exactly like its banks.
+    ///
+    /// The segments named here are the ones the HOST owns: their boot content is the staged
+    /// shadow (weights, the spill tail, the activation segment's staged constants and born
+    /// zeros), sent by H2D, and the session keeps using their shadow after prepare (the
+    /// activation segment it writes every step, the logits segment the per-step D2H reads
+    /// back into). Every other segment — the KV pool, the intermediates — is DEVICE-ONLY:
+    /// `prepare` fills its region on the device ([`Stream::fill_zero`], ~62 GB/s measured,
+    /// vs ~6-7 GB/s for host-pushed zeros — for the KV pool alone that is ~10 GB of wire
+    /// time) and it gets NO host shadow, which deletes the ~10 GB a 2b model allocated,
+    /// memset, and held in RSS for the session's whole life.
+    fn host_owned_seg(&self, i: usize) -> bool {
+        use scratchy_target_spyre::lower_subtile_tape_to_superdsc::SegRole;
+        i == SegRole::Weight.segment()
+            || i == SegRole::Activation.segment()
+            || i == SegRole::Logits.segment()
+            || (matches!(
+                self.code.layout.weight_tail,
+                bundle::WeightTail::Spilled { segment, .. } if segment as usize == i
+            ) && self.stages_weights())
+    }
+
+    /// ⭐ THE ONE DOOR THAT MATERIALIZES A HOST SHADOW FOR A READ. A device-only slot holds
+    /// no host bytes by design; a read (`read_seg`, `read_tensor`, the deferred reads, the
+    /// logits readback) is what asks for some, so it lands D2H bytes in a fresh zeroed
+    /// buffer of exactly the window it reads. A mirrored buffer shorter than `want` grows —
+    /// the bytes past its old end are born zeros, and the D2H overwrites the window anyway.
+    /// The buffer is MAPPED memory, so a materialization or growth the kernel refuses is a
+    /// refusal the caller reports, never a panic or a shorter buffer.
+    fn shadow_for_read(&mut self, seg: SegIdx, want: usize) -> Result<()> {
+        let i = seg.get();
+        match self.seg_host[i].host_buf_mut() {
+            Some(v) if v.len() >= want => {}
+            Some(v) => v.resize(want)?,
+            // `None` carries no live borrow, so the slot can be replaced in this arm.
+            None => self.seg_host[i] = HostShadow::Host(HostBuf::zeroed(want)?),
+        }
+        Ok(())
+    }
+
+    pub fn stage_weights(&mut self) -> Result<()> {
+        if self.staged_host {
+            return Ok(());
+        }
+        // NOTHING BOUND ⇒ this session holds allocations only; it is aliased onto an owner's
+        // populated regions before use, so every host shadow here is dead. The shadows are sized
+        // BELOW, once the staged extents say which slots carry content at all.
+        let reserve_only = !self.binds_resident();
+
+        // ── Collect the weight placements, validating each against its own extent. ──
+        // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
+        // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: this used to be
+        // `Option<(&KernelWeight, Element)>`, where `None` meant "convert", so an fp32 const
+        // had no honest spelling — its bytes are neither retiled nor IEEE-fp16-to-SEN
+        // re-encoded, they are already the device's own (`Df::Fp32` = IEEE_FP32).
+        #[derive(Clone, Copy)]
+        enum StageMode<'a> {
+            /// IEEE f16 → SEN169 f16 — the default for every magnitude the card holds in fp16.
+            Convert,
+            /// Retile into the device tile layout this matmul kernel reads.
+            Retile(&'a KernelWeight<'a>, Element),
+            /// Copy VERBATIM — a resident fp32 constant ([`Executor::bind_const_fp32`]).
+            Verbatim,
+        }
+        struct Item<'a> {
+            /// The weight's own id — what the stage-time diagnostic names a row by.
+            name: String,
+            /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
+            /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
+            /// index alone stopped being an address.
+            slot: usize,
+            offset: usize,
+            src: &'a [u8],
+            mode: StageMode<'a>,
+        }
+        let mut items: Vec<Item<'_>> = Vec::new();
+        for (nm, src) in &self.bound {
+            if !self.weight_ids.contains(nm) {
+                continue; // activation
+            }
+            // The bytes themselves, whatever their provenance — the whole walk below reads
+            // this slice, so a `View` of the mmap and an `Owned` copy stage identically.
+            let src: &[u8] = src.as_slice();
+            // ⛔ A RAW BIND CANNOT BE A WEIGHT. This loop's every destination goes through
+            // `ieee_to_sen_bytes` or the retile walk, neither of which may touch int32 index entries
+            // (see [`Self::raw_ids`]) — and a raw id lands here only by having been bound BEFORE
+            // prepare, which `bind_input_raw` records as a weight like any other. Refuse rather than
+            // stage it through a converter that would rewrite every entry.
+            if self.raw_ids.contains(nm) {
+                bail!(
+                    "stage: '{nm}' was bound RAW but is a WEIGHT (bound before prepare) — raw bytes \
+                     are only honoured on the per-step activation path, and this loop would re-encode \
+                     them as fp16. Bind it after prepare."
+                );
+            }
+            let Some(p) = self.places.get(nm) else {
+                // ⛔ WAS `eprintln!` + `continue` — a weight the bake never placed was SKIPPED, so
+                // the device read whatever the segment happened to hold and the model produced
+                // fluent garbage. With the id as the key, a miss means the host bound a tensor this
+                // bundle does not have: a wiring bug, not a condition to carry on from.
+                bail!("stage: weight {nm} has NO placement in this bundle — REFUSING");
+            };
+            let Some(seg) = SegIdx::checked(p.segment as i64) else {
+                bail!(
+                    "stage: weight '{nm}' names segment {} — out of range",
+                    p.segment
+                );
+            };
+            // OVER-BIND GUARD: a weight whose staged bytes exceed its own placement would
+            // overwrite whatever the layout put after it. `>` not `!=`: a short bind is legitimate.
+            if src.len() as u64 > p.size {
+                bail!(
+                    "stage: weight '{nm}' stages {} B into a {} B placement (seg{} off {}) — \
+                     REFUSING, this would corrupt the following tensors",
+                    src.len(),
+                    p.size,
+                    p.segment,
+                    p.offset
+                );
+            }
+            let Some(slot) = self.slot_of(seg.get(), p.bank) else {
+                bail!(
+                    "stage: weight '{nm}' names seg{} bank {}, which this session has no shadow for \
+                     ({} weight bank(s))",
+                    p.segment,
+                    p.bank,
+                    self.weight_bank_bytes.len() + 1
+                );
+            };
+            // ⭐ MEASURED AGAINST THE SLOT'S DECLARED CAPACITY, not this session's shadow: the
+            // shadows are sized after this loop (a reserving or borrowing session stages nothing,
+            // so its shadows are placeholders), but the placement has to fit the segment the
+            // bundle DECLARES regardless of who stages it.
+            let cap = match slot.checked_sub(NUM_SEGMENTS) {
+                None => self.segment_bytes[slot],
+                Some(b) => self.weight_bank_bytes[b],
+            };
+            if p.offset as usize + src.len() > cap as usize {
+                bail!(
+                    "stage: weight '{nm}' off {} + {} B exceeds seg{} bank {} ({} B)",
+                    p.offset,
+                    src.len(),
+                    p.segment,
+                    p.bank,
+                    cap
+                );
+            }
+            let mode = if self.const_fp32_ids.contains(nm) {
+                // A resident fp32 const — its LE bytes are the device encoding, so nothing
+                // here may touch them. Checked FIRST so the kernel-weight lookup below can
+                // never hand a const a tile walk (it has no KernelWeight, but the ordering
+                // makes that a structural fact rather than a happy one).
+                StageMode::Verbatim
+            } else {
+                match self.kernel_weights.get(nm) {
+                    Some(&k) => {
+                        let dev_elems: u64 = k.axes.iter().map(|&(e, _)| e).product();
+                        if dev_elems as usize * k.word_length as usize != src.len() {
+                            bail!(
+                                "stage: kernel weight '{nm}' host size {} B != \
+                                 prod(device_size)*word_length ({} B) — manifest/shape mismatch",
+                                src.len(),
+                                dev_elems as usize * k.word_length as usize
+                            );
+                        }
+                        let Some(elem) = Element::from_word_length(k.word_length) else {
+                            bail!(
+                                "stage: kernel weight '{nm}' word_length {} has no tile walk",
+                                k.word_length
+                            );
+                        };
+                        StageMode::Retile(k, elem)
+                    }
+                    None => StageMode::Convert,
+                }
+            };
+            items.push(Item {
+                name: format!("{nm}"),
+                slot,
+                offset: p.offset as usize,
+                src,
+                mode,
+            });
+        }
+
+        // ── Size the host shadows BY THE BUNDLE'S OWN ROLE STATEMENT
+        //    ([`Self::host_owned_seg`]): a slot the host owns gets a real buffer (staged
+        //    weights, the spill tail, the activation segment's staged constants, the logits
+        //    readback mirror); every other slot — the KV pool, the intermediates — is
+        //    DEVICE-ONLY: no host bytes at all, `prepare` fills its region on the device.
+        //    That deletes the ~10 GB KV shadow a 2b model allocated, memset, and kept in RSS
+        //    for the session's whole life. ──
+        for i in 0..NUM_SEGMENTS {
+            // A BORROWED segment is never staged or H2D'd by this session, so its host side is
+            // dead too (an alias repoints the region at the owner's). ...but ONLY for the
+            // segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segment is bound
+            // per-forward by this very session and must keep its real size.
+            let aliased_later = reserve_only && is_resident_seg(i);
+            if self.seg_borrowed[i] || aliased_later || !self.host_owned_seg(i) {
+                self.seg_host[i] = HostShadow::DeviceOnly;
+            } else {
+                self.seg_host[i] =
+                    HostShadow::Host(HostBuf::zeroed(self.segment_bytes[i].max(128) as usize)?);
+            }
+        }
+        // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK: a bank holds only weights, so it follows the
+        // weight segment's own session rule exactly ([`Self::stages_weights`]) — a session
+        // that stages no weights stages into no bank at all, so every bank of such a session
+        // is device-only.
+        for b in 0..self.weight_bank_bytes.len() {
+            if !self.stages_weights() {
+                self.weight_bank_host[b] = HostShadow::DeviceOnly;
+            } else {
+                self.weight_bank_host[b] =
+                    HostShadow::Host(HostBuf::zeroed(self.weight_bank_bytes[b].max(128) as usize)?);
+            }
+        }
+
+        // ── Hand each item its OWN destination sub-slice. Splitting the segment buffers this way
+        //    is what makes the parallel stage safe with no unsafe at all — and it PROVES the
+        //    placements are disjoint (an overlap shows up as a backwards cursor, which is a
+        //    refusal, where the C++ would simply have raced).
+        /// One weight's staging work: its source bytes, its OWN destination sub-slice, its
+        /// staging transform ([`StageMode`]), and its destination's own address — slot and byte
+        /// offset, the identity the stage-time diagnostic reports a row by.
+        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>, usize, usize);
+        let n_items = items.len();
+        items.sort_by_key(|i| (i.slot, i.offset));
+        let mut tasks: Vec<StageTask<'_>> = Vec::with_capacity(n_items);
+        {
+            // ⭐ THE SLOT SPACE IS THE SEGMENTS **THEN** THE EXTRA WEIGHT BANKS, in that order, which
+            // is exactly what `slot_of` returns — one flat list of destinations, so the split-and-
+            // advance below (and its disjointness proof) is unchanged by banking. `chain` here rather
+            // than a second staging loop: a bank holds ~half a model's weights, and a serial pass
+            // over those would cost more than the whole parallel stage it bypassed.
+            // A device-only slot holds `None` — no item may land in one (items stage weights, and
+            // weights only land in host-owned slots), so the take below refuses instead of
+            // silently staging into nothing.
+            let mut rests: Vec<Option<&mut [u8]>> = self
+                .seg_host
+                .iter_mut()
+                .chain(self.weight_bank_host.iter_mut())
+                .map(|s| s.host_buf_mut().map(|v| &mut v[..]))
+                .collect();
+            let mut cursor = vec![0usize; rests.len()];
+            for it in &items {
+                let Some(skip) = it.offset.checked_sub(cursor[it.slot]) else {
+                    bail!(
+                        "stage: placements overlap in slot {} at byte {} — refusing to stage \
+                         (a weight would overwrite the previous one)",
+                        it.slot,
+                        it.offset
+                    );
+                };
+                let rest = rests[it.slot].take().ok_or_else(|| {
+                    anyhow!(
+                        "stage: a weight would land in slot {}, which is DEVICE-ONLY — weights \
+                         only stage into host-owned slots (the weight segment, its banks, the \
+                         spill slot), so the placement and the bundle's own role statement \
+                         disagree",
+                        it.slot
+                    )
+                })?;
+                let (_, r) = rest.split_at_mut(skip);
+                let (dst, r2) = r.split_at_mut(it.src.len());
+                rests[it.slot] = Some(r2);
+                cursor[it.slot] = it.offset + it.src.len();
+                tasks.push((it.src, dst, it.mode, it.slot, it.offset));
+            }
+        }
+
+        // ── LPT deal across the cores: sort by size descending and deal round-robin, which is
+        //    better balanced than equal chunking (weights differ by orders of magnitude) and needs
+        //    no shared counter — the C++ used an atomic work-stealing index for the same reason.
+        tasks.sort_by_key(|(src, _, _, _, _)| std::cmp::Reverse(src.len()));
+        let nthreads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(tasks.len().max(1));
+        let mut buckets: Vec<Vec<_>> = (0..nthreads).map(|_| Vec::new()).collect();
+        for (i, t) in tasks.into_iter().enumerate() {
+            buckets[i % nthreads].push(t);
+        }
+
+        // ── STAGE-TIME DIAGNOSTIC (`SCRATCHY_SDSC_STAGE_TIME`): the boot layer this loop is
+        //    runs BEFORE prepare, off its laps — the silent multi-second gap between "staged N
+        //    weights" and the device opening. This instrument states which transform arm each
+        //    weight's bytes took (row-copy vs per-element walk, by the walk's own
+        //    [`RetileWalk::inner_contig`] statement), what each arm cost in aggregate, and the
+        //    slowest items by name and walk shape. Off by default; on, it costs one
+        //    `Instant::now` and one mutex push per weight. ──
+        let stage_diag = Diag::get().stage_time;
+        /// Which arm of the staging transforms a weight's bytes took.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ArmKind {
+            PermFp8,
+            PermF16,
+            RowCopyFp8,
+            RowConvertF16,
+            PerElementFp8,
+            PerElementF16,
+            Convert,
+            Verbatim,
+        }
+        /// One weight's measured staging: its destination address, its arm, its bytes, its time.
+        struct StageRow {
+            slot: usize,
+            offset: usize,
+            arm: ArmKind,
+            bytes: usize,
+            nanos: u64,
+        }
+        let rows: std::sync::Mutex<Vec<StageRow>> = std::sync::Mutex::new(Vec::new());
+        let t_stage = stage_diag.then(Instant::now);
+        let stage_arm = |mode: StageMode<'_>| match mode {
+            // The arm label reads the BAKE'S verdict (`k.arm`), not a re-derivation — the
+            // table is the record of what the boot dispatched on.
+            StageMode::Retile(k, elem) => match (&k.arm, elem) {
+                (WalkArm::Permutation { .. }, Element::Fp8) => ArmKind::PermFp8,
+                (WalkArm::Permutation { .. }, Element::F16) => ArmKind::PermF16,
+                (WalkArm::InnerContig, Element::Fp8) => ArmKind::RowCopyFp8,
+                (WalkArm::InnerContig, Element::F16) => ArmKind::RowConvertF16,
+                (WalkArm::PerElement, Element::Fp8) => ArmKind::PerElementFp8,
+                (WalkArm::PerElement, Element::F16) => ArmKind::PerElementF16,
+            },
+            StageMode::Convert => ArmKind::Convert,
+            StageMode::Verbatim => ArmKind::Verbatim,
+        };
+
+        std::thread::scope(|scope| {
+            for bucket in buckets {
+                let rows = &rows;
+                scope.spawn(move || {
+                    for (src, dst, mode, slot, offset) in bucket {
+                        let t0 = stage_diag.then(Instant::now);
+                        match mode {
+                            // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot, for ANY
+                            // arm: each arm's own walker runs directly (no wildcard to re-slot,
+                            // no `stage_weight_tiled` to re-derive the walk's law), the
+                            // permutation arm playing the order the arm itself carries.
+                            StageMode::Retile(k, elem) => match &k.arm {
+                                WalkArm::Permutation { order } => {
+                                    stage_weight_permuted(src, dst, &k.axes, order, elem)
+                                }
+                                WalkArm::InnerContig => {
+                                    stage_weight_rows(src, dst, RetileWalk { axes: &k.axes }, elem)
+                                }
+                                WalkArm::PerElement => stage_weight_per_element(
+                                    src,
+                                    dst,
+                                    RetileWalk { axes: &k.axes },
+                                    elem,
+                                ),
+                            },
+                            StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
+                            StageMode::Verbatim => dst.copy_from_slice(src),
+                        }
+                        if let Some(t0) = t0
+                            && let Ok(mut rows) = rows.lock()
+                        {
+                            rows.push(StageRow {
+                                slot,
+                                offset,
+                                arm: stage_arm(mode),
+                                bytes: src.len(),
+                                nanos: t0.elapsed().as_nanos() as u64,
+                            });
+                        }
+                    }
+                });
+            }
+        });
+
+        if stage_diag {
+            let rows = rows.into_inner().unwrap_or_default();
+            let wall = t_stage.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let work = rows.iter().map(|r| r.nanos as f64).sum::<f64>() / 1e9;
+            let bytes = rows.iter().map(|r| r.bytes).sum::<usize>();
+            eprintln!(
+                "[sdsc-stage-time] {} weights, {:.1} MiB staged in {:.3}s wall across {} threads \
+                 ({:.3}s summed work, {:.2} GB/s wall, {:.2} GB/s single-thread)",
+                rows.len(),
+                bytes as f64 / (1 << 20) as f64,
+                wall,
+                nthreads,
+                work,
+                if wall > 0.0 {
+                    bytes as f64 / wall / 1e9
+                } else {
+                    0.0
+                },
+                if work > 0.0 {
+                    bytes as f64 / work / 1e9
+                } else {
+                    0.0
+                },
+            );
+            for (arm, name) in [
+                (ArmKind::PermFp8, "retile fp8 permutation scan"),
+                (ArmKind::PermF16, "retile f16 permutation scan"),
+                (ArmKind::RowCopyFp8, "retile fp8 row-copy"),
+                (ArmKind::RowConvertF16, "retile f16 row-convert"),
+                (ArmKind::PerElementFp8, "retile fp8 per-element"),
+                (ArmKind::PerElementF16, "retile f16 per-element"),
+                (ArmKind::Convert, "ieee-f16 -> sen convert"),
+                (ArmKind::Verbatim, "verbatim"),
+            ] {
+                let rs: Vec<&StageRow> = rows.iter().filter(|r| r.arm == arm).collect();
+                if rs.is_empty() {
+                    continue;
+                }
+                let b = rs.iter().map(|r| r.bytes).sum::<usize>();
+                let s = rs.iter().map(|r| r.nanos).sum::<u64>() as f64 / 1e9;
+                eprintln!(
+                    "[sdsc-stage-time]   {name:<28} {:>3} items {:>8.1} MiB {:>7.3}s {:>6.2} GB/s",
+                    rs.len(),
+                    b as f64 / (1 << 20) as f64,
+                    s,
+                    if s > 0.0 { b as f64 / s / 1e9 } else { 0.0 },
+                );
+            }
+            // The slowest weights by name and walk shape — the rows that name the fix.
+            let mut rows = rows;
+            rows.sort_by_key(|r| std::cmp::Reverse(r.nanos));
+            for r in rows.iter().take(10) {
+                let Some(it) = items
+                    .iter()
+                    .find(|i| i.slot == r.slot && i.offset == r.offset)
+                else {
+                    continue;
+                };
+                let shape = match it.mode {
+                    StageMode::Retile(k, _) => {
+                        format!(" axes={:?} arm={:?}", k.axes, k.arm)
+                    }
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[sdsc-stage-time]   {:.3}s {:>7.1} MiB slot{}+{} '{}'{shape}",
+                    r.nanos as f64 / 1e9,
+                    r.bytes as f64 / (1 << 20) as f64,
+                    r.slot,
+                    r.offset,
+                    it.name,
+                );
+            }
+        }
+
+        self.n_weights_staged = n_items;
+        self.staged_host = true;
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Prepare
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Init the device runtime + stream; allocate + H2D every program ONCE; allocate the ≤7 packed
+    /// tensor-segment regions; H2D the staged weights; then reclaim the host bytes that are dead.
+    pub fn prepare(&mut self) -> Result<()> {
+        if self.prepared {
+            return Ok(());
+        }
+        let d = Diag::get();
+        let start = Instant::now();
+        let mut t0 = Instant::now();
+        let lap = |what: &str, from: &mut Instant| {
+            if d.prep_time {
+                eprintln!(
+                    "[sdsc-prep-time] {what:<16} {:.3}s",
+                    from.elapsed().as_secs_f64()
+                );
+            }
+            *from = Instant::now();
+        };
+
+        // A DEDICATED created stream (not the default), and PERSISTENT for the session: the
+        // scheduler retires each op's fence from its per-stream deque at completion
+        // (SchedulerState::retire_fence), so the deques hold only in-flight fences instead of
+        // one entry per launch forever. Unbounded, not large per step — ~200 launches per
+        // decode step (202 measured on 2b fp8) is tens of KB/forward, but a session stream
+        // never dies, so it accumulates for its whole life (the old per-forward
+        // recreate-and-destroy workaround papered over exactly this; the PR1 gate run retired
+        // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
+        // program/weight/KV allocations live on the runtime, not the stream.
+        self.stream = Some(
+            Stream::create(self.card)
+                .map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?,
+        );
+        lap("stream-create", &mut t0);
+
+        // ── Programs. Each op's device binary gets its OWN Program-segment alloc + H2D ONCE; they
+        //    all SHARE the resident tensor segments below. ──
+        {
+            self.alloc_ops_at(ListSel::Prefix)?;
+            for c in 0..self.body_ops.len() {
+                self.alloc_ops_at(ListSel::Body(c))?;
+            }
+            for i in 0..self.body_rungs.len() {
+                for c in 0..self.body_rungs[i].1.len() {
+                    self.alloc_ops_at(ListSel::Rung(i, c))?;
+                }
+            }
+            self.alloc_ops_at(ListSel::Suffix)?;
+        }
+        lap("program-h2d", &mut t0);
+
+        // ── ONE device region per tensor segment, sized from the manifest. Even an empty segment
+        //    gets a 128 B placeholder so `tensor_allocs` stays POSITIONAL (entry i backs the
+        //    program's logical segment i). Packing many tensors into ≤7 regions is what defeats the
+        //    7-tensor-segment hardware cap. ──
+        // ⛔⛔⛔⭐⭐⭐ THE ALLOCATION ORDER IS NATURAL (seg 0..N), AND WEIGHT-FIRST IS **MEASURABLY
+        // WORSE** — tried and rejected 2026-08-16, so nobody spends another bake on the inference.
+        //
+        // An allocation ahead of the weights taxes decode and leaves prefill alone. It is TEMPTING to
+        // read that as "so allocate the weights first", especially since 8b puts 110 MB of SEG_INTERMEDIATE ahead of an 8.9 GB weight region
+        // while 2b puts only 16 MB ahead of 5.07 GB, and 8b streams at 103 GB/s against 2b's 185.
+        //
+        // MEASURED, granite-3.1-8b fp8, 10 runs each:
+        //   natural order  modal 12.1-12.2 tok/s, ITL 82.4 ms
+        //   weight-first   modal 11.8-11.9 tok/s, ITL 84.4 ms   <-- WORSE
+        //
+        // So the region effect is REAL but NOT MONOTONIC IN ORDER: allocating the weights first does
+        // not hand them the fast region, it lands them somewhere slower. Whatever selects the fast
+        // region is not "earliest large allocation", so an ordering heuristic here cannot reach it —
+        // consistent with the recorded finding that flex exposes no placement input and only the region
+        // table is readable.
+        for i in 0..NUM_SEGMENTS {
+            let bytes = if self.seg_borrowed[i] {
+                // A BORROWED segment gets the same 128 B placeholder an empty one does: `alias_seg`
+                // replaces this address with the owner's region, so allocating the full extent
+                // would reserve device memory only to drop it immediately.
+                128
+            } else if self.segment_bytes[i] > 0 {
+                self.segment_bytes[i]
+            } else {
+                128
+            };
+            self.seg_addr[i] = Some(
+                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
+                    .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
+            );
+        }
+        // ⭐ AND ONE REGION PER EXTRA WEIGHT BANK, immediately after the weight segment's own —
+        // banks ARE the weight segment, split because a region is capped at 16 GiB while the
+        // addresses are not. Same borrowed-placeholder rule: a borrowing session aliases the owner's
+        // banks (a bank is aliasable BECAUSE it holds only weights, placed identically in every
+        // bundle), so allocating the full extent here would reserve tens of GB only to drop it.
+        for b in 0..self.weight_bank_bytes.len() {
+            // A HOST placeholder allowance, NOT the flit (see the host-buffer twin
+            // of this loop above): a borrowed bank gets a minimal alloc so the
+            // address exists — an owner's region replaces it.
+            let bytes = if self.seg_borrowed[SEG_WEIGHT.get()] {
+                128
+            } else {
+                self.weight_bank_bytes[b].max(128)
+            };
+            self.weight_bank_addr[b] = Some(
+                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                    anyhow!(
+                        "prepare: weight bank {} alloc of {bytes} B failed: {e}",
+                        b + 1
+                    )
+                })?,
+            );
+        }
+        lap("seg-alloc", &mut t0);
+        // ⭐ THE REGION BASES, ONCE PER SESSION. A card HMI fault names a device address; these
+        // lines are what turns that address into "which segment/bank, which offset" — chunk0's
+        // (region, offset) plus the alloc's padded total, for every segment and every weight bank.
+        // Read against the launch-table debug line: together they are the full addressing state the
+        // launch loop computes from.
+        for i in 0..NUM_SEGMENTS {
+            let Some(a) = self.seg_addr[i].as_ref() else {
+                continue;
+            };
+            debug!(
+                "[sdsc-superdsc] seg-alloc seg{i}: bytes={} chunk0={:?} (padded total {})",
+                self.segment_bytes[i],
+                a.chunk0(),
+                a.total_size().as_u64()
+            );
+        }
+        for b in 0..self.weight_bank_bytes.len() {
+            let Some(a) = self.weight_bank_addr[b].as_ref() else {
+                continue;
+            };
+            debug!(
+                "[sdsc-superdsc] seg-alloc bank{}: bytes={} chunk0={:?} (padded total {})",
+                b + 1,
+                self.weight_bank_bytes[b],
+                a.chunk0(),
+                a.total_size().as_u64()
+            );
+        }
+
+        // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
+        //    critical path. Then grow each HOST-OWNED seg_host to the device alloc's size
+        //    (alignment pad, zero) so the H2D copies a full region, and FAULT ITS PAGES IN —
+        //    value-preserving ([`fault_in`]), so the staged bytes cross untouched; what it
+        //    adds is residency for the extents the staging walk never wrote (the pad between
+        //    placements, a region's tail), which the pre-mapped pin below then walks as
+        //    THP-backed pages instead of faulting them itself at 4 KiB granularity.
+        //    Device-only slots never H2D their shadow — they have none, so a borrowed
+        //    segment (marked device-only at staging) faults nothing either. ──
+        self.stage_weights()?;
+        let reserve_only = !self.binds_resident();
+        for i in 0..NUM_SEGMENTS {
+            // Same rule as the staging shadow: skip only what an alias replaces, and grow only
+            // what this send loop is about to H2D in full.
+            if (reserve_only && is_resident_seg(i)) || !self.host_owned_seg(i) {
+                continue;
+            }
+            let need = self.seg_addr[i]
+                .as_ref()
+                .map_or(0, |a| a.total_size().as_u64()) as usize;
+            if let Some(v) = self.seg_host[i].host_buf_mut() {
+                if v.len() < need {
+                    v.resize(need)?;
+                }
+                if let Some(pages) = v.get_mut(..need) {
+                    fault_in(pages);
+                }
+            }
+        }
+        // The weight banks follow the weight segment's own session rule exactly
+        // ([`Self::stages_weights`]): grow to the device extent when this session stages.
+        if self.stages_weights() {
+            for b in 0..self.weight_bank_bytes.len() {
+                let need = self.weight_bank_addr[b]
+                    .as_ref()
+                    .map_or(0, |a| a.total_size().as_u64()) as usize;
+                if let Some(v) = self.weight_bank_host[b].host_buf_mut() {
+                    if v.len() < need {
+                        v.resize(need)?;
+                    }
+                    if let Some(pages) = v.get_mut(..need) {
+                        fault_in(pages);
+                    }
+                }
+            }
+        }
+        let n_weights = self.n_weights_staged;
+        lap("weight-convert", &mut t0);
+
+        // ── SEND every tensor-segment region's content ONCE, ROUTED BY THE BUNDLE'S OWN ROLE
+        //    STATEMENT ([`Self::host_owned_seg`]): a host-owned slot (the weight segment, the
+        //    spill slot, the activation segment with its staged constants) goes out by the
+        //    PRE-MAPPED door ([`send_premapped`]) from its shadow — pinned once, ~59 GB/s,
+        //    where the plain per-call door pays its DmaBuf setup for 6-7; every other slot —
+        //    the KV pool, the intermediates — holds only zeros at boot, and those go out as
+        //    a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s measured), which for the KV
+        //    pool alone is ~10 GB of wire time on a 2b model. Activations refill per
+        //    predict. ──
+        // The mapper is one per prepare (a page size and a table); `pinned` holds every
+        // guard the sends below take. Each guard owns its mapping and borrows the shadow
+        // it pinned, and its own Drop synchronizes before unpinning — so the guards are
+        // safe to drop on ANY exit from here on, not just the sync below.
+        let mapper = PfIommuMapper::new(self.card.card().clone());
+        let mut pinned: Vec<H2dPin<'_>> = Vec::new();
+        for i in 0..NUM_SEGMENTS {
+            // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
+            // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
+            // shadow over the owner's live data would be WRONG.
+            if self.seg_borrowed[i] {
+                continue;
+            }
+            // Nothing bound ⇒ the resident segments hold no content worth sending and are about to
+            // be aliased.
+            if reserve_only && is_resident_seg(i) {
+                continue;
+            }
+            let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
+            let host_owned = self.host_owned_seg(i);
+            if d.prep_time {
+                eprintln!(
+                    "[sdsc-prep-time] seg{i}: region {} B → {}",
+                    addr.total_size().as_u64(),
+                    if host_owned {
+                        "pre-mapped H2D"
+                    } else {
+                        "device fill"
+                    }
+                );
+            }
+            if !host_owned {
+                fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
+                continue;
+            }
+            // The shadow was grown (and its pages faulted in) by the loop above, so this slice
+            // is the whole region — and taking it AS A SLICE is what proves the H2D cannot read
+            // past the shadow. `get` rather than `[..]`: a short shadow is a wiring bug to
+            // report, not a panic, and never a DMA over-read. A host-owned slot with no shadow
+            // is the same disagreement, refused.
+            let src = whole_shadow(
+                self.seg_host[i].host().ok_or_else(|| {
+                    anyhow!("prepare: seg{i} is host-owned but holds no host shadow")
+                })?,
+                addr,
+                i,
+            )?;
+            send_premapped(
+                stream,
+                src,
+                addr,
+                &mapper,
+                &mut pinned,
+                &format!("prepare: seg{i}"),
+            )?;
+        }
+        // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own session rule
+        // ([`Self::stages_weights`]) — a bank holds only weights by construction, so it
+        // always follows the host-owned route when this session stages any.
+        if self.stages_weights() {
+            for b in 0..self.weight_bank_bytes.len() {
+                let (stream, addr) = (
+                    self.stream_ref()?,
+                    self.weight_bank_addr[b]
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
+                );
+                let src = whole_shadow(
+                    self.weight_bank_host[b].host().ok_or_else(|| {
+                        anyhow!(
+                            "prepare: weight bank {} is host-owned but holds no host shadow",
+                            b + 1
+                        )
+                    })?,
+                    addr,
+                    NUM_SEGMENTS + b,
+                )?;
+                send_premapped(
+                    stream,
+                    src,
+                    addr,
+                    &mapper,
+                    &mut pinned,
+                    &format!("prepare: weight bank {}", b + 1),
+                )?;
+            }
+        }
+        lap("tensor-h2d", &mut t0);
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("prepare: sync: {e}"))?;
+        lap("sync", &mut t0);
+        // ⭐ THE PINS RETIRE HERE — and would on any earlier exit too: the sync above waited
+        // out every pre-mapped window, and each guard's own Drop synchronizes before it
+        // unpins, so no DMA reads a shadow's iova after its pin is gone on this path, a
+        // refused one, or an unwind. Dropping here (rather than at scope end) simply unpins
+        // before the parity gate and the ladder run on.
+        drop(pinned);
+        // ⭐ #603 PR2 2a — THE CB PARITY GATE, before the session becomes loadable: a plan twin
+        // that disagrees with the walk refuses the LOAD here, never a step.
+        //
+        // A BORROWING session cannot be gated here: its borrowed segments still hold the
+        // 128 B placeholders `mark_borrowed` left them, and a placeholder has no renderable
+        // address BY DESIGN (`alias_seg_from` replaces it with the owner's region only after
+        // prepare returns — rendering through it is exactly the un-aliased-read the
+        // placeholder exists to poison). Such a session is gated at the alias that
+        // completes its borrowed set instead; one that never completes its aliases can
+        // never launch (the un-aliased placeholder guard refuses its fold), so no session
+        // escapes the gate.
+        if self.borrow_set_pending() {
+            debug!(
+                "[sdsc-cbplan] parity gate DEFERRED: borrowed segment(s) still on placeholders — \
+                 it runs at the alias that completes the borrowed set"
+            );
+        } else {
+            self.check_cb_plan_parity()?;
+        }
+        lap("cb-parity", &mut t0);
+        self.prepared = true;
+
+        // ── RECLAIM host memory that is DEAD after prepare (~2× the model in host RSS otherwise).
+        //    The weights are resident on-device; nothing reads their host bytes again, and a
+        //    segment holding ONLY weights has a dead staging buffer too (predict re-H2Ds only
+        //    activation segments). Guarded by !SCRATCHY_SUPERDSC_DBG, whose readback D2Hs arbitrary
+        //    segments back into seg_host. ──
+        for nm in &self.weight_ids {
+            self.bound.remove(nm);
+        }
+        if std::env::var_os("SCRATCHY_SUPERDSC_DBG").is_none() {
+            let mut seg_has_activation = [false; NUM_SEGMENTS];
+            for (nm, p) in &self.places {
+                if !self.weight_ids.contains(nm)
+                    && let Some(s) = SegIdx::checked(p.segment as i64)
+                {
+                    seg_has_activation[s.get()] = true;
+                }
+            }
+            for (i, (host, has_act)) in self.seg_host.iter_mut().zip(seg_has_activation).enumerate()
+            {
+                // The KV slot is device-only by the role statement (read doors materialize on
+                // demand), so this keep is about the mirrored segments: has_act covers the
+                // activation segment and anything else the host re-binds per step.
+                if i == SEG_KV.get() || has_act {
+                    continue;
+                }
+                // Empty, not gone: a read door may still materialize this slot again, and a
+                // device-only slot stays device-only.
+                if let HostShadow::Host(v) = host {
+                    *v = HostBuf::empty();
+                }
+            }
+            // ⭐ AND EVERY BANK SHADOW, unconditionally: a bank holds ONLY weights (that is what
+            // makes it aliasable), so there is no activation to keep one alive and nothing reads its
+            // host bytes after the H2D. Not reclaiming these is the largest host allocation in the
+            // process — a bank is up to 16 GiB.
+            for host in self.weight_bank_host.iter_mut() {
+                if let HostShadow::Host(v) = host {
+                    *v = HostBuf::empty();
+                }
+            }
+        }
+        debug!(
+            "[sdsc-superdsc] prepare OK — {n_weights} weight(s) placed into {NUM_SEGMENTS} packed \
+             segments"
+        );
+        lap("reclaim", &mut t0);
+        if d.prep_time {
+            eprintln!(
+                "[sdsc-prep-time] {:<16} {:.3}s  (laps above should sum to this; a gap is work no \
+                 lap covers)",
+                "TOTAL",
+                start.elapsed().as_secs_f64()
+            );
+        }
+        Ok(())
+    }
+
+    /// ⭐ #603 PR2 STAGE 2a — THE PREPARE-TIME CB PARITY GATE. Every allocated launch list is
+    /// rendered TWO ways — the submit walk's own enumeration (`cb_plan::walk_items`) and the data
+    /// twin (`cb_plan::build_cb_plan` + `CbPlan::render`) — through ONE render door
+    /// (`Stream::render_batch`, the same `build_compute_cb` the submit path runs), and a
+    /// differing byte REFUSES THE LOAD. This is the gate that lets the player replay pre-rendered
+    /// images: it proves, at prepare, that the plan's data twin of the walk is byte-identical, so
+    /// no step ever needs to re-derive (or re-check) what it replays.
+    ///
+    /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
+    /// list that exists by then) and at [`Self::alias_seg_from`] (a borrowing session's segments
+    /// are placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
+    /// borrowed set).
+    fn check_cb_plan_parity(&self) -> Result<()> {
+        let stream = self.stream_ref()?;
+        let mk = |bank: usize, off: [u64; NUM_SEGMENTS], requests| LaunchWhere {
+            byte_off: off,
+            weight_bank: bank,
+            requests,
+        };
+        // One `LaunchWhere` per distinct weight bank the launch table names (a representative
+        // row's shifts — parity is about the twin agreeing, not about covering every shift
+        // value), plus the prefix's and suffix's own banks. A bank with no region is SKIPPED, not
+        // refused: the submit walk would refuse that launch itself, and this gate is about the
+        // plan twin, not the session.
+        let bank_ok = |bank: usize| {
+            if bank == 0 {
+                self.seg_addr[SEG_WEIGHT.get()].is_some()
+            } else {
+                self.weight_bank_addr
+                    .get(bank - 1)
+                    .is_some_and(|a| a.is_some())
+            }
+        };
+        // The launch ROWS: one (tag, bank, shifts) per distinct weight bank the session could
+        // launch.
+        let mut rows: Vec<(String, usize, [u64; NUM_SEGMENTS])> = Vec::new();
+        match self.rolled.as_ref() {
+            // Unrolled: no layer boundary to bank on — bank 0 and zero shifts are the only shape
+            // the walk ever launches this bundle with.
+            None => rows.push(("unrolled".into(), 0, [0; NUM_SEGMENTS])),
+            Some(r) => {
+                if bank_ok(r.prefix_weight_bank) {
+                    rows.push((
+                        format!("prefix-bank{}", r.prefix_weight_bank),
+                        r.prefix_weight_bank,
+                        [0; NUM_SEGMENTS],
+                    ));
+                }
+                if bank_ok(r.suffix_weight_bank) {
+                    rows.push((
+                        format!("suffix-bank{}", r.suffix_weight_bank),
+                        r.suffix_weight_bank,
+                        [0; NUM_SEGMENTS],
+                    ));
+                }
+                let mut seen: Vec<usize> = Vec::new();
+                for &(_class, wbank, woff, kvoff) in &r.launches {
+                    let bank = wbank as usize;
+                    if seen.contains(&bank) || !bank_ok(bank) {
+                        continue;
+                    }
+                    seen.push(bank);
+                    let mut off = [0u64; NUM_SEGMENTS];
+                    off[SEG_WEIGHT.get()] = woff;
+                    off[SEG_KV.get()] = kvoff;
+                    rows.push((format!("launch-row-bank{bank}"), bank, off));
+                }
+            }
+        }
+        // ⭐ EVERY ROW AT ONE REQUEST, AND AGAIN AT TWO — the request half of the relaunch law (a
+        // walking bundle's span repeats once per request, its tables `request · pitch` in) has to
+        // be proven twin-identical too, and no launch states more than one request yet. The
+        // two-request row states a SYNTHETIC pitch: parity is about the walk and its data twin
+        // composing the same request shift, never about this pitch being any model's — the same
+        // standing as the representative bank shifts above.
+        let wheres: Vec<(String, LaunchWhere)> = rows
+            .iter()
+            .flat_map(|(tag, bank, off)| {
+                let two = fold_plan::Requests {
+                    count: 2,
+                    pitch: 4096,
+                };
+                [
+                    (tag.clone(), mk(*bank, *off, fold_plan::Requests::default())),
+                    (format!("{tag}/req2"), mk(*bank, *off, two)),
+                ]
+            })
+            .collect();
+
+        // Every list the session could launch — the class dimension is enumerated whole here, so
+        // a where need not be matched to the classes its rows name (parity reads the same ops
+        // either way). A list whose programs are not allocated yet (the deferred rungs) is
+        // skipped here and gated at its allocation instead.
+        let mut sels: Vec<ListSel> = vec![ListSel::Prefix, ListSel::Suffix];
+        for c in 0..self.body_ops.len() {
+            sels.push(ListSel::Body(c));
+        }
+        for (i, rung) in self.body_rungs.iter().enumerate() {
+            for c in 0..rung.1.len() {
+                sels.push(ListSel::Rung(i, c));
+            }
+        }
+        let mut cbs = 0usize;
+        let mut contexts = 0usize;
+        for sel in sels {
+            let ops = self.list(sel);
+            if ops.is_empty() || !ops.iter().all(|o| o.addr.is_some()) {
+                continue;
+            }
+            for (tag, where_) in &wheres {
+                let label = format!("{sel:?}/{tag}");
+                cbs += cb_plan::parity_check(
+                    ops,
+                    &self.seg_addr,
+                    &self.weight_bank_addr,
+                    where_,
+                    &label,
+                    stream,
+                )?;
+                contexts += 1;
+            }
+        }
+        if contexts == 0 {
+            // The gate may not pass vacuously: prepare allocates the prefix and suffix lists
+            // unconditionally and bank 0's region exists by the time this runs, so zero
+            // checkable contexts means the enumeration itself is broken — refuse rather than
+            // "prove" nothing.
+            bail!(
+                "[cbplan] parity gate REFUSED: no (list × launch-row) context was checkable — \
+                 every bank was skipped or no list is allocated"
+            );
+        }
+        debug!(
+            "[sdsc-cbplan] parity gate: {cbs} CB(s) proven byte-identical across {contexts} \
+             (list × launch-row) context(s)"
+        );
+        Ok(())
+    }
+
+    fn stream_ref(&self) -> Result<&Stream> {
+        self.stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("no stream — prepare was not called"))
+    }
+
+    /// Give every op in one list its own Program-segment allocation and upload its device binary.
+    fn alloc_ops_at(&mut self, sel: ListSel) -> Result<()> {
+        // The list is taken out so the stream (also `&self`) can be borrowed alongside it.
+        let mut ops = std::mem::take(self.list_mut(sel));
+        // Heap copies of any `.rodata`-backed program bytes, kept alive until the async H2Ds have
+        // been synchronized at the end of the loop. See the `Cow` match below for why.
+        let mut pinnable: Vec<Vec<u8>> = Vec::new();
+        let r = (|| -> Result<()> {
+            for op in &mut ops {
+                // ⛔⛔⛔ THE IMAGE IS NOT ALWAYS AT THE HEAD OF ITS ALLOCATION. dxp's
+                // `InitTransfer.dev_ptr` — which `parse_spyrecode` has REFUSED unless it equals
+                // `job_bin_ptr` — can name an address above `PROG_OFFSET_BASE`, reserving a prologue
+                // it does not fill. So `head` is that prologue, and it is the SAME number the launch
+                // passes as the bootstrap offset below: the device starts where the image starts
+                // because both come from `job_bin_ptr`, not because both happen to be zero.
+                //
+                // ⛔ IT WAS ZERO FOR EVERY PROGRAM THAT HAS EVER SHIPPED, which is why uploading at
+                // offset 0 worked until the batched-decode collapse produced the first group with a
+                // non-zero one — and then failed as `syndrome=0xc00 [PrepZeroFlitCnt, PrepSwVer]`,
+                // `job_count=0`, at exactly `PROG_OFFSET_BASE + head`: the device read the image's own
+                // flit `head/128` as its first job header. The image content was byte-identical to the
+                // bake (D2H'd and diffed, all 8 and all 20 programs of both faulting bundles); only
+                // its placement was wrong.
+                //
+                // ⭐ AND IT IS ONE VALUE, NOT A SUBTRACTION REPEATED AT THE LAUNCH. `prog_image` is the
+                // only place `job_bin_ptr` becomes an offset; the bootstrap the launch passes is
+                // `bootstrap()` of this same value, so the upload destination and the start address
+                // cannot be computed from different arithmetic (this site used `checked_sub` + a refusal
+                // while the launch used a bare `-`).
+                let img = op
+                    .code
+                    .prog_image(crate::runtime::prog_offset_base())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "program job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x}",
+                            op.code.job_bin_ptr,
+                            crate::runtime::prog_offset_base()
+                        )
+                    })?;
+                let head = img.bootstrap();
+                let addr = DevAddr::alloc(
+                    self.card,
+                    ByteSize(img.alloc_bytes()),
+                    MemoryType::Program,
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
+                        img.alloc_bytes(),
+                        img.image_bytes()
+                    )
+                })?;
+                // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
+                //
+                // A BAKED program is `Cow::Borrowed(&'static [u8])`, which lives in the executable's
+                // read-only FILE-BACKED mapping — the failing pin's `hmva` sat inside
+                // `r--p 00000000 … /target/release/scr`. Pinning THAT for DMA returned `EFAULT`,
+                // which senlib reports as RAS `0xad15` "Unable to map DMA to the device address" — a
+                // message about the DEVICE address for a fault on the HOST side. The stream was
+                // poisoned, the rest of that rung's programs were rejected, `destroy_stream`
+                // swallowed the residue while draining, and granite-3.1-8b lost prefill rung m=11
+                // out of its ladder.
+                //
+                // ⚠️ WHAT IS *NOT* ESTABLISHED: that pinning `.rodata` always fails. It plainly does
+                // not — the `debug!` below counts EVERY program as `Cow::Borrowed` (3 of 3, 66 of
+                // 66, every list), so this path DMA'd hundreds of programs out of the executable and
+                // exactly one pin failed, deterministically, on the 8b and never on the 2b. Why that
+                // one is open. What is certain is that the whole class is avoidable for the price of
+                // a load-time copy, so the fix does not depend on the answer.
+                //
+                // The `Cow` variant IS the provenance: `Owned` is a heap `Vec` (anonymous, private,
+                // always pinnable); `Borrowed` is the executable's pages. So copy exactly the
+                // borrowed case. The staging buffers must outlive the ASYNC transfer, hence the sync
+                // below.
+                let staged: &[u8] = match &op.code.init_binary {
+                    std::borrow::Cow::Owned(v) => v,
+                    std::borrow::Cow::Borrowed(b) => {
+                        pinnable.push(b.to_vec());
+                        pinnable.last().expect("just pushed")
+                    }
+                };
+                // ⛔ THE PROGRAM'S OWN BYTES, NOT THE REGION'S PADDED EXTENT. `DevAddr::alloc`
+                // rounds up, so `addr.total_size()` can exceed the binary — sending that many bytes
+                // reads past its end. The pad needs no content: nothing executes past the program.
+                let dst = addr
+                    .window(ByteOffset(head), ByteSize(op.code.init_binary.len() as u64))
+                    .ok_or_else(|| anyhow!("program window at {head} B unaddressable"))?;
+                self.stream_ref()?
+                    .h2d(staged, &dst)
+                    .map_err(|e| anyhow!("program H2D: {e}"))?;
+                op.addr = Some(addr);
+            }
+            // ⛔ BEFORE `pinnable` DROPS. The H2Ds above are asynchronous, so the staging buffers
+            // must still exist when the DMA reads them. Programs are uploaded once per list at
+            // load, so this sync costs nothing per step.
+            if !pinnable.is_empty() {
+                self.stream_ref()?
+                    .synchronize()
+                    .map_err(|e| anyhow!("program H2D sync: {e}"))?;
+            }
+            // How much of a list is `.rodata`-backed says how much of the program set the copy above
+            // is load-bearing for — 1-of-many and all-of-many are different stories about the bake,
+            // and the difference is invisible without counting.
+            debug!(
+                "[sdsc-superdsc] program H2D {sel:?}: {} of {} op(s) staged through a heap copy \
+                 (Cow::Borrowed ⇒ possibly .rodata ⇒ unpinnable for DMA)",
+                pinnable.len(),
+                ops.len(),
+            );
+            Ok(())
+        })();
+        *self.list_mut(sel) = ops;
+        r
+    }
+
+    fn list_mut(&mut self, sel: ListSel) -> &mut Ops<T> {
+        match sel {
+            ListSel::Prefix => &mut self.prefix_ops,
+            ListSel::Body(c) => &mut self.body_ops[c],
+            ListSel::Suffix => &mut self.suffix_ops,
+            ListSel::Rung(i, c) => &mut self.body_rungs[i].1[c],
+        }
+    }
+
+    /// The same list, read-only — for the per-body facts [`StepBody`] carries, which are read off the
+    /// body's own OPS.
+    fn list(&self, sel: ListSel) -> &Ops<T> {
+        match sel {
+            ListSel::Prefix => &self.prefix_ops,
+            ListSel::Body(c) => &self.body_ops[c],
+            ListSel::Suffix => &self.suffix_ops,
+            ListSel::Rung(i, c) => &self.body_rungs[i].1[c],
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ **THE BODY THIS STEP WILL RUN**, and the only way anyone gets one.
+    ///
+    /// ⛔⛔⛔ IT TAKES THE WRITE SLOT AND NOTHING ELSE, WHICH IS THE WHOLE POINT. The selector's input
+    /// is `valid_len`, a function of the slot this step writes — so if a caller could pass it, it could
+    /// pass one the launch will not use, and then the host's index table, the host's mask FORM and the
+    /// launched descriptor would be about different bodies.
+    /// Derived here, from the one value the host also hands to `run_step` as `start`, there is no second
+    /// derivation to drift.
+    ///
+    /// ⛔ AND THIS IS THE THIRD TIME THE HOST ASKED A PER-BODY QUESTION OF THE WRONG BUNDLE.
+    /// `bake_gathers_kv` asked the m=1 decode bucket (`8f03f9974`), the gather scratch's window count
+    /// came off the CEILING body while an interior rung was launched (`49a99fd45`), and the swept extent
+    /// the unswept-slot guard used was the ceiling's too. All three had the same shape: a fact that
+    /// differs per BODY, read from something that is per BUNDLE. The fix is not a third careful call
+    /// site — it is that `DecodeRung` no longer HAS a `swept` or a `gathers_kv` field to read, and the
+    /// only value that answers either question is minted here, by the selector, from the selector's own
+    /// answer.
+    /// The baked bundle this executor runs.
+    pub fn code(&self) -> &'static bundle::BundleCode<'static, T> {
+        self.code
+    }
+
+    pub fn step_body(&mut self, seq_pos: SeqPos) -> Result<StepBody> {
+        // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
+        // KV before attention. Spelled ONCE, here, for every reader of the selection.
+        let sel = self.select_body(seq_pos.0 + 1)?;
+        // ⭐ EVERY CLASS'S OWN OPS ANSWER IT, folded to the strongest claim: the gather scratch must
+        // satisfy every class that reads through one, and the unswept-slot guard must use the
+        // NARROWEST sweep any class runs (a rung's extent is shared by every class, so this is the
+        // same number for each — but reading it per class keeps the fact with the ops that carry
+        // it). A bake fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
+        // that gathers cannot be driven as one that does not, or the reverse.
+        let mut gathers_any = false;
+        // Same authority, same reason: whether this body re-launches a page fold is the
+        // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by) — any
+        // class's fold makes the step a fold, not a chunk.
+        let mut folds_any = false;
+        for c in 0..self.n_classes() {
+            let ls = self.list_sel_for(sel, c);
+            gathers_any |= scratchy_target_spyre::wiring::GathersKv::of_launch_groups(
+                self.list(ls).iter().map(|o| o.kv.gathered),
+            )
+            .get();
+            folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold);
+        }
+        Ok(StepBody {
+            sel,
+            swept: self.body_swept(sel),
+            gathers: scratchy_target_spyre::wiring::GathersKv::of_launch_groups([gathers_any]),
+            folds: folds_any,
+            // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
+            // rung carries the same number, so the body's own artifact is as good a seat as any.
+            lx_op_local_bytes: self.code.layout.lx_op_local_bytes,
+            // The chunk form's probability-part pins, the same layout's recorded term — the
+            // admission summed it beside the gathers, so the host's read must carry it too.
+            lx_prob_pin_bytes: self.code.layout.lx_prob_pin_bytes,
+        })
+    }
+
+    /// How many attention classes this session carries (one body each). 1 for every single-class
+    /// model — the case every existing rolled bundle was.
+    fn n_classes(&self) -> usize {
+        self.rolled.as_ref().map_or(1, |r| r.n_bodies).max(1)
+    }
+
+    /// THIS selection's swept extent — its own ladder rung's `active_cap`, which every class of a
+    /// rung shares (a rung IS one swept extent; the classes are the programs baked for it). `None` for
+    /// the ladderless arm (`Body`: an UNROLLED bundle, which bakes no rung and so states
+    /// no sweep — there is no walk to stage for it, and none is made up).
+    fn body_swept(&self, sel: BodySel) -> Option<SweptCols> {
+        match sel {
+            BodySel::Rung(i) => Some(self.body_rungs[i].0),
+            BodySel::Body => None,
+        }
+    }
+
+    /// One `ListSel` for every class of a body selection — the class dimension is the launch
+    /// table's to supply, not the selector's: a rung is ONE swept extent shared by every class.
+    fn list_sel_for(&self, sel: BodySel, class: usize) -> ListSel {
+        match sel {
+            BodySel::Body => ListSel::Body(class),
+            BodySel::Rung(i) => ListSel::Rung(i, class),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Body selection
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Select the decode body for a valid KV length of `valid_len` positions: the smallest rung whose
+    /// `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every body is allocated at prepare.
+    fn select_body(&mut self, valid_len: i64) -> Result<BodySel> {
+        if self.body_rungs.is_empty() {
+            // The ladderless single body — traced: an untraced return is indistinguishable from a
+            // step that never reached the selector at all.
+            self.trace_body("noladder", valid_len, 0);
+            return Ok(BodySel::Body);
+        }
+        // ⭐ THE ONE SELECTION (`Ladder::rung_for`), which the bake ran over every position this bundle
+        // admits: the narrowest rung whose sweep covers `valid_len` (`SweptCols::covers`, never `>=` on
+        // bare integers — the sibling ladder is keyed by the batch WIDTH), else the baked fallback.
+        let Some(meta) = self.code.reroll.as_ref() else {
+            return Err(anyhow!(
+                "bundle {}: {} decode rung(s) and no ladder to select among them",
+                self.code.fp,
+                self.body_rungs.len()
+            ));
+        };
+        let (at, rung) = meta
+            .ladder()
+            .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
+            .rung_for(valid_len.max(0) as u64);
+        let variant = if rung.active_cap.covers(valid_len.max(0) as u64) {
+            "rung"
+        } else {
+            "rung-CEILING"
+        };
+        self.trace_body(variant, valid_len, rung.active_cap.get() as i64);
+        Ok(BodySel::Rung(at))
+    }
+
+    /// WHICH BODY A STEP ACTUALLY RUNS — printed, because it was unobservable and that cost a day.
+    fn trace_body(&self, variant: &str, valid_len: i64, rung: i64) {
+        if !Diag::get().body_trace {
+            return;
+        }
+        eprintln!("[body-choice] {variant} valid_len={valid_len} -> rung={rung}");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  The launch loop
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Launch each group of `sel` IN ORDER against the shared resident segments
+    /// (positional `tensor_allocs[i]` = segment i's region); `byte_off` is the per-segment offset
+    /// applied to every op (zero for prefix/suffix; `v·stride` for body layer v). Tensors stay
+    /// resident — a producer op's output and the consumer's input resolve to the SAME
+    /// segment+offset (one global placement per tensor), so threading is automatic.
+    fn launch_ops(
+        &mut self,
+        sel: ListSel,
+        byte_off: [u64; NUM_SEGMENTS],
+        // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
+        // bundle, which is what makes banking invisible to every model whose weights fit one region.
+        weight_bank: usize,
+    ) -> Result<()> {
+        let d = Diag::get();
+        // The list is taken out so `&self` stays free for the stream and the fold state; every op
+        // is read-only here, which is the point of the C++ `const std::vector&` — this function
+        // runs once per forward per REQUEST, so anything written back through it is state one
+        // request leaves for the next.
+        let ops = std::mem::take(self.list_mut(sel));
+        let r = self.launch_ops_inner(
+            &ops,
+            LaunchWhere {
+                byte_off,
+                weight_bank,
+                // One request — the count a packed prefill launch states is a later law's; every
+                // launch today serves one, and the span law is inert at one.
+                requests: fold_plan::Requests::default(),
+            },
+            d,
+        );
+        *self.list_mut(sel) = ops;
+        r
+    }
+
+    fn launch_ops_inner(&mut self, ops: &Ops<T>, where_: LaunchWhere, d: &Diag) -> Result<()> {
+        // `weight_bank` is read only inside `cb_plan::launch_site`, through `where_`.
+        let byte_off = where_.byte_off;
+        // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
+        // the stream is in-order, so at any moment the device is a whole layer behind the host.
+        // Timing from an un-drained start measures `backlog + ops[0..j]`, and the backlog shrinks by
+        // exactly the ops the rung adds — so every rung after the first read the SAME number, and
+        // one came out NEGATIVE. Draining first costs one settle per layer instead of one per group.
+        if d.prefix_time {
+            let _ = self.stream_ref()?.synchronize();
+        }
+        let px0 = Instant::now();
+        let px_target: Option<usize> = (d.prefix_time && !ops.is_empty()).then(|| {
+            let mut t = timers();
+            let c = t.prefix_call.entry(ops.len()).or_insert(0);
+            let target = (*c as usize) % ops.len();
+            *c += 1;
+            target
+        });
+
+        // ⛔ NO KNOB OF ITS OWN — THE BATCH IS THE PATH. Every launch this rung would make is
+        // collected below and paid as ONE doorbell at the end (the vendor's multi-CB branch;
+        // `Stream::compute_batch`). The knobs that sync MID-RUNG cannot see a
+        // pending batch — a drain between ops of an unflushed rung observes nothing — so each of
+        // them falls back to this function's per-op submission, bit for bit:
+        // `perop_sync`/`group_time` (drain per op), `prefix_time`
+        // (drains at a rotating MID-RUNG group), `optrace` and `tensordump` (drain + D2H after
+        // each op). `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read
+        // program memory or host state this rung's compute ops never write, and `submit_time`
+        // measures the flush itself as the enqueue.
+        let collect =
+            !(d.perop_sync || d.group_time || d.prefix_time || d.optrace || d.tensordump.is_some());
+        let mut pending: Vec<PendingLaunch> = Vec::new();
+        // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
+        // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
+        // fences on the first true barrier and waits on nothing after; the ring stays FIFO).
+        let mut batch_barrier = false;
+
+        // ⭐ THE ONE ENUMERATION — `fold_plan::launches`: a walking bundle's span repeats once per
+        // request of the launch, request-outer (the seed re-runs ahead of each request's body), and
+        // every other op launches once. At one request this is exactly the op-major
+        // `for op { for rep }` sequence it has always been. The per-op diag epilogue below fires at
+        // each op's run end — a run is the op's contiguous stretch of the sequence, so at one
+        // request it fires exactly where the old nested loop's did.
+        let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
+        let seq = fold_plan::launches(&kvs, where_.requests.count);
+        let mut at = 0;
+        while at < seq.len() {
+            let oi = seq[at].op;
+            let op = &ops[oi];
+
+            while at < seq.len() && seq[at].op == oi {
+                let l = seq[at];
+                at += 1;
+                let (request, rep) = (l.request, l.rep);
+                let stream = self.stream_ref()?;
+                // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The request and walk shifts,
+                //    the shifted tensor bases, the weight bank, the program and the bootstrap are
+                //    `cb_plan::launch_site` — the submit walk below, the diag printers it feeds, and
+                //    the CB-plan parity gate (which proves the plan's data twin of exactly this
+                //    computation byte-identical at prepare) all read the ONE function.
+                let site = cb_plan::launch_site(
+                    ops,
+                    oi,
+                    request,
+                    rep,
+                    &self.seg_addr,
+                    &self.weight_bank_addr,
+                    &where_,
+                )?;
+                // The walk's own locals, re-bound from the site: `ta` as the borrows the submit
+                // and dump paths take, everything else by copy or borrow.
+                let ta: Vec<&DevAddr> = site.ta.iter().collect();
+                // Every launch fences: the host fence is one call per launch, never a wire bit.
+                let (off, prog, bootstrap, barrier) = (site.off, &site.prog, site.bootstrap, true);
+                let gt0 = Instant::now();
+                if d.launch_mark {
+                    // ⛔ ONE WRITE, and it must reach the fd BEFORE the submit: an abort from senlib's
+                    // monitor thread takes the process down with no unwinding, so a buffered line is a
+                    // line that never existed. Same single-`format!` discipline as `[progverify]`.
+                    // ⭐ THE SEGMENT SHIFTS RIDE THE MARK. A gathered fold's index lives in seg3 and
+                    // moves ONLY by `delta.mask`, so "did the host shift pass p's index" is answered
+                    // by this line and nothing else — `[gather]` prints the TABLE, not the base.
+                    let one = format!(
+                        "[mark] op[{}] req={request} rep={rep} seg0+{} seg2+{} seg3+{} gathered={} \
+                         pf={} {}\n",
+                        op.index,
+                        off[SEG_INTERMEDIATE.get()],
+                        off[SEG_KV.get()],
+                        off[SEG_MASK.get()],
+                        op.kv.gathered,
+                        op.kv.page_fold,
+                        op.label()
+                    );
+                    eprint!("{one}");
+                }
+
+                if d.segaddr
+                    && oi == 0
+                    && byte_off[SEG_WEIGHT.get()] == 0
+                    && byte_off[SEG_KV.get()] == 0
+                {
+                    self.dump_seg_addrs(&ta, op, prog, bootstrap, &off);
+                }
+                // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM. The one-shot dump above describes op[0]
+                // of whichever list launched FIRST, which is a different bundle from the one that
+                // faults — and that mis-attribution cost a session: `job_bin_ptr=0x1c00000000` was
+                // read off a prefill op and carried onto a decode fault whose bootstrap nobody had
+                // measured. A fault path is not a mode, so this has no knob.
+                let fault = |e: HwError| -> anyhow::Error {
+                    self.dump_launch_site("FAULT(submit-refused)", &ta, op, prog, bootstrap, &off);
+                    let sweep = self.prog_images_sweep("FAULT", ops);
+                    eprint!("{sweep}");
+                    launch_err(e)
+                };
+                // ⭐ DATES THE DIVERGENCE. The fault path's readback runs after the abend, on a stream
+                // that may no longer answer; this one runs on a healthy stream immediately before the
+                // launch, so a program that already reads back wrong here was clobbered by its upload
+                // or by an EARLIER launch rather than by its own. Silent when the image matches —
+                // every launch printing "OK" would bury the one that does not.
+                if d.prog_verify {
+                    // ⭐ THE WHOLE LIST BEFORE ITS FIRST LAUNCH — on a HEALTHY stream, which the fault
+                    // path's sweep is not. Both of the load-time ways a program image can be wrong
+                    // (the H2D staged the wrong bytes; two program allocations overlap, so the second
+                    // upload lands in the first's flits) are already true here, before any op of this
+                    // list has run, so this dates them without depending on the abend leaving the
+                    // stream able to answer a D2H at all.
+                    if oi == 0 {
+                        let sweep = self.prog_images_sweep("PRE", ops);
+                        eprint!("{sweep}");
+                    }
+                    let r = self.prog_image_report(op, prog);
+                    if !r.starts_with("progimg: IDENTICAL") {
+                        // ⛔ ONE WRITE. A multi-argument `eprintln!` reaches the fd in pieces and the
+                        // CB-error lines are written from flex's completion THREAD, so a report built
+                        // by the formatter came back shredded mid-number.
+                        let one = format!("[progverify] op[{}] {} {r}\n", op.index, op.label());
+                        eprint!("{one}");
+                    }
+                }
+
+                if d.rb_time {
+                    // The launch sequence the post-synchronize drain zips against: entry i is the
+                    // i-th compute CB of this forward in submission order, keyed by (rung length,
+                    // op index) so prefix/body/suffix op numbers cannot average into each other.
+                    // Recorded before the collect branch so a batched rung's ops land here in the
+                    // same submission order its single doorbell emits them in.
+                    timers().rb_seq.push(((ops.len(), oi), op.label()));
+                }
+
+                // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
+                // its send and its wait — staged by `cb_plan::site_cbs`, the one function the
+                // parity twin stages through too.
+                let cbs = cb_plan::site_cbs(op.site_tp(), site.batched_compute())?;
+                if collect {
+                    // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
+                    // its handles because the shifted bases and `ta` borrows above are rep-local.
+                    // ⭐ And it is built by `LaunchSite::batched_compute` — the ONE constructor
+                    // `cb_plan::walk_items` stages through too — so the item the real walk
+                    // submits and the item the parity gate renders cannot drift apart in shape.
+                    let st0 = Instant::now();
+                    pending.extend(cbs.into_iter().map(|item| PendingLaunch {
+                        item,
+                        op_index: oi,
+                        request,
+                        rep,
+                        off,
+                    }));
+                    batch_barrier |= barrier;
+                    if d.submit_time {
+                        // Prep is still per-op; the enqueue it feeds is now the rung's single
+                        // flush, timed there — so only the prep half accumulates here.
+                        let mut t = timers();
+                        t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
+                    }
+                } else if op.collective.is_some() {
+                    // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
+                    // consume ride one doorbell, in order, so no diag mode can split them.
+                    stream.submit_batch(&cbs, barrier).map_err(fault)?;
+                } else if d.submit_time {
+                    // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
+                    // this measure the very pipeline it is trying to leave undisturbed.
+                    let st0 = Instant::now();
+                    stream
+                        .compute(prog, &ta, "", bootstrap, &[], barrier)
+                        .map_err(fault)?;
+                    let st1 = Instant::now();
+                    let mut t = timers();
+                    t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
+                    t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
+                    t.submit_calls += 1;
+                    if barrier {
+                        t.host_fence_launches += 1;
+                    }
+                } else {
+                    // Match torch-spyre's JobPlanStepCompute EXACTLY: kernel_name="" (NOT the mlir
+                    // path) — it runs the resident dxp binary via its binary address, and passing
+                    // the mlir path may route flex down a different (seed-only) path for the SFP
+                    // transcendental while the matmul tolerates it. The same "" at the diag probes
+                    // above and inside the rung flush's `compute_batch` / the CB render door.
+                    stream
+                        .compute(prog, &ta, "", bootstrap, &[], barrier)
+                        .map_err(fault)?;
+                }
+
+                // DEFAULT-OFF: skipping the per-group drain removes the ~868-ops/layer
+                // serialization — STRICT_ORDERING (ring FIFO) plus the always-set cmpt.sync
+                // preserve the on-device dataflow (pod-confirmed coherent and ~11% faster);
+                // `pipeline_barrier` itself is a host fence call, a no-op for all-compute runs.
+                if d.perop_sync {
+                    let _ = stream.synchronize();
+                }
+                if d.group_time {
+                    // Needs a drain to attribute anything, so it costs what the per-op sync costs.
+                    let _ = stream.synchronize();
+                    let ms = gt0.elapsed().as_secs_f64() * 1e3;
+                    let mut t = timers();
+                    let e = t.group_ms.entry(op.label()).or_insert((0.0, 0));
+                    e.0 += ms;
+                    e.1 += 1;
+                    t.group_calls += 1;
+                    if t.group_calls.is_multiple_of(20_000) {
+                        report_group_time(&t);
+                    }
+                }
+            } // end walk relaunch
+
+            if Some(oi) == px_target {
+                // AFTER every rep of this group, so a fold's whole pass count lands in one rung.
+                let _ = self.stream_ref()?.synchronize();
+                let mut t = timers();
+                let e = t
+                    .prefix_ms
+                    .entry((ops.len(), oi))
+                    .or_insert((0.0, 0, String::new()));
+                e.0 += px0.elapsed().as_secs_f64() * 1e3;
+                e.1 += 1;
+                if e.2.is_empty() {
+                    e.2 = op.label();
+                }
+            }
+
+            if d.optrace {
+                self.optrace(oi)?;
+            }
+            if d.tensordump.is_some() {
+                self.tensordump(oi, op)?;
+            }
+        }
+
+        // ── THE RUNG'S ONE DOORBELL ──
+        // Everything the loop staged goes to the card as ONE submission: one capacity gate, one
+        // grouped completion, one `QueueControlBlocksSBF`. The CB ring is FIFO, so the device
+        // sees exactly the sequence the per-op path would have submitted — fewer doorbells,
+        // same order, same dataflow (the head barrier carries the OR of the per-op barriers;
+        // see `Stream::compute_batch`).
+        if !pending.is_empty() {
+            // Split the site context from the items once, at the boundary: the items are what
+            // the doorbell takes, the context is what a refusal dumps.
+            let mut sites: Vec<(usize, u32, i64, [u64; NUM_SEGMENTS])> =
+                Vec::with_capacity(pending.len());
+            let items: Vec<BatchedCb> = pending
+                .drain(..)
+                .map(|p| {
+                    sites.push((p.op_index, p.request, p.rep, p.off));
+                    p.item
+                })
+                .collect();
+            let stream = self.stream_ref()?;
+            let st0 = Instant::now();
+            let r = stream.submit_batch(&items, batch_barrier);
+            let st1 = Instant::now();
+            if let Err(e) = r {
+                // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
+                // The loop locals the per-op `fault` closure dumps from are gone here, so the
+                // offending entry's site is rebuilt from what the batch carries: flex-rs wraps
+                // the failing element's index when it has one; a refusal that names no element
+                // (shutdown, capacity) still gets the sweep and the rung's shape.
+                if let HwError::Stream(RuntimeStreamError::BatchElement { index, .. }) = &e
+                    && let Some(&(oi, request, rep, off)) = sites.get(*index)
+                {
+                    // ⛔ ONE WRITE — same single-`format!` discipline as `[progverify]`.
+                    let one = format!(
+                        "[flush] refused at batch entry {index} (op {oi}, req {request}, rep \
+                         {rep}) of {} staged launch(es)\n",
+                        items.len()
+                    );
+                    eprint!("{one}");
+                    // A launch dumps its aim; a send or wait has no program to dump, and its op's
+                    // launch sits two entries on.
+                    if let BatchedCb::Compute(l) | BatchedCb::Consume(l) = &items[*index] {
+                        let ta: Vec<&DevAddr> = l.tensor_allocs.iter().collect();
+                        self.dump_launch_site(
+                            "FAULT(batch-flush)",
+                            &ta,
+                            &ops[oi],
+                            &l.prog,
+                            l.bootstrap_offset,
+                            &off,
+                        );
+                    }
+                }
+                let sweep = self.prog_images_sweep("FAULT", ops);
+                eprint!("{sweep}");
+                return Err(launch_err(e).context(format!(
+                    "rung flush refused: {} launch(es), one doorbell, barrier={batch_barrier}",
+                    items.len()
+                )));
+            }
+            if d.submit_time {
+                // The flush IS the enqueue the loop's per-op prep times fed: one submit call
+                // for the whole rung, so `submit_calls` counts doorbells, not ops, on this
+                // path — the honest answer to "what does one doorbell cost" is the flush.
+                let mut t = timers();
+                t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
+                t.submit_calls += 1;
+                if batch_barrier {
+                    t.host_fence_launches += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// ONE-SHOT SEGMENT-BASE DUMP: every segment's resolved runtime base (region, byte offset,
+    /// chunk size) for the FIRST op of the FIRST layer — checkable by hand against
+    /// bundle_layout.json's declared (segment, offset), instead of guessing from static JSON.
+    fn dump_seg_addrs(
+        &self,
+        ta: &[&DevAddr],
+        op: &OpProg<T>,
+        prog: &DevAddr,
+        bootstrap: u64,
+        off: &[u64; NUM_SEGMENTS],
+    ) {
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.dump_launch_site("op[0]", ta, op, prog, bootstrap, off);
+    }
+
+    /// ⭐⭐⭐ WHERE ONE LAUNCH WAS AIMED — every resolved segment base and, decisively, the PROGRAM
+    /// segment's own two numbers: the bootstrap offset the device starts executing at and the extent
+    /// of the allocation holding the binary.
+    ///
+    /// ⛔ THIS IS WHAT SEPARATES A PROGRAM FAULT FROM A DATA FAULT. A QGI/HMI address is a DMVA, and a
+    /// DMVA's top bits ARE the segment (`SEGMENT_SIZE_BITS = 34`, `PROG_SEGMENT = 7`), so an address in
+    /// `0x1c00000000..` is in the program segment by construction — but that is equally the shape of a
+    /// data operand whose base got resolved against segment 7, so the segment bits alone settle
+    /// nothing. The number that settles it is THIS LAUNCH'S BOOTSTRAP: if the faulting DMVA is
+    /// `PROG_OFFSET_BASE + bootstrap`, the device faulted on the very address the host told it to start
+    /// at, and no data operand is involved at all.
+    fn dump_launch_site(
+        &self,
+        who: &str,
+        ta: &[&DevAddr],
+        op: &OpProg<T>,
+        prog: &DevAddr,
+        bootstrap: u64,
+        off: &[u64; NUM_SEGMENTS],
+    ) {
+        // ⛔ ONE WRITE, NOT TWELVE. `eprintln!` reaches the fd in several unlocked pieces and the
+        // tracing subscriber writes the CB-error lines from the completion THREAD, so a per-line dump
+        // came back shredded mid-number — unreadable exactly when it matters.
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (i, a) in ta.iter().enumerate() {
+            match a.chunk0() {
+                Some(c) if a.is_single_chunk() => {
+                    let _ = writeln!(
+                        out,
+                        "[segaddr] {who} seg{i} region={} offset={} size={} shift={}",
+                        c.region.0, c.offset.0, c.size.0, off[i]
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "[segaddr] {who} seg{i} MULTI-CHUNK shift={}", off[i]);
+                }
+            }
+        }
+        let base = crate::runtime::prog_offset_base();
+        match prog.chunk0() {
+            Some(c) => {
+                let _ = writeln!(
+                    out,
+                    "[segaddr] {who} seg7/PROG region={} offset={} size={} (binary {} B)",
+                    c.region.0,
+                    c.offset.0,
+                    c.size.0,
+                    op.code.init_binary.len()
+                );
+            }
+            None => {
+                let _ = writeln!(out, "[segaddr] {who} seg7/PROG no chunk");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "[segaddr] {who} op[{}] {} job_bin_ptr={:#x} PROG_OFFSET_BASE={base:#x} \
+             bootstrap={bootstrap:#x} ({bootstrap} B = flit {}) bootstrap_dmva={:#x} \
+             prog_extent={} B = {} flit(s)",
+            op.index,
+            op.label(),
+            op.code.job_bin_ptr,
+            // A flit IS a stick: 128 B (`sys-arch-spec/sysdef.cpp bytesPerStick`), the unit QGI and
+            // HMI report their addresses in.
+            bootstrap
+                / u64::from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES),
+            base + bootstrap,
+            prog.total_size().as_u64(),
+            prog.total_size().as_u64()
+                / u64::from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES),
+        );
+        let _ = writeln!(out, "[segaddr] {who} {}", self.prog_image_report(op, prog));
+        eprint!("{out}");
+    }
+
+    /// ⭐⭐⭐ EVERY PROGRAM IN ONE LIST, READ BACK AND DIFFED — the reading that needs no attribution.
+    ///
+    /// ⛔ THE FAULTING OP IS NOT THE OP THAT REPORTS THE FAULT, and assuming otherwise is a live
+    /// hazard here. A compute launch returns `rc = 0` at submit and the hardware's verdict arrives
+    /// later on its own control block, so what a failed `compute` call actually means is "the stream
+    /// is in an error state from a PRIOR operation" — the log reads
+    /// `scheduler rejected submission: deferred error from a prior operation`. The op named by the
+    /// launch-site dump is therefore the first op to be REFUSED, which is some op after the one that
+    /// faulted. Sweeping the whole list sidesteps the question entirely: if any program's device copy
+    /// differs from its baked bytes, this finds it without having to know which one the hardware was
+    /// running.
+    fn prog_images_sweep(&self, who: &str, ops: &Ops<T>) -> String {
+        use std::fmt::Write as _;
+        let mut same = 0usize;
+        let mut unread = 0usize;
+        let mut bad: Vec<usize> = Vec::new();
+        let mut detail = String::new();
+        for op in ops.iter() {
+            let Some(prog) = op.addr.as_ref() else {
+                continue;
+            };
+            let r = self.prog_image_report(op, prog);
+            if r.starts_with("progimg: IDENTICAL") {
+                same += 1;
+            } else if r.starts_with("progimg: DIFFERS") {
+                bad.push(op.index);
+                if bad.len() <= 4 {
+                    let i = op.index;
+                    let _ = writeln!(detail, "[progsweep] {who} op[{i}] {} {r}", op.label());
+                }
+            } else {
+                unread += 1;
+                if unread == 1 {
+                    let i = op.index;
+                    let _ = writeln!(detail, "[progsweep] {who} op[{i}] {} {r}", op.label());
+                }
+            }
+        }
+        format!(
+            "[progsweep] {who} {} op(s): {same} IDENTICAL, {} DIFFER {:?}, {unread} \
+             UNREADABLE\n{detail}",
+            ops.len(),
+            bad.len(),
+            bad,
+        )
+    }
+
+    /// ⭐⭐⭐ THE DEVICE'S OWN COPY OF ONE PROGRAM, READ BACK AND DIFFED AGAINST THE BAKED BYTES.
+    ///
+    /// ⛔ THIS IS THE DIRECT READ OF THE ONLY SURVIVING CLASS behind a `PrepZeroFlitCnt`+`PrepSwVer`
+    /// fault. Those two cases are the job-header parser refusing a header, and the baked header chain
+    /// has been walked in full — every program is well-formed under dip's own writer arithmetic, and
+    /// the flit the hardware names is ordinary payload, never a declared job boundary. Two statements
+    /// that cannot both be true, so one of them is not about the same bytes: the device is executing
+    /// an image that differs from the one the bake produced. Everything else about the launch (the
+    /// allocation's size, the H2D's length, `bootstrap`, the segment-7 translation) has been measured
+    /// and agrees, and none of those readings can see the CONTENT.
+    ///
+    /// The comparison is byte-for-byte over the binary's own length — never the allocation's
+    /// alignment-padded extent, which holds nothing and is not uploaded.
+    ///
+    /// ⚠️ WHAT AN "IDENTICAL" READING DOES *NOT* PROVE: that the device fetched these bytes. A D2H
+    /// resolves the host's `DevAddr` — region, offset, length — so it re-reads through the host's own
+    /// notion of where the program is. If the device fetched instructions through a DIFFERENT
+    /// translation for segment 7 than the one this address describes, the bytes here are the correct
+    /// ones and the fault is in the mapping, not the image. That is the shape "identical" leaves
+    /// standing, and it is worth naming because it is the only one left after this.
+    fn prog_image_report(&self, op: &OpProg<T>, prog: &DevAddr) -> String {
+        use std::fmt::Write as _;
+        let baked: &[u8] = &op.code.init_binary;
+        let stick =
+            usize::try_from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES)
+                .expect("STICK_BYTES fits usize");
+        let Ok(stream) = self.stream_ref() else {
+            return "progimg: no stream — nothing to read back".to_string();
+        };
+        // ⛔ READ WHERE THE IMAGE WAS PUT, not where the allocation starts — `alloc_ops_at` places it
+        // at dxp's declared prologue, so a base-relative readback would diff the prologue against the
+        // image and call every such program corrupt.
+        let head = op
+            .code
+            .job_bin_ptr
+            .saturating_sub(crate::runtime::prog_offset_base());
+        let Some(win) = prog.window(ByteOffset(head), ByteSize(baked.len() as u64)) else {
+            return "progimg: program window unaddressable".to_string();
+        };
+        let mut host = vec![0u8; baked.len()];
+        if let Err(e) = stream.d2h(&mut host, &win) {
+            return format!("progimg: D2H: {e} — THE READBACK ITSELF FAILED, no verdict");
+        }
+        if let Err(e) = stream.synchronize() {
+            return format!("progimg: D2H sync: {e} — THE READBACK ITSELF FAILED, no verdict");
+        }
+        // The header as dip writes it and `QGHeader` reads it (`dip/dip.cpp:77-91`, `senulator/qg.h`):
+        // `u8[0]` is `SW_VER`, bits 21:8 are the flit count EXCLUDING the header's own flit
+        // (`myflits = totalFlits_ - 1`), and bit 22 marks the last job of a program.
+        let hdr = |b: &[u8], f: usize| -> String {
+            match b.get(f * stick..f * stick + 4) {
+                None => "(short)".to_string(),
+                Some(w) => {
+                    let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    format!(
+                        "{v:#010x} swver={:#04x} count={} term={}",
+                        v & 0xff,
+                        (v >> 8) & 0x3fff,
+                        (v >> 22) & 1
+                    )
+                }
+            }
+        };
+        let hex = |b: &[u8], f: usize| -> String {
+            let Some(s) = b.get(f * stick..f * stick + 32) else {
+                return "(short)".to_string();
+            };
+            let mut h = String::new();
+            for x in s {
+                let _ = write!(h, "{x:02x}");
+            }
+            h
+        };
+        let Some(first) = (0..baked.len()).find(|&i| host[i] != baked[i]) else {
+            return format!(
+                "progimg: IDENTICAL {} B — the device's copy of this program IS the baked image \
+                 (flit0 {})",
+                baked.len(),
+                hdr(baked, 0)
+            );
+        };
+        let ndiff = (0..baked.len()).filter(|&i| host[i] != baked[i]).count();
+        let nflits = baked.len() / stick;
+        let bad: Vec<usize> = (0..nflits)
+            .filter(|&f| {
+                (f * stick..(f + 1) * stick).any(|i| i < baked.len() && host[i] != baked[i])
+            })
+            .collect();
+        let ff = first / stick;
+        let mut out = format!(
+            "progimg: DIFFERS {} B of {} B, FIRST at byte {first} = flit {ff} + {} — \
+             {} of {nflits} flit(s) differ, first differing flits {:?}{}",
+            ndiff,
+            baked.len(),
+            first % stick,
+            bad.len(),
+            &bad[..bad.len().min(24)],
+            if bad.len() > 24 { " …" } else { "" },
+        );
+        let _ = write!(
+            out,
+            "\n[segaddr]   flit0  hdr baked={} | device={}\
+             \n[segaddr]   flit{ff} hdr baked={} | device={}\
+             \n[segaddr]   flit{ff} baked [0..32]={}\
+             \n[segaddr]   flit{ff} devic [0..32]={}",
+            hdr(baked, 0),
+            hdr(&host, 0),
+            hdr(baked, ff),
+            hdr(&host, ff),
+            hex(baked, ff),
+            hex(&host, ff),
+        );
+        out
+    }
+
+    /// ONE-PASS OPTRACE: after each on-card op, D2H the activation/intermediate/KV segments and
+    /// print nonzero-count + max|.|. One prefill run then shows the signal flow op-by-op; the op
+    /// index where nz collapses to 0 (or max → inf) IS the divergence. seg1 (weights, ~2.6 GB) is
+    /// deliberately SKIPPED: static across the pass and already ruled out.
+    fn optrace(&mut self, oi: usize) -> Result<()> {
+        let _ = self.stream_ref()?.synchronize();
+        let mut line = format!("[optrace] op[{oi}]");
+        for i in [0usize, 2, 3, 4, 5, 6] {
+            let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
+            // Device-only segments hold no mirror; this probe wants their real bytes,
+            // so it materializes one first (`read_seg`'s own rule).
+            let _ = self.mirror_seg_shadow(seg);
+            let got = self.d2h_seg_clamped(seg);
+            let stat = match got {
+                Ok(got) => {
+                    let shadow = self.seg_host[i].host().unwrap_or(&[]);
+                    let host = &shadow[..got.min(shadow.len())];
+                    let (mut nz, mut mx) = (0usize, 0.0f32);
+                    let mut n_inf = 0usize;
+                    // First NON-FINITE element offsets (element index in the segment), so a divergence
+                    // probe can say WHICH tensor went inf rather than only that the segment holds one.
+                    // `SCRATCHY_SDSC_OPTRACE_INF=1` opts in: printing offsets costs a scan this line
+                    // already pays, but the extra string only matters when it fires.
+                    let mut inf_at: Vec<usize> = Vec::new();
+                    // `as_chunks` over `chunks_exact`: a CONSTANT chunk width yields `&[u8; 2]`, so the
+                    // pair cannot be short (clippy::chunks_exact_to_as_chunks).
+                    for (ei, c) in host.as_chunks::<2>().0.iter().enumerate() {
+                        let bits = u16::from_le_bytes(*c);
+                        if bits != 0 {
+                            nz += 1;
+                            let v = sen_convert::sen_to_f32(sen_convert::SenF16(bits)).abs();
+                            if v > mx {
+                                mx = v;
+                            }
+                            if !v.is_finite() {
+                                n_inf += 1;
+                                if inf_at.len() < 4 {
+                                    inf_at.push(ei);
+                                }
+                            }
+                        }
+                    }
+                    if n_inf > 0 && std::env::var_os("SCRATCHY_SDSC_OPTRACE_INF").is_some() {
+                        format!("nz={nz} max={mx:.3} INF={n_inf} at {inf_at:?}")
+                    } else {
+                        format!("nz={nz} max={mx:.3}")
+                    }
+                }
+                Err(_) => "unreadable".to_string(),
+            };
+            line.push_str(&format!(" | seg{i} {stat}"));
+        }
+        eprintln!("{line}");
+        Ok(())
+    }
+
+    /// ⭐ CARD-SIDE TENSORDUMP (`SCRATCHY_SDSC_TENSORDUMP=<dir>`) — the emulator-diff half of the
+    /// bisection instrument. After the op at `oi` settles, D2H every readable segment and write each
+    /// placement whose bytes MOVED since the last dump:
+    ///
+    /// * `prog{P}_seg{S}_t{T}.bin` + `.n` — the LATEST value, named to match the emulator's
+    ///   `SCRATCHY_EMU_TENSORDUMP` (`ktir-emulator/src/resident.rs`) so a diff joins on
+    ///   (program, tensor id). The emulator's `seg` is ITS planned-segment index (a run of fused
+    ///   nodes) while ours is the memory segment — the join key is (prog, tid), never the seg number.
+    /// * `op{O}_prog{P}_seg{S}_t{T}.bin` + `.n` — the timeline copy, one file per write, so the
+    ///   FIRST divergent op for a tensor is the first `op…` file that disagrees with the emulator's
+    ///   trajectory for that tid.
+    /// * `ops.txt` — one line per op: `op{O} prog{P} list-oi {label}`. `progs.txt` — the
+    ///   fingerprint → program-index assignment.
+    ///
+    /// First-writer semantics match the emulator's dump law (only tensors the segment actually
+    /// wrote), by CHANGE DETECTION on the host shadow rather than by an output list: a card launch
+    /// group carries its program's arg→tensor mapping but no direction, and a byte-move is the same
+    /// evidence the emulator's `PROBE6` change detection uses. A recolored slot whose bytes moved
+    /// under an ALIASED tensor fires here too — the diff script must tolerate a card-only dump file
+    /// (the emulator has no entry for that tid at that point), which is why every file is
+    /// self-describing via `.n`.
+    ///
+    /// Elements are LE f32 converted from the device's SEN169 fp16 (2 B/elem) — the same
+    /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, in
+    /// `raw_ids`) are dumped as i32→f32 with `.n = size/4` so the file stays comparable; the
+    /// emulator never dumps those (host-bound sources), so they simply have no reference file.
+    /// Bank ≥ 1 weights are skipped (not in their segment's region), and a placement past what
+    /// was read back is a layout shock — each with one `skip.txt` line so the gap is visible
+    /// rather than silent. Every segment is materialized to its full region before the D2H, so
+    /// the intermediates the ops compute into are dumped exactly as they were when every shadow
+    /// was host-mirrored; nothing reads back as a quiet 0 B.
+    fn tensordump(&mut self, oi: usize, op: &OpProg<T>) -> Result<()> {
+        let Some(dir) = Diag::get().tensordump.clone() else {
+            return Ok(());
+        };
+        if self.dump.is_none() {
+            let prog = dump_prog_index(&self.code.fp);
+            let _ = std::fs::create_dir_all(&dir);
+            // Append (never truncate): a run may build several sessions, and the registry line for
+            // each is one row.
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("progs.txt"))
+            {
+                let _ = writeln!(f, "prog{prog} fp={}", self.code.fp);
+            }
+            self.dump = Some(TensorDump {
+                prog,
+                op: 0,
+                snap: std::collections::HashMap::new(),
+            });
+        }
+        let _ = self.stream_ref()?.synchronize();
+        // D2H every segment a placement can live in — `read_seg`'s own rule: this tool exists to
+        // see the bytes the ops COMPUTE (the intermediates above all), which are device-only slots,
+        // so every segment with a region materializes its shadow first. An aliased segment's
+        // device region belongs to its owner — reading it back is still SOUND (a read never
+        // writes), it just reflects the owner's bytes, which is exactly what this session's
+        // launches compute against. And a failed read is an `Err`, never a quiet 0 B: a segment
+        // that reads as nothing would hide every placement in it from the diff.
+        let mut got = [0usize; NUM_SEGMENTS];
+        for (i, g) in got.iter_mut().enumerate() {
+            if self.seg_addr[i].is_none() {
+                continue;
+            }
+            let seg = SegIdx::checked(i as i64).expect("< NUM_SEGMENTS");
+            self.mirror_seg_shadow(seg)?;
+            *g = self.d2h_seg_clamped(seg)?;
+        }
+        let dump = self.dump.as_mut().expect("just initialized");
+        dump.op += 1;
+        let (prog, opno) = (dump.prog, dump.op);
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("ops.txt"))
+            {
+                let _ = writeln!(f, "op{opno} prog{prog} list-oi={oi} {}", op.label());
+            }
+        }
+        let mut skipped = String::new();
+        for (id, p) in &self.places {
+            if p.bank != 0 || p.size == 0 {
+                continue; // a banked weight is not in its segment's region
+            }
+            let i = p.segment as usize;
+            if i >= NUM_SEGMENTS || self.seg_addr[i].is_none() {
+                continue;
+            }
+            // Only whole-tensor reads that the clamped D2H actually brought back: a placement past
+            // what was read would read stale host bytes and masquerade as a write. Every segment
+            // was materialized to its full region above, so a miss here is a layout shock in ANY
+            // segment — and the skip is WRITTEN, never silent (the doc's own law).
+            let avail = got[i] as u64;
+            if avail == 0 || p.offset + p.size > avail {
+                skipped.push_str(&format!(
+                    "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
+                    p.segment, p.offset, p.size, avail
+                ));
+                continue;
+            }
+            // The loop above materialized every segment with a region, and `avail > 0` proves the
+            // D2H brought its bytes back — a `DeviceOnly` slot here is a wiring bug, refused.
+            let Some(host) = self.seg_host[i].host() else {
+                bail!(
+                    "tensordump: placement {id} names seg{i}, which is DEVICE-ONLY despite the \
+                     materialize pass above — the shadow state and the dump loop disagree"
+                );
+            };
+            let cur = &host[p.offset as usize..][..p.size as usize];
+            let moved = match dump.snap.get(id) {
+                Some(prev) => prev.as_slice() != cur,
+                None => cur.iter().any(|b| *b != 0),
+            };
+            if !moved {
+                continue;
+            }
+            dump.snap.insert(*id, cur.to_vec());
+            let raw = self.raw_ids.contains(id);
+            let elems = if raw {
+                p.size as usize / 4
+            } else {
+                p.size as usize / 2
+            };
+            let mut vals = Vec::with_capacity(elems);
+            if raw {
+                for c in cur.as_chunks::<4>().0 {
+                    vals.push(i32::from_le_bytes(*c) as f32);
+                }
+            } else {
+                for c in cur.as_chunks::<2>().0 {
+                    vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(
+                        u16::from_le_bytes(*c),
+                    )));
+                }
+            }
+            let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let stem = format!("prog{prog}_seg{}_t{id}", p.segment);
+            let tl = format!("op{opno}_prog{prog}_seg{}_t{id}", p.segment);
+            let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
+            let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
+            let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
+            let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+        }
+        if !skipped.is_empty() {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("skip.txt"))
+            {
+                let _ = write!(f, "{skipped}");
+            }
+        }
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Predict
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Attribute this forward's harvested RB timings to the ops that launched them, and report on
+    /// the same cadence `group_time` does. The completion thread records every CB's five device
+    /// cycle counts as it completes (`flex_rs::rb_telemetry`), so after the step's `synchronize`
+    /// — the one the step already performs, no extra drain — the ring holds exactly this
+    /// forward's CBs. Op compute entries (DMA crossings excluded by
+    /// [`flex_rs::rb_telemetry::RbTiming::dma`]) sorted by
+    /// submission id zip 1:1 against [`Timers::rb_seq`], which the launch loop filled in the same
+    /// order. This is the attribution `group_time`/`prefix_time` pay ~11% of decode to estimate,
+    /// read for free instead.
+    fn rb_attribute(&mut self) {
+        let seq = std::mem::take(&mut timers().rb_seq);
+        let mut entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
+        let mut t = timers();
+        t.rb_steps += 1;
+        // The DMA crossings belong to no op — the preamble-H2D and logits-D2H — so they
+        // accumulate wherever they arrive, attribution-free. Since #544 those two ride the
+        // COMPUTE pipeline (they used to take the async ones), so `pipeline` alone no longer
+        // routes them: a Compute entry carrying a direction is a crossing and goes to its
+        // direction's total, exactly where it lived before the move.
+        for e in &entries {
+            match (e.pipeline, e.dma) {
+                (flex_rs::scheduler::PipelineId::AsyncDmaI, _)
+                | (
+                    flex_rs::scheduler::PipelineId::Compute,
+                    Some(flex_rs::dma::DmaDirection::HostToDevice),
+                ) => t.rb_dmai.add_dmai(e.rb),
+                (flex_rs::scheduler::PipelineId::AsyncDmaO, _)
+                | (
+                    flex_rs::scheduler::PipelineId::Compute,
+                    Some(flex_rs::dma::DmaDirection::DeviceToHost),
+                ) => t.rb_dmao.add_dmao(e.rb),
+                (flex_rs::scheduler::PipelineId::Compute, None) => {}
+            }
+        }
+        // PIN THE MAPPING ON-CARD: raw per-CB records for the first few forwards, verbatim. The
+        // aggregates below blend forwards (prefill and decode CBs differ) and cannot decide the
+        // slot-to-name mapping; these can — an H2D CB lights the dmai slots, a D2H the dmao
+        // slots, a compute CB the rest, and only same-domain slot pairs difference to durations.
+        // The compute-pipeline DMA crossings print here too (a Compute line in this print IS one
+        // — no op entry reaches it), so their own slot mapping gets pinned the same way.
+        if t.rb_steps <= 3 {
+            for e in entries.iter().filter(|e| {
+                !matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) || e.dma.is_some()
+            }) {
+                eprintln!(
+                    "[sdsc-rbtime] fwd {} {:?} id {} slots {:?} power {}",
+                    t.rb_steps,
+                    e.pipeline,
+                    e.id,
+                    e.rb.timestamps(),
+                    e.rb.power()
+                );
+            }
+        }
+        // The inter-step device-idle gap's raw material, one line EVERY forward (the raw
+        // per-CB probe above stops at three): each class's device-clock window. The
+        // post-processor differences fwd N's `last` into fwd N+1's `first` — wrap-exact at
+        // any real step gap, the counter is free-running u32 — and decomposes the window by
+        // class: last compute end → D2H span → host tail → H2D span → first compute start.
+        // Classes mirror the routing above: crossings by direction on whichever pipeline
+        // carried them, non-crossing async/fill CBs as `other`, op CBs as `compute`.
+        {
+            use flex_rs::dma::DmaDirection;
+            use flex_rs::scheduler::PipelineId;
+            let compute = rb_class_window(&entries, |e| {
+                matches!(e.pipeline, PipelineId::Compute) && e.dma.is_none()
+            });
+            let h2d = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice));
+            let d2h = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::DeviceToHost));
+            let other = rb_class_window(&entries, |e| {
+                e.dma.is_none() && !matches!(e.pipeline, PipelineId::Compute)
+            });
+            let all = rb_class_window(&entries, |_| true);
+            let fmt = |w: &Option<RbClassWindow>| match w {
+                Some(w) => format!("[{},{},{}]", w.first, w.last, w.n),
+                None => "-".to_string(),
+            };
+            eprintln!(
+                "[sdsc-rbgap] fwd {} all{} compute{} h2d{} d2h{} other{}",
+                t.rb_steps,
+                fmt(&all),
+                fmt(&compute),
+                fmt(&h2d),
+                fmt(&d2h),
+                fmt(&other)
+            );
+        }
+        // ⭐ ONE FORWARD'S DEVICE TIME BY CB KIND — one line per forward, every forward: the span
+        // from the first compute CB's start to the last's end, the summed compute EXEC, and the
+        // gaps (span − exec: waits, sends, idle). A replayed forward records no launch sequence,
+        // so this is the replay path's one decomposition; a decode step of a sharded world reads
+        // its collectives' cost straight off it.
+        {
+            let ops: Vec<&flex_rs::rb_telemetry::RbTiming> = entries
+                .iter()
+                .filter(|e| {
+                    matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
+                })
+                .collect();
+            let exec: u64 = ops.iter().map(|e| u64::from(e.rb.exec_cmpt_cycles())).sum();
+            let busy = ops.iter().filter(|e| e.rb.exec_cmpt_cycles() > 0).count();
+            let start = ops
+                .iter()
+                .map(|e| e.rb.timestamps()[0])
+                .filter(|&t| t != 0)
+                .min();
+            let end = ops.iter().map(|e| e.rb.timestamps()[4]).max();
+            if let (Some(a), Some(b)) = (start, end) {
+                let span = u64::from(b.wrapping_sub(a));
+                // The top exec-time CBs, by their place in the forward: which CB of the step the
+                // time is in (the sends, waits and consumes sit at fixed places in a replayed
+                // step, the same every forward).
+                let mut by_place: Vec<(u32, usize)> = ops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (e.rb.exec_cmpt_cycles(), i))
+                    .collect();
+                by_place.sort_unstable_by(|x, y| y.cmp(x));
+                let top: Vec<String> = by_place
+                    .iter()
+                    .take(6)
+                    .map(|(c, i)| format!("{i}:{c}"))
+                    .collect();
+                // Where the gaps sit: the largest waits between one CB's end and the next's start.
+                let mut gaps: Vec<(u32, usize)> = ops
+                    .windows(2)
+                    .enumerate()
+                    .map(|(i, w)| {
+                        (
+                            w[1].rb.timestamps()[2].wrapping_sub(w[0].rb.timestamps()[4]),
+                            i + 1,
+                        )
+                    })
+                    .filter(|(g, _)| *g < 1 << 31)
+                    .collect();
+                gaps.sort_unstable_by(|x, y| y.cmp(x));
+                let gtop: Vec<String> = gaps
+                    .iter()
+                    .take(6)
+                    .map(|(g, i)| format!("{i}:{g}"))
+                    .collect();
+                eprintln!(
+                    "[sdsc-rbkind] fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
+                     cycles  top-exec {} top-gap {}",
+                    t.rb_steps,
+                    ops.len(),
+                    span.saturating_sub(exec),
+                    top.join(" "),
+                    gtop.join(" ")
+                );
+            }
+        }
+        // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
+        // both break the 1:1 zip below and bill the preamble/readback to whichever op it
+        // happened to sort next to.
+        entries.retain(|e| {
+            matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
+        });
+        entries.sort_unstable_by_key(|e| e.id);
+        if entries.len() != seq.len() {
+            // LOUD, NOT SILENT: a mismatch means per-op attribution would be WRONG, not merely
+            // missing — a rotated ring loses launches from its front. (The DMA crossings
+            // are NOT a mismatch source anymore: `dma` excludes them above.) Skip the
+            // attribution entirely; the DMA totals above stay honest either way.
+            eprintln!(
+                "[sdsc-rbtime] sequence mismatch: {} completed compute CBs vs {} recorded \
+                 launches — per-op attribution SKIPPED for this forward",
+                entries.len(),
+                seq.len()
+            );
+            return;
+        }
+        let zipped: Vec<_> = entries.iter().zip(seq).collect();
+        if t.rb_steps <= 3 {
+            let n = zipped.len();
+            for (i, (e, ((rung, oi), label))) in zipped
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i < 20 || *i + 8 >= n)
+            {
+                eprintln!(
+                    "[sdsc-rbtime] fwd {} op ({rung},{oi}) rec {i} id {} slots {:?} power {}  {}",
+                    t.rb_steps,
+                    e.id,
+                    e.rb.timestamps(),
+                    e.rb.power(),
+                    label
+                );
+            }
+        }
+        let mut new_cbs = 0u64;
+        for (e, ((rung, oi), label)) in zipped {
+            let acc = t.rb_cycles.entry((rung, oi)).or_default();
+            acc.cycles.add_compute(e.rb);
+            new_cbs += 1;
+            if acc.label.is_empty() {
+                acc.label = label;
+            }
+        }
+        t.rb_cbs += new_cbs;
+        // Same cadence as `group_time`'s report: rare enough not to distort, often enough that a
+        // long run does not have to end first. Watermarked rather than `is_multiple_of` because
+        // the cumulative count jumps a whole forward at a time.
+        if t.rb_cbs - t.rb_reported >= 20_000 {
+            t.rb_reported = t.rb_cbs;
+            report_rb_time(&t);
+        }
+    }
+
+    /// The shared FORWARD HALF of a step: the prepared/source gates, the RB window reset, the
+    /// activation refill, and the replay-or-launch decision — extracted from `predict`, so
+    /// the refill law, the replay gate and
+    /// the launch are ONE behavior the readback rides, never a copy. `suffix` is
+    /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
+    fn forward_half(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        suffix: SuffixLaunch,
+        d: &Diag,
+    ) -> Result<ForwardHalf> {
+        if !self.prepared {
+            bail!("predict before prepare");
+        }
+        self.require_sources_filled()?;
+
+        // RB timing: start the forward's window empty. The previous forward drained its own
+        // entries at its synchronize; what is left in the ring now is pre-forward history
+        // (prepare's weight uploads belong to no op), and the launch sequence starts at zero.
+        if d.rb_time {
+            let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
+        }
+        timers().rb_seq.clear();
+
+        // The stream is PERSISTENT: the scheduler retires each op's fence from its per-stream
+        // deque the moment that fence resolves (SchedulerState::retire_fence), so nothing
+        // per-forward accumulates on it and the old recreate-to-drain-every-forward workaround
+        // is gone. The previous forward already synchronized before returning (the trailing
+        // `synchronize` below waits out every op, H2Ds included), so dropping the recreate's
+        // implicit destroy-sync changes no ordering; the resident weight/KV/program
+        // allocations live on the runtime either way.
+        let t_stream0 = Instant::now();
+        let t0 = t_stream0;
+        let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
+        let t0b = Instant::now();
+        // ⛔ A SHARDED RANK NEVER DRAINS MID-SUBMIT. Its forward's collectives wait on every peer's
+        // sends, and a peer submits only after this rank returns: a drain here waits on a send that
+        // cannot have been issued yet, and the stream times out (measured: 280 s, every phase-timed
+        // tp/2 prefill). The phase split of a sharded step is the finish side's alone.
+        let sharded = <T as ktir_superdsc::collective::World>::SHARDED;
+        if d.phase_time && !sharded {
+            let _ = self.stream_ref()?.synchronize();
+        }
+        let t1 = Instant::now();
+
+        // ⭐ #603 PR2 2c — a ONE-TOKEN step on a quiet diag replays from a cached image
+        // (canvas copy + patches + ONE doorbell); everything else takes the walk.
+        // `n_new == 1` is the step's own shape, not a toggle: a chunked-prefill step
+        // (n_new > 1) sweeps a fresh page count per chunk and would pay a derivation
+        // per chunk — PR4's rungs, not the player's. `try_replay_forward` states its
+        // own other refusals (batched fold, instruments) and hands back `None` for
+        // the walk.
+        // The player's images all carry the suffix, so a forward that skips it takes the walk.
+        let replayed = n_new.0 == 1
+            && suffix == SuffixLaunch::Launched
+            && self.try_replay_forward(seq_pos)?.is_some();
+        if !replayed {
+            self.launch_forward(seq_pos, suffix)?;
+        }
+
+        if d.phase_time && !sharded {
+            let _ = self.stream_ref()?.synchronize();
+        }
+        let t2 = Instant::now();
+        Ok(ForwardHalf {
+            t_stream0,
+            t0,
+            t0b,
+            t1,
+            t2,
+            h2d_note,
+            h2d_bytes,
+        })
+    }
+
+    /// The `[sdsc-phase]` block both readback tails print — one renderer, parameterized only by
+    /// WHICH readback ran (`"logits"` / `"idx"`), so the token step's line set cannot drift from
+    /// the logits step's. The rbgap and phase harnesses grep these lines.
+    fn print_step_phase(
+        half: &ForwardHalf,
+        d2h_name: &str,
+        d2h_seg: i64,
+        d2h_bytes: u64,
+        t2b: Instant,
+        t3: Instant,
+        n_new: i64,
+    ) {
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+        let ForwardHalf {
+            t_stream0,
+            t0,
+            t0b,
+            t1,
+            t2,
+            h2d_note,
+            h2d_bytes,
+        } = half;
+        eprintln!(
+            "[sdsc-phase] stream_recreate={:.2}  preamble_h2d={:.2}  compute={:.2}  \
+             {d2h_name}_d2h={:.2}  predict_total={:.2} ms  (n_new={})\n\
+             [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}\n\
+             [sdsc-phase]   d2h: seg{} {}KB | enqueue={:.2} sync={:.2}",
+            ms(*t_stream0, *t0),
+            ms(*t0, *t1),
+            ms(*t1, *t2),
+            ms(*t2, t3),
+            ms(*t_stream0, t3),
+            n_new,
+            h2d_bytes >> 10,
+            if h2d_note.is_empty() {
+                " (nothing)".to_string()
+            } else {
+                h2d_note.clone()
+            },
+            ms(*t0, *t0b),
+            ms(*t0b, *t1),
+            d2h_seg,
+            d2h_bytes >> 10,
+            ms(*t2, t2b),
+            ms(t2b, t3),
+        );
+    }
+
+    /// The shared post-readback tail: RB attribution and the one-shot flex-leak probe — the
+    /// two things every step does after its synchronize, extracted with `forward_half` so the
+    /// token step keeps them by construction rather than by copy.
+    fn step_epilogue(&mut self, d: &Diag) {
+        if d.rb_time {
+            self.rb_attribute();
+        }
+
+        // FLEX-LEAK PROBE (one-shot): after the N-th forward, tear the stream + the whole runtime
+        // down. This BREAKS the session (no re-prepare) — measure, then stop the serve.
+        if let Some(n) = d.reset_probe {
+            let mut t = timers();
+            t.forwards += 1;
+            if t.forwards == n {
+                let before = vmrss_kb();
+                self.stream = None;
+                let _ = self.card.reset();
+                let after = vmrss_kb();
+                eprintln!(
+                    "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
+                    before - after
+                );
+            }
+        }
+    }
+
+    /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
+    /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
+    /// `logits` says what the caller does with this forward's logits ([`Logits`]): a prompt chunk
+    /// whose logits nobody reads skips the suffix and the read-back both.
+    pub fn predict(&mut self, n_new: NewTokens, seq_pos: SeqPos, logits: Logits<'_>) -> Result<()> {
+        let want = LogitsRead::of(&logits);
+        let submitted = self.predict_submit(n_new, seq_pos, want)?;
+        self.predict_finish(submitted, logits)
+    }
+
+    /// ⭐ THE SUBMIT HALF OF [`Self::predict`]: the forward and, when its logits are read back, the
+    /// logits D2H behind it on the compute pipeline — enqueued, nothing waited on. A forward that
+    /// spans several cards (a sharded world's ranks, whose collectives wait on each other's sends)
+    /// submits on EVERY card before it waits on any, so no card's wait can stall a peer's send;
+    /// [`Self::predict_finish`] is the wait. One card is the same two halves back to back.
+    pub fn predict_submit(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        want: LogitsRead,
+    ) -> Result<PredictSubmitted> {
+        let suffix = match want {
+            LogitsRead::Discarded => SuffixLaunch::Skipped,
+            LogitsRead::ReadBack | LogitsRead::LeftOnDevice => SuffixLaunch::Launched,
+        };
+        let d = Diag::get();
+        let n_new = NewTokens(n_new.0.max(1));
+        let half = self.forward_half(n_new, seq_pos, suffix, d)?;
+
+        // ── D2H the logits' segment, sen→IEEE the logits slice at its baked offset. ──
+        // Skipped entirely when the caller wants no logits: only the LAST prefill chunk asks for
+        // them (the prefill suffix runs its lm-head tail at m=1 over the chunk's last row), so every
+        // earlier chunk would transfer ~3 MB of untouched memory (~1.7 ms at the measured DMA rate).
+        //
+        // NOTE the read is at the logits placement's offset with NO row indexing — exactly right for
+        // the folded tail, which writes ONE [1,vocab] row at offset 0 whatever `n_new` is, and
+        // unchanged for decode (n_new=1).
+        let lp = self
+            .places
+            .get(&self.logits_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
+        let (mut d2h_seg, mut d2h_bytes) = (-1i64, 0u64);
+        if want == LogitsRead::ReadBack {
+            let seg = SegIdx::checked(lp.segment as i64)
+                .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
+            // The shadow the readback lands in must cover the window below (and the multi-chunk
+            // fallback reads the WHOLE region): the mirrored shadow is sized to the segment's
+            // placements, so grow it to the region's padded extent first.
+            self.mirror_seg_shadow(seg)?;
+            d2h_seg = lp.segment as i64;
+            let addr = self.seg_addr[seg.get()].as_ref().unwrap();
+            let tot = addr.total_size().as_u64();
+            // ⭐ THE LOGITS **PLACEMENT**, NOT ITS SEGMENT'S ALLOCATION — `d2h_bytes =
+            // addr.total_size()` copied the WHOLE region every token to obtain one [1,vocab] row.
+            //
+            // ⛔ THAT COST WAS INVISIBLE BECAUSE IT IS NOT WRITTEN DOWN ANYWHERE: it is whatever
+            // else the layout happens to pack into the logits segment. Today that is nothing (~102
+            // KB, so the whole-region read was ~the row), which is exactly why a whole-region read
+            // survived review. But it is what disqualified seg4 as the weight-tail spill slot in
+            // `spill_weight_tail`: a 419 MB tenant there would have cost ~240 ms PER TOKEN, with
+            // nothing about the placement looking wrong. Reading the PLACEMENT makes the transfer a
+            // property of the logits row (vocab × 2 B) instead of a property of the segment's other
+            // tenants, so no future packing decision can put bytes on this critical path.
+            //
+            // Two facts make the window safe, and both are guarded at cargo-build in
+            // `audit_layout_addresses` rather than trusted here:
+            //   * `lp.offset % 128 == 0` — a chunk offset is written in flits, and flex's
+            //     `each_chunk_128_byte_aligned` rejects an unaligned one.
+            //   * `lp.offset + lp.size <= segment_bytes[seg]` — and `segment_bytes` is an align128
+            //     accumulation, so rounding the LENGTH up to a flit stays inside the region. The
+            //     round-up is not optional: `Flits::from_bytes` TRUNCATES (`>> 7`), so a length that
+            //     is not a multiple of 128 would transfer a short row and lose the tail logits.
+            // The destination is the SAME `[lp.offset, …)` window of the shadow the sen→IEEE convert
+            // below reads from, so the row lands where the caller already looks for it.
+            //
+            // ⭐ AND ONLY THE ROW THE CONVERT BELOW READS. The convert takes `vocab` elements at
+            // `lp.offset` — the folded tail's one `[1, vocab]` row — but a prefill rung's logits
+            // PLACEMENT is `[rows, vocab]` wide: 25.6 MB at granite-2b's 256-row rung, read back to
+            // convert 100 KB of it (15.1 ms on a fresh session, 3.6 ms warm, measured). The window
+            // is the row, so the bytes converted are the same bytes; decode's placement already is
+            // one row, so it is unchanged.
+            let lo = lp.offset;
+            let row = (self.vocab.0 as u64 * 2).min(lp.size);
+            let len =
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::align128(row).min(tot - lo);
+            // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
+            // whole-region read, which is what this always did.
+            let win = (len < tot)
+                .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
+                .flatten();
+            let (src, a, b) = match win.as_ref() {
+                Some(w) => (w, lo, lo + len),
+                None => (addr, 0, tot),
+            };
+            d2h_bytes = b - a;
+            // The mirror grew the shadow to the whole region above (the multi-chunk fallback
+            // reads all of it), and the window is clamped to `tot`, so the slice is in range;
+            // the let-else is the shadow type's price — the logits segment is host-owned by
+            // the role statement, so this arm is a consistency refusal, not an expectation.
+            let host = {
+                let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
+                    bail!("predict: the logits segment {} is DEVICE-ONLY", seg.get());
+                };
+                &mut v[a as usize..b as usize]
+            };
+            // ON THE COMPUTE PIPELINE (#544): the logits readback is the LAST op of every
+            // step, right after the step's COMPUTE ops. Riding ASYNC_DMAO, its switch
+            // barrier drained the COMPUTE deque — the readback submission HOST-BLOCKED until
+            // the whole step's compute work completed. On COMPUTE the barrier drains the
+            // (empty) DMA deques instead, the readback submits immediately, and the queue's
+            // FIFO — readback CB behind the step's compute CBs on the same queue — carries
+            // the ordering the host-side wait used to.
+            self.stream
+                .as_ref()
+                .unwrap()
+                .d2h_on_compute(host, src)
+                .map_err(|e| anyhow!("logits D2H: {e}"))?;
+        }
+        Ok(PredictSubmitted {
+            half,
+            want,
+            n_new,
+            d2h_seg,
+            d2h_bytes,
+            t2b: Instant::now(),
+        })
+    }
+
+    /// ⭐ A PEER RANK'S HALF OF THE LOOP'S ONE FENCE — what a sharded step's non-lead card does when
+    /// the lead's stick read lands: take its shadow's quiet point ([`Self::quiet_shadow`], the same
+    /// door every shadow writer passes through), and nothing else. Its stream holds the step the
+    /// pipelined loop already submitted behind this one, so a whole-stream synchronize here would
+    /// fence that step too and serialize the pipeline; the collectives tie the peer's progress to
+    /// the lead's, so the lead's landed read is the step's end on every card that matters.
+    pub fn settle_peer_step(&mut self) -> Result<()> {
+        self.quiet_shadow()?;
+        // A peer's RB records — whatever of its steps has completed (`[sdsc-rbkind]`).
+        if Diag::get().rb_time {
+            self.rb_attribute();
+        }
+        Ok(())
+    }
+
+    /// ⭐ THE WAIT HALF OF [`Self::predict`]: drain this card's stream, then convert the logits row
+    /// into `logits` when the submit read it back. `logits` must be the read the submit was asked
+    /// for — a mismatch is refused, never a silent skip.
+    pub fn predict_finish(&mut self, s: PredictSubmitted, logits: Logits<'_>) -> Result<()> {
+        if LogitsRead::of(&logits) != s.want {
+            bail!(
+                "predict_finish: the forward was submitted for {:?} and finished for {:?}",
+                s.want,
+                LogitsRead::of(&logits)
+            );
+        }
+        let d = Diag::get();
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("predict: sync: {e}"))?;
+
+        if d.phase_time {
+            let t3 = Instant::now();
+            Self::print_step_phase(
+                &s.half,
+                "logits",
+                s.d2h_seg,
+                s.d2h_bytes,
+                s.t2b,
+                t3,
+                s.n_new.0,
+            );
+            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
+            report_phase_timers(ms(s.half.t1, s.half.t2));
+        }
+
+        if let Logits::ReadBack(out) = logits {
+            let lp = self
+                .places
+                .get(&self.logits_id)
+                .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
+            let seg = SegIdx::checked(lp.segment as i64)
+                .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
+            let elems = self.vocab.0.min(out.len() / 2);
+            // The submit half materialized this shadow for its readback window; the convert
+            // reads inside that same window. A device-only logits segment would mean the two
+            // halves of the read disagree with the role statement — refuse, never convert
+            // nothing.
+            let src = self.seg_host[seg.get()]
+                .host()
+                .and_then(|h| h.get(lp.offset as usize..))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "predict_finish: the logits segment {} holds no host shadow",
+                        seg.get()
+                    )
+                })?;
+            sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
+        }
+
+        self.step_epilogue(d);
+        Ok(())
+    }
+
+    /// ⭐ #32 (A) — THE PIPELINED DECODE STEP'S SUBMIT HALF: one one-token
+    /// forward with NO trailing drain. `predict`'s readback tail runs a
+    /// full-stream synchronize after every step — the FIRST of the two
+    /// per-step drains the pipelined loop deletes (the second is
+    /// `read_tensor_raw`'s own, split into `defer_read_tensor_raw` +
+    /// `finish_deferred_read_raw`). The loop's ONE fence per step — taken
+    /// after its prep-ahead, inside the finish half — is what waits this
+    /// submission (and the stick D2H enqueued behind it) out. Everything
+    /// else is `predict`'s own one-token path BY CONSTRUCTION, not by copy:
+    /// the same `forward_half` (the same refill, the same ONE doorbell, the
+    /// same accounting), reached through the same private body `predict`
+    /// runs for `Logits::LeftOnDevice`.
+    ///
+    /// The step's epilogue (RB attribution, the leak probe) does not ride
+    /// this door: both bodies are Diag-gated, and every Diag instrument
+    /// disqualifies a forward from the emitted-row regime by the seat's
+    /// own `is_quiet` gate — on this path they have no reachable input.
+    /// Stated here rather than silently dropped.
+    pub fn submit_step(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<()> {
+        let d = Diag::get();
+        let _half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
+        Ok(())
+    }
+
+    /// ⭐ #32 — THE SHADOW'S QUIET POINT, TAKEN BY EVERY DOOR THAT WRITES IT.
+    /// An H2D reads the host shadow at DEVICE-EXECUTION time (the CB DMAs from
+    /// the shadow pointer when the card plays it), so a host write into
+    /// `seg_host` may only happen once every in-flight H2D has executed; FIFO
+    /// retires the whole prefix behind the last-enqueued one, so waiting IT is
+    /// waiting them all. The doors that write the shadow —
+    /// [`Self::bind_input_f32`], the refill's convert loop,
+    /// [`Self::write_seg_prefix`] (and through the convert
+    /// loop, every door whose bytes it writes: `stage_keyed`, the keyed and raw
+    /// bind channels) — all pass through here first. A wait in the drain alone
+    /// does not close the law: a bind can arrive with NO drain behind it
+    /// (a k>1 loop iteration, a request switch), and those writes race exactly
+    /// the same H2Ds.
+    ///
+    /// In the pipelined cadence this is FREE — the drain took the latch one
+    /// message ago and the take finds `None`; at startup and between
+    /// back-to-back submits it costs exactly one H2D's execution, which is the
+    /// price of the card not reading bytes the host already replaced.
+    ///
+    /// Device-side landings need no such wait: a D2H writes its host buffer
+    /// when IT executes, FIFO behind every earlier H2D, so the queue itself
+    /// orders those writes — only the HOST's own copies race, and only those
+    /// go through this door. `prepare`/`stage_weights` write the shadow before
+    /// any refill exists to arm a latch, so they are exempt by construction
+    /// (and the first refill re-sends every per-step range regardless).
+    ///
+    /// The dead arm is the same escape [`Self::finish_deferred_read_raw`]
+    /// runs: a failed op never fires its callback, the latch's timeout tick
+    /// hands the park back, the synchronize below rethrows the stream's
+    /// deferred error, and a stream that died is REFUSED rather than written
+    /// past.
+    fn quiet_shadow(&mut self) -> Result<()> {
+        let Some(h2d) = self.last_h2d.take() else {
+            return Ok(()); // nothing was ever enqueued — nothing to wait
+        };
+        let quiet = {
+            // Scoped: `dead` borrows `self` immutably for the park, and the
+            // take above was the one mutable touch — sequenced first, the two
+            // never overlap.
+            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
+            h2d.wait_or(dead)
+        };
+        if !quiet {
+            self.stream_ref()?
+                .synchronize()
+                .map_err(|e| anyhow!("shadow quiet point: sync: {e}"))?;
+            bail!(
+                "the stream died before the shadow went quiet — refusing to write bytes an \
+                 in-flight H2D may still read"
+            );
+        }
+        Ok(())
+    }
+
+    /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset
+    /// (IEEE→sen), and re-H2D the dirtied segments. Weights (seg1) and KV (seg2) stay RESIDENT —
+    /// never re-uploaded, which is the whole perf point.
+    fn refill_activations(&mut self, d: &Diag) -> Result<(String, u64)> {
+        // ⛔ A WHOLE-SEGMENT H2D IS THE O(cap) DECODE CLIFF. seg3 is 8425 KB and a bs=8 decode step
+        // writes a small fraction of it, so nearly every byte uploaded is unchanged — a flat
+        // ~1.5 ms no amount of shrinking the mask could reach, because the transfer is sized by the
+        // SEGMENT and not by the content.
+        //
+        // Each bind goes out in its own ALIGNED COVERING WINDOW ([`h2d_run`]). It degrades to the
+        // whole segment whenever a window cannot be formed, so the worst case is exactly the old
+        // behaviour.
+        let mut seg_dirty = [false; NUM_SEGMENTS];
+        // ⛔ ONE COVERING WINDOW IS NOT ENOUGH — MEASURED. The bound tensors are SCATTERED across
+        // seg3 (model constants low, masks high), so min-to-max spanned the whole 8425 KB and
+        // narrowed nothing. Keep each tensor's own range and merge only what actually overlaps.
+        let mut seg_runs: [Vec<(u64, u64)>; NUM_SEGMENTS] = [const { Vec::new() }; NUM_SEGMENTS];
+
+        // Collect first (the borrow of `bound` and the mutation of `seg_host` cannot overlap).
+        let mut writes: Vec<(usize, u64, &[u8])> = Vec::new();
+        for (nm, src) in &self.bound {
+            if self.weight_ids.contains(nm) {
+                continue; // weight, resident
+            }
+            // An activation is always an `Owned` bind, so this is its own buffer's slice —
+            // stated through the provenance type like every other bound read.
+            let src: &[u8] = src.as_slice();
+            if !refill_sends(&self.keyed, nm) {
+                continue; // keyed, and the device already holds this key's bytes
+            }
+            let Some(p) = self.places.get(nm) else {
+                continue; // no placement → not a program input, skip
+            };
+            let Some(seg) = SegIdx::checked(p.segment as i64) else {
+                continue;
+            };
+            // OVER-BIND GUARD: the host must never write more bytes into a tensor than its OWN
+            // placement reserves. Checking the SEGMENT bound alone passes happily while silently
+            // overwriting the NEXT tensors — which is exactly how a one-stick ATTN_ZERO reservation
+            // vs an [mq_pad,hd] bind zeroed the fp8 clamp constants at mq_pad=128 and made every
+            // fp8 projection emit 0 (all-zero prefill KV, fluent but off-topic output). MUST be `>`
+            // and not `!=`: several activations legitimately bind LESS than their placement (pmask
+            // reserves [nqh*mq, cap] but binds a single broadcast row).
+            if src.len() as u64 > p.size {
+                bail!(
+                    "predict: activation '{nm}' binds {} B into a {} B placement (seg{} off {}) — \
+                     REFUSING, this would corrupt the following tensors",
+                    src.len(),
+                    p.size,
+                    p.segment,
+                    p.offset
+                );
+            }
+            match self.seg_host[seg.get()].host() {
+                None => bail!(
+                    "predict: activation '{nm}' names seg{}, which is DEVICE-ONLY — the \
+                     placement and the bundle's own role statement disagree",
+                    p.segment
+                ),
+                Some(h) if p.offset as usize + src.len() > h.len() => {
+                    bail!("predict: activation '{nm}' overflows seg{}", p.segment);
+                }
+                _ => {}
+            }
+            writes.push((seg.get(), p.offset, src));
+            seg_dirty[seg.get()] = true;
+            seg_runs[seg.get()].push(h2d_run(p.offset, src.len() as u64));
+            if d.phase_time {
+                eprintln!(
+                    "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB",
+                    p.segment,
+                    p.offset,
+                    src.len() as f64 / 1048576.0
+                );
+            }
+        }
+        // ⭐ AND EVERY ACTIVATION ALREADY CONVERTED INTO THE SHADOW (`bind_input_f32`): its range
+        // goes out this step exactly as a `bound` one's does — same window law, every step — and
+        // nothing converts it again. Its placement was checked where it was written.
+        for (nm, &len) in &self.staged {
+            let Some(p) = self.places.get(nm) else {
+                continue;
+            };
+            let Some(seg) = SegIdx::checked(p.segment as i64) else {
+                continue;
+            };
+            seg_dirty[seg.get()] = true;
+            seg_runs[seg.get()].push(h2d_run(p.offset, len));
+            if d.phase_time {
+                eprintln!(
+                    "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB (converted at bind)",
+                    p.segment,
+                    p.offset,
+                    len as f64 / 1048576.0
+                );
+            }
+        }
+        // The convert cannot borrow `self.bound` and `self.seg_host` at once, so the sources move
+        // out for the duration — a `Vec` swap, not a copy of the bytes.
+        //
+        // ⭐ AND THE QUIET POINT IS TAKEN AT THE DOOR, not assumed of the caller:
+        // a refill can run with the previous submit's H2Ds still in flight
+        // (a k>1 loop iteration with no drain between submits, or a request
+        // switch's fresh binds). The latch is free in the drained cadence (the
+        // drain took it one message ago) and costs one H2D otherwise.
+        self.quiet_shadow()?;
+        let bound = std::mem::take(&mut self.bound);
+        for (nm, src) in &bound {
+            if self.weight_ids.contains(nm) {
+                continue;
+            }
+            let src: &[u8] = src.as_slice();
+            if !refill_sends(&self.keyed, nm) {
+                continue;
+            }
+            let Some(p) = self.places.get(nm) else {
+                continue;
+            };
+            let Some(seg) = SegIdx::checked(p.segment as i64) else {
+                continue;
+            };
+            // The convert loop's destinations are the ACTIVATION segment the collect pass just
+            // bounds-checked above — a device-only slot there is a role-statement mismatch, not
+            // a condition to carry on from (the convert would be writing into nothing).
+            let dst = self.seg_host[seg.get()]
+                .host_buf_mut()
+                .ok_or_else(|| anyhow!("predict: seg{} is DEVICE-ONLY", p.segment))?
+                .get_mut(p.offset as usize..p.offset as usize + src.len())
+                .ok_or_else(|| anyhow!("predict: activation '{nm}' overflows seg{}", p.segment))?;
+            // ⛔ A RAW BIND IS COPIED, NOT RE-ENCODED. `ieee_to_sen_bytes` treats its source as fp16
+            // pairs; for the gather's int32 index table that rewrites every entry into a different
+            // valid block number. See [`Self::raw_ids`].
+            if self.raw_ids.contains(nm) {
+                dst.copy_from_slice(src);
+            } else {
+                sen_convert::ieee_to_sen_bytes(src, dst);
+            }
+        }
+        self.bound = bound;
+        // This step's keyed binds are in the shadow and in the runs below; the next step that does
+        // not re-bind them sends nothing for them.
+        for k in self.keyed.values_mut() {
+            k.fresh = false;
+        }
+
+        let mut note = String::new();
+        let mut total = 0u64;
+        // ⭐ #32 — THE LAST-ENQUEUED H2D'S SIGNAL, kept for the drain: FIFO
+        // retires every earlier H2D behind it, so this one latch is the whole
+        // submit's shadow-quiet point (see the `last_h2d` field's law). Every
+        // window is armed and the final overwrite wins — the dropped latches
+        // fire harmlessly into nothing (their own `Arc` keeps the callback
+        // sound), and tracking "only the last call" would re-derive the same
+        // fact the enqueue order already states.
+        let mut last_h2d: Option<crate::runtime::ReadSignal> = None;
+        for i in 0..NUM_SEGMENTS {
+            if !seg_dirty[i] {
+                continue; // only re-upload activation segments
+            }
+            // NEVER H2D a BORROWED segment: its device region belongs to another session and this
+            // session's shadow is a stale zero-fill, so uploading it would wipe the owner's live
+            // data (for seg2 that is the whole KV cache).
+            if self.seg_aliased[i] {
+                continue;
+            }
+            let addr = self.seg_addr[i].as_ref().unwrap();
+            let tot = addr.total_size().as_u64();
+            // THE MERGED ALIGNED RUNS, or the whole segment when they cannot be used.
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            if addr.is_single_chunk() {
+                let mut r = seg_runs[i].clone();
+                r.sort_unstable();
+                for (a, b) in r {
+                    let b = b.min(tot);
+                    if b <= a {
+                        continue;
+                    }
+                    match runs.last_mut() {
+                        Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                        _ => runs.push((a, b)),
+                    }
+                }
+                // If the runs cover essentially everything, one whole-segment DMA is cheaper.
+                let covered: u64 = runs.iter().map(|(a, b)| b - a).sum();
+                if runs.is_empty() || covered * 8 >= tot * 7 {
+                    runs.clear();
+                }
+            }
+            let sent = if runs.is_empty() {
+                tot
+            } else {
+                runs.iter().map(|(a, b)| b - a).sum()
+            };
+            total += sent;
+            if d.phase_time {
+                note.push_str(&format!(" seg{i}={}KB", sent >> 10));
+            }
+            let stream = self.stream.as_ref().unwrap();
+            // ON THE COMPUTE PIPELINE (#544): the preamble is the FIRST op of every step with
+            // the step's COMPUTE ops right behind it. Riding ASYNC_DMAI made the compute
+            // submission HOST-BLOCK on the preamble's fence (its switch barrier drained the
+            // DMAI deque), and made the preamble itself block on the PREVIOUS step's readback
+            // (its own barrier drained the DMAO deque). On COMPUTE the junction isn't a
+            // switch at all, the remaining cross-step barrier drains deques that hold
+            // nothing, and the queue's own FIFO orders the preamble CB ahead of the step's
+            // compute CBs — the whole step submits with no host-side waits.
+            if runs.is_empty() {
+                last_h2d = Some(
+                    stream
+                        .h2d_on_compute_signaled(
+                            whole_shadow(
+                                self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?,
+                                addr,
+                                i,
+                            )?,
+                            addr,
+                        )
+                        .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?,
+                );
+            } else {
+                for (a, b) in runs {
+                    let win = addr
+                        .window(ByteOffset(a), ByteSize(b - a))
+                        .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
+                    last_h2d = Some(
+                        stream
+                            .h2d_on_compute_signaled(
+                                &self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?[a as usize..b as usize],
+                                &win,
+                            )
+                            .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
+                    );
+                }
+            }
+        }
+        self.last_h2d = last_h2d;
+        Ok((note, total))
+    }
+
+    /// The forward itself: prefix → body×iters → suffix (rolled), or the single body. `suffix` is
+    /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
+    fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<()> {
+        let zero = [0u64; NUM_SEGMENTS];
+        let Some(rolled) = self.rolled.as_ref() else {
+            // Not rolled: one body over the whole model.
+            // ⭐ THE SAME DOOR THE HOST ASKS THROUGH — [`Executor::step_body`], from the same write slot.
+            // Two call sites here and one on the host, all three taking `seq_pos` and nothing else, so
+            // the body the host staged for IS the body launched.
+            let sel = self.step_body(seq_pos)?.sel;
+            // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
+            // split), and an unrolled bundle has no layer boundary to bank on — its weights are one
+            // region by construction (`bank_weight_segment` refuses to bank without layer classes),
+            // so bank 0 is the only bank there is.
+            let ls = self.list_sel_for(sel, 0);
+            return self.launch_ops(ls, zero, 0);
+        };
+        let pre_bank = rolled.prefix_weight_bank;
+        let suf_bank = rolled.suffix_weight_bank;
+
+        self.launch_ops(ListSel::Prefix, zero, pre_bank)?;
+
+        // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
+        // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
+        // before attention). The same rung serves every layer this step; only the swept extents
+        // differ, and the resident KV is shared.
+        let sel = self.step_body(seq_pos)?.sel;
+        // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
+        // order, each naming its body's CLASS and the segment shifts the launch applies — no
+        // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
+        // against the placements that were baked (see the launch-table guard in
+        // `lower_subtile_tape_to_ktir`), so this loop cannot disagree with the layout: it reads
+        // the table the layout was checked against.
+        //
+        // A class-split model runs its bodies OUT of tape order here — the table is TRUE ORDER
+        // (sorted by absolute layer id), which a single-class roll degenerates to
+        // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
+        // COPIED OUT before the loop: each launch takes `&mut self`, so the table cannot be
+        // borrowed out of `self.rolled` across them. It is one small tuple per layer — the copy
+        // is the table's bytes, not a graph.
+        let launches: Vec<_> = self
+            .rolled
+            .as_ref()
+            .expect("checked above")
+            .launches
+            .clone();
+        for (body, wbank, woff, kvoff) in launches {
+            let mut off = [0u64; NUM_SEGMENTS];
+            off[SEG_WEIGHT.get()] = woff;
+            off[SEG_KV.get()] = kvoff;
+            let ls = self.list_sel_for(sel, body);
+            self.launch_ops(ls, off, wbank as usize)?;
+        }
+        // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
+        // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
+        // buffer). No D2H/memcpy/H2D — the residual lives on-device across iterations.
+        //
+        // ⭐ A DISCARDED FORWARD STOPS HERE. The suffix (final norm → lm-head → logits scaling) only
+        // READS the residual the last layer left in that shared buffer and writes the suffix's own
+        // tensors, which only the logits read-back consumes: the KV every later chunk attends was
+        // written by the bodies above. MEASURED (granite-2b fp16, RB_TIME): 2.73 ms per prompt
+        // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
+        // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
+        match suffix {
+            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank),
+            SuffixLaunch::Skipped => Ok(()),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  #603 PR2 2c — the replay player: one decode step as canvas-copy + ONE doorbell
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// ⭐ THE PLAYER — the decode step's whole forward from a cached image:
+    /// select the image by its body, let the submit path copy the canvas and
+    /// stamp the pool-leased tags, and ring ONE doorbell for the step. The
+    /// per-step host work is a memcpy, N tag stamps and one submission — no
+    /// per-op `launch_site`, no `BatchedCompute` build, no per-rung flush. The
+    /// image is proven at its derivation: `cb_plan::parity_check` per launch
+    /// row (canvas ≡ walk). Nothing a launch addresses moves with the step's
+    /// position, so the canvas IS every step's CBs for that body.
+    ///
+    /// Returns `Ok(None)` — the caller takes the walk — when any Diag
+    /// instrument is on ([`Diag::is_quiet`] — each one reads walk state). There
+    /// is no other path and no toggle: the production configuration is the
+    /// player.
+    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
+        if !Diag::get().is_quiet() {
+            return Ok(None);
+        }
+        let sel = self.step_body(seq_pos)?.sel;
+        let key = StepImageKey { sel };
+        let image = match self.step_images.lookup_cached(&key) {
+            Some(hit) => hit,
+            None => {
+                let t1 = Instant::now();
+                let image = self.derive_step_image(sel)?;
+                self.step_images.note_derived(key, image.clone(), t1);
+                image
+            }
+        };
+        // The stamp closure stamps the leased tags over the render-time ones.
+        let data = std::sync::Arc::clone(&image.data);
+        let batch = ComputeWireBatch {
+            canvas: std::sync::Arc::clone(&data.canvas),
+            patch: Box::new(move |tags, cbs| {
+                for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                    cb.set_tag(*tag);
+                }
+            }),
+        };
+        let stream = self.stream_ref()?;
+        let t1 = Instant::now();
+        let cbs = image.data.canvas.len();
+        let r = stream.compute_wires(batch, image.barrier);
+        let t2 = Instant::now();
+        if let Err(e) = r {
+            // The image itself was proven at derivation (per-row gates); a refused submit here is
+            // capacity or shutdown, not addressing — so the refusal names the image and the step.
+            return Err(anyhow::Error::new(e).context(format!(
+                "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
+                 sel={sel:?}, step at {}",
+                image.data.rows, image.barrier, seq_pos.0
+            )));
+        }
+        let mut t = timers();
+        t.replay_steps += 1;
+        t.replay_cbs += cbs as u64;
+        t.replay_submit_ms += (t2 - t1).as_secs_f64() * 1e3;
+        // First step AND the 256 cadence: the canonical gate cell is 64 tokens,
+        // so a cadence-only marker would stay silent in exactly the run that
+        // must prove replay happened — the line IS the liveness proof, under
+        // `RUST_LOG=debug` like every other `[sdsc-replay]` line: a plain
+        // `scr chat` (level `info`) must emit nothing.
+        if t.replay_steps == 1 || t.replay_steps.is_multiple_of(256) {
+            report_replay(&t);
+        }
+        Ok(Some(()))
+    }
+
+    /// Derive one step image at its first use — the row sequence is
+    /// EXACTLY `launch_forward`'s (that is the merge's one law: the step's
+    /// CBs, in the order the walk would submit them), each row proven by the
+    /// parity gate and rendered at its own `where_`, concatenated into one canvas.
+    fn derive_step_image(&self, sel: BodySel) -> Result<StepImage> {
+        let stream = self.stream_ref()?;
+        // (list, where) per launch row, mirroring `launch_forward` arm by arm. An empty list
+        // launches nothing in the walk (its flush stages zero CBs), so it contributes no row here.
+        let mut specs: Vec<(ListSel, LaunchWhere)> = Vec::new();
+        let zero = [0u64; NUM_SEGMENTS];
+        match self.rolled.as_ref() {
+            Some(r) => {
+                specs.push((
+                    ListSel::Prefix,
+                    LaunchWhere {
+                        byte_off: zero,
+                        weight_bank: r.prefix_weight_bank,
+                        requests: fold_plan::Requests::default(),
+                    },
+                ));
+                for (class, wbank, woff, kvoff) in r.launches.clone() {
+                    let mut off = [0u64; NUM_SEGMENTS];
+                    off[SEG_WEIGHT.get()] = woff;
+                    off[SEG_KV.get()] = kvoff;
+                    specs.push((
+                        self.list_sel_for(sel, class),
+                        LaunchWhere {
+                            byte_off: off,
+                            weight_bank: wbank as usize,
+                            requests: fold_plan::Requests::default(),
+                        },
+                    ));
+                }
+                specs.push((
+                    ListSel::Suffix,
+                    LaunchWhere {
+                        byte_off: zero,
+                        weight_bank: r.suffix_weight_bank,
+                        requests: fold_plan::Requests::default(),
+                    },
+                ));
+            }
+            None => {
+                // Unrolled: one body over the whole model, bank 0, no seams.
+                specs.push((
+                    self.list_sel_for(sel, 0),
+                    LaunchWhere {
+                        byte_off: zero,
+                        weight_bank: 0,
+                        requests: fold_plan::Requests::default(),
+                    },
+                ));
+            }
+        }
+        let mut canvas: Vec<ControlBlockWire> = Vec::new();
+        let mut rows = 0usize;
+        let mut barrier = false;
+        for (ls, where_) in specs {
+            let ops = self.list(ls);
+            if ops.is_empty() {
+                continue;
+            }
+            let label = format!("{ls:?}/replay-canvas");
+            cb_plan::parity_check(
+                ops,
+                &self.seg_addr,
+                &self.weight_bank_addr,
+                &where_,
+                &label,
+                stream,
+            )?;
+            let (row_canvas, row_barrier) = cb_plan::render_canvas(
+                ops,
+                &self.seg_addr,
+                &self.weight_bank_addr,
+                &where_,
+                stream,
+            )?;
+            barrier |= row_barrier;
+            rows += 1;
+            canvas.extend(row_canvas);
+        }
+        if canvas.is_empty() {
+            bail!(
+                "replay image derivation REFUSED: sel={sel:?} produced zero CBs — the walk it \
+                 mirrors launches nothing, which no body selection can do"
+            );
+        }
+        // The image's own first CB carries the same EDEP1 the submit path
+        // stamps (`ResponseWorker::prepare_cbs`, the vendor `Finalize` port at
+        // control_block_stream.cpp:423): the replay patch rewrites tags in
+        // place and never touches the CTRL mode bits, so what derivation
+        // stores is what every replay of this image submits — a cached image
+        // must not hold the EDEP0 its rows were rendered with. The
+        // submit-side stamp makes the two agree rather than this one being
+        // load-bearing (a double-set of the same value is fine; a miss is the
+        // defect).
+        canvas[0].set_edep(1);
+        debug!(
+            "[sdsc-replay] derived image sel={sel:?}: {} CB(s) over {rows} launch row(s), \
+             barrier={barrier}",
+            canvas.len()
+        );
+        Ok(StepImage {
+            data: std::sync::Arc::new(StepImageData {
+                canvas: std::sync::Arc::new(canvas),
+                rows,
+            }),
+            barrier,
+        })
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Selftest entry points (opt-in bisection; NOT a run path)
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Bind synthetic activations, then run ONLY the prefix program, leaving every tid resident for
+    /// read-back so the caller can compare each to the `eval_dag` golden.
+    pub fn run_prefix_only(&mut self) -> Result<()> {
+        if !self.prepared {
+            bail!("run_prefix_only before prepare");
+        }
+        self.refill_activations(Diag::get())?;
+        let zero = [0u64; NUM_SEGMENTS];
+        let (sel, bank) = match self.rolled.as_ref() {
+            Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
+            None => (ListSel::Body(0), 0),
+        };
+        self.launch_ops(sel, zero, bank)?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
+    }
+
+    /// The FULL forward for the selftest: prefix → body×iters (per-layer advance + in-place hidden
+    /// threading) → suffix, leaving every tid resident. Exercises what prefix-only cannot: the
+    /// per-layer weight/KV advance, the body→suffix seam, and the suffix ops (final norm + tiled
+    /// lm_head). Only a ROLLED bundle has those seams, so an unrolled one reports `false`.
+    pub fn run_full(&mut self) -> Result<bool> {
+        if !self.prepared {
+            bail!("run_full before prepare");
+        }
+        if self.rolled.is_none() {
+            return Ok(false);
+        }
+        self.refill_activations(Diag::get())?;
+        self.launch_forward(SeqPos(0), SuffixLaunch::Launched)?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("run_full sync: {e}"))?;
+        Ok(true)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Read-back / segment surgery
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// D2H a whole tensor segment into its host shadow, CLAMPED to the shadow's allocated size.
+    ///
+    /// ⛔ A DEVICE-ONLY SLOT IS REFUSED, NOT READ AS 0 B. This is the clamped reader every read
+    /// door lands in; if it answered "0 B, `debug!`" for a slot with no host mirror, that answer
+    /// would stand in for every caller's own decision — and a caller that had nothing to say
+    /// about it (tensordump, once) would hand back a silently empty dump. The doors that want a
+    /// device-only slot's bytes (`read_seg`, `read_tensor`, `optrace`, `tensordump`, the logits
+    /// readback) materialize a shadow through [`Self::shadow_for_read`] FIRST; a caller that
+    /// reaches this reader with a `DeviceOnly` slot is a wiring bug, and this is its `Err`.
+    ///
+    /// The two sizes may still differ — a read may have materialized only a window — and then
+    /// only the shadow's leading window transfers, with the clamped-vs-requested sizes printed:
+    /// a truncated readback is visible, never silent. Returns the bytes transferred.
+    fn d2h_seg_clamped(&mut self, seg: SegIdx) -> Result<usize> {
+        let i = seg.get();
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64();
+        // The shadow, the region and the stream are three disjoint fields of `self`; splitting the
+        // borrow here is what lets the DMA write into a real `&mut [u8]` instead of a pointer
+        // conjured from a shared reference.
+        let Executor {
+            seg_addr,
+            seg_host,
+            stream,
+            ..
+        } = self;
+        let addr = seg_addr[i].as_ref().expect("checked above");
+        let stream = stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
+        let Some(shadow) = seg_host[i].host_buf_mut() else {
+            bail!(
+                "read seg{i}: DEVICE-ONLY — no host mirror to read into. A read door that wants \
+                 these bytes materializes one first (shadow_for_read); one that does not know \
+                 what they mean has no business reading this segment"
+            );
+        };
+        let host = shadow.len() as u64;
+        if host >= dev {
+            stream
+                .d2h(&mut shadow[..dev as usize], addr)
+                .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
+            stream
+                .synchronize()
+                .map_err(|e| anyhow!("seg{i} D2H sync: {e}"))?;
+            return Ok(dev as usize);
+        }
+        if !addr.is_single_chunk() {
+            bail!(
+                "read seg{i}: host shadow {host} B < device region {dev} B and the region is \
+                 multi-chunk — readback REFUSED (no addressable leading window)"
+            );
+        }
+        if host > 0 {
+            let win = addr
+                .window(ByteOffset(0), ByteSize(host))
+                .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
+            stream
+                .d2h(&mut shadow[..host as usize], &win)
+                .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
+            stream
+                .synchronize()
+                .map_err(|e| anyhow!("seg{i} D2H sync: {e}"))?;
+        }
+        debug!(
+            "[sdsc-superdsc] read seg{i} CLAMPED to its host shadow: {host} of {dev} B D2H'd \
+             (readable window = the leading {host} B; the rest has no host mirror)"
+        );
+        Ok(host as usize)
+    }
+
+    /// D2H tensor `id`'s segment and convert its `[offset, size)` slice to IEEE-f16 elements.
+    /// Clamped to `cap_elems` and to what the transfer actually brought back.
+    pub fn read_tensor(&mut self, id: bundle::PlaceId, cap_elems: usize) -> Result<Vec<u8>> {
+        let name = id;
+        let p = self
+            .places
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown tensor {id}"))?;
+        let seg = SegIdx::checked(p.segment as i64)
+            .ok_or_else(|| anyhow!("tensor '{name}' segment {} out of range", p.segment))?;
+        // ⛔ A BANKED TENSOR IS NOT IN ITS SEGMENT'S REGION. `d2h_seg_clamped` reads `seg_addr[seg]`,
+        // which for a weight in bank ≥ 1 is a DIFFERENT region — the read would return bank 0's bytes
+        // at this offset and the caller would compare a golden against another tensor entirely. This
+        // is a selftest/debug reader, so refusing is free; making it bank-aware would mean giving
+        // every segment reader the bank coordinate for a path no forward uses.
+        if p.bank != 0 {
+            bail!(
+                "read_tensor('{name}'): it is in weight bank {}, and a segment read addresses only \
+                 bank 0's region — REFUSING rather than returning another bank's bytes",
+                p.bank
+            );
+        }
+        // ⭐ THE WHOLE SEGMENT, NOT WHAT A DEVICE-ONLY SLOT HAPPENS TO MIRROR: this is the
+        // probe harness's reader, and an intermediate's slot holds no host bytes until a read
+        // asks. Materialize the full region first (the same door `read_seg` takes), or the
+        // clamped D2H below would hand back 0 B and this door would report a truncated file
+        // as success.
+        let dev = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?
+            .total_size()
+            .as_u64() as usize;
+        self.shadow_for_read(seg, dev)?;
+        let got = self.d2h_seg_clamped(seg)?;
+        let mut elems = (p.size / 2) as usize;
+        elems = elems.min(cap_elems);
+        // The convert may only read the bytes the transfer actually brought back: a placement
+        // reaching past the shadow's window yields what exists, and says how much.
+        let avail = (got as u64).saturating_sub(p.offset);
+        if elems as u64 * 2 > avail {
+            debug!(
+                "[sdsc-superdsc] read_tensor({name}): {elems} elems requested at seg{} off {} but \
+                 only {got} B of the segment are host-readable — CLAMPED to {} elems",
+                p.segment,
+                p.offset,
+                avail / 2
+            );
+            elems = (avail / 2) as usize;
+        }
+        if elems == 0 {
+            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
+        }
+        let src = self.seg_host[seg.get()]
+            .host()
+            .and_then(|h| h.get(p.offset as usize..p.offset as usize + elems * 2))
+            .ok_or_else(|| {
+                anyhow!(
+                    "read_tensor('{name}'): seg{} lost its host mirror",
+                    p.segment
+                )
+            })?;
+        let mut out = vec![0u8; elems * 2];
+        sen_convert::sen_to_ieee_bytes(src, &mut out);
+        Ok(out)
+    }
+
+    /// ⭐ THE RAW TWIN OF [`Self::read_tensor`] — the placement's own bytes,
+    /// VERBATIM, no f16 convert: a rung whose result is not the f16 row (an
+    /// index stick, read at the dtype its producer's kernel signature stated)
+    /// is decoded by the CALLER, because only the wiring knows the dtype. Same
+    /// clamps: to `cap_bytes`, and to what the transfer actually brought back.
+    ///
+    /// ⭐ THE TRANSFER IS THE PLACEMENT'S OWN WINDOW, never its segment's
+    /// allocation — the same law [`Self::predict`] states for the row: this
+    /// sits on the TOKEN critical path (the answer re-point's whole point is
+    /// that the ~100 KB row readback collapses to the stick's own bytes), and
+    /// a whole-segment D2H would price the token by whatever else the segment
+    /// packs (measured: the whole-segment read held mean ITL at the row
+    /// readback's level — the collapse never reached the wire). Rides the
+    /// COMPUTE pipeline for the same #544 reason the row's readback does: its
+    /// CB queues behind the step's compute CBs and the FIFO carries the
+    /// ordering the host-side wait used to.
+    pub fn read_tensor_raw(&mut self, id: bundle::PlaceId, cap_bytes: usize) -> Result<Vec<u8>> {
+        let read = self.defer_read_tensor_raw(id, cap_bytes)?;
+        self.finish_deferred_read_raw(&read)
+    }
+
+    /// ⭐ #32 — THE ENQUEUE HALF of [`Self::read_tensor_raw`]: the same
+    /// placement law, the same window, but the transfer is ARMED
+    /// (`d2h_on_compute_signaled`) and the handle comes back UNRESOLVED — the
+    /// one-shot caller resolves it immediately (the pair above composes into
+    /// exactly the old one-shot contract), while the pipelined loop holds the
+    /// enqueue across its prep-ahead and drains at the token's own deadline.
+    pub fn defer_read_tensor_raw(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.defer_read_into(id, cap_bytes, false)
+    }
+
+    /// ⭐ #32 (C) — THE RING TWIN of [`Self::defer_read_tensor_raw`]: the same
+    /// placement law, the same enqueue, a DIFFERENT landing — a persistent ring slot
+    /// instead of the placement's shadow window. The in-flight spelling: a step whose
+    /// pick is not consumed until a later drain lands here, because two outstanding
+    /// shadow reads for the same stick would race (the later transfer clobbers the
+    /// earlier pick before the host slices it out). The one-shot and the ring compose
+    /// into the SAME finish half — `finish_deferred_read_raw` reads whichever site the
+    /// handle names — so the two doors cannot drift apart.
+    pub fn defer_read_tensor_ring(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.defer_read_into(id, cap_bytes, true)
+    }
+
+    /// The ONE body behind the two read doors: the placement table lookup, the bank
+    /// law, the flit round-up, the whole-region fallback — everything except WHERE the
+    /// transfer lands, which is the doors' only difference.
+    fn defer_read_into(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+        ring: bool,
+    ) -> Result<DeferredRead> {
+        let p = self
+            .places
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown tensor {id}"))?;
+        let seg = SegIdx::checked(p.segment as i64)
+            .ok_or_else(|| anyhow!("tensor '{id}' segment {} out of range", p.segment))?;
+        // The bank law is read_tensor's own: a segment read addresses bank 0's
+        // region only, and handing back another bank's bytes at this offset is
+        // worse than refusing.
+        if p.bank != 0 {
+            bail!(
+                "read_tensor_raw('{id}'): it is in weight bank {}, and a segment read addresses \
+                 only bank 0's region — REFUSING rather than returning another bank's bytes",
+                p.bank
+            );
+        }
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?;
+        let tot = addr.total_size().as_u64();
+        let want = p.size.min(cap_bytes as u64);
+        // The round-up to a flit is not optional (`Flits::from_bytes` TRUNCATES),
+        // and the same two facts predict's window relies on hold here by the
+        // same cargo-build guard (`audit_layout_addresses`): the offset is
+        // 128-aligned and offset+size stays inside the region.
+        let len = scratchy_target_spyre::lower_subtile_tape_to_superdsc::align128(want)
+            .min(tot - p.offset);
+        // A multi-chunk region has no addressable sub-window; fall back to the
+        // whole-region read, exactly as predict does.
+        let win = (len < tot)
+            .then(|| addr.window(ByteOffset(p.offset), ByteSize(len)))
+            .flatten();
+        let (src, a, b) = match win.as_ref() {
+            Some(w) => (w, p.offset, p.offset + len),
+            None => (addr, 0, tot),
+        };
+        // The landing: the shadow window (one-shot law) or a ring slot (in-flight
+        // law). Field-direct on purpose — `addr`/`win` hold the shared borrow of
+        // `seg_addr` this whole body is written under, and the slot's take/grow is
+        // field moves on `seg_host`/`read_ring`, disjoint from that borrow.
+        let (host, ring_slot) = if ring {
+            let need = (b - a) as usize;
+            let slot = match self.read_ring_free.pop() {
+                Some(s) => s,
+                None => {
+                    self.read_ring.push(Vec::new());
+                    self.read_ring.len() - 1
+                }
+            };
+            let s = &mut self.read_ring[slot];
+            if s.len() < need {
+                // A wider stick than the slot has seen (a different bundle's cap):
+                // grow IN PLACE — the slot stays the same index, so outstanding
+                // handles naming it stay valid, and the allocation is paid once
+                // per width, not per read.
+                s.resize(need, 0);
+            }
+            (&mut s[..need], Some(slot))
+        } else {
+            // ⭐ A ONE-SHOT READ MAY NAME A DEVICE-ONLY SLOT — an intermediate, when the
+            // answer re-point reads the idx stick — and its landing window does not exist
+            // until this read asks for it; indexing it was a PANIC. Materialized to the
+            // window's END and never the whole region: this door sits on the token path,
+            // and the bytes past the window are nobody's.
+            if matches!(self.seg_host[seg.get()], HostShadow::DeviceOnly) {
+                self.seg_host[seg.get()] =
+                    HostShadow::Host(HostBuf::zeroed(b as usize).map_err(|e| {
+                        anyhow!(
+                            "read_tensor_raw('{id}'): materializing seg{}: {e}",
+                            seg.get()
+                        )
+                    })?);
+            } else if let Some(v) = self.seg_host[seg.get()].host_buf_mut()
+                && v.len() < b as usize
+            {
+                v.resize(b as usize).map_err(|e| {
+                    anyhow!("read_tensor_raw('{id}'): growing seg{}: {e}", seg.get())
+                })?;
+            }
+            let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
+                bail!(
+                    "read_tensor_raw('{id}'): seg{} lost its host mirror mid-read",
+                    seg.get()
+                );
+            };
+            (&mut v[a as usize..b as usize], None)
+        };
+        let done = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
+            .d2h_on_compute_signaled(host, src)
+            .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
+        Ok(DeferredRead {
+            id,
+            seg,
+            offset: p.offset,
+            end: b,
+            win_start: a,
+            size: p.size,
+            cap: cap_bytes,
+            ring: ring_slot,
+            done,
+        })
+    }
+
+    /// ⭐ #32 — THE STICK READ'S FINISH HALF: the loop's ONE fence, now scoped
+    /// to THIS read — park on the transfer's own completion signal (armed at
+    /// the enqueue, `d2h_on_compute_signaled`), then slice the landed bytes out
+    /// of whichever site the handle names (the shadow window, one-shot, or the
+    /// ring slot, in-flight, returned to the free list here, the slot's
+    /// one-way-out) under `read_tensor_raw`'s own return clamps. The two halves
+    /// compose into exactly the old one-shot contract — `read_tensor_raw` above
+    /// IS this pair — so the one-shot caller keeps its behavior byte-for-byte
+    /// while the pipelined loop holds the enqueue across its prep-ahead.
+    ///
+    /// ⛔ THE WAIT IS TWO-SIGNALS, NOT THE STREAM. The whole-stream synchronize
+    /// this replaces retired EVERY op the stream held — including the step the
+    /// pipelined loop had just submitted for overlap — so each per-step drain
+    /// fenced a full step anyway and the depth-2 queue bought nothing
+    /// (measured 2026-10-25: fence mean = one step ≈ 23.8 ms, ≈ serial tok/s).
+    /// The two signals are the read's own D2H (the bytes this call returns)
+    /// and the LAST H2D a submit enqueued — the shadow's quiet point, taken
+    /// here through the SAME door ([`Self::quiet_shadow`]) every writer of the
+    /// shadow passes through, so the drain and any later bind cannot disagree
+    /// about when the shadow went quiet. Both sit adjacent in the queue at
+    /// depth 2 — the DMAs of the next step's preamble, microseconds behind
+    /// this read — so the park costs the read and not the step, and the steps'
+    /// COMPUTE behind them runs through the drain.
+    ///
+    /// The dead arm is the error escape, and it surfaces the SAME error the
+    /// whole-stream wait did by the SAME door: a failed op never fires its
+    /// user callback (the stream records a deferred error and goes
+    /// sticky-shutdown, `make_completion_callback`'s Err arm), so the signal's
+    /// timeout tick hands the park back and the synchronize below — which does
+    /// not wait a dead stream, it rethrows — carries the root cause out.
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        // The read's own landing, scoped so `dead`'s immutable borrow of `self`
+        // ends before the quiet point's mutable half begins.
+        let landed = {
+            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
+            read.done.wait_or(dead)
+        };
+        if !landed {
+            self.stream_ref()?
+                .synchronize()
+                .map_err(|e| anyhow!("read_tensor_raw({}) sync: {e}", read.id))?;
+            // A dead stream's synchronize rethrows its deferred error; if it
+            // returned anyway, the transfer never landed and the bytes below
+            // would be a lie — refuse rather than slice them. The ring slot is
+            // deliberately NOT returned on this path: only its own signal (or
+            // teardown) walks a slot back.
+            bail!(
+                "read_tensor_raw({}): the stream died before this read landed — no bytes to slice",
+                read.id
+            );
+        }
+        // And the shadow half — the shared door. In the drained cadence the
+        // latch has fired (or was never armed); this is where the drain
+        // HANDS the quiet point to the next writer by taking it.
+        self.quiet_shadow()?;
+        // The pipelined step's RB records — its one decomposition, since a replayed step records
+        // no launch sequence (`[sdsc-rbkind]`).
+        if Diag::get().rb_time {
+            self.rb_attribute();
+        }
+        // May only return the bytes the transfer actually brought back.
+        let avail = (read.end - read.offset) as usize;
+        let n = (read.size as usize).min(read.cap).min(avail);
+        if n == 0 {
+            if let Some(slot) = read.ring {
+                self.read_ring_free.push(slot);
+            }
+            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
+        }
+        match read.ring {
+            Some(slot) => {
+                // The slot holds the WINDOW; the placement's bytes start
+                // `offset − win_start` into it (0 on the own-window arm — the
+                // placement IS the window's start).
+                let start = (read.offset - read.win_start) as usize;
+                let bytes = self.read_ring[slot][start..][..n].to_vec();
+                self.read_ring_free.push(slot);
+                Ok(bytes)
+            }
+            None => {
+                // The one-shot landing's window — materialized by the enqueue half
+                // (a device-only slot grows its shadow there); refuse rather than
+                // index if something tore it down in between.
+                let host = self.seg_host[read.seg.get()].host().ok_or_else(|| {
+                    anyhow!(
+                        "read_tensor_raw({}): seg{} lost its host mirror mid-read",
+                        read.id,
+                        read.seg.get()
+                    )
+                })?;
+                Ok(host[read.offset as usize..][..n].to_vec())
+            }
+        }
+    }
+
+    /// The byte size a [`Executor::read_seg`] of `seg` returns: the DEVICE region's
+    /// extent — a read materializes the shadow to exactly that, whatever the slot's
+    /// role (`read_seg`'s own rule, via [`Self::mirror_seg_shadow`]).
+    pub fn seg_bytes(&self, seg: SegIdx) -> usize {
+        self.seg_addr[seg.get()]
+            .as_ref()
+            .map(|a| a.total_size().as_u64() as usize)
+            .unwrap_or(0)
+    }
+
+    /// ZERO a whole tensor segment ON THE DEVICE, with the vendor's fill op.
+    ///
+    /// Exists so zeroing the KV pool requires neither a host mirror of it nor host-pushed
+    /// zeros. The pool has to start zeroed — a page handed to a request otherwise holds
+    /// whatever was in device memory, and decode computes q·k over the WHOLE page before the
+    /// validity mask applies, so uninitialised bytes go through the arithmetic as denormals
+    /// and NaN. And the bytes must not ride the host→device path to get there: that path is
+    /// bandwidth-bound (~3.5 GB/s effective), so a host-pushed fill of a 16384 MB pool costs
+    /// seconds, while the card writes its own memory far faster
+    /// ([`Stream::fill_zero`]; measured rate on the card: `fill_zero_probe`).
+    ///
+    /// The walk is [`DevAddr::windows`] at 64 MB, so a multi-chunk (interleaved) region is
+    /// zeroed chunk by chunk — every byte the region owns, none it does not — and each window
+    /// is the single-chunk shape the fill control block resolves.
+    pub fn zero_seg(&mut self, seg: SegIdx) -> Result<()> {
+        let i = seg.get();
+        let addr = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
+        let total = addr.total_size().as_u64();
+        if total == 0 {
+            return Ok(());
+        }
+        // The window size only sets how many fill control blocks the walk submits (each is a
+        // fixed enqueue cost on both host and device); no host buffer rides the fill.
+        let stream = self.stream_ref()?;
+        fill_zero_walk(stream, addr, &format!("zero fill (seg{i})"))?;
+        stream
+            .synchronize()
+            .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
+        Ok(())
+    }
+
+    /// D2H the WHOLE tensor segment (raw sen-fp16 bytes, NO conversion).
+    ///
+    /// ⭐ MATERIALIZES THE SHADOW FIRST (see [`Self::mirror_seg_shadow`]): device-only
+    /// segments hold no mirror at all, and a clamped short read here would quietly
+    /// hide most of the segment this door exists to show.
+    pub fn read_seg(&mut self, seg: SegIdx) -> Result<Vec<u8>> {
+        self.mirror_seg_shadow(seg)?;
+        let got = self.d2h_seg_clamped(seg)?;
+        let host = self.seg_host[seg.get()].host().unwrap_or(&[]);
+        Ok(host[..got.min(host.len())].to_vec())
+    }
+
+    /// Materialize `seg`'s host shadow to its device region's full extent — the
+    /// one materialize rule ([`Self::shadow_for_read`]) applied at region scale.
+    /// Device-only segments (the KV pool, the intermediates) hold NO mirror after
+    /// [`Executor::stage_weights`] — nothing in a forward ever touches their host
+    /// side — so the inspection doors that DO want their bytes (`read_seg`,
+    /// `optrace`, the logits readback's multi-chunk fallback) materialize one
+    /// here, on demand. Returns the region's size in bytes.
+    fn mirror_seg_shadow(&mut self, seg: SegIdx) -> Result<usize> {
+        let i = seg.get();
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64() as usize;
+        self.shadow_for_read(seg, dev)?;
+        Ok(dev)
+    }
+
+    /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
+    ///
+    /// ⛔ WHY A PREFIX AND NOT A WHOLE-SEGMENT COPY: the thing this exists for — handing a BORROWING
+    /// session its own copy of the spilled weight tail — crosses two bundles whose extents for that
+    /// segment DIFFER. The spill slot is also an intermediate COLOR segment, and a prefill rung's
+    /// intermediates are wider than decode's, so a whole-segment copy is not merely wasteful but
+    /// unrepresentable: MEASURED, 421,257,216 source bytes against a 432,218,112 B segment.
+    ///
+    /// The tail occupies `[0, len)` by construction (`spill_weight_tail` places it at offset 0 for
+    /// exactly this reason), so writing that prefix and leaving the rest of the shadow as `prepare`
+    /// zeroed it is both the correct result and the smaller transfer.
+    pub fn write_seg_prefix(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
+        let i = seg.get();
+        // ⭐ MEASURED AGAINST THE REGION, NOT THE SHADOW: a device-only slot holds no
+        // mirror at all (nothing staged into it), but the spilled tail this exists to
+        // hand a borrower still fits the REGION the bundle allocated — so the shadow
+        // materializes to the prefix and only the prefix is H2D'd, exactly the window
+        // the doc above promises.
+        // (The region is re-borrowed below: the address borrows `self` immutably, and the
+        // quiet point + the copy in between need it mutably.)
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64() as usize;
+        if data.len() > dev {
+            bail!(
+                "write_seg_prefix(seg{i}): {} B does not fit this session's {dev} B segment",
+                data.len()
+            );
+        }
+        // The shadow's quiet point, at the door — this copy overwrites the whole
+        // prefix while an earlier H2D may still be reading the shadow.
+        self.quiet_shadow()?;
+        // The one materialize rule, at prefix scale: a Host slot shorter than the
+        // prefix grows; a DeviceOnly slot becomes one.
+        self.shadow_for_read(seg, data.len())?;
+        let dst = self.seg_host[i]
+            .host_buf_mut()
+            .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?;
+        dst[..data.len()].copy_from_slice(data);
+        let addr = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
+        let win = addr
+            .window(ByteOffset(0), ByteSize(data.len() as u64))
+            .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
+        let stream = self.stream_ref()?;
+        stream
+            .h2d(
+                self.seg_host[i]
+                    .host()
+                    .and_then(|h| h.get(..data.len()))
+                    .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?,
+                &win,
+            )
+            .map_err(|e| anyhow!("write_seg_prefix H2D seg{i}: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| anyhow!("write_seg_prefix sync seg{i}: {e}"))
+    }
+
+    /// Point THIS session's segment `seg` at `owner`'s DEVICE region so the two SHARE it outright
+    /// and no copy is ever needed.
+    ///
+    /// Used to alias the batched-PREFILL session's seg2 (resident KV) onto the DECODE session's.
+    /// Both bundles place seg2 identically BY CONSTRUCTION — `compute_bundle_layout` sizes kc/vc at
+    /// `nqh*hd*cap*2` and the resident kct at `nkvh*hd*cap*2` per AttnDecode node in node order, and
+    /// not one of those terms depends on the query-row count. So the prefill forward can write the
+    /// KV directly where decode will read it, deleting a 188,743,680 B per-prompt D2H+H2D round trip
+    /// (~125-133 ms including the two 90 MiB host memcpys).
+    ///
+    /// Only THIS session's descriptor is replaced; `owner` is untouched, so aliasing prefill onto
+    /// decode leaves the decode session bit-for-bit unchanged. MUST be called AFTER both sessions'
+    /// prepare (which zero-inits and H2Ds every segment).
+    /// ⭐ POINT THIS CARD'S LANDING SLOTS AT THIS SESSION'S RECEIVE WINDOW — the owner session's,
+    /// once [`Self::prepare`] has allocated its weight segment (the window is a placement in it). A
+    /// world of one has no window and nothing to point.
+    ///
+    /// # Errors
+    /// An unprepared session, or the link's refusal ([`crate::runtime::point_landing_slots`]).
+    pub fn point_landing_slots(&self) -> Result<()> {
+        if self.seat_window()?.is_none() {
+            return Ok(());
+        }
+        let region = self.seg_addr[SEG_WEIGHT.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("point_landing_slots: the weight segment is not allocated"))?;
+        crate::runtime::point_landing_slots(self.card, region).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// The receive window this session's bundle bakes, `None` in a world of one.
+    fn seat_window(&self) -> Result<Option<bundle::collective::RecvWindow<T>>> {
+        RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
+    }
+
+    pub fn alias_seg_from(&mut self, owner: &Executor<'_, T>, seg: SegIdx) -> Result<()> {
+        let i = seg.get();
+        let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
+            bail!("alias_seg(seg{i}): a session has no region for it");
+        };
+        // A session that DECLARED this segment borrowed holds a 128 B placeholder on purpose, so
+        // its region size is expected to differ — skip only that comparison for it. The two checks
+        // that actually prove the layouts match are untouched.
+        if self.segment_bytes[i] != owner.segment_bytes[i]
+            || (!self.seg_borrowed[i] && dst.total_size() != src.total_size())
+        {
+            bail!(
+                "alias_seg(seg{i}): SIZE MISMATCH dst(packed={},region={}) src(packed={},region={}) \
+                 — REFUSING",
+                self.segment_bytes[i],
+                dst.total_size().as_u64(),
+                owner.segment_bytes[i],
+                src.total_size().as_u64()
+            );
+        }
+        // Every tensor EITHER session places in this segment must agree on (offset, size). This is
+        // the real layout-equality check; a byte total alone would happily accept two different
+        // packings that sum the same.
+        for (nm, p) in &self.places {
+            if p.segment as usize != i {
+                continue;
+            }
+            match owner.places.get(nm) {
+                // ⛔ THE BANK IS PART OF THE ADDRESS. Two bundles could agree on every offset and
+                // size and still put a weight in DIFFERENT regions, and sharing the regions then
+                // gives the borrower one program's worth of the wrong weights. Comparing the bank is
+                // what makes "the layouts match" mean the same thing it meant before banking.
+                Some(q)
+                    if q.segment == p.segment
+                        && q.bank == p.bank
+                        && q.offset == p.offset
+                        && q.size == p.size => {}
+                _ => bail!("alias_seg(seg{i}): PLACEMENT MISMATCH for '{nm}' — REFUSING"),
+            }
+        }
+        for (nm, p) in &owner.places {
+            if p.segment as usize == i && !self.places.contains_key(nm) {
+                bail!("alias_seg(seg{i}): '{nm}' placed in src but ABSENT in dst — REFUSING");
+            }
+        }
+        // The rebuild can only express a single-chunk region (the same restriction every windowed
+        // transfer operates under). Refuse loudly rather than aliasing only the first chunk.
+        let c0 = src
+            .chunk0()
+            .filter(|_| src.is_single_chunk())
+            .ok_or_else(|| anyhow!("alias_seg(seg{i}): src region is MULTI-CHUNK — REFUSING"))?;
+        // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
+        self.seg_addr[i] = Some(DevAddr::from_chunk(c0));
+        // The borrowed segment is marked so this session's preamble can never H2D its own stale
+        // host shadow over the owner's live data.
+        self.seg_aliased[i] = true;
+        debug!(
+            "[sdsc-superdsc] alias_seg(seg{i}): dst now SHARES src's region ({} B)",
+            c0.size.0
+        );
+        // ⭐⭐ AND THE WEIGHT SEGMENT'S EXTRA BANKS — because they ARE the weight segment. Aliasing
+        // seg1 while leaving a bank pointing at this session's own (zero-filled) region would give
+        // the borrower a working body and a suffix that reads zeros: an lm_head of zeros makes every
+        // logit zero, so argmax returns token 0. One wrong token, no crash.
+        //
+        // ⭐ THIS IS THE PAYOFF OVER THE SEG6 TAIL SPILL. A bank holds ONLY weights, placed
+        // identically in every bundle of the ladder, so both equality checks above pass and the
+        // region can be SHARED. The spill slot was also an intermediate COLOUR, whose extent depends
+        // on the rung's query width, so it could never be aliased and every borrowing session needed
+        // its own COPY of the tail — 27–28 × 419,430,400 B = 10.5 GiB of device memory and ~7.6 s of
+        // load for granite-3.1-8b-fp16, all of which banking removes.
+        if i == SEG_WEIGHT.get() {
+            if self.weight_bank_bytes.len() != owner.weight_bank_bytes.len() {
+                bail!(
+                    "alias_seg(seg{i}): BANK COUNT MISMATCH dst has {} extra weight bank(s), src \
+                     has {} — REFUSING",
+                    self.weight_bank_bytes.len(),
+                    owner.weight_bank_bytes.len()
+                );
+            }
+            for b in 0..self.weight_bank_bytes.len() {
+                if self.weight_bank_bytes[b] != owner.weight_bank_bytes[b] {
+                    bail!(
+                        "alias_seg(seg{i}): weight bank {} SIZE MISMATCH dst={} src={} — REFUSING",
+                        b + 1,
+                        self.weight_bank_bytes[b],
+                        owner.weight_bank_bytes[b]
+                    );
+                }
+                let Some(sb) = owner.weight_bank_addr[b].as_ref() else {
+                    bail!(
+                        "alias_seg(seg{i}): src has no region for weight bank {}",
+                        b + 1
+                    );
+                };
+                let bc0 = sb
+                    .chunk0()
+                    .filter(|_| sb.is_single_chunk())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "alias_seg(seg{i}): src weight bank {} is MULTI-CHUNK — REFUSING",
+                            b + 1
+                        )
+                    })?;
+                // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
+                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
+                self.weight_bank_aliased[b] = true;
+            }
+        }
+        // ⭐ #603 PR2 2a — A BORROWING SESSION'S PARITY GATE runs HERE, at the alias that
+        // completes its borrowed set: the first moment every segment it declared borrowed
+        // holds a real, renderable address (prepare had to defer it — the placeholders it
+        // rendered through then are poison by contract). A disagreement refuses the
+        // ADOPTION, which the caller already treats as fatal-for-this-session, never a
+        // step. A session with NO borrowed segments gated at prepare and is not re-gated
+        // here (the batched-prefill top rung aliases seg2 post-prepare without borrowing).
+        if self.seg_borrowed.iter().any(|b| *b) && !self.borrow_set_pending() {
+            self.check_cb_plan_parity()?;
+        }
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  Accessors + the declared session facts
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// ⛔⛔⛔ THE COLUMNS THE BROADCAST PREFIX MASK RESERVES — **READ OFF THE PLACEMENT THE BIND GUARD
+    /// CHECKS AGAINST**, so the extent the host stages and the size it is validated against are ONE
+    /// FIELD and cannot disagree.
+    ///
+    /// This exists because they did disagree. The mask extent used to come from [`Self::cap`], and for an
+    /// UNPAGED bundle that is `num_blocks * 64` — a fact about the POOL with no request in it. Sizing the
+    /// pool from the card took it to 513 * 64 = 32832 slots against placements reserving 8192, and every
+    /// prompt died in `refill_activations`: `binds 65664 B into a 16384 B placement`. Fixing the prefill
+    /// staging alone moved the SAME over-bind to the solo decode staging one step later
+    /// (`run_step (pos 6)`), because two readers shared one wrong number.
+    ///
+    /// ⛔ ONLY FOR THE BROADCAST (`pm_rows == 1`) MASK a prompt chunk or a SOLO decode step stages. A
+    /// decode-BATCH bundle places `[nqh*mq, ...]` instead, and its staging is blocked by the DECLARED fold
+    /// grid (`PrefixMaskShape` / `MaskBlocks`), not by this. `None` when the bundle placed no mask, or when
+    /// the placement is not a whole number of pages — either way the caller must refuse rather than guess.
+    pub fn pmask_slots(&self) -> Option<usize> {
+        let nm = bundle::PlaceId::Act(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
+        );
+        let slots = (self.places.get(&nm)?.size / 2) as usize;
+        let per_page = ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
+        (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
+    }
+}
+
+/// ⭐ WHICH BODY — NOT WHICH LIST. The selector picks the BODY (a swept extent); the launch table then names the CLASS whose list runs it. Splitting the two is
+/// what keeps a hybrid model's selector identical to a single-class one: a rung is one extent
+/// shared by every class, so "which body serves this context" never needs a class argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum BodySel {
+    Body,
+    Rung(usize),
+}
+
+/// Which op list a selection names. An index rather than a reference so the selector can hand one
+/// back while `&mut self` is still needed to allocate it.
+///
+/// ⭐ EVERY BODY ARM CARRIES A CLASS INDEX. A hybrid-attention model has one body per attention
+/// class; a single-class model has exactly one, so `Body(0)`/`Rung(i, 0)` is the
+/// case every existing rolled bundle was. The RUNG index names the ladder entry (shared by every
+/// class — a rung is one swept extent); the class index names which class's list inside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListSel {
+    Prefix,
+    Body(usize),
+    Suffix,
+    Rung(usize, usize),
+}
+
+/// ⭐ WHAT A FORWARD'S CALLER DOES WITH ITS LOGITS — the one fact that decides both whether the suffix
+/// runs and whether its row comes back, so the two cannot be asked separately and disagree.
+///
+/// ⛔ THREE STATES, NOT A `bool`. A decode batch passes no host buffer and still READS the logits: it
+/// pulls the whole `[rows, vocab]` tensor itself afterwards (`read_tensor`), because the read-back here
+/// converts one row. "No buffer" therefore cannot mean "skip the suffix" — only [`Logits::Discarded`]
+/// does, and only a caller that never looks at the tensor can name it.
+pub enum Logits<'a> {
+    /// The suffix runs and its `[1, vocab]` row is converted into this buffer — decode, and a prompt's
+    /// last chunk.
+    ReadBack(&'a mut [u8]),
+    /// The suffix runs and its output stays on the device for the caller to read itself — a decode
+    /// batch's `[rows, vocab]` logits.
+    LeftOnDevice,
+    /// Nobody reads this forward's logits — every prompt chunk but the last — so the suffix (final
+    /// norm → lm-head → logits scaling) is not launched at all.
+    Discarded,
+}
+
+/// What a forward's submit half reads back — [`Logits`] without the buffer, which only the wait
+/// half ([`Executor::predict_finish`]) holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogitsRead {
+    ReadBack,
+    LeftOnDevice,
+    Discarded,
+}
+
+impl LogitsRead {
+    /// The read `logits` asks for.
+    pub fn of(logits: &Logits<'_>) -> Self {
+        match logits {
+            Logits::ReadBack(_) => Self::ReadBack,
+            Logits::LeftOnDevice => Self::LeftOnDevice,
+            Logits::Discarded => Self::Discarded,
+        }
+    }
+}
+
+/// One forward submitted by [`Executor::predict_submit`] and not yet waited on — the token
+/// [`Executor::predict_finish`] consumes. Not `Clone`: a submission is finished once.
+pub struct PredictSubmitted {
+    half: ForwardHalf,
+    want: LogitsRead,
+    n_new: NewTokens,
+    d2h_seg: i64,
+    d2h_bytes: u64,
+    t2b: Instant,
+}
+
+/// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SuffixLaunch {
+    Launched,
+    Skipped,
+}
+
+/// ⭐⭐⭐⭐⭐ THE BODY ONE STEP RUNS, AND THE PER-BODY FACTS THE HOST MUST DECIDE FROM — as ONE value,
+/// minted only by [`Executor::step_body`].
+///
+/// ⛔ WHY THE FACTS TRAVEL WITH THE SELECTION AND NOT BESIDE IT. The host has to stage the gather's
+/// index table and choose the prefix mask's block FORM **before** the launch, and both answers belong
+/// to the body the launch will pick — not to the bundle, which holds several. Staging the wrong form is
+/// silent in both directions (`PerRowPage` against a collapsed fold leaves `mq-1` of every `mq` rows at
+/// −∞; `PerPage` against an uncollapsed one gives every pass row 0's validity), and staging no index for
+/// a body that gathers is `0xa35e RAS::PCI::BusFence` with no operand named. So the selection and the
+/// facts are one value: holding the facts means having asked the selector.
+///
+/// ⛔ `sel` IS PRIVATE. The host may not name a body — only ask which one, and read what it declares.
+#[derive(Clone, Copy, Debug)]
+pub struct StepBody {
+    sel: BodySel,
+    swept: Option<SweptCols>,
+    gathers: scratchy_target_spyre::wiring::GathersKv,
+    folds: bool,
+    lx_op_local_bytes: u64,
+    lx_prob_pin_bytes: u64,
+}
+
+impl StepBody {
+    /// ⭐ THE COLUMNS ONE FOLD PASS OF **THIS** BODY SWEEPS — its own `active_cap`.
+    ///
+    /// Two host decisions derive from it and both used to take the CEILING rung's: the gather scratch's
+    /// window count (`nb`), and how far the fold's sweep reaches (`first_unswept_slot`). The ceiling is
+    /// the LOOSE bound for the guard — it passed at 1536 covered slots while a 128-column body really
+    /// covered 768 — and for the scratch it is a different NUMBER from the one the body reads.
+    /// `None` for an unrolled bundle's body, which bakes no rung and so states no sweep.
+    pub const fn swept(self) -> Option<SweptCols> {
+        self.swept
+    }
+
+    /// ⭐ WHETHER **THIS** BODY READS ITS KV THROUGH A GATHERED SCRATCH — off the body's own launch
+    /// groups (`bundle::KvShifts::gathered`).
+    pub const fn gathers(self) -> scratchy_target_spyre::wiring::GathersKv {
+        self.gathers
+    }
+
+    /// ⭐ WHETHER **THIS** BODY IS A SPLIT-KV CHUNK — it gathers and carries no page fold, so it attends
+    /// exactly its own chunk in one launch and the host stages the CHUNK's index and mask, not the
+    /// fold's. On a decode batch this is what separates a chunk rung from the gathered fold below and
+    /// past it — both gather, and staging one's table for the other reads real block numbers from the
+    /// wrong layout.
+    pub const fn chunk(self) -> bool {
+        self.gathers.get() && !self.folds
+    }
+
+    /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked
+    /// layout (`bundle::BundleLayout::lx_op_local_bytes`), the host's term of the one
+    /// `lx_window_fits` budget. The host's chunk-table arm threads this into
+    /// `chunk_gather_index_table`, so the host refuses exactly the chunks the bake's `lx_form`
+    /// witness refused — neither arm budgets against another rung's pins.
+    pub const fn lx_op_local_bytes(self) -> u64 {
+        self.lx_op_local_bytes
+    }
+
+    /// ⭐ THE CHUNK FORM'S PROBABILITY-PART LX PINS, in bytes — read off the selected body's own
+    /// baked layout (`bundle::BundleLayout::lx_prob_pin_bytes`), the host's SECOND core-local
+    /// term of the same budget: the bake's `lx_form` admission summed it beside the gather pins,
+    /// and the host's chunk-table arm threads it in beside [`Self::lx_op_local_bytes`], so the
+    /// host refuses exactly what the bake refused.
+    pub const fn lx_prob_pin_bytes(self) -> u64 {
+        self.lx_prob_pin_bytes
+    }
+}
+
+/// This bundle's launches that the session running as `session` plays, in launch order — every
+/// group of a world of one; a sharded rank's minus every other rank's consumes
+/// ([`bundle::collective::plays_on`], the law the bundle's CB pipeline reads too). Each consume
+/// carries its send, read off the bundle's baked placements.
+///
+/// A launch IS its program ([`bundle::LaunchGroup`]), so there is no index that could name a
+/// program the bundle does not carry. What can fail is the WORLD: a consume bound by a session of
+/// a world of one, or a rank-selected consume baked for another world, is a bundle the session was
+/// never meant to run.
+fn bind_ops<T: ktir_superdsc::collective::Tp>(
+    code: &'static bundle::BundleCode<'static, T>,
+    session: Option<bundle::collective::Rank<T>>,
+) -> Result<Ops<T>> {
+    let sends: BTreeMap<usize, bundle::collective::TpSend<T>> =
+        bundle::collective::sends(&code.layout, &code.groups)
+            .map_err(|u| {
+                anyhow!(
+                    "bundle {}: group {}'s collective send names no baked bytes: {:?}",
+                    code.fp,
+                    u.group,
+                    u.why
+                )
+            })?
+            .into_iter()
+            .map(|s| (s.group, s.send))
+            .collect();
+    let mut ops = Vec::with_capacity(code.groups.len());
+    // ⭐ DOES THIS BUNDLE WALK — stated once, from the bundle's own groups, and stamped onto every
+    // group of it below: a walking program's whole span (seed, walk body, epilogue) serves one
+    // request per relaunch, so the seed re-runs between requests. Derived here because the span is
+    // a fact of WHICH GROUPS SIT IN ONE BUNDLE — no single group's record can state it.
+    let per_request = code.groups.iter().any(|g| g.kv.walk.is_some());
+    for (i, g) in code.groups.iter().enumerate() {
+        let mut collective = None;
+        if let Some(consume) = g.kv.tp {
+            let Some(me) = session else {
+                bail!(
+                    "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
+                     sharded world — a world-of-one session cannot run it (link the world's \
+                     cards before loading: `runtime::link_peers`)",
+                    code.fp
+                );
+            };
+            if !bundle::collective::plays_on(Some(consume), me) {
+                continue;
+            }
+            let Some(&send) = sends.get(&i) else {
+                bail!(
+                    "bundle {} group {i}: a consume `sends` did not resolve",
+                    code.fp
+                );
+            };
+            collective = Some(cb_plan::BoundCollective { send, me });
+        }
+        ops.push(OpProg::new(g, &code.fp, i, collective, per_request));
+    }
+    Ok(ops)
+}
+
+fn launch_err(e: HwError) -> anyhow::Error {
+    anyhow!("compute launch: {e}")
+}
+
+/// Process RSS in KB (for the flex-leak reset probe).
+fn vmrss_kb() -> i64 {
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+        return -1;
+    };
+    s.lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1)
+}
+
+fn report_group_time(t: &Timers) {
+    let total: f64 = t.group_ms.values().map(|(ms, _)| ms).sum();
+    let mut top: Vec<_> = t
+        .group_ms
+        .iter()
+        .map(|(label, (ms, n))| (*ms, label.as_str(), *n))
+        .collect();
+    top.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprintln!(
+        "[sdsc-grouptime] top groups by total ms (of {total:.1} ms over {} launches)",
+        t.group_calls
+    );
+    // Every group: a prompt spans one bundle per chunk width, each with its own groups.
+    for (ms, label, n) in &top {
+        eprintln!(
+            "[sdsc-grouptime]   {label:<40}  {ms:8.1} ms total  {:6.3} ms/launch  {n:6} launches  \
+             {:5.1}%",
+            ms / *n as f64,
+            100.0 * ms / total.max(1e-9)
+        );
+    }
+}
+
+/// One CB class's device-clock window inside one forward: the extreme WRITTEN timestamp snapshots
+/// over that class's CBs. The five TS words are snapshots of one free-running u32 counter
+/// ([`flex_rs::control_block_wire::ResponseBlockWire::timestamps`]'s measured layout: ~1012
+/// cyc/µs, ~4.2 s wrap; a slot a CB does not write reads zero), so `first`/`last` are raw ticks —
+/// consecutive forwards' windows difference wrap-exactly into the inter-step device-idle gap
+/// (fwd N `last` → fwd N+1 `first`), the number #603's loop closure exists to move.
+struct RbClassWindow {
+    first: u32,
+    last: u32,
+    n: usize,
+}
+
+/// The window of every entry matching `class`, over written (nonzero) TS slots only: a CB
+/// hardware left unwritten cannot bound the window, and a class with no CBs is `None` — absent,
+/// never zero-bounded, so a missing class cannot swallow the gap being measured.
+fn rb_class_window(
+    entries: &[flex_rs::rb_telemetry::RbTiming],
+    class: impl Fn(&flex_rs::rb_telemetry::RbTiming) -> bool,
+) -> Option<RbClassWindow> {
+    let mut window: Option<RbClassWindow> = None;
+    for e in entries.iter().filter(|e| class(e)) {
+        let mut cb_first: Option<u32> = None;
+        let mut cb_last = 0u32;
+        for &ts in &e.rb.timestamps() {
+            if ts != 0 {
+                cb_first = Some(cb_first.map_or(ts, |f: u32| f.min(ts)));
+                cb_last = cb_last.max(ts);
+            }
+        }
+        let Some(cb_first) = cb_first else {
+            continue;
+        };
+        match &mut window {
+            Some(w) => {
+                w.first = w.first.min(cb_first);
+                w.last = w.last.max(cb_last);
+                w.n += 1;
+            }
+            None => {
+                window = Some(RbClassWindow {
+                    first: cb_first,
+                    last: cb_last,
+                    n: 1,
+                })
+            }
+        }
+    }
+    window
+}
+
+/// The RB-timestamp report: per-op device cycles, harvested from the response blocks at
+/// completion (no drain), cumulative across the run. Phases are named per the card-measured slot
+/// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::exec_cmpt_cycles`] and siblings):
+/// `exec` is the compute engine's own time, `prep` the queue+prep wait behind earlier CBs — on a
+/// pipelined stream consecutive CBs overlap (the next CB's prep runs during the previous CB's
+/// exec), so Σ exec, not Σ total, is the stream's device span.
+fn report_rb_time(t: &Timers) {
+    let exec_total: u64 = t.rb_cycles.values().map(|a| a.cycles.exec).sum();
+    let prep_total: u64 = t.rb_cycles.values().map(|a| a.cycles.prep).sum();
+    let dma_total = t.rb_dmai.dmai + t.rb_dmao.tail;
+    eprintln!(
+        "[sdsc-rbtime] device exec cycles by op (of {exec_total} exec + {prep_total} prep + \
+         {dma_total} dma cycles over {} compute CBs, {} forwards)",
+        t.rb_cbs, t.rb_steps
+    );
+    let mut top: Vec<_> = t
+        .rb_cycles
+        .iter()
+        .map(|(k, a)| (a.cycles.exec, *k, a))
+        .collect();
+    top.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (cyc, (rung, oi), a) in top.iter().take(20) {
+        eprintln!(
+            "[sdsc-rbtime]   op ({rung},{oi:<3}) {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
+             prep {:>12}  {}",
+            cyc,
+            cyc / a.cycles.cbs.max(1),
+            a.cycles.cbs,
+            a.cycles.prep,
+            a.label
+        );
+    }
+    eprintln!(
+        "[sdsc-rbtime]   dmai: {} cb, {} cyc ({} cyc/cb)  |  dmao: {} cb, {} cyc ({} cyc/cb)",
+        t.rb_dmai.cbs,
+        t.rb_dmai.dmai,
+        t.rb_dmai.dmai / t.rb_dmai.cbs.max(1),
+        t.rb_dmao.cbs,
+        t.rb_dmao.tail,
+        t.rb_dmao.tail / t.rb_dmao.cbs.max(1),
+    );
+}
+
+/// The replay player's decomposition — cumulative since process start, on a
+/// 256-step cadence. ⛔ ONE WRITE: the same single-`format!` discipline as
+/// `[progverify]` — an abort from senlib's monitor thread takes the process
+/// down with no unwinding, so a buffered line is a line that never existed.
+/// This line is also the player's LIVENESS MARKER: a `RUST_LOG=debug` run
+/// whose stderr never shows it replayed nothing. A plain `scr chat` (level
+/// `info`) sees nothing — debug output is asked for, never imposed.
+fn report_replay(t: &Timers) {
+    let steps = t.replay_steps.max(1);
+    let derives = t.replay_derives.max(1);
+    debug!(
+        "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step | \
+         lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at {:.1} ms each",
+        t.replay_steps,
+        100.0 * t.replay_hits as f64 / steps as f64,
+        t.replay_cbs as f64 / steps as f64,
+        1000.0 * t.replay_lookup_ms / steps as f64,
+        t.replay_submit_ms / steps as f64,
+        t.replay_derives,
+        t.replay_derive_ms / derives as f64,
+    );
+}
+
+/// The submit / prefix-ladder reports, emitted with the phase line.
+fn report_phase_timers(compute_ms: f64) {
+    let d = Diag::get();
+    let mut t = timers();
+    // WHERE THE COMPUTE PHASE'S TIME ISN'T: `compute` is wall time from the last H2D to the drain,
+    // so it holds device work AND whatever the host spent feeding the stream. These say how much of
+    // it the host owns, per launch — the number that decides whether a batch's launch count is the
+    // cost.
+    if d.submit_time && t.submit_calls > 0 {
+        eprintln!(
+            "[sdsc-phase]   host: {} launches ({} with a host fence call) | submit={:.2} ms \
+             ({:.1} us/ea) prep={:.2} ms ({:.1} us/ea) | = {:.0}% of compute",
+            t.submit_calls,
+            t.host_fence_launches,
+            t.submit_ms,
+            1000.0 * t.submit_ms / t.submit_calls as f64,
+            t.prep_ms,
+            1000.0 * t.prep_ms / t.submit_calls as f64,
+            100.0 * (t.submit_ms + t.prep_ms) / compute_ms.max(1e-9),
+        );
+        t.submit_ms = 0.0;
+        t.prep_ms = 0.0;
+        t.submit_calls = 0;
+        t.host_fence_launches = 0;
+    }
+    // THE HARVEST, DRAIN-FREE: per-op device cycles the response blocks carried all along. This
+    // section rides the phase line (turn `SCRATCHY_SDSC_RB_TIME` on WITH `phase_time` for the
+    // per-forward view; alone, the report fires on the same 20k-CB cadence as `group_time`).
+    if d.rb_time && t.rb_cbs > 0 {
+        report_rb_time(&t);
+    }
+    // THE LADDER: T(j) is the mean time from a layer's first launch to the drain after group j, so
+    // the RISE from one rung to the next is group j's own device time. A rung with a small rise is a
+    // group the card finishes while the host is still submitting. Ragged rungs mean the backlog
+    // assumption broke down for that sample and the rise is not readable — take more layers.
+    if d.prefix_time && !t.prefix_ms.is_empty() {
+        let mut prev = 0.0;
+        let mut cur_len = 0usize;
+        for ((len, oi), (ms, n, prog)) in &t.prefix_ms {
+            if *len != cur_len {
+                cur_len = *len;
+                prev = 0.0;
+                eprintln!(
+                    "[sdsc-prefix] {cur_len}-group rung: cumulative ladder per call (rise = that \
+                     group's device time)"
+                );
+            }
+            let v = ms / *n as f64;
+            eprintln!(
+                "[sdsc-prefix]   op {oi:<3}  T={v:7.3} ms  dev={:+7.3} ms  n={n:<4}  {prog}",
+                v - prev
+            );
+            prev = v;
+        }
+        t.prefix_ms.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ THE SHADOW BUFFER'S OWN LAWS — everything the pre-mapped send rests on that a card
+    /// is not needed for: page alignment (the vendor's pre-mapped contract), born zeros
+    /// (mmap semantics — the pad extents a staging walk never touches still read as zero),
+    /// `Vec::resize`'s grow/shrink contract, and [`fault_in`] preserving written bytes while
+    /// it populates the rest.
+    #[test]
+    fn a_host_buf_is_page_aligned_born_zero_and_resizes_like_a_vec() {
+        let mut b = HostBuf::zeroed(3 * HOST_PAGE + 100).expect("mmap of a few pages");
+        assert_eq!(b.len(), 3 * HOST_PAGE + 100);
+        // Page alignment is the pre-mapped door's contract, so it is the type's contract.
+        assert_eq!(
+            b.as_ptr() as usize % HOST_PAGE,
+            0,
+            "the shadow buffer must be page-aligned for the pre-mapped door"
+        );
+        // Born zeros — every byte, including the mapping's whole page-rounded extent.
+        assert!(b.iter().all(|&x| x == 0));
+        assert_eq!(pages_of(b.len()), 4 * HOST_PAGE);
+
+        // Write, then grow: the prefix is carried, the tail is born zeros (Vec::resize's
+        // contract, which `shadow_for_read`'s mirror-growth and prepare's pad-growth both
+        // rely on).
+        b[..7].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+        b.resize(5 * HOST_PAGE).expect("growth by mremap or copy");
+        assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        assert!(b[7..].iter().all(|&x| x == 0));
+        assert_eq!(b.len(), 5 * HOST_PAGE);
+
+        // Shrink drops the tail; a regrown buffer does not remember it.
+        b.resize(HOST_PAGE).expect("shrink");
+        assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        b.resize(2 * HOST_PAGE).expect("regrow");
+        assert!(b[HOST_PAGE..].iter().all(|&x| x == 0));
+
+        // The fault sweep is value-preserving: staged bytes survive it byte for byte.
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = (i % 251) as u8;
+        }
+        let before = b.to_vec();
+        fault_in(&mut b[..]);
+        assert_eq!(&b[..], &before[..]);
+
+        // The empty buffer is a value like any other: no mapping, reads as empty, and a
+        // resize out of it is a fresh born-zero buffer.
+        let mut e = HostBuf::empty();
+        assert!(e.is_empty());
+        e.resize(64).expect("resize out of empty");
+        assert_eq!(&e[..], &[0u8; 64]);
+        e.resize(0).expect("resize to empty");
+        assert!(e.is_empty());
+    }
+
+    /// The seat law: a bundle runs in a process only when both agree on the world — no window and
+    /// no link, or the link's window exactly — and every disagreement refuses by name.
+    #[test]
+    fn a_bundle_runs_only_where_the_process_linked_its_window() {
+        use bundle::collective::{Payload, RecvWindow, TpWorld, WireBytes};
+        type W4 = TpWorld<4>;
+        let at = |offset| RecvWindow::<W4>::new(offset, Payload::from(WireBytes::CAP)).unwrap();
+        assert_eq!(RankSeat::<W4>::agree(None, None), Ok(()));
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),
+            Ok(())
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), None),
+            Err(SeatRefusal::Unlinked)
+        );
+        assert_eq!(
+            RankSeat::agree(None, Some(at(1 << 20))),
+            Err(SeatRefusal::UnshardedBundle)
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(2 << 20)), Some(at(1 << 20))),
+            Err(SeatRefusal::WindowMoved {
+                baked: at(2 << 20),
+                linked: at(1 << 20)
+            })
+        );
+    }
+
+    /// A compile-time-named segment cannot be out of range, and a runtime one is checked.
+    #[test]
+    fn segment_indices_are_bounded() {
+        assert_eq!(SEG_INTERMEDIATE.get(), 0);
+        assert_eq!(SEG_WEIGHT.get(), 1);
+        assert_eq!(SEG_KV.get(), 2);
+        assert_eq!(SEG_MASK.get(), 3);
+        assert!(SegIdx::checked(6).is_some());
+        assert!(
+            SegIdx::checked(7).is_none(),
+            "seg7 is the PROGRAM segment, not a tensor segment"
+        );
+        assert!(SegIdx::checked(-1).is_none());
+        assert_eq!(SegIdx::all().count(), NUM_SEGMENTS);
+    }
+
+    /// `Seg::known` is const-evaluated, so this is a compile-time proof rather than a test — the
+    /// value exists only if the assert held.
+    const _SEG6: SegIdx = SegIdx::known::<6>();
+
+    /// ⭐ ONLY A KEYED BIND IS SPARED THE PER-STEP RE-UPLOAD, AND ONLY AFTER ITS FIRST STEP. An
+    /// unkeyed activation is sent every step (an input someone forgets to re-bind must keep being
+    /// caught by today's path); a keyed one is sent in the step that bound it and not again until a
+    /// new key re-binds it.
+    #[test]
+    fn a_keyed_bind_goes_out_once_and_an_unkeyed_one_every_step() {
+        use ktir_superdsc::sdsc_abstract::{CausalKey, RungWidth};
+        let key =
+            CausalKey::chunk(RungWidth::of_baked_rows(512).expect("a width"), 512).expect("a key");
+        let (mask, rope) = (bundle::PlaceId::Act(7), bundle::PlaceId::Act(8));
+        let mut keyed = BTreeMap::new();
+        assert!(refill_sends(&keyed, &rope), "unkeyed: sent");
+        keyed.insert(mask, Keyed { key, fresh: true });
+        assert!(refill_sends(&keyed, &mask), "keyed, bound this step: sent");
+        assert!(
+            refill_sends(&keyed, &rope),
+            "a keyed neighbour changes nothing for the rest"
+        );
+        // What `refill_activations` does after the convert: every keyed bind is now on the device.
+        for k in keyed.values_mut() {
+            k.fresh = false;
+        }
+        assert!(
+            !refill_sends(&keyed, &mask),
+            "keyed, already uploaded: not sent"
+        );
+        assert!(
+            refill_sends(&keyed, &rope),
+            "unkeyed: still sent every step"
+        );
+    }
+
+    /// ⭐ A BIND CONVERTED AT BIND GOES OUT EXACTLY AS ONE CONVERTED AT THE REFILL: the same window
+    /// (one [`h2d_run`] law for both sources), and the same bytes in it — the shadow slot
+    /// `bind_input_f32` writes in one pass is the slot the refill's `ieee_to_sen_bytes` wrote from
+    /// `f32_to_f16_le`'s buffer. Over offsets on and off the 4 KiB grid and lengths on both sides
+    /// of it, so the window's round-down and round-up both move.
+    #[test]
+    fn a_bind_converted_at_bind_goes_out_as_one_converted_at_refill() {
+        let vals: Vec<f32> = (0..3000).map(|i| (i as f32 - 1500.0) * 0.37).collect();
+        for (offset, n) in [
+            (0u64, 1usize),
+            (128, 2048),
+            (4096, 2048),
+            (4224, 3000),
+            (8064, 64),
+        ] {
+            let len = n as u64 * 2;
+            let (a, b) = h2d_run(offset, len);
+            assert!(
+                a <= offset && offset + len <= b,
+                "the window covers the bind"
+            );
+            assert!(a % H2D_ALIGN == 0 && b % H2D_ALIGN == 0, "on the grid");
+            assert!(
+                b - a < len + 2 * H2D_ALIGN,
+                "and no wider than the grid forces"
+            );
+            // The two shadows: the refill's two-pass write, and the one-pass write at bind.
+            let mut two = vec![0u8; b as usize];
+            let ieee = sen_convert::f32_to_f16_le(&vals[..n]);
+            sen_convert::ieee_to_sen_bytes(&ieee, &mut two[offset as usize..][..ieee.len()]);
+            let mut one = vec![0u8; b as usize];
+            sen_convert::f32_to_sen_bytes(&vals[..n], &mut one[offset as usize..][..len as usize]);
+            assert!(
+                one[a as usize..b as usize] == two[a as usize..b as usize],
+                "offset {offset} n {n}: the window's bytes differ"
+            );
+        }
+    }
+
+    /// ⭐ FAULTING A SHADOW IN CHANGES NONE OF ITS BYTES — the property that lets the load-time
+    /// materialize run after `stage_keyed` (or in any order with it): the keyed bytes already in
+    /// the shadow are the ones a later aligned H2D window may re-send. Over a length that is not a
+    /// whole number of pages, so the last partial page is covered too.
+    #[test]
+    fn faulting_a_shadow_in_changes_none_of_its_bytes() {
+        let n = 5 * HOST_PAGE + 123;
+        let want: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
+        let mut got = want.clone();
+        fault_in(&mut got);
+        assert!(got == want, "a byte moved");
+        let mut zeros = vec![0u8; n];
+        fault_in(&mut zeros);
+        assert!(zeros.iter().all(|&b| b == 0), "a zeroed shadow stays zero");
+    }
+
+    /// Two steps on ONE image key: the first derives, the second hits the cache —
+    /// and the hit arm must COUNT it. The cadence line's "% from cached" read 0.0
+    /// forever because it didn't: 256 replayed steps off 4 derivations
+    /// printed "0.0% from cached" on a live card.
+    #[test]
+    fn replay_image_cache_counts_its_hits() {
+        let (hits, derives) = {
+            let t = timers();
+            (t.replay_hits, t.replay_derives)
+        };
+        let mut cache = StepImageCache::default();
+        let key = StepImageKey {
+            sel: BodySel::Rung(0),
+        };
+        let dummy = StepImage {
+            data: std::sync::Arc::new(StepImageData {
+                canvas: std::sync::Arc::new(Vec::new()),
+                rows: 0,
+            }),
+            barrier: false,
+        };
+        assert!(
+            cache.lookup_cached(&key).is_none(),
+            "an empty cache has no image: the first step derives"
+        );
+        cache.note_derived(key.clone(), dummy, Instant::now());
+        assert!(
+            cache.lookup_cached(&key).is_some(),
+            "the second step on the same key must hit the cache"
+        );
+        let t = timers();
+        assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it");
+        assert_eq!(t.replay_derives, derives + 1);
+    }
+
+    /// The rbgap window takes the extreme WRITTEN TS slots per class: a CB whose slots hardware
+    /// left zero never bounds it, and a class with no CBs is absent rather than zero-bounded —
+    /// the inter-step gap differences consecutive forwards' windows, so a bogus zero would
+    /// swallow the very window being measured.
+    #[test]
+    fn rbgap_window_bounds_only_written_slots() {
+        use flex_rs::control_block_wire::{RB_NUM_BYTES, ResponseBlockWire, TS_SECTION};
+        use flex_rs::dma::DmaDirection;
+        use flex_rs::rb_telemetry::RbTiming;
+        use flex_rs::scheduler::PipelineId;
+
+        let rb = |ts: [u32; 5]| {
+            let mut b = [0u8; RB_NUM_BYTES];
+            for (i, w) in ts.iter().enumerate() {
+                b[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            ResponseBlockWire::from_bytes(&b)
+        };
+        let entry =
+            |id: u64, pipeline: PipelineId, dma: Option<DmaDirection>, ts: [u32; 5]| RbTiming {
+                source: 0,
+                id,
+                pipeline,
+                dma,
+                rb: rb(ts),
+            };
+        // A compute CB writes all five words (word1 == word0 per the measured layout); a D2H
+        // crossing writes only words 3-4; one pathological CB writes nothing at all.
+        let entries = vec![
+            entry(1, PipelineId::Compute, None, [100, 100, 120, 200, 210]),
+            entry(
+                2,
+                PipelineId::Compute,
+                Some(DmaDirection::DeviceToHost),
+                [0, 0, 0, 300, 340],
+            ),
+            entry(3, PipelineId::AsyncDmaI, None, [0; 5]),
+        ];
+        let all = rb_class_window(&entries, |_| true).unwrap();
+        assert_eq!((all.first, all.last, all.n), (100, 340, 2));
+        let compute = rb_class_window(&entries, |e| {
+            matches!(e.pipeline, PipelineId::Compute) && e.dma.is_none()
+        })
+        .unwrap();
+        assert_eq!((compute.first, compute.last, compute.n), (100, 210, 1));
+        let d2h = rb_class_window(&entries, |e| e.dma == Some(DmaDirection::DeviceToHost)).unwrap();
+        assert_eq!((d2h.first, d2h.last, d2h.n), (300, 340, 1));
+        assert!(
+            rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice)).is_none(),
+            "an absent class is absent, not zero-bounded"
+        );
+    }
+}

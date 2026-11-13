@@ -1,0 +1,85 @@
+# The card side of the Spyre target: what runs on a card — its runtime (flex-rs and the resident
+# executor), the worker, and the `spyre` binary (which also runs the emulator). It depends on
+# `../spyre`, the workspace CI builds, by path, and may depend on what CI cannot reach; nothing in
+# `../spyre` depends on it.
+[workspace]
+resolver = "2"
+default-members = ["crates/cli"]
+members = [
+    "crates/card",
+    "crates/flex-rs",
+    "crates/worker",
+    "crates/cli",
+    "crates/tp",
+    "crates/builder",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# The same requirements as the root workspace's rows of the same names (its comments say why).
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+half = "2.7"
+inventory = "0.3"
+libc = "0.2"
+rayon = "1"
+safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
+# The shared crates, from the root workspace.
+scratchy-cli = { path = "../../crates/cli/scr", default-features = false }
+scratchy-core-common = { path = "../../crates/core/common" }
+scratchy-core-model = { path = "../../crates/core/model" }
+scratchy-serving-engine = { path = "../../crates/serving/engine" }
+scratchy-serving-scheduler = { path = "../../crates/serving/scheduler" }
+scratchy-serving-worker = { path = "../../crates/serving/worker" }
+
+scratchy-target-spyre-worker = { path = "crates/worker" }
+
+# Profiles apply only from a workspace root, so these repeat the root workspace's (its comments
+# say why each is set), plus the two for spyre's own compiled models, which this workspace's
+# `spyre` binary builds.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.scratchy-models]
+debug = 0
+
+[profile.dev.package.scratchy-target-spyre-models]
+debug = 0
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.release.package.scratchy-models]
+debug = 0
+opt-level = 1
+
+# Spyre's compiled models: the same emitted dispatch glue as scratchy-models, the same reasoning.
+[profile.release.package.scratchy-target-spyre-models]
+debug = 0
+opt-level = 1
+
+[profile.release-dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release-dist.package.scratchy-models]
+opt-level = 3
+
+[profile.release-dist.package.scratchy-target-spyre-models]
+opt-level = 3

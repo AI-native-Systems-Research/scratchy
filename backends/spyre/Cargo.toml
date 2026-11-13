@@ -1,18 +1,18 @@
 # The Spyre target is its own workspace, apart from the root one: nothing in the root workspace
 # depends on it, and phase 2 lifts this directory out as its own repository. Its crates are under
 # `crates/`, as the root's are; it reaches the shared ones by path into the root's `crates/`.
+#
+# This workspace is everything CI builds and tests: the lowering, the bake, the compiled models,
+# the KTIR emulator and the Triton front end. What runs on a card (its runtime, the worker and the
+# `spyre` binary) is `../spyre-hw`'s, which depends on this one and may depend on what CI cannot
+# reach. Nothing here depends on it.
 [workspace]
 resolver = "2"
-default-members = ["crates/cli"]
 members = [
     "crates/spyre",
     "crates/bundle",
-    "crates/builder",
-    "crates/worker",
     "crates/compiler",
     "crates/models",
-    "crates/cli",
-    "crates/tp",
     # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE
     # from the lowering rather than reached through a text round trip.
     "crates/ktir/ktir-core",
@@ -47,30 +47,18 @@ anyhow = "1"
 # dependency sites (target-specific + non-default-features) like it did in
 # https://github.com/AI-native-Systems-Research/scratchy/pull/59.
 blas-src = { version = "0.14", default-features = false }
-clap = { version = "4", features = ["derive", "env"] }
-dotenvy = "0.15"
 half = "2.7"
 inventory = "0.3"
 libc = "0.2"
 memmap2 = "0.9"
 rayon = "1"
-safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 # The shared crates, from the root workspace.
-scratchy-cli = { path = "../../crates/cli/scr", default-features = false }
-scratchy-core-common = { path = "../../crates/core/common" }
 scratchy-core-model = { path = "../../crates/core/model" }
-scratchy-serving-engine = { path = "../../crates/serving/engine" }
-scratchy-serving-scheduler = { path = "../../crates/serving/scheduler" }
-scratchy-serving-worker = { path = "../../crates/serving/worker" }
-
-scratchy-target-spyre-worker = { path = "crates/worker" }
 
 # Profiles apply only from a workspace root, so these repeat the root workspace's (its comments
 # say why each is set), plus the two for spyre's own compiled models.

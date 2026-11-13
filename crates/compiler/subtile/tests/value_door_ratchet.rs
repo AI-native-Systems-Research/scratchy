@@ -31,13 +31,14 @@ const LAW_ASSERTS: usize = 31;
 const VALUE_DOORS: usize = 10;
 
 /// The crates scanned, from the repository root: the root workspace's compiler, tensor, layer and
-/// target crates, and the spyre backend's own workspace (its crates left `crates/targets` with it).
+/// target crates, and the spyre backend's own two workspaces (its crates left `crates/targets`).
 const ROOTS: &[&str] = &[
     "crates/compiler",
     "crates/tensors",
     "crates/layers",
     "crates/targets",
     "backends/spyre/crates",
+    "backends/spyre-hw/crates",
 ];
 
 /// The directories whose files are not library code.

@@ -1,0 +1,64 @@
+[package]
+name = "scratchy-target-spyre-card"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IBM Spyre's card runtime for scratchy: the typed card surface over flex-rs, the resident SuperDSC executor, and the session the worker drives."
+
+[features]
+# THE BUILD'S ONE TENSOR-PARALLEL WORLD, as the target crate's.
+tp-2 = ["scratchy-target-spyre/tp-2"]
+tp-4 = ["scratchy-target-spyre/tp-4"]
+tp-8 = ["scratchy-target-spyre/tp-8"]
+
+[dependencies]
+# The shared target: the bundle types, the lowering's outputs, the weight staging and the wiring
+# the executor launches against. It never depends on this crate.
+scratchy-target-spyre = { path = "../../../spyre/crates/spyre", features = ["spyre-hw"] }
+# In-tree crate: the senlib flex port's PUBLIC face — the C-ABI declarations and the pure-Rust type
+# layer (addressing, control-block words, scheduler) the card surface compiles against. The
+# implementing archives are linked statically at build (see flex-rs/build.rs), so this builds on any
+# host and links the real implementation only where the archives exist.
+flex-rs = { path = "../flex-rs" }
+scratchy-spyre-bundle = { path = "../../../spyre/crates/bundle" }
+ktir-superdsc = { path = "../../../spyre/crates/ktir/ktir-superdsc" }
+scratchy-tensors = { path = "../../../../crates/tensors" }
+libc = { workspace = true }
+half = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# EXAMPLES ONLY. `bundle_run_dev` installs a subscriber so flex's completion thread has somewhere to
+# write its CB-error lines — the `hmi_syndrome` / `qgi_syndrome` / `job_count` that say why a launch
+# was rejected. Without one, a rejected launch is a bare `sync rc=-1`.
+tracing-subscriber = { workspace = true }
+
+# The examples run on a card: every one launches through flex-rs.
+#
+# `bundle_run_dev`: a bundle this binary did not bake, launched on the card.
+[[example]]
+name = "bundle_run_dev"
+
+# #546's concurrency leg: two tracked OP_ORDERING streams, one cross-stream RAW hazard,
+# one shared card — the hazard tracker's ordering demo on real hardware.
+[[example]]
+name = "hazard_concurrency"
+
+# #606's card leg: the shared host pool's cardless-unreachable invariants on real
+# hardware — the whole-region pin (non-null IOVA), index addressing + IOVA stability,
+# the pre-mapped H2D/D2H round trip through a slot, and the copyRaw validation set.
+[[example]]
+name = "shared_host_pool_probe"
+
+# #1016's card leg: `Stream::fill_zero` on real hardware — the vendor's fill op's
+# first caller is `zero_seg`, so this proves the fill CB writes zeros on a card
+# (poisoned non-zero first, all-zero after), across a window boundary.
+[[example]]
+name = "fill_zero_probe"
+
+# One process, N cards: an all-gather over the real flex card-to-card path, byte-exact on every card.
+[[example]]
+name = "cards_all_gather"
