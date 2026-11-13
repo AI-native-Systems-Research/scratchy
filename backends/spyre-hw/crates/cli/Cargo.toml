@@ -51,10 +51,18 @@ scratchy-target-spyre-card = { path = "../card", optional = true }
 # scratchy-models' own features, as `scr`'s `model` alias does (the same package, so the same
 # features). `quant` and `tp` likewise: `--features quant/<preset>`, `--features tp/<W>`.
 model = { package = "scratchy-models", path = "../../../../crates/models/arch", default-features = false }
-tp = { package = "scratchy-tp", path = "../tp", optional = true }
 quant = { package = "scratchy-quantizations", path = "../../../../crates/models/quantization", default-features = false }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
 libc = { workspace = true }
+
+# THE TP ALIAS, in cargo's documented home for forwarding-only deps: it exists
+# solely so `--features tp/<W>` can name the sharded worlds the bake emits
+# (its features forward to scratchy-target-spyre-worker's `tp-<W>`). A cfg(false)
+# target keeps it in the resolve graph — the features apply — while the crate
+# itself never builds, which is also why no code uses it and
+# cargo::unused_dependencies would otherwise warn.
+[target."cfg(false)".dependencies]
+tp = { package = "scratchy-tp", path = "../tp" }
