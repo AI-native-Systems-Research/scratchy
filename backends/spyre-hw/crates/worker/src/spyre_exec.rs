@@ -14,16 +14,18 @@ use crate::spyre_worker::*;
 use scratchy_serving_worker::error::ExecutorResult;
 use scratchy_serving_worker::worker::Worker;
 
-/// One scheduled token of a cached request is a DECODE step only when the request's
-/// prompt is already fully computed — the token this step runs sits at a GENERATED
-/// position (`num_computed >= prompt_len`). A 1-token slice of an UNFINISHED prompt is
-/// a prefill continuation and must take the per-request path: `run_request_step` runs
-/// it through the token-addressed m=1 forward, which writes its K/V at its own token
-/// position and samples nothing. Sent to batched decode instead, it would
-/// `push_generated` a token the prompt never contained and `record_kv` it at the
-/// SHARED batch slot — a bogus sample, plus a hole between the request's history and
-/// its token positions that the batched chunk loop (whose write slot IS its token
-/// position) can no longer write correctly.
+/// One scheduled token is a DECODE step when the row it runs is the prompt's FINAL
+/// row or beyond (`num_computed + 1 >= prompt_len`) — that row's logits sample the
+/// request's next token, which is the decode contract, and its seed is
+/// `token_at(num_computed)`: the prompt's final token for a fresh row, the previous
+/// pick for a continuing one. A 1-token slice of an UNFINISHED prompt (any earlier
+/// row) is a prefill continuation and must take the per-request path:
+/// `run_request_step` runs it through the token-addressed m=1 forward, which writes
+/// its K/V at its own token position and samples nothing. Sent to batched decode
+/// instead, it would `push_generated` a token the prompt never contained and
+/// `record_kv` it at the SHARED batch slot — a bogus sample, plus a hole between the
+/// request's history and its token positions that the batched chunk loop (whose
+/// write slot IS its token position) can no longer write correctly.
 // The `test` arm makes the fn exist under `spyre-emu`, which compiles this
 // module via the `spyre` feature but has no `spyre-hw`; CI runs the contract
 // test in that shape (the spyre-triton job).
@@ -33,7 +35,7 @@ pub(crate) fn solo_step_is_decode(
     num_computed: usize,
     prompt_len: usize,
 ) -> bool {
-    num_scheduled == 1 && num_computed >= prompt_len
+    num_scheduled == 1 && num_computed + 1 >= prompt_len
 }
 
 impl Worker for SpyreWorker {
@@ -242,6 +244,18 @@ impl Worker for SpyreWorker {
         // exactly as before: a selection, never a refusal.
         #[cfg(feature = "spyre-hw")]
         let mut wave: Vec<PackedTail> = Vec::new();
+        // ⭐ A NEW REQUEST'S PROMPT-FINAL ROW JOINS THE DECODE BATCH. A request whose
+        // prompt is entirely cached is admitted with one token to run (the scheduler's
+        // one-token backup) — that row is the prompt's final row, it samples, and
+        // `solo_step_is_decode` is its law. Running it as a solo 1-row prefill would
+        // pay the whole weight stream for one row; joining the batch rides the one
+        // decode launch every step already pays. The row leaves the per-request path
+        // here (`continue`) exactly as the wave's tails leave it, and lands in
+        // `decode_ids` below, appended after the cached decoders — every store the
+        // batch reads (draw, prompt ids, block table) was filled by the registration
+        // above.
+        #[cfg(feature = "spyre-hw")]
+        let mut decode_join: Vec<(String, usize)> = Vec::new();
         for nr in &scheduler_output.scheduled_new_reqs {
             let n = scheduler_output
                 .num_scheduled_tokens
@@ -309,6 +323,11 @@ impl Worker for SpyreWorker {
                     draw,
                     finishes: start + n >= prompt_len,
                 });
+                continue;
+            }
+            #[cfg(feature = "spyre-hw")]
+            if n == 1 && solo_step_is_decode(n, start, input_batch.prompt_len(&nr.req_id)) {
+                decode_join.push((nr.req_id.clone(), start));
                 continue;
             }
             let req = requests.get_mut(&nr.req_id).expect("just inserted");
@@ -464,7 +483,7 @@ impl Worker for SpyreWorker {
         let mut batched: std::collections::HashSet<String> = std::collections::HashSet::new();
         #[cfg(feature = "spyre-hw")]
         {
-            let decode_ids: Vec<(String, usize)> = cr
+            let mut decode_ids: Vec<(String, usize)> = cr
                 .req_ids
                 .iter()
                 .enumerate()
@@ -482,6 +501,10 @@ impl Worker for SpyreWorker {
                 })
                 .map(|(i, id)| (id.clone(), cr.num_computed_tokens[i] as usize))
                 .collect();
+            // The join rows ride after the cached decoders — a deterministic seat
+            // order is all the churn law needs; the fresh row's seed is its prompt's
+            // final token either way.
+            decode_ids.extend(decode_join.iter().cloned());
             // ORDER IS BY KV ROW, NOT BY LENGTH — and the row a request occupies in the launch is the
             // row it owns for its whole life (`ReqState::row`). The sort therefore happens AFTER
             // `ensure_pages`, which is what claims the row.
@@ -884,18 +907,23 @@ mod tests {
     use super::solo_step_is_decode;
 
     #[test]
-    fn a_one_token_slice_of_an_unfinished_prompt_is_not_a_decode_step() {
+    fn the_prompt_final_row_and_beyond_decode_every_earlier_row_continues() {
         // Mid-prompt: this step computes the prompt's 2nd token — a continuation.
         assert!(!solo_step_is_decode(1, 1, 500));
-        // The prompt's LAST token is still a prompt token, not a generated one —
-        // the exact 1-token remainder a ragged budget leaves, and the case the
-        // shared-slot write would corrupt.
-        assert!(!solo_step_is_decode(1, 499, 500));
+        // The row BEFORE the prompt's last: still a continuation.
+        assert!(!solo_step_is_decode(1, 498, 500));
+        // The prompt's FINAL row: its logits sample the request's next token —
+        // the decode contract. Its seed is `token_at(499)` = the prompt's last
+        // token, and its pick is the first GENERATED token — exactly what the
+        // prompt-final prefill row always produced.
+        assert!(solo_step_is_decode(1, 499, 500));
         // First generated position: the prompt is fully computed.
         assert!(solo_step_is_decode(1, 500, 500));
         // Mid-generation.
         assert!(solo_step_is_decode(1, 600, 500));
         // A multi-token slice is a continuation wave, never a decode step.
         assert!(!solo_step_is_decode(96, 96, 500));
+        // A 1-token prompt: its only row is its final row.
+        assert!(solo_step_is_decode(1, 0, 1));
     }
 }

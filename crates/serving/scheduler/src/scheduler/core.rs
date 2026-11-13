@@ -3653,17 +3653,25 @@ impl SchedulerInterface for Scheduler {
                 // How many tokens need to be scheduled.
                 let total_tokens = request.num_tokens();
 
-                // When the prefix cache covers the entire prompt, backing up
-                // by one block ensures the model has real input tokens to
-                // process. Without this, num_new_tokens would be 0 and the
-                // request would be stuck in WAITING forever. Reprocessing the
-                // last block is cheap and establishes the decode invariant
+                // When the prefix cache covers the entire prompt, the request
+                // still needs real input tokens to process — without a backup,
+                // num_new_tokens would be 0 and the request would be stuck in
+                // WAITING forever. The backup establishes the decode invariant
                 // (num_tokens > num_computed after the first output token is
-                // generated).
+                // generated); only the prompt's FINAL row is live (it samples
+                // the first output token — every earlier row's KV is already
+                // cached and never read back), so a non-recurrent request
+                // backs up ONE TOKEN: its final row runs as a decode row.
+                // A recurrent resume re-runs its snapshot's tail to rebuild
+                // state, so it keeps the block-granular backup.
                 let num_computed_tokens =
                     if num_cached_tokens as usize >= total_tokens && num_cached_tokens > 0 {
-                        let bs = self.kv_cache.block_size().get();
-                        (((num_cached_tokens as usize) / bs).saturating_sub(1) * bs) as u32
+                        if recurrent.is_some() {
+                            let bs = self.kv_cache.block_size().get();
+                            (((num_cached_tokens as usize) / bs).saturating_sub(1) * bs) as u32
+                        } else {
+                            total_tokens.saturating_sub(1) as u32
+                        }
                     } else {
                         num_cached_tokens
                     };
@@ -6216,7 +6224,7 @@ mod tests {
         sched.add_request(r2);
         let output2 = sched.schedule();
 
-        // Must schedule >0 tokens (the last block gets reprocessed).
+        // Must schedule >0 tokens (the prompt's final row runs).
         let sched_tokens_2 = *output2
             .num_scheduled_tokens
             .get("r2")
@@ -6225,11 +6233,21 @@ mod tests {
             sched_tokens_2 > 0,
             "fully-cached request must still schedule tokens, got 0"
         );
-        // Specifically: we back up by one block, so 16 tokens get reprocessed.
+        // Specifically: a fully-cached prompt backs up ONE TOKEN — its final
+        // row is the only live row (it samples the first output token; every
+        // earlier row's KV is already cached). The row runs as a decode row.
         assert_eq!(
-            sched_tokens_2, 16,
-            "should reprocess the last block ({block_size} tokens)"
+            sched_tokens_2, 1,
+            "fully-cached request should schedule exactly its final token"
         );
+        // And the computed count the step carries is the position of that row.
+        let computed_2 = output2
+            .scheduled_new_reqs
+            .iter()
+            .find(|nr| nr.req_id == "r2")
+            .expect("r2 is a new request")
+            .num_computed_tokens;
+        assert_eq!(computed_2, 31, "the final row sits at position total-1");
     }
 
     #[test]
