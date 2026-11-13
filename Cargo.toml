@@ -246,8 +246,9 @@ scratchy-cli = { path = "crates/cli/scr", default-features = false }
 [profile.dev]
 debug = "line-tables-only"
 
-# `scratchy-models` is the proc-macro fan-out site: `#[forward]`
-# expands each arch DSL into 10-20 dense-size specializations plus
+# A target's models crate (`scratchy-target-<target>-models`) is the
+# fan-out site: its build expands each arch DSL `scratchy-models`
+# selects into 10-20 dense-size specializations plus
 # shim variants per quant overlay. Cross-variant forward-fn +
 # load-body dedup collapses most bodies to one canonical per
 # equivalence class (same Impl-family, same bounds, same SFUF), but
@@ -257,7 +258,7 @@ debug = "line-tables-only"
 # without affecting optimization or the crate's debuggability at
 # the forward-fn / kernel boundary — gdb backtraces still resolve
 # in the target crates where the actual kernel calls live.
-[profile.dev.package.scratchy-models]
+[profile.dev.package.scratchy-target-metal-models]
 debug = 0
 
 [profile.dev.package.scratchy-target-spyre-models]
@@ -282,10 +283,10 @@ opt-level = 3
 [profile.release.build-override]
 opt-level = 3
 
-[profile.release.package.scratchy-models]
+[profile.release.package.scratchy-target-metal-models]
 debug = 0
-# The emitted forward code is dispatch glue — the real compute is in the metal /
-# cuda kernels, compiled separately. At -O3 the sheer volume (models × quant
+# The emitted forward code is dispatch glue — the real compute is in the
+# target's kernels, compiled separately. At -O3 the sheer volume (models × quant
 # variants) makes LLVM the dominant `cargo build --release` cost. opt-level = 1
 # still inlines the hot dispatch but slashes LLVM time. `release-dist` (below)
 # overrides back to -O3 + fat LTO for the shipping build.
@@ -304,7 +305,7 @@ codegen-units = 1
 
 # Keep the model code fully optimized in the shipping build (release inherits
 # opt-level = 1 above; undo it here).
-[profile.release-dist.package.scratchy-models]
+[profile.release-dist.package.scratchy-target-metal-models]
 opt-level = 3
 
 [profile.release-dist.package.scratchy-target-spyre-models]
