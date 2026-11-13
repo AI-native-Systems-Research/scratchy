@@ -3518,15 +3518,24 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 // one is open. What is certain is that the whole class is avoidable for the price of
                 // a load-time copy, so the fix does not depend on the answer.
                 //
-                // The `Cow` variant IS the provenance: `Owned` is a heap `Vec` (anonymous, private,
-                // always pinnable); `Borrowed` is the executable's pages. So copy exactly the
-                // borrowed case. The staging buffers must outlive the ASYNC transfer, hence the sync
-                // below.
+                // The `BakedImage` variant IS the provenance: `Raw(Owned)` is a heap `Vec`
+                // (anonymous, private, always pinnable); `Raw(Borrowed)` is the executable's pages;
+                // `Baked` is the executable's pages of the FRAME, which is not the program at all
+                // until decoded. So copy exactly the borrowed case, and decode the baked case into
+                // the same staging — a decompressed image is a fresh heap `Vec`, the identical
+                // class the copy above exists to produce. The staging buffers must outlive the
+                // ASYNC transfer, hence the sync below.
                 let t = Instant::now();
                 let staged: &[u8] = match &op.code.init_binary {
-                    std::borrow::Cow::Owned(v) => v,
-                    std::borrow::Cow::Borrowed(b) => {
+                    bundle::BakedImage::Raw(std::borrow::Cow::Owned(v)) => v,
+                    bundle::BakedImage::Raw(std::borrow::Cow::Borrowed(b)) => {
                         pinnable.push(b.to_vec());
+                        pinnable.last().expect("just pushed")
+                    }
+                    bundle::BakedImage::Baked { images, row } => {
+                        let bytes = crate::baked_image::decompress(images, *row)
+                            .map_err(|e| anyhow!("op {}: {e}", op.label()))?;
+                        pinnable.push(bytes);
                         pinnable.last().expect("just pushed")
                     }
                 };
@@ -4256,7 +4265,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// standing, and it is worth naming because it is the only one left after this.
     fn prog_image_report(&self, op: &OpProg<T>, prog: &DevAddr) -> String {
         use std::fmt::Write as _;
-        let baked: &[u8] = &op.code.init_binary;
+        // The image the upload staged — `Raw` bytes as they are, a `Baked` frame decoded. The
+        // diff below is against the SAME bytes the card received, whichever arm held them.
+        let baked: Vec<u8> = match &op.code.init_binary {
+            bundle::BakedImage::Raw(c) => c.to_vec(),
+            bundle::BakedImage::Baked { images, row } => {
+                match crate::baked_image::decompress(images, *row) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return format!("progimg: {e}"),
+                }
+            }
+        };
         let stick =
             usize::try_from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES)
                 .expect("STICK_BYTES fits usize");
@@ -4312,7 +4331,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 "progimg: IDENTICAL {} B — the device's copy of this program IS the baked image \
                  (flit0 {})",
                 baked.len(),
-                hdr(baked, 0)
+                hdr(&baked, 0)
             );
         };
         let ndiff = (0..baked.len()).filter(|&i| host[i] != baked[i]).count();
@@ -4339,11 +4358,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
              \n[segaddr]   flit{ff} hdr baked={} | device={}\
              \n[segaddr]   flit{ff} baked [0..32]={}\
              \n[segaddr]   flit{ff} devic [0..32]={}",
-            hdr(baked, 0),
+            hdr(&baked, 0),
             hdr(&host, 0),
-            hdr(baked, ff),
+            hdr(&baked, ff),
             hdr(&host, ff),
-            hex(baked, ff),
+            hex(&baked, ff),
             hex(&host, ff),
         );
         out

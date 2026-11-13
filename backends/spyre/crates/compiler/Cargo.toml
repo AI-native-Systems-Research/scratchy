@@ -50,6 +50,11 @@ syn = { version = "3", features = ["full"] }
 rayon = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# The bake's device images are packed as zstd frames against one dictionary trained on the whole
+# build — the metal AOT precedent (`crates/targets/metal/src/aot.rs`, `pack`). Compression runs HERE,
+# at expansion; decoding runs in the card crate (`backends/spyre-hw/crates/card`). `zdict_builder`
+# is the trainer: this crate trains the dictionary, the card crate only decodes against it.
+zstd = { version = "0.14", default-features = false, features = ["zdict_builder"] }
 
 # The pipeline's real-config fixtures, for the bake's tests on checked-in models.
 [dev-dependencies]

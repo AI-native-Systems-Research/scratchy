@@ -7295,7 +7295,7 @@ impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
                         // is compiled FROM these, and is their artifact rather than a second
                         // source of truth."
                         programs: std::borrow::Cow::Borrowed(&[]),
-                        init_binary: std::borrow::Cow::Owned(init_binary),
+                        init_binary: bundle::BakedImage::Raw(std::borrow::Cow::Owned(init_binary)),
                         job_bin_ptr,
                         correction: std::borrow::Cow::Owned(correction),
                     });
@@ -7861,7 +7861,7 @@ pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
                 ..bundle::KvShifts::default()
             },
             programs: std::borrow::Cow::Owned(vec![program]),
-            init_binary: std::borrow::Cow::Borrowed(&[]),
+            init_binary: bundle::BakedImage::Raw(std::borrow::Cow::Borrowed(&[])),
             job_bin_ptr: 0,
             correction: std::borrow::Cow::Borrowed(&[]),
         });
