@@ -31,6 +31,20 @@ pub(crate) struct SubmittedDecode {
     pub(crate) idx_row_words: u32,
     pub(crate) result_id: u32,
     pub(crate) vocab: usize,
+    /// ⭐ THE SEAT'S OWN LOGITS, DEFERRED BESIDE THE PICK — armed only at
+    /// `debug`: the same step's `[rows, pad_vocab]` f16 result the on-card
+    /// sampler consumed, read through the same ring door and the same
+    /// stream order (enqueued right behind the idx stick, so the next step's
+    /// write cannot pass it). The collect half states each row's top-2
+    /// margin beside the pick — the fact that decides whether a reply that
+    /// differs between two batch compositions is a near-tie either fp order
+    /// may take, or a row computed wrong. `(read, seat's logits tid,
+    /// pad_vocab)` — the facts the submit half held; nothing is re-derived.
+    pub(crate) dbg_seat: Option<(
+        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+        u32,
+        usize,
+    )>,
 }
 
 /// What `run_card_launch` hands back: a finished step's picks, or a
@@ -526,6 +540,20 @@ pub(crate) fn run_card_launch(
                     busy: card_busy_at_submit,
                 },
             );
+            // ⭐ THE SEAT'S OWN LOGITS, DEFERRED BESIDE THE PICK (debug only): the
+            // ring grows a slot in place for the wider read, and the enqueue's
+            // stream order is the idx read's own — the next step on this rung
+            // cannot write the seat before this read has taken it.
+            let dbg_seat = if tracing::enabled!(tracing::Level::DEBUG) {
+                pf.defer_read_tensor_ring(
+                    scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
+                    seat_width.get() * seat.pad_vocab as usize * 2,
+                )
+                .ok()
+                .map(|r| (r, seat.row, seat.pad_vocab as usize))
+            } else {
+                None
+            };
             return Ok(BatchOut::Deferred(SubmittedDecode {
                 read,
                 rows: seat_width,
@@ -535,6 +563,7 @@ pub(crate) fn run_card_launch(
                 idx_row_words: seat.idx_row_words,
                 result_id: b.result_id as u32,
                 vocab,
+                dbg_seat,
             }));
         }
         // A deferred decode whose bundle mints no draw — refused at the arm,
@@ -1041,7 +1070,68 @@ pub(crate) fn collect_decode_tokens(
             pick: t_pick.elapsed(),
         },
     );
+    // ⭐ THE SEAT'S OWN ANSWER, STATED BESIDE THE PICK (debug only): the same
+    // step's logits, one line per row — the card's pick, the row's own argmax,
+    // and the top-2 margin the pick won by. A reply that differs between two
+    // batch compositions diverged at SOME step; this line names that step's
+    // margin, and the margin is the verdict: a pick won by less than the
+    // rungs' fp drift is a near-tie either order may take, a pick won wide and
+    // still differing is a row computed wrong.
+    if let Some((hread, row_tid, pad_vocab)) = &sub.dbg_seat {
+        match session.finish_deferred_read_raw(hread) {
+            Ok(b) => {
+                log_decode_top2(&b, sub.rows.get(), *pad_vocab, sub.vocab, &toks, *row_tid)
+            }
+            Err(e) => {
+                tracing::debug!("DECODE_READBACK t{row_tid}: the seat read failed: {e}")
+            }
+        }
+    }
     Ok(toks)
+}
+
+/// ⭐ THE DECODE SEAT'S OWN READBACK — the collect half of the debug seat read:
+/// each row's argmax and second-best over the step's f16 logits, through the
+/// same stick law the prefill-final readback argmaxes by (the row's pick rides
+/// in `toks`, the card's own draw). One debug line per row, per step.
+fn log_decode_top2(bytes: &[u8], rows: usize, pad_vocab: usize, vocab: usize, toks: &[u32], tid: u32) {
+    const FP16_ELEMS_PER_STICK: usize =
+        <ktir_superdsc::superdsc_opspec::Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+    for r in 0..rows {
+        // Top AND second — the margin a pick won by is the fact that decides
+        // whether a rung's ulp drift can flip it.
+        let mut best = (0usize, f32::NEG_INFINITY);
+        let mut second = f32::NEG_INFINITY;
+        for j in 0..vocab {
+            let e = ktir_superdsc::sdsc_abstract::dev_off_stk(
+                &[rows, pad_vocab],
+                1,
+                &[r, j],
+                FP16_ELEMS_PER_STICK,
+            );
+            let o = e * 2;
+            if let Some(v) = bytes.get(o..o + 2) {
+                let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
+                if x > best.1 {
+                    second = best.1;
+                    best = (j, x);
+                } else if x > second {
+                    second = x;
+                }
+            }
+        }
+        let pick = toks.get(r).copied();
+        tracing::debug!(
+            "DECODE_READBACK t{tid} r{r}:pick={:?}:argmax={}:eq={}:top2={:.4}-{:.4}={:.4}",
+            pick,
+            best.0,
+            pick == Some(best.0 as u32),
+            best.1,
+            second,
+            best.1 - second
+        );
+    }
 }
 
 /// ⭐ THE SEAT READBACK — the greedy-draw localization (auditor order
@@ -1207,14 +1297,19 @@ fn log_seat_readback(
     let vocab = seat.vocab as usize;
     let stk = <ktir_superdsc::superdsc_opspec::Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
-    let mut argmax: Vec<(usize, u32)> = Vec::with_capacity(report.len());
+    let mut argmax: Vec<(usize, u32, f32, f32)> = Vec::with_capacity(report.len());
     match session.read_tensor_raw(
         scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
         rows * pad_v * 2,
     ) {
         Ok(b) => {
             for &r in &report {
+                // Top AND second: the margin a pick won by is the fact that
+                // decides whether a rung's ulp drift can flip it — a pick won
+                // by less than the drift is a near-tie, and any equally-valid
+                // fp order may take the other side.
                 let mut best = (0usize, f32::NEG_INFINITY);
+                let mut second = f32::NEG_INFINITY;
                 for j in 0..vocab {
                     let e =
                         ktir_superdsc::sdsc_abstract::dev_off_stk(&[rows, pad_v], 1, &[r, j], stk);
@@ -1222,11 +1317,14 @@ fn log_seat_readback(
                     if let Some(v) = b.get(o..o + 2) {
                         let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
                         if x > best.1 {
+                            second = best.1;
                             best = (j, x);
+                        } else if x > second {
+                            second = x;
                         }
                     }
                 }
-                argmax.push((r, best.0 as u32));
+                argmax.push((r, best.0 as u32, best.1, second));
             }
         }
         Err(e) => {
@@ -1243,15 +1341,21 @@ fn log_seat_readback(
             let am = argmax
                 .iter()
                 .copied()
-                .find(|(ar, _)| *ar == r)
-                .map(|(_, a)| a);
+                .find(|(ar, _, _, _)| *ar == r)
+                .map(|(_, a, _, _)| a);
+            let margin = argmax
+                .iter()
+                .copied()
+                .find(|(ar, _, _, _)| *ar == r)
+                .map(|(_, _, v1, v2)| format!("{v1:.4}-{v2:.4}={:.4}", v1 - v2));
             format!(
-                "r{r}:words={:?}:invt={}:pick={:?}:argmax={:?}:eq={}",
+                "r{r}:words={:?}:invt={}:pick={:?}:argmax={:?}:eq={}:top2={}",
                 words[r],
                 invt[r],
                 pick,
                 am,
-                pick == am
+                pick == am,
+                margin.unwrap_or_default()
             )
         })
         .collect();
@@ -1613,7 +1717,8 @@ mod pad_clamp_tests {
         // this pin checks is the same mint every launch reads.
         let rows_in = LaunchRows::Sequence {
             blocks: &[],
-            rows: scratchy_target_spyre::paged_step::StepRows::new(10, 4).expect("four real rows"),
+            rows: scratchy_target_spyre::paged_step::StepRows::new(10, 4)
+                .expect("the four-real-row rung the pad clamp pins stages"),
         };
         let binds = sample_binds(
             seat,

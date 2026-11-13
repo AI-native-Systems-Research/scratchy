@@ -88,6 +88,11 @@ impl SpyreWorker {
             // `req_ids[i]` and the in-call drain reads slot `i`, so a dropped row would hand every
             // later row its neighbour's token. A gone request's overshoot pick is discarded by the
             // engine; it only skips the pool bookkeeping of a request that no longer exists.
+            // Every pick the drain owns, one line each: request, the position the row
+            // computed, the token id. The stream a request's reply is made of, stated as
+            // the fact the numerics bar argues over — WHERE a reply diverges between two
+            // cells names the step, and the step names the rung.
+            tracing::debug!("[spyre-worker] pick {id} at {start} = {tok}");
             if requests.contains_key(&id) {
                 input_batch.push_generated(&id, tok);
                 input_batch.set_tokens_in_pool(&id, start + 1);
