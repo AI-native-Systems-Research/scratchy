@@ -429,7 +429,7 @@ pub enum ConfigError {
         limit: serde_json::Value,
     },
     /// A config's quant spec carries per-module (mixed-bit, OptiQ/DWQ) affine
-    /// overrides that this backend cannot lower (only metal reads the
+    /// overrides that this target cannot lower (a target that does reads the
     /// per-tensor widths back: `unpack_moe_expert_bits` /
     /// `affine_gather_qmv_symbol`). Raised at the ONE place the quant spec is
     /// decided — `parse_quantization` — naming the config and WHICH tensors
@@ -480,7 +480,7 @@ impl std::fmt::Display for ConfigError {
             Self::MixedBitAffine { stem, tensors } => write!(
                 f,
                 "{stem}: ships a mixed-bit (OptiQ) affine quantization — per-tensor width \
-                 overrides only metal lowers; this backend cannot compile it. Mixed-bit \
+                 overrides this target does not lower, so it cannot compile it. Mixed-bit \
                  tensors: {}",
                 tensors.join(", ")
             ),
@@ -519,8 +519,9 @@ pub fn load_dir(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
     scope: &Scope,
+    target: &dyn crate::target::TargetEmitter,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Decoder, spec, scope)
+    load_dir_mode(dir, ConfigMode::Decoder, spec, scope, target)
 }
 
 /// [`load_dir`] for a `#[vision_forward]` crate's configs/ dir.
@@ -532,14 +533,15 @@ pub fn load_dir_vision(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
     scope: &Scope,
+    target: &dyn crate::target::TargetEmitter,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Vision, spec, scope)
+    load_dir_mode(dir, ConfigMode::Vision, spec, scope, target)
 }
 
 /// Process-wide count of models actually forward-expanded (dense bases +
 /// synthesized quant variants), across every arch directory processed so
 /// far. `scratchy-models` has no default model/quant features (deliberately
-/// — a plain `-Fmetal` with nothing else selected should fail loudly, not
+/// — a target build with no model selected should fail loudly, not
 /// silently link a binary with zero models). Call once, after every
 /// `load_dir`/`load_dir_vision` invocation has run (i.e. from
 /// `scratchy-forwards.rs` after its `par_iter` over arches completes).
@@ -792,6 +794,7 @@ fn load_dir_mode(
     mode: ConfigMode,
     spec: &crate::arch_spec::DeclaredArchSpec,
     scope: &Scope,
+    target: &dyn crate::target::TargetEmitter,
 ) -> Result<Vec<ModelParams>, ConfigError> {
     init_stem_logging();
     if !dir.is_dir() {
@@ -822,7 +825,7 @@ fn load_dir_mode(
         |arch_name: &str, stem: &str| -> bool { scope.model_selected(arch_name, stem) };
     // A head (an arch registering under an identity of its own, `hf_architectures`) compiles beside
     // the targets it drafts for: one that ships inside its targets' checkpoints (`checkpoint_of`)
-    // under scratchy-models' `mtp-heads` feature (which `metal` turns on, and `mtp` implies), on
+    // under scratchy-models' `mtp-heads` feature (which `scr` turns on, and `mtp` implies), on
     // every selected config of those arches that carries it — its config is the target's own
     // file; one published as a checkpoint of its own (`head_targets`), on each of its configs
     // whose target is selected ([`compiled_head_targets`]): under `mtp-heads` the one its target
@@ -849,8 +852,8 @@ fn load_dir_mode(
     // What the heads compiled beside a target config bake into it: the most drafts one of them
     // carries a sequence (its verify steps hold that many), and the layers whose outputs one reads
     // (`target_capture_layers`, its arch.json: a path into its own config), which the target
-    // captures. A head that does not compile in this build ([`Scope::arch_compiled`]: a metal-only
-    // drafter under cuda) bakes nothing into it.
+    // captures. A head that does not compile in this build ([`Scope::arch_compiled`]: one target's
+    // drafter under another) bakes nothing into it.
     let head_facts = |stem: &str, json: &serde_json::Value| -> Result<HeadFacts, ConfigError> {
         let mut facts = HeadFacts::default();
         if !mtp_heads || !spec.hf_architectures.is_empty() {
@@ -926,22 +929,16 @@ fn load_dir_mode(
     // scratchy-quantizations), only listed presets are active. `None` ⇒
     // legacy all-presets behaviour.
     //
-    // Backend claimability — metal: `mlx-affine-*` variants reach the
-    // solver as Dense (codegen dequantizes at load time), and `nvfp4`
-    // reaches it as a genuine metal quant claimed by `MetalNvfp4QmmImpl`
-    // (forward-time E2M1 dequant-on-read qmv/qmm_t). Every other preset
-    // routes through Impls (Marlin / Bnb4 / Fp8 / Ggml) that the metal
-    // impl pool has no claimants for, so the solver would explode
-    // with `UnclaimedTile`.
+    // And a preset is active only where the target lowers it
+    // (`TargetEmitter::lowers_preset`): one it has no kernels for is no
+    // variant of any model.
     let quant_preset_active = |preset_name: &str| -> bool {
         if let Some(q) = &enabled_quants
             && !q.contains(preset_name)
         {
             return false;
         }
-        !(cfg!(feature = "metal")
-            && !preset_name.starts_with("mlx-affine-")
-            && preset_name != "nvfp4")
+        target.lowers_preset(preset_name)
     };
 
     // An in-checkpoint head's configs are the selected configs of its target arches that carry it.
@@ -1041,13 +1038,13 @@ fn load_dir_mode(
     // identical Impl-set signatures share one emitted body. Without
     // that dedup, N sizes × M presets quickly blow up release-build
     // LLVM work.
-    // Under `--features metal` we skip quant variants metal can't claim
-    // (awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml) —
+    // A target skips the quant variants it does not lower (`TargetEmitter::lowers_preset`, e.g.
+    // awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml on one) —
     // their on-disk layouts route through `MarlinFusedGateUpSiluMul` /
-    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that the metal
-    // impl pool has no claimants for, so the solver explodes with
+    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that its
+    // kernels have no claimants for, so its lowering would explode with
     // `UnclaimedTile` on the first quant tile. A preset being
-    // skipped this way on metal means it was never `quant_preset_active`
+    // skipped this way means it was never `quant_preset_active`
     // in the first place, so it also never suppressed the dense base
     // above — dense only drops out for a preset that actually synthesizes.
     //
@@ -1055,7 +1052,7 @@ fn load_dir_mode(
     // exception: their codegen materializes a Dense `LinearLayer` at
     // load time via `LinearLayer::load_affine_dequant_as_dense`, so
     // the forward path remains the existing bf16 Gemm path that the
-    // metal impl pool already claims. The preset-filter inside the
+    // kernels already claim. The preset-filter inside the
     // overlay loop below keeps unclaimable presets out while still
     // synthesizing the affine variant.
     let quantizations_path = dir.join("quantizations.json");
@@ -1089,10 +1086,9 @@ fn load_dir_mode(
         };
 
         for preset_name in &presets {
-            // Quant feature scoping (the scope's `quants`) + backend claimability
-            // (metal only claims mlx-affine-*/nvfp4 as those route through
-            // Dense/MetalNvfp4QmmImpl — see
-            // `quant_preset_active`'s definition above for the full backend
+            // Quant feature scoping (the scope's `quants`) + the target's lowering (`TargetEmitter::lowers_preset`
+            // — see
+            // `quant_preset_active`'s definition above for the full
             // reasoning, shared with the dense-suppression pre-check so the
             // two can't drift apart).
             if !quant_preset_active(preset_name) {
@@ -1127,24 +1123,15 @@ fn load_dir_mode(
         }
     }
 
-    // Drop any explicitly-quantized base configs under
-    // `--features metal` *except* MLX-affine, which routes through the
-    // existing Dense Impl pool at solve time (codegen materializes a
-    // Dense `LinearLayer` at load via
-    // `LinearLayer::load_affine_dequant_as_dense`). Other
-    // checked-in `<size>-<preset>.json` base configs
-    // (e.g. `qwen3-0.6b-bnb-4bit.json`) still reach the solver as
-    // quantized and the metal impl pool has no claimants — the
-    // solver would explode on the first quantized tile.
-    if cfg!(feature = "metal") {
-        out.retain(|m| {
-            m.quantization.is_none()
-                || matches!(
-                    m.quantization.as_ref().map(|qc| &qc.method),
-                    Some(crate::quantization::QuantMethod::Affine { .. })
-                        | Some(crate::quantization::QuantMethod::Nvfp4 { .. })
-                )
-        });
+    // Drop any explicitly-quantized base config (a checked-in
+    // `<size>-<preset>.json`, e.g. `qwen3-0.6b-bnb-4bit.json`) the target
+    // does not lower (`TargetEmitter::lowers_quantized_config`): its
+    // quantized tiles would reach a lowering with no kernel for them.
+    out.retain(|m| {
+        (m.quantization.as_ref()).is_none_or(|qc| target.lowers_quantized_config(&qc.method))
+    });
+    for m in &out {
+        refuse_unlowered_mixed_bits(m, target)?;
     }
 
     // Keep the final list sorted by stem so emitted
@@ -1739,30 +1726,32 @@ fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
 
 fn parse_quantization(
     json: &serde_json::Value,
-    stem: &str,
     source_path: &Path,
 ) -> Result<Option<crate::quantization::QuantizationConfig>, ConfigError> {
-    let parsed = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
-        ConfigError::Quantization {
-            path: source_path.to_path_buf(),
-            source: e,
-        }
-    })?;
-    // THE one place mixed-bit-ness is decided: the quant spec itself. A
-    // per-module (OptiQ/DWQ) override map is a fact of the checkpoint; a
-    // backend that cannot lower it refuses here, by name, listing the
-    // tensors — no second, downstream re-derivation from the raw JSON.
-    if let Some(cfg) = &parsed
+    crate::quantization::QuantizationConfig::parse(json).map_err(|e| ConfigError::Quantization {
+        path: source_path.to_path_buf(),
+        source: e,
+    })
+}
+
+/// A target that cannot lower a mixed-bit affine quantization refuses the model, by name, listing
+/// its tensors. Mixed-bit-ness is the quant spec's own fact (a per-module OptiQ/DWQ override map),
+/// read here off the parsed spec — no second re-derivation from the raw JSON.
+fn refuse_unlowered_mixed_bits(
+    model: &ModelParams,
+    target: &dyn crate::target::TargetEmitter,
+) -> Result<(), ConfigError> {
+    if let Some(cfg) = &model.quantization
         && let crate::quantization::QuantMethod::Affine { per_module, .. } = &cfg.method
         && !per_module.is_empty()
-        && !cfg!(feature = "metal")
+        && !target.lowers_mixed_bit_affine()
     {
         return Err(ConfigError::MixedBitAffine {
-            stem: stem.to_string(),
+            stem: model.source_stem.clone(),
             tensors: per_module.iter().map(|(k, _)| k.clone()).collect(),
         });
     }
-    Ok(parsed)
+    Ok(())
 }
 
 /// `None` (field absent) lets `apply_arch_semantic_defaults` supply
@@ -1935,7 +1924,7 @@ fn model_params_from_json(
     for (k, v) in &spec.scalar_defaults {
         scalars.entry(k.clone()).or_insert(*v);
     }
-    let quantization = parse_quantization(json, source_stem, source_path)?;
+    let quantization = parse_quantization(json, source_path)?;
     // An in-checkpoint head reads its target's config, whose `tie_word_embeddings` says where the
     // TARGET keeps its lm_head (Qwen3.5-0.8B: in its embedding table). The head's lm_head is a
     // slot of its own the target lends either way (`target.lent_weight_prefix`), never its embedding.
@@ -2063,7 +2052,7 @@ fn vision_params_from_json(
     let tie_word_embeddings = parse_tie_word_embeddings(json)
         .or(spec.tie_default)
         .unwrap_or(false);
-    let quantization = parse_quantization(json, source_stem, source_path)?;
+    let quantization = parse_quantization(json, source_path)?;
     let arch = resolve_arch_spec(spec, json, source_stem);
 
     // A vision arch MUST declare its on-disk structure — there is no
@@ -3051,6 +3040,7 @@ fn stem_to_ident(stem: &str) -> Result<String, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::Shared;
 
     /// Absolute path to `crates/models/arch/<arch>/configs/` from
     /// this crate's manifest dir, for tests that load real configs.
@@ -3081,12 +3071,9 @@ mod tests {
         assert!(stem_to_ident("").is_err());
     }
 
-    /// The presets of an arch's `quantizations.json` the backend this test binary is built
-    /// for can lower (`quant_preset_active`): metal claims the MLX affine presets and
-    /// NVFP4; any other backend claims every preset.
-    #[cfg(feature = "metal")]
-    const LLAMA_PRESETS: &[&str] = &["mlx-affine-b4-g64", "mlx-affine-b4-g64-qembed", "nvfp4"];
-    #[cfg(not(feature = "metal"))]
+    /// The presets of an arch's `quantizations.json`, every one of which the shared target
+    /// lowers (`quant_preset_active`). A target lowering fewer loads fewer variants: its own
+    /// compiler's tests pin its subset.
     const LLAMA_PRESETS: &[&str] = &[
         "awq-gemm",
         "bnb-nf4-dq",
@@ -3100,9 +3087,6 @@ mod tests {
         "mlx-affine-b4-g64-qembed",
         "nvfp4",
     ];
-    #[cfg(feature = "metal")]
-    const QWEN2_PRESETS: &[&str] = &["mlx-affine-b4-g64", "mlx-affine-b4-g64-qembed"];
-    #[cfg(not(feature = "metal"))]
     const QWEN2_PRESETS: &[&str] = &[
         "awq-gemm",
         "bnb-nf4-dq",
@@ -3122,8 +3106,13 @@ mod tests {
     fn every_variant_of(dir: &Path, presets: &[&str]) -> Vec<ModelParams> {
         let spec =
             load_arch_json(dir).unwrap_or_else(|e| panic!("{} arch.json: {e}", dir.display()));
-        let dense = load_dir(dir, &spec, &Scope::all().with_quants(Vec::<String>::new()))
-            .unwrap_or_else(|e| panic!("load {} dense: {e}", dir.display()));
+        let dense = load_dir(
+            dir,
+            &spec,
+            &Scope::all().with_quants(Vec::<String>::new()),
+            &Shared,
+        )
+        .unwrap_or_else(|e| panic!("load {} dense: {e}", dir.display()));
         let mut bases: Vec<&str> = dense.iter().map(|c| c.source_stem.as_str()).collect();
         bases.sort();
         let mut files: Vec<String> = model_configs(dir)
@@ -3134,7 +3123,7 @@ mod tests {
         files.sort();
         assert_eq!(bases, files, "every config loads as one dense variant");
 
-        let quantized = load_dir(dir, &spec, &Scope::all())
+        let quantized = load_dir(dir, &spec, &Scope::all(), &Shared)
             .unwrap_or_else(|e| panic!("load {} with every preset: {e}", dir.display()));
         let mut got: Vec<&str> = quantized.iter().map(|c| c.source_stem.as_str()).collect();
         got.sort();
@@ -3220,6 +3209,7 @@ mod tests {
             &dir,
             &load_arch_json(&dir).expect("qwen2-vl arch.json"),
             &Scope::all(),
+            &Shared,
         )
         .expect("load qwen2-vl vision configs");
         let mut stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
@@ -3346,7 +3336,8 @@ mod tests {
     #[test]
     fn bounds_are_sorted_by_stem_for_determinism() {
         let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &load_arch_json(&dir).unwrap(), &Scope::all()).unwrap();
+        let configs =
+            load_dir(&dir, &load_arch_json(&dir).unwrap(), &Scope::all(), &Shared).unwrap();
         let stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
         let mut sorted = stems.clone();
         sorted.sort();
@@ -4157,6 +4148,7 @@ mod tests {
             Path::new("/nonexistent/path/to/configs"),
             &Default::default(),
             &Scope::all(),
+            &Shared,
         );
         assert!(matches!(result, Err(ConfigError::NotADirectory(_))));
     }
@@ -4208,6 +4200,7 @@ mod tests {
             &dir,
             &load_arch_json(&dir).expect("llama arch.json"),
             &Scope::all(),
+            &Shared,
         )
         .expect("load llama configs");
         for cfg in &configs {
@@ -4237,7 +4230,7 @@ mod tests {
         .unwrap();
         fs::write(tmp.join("README.txt"), "ignore me").unwrap();
 
-        let configs = load_dir(&tmp, &Default::default(), &Scope::all()).unwrap();
+        let configs = load_dir(&tmp, &Default::default(), &Scope::all(), &Shared).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].source_stem, "model");
 

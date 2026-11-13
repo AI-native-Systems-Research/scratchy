@@ -41,7 +41,7 @@ impl HostBytes {
     /// The bytes themselves, either way. Every read of staged weight bytes
     /// goes through here — byte slices only; no reader may cast these to a
     /// wider type (the mmap's tensor offsets carry no alignment guarantee,
-    /// unlike metal's alias, whose GPU reads SIMD-wide and which therefore
+    /// unlike the GPU target's alias, whose GPU reads SIMD-wide and which therefore
     /// gates on alignment — this backend's readers are all host byte walks).
     pub fn as_slice(&self) -> &[u8] {
         match self {
@@ -108,15 +108,15 @@ impl HostBytes {
 /// contract — "allocate `bytes` and copy `src_host` onto it" — is a host
 /// allocation + `memcpy`. The allocator owns every buffer it hands out and frees
 /// them on drop; the returned pointers stay valid for the allocator's lifetime
-/// (the same ownership model as the Metal allocator).
+/// (the same ownership model as the GPU target's allocator).
 ///
 /// ⭐ THE COPY IS CONDITIONAL ON WHERE THE BYTES ALREADY LIVE: a source that
 /// points into a registered safetensors mmap is ALIASED, not copied — spyre's
 /// "device memory" is host memory, and staging (the bytes' only reader) walks
 /// byte slices, so the mmap's own pages serve directly (MEASURED 2b fp8,
 /// nickm3, 2026-11-10: the unconditional copy was the whole wiring walk —
-/// 1.27s for 2.65 GB at 2.1 GB/s; f16 2.46s). This is metal's zero-copy mmap
-/// alias with the alignment gate dropped, because metal's gate exists for
+/// 1.27s for 2.65 GB at 2.1 GB/s; f16 2.46s). This is the GPU target's zero-copy mmap
+/// alias with the alignment gate dropped, because its gate exists for
 /// SIMD-wide GPU reads of the mapping and this backend's readers are all host
 /// byte walks (see [`HostBytes::as_slice`]).
 #[derive(Default)]
@@ -210,7 +210,7 @@ impl SpyreAllocator {
 }
 
 /// Device-memory witness for the host-backed Spyre allocator. The buffers are
-/// owned by [`SpyreAllocator::allocs`] (the same model metal uses for its
+/// owned by [`SpyreAllocator::allocs`] (the same model the GPU target uses for its
 /// arenas), so the `take_allocations` / `push_alloc` tracking hooks stay at
 /// their no-op defaults and no `SpyreMem` is ever constructed — it exists only
 /// to satisfy the [`DeviceAllocator::Mem`] associated type (`Mem: PoolMemory`)
@@ -236,7 +236,7 @@ impl DeviceAllocator for SpyreAllocator {
     /// `Arc`s; this one is what makes an alias valid after `take` removes the
     /// store's last reference to a tensor's `CpuTensorRef`.
     ///
-    /// ⭐ AND DISPATCH THE PREFETCH THAT RIDES THE BRING-UP (metal's own
+    /// ⭐ AND DISPATCH THE PREFETCH THAT RIDES THE BRING-UP (the GPU target's own
     /// `register_mmap` shape: background `pread`s). The view load's first
     /// reader of the shard pages is staging, after the card join — on a
     /// page-cache-cold boot that puts the whole checkpoint read on the boot

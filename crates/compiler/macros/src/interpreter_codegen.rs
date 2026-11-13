@@ -489,7 +489,7 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let c = lit_u32(c);
             quote! { SharedFusedMoe(#a, #b, #c) }
         }
-        I::MetalFusedMoe(a, b, c, d, e, f, g, h, i) => {
+        I::AffineFusedMoe(a, b, c, d, e, f, g, h, i) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
@@ -499,9 +499,9 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let g = lit_u32(g);
             let h = lit_u32(h);
             let i = lit_u32(i);
-            quote! { MetalFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+            quote! { AffineFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
         }
-        I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, i, j, k) => {
+        I::AffineSharedFusedMoe(a, b, c, d, e, f, g, h, i, j, k) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
@@ -517,7 +517,7 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             } else {
                 quote! { false }
             };
-            quote! { MetalSharedFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j, #k) }
+            quote! { AffineSharedFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j, #k) }
         }
         I::GemmaMoe(a, b, c, d, e, f, g, h, i, j) => {
             let a = lit_u32(a);
@@ -781,15 +781,15 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let a = lit_u32(a);
             quote! { Free(#a) }
         }
-        // Metal-only variants — only emitted on metal builds by the
+        // Variants only one target emits, in its
         // per-arch lowering. The macro-static slice emission walks
         // them through this same path; emit field-for-field literals.
-        I::MetalBiasAdd(a, b, c, d, e) => {
+        I::LinearBiasAdd(a, b, c, d, e) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
             let d = lit_u32(d);
-            quote! { MetalBiasAdd(#a, #b, #c, #d, #e) }
+            quote! { LinearBiasAdd(#a, #b, #c, #d, #e) }
         }
         I::AttentionPrefillPaged(a, b, c, d) => {
             let a = lit_u32(a);
@@ -915,13 +915,12 @@ pub struct LoweredBucket {
     /// into `instances`.
     pub weight_slots: Vec<Vec<WeightSlot>>,
     /// One `barrier_before` flag per entry in `instances`. `true`
-    /// means a concurrency-aware backend (today: metal MTL4
+    /// means a concurrency-aware backend (e.g. an MTL4
     /// encoder) must serialize the dispatched instance against
     /// every prior instance in the bucket. Computed at macro time —
-    /// runtime never re-derives. Read only by metal's codegen — in a
+    /// runtime never re-derives. Read only by a target's codegen — in a
     /// build without it the tape path writes this field but never reads it, and
     /// that is EXPECTED.
-    #[cfg_attr(not(feature = "metal"), expect(dead_code))]
     pub barriers: Vec<bool>,
 }
 

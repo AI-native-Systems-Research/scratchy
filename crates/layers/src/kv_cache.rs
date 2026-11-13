@@ -4,7 +4,7 @@
 //! Layout per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`,
 //! stored as a series of fixed-size chunk buffers. Backend-neutral: storage,
 //! sizing and chunk bookkeeping live here; the actual buffer allocation is a
-//! caller-supplied closure (metal wraps `device.new_buffer`), so this type
+//! caller-supplied closure (a target wraps its device's buffer allocation), so this type
 //! names no backend.
 
 use anyhow::Result;
@@ -43,7 +43,7 @@ pub struct KvCachePool<M: PoolMemory> {
     /// to one group), so co-resident layers never write the same physical block.
     layer_to_tensor: Vec<usize>,
     /// vLLM KV-cache-GROUP layout (distinct from `layer_to_tensor`): number of
-    /// per-group block tables and each layer's group index. The metal worker
+    /// per-group block tables and each layer's group index. The worker
     /// binds `block_tables[layer_to_group[layer]]` / `slot_mappings[...]`.
     /// `None` = uniform single group (every layer → group 0); `Some((n, map))`
     /// for gemma4 SWA (full + N sliding groups). Set from `HybridKvLayout`.
@@ -115,11 +115,11 @@ impl<M: PoolMemory> KvCachePool<M> {
         }
     }
 
-    /// Allocate a **reactive (chunked)** metal KV pool: per layer per
+    /// Allocate a **reactive (chunked)** KV pool: per layer per
     /// K/V, a series of `blocks_per_chunk`-block chunk buffers plus one
     /// chunk-address table buffer (the chunk bytes sum to the whole
     /// pool, last chunk partial), so the `MTLResidencySet` tracks only
-    /// the chunks that back live KV. Metal binds chunk *tables* at the
+    /// the chunks that back live KV. A target binds chunk *tables* at the
     /// `KvCacheK/V` slots (see [`Self::k_chunk_table_mem`]).
     ///
     /// `alloc_chunk(bytes)` allocates a StorageModePrivate chunk data
@@ -128,14 +128,14 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// (host-writable via [`Self::fill_chunk_tables`], also residency-
     /// inserted). The chunk gpuAddresses are written into the tables by
     /// a later `fill_chunk_tables` call (the caller supplies the
-    /// metal-specific `gpuAddress` accessor so this crate stays
+    /// target's device-address accessor so this crate stays
     /// objc2-free).
     ///
     /// # Safety
-    /// Caller must ensure the metal device is initialized on this
+    /// Caller must ensure the target's device is initialized on this
     /// thread.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn new_metal_chunked(
+    pub unsafe fn new_chunked(
         num_layers: usize,
         num_blocks: usize,
         block_size: usize,
@@ -166,7 +166,7 @@ impl<M: PoolMemory> KvCachePool<M> {
     ) -> Result<Self> {
         assert!(blocks_per_chunk > 0, "blocks_per_chunk must be non-zero");
         if dtype.is_fp8() {
-            anyhow::bail!("new_metal_chunked: FP8 cache dtype is not supported");
+            anyhow::bail!("new_chunked: FP8 cache dtype is not supported");
         }
         let num_chunks = num_blocks.div_ceil(blocks_per_chunk);
         let elem = dtype.size_bytes();
@@ -235,7 +235,7 @@ impl<M: PoolMemory> KvCachePool<M> {
         let ceiling_mb =
             (2 * num_tensors * num_blocks * per_block_elems * elem) as f64 / (1024.0 * 1024.0);
         tracing::info!(
-            "KvCachePool(metal chunked, reactive): {num_layers} layers / {num_tensors} physical \
+            "KvCachePool(chunked, reactive): {num_layers} layers / {num_tensors} physical \
              tensors, {initial_chunks}/{num_chunks} chunks resident at init ({initial_mb:.0} MB) — \
              grows on demand up to {num_blocks} blocks ({ceiling_mb:.0} MB ceiling) at \
              {blocks_per_chunk} blocks/chunk ({dtype})"
@@ -264,13 +264,13 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// Per-layer K chunk-address *table* backing memory (the buffer the
     /// kernels bind at the `KvCacheK` slot — a device array of chunk
     /// gpuAddresses, not the cache data). Empty unless built via
-    /// [`Self::new_metal_chunked`].
+    /// [`Self::new_chunked`].
     pub fn k_chunk_table_mem(&self, layer: usize) -> &M {
         &self.k_chunk_tables[self.layer_to_tensor[layer]]
     }
 
     /// Number of vLLM KV-cache GROUPS (per-group block tables). `1` for
-    /// uniform models; `1 + N` sliding for gemma4 SWA. The metal worker
+    /// uniform models; `1 + N` sliding for gemma4 SWA. The worker
     /// allocates this many `slot_mappings` / `block_tables` buffers.
     pub fn num_kv_groups(&self) -> usize {
         self.kv_group_layout.as_ref().map_or(1, |(n, _)| *n)
@@ -327,8 +327,8 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// table (StorageModeShared, host-writable). `gpu_addr` extracts the
     /// 64-bit GPU virtual address of a chunk buffer — the caller
     /// supplies it (`|m| m.buffer().gpuAddress()`) so this crate needs
-    /// no objc2-metal dependency. Call once after
-    /// [`Self::new_metal_chunked`] and (in later phases) again whenever
+    /// no device-API dependency. Call once after
+    /// [`Self::new_chunked`] and (in later phases) again whenever
     /// the chunk set changes.
     pub fn fill_chunk_tables(&self, gpu_addr: impl Fn(&M) -> u64) {
         for tensor in 0..self.num_tensors {
@@ -515,7 +515,7 @@ mod group_shared_tests {
 
     fn build(num_layers: usize, map: Option<Vec<usize>>) -> KvCachePool<MockMem> {
         unsafe {
-            KvCachePool::<MockMem>::new_metal_chunked(
+            KvCachePool::<MockMem>::new_chunked(
                 num_layers,
                 64,
                 16,

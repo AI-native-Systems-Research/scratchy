@@ -8,10 +8,8 @@ description = "Scratchy vision-tower host glue (rope tables, varlen cu_seqlens, 
 [features]
 # Backend-dep-free: this crate is pure-CPU vision host glue (rope tables,
 # cu_seqlens, patch flatten, VisionConfig, MmMetadata). It depends on no
-# backend target; the `metal` feature is a pure source toggle (currently a
-# no-op; reserved for symmetry with sibling crates).
+# backend target and has no target feature.
 default = []
-metal = []
 
 [dependencies]
 scratchy-core-common = { path = "../../core/common" }

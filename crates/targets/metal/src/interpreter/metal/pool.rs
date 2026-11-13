@@ -2481,7 +2481,7 @@ mod tests {
             5632,
             2048,
             0.125,
-            scratchy_ir::model_facts::MetalDtype::Bf16,
+            scratchy_ir::model_facts::ActDtype::Bf16,
         );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
@@ -2663,7 +2663,7 @@ mod tests {
 
         let tapes: Arc<[_]> = Arc::from(vec![synthetic_tape(1)]);
         let pipelines = Arc::new(
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::ACT_DTYPE, TEST_VARIANT)
                 .expect("pipelines"),
         );
 
@@ -2882,7 +2882,7 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         let pipelines = Arc::new(
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::ACT_DTYPE, TEST_VARIANT)
                 .expect("pipelines"),
         );
         // Arena slot for the synthetic RmsNorm: M × hidden_size f16 =

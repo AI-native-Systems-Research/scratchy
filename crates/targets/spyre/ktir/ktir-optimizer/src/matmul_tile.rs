@@ -99,7 +99,7 @@ struct Untiled {
     /// SPLAT itself — as this pass originally did, reading "reused, not rebuilt" one level too
     /// far — is only shape-correct at `m == 1` with one N-block, i.e. decode. On the CPU
     /// interpreter the per-iteration `linalg.matmul` then refuses with `outs shape [31, 512] !=
-    /// product shape [1, 512]` (the Metal/NAX offload never runs the body, so macOS never saw
+    /// product shape [1, 512]` (the emulator's GPU offload never runs the body, so macOS never saw
     /// it — the Linux CI gate did). The splat's SCALAR operand, however, is what must be kept
     /// alive: the splat zeroes an immediate scalar (`scalar(0.0)`), and minting a
     /// fresh constant in place of the operand would orphan the original splat's parameter —

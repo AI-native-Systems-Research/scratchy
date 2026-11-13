@@ -230,12 +230,12 @@ target's verify steps carry exactly that many rows per sequence, and both
 models' kernels bake it. To serve without it, `--num-speculative-tokens 0`:
 
 ```bash
-cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,\
+cargo build --release -p scratchy-target-metal-cli --features serve,model/qwen3.6-35b-a3b,\
 quant/mlx-affine-b4-g64-qembed
 scr serve mlx-community/Qwen3.6-35B-A3B-4bit   # head from mlx-community/Qwen3.6-35B-A3B-MTP-4bit
 scr serve mlx-community/Qwen3.6-35B-A3B-4bit --num-speculative-tokens 0   # no drafting
 
-cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.5-122b-a10b,\
+cargo build --release -p scratchy-target-metal-cli --features serve,model/qwen3.5-122b-a10b,\
 quant/mlx-affine-b4-g64-qembed
 scr serve scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp   # head inside the checkpoint
 ```
@@ -260,7 +260,7 @@ architecture) drafts with it, downloading it on first use. The others compile
 under `spec/mtp` and draft when `--speculative-model` names them:
 
 ```bash
-cargo build --release -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,quant/mlx
+cargo build --release -p scratchy-target-metal-cli --features serve,model/gemma-4-26b-a4b-it,quant/mlx
 scr serve mlx-community/gemma-4-26b-a4b-it-4bit   # drafter: guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit
 ```
 
@@ -392,7 +392,7 @@ reference.
 Add `testdata/<arch>_<size>.json` generated from Python vLLM on the
 same prompts the existing goldens use. Add a
 `test_metal_correctness_<arch>_<size>` in
-`crates/e2e/tests/e_correctness.rs`. Verify the test passes on
+`crates/targets/metal/e2e/tests/e_correctness.rs`. Verify the test passes on
 Metal before claiming the arch is landed:
 
 ```

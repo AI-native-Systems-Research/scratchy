@@ -6,7 +6,7 @@
 //! `scales` and `biases` (`F16`/`BF16`, 2 bytes each) — into a dense `[N, K]`
 //! `F16`/`BF16` weight, as raw little-endian bytes. The dequant rule is
 //! `w[i] = nibble[i] * scale[group(i)] + bias[group(i)]`, computed through an
-//! `f32` intermediate so the single FMA rounding matches the metal kernel's
+//! `f32` intermediate so the single FMA rounding matches the kernel's
 //! hardware fp16/bf16 FMA (see `cpu_golden::affine_dequantize_b4_*` in
 //! scratchy-forward-compiler).
 //!
@@ -151,7 +151,7 @@ pub fn affine_dequant_b4_to_dtype(
                 // bits [0, 24) — exactly 3 bytes — and since group_size (32/64/128)
                 // is a multiple of 8, every 8-element run starts byte-aligned at
                 // byte 3*(i/8). Mirrors MLX's `qdot` bits==3 shifts so a code that
-                // straddles a byte boundary decodes identically to the metal
+                // straddles a byte boundary decodes identically to the GPU
                 // kernels.
                 let total = out_halves.len();
                 let (packs, _rem) = weight_bytes.as_chunks::<3>();

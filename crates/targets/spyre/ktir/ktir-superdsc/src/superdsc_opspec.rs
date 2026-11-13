@@ -245,7 +245,7 @@ impl DataFormat for Fp16 {
 /// fp32 (IEEE_FP32) — 32 elems / 128 B stick, 4 bytes/elem. Used ONLY by the fp32-SFP-merge split-K
 /// accumulation path: the matmul PE stays fp16 (RCUDD1A has no fp32 PE — SEN1P5-only), but the split-K
 /// partials are merged with fp32 SFP `add` ops (`broadcast_ops.ddl` binds "add" for [fp16, fp32]) so the
-/// accumulation approaches the fp32 golden (metal `gemm.metal c_scratch: float`). 4-byte, so the byte/stride
+/// accumulation approaches the fp32 golden (a GPU gemm's `c_scratch: float`). 4-byte, so the byte/stride
 /// math must NOT reuse `Fp16::WORD_LENGTH` for fp32 tensors (the `_bf16`-marker shortcut fails here).
 #[derive(Clone, Copy, Debug)]
 pub enum Fp32 {}

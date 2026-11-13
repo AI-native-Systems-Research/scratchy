@@ -2,7 +2,7 @@
 //! TurboQuant / PolarQuant — a faithful port of arozanov's `turboquant-mlx`
 //! (`turboquant_mlx/{rotation,packing,quantizer}.py`) to Rust. Same algorithm,
 //! same hardcoded Lloyd-Max codebook, same scaling structure, same bit-packing
-//! layout. The host reference; the Metal kernels (`metal.py`) and the
+//! layout. The host reference; a target's GPU kernels and the
 //! dequant-to-buffer + incremental decode cache (`cache.py`) port on top.
 
 // ── rotation.py ────────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ impl std::fmt::Display for KvCodec {
 ///
 /// TurboQuant trades fidelity for KV CAPACITY. Below this, the capacity
 /// is not the constraint and the trade is a bad one. Sized to sit
-/// between the models measured on metal:
+/// between the models measured on device:
 ///
 /// ```text
 /// qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> dense
@@ -315,7 +315,7 @@ impl std::fmt::Display for KvCodec {
 /// measurement of them (#275), not on this definition.
 pub const MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
 
-/// The widest head the codec's metal kernels take: their threadgroup arrays
+/// The widest head the codec's kernels take: their threadgroup arrays
 /// hold one element per thread of a head.
 pub const MAX_HEAD_DIM: u32 = 512;
 
@@ -411,8 +411,8 @@ pub const SCRATCH_ELEM_BYTES: usize = 2;
 /// Bytes one token's K and V cost in a KV pool of `num_layers` layers of
 /// `num_kv_heads × head_dim` stored as `codec`: dense, every layer's
 /// `dense_elem_bytes`-wide row; TurboQuant, every layer's packed codes and
-/// norms ([`bytes_per_vec`]) plus the one-layer fp16 scratch — what the metal
-/// target's `build_tq_provision` allocates per token.
+/// norms ([`bytes_per_vec`]) plus the one-layer fp16 scratch — what a
+/// target's provisioning allocates per token.
 pub fn kv_bytes_per_token(
     codec: KvCodec,
     num_layers: usize,
@@ -431,7 +431,7 @@ pub fn kv_bytes_per_token(
 
 /// What one block of `block_size` tokens takes in each store a TurboQuant pool lays out: a
 /// layer's packed codes, and its norms (one K or V each), and the one-layer fp16 scratch — as the
-/// metal target's `build_tq_provision` lays them out, one source for it and for whoever must know
+/// target's provisioning lays them out, one source for it and for whoever must know
 /// each store's bytes (the runs a shared KV budget maps apart).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TqBlockBytes {
@@ -463,8 +463,8 @@ pub fn scratch_bytes_per_token(num_kv_heads: usize, head_dim: usize) -> usize {
 /// hand that buffer to ordinary attention. Per-token dequant is independent, so
 /// the incremental buffer is bit-identical to a full re-dequant; this struct is
 /// the host correctness reference for that mechanism before the paged-cache +
-/// worker wiring. (Production metal attention reads the packed store itself,
-/// `attention.metal`; this uses the host quantizer to validate the logic.)
+/// worker wiring. (A target's attention reads the packed store itself
+/// on device; this uses the host quantizer to validate the logic.)
 pub struct TurboQuantKvStore {
     q: PolarQuantizer,
     pdim: usize,
@@ -636,7 +636,7 @@ mod tests {
         }
     }
 
-    /// Fidelity at every head_dim the metal path actually provisions,
+    /// Fidelity at every head_dim a target actually provisions,
     /// not just 128. `qwen2.5-0.5b` (head_dim 64) decoded garbage under
     /// TurboQuant while `llama-3.2-1b` (also 64) was fine, so the
     /// question "is the CODEBOOK weak at 64?" needed an answer that was

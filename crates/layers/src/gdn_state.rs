@@ -13,7 +13,7 @@
 //!
 //! The conv ring and the draft lanes' records are **f32** everywhere (every
 //! `gdn_*` kernel reads and writes them as `device float*`); the ssm state's
-//! element dtype is the worker's to declare (`ssm_dtype` — metal's kernels read
+//! element dtype is the worker's to declare (`ssm_dtype` — one target's kernels read
 //! and write it as `device half`), its arithmetic f32 either way. The slot a sequence owns is
 //! decided host-side by the forward compiler's `GdnSlotAllocator`;
 //! the per-step `state_indices` tensor (one slot id per batched sequence) is
@@ -26,8 +26,8 @@
 //! takes the model's global layer index directly) while not wasting the large
 //! `ssm_state` allocation on full-attention layers.
 //!
-//! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (metal
-//! wraps `device.new_buffer`); the layout /
+//! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (a target
+//! wraps its device's buffer allocation); the layout /
 //! sizing / accessor logic is backend-neutral.
 //!
 //! **Checkpoints (speculative decoding).** A verify step runs a sequence's last token and its
@@ -60,8 +60,8 @@ use std::num::NonZeroU16;
 use anyhow::Result;
 use scratchy_tensors::{DType, GpuTensor, PoolMemory, TensorView};
 
-/// The conv-state ring and the draft lanes' records are f32: every GDN kernel, metal's and
-/// cuda's, reads and writes them as `device float*`.
+/// The conv-state ring and the draft lanes' records are f32: every GDN kernel, every
+/// target's, reads and writes them as `device float*`.
 pub const GDN_CONV_AND_RECORD_DTYPE: DType = DType::F32;
 
 /// The drafts a verify step carries: it checkpoints the conv state after, and records the ssm
@@ -636,7 +636,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
         unsafe { TensorView::from_raw(t) }
     }
 
-    /// Per-layer conv-state backing memory (metal ICB binding). Panics if the
+    /// Per-layer conv-state backing memory (a device binding). Panics if the
     /// layer is not a GDN layer.
     pub fn conv_layer_mem(&self, layer: usize) -> &M {
         self._conv_ptrs[layer]
@@ -644,7 +644,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
             .expect("GdnStatePool::conv_layer_mem: layer is not a GDN layer")
     }
 
-    /// Per-layer ssm-state backing memory (metal ICB binding). See
+    /// Per-layer ssm-state backing memory (a device binding). See
     /// [`Self::conv_layer_mem`].
     pub fn ssm_layer_mem(&self, layer: usize) -> &M {
         self._ssm_ptrs[layer]
@@ -652,7 +652,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
             .expect("GdnStatePool::ssm_layer_mem: layer is not a GDN layer")
     }
 
-    /// Per-layer backing memory of the draft lanes' conv checkpoints (metal ICB binding); `None`
+    /// Per-layer backing memory of the draft lanes' conv checkpoints (a device binding); `None`
     /// on a non-GDN layer or a pool without lanes.
     pub fn conv_lanes_mem(&self, layer: usize) -> Option<&M> {
         self.conv_lanes.get(layer)?.as_ref()
@@ -743,7 +743,7 @@ mod tests {
             |slots, lanes| GdnStatePool::<NoMem>::reserve_bytes(30, slots, lanes, dims, DType::F16);
         let plain = pool(128, None);
         let lanes = DraftLanes::new(rows, 4);
-        // A slot's entry: its f32 conv ring, its ssm state at the metal kernels' half width.
+        // A slot's entry: its f32 conv ring, its ssm state at the kernels' half width.
         let entry = 4 * dims.conv_entry_len() + 2 * dims.ssm_entry_len();
         assert_eq!(plain, 30 * 128 * entry);
         // A lane is the draft area every slot used to carry: (k + 1) conv checkpoints and two

@@ -71,7 +71,7 @@ tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 rand = { workspace = true }
 # Only `server.rs` (behind `serve`) names it, and it stays optional for that
-# reason: the `scratchy-models` build script compiles its own copy of the stack
+# reason: a target's models build script compiles its own copy of the stack
 # below `ureq`, which enables `http` WITHOUT `default`. Enabling `http/default`
 # in the binary too gives the two copies different feature sets, and cargo then
 # compiles every crate between them (the target backend crate, scratchy-layers,

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! `scr model cache clean` — reclaim disk space from on-disk model caches.
+//! `model cache clean` — reclaim disk space from on-disk model caches.
 //!
 //! Scans two caches:
 //!   1. The HuggingFace Hub cache (`~/.cache/huggingface/hub`, downloaded
 //!      checkpoints) — one entry per `models--org--name` directory.
-//!   2. The scratchy weight cache (`~/.cache/scratchy/metal-aligned-weights`,
-//!      realigned weight blobs scratchy writes so it can mmap them zero-copy
+//!   2. The scratchy weight caches (`~/.cache/scratchy/<target>-aligned-weights`,
+//!      realigned weight blobs a target writes so it can mmap them zero-copy
 //!      on relaunch) — one entry per `<hash>-<stem>` sidecar group.
 //!
 //! By default it removes entries not used in the last 30 days (`--days N`
@@ -45,16 +45,11 @@ pub async fn run_cache_clean(args: CacheCleanArgs) -> anyhow::Result<()> {
     let now = SystemTime::now();
 
     let hf_root = hf_cache_dir();
-    let weight_root = scratchy_core_common::cache::metal_aligned_weights_dir();
+    let weight_root = scratchy_core_common::cache::aligned_weights_root();
 
     let key_to_model = build_weight_key_to_model(&hf_root);
     let hf = select_stale(scan_hf_cache(&hf_root), args.nuke, args.days, now);
-    let weights = select_stale(
-        scan_weight_cache(&weight_root, &key_to_model),
-        args.nuke,
-        args.days,
-        now,
-    );
+    let weights = select_stale(scan_weight_caches(&key_to_model), args.nuke, args.days, now);
 
     let count = hf.len() + weights.len();
     if count == 0 {
@@ -117,11 +112,11 @@ pub async fn run_cache_inspect(args: CacheInspectArgs) -> anyhow::Result<()> {
     let now = SystemTime::now();
 
     let hf_root = hf_cache_dir();
-    let weight_root = scratchy_core_common::cache::metal_aligned_weights_dir();
+    let weight_root = scratchy_core_common::cache::aligned_weights_root();
 
     let key_to_model = build_weight_key_to_model(&hf_root);
     let mut hf = scan_hf_cache(&hf_root);
-    let mut weights = scan_weight_cache(&weight_root, &key_to_model);
+    let mut weights = scan_weight_caches(&key_to_model);
     sort_entries(&mut hf, &args.sort);
     sort_entries(&mut weights, &args.sort);
 
@@ -188,7 +183,15 @@ fn scan_hf_cache(root: &Path) -> Vec<CacheEntry> {
     out
 }
 
-/// Scan the scratchy weight cache. Files are first grouped by their shared
+/// Scan every target's aligned-weight cache ([`scratchy_core_common::cache::aligned_weights_dirs`]):
+/// the caches are pure files, whichever target wrote them, so every build reads them all.
+fn scan_weight_caches(key_to_model: &BTreeMap<String, String>) -> Vec<CacheEntry> {
+    (scratchy_core_common::cache::aligned_weights_dirs().iter())
+        .flat_map(|root| scan_weight_cache(root, key_to_model))
+        .collect()
+}
+
+/// Scan one target's aligned-weight cache. Files are first grouped by their shared
 /// `<hash>-<stem>` sidecar key (so the `.bin`, `.meta.json`, `.lock`, and
 /// any orphaned `.tmp.<pid>` stay together), then folded into one entry per
 /// **model** when `key_to_model` resolves the source — a sharded model's
@@ -266,8 +269,8 @@ fn scan_weight_cache(root: &Path, key_to_model: &BTreeMap<String, String>) -> Ve
     entries.into_values().collect()
 }
 
-/// Build a `<hash>-<stem>` → `org/model` map by replaying the metal
-/// allocator's sidecar-naming hash over every safetensors file in the HF
+/// Build a `<hash>-<stem>` → `org/model` map by replaying the aligned-weight
+/// sidecar-naming hash over every safetensors file in the HF
 /// cache. The hash (`DefaultHasher` over the canonicalized source path,
 /// stem = the shard filename) is deterministic across runs, so the
 /// sidecar names are reproducible and reversible to a model id here. All
@@ -311,8 +314,8 @@ fn build_weight_key_to_model(hf_root: &Path) -> BTreeMap<String, String> {
 }
 
 /// The sidecar group key (`<hash>-<stem>`) a given source safetensors file
-/// would produce — mirrors `scratchy_target_metal::metal_allocator`'s
-/// `aligned_cache_meta`.
+/// would produce — the same naming the target's allocator writes its sidecars under
+/// (`aligned_cache_meta`).
 fn sidecar_key_for_source(path: &Path, stem: &str) -> String {
     use std::hash::{Hash, Hasher};
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());

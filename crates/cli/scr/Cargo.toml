@@ -3,158 +3,77 @@ name = "scratchy-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "`scr`: the scratchy inference engine CLI"
+description = "The scratchy CLI's common core: every command, its arguments and `run`, shared by each target's binary (`scr` on Apple silicon, `spyre` on IBM Spyre)"
 
+# A library, no binary: each target's CLI crate (`crates/targets/<target>/cli`) parses its command
+# line, links its target's worker and runs these commands through `scratchy_cli::run`. Nothing here
+# names a target: the engine serves through the worker the binary links (`linked_factory`).
 [features]
-# `multimodal` now actually gates the image-decode stack (scratchy-vision /
-# image / png / zune-jpeg / ...) — it used to be a no-op default because
-# vision was unconditionally compiled anyway. Off by default so a plain
-# `-Fmetal` build is genuinely chat-only-sized; pass `--features
-# chat,multimodal` (or `--features metal,multimodal`) explicitly for vision.
-#
-# Shell tab completion over real HuggingFace model ids is ON by default:
-# scratchy-models' `hf-completions`, whose build script resolves the candidate
-# list against huggingface.co at build time (see docs/BUILD.md). Completing
-# model names is the point of `scr completions`, and a binary that silently
-# can't do it is the confusing case, not the useful one. Named here, not as a
-# feature of this crate, like every scratchy-models feature (see `metal`).
-#
-# `model?/...` is a WEAK dependency feature on purpose: it fires only when the
-# `model` dep is actually activated (i.e. the build named a `-Fmodel/<stem>`).
-# A build with no model scope compiles no registry to fill, and a CI run that
-# enables `scratchy-models/all` directly reaches scratchy-models rather than
-# through this edge, so neither pays for a Hub query it has no use for.
-#
-# To build with NO network access at all (air-gapped), drop the defaults:
-#   cargo build -p scratchy-cli --no-default-features --features chat,metal,model/<stem>
-default = ["chat", "model?/hf-completions"]
+default = ["chat"]
 
-# The in-process ENGINE (local model inference), no HTTP server: `scr chat`
+# The in-process ENGINE (local model inference), no HTTP server: `chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
-# feature, so no axum). A backend feature adds the target's worker.
+# feature, so no axum). A target's binary adds its worker.
 chat = ["dep:scratchy-serving-api"]
-# The OpenAI/Anthropic HTTP server ON TOP of the engine: `scr serve` (and the
+# The OpenAI/Anthropic HTTP server ON TOP of the engine: `serve` (and the
 # offline `batch` command). Adds axum/tower via scratchy-serving-api/serve.
 # Pulls `guided-decoding` too: OpenAI's `response_format: json_schema` /
-# grammar constraints are a server-side request field — `scr chat` never
+# grammar constraints are a server-side request field — `chat` never
 # exposes a grammar flag, so plain `chat` builds skip the llguidance stack
 # (17 crates incl. a duplicate `tokenizers` pulled by toktrie_hf_tokenizers,
 # which is pinned to tokenizers 0.21 upstream while we're on 0.23).
 serve = ["dep:scratchy-serving-api", "scratchy-serving-api/serve", "guided-decoding"]
-# `scr launch claude` spawns `<this binary> serve` as a child, so it needs the
+# `launch claude` spawns `<this binary> serve` as a child, so it needs the
 # server compiled in.
 claude = ["serve"]
 
 otel = ["scratchy-serving-api?/otel"]
 bench = ["scratchy-bench"]
-# The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
+# The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `bench
 # serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
 bench-datasets = ["bench", "scratchy-bench/datasets"]
-# `dep:scratchy-forward-compiler` surfaces
-# `BackboneDumpRegistration` + `Instruction::normalize` so
-# `scr model info` works on metal builds. Backends enable the ENGINE and their target's worker,
-# not the HTTP server — a backend is only meaningful with local
-# inference.
-#
-# `metal` is `metal-base` with two scratchy-models features on. They are named here, not as features of this crate:
-# `model/<feature>` already reaches every scratchy-models feature (see
-# `tests/arch_feature_passthrough.rs`).
-#
-# `turboquant` — TurboQuant KV compression. Every metal model whose geometry
-# the codec takes stores its KV cache as TurboQuant codes; the rest stay dense,
-# and the build output names them. `--kv-cache-dtype` cannot change it at
-# runtime.
-#
-# `mtp-heads` — multi-token-prediction drafting. Every selected model whose
-# checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
-# selected model whose drafter is published as a model of its own (Gemma 4
-# 26B-A4B's assistant at MLX 4-bit g32, under `quant/mlx`). Serving the model
-# drafts with it; a checkpoint whose head is nowhere serves without drafting.
-# `spec/mtp` adds the other published drafters (Gemma 4's bf16 and QAT
-# assistants), which draft only when `--speculative-model` names them.
-#
-# `metal-base` alone builds the same engine with a dense KV cache and no MTP
-# heads; add `model/mtp-heads` back for drafting over a dense cache.
-metal-base = ["dep:scratchy-serving-api", "dep:scratchy-target-metal-worker", "dep:scratchy-forward-compiler"]
-metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
 # build grammar support into a non-`serve` binary.
-guided-decoding = ["scratchy-serving-api?/guided-decoding", "scratchy-target-metal-worker?/guided-decoding"]
+guided-decoding = ["scratchy-serving-api?/guided-decoding"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
-# its `scratchy-vision`/`image` deps optional-and-on, forwards
-# `scratchy-forward-compiler/vision`, and the metal worker's `vision`
-# when that target is linked, so a plain
-# `chat` build (no `multimodal`) never compiles image/png/zune-jpeg/etc.
-multimodal = ["scratchy-serving-api?/multimodal", "scratchy-target-metal-worker?/vision"]
+# its `scratchy-vision`/`image` deps optional-and-on and forwards
+# `scratchy-forward-compiler/vision`, so a plain `chat` build (no
+# `multimodal`) never compiles image/png/zune-jpeg/etc.
+multimodal = ["scratchy-serving-api?/multimodal"]
 tls = ["scratchy-serving-api?/tls"]
 metrics = ["scratchy-serving-api?/metrics"]
-# EXPERIMENTAL, off by default, and deliberately not a `scr serve` flag: see
+# EXPERIMENTAL, off by default, and deliberately not a `serve` flag: see
 # the feature's own comment in crates/serving/api/Cargo.toml.
 tool-spans = ["scratchy-serving-api?/tool-spans"]
 rag = ["scratchy-serving-api?/rag"]
 
-# Model scope (which archs/configs compile into scratchy-models) is NOT
-# re-declared here. `model` above is a local rename of the scratchy-models
-# dependency edge (`package = "scratchy-models"`), and Cargo's `pkg/feature`
-# CLI syntax resolves against that local name and activates the (optional)
-# dependency itself — no passthrough feature needed. So `-p scratchy-cli
-# --features model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel`
-# works directly, reaching straight into scratchy-models' own
-# arch-<name>/<stem>/<arch> (bare, e.g. `granite`)/all features — no
-# `model-` text prefix on `<stem>`, the `model` alias already says that
-# (`model/granite` is shorthand for "all granite models"). Quant presets are
-# a SEPARATE crate, scratchy-quantizations, aliased `quant` below (Cargo
-# forbids aliasing one crate under two names, so `model`/`quant` can't both
-# point at scratchy-models); speculative-decoding drafters likewise live on
-# scratchy-spec, aliased `spec`. scratchy-models has no default model scope
-# (`default-features = false` below) — naming zero is a build-time panic,
-# not a silently empty binary.
-
-# The shared commands, as a library a target's own binary runs them through.
 [lib]
 name = "scratchy_cli"
 path = "src/lib.rs"
 
-[[bin]]
-name = "scr"
-path = "src/main.rs"
-
 [dependencies]
-# The target's worker: the `WorkerFactory` the engine serves through. The engine never names a
-# concrete worker, so `main.rs` anchors it with an `extern crate ... as _`.
-scratchy-target-metal-worker = { workspace = true, optional = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-serving-api = { workspace = true, optional = true }
 scratchy-core-model = { workspace = true }
-scratchy-forward-compiler = { path = "../../compiler", optional = true }
+# The compiled variants' dumps (`BackboneDumpRegistration`), which `model info` and its stem
+# completion walk.
+scratchy-forward-compiler = { path = "../../compiler" }
+# The model scope's compiled HF registry (`compiled_hf_registry()`), which `model names`
+# completes from. A target's binary turns it on (`features = ["model"]`).
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
-# Purely for CLI feature-reachability, like `quant` below: `--features spec/mtp`
-# compiles the MTP head of every selected model that has one. scratchy-spec's
-# features forward to scratchy-models (this same `model` instance).
-spec = { package = "scratchy-spec", path = "../../models/spec", optional = true }
-# Purely for CLI feature-reachability — nothing here calls into
-# scratchy-quantizations directly. Quant-preset build scope (no `quant-`
-# text prefix on the feature names — the alias already says that) lives on
-# that crate, not on `model` (scratchy-models), because Cargo forbids
-# aliasing one crate under two different names — `model` and `quant` have
-# to be two different crates. scratchy-models depends on this same crate
-# and its build script reads the enabled presets from it, so
-# `--features quant/mlx-affine-b4-g32` lands on the instance it reads.
-quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-dotenvy = { workspace = true }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 libc = { workspace = true }
-# ureq, not reqwest: see src/http.rs. Not optional — `scr chat --url`
-# and `scr complete` are always built, and ureq is already in the tree via
+# ureq, not reqwest: see src/http.rs. Not optional — `chat --url`
+# and `complete` are always built, and ureq is already in the tree via
 # hf-hub-downloader, so they cost no additional crates.
 ureq = { workspace = true }
 

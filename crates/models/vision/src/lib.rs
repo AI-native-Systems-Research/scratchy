@@ -198,7 +198,7 @@ impl VisionConfig {
     /// shape `[total_l, half_rot]` row-major (theta_h's then theta_w's
     /// per token). Identical position logic to
     /// [`Self::build_rope_cos_sin_bf16`] but emits the raw angles
-    /// `theta = pos * inv_freq` instead of their cos/sin — the metal
+    /// `theta = pos * inv_freq` instead of their cos/sin — the
     /// `vision_rope_2d` kernel reads `freqs` and computes cos/sin
     /// internally.
     pub fn build_rope_freqs_f32(&self, grid_thw: &[(u32, u32, u32)], total_l: usize) -> Vec<f32> {
@@ -346,7 +346,7 @@ impl VisionConfig {
     /// torch-style bicubic: kernel a = -0.75, `align_corners = false`
     /// (`src = (dst + 0.5)·in/out − 0.5`), out-of-range taps dropped and
     /// the remaining weights renormalized (mirrors mlx-vlm
-    /// `kernels.bicubic_interpolate`'s accumulate-and-normalize Metal
+    /// `kernels.bicubic_interpolate`'s accumulate-and-normalize GPU
     /// path; numpy transcription == mlx golden, cosine 0.9999991 — see
     /// tools/vision_parity).
     ///
@@ -693,7 +693,7 @@ fn invert_permutation(perm: &[u32]) -> Vec<u32> {
 /// pattern: reshape to `[L/S², S²·inner]`, gather by `window_index`,
 /// reshape back to `[L, inner]`.
 /// f32 sibling of [`permute_rows_block_grouped_bf16`] — same S²-block
-/// row permutation over an f32 table. Used for the metal `freqs`
+/// row permutation over an f32 table. Used for the `freqs`
 /// angle extern on windowed towers (Qwen2.5-VL): the `vision_rope_2d`
 /// kernel reads per-token angle rows, so window-permuted tokens need
 /// window-permuted rows.

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! The scratchy CLI's commands, shared by every target's binary: `scr` (metal) and any target's
-//! own binary each parse their command line, link their target's worker, and run the shared
+//! The scratchy CLI's commands, shared by every target's binary (`scr`, `spyre`): each target's
+//! binary parses its command line, links its target's worker, and runs the shared
 //! subcommands through [`run`]. Nothing here names a worker: the engine serves through the one
 //! the binary links (`linked_factory`).
 
@@ -60,7 +60,6 @@ pub async fn run<C: clap::CommandFactory>(command: Commands) -> anyhow::Result<(
                         commands::cache::run_cache_inspect(args).await
                     }
                 },
-                #[cfg(feature = "metal")]
                 ModelSubcommand::Info(args) => commands::model_info::run_info(args).await,
                 #[cfg(feature = "model")]
                 ModelSubcommand::Names(args) => commands::model::run_model_names(args).await,

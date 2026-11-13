@@ -4,15 +4,15 @@
 //! Owns a device allocation behind a [`GpuTensor`] descriptor and releases it
 //! on `Drop`. The backend-specific lifecycle is captured in two thunks at
 //! construction so this type names no backend:
-//! - `free` runs on `Drop` (Metal's thunk simply owns the `MTLBuffer`,
+//! - `free` runs on `Drop` (a thunk may simply own the device buffer,
 //!   releasing it when dropped).
 //! - `detach` runs in [`OwnedTensor::into_gpu_tensor`] to hand ownership out
-//!   without freeing (Metal has nothing to detach).
+//!   without freeing (a thunk that only owns its buffer has nothing to detach).
 
 use crate::dtype::DType;
 use crate::tensor::{GpuTensor, TensorView};
 
-// Not `Send + Sync`: the metal thunk captures a retained buffer. The struct's `unsafe impl Send/Sync` below
+// Not `Send + Sync`: a thunk may capture a retained buffer. The struct's `unsafe impl Send/Sync` below
 // asserts the whole `OwnedTensor` is safe to move across threads (same
 // contract the previous per-backend struct upheld with its raw fields).
 type FreeThunk = Box<dyn FnMut(*mut u8, usize)>;

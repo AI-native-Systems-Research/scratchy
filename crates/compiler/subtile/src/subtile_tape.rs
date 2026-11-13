@@ -1391,7 +1391,7 @@ fn reroll_fingerprint(instr: &Instr, classes: &[u64]) -> u64 {
 /// body.
 ///
 /// [`reroll_subtile_tape`] uses it to build the rolled tape a looping target lowers. A target
-/// that emits its own instruction stream — metal — asks for the same answer here and maps it
+/// that emits its own instruction stream asks for the same answer here and maps it
 /// through its own step→instruction spans, instead of re-searching its stream for a repeating
 /// run. ONE search, one answer, so the two targets cannot disagree about where the layer
 /// boundary is.
@@ -1470,7 +1470,7 @@ pub enum RollPlan {
 
 /// ⭐ THE TAPE'S LAYERS AS SLICES — the shared half of every class-aware roll.
 ///
-/// [`layer_class_plan`] (metal) and [`reroll_layer_classes`] (a looping target) both need the
+/// [`layer_class_plan`] (a target with its own stream) and [`reroll_layer_classes`] (a looping target) both need the
 /// same answer: where each layer's steps live on the un-rolled tape, which ABSOLUTE layer it is,
 /// and where the pre-layer prefix / post-layer suffix start. Derived ONCE here so the two targets
 /// cannot disagree about where the layer boundary is — the same discipline as

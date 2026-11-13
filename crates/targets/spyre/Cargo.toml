@@ -15,7 +15,7 @@ tp-8 = ["ktir-superdsc/tp-8"]
 # only present/linked on a Spyre host. Pulls in `scratchy-subtile` because the session setters take
 # its `sdsc_abstract` law types (mask stride / fold pages / mask blocks / int stride) rather than
 # u64s, and owns the `flex-rs` dependency — flex-rs's build.rs cc-compiles its senlib shim, which
-# only exists on a Spyre host, so flex-rs must NOT be pulled into a metal/emit-only build.
+# only exists on a Spyre host, so flex-rs must NOT be pulled into an emit-only or non-Spyre build.
 # `runtime`, the only module that touches flex-rs, is gated on this same feature.
 #
 # THE FEATURE TIERS. Cargo features are ADDITIVE, so a device is chosen by naming it, never by
@@ -111,8 +111,8 @@ ktir-core = { path = "ktir/ktir-core" }
 # path OTHER than a `scratchy-subtile` re-export, this crate must name it directly. Feature-free and
 # unconditional, like `ktir-core`: the lowering is not a device.
 ktir-superdsc = { path = "ktir/ktir-superdsc" }
-# No `metal` feature forced here: the emulator's build.rs enables its Metal/NAX
-# backend automatically on macOS (`cfg(metal)` from `CARGO_CFG_TARGET_OS`), so the
+# No emulator GPU feature forced here: the emulator's build.rs enables its Apple GPU
+# backend automatically on macOS (its own cfg from `CARGO_CFG_TARGET_OS`), so the
 # feature would only ever force `objc2` (Apple-only) onto a Linux build — which
 # cannot compile it. macOS keeps the backend; Linux falls back to the naive
 # sgemm parity oracle in the emulator's `blas.rs`.

@@ -297,7 +297,6 @@ pub fn insert_lm_head_allgather(fuf: &mut Fuf, program: &Program, tp_world_size:
 /// effect: image content is functionally invisible to the LM, so
 /// outputs are independent of which image was sent (R1 red and R2 blue
 /// produce byte-identical first-token logits when the bug is live).
-#[cfg(feature = "metal")]
 pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
     let mut insertions: Vec<TileId> = Vec::new();
     for node in &fuf.nodes {
@@ -342,7 +341,6 @@ pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
 /// from `src_id` and one Scalar — i.e. the `x * scalar` pattern that
 /// `ScalarMulImpl` claims. Returns the Mul's TileId so the caller can
 /// place a splice after it. Returns `None` if no such consumer exists.
-#[cfg(feature = "metal")]
 fn scalar_mul_consumer(fuf: &Fuf, src_id: TileId) -> Option<TileId> {
     fuf.nodes.iter().find_map(|n| {
         if n.op != OpKind::Mul || n.inputs.len() != 2 {

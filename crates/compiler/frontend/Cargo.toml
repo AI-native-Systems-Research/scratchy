@@ -10,9 +10,6 @@ license.workspace = true
 # crate's build script (the typed-Rust emit pass, whose output the macro crate's own compile
 # type-checks).
 [features]
-# The backend whose lowering constructs the lowering-only op kinds (`OpKind::MmEmbedSplice`): the
-# macro crate forwards it here, so the op exists exactly where it did.
-metal = []
 # The fixtures the macro crate's tests build programs from (`parse_python::parse_body`, the
 # literal and llama-convention weights manifests): on in that crate's dev-dependency edge only.
 test-support = []

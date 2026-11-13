@@ -651,7 +651,7 @@ pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// multiplies the score tile by `f16(s)` once, exactly as the emulator's program
 /// (`qk · SCALE` on the f16 dot) does. The SPLIT norm pair
 /// (`RmsNormReduce`/`RmsNormApply`) is absent for the same reason it is absent
-/// from the census: it is host-routed on spyre (metal's `decompose_rmsnorm` is the
+/// from the census: it is host-routed on spyre (the GPU target's `decompose_rmsnorm` is the
 /// only producer), and a host-routed eps never becomes a device scalar — staging
 /// it would mis-model host-exact glue.
 ///

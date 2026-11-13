@@ -94,22 +94,22 @@ pub enum BridgeError {
     /// emit (fp8 needs the weight_scale wired as a 3rd Gemm input + 1-byte staging; int4/ggml unwired).
     /// A build-time refusal — NOT a silent mis-lower of a packed weight as dense fp16.
     UnsupportedWeight { tile: TileId, detail: &'static str },
-    /// METAL HAS NO KERNEL for this shape at all — not a gap in the
-    /// bridge, a gap in the backend. Distinct from
+    /// NO KERNEL takes this shape at all — not a gap in the bridge, a gap
+    /// in the kernels. Distinct from
     /// [`Self::UnsupportedWeight`] because the two are handled
     /// differently: this one is TOLERATED the way the runtime-lowering
     /// path tolerated it (the preset bakes an empty variant list and
     /// the pool refuses at load), while a bridge gap must stay fatal
     /// or the front-end swap silently drops a tile.
-    NoMetalRealization { tile: TileId, detail: &'static str },
+    NoKernel { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
     UnrealizedExpertActivation { tile: TileId, act: String },
 }
 
 impl BridgeError {
-    /// See [`Self::NoMetalRealization`].
-    pub fn is_no_metal_realization(&self) -> bool {
-        matches!(self, Self::NoMetalRealization { .. })
+    /// See [`Self::NoKernel`].
+    pub fn is_no_kernel(&self) -> bool {
+        matches!(self, Self::NoKernel { .. })
     }
 }
 
@@ -152,7 +152,7 @@ impl std::fmt::Display for BridgeError {
                  and no kernel implements a third",
                 tile.0
             ),
-            Self::NoMetalRealization { tile, detail } => {
+            Self::NoKernel { tile, detail } => {
                 write!(f, "tile {}: {detail}", tile.0)
             }
             Self::UnrealizedExpertActivation { tile, act } => write!(
@@ -240,7 +240,7 @@ struct Builder<'a> {
     /// directly (an in-graph `Concat`-tile of an identical `[1, head_dim]` row
     /// crashes the DeepTools partitioner; see `guard_known_crash_patterns`).
     /// GQA needs two widths (Q: `n_q_heads*hd`, K: `n_kv_heads*hd`). The eval /
-    /// ktir / metal consumers read the first `head_dim` and broadcast, so a
+    /// every target's consumers read the first `head_dim` and broadcast, so a
     /// wider source is backward-compatible for them.
     cos_sin: BTreeMap<(u32, bool), (usize, usize)>,
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
@@ -677,7 +677,7 @@ pub fn lower_decode_to_wavefront(
 
     // Topological walk over `fuf.nodes`. The bridge's resolver looks
     // up each input's producer in `bx.produced`, so a tile must be
-    // visited only AFTER every tile-input it references. Metal's
+    // visited only AFTER every tile-input it references. A target's
     // post-fusion FUF happens to be stored in ascending-id topo order
     // (which is why the original `for node in &fuf.nodes` loop
     // sufficed), but cuda's fusion pass reorders ids — so we must
@@ -746,7 +746,6 @@ pub fn lower_decode_to_wavefront(
             // the splice's output slot so downstream tiles read the
             // same `EmbeddedHidden` source. No op is emitted
             // — this op is structurally absent from the megakernel.
-            #[cfg(feature = "metal")]
             OpKind::MmEmbedSplice => {
                 let upstream = bx.input_at(tile, 0)?;
                 let producer = match upstream {
@@ -859,7 +858,7 @@ pub fn lower_decode_to_wavefront(
                     // qfp8ch quant + matmulfp8 (fp8×fp8→fp16) + `a_scale·w_scale` dequant. Feed it the
                     // per-channel `weight_scale` as the 3rd input; the worker loads the 1-byte weight + scale.
                     Some(crate::quantization::StorageFormat::Fp8 { .. }) => GemmWeight::Fp8Dynamic,
-                    // MLX-affine packed weights — the format every 4-bit metal checkpoint
+                    // MLX-affine packed weights — the format every 4-bit MLX checkpoint
                     // ships. `k` is the activation's column count, checked here against the
                     // group so a weight whose groups do not tile K cannot be lowered.
                     Some(crate::quantization::StorageFormat::Affine { bits, group_size }) => {
@@ -1437,10 +1436,10 @@ pub fn lower_decode_to_wavefront(
                         (*group_size, *bits)
                     }
                     _ => {
-                        return Err(BridgeError::NoMetalRealization {
+                        return Err(BridgeError::NoKernel {
                             tile,
-                            detail: "MoE without affine expert storage has no metal \
-                                     realization (dense MoE is unclaimed on metal)",
+                            detail: "MoE without affine expert storage has no kernel \
+                                     (no expert kernel takes dense expert storage)",
                         });
                     }
                 };
@@ -1755,10 +1754,10 @@ pub fn lower_decode_to_wavefront(
                         (*group_size, *bits)
                     }
                     _ => {
-                        return Err(BridgeError::NoMetalRealization {
+                        return Err(BridgeError::NoKernel {
                             tile,
-                            detail: "gptoss_moe without affine expert storage has no metal \
-                                     realization (dense MoE is unclaimed on metal)",
+                            detail: "gptoss_moe without affine expert storage has no kernel \
+                                     (no expert kernel takes dense expert storage)",
                         });
                     }
                 };
@@ -1821,8 +1820,8 @@ pub fn lower_decode_to_wavefront(
                 // are the capping ones, so it is present whenever this arm runs.
                 // Read at the same site every other model-const scalar is (the
                 // parsed `scalars` table, which hoists nested `text_config`),
-                // and carried on the op so the tape holds it — metal/cuda bake
-                // it into kernels and a target may bind it as a registry const.
+                // and carried on the op so the tape holds it — a target may bake
+                // it into kernels or bind it as a registry const.
                 let cap = bx
                     .model
                     .scalars

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE `Worker` TRAIT — the engine's view of a Spyre device.
 //!
-//! Scheduling, batching, cache sizing and the step loop. Target-neutral in SHAPE (metal's
-//! equivalent is `gpu_worker`'s own `impl Worker`, which is larger) and model-neutral in CONTENT:
+//! Scheduling, batching, cache sizing and the step loop. Target-neutral in SHAPE (a GPU target's
+//! equivalent is its worker's own `impl Worker`, which is larger) and model-neutral in CONTENT:
 //! every model-specific decision was resolved at bake and reaches here as generated data.
 
 #[cfg(feature = "spyre-hw")]
@@ -40,7 +40,7 @@ pub(crate) fn solo_step_is_decode(
 }
 
 /// CONTINUOUS BATCHING (#45) execute_model for the sendnn PAGED session. Consumes
-/// the scheduler's batched `SchedulerOutput` like the metal gpu_worker:
+/// the scheduler's batched `SchedulerOutput` like a GPU target's worker:
 ///   • PREFILL (scheduled_new_reqs + cached chunks with n>1): each request's chunk
 ///     runs as its OWN multi-row `predict_perrow` over THAT request's scheduler
 ///     blocks (rows = consecutive prompt positions, causal self-attention).
@@ -311,7 +311,7 @@ impl Worker for SpyreWorker {
         //
         // ⭐ THE COMMON BACKEND ALREADY HAD THE ORDER RIGHT: `gpu_worker.rs` is literally
         // "── 1. Lifecycle: drop finished requests" then "── 2. Lifecycle: add newly scheduled requests".
-        // Third time this session that the metal path had the answer written down.
+        // Third time this session that the GPU path had the answer written down.
         //
         // `finished_req_ids` are requests that finished in the PREVIOUS step, which is why cleaning them up
         // before this step's admissions is correct and not a race.
@@ -387,7 +387,7 @@ impl Worker for SpyreWorker {
                 .map_or(&[], |g| g.as_slice());
             let resumed = cr.resumed_req_ids.contains(id);
             // ⭐ INTO THE ONE STORE, REPLACING. `InputBatch::update_blocks` is the backend-neutral
-            // per-request block table metal already uses, and its own doc carries the rule: the
+            // per-request block table the GPU target already uses, and its own doc carries the rule: the
             // scheduler ships the FULL table every step, so this REPLACES rather than appends. That is
             // also exactly what a RESUMED request needs — its old blocks were freed and re-allocated.
             if !ids.is_empty() {

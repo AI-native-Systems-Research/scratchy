@@ -7,13 +7,9 @@
 //! - publishes that scope as build metadata (`links = "scratchy-models"`), which a target's own
 //!   models crate reads back to compile the same selection with its emitter
 //!   (`scratchy_models_build::ScopeMetadata`);
-//! - under `metal`, compiles the selected models for metal itself, through the shared driver
-//!   (`scratchy_models_build::build`) — `src/lib.rs` wraps each emitted arch in `pub mod <mod>`;
 //! - writes the shell-completion registry (`hf_registry.rs`), a fact of the scope alone.
-#[cfg(feature = "metal")]
-use proc_macro2::{TokenStream, TokenTree};
-#[cfg(feature = "metal")]
-use scratchy_models_build::ModelsBuild;
+//!
+//! It compiles no model: every target's models crate does, for its target.
 use scratchy_models_build::{ScopeMetadata, write_if_changed};
 use std::path::{Path, PathBuf};
 
@@ -53,66 +49,6 @@ fn write_hf_registry_file(out_dir: &Path, ids: &[String]) {
     write_if_changed(&out_dir.join("hf_registry.rs"), &rendered);
 }
 
-/// The model modules of one arch's emit that carry a metal tape: each top-level
-/// `pub mod <model> { … }` whose body names `METAL_BUCKETS` (a canonical's
-/// `static`, a shim's re-export of its canonical's).
-#[cfg(feature = "metal")]
-fn metal_tape_models(arch: &TokenStream) -> Vec<String> {
-    fn names_metal_buckets(ts: TokenStream) -> bool {
-        ts.into_iter().any(|tt| match tt {
-            TokenTree::Ident(i) => i == "METAL_BUCKETS",
-            TokenTree::Group(g) => names_metal_buckets(g.stream()),
-            _ => false,
-        })
-    }
-    let tts: Vec<TokenTree> = arch.clone().into_iter().collect();
-    (tts.windows(4))
-        .filter_map(|w| match w {
-            [
-                TokenTree::Ident(vis),
-                TokenTree::Ident(kw),
-                TokenTree::Ident(model),
-                TokenTree::Group(body),
-            ] if vis == "pub" && kw == "mod" && names_metal_buckets(body.stream()) => {
-                Some(model.to_string())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Write `$OUT_DIR/metal_models.rs`: `METAL_MODELS`, every model module this
-/// build bakes a metal tape for (`<arch>::<model>`, sorted) beside its
-/// `METAL_BUCKETS`. `src/lib.rs` includes it under `metal`.
-#[cfg(feature = "metal")]
-fn write_metal_models(out_dir: &Path, models: &[String]) {
-    let rows: String = (models.iter())
-        .map(|m| format!("    ({m:?}, crate::{m}::METAL_BUCKETS),\n"))
-        .collect();
-    let rendered = format!(
-        "/// Every model module this build bakes a metal tape for (`<arch>::<model>`), beside\n\
-         /// its baked buckets: read off the emitted modules by the build script, sorted.\n\
-         pub static METAL_MODELS: &[(\n    \
-             &str,\n    \
-             &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec],\n\
-         )] = &[\n{rows}];\n"
-    );
-    write_if_changed(&out_dir.join("metal_models.rs"), &rendered);
-}
-
-/// Write `$OUT_DIR/metal_bake.rs`: the crate-root `__metal_bake` module (`src/lib.rs`) the
-/// emitted models' baked kernels resolve in — every kernel the arches named, baked once. Runs
-/// after every arch is emitted.
-#[cfg(feature = "metal")]
-fn write_metal_bake(out_dir: &Path) {
-    let mut rendered = String::with_capacity(1 << 20);
-    scratchy_forward_compiler_macro::render_tokens(
-        scratchy_forward_compiler_macro::metal_bake_module(),
-        &mut rendered,
-    );
-    write_if_changed(&out_dir.join("metal_bake.rs"), &rendered);
-}
-
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -145,29 +81,6 @@ fn main() {
             .collect(),
     };
     metadata.publish();
-
-    // The arch gates in `src/lib.rs` read `scratchy_backend`, which this script sets exactly when
-    // it compiles the models itself — so an arch's `pub mod` exists iff its `arch-<name>` feature
-    // is on and this build emitted it.
-    println!("cargo::rustc-check-cfg=cfg(scratchy_backend)");
-    #[cfg(feature = "metal")]
-    {
-        println!("cargo::rustc-cfg=scratchy_backend");
-        let built = scratchy_models_build::build(&ModelsBuild {
-            metadata: &metadata,
-            out_dir: &out_dir,
-            emitter: &scratchy_forward_compiler_macro::target::Metal,
-            dump_dir: None,
-            inspect: &metal_tape_models,
-        });
-        write_metal_bake(&out_dir);
-        write_metal_models(&out_dir, &built.inspected);
-    }
-    // Without a target compiled here the crate is the scope alone: no model, no tokenizer.
-    #[cfg(not(feature = "metal"))]
-    {
-        write_if_changed(&out_dir.join("baked_tokenizers.rs"), "");
-    }
 
     // Shell-completion registry. Resolving it needs the network, so it happens
     // only under `hf-completions`; WRITING it is unconditional, because

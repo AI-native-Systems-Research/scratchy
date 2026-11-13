@@ -469,9 +469,8 @@ pub enum OpKind {
     /// Embed output — same semantics as the pre-refactor
     /// `Instruction::Embed::eval` inline splice.
     ///
-    /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which is
-    /// metal-gated: the op exists on that target only.
-    #[cfg(feature = "metal")]
+    /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which runs
+    /// only for a target that splices: the op exists on such a target only.
     MmEmbedSplice,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
@@ -543,7 +542,7 @@ pub enum OpKind {
     /// carrying the 4-bit GeGLU experts). Routing = folded-temperature
     /// softmax over the top-k scores × per-expert-scale; experts use
     /// GeGLU (not SiLU). No shared expert. Output = `expert_in` shape.
-    /// Metal-only; claimed by `MetalGemmaMoeImpl`.
+    /// lowered by a target's Gemma MoE arm.
     GemmaMoe,
     /// gpt-oss fused MoE block (`GptOssForCausalLM`, 20b / 120b). DSL
     /// form: `h = gptoss_moe(x, mlp[layer])` — like [`OpKind::Moe`] it
@@ -554,7 +553,7 @@ pub enum OpKind {
     /// experts are SwiGLU-OAI (`y = (clamp(u,±7)+1)·min(g,7)·
     /// sigmoid(1.702·g)`) with per-expert LINEAR biases on gate/up/down.
     /// Resolves to a `GptOssMoELayer` at base `mlp`. Shape-preserving.
-    /// Metal-only; claimed by `MetalGptOssMoeImpl`.
+    /// lowered by a target's gpt-oss MoE arm.
     GptOssMoe,
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). One coarse op
     /// orchestrating the surviving `gdn_*` kernels: causal conv1d(+SiLU) →
@@ -794,7 +793,6 @@ impl OpKind {
             Self::AllGather => "all_gather",
             // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
             // doc-comment. No DSL surface.
-            #[cfg(feature = "metal")]
             Self::MmEmbedSplice => "mm_embed_splice",
             // Lowering-pass-only op kind — see `OpKind::LoadRows` doc-comment. No DSL surface.
             Self::LoadRows(_) => "load_rows",

@@ -127,7 +127,7 @@ pub(crate) struct ChildUsage {
 /// `getrusage(RUSAGE_CHILDREN)` cannot do this, and the difference is not
 /// academic: its `ru_maxrss` is a high-water mark over every child the process
 /// has ever reaped, so a per-repetition delta silently breaks after the first
-/// rep — one earlier, larger child hides every later one. A Metal run reported
+/// rep — one earlier, larger child hides every later one. A run on a Mac reported
 /// a WARM server at 1 MiB for exactly that reason, because an earlier COLD rep
 /// had already pushed the mark to ~270 MiB. `wait4` returns the usage of the
 /// single child that exited, which is what the report claims to show, and it
@@ -172,7 +172,7 @@ fn spawn_child(argv: &[String]) -> Result<Child> {
 /// Kill the child's whole process group, then reap the child itself.
 ///
 /// How long `kill_group` waits after SIGTERM before it sends SIGKILL. Mirrors
-/// the metal aligned-weights sidecar writer's own drain budget
+/// a target's aligned-weights sidecar writer's own drain budget
 /// (`DRAIN_BUDGET_SECS` in `join_sidecar_writers`): a server tearing down
 /// gracefully flushes one-time on-disk caches, the sidecar's background writer
 /// only persists its build through that drain, and the writer's own watchdog
@@ -196,8 +196,8 @@ const KILL_GRACE: Duration = Duration::from_secs(300);
 /// SIGTERM first, SIGKILL only after [`KILL_GRACE`]. The order is
 /// load-bearing, not politeness: the ladder's COLD/WARM rungs mean "the
 /// derived on-disk caches are populated", and a cache that is only written by
-/// a graceful shutdown never populates under a straight SIGKILL. The metal
-/// worker's aligned-weights sidecar is exactly that — its background writer
+/// a graceful shutdown never populates under a straight SIGKILL. A target's
+/// aligned-weights sidecar is exactly that — its background writer
 /// is detached, persists only through `join_sidecar_writers` at exit, and a
 /// SIGKILL discards the build mid-write. Measured consequence: every primed
 /// launch re-paid the realign copy (peak RSS ≈ 2× the weights, #411), so the
@@ -1124,7 +1124,7 @@ const PARITY_PROMPTS: &[(&str, &str, usize)] = &[
 ///
 /// Its 3-bit thought preamble ties at 0.0–0.5 logits on every procedural
 /// phrasing we measured (bare count, comma-instructed count, a months
-/// listing), while the metal build's default TurboQuant 4-bit KV cache —
+/// listing), while `scr`'s default TurboQuant 4-bit KV cache —
 /// which the mlx-lm reference does not share, it runs fp16 KV — shifts
 /// logits past exactly those ties: the bare count flipped at a 0.25-margin
 /// step, while capital's 0.5 and arith's 2.25 held. The load path is not in
@@ -1531,7 +1531,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
             // PRIME. A COLD rung means "you ran this before" — but the first
             // launch in a fresh run has never touched the binary or the
             // weights, so without this it silently measures FROZEN instead.
-            // Observed on Metal before this existed: COLD rep 0 took 7.935 s
+            // Observed on a Mac before this existed: COLD rep 0 took 7.935 s
             // with ~31,570 major faults while rep 1 took 1.218 s with ~0, so
             // the rung's own median averaged a frozen start with a cold one.
             // One throwaway launch, discarded, and only when nothing has run
@@ -2212,7 +2212,7 @@ mod tests {
 
     /// A real child, reaped with wait4, must report ITS OWN usage.
     ///
-    /// This is the regression guard for the bug a Metal run exposed: with
+    /// This is the regression guard for the bug a run on a Mac exposed: with
     /// `getrusage(RUSAGE_CHILDREN)` the second child's "peak RSS" was the amount
     /// by which it exceeded the first child's high-water mark, which reported a
     /// live server at 1 MiB. Run a big child then a small one; the small one

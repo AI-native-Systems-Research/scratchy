@@ -113,7 +113,7 @@ pub(crate) const fn llama_like(
     intermediate: usize,
     hidden: usize,
     scale: f32,
-    metal_dtype: scratchy_ir::model_facts::MetalDtype,
+    act_dtype: scratchy_ir::model_facts::ActDtype,
 ) -> ModelFacts {
     use scratchy_ir::model_facts::{
         AttnScale, BlockSize, FactsParts, HeadDim, HiddenSize, KvHeads, NormWeightOffset,
@@ -127,7 +127,7 @@ pub(crate) const fn llama_like(
         BlockSize::new(16),
     );
     ModelFacts::new(FactsParts {
-        metal_dtype,
+        act_dtype,
         scale_dtype: ScaleDtype::F16,
         hidden: HiddenSize::new(hidden),
         intermediate: Some(IntermediateSize::new(intermediate)),

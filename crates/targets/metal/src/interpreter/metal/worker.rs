@@ -1670,7 +1670,7 @@ fn bake_bucket<W: CanonicalParams>(
                 // custom kernels on the same per-step dispatch plumbing as every other compute
                 // kernel — no MPS (it rejects BFloat16), no classic command buffer.
                 let (pipeline, shape) = pipelines
-                    .pipeline_for_gemm(W::FACTS.metal_dtype(), dims)
+                    .pipeline_for_gemm(W::FACTS.act_dtype(), dims)
                     .map_err(WorkerError::PipelineLookup)?;
                 let size = |(width, height, depth): (u32, u32, u32)| MTLSize {
                     width: width as usize,
@@ -1695,7 +1695,7 @@ fn bake_bucket<W: CanonicalParams>(
             TapeCommand::Dispatch(cmd) => {
                 // The lowering pass baked `library` / `function` / `constants`
                 // into the command directly — every per-layer scalar (eps,
-                // attn_scale, paging strides) and the `W::METAL_DTYPE`-driven
+                // attn_scale, paging strides) and the `W::ACT_DTYPE`-driven
                 // symbol picks happen at lowering time, so this layer is a
                 // thin cache lookup.
                 let pipeline = pipelines
@@ -2439,7 +2439,7 @@ mod tests {
             // `worker_routes_gemm_step` / `worker_interleaves_gemm_with_icb`
             // tests below assert specifically on the MPS GEMM branch. The
             // bf16 dispatch GEMM routing has its own coverage in the e2e tests.
-            scratchy_ir::model_facts::MetalDtype::F16,
+            scratchy_ir::model_facts::ActDtype::F16,
         );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
@@ -2696,7 +2696,7 @@ mod tests {
         let pipelines = crate::aot::tape_pipelines(
             &device,
             &tapes,
-            TestWeights::FACTS.metal_dtype(),
+            TestWeights::FACTS.act_dtype(),
             TEST_VARIANT,
         )
         .expect("pipelines");
@@ -2858,7 +2858,7 @@ mod tests {
         let pipelines = crate::aot::tape_pipelines(
             &device,
             &tapes,
-            TestWeights::FACTS.metal_dtype(),
+            TestWeights::FACTS.act_dtype(),
             TEST_VARIANT,
         )
         .expect("pipelines");
@@ -2964,7 +2964,7 @@ mod tests {
         let pipelines = crate::aot::tape_pipelines(
             &device,
             &tapes,
-            TestWeights::FACTS.metal_dtype(),
+            TestWeights::FACTS.act_dtype(),
             TEST_VARIANT,
         )
         .expect("pipelines");
@@ -3077,7 +3077,7 @@ mod tests {
         let pipelines = crate::aot::tape_pipelines(
             &device,
             &[tape],
-            TestWeights::FACTS.metal_dtype(),
+            TestWeights::FACTS.act_dtype(),
             TEST_VARIANT,
         )
         .expect("pipelines");
@@ -3148,7 +3148,7 @@ mod tests {
         let pipelines = crate::aot::tape_pipelines(
             &device,
             &[tape],
-            TestWeights::FACTS.metal_dtype(),
+            TestWeights::FACTS.act_dtype(),
             TEST_VARIANT,
         )
         .expect("pipelines");
@@ -3319,7 +3319,7 @@ mod tests {
         let pipelines = crate::aot::tape_pipelines(
             &device,
             &[tape],
-            TestWeights::FACTS.metal_dtype(),
+            TestWeights::FACTS.act_dtype(),
             TEST_VARIANT,
         )
         .expect("pipelines");

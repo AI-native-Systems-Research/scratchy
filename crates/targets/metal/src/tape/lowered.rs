@@ -664,10 +664,10 @@ impl KernelId {
 }
 
 /// `MetalDtype` relocated to the cfg-free `scratchy-tensors` core so
-/// the `scratchy-ir` `CanonicalParams::METAL_DTYPE` const can name
+/// the `scratchy-ir` `CanonicalParams::ACT_DTYPE` const can name
 /// it. Re-exported here so `crate::tape::MetalDtype` (the
-/// ~54 `W::METAL_DTYPE` reads + the `mod.rs` re-export) keeps resolving.
-pub use scratchy_tensors::MetalDtype;
+/// ~54 `W::ACT_DTYPE` reads + the `mod.rs` re-export) keeps resolving.
+pub use scratchy_tensors::ActDtype as MetalDtype;
 
 /// Per-axis dispatch grid: threadgroup count + threads per group.
 ///

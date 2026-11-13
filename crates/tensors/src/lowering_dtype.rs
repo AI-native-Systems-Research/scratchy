@@ -1,42 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Backend-neutral lowering dtypes.
 //!
-//! [`MetalDtype`] and [`ScaleDtype`] are trivial dependency-free enums
-//! the metal lowering pass + the per-canonical `CanonicalParams` consts
+//! [`ActDtype`] and [`ScaleDtype`] are trivial dependency-free enums a
+//! target's lowering and the per-canonical `CanonicalParams` consts
 //! speak in. They live here in the cfg-free tensor core so the cfg-free
 //! `scratchy-ir` crate can name them from `CanonicalParams`
-//! without pulling a backend feature; the metal interpreter +
-//! `targets/metal` re-export them from their historical module paths.
+//! without pulling a target in.
 
-/// Element dtype the metal pipeline should pick. The shader source
-/// contains both `_f16_specialized` and `_bf16_specialized` symbols
-/// per kernel; the lowering arms in `lowering::lower_one` consult
-/// `W::METAL_DTYPE` to pick the right symbol when populating
-/// [`LoweredCommand::function`].
+/// The element dtype a model's activations run in — a fact of the model
+/// (`CanonicalParams::ACT_DTYPE`) a target lowers each kernel at (a
+/// dtype-specialized kernel symbol is picked by it).
 ///
-/// Llama-3.x ships bf16 on disk, and Apple Silicon (M3+) has hardware
-/// bf16 MMA. Casting
-/// to fp16 — which the metal backend did originally — clips
-/// exponent range and accumulates into nonsense output across deep
-/// layer chains (28 layers for Llama-3.2-3B).
+/// Llama-3.x ships bf16 on disk. Casting to fp16 clips the exponent range
+/// and accumulates into nonsense output across deep layer chains (28
+/// layers for Llama-3.2-3B).
 ///
 /// `Int4` is a placeholder for the upcoming AWQ / GPTQ dequant path
 /// (group-wise int4 weights with bf16 scales / zeros). When that
 /// lands the dtype routes through this enum just like bf16 does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MetalDtype {
+pub enum ActDtype {
     F16,
     Bf16,
     /// Reserved — int4 quantized weight path. Not yet wired through
     /// the lowering kernel-symbol pickers; placed here so callers
-    /// can already speak in `MetalDtype` terms.
+    /// can already speak in `ActDtype` terms.
     Int4,
 }
 
-impl MetalDtype {
-    /// `_f16_specialized` / `_bf16_specialized` infix used by every
-    /// dtype-parameterized shader symbol. Centralized so symbol naming
-    /// stays consistent across the on-path kernels.
+impl ActDtype {
+    /// The `f16` / `bf16` infix every dtype-specialized kernel symbol
+    /// carries. Centralized so symbol naming stays consistent across
+    /// the on-path kernels.
     pub fn symbol_infix(self) -> &'static str {
         match self {
             Self::F16 => "f16",
@@ -52,8 +47,8 @@ impl MetalDtype {
 /// mlx-community 4bit ships F16 scales; Qwen3-MoE (and other
 /// `torch_dtype: bfloat16` exports) ships BF16 scales. MLX templates
 /// both natively (`mlx/.../quantized.h:INSTANTIATE_QUANTIZED_FUNCTIONS`
-/// instantiates `T_scale ∈ {half, bfloat16_t}`); scratchy-target-metal mirrors
-/// that surface.
+/// instantiates `T_scale ∈ {half, bfloat16_t}`), and a target's kernels
+/// mirror that surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScaleDtype {
     F16,
@@ -70,7 +65,7 @@ impl ScaleDtype {
 
     /// The on-device element dtype the `_s_<scale>_` kernel arm binds the
     /// scale/gain pointer as. A loader that must guarantee the gain buffer
-    /// matches the kernel's `T_scale` (e.g. metal's RMSNorm gain, which is
+    /// matches the kernel's `T_scale` (e.g. an RMSNorm gain, which is
     /// read through a `device const T_scale*`) converts the on-disk tensor
     /// to this dtype.
     pub fn as_dtype(self) -> crate::DType {
@@ -88,7 +83,7 @@ mod tests {
 
     #[test]
     fn scale_dtype_maps_to_matching_element_dtype() {
-        // The metal RMSNorm gain loader (`take_as_dtype`) relies on this
+        // A target's RMSNorm gain loader (`take_as_dtype`) relies on this
         // mapping to convert a gain to the dtype the `_s_<scale>_` kernel
         // arm binds. A mismatch here would re-introduce the bf16-gain-read-
         // as-f16 garbage bug on standard HF bf16 checkpoints.

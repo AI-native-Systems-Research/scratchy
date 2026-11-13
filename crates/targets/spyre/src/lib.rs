@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! IBM Spyre (KTIR) backend target for scratchy — the `-Fspyre` peer of
-//! `crates/targets/metal`.
+//! IBM Spyre (KTIR) backend target for scratchy — a peer of every other
+//! target crate.
 //!
-//! The Spyre AIU executes per-bundle KTIR; there is no GPU device memory in the
-//! Metal sense, and the hardware-free path runs the same KTIR on the
+//! The Spyre AIU executes per-bundle KTIR; there is no GPU device memory, and
+//! the hardware-free path runs the same KTIR on the
 //! `ktir-emulator` emulator. So the platform-specific seam the rest of scratchy needs
 //! from a target — "allocate device memory and put these host bytes on it" — is,
 //! for Spyre, a host malloc + memcpy. [`SpyreAllocator`] provides that as the
 //! host impl of [`scratchy_tensors::DeviceAllocator`], so `GpuWeights` loads
-//! weights through the exact same disk→host pipeline metal uses, with no GPU
+//! weights through the exact same disk→host pipeline the GPU target uses, with no GPU
 //! toolchain pulled in.
 
 pub mod allocator;
@@ -108,7 +108,7 @@ pub use model::{BoundWeight, SpyreArchRegistration, SpyreWeights, try_load};
 // ── `__gpu` facade for the `#[forward]` macro's spyre path ──
 //
 // The macro aliases `crate::__gpu` to this crate under `-Fspyre` (the way it
-// aliases to scratchy-target-metal under metal) and emits `crate::__gpu::…` for
+// aliases to every other target's crate under that target) and emits `crate::__gpu::…` for
 // the neutral surface its per-arch `Weights::load` / `fingerprint_matches` name.
 // We re-export the neutral pieces (NEVER another `targets/` crate — only the
 // cfg-free `scratchy-layers` / `scratchy-tensors` leaves):
@@ -127,7 +127,7 @@ pub mod weights {
 //
 // The `#[forward]` macro emits one `Weights` struct + one `Weights::load` body,
 // the same for every target, written entirely against `crate::__gpu::…`. spyre
-// supplies that surface the same way `crates/targets/{cuda,metal}` do: the layer
+// supplies that surface the same way every other target crate does: the layer
 // TYPES come from the neutral `scratchy-layers` / `scratchy-quantizations` /
 // `scratchy-tensors` leaves; the LOADER `*Ops` traits + `load_layered_*` free fns
 // are spyre's own (host, allocator-generic — no GPU kernels), living in the
@@ -139,7 +139,7 @@ pub mod layers_quant;
 pub mod loaders;
 pub mod rotary;
 // Re-export the `load_layered_*` free fns at the crate root so the macro's
-// `crate::__gpu::load_layered_*` calls resolve (mirrors metal's lib.rs).
+// `crate::__gpu::load_layered_*` calls resolve (mirrors every other target's lib.rs).
 pub use loaders::{
     load_layered_embedding, load_layered_fp8_linear, load_layered_layer_norm,
     load_layered_layer_norm_vision, load_layered_linear_affine_dequant_as_dense,

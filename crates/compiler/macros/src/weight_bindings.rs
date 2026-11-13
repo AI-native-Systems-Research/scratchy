@@ -12,7 +12,7 @@
 //! target inherits it by construction rather than by re-deriving it.
 //!
 //! ⛔ WHY THIS EXISTS AT ALL. Without it the accessor set had one producer and
-//! it was target-locked: metal's instruction-stream bridge. Under any other
+//! it was target-locked: one target's instruction-stream bridge. Under any other
 //! target it is empty, so the emitted `Weights` struct carried NO weight fields — verified
 //! in generated output:
 //!
@@ -45,7 +45,7 @@ use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 /// wrong flag, it is a field that resolves to no safetensors key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MlpPacking {
-    /// ONE buffer holding both, named `{gate}__fused__{up}` — metal's fused-MLP kernel reads a
+    /// ONE buffer holding both, named `{gate}__fused__{up}` — a fused-MLP kernel reads a
     /// single packed weight.
     Packed,
     /// Two weights: an MLP of two matmuls plus a `SiluMul`, with no packed-buffer kernel.
@@ -82,7 +82,7 @@ pub struct WeightAbi {
 
 /// The accessor BASE of a weight: its path joined. Its layer is its unroll index's alone, appended
 /// downstream; a path ending in a numeral (Qwen2-VL's `merger.mlp.0`, `merger.mlp.2`) is its own
-/// base. This is the metal bridge's `base` exactly — two spellings of one base is what this file
+/// base. This is a target bridge's `base` exactly — two spellings of one base is what this file
 /// exists to prevent.
 fn accessor_base(program: &Program, id: WeightId) -> String {
     program.weights.path(id).join("_")
@@ -110,7 +110,7 @@ fn fused_field_name(
 /// The gate/up pair a `Mul` closes, when the op is the tail of an MLP
 /// `silu(gate(x)) * up(x)`.
 ///
-/// ⭐ ONE DETECTION, TWO CONSUMERS. The metal bridge finds this same triple to emit
+/// ⭐ ONE DETECTION, TWO CONSUMERS. A target's bridge finds this same triple to emit
 /// `FusedGateUpSiluMul`; the accessor set finds it to name ONE packed weight field instead of
 /// two. They were separate three-line walks over the same shape, which is two chances to
 /// disagree about what "fused" means — and the accessor name is derived from the pair, so a
@@ -201,7 +201,7 @@ fn weight_of(lowered: &LoweredDecode, ext: usize) -> Option<(WeightId, Option<Un
 /// ⛔ RETURNS `Err` RATHER THAN A DEFAULT for an op this walk has not been
 /// taught. A silent "assume Linear" would emit a `Weights` field of the wrong
 /// type and fail far away at load, so a new weight-binding opcode is a build
-/// error here — the same discipline `metal_colour_rule`'s exhaustive match
+/// error here — the same discipline a target's colour rule's exhaustive match
 /// uses.
 fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String> {
     use SubOp as L;
@@ -326,7 +326,7 @@ pub fn from_tape(
         // `BiasAdd`'s own weight operand mints no field of its own — the bias
         // rides on its upstream gemm's accessor (`AffineQuantLinear`/`Linear`
         // both carry an optional bias loaded off the SAME prefix), matching
-        // metal's own `steps_from_tape.rs` `BiasAdd` arm, which derives
+        // a target's own `BiasAdd` step lowering, which derives
         // base/kind from the upstream gemm and never reads this op's weight
         // input. Minting a second, independent accessor here for the same
         // on-disk tensor produced a spurious `<gemm>.bias`-named field that
@@ -499,9 +499,9 @@ mod tests {
 
     /// ⭐⭐ THE ONE THING THE TWO PRODUCERS EVER DISAGREED ABOUT, AS A TEST.
     ///
-    /// Metal's kernel reads gate and up from ONE packed buffer; a split-MLP target binds two
+    /// A packed-MLP kernel reads gate and up from ONE buffer; a split-MLP target binds two
     /// weights. That is a target-ABI fact, so it is an ARGUMENT — and this pins both answers from
-    /// one walk, which is the whole reason the inline metal producer could be deleted.
+    /// one walk, which is the whole reason a target's inline producer could be deleted.
     ///
     /// The packed name is load-bearing, not cosmetic: the emitted load body recovers the
     /// sources by splitting it on `__fused__`, so a different spelling is a field that resolves
@@ -587,7 +587,7 @@ mod tests {
 
     /// ⭐ THE PROPERTY THE WHOLE GENERATED LOADER RESTS ON: one field per
     /// DISTINCT `(weight, layer)`, and a weight bound by several ops is ONE
-    /// field. Before this walk existed the accessor set was empty off metal
+    /// field. Before this walk existed the accessor set was empty off one target
     /// and the worker re-found every tensor by string, so "did we derive a
     /// field for each bound weight" is the invariant worth pinning.
     #[test]

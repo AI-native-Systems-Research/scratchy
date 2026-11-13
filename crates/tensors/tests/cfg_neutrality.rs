@@ -1,10 +1,10 @@
-//! Architectural guard: target-specific (`cuda`/`metal`) `cfg` gates are a code
-//! smell that this workspace forbids outside of dedicated test code.
+//! Architectural guard: target-specific `cfg` gates (any target under `crates/targets/`, or the
+//! removed `cuda`) are a code smell this workspace forbids outside of dedicated test code.
 //!
 //! Principle, not a file list: a backend is selected by which target crate the
 //! binary links (unconditional `dep:` + a feature on the *binary*), and dispatch
 //! happens through neutral trait/registry seams — NOT by sprinkling
-//! `#[cfg(feature = "metal")]` / `#[cfg(any(metal, cuda))]` through neutral code
+//! `#[cfg(feature = "<target>")]` / `#[cfg(any(<target>, cuda))]` through neutral code
 //! or even inside the target crates (which are unconditionally their target).
 //!
 //! These tests walk whole directory zones and fail listing every violation, so
@@ -39,13 +39,25 @@ fn has_word(hay: &str, needle: &str) -> bool {
     false
 }
 
-/// A source line that gates on a `cuda`/`metal` cfg (covers `feature = "cuda"`,
-/// bare `cfg(cuda)`, and `any(...)`/`all(...)`/`not(...)` wrappers).
-fn line_gates_on_target(line: &str) -> bool {
+/// The targets' names: each directory under `crates/targets/`, read off the tree so a new target
+/// is checked without a word here, and the removed CUDA backend's, so it does not creep back.
+fn target_names() -> Vec<String> {
+    let targets = workspace_root().join("crates/targets");
+    let mut names: Vec<String> = (fs::read_dir(&targets).expect("crates/targets").flatten())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.push("cuda".to_string());
+    names
+}
+
+/// A source line that gates on a target's cfg (covers `feature = "<target>"`,
+/// bare `cfg(<target>)`, and `any(...)`/`all(...)`/`not(...)` wrappers).
+fn line_gates_on_target(line: &str, targets: &[String]) -> bool {
     let mut rest = line;
     while let Some(i) = rest.find("cfg(") {
         let seg = &rest[i + 4..];
-        if has_word(seg, "cuda") || has_word(seg, "metal") {
+        if targets.iter().any(|t| has_word(seg, t)) {
             return true;
         }
         rest = &rest[i + 4..];
@@ -53,15 +65,13 @@ fn line_gates_on_target(line: &str) -> bool {
     false
 }
 
-/// A per-target crate root: a directory named `cuda`/`metal` that is itself a
+/// A per-target crate root: a directory named for a target that is itself a
 /// crate (`Cargo.toml` present). These ARE a backend and are skipped by the
-/// agnostic scans. A mere module dir like `compiler/macros/src/metal/` has no
-/// `Cargo.toml`, so it is NOT skipped — agnostic code there must be cleaned.
-fn is_per_target_crate(dir: &Path) -> bool {
-    matches!(
-        dir.file_name().and_then(|n| n.to_str()),
-        Some("cuda") | Some("metal")
-    ) && dir.join("Cargo.toml").exists()
+/// agnostic scans. A mere module dir named for one has no `Cargo.toml`, so it
+/// is NOT skipped — agnostic code there must be cleaned.
+fn is_per_target_crate(dir: &Path, targets: &[String]) -> bool {
+    (dir.file_name().and_then(|n| n.to_str())).is_some_and(|n| targets.iter().any(|t| t == n))
+        && dir.join("Cargo.toml").exists()
 }
 
 fn is_test_path(p: &Path) -> bool {
@@ -71,11 +81,12 @@ fn is_test_path(p: &Path) -> bool {
             .is_some_and(|f| f.ends_with("_tests.rs"))
 }
 
-/// All `cuda`/`metal` cfg-gate violations under `rel` (a path relative to the
+/// All target cfg-gate violations under `rel` (a path relative to the
 /// workspace root), as `"relpath:line: content"`, skipping `target/` build
 /// output and any test code.
 fn target_cfg_violations(rel: &str) -> Vec<String> {
     let root = workspace_root();
+    let targets = target_names();
     let base = root.join(rel);
     let mut out = Vec::new();
     let mut stack = vec![base];
@@ -87,7 +98,7 @@ fn target_cfg_violations(rel: &str) -> Vec<String> {
             let path = e.path();
             if path.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name == "target" || name == "tests" || is_per_target_crate(&path) {
+                if name == "target" || name == "tests" || is_per_target_crate(&path, &targets) {
                     continue;
                 }
                 stack.push(path);
@@ -105,7 +116,7 @@ fn target_cfg_violations(rel: &str) -> Vec<String> {
                 .display()
                 .to_string();
             for (n, line) in txt.lines().enumerate() {
-                if line_gates_on_target(line) {
+                if line_gates_on_target(line, &targets) {
                     out.push(format!("{relp}:{}: {}", n + 1, line.trim()));
                 }
             }
@@ -119,7 +130,7 @@ fn assert_zone_clean(zone: &str) {
     let v = target_cfg_violations(zone);
     assert!(
         v.is_empty(),
-        "\n`crates/{zone}` has {} cuda/metal cfg gate(s) — neutral/target code must \
+        "\n`{zone}` has {} target cfg gate(s) — neutral/target code must \
          not gate on a backend cfg (dispatch through a trait/registry seam; target \
          crates are unconditionally their target):\n{}\n",
         v.len(),
@@ -174,6 +185,7 @@ fn no_target_cfg_in_tensors() {
 
 fn imports_target_crate(rel: &str, krate: &str) -> Vec<String> {
     let root = workspace_root();
+    let targets = target_names();
     let mut out = Vec::new();
     let mut stack = vec![root.join(rel)];
     while let Some(dir) = stack.pop() {
@@ -184,7 +196,7 @@ fn imports_target_crate(rel: &str, krate: &str) -> Vec<String> {
             let path = e.path();
             if path.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name != "target" && name != "tests" && !is_per_target_crate(&path) {
+                if name != "target" && name != "tests" && !is_per_target_crate(&path, &targets) {
                     stack.push(path);
                 }
                 continue;

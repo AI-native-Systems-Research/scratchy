@@ -180,7 +180,7 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 
     // OS readahead prefault (MADV_WILLNEED) is backend-specific and now runs
     // through `DeviceAllocator::prefault_mmap` at the call sites that hold the
-    // allocator (metal prefaults per-shard in register_mmap).
+    // allocator (an allocator may prefault per-shard in register_mmap).
 
     // Parse safetensors header to find tensor offsets.
     let _t_des = std::time::Instant::now();
@@ -239,7 +239,7 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
                 // `model.visual.*` on the official HF repo (`Qwen/Qwen3.5-9B`),
                 // but the qwen3-5-vl scratchy variant config bakes
                 // `vision_tower.*` (matching the mlx-community 4bit repack
-                // the metal green_gate test loads from). A compiled variant
+                // the vision green-gate tests load from). A compiled variant
                 // bakes ONE ordering, so without this alias `try_load_mm`'s
                 // fingerprint key `vision_tower.merger.linear_fc2.weight` is
                 // absent on the HF repo and `try_load_mm` returns Ok(None).
@@ -313,7 +313,7 @@ pub struct GpuWeights<A: DeviceAllocator> {
     /// to this dtype on CPU before H2D copy.
     target_dtype: Option<DType>,
     /// Dtype the RMSNorm gain MUST be stored as so it matches the kernel's
-    /// `T_scale` pointer (metal binds the gain through `device const T_scale*`
+    /// `T_scale` pointer (a target binds the gain through `device const T_scale*`
     /// and picks `T_scale` from the compile-time `W::SCALE_DTYPE`, not the
     /// on-disk dtype). Set once per model from `W::SCALE_DTYPE`;
     /// [`take_as_dtype`](Self::take_as_dtype) honors it, converting only when
@@ -324,8 +324,8 @@ pub struct GpuWeights<A: DeviceAllocator> {
     /// Reusable host scratch for casting a tensor before upload.
     /// Grows as needed, never shrinks.
     cast_scratch: Vec<u8>,
-    /// Backend allocator: device memory + H2D primitive (`MetalAllocator`
-    /// under metal; each target supplies its own).
+    /// Backend allocator: device memory + H2D primitive (each
+    /// target's own).
     allocator: A,
     /// Keep mmaps alive for the lifetime of GpuWeights.
     ///
@@ -425,7 +425,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// of its target's lm_head). How a multi-token-prediction head borrows its target's token
     /// embedding and lm_head, and loads its own tensors from a target checkpoint that carries
     /// them: the refs share the source's mmap, so an allocator that maps registered mmaps
-    /// zero-copy (metal) uploads nothing new. Errors when `from` holds nothing under the prefix,
+    /// zero-copy uploads nothing new. Errors when `from` holds nothing under the prefix,
     /// or this store already holds a lent name.
     pub fn lend(
         &mut self,
@@ -585,7 +585,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             let (shard_tensors, mmap) = result?;
             tensors.extend(shard_tensors);
             // Register every shard's mmap with the allocator so
-            // metal `take()` can alias the safetensors pages directly
+            // a `take()` can alias the safetensors pages directly
             // (zero-copy weight load). `register_mmap` dispatches
             // background `pread`s to populate a 16-aligned per-tensor
             // layout; per-tensor join happens at `take()` time inside
@@ -613,7 +613,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     fn load_shard(&mut self, path: &Path) -> Result<()> {
         let (shard_tensors, mmap) = load_shard_into_map(path)?;
         self.tensors.extend(shard_tensors);
-        // Register the mmap with the allocator so metal `take()` can alias the
+        // Register the mmap with the allocator so a `take()` can alias the
         // safetensors pages directly; `prefault_mmap` issues the readahead hint
         // where the backend wants one.
         self.allocator.register_mmap(path, Arc::clone(&mmap))?;
@@ -791,7 +791,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         self.target_dtype
     }
 
-    /// Pin the dtype RMSNorm gains must be stored as to match the metal
+    /// Pin the dtype RMSNorm gains must be stored as to match the
     /// `_s_<scale>_` kernel's `T_scale` pointer. Set once per model from
     /// `W::SCALE_DTYPE`. See [`Self::take_as_dtype`] and the
     /// `rmsnorm_scale_dtype` field doc.
@@ -799,7 +799,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         self.rmsnorm_scale_dtype = Some(dtype.as_dtype());
     }
 
-    /// The pinned RMSNorm gain dtype, if any. Metal's RMSNorm loader uses it
+    /// The pinned RMSNorm gain dtype, if any. A target's RMSNorm loader uses it
     /// to decide whether the on-disk gain needs converting; `None` (a backend
     /// that casts the gain itself, GGUF) means keep the on-disk dtype.
     pub fn rmsnorm_scale_dtype(&self) -> Option<DType> {
@@ -865,18 +865,18 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// the device exactly as they were stored on disk.
     ///
     /// Used by `AffineQuantLinear::load` / `AffineQuantEmbedding::load`
-    /// (Metal int4 path) for `*.scales` / `*.biases`: those ship F16
-    /// on disk and the scratchy-target-metal int4 kernels read them as `F16`
+    /// (the int4 path) for `*.scales` / `*.biases`: those ship F16
+    /// on disk and the int4 kernels read them as `F16`
     /// `T_scale` pointers, casting to the activation dtype in-register.
     /// Routing through `take()` would F16→BF16 truncate the scales at
     /// load on the bf16 stack — that's the P10b regression site.
     ///
     /// Routes through [`alloc_and_copy_host_aligned`] with the
-    /// dtype's scalar size as `min_align`. On Metal this unlocks the
+    /// dtype's scalar size as `min_align`. On a target that maps registered mmaps this unlocks the
     /// mmap-zero-copy fast path for F16/BF16 scales/biases/RMSNorm
     /// gains in `mlx-community` 4bit safetensors (whose data section
     /// lands at file-offset `mod 16 = 2`, permanently failing the
-    /// strict 16-byte `MetalAllocator::MIN_BIND_ALIGN` gate).
+    /// strict 16-byte allocator's minimum bind alignment gate).
     ///
     /// [`take`]: Self::take
     /// [`alloc_and_copy_host_aligned`]: crate::device_allocator::DeviceAllocator::alloc_and_copy_host_aligned
@@ -905,7 +905,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// mismatch (e.g. a standard HF `bfloat16` checkpoint feeding a kernel
     /// whose `T_scale` arm is `half`) triggers a one-shot CPU cast.
     ///
-    /// Metal's RMSNorm gain load uses this: the `_s_<scale>_` kernel binds the
+    /// A target's RMSNorm gain load uses this: the `_s_<scale>_` kernel binds the
     /// gain through a `device const T_scale*` chosen at compile time from
     /// `W::SCALE_DTYPE`, so the gain buffer's dtype must match `T_scale`
     /// regardless of what the checkpoint shipped. A backend that casts the gain
@@ -1007,7 +1007,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// active [`DeviceAllocator`]. Returns a fresh `GpuTensor` of the
     /// given `shape` and `dtype` over that buffer.
     ///
-    /// Backend-neutral: under metal it allocates a `StorageModeShared` arena slice and
+    /// Backend-neutral: an allocator over host-visible memory allocates an arena slice and
     /// memcpys into it. Used by stream-free fused loaders (e.g.
     /// `LinearLayer::load_dense_concat_packed`) that pre-concatenate
     /// CPU bytes and need a single packed device buffer.
@@ -1034,7 +1034,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     }
 
     /// A `shape`/`dtype` device tensor whose packed bytes `fill` writes: in place where the
-    /// allocator's memory is host-visible ([`DeviceAllocator::alloc_host_writable`]: metal's
+    /// allocator's memory is host-visible ([`DeviceAllocator::alloc_host_writable`]: a
     /// unified memory), else into host memory then copied up as [`Self::alloc_packed_from_host`].
     /// For a table built on the host, which then has no host copy to make.
     pub fn alloc_packed_with(
@@ -2271,7 +2271,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     ///
     /// Routes through [`Self::maybe_cast_cpu`] so the bytes match
     /// `target_dtype` when one is set, so callers don't have to track
-    /// the dtype drift between disk and target separately. Under metal
+    /// the dtype drift between disk and target separately. With an mmap-aliasing allocator
     /// this is the only on-the-way-in cast path.
     pub fn take_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {
         let cpu_ref = self

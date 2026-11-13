@@ -4,7 +4,7 @@
 //! Pure `String`-building helpers shared by the forward-compiler codegen and the
 //! per-target layered-load helpers. They live in the universal leaf crate so
 //! every target crate and the compiler can name them without a
-//! dependency cycle (metal cannot depend on the compiler).
+//! dependency cycle (a target cannot depend on the compiler).
 
 /// Multimodal-aware decoder layered key. `root` is the per-arch
 /// `<prefix>.layers` template (e.g. `"model.layers"` for text-only and

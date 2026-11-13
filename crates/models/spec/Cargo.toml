@@ -10,14 +10,14 @@ description = "Speculative-decoding build scope: which drafters compile alongsid
 # forbids aliasing one crate under two names in one Cargo.toml, and
 # `crates/cli/scr/Cargo.toml` already aliases scratchy-models `model` and
 # scratchy-quantizations `quant`. Its features forward to scratchy-models,
-# whose build script compiles the drafters.
+# whose scope each target's models crate compiles the drafters of.
 #
 # `mtp`: every drafter published as a model of its own (Gemma 4's bf16 and QAT
 # assistants, drafting when `--speculative-model` names one), besides the heads
 # inside their targets' checkpoints and each target's default published
-# drafter (Gemma 4 26B-A4B's assistant at MLX 4-bit g32), which `metal` already
+# drafter (Gemma 4 26B-A4B's assistant at MLX 4-bit g32), which `scr` already
 # compiles —
-# `--features metal,model/gemma-4-26b-a4b-it,spec/mtp`.
+# `--features model/gemma-4-26b-a4b-it,spec/mtp` on `scr`.
 mtp = ["scratchy-models/mtp"]
 
 [dependencies]

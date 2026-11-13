@@ -48,7 +48,7 @@
 #
 # The scratchy binary must be built with the model compiled in — no default
 # model scope, name it explicitly (quant defaults are already on for metal):
-#   cargo build --release -p scratchy-cli --features metal,bench,model/llama-3.2-3b
+#   cargo build --release -p scratchy-target-metal-cli --features bench,model/llama-3.2-3b
 #
 # Outputs land under vllm-rs/bench_results/serve_compare/<timestamp>_<label>/:
 #   <backend>.serve.log, <backend>.<cell>.json, summary.md

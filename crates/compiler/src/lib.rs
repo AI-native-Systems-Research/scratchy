@@ -25,12 +25,12 @@ pub mod gdn_state_layout;
 // `scr model info`. The whole pipeline (BackboneDumpRegistration
 // inventory + Instruction::normalize) is backend-agnostic.
 pub mod info;
-// The Metal interpreter (lowering pass + worker pool) lives in
-// `scratchy-target-metal`; this crate no longer re-exports it. Consumers
-// (the metal worker, per-arch crates, macro emissions) name
-// `scratchy_target_metal::interpreter::metal::*` directly — they all depend on
-// the metal target under their own `metal` feature. Severing the re-export
-// drops this crate's `scratchy-target-metal` dependency, which lets the metal
+// A target's interpreter (lowering pass + worker pool) lives in
+// its target crate; this crate re-exports none. Consumers
+// (the worker, per-arch crates, macro emissions) name
+// the target's interpreter directly — they all depend on
+// the target. Severing the re-export
+// drops this crate's dependency on any target, which lets a
 // target depend UP on this compiler (for `MultimodalForward` / `EmbedPatch`).
 
 pub use info::{
@@ -43,15 +43,15 @@ pub use info::{
 // `scratchy-ir` crate; re-exported here so the macro path
 // `::scratchy_forward_compiler::Instruction` keeps resolving.
 pub use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets, RowsExtern};
-// Routed-expert per-projection bit packing for `MetalSharedFusedMoe`
+// Routed-expert per-projection bit packing for `AffineSharedFusedMoe`
 // (OptiQ mixed 4/8-bit). Re-exported so the macro codegen can pack and
-// the metal lowering can unpack via the same convention.
+// the target's lowering can unpack via the same convention.
 pub use scratchy_ir::{pack_moe_expert_bits, unpack_moe_expert_bits};
 // `CanonicalParams` + `WeightAccessors` are cross-backend — the
-// metal interpreter (`interpreter::metal::worker::resolve_weight`)
+// target's interpreter
 // invokes both. Both live in the cfg-free `scratchy-ir` crate (`CanonicalParams`'s
-// `METAL_DTYPE` / `SCALE_DTYPE` consts name the relocated
-// `scratchy_tensors::{MetalDtype, ScaleDtype}` enums), so the
+// `ACT_DTYPE` / `SCALE_DTYPE` consts name the relocated
+// `scratchy_tensors::{ActDtype, ScaleDtype}` enums), so the
 // re-exports are unconditional and the macro path
 // `::scratchy_forward_compiler::CanonicalParams` keeps resolving.
 pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors, model_facts};
@@ -87,8 +87,8 @@ pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors, model_f
 ///   8 = terminal_slot  — slot `forward` returns (after lm_head)
 // `BucketEntry` is a plain tuple struct — no backend deps. The macro emits
 // `FORWARD_TABLE` and `scr model info`'s `dump()` walks it. Fields 6/7/8
-// (num_slots / backbone_slot / terminal_slot) stay populated; the metal pool
-// sizes from `METAL_BUCKETS` instead and leaves them untouched.
+// (num_slots / backbone_slot / terminal_slot) stay populated; a target's pool
+// may size from its own bucket table instead and leave them untouched.
 pub struct BucketEntry<Op: 'static>(
     pub u64,
     pub u64,

@@ -400,7 +400,7 @@ fn is_progress(chunk: &serde_json::Value) -> bool {
 /// A chat chunk whose delta names its role and carries nothing generated: how a chat stream
 /// opens, before prefill (OpenAI's API, oMLX), whatever oMLX's keepalive mode (#1051). An oMLX
 /// 0.7.3 chat keepalive is one too, under the request's own model (jundot/omlx#4797), if oMLX
-/// is not run with `--sse-keepalive-mode comment` as the Metal matrix runs it (#1056).
+/// is not run with `--sse-keepalive-mode comment` as the Mac bench matrix runs it (#1056).
 fn only_a_role(chunk: &serde_json::Value) -> bool {
     let Some(delta) = chunk["choices"][0]["delta"].as_object() else {
         return false;
@@ -3011,7 +3011,7 @@ mod tests {
             r#"{"model":"keepalive","choices":[{"text":"","finish_reason":null}]}"#
         )));
         // From 0.7.3 its keepalive carries the real model name and reads as output, the same as
-        // the gpt-oss chunk above: the Metal matrix serves oMLX with `--sse-keepalive-mode comment`.
+        // the gpt-oss chunk above: the Mac bench matrix serves oMLX with `--sse-keepalive-mode comment`.
         assert!(is_progress(&c(
             r#"{"model":"gpt-oss","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}"#
         )));

@@ -230,6 +230,12 @@ fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
 /// [`Worker::kv_block_bytes`] — two mints of one value, a guard apiece. There is no second
 /// mint below the door now: `init_cache`, `compute_kv_blocks` and `Worker::kv_block_bytes`
 /// all take the type, so block == page holds because there is ONE value, not two mints of one.
+/// The target the binary serves on: its linked worker's name, `None` when it links none (or
+/// several, which the engine refuses).
+pub fn linked_target() -> Option<&'static str> {
+    linked_factory().ok().map(|f| f.name())
+}
+
 fn effective_block_size(configured: KvBlockTokens) -> KvBlockTokens {
     linked_factory()
         .ok()

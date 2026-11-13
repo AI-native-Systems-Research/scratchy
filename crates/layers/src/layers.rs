@@ -8,7 +8,7 @@
 //! extension traits; the **backend-neutral** `GpuWeights`-bound `load_*` logic
 //! (which names only neutral `GpuWeights` access methods) lives here as shared
 //! free fns every target delegates to — only genuinely backend-divergent loads
-//! (metal direct-write packing, the RmsNorm keep-dtype split) stay in the target crates.
+//! (direct-write packing, the RmsNorm keep-dtype split) stay in the target crates.
 
 use anyhow::Result;
 use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
@@ -205,7 +205,7 @@ impl Fp8Linear {
 // ---------------------------------------------------------------------------
 
 /// Unified linear layer — dense, Marlin INT4, GGML quantized,
-/// BNB 4-bit, FP8, or MLX-affine INT4 (Metal-only).
+/// BNB 4-bit, FP8, or MLX-affine INT4.
 ///
 /// Models use this everywhere they currently use `Linear`. The factory decides
 /// at load time which variant to create based on weight format.
@@ -226,10 +226,10 @@ pub enum LinearLayer {
     Bnb4bit(Box<Bnb4bitLinear>),
     Fp8(Box<Fp8Linear>),
     Fp8Block(Box<Fp8BlockLinear>),
-    /// MLX-native int4 affine quantization (Metal-only). The variant
+    /// MLX-native int4 affine quantization. The variant
     /// is unconditional here so this enum stays backend-neutral.
     AffineQuant(Box<AffineQuantLinear>),
-    /// NVIDIA ModelOpt NVFP4 4-bit quantization (Metal-only). Like
+    /// NVIDIA ModelOpt NVFP4 4-bit quantization. Like
     /// `AffineQuant` it's dequant-on-read; the difference is the decode
     /// (E2M1 LUT, no per-group bias) — see `Nvfp4Linear`.
     Nvfp4(Box<Nvfp4Linear>),
@@ -331,7 +331,7 @@ impl LinearLayer {
 
     /// Access the affine-quantized packed weight tensor (`[N, ceil(K*bits/32)]`
     /// U32). Panics on every other LinearLayer arm — affine accessors
-    /// are meaningful only on Affine layers (Metal builds).
+    /// are meaningful only on Affine layers.
     pub fn affine_weight(&self) -> GpuTensor {
         match self {
             Self::AffineQuant(l) => l.weight,
@@ -789,7 +789,7 @@ pub struct GatedDeltaNetLayer {
 // Backend-agnostic weight-load logic shared by both targets' `*Ops` trait
 // impls. They name only the neutral `GpuWeights<A>` access methods, so the
 // load logic lives once here instead of being copied into each target crate.
-// Genuinely-divergent loads (metal direct-write packing, the RmsNorm
+// Genuinely-divergent loads (direct-write packing, the RmsNorm
 // keep-dtype split) stay in the target crates.
 
 /// Packed-source fallback: when `{prefix}.weight` is missing, detect the
@@ -943,8 +943,8 @@ pub fn gated_delta_net_load<A: DeviceAllocator>(
 /// `in_features` (`hidden`) and `dtype`. Returns
 /// `(total_out_features, hidden, dtype, total_bytes)` for the packed buffer.
 /// The neutral preamble shared by both backends' direct-pack loaders (only the
-/// per-tensor byte-copy into the packed buffer differs, e.g. metal's
-/// direct-write via `take_into_metal`).
+/// per-tensor byte-copy into the packed buffer differs, e.g. a
+/// target's direct write into device memory).
 pub fn concat_packed_plan<A: DeviceAllocator>(
     weights: &mut GpuWeights<A>,
     prefixes: &[&str],

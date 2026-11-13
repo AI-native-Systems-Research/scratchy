@@ -687,7 +687,7 @@ fn sample_slice_command(
     LoweredCommand {
         kernel,
         library: "sample_rows",
-        function: pick_specialized_symbol(f16_symbol, bf16_symbol, p.metal_dtype()),
+        function: pick_specialized_symbol(f16_symbol, bf16_symbol, p.act_dtype()),
         constants: super::kernel_constants::SampleRowsConstants { row_stride }.into_baked(),
         dispatch: DispatchShape {
             threadgroups: (row_stride.get().div_ceil(THREADS_PER_TG), 1, 1),
@@ -815,7 +815,7 @@ fn tq_stage_command<const IS_K: bool>(
         function: pick_specialized_symbol(
             "tq_stage_rotated_f16",
             "tq_stage_rotated_bf16",
-            p.metal_dtype(),
+            p.act_dtype(),
         ),
         constants: super::kernel_constants::TqStageConstants {
             head_dim: super::ids::HeadDim(global.head_dim().get()),
@@ -853,10 +853,10 @@ fn tq_rotate_command(
         pick_specialized_symbol(
             "tq_unrotate_rows_f16",
             "tq_unrotate_rows_bf16",
-            p.metal_dtype(),
+            p.act_dtype(),
         )
     } else {
-        pick_specialized_symbol("tq_rotate_rows_f16", "tq_rotate_rows_bf16", p.metal_dtype())
+        pick_specialized_symbol("tq_rotate_rows_f16", "tq_rotate_rows_bf16", p.act_dtype())
     };
     Ok(LoweredCommand {
         kernel: KernelId::TqRotateRows,
@@ -1724,7 +1724,7 @@ fn decode_attention_per_kv_head(
     }
     let row_bytes = row_partials as u32;
     let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
-    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype());
+    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.act_dtype());
     let mut out = Vec::with_capacity(cmds.len() + 1);
     for c in cmds {
         let (Some(command), gate) = (taken(&c), c.gate) else {
@@ -2542,7 +2542,7 @@ fn sdpa_paged_command(
             bucket_m: super::ids::BucketM(bucket_m),
         }),
     };
-    match p.metal_dtype() {
+    match p.act_dtype() {
         crate::tape::lowered::MetalDtype::Bf16 => {
             LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(constants, bindings, dispatch)
         }
@@ -2658,7 +2658,7 @@ fn verify_lane_attention(
         function: pick_specialized_symbol(
             "attention_via_cache_v2_combine_f16_specialized",
             "attention_via_cache_v2_combine_bf16_specialized",
-            p.metal_dtype(),
+            p.act_dtype(),
         ),
         // The combine's own slots (`attention.metal`): the geometry and ATTN_SPLITS, ATTN_TQ unset.
         constants: baked(vec![
@@ -2940,7 +2940,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "embed_f16_specialized",
                 "embed_bf16_specialized",
-                p.metal_dtype(),
+                p.act_dtype(),
             ),
             constants: super::kernel_constants::EmbedConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
@@ -3119,7 +3119,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "rmsnorm_unit_f16_specialized",
                 "rmsnorm_unit_bf16_specialized",
-                p.metal_dtype(),
+                p.act_dtype(),
             ),
             // The unit kernel declares fn-consts 0..2 only (no
             // WEIGHT_OFFSET slot 3); RmsNormConstants sets 0..3 and the
@@ -3162,7 +3162,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "scalar_weight_mul_f16_specialized",
                 "scalar_weight_mul_bf16_specialized",
-                p.metal_dtype(),
+                p.act_dtype(),
             ),
             constants: &[],
             dispatch: {
@@ -4831,7 +4831,7 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "rope_append_f16_specialized",
                     "rope_append_bf16_specialized",
-                    p.metal_dtype(),
+                    p.act_dtype(),
                 ),
                 constants: super::kernel_constants::RopeAppendConstants {
                     head_dim: super::ids::HeadDim(hd),
@@ -4894,11 +4894,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::KvAppend,
                 library: "kv_append",
-                function: pick_specialized_symbol(
-                    "kv_append_f16",
-                    "kv_append_bf16",
-                    p.metal_dtype(),
-                ),
+                function: pick_specialized_symbol("kv_append_f16", "kv_append_bf16", p.act_dtype()),
                 constants: super::kernel_constants::KvAppendConstants {
                     head_dim: super::ids::HeadDim(hd),
                     num_kv_heads: super::ids::NumKvHeads(n_kv),
@@ -5048,7 +5044,7 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "attention_via_cache_v2_f16_specialized",
                     "attention_via_cache_v2_bf16_specialized",
-                    p.metal_dtype(),
+                    p.act_dtype(),
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
                     // `attention()` tiles are the GLOBAL class on
@@ -5195,7 +5191,7 @@ fn lower_one(
             // The unfused kernels read sequence 0 only (`seq_used[0]`,
             // `cu_seqlens_q[1] - cu_seqlens_q[0]`): they serve single-sequence
             // steps, and the paged attention below the rest.
-            let steel_dtype_tag: &str = match p.metal_dtype() {
+            let steel_dtype_tag: &str = match p.act_dtype() {
                 crate::tape::lowered::MetalDtype::Bf16 => "bf16",
                 _ => "f16",
             };
@@ -5802,7 +5798,7 @@ fn lower_one(
                                 ),
                         )
                     };
-                    let elem_bytes = match p.metal_dtype() {
+                    let elem_bytes = match p.act_dtype() {
                         crate::tape::lowered::MetalDtype::Bf16 => 2u32,
                         _ => 2u32,
                     };
@@ -5876,7 +5872,7 @@ fn lower_one(
                         function: pick_specialized_symbol(
                             "attention_prefill_sdpa_gqa_shared_f16_specialized",
                             "attention_prefill_sdpa_gqa_shared_bf16_specialized",
-                            p.metal_dtype(),
+                            p.act_dtype(),
                         ),
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
@@ -5982,7 +5978,7 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "attention_via_cache_v2_f16_specialized",
                     "attention_via_cache_v2_bf16_specialized",
-                    p.metal_dtype(),
+                    p.act_dtype(),
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
                     head_dim: super::ids::HeadDim(base(p)?.head_dim().get()),
@@ -6037,7 +6033,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "residual_add_f16_specialized",
                 "residual_add_bf16_specialized",
-                p.metal_dtype(),
+                p.act_dtype(),
             ),
             // Token-parallel kernel reads element count from dispatch
             // shape; no function constants.
@@ -6074,7 +6070,7 @@ fn lower_one(
             function: pick_specialized_symbol(
                 "scalar_mul_f16_specialized",
                 "scalar_mul_bf16_specialized",
-                p.metal_dtype(),
+                p.act_dtype(),
             ),
             constants: super::kernel_constants::ScalarMulConstants {
                 scale: *scale,
@@ -6143,7 +6139,7 @@ fn lower_one(
             LoweredCommand {
                 kernel,
                 library: "elementwise",
-                function: pick_specialized_symbol(f16, bf16, p.metal_dtype()),
+                function: pick_specialized_symbol(f16, bf16, p.act_dtype()),
                 constants: baked(vec![constants, ConstantValue::uint(6, width)]),
                 dispatch: DispatchShape {
                     threadgroups: (width.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
@@ -6181,7 +6177,7 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "tanh_soft_cap_f16_specialized",
                     "tanh_soft_cap_bf16_specialized",
-                    p.metal_dtype(),
+                    p.act_dtype(),
                 ),
                 // Slot 1: elementwise.metal's fn-const indices are
                 // file-scoped (slot 0 = BIAS_ADD_NUM_COLS).
@@ -6233,7 +6229,7 @@ fn lower_one(
                 function: pick_specialized_symbol(
                     "bias_add_f16_specialized",
                     "bias_add_bf16_specialized",
-                    p.metal_dtype(),
+                    p.act_dtype(),
                 ),
                 constants: baked(vec![ConstantValue::uint(0, *n)]),
                 dispatch: {
@@ -6670,7 +6666,7 @@ fn lower_one(
                 kernel: KernelId::VisionLayerNorm,
                 library: "vision_layernorm",
                 function: vision_layernorm_static_name(
-                    p.metal_dtype(),
+                    p.act_dtype(),
                     norm_gain_dtype(p, WeightKind::RmsNorm),
                 ),
                 constants: baked(vec![
@@ -6718,7 +6714,7 @@ fn lower_one(
                 kernel: KernelId::VisionLayerNorm,
                 library: "vision_layernorm",
                 function: vision_layernorm_static_name(
-                    p.metal_dtype(),
+                    p.act_dtype(),
                     norm_gain_dtype(p, WeightKind::LayerNorm),
                 ),
                 constants: baked(vec![
@@ -6772,7 +6768,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
-                function: pick_specialized_symbol(f16, bf16, p.metal_dtype()),
+                function: pick_specialized_symbol(f16, bf16, p.act_dtype()),
                 constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
@@ -6806,7 +6802,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::ConcatRows,
                 library: "elementwise",
-                function: concat_rows_static_name(p.metal_dtype()),
+                function: concat_rows_static_name(p.act_dtype()),
                 constants: super::kernel_constants::ConcatRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
                     width: *width,
@@ -6863,7 +6859,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::LoadRows,
                 library: "elementwise",
-                function: copy_rows_static_name(p.metal_dtype()),
+                function: copy_rows_static_name(p.act_dtype()),
                 constants: super::kernel_constants::CopyRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
                 }
@@ -6930,7 +6926,7 @@ fn lower_one(
             let rope_cmd = |out_slot: u32, in_slot: u32| LoweredCommand {
                 kernel: KernelId::VisionRope,
                 library: "vision_rope_2d",
-                function: vision_rope_2d_static_name(p.metal_dtype(), interleaved),
+                function: vision_rope_2d_static_name(p.act_dtype(), interleaved),
                 constants: baked(consts()),
                 dispatch: dispatch(),
                 bindings: baked(vec![
@@ -6985,7 +6981,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::VisionVarlenAttn,
                 library: "vision_varlen_attn",
-                function: vision_varlen_attn_static_name(p.metal_dtype()),
+                function: vision_varlen_attn_static_name(p.act_dtype()),
                 constants: baked(vec![
                     ConstantValue::uint(0, hd),
                     ConstantValue::uint(1, nh),
@@ -7047,7 +7043,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::VisionVarlenAttn,
                 library: "vision_varlen_attn",
-                function: vision_varlen_attn_static_name(p.metal_dtype()),
+                function: vision_varlen_attn_static_name(p.act_dtype()),
                 constants: baked(vec![
                     ConstantValue::uint(0, hd),
                     ConstantValue::uint(1, nh),
@@ -7112,7 +7108,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::EmbeddingGather,
                 library: "embedding_gather",
-                function: embedding_gather_static_name(p.metal_dtype()),
+                function: embedding_gather_static_name(p.act_dtype()),
                 constants: super::kernel_constants::EmbeddingGatherConstants {
                     elements: super::ids::ElementCount(n_elems),
                     width: *width,
@@ -7171,7 +7167,7 @@ fn lower_one(
             LoweredCommand {
                 kernel: KernelId::MmEmbedSplice,
                 library: "elementwise",
-                function: mm_embed_splice_static_name(p.metal_dtype()),
+                function: mm_embed_splice_static_name(p.act_dtype()),
                 constants: super::kernel_constants::MmEmbedSpliceConstants {
                     hidden: HiddenSize(hidden),
                 }
@@ -7543,7 +7539,7 @@ fn gdn_rms_norm_gated_simd_static_name(dtype: DequantDtype) -> &'static str {
 fn norm_gain_dtype(p: &ModelFacts, bundle: WeightKind) -> ScaleDtype {
     match bundle {
         WeightKind::RmsNorm => scale_dtype_for(p),
-        WeightKind::LayerNorm => match p.metal_dtype() {
+        WeightKind::LayerNorm => match p.act_dtype() {
             MetalDtype::F16 => ScaleDtype::F16,
             MetalDtype::Bf16 => ScaleDtype::Bf16,
             MetalDtype::Int4 => {
@@ -7615,13 +7611,13 @@ fn fused_gate_up_mul_cmd(
         pick_specialized_symbol(
             "fused_gate_up_silu_mul_decode_f16_specialized",
             "fused_gate_up_silu_mul_decode_bf16_specialized",
-            p.metal_dtype(),
+            p.act_dtype(),
         )
     } else {
         pick_specialized_symbol(
             "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
             "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
-            p.metal_dtype(),
+            p.act_dtype(),
         )
     };
     let constants: Vec<ConstantValue> = if bucket_m == 1 {
@@ -7751,11 +7747,11 @@ fn mm_embed_splice_static_name(dtype: MetalDtype) -> &'static str {
 /// the duplicate enum exists because the kernel-dispatcher crate
 /// can't depend on lowering types.
 fn dequant_dtype_for(p: &ModelFacts) -> DequantDtype {
-    match p.metal_dtype() {
+    match p.act_dtype() {
         MetalDtype::F16 => DequantDtype::F16,
         MetalDtype::Bf16 => DequantDtype::Bf16,
         MetalDtype::Int4 => panic!(
-            "metal lowering: MetalStep::AffineQmm requires p.metal_dtype() \
+            "metal lowering: MetalStep::AffineQmm requires p.act_dtype() \
              ∈ {{F16, Bf16}} (the activation dtype); got Int4"
         ),
     }
@@ -7844,7 +7840,7 @@ fn elem_size_bytes(dtype: DequantDtype) -> u32 {
 /// pointer and casts to `T_act` in registers.
 fn rmsnorm_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype(), scale_dtype) {
+    match (p.act_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "rmsnorm_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "rmsnorm_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "rmsnorm_f16_s_bf16_specialized",
@@ -7862,7 +7858,7 @@ fn rmsnorm_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'stat
 /// `shaders/fused_add_rmsnorm.metal`.
 fn fused_add_rmsnorm_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype(), scale_dtype) {
+    match (p.act_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "fused_add_rmsnorm_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "fused_add_rmsnorm_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "fused_add_rmsnorm_f16_s_bf16_specialized",
@@ -7883,7 +7879,7 @@ fn normed_gemv_kernel_static_name(
     bucket_m: super::ids::BucketM,
 ) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype(), scale_dtype, bucket_m.0 == 1) {
+    match (p.act_dtype(), scale_dtype, bucket_m.0 == 1) {
         (MetalDtype::F16, S::F16, true) => "gemv_normed_f16_s_f16",
         (MetalDtype::Bf16, S::F16, true) => "gemv_normed_bf16_s_f16",
         (MetalDtype::F16, S::Bf16, true) => "gemv_normed_f16_s_bf16",
@@ -7900,7 +7896,7 @@ fn normed_gemv_kernel_static_name(
 
 fn row_program_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype(), scale_dtype) {
+    match (p.act_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "row_program_f16_s_f16",
         (MetalDtype::Bf16, S::F16) => "row_program_bf16_s_f16",
         (MetalDtype::F16, S::Bf16) => "row_program_f16_s_bf16",
@@ -7916,7 +7912,7 @@ fn row_program_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'
 /// same `fused_add_rmsnorm` library.
 fn norm_add_scalar_mul_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype(), scale_dtype) {
+    match (p.act_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "norm_add_scalar_mul_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "norm_add_scalar_mul_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "norm_add_scalar_mul_f16_s_bf16_specialized",
@@ -7932,7 +7928,7 @@ fn norm_add_scalar_mul_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtyp
 /// dtype), `rope` library.
 fn rope_append_normed_kernel_static_name(p: &ModelFacts, scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype(), scale_dtype) {
+    match (p.act_dtype(), scale_dtype) {
         (MetalDtype::F16, S::F16) => "rope_append_normed_f16_s_f16_specialized",
         (MetalDtype::Bf16, S::F16) => "rope_append_normed_bf16_s_f16_specialized",
         (MetalDtype::F16, S::Bf16) => "rope_append_normed_f16_s_bf16_specialized",
@@ -8477,7 +8473,7 @@ impl MoeScratchLayout {
 }
 
 fn softmax_precise_symbol(p: &ModelFacts) -> &'static str {
-    match p.metal_dtype() {
+    match p.act_dtype() {
         MetalDtype::F16 => "block_softmax_precise_float16",
         MetalDtype::Bf16 => "block_softmax_precise_bfloat16",
         MetalDtype::Int4 => panic!(),
@@ -8485,7 +8481,7 @@ fn softmax_precise_symbol(p: &ModelFacts) -> &'static str {
 }
 
 fn take_along_axis_symbol(p: &ModelFacts) -> &'static str {
-    match p.metal_dtype() {
+    match p.act_dtype() {
         MetalDtype::F16 => "take_along_axis_2d_contig_float16",
         MetalDtype::Bf16 => "take_along_axis_2d_contig_bfloat16",
         MetalDtype::Int4 => panic!(),
@@ -8493,7 +8489,7 @@ fn take_along_axis_symbol(p: &ModelFacts) -> &'static str {
 }
 
 fn moe_weighted_sum_symbol(p: &ModelFacts) -> &'static str {
-    match p.metal_dtype() {
+    match p.act_dtype() {
         MetalDtype::F16 => "moe_weighted_sum_float16",
         MetalDtype::Bf16 => "moe_weighted_sum_bfloat16",
         MetalDtype::Int4 => panic!(),
@@ -8505,9 +8501,9 @@ fn moe_weighted_sum_symbol(p: &ModelFacts) -> &'static str {
 /// Qwen2-MoE E=60, Qwen3-MoE E=128; Qwen3.5-MoE E=256 needs the
 /// `bn=64` (N_PER_BLOCK=256) instantiation. The router input is
 /// router-probs (Qwen) or router-logits (Mixtral), both in
-/// p.metal_dtype().
+/// p.act_dtype().
 fn argpartition_symbol(p: &ModelFacts, num_experts: u32) -> &'static str {
-    match (p.metal_dtype(), num_experts > 128) {
+    match (p.act_dtype(), num_experts > 128) {
         (MetalDtype::F16, false) => "c_arg_block_sort_float16_uint32_bn32_tn4",
         (MetalDtype::Bf16, false) => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
         (MetalDtype::F16, true) => "c_arg_block_sort_float16_uint32_bn64_tn4",
@@ -8520,7 +8516,7 @@ fn argpartition_symbol(p: &ModelFacts, num_experts: u32) -> &'static str {
 
 /// The routing kernel over `num_experts`: the argsort's dtype and threadgroup.
 fn moe_route_symbol(p: &ModelFacts, num_experts: u32) -> &'static str {
-    match (p.metal_dtype(), num_experts > 128) {
+    match (p.act_dtype(), num_experts > 128) {
         (MetalDtype::F16, false) => "moe_route_float16_bn32",
         (MetalDtype::Bf16, false) => "moe_route_bfloat16_bn32",
         (MetalDtype::F16, true) => "moe_route_float16_bn64",
@@ -9346,7 +9342,7 @@ fn lower_moe_step(
         }
         S::Scale(scale) => {
             let (f16, bf16) = ("scalar_mul_f16_specialized", "scalar_mul_bf16_specialized");
-            let symbol = pick_specialized_symbol(f16, bf16, p.metal_dtype());
+            let symbol = pick_specialized_symbol(f16, bf16, p.act_dtype());
             let bindings = vec![s.at(0, R::TopKScores), s.at(1, R::TopKScores)];
             let shape = rows_1d(pairs, THREADS_PER_GROUP, A::X);
             let constants = super::kernel_constants::ScalarMulConstants {
@@ -9364,7 +9360,7 @@ fn lower_moe_step(
             )]
         }
         S::Renorm => {
-            let symbol = match p.metal_dtype() {
+            let symbol = match p.act_dtype() {
                 MetalDtype::F16 => "topk_renorm_float16",
                 MetalDtype::Bf16 => "topk_renorm_bfloat16",
                 MetalDtype::Int4 => panic!("topk_renorm: int4 unreachable"),
@@ -9482,7 +9478,7 @@ fn lower_moe_step(
             } else {
                 (
                     KernelId::MoeGroupScatter,
-                    moe_group_scatter_symbol(p.metal_dtype()),
+                    moe_group_scatter_symbol(p.act_dtype()),
                     arena_at(2, x),
                     hidden.min(256),
                 )
@@ -9803,7 +9799,7 @@ fn lower_moe_step(
                 MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
-            let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype());
+            let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.act_dtype());
             let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
             let bindings = vec![s.at(0, R::ExpertUp), s.at(1, R::ExpertUp)];
             let kernel = KernelId::VisionGelu;
@@ -9834,7 +9830,7 @@ fn lower_moe_step(
 
 /// `moe_per_expert_scale_{float16,bfloat16}` symbol picker.
 fn moe_per_expert_scale_symbol(p: &ModelFacts) -> &'static str {
-    match p.metal_dtype() {
+    match p.act_dtype() {
         MetalDtype::F16 => "moe_per_expert_scale_float16",
         MetalDtype::Bf16 => "moe_per_expert_scale_bfloat16",
         MetalDtype::Int4 => panic!("moe_per_expert_scale: int4 unreachable"),
@@ -9972,7 +9968,7 @@ mod tests {
 
     /// Minimal `CanonicalParams` impl for lowering-shape tests. No
     /// kernel actually runs — `lower_one` just inspects the variant
-    /// fields and `p.metal_dtype()`. Pinned to bf16 to match the
+    /// fields and `p.act_dtype()`. Pinned to bf16 to match the
     /// canonical Llama-3.x configuration the macro emits.
     struct TestParams;
     impl CanonicalParams for TestParams {

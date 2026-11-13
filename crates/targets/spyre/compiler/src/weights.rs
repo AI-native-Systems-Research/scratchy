@@ -53,7 +53,7 @@ pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
             WeightAbi {
                 // Two matmuls plus a SiluMul — no packed-buffer kernel to read one.
                 mlp: MlpPacking::Split,
-                // ⛔ DERIVED, NOT ASSUMED. Read from the FUF, exactly as the metal bridge reads
+                // ⛔ DERIVED, NOT ASSUMED. Read from the FUF, exactly as the subtile bridge reads
                 // it, so the two cannot disagree about one model.
                 embed: match fuf.nodes.iter().find_map(|n| {
                     (n.op == OpKind::Embed)
@@ -117,7 +117,7 @@ pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
 /// `load_weights` re-found every tensor at runtime by building
 /// `"{disk}.weight"` and asking the weight store for it, because nothing told
 /// it which struct field a source id meant. Only GENERATED code can name a
-/// GENERATED field, so this is emitted per model — the same reason metal's
+/// GENERATED field, so this is emitted per model — the same reason the GPU target's
 /// forward reads `wm.q_proj` rather than looking a name up.
 ///
 /// ⛔ AND IT IS A `match` OVER REAL FIELDS, NOT A TABLE OF NAMES. A name here
@@ -132,7 +132,7 @@ fn emit_weight_bindings(
 ) -> Result<proc_macro2::TokenStream, String> {
     use quote::quote;
     // Function-scoped because every user is in this spyre-gated body: a
-    // module-level import would be dead under `-Fmetal` (b76516bab).
+    // module-level import would be dead outside spyre (b76516bab).
     use scratchy_subtile::handoff::BundleTensor;
     // Accessor name → how to reach that field on `w`. The three group shapes
     // are the struct emitter's own (`Unindexed` ⇒ `w.base`,

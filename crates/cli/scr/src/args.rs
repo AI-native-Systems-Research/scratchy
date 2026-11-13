@@ -222,7 +222,6 @@ pub enum ModelSubcommand {
     /// scratchy variants. Optional positional filters AND-substring
     /// match against `<arch>/<variant_stem>` — e.g.
     /// `scr model info llama 3.2 awq`.
-    #[cfg(feature = "metal")]
     Info(ModelInfoArgs),
     /// Print compiled-in HuggingFace model ids for shell tab completion
     /// (one per line), optionally filtered by prefix. Sourced from
@@ -282,7 +281,6 @@ pub enum NamesSource {
     Stems,
 }
 
-#[cfg(feature = "metal")]
 #[derive(Parser, Debug)]
 pub struct ModelInfoArgs {
     /// Color/style output. `auto` uses ANSI when stdout is a tty
@@ -296,7 +294,6 @@ pub struct ModelInfoArgs {
     pub filters: Vec<String>,
 }
 
-#[cfg(feature = "metal")]
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 pub enum ColorWhen {
     #[default]
@@ -488,7 +485,7 @@ pub struct ServeArgs {
     pub no_prefix_caching: bool,
 
     /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3" (FP8).
-    /// FP8 halves KV cache memory, doubling capacity. On metal the KV codec is
+    /// FP8 halves KV cache memory, doubling capacity. Where the target's KV codec is
     /// fixed when the binary is built (the `turboquant` feature): "auto" takes
     /// it, and "fp16" / "turboquant" assert it — a mismatch refuses to start.
     #[arg(long, default_value = "auto")]

@@ -123,7 +123,7 @@ pub enum StorageFormat {
     /// is `float8_e4m3` `[N, K/group_size]` per-block scale (stored
     /// linear on disk — the CUTLASS swizzle is a post-load step we
     /// don't apply for dequant-on-read). `.weight_scale_2` is an
-    /// `f32` per-tensor global scale. The Metal load folds
+    /// `f32` per-tensor global scale. The load folds
     /// `f32(weight_scale)/weight_scale_2` into a single per-group F16
     /// scale (`Nvfp4Linear`), and the `qmv`/`qmm_t` kernels dequant on
     /// read — weight-only (activations stay bf16/f16). `group_size` is
@@ -280,8 +280,8 @@ pub enum QuantMethod {
     /// NVIDIA ModelOpt NVFP4. Detected via `quant_method: "modelopt"`
     /// (or no `quant_method` in a standalone `hf_quant_config.json`)
     /// with a `quant_algo` containing `"NVFP4"`. `group_size` is read
-    /// from the config (default 16). Weight-only dequant-on-read on
-    /// Metal; embeddings + `lm_head` stay dense (ModelOpt keeps them
+    /// from the config (default 16). Weight-only dequant-on-read on the
+    /// device; embeddings + `lm_head` stay dense (ModelOpt keeps them
     /// high precision and usually lists `lm_head` in `exclude_modules`).
     Nvfp4 { group_size: u32 },
 }
@@ -1389,11 +1389,11 @@ pub fn storage_format_for_weight(
     // sampled in P0). Pre-P6, the load path CPU-dequantized the
     // embedding (`Embedding::load_affine_dequant` → BF16 Dense),
     // so the tied lm_head saw a Dense tensor and routed through
-    // MetalGemmImpl. P6 lifts the embedding to forward-time gather
+    // the dense gemm. P6 lifts the embedding to forward-time gather
     // + dequant (`Instruction::AffineEmbed`), which means the
     // embed buffer triple stays quantized at runtime — the tied
     // lm_head must now also see Affine storage so the solver
-    // picks `MetalAffineQmmImpl` and the codegen
+    // picks the affine qmm and the codegen
     // `LinearTiedToEmbedding { affine: Some((gs, bits)) }` arm
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.

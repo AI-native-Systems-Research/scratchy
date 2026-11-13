@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `MetalWorker`: the `Worker` implementation backed by the Metal runtime
 //! (scratchy-forward-compiler `MetalWorkerPool` + scratchy-target-metal).
-//!
-//! Gated behind the `metal` feature flag.
 
-// Force the linker to keep `scratchy_models` — its `#[forward]`
-// modules register with `inventory::submit!` for auto-discovery by
+// Force the linker to keep the compiled models — their emitted modules
+// register with `inventory::submit!` for auto-discovery by
 // `scratchy_target_metal::try_load`. Without this, the linker gc's the
-// crate (no direct symbol references after the Phase B collapse)
-// and the inventory comes up empty.
-extern crate scratchy_models as _;
+// crate (nothing names its symbols directly) and the inventory comes up
+// empty.
+extern crate scratchy_target_metal_models as _;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -3153,7 +3151,7 @@ impl MetalWorker {
             // the call sequence L0_K_c0, L0_V_c0, L0_K_c1, L0_V_c1, ...
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
             let chunks_per_layer = draft_chunks;
-            KvCachePool::new_metal_chunked(
+            KvCachePool::new_chunked(
                 num_layers_draft,
                 draft_blocks,
                 self.config.block_size.get(),
@@ -6298,7 +6296,7 @@ impl Worker for MetalWorker {
         // Phi / Mistral checkpoint. Apple Silicon M3+ has hardware bf16 MMA; the metal
         // shaders ship `_bf16_specialized` siblings for every
         // on-path kernel and `MetalDtype::Bf16` is the default on
-        // `CanonicalParams::METAL_DTYPE`. F16-on-disk weights get
+        // `CanonicalParams::ACT_DTYPE`. F16-on-disk weights get
         // cast up to bf16 here (lossy in the mantissa but matches
         // the kernel's expected binding type).
         weights.set_target_dtype(GpuDType::BF16);
@@ -6767,7 +6765,7 @@ impl Worker for MetalWorker {
             // `2*num_layers` calls in slot order, repeated per added chunk).
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
             let n_slots = num_tensors_for_pool * 2;
-            KvCachePool::new_metal_chunked(
+            KvCachePool::new_chunked(
                 num_layers_for_pool,
                 num_gpu_blocks,
                 self.config.block_size.get(),
@@ -6834,7 +6832,7 @@ impl Worker for MetalWorker {
         // (returns sparse_base + metal_offset).
         pool.fill_chunk_tables(|m| m.gpu_address());
         info!(
-            "ScratchyWorker(metal): init_cache phases — KvCachePool::new_metal_chunked({} blocks/chunk) {:?} (residency.commit deferred to first forward)",
+            "ScratchyWorker(metal): init_cache phases — KvCachePool::new_chunked({} blocks/chunk) {:?} (residency.commit deferred to first forward)",
             blocks_per_chunk,
             t_pool.elapsed(),
         );

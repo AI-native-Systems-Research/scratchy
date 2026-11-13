@@ -15,7 +15,6 @@ pub mod convert;
 #[cfg(feature = "claude")]
 pub mod launch;
 pub mod model;
-#[cfg(feature = "metal")]
 pub mod model_info;
 pub mod pull;
 #[cfg(feature = "serve")]

@@ -9,7 +9,7 @@
 //! Spyre is a HOST backend (fp16) — loading a weight is "read the bytes out of
 //! `GpuWeights<SpyreAllocator>` and construct the neutral struct". Every dense
 //! load is therefore allocator-generic: it delegates to the shared neutral free
-//! fns in `scratchy_layers::layers` (the same ones metal uses) or builds
+//! fns in `scratchy_layers::layers` (the same ones every target uses) or builds
 //! the packed buffer through the allocator-generic `take_cpu` /
 //! `alloc_packed_from_host` host pipeline — no GPU kernels, no stream.
 //!
@@ -28,13 +28,13 @@ use crate::weights::GpuWeights;
 // `crate::__gpu::layers::*` field-type surface (LinearLayer, Embedding, RmsNorm,
 // LayerNorm, GatedDeltaNetLayer, GpuTensor handles, …) resolves through this
 // glob — it formerly lived inline in `lib.rs`, moved here so the whole layer
-// surface is in one place, peer to targets/metal's `layers.rs`.
+// surface is in one place, peer to every other target's `layers.rs`.
 pub use scratchy_layers::layers::*;
 
 // The quant payload TYPES live in `scratchy-quantizations` (a neutral leaf,
 // NOT a `targets/` crate). Re-export them under `crate::__gpu::layers::…` so the
 // macro-emitted `AffineQuant*` / `Nvfp4Linear` constructor + field paths keep
-// resolving against the same type the metal arms use.
+// resolving against the same type every target's arms use.
 pub use scratchy_quantizations::{AffineQuantEmbedding, AffineQuantLinear, Nvfp4Linear};
 
 // ---------------------------------------------------------------------------
@@ -378,7 +378,7 @@ impl LinearLayerOps for LinearLayer {
 
 // ── MLX-affine int4 → dense host dequant (the P2 slow-reference path) ───────
 //
-// The same three helpers metal's `layers_quant.rs` carries, over the SAME
+// The same three helpers the GPU target's `layers_quant.rs` carries, over the SAME
 // frozen `WeightSource` seam: spyre's `GpuWeights` implements it (neutral, in
 // scratchy-layers), so the reads and the `alloc_packed_from_host` writes are
 // allocator-generic with no GPU kernel anywhere. The dequant arithmetic itself
@@ -387,7 +387,7 @@ impl LinearLayerOps for LinearLayer {
 // ⛔ THE FORWARD-TIME KERNEL PATH (`load_affine_quant`) STAYS A `bail!` — this
 // is the DEQUANT-AT-LOAD path only, which the macro emits for `mlx-affine-*`
 // presets. A dequantized-then-staged weight is fp16 bandwidth, not int4 — the
-// slow reference, exactly as on metal.
+// slow reference, exactly as on a GPU.
 
 /// CPU-dequantize one MLX-affine int4 prefix's `{weight,scales,biases}` triple
 /// to `(dense [N,K] bytes, n, k)` — the shared validation + math half.
@@ -590,7 +590,7 @@ impl EmbeddingOps for Embedding {
 }
 
 // ---------------------------------------------------------------------------
-// RmsNorm — load (keep on-disk dtype, mirroring metal)
+// RmsNorm — load (keep on-disk dtype, mirroring the GPU target)
 // ---------------------------------------------------------------------------
 
 /// Spyre load surface for [`RmsNorm`].
@@ -601,7 +601,7 @@ pub trait RmsNormOps: Sized {
 impl RmsNormOps for RmsNorm {
     /// Route through `take_keep_dtype` so the on-disk gain dtype (F16 on every
     /// sampled mlx-community / Llama-3.x checkpoint) reaches the host verbatim
-    /// — spyre is fp16 like metal, so it mirrors metal's keep-dtype choice
+    /// — spyre is fp16 like the GPU target, so it mirrors its keep-dtype choice
     /// rather than cuda's load-time bf16 cast. Falls back to the bare `<prefix>`
     /// key (Gemma's per-layer scalar gain ships with no `.weight` suffix).
     fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
@@ -640,7 +640,7 @@ pub trait GatedDeltaNetOps: Sized {
 
 impl GatedDeltaNetOps for GatedDeltaNetLayer {
     /// Load the linear-attn bundle. Tensors keep their on-disk dtype except
-    /// `norm.weight` (upcast to f32) — same neutral logic the metal arms
+    /// `norm.weight` (upcast to f32) — same neutral logic every target's arms
     /// use.
     fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
         scratchy_layers::layers::gated_delta_net_load(weights, prefix)

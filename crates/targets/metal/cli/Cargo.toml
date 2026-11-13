@@ -1,0 +1,73 @@
+[package]
+name = "scratchy-target-metal-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "`scr`: the scratchy CLI on Apple silicon — the common CLI core's commands, served through the metal worker"
+
+[features]
+# Shell tab completion over real HuggingFace model ids is ON by default:
+# scratchy-models' `hf-completions`, whose build script resolves the candidate
+# list against huggingface.co at build time (see docs/BUILD.md). Completing
+# model names is the point of `scr completions`, and a binary that silently
+# can't do it is the confusing case, not the useful one. It and `mtp-heads`
+# are named here as `model/<feature>`, not as features of this crate:
+# `model/<feature>` already reaches every scratchy-models feature (see
+# `tests/arch_feature_passthrough.rs`).
+#
+# `turboquant` — TurboQuant KV compression. Every model whose geometry the
+# codec takes stores its KV cache as TurboQuant codes; the rest stay dense, and
+# the build output names them. `--kv-cache-dtype` cannot change it at runtime.
+#
+# `mtp-heads` — multi-token-prediction drafting. Every selected model whose
+# checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
+# selected model whose drafter is published as a model of its own (Gemma 4
+# 26B-A4B's assistant at MLX 4-bit g32, under `quant/mlx`). Serving the model
+# drafts with it; a checkpoint whose head is nowhere serves without drafting.
+# `spec/mtp` adds the other published drafters (Gemma 4's bf16 and QAT
+# assistants), which draft only when `--speculative-model` names them.
+#
+# Dropping the defaults builds the same engine with a dense KV cache, no MTP
+# heads and NO network access at build time (air-gapped); name back what you want:
+#   cargo build -p scratchy-target-metal-cli --no-default-features --features chat,model/<stem>
+default = ["chat", "model/hf-completions", "turboquant", "model/mtp-heads"]
+turboquant = ["scratchy-target-metal-worker/turboquant"]
+
+# The common core's features, here so `scr`'s own build line names them.
+chat = ["scratchy-cli/chat"]
+serve = ["scratchy-cli/serve", "guided-decoding"]
+claude = ["scratchy-cli/claude", "serve"]
+otel = ["scratchy-cli/otel"]
+bench = ["scratchy-cli/bench"]
+bench-datasets = ["scratchy-cli/bench-datasets"]
+guided-decoding = ["scratchy-cli/guided-decoding", "scratchy-target-metal-worker/guided-decoding"]
+# The image-decode stack, and the vision towers' runtime the metal worker and its models crate
+# compile under it.
+multimodal = ["scratchy-cli/multimodal", "scratchy-target-metal-worker/vision"]
+tls = ["scratchy-cli/tls"]
+metrics = ["scratchy-cli/metrics"]
+tool-spans = ["scratchy-cli/tool-spans"]
+rag = ["scratchy-cli/rag"]
+
+[[bin]]
+name = "scr"
+path = "src/main.rs"
+
+[dependencies]
+# The common CLI core (`scratchy_cli::run`), with model-name completion.
+scratchy-cli = { workspace = true, features = ["model"] }
+# The metal worker: the `WorkerFactory` the engine serves through. `main.rs` anchors it.
+scratchy-target-metal-worker = { workspace = true }
+# THE MODEL SCOPE, for CLI feature reachability: `--features model/<stem>` selects through
+# scratchy-models' own features (`model/granite-3.1-2b-instruct`, `model/granite` for every granite
+# config, `model/all`). Quant presets live on a separate crate, scratchy-quantizations, aliased
+# `quant` (Cargo forbids aliasing one crate under two names); drafters on scratchy-spec, aliased
+# `spec`. scratchy-models has no default model scope — naming zero is a build-time panic, not a
+# silently empty binary.
+model = { package = "scratchy-models", path = "../../../models/arch", default-features = false }
+quant = { package = "scratchy-quantizations", path = "../../../models/quantization", default-features = false }
+spec = { package = "scratchy-spec", path = "../../../models/spec" }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }

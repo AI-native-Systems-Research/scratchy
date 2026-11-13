@@ -3,7 +3,7 @@
 //!
 //! These types and helpers describe WHERE a weight lives and WHICH slot a
 //! value occupies. They are consumed by `to_wavefront` (the shared front
-//! end), `metal_from_subtile` (metal's bridge) and codegen.
+//! end), a target's bridge and codegen.
 
 use std::collections::BTreeMap;
 

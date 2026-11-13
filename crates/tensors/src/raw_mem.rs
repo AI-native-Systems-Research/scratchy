@@ -3,8 +3,8 @@
 //!
 //! A device allocation reduced to its neutral essence: a pointer, a size, and
 //! an optional free thunk run on `Drop`. The thunk captures the backend's free
-//! routine at construction (Metal passes a thunk that simply owns the
-//! `MTLBuffer` so it is released on drop), so this type names no backend. Backends needing richer handles (Metal's `MTLBuffer` +
+//! routine at construction (a target may pass a thunk that simply owns the
+//! device buffer so it is released on drop), so this type names no backend. Backends needing richer handles (a device buffer +
 //! GPU address) wrap this in their own type.
 
 /// Opaque device allocation with a backend-supplied free thunk.

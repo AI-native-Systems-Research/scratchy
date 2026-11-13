@@ -120,7 +120,7 @@ impl CacheableTokens {
 /// that is not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum KvAddressing {
-    /// Key `n` lives at slot `n`: metal, and every backend whose pool is indexed by token. The
+    /// Key `n` lives at slot `n`: every backend whose pool is indexed by token. The
     /// default, so a backend that says nothing keeps the arithmetic it always had.
     #[default]
     ByToken,
@@ -148,7 +148,7 @@ pub enum HybridKvStores {
     /// Every group's blocks are pages of one shared pool. The default.
     #[default]
     Shared,
-    /// The global (full-attention) group's KV lives in a store of its own — metal's TurboQuant store,
+    /// The global (full-attention) group's KV lives in a store of its own — a TurboQuant store,
     /// mapped through the global group's highest block — and the sliding groups' in the shared pool,
     /// mapped through theirs.
     GlobalApart,
@@ -166,7 +166,7 @@ pub enum KvBacking {
     /// default.
     #[default]
     Allocated,
-    /// A block is backed the first time the pool reaches it, and stays backed — metal's KV stores, which
+    /// A block is backed the first time the pool reaches it, and stays backed — a target's KV stores, which
     /// take no memory until a step maps them. The worker reports how far after each step
     /// ([`KvBackedBlocks`]); a never-used block past that would map more, so cached ones go first.
     OnFirstUse,
@@ -268,7 +268,7 @@ impl KvSlotSpan {
     /// appends one decode token leaves the shallow row exactly one page short. So the three terms are maxed —
     /// `writing` is NOT added to `reach`, because `reach` already contains the deepest row's append.
     ///
-    /// `reach` is [`KvSlotSpan::NONE`] on every token-addressed backend (metal), and the arithmetic is then
+    /// `reach` is [`KvSlotSpan::NONE`] on every token-addressed backend, and the arithmetic is then
     /// exactly what it always was for them.
     pub fn slots_this_step(self, reach: KvSlotSpan, own_tokens: usize, writing: usize) -> usize {
         (self.get() as usize + writing)
@@ -576,7 +576,7 @@ mod step_reach_proofs {
         );
     }
 
-    /// A TOKEN-ADDRESSED BACKEND IS UNTOUCHED. metal reports no pool reach, so it passes
+    /// A TOKEN-ADDRESSED BACKEND IS UNTOUCHED. Such a backend reports no pool reach, so it passes
     /// [`KvSlotSpan::NONE`] and must get byte-identical arithmetic to what it had before the reach existed.
     #[kani::proof]
     fn no_reach_is_the_arithmetic_that_was_there_before() {

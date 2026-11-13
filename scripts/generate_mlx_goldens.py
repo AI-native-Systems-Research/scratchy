@@ -12,7 +12,7 @@ in `~/.venv`:
     cd /path/to/vllm-rs
     python3 scripts/generate_mlx_goldens.py
 
-Output: `crates/e2e/testdata/golden/<model_key>_mlx_4bit.json`
+Output: `crates/targets/metal/e2e/testdata/golden/<model_key>_mlx_4bit.json`
 matching the `GoldenReference` schema in `e2e/src/assertions.rs`
 (model, max_tokens, num_logprobs, results: [{prompt, output_tokens,
 output_text, logprobs}]).
@@ -45,7 +45,7 @@ PROMPTS = [
 ]
 
 # MLX-only mlx-community 4bit checkpoints. Keys mirror the
-# `llama_3_2_1b_*` family in `crates/e2e/testdata/golden/`.
+# `llama_3_2_1b_*` family in `crates/targets/metal/e2e/testdata/golden/`.
 # Stick to 1B for now to fit the 24Gi dev machine; 3B added when
 # we validate that path separately (see P10).
 MODELS = {
@@ -57,7 +57,7 @@ MAX_TOKENS = 64
 # use 20; match for downstream `check_logprobs_close` compatibility.
 NUM_LOGPROBS = 20
 
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "crates" / "e2e" / "testdata" / "golden"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "crates" / "targets" / "metal" / "e2e" / "testdata" / "golden"
 
 
 def generate_golden_for_model(repo: str, model_key: str) -> dict:

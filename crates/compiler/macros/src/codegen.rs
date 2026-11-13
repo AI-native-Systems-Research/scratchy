@@ -22,7 +22,7 @@
 //! The caller's entire integration is two calls: `Weights::load(...)`
 //! at startup and `forward(...)` per step.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -30,8 +30,7 @@ use syn::Ident;
 
 use crate::classified::{OpKind, Program, UnrollIndex, WeightId};
 use crate::config::ModelParams;
-use crate::fuf::{Fuf, FufInput, TileId};
-use crate::interpreter_codegen::emit_bucket_static_slice;
+use crate::fuf::{Fuf, FufInput};
 use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
 use crate::workload::{WorkloadPoint, WorkloadPoints};
 
@@ -141,7 +140,7 @@ pub(crate) fn under_root(root: &str, rest: &str) -> String {
 /// The on-disk prefix `model` loads the lent weight `w` from: what a multi-token-prediction head
 /// borrows from its target is found under the target's prefix and placed under the head's.
 /// A tied lm_head loads from the embedding table. `None` when the program has no such weight.
-pub(crate) fn lent_weight_prefix(
+pub fn lent_weight_prefix(
     program: &Program,
     fuf: &crate::fuf::Fuf,
     model: &crate::config::ModelParams,
@@ -209,7 +208,7 @@ fn translate_digit_suffix(seg: &str) -> String {
 enum FieldLoad {
     /// `Embedding::load(gw, prefix)`.
     Embedding(String),
-    /// MLX-affine int4 quantized embedding (Metal-only). Reads
+    /// MLX-affine int4 quantized embedding. Reads
     /// `<prefix>.{weight,scales,biases}` and CPU-dequantizes to BF16
     /// at load time so the rest of the forward path sees a normal
     /// dense embedding. Used by every `mlx-community/*-4bit` checkpoint
@@ -226,12 +225,12 @@ enum FieldLoad {
     },
     /// Affine-quant embedding loaded into a DENSE `Embedding` by host/CPU
     /// dequant: `Embedding::load_affine_dequant(gw, prefix, group_size, bits)`.
-    /// Chosen when the embed ACCESSOR is a dense `Embedding` (not the metal
+    /// Chosen when the embed ACCESSOR is a dense `Embedding` (not the
     /// `AffineQuantEmbedding`) yet the on-disk storage is Affine — the
     /// storage-agnostic path `EmbedRefImpl` takes on a host-dequant target (the
     /// host worker dequantizes the embed weight), so the loaded field type matches the
     /// dense accessor. Distinct from [`Self::EmbeddingAffine`], which keeps the
-    /// packed `AffineQuantEmbedding` for metal's fused gather+dequant kernel.
+    /// packed `AffineQuantEmbedding` for a fused gather+dequant kernel.
     EmbeddingAffineDequant {
         prefix: String,
         group_size: u32,
@@ -253,7 +252,7 @@ enum FieldLoad {
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
     LinearConcat(Vec<String>),
-    /// MLX-affine int4 quantized linear (Metal-only), single source.
+    /// MLX-affine int4 quantized linear, single source.
     /// `group_size` and `bits` come from `quantization_config`. Under
     /// INT4 P2 emits `LinearLayer::load_affine_dequant_as_dense`
     /// (CPU dequant at load → Dense BF16). Under P3 will flip to
@@ -263,16 +262,16 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
         /// In-features (K) the arch manifest declares for this linear.
-        /// The metal loader asserts the on-disk packed `.weight` width is
+        /// The loader asserts the on-disk packed `.weight` width is
         /// `ceil(K*bits/32)`, rejecting a checkpoint quantized at different
         /// bits/group_size than this build's preset (else geometry is
         /// silently mis-derived from the on-disk shape).
         in_features: u32,
     },
-    /// Fused-concat MLX-affine int4 quantized linear (Metal-only).
+    /// Fused-concat MLX-affine int4 quantized linear.
     /// `gate_proj` + `up_proj` (and q/k/v) ship as separate affine
     /// triples in mlx-community 4bit repos; the forward DSL fuses
-    /// them into one `gate_up_proj` / `qkv_proj` linear so the metal
+    /// them into one `gate_up_proj` / `qkv_proj` linear so the
     /// `FusedGateUpSiluMul` impl pool matches the standard pattern.
     /// Emits `LinearLayer::load_affine_dequant_concat_as_dense`
     /// (CPU dequant per prefix, byte-concat along dim 0, alloc once).
@@ -281,7 +280,7 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
         /// Shared in-features (K) across the fused sources (gate_up / qkv all
-        /// share K). The metal loader asserts each prefix's on-disk packed
+        /// share K). The loader asserts each prefix's on-disk packed
         /// `.weight` width is `ceil(K*bits/32)`. See [`FieldLoad::LinearAffine`].
         in_features: u32,
     },
@@ -294,12 +293,12 @@ enum FieldLoad {
         bits: u32,
         in_features: u32,
     },
-    /// NVFP4 int4 quantized linear (Metal-only), single source. Emits
+    /// NVFP4 int4 quantized linear, single source. Emits
     /// `LinearLayer::load_nvfp4_quant` (forward-time `nvfp4_qmv` /
     /// `nvfp4_qmm_t`). `group_size` from `quantization_config` (16);
     /// bits is always 4.
     LinearNvfp4 { prefix: String, group_size: u32 },
-    /// Fused-concat NVFP4 int4 quantized linear (Metal-only). `qkv_proj`
+    /// Fused-concat NVFP4 int4 quantized linear. `qkv_proj`
     /// / `gate_up_proj` ship as separate NVFP4 triples in ModelOpt
     /// checkpoints; the forward DSL fuses them. Emits
     /// `LinearLayer::load_nvfp4_quant_concat` (per-prefix fold, byte-
@@ -430,7 +429,7 @@ enum FieldLoad {
     /// Mixtral-style fused MoE — no shared expert. Dispatches to
     /// `FusedMoELayer::load` (Dense BF16 expert weights, cuda) or
     /// `FusedMoELayer::load_affine` (MLX-affine int4 expert weights,
-    /// metal) based on `affine`. Mixtral uses HF's
+    /// on device) based on `affine`. Mixtral uses HF's
     /// `block_sparse_moe.experts.{e}.{w1,w2,w3}` layout.
     FusedMoe {
         prefix: String,
@@ -440,7 +439,7 @@ enum FieldLoad {
         hidden_size: usize,
         /// `Some((group_size, bits))` when the macro detected
         /// `StorageFormat::Affine` on the MoE source weight — emits
-        /// the Metal `load_affine` call site, `bits` each routed-expert
+        /// the `load_affine` call site, `bits` each routed-expert
         /// projection's own width. `None` → Dense BF16 path → cuda
         /// `load` call site.
         affine: Option<(u32, crate::quantization::ExpertBits)>,
@@ -453,7 +452,7 @@ enum FieldLoad {
         gate_bits: Option<u32>,
     },
     /// Qwen-MoE-style fused MoE + shared expert. Cuda Dense via
-    /// `SharedFusedMoELayer::load`, metal MLX-affine int4 via
+    /// `SharedFusedMoELayer::load`, MLX-affine int4 via
     /// `SharedFusedMoELayer::load_affine`. Qwen2-MoE / Qwen3-MoE use
     /// HF's `experts.{e}.{gate,up,down}_proj` naming.
     SharedFusedMoe {
@@ -492,7 +491,7 @@ enum FieldLoad {
     },
     /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op, base
     /// `experts.switch_glu`). Dispatches to `SwitchGluExpertsLayer::load`
-    /// (metal-only). Always MLX-affine int4 (`group_size`, `bits`).
+    /// Always MLX-affine int4 (`group_size`, `bits`).
     GemmaSwitchGlu {
         prefix: String,
         num_experts: usize,
@@ -503,7 +502,7 @@ enum FieldLoad {
         bits: u32,
     },
     /// gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`). Dispatches
-    /// to `GptOssMoELayer::load` (metal-only). One bundle carries the
+    /// to `GptOssMoELayer::load`. One bundle carries the
     /// affine router gate at `{prefix}.router` (dequantized at
     /// `gate_bits` — gpt-oss-2Bit quantizes the router at the preset's
     /// own width), the F32 router bias, the pre-stacked affine experts,
@@ -515,7 +514,7 @@ enum FieldLoad {
         intermediate_size: usize,
         hidden_size: usize,
         /// `Some((group_size, bits))` when the experts are MLX-affine —
-        /// the only storage with a metal realization. `None` tolerated
+        /// the only storage an expert kernel takes. `None` tolerated
         /// for the dense/verbatim config (never runtime-selected).
         affine: Option<(u32, u32)>,
         /// Router `{prefix}.router` dequant bit-width, resolved through
@@ -982,7 +981,7 @@ fn storage_requirement_error(
 }
 
 /// Did the solver keep the `embed_tokens` of `accessors` as the packed `AffineQuantEmbedding`
-/// (metal's fused gather+dequant) or dequantize it to a dense `Embedding` (the host-dequant path)?
+/// (a fused gather+dequant kernel reads) or dequantize it to a dense `Embedding` (the host-dequant path)?
 /// A tied `lm_head` follows that representation.
 fn embed_is_affine_repr(accessors: &[WeightAccessor]) -> bool {
     accessors.iter().any(|a| {
@@ -1028,7 +1027,7 @@ fn plan_field_load(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     // Whether the `embed_tokens` accessor the solver picked is the packed
-    // `AffineQuantEmbedding` representation (metal's fused gather+dequant) vs a
+    // `AffineQuantEmbedding` representation (a fused gather+dequant kernel reads) vs a
     // dense `Embedding` (the host-dequant path). A tied `lm_head`
     // must follow the embedding's REPRESENTATION, not the raw on-disk storage:
     // when the embed is dense, the tied head reuses its dense weight; only when
@@ -1069,7 +1068,7 @@ fn plan_field_load(
     // `Embedding` (carries packed U32 weight + F16 scales + F16
     // affine offsets); the field_load arm always routes to
     // `EmbeddingAffine` since the storage is known-Affine by
-    // construction (`MetalAffineEmbedImpl::matches` gates on
+    // construction (its weight-binding pass gates on
     // `StorageFormat::Affine`).
     let is_affine_quant_embedding = ty.ends_with("::AffineQuantEmbedding")
         || ty == "AffineQuantEmbedding"
@@ -1388,9 +1387,9 @@ fn plan_field_load(
         let (num_experts, hidden_size, intermediate_size) = dims.bank(accessor);
         let top_k = routed_top_k(model);
         // Probe storage format: if expert weights are MLX-affine int4
-        // (mlx-community 4bit Mixtral / Qwen-MoE), emit the metal
+        // (mlx-community 4bit Mixtral / Qwen-MoE), emit the affine
         // `load_affine` call site; otherwise emit cuda `load`.
-        // Same check the `MetalFusedMoeImpl::matches` uses via
+        // Same check the expert kernels key on via
         // `affine_gs_bits`. Source weights all share storage format
         // (the macro asserts this elsewhere for AffineQuantLinear).
         // Resolved at this accessor's layer index — MLX mixed/dynamic quant
@@ -1423,7 +1422,7 @@ fn plan_field_load(
         let top_k = routed_top_k(model);
         let shared_expert_intermediate_size = dims.shared.unwrap_or(0);
         let only_src = accessor.source_weights[0].0;
-        // Single-owner rule (mirrors `MetalSharedFusedMoeImpl::fan_out`):
+        // Single-owner rule (as the shared-expert MoE lowering does):
         // when the DSL claims `<moe>.shared_expert.*` leaves in the
         // manifest, the struct loader must not also load them — zero the
         // internal shared width so `load_affine`/dense load skip the
@@ -1511,7 +1510,7 @@ fn plan_field_load(
         let only_idx = accessor.source_weights[0].1;
         // The mlx-4bit checkpoint is the real runtime path (Affine gs/bits).
         // The verbatim BF16/Dense config also reaches here; it never becomes
-        // the runtime-selected specialization on metal but must still codegen,
+        // the runtime-selected specialization but must still codegen,
         // so default to the mlx checkpoint's g64/b4 rather than panicking
         // (same tolerance as the GemmaRouter group_size default above).
         let (group_size, bits) = match crate::quantization::storage_format_for_weight(
@@ -1554,7 +1553,7 @@ fn plan_field_load(
         // Op-keyed arm (the `GptOssMoe` op selects it), so like GemmaSwitchGlu
         // it MUST tolerate the Dense/verbatim config and default its storage
         // params rather than panic — that config never becomes the
-        // runtime-selected specialization on metal.
+        // runtime-selected specialization.
         let only_src = accessor.source_weights[0].0;
         let only_idx = accessor.source_weights[0].1;
         let affine = match crate::quantization::storage_format_for_weight(
@@ -1660,7 +1659,7 @@ fn plan_field_load(
         {
             let prefix = prefixes.into_iter().next().unwrap();
             // The loader follows the ACCESSOR type the solver picked, so the
-            // built field matches the struct field. A metal `AffineQuantEmbedding`
+            // built field matches the struct field. An `AffineQuantEmbedding`
             // accessor keeps the packed bundle (`EmbeddingAffine`); a dense
             // `Embedding` accessor with Affine storage — the storage-agnostic
             // path `EmbedRefImpl` takes on a host-dequant target — dequantizes host-side.
@@ -1680,7 +1679,7 @@ fn plan_field_load(
         }
         // If the accessor type is AffineQuantEmbedding but the source
         // weight is NOT Affine, the macro / impl pairing is broken —
-        // MetalAffineEmbedImpl should only fire on Affine sources.
+        // an affine embedding accessor only binds Affine sources.
         if is_affine_quant_embedding {
             let got =
                 crate::quantization::storage_format_for_weight(program, fuf, only_src, None, model);
@@ -1689,7 +1688,7 @@ fn plan_field_load(
                 storage_requirement_error(
                     model,
                     accessor,
-                    "Affine (MetalAffineEmbedImpl::matches should have rejected this)",
+                    "Affine (an affine embedding accessor binds only Affine sources)",
                     &format!("{got:?}"),
                 )
             );
@@ -1742,7 +1741,7 @@ fn plan_field_load(
             // representation. The tied lm_head's `source_weights` resolves
             // to the embed_tokens weight ID — but it must follow the embed's
             // REPRESENTATION: only when the embed kept the affine triple
-            // (`embed_is_affine_repr`, i.e. metal) does the tied head read
+            // (`embed_is_affine_repr`) does the tied head read
             // its `scales`/`biases`. When the embed was dequantized to a dense
             // `Embedding` (the host-dequant path) the tied head reuses the dense
             // weight, so `affine` stays `None`.
@@ -2002,7 +2001,7 @@ pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
-// `pub(crate)`: also consulted by `MetalRopeAppendNormedImpl::applies_to`
+// `pub(crate)`: also consulted by a target's normed rope-append lowering
 // (the synth norm prologue is only bit-correct for offset-0 models).
 pub(crate) fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
     // Read the parsed `bounds` table (booleans land there as 0/1, and
@@ -3094,7 +3093,7 @@ fn emit_weights_struct(
     program: &Program,
     fuf: &Fuf,
     // The accessor set, from the SHARED TAPE. `None` (no tape lowered
-    // for this variant — a shim, or metal's first pass before the
+    // for this variant — a shim, or a target's first pass before the
     // front-end swap) emits a `Weights` with no accessor fields.
     tape_accessors: Option<&[WeightAccessor]>,
     // The fields' typed handles (none for a shim, whose `Weights` is its canonical's).
@@ -3231,11 +3230,11 @@ fn emit_weights_struct(
                         false
                     ),
                 );
-            // The storage/accessor match only matters for backends that emit a
-            // concrete per-accessor host FieldLoad (metal). A target that
+            // The storage/accessor match only matters for a target that loads each weight
+            // through its accessor's host FieldLoad (`loads_by_accessor`). A target that
             // runs an embedded fused program loads + dequantizes weights itself
             // (no host FieldLoad), so the dense accessor is fine for any storage.
-            if !ok && cfg!(feature = "metal") {
+            if !ok && emitter.loads_by_accessor() {
                 let dotted = program.weights.path(*wid).join(".");
                 let msg = format!(
                     "model `{stem}`: weight `{dotted}` has storage ({fmt:?}) that \
@@ -3354,7 +3353,10 @@ fn emit_weights_struct(
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     let lets: Vec<TokenStream> = groups
         .iter()
-        .map(|g| emit_group_let(g, &plan_by_name, model, tp_world_size, is_vision))
+        .map(|g| {
+            let packed = emitter.loads_concat_packed();
+            emit_group_let(g, &plan_by_name, model, tp_world_size, is_vision, packed)
+        })
         .collect();
 
     // Shared-per-model Marlin prelude: one workspace allocation
@@ -3638,7 +3640,7 @@ fn emit_weights_struct(
         })
     });
 
-    // The RoPE tables are `OnceLock`s: a target builds them at load, or (metal) when its pool
+    // The RoPE tables are `OnceLock`s: a target builds them at load, or (one whose pool is built after load) when its pool
     // is built (`build_rope_tables`), for the positions the KV cache's block table reaches.
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
@@ -3646,7 +3648,7 @@ fn emit_weights_struct(
         quote! {}
     };
 
-    let rotary_local_load_metal: TokenStream = if uses_rotary_local {
+    let rotary_local_load: TokenStream = if uses_rotary_local {
         let head_dim = model.text.head_dim.get() as usize;
         let local_theta = model.text.rope_local_for(&model.source_stem).get();
         quote! {
@@ -3694,15 +3696,15 @@ fn emit_weights_struct(
         quote! {}
     };
 
-    // Stream-free metal counterpart to `rotary_load`. The
+    // The stream-free rotary load. The
     // `*_from_gpuweights` constructors cover every rope family the
     // cuda path emits — basic, Llama3, LongRoPE, YaRN, partial rotary
     // (combined with each scaling where the family allows it), and
     // the Gemma4 proportional-global class handled above — so the
-    // metal match below is exhaustive with no refusal arm.
+    // match below is exhaustive with no refusal arm.
     //
-    // Cache dtype is `BF16` to match the rest of the metal stack:
-    // `CanonicalParams::METAL_DTYPE` defaults to bf16, the
+    // Cache dtype is `BF16` to match the rest of the stack:
+    // `CanonicalParams::ACT_DTYPE` defaults to bf16, the
     // `rope_append_bf16_specialized` shader binds `cos_sin` as
     // `device const bfloat*`, and Llama-3.x weights ship bf16 on
     // disk. (The previous codegen pinned this at BF16 too but the
@@ -3715,7 +3717,7 @@ fn emit_weights_struct(
     // `max_model_len` (a chat context of 4-8K on Llama-3.2's 131072 builds
     // 16-32× fewer), capped by `__rope_rows`, the most a request can reach:
     // `max_position_embeddings`. Whatever builds the tables binds `__rope_rows`
-    // ahead of these loads: a target's `load`, or metal's `build_rope_tables`,
+    // ahead of these loads: a target's `load`, or a target's `build_rope_tables`,
     // whose `max_model_len` is also capped at the block table's reach.
     let rope_rows: TokenStream = if uses_rotary || uses_rotary_local {
         let max_pos = *model
@@ -3727,7 +3729,7 @@ fn emit_weights_struct(
     } else {
         quote! {}
     };
-    let rotary_load_metal: TokenStream = if uses_rotary {
+    let rotary_load: TokenStream = if uses_rotary {
         let head_dim = model.text.head_dim.get() as usize;
         let rope_theta = model.text.rope_theta.get();
         let partial = model
@@ -3743,7 +3745,7 @@ fn emit_weights_struct(
             model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
         // rotary_dim = partial_rotary_factor * head_dim (e.g. Qwen3.5:
         // 0.25 * 256 = 64); `None` ⇒ full rotary (rotary_dim == head_dim).
-        let rotary_dim_metal: Option<usize> =
+        let partial_rotary_dim: Option<usize> =
             partial.map(|f| (f * head_dim as f64).round() as usize);
         // Gemma4 hybrid geometry: the `rotary` extern is the GLOBAL
         // class's cache — "proportional" rope on global_head_dim (512)
@@ -3787,7 +3789,7 @@ fn emit_weights_struct(
                     )?;
             }
         } else {
-            match (rotary_dim_metal, scaling) {
+            match (partial_rotary_dim, scaling) {
                 (None, None) => quote! {
                     let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                     let rotary = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
@@ -3964,12 +3966,12 @@ fn emit_weights_struct(
     } else {
         quote! {}
     };
-    // Metal's tables wait for its pool; the context `load` was asked for bounds them.
+    // A target whose tables wait for its KV cache bounds them by the context `load` was asked for.
     let uses_rope = uses_rotary || uses_rotary_local;
     let rope_context_field: TokenStream = if uses_rope {
         quote! {
             /// The context `load` was asked for: with the block table's reach it bounds the
-            /// rows of the RoPE tables the metal pool builds.
+            /// rows of RoPE tables built after load.
             pub max_model_len: usize,
         }
     } else {
@@ -3993,54 +3995,6 @@ fn emit_weights_struct(
     .into_iter()
     .filter_map(|(used, init)| used.then_some(init))
     .collect();
-    // `Weights::build_rope_tables`: the metal pool builds the RoPE tables before it binds them,
-    // once the KV cache is sized, for the positions its block table reaches — the KV cap rung the
-    // pool runs on, picked from `max_model_len` and the blocks the memory budget funds — rather
-    // than at load for every position the checkpoint names. A launch whose KV cache holds less
-    // than `max_position_embeddings` builds only the rows it can serve.
-    let build_rope_tables: TokenStream = {
-        let set_rotary = uses_rotary.then(|| {
-            quote! {
-                if self.rotary.set(rotary).is_err() {
-                    ::anyhow::bail!("RoPE table built twice");
-                }
-            }
-        });
-        let set_rotary_local = uses_rotary_local.then(|| {
-            quote! {
-                if self.rotary_local.set(rotary_local).is_err() {
-                    ::anyhow::bail!("local RoPE table built twice");
-                }
-            }
-        });
-        let body = if uses_rope {
-            quote! {
-                let reach = ctx.kv_cache.max_blocks_per_seq * ctx.kv_cache.block_size;
-                let max_model_len = ::core::cmp::min(self.max_model_len, reach);
-                let gw = &mut crate::__gpu::weights::GpuWeights::empty((*device.allocator).clone());
-                #rope_rows
-                #rotary_load_metal
-                #rotary_local_load_metal
-                #set_rotary
-                #set_rotary_local
-            }
-        } else {
-            quote! { let _ = (ctx, device); }
-        };
-        quote! {
-            impl Weights {
-                #[cfg(scratchy_target = "metal")]
-                pub fn build_rope_tables(
-                    &self,
-                    ctx: &crate::__gpu::ForwardCtx,
-                    device: &crate::__gpu::GpuDevice,
-                ) -> ::anyhow::Result<()> {
-                    #body
-                    Ok(())
-                }
-            }
-        }
-    };
 
     // Per-arch accessor methods on `Weights`. Group accessor field
     // names by stripping any trailing `_<digits>` suffix; for each
@@ -4077,7 +4031,7 @@ fn emit_weights_struct(
                     pub fn rotary_cos_sin(&self, _layer: u32)
                         -> crate::__gpu::tensor::GpuTensor
                     {
-                        self.rotary.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache
+                        self.rotary.get().expect("RoPE tables are built at load, or after it (`build_rope_tables`)").cos_sin_cache
                     }
                 }
             } else {
@@ -4090,7 +4044,7 @@ fn emit_weights_struct(
                     pub fn rotary_local_cos_sin(&self, _layer: u32)
                         -> crate::__gpu::tensor::GpuTensor
                     {
-                        self.rotary_local.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache
+                        self.rotary_local.get().expect("RoPE tables are built at load, or after it (`build_rope_tables`)").cos_sin_cache
                     }
                 }
             } else {
@@ -4152,8 +4106,9 @@ fn emit_weights_struct(
         }
     };
 
-    // The target's canonical `load`, over the shared per-accessor load plans.
-    let target_load = emitter.load_fn(&crate::target::LoadCx {
+    // The target's canonical `load`, over the shared per-accessor load plans, and its own items on
+    // `Weights` over the same pieces.
+    let load_cx = crate::target::LoadCx {
         weights_ctor: &weights_ctor,
         lets: &lets,
         field_shorthand: &field_shorthand,
@@ -4161,14 +4116,18 @@ fn emit_weights_struct(
         marlin_prelude: &marlin_prelude,
         bnb4_prelude: &bnb4_prelude,
         fp8_prelude: &fp8_prelude,
+        uses_rotary,
+        uses_rotary_local,
         rope_rows: &rope_rows,
-        rotary_load: &rotary_load_metal,
-        rotary_local_load: &rotary_local_load_metal,
+        rotary_load: &rotary_load,
+        rotary_local_load: &rotary_local_load,
         rotary_init: &rotary_init,
         rotary_local_init: &rotary_local_init,
         rotary_deferred_init: &rotary_deferred_init,
         rope_context_init: &rope_context_init,
-    });
+    };
+    let target_load = emitter.load_fn(&load_cx);
+    let target_weights_impl = emitter.weights_impl(&load_cx);
 
     // Canonical emits the full `load_with(marlin_storage)` body +
     // a thin `load()` wrapper that passes this variant's Marlin
@@ -4188,7 +4147,7 @@ fn emit_weights_struct(
 
             #rotary_cos_sin_methods
 
-            #build_rope_tables
+            #target_weights_impl
 
             #fingerprint_method
 
@@ -4284,17 +4243,17 @@ pub enum AccessorGroupKind {
 /// group's weight at its declared shape, spelled in the model's dim markers), and the bounds the
 /// handles name, which [`ModelDims::module`] declares with the model's numbers.
 #[derive(Default)]
-pub(crate) struct ModelDims {
+pub struct ModelDims {
     handles: BTreeMap<String, TypedHandle>,
     bounds: std::collections::BTreeSet<String>,
     /// Each DSL weight a typed field holds, by `WeightId`: its marker in `__weights`.
-    pub(crate) weight_markers: BTreeMap<u32, String>,
+    pub weight_markers: BTreeMap<u32, String>,
 }
 
 /// One field's typed handle: its path (`__handles::<Field>`, what the field, its accessor and
 /// its source slot spell), its name there and the type it names, and the tensor the load mint
 /// names on a mismatch.
-pub(crate) struct TypedHandle {
+pub struct TypedHandle {
     pub ty: TokenStream,
     /// The marker of the DSL weights the field stands in for (`__weights::<Marker>`): a field of
     /// one weight is that weight's marker, a packed pair's or a bundle's the field's own.
@@ -4501,7 +4460,7 @@ impl ModelDims {
         Ok(dims)
     }
 
-    pub(crate) fn handle(&self, base: &str) -> Option<&TypedHandle> {
+    pub fn handle(&self, base: &str) -> Option<&TypedHandle> {
         self.handles.get(base)
     }
 
@@ -4645,7 +4604,7 @@ impl ModelDims {
 
 /// `n` as its type-level number: a literal dim is the number itself
 /// (`scratchy_tensors::typed::unsigned_path`).
-fn unsigned_tokens(n: u64) -> TokenStream {
+pub fn unsigned_tokens(n: u64) -> TokenStream {
     (scratchy_tensors::typed::unsigned_path(n).parse()).expect("a typenum path is Rust tokens")
 }
 
@@ -4661,170 +4620,8 @@ fn dim_tokens(
     })
 }
 
-/// ⭐ A MODEL'S ARENA TYPES, EACH DECLARED ONCE: every extent its buckets' tile outputs are, spelled
-/// at a bucket's rows' parameters, as one marker (`E<n>`); every colour its buckets' colourings
-/// make — a slot and the extents it hosts — as one colour type (`K<n>`); and every colouring as one
-/// arena of them (`S<n>`). Buckets whose colourings agree share all three, at their own rows
-/// (`S0<U8, U128>`, their numbers as `typenum` types).
-#[derive(Default)]
-struct ArenaTypes {
-    /// Each extent's marker, by its spelling.
-    extents: BTreeMap<String, String>,
-    /// Each arena value's extent's marker: what the bake names a binding of it by.
-    values: scratchy_subtile::handoff::ArenaExtents,
-    extent_defs: Vec<TokenStream>,
-    /// The extents that compute over a bucket's rows ([`computes_over_rows`]).
-    computed_defs: Vec<TokenStream>,
-    colours: BTreeMap<String, String>,
-    colour_defs: Vec<TokenStream>,
-    arenas: BTreeMap<Vec<String>, String>,
-    arena_defs: Vec<TokenStream>,
-}
-
-impl ArenaTypes {
-    /// The marker of extent `at` (spelled at the rows' parameters).
-    /// `computed`: whether it computes over the rows ([`computes_over_rows`]).
-    fn extent(&mut self, (at, computed): &(TokenStream, bool)) -> Ident {
-        let n = self.extents.len();
-        let defs = match computed {
-            true => &mut self.computed_defs,
-            false => &mut self.extent_defs,
-        };
-        let name = (self.extents.entry(at.to_string())).or_insert_with(|| {
-            let name = format_ident!("E{n}");
-            defs.push(quote!(#name = #at;));
-            name.to_string()
-        });
-        format_ident!("{name}")
-    }
-
-    /// Note arena value `value`'s extent, `at`: its marker is the one a binding of it names.
-    fn value(&mut self, value: scratchy_subtile::handoff::ArenaValue, at: &(TokenStream, bool)) {
-        let marker = self.extent(at).to_string();
-        self.values.insert(value, marker);
-    }
-
-    /// The colour type of slot `slot` hosting the extents `sized` (counted in its bytes) and
-    /// `unsized_`.
-    fn colour(&mut self, slot: u32, sized: &[Ident], unsized_: &[Ident]) -> Ident {
-        let def = quote!(= #slot [#(#sized),*] [#(#unsized_),*]);
-        let n = self.colours.len();
-        let defs = &mut self.colour_defs;
-        let name = (self.colours.entry(def.to_string())).or_insert_with(|| {
-            let name = format_ident!("K{n}");
-            defs.push(quote!(#name #def));
-            name.to_string()
-        });
-        format_ident!("{name}")
-    }
-
-    /// The arena whose slot `k` is `colours[k]`.
-    fn arena(&mut self, colours: &[Ident]) -> Ident {
-        let n = self.arenas.len();
-        let defs = &mut self.arena_defs;
-        let key = colours.iter().map(Ident::to_string).collect();
-        let name = (self.arenas.entry(key)).or_insert_with(|| {
-            let name = format_ident!("S{n}");
-            defs.push(quote!(#name [#(#colours),*]));
-            name.to_string()
-        });
-        format_ident!("{name}")
-    }
-
-    /// The declarations, in the model's `__arena`.
-    fn tokens(&self) -> TokenStream {
-        let (extents, computed) = (&self.extent_defs, &self.computed_defs);
-        let (colours, arenas) = (&self.colour_defs, &self.arena_defs);
-        quote! {
-            ::scratchy_target_metal::arena_extents! { <M, S> [#(#extents)*] [#(#computed)*] }
-            ::scratchy_target_metal::arena_colours! { <M, S> #(#colours)* }
-            ::scratchy_target_metal::arena_schemas! { <M, S> #(#arenas)* }
-        }
-    }
-}
-
-/// Whether an extent of `shape` computes over a bucket's rows: names `num_tokens` or `sk_bucket`
-/// anywhere but as its rows themselves (`Act<M, D>`), so it is an extent only where its dims' laws
-/// hold at the bucket's rows.
-fn computes_over_rows(shape: &[crate::dim::Dim]) -> bool {
-    use crate::dim::Dim;
-    fn names_rows(dim: &Dim) -> bool {
-        match dim {
-            Dim::Bound(name) => name == "num_tokens" || name == "sk_bucket",
-            Dim::Lit(_) => false,
-            Dim::Mul(parts) | Dim::Add(parts) => parts.iter().any(names_rows),
-            Dim::Div(n, d) | Dim::FloorDiv(n, d) => names_rows(n) || names_rows(d),
-        }
-    }
-    match shape {
-        [] => false,
-        [d] => names_rows(d),
-        [rows, rest @ ..] => {
-            let plain_rows = matches!(rows, Dim::Bound(name) if name == "num_tokens");
-            (!plain_rows && names_rows(rows)) || rest.iter().any(names_rows)
-        }
-    }
-}
-
-/// A tile output of `shape` as the arena extent a colour hosts, `Act<rows, columns>`: its first
-/// dim its rows, the product of the rest its columns (a rank-1 value is one row). A bucket's own
-/// bounds are the bucket's rows' types, `num_tokens` as `m` and `sk_bucket` as `sk` (a colour
-/// type's parameters, or one bucket's numbers); any other is the model's `__dims`' marker
-/// ([`ModelDims::declare_tile_bounds`]).
-fn arena_extent(
-    shape: &[crate::dim::Dim],
-    m: &TokenStream,
-    sk: &TokenStream,
-) -> Result<TokenStream, String> {
-    use crate::dim::Dim;
-    let mut bound = |name: &str| -> Result<TokenStream, String> {
-        match name {
-            "num_tokens" => Ok(m.clone()),
-            "sk_bucket" => Ok(sk.clone()),
-            _ => {
-                let marker = bound_marker(name);
-                Ok(quote!(__dims::#marker))
-            }
-        }
-    };
-    let (rows, cols) = match shape {
-        [] => (Dim::Lit(1), Dim::Lit(1)),
-        [d] => (Dim::Lit(1), d.clone()),
-        [r, c] => (r.clone(), c.clone()),
-        [r, rest @ ..] => (r.clone(), Dim::Mul(rest.to_vec())),
-    };
-    let (rows, cols) = (dim_type(&rows, &mut bound)?, dim_type(&cols, &mut bound)?);
-    // `Act` is in scope wherever an extent is spelled (`scratchy_tensors::typed::Act`).
-    Ok(quote!(Act<#rows, #cols>))
-}
-
-/// The shape an arena value of `fuf` has: a tile output's, or — the one graph source a step
-/// names in the arena, the embedded hidden — its `Embed` tile's.
-fn arena_value_shape(
-    fuf: &crate::fuf::Fuf,
-    value: scratchy_subtile::handoff::ArenaValue,
-) -> Result<&crate::dim::Shape, String> {
-    use scratchy_subtile::handoff::ArenaValue;
-    let output = |tile: u32, out: u8| {
-        let node = fuf.nodes.get(tile as usize);
-        node.and_then(|n| n.outputs.get(out as usize))
-            .ok_or_else(|| format!("arena value of tile {tile} output {out}, which has none"))
-    };
-    match value {
-        ArenaValue::Tile { tile, out } => output(tile, out),
-        ArenaValue::Source(_) => {
-            let embed = |n: &&crate::fuf::FufNode| n.op == crate::classified::OpKind::Embed;
-            let mut embeds = fuf.nodes.iter().filter(embed);
-            match (embeds.next(), embeds.next()) {
-                (Some(embed), None) => output(embed.id.0, 0),
-                _ => Err("the embedded hidden is not one `Embed` tile's output".to_string()),
-            }
-        }
-    }
-}
-
 /// A config bound's marker type's name.
-fn bound_marker(name: &str) -> Ident {
+pub fn bound_marker(name: &str) -> Ident {
     format_ident!(
         "{}",
         scratchy_forward_compiler_frontend::typed_emit::marker(name)
@@ -4833,7 +4630,7 @@ fn bound_marker(name: &str) -> Ident {
 
 /// `dim` as a type, each bound it names spelled by `bound`: a product, sum or quotient over the
 /// shared `scratchy_tensors::typed` operators, in the order the dim states it.
-fn dim_type<F: FnMut(&str) -> Result<TokenStream, String>>(
+pub fn dim_type<F: FnMut(&str) -> Result<TokenStream, String>>(
     dim: &crate::dim::Dim,
     bound: &mut F,
 ) -> Result<TokenStream, String> {
@@ -5069,7 +4866,12 @@ fn layered_suffix<'a>(
 /// literal, so no runtime `format!` machinery is needed). The
 /// returned tokens include the trailing `;` and the leading
 /// `let #name = …`.
-fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) -> TokenStream {
+fn emit_unindexed_let(
+    name: &syn::Ident,
+    plan: &FieldLoad,
+    tp_world_size: u8,
+    packed_concat: bool,
+) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
     let sharded = tp_world_size > 1;
@@ -5097,14 +4899,14 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             group_size,
             bits,
         } => {
-            // MLX-affine int4 quantized embedding (Metal-only). P6 lift:
+            // MLX-affine int4 quantized embedding. P6 lift:
             // load the packed U32 weight + F16 scales + F16 affine
             // offsets verbatim into an `AffineQuantEmbedding` bundle;
             // the forward path emits `Instruction::AffineEmbed`, which
             // dispatches the fused `affine_embed_*_gs_*_b_4` gather +
             // dequant kernel (saves ~vocab * hidden * 1.5 bytes of
             // BF16 arena vs the old load-time CPU-dequant fallback).
-            // No sharded variant — single-GPU is the only metal target.
+            // No sharded variant — an affine embedding loads on one device.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
@@ -5171,12 +4973,12 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
         }
         FieldLoad::LinearConcat(prefixes) => {
             // Fused QKV / gate_up are always column-parallel — no
-            // row-parallel concat exists in any current arch. Under
-            // metal the macro emits a stream-free `_concat_packed`
-            // path (CPU-concat then one allocator call); other builds
-            // keep the GGUF/safetensors `_or_ggml` path. Metal is
-            // single-GPU, so it emits no sharded variant.
-            if cfg!(feature = "metal") {
+            // row-parallel concat exists in any current arch. A target
+            // that loads concats packed takes the stream-free `_concat_packed`
+            // path (CPU-concat then one allocator call); any other
+            // keeps the GGUF/safetensors `_or_ggml` path. A packed load
+            // has no sharded variant.
+            if packed_concat {
                 quote! {
                     let #name = crate::__gpu::layers::LinearLayer::load_dense_concat_packed(
                         gw,
@@ -5225,14 +5027,14 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             bits,
             in_features,
         } => {
-            // MLX-affine int4 (Metal-only). No sharded variant —
-            // single-GPU is the only metal target initially. No
+            // MLX-affine int4. No sharded variant —
+            // an affine linear loads on one device. No
             // GGUF fallback — affine and ggml are disjoint storage
             // formats.
             //
             // INT4 P3/P4 forward-time path (post-C4b): keeps the
             // packed / scales / biases on device so the solver's
-            // `MetalAffineQmmImpl` can drive qmv (decode) / qmm_t
+            // affine kernels can drive qmv (decode) / qmm_t
             // (prefill) kernels per `Instruction::AffineQmm`.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
@@ -5298,7 +5100,7 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             }
         }
         FieldLoad::LinearNvfp4 { prefix, group_size } => {
-            // NVFP4 int4 (Metal-only), single source. Keeps packed E2M1
+            // NVFP4 int4, single source. Keeps packed E2M1
             // weight + folded F16 scales on device for the forward-time
             // `nvfp4_qmv` / `nvfp4_qmm_t` kernels via
             // `Instruction::Nvfp4Qmm`.
@@ -5343,7 +5145,7 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 // carrying the packed U32 weight + F16 scales + F16
                 // affine offsets; the lm_head reads those same
                 // buffers via `LinearLayer::AffineQuant`. `GpuTensor`
-                // is Copy on metal (raw pointer wrapper), so the
+                // is Copy (a raw pointer wrapper), so the
                 // buffer triple is shared with the embedding's
                 // forward-time gather kernel without ownership
                 // gymnastics. `in_features = hidden_size`,
@@ -5776,7 +5578,7 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let hidden_size = *hidden_size;
             // Op-keyed arm: the Dense/verbatim config reaches here too and
             // must still codegen (it is never the runtime-selected
-            // specialization on metal), so default its storage params —
+            // specialization), so default its storage params —
             // the GemmaSwitchGlu tolerance.
             let (group_size, bits) = affine.unwrap_or((64, 4));
             let gate_bits = gate_bits.unwrap_or(bits);
@@ -5869,6 +5671,8 @@ fn emit_group_let(
     model: &ModelParams,
     tp_world_size: u8,
     is_vision: bool,
+    // Whether a concatenated weight loads packed (`TargetEmitter::loads_concat_packed`).
+    packed_concat: bool,
 ) -> TokenStream {
     match group.kind {
         AccessorGroupKind::Unindexed => {
@@ -5878,7 +5682,7 @@ fn emit_group_let(
                 .get(&acc.name.to_string())
                 .copied()
                 .expect("unindexed accessor missing from plan map");
-            emit_unindexed_let(&base_ident, plan, tp_world_size)
+            emit_unindexed_let(&base_ident, plan, tp_world_size, packed_concat)
         }
         AccessorGroupKind::LayeredSparse => {
             // Each entry keeps its per-layer field name and gets
@@ -5893,7 +5697,7 @@ fn emit_group_let(
                         .get(&acc.name.to_string())
                         .copied()
                         .expect("sparse-layered accessor missing from plan map");
-                    emit_unindexed_let(&acc.name, plan, tp_world_size)
+                    emit_unindexed_let(&acc.name, plan, tp_world_size, packed_concat)
                 })
                 .collect();
             quote! { #(#lets)* }
@@ -5964,10 +5768,10 @@ fn emit_group_let(
                 plan,
                 n_layers,
                 tp_world_size,
-                is_vision,
                 vision_root_owned.as_deref(),
                 &decoder_root_owned,
                 per_layer_bits.as_deref(),
+                packed_concat,
             );
             quote! {
                 let #base_ident = #call;
@@ -5992,15 +5796,18 @@ fn emit_layered_load_body(
     plan: &FieldLoad,
     n_layers: u32,
     tp_world_size: u8,
-    is_vision: bool,
+    // A vision body's per-model layered root; `None` for a decoder body.
     vision_layered_root: Option<&str>,
     decoder_layered_root: &str,
     // `Some(bits per layer)` when this layered group is MLX-native
     // mixed/dynamic quant (OptiQ) with differing per-layer bit-widths;
     // the affine arms then emit the per-layer loader. `None` = uniform.
     per_layer_bits: Option<&[PlanBits]>,
+    // Whether a concatenated weight loads packed (`TargetEmitter::loads_concat_packed`).
+    packed_concat: bool,
 ) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
+    let is_vision = vision_layered_root.is_some();
     let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
     // Literal `[b0, b1, ...]` per-layer bits slice for the mixed loaders.
     let per_layer_bits_lit: Option<TokenStream> =
@@ -6145,10 +5952,10 @@ fn emit_layered_load_body(
                 .map(|p| layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref))
                 .collect();
             // Always column-parallel — no row-parallel concat exists.
-            // Under metal the layered helper routes to the stream-free
-            // `_concat_packed` path; cuda keeps the existing stream-
+            // A target that loads concats packed routes the layered helper to the stream-free
+            // `_concat_packed` path; any other keeps the stream-
             // based GGUF / vision / sharded variants.
-            if cfg!(feature = "metal") {
+            if packed_concat {
                 // Vision bodies use the per-MODEL vision layered root
                 // (Qwen2.5-VL's fused gate_up under `vision_tower.
                 // blocks`); the decoder root here would query
@@ -6230,7 +6037,7 @@ fn emit_layered_load_body(
             let inf_lit = proc_macro2::Literal::u32_unsuffixed(*in_features);
             // INT4 P3/P4 forward-time path (post-C4b): per-layer
             // AffineQuant LinearLayers kept on device for the qmv /
-            // qmm_t dispatchers `MetalAffineQmmImpl` emits. When the group
+            // qmm_t kernels. When the group
             // is MLX-native mixed-bit (OptiQ), route to the per-layer
             // loader with the gathered bits slice; both paths thread the
             // manifest in_features so the loader's packed-width guard fires.
@@ -6956,7 +6763,7 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims)
 /// new kind is a single-site change (adding a variant without a row
 /// here is a non-exhaustive-match build error).
 pub(crate) fn weight_kind_rust_type(kind: &crate::weight_vocab::WeightKind) -> TokenStream {
-    // The mapping itself lives on `WeightKind` (`scratchy_subtile::handoff`) so metal's
+    // The mapping itself lives on `WeightKind` (`scratchy_subtile::handoff`) so a target's
     // compiler reads the SAME table when it compares accessor group signatures. Here it only
     // becomes tokens.
     kind.rust_type_name()
@@ -7005,7 +6812,7 @@ pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind
 /// `embedding_at`, `cos_sin_at`, MoE getters) land per sprint as
 /// the matching `Instruction<W>` variants migrate off
 /// `WtFn`/`CosSinFn`.
-fn emit_weight_accessors_impl(
+pub fn emit_weight_accessors_impl(
     canonical_lowered: &BTreeMap<WorkloadPoint, (CanonicalLowered, u32, u32, u32, SlotMap)>,
     variant_name: &str,
 ) -> TokenStream {
@@ -7068,7 +6875,7 @@ fn emit_weight_accessors_impl(
                         key,
                         slot.base.to_string(),
                     ));
-                    // `WeightSlot::base` is a `String` (it crosses into the metal compiler
+                    // `WeightSlot::base` is a `String` (it crosses into a target's compiler
                     // crate, which must not pull `syn`); the identifier is minted HERE, at the
                     // one place that emits tokens for it.
                     let base = quote::format_ident!("{}", slot.base);
@@ -7081,7 +6888,7 @@ fn emit_weight_accessors_impl(
                     // `.clone()` needed (it would just be a redundant copy).
                     let arm_body = match slot.kind {
                         WeightKind::CosSin => quote! {
-                            self.#base.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache
+                            self.#base.get().expect("RoPE tables are built at load, or after it (`build_rope_tables`)").cos_sin_cache
                         },
                         // The layered sinks accessor hands back a
                         // borrow; the trait hands the `Copy` handle
@@ -7292,11 +7099,10 @@ fn emit_weight_accessors_impl(
     let gemma_switch_glu = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaSwitchGlu);
     let cos_sin = method_emit_kind(&crate::weight_vocab::WeightKind::CosSin);
     let attn_sinks = method_emit_kind(&crate::weight_vocab::WeightKind::AttnSinks);
-    // `affine_quant_embedding_at` is gated `#[cfg(feature = "metal")]`
-    // on the trait so we must emit the cfg attribute together with the
-    // method body, or skip both when the arch never resolves an
-    // `AffineQuantEmbedding` — otherwise a bare `#[cfg]` with no item
-    // would surface as "expected item after attributes".
+    // `affine_quant_embedding_at` is emitted only when the arch resolves an
+    // `AffineQuantEmbedding`: its return type is one only a target that loads
+    // affine-quantized embeddings names, and every other arch takes the
+    // trait's default.
     let aqe_arms = by_kind
         .get("affine_quant_embedding_at")
         .cloned()
@@ -7310,7 +7116,6 @@ fn emit_weight_accessors_impl(
             .unwrap_or_else(|| "    (none recorded for this method)".to_string());
         let aqe_summary_lit = proc_macro2::Literal::string(&aqe_summary);
         quote! {
-            #[cfg(scratchy_target = "metal")]
             fn affine_quant_embedding_at(
                 &self,
                 tape_index: u32,
@@ -7345,8 +7150,8 @@ fn emit_weight_accessors_impl(
     // Emit the impl unconditionally — `CanonicalParams: WeightAccessors`
     // is an unconditional bound, so leaving this behind a feature gate
     // would surface as `Weights: WeightAccessors not satisfied` in any
-    // arch whose own `metal` feature is empty
-    // or absent (e.g. phi3 which declares `metal = []`).
+    // arch whose target emits no accessor of a kind
+    // (the trait defaults cover those).
     // The trait methods all return cross-backend types from
     // `scratchy_layers::layers{,_moe}` plus `GpuTensor` from
     // `scratchy-tensors` — both available regardless of backend feature.
@@ -7393,7 +7198,7 @@ fn emit_weight_accessors_impl(
 /// Mirrors [`bucket_fn_ident`] in shape but uses upper-case so the
 /// emitted module reads naturally — `FORWARD_M_64` /
 /// `BACKBONE_M_64_SK_2048`.
-fn bucket_static_ident(prefix: &str, wp: WorkloadPoint) -> proc_macro2::Ident {
+pub fn bucket_static_ident(prefix: &str, wp: WorkloadPoint) -> proc_macro2::Ident {
     if wp.sk_bucket == 0 {
         format_ident!("{}_{}", prefix, wp.num_tokens)
     } else {
@@ -7406,9 +7211,9 @@ fn bucket_static_ident(prefix: &str, wp: WorkloadPoint) -> proc_macro2::Ident {
 /// `lm_head` gemm; the `lm_head` slice carries that single row.
 /// `forward` runs both, `forward_backbone` runs only the backbone
 /// and DtoD-copies the backbone-output slot.
-struct CanonicalLowered {
-    backbone: crate::interpreter_codegen::LoweredBucket,
-    lm_head: crate::interpreter_codegen::LoweredBucket,
+pub struct CanonicalLowered {
+    pub backbone: crate::interpreter_codegen::LoweredBucket,
+    pub lm_head: crate::interpreter_codegen::LoweredBucket,
 }
 
 /// Walk the FUF from the end, skipping nodes appended by lowering
@@ -7428,12 +7233,12 @@ struct CanonicalLowered {
 /// identification must be the body's actual terminal — the lm_head
 /// Gemm (tp=1) or its AllGather wrapper (tp>1) for decoders, the
 /// merger MLP's bias_add for vision encoders.
-fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
-    fuf.nodes.iter().rev().find(|n| match n.op {
-        #[cfg(feature = "metal")]
-        crate::classified::OpKind::MmEmbedSplice => false,
-        crate::classified::OpKind::LoadRows(_) => false,
-        _ => true,
+pub fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
+    fuf.nodes.iter().rev().find(|n| {
+        !matches!(
+            n.op,
+            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadRows(_)
+        )
     })
 }
 
@@ -7451,7 +7256,7 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 ///   is empty, and `forward` returns the FUF's last-node output
 ///   directly.
 #[derive(Clone, Copy, Debug)]
-enum BackboneLayout {
+pub enum BackboneLayout {
     Decoder,
     Encoder,
 }
@@ -7462,262 +7267,7 @@ enum BackboneLayout {
 /// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadRows`
 /// nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
-/// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
-/// logits `width` and `dtype`, and — `head`, a multi-token-prediction head's drafts a step and the
-/// width of the hidden rows its passes read — its chain between passes
-/// (`scratchy_target_metal::off_tape`).
-#[cfg(feature = "metal")]
-fn metal_off_tape_tokens(
-    width: u64,
-    mc: &scratchy_ir::model_facts::ModelFacts,
-    head: Option<(u32, u32)>,
-    vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
-) -> TokenStream {
-    use scratchy_target_metal::off_tape::{
-        ByCodes, Dflash2Role, OffTape, SuffixKernels, TargetSampling, VocabSuffix,
-    };
-    use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
-    use scratchy_target_metal::tape::kernel_constants::{DraftAcceptConstants, MtpChainConstants};
-    let width = u32::try_from(width).expect("logits width fits u32");
-    use scratchy_ir::model_facts::DEFAULT_KV_PAGE;
-    // The chain advances the full-context group's slots (KV group 0), at the global class's page;
-    // a model without attention has no page of its own, and takes the default one.
-    let page = mc
-        .attention()
-        .map_or(DEFAULT_KV_PAGE, |a| a.global().page());
-    let block_size = BlockSize(page.get());
-    // A draft block: its anchor row and its drafts.
-    let block_rows = 1 + mc.spec_drafts().map_or(0, |d| d.get());
-    let head = head.map(|(drafts, hidden)| MtpChainConstants {
-        hidden: HiddenSize(hidden),
-        drafts: NumDrafts(drafts),
-        // An MRoPE head reads a cos/sin row a token in place of its position, its rot window
-        // wide. The kernel's ABI spells the 1-D positions' path as 0.
-        rope: RotDim(
-            (mc.attention())
-                .filter(|a| a.mrope().is_some())
-                .map_or(0, |a| a.base().rot_dim().get()),
-        ),
-    });
-    let keys = OffTape::keys(
-        LogitsWidth(width),
-        mc.metal_dtype(),
-        block_size,
-        head,
-        mc.spec_drafts().is_some(),
-        vocab_suffix,
-        // A DFlash2 drafter (its block and the token its proposal rows embed), or a target one
-        // drafts for (the rows a lane of its verify holds: the drafter's block).
-        match (mc.drafter(), mc.capture_slots()) {
-            (Some(drafter), _) => Dflash2Role::Drafter(DraftAcceptConstants {
-                rows: block_rows,
-                mask: drafter.mask_token().get(),
-            }),
-            (None, Some(_)) => Dflash2Role::Target { block_rows },
-            (None, None) => Dflash2Role::None,
-        },
-    );
-    let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
-    let OffTape {
-        vocab,
-        argmax,
-        argmax_dual_write,
-        logprobs,
-        grammar_mask,
-        sampler,
-        chain_advance,
-        mtp_chain,
-        select_rows,
-        vocab_suffix,
-        dflash2_accept,
-        dflash2_sampling,
-    } = ids;
-    let dflash2_sampling = dflash2_sampling.map(|TargetSampling { mass, search, draw }| {
-        quote!(::scratchy_target_metal::off_tape::TargetSampling {
-            mass: #mass,
-            search: #search,
-            draw: #draw,
-        })
-    });
-    let vocab_suffix = vocab_suffix.map(
-        |SuffixKernels {
-             suffix,
-             qmv,
-             argmax,
-         }| {
-            let VocabSuffix {
-                prefix,
-                rows,
-                hidden,
-                bits,
-                group,
-                scale,
-                verify_rows,
-                window,
-            } = suffix;
-            use scratchy_target_metal::tape::quantized::ScaleDtype;
-            // Minted in a const context: a width or group no kernel is instantiated for fails the
-            // build.
-            let (bits, group) = (bits.get(), group.get());
-            let scale = match scale {
-                ScaleDtype::F16 => {
-                    quote!(::scratchy_target_metal::tape::quantized::ScaleDtype::F16)
-                }
-                ScaleDtype::Bf16 => {
-                    quote!(::scratchy_target_metal::tape::quantized::ScaleDtype::Bf16)
-                }
-            };
-            let ByCodes {
-                as_written,
-                offset8,
-            } = qmv;
-            quote!(::scratchy_target_metal::off_tape::SuffixKernels {
-                suffix: ::scratchy_target_metal::off_tape::VocabSuffix {
-                    prefix: #prefix,
-                    rows: #rows,
-                    hidden: #hidden,
-                    bits: const { ::scratchy_target_metal::tape::ids::AffineBits::of(#bits) },
-                    group: const { ::scratchy_target_metal::tape::ids::AffineGroupSize::of(#group) },
-                    scale: #scale,
-                    verify_rows: #verify_rows,
-                    window: #window,
-                },
-                qmv: ::scratchy_target_metal::off_tape::ByCodes {
-                    as_written: &[#(#as_written),*],
-                    offset8: &[#(#offset8),*],
-                },
-                argmax: #argmax,
-            })
-        },
-    );
-    let vocab = vocab.get();
-    let sampler = sampler.iter().map(|row| {
-        let row = row.iter();
-        quote!([#(#row),*])
-    });
-    let option = |k: Option<TokenStream>| match k {
-        Some(k) => quote!(::core::option::Option::Some(#k)),
-        None => quote!(::core::option::Option::None),
-    };
-    let (mtp_chain, select_rows, vocab_suffix, dflash2_accept, dflash2_sampling) = (
-        option(mtp_chain),
-        option(select_rows),
-        option(vocab_suffix),
-        option(dflash2_accept),
-        option(dflash2_sampling),
-    );
-    quote! {
-        /// This model's off-tape kernels, baked for its logits.
-        #[cfg(scratchy_target = "metal")]
-        pub static METAL_OFF_TAPE: ::scratchy_target_metal::off_tape::OffTapeKernels = {
-            ::scratchy_target_metal::off_tape::OffTape {
-                vocab: ::scratchy_target_metal::tape::ids::LogitsWidth(#vocab),
-                argmax: #argmax,
-                argmax_dual_write: #argmax_dual_write,
-                logprobs: #logprobs,
-                grammar_mask: #grammar_mask,
-                sampler: [#(#sampler),*],
-                chain_advance: #chain_advance,
-                mtp_chain: #mtp_chain,
-                select_rows: #select_rows,
-                vocab_suffix: #vocab_suffix,
-                dflash2_accept: #dflash2_accept,
-                dflash2_sampling: #dflash2_sampling,
-            }
-        };
-    }
-}
-
-/// A multi-token-prediction head drafting over a prefix of its target's vocabulary — its logits
-/// `vocab_size` wide, its target's `target_vocab_size` — whose lm_head is MLX-affine: the rest of
-/// its target's lm_head (`scratchy_target_metal::off_tape::VocabSuffix`), at the widths its
-/// lm_head is quantized to, a pass reading at most its `spec_verify_rows` rows. `None` for any
-/// other model; a head whose lm_head is stored otherwise (a dense bf16 build) has no kernel past
-/// its prefix, and drafts over the prefix alone.
-#[cfg(feature = "metal")]
-fn metal_vocab_suffix(
-    program: &Program,
-    fuf: &crate::fuf::Fuf,
-    model: &crate::config::ModelParams,
-    mc: &scratchy_ir::model_facts::ModelFacts,
-) -> Option<scratchy_target_metal::off_tape::VocabSuffix> {
-    let (&prefix, &all) = (
-        model.bounds.get("vocab_size")?,
-        model.bounds.get("target_vocab_size")?,
-    );
-    if all <= prefix {
-        return None;
-    }
-    let stem = &model.source_stem;
-    let bound = |name: &str| {
-        *(model.bounds.get(name)).unwrap_or_else(|| {
-            panic!("`{stem}`: a head drafting over a vocabulary prefix declares its `{name}`")
-        })
-    };
-    let (verify_rows, window) = (bound("spec_verify_rows"), bound("spec_wide_window"));
-    let lm_head = lent_weight_prefix(
-        program,
-        fuf,
-        model,
-        scratchy_forward_compiler::LentWeight::LmHead,
-    )?;
-    let method = &model.quantization.as_ref()?.method;
-    let (group, bits) = crate::quantization::affine_role_widths(program, method, &lm_head, None)?;
-    let fits = |v: u64| u32::try_from(v).expect("a vocabulary fits u32");
-    use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
-    Some(scratchy_target_metal::off_tape::VocabSuffix {
-        prefix: fits(prefix),
-        rows: fits(all - prefix),
-        hidden: fits(mc.hidden().get() as u64),
-        bits: AffineBits::new(bits).unwrap_or_else(|| {
-            panic!("the lm_head's {bits}-bit width is one no affine kernel is instantiated for")
-        }),
-        group: AffineGroupSize::new(group).unwrap_or_else(|| {
-            panic!("the lm_head's group of {group} is one no affine kernel is instantiated for")
-        }),
-        scale: mc.scale_dtype(),
-        verify_rows: fits(verify_rows),
-        window: fits(window),
-    })
-}
-
-/// The model's `METAL_TQ_CODEBOOK`: its TurboQuant codebook at the global head dim, computed here
-/// (`None` for a dense KV cache).
-#[cfg(feature = "metal")]
-fn metal_tq_codebook_tokens(mc: &scratchy_ir::model_facts::ModelFacts) -> TokenStream {
-    use scratchy_target_metal::turboquant::TqCodebook;
-    let codebook = match mc.kv_codec() {
-        scratchy_forward_compiler::KvCodec::Dense => quote!(::core::option::Option::None),
-        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
-            // The global class's head: the codebook rotates the full layers' keys.
-            let attention =
-                (mc.attention()).expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
-            let cb = TqCodebook::compute(attention.global().head_dim().get() as usize, bits);
-            let table = |t: &[f32]| {
-                let words = t.iter().map(|v| v.to_bits());
-                quote!(&[#(f32::from_bits(#words)),*])
-            };
-            let (signs, centroids) = (table(cb.signs), table(cb.centroids));
-            let (boundaries, bits, packed_dim) = (table(cb.boundaries), bits.get(), cb.packed_dim);
-            quote!(::core::option::Option::Some(::scratchy_target_metal::turboquant::TqCodebook {
-                bits: ::scratchy_forward_compiler::TqBits::new(#bits),
-                packed_dim: #packed_dim,
-                signs: #signs,
-                centroids: #centroids,
-                boundaries: #boundaries,
-            }))
-        }
-    };
-    quote! {
-        /// This model's TurboQuant codebook (`None`: dense KV cache).
-        #[cfg(scratchy_target = "metal")]
-        pub static METAL_TQ_CODEBOOK: ::core::option::Option<
-            ::scratchy_target_metal::turboquant::TqCodebook,
-        > = #codebook;
-    }
-}
-
-fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
+pub fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
     const LM_HEAD_PREFIX: &str = "lm_head";
 
     let last_node = last_non_splice_node(fuf).expect("FUF must be non-empty to emit a forward fn");
@@ -7725,7 +7275,7 @@ fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
     // terminates in `Mul(gemm_out, scalar)` rather than the lm_head Gemm
     // itself. That is still a DECODER: walk past the scalar multiply to the
     // Gemm, exactly as the AllGather arm below walks past tp>1's collective.
-    // Misreading it as an encoder bakes `METAL_VOCAB_SIZE = hidden_size`, and
+    // Misreading it as an encoder bakes a logits width of `hidden_size`, and
     // the argmax kernel then scans only the first `hidden_size` of
     // `vocab_size` logits — greedy decode picks low-id tokens (asterisks and
     // single characters) while sampling, which does not use that kernel,
@@ -7794,7 +7344,7 @@ fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
 /// Build the workload-point bounds map the tape lowering consumes —
 /// model.bounds + the workload-specific `num_tokens` and `sk_bucket`
 /// overrides.
-fn bounds_for_wp(
+pub fn bounds_for_wp(
     model: &ModelParams,
     wp: WorkloadPoint,
     tp_world_size: u8,
@@ -7886,57 +7436,52 @@ impl KvCacheLayers {
     }
 }
 
-/// The model's KV codec. TurboQuant under the `turboquant` feature, on metal
-/// only, wherever `codec_for` takes its geometry; dense everywhere else. A
-/// model the feature would compress but can't is named in the build output.
-/// The geometry is the KV pool's: a head's KV is its target's capacity, a
-/// pool mirroring the target's blocks, so it is decided at the target's layer
-/// count (`target_num_hidden_layers`) — the target's codec.
+/// The model's KV codec. TurboQuant on a target that compresses KV (`compress`), wherever
+/// `codec_for` takes its geometry; dense everywhere else. A model it would compress but can't is
+/// named in the build output. The geometry is the KV pool's: a head's KV is its target's
+/// capacity, a pool mirroring the target's blocks, so it is decided at the target's layer count
+/// (`target_num_hidden_layers`) — the target's codec.
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
     kv_layers: &KvCacheLayers,
     bits: scratchy_forward_compiler::TqBits,
+    compress: bool,
 ) -> scratchy_forward_compiler::KvCodec {
-    #[cfg(all(feature = "turboquant", feature = "metal"))]
-    {
-        use scratchy_ir::{DenseReason, KvGeometry, codec_for};
-        let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
-        let pool_layers = (model.bounds.get("target_num_hidden_layers"))
-            .map_or(model.text.layers.get(), |&n| n as usize);
-        let geometry = KvGeometry {
-            num_layers: pool_layers,
-            num_kv_heads: bound("num_key_value_heads"),
-            head_dim,
-            global_head_dim,
-            latent: bound("kv_lora_rank") > 0,
-            has_kv_cache: kv_layers.any(),
-        };
-        match codec_for(geometry, bits) {
-            Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
-            Err(reason) => {
-                if reason != DenseReason::NoKvCache {
-                    println!(
-                        "cargo:warning=turboquant: {} keeps a dense KV cache: {reason}",
-                        model.source_stem
-                    );
-                }
-                scratchy_forward_compiler::KvCodec::Dense
-            }
-        }
+    use scratchy_ir::{DenseReason, KvGeometry, codec_for};
+    if !compress {
+        return scratchy_forward_compiler::KvCodec::Dense;
     }
-    #[cfg(not(all(feature = "turboquant", feature = "metal")))]
-    {
-        let _ = (model, head_dim, global_head_dim, kv_layers, bits);
-        scratchy_forward_compiler::KvCodec::Dense
+    let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
+    let pool_layers = (model.bounds.get("target_num_hidden_layers"))
+        .map_or(model.text.layers.get(), |&n| n as usize);
+    let geometry = KvGeometry {
+        num_layers: pool_layers,
+        num_kv_heads: bound("num_key_value_heads"),
+        head_dim,
+        global_head_dim,
+        latent: bound("kv_lora_rank") > 0,
+        has_kv_cache: kv_layers.any(),
+    };
+    match codec_for(geometry, bits) {
+        Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
+        Err(reason) => {
+            if reason != DenseReason::NoKvCache {
+                println!(
+                    "cargo:warning=turboquant: {} keeps a dense KV cache: {reason}",
+                    model.source_stem
+                );
+            }
+            scratchy_forward_compiler::KvCodec::Dense
+        }
     }
 }
 
 /// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
 /// group through its own constructor (an attention through `Attention::of`, a GDN through
 /// `Gdn::of`: their laws bounds on their numbers as types), so the emitted const re-checks each
-/// law when rustc type-checks it. The one serializer of the value the fill built (and the metal
+/// law when rustc type-checks it. The one serializer of the value the fill built (and a target's
 /// bake read).
 fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_ir::model_facts::{
@@ -8082,10 +7627,10 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             }
         }
     };
-    let metal_dtype = match f.metal_dtype() {
-        scratchy_ir::model_facts::MetalDtype::Bf16 => quote! { #m::MetalDtype::Bf16 },
-        scratchy_ir::model_facts::MetalDtype::F16 => quote! { #m::MetalDtype::F16 },
-        scratchy_ir::model_facts::MetalDtype::Int4 => quote! { #m::MetalDtype::Int4 },
+    let act_dtype = match f.act_dtype() {
+        scratchy_ir::model_facts::ActDtype::Bf16 => quote! { #m::ActDtype::Bf16 },
+        scratchy_ir::model_facts::ActDtype::F16 => quote! { #m::ActDtype::F16 },
+        scratchy_ir::model_facts::ActDtype::Int4 => quote! { #m::ActDtype::Int4 },
     };
     let scale_dtype = match f.scale_dtype() {
         scratchy_ir::model_facts::ScaleDtype::Bf16 => quote! { #m::ScaleDtype::Bf16 },
@@ -8115,7 +7660,7 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     }));
     quote! {
         #m::ModelFacts::new(#m::FactsParts {
-            metal_dtype: #metal_dtype,
+            act_dtype: #act_dtype,
             scale_dtype: #scale_dtype,
             hidden: #m::HiddenSize::new(#hidden),
             intermediate: #intermediate,
@@ -8200,7 +7745,7 @@ pub(crate) fn target_width(
 }
 
 /// Whether a body reads its target's final hidden rows (`RowsExtern::TargetHidden`): a head.
-fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
+pub fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
     fuf.nodes.iter().any(|n| {
         n.op == crate::classified::OpKind::LoadRows(
             scratchy_forward_compiler::RowsExtern::TargetHidden,
@@ -8218,6 +7763,8 @@ pub(crate) fn fill_canonical_params(
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
     target: Option<scratchy_ir::model_facts::TargetWidth>,
+    // Whether the target compresses a KV cache the codec takes (`TargetEmitter::compresses_kv`).
+    compress_kv: bool,
 ) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8273,7 +7820,7 @@ pub(crate) fn fill_canonical_params(
     // Vision 2D-RoPE pairing convention (`vision_rope_style` config
     // key, validated at parse): absent/"neox_hw" → false (Qwen),
     // "interleaved_xy" → true (MoonViT / LocateAnything). Selects the
-    // metal `vision_rope_2d[_interleaved]` entry point at lowering.
+    // interleaved or split 2D vision rope at lowering.
     let vision_rope_interleaved =
         matches!(model.arch.rope_style.as_deref(), Some("interleaved_xy"));
 
@@ -8402,7 +7949,7 @@ pub(crate) fn fill_canonical_params(
     let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
     let v_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(v_head_dim);
     let qk_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_head_dim);
-    // Rotary dim for the metal rope kernel's `ROT_DIM` fn-const. Mirrors
+    // Rotary dim for the rope kernel's `ROT_DIM` fn-const. Mirrors
     // the rope-cache builder (codegen.rs ~2758): `partial_rotary_factor
     // * head_dim` for partial-rope arches (Qwen3.5: 0.25*256 = 64), else
     // the full `head_dim`. Without this the impl falls back to the trait
@@ -8420,7 +7967,7 @@ pub(crate) fn fill_canonical_params(
     // global 512×1kv proportional-rope-128). Config keys
     // `global_head_dim` / `num_global_key_value_heads` /
     // `global_partial_rotary_factor` feed the GLOBAL_* consts read by
-    // the full-attention metal lowering arms; absent keys fall back to
+    // the full-attention lowering arms; absent keys fall back to
     // the base values (uniform models unchanged).
     let global_head_dim: u32 = model
         .bounds
@@ -8469,7 +8016,7 @@ pub(crate) fn fill_canonical_params(
     );
     // Proportional rope marker — same predicate that routes the
     // rotary cache builder to `new_proportional_from_gpuweights`.
-    // Drives the metal rope kernel's pairing offset (lane i pairs
+    // Drives the rope kernel's pairing offset (lane i pairs
     // with i + head_dim/2, not i + rot_dim/2).
     let rope_proportional = global_rot_dim != global_head_dim
         && model.scalars.contains_key("global_partial_rotary_factor");
@@ -8514,7 +8061,7 @@ pub(crate) fn fill_canonical_params(
     };
     let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
 
-    // SCALE_DTYPE override — only matters under `--features metal`.
+    // SCALE_DTYPE override — only matters to a target whose kernels read it.
     // mlx-community 4bit convention (probed across cached HF snapshots):
     // Llama-3.x / Qwen2.5 / SmolLM ship F16 scales+biases+norm gains,
     // Qwen3 family ships BF16. Default in the trait is F16; emit a
@@ -8543,7 +8090,7 @@ pub(crate) fn fill_canonical_params(
         is_bf16_scale || is_nvfp4
     };
 
-    // TurboQuant KV bit-width policy (Metal). 3-bit (~4.7x) is validated
+    // TurboQuant KV bit-width policy. 3-bit (~4.7x) is validated
     // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
     // activations) degrades at 3-bit and needs 4-bit. Promote arches to 3 here
     // as the validation sweep confirms them.
@@ -8554,7 +8101,14 @@ pub(crate) fn fill_canonical_params(
             .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
         scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
     };
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
+    let kv_codec = kv_codec_for(
+        model,
+        head_dim,
+        global_head_dim,
+        kv_layers,
+        tq_bits,
+        compress_kv,
+    );
 
     let num_hidden_layers = model.text.layers.get();
 
@@ -8648,8 +8202,8 @@ pub(crate) fn fill_canonical_params(
         let kv_layers = (kv_layers.proper_subset(num_hidden_layers))
             .map(|layers| mf::KvLayers::new(Vec::leak(layers.to_vec())));
         mf::ModelFacts::new(mf::FactsParts {
-            // No arch overrides the metal element dtype.
-            metal_dtype: mf::MetalDtype::Bf16,
+            // No arch overrides the activation dtype.
+            act_dtype: mf::ActDtype::Bf16,
             scale_dtype: match scale_dtype_is_bf16 {
                 true => mf::ScaleDtype::Bf16,
                 false => mf::ScaleDtype::F16,
@@ -8888,7 +8442,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 /// Splash's SPLASH_MAXIMUM_BATCH_WIDTH. Its buckets through `lanes × spec_verify_rows` rows play the
 /// block draft. The engine's lane cap (`scratchy_serving_engine::spec_decode::BLOCK_LANES`) is
 /// asserted equal where both are in scope (`scratchy_forward_compiler::DFLASH2_BLOCK_LANES`).
-const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES as u64;
+pub const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES as u64;
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_model(
@@ -8915,8 +8469,6 @@ pub fn emit_model(
     // The target this build compiles for: what it bakes per model is its own.
     emitter: &dyn crate::target::TargetEmitter,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
-    // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
-    let reads_target_kv = model.arch.reads_target_kv;
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
     // (which already covers text-side encoders like ModernBERT)
@@ -8937,11 +8489,9 @@ pub fn emit_model(
             emitter,
         );
     }
-    // The struct emitter. Metal calls it twice: once with no accessors
-    // and — after the front-end swap has produced them — once with the
-    // tape's. Returns the emitted tokens alongside the affine rows its
-    // fingerprint gate carries (the tape call's rows are what survive
-    // — `weights_affine_rows` is overwritten alongside `weights`).
+    // The struct emitter. A target may call it more than once — with no accessors, then with its
+    // tape's once it has lowered one. Returns the emitted tokens alongside the affine rows its
+    // fingerprint gate carries.
     let emit_struct = |tape_accs: Option<&[WeightAccessor]>, dims: &ModelDims| {
         emit_weights_struct(
             program,
@@ -8957,10 +8507,8 @@ pub fn emit_model(
             emitter,
         )
     };
-    #[cfg(feature = "metal")]
-    let mut tape_accessors_for_struct: Option<Vec<WeightAccessor>> = None;
-    // The fields' typed handles, from the tape's accessor set: the struct holds them, and the
-    // metal resolver reaches each through its source slot.
+    // The fields' typed handles, from the tape's accessor set: the struct holds them, and a
+    // target's resolver reaches each through its source slot.
     // Its `__dims` declares every bound its tile outputs name too: the arena's extents' markers.
     let model_dims = |accs: Option<&[WeightAccessor]>| {
         let mut dims = accs.map_or_else(ModelDims::default, |accs| {
@@ -8986,2547 +8534,37 @@ pub fn emit_model(
         dims.declare_tile_bounds(fuf, model);
         dims
     };
-    // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and threaded to every consumer below:
-    // the bridge calls (a target-derived weight struct, metal's tape fingerprint, metal's canonical
-    // lowering) and the per-canonical `CanonicalParams` impl. Every fact is a field of this
-    // one value; nothing below re-reads a config or a bound for a fact it states.
+    // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and handed to the target, whose every
+    // consumer reads them: its weight struct, its lowering and the per-canonical
+    // `CanonicalParams` impl. Every fact is a field of this one value; nothing downstream
+    // re-reads a config or a bound for a fact it states.
     let (model_facts, mla_consts) = fill_canonical_params(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
+        emitter.compresses_kv(),
     );
-    // The config params and the typed facts are ONE model — the bridge takes them together.
-    #[cfg(feature = "metal")]
-    let bridge_model = crate::to_wavefront::BridgeModel {
-        params: model,
-        facts: &model_facts,
-    };
-
-    // THE MODEL'S WEIGHTS STRUCT. A target that derives it itself (e.g. from its decode tape's
-    // weight bindings) hands it back; otherwise the accessor-less first pass, which the tape
-    // re-emits below once the front-end swap has produced its accessors.
-    let (weights, weights_affine_rows) = {
-        let decode_point = workloads
-            .iter()
-            .find(|w| w.num_tokens == 1)
-            .or_else(|| workloads.iter().next())
-            .copied()
-            .map(|wp| {
-                (
-                    bounds_for_wp(model, wp, tp_world_size),
-                    wp.num_tokens as u32,
-                )
-            });
-        let struct_of = |accs: Option<&[WeightAccessor]>| emit_struct(accs, &model_dims(accs));
-        emitter
-            .weights_struct(&crate::target::StructCx {
-                program,
-                model,
-                facts: &model_facts,
-                fuf,
-                inferred,
-                decode_point: decode_point.as_ref().map(|(b, m)| (b, *m)),
-                struct_of: &struct_of,
-            })
-            .unwrap_or_else(|| struct_of(None))
-    };
-
-    // Group workload points by TAPE fingerprint. Buckets that lower to
-    // the same tape produce byte-identical fn bodies, so the canonical
-    // is lowered ONCE and duplicates delegate to it through the bucket
-    // table. Public API (every `forward_m_<M>[_sk_<SK>]` /
-    // `forward_backbone_m_<M>[_sk_<SK>]` name a user might take a
-    // fn-pointer to) is preserved. Dedup runs over `(num_tokens,
-    // sk_bucket)` 2-D points.
-    //
-    // A non-metal build folds every point onto the FIRST point: its
-    // per-bucket host tapes are all empty (the model runs from the target's
-    // embedded bundle).
-    let bucket_points: Vec<WorkloadPoint> = workloads.iter().copied().collect();
-    #[cfg(not(feature = "metal"))]
-    let bucket_canonical: Vec<WorkloadPoint> =
-        bucket_points.iter().map(|_| bucket_points[0]).collect();
-    #[cfg(feature = "metal")]
-    let bucket_canonical: Vec<WorkloadPoint> = {
-        let mut tape_to_canonical: HashMap<String, WorkloadPoint> = HashMap::new();
-        let mut bucket_canonical = Vec::with_capacity(bucket_points.len());
-        for wp in &bucket_points {
-            let bounds = bounds_for_wp(model, *wp, tp_world_size);
-            let fp = match crate::to_wavefront::lower_decode_to_wavefront(
-                fuf,
-                inferred,
-                &bounds,
-                &bridge_model,
-                crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
-                wp.num_tokens as u32,
-            ) {
-                Ok(l) => {
-                    let m = wp.num_tokens as u32;
-                    // A canonical realizes its codec guards at its own rows
-                    // (`metal_guard_gates`), for every bucket it stands for: buckets whose
-                    // realizations differ cannot share one (`lower_canonical` refuses it).
-                    let guards = scratchy_target_metal::op_abi::metal_guard_gates(m);
-                    let ops = l
-                        .input
-                        .ops
-                        .iter()
-                        .map(|od| {
-                            // Row counts that track the bucket's `m`
-                            // normalize to their EMISSION CLASS (decode
-                            // m=1 vs prefill m>1 select different
-                            // attention forms); fixed row counts stay
-                            // verbatim. Normalizing to one sentinel
-                            // collapsed m=1 with m=2 — the drift gate
-                            // caught it against the solve's folding.
-                            // The metal fold pass folds matvec ends on
-                            // every bucket in the qmv matvec band (its
-                            // floor: `QMV_MATVEC_BAND_ROWS`) and not
-                            // above, so the classes split there too —
-                            // a shared canonical would bake one band's
-                            // steps at the other's bucket.
-                            let band = scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS;
-                            let mm = if od.m == m {
-                                if m == 1 {
-                                    u32::MAX
-                                } else if m <= band {
-                                    u32::MAX - 1
-                                } else {
-                                    u32::MAX - 2
-                                }
-                            } else {
-                                od.m
-                            };
-                            format!("{:?}#{mm}#{:?};", od.op, od.inputs)
-                        })
-                        .collect::<String>();
-                    format!("{guards:?}{ops}")
-                }
-                Err(e) => format!("REFUSED:{e:?}"),
-            };
-            bucket_canonical.push(*tape_to_canonical.entry(fp).or_insert(*wp));
-        }
-        bucket_canonical
-    };
-
-    // Lower every canonical tape_index once, backbone-shaped: skip the
-    // terminal subgraph (the `gemm(<final_norm>, lm_head)` row) and
-    // emit it separately as a tiny LM_HEAD slice. forward and
-    // forward_backbone share the backbone slice; forward additionally
-    // runs LM_HEAD; forward_backbone DtoD-copies the backbone-output
-    // slot. No more pair of near-identical full slices per tape_index.
-    let mut canonical_lowered: BTreeMap<
-        WorkloadPoint,
-        (
-            CanonicalLowered,
-            /* num_slots */ u32,
-            /* backbone_slot */ u32,
-            /* terminal_slot */ u32,
-            /* slots: shared coloring across every tape_index in this
-             * canonical's group. Per-tape_index arena_bytes (below in
-             * the metal emission loop) computes its OWN sizes from
-             * this map + that tape_index's bounds, so each tape_index gets
-             * a tight arena sized for its own num_tokens. */
-            crate::weight_vocab::SlotMap,
-        ),
-    > = BTreeMap::new();
-    // `last_node_id` must be the lm_head Gemm, not one of the post-Embed `MmEmbedSplice` nodes
-    // that sit at fuf-array-tail but semantically belong near the Embed; walking past them with
-    // `last_non_splice_node` recovers the real terminal. The metal bucket facts walk the logits
-    // chain from it (#784).
-    let last_node_id = last_non_splice_node(fuf)
-        .expect("non-empty FUF expected")
-        .id;
-    let layout = backbone_layout(fuf, program);
-    // The canonical tuple starts as an empty placeholder and the
-    // front-end swap below fills every field from the shared tape (a
-    // swap that then refuses panics loudly there — an empty stream
-    // cannot ship silently because the bucket table still reads these
-    // fields).
-    for (i, wp) in bucket_points.iter().enumerate() {
-        if bucket_canonical[i] != *wp {
-            continue;
-        }
-        canonical_lowered.insert(
-            *wp,
-            (
-                CanonicalLowered {
-                    backbone: crate::interpreter_codegen::LoweredBucket {
-                        instances: Vec::new(),
-                        weight_slots: Vec::new(),
-                        barriers: Vec::new(),
-                    },
-                    lm_head: crate::interpreter_codegen::LoweredBucket {
-                        instances: Vec::new(),
-                        weight_slots: Vec::new(),
-                        barriers: Vec::new(),
-                    },
-                },
-                0,
-                0,
-                0,
-                crate::weight_vocab::SlotMap::new(),
-            ),
-        );
-    }
-
-    // Per-canonical CanonicalParams impl + Instruction type alias.
-    // The alias keeps every static-slice row short instead of
-    // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    // One value, two consumers: the impl's `FACTS` (serialized) and the metal bake — the
-    // `model_facts` hoisted above the bridge calls, computed once for both.
     let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
-    // Per-canonical: alias the generic `Instruction<Weights>` for
-    // the slice element type AND glob-import the variant
-    // constructors so each static-slice row reads `Embed(...)` /
-    // `RmsNorm(...)` instead of
-    // `::scratchy_forward_compiler::Instruction::<Weights>::Embed(...)`.
-    // The `__I` alias and the variant glob-import are backend-agnostic
-    // — `Instruction<W>` is defined in `scratchy-forward-compiler` without a
-    // backend gate. The per-tape_index static slices reference both, so
-    // they compile under every backend feature.
-    let instruction_alias = quote! {
-        #[allow(non_camel_case_types, dead_code)]
-        type __I = ::scratchy_forward_compiler::Instruction;
-        use ::scratchy_forward_compiler::Instruction::*;
-    };
-
-    // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
-    // tape_index only. Non-canonical buckets share their canonical
-    // sibling's slices via the FORWARD_TABLE entries below.
-    let mut static_slices: Vec<TokenStream> = Vec::new();
-    for (i, wp) in bucket_points.iter().enumerate() {
-        if bucket_canonical[i] != *wp {
-            continue;
-        }
-        let (lowered, _, _, _, _) = &canonical_lowered[wp];
-        let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
-        let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
-        static_slices.push(emit_bucket_static_slice(
-            &backbone_static_ident,
-            &lowered.backbone.instances,
-        ));
-        static_slices.push(emit_bucket_static_slice(
-            &lm_head_static_ident,
-            &lowered.lm_head.instances,
-        ));
-        // Metal MTL4 barrier flags, computed at FUF/SlotMap level
-        // (one bool per `OpInstance`). Length
-        // tracks the corresponding instructions static. Runtime
-        // consumes via `MetalBucketSpec.{backbone,lm_head}_barriers`.
-        // The dataflow helper lives under `crate::metal`, which is
-        // itself `#[cfg(feature = "metal")]`, so the call sites must
-        // match — without the metal feature these statics aren't
-        // referenced (METAL_BUCKETS is also metal-gated).
-        #[cfg(feature = "metal")]
-        {
-            let bb_barriers_ident = bucket_static_ident("BACKBONE_BARRIERS_M", *wp);
-            let lh_barriers_ident = bucket_static_ident("LM_HEAD_BARRIERS_M", *wp);
-            static_slices.push(
-                scratchy_target_metal_compiler::static_tape::emit_bucket_barriers_static(
-                    &bb_barriers_ident,
-                    &lowered.backbone.barriers,
-                ),
-            );
-            static_slices.push(
-                scratchy_target_metal_compiler::static_tape::emit_bucket_barriers_static(
-                    &lh_barriers_ident,
-                    &lowered.lm_head.barriers,
-                ),
-            );
-        }
-    }
-
-    // `sk_axis_active`: true when the model declared `sk_buckets`;
-    // otherwise every wp has sk_bucket==0 and the table emits
-    // `[0, u64::MAX)` for sk on every entry.
-    let sk_axis_active = workloads.iter().any(|wp| wp.sk_bucket != 0);
-    let num_tokens_points: Vec<u64> = workloads.num_tokens_points();
-    let mut sk_by_m: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for wp in workloads.iter() {
-        sk_by_m.entry(wp.num_tokens).or_default().push(wp.sk_bucket);
-    }
-    for v in sk_by_m.values_mut() {
-        v.sort();
-        v.dedup();
-    }
-
-    // (m_min, m_max_excl, sk_min, sk_max_excl) for each workload.
-    // M=1 is special-cased: the solver may pick M=1-only kernels
-    // (cutlass_gemv) that fail at M>1, so the next tape_index starts at
-    // M=2 even if the configured points list `[1, 8, ...]`.
-    let m_max_excl_for = |m_idx: usize| -> u64 {
-        if m_idx + 1 == num_tokens_points.len() {
-            u64::MAX
-        } else {
-            num_tokens_points[m_idx + 1]
-        }
-    };
-    let m_min_for = |m_idx: usize, m: u64| -> u64 {
-        if m_idx > 0 && num_tokens_points[0] == 1 && num_tokens_points[m_idx - 1] == 1 {
-            2
-        } else {
-            m
-        }
-    };
-    let m_idx_of: HashMap<u64, usize> = num_tokens_points
-        .iter()
-        .enumerate()
-        .map(|(i, &m)| (m, i))
-        .collect();
-    // Bucket-id assignment for the per-arch `WeightAccessors` impl:
-    // canonical_lowered.iter() ordering pairs each canonical with
-    // tape_index ids `(2*ci, 2*ci+1)` for backbone and lm_head. This
-    // mapping must match the iteration order in
-    // `emit_weight_accessors_impl` so the match-arm keys line up.
-    let canonical_to_bucket_id: HashMap<_, u32> = canonical_lowered
-        .iter()
-        .enumerate()
-        .map(|(ci, (wp, _))| (*wp, (ci as u32) * 2))
-        .collect();
-
-    // PD-wavefront macro-emission (env-gated, diagnostic + the const builder).
-    // HERE — not in the pre-emit drive — because the decode bucket's
-    // `weight_slots` (the real weight-locator source) only exists post-lowering
-    // + post-loop-compression, and the `(bucket, op_idx, slot)` triples must
-    // match the very match table `emit_weight_accessors_impl` builds from this
-    // same `canonical_lowered`.
-    // Wavefront-emitting builds only — a bundle target lowers the decode to a
-    // single fused bundle. Plain metal dispatches per-op and skips
-    // this; the expensive lowering + its hard panic on un-lowerable models
-    // must not run for them.
-
-    // THE METAL FRONT END. Each decode canonical is lowered from the SHARED subtile tape by
-    // `scratchy_target_metal_compiler::canonical::lower_canonical` — metal's orchestration lives in
-    // the target's compiler crate. This computes the facts only the macro can (the weight table's
-    // paths, the embed's storage, the MLP form, the per-module MoE widths), makes the one call, and
-    // writes back what the bucket table, the arena statics, the accessor table and the bake read.
-    #[cfg(feature = "metal")]
-    let mut metal_steps: BTreeMap<
-        WorkloadPoint,
-        scratchy_target_metal_compiler::canonical::ClassedCanonical,
-    > = BTreeMap::new();
-    // THE MODEL'S SOURCE MANIFEST: every weight family its tapes bind, interned as the canonicals
-    // lower, plus the class rotary tables rope-on-read binds (the same caches the Weights struct
-    // declares: `rotary`, and `rotary_local` on a dual-rotary arch).
-    #[cfg(feature = "metal")]
-    let mut metal_sources = scratchy_target_metal_compiler::canonical::SourceManifest::default();
-    #[cfg(feature = "metal")]
-    let metal_rotary = fuf_uses_rotary(fuf).then(|| {
-        let local = fuf.nodes.iter().any(|n| {
-            n.inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    crate::fuf::FufInput::Extern {
-                        kind: crate::classified::ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        metal_sources.rotary_tables(local)
+    let crate::target::ModelEmission { weights, items } = emitter.model(&crate::target::ModelCx {
+        program,
+        model,
+        facts: &model_facts,
+        fuf,
+        workloads,
+        inferred,
+        tp_world_size,
+        dump_dir,
+        canonical_params_impl: &canonical_params_impl,
+        struct_with: &emit_struct,
+        dims_of: &model_dims,
     });
-    #[cfg(feature = "metal")]
-    for (canonical, (_, ns_field, bb_slot_field, term_field, slots_dec)) in
-        canonical_lowered.iter_mut()
-    {
-        use crate::weight_bindings::{EmbedStorage, MlpPacking, WeightAbi};
-        use scratchy_target_metal::tape::step as st;
-        use scratchy_target_metal_compiler::canonical as mc3;
-        let (m, stem) = (canonical.num_tokens, &model.source_stem);
-        let bounds = bounds_for_wp(model, *canonical, tp_world_size);
-        let prefix =
-            crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
-        let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf,
-            inferred,
-            &bounds,
-            &bridge_model,
-            prefix,
-            m as u32,
-        ) {
-            Ok(l) => l,
-            // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
-            // so the bake bakes NO variants and the pool refuses at load. Anything else has no
-            // fallback.
-            Err(e) => {
-                assert!(
-                    e.is_no_metal_realization(),
-                    "[m2-flip] {stem} m={m}: the shared tape refused a DECLARED pilot ({e:?}) — \
-                     with the solve off there is no fallback",
-                );
-                eprintln!("[m2-eq] {stem} m={m} wavefront REFUSED: {e}");
-                continue;
-            }
-        };
-        // A preset's widths and groups are the kernels' (`quantization`'s preset check refuses
-        // any other), so each mints.
-        let affine_group = |g: u32| {
-            st::AffineGroupSize::new(g).unwrap_or_else(|| {
-                panic!("an affine group of {g}, which no kernel is instantiated for")
-            })
-        };
-        let affine_bits = |b: u32| {
-            st::AffineBits::new(b).unwrap_or_else(|| {
-                panic!("an affine width of {b} bits, which no kernel is instantiated for")
-            })
-        };
-        let embed_quant = fuf.nodes.iter().find_map(|n| {
-            match (n.op, crate::weight_vocab::weight_storage_of(n)) {
-                (
-                    OpKind::Embed,
-                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }),
-                ) => Some((affine_group(*group_size), affine_bits(*bits))),
-                _ => None,
-            }
-        });
-        let fused_mlp = l.input.ops.iter().all(|od| {
-            !matches!(
-                od.op,
-                scratchy_subtile::subtile_ir::SubOp::MatmulTile {
-                    weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
-                    ..
-                }
-            )
-        });
-        let weight_paths: Vec<Vec<String>> = (program.weights.ids())
-            .map(|id| program.weights.path(id).to_vec())
-            .collect();
-        let embed_base = weight_paths
-            .iter()
-            .map(|p| p.join("_"))
-            .find(|p| p.contains("embed"));
-        let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        // Each DSL weight whose own subtree declares a `shared_expert`, by id: the bank a MoE op
-        // reads is looked up by the weight it reads.
-        let shared_expert_banks: std::collections::BTreeSet<u32> = (program.weights.ids())
-            .filter(|&id| {
-                let path = program.weights.path(id);
-                let prefix: Vec<&str> = (path.iter().map(String::as_str))
-                    .chain(["shared_expert"])
-                    .collect();
-                program.weights.has_subtree(&prefix)
-            })
-            .map(|id| id.0)
-            .collect();
-        let quant = model.quantization.as_ref();
-        // A bank's widths, by the weight its op reads: its DSL path is the resolver's prefix.
-        let widths = |bank: u32, layer: st::LayerId, body| {
-            let qc = quant.expect("MoE widths are read for a quantized model only");
-            let at = Some(UnrollIndex(layer.0 as u64));
-            let prefix = program.weights.path(WeightId(bank)).join(".");
-            let bits =
-                crate::quantization::affine_moe_expert_bits(program, &qc.method, &prefix, at, body);
-            bits.map_or([None; 3], |b| b.projections().map(|w| w.map(affine_bits)))
-        };
-        let facts = mc3::MetalStepFacts {
-            weight_paths: &weight_paths,
-            shared_expert_banks: &shared_expert_banks,
-            embed_base: &embed_base,
-            embed_quant,
-            mlp: if fused_mlp {
-                mc3::MlpForm::Packed
-            } else {
-                mc3::MlpForm::Split
-            },
-            moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
-        };
-        let mc = &model_facts;
-        let buckets: Vec<u64> = (bucket_points.iter().zip(&bucket_canonical))
-            .filter(|&(_, c)| c == canonical)
-            .map(|(wp, _)| wp.num_tokens)
-            .collect();
-        let at = mc3::CanonicalAt {
-            stem,
-            m,
-            buckets: &buckets,
-            rows: match layout {
-                BackboneLayout::Decoder => scratchy_subtile::sample_rows::ResultRows::Sampled,
-                BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
-            },
-        };
-        let lowered = mc3::lower_canonical_classed(&l, &facts, mc, at, &mut metal_sources)
-            .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
-        // The narrow band's shared bucket facts — the classed lowering proved the wide band
-        // keeps every one of them (only the step tapes may differ).
-        *ns_field = lowered.narrow.colours.get();
-        *bb_slot_field = lowered.narrow.hidden.0;
-        *term_field = lowered.narrow.result.index();
-        // Arena sizing evaluates a FUF shape per colour, so colour 0 (the embedded hidden) is
-        // keyed by the FUF Embed tile.
-        let mut arena = lowered.narrow.arena.clone();
-        if let Some(et) = fuf.nodes.iter().find(|nd| nd.op == OpKind::Embed) {
-            arena.insert_at(et.id, 0, 0);
-        }
-        *slots_dec = arena;
-        metal_steps.insert(*canonical, lowered);
-        // THE WEIGHTS STRUCT, from the tape's bindings. Metal's one ABI fact in it: a gate/up
-        // pair is ONE packed `__fused__` buffer.
-        let abi = WeightAbi {
-            mlp: if fused_mlp {
-                MlpPacking::Packed
-            } else {
-                MlpPacking::Split
-            },
-            embed: match embed_quant {
-                Some(_) => EmbedStorage::AffineQuant,
-                None => EmbedStorage::Dense,
-            },
-        };
-        let synth = crate::weight_bindings::from_tape(&l, program, abi)
-            .unwrap_or_else(|e| panic!("[weight-bindings] {stem}: {e}"));
-        tape_accessors_for_struct = Some(synth.accessors);
-    }
-    // The `(bucket, op_idx, slot)` accessor table. No stream records a slot, so it is the
-    // trait's defaults; on metal the model's tensors resolve through the source manifest's
-    // resolver instead.
-    let weight_accessors_impl =
-        emit_weight_accessors_impl(&canonical_lowered, model.source_stem.as_str());
-    #[cfg(feature = "metal")]
-    let dims = model_dims(tape_accessors_for_struct.as_deref());
-    #[cfg(feature = "metal")]
-    let resolver = metal_sources
-        .resolver(&|base| {
-            dims.handle(base).map(|h| {
-                let weights = &h.weights;
-                (h.ty.clone(), quote!(__weights::#weights))
-            })
-        })
-        .unwrap_or_else(|e| panic!("[metal sources] {}: {e:?}", model.source_stem));
-    #[cfg(feature = "metal")]
-    let weight_accessors_impl = {
-        let resolver = &resolver.tokens;
-        quote! {
-            #weight_accessors_impl
-            #[cfg(scratchy_target = "metal")]
-            #resolver
-        }
-    };
-    // The Weights struct is emitted from the TAPE's accessor set.
-    // Re-emitted HERE because the tape accessors only exist after the
-    // front-end swap has lowered the canonical.
-    #[cfg(feature = "metal")]
-    let (weights, weights_affine_rows) = match tape_accessors_for_struct.as_ref() {
-        Some(tape_accs) => emit_struct(Some(tape_accs), &dims),
-        None => (weights, weights_affine_rows),
-    };
-
-    // The target's own baked program for this model, at the decode (num_tokens=1) point's
-    // bounds — spliced into the per-model module; empty for a target that bakes none this way.
-    let target_bake = {
-        let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
-        let decode_bounds = decode_wp.map(|wp| bounds_for_wp(model, wp, tp_world_size));
-        emitter.bake_model(&crate::target::BakeCx {
-            program,
-            model,
-            facts: &model_facts,
-            fuf,
-            inferred,
-            decode_bounds: decode_bounds.as_ref(),
-            dump_dir,
-        })
-    };
-
-    let mut bucket_table_entries: Vec<TokenStream> = Vec::new();
-    for (i, wp) in bucket_points.iter().enumerate() {
-        let canonical = bucket_canonical[i];
-        let bb_static = bucket_static_ident("BACKBONE_M", canonical);
-        let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
-        let bb_bucket_id = *canonical_to_bucket_id
-            .get(&canonical)
-            .expect("canonical_to_bucket_id missing entry for canonical workload point");
-        let bb_bucket_lit = proc_macro2::Literal::u32_unsuffixed(bb_bucket_id);
-        let lm_bucket_lit = proc_macro2::Literal::u32_unsuffixed(bb_bucket_id + 1);
-        // Per-tape_index slot metadata. The colored slot map is built
-        // per workload point (the solver may pick Impls that need
-        // different intermediate-tile counts per tape_index — e.g.
-        // CutlassGemmAdd fuses the residual into the GEMM at
-        // prefill, freeing a slot vs the decode-tape_index's separate
-        // Add). The non-canonical buckets share their canonical's
-        // slot metadata since they share its static slices.
-        let (_, num_slots_b, backbone_slot_b, terminal_slot_b, _) = &canonical_lowered[&canonical];
-        let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
-        let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_b);
-        let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
-        let m_idx = m_idx_of[&wp.num_tokens];
-        let m_min = if wp.num_tokens == 1 {
-            1
-        } else {
-            m_min_for(m_idx, wp.num_tokens)
-        };
-        let m_max_excl = if wp.num_tokens == 1 {
-            2
-        } else {
-            m_max_excl_for(m_idx)
-        };
-        let (sk_min, sk_max_excl) = if sk_axis_active {
-            let sk_buckets = &sk_by_m[&wp.num_tokens];
-            let j = sk_buckets
-                .iter()
-                .position(|&sk| sk == wp.sk_bucket)
-                .unwrap();
-            // The first sk tape_index per m group must accept sk < its
-            // own configured value — old codegen routed this via a
-            // `_ =>` fallback arm onto the smallest sk fn. So emit
-            // sk_min=0 for j==0 instead of wp.sk_bucket; without
-            // this, find_bucket misses on small max_seqlen_k (the
-            // prefill case for short prompts) and the fallback to
-            // table[0] silently picks an m=1 row.
-            let sk_min = if j == 0 { 0 } else { wp.sk_bucket };
-            let sk_max_excl = if j + 1 == sk_buckets.len() {
-                u64::MAX
-            } else {
-                sk_buckets[j + 1]
-            };
-            (sk_min, sk_max_excl)
-        } else {
-            (0u64, u64::MAX)
-        };
-        let m_min_lit = proc_macro2::Literal::u64_unsuffixed(m_min);
-        let m_max_lit = if m_max_excl == u64::MAX {
-            quote! { u64::MAX }
-        } else {
-            let v = proc_macro2::Literal::u64_unsuffixed(m_max_excl);
-            quote! { #v }
-        };
-        let sk_min_lit = proc_macro2::Literal::u64_unsuffixed(sk_min);
-        let sk_max_lit = if sk_max_excl == u64::MAX {
-            quote! { u64::MAX }
-        } else {
-            let v = proc_macro2::Literal::u64_unsuffixed(sk_max_excl);
-            quote! { #v }
-        };
-        bucket_table_entries.push(quote! {
-            __B(
-                #m_min_lit, #m_max_lit, #sk_min_lit, #sk_max_lit,
-                #bb_static, #lm_static,
-                #num_slots_lit, #backbone_slot_lit, #terminal_slot_lit,
-                #bb_bucket_lit, #lm_bucket_lit,
-            ),
-        });
-    }
-
-    // FORWARD_TABLE — one row per tape_index. `__B` aliases the
-    // `BucketEntry` tuple-struct constructor so each row stays on a
-    // single line in expanded source. `scr model info`'s per-variant
-    // `dump()` walks it; metal's pool uses `METAL_BUCKETS` for the
-    // forward and ignores the runtime fields here.
-    let forward_table = quote! {
-        #[cfg(scratchy_target = "metal")]
-        static FORWARD_TABLE: &[::scratchy_forward_compiler::BucketEntry<__I>] = {
-            use ::scratchy_forward_compiler::BucketEntry as __B;
-            &[
-                #(#bucket_table_entries)*
-            ]
-        };
-    };
-
-    // METAL_BUCKETS — one row per distinct `num_tokens` point per routed fold band: the bands
-    // colour differently, so each carries its own slots, terminal and arena (twin rows, sharing
-    // everything, when the bands fold the same step tape). The
-    // metal pool dispatches on `num_tokens` only (no sk axis); for
-    // models that declared `sk_buckets` we pick the `sk_bucket == 0`
-    // canonical at each `m`, falling back to whichever wp exists for
-    // that `m` if the model elided the sk=0 entry. TinyLlama-class
-    // models have no sk axis, so this is a 1:1 enumeration of
-    // `num_tokens_points`.
-    //
-    // Each row's `backbone` / `lm_head` ride on the per-canonical
-    // static slices the cuda emission already produced — under both
-    // backends the slices are unconditionally emitted (the
-    // `instruction_alias` and `Weights` definitions are now
-    // mutually-exclusive cfg-gated, but the slice statics
-    // themselves are backend-agnostic).
-    let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
-    // Each row of `METAL_BUCKETS` as its bucket type, in row order: its rows, band and arena
-    // (`baked_buckets!`).
-    let mut metal_bucket_types: Vec<TokenStream> = Vec::new();
-    let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
-    #[cfg(feature = "metal")]
-    let mut metal_tape_cmds = scratchy_target_metal_compiler::static_tape::CommandPool::default();
-    // The most arena slots a bucket has: how many the model's arena ranks rank (`RankedSlots`).
-    let mut metal_arena_slots: u32 = 0;
-    // Every colour and arena the buckets' colourings make, in the model's `__arena`.
-    let mut metal_arena_types = ArenaTypes::default();
-    // Whether the model's tapes read a paged KV pool. One that reads none (Splash's DFlash2
-    // drafter, whose rings are its KV) holds any pool's block count at its ladder's floor.
-    let pool_block_cap = match KvCacheLayers::of(fuf).any() {
-        true => quote! { ctx.kv_cache.max_blocks_per_seq },
-        false => quote! { 0 },
-    };
-    // The KV cap rungs every bucket bakes, topped by every block the model's positions fill.
-    #[cfg(feature = "metal")]
-    let metal_cap_ladder = {
-        use scratchy_target_metal::tape::ids::{BlockSize, MaxPositions};
-        let mc = &model_facts;
-        let max_pos = KvCacheLayers::of(fuf).any().then(|| {
-            let max_pos = model.bounds.get("max_position_embeddings").copied();
-            max_pos
-                .and_then(|p| u32::try_from(p).ok())
-                .map(MaxPositions)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "model `{}`: no u32 max_position_embeddings to top the KV cap ladder",
-                        model.source_stem
-                    )
-                })
-        });
-        // The pool's page is the base class's; a model without attention reads no pool (its
-        // `max_pos` is `None`), and its ladder is the floor whatever the page.
-        let page = mc
-            .attention()
-            .map_or(scratchy_ir::model_facts::DEFAULT_KV_PAGE, |a| {
-                a.base().page()
-            });
-        let ladder = scratchy_target_metal_compiler::static_tape::kv_cap_ladder(
-            max_pos,
-            BlockSize(page.get()),
-        );
-        eprintln!(
-            "[metal bake] {}: KV cap rungs {ladder:?}",
-            model.source_stem
-        );
-        ladder
-    };
-    // Splash's two draft graphs (runtime/model/DFlashDraft.cpp `addContextCommit`, `addDecode`)
-    // are one tape here, played apart. A DFlash2 drafter's block draft runs a step's lanes'
-    // blocks: at most its target's verify rows (`spec_verify_rows`), so at the smallest bucket
-    // that holds them (`plays_result_through`). A bucket past it plays the context commit alone,
-    // and its arena holds what the commit's tiles (`commit_tiles`) write: the block's — its
-    // lm_head's logits, a vocabulary a row, above all — are never written there.
-    // The rows are a lane's (`spec_verify_rows`) times the lanes a step drafts
-    // (`scratchy_serving_engine::spec_decode::BLOCK_LANES`, Splash's SPLASH_MAXIMUM_BATCH_WIDTH).
-    let plays_result_through = match model.bounds.get("selector_rank") {
-        Some(&rank) if rank > 0 => {
-            (model.bounds.get("spec_verify_rows").copied()).and_then(|rows| {
-                let rows = rows * DFLASH2_BLOCK_LANES;
-                num_tokens_points
-                    .iter()
-                    .copied()
-                    .filter(|&m| m >= rows)
-                    .min()
-            })
-        }
-        _ => None,
-    };
-    let commit_tiles: HashSet<TileId> = {
-        let mut live: HashSet<TileId> = HashSet::new();
-        let mut todo: Vec<TileId> = (fuf.nodes.iter())
-            .filter(|n| n.op == crate::classified::OpKind::DraftContextKv)
-            .map(|n| n.id)
-            .collect();
-        while let Some(id) = todo.pop() {
-            if live.insert(id) {
-                todo.extend(fuf.get(id).inputs.iter().filter_map(|i| match *i {
-                    crate::fuf::FufInput::Tile { id, .. } => Some(id),
-                    _ => None,
-                }));
-            }
-        }
-        live
-    };
-    for &m in &num_tokens_points {
-        // Prefer the sk=0 canonical for this `m`; fall back to any wp
-        // at `m` if the model never declared sk=0 explicitly.
-        let wp = bucket_points
-            .iter()
-            .find(|wp| wp.num_tokens == m && wp.sk_bucket == 0)
-            .copied()
-            .or_else(|| bucket_points.iter().find(|wp| wp.num_tokens == m).copied())
-            .expect("every num_tokens point has at least one wp");
-        let i = bucket_points
-            .iter()
-            .position(|w| *w == wp)
-            .expect("wp came from bucket_points");
-        let canonical = bucket_canonical[i];
-        let bb_static = bucket_static_ident("BACKBONE_M", canonical);
-        let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
-        let bb_barriers_static = bucket_static_ident("BACKBONE_BARRIERS_M", canonical);
-        let lh_barriers_static = bucket_static_ident("LM_HEAD_BARRIERS_M", canonical);
-        let (_, num_slots_b, backbone_slot_b, terminal_slot_b, slots_b) =
-            &canonical_lowered[&canonical];
-        let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
-
-        // Per-tape_index arena_bytes: register-coloring tells us which
-        // (tile, output_slot) pairs share an arena slot; for THIS
-        // tape_index M we evaluate each tile's output shape against this
-        // tape_index's bounds and take the per-color max. Each tape_index
-        // gets a tight arena sized exactly for its own num_tokens —
-        // the worker pool elementwise-maxes across MetalBucketSpec
-        // entries once at init time to size the per-worker arena
-        // (init-time alloc, reused across every forward).
-        let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
-        let plays_result = plays_result_through.is_none_or(|through| m <= through);
-        // One fold band's bucket facts — its colouring's slot count, terminal, hidden and
-        // per-slot bytes; each band's step tape was coloured under its own colouring, so its
-        // bucket row carries its own. The logits: the terminal tile and the in-place logit
-        // tail under it, back to the lm_head — the terminal slot's chain. A forward leaves only
-        // the rows its step samples there, so they take that slot's bytes a row
-        // (`MetalBucketSpec::logits_row_bytes`), its rows counted at load; an encoder's
-        // terminal rows are every row, as are every row of a backend that samples none (metal
-        // alone compacts them). A tile output the coloring did not register (a refused
-        // canonical's empty map, an input the tape's arena keys by another tile) is in no
-        // slot, so not the terminal's.
-        let mut band_facts = |num_slots: u32,
-                              terminal_slot: u32,
-                              backbone_slot: u32,
-                              slots: &crate::weight_vocab::SlotMap|
-         -> (u32, u32, u32, u64, (Ident, Vec<String>)) {
-            let in_terminal = |id: TileId, slot: u8| {
-                (slots.iter()).any(|(at, colour)| at == (id, slot) && colour == terminal_slot)
-            };
-            let logits_tiles: Vec<(TileId, u8)> = match layout {
-                BackboneLayout::Decoder if cfg!(feature = "metal") => {
-                    let mut chain = vec![(last_node_id, 0u8)];
-                    while let Some(&(tile, _)) = chain.last() {
-                        let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
-                            crate::fuf::FufInput::Tile { id, slot } if in_terminal(id, slot) => {
-                                Some((id, slot))
-                            }
-                            _ => None,
-                        });
-                        match under {
-                            Some(under) if !chain.contains(&under) => chain.push(under),
-                            _ => break,
-                        }
-                    }
-                    chain
-                }
-                BackboneLayout::Decoder | BackboneLayout::Encoder => Vec::new(),
-            };
-            let mut logits_row_bytes: u64 = 0;
-            // The extents each colour hosts, each once (by its spelling, at the rows' parameters):
-            // those its `Colour::BYTES` is the largest of, and those another size covers — the
-            // logits rows (`logits_row_bytes`), the tiles a bucket that plays no result never
-            // commits, the embedded hidden colour 0 is (`arena_colours!`).
-            let no_slots =
-                || vec![BTreeMap::<String, (TokenStream, bool)>::new(); num_slots as usize];
-            let (mut sized, mut unsized_) = (no_slots(), no_slots());
-            let extent = |shape: &crate::dim::Shape| {
-                let at = arena_extent(shape, &quote!(M), &quote!(S))
-                    .unwrap_or_else(|e| panic!("[metal arena] {}: m={m}: {e}", model.source_stem));
-                (at, computes_over_rows(shape))
-            };
-            for ((tile_id, out_slot), color) in slots.iter() {
-                let node = fuf.get(tile_id);
-                let shape = &node.outputs[out_slot as usize];
-                let e = extent(shape);
-                let value = scratchy_subtile::handoff::ArenaValue::Tile {
-                    tile: tile_id.0,
-                    out: out_slot,
-                };
-                metal_arena_types.value(value, &e);
-                if !plays_result && !commit_tiles.contains(&tile_id) {
-                    unsized_[color as usize].insert(e.0.to_string(), e);
-                } else if logits_tiles.contains(&(tile_id, out_slot)) {
-                    // f16 = 2 bytes/element; metal kernels are f16-only.
-                    let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
-                        .expect("a tile output names a bound the model lacks — codegen invariant");
-                    let row: u64 = dims.iter().skip(1).product();
-                    logits_row_bytes = logits_row_bytes.max(row.saturating_mul(2));
-                    unsized_[color as usize].insert(e.0.to_string(), e);
-                } else {
-                    sized[color as usize].insert(e.0.to_string(), e);
-                }
-            }
-            let embedded = scratchy_subtile::handoff::ArenaValue::Source(0);
-            if let (Ok(shape), Some(zero)) =
-                (arena_value_shape(fuf, embedded), unsized_.first_mut())
-            {
-                let e = extent(shape);
-                metal_arena_types.value(embedded, &e);
-                zero.insert(e.0.to_string(), e);
-            }
-            for (sized, unsized_) in sized.iter().zip(&mut unsized_) {
-                unsized_.retain(|e, _| !sized.contains_key(e));
-            }
-            metal_arena_slots = metal_arena_slots.max(num_slots);
-            // The bucket's arena: each slot's colour type, and the arena of them.
-            let colours: Vec<Ident> = (sized.iter().zip(&unsized_).enumerate())
-                .map(|(slot, (sized, unsized_))| {
-                    let mut markers = |extents: &BTreeMap<String, (TokenStream, bool)>| {
-                        let at = extents.values();
-                        at.map(|at| metal_arena_types.extent(at))
-                            .collect::<Vec<_>>()
-                    };
-                    let (sized, unsized_) = (markers(sized), markers(unsized_));
-                    metal_arena_types.colour(slot as u32, &sized, &unsized_)
-                })
-                .collect();
-            let arena = metal_arena_types.arena(&colours);
-            let colours = colours.iter().map(Ident::to_string).collect::<Vec<_>>();
-            (
-                num_slots,
-                terminal_slot,
-                backbone_slot,
-                logits_row_bytes,
-                (arena, colours),
-            )
-        };
-        // The narrow band's facts: the shared tuple the metal front-end swap wrote (which the
-        // FORWARD_TABLE row reads too).
-        let narrow = band_facts(*num_slots_b, *terminal_slot_b, *backbone_slot_b, slots_b);
-        // The wide band's: its own canonical's when the bands fold differently at this bucket,
-        // the narrow's twin when they fold the same (no routing ops, or the fold refused) —
-        // either way the pool picks one row per bucket by its device's band.
-        // `None`: the narrow's twin, whose arena it shares.
-        #[cfg(feature = "metal")]
-        let wide = (metal_steps.get(&canonical).and_then(|c| c.wide.as_ref())).map(|wide| {
-            band_facts(
-                wide.colours.get(),
-                wide.result.index(),
-                wide.hidden.0,
-                &wide.arena,
-            )
-        });
-        #[cfg(not(feature = "metal"))]
-        let wide = None;
-        // Bake this bucket's tape rungs at expansion — one per device
-        // generation, addressing, KV cap and TurboQuant decode heads —
-        // every fact baked; the pool picks one. See static_tape.rs.
-        #[cfg(feature = "metal")]
-        let tapes_static_toks = {
-            let mc = &model_facts;
-            // A canonical metal has no kernel for (`[m2-eq] … REFUSED`: it has no steps) bakes NO
-            // variants, so `MetalWorkerPool::for_buckets` refuses at load (`NoRung`), naming
-            // the bucket. Baking its empty step tape instead would build VALID empty-command tapes:
-            // the forward would no-op and the tail would index the arena out of bounds.
-            let tapes_expr = match metal_steps.get(&canonical) {
-                None => {
-                    eprintln!(
-                        "[metal static tape] {}: bucket_m={m}: front-end REFUSED this canonical — \
-                         baking an empty variant list so the pool refuses at load",
-                        model.source_stem
-                    );
-                    quote! { &[] }
-                }
-                Some(classed) => {
-                    use scratchy_target_metal_compiler::static_tape::{BandArena, BucketRows};
-                    // Each band's colour types by slot, at the bucket's rows; a wide band that
-                    // folds as the narrow one does is its twin.
-                    let rows = BucketRows::At {
-                        m: m as u32,
-                        sk: wp.sk_bucket as u32,
-                    };
-                    let band_arena = |(_, colours): &(Ident, Vec<String>)| BandArena {
-                        colours: colours.clone(),
-                        rows,
-                    };
-                    let narrow_arena = band_arena(&narrow.4);
-                    let wide_arena = band_arena(&wide.as_ref().unwrap_or(&narrow).4);
-                    let input = scratchy_target_metal_compiler::static_tape::BucketLowerInput {
-                        steps: &classed.narrow.steps,
-                        wide_band: classed.wide.as_ref().map(|wide| {
-                            scratchy_target_metal_compiler::static_tape::WideBand {
-                                steps: &wide.steps,
-                                num_arena_slots: wide.colours.get(),
-                                operands: &wide.operands,
-                                arena: &wide_arena,
-                            }
-                        }),
-                        bucket_m: m as u32,
-                        num_arena_slots: *num_slots_b,
-                        rotary: metal_rotary,
-                        cap_ladder: &metal_cap_ladder,
-                        operands: &classed.narrow.operands,
-                        arena: &narrow_arena,
-                        // What each value its steps name is, as its colour hosts it.
-                        extents: &metal_arena_types.values,
-                    };
-                    scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
-                        mc,
-                        &input,
-                        &mut metal_tape_cmds,
-                    )
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "[metal static tape] {}: bucket_m={m}: {e}",
-                            model.source_stem
-                        )
-                    })
-                }
-            };
-            let ident = bucket_static_ident("METAL_TAPES_M", wp);
-            metal_arena_bytes_statics.push(quote! {
-                #[cfg(scratchy_target = "metal")]
-                static #ident:
-                    &[::scratchy_target_metal::tape::lowered::ClassedTape] = #tapes_expr;
-            });
-            quote! { #ident }
-        };
-        #[cfg(not(feature = "metal"))]
-        let tapes_static_toks = quote! { &[] };
-        // The weight bytes a forward of the bucket reads (`MetalStepTape::weight_bytes`).
-        #[cfg(feature = "metal")]
-        let (fixed, per_row) = (metal_steps.get(&canonical))
-            .map(|classed| classed.narrow.steps.weight_bytes())
-            .map_or((0, 0), |b| (b.fixed, b.per_row));
-        #[cfg(not(feature = "metal"))]
-        let (fixed, per_row) = (0u64, 0u64);
-        let weight_bytes_toks = {
-            let (fixed, per_row) = (
-                proc_macro2::Literal::u64_unsuffixed(fixed),
-                proc_macro2::Literal::u64_unsuffixed(per_row),
-            );
-            quote! {
-                ::scratchy_target_metal::tape::step::WeightBytes { fixed: #fixed, per_row: #per_row }
-            }
-        };
-        // The model's baked kernels (`CommandPool::into_tokens`).
-        let kernels_toks = match cfg!(feature = "metal") {
-            true => quote! { METAL_KERNELS },
-            false => quote! { &[] },
-        };
-        // One row per fold band — the wide band's statics under its own names, the tapes and
-        // kernels shared: the pick keeps the row whose band the device's class lowers.
-        // A wide band that folds as the narrow one does is its twin.
-        let band_rows = [
-            ("Narrow", &narrow),
-            ("Wide", wide.as_ref().unwrap_or(&narrow)),
-        ];
-        for (band, (num_slots, terminal_slot, backbone_slot, logits_row_bytes, (arena, _))) in
-            band_rows
-        {
-            let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots);
-            let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot);
-            let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot);
-            let logits_row_bytes_lit = proc_macro2::Literal::u64_unsuffixed(*logits_row_bytes);
-            // The band row's arena at the bucket's rows: each slot's bytes are its colour's.
-            let rows = |n: u64| {
-                let path = scratchy_tensors::typed::unsigned_alias_path(n);
-                (path.parse::<TokenStream>()).unwrap_or_else(|e| {
-                    panic!("[metal arena] {}: rows `{path}`: {e}", model.source_stem)
-                })
-            };
-            let (m_rows, sk_rows) = (rows(m), rows(wp.sk_bucket));
-            let arena_bytes = quote! {
-                <__arena::#arena<#m_rows, #sk_rows> as ::scratchy_target_metal::tape::typed::Arena>
-                    ::BYTES
-            };
-            let band_ident = proc_macro2::Ident::new(band, proc_macro2::Span::call_site());
-            let bucket_type = format_ident!("B{}", metal_bucket_types.len());
-            metal_bucket_types.push(quote! {
-                #bucket_type = (#m_rows, #band_ident, super::__arena::#arena<#m_rows, #sk_rows>)
-            });
-            metal_bucket_entries.push(quote! {
-                ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
-                    bucket_m: #bucket_m_lit,
-                    band: ::scratchy_target_metal::interpreter::metal::FoldBand::#band_ident,
-                    num_arena_slots: #num_slots_lit,
-                    terminal_slot: #terminal_slot_lit,
-                    backbone_slot: #backbone_slot_lit,
-                    arena_bytes: #arena_bytes,
-                    logits_row_bytes: #logits_row_bytes_lit,
-                    backbone: #bb_static,
-                    lm_head: #lm_static,
-                    backbone_barriers: #bb_barriers_static,
-                    lm_head_barriers: #lh_barriers_static,
-                    tapes: #tapes_static_toks,
-                    kernels: #kernels_toks,
-                    plays_result: #plays_result,
-                    weight_bytes: #weight_bytes_toks,
-                },
-            });
-        }
-    }
-
-    // THE ARENA RANKS: the slots by size at their largest bucket, largest first, ties by slot —
-    // the order in which another model whose forwards never overlap this one's shares its arena
-    // (`ArenaRanks`): every slot as a guest, all but the buckets' final hidden states as a host.
-    // Read off `METAL_BUCKETS` as their `static` compiles (`RankedSlots`): each slot's bytes are
-    // its colours'.
-    let metal_ranked_slots = proc_macro2::Literal::usize_unsuffixed(metal_arena_slots as usize);
-    let metal_arena_types = metal_arena_types.tokens();
-    metal_arena_bytes_statics.push(quote! {
-        /// The model's arena: the colours and arenas its buckets' colourings make, and its slots
-        /// ranked by their bytes.
-        #[cfg(scratchy_target = "metal")]
-        mod __arena {
-            use super::__dims;
-            use ::scratchy_tensors::typed::Act;
-            #metal_arena_types
-            /// [`super::METAL_BUCKETS`]' arena slots, ranked by the bytes their colours host.
-            pub(super) static RANKED: ::scratchy_target_metal::interpreter::metal::RankedSlots<
-                #metal_ranked_slots,
-            > = ::scratchy_target_metal::interpreter::metal::RankedSlots::of(super::METAL_BUCKETS);
-        }
-
-        /// The model's buckets: each row of [`METAL_BUCKETS`] as a type, and the enum a forward's
-        /// bucket is, chosen at the door (`scratchy_target_metal::interpreter::metal::bucket`).
-        #[cfg(scratchy_target = "metal")]
-        mod __buckets {
-            ::scratchy_target_metal::baked_buckets! {
-                pub enum Bucket { #(#metal_bucket_types),* }
-            }
-        }
-
-        #[cfg(scratchy_target = "metal")]
-        impl ::scratchy_target_metal::interpreter::metal::BakedBuckets for Weights {
-            type Bucket = __buckets::Bucket;
-        }
-    });
-
-    // Largest `num_tokens` across all buckets — drives runtime
-    // buffer sizing in the metal forward body's `RuntimeFactory`.
-    let max_bucket_m_lit = {
-        let max_m = num_tokens_points
-            .iter()
-            .copied()
-            .max()
-            .expect("at least one num_tokens point per canonical");
-        proc_macro2::Literal::u32_unsuffixed(max_m as u32)
-    };
-
-    // Vision runtime-extern buffer sizes (bytes), baked from the largest
-    // bucket + vision geometry. Zero (→ alloc's 16-byte floor) on
-    // non-vision arches (the `vision_*` bounds are absent in text
-    // configs). `freqs` is f32 `[total_L, vision_head_dim/2]`; `pixels`
-    // is the model dtype (bf16) `[num_tokens, vision_in_features]`.
-    // An MTP head's body reads its target's final hidden rows (`RowsExtern::TargetHidden`).
-    let reads_target_hidden = fuf_reads_target_hidden(fuf);
-    // The width of those rows (the `TargetHidden` extern's): its target's hidden size — which a
-    // drafter of its own width (Gemma 4's assistant) reads and exports at, its passes chained at.
-    let target_hidden_width: u64 = model
-        .bounds
-        .get("backbone_hidden_size")
-        .or_else(|| model.bounds.get("hidden_size"))
-        .copied()
-        .unwrap_or(0);
-    let (
-        vision_freqs_bytes_lit,
-        vision_pixels_bytes_lit,
-        vision_posemb_bytes_lit,
-        target_hidden_bytes_lit,
-        mm_embeds_bytes_lit,
-        mm_dst_rows_bytes_lit,
-        mrope_cos_sin_bytes_lit,
-    ) = {
-        let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
-        let vis_head_dim = model.bounds.get("vision_head_dim").copied().unwrap_or(0);
-        let vis_in_features = model.bounds.get("vision_in_features").copied().unwrap_or(0);
-        let vis_embed_dim = model.bounds.get("vision_embed_dim").copied().unwrap_or(0);
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
-        let freqs_bytes = max_m * (vis_head_dim / 2) * 4;
-        let pixels_bytes = max_m * vis_in_features * 2;
-        // pos_embeds: model-dtype (bf16) `[num_tokens, vision_embed_dim]`,
-        // host-interpolated and added to the patch-embed output.
-        let posemb_bytes = max_m * vis_embed_dim * 2;
-        // target_hidden (MTP heads): model-dtype `[num_tokens, target_hidden_width]`, the
-        // target's final hidden rows. Zero unless the body reads the extern.
-        let target_hidden_bytes = match reads_target_hidden {
-            true => max_m * target_hidden_width * 2,
-            false => 0,
-        };
-        // mm splice (text decoder): mm_embeds = bf16 `[max_m, hidden]`;
-        // mm_dst_rows = u32 `[max_m]`. Zero on non-MM arches.
-        let mm_embeds_bytes = max_m * hidden_size * 2;
-        let mm_dst_rows_bytes = max_m * 4;
-        // MRoPE cos/sin override (MRoPE text decoders only): model-dtype
-        // (f16/bf16 → 2 bytes) `[max_m, rot_dim]`. 0 on 1D-rope arches
-        // (the `resolve_bindings` swap never fires, so the buffer is
-        // never bound — `alloc`'s 16-byte floor covers the placeholder).
-        // `rot_dim = partial_rotary_factor * head_dim` (Qwen3.5: 0.25*256
-        // = 64), mirroring the rope-cache builder / `ROT_DIM` fn-const.
-        let mrope_cos_sin_bytes = if model.mrope_section.is_some() {
-            let head_dim = u64::from(model.text.head_dim.get());
-            let rot_dim = model
-                .scalars
-                .get("partial_rotary_factor")
-                .copied()
-                .filter(|&f| (f - 1.0).abs() > 1e-9)
-                .map(|f| (f * head_dim as f64).round() as u64)
-                .unwrap_or(head_dim);
-            max_m * rot_dim * 2
-        } else {
-            0
-        };
-        (
-            proc_macro2::Literal::u64_unsuffixed(freqs_bytes),
-            proc_macro2::Literal::u64_unsuffixed(pixels_bytes),
-            proc_macro2::Literal::u64_unsuffixed(posemb_bytes),
-            proc_macro2::Literal::u64_unsuffixed(target_hidden_bytes),
-            proc_macro2::Literal::u64_unsuffixed(mm_embeds_bytes),
-            proc_macro2::Literal::u64_unsuffixed(mm_dst_rows_bytes),
-            proc_macro2::Literal::u64_unsuffixed(mrope_cos_sin_bytes),
-        )
-    };
-    // The rows a target captures for its DFlash2 drafter (model dtype, `[max_m, slots · hidden]`;
-    // 0 on a model no drafter reads), and a drafter's block (its drafts and their anchor).
-    let (draft_capture_bytes_lit, draft_rows_lit, captured_rows) = {
-        let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
-        let slots = (model
-            .layer_sets
-            .get(crate::draft_capture::DRAFT_CAPTURE_LAYERS))
-        .map_or(0, |s| s.members().len() as u64);
-        let rows = *model.bounds.get("spec_drafts").unwrap_or(&0) + 1;
-        let bytes = max_m * slots * hidden_size * 2;
-        // What a step's followup gets of them, from the worker's runtime bindings: they, or none
-        // on a model no drafter reads.
-        let captured_rows = match bytes > 0 {
-            true => (quote! { runtime }, quote! { Some(&*runtime.draft_capture) }),
-            false => (quote! { _ }, quote! { None }),
-        };
-        (
-            proc_macro2::Literal::u64_unsuffixed(bytes),
-            proc_macro2::Literal::u64_unsuffixed(rows),
-            captured_rows,
-        )
-    };
-    let (captured_runtime, captured_rows) = captured_rows;
-
-    // Width of ONE row of the terminal arena slot, baked at
-    // macro-expansion time: the metal forward shapes its returned
-    // `OwnedTensor` as `[num_tokens, width]` over that slot, and the
-    // argmax kernel strides by it.
-    //
-    // Decoder layouts terminate in the lm_head Gemm, so the width is
-    // `vocab_size`. ENCODER layouts (ModernBERT and every
-    // `#[vision_forward]` body) have no lm_head — the terminal slot
-    // holds hidden states, so the width is `hidden_size`. Using vocab
-    // there would stride rows by ~65x the real row and read past the
-    // slot. Vision-only encoders carry no vocab at all and would get
-    // 0. Cuda builds skip the constant entirely.
-    let logits_width = match layout {
-        BackboneLayout::Decoder => model.bounds.get("vocab_size").copied().unwrap_or(0),
-        BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
-    };
-    let vocab_size_lit = proc_macro2::Literal::u64_unsuffixed(logits_width);
-    // The rows of the terminal slot a forward leaves for its caller: a decoder's logits of the
-    // rows its step samples, at the front; an encoder's hidden state at every row.
-    let terminal_rows = match layout {
-        BackboneLayout::Decoder => quote! { inputs.sampled_rows.len() },
-        BackboneLayout::Encoder => quote! { n },
-    };
-
-    // Per-forward MRoPE cos/sin override builder, spliced into the metal
-    // `forward` / `forward_with_metal_followup` bodies just before
-    // `ForwardInputs`. Only MRoPE text decoders (config carries
-    // `rope_scaling.mrope_section`) build the per-token band-split table
-    // and switch the rope kernel to identity positions (option (b)):
-    // `positions[t] = t` indexes row `t` of the table, so the unmodified
-    // 1D rope kernel reads the right (T/H/W band-split) cos/sin without an
-    // in-kernel band-split. The worker's `resolve_bindings` redirects the
-    // baked `WeightBundleKind::CosSin` pointer to `runtime.mrope_cos_sin`
-    // under the same `W::MROPE_SECTION` gate. Every 1D-rope arch keeps
-    // `positions` untouched and passes `mrope_cos_sin: None`. The `[3, n]`
-    // vs broadcast `[n]` positions are disambiguated at runtime by
-    // `ctx.positions` numel (the worker uploads `[3, n]` only when image
-    // tokens are present).
-    // MRoPE (Qwen3.5-VL): the per-token rotary cos/sin rows a forward reads in place of the
-    // position-indexed cache, built on the host from its positions (`metal_rope_rows`); `None` on
-    // 1D-rope arches, whose rope reads the positions.
-    let metal_rope_rows_fn: proc_macro2::TokenStream = match model.mrope_section {
-        Some([t, h, w]) => {
-            let head_dim = u64::from(model.text.head_dim.get());
-            let rot_dim_val = model
-                .scalars
-                .get("partial_rotary_factor")
-                .copied()
-                .filter(|&f| (f - 1.0).abs() > 1e-9)
-                .map(|f| (f * head_dim as f64).round() as u32)
-                .unwrap_or(head_dim as u32);
-            let rope_theta_val: f64 = model.text.rope_theta.get();
-            let rope_theta_lit = proc_macro2::Literal::f64_unsuffixed(rope_theta_val);
-            let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
-            let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
-            let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
-            let rot_dim_lit2 = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
-            quote! {
-                /// The rotary cos/sin rows a forward of `n` tokens at `positions` (`[n]`, or MRoPE's
-                /// `[3, n]`) reads in place of the position-indexed cache — its positions then each
-                /// row's own index.
-                #[cfg(scratchy_target = "metal")]
-                pub fn metal_rope_rows(
-                    positions: &[u32],
-                    n: usize,
-                ) -> ::core::option::Option<::std::vec::Vec<u8>> {
-                    ::core::option::Option::Some(
-                        ::scratchy_target_metal::interpreter::metal::build_mrope_cos_sin_override(
-                            positions,
-                            n,
-                            #rot_dim_lit2 as usize,
-                            #rope_theta_lit,
-                            [#t_lit, #h_lit, #w_lit],
-                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.metal_dtype(),
-                        ),
-                    )
-                }
-            }
-        }
-        None => quote! {
-            /// None: this model's rope reads the positions.
-            #[cfg(scratchy_target = "metal")]
-            pub fn metal_rope_rows(
-                _positions: &[u32],
-                _n: usize,
-            ) -> ::core::option::Option<::std::vec::Vec<u8>> {
-                ::core::option::Option::None
-            }
-        },
-    };
-    let mrope_runtime_block = quote! {
-        let mut __mrope_ident_vec: ::std::vec::Vec<u32> = ::std::vec::Vec::new();
-        let __rope_rows = if !ctx.positions.as_raw().raw_ptr().is_null() {
-            let __pos_all = ::std::slice::from_raw_parts(
-                ctx.positions.as_raw().raw_ptr() as *const u32,
-                ctx.positions.as_raw().numel(),
-            );
-            metal_rope_rows(__pos_all, n)
-        } else {
-            ::core::option::Option::None
-        };
-        let (positions, mrope_cos_sin): (&[u32], ::core::option::Option<&[u8]>) =
-            match &__rope_rows {
-                ::core::option::Option::Some(rows) => {
-                    __mrope_ident_vec.extend(0..n as u32);
-                    (__mrope_ident_vec.as_slice(), ::core::option::Option::Some(rows.as_slice()))
-                }
-                ::core::option::Option::None => (positions, ::core::option::Option::None),
-            };
-    };
-
-    #[cfg(feature = "metal")]
-    {
-        let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &resolver.named, &dims.weight_markers)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "[metal static tape] {}: command table: {e}",
-                    model.source_stem
-                )
-            });
-        metal_arena_bytes_statics.push(table);
-    }
-    #[cfg(feature = "metal")]
-    {
-        let mc = &model_facts;
-        metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc));
-        // A multi-token-prediction head (its body reads the target's hidden rows) chains its
-        // passes on the device.
-        let head = reads_target_hidden.then(|| {
-            let drafts = model.bounds.get("spec_drafts").copied();
-            let drafts =
-                u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32");
-            let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
-            (drafts, hidden)
-        });
-        let vocab_suffix = metal_vocab_suffix(program, fuf, model, mc);
-        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head, vocab_suffix));
-    }
-    let metal_emission = quote! {
-        #(#metal_arena_bytes_statics)*
-
-        /// Per-canonical tape_index plan for the Metal pool. One row per
-        /// `num_tokens` point per routed fold band (`FoldBand`), ordered ascending, a
-        /// bucket's band rows adjacent. A pool keeps one band's rows (`pick_rung`), so its
-        /// bucket index is no index into this table: a forward's slots come from its bucket's row
-        /// (`Buckets::row`), the one the door chose.
-        #[cfg(scratchy_target = "metal")]
-        pub static METAL_BUCKETS:
-            &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec]
-            = &[
-                #(#metal_bucket_entries)*
-            ];
-
-        /// [`METAL_BUCKETS`]' baked rungs, which the worker picks the rung a pool runs on from
-        /// before the pool exists: the KV pool's block-table width, the memory budget.
-        #[cfg(scratchy_target = "metal")]
-        pub static METAL_RUNGS: ::scratchy_target_metal::interpreter::metal::MetalRungs =
-            ::scratchy_target_metal::interpreter::metal::MetalRungs {
-                buckets: METAL_BUCKETS,
-                tq: ::scratchy_target_metal::interpreter::metal::TqGroup::of(
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS,
-                ),
-                // Checked against the buckets as this static compiles: every slot of every bucket
-                // ranked once, and no bucket's final hidden states among the hosting ranks.
-                ranks: __arena::RANKED.ranks(METAL_BUCKETS),
-                door: ::scratchy_target_metal::interpreter::metal::bucket_row::<__buckets::Bucket>,
-            };
-
-        /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
-        /// metal forward body's `RuntimeFactory` allocates per-worker
-        /// runtime buffers (input_ids/positions/slot_mapping/...) at
-        /// `METAL_MAX_BUCKET_M * sizeof(u32)`.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_MAX_BUCKET_M: u32 = #max_bucket_m_lit;
-
-        /// Byte size of the vision 2D-RoPE `freqs` runtime buffer
-        /// (f32 `[max_bucket_m, vision_head_dim/2]`). 0 on non-vision
-        /// arches (`alloc` floors to 16 bytes).
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_VISION_FREQS_BYTES: u64 = #vision_freqs_bytes_lit;
-
-        /// Byte size of the vision `pixels` runtime buffer (model dtype
-        /// `[max_bucket_m, vision_in_features]`). 0 on non-vision arches.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_VISION_PIXELS_BYTES: u64 = #vision_pixels_bytes_lit;
-
-        /// Byte size of the vision `pos_embeds` runtime buffer (model
-        /// dtype `[max_bucket_m, vision_embed_dim]`). 0 on non-vision
-        /// arches and on towers without a learned positional embedding.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_VISION_POSEMB_BYTES: u64 = #vision_posemb_bytes_lit;
-
-        /// Byte size of the `target_hidden` runtime buffer (model dtype
-        /// `[max_bucket_m, hidden]`). 0 on every arch but an MTP head.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_TARGET_HIDDEN_BYTES: u64 = #target_hidden_bytes_lit;
-
-        /// Byte size of the rows a target captures for its DFlash2 drafter (model dtype
-        /// `[max_bucket_m, slots · hidden]`). 0 on a model no drafter reads.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_DRAFT_CAPTURE_BYTES: u64 = #draft_capture_bytes_lit;
-
-        /// A DFlash2 drafter's block: its drafts and their anchor.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_DRAFT_ROWS: u64 = #draft_rows_lit;
-
-        /// Byte size of the `mm_embeds` splice buffer (bf16
-        /// `[max_bucket_m, hidden]`) and the `mm_dst_rows` buffer (u32
-        /// `[max_bucket_m]`). 0 on arches without the multimodal splice.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_MM_EMBEDS_BYTES: u64 = #mm_embeds_bytes_lit;
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_MM_DST_ROWS_BYTES: u64 = #mm_dst_rows_bytes_lit;
-
-        /// Byte size of the MRoPE cos/sin override buffer (model dtype
-        /// `[max_bucket_m, rot_dim]`). 0 on 1D-rope arches (the rope
-        /// kernel keeps the static cos/sin cache; `alloc` floors to 16
-        /// bytes and the buffer is never bound).
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_MROPE_COS_SIN_BYTES: u64 = #mrope_cos_sin_bytes_lit;
-
-        /// Width of one row of the terminal arena slot: `vocab_size`
-        /// on decoder layouts (the lm_head Gemm's output),
-        /// `hidden_size` on encoder layouts (no lm_head — the terminal
-        /// IS the hidden state). The metal forward shapes its returned
-        /// `OwnedTensor` as `[num_tokens, METAL_VOCAB_SIZE]` f16.
-        #[cfg(scratchy_target = "metal")]
-        pub const METAL_VOCAB_SIZE: u64 = #vocab_size_lit;
-
-        /// Build a [`MetalWorkerPool`] for this canonical. Thin
-        /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
-        /// the per-canonical [`METAL_BUCKETS`] static so callers don't
-        /// have to construct the tape_index plan by hand. The arena layout
-        /// is derived from each tape_index's `arena_bytes` field — taking
-        /// the elementwise max so the single per-worker arena fits the
-        /// largest activation across every tape_index.
-        ///
-        /// `weights` is borrowed once: the pool resolves the tapes'
-        /// model sources at construction and keeps only their
-        /// buffers, so it can live as a field on the `Weights` struct
-        /// without an `Arc`-cycle.
-        ///
-        /// [`MetalWorkerPool`]: ::scratchy_target_metal::interpreter::metal::MetalWorkerPool
-        /// [`MetalWorkerPool::for_buckets`]: ::scratchy_target_metal::interpreter::metal::MetalWorkerPool::for_buckets
-        #[cfg(scratchy_target = "metal")]
-        pub fn metal_pool(
-            device: ::std::sync::Arc<
-                ::scratchy_target_metal::interpreter::metal::__re::Device,
-            >,
-            weights: &Weights,
-            allocator: ::std::sync::Arc<crate::__gpu::MetalAllocator>,
-            runtime_factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory,
-            max_workers: usize,
-            // Runtime per-sequence block-table capacity
-            // (`KvCachePool::max_blocks_per_seq`); picks the KV cap rung.
-            block_cap: usize,
-            addressing: ::scratchy_target_metal::tape::lowered::KvAddressing,
-        ) -> ::core::result::Result<
-            ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Weights>,
-            ::scratchy_target_metal::interpreter::metal::PoolBuildError,
-        > {
-            ::scratchy_target_metal::interpreter::metal::MetalWorkerPool::for_buckets(
-                device,
-                weights,
-                allocator,
-                &METAL_RUNGS,
-                runtime_factory,
-                max_workers,
-                // Standalone factory: no device-budget context here, so keep
-                // all buckets. The lazy-init path below passes the real cap.
-                None,
-                block_cap,
-                addressing,
-                // Nor the serving engine's batch: every bucket row's decode partials.
-                None,
-                // Its arena is its own.
-                ::scratchy_target_metal::interpreter::metal::ArenaShare::Own,
-                // Its callers read the logits on the host.
-                ::scratchy_target_metal::interpreter::metal::TerminalReads::Host,
-            )
-        }
-
-        /// The model's resident metal pool, built on its first forward.
-        ///
-        /// The factory closure captures (a) the metal device handle
-        /// for runtime-buffer allocation, (b) the KV pool's block-table
-        /// row stride and the serving batch, which size the block tables,
-        /// (c) Arc-handle clones of the per-layer KV
-        /// buffers from `ctx.kv_cache` so worker spawns inherit
-        /// them without re-allocation. The closure is invoked
-        /// once per worker spawn — the pool starts at size 1 so
-        /// the first forward triggers the only factory invocation
-        /// in single-worker configs. Every forward entry point
-        /// reaches the pool through here, whichever runs first.
-        #[cfg(scratchy_target = "metal")]
-        fn resident_metal_pool<'w>(
-            wm: &'w Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &crate::__gpu::GpuDevice,
-        ) -> &'w ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Weights> {
-            use ::scratchy_forward_compiler::CanonicalParams as _;
-            use ::scratchy_target_metal::interpreter::metal::__re::{Buffer, MTLResourceOptions};
-
-            wm.metal_pool.get_or_init(|| {
-                // The RoPE tables the pool binds, for the positions this KV cache's block table
-                // reaches.
-                wm.build_rope_tables(ctx, device)
-                    .expect("Weights::build_rope_tables: RoPE table build failed");
-                let num_layers = ctx.kv_cache.num_layers;
-                // Reactive (chunked) KV pool: bind the per-layer
-                // chunk-address TABLE buffers (device uint64 arrays of
-                // chunk gpuAddresses), not the cache data. The KV
-                // kernels deref `table[block_id / BLOCKS_PER_CHUNK]`.
-                // The table buffer identity is stable across the
-                // pool's life (chunk-set growth edits its contents, not
-                // its binding), so baking its gpuAddress once is sound.
-                let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.k_chunk_table_mem(l).buffer().clone())
-                    .collect();
-                let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.v_chunk_table_mem(l).buffer().clone())
-                    .collect();
-                // KV-cache groups (vLLM hybrid layout). Uniform models have a
-                // single group with an all-zero layer→group map (byte-identical
-                // to the pre-hybrid single block-table path); gemma4 SWA reports
-                // its real group count + per-layer mapping through the pool.
-                let num_kv_groups: usize = ctx.kv_cache.num_kv_groups();
-                let kv_layer_to_group: ::std::vec::Vec<u32> =
-                    ctx.kv_cache.layer_to_group_u32();
-                // GDN (Gated-DeltaNet) persistent state buffers, captured per
-                // (global) layer from `ctx.gdn_state` for hybrid arches; empty
-                // for non-hybrid. Non-linear layers reuse the first linear
-                // layer's buffer as a never-bound placeholder (the
-                // GatedDeltaNet lowering only emits GdnConvState/GdnSsmState on
-                // linear layers, so the placeholder is never read).
-                let (gdn_conv, gdn_ssm): (::std::vec::Vec<Buffer>, ::std::vec::Vec<Buffer>) =
-                    match ctx.gdn_state {
-                        ::core::option::Option::Some(gp) => {
-                            match (0..gp.num_layers).find(|&l| gp.is_linear(l)) {
-                                ::core::option::Option::Some(f0) => {
-                                    let fc = gp.conv_layer_mem(f0).buffer().clone();
-                                    let fs = gp.ssm_layer_mem(f0).buffer().clone();
-                                    let conv = (0..gp.num_layers)
-                                        .map(|l| if gp.is_linear(l) {
-                                            gp.conv_layer_mem(l).buffer().clone()
-                                        } else { fc.clone() })
-                                        .collect();
-                                    let ssm = (0..gp.num_layers)
-                                        .map(|l| if gp.is_linear(l) {
-                                            gp.ssm_layer_mem(l).buffer().clone()
-                                        } else { fs.clone() })
-                                        .collect();
-                                    (conv, ssm)
-                                }
-                                ::core::option::Option::None => {
-                                    (::std::vec::Vec::new(), ::std::vec::Vec::new())
-                                }
-                            }
-                        }
-                        ::core::option::Option::None => {
-                            (::std::vec::Vec::new(), ::std::vec::Vec::new())
-                        }
-                    };
-                // Its draft lanes, the same way (`GdnStatePool::lanes`). A pool without lanes — a
-                // model that drafts nothing, or one whose run drafts with nothing (no head found,
-                // `--num-speculative-tokens 0`) — runs only plain steps (its slot allocator builds
-                // no other: `GdnStepError::Drafts`), which never touch a lane, so a drafting
-                // model's tapes bind the layer's own state buffers there, never read.
-                let (gdn_lanes_conv, gdn_lanes_ssm): (
-                    ::std::vec::Vec<Buffer>,
-                    ::std::vec::Vec<Buffer>,
-                ) = match ctx.gdn_state {
-                    ::core::option::Option::Some(gp) => {
-                        let first = (0..gp.num_layers)
-                            .find_map(|l| gp.conv_lanes_mem(l).zip(gp.ssm_lanes_mem(l)));
-                        match first {
-                            ::core::option::Option::Some((fc, fs)) => (0..gp.num_layers)
-                                .map(|l| {
-                                    let (c, s) = gp
-                                        .conv_lanes_mem(l)
-                                        .zip(gp.ssm_lanes_mem(l))
-                                        .unwrap_or((fc, fs));
-                                    (c.buffer().clone(), s.buffer().clone())
-                                })
-                                .unzip(),
-                            ::core::option::Option::None => (gdn_conv.clone(), gdn_ssm.clone()),
-                        }
-                    }
-                    ::core::option::Option::None => {
-                        (::std::vec::Vec::new(), ::std::vec::Vec::new())
-                    }
-                };
-                // A DFlash2 drafter's rings, the pool `ctx` lends (the sibling of `gdn_state`):
-                // `Some` exactly for a drafter.
-                let __draft_rings: ::core::option::Option<(
-                    ::std::vec::Vec<Buffer>,
-                    ::std::vec::Vec<Buffer>,
-                    Buffer,
-                )> = ctx.draft_ring.map(|pool| {
-                    let (keys, values) = (0..pool.num_layers())
-                        .map(|l| {
-                            let (k, v) = pool.layer(l);
-                            (k.buffer().clone(), v.buffer().clone())
-                        })
-                        .unzip();
-                    (keys, values, pool.windows().buffer().clone())
-                });
-                // TurboQuant: captured (Copy) so the 'static factory closure can
-                // provision the packed stores + scratch per worker for a model
-                // whose `KV_CODEC` is TurboQuant. UNIFORM arches (num_kv_groups
-                // == 1): every layer is "global", compressed at the base
-                // geometry. HYBRID/SWA arches (gemma4: num_kv_groups > 1)
-                // compress ONLY the GLOBAL (full-context, group 0) layers at the
-                // GLOBAL geometry; the sliding layers stay fp16.
-                // `is_global[L]` = (group_of(L) == 0): group 0 is always the
-                // full-context group (see `compute_hybrid_kv_layout`); uniform →
-                // all-zero map → all-true. A recurrent hybrid's layers that hold
-                // no KV (`FACTS.kv_layers()`) get no store.
-                let __tq_nb = ctx.kv_cache.num_blocks;
-                let __tq_kv_layers = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
-                    .kv_layers()
-                    .map(::scratchy_forward_compiler::model_facts::KvLayers::get);
-                // The attention's global class: the full layers' pages and kv heads. `None` for a
-                // model without attention, which has neither.
-                let __global = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
-                    .attention()
-                    .map(|a| a.global());
-                let __tq_is_global: ::std::vec::Vec<bool> = ctx
-                    .kv_cache
-                    .layer_to_group_u32()
-                    .iter()
-                    .zip(0u32..)
-                    .map(|(&g, l)| g == 0 && __tq_kv_layers.is_none_or(|kv| kv.contains(&l)))
-                    .collect();
-                // The stores register with the device's allocator, whose KV growth maps them.
-                let __tq_allocator = device.allocator.clone();
-                // A step's block tables: a row per sequence, at most the serving batch (every
-                // row of the largest bucket when the worker has not stashed one), each the KV
-                // pool's row stride — the KV cap rung it runs on, which the host pads every row
-                // to.
-                let __bt_stride = ctx.kv_cache.max_blocks_per_seq as u64;
-                let __bt_rows = device.max_decode_rows.map_or(METAL_MAX_BUCKET_M, |r| {
-                    r.get().min(METAL_MAX_BUCKET_M)
-                }) as u64;
-                let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
-                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev, host| {
-                        let max_m = METAL_MAX_BUCKET_M as u64;
-                        let alloc = |bytes: u64| {
-                            use ::scratchy_target_metal::interpreter::metal::__re::MTLDevice as _;
-                            dev.newBufferWithLength_options(
-                                bytes.max(16) as usize,
-                                MTLResourceOptions::StorageModeShared,
-                            )
-                            .expect("newBufferWithLength_options returned nil")
-                        };
-                        // Provision at the GLOBAL geometry: uniform arches have
-                        // GLOBAL_* == base, so this is identical to the base-geometry
-                        // call (every layer global). gemma4 provisions GLOBAL-sized
-                        // packed/norms/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
-                        // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
-                        let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
-                            // A head reading its target's KV binds its target's packed stores.
-                            if #reads_target_kv {
-                                return host.tq.clone().expect(
-                                    "a head reading its target's TurboQuant KV builds its pool in \
-                                     its target's, which shares it",
-                                );
-                            }
-                            let global = __global
-                                .expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
-                            ::scratchy_target_metal::turboquant::build_tq_provision(
-                                &__tq_allocator,
-                                ::scratchy_target_metal::turboquant::TqPool {
-                                    is_global: &__tq_is_global,
-                                    num_blocks: __tq_nb,
-                                    block_size: global.page().get() as usize,
-                                    num_kv_heads: global.kv_heads().get() as usize,
-                                    blocks_per_chunk: ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
-                                },
-                                codebook,
-                                host.tq_scratch.as_ref(),
-                            )
-                        });
-                        ::scratchy_target_metal::interpreter::metal::RuntimeBindings {
-                            input_ids: alloc(max_m * 4),
-                            positions: alloc(max_m * 4),
-                            // One slot_mapping + block_table per KV-cache group
-                            // (vLLM hybrid layout). Uniform models have one
-                            // group; gemma4 SWA has full + N sliding. The worker
-                            // sizes the group count + fills layer_to_group from
-                            // the model's HybridKvLayout at runtime (stage 6);
-                            // the default single group is byte-identical to the
-                            // pre-hybrid path.
-                            slot_mappings: (0..num_kv_groups).map(|_| alloc(max_m * 4)).collect(),
-                            cu_seqlens_q: alloc((max_m + 1) * 4),
-                            seq_used_k: alloc(max_m * 4),
-                            // Per-token span label for block-diagonal span
-                            // attention, for a step of one sequence: as many as
-                            // its full-attention row reaches, the stride's blocks of
-                            // `GLOBAL_BLOCK_SIZE` tokens. All-zero unless the
-                            // request carries Relocatable spans.
-                            span_ids: alloc(
-                                __global.map_or(0, |g| __bt_stride * g.page().get() as u64 * 4),
-                            ),
-                            block_tables: (0..num_kv_groups)
-                                .map(|_| alloc(__bt_rows * __bt_stride * 4))
-                                .collect(),
-                            layer_to_group: kv_layer_to_group.clone(),
-                            // TurboQuant: when provisioned, the GLOBAL (group-0)
-                            // layers' KV points at the one fp16 scratch (the
-                            // injected per-layer dequant/quantize tape ops fill/drain
-                            // it); SLIDING layers keep the normal fp16 pool. For
-                            // uniform arches every layer is global → all scratch
-                            // (byte-identical to the prior all-layers override).
-                            // Without tq, every layer uses the fp16 pool.
-                            kv_cache_k: __tq_prov
-                                .as_ref()
-                                .map(|p| {
-                                    (0..num_layers)
-                                        .map(|l| if __tq_is_global[l] {
-                                            p.scratch.k_table.clone()
-                                        } else {
-                                            kv_k[l].clone()
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_else(|| kv_k.clone()),
-                            kv_cache_v: __tq_prov
-                                .as_ref()
-                                .map(|p| {
-                                    (0..num_layers)
-                                        .map(|l| if __tq_is_global[l] {
-                                            p.scratch.v_table.clone()
-                                        } else {
-                                            kv_v[l].clone()
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_else(|| kv_v.clone()),
-                            // Spans rope-on-read per-layer flag mirror.
-                            // 16-byte placeholder here; the worker sizes
-                            // it to the pool's num_blocks and binds it
-                            // only on W::ROPE_ON_READ arches (the metal
-                            // lowering omits the binding otherwise, so
-                            // this is never read on the non-spans path).
-                            block_unrotated_flags: (0..num_layers)
-                                .map(|_| alloc(16))
-                                .collect(),
-                            tq: __tq_prov,
-                            // 4 bytes — worker writes the forward's
-                            // `num_tokens` here before dispatch: the MoE
-                            // sort counts the step's live pairs.
-                            num_tokens_u32: alloc(4),
-                            // 4 bytes — worker writes the sampled rows'
-                            // count here before dispatch so the lm_head
-                            // slice's gather / scatter know how many rows
-                            // to move.
-                            num_sample_rows_u32: alloc(4),
-                            // [max_m] u32 — worker writes the sampled
-                            // rows here before dispatch.
-                            sample_indices: alloc(max_m * 4),
-                            // GDN persistent state (per-layer) + per-forward
-                            // indices/fresh flags (Shared, overwritten each
-                            // forward). Index buffers sized to the max bucket
-                            // (num_seqs <= num_tokens <= max_m): a 24-byte
-                            // `GdnSeqSlots` record a sequence, a u32 step code.
-                            gdn_state_conv: gdn_conv.clone(),
-                            gdn_state_ssm: gdn_ssm.clone(),
-                            gdn_lanes_conv: gdn_lanes_conv.clone(),
-                            gdn_lanes_ssm: gdn_lanes_ssm.clone(),
-                            gdn_state_indices: alloc(
-                                max_m
-                                    * ::std::mem::size_of::<
-                                        ::scratchy_target_metal::gdn_state::GdnSeqSlots,
-                                    >() as u64,
-                            ),
-                            gdn_is_fresh: alloc(max_m * 4),
-                            // Vision externs: sized from the baked
-                            // METAL_VISION_*_BYTES consts (16-byte floor
-                            // on non-vision arches). Overwritten per
-                            // forward by `write_runtime_inputs`.
-                            vision_rope_freqs: alloc(METAL_VISION_FREQS_BYTES),
-                            pixels: alloc(METAL_VISION_PIXELS_BYTES),
-                            vision_pos_embeds: alloc(METAL_VISION_POSEMB_BYTES),
-                            target_hidden: alloc(METAL_TARGET_HIDDEN_BYTES),
-                            mm_embeds: alloc(METAL_MM_EMBEDS_BYTES),
-                            mm_dst_rows: alloc(METAL_MM_DST_ROWS_BYTES),
-                            mrope_cos_sin: alloc(METAL_MROPE_COS_SIN_BYTES),
-                            // Qwen2.5-VL windowed-attention externs:
-                            // i32/u32 rows bounded by the max bucket.
-                            // Tiny — sized unconditionally.
-                            vision_cu_seqlens_full: alloc(
-                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
-                            ),
-                            vision_cu_seqlens_window: alloc(
-                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
-                            ),
-                            vision_window_index: alloc(
-                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
-                            ),
-                            vision_reverse_indices: alloc(
-                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
-                            ),
-                            vision_position_ids: alloc(
-                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
-                            ),
-                            // The rows a target captures for its DFlash2 drafter: every row of
-                            // the largest bucket, a block a captured layer (16-byte floor on a
-                            // model no drafter reads).
-                            draft_capture: alloc(METAL_DRAFT_CAPTURE_BYTES),
-                            // A DFlash2 drafter's buffers: its rings, the pool `ctx` lends (kept
-                            // across forwards, pinned by it), and a cycle's per-lane inputs and
-                            // outputs, sized for the largest bucket's lanes.
-                            draft: __draft_rings.as_ref().map(|(keys, values, windows)| {
-                                let lanes = max_m / METAL_DRAFT_ROWS.max(1);
-                                ::scratchy_target_metal::interpreter::metal::DraftRuntimeBuffers {
-                                    ring_keys: keys.clone(),
-                                    ring_values: values.clone(),
-                                    ring_slots: alloc(lanes * 4),
-                                    windows: windows.clone(),
-                                    retained: alloc(lanes * 4),
-                                    lane_params: alloc(
-                                        lanes
-                                            * ::std::mem::size_of::<
-                                                ::scratchy_target_metal::dflash2::DraftLaneParams,
-                                            >() as u64,
-                                    ),
-                                    outputs: ::scratchy_target_metal::dflash2::DraftOutput::ALL
-                                        .map(|r| alloc(r.bytes(lanes))),
-                                }
-                            }),
-                            written: ::std::default::Default::default(),
-                        }
-                    });
-                ::scratchy_target_metal::interpreter::metal::MetalWorkerPool::for_buckets(
-                    device.device.clone(),
-                    wm,
-                    device.allocator.clone(),
-                    &METAL_RUNGS,
-                    factory,
-                    1,
-                    // Target-reactive cap stashed on the device by the worker
-                    // after `determine_available_memory`. Prunes the compiled
-                    // ladder so the colored arena fits the KV budget.
-                    device.metal_bucket_max_m,
-                    // Runtime per-sequence block-table capacity, read off the KV
-                    // pool: it picks the KV cap rung — none for a model reading no KV.
-                    #pool_block_cap,
-                    device.kv_addressing,
-                    // The serving engine's batch, stashed by the worker: the decode split's
-                    // partials are reserved for that many rows.
-                    device.max_decode_rows,
-                    // How its arena is shared with that of a model whose forwards never overlap
-                    // its own: an MTP target holds its head's (a fact of the target, set before
-                    // its first forward), a head runs in its target's (its device's).
-                    ::scratchy_target_metal::interpreter::metal::ArenaShare::of(
-                        wm.metal_guest.get(),
-                        device.host.as_deref(),
-                    ),
-                    // Whether its owner reads the logits on the host (a draft model's seed).
-                    device.terminal_reads,
-                )
-                .expect("MetalWorkerPool::for_buckets: pool init failed")
-            })
-        }
-
-        /// Per-canonical metal forward dispatch. Lazy-inits
-        /// `weights.metal_pool` on the first call (factory closure
-        /// captures the per-layer `metal::Buffer` Arc-handles from
-        /// `ctx.kv_cache` and the `MAX_BLOCKS_PER_SEQ` block-table
-        /// stride from `<Weights as CanonicalParams>`); on every call
-        /// reads the runtime input slices off the host-visible
-        /// `ctx.<input>` `TensorView`s — under metal those raw_ptrs
-        /// are `metal::Buffer.contents()` so the slice borrow lives
-        /// as long as the call — hands them to
-        /// `MetalWorkerPool::forward`, and copies the tape_index's
-        /// terminal arena slot out as a fresh `OwnedTensor` of
-        /// `[num_tokens, vocab_size]` f16 logits.
-        #[cfg(scratchy_target = "metal")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward(
-            wm: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-        ) -> crate::__gpu::OwnedTensor {
-            unsafe { forward_with_metal_followup(wm, ctx, device, num_tokens, None) }
-                .unwrap_or_else(|e| ::core::panic!("{e}"))
-        }
-
-        /// The runtime inputs `ctx` carries for a forward of `num_tokens` tokens, handed to `run`:
-        /// they borrow the host slices `ctx`'s views point at and the rows built here. Refused
-        /// when they name no rows to sample (`ForwardError::EmptySequence`).
-        ///
-        /// # Safety
-        /// Every non-null view in `ctx` points at host-visible memory of its numel.
-        #[cfg(scratchy_target = "metal")]
-        unsafe fn with_forward_inputs<R>(
-            ctx: &crate::__gpu::ForwardCtx,
-            num_tokens: u64,
-            run: impl FnOnce(&::scratchy_target_metal::interpreter::metal::ForwardInputs<'_>) -> R,
-        ) -> ::core::result::Result<R, ::scratchy_target_metal::interpreter::metal::ForwardError> {
-            // ── Read host-visible input slices off ctx ────────────
-            //
-            // Under metal, every `TensorView` in `ctx` resolves to a
-            // pointer inside a `StorageModeShared` `MTLBuffer.contents()`,
-            // so reading as `&[u32]` is a direct CPU borrow. The
-            // shared buffer keeps backing the slice until the worker
-            // memcopies through `write_runtime_inputs`.
-            let n = num_tokens as usize;
-            // Vision towers carry no token ids / positions — the tape
-            // consumes pixels / freqs / cu_seqlens instead, so the macro's
-            // ctx leaves these as `null_view`. `from_raw_parts(null, n)` is
-            // UB even for an unused read (and `write_runtime_inputs` only
-            // copies `len` bytes), so hand the worker an empty slice when
-            // the pointer is null — same null-guard shape as the optional
-            // decoder inputs (slot_mapping / cu_seqlens_q / …) just below.
-            let input_ids: &[u32] = if ctx.input_ids.as_raw().raw_ptr().is_null() {
-                &[]
-            } else {
-                ::std::slice::from_raw_parts(
-                    ctx.input_ids.as_raw().raw_ptr() as *const u32,
-                    n,
-                )
-            };
-            let positions: &[u32] = if ctx.positions.as_raw().raw_ptr().is_null() {
-                &[]
-            } else {
-                ::std::slice::from_raw_parts(
-                    ctx.positions.as_raw().raw_ptr() as *const u32,
-                    n,
-                )
-            };
-            let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
-                    n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            let cu_seqlens_q = if !ctx.cu_seqlens_q.as_raw().raw_ptr().is_null() {
-                let cu_n = ctx.cu_seqlens_q.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.cu_seqlens_q.as_raw().raw_ptr() as *const u32,
-                    cu_n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            let seq_used_k = if !ctx.seqused_k.as_raw().raw_ptr().is_null() {
-                let su_n = ctx.seqused_k.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.seqused_k.as_raw().raw_ptr() as *const u32,
-                    su_n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            let block_table = if !ctx.block_table.as_raw().raw_ptr().is_null() {
-                let bt_n = ctx.block_table.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.block_table.as_raw().raw_ptr() as *const u32,
-                    bt_n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            // Sliding KV-cache GROUPS (gemma4 SWA): per sliding group, the
-            // per-token slot_mapping + per-block block table. Empty on non-SWA
-            // models. Group `s` here is KV-cache group `s + 1` (group 0 = full).
-            let sliding_slot_mappings: ::std::vec::Vec<&[u32]> = ctx
-                .sliding_slot_mappings
-                .iter()
-                .map(|v| ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, n))
-                .collect();
-            let sliding_block_tables: ::std::vec::Vec<&[u32]> = ctx
-                .sliding_block_tables
-                .iter()
-                .map(|v| {
-                    let sbt_n = v.as_raw().numel();
-                    ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, sbt_n)
-                })
-                .collect();
-
-            // The rows the forward samples (`None`: each sequence's last), resolved once here
-            // for every reader of the inputs: the lm_head leaves their logits at the front of
-            // its output, in order. A sequence of no rows has no last row: refused.
-            let last_rows;
-            let sampled_rows: &[u32] = match ctx.sampled_rows.as_ref() {
-                ::std::option::Option::Some(view) => {
-                    let raw = view.as_raw();
-                    ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
-                }
-                ::std::option::Option::None => {
-                    last_rows = ::scratchy_target_metal::interpreter::metal::ForwardInputs::last_rows(
-                        cu_seqlens_q,
-                        num_tokens as u32,
-                    )
-                    .map_err(::scratchy_target_metal::interpreter::metal::ForwardError::EmptySequence)?;
-                    last_rows.rows()
-                }
-            };
-
-            // GDN per-forward indices (hybrid arches): read from ctx's
-            // host-visible TensorViews (a `GdnSeqSlots` record — 6 i32s —
-            // per seq, a step code per seq). `None` for non-hybrid arches
-            // (ctx fields are None).
-            let gdn_state_indices = ctx.gdn_state_indices.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const i32,
-                    tv.as_raw().numel(),
-                )
-            });
-            let gdn_is_fresh = ctx.gdn_is_fresh.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u32,
-                    tv.as_raw().numel(),
-                )
-            });
-            // Vision externs (vision towers): read as raw bytes from the
-            // ctx TensorViews. `freqs` is f32, `pixels` is the model
-            // dtype; the worker copies bytes verbatim. `None` for text.
-            let vision_rope_freqs = ctx.vision_rope_freqs.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let pixels = ctx.pixels.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let pos_embeds = ctx.pos_embeds.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let target_hidden = ctx.target_hidden.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            // Qwen2.5-VL windowed-attention externs (i32/u32 byte
-            // views; `None` on non-windowed towers and text bodies).
-            let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_cu_seqlens_window = ctx.vision_cu_seqlens_window.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_window_index = ctx.vision_window_index.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_reverse_indices = ctx.vision_reverse_indices.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_position_ids = ctx.vision_position_ids.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            // Multimodal splice: vision embeddings (bytes) + a per-source-
-            // row destination map built from `embed_patches`. Text-only
-            // batches leave `embed_patches` empty → both `None` (no-op).
-            let mm_embeds = ctx.mm_embeds.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            // ALWAYS materialized (all-`u32::MAX` for text-only batches):
-            // the splice command sits in every decoder tape, so the kernel
-            // must read `MAX` (= skip) for non-image rows — an unwritten
-            // placeholder buffer would scatter garbage into the residual.
-            let __mm_dst_rows_vec: ::std::vec::Vec<u32> = {
-                let mut __v = ::std::vec![u32::MAX; n];
-                let mut __src: usize = 0;
-                for __p in ctx.embed_patches {
-                    for __k in 0..(__p.length as usize) {
-                        if __src < __v.len() {
-                            __v[__src] = __p.token_offset + __k as u32;
-                        }
-                        __src += 1;
-                    }
-                }
-                __v
-            };
-            let mm_dst_rows = ::core::option::Option::Some(__mm_dst_rows_vec.as_slice());
-            // MRoPE (Qwen3.5-VL) only: build the per-token cos/sin override
-            // table + identity positions (shadows `positions`); a no-op
-            // `let mrope_cos_sin = None;` on 1D-rope arches.
-            #mrope_runtime_block
-            let inputs = ::scratchy_target_metal::interpreter::metal::ForwardInputs {
-                num_tokens: num_tokens as u32,
-                input_ids,
-                positions,
-                // Per-KV-cache-group slot_mappings / block tables (vLLM hybrid
-                // layout): group 0 = full, then the sliding group(s). On non-SWA
-                // models `sliding_*` are `None`, so this is a single-element vec
-                // == the pre-hybrid single table (byte-identical). Stage 6
-                // widens `ForwardCtx` to carry all N sliding groups.
-                slot_mappings: slot_mapping
-                    .into_iter()
-                    .chain(sliding_slot_mappings)
-                    .collect(),
-                cu_seqlens_q,
-                seq_used_k,
-                // Block-diagonal span labels — wired from the request's block
-                // annotations via ForwardCtx; `None` until that path is
-                // populated (buffer stays zeroed ⇒ span mask inert).
-                span_ids: ctx.span_ids.as_deref(),
-                block_tables: block_table
-                    .into_iter()
-                    .chain(sliding_block_tables)
-                    .collect(),
-                sampled_rows,
-                gdn_state_indices,
-                gdn_is_fresh,
-                vision_rope_freqs,
-                pixels,
-                pos_embeds,
-                target_hidden,
-                vision_cu_seqlens_full,
-                vision_cu_seqlens_window,
-                vision_window_index,
-                vision_reverse_indices,
-                vision_position_ids,
-                mm_embeds,
-                mm_dst_rows,
-                mrope_cos_sin,
-                draft: ctx.draft,
-                device_inputs: ctx.device_inputs,
-                deferred: ctx.deferred,
-                reads: ctx.reads,
-            };
-            ::core::result::Result::Ok(run(&inputs))
-        }
-
-        #metal_rope_rows_fn
-
-        /// Same as [`forward`] but takes an optional encoder-tail hook
-        /// that's invoked on the same MTL4 compute encoder used to
-        /// encode the forward, AFTER the bucket dispatches and BEFORE
-        /// `endEncoding`. Lets the caller (the executor's argmax
-        /// dispatch, today) append its own dispatches onto the same
-        /// CB so forward + tail share one commit and one host wait.
-        #[cfg(scratchy_target = "metal")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_with_metal_followup(
-            wm: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-            followup: ::core::option::Option<::scratchy_target_metal::model::MetalForwardFollowup<'_>>,
-        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_target_metal::model::GpuExecutionFailed> {
-            let pool = resident_metal_pool(wm, ctx, device);
-            // A guest's slots are its host's, which may be sparse: the host reads none of them.
-            assert!(
-                ctx.hidden_out.is_none()
-                    || pool.role() != ::scratchy_target_metal::interpreter::metal::ArenaRole::Guest,
-                "a forward asked the host for hidden rows of a pool that runs in another's arena \
-                 (an MTP head's)"
-            );
-            let n = num_tokens as usize;
-
-            // ── Run forward + copy logits out ─────────────────────
-            //
-            // The pool picks the tape_index from `num_tokens`, runs
-            // `executeCommandsInBuffer` (interleaved with MPS GEMMs
-            // on <M4 hardware), waits for completion, then invokes
-            // the closure with `&MetalWorker` + `bucket_idx`. The
-            // tape_index's terminal arena slot holds the lm_head output —
-            // the logits of the rows the step samples, at its front;
-            // we wrap that buffer in a fresh `OwnedTensor` (Arc-
-            // handle clone — no copy) so the caller can read
-            // `[sampled rows, vocab_size]` f16 logits without taking
-            // ownership of the worker's arena.
-            with_forward_inputs(ctx, num_tokens, |inputs| {
-                let rows = #terminal_rows;
-                // Adapter: pool's tail receives `(encoder, worker, runtime, bucket)`
-                // and returns `Result<(), ForwardError>`. The public hook
-                // is `(encoder, FollowupOutputs) -> Result<(), String>`.
-                // Resolve the outputs from the worker's arena, its runtime bindings and the
-                // canonical's compile-time vocab; map error variants.
-                let tail_adapter = followup.map(|f| {
-                    move |enc: &::scratchy_target_metal::model::ProtocolObject<
-                              dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
-                          >,
-                          worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
-                          #captured_runtime: &::scratchy_target_metal::interpreter::metal::RuntimeBindings,
-                          bucket: &__buckets::Bucket|
-                          -> ::core::result::Result<
-                        (),
-                        ::scratchy_target_metal::interpreter::metal::ForwardError,
-                    > {
-                        let spec = ::scratchy_target_metal::interpreter::metal::Buckets::row(bucket);
-                        let outputs = ::scratchy_target_metal::model::FollowupOutputs {
-                            logits: &worker.arena[spec.terminal_slot as usize],
-                            hidden: &worker.arena[spec.backbone_slot as usize],
-                            // A DFlash2 head's target's captured rows.
-                            captured: #captured_rows,
-                            rows: rows as u32,
-                            vocab: METAL_VOCAB_SIZE as u32,
-                        };
-                        f(enc, outputs).map_err(
-                            ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
-                        )
-                    }
-                });
-                pool.forward_with_tail(
-                    inputs,
-                    |worker, bucket| {
-                        let spec = ::scratchy_target_metal::interpreter::metal::Buckets::row(bucket);
-                        use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
-                        // The caller's rows of the final hidden states (an MTP head's next input),
-                        // before the worker goes back to the pool and its arena is reused.
-                        if let Some(h) = ctx.hidden_out {
-                            let row_bytes =
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.hidden().get() * 2;
-                            let hidden = worker.arena[spec.backbone_slot as usize].contents();
-                            let mut out = h.out.borrow_mut();
-                            out.clear();
-                            for &row in h.rows {
-                                assert!((row as usize) < n, "hidden row {row} past the forward's {n} rows");
-                                // SAFETY: the backbone slot holds `[n, HIDDEN_SIZE]` 2-byte rows (the
-                                // bucket's arena is sized for at least `n`), and `row < n`.
-                                out.extend_from_slice(unsafe {
-                                    ::std::slice::from_raw_parts(
-                                        (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
-                                        row_bytes,
-                                    )
-                                });
-                            }
-                        }
-                        let buf = worker.arena[spec.terminal_slot as usize].clone();
-                        let vocab = METAL_VOCAB_SIZE as usize;
-                        let shape = [rows, vocab];
-                        let bytes = rows * vocab * 2; // bf16/f16 — both 2 bytes
-                        let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.metal_dtype() {
-                            ::scratchy_target_metal::interpreter::metal::MetalDtype::F16 =>
-                                crate::__gpu::dtype::DType::F16,
-                            ::scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 =>
-                                crate::__gpu::dtype::DType::BF16,
-                            ::scratchy_target_metal::interpreter::metal::MetalDtype::Int4 =>
-                                ::core::unreachable!("Int4 has no logits dtype"),
-                        };
-                        // Null where the logits are a sparse (private) slot the host cannot read:
-                        // the GPU's argmax and sampler bind the buffer, and a pool whose owner
-                        // reads them on the host keeps the slot shared (`TerminalReads::Host`).
-                        let inner = crate::__gpu::tensor::GpuTensor::new(
-                            ::scratchy_target_metal::sparse_arena::host_ptr(&buf),
-                            &shape,
-                            dtype,
-                        );
-                        crate::__gpu::owned_from_metal_buffer(inner, buf, bytes)
-                    },
-                    tail_adapter,
-                )
-            })
-            .and_then(::core::convert::identity)
-            // A command buffer the GPU failed (an out-of-memory, say) fails this step, not the
-            // worker thread: the executor fails its requests and schedules again. Any other error
-            // is an invariant the forward broke (no bucket fits, a block table of the wrong width,
-            // KV not mapped), which still stops the server.
-            .map_err(|e| match e {
-                ::scratchy_target_metal::interpreter::metal::ForwardError::ExecutionFailed(_) => {
-                    ::scratchy_target_metal::model::GpuExecutionFailed(e.to_string())
-                }
-                // Its `Display` names `MetalWorkerPool::forward` already.
-                other => ::core::panic!("{other}"),
-            })
-        }
-
-        /// One forward encoded onto `encoder` — another model's command buffer, after that model's
-        /// forward, whose outputs `ctx.device_inputs` read — with its input writes at its head
-        /// (`MetalWorkerPool::forward_onto`). Its worker stays out of the pool until the returned
-        /// forward drops, once that command buffer is done.
-        ///
-        /// # Safety
-        /// Same as [`forward`].
-        #[cfg(scratchy_target = "metal")]
-        pub unsafe fn forward_onto<'w>(
-            wm: &'w Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-            encoder: &::scratchy_target_metal::model::ProtocolObject<
-                dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
-            >,
-        ) -> ::core::result::Result<
-            ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>,
-            ::std::string::String,
-        > {
-            struct Onto<'p>(::scratchy_target_metal::interpreter::metal::Onto<'p, Weights>);
-            impl ::scratchy_target_metal::model::MetalForwardOnto for Onto<'_> {
-                unsafe fn then(
-                    &mut self,
-                    ctx: crate::__gpu::ForwardCtxHandle<'_>,
-                    num_tokens: u64,
-                    encoder: &::scratchy_target_metal::model::ProtocolObject<
-                        dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
-                    >,
-                ) -> ::core::result::Result<(), ::std::string::String> {
-                    let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
-                    with_forward_inputs(ctx, num_tokens, |inputs| self.0.then(inputs, encoder))
-                        .and_then(::core::convert::identity)
-                        .map_err(|e| format!("Onto::then: {e}"))
-                }
-
-                fn hidden(
-                    &self,
-                ) -> &::scratchy_target_metal::model::ProtocolObject<
-                    dyn ::scratchy_target_metal::model::MTLBuffer,
-                > {
-                    let row = ::scratchy_target_metal::interpreter::metal::Buckets::row(self.0.bucket());
-                    &self.0.worker().arena[row.backbone_slot as usize]
-                }
-
-                fn logits(
-                    &self,
-                ) -> &::scratchy_target_metal::model::ProtocolObject<
-                    dyn ::scratchy_target_metal::model::MTLBuffer,
-                > {
-                    let row = ::scratchy_target_metal::interpreter::metal::Buckets::row(self.0.bucket());
-                    &self.0.worker().arena[row.terminal_slot as usize]
-                }
-
-                fn draft_selection(
-                    &self,
-                ) -> ::core::option::Option<::scratchy_target_metal::model::DraftSelection<'_>> {
-                    use ::scratchy_target_metal::dflash2::DraftOutput as O;
-                    (self.0.runtime().draft.as_ref()).map(|d| {
-                        ::scratchy_target_metal::model::DraftSelection {
-                            tokens: d.output(O::Tokens),
-                            candidates: d.output(O::Candidates),
-                            q_probs: d.output(O::QProbs),
-                            confidence: d.output(O::Confidence),
-                            verify_rows: d.output(O::VerifyRows),
-                        }
-                    })
-                }
-
-                fn vocab(&self) -> u32 {
-                    METAL_VOCAB_SIZE as u32
-                }
-            }
-            let pool = resident_metal_pool(wm, ctx, device);
-            with_forward_inputs(ctx, num_tokens, |inputs| pool.forward_onto(inputs, encoder))
-                .and_then(::core::convert::identity)
-                .map(|onto| ::std::boxed::Box::new(Onto(onto))
-                    as ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>)
-                .map_err(|e| format!("MetalWorkerPool::forward_onto: {e}"))
-        }
-
-        /// Phase 6 chain entry point. Opens ONE MTL4 cmdbuf on the
-        /// pool's MTL4 queue and invokes `body` with a
-        /// [`ChainStepHandle`] adapter + the worker's runtime + the
-        /// chain encoder. Caller drives K bucket forwards + per-iter
-        /// argmax + chain_advance dispatches onto the same encoder;
-        /// pool owns CB lifecycle (one commit, one host wait for
-        /// the entire chain). Falls back to a clear error string when
-        /// the bucket pick fails for the iter shape.
-        ///
-        /// `num_tokens` is the shape of EACH forward iter (constant
-        /// across iters because the K-step decode shape is fixed).
-        ///
-        /// [`ChainStepHandle`]: ::scratchy_target_metal::model::ChainStepHandle
-        #[cfg(scratchy_target = "metal")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_chain_with_encoder(
-            wm: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-            body: ::scratchy_target_metal::model::MetalChainBody<'_>,
-        ) -> ::core::result::Result<(), ::std::string::String> {
-            let pool = resident_metal_pool(wm, ctx, device);
-            with_forward_inputs(ctx, num_tokens, |inputs| {
-                // The bucket of iter 0's tokens, at the door. The chain's shape is constant across
-                // iters, so every iter plays it, at its tokens.
-                let bucket = pool
-                    .bucket_for(inputs)
-                    .map_err(|e| format!("MetalWorkerPool::bucket_for: {e}"))?;
-                let terminal_slot =
-                    ::scratchy_target_metal::interpreter::metal::Buckets::row(&bucket).terminal_slot
-                        as usize;
-                let vocab = METAL_VOCAB_SIZE as u32;
-
-                pool.with_chain_encoder(
-                    inputs,
-                    |worker, runtime, enc| {
-                        // Concrete adapter that satisfies the non-generic
-                        // `ChainStepHandle` trait. Holds the worker
-                        // borrow + the bucket; calls
-                        // `worker.run_bucket_mtl4` to encode one iter onto
-                        // the encoder.
-                        struct Adapter<'a, W: ::scratchy_forward_compiler::CanonicalParams
-                            + ::scratchy_target_metal::interpreter::metal::BakedBuckets>
-                        {
-                            worker: &'a ::scratchy_target_metal::interpreter::metal::MetalWorker<W>,
-                            bucket: W::Bucket,
-                            terminal_slot: usize,
-                            vocab: u32,
-                        }
-                        impl<W: ::scratchy_forward_compiler::CanonicalParams
-                            + ::scratchy_target_metal::interpreter::metal::BakedBuckets>
-                            ::scratchy_target_metal::model::ChainStepHandle for Adapter<'_, W>
-                        {
-                            fn run_forward_step(
-                                &self,
-                                encoder: &::scratchy_target_metal::model::ProtocolObject<
-                                    dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
-                                >,
-                                num_seqs: u32,
-                                sampled_rows: ::scratchy_target_metal::model::SampledRowCount,
-                            ) -> ::core::result::Result<(), ::std::string::String> {
-                                self.worker
-                                    .run_bucket_mtl4(
-                                        &self.bucket,
-                                        num_seqs,
-                                        sampled_rows,
-                                        ::scratchy_target_metal::interpreter::metal::ForwardReads::Outputs,
-                                        encoder,
-                                    )
-                                    .map_err(|e| format!("run_bucket_mtl4: {e:?}"))
-                            }
-
-                            fn logits_buf(
-                                &self,
-                            ) -> &::scratchy_target_metal::model::ProtocolObject<
-                                dyn ::scratchy_target_metal::model::MTLBuffer,
-                            > {
-                                &self.worker.arena[self.terminal_slot]
-                            }
-
-                            fn vocab(&self) -> u32 { self.vocab }
-                        }
-                        let adapter = Adapter {
-                            worker,
-                            bucket,
-                            terminal_slot,
-                            vocab,
-                        };
-                        // Erase the metal-typed `&RuntimeBindings` behind the
-                        // neutral handle so `MetalChainBody` (defined in the
-                        // target-free compiler) names no metal-target type; the
-                        // worker's body closure recovers `&RuntimeBindings`.
-                        body(
-                            &adapter,
-                            ::scratchy_target_metal::model::MetalRuntimeHandle::new(runtime),
-                            enc,
-                        )
-                        .map_err(
-                            ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
-                        )
-                    },
-                )
-                .map_err(|e| format!("MetalWorkerPool::with_chain_encoder: {e}"))
-            })
-            .map_err(|e| format!("forward_chain_with_encoder: {e}"))
-            .and_then(::core::convert::identity)
-        }
-    };
-
-    // Encoder layouts have no lm_head split — `forward_backbone` is
-    // semantically identical to `forward`. Decoder layouts return the
-    // pre-lm_head activation via a DtoD memcpy of the protected
-    // backbone slot. Both shapes are dispatched via the same
-    // `FORWARD_TABLE` row.
-    let forward_backbone_fn = match layout {
-        BackboneLayout::Decoder => quote! {},
-        BackboneLayout::Encoder => quote! {},
-    };
-
-    // The per-arch device-runtime emit (weight-accessor impl, the static `Op`
-    // tapes, `FORWARD_TABLE`) is the per-op host-dispatch surface — it exists
-    // only for backends that dispatch each op through a host-emitted table
-    // (metal). A target that runs an embedded fused program instead
-    // (e.g. KTIR on the host) emits none of it. The macro is built per-backend,
-    // so gate the EMISSION via `cfg!` rather than per-item `#[cfg]` attrs (the
-    // static-slice repetition can't take one).
-    let (canonical_params_impl, weight_accessors_impl, static_slices_emit, forward_table) =
-        if cfg!(feature = "metal") {
-            (
-                canonical_params_impl,
-                weight_accessors_impl,
-                quote! { #(#static_slices)* },
-                forward_table,
-            )
-        } else {
-            (quote! {}, quote! {}, quote! {}, quote! {})
-        };
-
+    let (weights, weights_affine_rows) = weights;
     let tokens = quote! {
         #weights
 
-        #target_bake
-
-        #canonical_params_impl
-
-        #weight_accessors_impl
-
-        #instruction_alias
-
-        #static_slices_emit
-
-        #forward_table
-
-        #metal_emission
-
-        #forward_backbone_fn
-
-        /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
-        /// row, with backbone + lm_head normalized for non-generic
-        /// inspection (no `&Weights`, no GPU). Used by
-        /// `scr model info` via the inventory registry. Available
-        /// under either backend so the CLI subcommand can dump
-        /// metal-compiled arches too.
-        #[cfg(scratchy_target = "metal")]
-        pub fn dump() -> ::std::vec::Vec<::scratchy_forward_compiler::BucketDump> {
-            FORWARD_TABLE
-                .iter()
-                .map(|e| ::scratchy_forward_compiler::BucketDump {
-                    m_min: e.0,
-                    m_max_excl: e.1,
-                    sk_min: e.2,
-                    sk_max_excl: e.3,
-                    backbone: ::scratchy_forward_compiler::normalize_slice(e.4),
-                    lm_head: ::scratchy_forward_compiler::normalize_slice(e.5),
-                })
-                .collect()
-        }
+        #items
     };
     (tokens, weights_affine_rows)
 }
@@ -11593,32 +8631,15 @@ fn emit_shim_model(
         emitter,
     );
 
-    // Per-tape_index fn surfaces are gone — dispatch lives on the
-    // canonical's `FORWARD_TABLE` + `find_bucket`. Re-export the
-    // arch-level dispatchers only. Under `metal` the shim shares the
-    // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
-    // — variant-specific differences (quant format, fingerprint) are
-    // load-time only; static tape_index plans are byte-identical.
+    // The shim's forward is its canonical's: the target re-exports whatever of the canonical's
+    // emission its loaded-model surface names — variant-specific differences (quant format,
+    // fingerprint) are load-time only.
     let target_shim_items = emitter.shim_items(canonical);
     let tokens = quote! {
         #weights
 
         // What the target re-exports from the canonical a shim shares its solve with.
         #target_shim_items
-
-        // `dump` is the per-variant `scr model info` accessor —
-        // available under either backend so shim variants register
-        // under metal too.
-        #[cfg(scratchy_target = "metal")]
-        pub use super::#canonical::dump;
-
-        #[cfg(scratchy_target = "metal")]
-        pub use super::#canonical::{
-            forward, forward_chain_with_encoder, forward_onto, forward_with_metal_followup,
-            metal_rope_rows,
-            METAL_BUCKETS, METAL_OFF_TAPE, METAL_RUNGS,
-            metal_pool,
-        };
     };
     (tokens, shim_affine_rows)
 }
@@ -11789,7 +8810,8 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None).0;
+            let facts =
+                fill_canonical_params(&model, 1, false, &every_layer(&model), None, false).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -11890,13 +8912,13 @@ mod tests {
             "GLOBAL_Q_SIZE",
             "ROPE_PROPORTIONAL",
             "ROPE_ON_READ",
-            "METAL_DTYPE",
+            "ACT_DTYPE",
             "HIDDEN_SIZE",
             "VOCAB_SIZE",
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None);
+        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -11912,7 +8934,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None).0;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -11944,7 +8966,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None).0;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -11990,7 +9012,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None).0;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
@@ -12339,7 +9361,7 @@ mod tests {
     fn emit_layered_load_body_uses_layer_template_for_rmsnorm() {
         let plan = FieldLoad::RmsNorm("model.layers.0.input_layernorm".to_string(), 1e-5);
         let ts =
-            emit_layered_load_body(&plan, 32, 1, false, None, "model.layers", None).to_string();
+            emit_layered_load_body(&plan, 32, 1, None, "model.layers", None, false).to_string();
         // Delegates to the load_layered_rms_norm helper in
         // scratchy-forward-compiler. The closure / collect / Vec annotation
         // the loop used to emit per accessor are now owned by the
@@ -12372,7 +9394,7 @@ mod tests {
             "model.layers.0.self_attn.v_proj".to_string(),
         ]);
         let ts =
-            emit_layered_load_body(&plan, 32, 1, false, None, "model.layers", None).to_string();
+            emit_layered_load_body(&plan, 32, 1, None, "model.layers", None, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_concat"),
             "expected helper call, got: {ts}"
@@ -12408,7 +9430,7 @@ mod tests {
         ];
         for plan in plans {
             let ts =
-                emit_layered_load_body(plan, 32, 1, false, None, "model.layers", None).to_string();
+                emit_layered_load_body(plan, 32, 1, None, "model.layers", None, false).to_string();
             assert!(
                 !ts.contains("_sharded"),
                 "tp=1 must never emit a `_sharded` helper call (got: {ts})",
@@ -12432,7 +9454,7 @@ mod tests {
     fn emit_layered_load_body_at_tp_gt_1_dispatches_by_shard_kind() {
         // Column-parallel (ShardDim0): q_proj. Expect `dim = 0` lit.
         let q = FieldLoad::LinearDense("model.layers.0.self_attn.q_proj".to_string());
-        let ts = emit_layered_load_body(&q, 32, 2, false, None, "model.layers", None).to_string();
+        let ts = emit_layered_load_body(&q, 32, 2, None, "model.layers", None, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_sharded"),
             "tp=2 q_proj must route to sharded helper (got: {ts})",
@@ -12445,7 +9467,7 @@ mod tests {
 
         // Row-parallel (ShardDim1): o_proj. Expect `dim = 1` lit.
         let o = FieldLoad::LinearDense("model.layers.0.self_attn.o_proj".to_string());
-        let ts = emit_layered_load_body(&o, 32, 2, false, None, "model.layers", None).to_string();
+        let ts = emit_layered_load_body(&o, 32, 2, None, "model.layers", None, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_sharded"),
             "tp=2 o_proj must route to sharded helper (got: {ts})",
@@ -12457,28 +9479,28 @@ mod tests {
 
         // Replicate (norm, etc.): NO sharded helper, even at tp>1.
         let n = FieldLoad::LinearDense("model.layers.0.input_layernorm".to_string());
-        let ts = emit_layered_load_body(&n, 32, 2, false, None, "model.layers", None).to_string();
+        let ts = emit_layered_load_body(&n, 32, 2, None, "model.layers", None, false).to_string();
         assert!(
             !ts.contains("_sharded"),
             "Replicate path must not route to sharded helper at tp>1 (got: {ts})",
         );
 
-        // Concat (always column-parallel). Under metal, which has no tensor-parallel load, the
-        // layered helper routes every concat to the stream-free `_concat_packed`, whatever the
-        // world; elsewhere a sharded world routes to `_concat_sharded`, which bakes the `world`
-        // literal but no `dim` arg (concat-sharded is always dim=0 internally).
+        // Concat (always column-parallel). A target that loads concats packed, which has no
+        // tensor-parallel load, routes every concat to the stream-free `_concat_packed`, whatever
+        // the world; any other routes a sharded world to `_concat_sharded`, which bakes the
+        // `world` literal but no `dim` arg (concat-sharded is always dim=0 internally).
         let c = FieldLoad::LinearConcat(vec![
             "model.layers.0.mlp.gate_proj".to_string(),
             "model.layers.0.mlp.up_proj".to_string(),
         ]);
-        let ts = emit_layered_load_body(&c, 32, 4, false, None, "model.layers", None).to_string();
-        if cfg!(feature = "metal") {
-            assert!(
-                ts.contains("load_layered_linear_dense_concat_packed") && !ts.contains("_sharded"),
-                "metal routes a tp=4 gate_up concat to concat_packed (got: {ts})",
-            );
-            return;
-        }
+        let packed =
+            emit_layered_load_body(&c, 32, 4, None, "model.layers", None, true).to_string();
+        assert!(
+            packed.contains("load_layered_linear_dense_concat_packed")
+                && !packed.contains("_sharded"),
+            "a packed-concat target routes a tp=4 gate_up concat to concat_packed (got: {packed})",
+        );
+        let ts = emit_layered_load_body(&c, 32, 4, None, "model.layers", None, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_concat_sharded"),
             "tp=4 gate_up concat must route to concat_sharded (got: {ts})",
@@ -12546,15 +9568,16 @@ mod fingerprint_tests {
     /// archs whose manifest declares `q_a_proj`. (The MLA and flat-Q
     /// MLA variants of this pin left with their deepseek-v3 configs,
     /// #721.)
-    // FP8-block presets are not claimable under metal (`quant_preset_active`), so no
-    // FP8-block variant exists to fingerprint there; a non-metal build's test step runs this.
-    #[cfg(not(feature = "metal"))]
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
         let dir = arch_configs("qwen3");
-        let configs =
-            crate::config::load_dir(&dir, &Default::default(), &crate::config::Scope::all())
-                .expect("load qwen3 configs");
+        let configs = crate::config::load_dir(
+            &dir,
+            &Default::default(),
+            &crate::config::Scope::all(),
+            &crate::target::Shared,
+        )
+        .expect("load qwen3 configs");
         let manifest =
             crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
         let model = configs
@@ -12853,7 +9876,6 @@ mod fingerprint_tests {
     /// heads x 128 are 6 and 8 KiB/token, below `MIN_KV_BYTES_PER_TOKEN`, where every one of
     /// their 52 / 88 layers would read as 52 / 88 KiB. Layers that all hold KV are no subset.
     #[test]
-    #[cfg(feature = "metal")]
     fn a_recurrent_hybrids_kv_layers_are_its_attention_layers() {
         use scratchy_ir::{DenseReason, KvGeometry, TqBits, codec_for};
         let preset = "mlx-affine-b4-g64-qembed";
@@ -13533,7 +10555,7 @@ mod fingerprint_tests {
     /// granite divides logits by `logits_scaling` (terminal `Mul` with a
     /// scalar operand); gemma2/gemma-4 apply `final_logit_softcapping`
     /// (terminal `TanhSoftCap`); command-r has `logit_scale`. Reading any of
-    /// them as an ENCODER bakes `METAL_VOCAB_SIZE = hidden_size`, and the
+    /// them as an ENCODER bakes a logits width of `hidden_size`, and the
     /// argmax kernel then scans `hidden_size` of `vocab_size` logits — 2048
     /// of granite's 49155 — so greedy decode can only reach low-id tokens and
     /// emits `" * **P*h*o*t*o*s*y*n*t*h*e*"`. Sampling does not use that

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Spyre's per-op ABI as DECLARED DATA — the counterpart to metal's
-//! `metal_op_abi`.
+//! Spyre's per-op ABI as DECLARED DATA — the counterpart to the GPU
+//! target's op ABI table.
 //!
 //! Adding one throwaway `SubOp` and reading the compiler's own errors
 //! measured what a new `SubOp` costs:
 //! five compiler-forced sites, three of them in spyre, with NOTHING
-//! absorbing any of them. Metal's equivalent number is three, one of
+//! absorbing any of them. The GPU target's equivalent number is three, one of
 //! which is the ABI table that takes its class's bridge arm. This
 //! module is that table for spyre's tile-op bridge.
 //!
@@ -23,7 +23,7 @@
 //!   not the active row.
 //!
 //! Those keep their arms. The table does not pretend to describe
-//! them, exactly as metal's declines the weight-binding ops.
+//! them, exactly as the GPU target's declines the weight-binding ops.
 
 use scratchy_subtile::subtile_ir::{EwKind, RopeForm, SubOp};
 
@@ -41,7 +41,7 @@ pub(crate) enum Operands {
 /// The ops whose tile-op is the standard `[mb, out_active, y]`
 /// pointwise/reduce shape. Used in PATTERN position by the bridge so
 /// its match stays exhaustive — an `if let` guard would compile but
-/// leave every arm in place, absorbing nothing (learned on the metal
+/// leave every arm in place, absorbing nothing (learned on the GPU
 /// side, `714860e08`).
 macro_rules! spyre_standard_tile_pat {
     () => {

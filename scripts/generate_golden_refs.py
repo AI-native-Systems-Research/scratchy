@@ -9,7 +9,7 @@ Run on a GPU pod with Python vLLM installed:
     cd /root/vllm/vllm-rs
     python3 scripts/generate_golden_refs.py
 
-Generates JSON files in crates/e2e/testdata/golden/ for use by
+Generates JSON files in crates/targets/metal/e2e/testdata/golden/ for use by
 Rust E2E correctness tests that compare our engine's output against
 Python vLLM's output.
 """
@@ -241,7 +241,7 @@ MODELS = {
 MAX_TOKENS = 32
 NUM_LOGPROBS = 20
 
-OUTPUT_DIR = Path(__file__).parent.parent / "crates" / "e2e" / "testdata" / "golden"
+OUTPUT_DIR = Path(__file__).parent.parent / "crates" / "targets" / "metal" / "e2e" / "testdata" / "golden"
 
 
 def generate_for_model(model_id: str, output_key: str):

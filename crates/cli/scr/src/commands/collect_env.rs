@@ -130,8 +130,10 @@ fn get_gpu_info() -> String {
 
 fn get_build_features() -> String {
     let mut features = Vec::new();
-    if cfg!(feature = "metal") {
-        features.push("metal");
+    // The target the binary serves on: its linked worker's.
+    #[cfg(any(feature = "chat", feature = "serve"))]
+    if let Some(target) = scratchy_serving_api::init::linked_target() {
+        features.push(target);
     }
     if cfg!(feature = "guided-decoding") {
         features.push("guided-decoding");

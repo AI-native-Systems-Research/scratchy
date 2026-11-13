@@ -355,7 +355,7 @@ pub struct LayerKvGeometry {
 }
 
 /// The physical hybrid KV layout — vLLM's `get_kv_cache_groups` result, plus
-/// the per-layer placement the metal pool/binding needs.
+/// the per-layer placement a target's pool/binding needs.
 ///
 /// This is the keystone of "do what vLLM does": layers are split into groups of
 /// equal size, the smaller-page group's `block_size` is scaled up so all groups
@@ -414,7 +414,7 @@ impl HybridKvLayout {
             .collect()
     }
 
-    /// `layer_to_group` as `u32` (for the metal pool / runtime bindings).
+    /// `layer_to_group` as `u32` (for a target's pool / runtime bindings).
     pub fn layer_to_group_u32(&self) -> Vec<u32> {
         self.layer_to_group.iter().map(|&g| g as u32).collect()
     }

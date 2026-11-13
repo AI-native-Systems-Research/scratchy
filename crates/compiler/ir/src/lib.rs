@@ -4,7 +4,7 @@
 //! [`Instruction`] is a closed enum over every kernel-call shape any
 //! solver-picked `Implementation` produces. It is pure data — every
 //! variant carries only scalar / `&'static str` fields — so it compiles
-//! under any feature combination and names no backend. The metal
+//! under any feature combination and names no backend. A target's
 //! lowering adds the runtime behaviour on top of this neutral definition.
 //!
 //! [`WeightAccessors`] is the per-arch weight-accessor dispatch trait.
@@ -16,12 +16,12 @@
 // ungated, so this import stays at the module level. `MAX_DIMS` is not
 // root-exported from `scratchy-tensors`, so use the module path.
 use scratchy_tensors::tensor::MAX_DIMS;
-// `MetalDtype` / `ScaleDtype` back the `CanonicalParams::METAL_DTYPE` /
+// `ActDtype` / `ScaleDtype` back the `CanonicalParams::ACT_DTYPE` /
 // `SCALE_DTYPE` consts. They relocated to the cfg-free
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
 pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
-use scratchy_tensors::{MetalDtype, ScaleDtype};
+use scratchy_tensors::{ActDtype, ScaleDtype};
 
 pub mod model_facts;
 
@@ -67,7 +67,7 @@ pub mod model_facts;
 /// Default bodies all `unreachable!()` so per-arch impls only
 /// override the methods their generated tape actually calls.
 ///
-/// The metal worker calls into the per-arch impl emitted by
+/// The worker calls into the per-arch impl emitted by
 /// `scratchy-forward-compiler-macro::codegen::emit_weight_accessors_impl`.
 pub trait WeightAccessors {
     fn rms_norm_at(
@@ -187,7 +187,7 @@ pub trait WeightAccessors {
     ) -> &::scratchy_layers::layers_moe::SharedFusedMoELayer {
         unreachable!("shared_fused_moe_at not implemented for this arch")
     }
-    /// Metal-only: Gemma-4 router bundle (`GemmaMoe` op, base `router`).
+    /// Gemma-4 router bundle (`GemmaMoe` op, base `router`).
     fn gemma_router_at(
         &self,
         _bucket: u32,
@@ -197,7 +197,7 @@ pub trait WeightAccessors {
     ) -> &::scratchy_layers::layers_moe::GemmaRouterLayer {
         unreachable!("gemma_router_at not implemented for this arch")
     }
-    /// Metal-only: Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op, base
+    /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op, base
     /// `experts.switch_glu`).
     fn gemma_switch_glu_at(
         &self,
@@ -217,7 +217,7 @@ pub trait WeightAccessors {
     ) -> ::scratchy_tensors::tensor::GpuTensor {
         unreachable!("cos_sin_at not implemented for this arch")
     }
-    /// Metal-only: MLX-affine int4 quantized embedding. Resolves the
+    /// MLX-affine int4 quantized embedding. Resolves the
     /// `AffineQuantEmbedding` field on `Weights` for the
     /// `Instruction::AffineEmbed` lowering.
     fn affine_quant_embedding_at(
@@ -251,7 +251,7 @@ pub trait WeightAccessors {
     ) -> ::scratchy_tensors::tensor::GpuTensor {
         unreachable!("tensor_at not implemented for this arch")
     }
-    /// Metal-only: gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`) —
+    /// gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`) —
     /// affine router gate + F32 router bias + pre-stacked affine experts +
     /// per-expert SwiGLU-OAI linear biases under one layer struct.
     fn gpt_oss_moe_at(
@@ -287,7 +287,7 @@ pub enum Instruction {
     /// token. For the standard residual-stream RmsNorm:
     /// `(hidden_size = W::HIDDEN_SIZE, m_multiplier = 1)`. For
     /// per-head `q_norm` (Qwen3): `(W::HEAD_DIM, num_q_heads)`;
-    /// for `k_norm`: `(W::HEAD_DIM, num_kv_heads)`. The metal kernel
+    /// for `k_norm`: `(W::HEAD_DIM, num_kv_heads)`. The kernel
     /// dispatches `bucket_m * m_multiplier` threadgroups, each
     /// reducing `hidden_size` elements. Pre-Qwen3 the lowering
     /// hardcoded `(W::Q_SIZE, 1)` — correct for Llama (Q_SIZE ==
@@ -384,7 +384,7 @@ pub enum Instruction {
     /// zero-centered form. `hidden_size` / `m_multiplier` mirror
     /// [`RmsNorm`](Instruction::RmsNorm): residual-stream norms are
     /// `(HIDDEN_SIZE, 1)`; per-head q/k norms are `(head_dim,
-    /// num_q/kv_heads)`. The metal lowering bakes them into the kernel
+    /// num_q/kv_heads)`. The target's lowering bakes them into the kernel
     /// fn-consts.
     ScalarOffsetRmsNorm(u32, u32, u32, f32, u32, u32),
     /// Norm→Gemm fusion: `cutlass_gemm(rms_norm(in), gemm_w)`. The
@@ -413,11 +413,11 @@ pub enum Instruction {
     /// the codegen prelude); no `out_slot` payload.
     FusedCublasGemmAdd(u32, u32, u32, u32, u32),
     FusedGemmBias(u32, u32, u32),
-    /// Metal-only per-row bias broadcast add. Emitted by
-    /// `MetalBiasAddImpl` when the synth-pre-attn megakernel doesn't
+    /// Per-row bias broadcast add. Emitted by
+    /// a target's bias lowering when the synth-pre-attn megakernel doesn't
     /// claim the biased QKV chain (today: M ≥ 2 prefill, where the
     /// cost CSV picks unfused).
-    /// On Metal the singleton path
+    /// The singleton path
     /// dispatches a separate `KernelId::BiasAdd` after the AffineQmm
     /// / Gemm; once the synth path absorbs biases the solver will
     /// prefer that over this singleton on decode workloads.
@@ -429,7 +429,7 @@ pub enum Instruction {
     /// .bias` or `LinearLayer::AffineQuant.linear_bias`. `n` is the
     /// bias's broadcast dimension — baked into the specialized
     /// pipeline as `function_constant(0)`.
-    MetalBiasAdd(u32, u32, u32, u32, bool),
+    LinearBiasAdd(u32, u32, u32, u32, bool),
     FusedGateUpSiluMul(u32, u32, u32),
     FusedGateUpGeluMul(u32, u32, u32),
     FusedQkvRopeCache(u32, u32, u32, bool, bool),
@@ -450,7 +450,7 @@ pub enum Instruction {
     /// caching, mixed prefill+decode batches, and multi-turn chat —
     /// scenarios `AttentionPrefillContiguous` cannot handle because
     /// its K-axis is bounded by `cu_seqlens_q` (new tokens only).
-    /// Emitted by the metal adapter.
+    /// Emitted by a target's adapter.
     AttentionPrefillPaged(u32, u32, u32, bool),
     /// Bidirectional / encoder attention. Reads contiguous Q/K/V from
     /// the upstream tile slots; calls `flash_attn_contiguous` with
@@ -464,11 +464,11 @@ pub enum Instruction {
     SlidingAttentionPrefillContiguous(u32, u32, u32, u32, bool),
     /// Sliding-window variant of [`Instruction::AttentionPrefillPaged`]
     /// — same operands `(q_slot, out_slot, layer, interleaved)` and the
-    /// same paged-cache read path; the metal lowering arm additionally
+    /// same paged-cache read path; the target's lowering arm additionally
     /// bakes `W::SLIDING_WINDOW` into the kernel's `ATTN_WINDOW`
     /// function constant and never routes to the steel kernel (steel
-    /// has no window support). Emitted only by the metal adapter
-    /// (`metal::attention::fan_out`, sliding+multihead arm).
+    /// has no window support). Emitted only by a target's adapter
+    /// (its sliding+multihead attention arm).
     SlidingAttentionPrefillPaged(u32, u32, u32, bool),
     /// Vision-tower variable-length attention: `(q_slot, k_slot,
     /// v_slot, out_slot, cu_seqlens_kind)`. The `cu_seqlens_kind`
@@ -567,7 +567,7 @@ pub enum Instruction {
     /// `(q_slot, k_slot, v_slot, q_out, k_out, v_out, layer,
     /// interleaved, is_global, kv_offsets)`. `is_global` selects the attention
     /// geometry class on hybrid sliding/global arches (Gemma4): the
-    /// metal lowering reads `GLOBAL_HEAD_DIM/NUM_GLOBAL_KV_HEADS/
+    /// target's lowering reads `GLOBAL_HEAD_DIM/NUM_GLOBAL_KV_HEADS/
     /// GLOBAL_ROT_DIM` when true, the base consts when false.
     /// Identical on uniform models (GLOBAL_* default to base).
     /// `kv_offsets`: the additive offset the K and V it writes carry — see
@@ -608,9 +608,9 @@ pub enum Instruction {
     /// `FusedMoe` (with `renormalize=true`); the shared expert is a
     /// SwiGLU MLP gated by `sigmoid(shared_expert_gate(x))`.
     SharedFusedMoe(u32, u32, u32),
-    /// Metal-only Mixtral-style fused MoE: carries the full structural
+    /// Mixtral-style fused MoE: carries the full structural
     /// shape baked at macro-expansion time from the model config, so
-    /// the Metal lowering pass + worker can specialize pipelines
+    /// the target's lowering pass + worker can specialize pipelines
     /// (`function_constant`s for moe_weighted_sum, affine_gather_qmv),
     /// bake the routing kernels' widths (top_k, axis_size), and size the
     /// per-bucket MoE scratch buffer — all without a runtime
@@ -625,14 +625,12 @@ pub enum Instruction {
     /// Softmax order is fixed by variant identity: Mixtral does
     /// `topk → softmax(scores)`, no renorm flag. (See `SharedFusedMoe`
     /// for the Qwen `softmax → topk → take_along_axis` order.)
-    /// The Metal-target `MetalFusedMoeImpl` (in
-    /// `scratchy-forward-compiler-macro::metal::moe`) emits this variant when
-    /// `profile.backend == Backend::Metal` and the per-expert weight
-    /// storage is `Affine`.
-    MetalFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32),
-    /// Metal-only Qwen-MoE-style fused MoE + optional shared expert.
-    /// Same rationale as [`Instruction::MetalFusedMoe`]: macro-baked
-    /// shape for the Metal lowering arm.
+    /// A target's affine MoE lowering emits this variant when the
+    /// per-expert weight storage is `Affine`.
+    AffineFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    /// Qwen-MoE-style fused MoE + optional shared expert.
+    /// Same rationale as [`Instruction::AffineFusedMoe`]: macro-baked
+    /// shape for the target's lowering arm.
     ///
     /// Tuple fields: `(in_slot, out_slot, layer, num_experts, top_k,
     /// moe_intermediate_size, hidden_size, shared_intermediate_size,
@@ -646,12 +644,12 @@ pub enum Instruction {
     ///
     /// Softmax order is fixed by variant identity: Qwen-MoE does
     /// `softmax → topk → take_along_axis(scores)`.
-    MetalSharedFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, bool),
-    /// Metal-only Gemma-4 fused MoE block (the `gemma_moe` op). Routes off
+    AffineSharedFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, bool),
+    /// Gemma-4 fused MoE block (the `gemma_moe` op). Routes off
     /// the post-attention residual (`router_in`, input 0) and runs the
     /// selected GeGLU experts on the pre-FF2-normed input (`expert_in`,
     /// input 1), summing by the routed weights. Distinct from
-    /// [`Instruction::MetalSharedFusedMoe`] in three ways the lowering needs:
+    /// [`Instruction::AffineSharedFusedMoe`] in three ways the lowering needs:
     /// a leading RMSNorm of `router_in` by the router gain, a softmax
     /// TEMPERATURE of `hidden_size^-0.5` applied to the gathered top-k scores
     /// BEFORE the softmax, a per-expert-scale gather-multiply after it, and
@@ -692,9 +690,9 @@ pub enum Instruction {
     Fp8FusedGateUpGeluMul(u32, u32, u32),
     Fp8FusedQkvRopeCache(u32, u32, u32),
     Fp8FusedQkvRopePrefill(u32, u32, u32, u32, u32),
-    /// MLX-affine int4 matmul (transpose=true). Metal-only. The
+    /// MLX-affine int4 matmul (transpose=true). The
     /// `LinearLayer` resolved through `WeightAccessors::linear_at`
-    /// must be `AffineQuant` — the metal worker reads the quant
+    /// must be `AffineQuant` — the worker reads the quant
     /// accessors (packed weight, scales, per-group affine biases,
     /// optional fp linear bias) through the `WeightTensor::Affine*`
     /// arms.
@@ -710,11 +708,11 @@ pub enum Instruction {
     /// M ≥ limit → qmm_t (prefill-matmul, SplitK heuristic deferred
     /// to C3).
     AffineQmm(u32, u32, u32, u32, u32, u32, u32, u32),
-    /// NVIDIA ModelOpt NVFP4 int4 matmul (transpose=true). Metal-only.
+    /// NVIDIA ModelOpt NVFP4 int4 matmul (transpose=true).
     /// Identical shape and dispatch to `AffineQmm` — the only difference
     /// is the in-shader weight decode (E2M1 LUT, no per-group bias). The
     /// `LinearLayer` resolved through `WeightAccessors::linear_at` must be
-    /// `Nvfp4`; the metal worker reads the quant accessors (packed E2M1
+    /// `Nvfp4`; the worker reads the quant accessors (packed E2M1
     /// weight, folded per-group scales, optional fp linear bias) through
     /// the `WeightTensor::Nvfp4*` arms.
     ///
@@ -724,7 +722,7 @@ pub enum Instruction {
     /// `AffineQmm`). M < limit → nvfp4_qmv (decode); M ≥ limit →
     /// nvfp4_qmm_t (prefill).
     Nvfp4Qmm(u32, u32, u32, u32, u32, u32, u32, u32),
-    /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
+    /// Compiler-synthesized pre-attention chunk megakernel.
     /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
     /// write) into one dispatch. The kernel itself is generated at
     /// macro-expansion time by
@@ -764,7 +762,7 @@ pub enum Instruction {
         /// quantized chains land here; Llama stays `false`.
         bool,
     ),
-    /// Compiler-synthesized MLP pre-down chunk megakernel. Metal-only.
+    /// Compiler-synthesized MLP pre-down chunk megakernel.
     /// Combines (FusedAddRmsNorm → AffineQmv gate → AffineQmv up →
     /// SiluMul) into one dispatch, leaving the down-projection as a
     /// standalone `AffineQmm` consumer of the synthesized output. The
@@ -792,7 +790,7 @@ pub enum Instruction {
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
-    /// MLX-affine quantized — `MetalFusedGateUpSiluMulImpl::fan_out`
+    /// MLX-affine quantized — a target's fused gate/up lowering
     /// produces (AffineQmm, AffineQmm, SiluMul) in that case rather
     /// than a single fused `FusedGateUpSiluMul` (which assumes Dense
     /// storage).
@@ -804,22 +802,22 @@ pub enum Instruction {
     /// model-level bound, because one model can carry SwiGLU blocks of
     /// different widths (e.g. Qwen3.5-MoE's 512-wide shared expert
     /// next to a dense `intermediate_size`-wide MLP in hybrid
-    /// configs). Metal-only.
+    /// configs).
     SiluMul(u32, u32, u32, u32),
     /// GELU (tanh approx) sibling of [`Instruction::SiluMul`] for the
     /// decomposed GeGLU q-MLP path (Gemma2/3/4:
     /// `gelu_pytorch_tanh(gate) * up`). Same tuple fields
     /// `(gate_slot, up_slot, out_slot)`, same `[M, intermediate_size]`
-    /// shapes. Metal-only.
+    /// shapes.
     GeluMul(u32, u32, u32),
     /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
-    /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
+    /// emitted by a target's synthesized gate/up lowering.
     /// Fields: `(x_norm_slot, out_slot, layer, group_size, bits,
     /// kernel_symbol)`. Gate/up LinearLayer accessors resolve through
     /// `WeightAccessors::linear_at` at slots 0/1 of the same
     /// `(bucket, op_idx)`.
     SynthGateUpSiluMul(u32, u32, u32, u32, u32, &'static str),
-    /// MLX-affine int4 quantized embedding lookup (Metal-only).
+    /// MLX-affine int4 quantized embedding lookup.
     /// Replaces `Instruction::Embed` when `model.embed_tokens` ships
     /// as a quantized triple `(weight=U32, scales, biases)` — i.e.
     /// every `mlx-community/*-4bit` checkpoint.
@@ -827,7 +825,7 @@ pub enum Instruction {
     /// Faithful port of MLX's `nn.QuantizedEmbedding.__call__`
     /// (`python/mlx/nn/layers/quantized.py:144`), fused into one
     /// dispatch via `affine_embed_<dtype>_gs_<gs>_b_4` in
-    /// `quantized_dequantize.metal`. Without this lift the embedding
+    /// the target's dequantize kernels. Without this lift the embedding
     /// would CPU-dequantize at load (P2 deviation), burning ~2 GB of
     /// arena on Llama-3.2-1B.
     ///
@@ -836,8 +834,8 @@ pub enum Instruction {
     /// `WeightAccessors::affine_quant_embedding_at` accessor (mirrors
     /// `embedding_at` for dense embeds). The hidden_size rides
     /// through `W::Q_SIZE` (function constant baked at lower time).
-    /// Metal-only — `AffineQuantEmbedding` is cfg-gated to the metal
-    /// backend (mirrors `LinearLayer::AffineQuant`).
+    /// `AffineQuantEmbedding` is the packed embedding of a target that keeps
+    /// it on device (mirrors `LinearLayer::AffineQuant`).
     AffineEmbed(u32, u32, u32),
     /// Re-run the next `body_len` instructions `count` times, advancing the LAYER by
     /// `layer_stride` each time.
@@ -910,11 +908,11 @@ impl KvOffsets {
 }
 
 /// Pack the three routed-expert projection bit-widths (gate / up / down)
-/// into the single `bits` field of [`Instruction::MetalSharedFusedMoe`].
+/// into the single `bits` field of [`Instruction::AffineSharedFusedMoe`].
 ///
 /// MLX dynamic/mixed quant (Qwen3.5 OptiQ) gives each routed-expert
 /// projection its OWN bit-width, and they can differ WITHIN one layer
-/// (e.g. layer 1: gate=4, up=8, down=8) — so the metal MoE dispatch needs
+/// (e.g. layer 1: gate=4, up=8, down=8) — so the MoE dispatch needs
 /// all three to pick each projection's `affine_gather_qmv_..._b_{bits}`
 /// symbol. Each width is 4 or 8 (fits a byte). Uniform / non-OptiQ
 /// checkpoints pack the same width three times, so decode is transparent.
@@ -966,7 +964,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// existing arches need no override; Qwen2-VL sets it via the
     /// proc-macro emit path. Plan: `~/.claude/plans/distributed-mapping-map.md`.
     const MROPE_SECTION: Option<[u32; 3]> = model_facts::raw::mrope_section(Self::FACTS);
-    /// How this model's KV cache is stored, fixed when it is built. The metal
+    /// How this model's KV cache is stored, fixed when it is built. A target's
     /// lowering injects the TurboQuant commands, the RuntimeFactory provisions
     /// the packed stores, and the worker sizes and grows the KV pool, all from
     /// this one value — so the tape, its buffers and the pool always agree.
@@ -995,7 +993,7 @@ pub trait CanonicalParams: WeightAccessors {
     const VISION_Q_SIZE: usize = model_facts::raw::vision_q_size(Self::FACTS);
     /// Vision patch-embed input width = `in_chans * temporal_patch_size
     /// * patch_size²` (Qwen3.5-VL: 3·2·16² = 1536). The rank-2 last-dim
-    /// of the `pixels` extern; the metal `LoadRows(Pixels)` arm uses it to
+    /// of the `pixels` extern; a target's `LoadRows(Pixels)` arm uses it to
     /// size the copy-into-arena dispatch. Same defaults / set-by rule as
     /// [`Self::VISION_NUM_HEADS`] (0 on non-vision arches).
     const VISION_IN_FEATURES: usize = model_facts::raw::vision_in_features(Self::FACTS);
@@ -1019,14 +1017,14 @@ pub trait CanonicalParams: WeightAccessors {
     const VISION_POOL_KERNEL: u32 = model_facts::raw::vision_pool_kernel(Self::FACTS);
 
     /// RmsNorm epsilon — read from `rms_norm_eps` in the model
-    /// config at macro-expand time. The metal `rmsnorm_*_specialized`
+    /// config at macro-expand time. The `rmsnorm_*_specialized`
     /// kernels consume this via `[[function_constant]]` baked into
     /// the compiled pipeline. Default is the value Llama / Qwen / Phi
     /// canonically use; per-canonical macro impls override.
     const RMS_NORM_EPS: f32 = Self::FACTS.eps().get();
 
     /// Zero-centered RMSNorm gain offset (Gemma / Qwen3.5): the effective
-    /// gain applied by the standard `RmsNorm` / `FusedAddRmsNorm` metal
+    /// gain applied by the standard `RmsNorm` / `FusedAddRmsNorm`
     /// kernels is `weight + NORM_WEIGHT_OFFSET`. `1.0` for `(1 + weight)`
     /// arches whose norm gains are stored zero-centered (Gemma2/3,
     /// Qwen3.5 — input/post/final layernorms + per-head q/k norm), `0.0`
@@ -1053,7 +1051,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// share one physical KV tensor. Gemma4: sliding `8·256 = 2048` vs
     /// global `2·512 = 1024` per token → global block_size `2 × 16 = 32`
     /// makes both blocks `32768` elems. Defaults to `BLOCK_SIZE` →
-    /// uniform-geometry models compile unchanged. The metal lowering
+    /// uniform-geometry models compile unchanged. The target's lowering
     /// feeds this to the full-attention + full-layer KV-write arms.
     const GLOBAL_BLOCK_SIZE: u32 = model_facts::raw::global_block_size(Self::FACTS);
 
@@ -1093,15 +1091,15 @@ pub trait CanonicalParams: WeightAccessors {
     const DRAFT_CAPTURE_SLOTS: u32 = model_facts::raw::draft_capture_slots(Self::FACTS);
 
     /// A block-table row stride (in u32s) for callers with no KV pool to read
-    /// one from: kernel tests, and the metal TurboQuant dequant grid before a
+    /// one from: kernel tests, and the TurboQuant dequant grid before a
     /// step has set its width. A served model's stride is its KV pool's
     /// (`KvCachePool::max_blocks_per_seq`, the KV cap rung it runs on).
     const MAX_BLOCKS_PER_SEQ: u32 = 128;
 
     /// Q-axis tile size for a contiguous-prefill kernel — the kernel
-    /// processes this many query tokens per threadgroup. Metal always
+    /// processes this many query tokens per threadgroup. A target that always
     /// emits `Instruction::AttentionPrefillPaged` (1 Q per TG via
-    /// `sdpa_vector` port), so it does not read this.
+    /// `sdpa_vector` port) does not read this.
     const PREFILL_TILE_Q: u32 = 16;
 
     /// Partial-rope rotation dim — for models where only the first
@@ -1114,7 +1112,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// layers `head_dim 256 × 8 kv heads`, global layers `head_dim 512
     /// × 1 kv head`). The DSL's `attention()` (global) vs
     /// `sliding_attention()` (local) tiles lower to distinct
-    /// Instruction variants, so the metal lowering feeds the GLOBAL_*
+    /// Instruction variants, so the target's lowering feeds the GLOBAL_*
     /// family to the full-attention arms and the base `HEAD_DIM` /
     /// `NUM_KV_HEADS` to the sliding arms. Defaults equal the base
     /// values — uniform-geometry models compile unchanged. Sourced
@@ -1134,7 +1132,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// head's halves — lane `i < GLOBAL_ROT_DIM/2` pairs with `i +
     /// GLOBAL_HEAD_DIM/2` (mlx `ProportionalRoPE`), NOT `i +
     /// GLOBAL_ROT_DIM/2` like standard HF partial rotary (Qwen3.5).
-    /// The metal RopeAppend arm keys the kernel's pairing offset on
+    /// A target's RopeAppend arm keys the kernel's pairing offset on
     /// this. False everywhere else.
     const ROPE_PROPORTIONAL: bool = model_facts::raw::rope_proportional(Self::FACTS);
 
@@ -1143,7 +1141,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// UNROTATED by `rope_append`, and the paged attention kernels
     /// re-rope cached K to each reader's position on read — letting one
     /// cached span be reused at any position (zero-copy block sharing).
-    /// A compile-time CAPABILITY: when set, the metal lowering binds the
+    /// A compile-time CAPABILITY: when set, the target's lowering binds the
     /// per-block unrotated-flag buffer + cos_sin into the attention /
     /// rope_append kernels and emits the rope-on-read function constants.
     /// Non-span requests carry an all-zero flag buffer → the per-block
@@ -1153,10 +1151,10 @@ pub trait CanonicalParams: WeightAccessors {
     /// Set true only for models/deployments that opt into spans.
     const ROPE_ON_READ: bool = model_facts::raw::rope_on_read(Self::FACTS);
 
-    /// Element dtype the metal backend should run this canonical in.
+    /// Element dtype this canonical runs its activations in.
     /// Picks between the `_f16_specialized` / `_bf16_specialized`
     /// shader symbols and matching MPS GEMM data type. Default
-    /// `MetalDtype::Bf16` matches every modern HF Llama / Qwen /
+    /// `ActDtype::Bf16` matches every modern HF Llama / Qwen /
     /// Phi / Mistral checkpoint (`torch_dtype: bfloat16` on disk).
     /// Per-canonical macro
     /// overrides set this from the model config's `torch_dtype`.
@@ -1165,14 +1163,14 @@ pub trait CanonicalParams: WeightAccessors {
     /// range over deep layer chains and produced incoherent outputs
     /// on Llama-3.x. The default is `Bf16` now; arches that ship
     /// fp16 on disk (rare) override.
-    const METAL_DTYPE: MetalDtype = Self::FACTS.metal_dtype();
+    const ACT_DTYPE: ActDtype = Self::FACTS.act_dtype();
 
     /// `hidden_size` (residual-stream width) — distinct from
     /// `Q_SIZE = num_q_heads * head_dim`. On Llama / Qwen2.5 these
     /// happen to be equal because each Q head is `hidden_size /
     /// num_heads`. On Qwen3 (and any GQA / different head_dim
     /// arch) they differ: e.g. Qwen3-30B-A3B has hidden=2048,
-    /// num_q=32, head_dim=128 → Q_SIZE=4096. The metal interpreter
+    /// num_q=32, head_dim=128 → Q_SIZE=4096. A target
     /// previously baked `W::Q_SIZE` as `AFFINE_EMBED_HIDDEN_SIZE`
     /// and `RMSNORM_HIDDEN_SIZE`, which broke Qwen3 silently. The
     /// macro emits this const from `model.bounds["hidden_size"]`.
@@ -1194,12 +1192,12 @@ pub trait CanonicalParams: WeightAccessors {
     const VOCAB_SIZE: usize = model_facts::raw::vocab_size(Self::FACTS);
 
     /// On-disk storage dtype for `*.scales` / `*.biases` tensors on
-    /// mlx-affine-b4 checkpoints. The affine quant Metal kernels
+    /// mlx-affine-b4 checkpoints. The affine quant kernels
     /// (`affine_qmv`, `affine_qmm_t`, `affine_qvm`, `affine_gather_qmv`,
     /// `affine_embed`) read these as `T_scale` and cast to `T_act` in-
     /// register. MLX templates `T_scale ∈ {half, bfloat16_t}` natively
     /// (`mlx/.../quantized.h INSTANTIATE_QUANTIZED_FUNCTIONS`);
-    /// scratchy-target-metal mirrors that surface, picking the right symbol
+    /// a target's kernels mirror that surface, picking the right symbol
     /// based on this const.
     ///
     /// `mlx-community` convention varies by arch family (probed across

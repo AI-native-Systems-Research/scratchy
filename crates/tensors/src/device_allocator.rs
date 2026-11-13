@@ -6,9 +6,9 @@
 //! "give me `N` bytes of device memory and put these host bytes on
 //! it" — lives behind this trait.
 //!
-//! - **Metal impl** (Apple silicon, unified memory) bump-allocates
-//!   inside an arena `MTLBuffer` in `StorageModeShared`. The
-//!   "transfer" is a `memcpy(buffer.contents() + offset, src, len)`
+//! - **Unified-memory impl** (host-visible device memory) bump-allocates
+//!   inside a host-mapped arena buffer. The
+//!   "transfer" is a `memcpy(arena + offset, src, len)`
 //!   — same-RAM copy, no DMA.
 //!
 //! - **Staged impl** (device memory that is not host-visible) holds host
@@ -23,7 +23,7 @@ use std::sync::Arc;
 ///
 /// Exposes the device-visible pointer so the generic, backend-neutral pool
 /// code can build [`GpuTensor`](crate::tensor::GpuTensor)s from a stored
-/// allocation without naming a concrete `RawGpuMem` / `MetalMem`.
+/// allocation without naming a concrete `RawGpuMem` or a target's memory type.
 pub trait PoolMemory: Send + Sync {
     /// Device-visible pointer to the first byte of this allocation.
     fn ptr(&self) -> *mut u8;
@@ -51,7 +51,7 @@ pub trait DeviceAllocator: Send + Sync {
     /// # Safety
     ///
     /// `src_host` must point to `bytes` valid host bytes for the
-    /// duration of this call. Metal implementations `memcpy` from
+    /// duration of this call. A unified-memory implementation `memcpy`s from
     /// `src_host`, so any host memory is fine.
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8>;
 
@@ -61,7 +61,7 @@ pub trait DeviceAllocator: Send + Sync {
     /// offset alignment (e.g. 2 for `device const half*` /
     /// `device const bfloat*`, 4 for `device const uint32_t*`).
     ///
-    /// Metal's zero-copy mmap-alias path is gated on the offset
+    /// A zero-copy mmap-alias path is gated on the offset
     /// being a multiple of `MIN_BIND_ALIGN = 16` (covers u32 packed
     /// int4 weights + simdgroup_float4 / any SIMD-wide reads).
     /// `mlx-community` 4bit safetensors land tensor offsets at
@@ -93,7 +93,7 @@ pub trait DeviceAllocator: Send + Sync {
     /// `bytes` of device memory the host writes in place, from where
     /// [`alloc_and_copy_host`] would copy to: `None` when the device's
     /// memory is not host-visible, so a caller fills host
-    /// memory and copies it instead. Metal's unified memory is.
+    /// memory and copies it instead. Unified memory is.
     ///
     /// # Safety
     ///
@@ -107,7 +107,7 @@ pub trait DeviceAllocator: Send + Sync {
     // ---- Backend-specific surface that generic `GpuWeights<A>` / pools need ----
     //
     // These let the shared containers stay backend-neutral: they name only
-    // `Self::Stream` / `Self::Mem`, never a concrete `MetalMem`. Used monomorphized (one backend per build), never as
+    // `Self::Stream` / `Self::Mem`, never a target's concrete memory type. Used monomorphized (one backend per build), never as
     // `dyn DeviceAllocator`, so associated types are fine.
 
     /// The host→device stream this allocator queues transfers on
@@ -115,7 +115,7 @@ pub trait DeviceAllocator: Send + Sync {
     type Stream;
 
     /// The device-memory handle this allocator hands out and tracks
-    /// (`MetalMem` under metal). Lets generic
+    /// (a target's memory type). Lets generic
     /// `GpuWeights` / KV / GDN pools store `Vec<Self::Mem>` without naming a
     /// backend type. The [`PoolMemory`] bound lets that generic pool code read
     /// back the device pointer to build views.
@@ -124,7 +124,7 @@ pub trait DeviceAllocator: Send + Sync {
     fn stream(&self) -> Self::Stream;
 
     /// Track an externally-allocated device buffer. Default: no-op — the
-    /// metal arenas own their memory.
+    /// a target's arenas own their memory.
     fn push_alloc(&mut self, _alloc: Self::Mem) {}
 
     /// Drain + transfer ownership of all tracked allocations. Default: empty.
@@ -136,15 +136,15 @@ pub trait DeviceAllocator: Send + Sync {
     /// owns the device memory. Default: no-op.
     fn unrecord_alloc(&mut self, _ptr: *mut u8) {}
 
-    /// Register a safetensors mmap for the zero-copy alias path (metal does a
-    /// realign-pack so tensor offsets become bind-aligned). Default: no-op.
+    /// Register a safetensors mmap for the zero-copy alias path (an allocator may
+    /// realign-pack it so tensor offsets become bind-aligned). Default: no-op.
     fn register_mmap(&self, _path: &Path, _mmap: Arc<memmap2::Mmap>) -> Result<()> {
         Ok(())
     }
 
     /// Hint the OS to start paging in a freshly-mapped safetensors shard
     /// (`MADV_WILLNEED`) to overlap disk I/O with parsing + the H2D copy.
-    /// Metal skips it (it prefaults per-shard inside
+    /// An allocator may skip it (prefaulting per-shard inside
     /// [`register_mmap`](Self::register_mmap), keeping the working set small).
     /// Default: no-op.
     fn prefault_mmap(&self, _mmap: &memmap2::Mmap) {}

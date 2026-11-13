@@ -14,7 +14,7 @@ pub use crate::KvCodec;
 use core::marker::PhantomData;
 use scratchy_tensors::typed::typenum::U2;
 use scratchy_tensors::typed::{Add, Dim, DimN, Divides, Equals, FitsIn, Mul};
-pub use scratchy_tensors::{MetalDtype, ScaleDtype};
+pub use scratchy_tensors::{ActDtype, ScaleDtype};
 
 /// A positive count or extent: the constructor refuses zero.
 macro_rules! positive {
@@ -903,7 +903,7 @@ impl Target {
 /// [`ModelFacts::new`] checks the laws between them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FactsParts {
-    pub metal_dtype: MetalDtype,
+    pub act_dtype: ActDtype,
     pub scale_dtype: ScaleDtype,
     pub hidden: HiddenSize,
     pub intermediate: Option<IntermediateSize>,
@@ -956,9 +956,9 @@ impl ModelFacts {
     pub const fn parts(self) -> FactsParts {
         self.0
     }
-    /// The metal element dtype.
-    pub const fn metal_dtype(self) -> MetalDtype {
-        self.0.metal_dtype
+    /// The activation element dtype.
+    pub const fn act_dtype(self) -> ActDtype {
+        self.0.act_dtype
     }
     /// The norm gains' dtype.
     pub const fn scale_dtype(self) -> ScaleDtype {
@@ -1461,7 +1461,7 @@ mod tests {
 
     fn parts(attention: Option<Attention>, kv_codec: KvCodec) -> FactsParts {
         FactsParts {
-            metal_dtype: MetalDtype::Bf16,
+            act_dtype: ActDtype::Bf16,
             scale_dtype: ScaleDtype::F16,
             hidden: HiddenSize::new(2048),
             intermediate: Some(IntermediateSize::new(8192)),

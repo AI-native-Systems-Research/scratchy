@@ -1,6 +1,7 @@
 # Building scratchy
 
-How to build `scratchy-cli` (binary `scr`) — backend selection, and the
+How to build the scratchy CLI — `scr` on metal, `spyre` on IBM Spyre, each its target's binary
+over the common CLI core (`scratchy-cli`) — and the
 `-Fmodel/`/`-Fquant/` feature landscape that scopes which models and
 quantization variants actually compile in. For adding a *new* model
 architecture (DSL carrier, `configs/`, weight shapes), see
@@ -10,16 +11,17 @@ exists, not adding to it.
 ## Quickstart
 
 ```bash
-cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b
+cargo build -p scratchy-target-metal-cli --release --features model/llama-3.2-3b      # scr
+cargo build -p scratchy-target-spyre-cli --release --features spyre-emu,model/granite-3.1-2b-instruct  # spyre
 ```
 
-`metal` and `spyre` are mutually exclusive. Add
+Each binary links its one target. Add
 `serve` for the HTTP server
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
-HuggingFace model ids is on by default (`hf-completions`); pass
+HuggingFace model ids is on by default in `scr` (`model/hf-completions`); pass
 `--no-default-features` to build with no network access at all. TurboQuant KV
-compression is on with `metal` (and off for spyre), fixed at build time — see
+compression is on in `scr` (and off for spyre), fixed at build time — see
 [`turboquant`](#turboquant--kv-cache-compression-fixed-at-build-time).
 
 ## There is no default model, quant or drafter scope
@@ -68,7 +70,7 @@ One Cargo feature per checked-in `configs/<arch>/<stem>.json`, named
 `<stem>` — no `model-` text prefix; the `model` alias already says that.
 
 ```bash
-cargo build -p scratchy-cli --features metal,model/qwen2.5-7b
+cargo build -p scratchy-target-metal-cli --features model/qwen2.5-7b
 ```
 
 - **`model/<stem>`** — exactly one model + variant, e.g.
@@ -97,7 +99,7 @@ One Cargo feature per preset, named `<preset>` — no `quant-` text prefix,
 same reasoning as `<stem>`.
 
 ```bash
-cargo build -p scratchy-cli --features metal,model/granite-3.1-2b-instruct,quant/mlx
+cargo build -p scratchy-target-metal-cli --features model/granite-3.1-2b-instruct,quant/mlx
 # → granite-3.1-2b-instruct compiles as its MLX affine variants, not dense
 ```
 
@@ -120,16 +122,16 @@ No `quant/*` feature named at all = every selected model compiles dense only.
 ## `-Fspec/<...>` — which drafters compile with the selected models
 
 ```bash
-cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
+cargo build -p scratchy-target-metal-cli --features serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
 # → Qwen3.6-35B-A3B plus its multi-token-prediction head; serving it drafts with the head
-cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,quant/mlx
+cargo build -p scratchy-target-metal-cli --features serve,model/gemma-4-26b-a4b-it,quant/mlx
 # → Gemma 4 26B-A4B plus its assistant at MLX 4-bit g32 (`quant/mlx` selects mlx-affine-b4-g32);
 #   serving it drafts with guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit
-cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec/mtp,quant/mlx
+cargo build -p scratchy-target-metal-cli --features serve,model/gemma-4-26b-a4b-it,spec/mtp,quant/mlx
 # → also the bf16 and QAT assistants; serving drafts with one when `--speculative-model` names it
 ```
 
-- **`metal`** turns on scratchy-models' **`mtp-heads`**: every selected model
+- **`scr`** turns on scratchy-models' **`mtp-heads`** by default: every selected model
   whose checkpoint carries a multi-token-prediction head compiles that head
   too. Such a head has no config of its own: its `arch.json` names the arches
   whose checkpoints carry it (`checkpoint_of`), and it compiles on each
@@ -160,21 +162,21 @@ cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec
   QAT assistants).
 
 No `spec/*` feature named = only the heads inside their targets' checkpoints
-and the targets' default published drafters compile (with `metal`); a spyre
+and the targets' default published drafters compile (in `scr`); a spyre
 build compiles none.
 
 ## `turboquant` — KV cache compression, fixed at build time
 
 On metal, a model's KV cache is either dense (the model's own dtype) or
 TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
-decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
-turns `turboquant` **on**; a spyre build does not have it. To build
-metal with a dense KV cache, name `metal-base` instead of `metal`: the same
-engine without scratchy-models' `turboquant` or `mtp-heads` (add
-`model/mtp-heads` back to keep MTP drafting):
+decides which: nothing chooses at runtime. `scr`'s default features turn
+`turboquant` **on**; a spyre build does not have it. To build `scr` with a
+dense KV cache, drop the defaults: the same engine without `turboquant` or
+scratchy-models' `mtp-heads` (add `model/mtp-heads` back to keep MTP drafting,
+`model/hf-completions` for tab completion):
 
 ```bash
-cargo build --release -p scratchy-cli --features metal-base,model/llama-3.2-1b
+cargo build --release -p scratchy-target-metal-cli --no-default-features --features chat,model/llama-3.2-1b
 ```
 
 With it on, every selected model whose geometry the codec takes is emitted with
@@ -182,7 +184,7 @@ With it on, every selected model whose geometry the codec takes is emitted with
 why:
 
 ```
-warning: scratchy-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
+warning: scratchy-target-metal-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
 ```
 
 A model stays dense when it has no KV cache, when its KV cache is an MLA
@@ -242,7 +244,7 @@ baked into the binary as a `&'static [&'static str]` — **tab completion itself
 never touches the network.**
 
 ```bash
-cargo build -p scratchy-cli --features metal,model/llama-3.2-1b
+cargo build -p scratchy-target-metal-cli --features model/llama-3.2-1b
 scr model names --source compiled      # what this build resolved to
 ```
 
@@ -252,16 +254,16 @@ scr model names --source compiled      # what this build resolved to
   network requests at all, drop the feature:
 
   ```bash
-  cargo build -p scratchy-cli --no-default-features \
-      --features chat,metal,model/llama-3.2-1b
+  cargo build -p scratchy-target-metal-cli --no-default-features \
+      --features chat,turboquant,model/mtp-heads,model/llama-3.2-1b
   ```
 
   `ureq` is then not even linked into the build script, so the build cannot
-  reach the Hub by accident. The feature rides `scratchy-cli`'s default
-  features via a weak `model?/hf-completions` edge, so it activates only when
-  a `-Fmodel/<stem>` is named; building `-p scratchy-models` directly does not
-  turn it on (its own `default` stays empty, which is what keeps CI's
-  `--workspace` and `metal,all` runs network-free).
+  reach the Hub by accident. The feature rides `scr`'s default features
+  (`model/hf-completions`); building `-p scratchy-models` or a models crate
+  directly does not turn it on (scratchy-models' own `default` stays empty,
+  which is what keeps CI's `--workspace` and `all` runs network-free). `spyre`
+  has it off by default (`hf-completions`): a card host's build is air-gapped.
 - **The names come most downloaded first**, the Hub's own ranking, so the
   canonical checkpoint leads its fine-tunes. `scr model names --source compiled`
   prints them in that order. zsh shows them in that order too. bash ≥ 4.4 does
@@ -294,7 +296,7 @@ need** — `-Fmodel/<stem>` (e.g. `-Fmodel/llama-3.2-1b` or
 `-Fquant/<preset>` only if the change is quant-specific:
 
 ```bash
-cargo build -p scratchy-cli --features metal,model/smollm2-135m
+cargo build -p scratchy-target-metal-cli --features model/smollm2-135m
 ```
 
 **Never build `model/<arch>` or `model/all` just to test one thing** — the
@@ -306,15 +308,15 @@ feature directly.
 
 ## Direct crate builds
 
-`-p scratchy-cli` reaches `scratchy-models`/`scratchy-quantizations`/`scratchy-spec`
-via the `model`/`quant`/`spec` aliases. Building `-p scratchy-models` or
-`-p scratchy-quantizations` directly uses their real crate names instead
-(the aliases only exist on `crates/cli/scr/Cargo.toml`'s dependency edges);
-`scratchy-models` names the drafters itself (`mtp`, which `spec/mtp` forwards to):
+A target's CLI (`-p scratchy-target-metal-cli`, `-p scratchy-target-spyre-cli`) reaches
+`scratchy-models`/`scratchy-quantizations`/`scratchy-spec` via the `model`/`quant`/`spec` aliases. Building a target's models crate
+directly (`scratchy-target-metal-models`, `scratchy-target-spyre-models`) names
+the scope crates by their real names instead (the aliases only exist on the
+CLIs' dependency edges); `scratchy-models` names the drafters itself (`mtp`,
+which `spec/mtp` forwards to):
 
 ```bash
-cargo build -p scratchy-models --no-default-features \
-    --features metal,llama-3.2-3b
+cargo build -p scratchy-target-metal-models --features scratchy-models/llama-3.2-3b
 # → only llama-3.2-3b's forward expands; its config.json is the only one
 #   even read out of crates/models/arch/configs/llama/
 ```

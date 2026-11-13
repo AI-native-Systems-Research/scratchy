@@ -5112,7 +5112,7 @@ impl PagedKvPool {
     ///
     /// Two things unlock it, in order: size the pool to the batch actually being run rather than to the
     /// widest baked rung, and make a page DENSER instead of BIGGER (a 4-bit KV cache gives four times
-    /// the positions for the same bytes — TurboQuant is already in-tree for metal). Then this goes back
+    /// the positions for the same bytes — TurboQuant is already in-tree for the GPU target). Then this goes back
     /// up and the win comes with it.
     ///
     /// ⭐ A MEASURED POLICY, NOT A DERIVATION: 256 is chosen on the measurements above
@@ -5398,7 +5398,7 @@ impl PagedKvPool {
     /// `compute_bundle_layout` reserves `MAX_SEGMENT_BYTES / page_bytes` blocks, the most pages
     /// ONE region of KV can hold, which is ≥ the pages any runtime pool can be budgeted for
     /// (`max_single_allocation()` is one region) — so the reservation covers every pool any card
-    /// can express and MEMORY is the binding constraint at runtime, exactly as it is on metal.
+    /// can express and MEMORY is the binding constraint at runtime, exactly as it is on a GPU.
     /// The number itself lives in each bundle's own pmask placement, read back as
     /// [`BakedMaskBlocks`]; the per-step `MaskBlocks::fits` check and `RowPages::within_mask_reach`
     /// enforce it from the artifact, never from a const.
@@ -9179,8 +9179,8 @@ impl TokenId {
 // It held `physical(lp) = row * pages_per_row + lp` — a page address DERIVED BY FORMULA from the row. That
 // formula is what made two requests sharing a page unrepresentable, which is why spyre became the only
 // backend whose worker reported `supports_prefix_caching() == false`, and it is what capped one request at
-// `pool_pages / rows` (the cap that killed granite-8b at 768 positions). metal and cuda address KV through
-// an arbitrary per-request `block_table` (`gpu_worker.rs`) and neither problem exists there.
+// `pool_pages / rows` (the cap that killed granite-8b at 768 positions). The GPU targets address KV through
+// an arbitrary per-request `block_table` and neither problem exists there.
 //
 // Pages now come from a FREE LIST (`pages_held` + `ensure_pages`, `f5e26a3e`), so a request's page list IS
 // its block table. Nothing in the tree maps `(row, logical page) -> physical page` any more, so the stripe

@@ -118,15 +118,15 @@ pub struct Built {
 /// own crate, so `crate::__gpu` / `crate::<Model>` meant "this arch's root").
 /// In the consolidated crate every arch lives under `pub mod <mod>`, so rewrite
 /// every path-root `crate ::` → `crate :: <mod> ::`. Leaves `pub(crate)` (a
-/// `crate` not followed by `::`), absolute `::foo` paths and `crate::__metal_bake`
-/// — the one module every arch shares, at the crate root — untouched.
-fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
+/// `crate` not followed by `::`), absolute `::foo` paths and the crate-root modules every arch
+/// shares (`shared`: the emitter's [`TargetEmitter::shared_root_modules`]) untouched.
+fn reroot_crate(ts: TokenStream, mod_name: &str, shared: &[&str]) -> TokenStream {
     let mut out: Vec<TokenTree> = Vec::new();
     let mut it = ts.into_iter().peekable();
     while let Some(tt) = it.next() {
         match tt {
             TokenTree::Group(g) => {
-                let ng = Group::new(g.delimiter(), reroot_crate(g.stream(), mod_name));
+                let ng = Group::new(g.delimiter(), reroot_crate(g.stream(), mod_name, shared));
                 out.push(TokenTree::Group(ng));
             }
             TokenTree::Ident(id) if id == "crate" => {
@@ -137,9 +137,9 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
                 if is_path {
                     out.push(it.next().unwrap()); // ':'
                     out.push(it.next().unwrap()); // ':'
-                    let shared =
-                        matches!(it.peek(), Some(TokenTree::Ident(id)) if id == "__metal_bake");
-                    if !shared {
+                    let at_root = matches!(it.peek(),
+                        Some(TokenTree::Ident(id)) if shared.iter().any(|m| id == m));
+                    if !at_root {
                         out.push(TokenTree::Ident(Ident::new(mod_name, Span::call_site())));
                         out.push(TokenTree::Punct(Punct::new(':', Spacing::Joint)));
                         out.push(TokenTree::Punct(Punct::new(':', Spacing::Alone)));
@@ -260,7 +260,7 @@ fn emit_arch(
         println!("cargo::rustc-cfg=compiled_model=\"{variant}\"");
     }
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
-    let tokens = reroot_crate(tokens, mod_name);
+    let tokens = reroot_crate(tokens, mod_name, build.emitter.shared_root_modules());
     let found = ((build.inspect)(&tokens).into_iter())
         .map(|f| format!("{mod_name}::{f}"))
         .collect();
@@ -279,6 +279,8 @@ pub fn build(build: &ModelsBuild<'_>) -> Built {
     // Its values are open: any target names itself.
     println!("cargo::rustc-check-cfg=cfg(scratchy_target, values(any()))");
     println!("cargo::rustc-check-cfg=cfg(compiled_model, values(any()))");
+    println!("cargo::rustc-check-cfg=cfg(compiled_arch, values(any()))");
+    println!("cargo::rustc-check-cfg=cfg(selected_model, values(any()))");
     println!(
         "cargo::rustc-cfg=scratchy_target=\"{}\"",
         build.emitter.name()
@@ -315,6 +317,21 @@ pub fn build(build: &ModelsBuild<'_>) -> Built {
     inspected.sort();
     let mut mods: Vec<String> = arches.iter().map(|(_, m, _)| m.clone()).collect();
     mods.sort();
+    // Each emitted arch as `cfg(compiled_arch = "<mod>")`, for a crate that declares the arch
+    // modules itself (beside items of its own) rather than including `modules.rs`.
+    for m in &mods {
+        println!("cargo::rustc-cfg=compiled_arch=\"{m}\"");
+    }
+    // Each model the scope selects as `cfg(selected_model = "<arch>/<stem>")` (its config's
+    // place under `configs/`), whatever variants of it compiled: what a test of a model's
+    // emission gates on, so that every variant missing fails it rather than skips it.
+    for config in scratchy_forward_compiler_macro::selected_config_paths() {
+        let stem = config.file_stem().and_then(|s| s.to_str());
+        let arch = (config.parent().and_then(Path::file_name)).and_then(|a| a.to_str());
+        if let (Some(arch), Some(stem)) = (arch, stem) {
+            println!("cargo::rustc-cfg=selected_model=\"{arch}/{stem}\"");
+        }
+    }
     let modules: String = (mods.iter())
         .map(|m| {
             format!("pub mod {m} {{\n    include!(concat!(env!(\"OUT_DIR\"), \"/{m}.rs\"));\n}}\n")

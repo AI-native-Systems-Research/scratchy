@@ -98,7 +98,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
             // runtime gate (`RuntimeGate::OnlyIfSingleSeqNoSpec`) that
             // skips the lm_head slice on the spec verify batch only;
             // prefill/decode keep the ~10 ms TTFT win the slice gives.
-            // See scratchy-forward-compiler/src/interpreter/metal/lowering.rs.
+            // See the target's tape lowering.
         }
     }
     if let Some(ref adapter) = args.lora_adapter {
@@ -215,7 +215,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     // engine step loop and WAIT for it to unwind: dropping the step task's
     // `EngineCoreClient` runs
     // `InprocClient::Drop -> executor.shutdown() -> worker.shutdown()`, which
-    // ends the Metal residency set and releases the system-wired GPU memory
+    // ends the target's device residency and releases its wired GPU memory
     // deterministically. Without this wait the process can exit before that
     // teardown runs, orphaning wired GPU memory.
     step_handle.abort();
