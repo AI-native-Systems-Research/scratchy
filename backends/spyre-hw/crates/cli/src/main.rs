@@ -17,6 +17,12 @@ mod bundle;
 #[cfg(any(feature = "spyre-hw", feature = "spyre-emu"))]
 extern crate scratchy_target_spyre_worker as _;
 
+// Anchor the tp alias into the build: `tp/<W>` is how the CLI names the sharded worlds
+// the bake emits, and resolver v2 drops the features of an optional dependency nothing
+// references — without this anchor every TP build silently bakes one card.
+#[cfg(feature = "tp")]
+extern crate tp as _;
+
 use clap::{Parser, Subcommand};
 
 /// scratchy on IBM Spyre.
