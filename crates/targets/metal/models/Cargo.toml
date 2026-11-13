@@ -1,0 +1,57 @@
+[package]
+name = "scratchy-target-metal-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The selected models, compiled for metal: the model scope `scratchy-models` states, through the shared pipeline with metal's emitter"
+
+[features]
+default = []
+# TurboQuant KV compression, fixed per model at build time: every model whose geometry the codec
+# takes (`scratchy_layers::turboquant::codec_for`) is emitted with `KV_CODEC = TurboQuant`, the rest
+# stay dense and are named in the build output. Nothing selects it at runtime.
+turboquant = ["scratchy-forward-compiler-macro/turboquant"]
+# The vision towers' runtime surface. A scope that selects a vision arch (`scratchy-models`'
+# `vision`, which every `arch-<X>-vl` turns on) needs it: the build script refuses that scope
+# without it, rather than fail inside the emitted tower.
+vision = ["dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-target-metal/vision"]
+
+[dependencies]
+# THE MODEL SCOPE: which models, heads and quant presets — `scratchy-models`' own features,
+# published as its build metadata (`DEP_SCRATCHY_MODELS_*`), which this crate's build script reads.
+scratchy-models = { path = "../../../models/arch", default-features = false }
+# What the emitted code names.
+scratchy-target-metal = { path = ".." }
+scratchy-forward-compiler = { path = "../../../compiler" }
+scratchy-layers = { path = "../../../layers" }
+# The dim markers and typed weight handles each model's emitted `Weights` holds.
+scratchy-tensors = { path = "../../../tensors" }
+scratchy-quantizations = { path = "../../../models/quantization" }
+scratchy-vision = { path = "../../../models/vision", optional = true }
+# The `BakedTokenizer`s the build bakes register against.
+scratchy-core-model = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+# The shared models build driver, and the emitter it runs metal's models through.
+scratchy-models-build = { path = "../../../models/build" }
+scratchy-forward-compiler-macro = { path = "../../../compiler/macros", features = ["metal"] }
+# Reading metal's tables off the emitted tokens.
+proc-macro2 = "1"
+
+[dev-dependencies]
+# bf16 readback in the parity tests and the vision towers' green gates.
+half = { workspace = true }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLDevice", "MTLResource"] }
+# harness.json / checkpoint config.json reads + ForwardCtxHandle /
+# ForwardDeviceHandle in the universal carrier parity gate
+# (tests/carrier_parity.rs). compute_hybrid_kv_layout (shared with the
+# worker) builds gemma4-style hybrid KV pools in the same gate.
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+serde_json = { workspace = true }
+# tests/metal_o2_logits.rs (the runtime logits oracle): local Hub-cache lookup, the tokenizer,
+# and the row hash (config parse and the hybrid KV layout: scratchy-core-config above).
+hf-hub-downloader = { workspace = true }
+sha2 = "0.11"
+tokenizers = { workspace = true }

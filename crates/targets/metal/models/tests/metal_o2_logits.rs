@@ -17,14 +17,14 @@
 //! per process — the wired KV pool and weights are never torn down between cases:
 //!
 //! ```text
-//! cargo test --release -p scratchy-models --features metal,<stem> --test metal_o2_logits \
+//! cargo test --release -p scratchy-target-metal-models --features scratchy-models/<stem> --test metal_o2_logits \
 //!     -- --ignored --exact --nocapture <case>
 //! ```
-#![cfg(all(feature = "metal", target_os = "macos"))]
+#![cfg(target_os = "macos")]
 
 // Nothing here names a model module — they register through `inventory` — so the crate has to be
 // linked explicitly or `try_load` sees no registrations at all.
-extern crate scratchy_models as _;
+extern crate scratchy_target_metal_models as _;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ enum Rows {
     Sampled,
     /// Encoder: the terminal slot is `[n, hidden]` hidden states — every row. Compiled with the
     /// one case that runs an encoder.
-    #[cfg(feature = "modernbert-base")]
+    #[cfg(selected_model = "modernbert/modernbert-base")]
     All,
 }
 
@@ -97,7 +97,7 @@ const PROMPTS: &[&str] = &[
 /// smallest bucket whose baked M5 tapes carry the lm_head slice (`GatherSampledRows` → qmv →
 /// `PutSampledRowsBack`); buckets ≤ 64 compact every row's logits on M5 instead.
 /// Compiled with the one case that reads it.
-#[cfg(feature = "llama-3.2-3b")]
+#[cfg(selected_model = "llama/llama-3.2-3b")]
 const LONG_PROMPTS: &[&str] = &[
     "A lighthouse keeper on a remote northern island keeps a careful journal of every ship that \
      passes, the weather at dawn and dusk, the colour of the sea, and the birds that nest on the \
@@ -108,14 +108,14 @@ const LONG_PROMPTS: &[&str] = &[
 ];
 
 /// The ladder cap of [`LONG_PROMPTS`] cases (keeps bucket 512, drops 1024+).
-#[cfg(feature = "llama-3.2-3b")]
+#[cfg(selected_model = "llama/llama-3.2-3b")]
 const LONG_BUCKET_CAP: u32 = 512;
 
 /// gpt-oss's sliding-window boundary probe: ~170 tokens, past the arch's 128-token window on the
 /// even (sliding) layers — the one e2e check that the windowed KV layout and the full layers'
 /// paged cache agree on what the model attends to once the window actually clips. Compiled with
 /// the one case that reads it.
-#[cfg(feature = "gpt-oss-20b")]
+#[cfg(selected_model = "gpt-oss/gpt-oss-20b")]
 const GPT_OSS_LONG_PROMPTS: &[&str] = &[
     "The old observatory on the hill above the fishing village has been staffed by three \
      generations of the same family, and each of them has kept the same leather-bound logbook \
@@ -130,7 +130,7 @@ const GPT_OSS_LONG_PROMPTS: &[&str] = &[
 ];
 
 /// The ladder cap of [`GPT_OSS_LONG_PROMPTS`] (keeps bucket 512, drops 1024+).
-#[cfg(feature = "gpt-oss-20b")]
+#[cfg(selected_model = "gpt-oss/gpt-oss-20b")]
 const GPT_OSS_LONG_BUCKET_CAP: u32 = 512;
 
 /// gpt-oss's sliding-window boundary pair, bracketing the arch's 128-token window from both
@@ -140,7 +140,7 @@ const GPT_OSS_LONG_BUCKET_CAP: u32 = 512;
 /// same bucket (512), so the pair differs in window clipping alone; a first-token mlx agreement
 /// that holds under the window but breaks past it indicts the windowed KV layout rather than
 /// length-scaling accumulation noise.
-#[cfg(feature = "gpt-oss-20b")]
+#[cfg(selected_model = "gpt-oss/gpt-oss-20b")]
 const GPT_OSS_WINDOW_PROMPTS: &[&str] = &[
     "The stone bridge at the edge of the market town has nine arches, and the middle one is \
      carved with the date the river last froze. Every morning the miller opens the sluice \
@@ -160,7 +160,7 @@ const GPT_OSS_WINDOW_PROMPTS: &[&str] = &[
 ];
 
 /// The ladder cap of [`GPT_OSS_WINDOW_PROMPTS`] (keeps bucket 512, drops 1024+).
-#[cfg(feature = "gpt-oss-20b")]
+#[cfg(selected_model = "gpt-oss/gpt-oss-20b")]
 const GPT_OSS_WINDOW_BUCKET_CAP: u32 = 512;
 
 /// gpt-oss's harmony chat framing, pinned verbatim (the render `scr chat` builds
@@ -170,7 +170,7 @@ const GPT_OSS_WINDOW_BUCKET_CAP: u32 = 512;
 /// prompts never exercise those embed rows. Greedy must reason here — mlx-lm
 /// continues `We need to answer: "The capital of France is". The answer: "Paris".`;
 /// echoing the user turn instead would indict the special-token path, not the model.
-#[cfg(feature = "gpt-oss-20b")]
+#[cfg(selected_model = "gpt-oss/gpt-oss-20b")]
 const GPT_OSS_HARMONY_PROMPTS: &[&str] = &[
     "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n\
      Knowledge cutoff: 2024-06\nCurrent date: 2026-10-09\n\nReasoning: medium\n\n\
@@ -179,7 +179,7 @@ const GPT_OSS_HARMONY_PROMPTS: &[&str] = &[
 ];
 
 /// The ladder cap of [`GPT_OSS_HARMONY_PROMPTS`] (keeps bucket 512, drops 1024+).
-#[cfg(feature = "gpt-oss-20b")]
+#[cfg(selected_model = "gpt-oss/gpt-oss-20b")]
 const GPT_OSS_HARMONY_BUCKET_CAP: u32 = 512;
 
 /// Greedy decode steps after each prefill (decoders only).
@@ -629,7 +629,7 @@ fn run_case(case: Case, paths: &[ExecPath]) {
     let dtype = l.model.metal_dtype();
     let steps = match case.rows {
         Rows::Sampled => DECODE_STEPS,
-        #[cfg(feature = "modernbert-base")]
+        #[cfg(selected_model = "modernbert/modernbert-base")]
         Rows::All => 0,
     };
     let block_sizes: Vec<usize> = (0..l.num_groups)
@@ -676,14 +676,14 @@ fn run_case(case: Case, paths: &[ExecPath]) {
                 let rows = bytes.len() / row_bytes;
                 let want_rows = match case.rows {
                     Rows::Sampled => 1,
-                    #[cfg(feature = "modernbert-base")]
+                    #[cfg(selected_model = "modernbert/modernbert-base")]
                     Rows::All => n,
                 };
                 assert_eq!(rows, want_rows, "terminal rows of a {n}-token step");
                 let sampled = &bytes[(rows - 1) * row_bytes..];
                 let hashed = match case.rows {
                     Rows::Sampled => sampled,
-                    #[cfg(feature = "modernbert-base")]
+                    #[cfg(selected_model = "modernbert/modernbert-base")]
                     Rows::All => &bytes[..],
                 };
                 let (tok, nans) = argmax(sampled, dtype);
@@ -721,7 +721,7 @@ macro_rules! o2_cases {
     (@or $default:ident) => { $default };
     (@or $default:ident, $given:ident) => { $given };
     ($( $feat:literal => $case:ident ($repo:literal, $rows:ident $(, $prompts:ident @ $cap:ident)?); )*) => {$(
-        #[cfg(feature = $feat)]
+        #[cfg(selected_model = $feat)]
         #[test]
         #[ignore = "needs a Metal 4 GPU and the checkpoint in the local Hub cache"]
         fn $case() {
@@ -744,23 +744,23 @@ macro_rules! o2_cases {
 // `/tmp/metal-unify/gate-builds.sh`. The suffix names the variant family the checkpoint matches.
 o2_cases! {
     // Dense (no quant preset).
-    "smollm2-135m" => o2_smollm2_135m("HuggingFaceTB/SmolLM2-135M-Instruct", Sampled);
-    "llama-3.2-1b" => o2_llama_3_2_1b("unsloth/Llama-3.2-1B-Instruct", Sampled);
-    "granite-3.1-2b-instruct" => o2_granite_3_1_2b_instruct("ibm-granite/granite-3.1-2b-instruct", Sampled);
-    "qwen2.5-0.5b" => o2_qwen2_5_0_5b("Qwen/Qwen2.5-0.5B-Instruct", Sampled);
-    "qwen3-0.6b" => o2_qwen3_0_6b("Qwen/Qwen3-0.6B", Sampled);
-    "modernbert-base" => o2_modernbert_base("answerdotai/ModernBERT-base", All);
+    "llama/smollm2-135m" => o2_smollm2_135m("HuggingFaceTB/SmolLM2-135M-Instruct", Sampled);
+    "llama/llama-3.2-1b" => o2_llama_3_2_1b("unsloth/Llama-3.2-1B-Instruct", Sampled);
+    "granite/granite-3.1-2b-instruct" => o2_granite_3_1_2b_instruct("ibm-granite/granite-3.1-2b-instruct", Sampled);
+    "qwen2/qwen2.5-0.5b" => o2_qwen2_5_0_5b("Qwen/Qwen2.5-0.5B-Instruct", Sampled);
+    "qwen3/qwen3-0.6b" => o2_qwen3_0_6b("Qwen/Qwen3-0.6B", Sampled);
+    "modernbert/modernbert-base" => o2_modernbert_base("answerdotai/ModernBERT-base", All);
     // mlx-affine-b4-g64.
-    "llama-3.2-3b" => o2_llama_3_2_3b_mlx("mlx-community/Llama-3.2-3B-Instruct-4bit", Sampled);
-    "llama-3.2-3b" => o2_llama_3_2_3b_mlx_long("mlx-community/Llama-3.2-3B-Instruct-4bit", Sampled, LONG_PROMPTS @ LONG_BUCKET_CAP);
-    "llama-3.2-1b" => o2_llama_3_2_1b_mlx("mlx-community/Llama-3.2-1B-Instruct-4bit", Sampled);
-    "gemma-4-26b-a4b-it" => o2_gemma_4_26b_a4b_mlx("mlx-community/gemma-4-26b-a4b-it-4bit", Sampled);
-    "gemma-3-1b-it" => o2_gemma_3_1b_mlx("mlx-community/gemma-3-1b-it-4bit", Sampled);
-    "granite-3.3-2b-instruct" => o2_granite_3_3_2b_mlx("mlx-community/granite-3.3-2b-instruct-4bit", Sampled);
-    "qwen2.5-0.5b" => o2_qwen2_5_0_5b_mlx("mlx-community/Qwen2.5-0.5B-Instruct-4bit", Sampled);
-    "qwen2.5-3b" => o2_qwen2_5_3b_mlx("mlx-community/Qwen2.5-3B-Instruct-4bit", Sampled);
-    "qwen3-0.6b" => o2_qwen3_0_6b_mlx("mlx-community/Qwen3-0.6B-4bit", Sampled);
-    "qwen3.5-0.8b" => o2_qwen3_5_0_8b_mlx("mlx-community/Qwen3.5-0.8B-4bit", Sampled);
+    "llama/llama-3.2-3b" => o2_llama_3_2_3b_mlx("mlx-community/Llama-3.2-3B-Instruct-4bit", Sampled);
+    "llama/llama-3.2-3b" => o2_llama_3_2_3b_mlx_long("mlx-community/Llama-3.2-3B-Instruct-4bit", Sampled, LONG_PROMPTS @ LONG_BUCKET_CAP);
+    "llama/llama-3.2-1b" => o2_llama_3_2_1b_mlx("mlx-community/Llama-3.2-1B-Instruct-4bit", Sampled);
+    "gemma4-moe/gemma-4-26b-a4b-it" => o2_gemma_4_26b_a4b_mlx("mlx-community/gemma-4-26b-a4b-it-4bit", Sampled);
+    "gemma3/gemma-3-1b-it" => o2_gemma_3_1b_mlx("mlx-community/gemma-3-1b-it-4bit", Sampled);
+    "granite/granite-3.3-2b-instruct" => o2_granite_3_3_2b_mlx("mlx-community/granite-3.3-2b-instruct-4bit", Sampled);
+    "qwen2/qwen2.5-0.5b" => o2_qwen2_5_0_5b_mlx("mlx-community/Qwen2.5-0.5B-Instruct-4bit", Sampled);
+    "qwen2/qwen2.5-3b" => o2_qwen2_5_3b_mlx("mlx-community/Qwen2.5-3B-Instruct-4bit", Sampled);
+    "qwen3/qwen3-0.6b" => o2_qwen3_0_6b_mlx("mlx-community/Qwen3-0.6B-4bit", Sampled);
+    "qwen3-5/qwen3.5-0.8b" => o2_qwen3_5_0_8b_mlx("mlx-community/Qwen3.5-0.8B-4bit", Sampled);
     // mlx-affine-b4-g64-qembed (untied, quantized embedding) and mlx-affine-b4-g32.
     // qwen3-5-moe is here, not above: its preset is `-qembed` (both checkpoints
     // pack `embed_tokens` AND `lm_head`). Each stem runs ITS OWN checkpoint —
@@ -770,24 +770,24 @@ o2_cases! {
     // `fingerprint_matches` is what keeps the two variants apart (#202). Before
     // that, one arch-wide 8-bit-gate preset described 3.6 only, so the 3.5 stem
     // was the only one compiled and it claimed the 3.6 checkpoint.
-    "qwen3.5-35b-a3b" => o2_qwen3_5_35b_a3b_mlx("mlx-community/Qwen3.5-35B-A3B-4bit", Sampled);
-    "qwen3.6-35b-a3b" => o2_qwen3_6_35b_a3b_mlx("mlx-community/Qwen3.6-35B-A3B-4bit", Sampled);
-    "qwen2.5-7b" => o2_qwen2_5_7b_mlx_qembed("mlx-community/Qwen2.5-7B-Instruct-4bit", Sampled);
-    "qwen2-vl-2b-mlx-text-only" => o2_qwen2_vl_2b_text_mlx_qembed("mlx-community/Qwen2-VL-2B-Instruct-4bit", Sampled);
+    "qwen3-5-moe/qwen3.5-35b-a3b" => o2_qwen3_5_35b_a3b_mlx("mlx-community/Qwen3.5-35B-A3B-4bit", Sampled);
+    "qwen3-5-moe/qwen3.6-35b-a3b" => o2_qwen3_6_35b_a3b_mlx("mlx-community/Qwen3.6-35B-A3B-4bit", Sampled);
+    "qwen2/qwen2.5-7b" => o2_qwen2_5_7b_mlx_qembed("mlx-community/Qwen2.5-7B-Instruct-4bit", Sampled);
+    "qwen2/qwen2-vl-2b-mlx" => o2_qwen2_vl_2b_text_mlx_qembed("mlx-community/Qwen2-VL-2B-Instruct-4bit", Sampled);
     // The 27B dense geometry: 3 GDN value heads per key head, 6 query heads per KV head.
-    "qwen3.8-27b-text-only" => o2_qwen3_8_27b_text_mlx_qembed("mlx-community/qwen3.8-27b-4bit", Sampled);
+    "qwen3-5/qwen3.8-27b" => o2_qwen3_8_27b_text_mlx_qembed("mlx-community/qwen3.8-27b-4bit", Sampled);
     // mlx-affine-b3-g64-qembed on the same stem: a fine-tune of it (Swift-1.5) at uniform 3-bit.
-    "qwen3.8-27b-text-only" => o2_qwen3_8_27b_swift_1_5_text_mlx_b3_qembed("ukisai/Swift-1.5-3bit-MLX-TextOnly", Sampled);
-    "granite-4.1-3b" => o2_granite_4_1_3b_mlx_g32("mlx-community/granite-4.1-3b-4bit", Sampled);
+    "qwen3-5/qwen3.8-27b" => o2_qwen3_8_27b_swift_1_5_text_mlx_b3_qembed("ukisai/Swift-1.5-3bit-MLX-TextOnly", Sampled);
+    "granite/granite-4.1-3b" => o2_granite_4_1_3b_mlx_g32("mlx-community/granite-4.1-3b-4bit", Sampled);
     // mlx-affine-b3-g64-qembed: GLM-4.5-Air — first 3-bit checkpoint, first
     // dense-router (no scales sibling) + sigmoid-bias (noaux_tc) MoE, first
     // q/k/v attention biases on the affine stack.
-    "glm-4.5-air" => o2_glm_4_5_air_mlx("mlx-community/GLM-4.5-Air-3bit", Sampled);
+    "glm4-moe/glm-4.5-air" => o2_glm_4_5_air_mlx("mlx-community/GLM-4.5-Air-3bit", Sampled);
     // gpt-oss: 120b is the first 2-bit checkpoint (mlx-affine-b2-g64-qembed,
     // uniform 2-bit INCLUDING the router); 20b rides b4-qembed as the quality
     // sanity anchor for the same arch (YaRN rope, attention sinks, biased
     // router, SwiGLU-OAI experts with per-expert linear biases).
-    "gpt-oss-120b" => o2_gpt_oss_120b_mlx("jesusoctavioas/gpt-oss-120b-mlx-2Bit", Sampled);
+    "gpt-oss/gpt-oss-120b" => o2_gpt_oss_120b_mlx("jesusoctavioas/gpt-oss-120b-mlx-2Bit", Sampled);
     // gpt-oss 120b "proper" 3-bit (scratchery/gpt-oss-120b-3bit): experts at
     // b3/g64 with attention 4, router 8, embed/lm_head 4 — the mixed-width
     // recipe the uniform-2-bit ablation convicted. The 2-bit-experts leg of
@@ -796,9 +796,9 @@ o2_cases! {
     // control generates clean harmony reasoning from this checkpoint. The
     // stem's own config carries the recipe (the qwen2.5-vl-3b-mlx
     // convention), so no quant feature is needed to build this case.
-    "gpt-oss-120b-3bit" => o2_gpt_oss_120b_3bit_mlx("scratchery/gpt-oss-120b-3bit", Sampled);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx("scratchery/gpt-oss-20b-4bit", Sampled);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);
-    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_harmony("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_HARMONY_PROMPTS @ GPT_OSS_HARMONY_BUCKET_CAP);
+    "gpt-oss/gpt-oss-120b-3bit" => o2_gpt_oss_120b_3bit_mlx("scratchery/gpt-oss-120b-3bit", Sampled);
+    "gpt-oss/gpt-oss-20b" => o2_gpt_oss_20b_mlx("scratchery/gpt-oss-20b-4bit", Sampled);
+    "gpt-oss/gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
+    "gpt-oss/gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);
+    "gpt-oss/gpt-oss-20b" => o2_gpt_oss_20b_mlx_harmony("scratchery/gpt-oss-20b-4bit", Sampled, GPT_OSS_HARMONY_PROMPTS @ GPT_OSS_HARMONY_BUCKET_CAP);
 }

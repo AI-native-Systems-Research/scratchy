@@ -3457,26 +3457,11 @@ dependencies = [
 name = "scratchy-models"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "half",
- "hf-hub-downloader",
- "objc2-metal",
- "proc-macro2",
  "rayon",
- "scratchy-core-common",
- "scratchy-core-config",
- "scratchy-core-model",
- "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
- "scratchy-layers",
  "scratchy-models-build",
  "scratchy-quantizations",
- "scratchy-target-metal",
- "scratchy-tensors",
- "scratchy-vision",
  "serde_json",
- "sha2 0.11.1",
- "tokenizers 0.23.2",
  "ureq 3.5.1",
 ]
 
@@ -3704,6 +3689,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-target-metal-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "hf-hub-downloader",
+ "objc2-metal",
+ "proc-macro2",
+ "scratchy-core-common",
+ "scratchy-core-config",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-forward-compiler-macro",
+ "scratchy-layers",
+ "scratchy-models",
+ "scratchy-models-build",
+ "scratchy-quantizations",
+ "scratchy-target-metal",
+ "scratchy-tensors",
+ "scratchy-vision",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokenizers 0.23.2",
+]
+
+[[package]]
 name = "scratchy-target-metal-worker"
 version = "0.1.0"
 dependencies = [
@@ -3718,11 +3729,11 @@ dependencies = [
  "scratchy-core-config",
  "scratchy-core-model",
  "scratchy-forward-compiler",
- "scratchy-models",
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
  "scratchy-serving-worker",
  "scratchy-target-metal",
+ "scratchy-target-metal-models",
  "serde_json",
  "tokenizers 0.23.2",
  "tokio",

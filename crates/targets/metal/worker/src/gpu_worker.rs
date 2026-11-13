@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `MetalWorker`: the `Worker` implementation backed by the Metal runtime
 //! (scratchy-forward-compiler `MetalWorkerPool` + scratchy-target-metal).
-//!
-//! Gated behind the `metal` feature flag.
 
-// Force the linker to keep `scratchy_models` — its `#[forward]`
-// modules register with `inventory::submit!` for auto-discovery by
+// Force the linker to keep the compiled models — their emitted modules
+// register with `inventory::submit!` for auto-discovery by
 // `scratchy_target_metal::try_load`. Without this, the linker gc's the
-// crate (no direct symbol references after the Phase B collapse)
-// and the inventory comes up empty.
-extern crate scratchy_models as _;
+// crate (nothing names its symbols directly) and the inventory comes up
+// empty.
+extern crate scratchy_target_metal_models as _;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

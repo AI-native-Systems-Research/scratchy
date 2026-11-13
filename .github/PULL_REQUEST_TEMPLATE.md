@@ -45,7 +45,7 @@ cargo build --release -p scratchy-cli --features metal,model/smollm2-135m
 ## CI gates run locally
 
 - [ ] `cargo fmt --all -- --check`
-- [ ] macOS/metal clippy — `cargo clippy -p scratchy-models --features metal,all -- -D warnings`
+- [ ] macOS/metal clippy — `cargo clippy -p scratchy-target-metal-models --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings`
 - [ ] linux/cuda clippy — see docs/CONTRIBUTING.md step 5
 - [ ] e2e smoke (if serving/runtime touched)
 - [ ] N/A — docs only

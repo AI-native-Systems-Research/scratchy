@@ -3,7 +3,7 @@ name = "scratchy-models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model architectures — one crate; scratchy-forwards.rs drives the #[forward] pipeline per arch"
+description = "The models — every arch's DSL carrier and configs — and the model scope a build compiles, as features"
 # Named build script (not build.rs) so the process shows as
 # `build-script-scratchy-forwards` instead of the opaque `build-script-build`.
 build = "scratchy-forwards.rs"
@@ -15,17 +15,17 @@ links = "scratchy-models"
 [features]
 # Deliberately empty. Every model + quant preset is fully opt-in — no
 # default scope to accidentally widen or need `--no-default-features` to
-# narrow. `scratchy-forwards.rs` panics at build time if zero model features
-# end up selected (see `total_models_emitted` in
+# narrow. A target's models build panics if zero model features end up
+# selected (see `total_models_emitted` in
 # crates/compiler/macros/src/config.rs), so a build naming no models fails
 # loudly instead of silently linking a binary with none. Name at least one,
-# e.g. `--features metal,llama-3.2-3b`, or a wider `--features metal,llama`
-# (bare arch name = every config in that arch) / `--features metal,all`.
+# e.g. `llama-3.2-3b`, or a wider `llama` (bare arch name = every config in
+# that arch) / `all`.
 default = []
 
-# Per-arch gates. `arch-<name>` compiles that arch's `pub mod <name>` and tells
-# the build script to emit it. Vision arches also pull their shared text decoder + the
-# vision host crate. (The build script scans dsl/*.py.)
+# Per-arch gates. `arch-<name>` selects the arch: a target's models build emits
+# it as `pub mod <name>`. Vision arches also pull their shared text decoder and
+# state `vision`. (The models build scans dsl/*.py.)
 arch-commandr = []
 arch-gemma2 = []
 arch-gemma3 = []
@@ -35,7 +35,7 @@ arch-glm4-moe = []
 arch-gpt-oss = []
 arch-granite = []
 arch-llama = []
-arch-locateanything = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-locateanything = ["arch-qwen2", "vision"]
 arch-mistral = []
 arch-mixtral = []
 arch-modernbert = []
@@ -44,9 +44,9 @@ arch-nemotron-h-latent = []
 arch-nemotron-h-mtp = []
 arch-phi3 = []
 arch-qwen2 = []
-arch-qwen2-5-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-5-vl = ["arch-qwen2", "vision"]
 arch-qwen2-moe = []
-arch-qwen2-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-vl = ["arch-qwen2", "vision"]
 arch-qwen3 = []
 arch-qwen3-5 = []
 arch-qwen3-5-moe = []
@@ -54,13 +54,13 @@ arch-qwen3-5-mtp = []
 arch-qwen3-5-dense-mtp = []
 arch-gemma4-assistant = []
 arch-dflash2 = []
-arch-qwen3-5-vl =["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen3-5-vl = ["arch-qwen3-5", "vision"]
 arch-qwen3-moe = []
 
-# Passthrough so the carrier-parity test can cfg-gate its vision arm on the
-# compiler's vision registry being compiled in (any arch-<X>-vl feature
-# enables it; nothing else does).
-vision = ["scratchy-forward-compiler/vision"]
+# The scope selects a vision arch (every arch-<X>-vl turns it on; nothing else
+# does): published with the rest of the scope, so a target's models crate
+# knows its build needs the vision towers' runtime.
+vision = []
 
 all-arches = [
     "arch-commandr",
@@ -104,8 +104,8 @@ all-arches = [
 # feature name itself would just be typed twice.
 #
 # A HANDFUL of stems are byte-identical files checked into two arch dirs at
-# once — the same checkpoint, loadable via a vision arch (pulls
-# `dep:scratchy-vision`) or via its non-vision base arch (doesn't). Verified
+# once — the same checkpoint, loadable via a vision arch (whose tower needs
+# the vision runtime) or via its non-vision base arch (doesn't). Verified
 # per pair, not a naming convention: the vision arch keeps the bare stem,
 # the base arch's copy is suffixed `-text-only` (established codebase
 # vocabulary — see e.g. crates/serving/api/src/multimodal.rs). Prefixing
@@ -693,7 +693,7 @@ all = [
 # a model of its own (`published_as`: Gemma 4 26B-A4B's assistant, from
 # `guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit` at MLX 4-bit g32);
 # serving it drafts with the head;
-# scratchy-cli's `metal` turns it on. `mtp` adds the other drafters published
+# `scr` turns it on. `mtp` adds the other drafters published
 # as models of their own, which name their targets (`head_targets`) and draft
 # only when `--speculative-model` names them. Reached as `spec/mtp` from
 # scratchy-cli through scratchy-spec (crates/models/spec), which forwards here:
@@ -701,19 +701,6 @@ all = [
 mtp-heads = ["arch-qwen3-5-mtp", "arch-qwen3-5-dense-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant", "arch-dflash2"]
 mtp = ["mtp-heads"]
 
-# Backends — ONE definition each (this is what kills the per-arch duplication).
-# The build-dep pipeline lib gets the backend so its emit matches; the runtime
-# compiler + target crates get it so the emitted code compiles; quant defaults
-# ride the backend.
-metal = [
-    "scratchy-forward-compiler-macro/metal",
-    "dep:scratchy-target-metal",
-    "scratchy-vision?/metal",
-]
-# TurboQuant KV compression for every metal model whose geometry the codec
-# takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
-# other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.
-turboquant = ["scratchy-forward-compiler-macro/turboquant"]
 # Shell tab-completion over REAL HuggingFace model ids. Off by default, and
 # deliberately so: the build script resolves the candidate list by querying
 # huggingface.co (one tag search per compiled arch, then one `config.json` per
@@ -726,29 +713,18 @@ turboquant = ["scratchy-forward-compiler-macro/turboquant"]
 # is public API), and `scr` completes models from the local hf-hub cache alone.
 # A cargo feature, NOT an env var — the build script reads `cfg!(feature = ...)`,
 # so the choice is recorded in the artifact rather than in a shell's environment.
-hf-completions = ["dep:ureq"]
-[dependencies]
-scratchy-layers = { path = "../../layers" }
-# The dim markers and typed weight handles each model's emitted `Weights` holds.
-scratchy-tensors = { path = "../../tensors" }
-scratchy-quantizations = { path = "../quantization" }
-scratchy-forward-compiler = { path = "../../compiler" }
-scratchy-target-metal = { path = "../../targets/metal", optional = true }
-scratchy-vision = { path = "../vision", optional = true }
-half = { workspace = true, optional = true }
-anyhow = { workspace = true }
-# The `BakedTokenizer`s the build script bakes (`baked_tokenizers.rs`) register against.
-scratchy-core-model = { workspace = true }
+hf-completions = ["dep:ureq", "dep:scratchy-forward-compiler-macro"]
 
-# scratchy-forwards.rs drives the #[forward] pipeline for every enabled arch (no attribute
-# macro). The backend feature is forwarded onto this build-dep above.
+[dependencies]
+# The quant presets the scope names: its build script publishes them as `links` metadata, which
+# cargo hands to this crate's build script, a direct dependent (`DEP_SCRATCHY_QUANTIZATIONS_PRESETS`).
+scratchy-quantizations = { path = "../quantization" }
+
 [build-dependencies]
-scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
-# The shared models build driver: every selected arch through the pipeline, with the target's
-# emitter (metal's, under `metal`).
+# The scope's metadata (`ScopeMetadata`), and the selected arches the registry resolves.
 scratchy-models-build = { path = "../build" }
-# `proc-macro2` for reading metal's tables off the emitted tokens.
-proc-macro2 = "1"
+# The quant configs the registry matches a candidate's `config.json` against (`hf_registry_build.rs`).
+scratchy-forward-compiler-macro = { path = "../../compiler/macros", optional = true }
 serde_json = { workspace = true }
 # The registry's Hub queries fan out on rayon (`hf_registry_build.rs`).
 rayon = { workspace = true }
@@ -760,33 +736,3 @@ rayon = { workspace = true }
 # `hf-completions`, so a build without that feature links no HTTP client into
 # the build script at all and cannot reach the network even by accident.
 ureq = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLDevice", "MTLResource"] }
-# bf16 logits readback in the qwen3 py-carrier parity test
-# (tests/qwen3_py_parity.rs).
-half = { workspace = true }
-# harness.json / checkpoint config.json reads + ForwardCtxHandle /
-# ForwardDeviceHandle in the universal carrier parity gate
-# (tests/carrier_parity.rs). compute_hybrid_kv_layout (shared with the
-# worker) builds gemma4-style hybrid KV pools in the same gate.
-scratchy-core-common = { workspace = true }
-scratchy-core-config = { workspace = true }
-serde_json = { workspace = true }
-# tests/metal_o2_logits.rs (the runtime logits oracle): local Hub-cache lookup, the tokenizer,
-# and the row hash (config parse and the hybrid KV layout: scratchy-core-config above).
-hf-hub-downloader = { workspace = true }
-scratchy-core-model = { workspace = true }
-sha2 = "0.11"
-tokenizers = { workspace = true }
-
-# The qwen3 py-parity test drives the real HF snapshot for the full
-# `qwen3-0.6b` stem directly (module path + goldens) on the metal target
-# (`scratchy-target-metal`, an optional dependency `metal` turns on), so a
-# build without both that stem and `metal` skips it. The universal gate
-# (tests/carrier_parity.rs) has no stem requirement — it skips arches the
-# build doesn't scope in, and compiles empty without `metal`.
-[[test]]
-name = "qwen3_py_parity"
-required-features = ["metal", "qwen3-0.6b"]
-

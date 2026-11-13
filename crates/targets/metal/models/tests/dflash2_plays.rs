@@ -4,14 +4,14 @@
 //! the drafter's rings after its acceptance. Here those are two plays of the drafter's one tape —
 //! its result play and its cache-writes play — so every baked tape plays its context commit in the
 //! second alone and its block draft in the first alone.
-#![cfg(all(feature = "metal", feature = "qwen3.6-35b-a3b-dflash2"))]
+#![cfg(compiled_model = "dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed")]
 
 use scratchy_target_metal::interpreter::metal::ForwardReads;
 use scratchy_target_metal::tape::lowered::KernelId as K;
 
 #[test]
 fn a_block_draft_and_its_commit_play_apart() {
-    use scratchy_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
+    use scratchy_target_metal_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
     assert!(!drafter::METAL_BUCKETS.is_empty());
     for spec in drafter::METAL_BUCKETS {
         for classed in spec.tapes {
@@ -96,7 +96,7 @@ fn a_block_draft_and_its_commit_play_apart() {
 #[test]
 fn its_context_rows_and_verify_rows_are_its_targets() {
     use scratchy_forward_compiler::CanonicalParams;
-    use scratchy_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
+    use scratchy_target_metal_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
     const {
         assert!(<drafter::Weights as CanonicalParams>::TARGET_HIDDEN_WIDTH == 8 * 2048);
         assert!(<drafter::Weights as CanonicalParams>::TARGET_ROUTES_EXPERTS);
@@ -109,7 +109,7 @@ fn its_context_rows_and_verify_rows_are_its_targets() {
 /// graphs, runtime/model/DFlashDraft.cpp, size their buffers apart).
 #[test]
 fn buckets_past_its_block_play_its_commit_alone() {
-    use scratchy_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
+    use scratchy_target_metal_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
     for spec in drafter::METAL_BUCKETS {
         let m = spec.bucket_m;
         assert_eq!(

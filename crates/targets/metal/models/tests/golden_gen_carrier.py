@@ -42,9 +42,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-ARCH_DIR = Path(__file__).parent.parent / "configs"
-DSL_DIR = Path(__file__).parent.parent / "dsl"
-PRESET_DIR = Path(__file__).parent.parent.parent / "quantization" / "presets"
+MODELS_DIR = Path(__file__).resolve().parents[4] / "models"
+ARCH_DIR = MODELS_DIR / "arch" / "configs"
+DSL_DIR = MODELS_DIR / "arch" / "dsl"
+PRESET_DIR = MODELS_DIR / "quantization" / "presets"
 
 INIT_SCALE = 0.02  # randn scale — deep stacks stay finite, logits non-degenerate
 BLOCK_SIZE = 16    # engine block size (metal worker default)

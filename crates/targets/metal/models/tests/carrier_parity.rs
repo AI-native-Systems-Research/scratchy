@@ -31,20 +31,20 @@
 //!   python tests/golden_gen_carrier.py --arch qwen3 --stem qwen3-0.6b --tiny
 //!
 //! Run (NO quant features — a preset replaces dense emission):
-//!   cargo test -p scratchy-models --features metal,qwen3-0.6b-parity-tiny \
+//!   cargo test -p scratchy-target-metal-models --features scratchy-models/qwen3-0.6b-parity-tiny \
 //!     --test carrier_parity -- --nocapture
 //!
 //! A `(stem, preset)` variant's golden (`golden_gen_carrier.py --preset P`)
 //! runs in a build selecting that preset
 //! (`--features ...,scratchy-quantizations/P`); every other build skips it.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(target_os = "macos")]
 mod imp {
     // The gate walks every goldens dir, but only arches whose stem feature
     // this build names have a compiled variant. Those variants register via
     // `inventory::submit!` ctors, which the linker dead-strips unless the
     // crate is force-linked — per the crate's own lib docs.
-    use scratchy_models as _;
+    use scratchy_target_metal_models as _;
 
     use half::bf16;
     use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -59,7 +59,7 @@ mod imp {
     use std::sync::Arc;
 
     const GOLDENS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens");
-    const CONFIGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/configs");
+    const CONFIGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../models/arch/configs");
     const BLOCK_SIZE: usize = 16; // engine block size (metal worker default)
     const NUM_BLOCKS: usize = 128; // pool size the oracle built its identity layout over
 
@@ -804,5 +804,5 @@ mod imp {
     }
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(target_os = "macos"))]
 mod imp {}

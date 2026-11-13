@@ -170,7 +170,7 @@ TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
 decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
 turns `turboquant` **on**; a spyre build does not have it. To build
 metal with a dense KV cache, name `metal-base` instead of `metal`: the same
-engine without scratchy-models' `turboquant` or `mtp-heads` (add
+engine without the metal worker's `turboquant` or scratchy-models' `mtp-heads` (add
 `model/mtp-heads` back to keep MTP drafting):
 
 ```bash
@@ -182,7 +182,7 @@ With it on, every selected model whose geometry the codec takes is emitted with
 why:
 
 ```
-warning: scratchy-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
+warning: scratchy-target-metal-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
 ```
 
 A model stays dense when it has no KV cache, when its KV cache is an MLA
@@ -261,7 +261,7 @@ scr model names --source compiled      # what this build resolved to
   features via a weak `model?/hf-completions` edge, so it activates only when
   a `-Fmodel/<stem>` is named; building `-p scratchy-models` directly does not
   turn it on (its own `default` stays empty, which is what keeps CI's
-  `--workspace` and `metal,all` runs network-free).
+  `--workspace` and `all` runs network-free).
 - **The names come most downloaded first**, the Hub's own ranking, so the
   canonical checkpoint leads its fine-tunes. `scr model names --source compiled`
   prints them in that order. zsh shows them in that order too. bash ≥ 4.4 does
@@ -307,14 +307,14 @@ feature directly.
 ## Direct crate builds
 
 `-p scratchy-cli` reaches `scratchy-models`/`scratchy-quantizations`/`scratchy-spec`
-via the `model`/`quant`/`spec` aliases. Building `-p scratchy-models` or
-`-p scratchy-quantizations` directly uses their real crate names instead
-(the aliases only exist on `crates/cli/scr/Cargo.toml`'s dependency edges);
-`scratchy-models` names the drafters itself (`mtp`, which `spec/mtp` forwards to):
+via the `model`/`quant`/`spec` aliases. Building a target's models crate
+directly (`scratchy-target-metal-models`, `scratchy-target-spyre-models`) names
+the scope crates by their real names instead (the aliases only exist on the
+CLIs' dependency edges); `scratchy-models` names the drafters itself (`mtp`,
+which `spec/mtp` forwards to):
 
 ```bash
-cargo build -p scratchy-models --no-default-features \
-    --features metal,llama-3.2-3b
+cargo build -p scratchy-target-metal-models --features scratchy-models/llama-3.2-3b
 # → only llama-3.2-3b's forward expands; its config.json is the only one
 #   even read out of crates/models/arch/configs/llama/
 ```

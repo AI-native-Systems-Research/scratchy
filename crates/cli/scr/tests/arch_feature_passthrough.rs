@@ -76,19 +76,16 @@ fn entries(array: &str) -> Vec<String> {
 
 /// Features that legitimately exist on BOTH crates under the same name —
 /// not passthrough duplication. `default` is a standard Cargo.toml key every
-/// `[features]` table has, unrelated across crates. The backend names
-/// (`metal`) are real, independent declarations on each crate —
-/// `scratchy-cli`'s versions do more than forward (they also gate
-/// `scratchy-serving-api`/-worker deps), not hand-forwarded scope features.
+/// `[features]` table has, unrelated across crates.
 ///
 /// The admission rule, so this list cannot become a dumping ground: a name
 /// belongs here ONLY if this crate's declaration does more than forward to
-/// scratchy-models. A backend gates its worker and the serving crates. A feature that only forwards (`x = ["model?/x"]`) is
+/// scratchy-models. A feature that only forwards (`x = ["model?/x"]`) is
 /// never admitted, whatever it names — a model scope or a capability alike:
 /// name the dependency feature where it is used instead (`metal` names
-/// `model?/turboquant`, `default` names `model?/hf-completions`), and
+/// `model?/mtp-heads`, `default` names `model?/hf-completions`), and
 /// [`no_feature_of_this_crate_only_forwards_to_scratchy_models`] fails on one.
-const SHARED_NON_SCOPE_FEATURES: &[&str] = &["default", "metal"];
+const SHARED_NON_SCOPE_FEATURES: &[&str] = &["default"];
 
 /// No feature of this crate only forwards to scratchy-models, whether or not
 /// the two crates share its name: `model/<feature>` already reaches every

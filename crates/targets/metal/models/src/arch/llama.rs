@@ -4,7 +4,7 @@ include!(concat!(env!("OUT_DIR"), "/llama.rs"));
 // selection is fully opt-in, no default) — this test hardcodes that one
 // model's emitted module path, so it can only compile when that model was
 // actually selected.
-#[cfg(all(test, feature = "metal", feature = "tinyllama-1.1b"))]
+#[cfg(all(test, compiled_model = "llama::tinyllama_1_1b"))]
 mod metal_emission_tests {
     /// Sanity-check that the macro emits the per-canonical metal
     /// surface (real Weights struct + accessor methods + load fn +

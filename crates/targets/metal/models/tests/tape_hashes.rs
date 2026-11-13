@@ -7,14 +7,13 @@
 //! every model's line as this build hashes it, and fails. A change that means to move a tape
 //! renames `.new` over the golden; nothing edits it by hand.
 //!
-//! The models are [`scratchy_models::METAL_MODELS`]: every model the build bakes a metal tape for,
+//! The models are [`scratchy_target_metal_models::METAL_MODELS`]: every model the build bakes a metal tape for,
 //! listed by its build script. The golden pins the scope CI runs it at (the metal-tests job's
 //! serving-layer step); at any other scope, a model it doesn't pin fails the same way a moved one
 //! does.
-#![cfg(feature = "metal")]
 
-use scratchy_models::METAL_MODELS;
 use scratchy_target_metal::interpreter::metal::MetalBucketSpec;
+use scratchy_target_metal_models::METAL_MODELS;
 use sha2::{Digest, Sha256};
 
 /// `buckets`' resolved commands, every bucket's every rung in order, hashed.

@@ -5,13 +5,16 @@
 //! drafter then reads the layer's input plus its attention, not its output, and accepts a fraction
 //! of what Splash does. So no capture of any baked tape is followed by the add-and-norm that
 //! finishes the row it copies.
-#![cfg(all(feature = "metal", feature = "mtp-heads", feature = "qwen3.6-35b-a3b"))]
+#![cfg(all(
+    compiled_arch = "dflash2",
+    compiled_model = "qwen3_5_moe::qwen3_6_35b_a3b_mlx_affine_b4_g64_qembed"
+))]
 
 use scratchy_target_metal::tape::lowered::KernelId;
 
 #[test]
 fn every_capture_copies_a_finished_layer_output() {
-    use scratchy_models::qwen3_5_moe::qwen3_6_35b_a3b_mlx_affine_b4_g64_qembed as target;
+    use scratchy_target_metal_models::qwen3_5_moe::qwen3_6_35b_a3b_mlx_affine_b4_g64_qembed as target;
     let mut captures = 0;
     for spec in target::METAL_BUCKETS {
         for classed in spec.tapes {

@@ -81,6 +81,7 @@ jobs:
         run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct
           --exclude scratchy-target-metal
           --exclude scratchy-target-metal-compiler
+          --exclude scratchy-target-metal-models
           --exclude scratchy-target-metal-worker
           -- -D warnings
 
@@ -243,9 +244,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.
   #
-  # `scratchy-models` (built here with `all-arches`) is the umbrella that
-  # compiles the whole Metal inference stack plus every per-arch model crate.
-  # The Linux-only workspace members are linted by linux-workspace. The runner
+  # `scratchy-target-metal-models` (built here at `all`) compiles the whole
+  # Metal inference stack and every model. The Linux-only workspace members are linted by linux-workspace. The runner
   # has a real Apple GPU, so kernel tests run.
   #
   # macos-26 (Tahoe) is required: the metal kernels target Metal 4 and the
@@ -275,14 +275,16 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy + test.
-      # `turboquant` is on in every default `scr` build but not in
-      # scratchy-models' own (empty) default, so name it: every model then
+      # `turboquant` is on in every default `scr` build but not in the metal
+      # models crate's own (empty) default, so name it: every model then
       # expands with the KV codec users get, and the lowering's check that a
       # TurboQuant model's tape compresses its KV runs across the whole catalog.
       # `mtp` adds the multi-token-prediction head of every model whose
-      # checkpoint carries one (heads have no configs of their own).
+      # checkpoint carries one (heads have no configs of their own). `vision`:
+      # `all` selects the vision arches, whose towers need it.
       - name: Clippy
-        run: cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings
+        run: cargo clippy -p scratchy-target-metal-models
+          --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings
 
       # The other half of macos-scope's skip: fails if this job compiled a crate
       # whose PRs skip it.
@@ -323,12 +325,10 @@ jobs:
       # the smallest stem: one arch, one Hub query. Runners have network; a Hub
       # outage degrades to an empty registry rather than failing the build.
       - name: Clippy (hf-completions)
-        run: cargo clippy -p scratchy-models --features metal,smollm2-135m,hf-completions -- -D warnings
+        run: cargo clippy -p scratchy-models --features smollm2-135m,hf-completions -- -D warnings
 
-      # `cargo test -p scratchy-models` runs ZERO tests — that crate is a pure
-      # re-export umbrella with no test targets, and a dependency's integration
-      # tests don't run transitively. Test the crate that actually holds the
-      # GPU kernel suite (~155 tests: qmm/qmv/softmax/attention/rope/moe vs CPU
+      # A dependency's integration tests don't run transitively: test the crate
+      # that holds the GPU kernel suite (~155 tests: qmm/qmv/softmax/attention/rope/moe vs CPU
       # reference). The macos-26 runner has a real Apple GPU, so these execute.
       - name: Kernel tests
         run: cargo test -p scratchy-target-metal
@@ -363,8 +363,8 @@ jobs:
       # pattern matcher or a dropped per-layer row rejects nothing, so the
       # symptom is a silent mis-load, not a red test. Nothing else in CI
       # reaches them: the workspace clippy has no `--all-targets`, and a
-      # dependency's tests do not run transitively (see the `cargo test -p
-      # scratchy-models` note above). scratchy-layers holds the runtime half
+      # dependency's tests do not run transitively (see the kernel tests
+      # above). scratchy-layers holds the runtime half
       # (`affine_pattern_matches`, `affine_widths_agree_in`) and needs no
       # features.
       - name: Variant-selection gate tests (scratchy-layers)
@@ -384,7 +384,7 @@ jobs:
       - name: Clippy (forward-compiler macro, metal, tests)
         run: cargo clippy -p scratchy-forward-compiler-macro --features metal --tests -- -D warnings
 
-      # Type-check scratchy-models' INTEGRATION tests (`tests/*.rs`). Nothing
+      # Type-check the metal models crate's INTEGRATION tests (`tests/*.rs`). Nothing
       # else does: every clippy step is `--lib`-shaped and the `cargo test`
       # steps above are `--lib` too, so these files only ever compile on a
       # developer's machine. They call `try_load` / the metal allocator
@@ -394,44 +394,44 @@ jobs:
       #
       # Deliberately a NARROW model scope, not `all` (every config's expansion
       # and bake). These three stems compile carrier_parity, metal_o2_logits
-      # and qwen3_py_parity (`qwen3-0.6b` is its `[[test]]` required feature:
-      # without it the file rotted unbuilt).
+      # and qwen3_py_parity (`qwen3-0.6b` compiles the model it runs: without
+      # it the file rotted unbuilt).
       - name: Model-crate integration tests type-check
-        run: cargo clippy -p scratchy-models --tests
-          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b,qwen3-0.6b -- -D warnings
+        run: cargo clippy -p scratchy-target-metal-models --tests
+          --features scratchy-models/qwen3.5-35b-a3b,scratchy-models/qwen3.6-35b-a3b,scratchy-models/qwen3-0.6b -- -D warnings
 
       # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
       # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the
       # Anthropic `/v1/messages` translation. Pure logic, no GPU and no real
-      # model at runtime, but scratchy-models has no default model scope
-      # (build-time panic otherwise), so name the smallest one.
+      # model at runtime; the metal models crate's tests run beside them, and its
+      # build panics on an empty model scope, so name the smallest one.
       #
       # `serve` is required, not optional: without it `anthropic` and `server`
       # are not compiled, so their tests cannot run.
       # `--test tape_hashes`: each baked model's resolved tape held to its pinned hash
-      # (crates/models/arch/tape_hashes.txt), at this step's scope and on its build.
+      # (crates/targets/metal/models/tape_hashes.txt), at this step's scope and on its build.
       - name: Serving-layer unit tests
-        run: cargo test -p scratchy-serving-api -p scratchy-models
-          --features metal,serve,scratchy-models/smollm2-135m --lib --test tape_hashes
+        run: cargo test -p scratchy-serving-api -p scratchy-target-metal-models
+          --features serve,scratchy-models/smollm2-135m --lib --test tape_hashes
 
       # The quarantined per-tool-spans path (#193) is off by default, so
       # nothing above compiles it. Type-check it and run its gated tests so it
       # cannot rot. Cheap: same deps as the step above, one extra cfg.
       - name: Serving-layer unit tests (tool-spans quarantine)
-        run: cargo test -p scratchy-serving-api -p scratchy-models
-          --features metal,serve,tool-spans,scratchy-models/smollm2-135m --lib
+        run: cargo test -p scratchy-serving-api -p scratchy-target-metal-models
+          --features serve,tool-spans,scratchy-models/smollm2-135m --lib
 
       # The metal e2e tests boot a server on a real model, so they need a Metal 4
       # GPU. This runner's paravirtual GPU has none, so each test would return
       # early (`skip_if_no_gpu!`) and pass without running. What CI can check
       # here is that the files compile and lint clean; run them on a real GPU.
       # `--tests` type-checks every e2e test target, and, since `-p
-      # scratchy-models` is what names the model, scratchy-models' own lib and
-      # integration tests at that model. e_otel.rs and scratchy-cli's test
+      # scratchy-target-metal-models` is what names the model, that crate's own
+      # lib and integration tests at that model. e_otel.rs and scratchy-cli's test
       # targets are linted in the linux-workspace job. `--keep-going` reports
       # every failing test target, not just those in flight at the first failure.
       - name: Lint the metal e2e tests
-        run: cargo clippy -p scratchy-e2e -p scratchy-models
+        run: cargo clippy -p scratchy-e2e -p scratchy-target-metal-models
           --features e2e,metal,scratchy-models/smollm2-135m
           --tests --keep-going -- -D warnings
 

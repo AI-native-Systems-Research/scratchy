@@ -19,8 +19,9 @@
 //!     --checkpoint ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<sha>
 //!
 //! Run:
-//!   cargo test -p scratchy-models --features metal,qwen3-0.6b \
+//!   cargo test -p scratchy-target-metal-models --features scratchy-models/qwen3-0.6b \
 //!     --test qwen3_py_parity -- --nocapture
+#![cfg(compiled_model = "qwen3::qwen3_0_6b")]
 
 use half::bf16;
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -135,7 +136,7 @@ fn qwen3_py_carrier_parity() {
     let mut gw = GpuWeights::from_dir(SNAPSHOT, allocator.clone()).expect("GpuWeights::from_dir");
     gw.set_target_dtype(DType::BF16);
     // max_model_len small: rope cache only needs to cover our positions.
-    let w = scratchy_models::qwen3::qwen3_0_6b::load(&mut gw, (), n_tokens, 0)
+    let w = scratchy_target_metal_models::qwen3::qwen3_0_6b::load(&mut gw, (), n_tokens, 0)
         .expect("load (qwen3-0.6b)");
 
     // ── Paged KV pool: the identity layout the oracle used ─────────
@@ -257,8 +258,9 @@ fn qwen3_py_carrier_parity() {
     let _ = null_view; // completeness placeholder, unused fields are None
 
     // ── RUN the compiled forward (the tape from the .py carrier) ──
-    let out =
-        unsafe { scratchy_models::qwen3::qwen3_0_6b::forward(&w, &ctx, &mut device, n as u64) };
+    let out = unsafe {
+        scratchy_target_metal_models::qwen3::qwen3_0_6b::forward(&w, &ctx, &mut device, n as u64)
+    };
 
     // ── Readback: StorageModeShared arena → host-readable after the
     // interpreter's waitUntilCompleted. Logits are bf16 [1, vocab]: the one

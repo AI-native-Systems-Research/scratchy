@@ -57,6 +57,7 @@ members = [
     "crates/compiler/subtile",
     "crates/targets/metal",
     "crates/targets/metal/compiler",
+    "crates/targets/metal/models",
     "crates/targets/metal/worker",
 ]
 # scratchy-tui pulls goose from git (not published to crates.io) and stands

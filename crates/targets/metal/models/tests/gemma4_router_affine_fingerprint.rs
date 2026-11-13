@@ -16,17 +16,17 @@
 //!
 //! This pins the WIRING end-to-end — config + preset + per-(stem, preset)
 //! overrides merged, forward-expanded, emitted — by reading the emission
-//! this very build produced (`scratchy-forwards.rs` writes
-//! `$OUT_DIR/gemma4_moe.rs`, which `src/lib.rs` includes). Each leg asserts
+//! this very build produced (the build script writes
+//! `$OUT_DIR/gemma4_moe.rs`, which `src/arch/gemma4_moe.rs` includes). Each leg asserts
 //! only the variant modules this build actually carries, but at least one
-//! 26b variant must be present: a stem-feature build with every variant
+//! 26b variant must be present: a build selecting the stem with every variant
 //! missing is a build bug, not a skip.
-#![cfg(feature = "gemma-4-26b-a4b-it")]
+#![cfg(selected_model = "gemma4-moe/gemma-4-26b-a4b-it")]
 
 /// The `gemma4_moe.rs` emission this build produced.
 fn emission() -> String {
     std::fs::read_to_string(concat!(env!("OUT_DIR"), "/gemma4_moe.rs"))
-        .expect("scratchy-forwards.rs writes $OUT_DIR/gemma4_moe.rs")
+        .expect("the build script writes $OUT_DIR/gemma4_moe.rs")
 }
 
 /// One variant module's body: from its `pub mod <name> {` to the next

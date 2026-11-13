@@ -345,7 +345,7 @@ impl CommandPool {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
             let tokens = quote! {
-                #[cfg(feature = "metal")]
+                #[cfg(scratchy_target = "metal")]
                 static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] = &[];
             };
             return Ok(tokens);
@@ -510,7 +510,7 @@ impl CommandPool {
             }
         });
         let tokens = quote! {
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             mod __tape_cmds {
                 #aliases
                 #markers
@@ -531,7 +531,7 @@ impl CommandPool {
                 };
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
             }
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
                 &__tape_cmds::KERNELS;
         };
@@ -1253,7 +1253,7 @@ pub fn kv_cap_ladder(
 /// A bucket's MTL4 barrier flags as a `static`.
 pub fn emit_bucket_barriers_static(static_ident: &syn::Ident, barriers: &[bool]) -> TokenStream {
     quote! {
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         static #static_ident: &[bool] = &[ #(#barriers),* ];
     }
 }

@@ -119,6 +119,13 @@ pub trait TargetEmitter: Sync {
     /// its layers and loaders) through it, as `crate::__gpu`.
     fn facade(&self) -> TokenStream;
 
+    /// The modules at the models crate's root that every arch's emitted code names
+    /// (`crate::<module>`): items the target bakes once for every arch, which the models build
+    /// leaves at the root rather than re-rooting under the arch's module.
+    fn shared_root_modules(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The items a target bakes for one model at its decode point — spliced into the model's
     /// module. Empty for a target whose program is emitted elsewhere in the pipeline.
     fn bake_model(&self, cx: &BakeCx<'_>) -> TokenStream {
@@ -144,6 +151,11 @@ impl TargetEmitter for Metal {
 
     fn facade(&self) -> TokenStream {
         quote::quote! { ::scratchy_target_metal }
+    }
+
+    /// The baked kernels, each once for every arch that names it (`crate::__metal_bake::K_<key>`).
+    fn shared_root_modules(&self) -> &'static [&'static str] {
+        &["__metal_bake"]
     }
 
     fn weights_fields(&self) -> TokenStream {

@@ -56,7 +56,8 @@ bench-datasets = ["bench", "scratchy-bench/datasets"]
 # not the HTTP server — a backend is only meaningful with local
 # inference.
 #
-# `metal` is `metal-base` with two scratchy-models features on. They are named here, not as features of this crate:
+# `metal` is `metal-base` with two features on: the metal worker's `turboquant`, and the
+# scratchy-models feature `mtp-heads`, named here, not as a feature of this crate:
 # `model/<feature>` already reaches every scratchy-models feature (see
 # `tests/arch_feature_passthrough.rs`).
 #
@@ -76,7 +77,7 @@ bench-datasets = ["bench", "scratchy-bench/datasets"]
 # `metal-base` alone builds the same engine with a dense KV cache and no MTP
 # heads; add `model/mtp-heads` back for drafting over a dense cache.
 metal-base = ["dep:scratchy-serving-api", "dep:scratchy-target-metal-worker", "dep:scratchy-forward-compiler"]
-metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
+metal = ["metal-base", "scratchy-target-metal-worker/turboquant", "model?/mtp-heads"]
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to

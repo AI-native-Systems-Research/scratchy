@@ -305,7 +305,7 @@ def main():
     lm_head = w_embed  # tied
 
     # ── EXECUTE THE CARRIER AS PYTHON ──
-    carrier = (Path(__file__).parent.parent / "dsl" / "qwen3.py").read_text()
+    carrier = (Path(__file__).resolve().parents[4] / "models" / "arch" / "dsl" / "qwen3.py").read_text()
     env = dict(globals())
     exec(compile(carrier, "qwen3.py", "exec"), env)
     logits = env["qwen3"]()
