@@ -114,6 +114,48 @@ unsafe extern "C" {
         col64: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemm_fp8_variant(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        n_tile: u32,
+        k_step: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_group_fp8_variant(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        m: u32,
+        k: u32,
+        count: u32,
+        k_step: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_up_gemm_fp8_variant(
+        a: *const c_void,
+        a_scale: *const c_void,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        act: u32,
+        n_tile: u32,
+        k_step: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_expert_gemm_fp8(
         a: *const c_void,
         a_scale: *const c_void,
@@ -4249,7 +4291,8 @@ pub unsafe fn quant_row_fp8_one(
 /// Launch the fp8 GEMM (`kernels/gemm_fp8.cu`): `c [m, n] = bf16((a · bᵀ) · b_scale[n] ·
 /// a_scale[m])`, accumulated in f32. At `col64` false on [`gemm_bf16_abt`]'s tile grid (`m`, `n`,
 /// `k` non-zero multiples of 128, 256 and 64), at `col64` true on [`gemm_col64_bf16_abt`]'s (128,
-/// 64, 64); none above `i32::MAX`. On an `n` both take, each element is the same bits.
+/// 64, 64); none above `i32::MAX`. On an `n` both take, each element is the same bits. Its K step
+/// is 128 where `k` is a multiple of 128 and 64 elsewhere (FP8 S8 G1), the same bits.
 /// Asynchronous; refused with [`KernelError::Shape`] before any pointer is touched.
 ///
 /// # Safety
@@ -4330,6 +4373,64 @@ pub unsafe fn gemm_group_fp8_abt(
     check(code, refused)
 }
 
+/// Test support for `tests/gemm_fp8.rs` only (FP8 S8 G1): [`gemm_fp8_abt`] at column tile `n_tile`
+/// (256, or 64: `col64`'s) and K step `k_step` (64, or 128 with `k` a multiple of 128), under that
+/// tile's rule. Each element is the same bits at every form. No `CudaStep` uses it.
+///
+/// # Safety
+///
+/// As [`gemm_fp8_abt`]'s.
+#[doc(hidden)]
+pub unsafe fn gemm_fp8_variant(
+    a: Fp8Operand,
+    b: Fp8Operand,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    (n_tile, k_step): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape and form and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_gemm_fp8_variant(a.0, a.1, b.0, b.1, c, m, n, k, n_tile, k_step, stream)
+    };
+    check(code, KernelError::Shape { m, n, k })
+}
+
+/// Test support (FP8 S8 G1): [`gemm_group_fp8_abt`] at K step `k_step` (64, or 128 with `k` a
+/// multiple of 128). No `CudaStep` uses it.
+///
+/// # Safety
+///
+/// As [`gemm_group_fp8_abt`]'s.
+#[doc(hidden)]
+pub unsafe fn gemm_group_fp8_variant(
+    a: Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    (m, k): (u32, u32),
+    k_step: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemm_group_fp8_variant", members, (m, k));
+    let count = members.len() as u32;
+    // SAFETY: as [`gemm_group_fp8_abt`]'s.
+    let code = unsafe {
+        scratchy_cuda_gemm_group_fp8_variant(
+            a.0,
+            a.1,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            m,
+            k,
+            count,
+            k_step,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
 /// The fp8 gate/up GEMM: `c [m, n] = bf16(act(g, u))`, `g` and `u` each [`gemm_fp8_abt`]'s value
 /// before its rounding (scaled by its own weight's scales and by `a`'s), `act` 0 for SwiGLU's
 /// `silu_mul` and 1 for GeGLU's `gelu_tanh_mul`, in f32, rounded once. Under [`gemm_fp8_abt`]'s
@@ -4368,6 +4469,37 @@ pub unsafe fn gate_up_gemm_fp8(
         code,
         KernelError::GateUpShape {
             kernel: "gate_up_gemm_fp8",
+            dims: [m, n, k, 1],
+        },
+    )
+}
+
+/// Test support (FP8 S8 G1): [`gate_up_gemm_fp8`] at `n_tile` columns per accumulator (128, 64, or
+/// 192 at K step 128 only) and K step `k_step` (64, or 128 with `k` a multiple of 128), `m` a
+/// multiple of 128 and `n` of `n_tile`. Each element is the same bits at every form. No
+/// `CudaStep` uses it.
+///
+/// # Safety
+///
+/// As [`gate_up_gemm_fp8`]'s.
+#[doc(hidden)]
+pub unsafe fn gate_up_gemm_fp8_variant(
+    (a, gate, up): (Fp8Operand, Fp8Operand, Fp8Operand),
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    (act, n_tile, k_step): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape, form and codes before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_gate_up_gemm_fp8_variant(
+            a.0, a.1, gate.0, gate.1, up.0, up.1, c, m, n, k, act, n_tile, k_step, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "gate_up_gemm_fp8_variant",
             dims: [m, n, k, 1],
         },
     )

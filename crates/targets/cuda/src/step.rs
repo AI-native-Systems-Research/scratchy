@@ -372,9 +372,10 @@ pub const fn gemv_tc_takes(ns: [u32; 3], k: u32, pairs: u32) -> bool {
     rows * k as u64 * pairs as u64 >= GEMV_TC_MIN_BYTES
 }
 
-/// An fp8 GEMM's or GEMV's `k` is a non-zero multiple of this: its K step (64 e4m3 bytes, one
-/// 64-byte-swizzled row, two `k32` WGMMAs). Every fp8 `k` of the three FP8 checkpoints is one
-/// (Gemma's down projections, 2112 and 704, are not multiples of 128).
+/// An fp8 GEMM's or GEMV's `k` is a non-zero multiple of this: its smallest K step (64 e4m3
+/// bytes, one 64-byte-swizzled row, two `k32` WGMMAs; a `k` that is a multiple of 128 runs the
+/// dense GEMMs at 128, the same bits, FP8 S8 G1). Every fp8 `k` of the three FP8 checkpoints is
+/// one (Gemma's down projections, 2112 and 704, are not multiples of 128).
 pub const GEMM_FP8_K_MULTIPLE: u32 = 64;
 
 /// One fp8 weight's device buffer ([`crate::weights::CudaWeight::Fp8`]): the checkpoint's e4m3

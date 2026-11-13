@@ -9,12 +9,14 @@
 // Adapted from ThunderKittens `kernels/gemm/fp8_h100_scaled/fp8_h100_gemm_scaled.cu` at 67845f5f
 // (MIT, see `thunderkittens/LICENSE`; that file is not vendored), through `gemm_bf16.cu`'s
 // templates, which keep their structure here. What changed from upstream:
-//   - The K step is 64, not 128: A is `st_fp8e4m3<64, 64>` and B `N_BLOCK` row-stacked
-//     `st_fp8e4m3<64, 64>` (64-byte rows, 64-byte swizzle), so each stage runs two `k32` WGMMAs.
-//     Every fp8 `k` of the three FP8 checkpoints is a multiple of 64 (Gemma's 704 and 2112 are not
-//     of 128): `step::GEMM_FP8_K_MULTIPLE`.
+//   - The K step is 128 where `k` is a multiple of 128 and 64 elsewhere (FP8 S8 G1): A is
+//     `st_fp8e4m3<64, K_STEP>` and B `N_BLOCK` row-stacked `st_fp8e4m3<64, K_STEP>` (K_STEP-byte
+//     rows and swizzle), so each stage runs four `k32` WGMMAs, or two. Every fp8 `k` of the three
+//     FP8 checkpoints is a multiple of 64 (Gemma's 704 and 2112 are not of 128):
+//     `step::GEMM_FP8_K_MULTIPLE`. A 128-byte box past `k` would read the next row's bytes
+//     (TK-1's R1), so K step 128 needs `k` a multiple of 128.
 //   - B is `N_BLOCK` 64-row tiles, as `gemm_bf16.cu`'s, so the accumulator is `rt_fl<16, 256>`
-//     (or 64 at col64), not upstream's 128.
+//     (or 64 at col64; the gate/up's two are 128 wide, or 64 or 192), not upstream's 128.
 //   - The epilogue is upstream's, `mul_col(acc, w_scale)` then `mul_row(acc, a_scale)`
 //     (`scale_acc`), and the store is bf16 (`st_bf` finish tiles, `gemm_bf16.cu`'s), the one
 //     rounding.
@@ -28,9 +30,13 @@
 //   - `gate_up_template`: the gate's and the up's GEMMs, each accumulator scaled by its own
 //     `w_scale` and by `a_scale`, then `OP` (`silu_mul` or `gelu_tanh_mul`) in f32, rounded once
 //     (`scratchy_cuda_gate_up_gemm_fp8`). Unlike the bf16 fold, the gate and the up are never
-//     rounded to bf16 on their own: the one rounding is the activation's output's.
-// Each instance's K loop is the same 64-wide steps in the same WGMMA order, so a member of a
-// group, or a 64-column tile, is the plain GEMM's bits at that element.
+//     rounded to bf16 on their own: the one rounding is the activation's output's. Its column
+//     tile is 128 per accumulator, or at `col64` 192 where `n` is a multiple of 192 and `k` of 128
+//     (Gemma's 2112 = 11 x 192 over 2816, FP8 S8 G1) and 64 elsewhere.
+// Each instance's K loop is the same `k32` WGMMAs in the same order at either K step, and each
+// output element is its own row's and column's K sequence, so a member of a group, a 64- or
+// 192-column tile, or a K step of 128 is the plain GEMM's bits at that element (`tests/gemm_fp8.rs`,
+// `G1_BITS`).
 //
 // Numerics: Hopper's fp8 WGMMA accumulates inside the tensor core at reduced precision (FP8 plan
 // Risk A); `tests/gemm_fp8.rs` measures it against f64 at every `k` of the three models.
@@ -45,6 +51,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <type_traits>
 
 using namespace kittens;
 using namespace kittens::prototype;
@@ -59,9 +66,12 @@ namespace {
 // One thread block per SM of an H100 SXM, as `gemm_bf16.cu`: correctness does not depend on it.
 constexpr int H100_SXM_SMS = 132;
 
-using in_tile = st_fp8e4m3<64, 64>;
+// An e4m3 operand's tile at K step `K_STEP` (64 or 128), and its view.
+template <int K_STEP> using k_tile = st_fp8e4m3<64, K_STEP>;
+template <int K_STEP> using k_gl = gl<fp8e4m3, 1, 1, -1, -1, k_tile<K_STEP>>;
+using in_tile = k_tile<64>;
 using out_tile = st_bf<64, 64>;
-using in_gl = gl<fp8e4m3, 1, 1, -1, -1, in_tile>;
+using in_gl = k_gl<64>;
 using out_gl = gl<bf16, 1, 1, -1, -1, out_tile>;
 // `[1, len]` f32: read by `warp::load`/`warpgroup::load` into register vectors, no tensor map.
 using scale_gl = gl<float, 1, 1, 1, -1>;
@@ -82,28 +92,41 @@ __device__ inline void scale_acc(ACC& acc, const WGL& w, int w_row, int col_bloc
     warp::mul_row(acc, acc, as);
 }
 
-template<int M_BLOCK, int N_BLOCK>
+// The input ring's stages: 4, or as many as fit the shared memory budget beside the alignment
+// `lcf` reserves (3 at the gate/up's 192-column tiles at K step 128). The stage count orders no
+// arithmetic.
+template <typename INPUT_BLOCK>
+constexpr int pipe_stages() {
+    constexpr int fit = int((kittens::MAX_SHARED_MEMORY - 2048) / sizeof(INPUT_BLOCK));
+    return fit < 4 ? fit : 4;
+}
+
+template<int M_BLOCK, int N_BLOCK, int K_STEP>
 struct matmul_layout {
-    struct globals        { in_gl A, B; out_gl C; scale_gl A_scale, B_scale; };
-    struct input_block    { in_tile a[M_BLOCK], b[N_BLOCK]; };
+    using a_gl = k_gl<K_STEP>;
+    struct globals        { a_gl A, B; out_gl C; scale_gl A_scale, B_scale; };
+    struct input_block    { k_tile<K_STEP> a[M_BLOCK], b[N_BLOCK]; };
     struct finish_block   { out_tile c[M_BLOCK][N_BLOCK]; };
     struct common_state   { int2 coord; };
     struct consumer_state { rt_fl<16, N_BLOCK*64> accum; };
 };
-template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _K_STEP=64>
 struct matmul_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
-    using layout    = matmul_layout<M_BLOCK, N_BLOCK>;
+    static constexpr int K_STEP = _K_STEP;
+    using layout    = matmul_layout<M_BLOCK, N_BLOCK, K_STEP>;
     // `gemm_bf16.cu`'s two views. The finish block's N_BLOCK column-adjacent 64x64 bf16 tiles as
     // one [64, 64*N_BLOCK] tile. The input block's N_BLOCK row-stacked 64x64 e4m3 B tiles as one
     // [64*N_BLOCK, 64] tile, layout-identical: each is 4 KB with 64-byte swizzled rows, so tile i's
     // row r sits at byte (64*i + r)*64 of `input.b`, where the [256, 64] tile keeps its row
     // 64*i + r; the 64-byte swizzle repeats every 512 bytes (a function of address bits 4-8) and
     // `input.b` starts 1024-byte aligned (the `lcf` input blocks are, and `a` before it is 8 KB),
-    // so the swizzle pattern matches too.
+    // so the swizzle pattern matches too. At K step 128 each B tile is 8 KB with 128-byte swizzled
+    // rows, the swizzle repeats every 1024 bytes and `a` before it is 16 KB: the same holds.
     using wide_tile = st_bf<64, 64*N_BLOCK>;
-    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, 64>;
-    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, K_STEP>;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, PRODUCER_BARRIER_ARRIVALS=1;
+    static constexpr int INPUT_PIPE_STAGES = pipe_stages<typename layout::input_block>();
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
@@ -121,7 +144,7 @@ struct matmul_template {
             args.num_iters = -1;
             return;
         }
-        args.num_iters = args.globals.A.cols()/64;
+        args.num_iters = args.globals.A.cols()/K_STEP;
         int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid(); // producer sets as 0
         args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
     }
@@ -148,7 +171,7 @@ struct matmul_template {
             kittens::warp::zero(args.state.accum);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
-            // Two `m64nNk32` WGMMAs: the 64-byte K step.
+            // `K_STEP / 32` `m64nNk32` WGMMAs: the K step.
             warpgroup::mma_ABt(
                 args.state.accum,
                 args.input.a[warpgroup::groupid()],
@@ -176,24 +199,28 @@ struct matmul_template {
 // The grouped GEMM: `gemm_bf16.cu`'s `group_template` (up to three members off one A, each its own
 // GEMM's bits), each member with its own B, C and `w_scale`. An absent third member repeats the
 // second's views and owns no task.
-template<int M_BLOCK, int N_BLOCK>
+template<int M_BLOCK, int N_BLOCK, int K_STEP>
 struct group_layout {
-    struct globals        { in_gl A, B0, B1, B2; out_gl C0, C1, C2;
+    using a_gl = k_gl<K_STEP>;
+    struct globals        { a_gl A, B0, B1, B2; out_gl C0, C1, C2;
                             scale_gl A_scale, S0, S1, S2; int members; };
-    struct input_block    { in_tile a[M_BLOCK], b[N_BLOCK]; };
+    struct input_block    { k_tile<K_STEP> a[M_BLOCK], b[N_BLOCK]; };
     struct finish_block   { out_tile c[M_BLOCK][N_BLOCK]; };
     struct common_state   { int2 coord; int member; };
     struct consumer_state { rt_fl<16, N_BLOCK*64> accum; };
 };
-template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _K_STEP=64>
 struct group_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
-    using layout    = group_layout<M_BLOCK, N_BLOCK>;
+    static constexpr int K_STEP = _K_STEP;
+    using layout    = group_layout<M_BLOCK, N_BLOCK, K_STEP>;
     using wide_tile = st_bf<64, 64*N_BLOCK>;
-    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, 64>;
+    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, K_STEP>;
     using globals = typename layout::globals;
-    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
-    __device__ static inline const in_gl& b_of(const globals& g, int m) {
+    using a_gl = typename layout::a_gl;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, PRODUCER_BARRIER_ARRIVALS=1;
+    static constexpr int INPUT_PIPE_STAGES = pipe_stages<typename layout::input_block>();
+    __device__ static inline const a_gl& b_of(const globals& g, int m) {
         return m == 2 ? g.B2 : m == 1 ? g.B1 : g.B0;
     }
     __device__ static inline const out_gl& c_of(const globals& g, int m) {
@@ -229,7 +256,7 @@ struct group_template {
             args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
         }
         args.common.member = member;
-        args.num_iters = G.A.cols()/64;
+        args.num_iters = G.A.cols()/K_STEP;
         int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid(); // producer sets as 0
         args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
     }
@@ -282,25 +309,28 @@ struct group_template {
 };
 
 // The gate/up GEMM: `gemm_bf16.cu`'s `gate_up_template` at half the column block (`N_BLOCK = 2`,
-// two `rt_fl<16, 128>` accumulators), each accumulator scaled by its own projection's `w_scale`
-// and by `a_scale` (so each is the plain fp8 GEMM's value before its rounding), then `OP` by TK's
+// two `rt_fl<16, 128>` accumulators; 1 or 3 at `col64`), each accumulator scaled by its own
+// projection's `w_scale` and by `a_scale` (so each is the plain fp8 GEMM's value before its rounding), then `OP` by TK's
 // map in f32, then the one rounding at the store. Only the result is stored, so the finish block
 // holds one set of tiles.
-template<int M_BLOCK, int N_BLOCK>
+template<int M_BLOCK, int N_BLOCK, int K_STEP>
 struct gate_up_layout {
-    struct globals        { in_gl A, G, U; out_gl C; scale_gl A_scale, G_scale, U_scale; };
-    struct input_block    { in_tile a[M_BLOCK], g[N_BLOCK], u[N_BLOCK]; };
+    using a_gl = k_gl<K_STEP>;
+    struct globals        { a_gl A, G, U; out_gl C; scale_gl A_scale, G_scale, U_scale; };
+    struct input_block    { k_tile<K_STEP> a[M_BLOCK], g[N_BLOCK], u[N_BLOCK]; };
     struct finish_block   { out_tile c[M_BLOCK][N_BLOCK]; };
     struct common_state   { int2 coord; };
     struct consumer_state { rt_fl<16, N_BLOCK*64> gate, up; };
 };
-template<typename OP, int _M_BLOCK=2, int _N_BLOCK=2, int _SUPER_M=12>
+template<typename OP, int _M_BLOCK=2, int _N_BLOCK=2, int _SUPER_M=12, int _K_STEP=64>
 struct gate_up_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
-    using layout    = gate_up_layout<M_BLOCK, N_BLOCK>;
+    static constexpr int K_STEP = _K_STEP;
+    using layout    = gate_up_layout<M_BLOCK, N_BLOCK, K_STEP>;
     using wide_tile = st_bf<64, 64*N_BLOCK>;
-    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, 64>;
-    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, K_STEP>;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, PRODUCER_BARRIER_ARRIVALS=1;
+    static constexpr int INPUT_PIPE_STAGES = pipe_stages<typename layout::input_block>();
     // `matmul_template`'s tile order.
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
@@ -319,7 +349,7 @@ struct gate_up_template {
             args.num_iters = -1;
             return;
         }
-        args.num_iters = args.globals.A.cols()/64;
+        args.num_iters = args.globals.A.cols()/K_STEP;
         int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid(); // producer sets as 0
         args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
     }
@@ -485,14 +515,18 @@ struct expert_template {
     };
 };
 
-using gemm_fp8_abt_mmt = matmul_template<2, 4, 8>;
-using gemm_col64_fp8_abt_mmt = matmul_template<2, 1, 8>;
-using gemm_group_fp8_abt_mmt = group_template<2, 4, 8>;
-using gate_up_silu_fp8_mmt = gate_up_template<scratchy::ops::silu_mul, 2, 2, 8>;
-using gate_up_gelu_fp8_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, 2, 8>;
-// One 64-column block per accumulator: the 64-column GEMM's shapes (Gemma's 2112-column MLP).
-using gate_up_silu_col64_fp8_mmt = gate_up_template<scratchy::ops::silu_mul, 2, 1, 8>;
-using gate_up_gelu_col64_fp8_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, 1, 8>;
+// The plain GEMM at 256 (`N_BLOCK` 4) or 64 (1) output columns a tile, and the grouped GEMM, each
+// at K step 64 and 128.
+template <int N_BLOCK, int K_STEP> using gemm_fp8_mmt = matmul_template<2, N_BLOCK, 8, K_STEP>;
+template <int K_STEP> using group_fp8_mmt = group_template<2, 4, 8, K_STEP>;
+using gemm_fp8_abt_mmt = gemm_fp8_mmt<4, 64>;
+using gemm_col64_fp8_abt_mmt = gemm_fp8_mmt<1, 64>;
+// The gate/up GEMM at 128 (`N_BLOCK` 2), 64 (1: the 64-column GEMM's shapes) or 192 (3: Gemma's
+// 2112-column MLP, FP8 S8 G1) columns per accumulator, each activation and K step.
+template <int N_BLOCK, int K_STEP>
+using gate_up_silu_fp8_mmt = gate_up_template<scratchy::ops::silu_mul, 2, N_BLOCK, 8, K_STEP>;
+template <int N_BLOCK, int K_STEP>
+using gate_up_gelu_fp8_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, N_BLOCK, 8, K_STEP>;
 // `op_abi::MOE_EXPERT_COUNTS` and `step::EXPERT_GEMM_N_TILES`, as `expert_gemm_bf16.cu`'s three.
 constexpr int EXPERTS_SMALL = 128;
 constexpr int EXPERTS_LARGE = 256;
@@ -520,11 +554,35 @@ cudaError_t smem_attr() {
                                 cudaFuncAttributeMaxDynamicSharedMemorySize, GEMM_FP8_SMEM_BYTES);
 }
 
+// `smem_attr` of each instance in order, stopping at the first that fails.
+template <typename... mmt>
+cudaError_t smem_attrs() {
+    cudaError_t e = cudaSuccess;
+    ((e = e == cudaSuccess ? smem_attr<mmt>() : e), ...);
+    return e;
+}
+
+// The dense instances at both K steps (FP8 S8 G1); the 192-column gate/up only at 128, where it
+// keeps every register (at 64 the GeGLU form spills).
+template <int K_STEP>
+cudaError_t dense_smem_attrs() {
+    cudaError_t e = smem_attrs<gemm_fp8_mmt<4, K_STEP>, gemm_fp8_mmt<1, K_STEP>,
+                               group_fp8_mmt<K_STEP>, gate_up_silu_fp8_mmt<2, K_STEP>,
+                               gate_up_gelu_fp8_mmt<2, K_STEP>, gate_up_silu_fp8_mmt<1, K_STEP>,
+                               gate_up_gelu_fp8_mmt<1, K_STEP>>();
+    if constexpr (K_STEP == 128) {
+        if (e == cudaSuccess) {
+            e = smem_attrs<gate_up_silu_fp8_mmt<3, 128>, gate_up_gelu_fp8_mmt<3, 128>>();
+        }
+    }
+    return e;
+}
+
 // The shape rule of `mmt`'s tile: `m`, `n` and `k` non-zero multiples of `M_BLOCK·64`, `N_BLOCK·64`
-// and 64, none above INT_MAX.
+// and its K step, none above INT_MAX.
 template <typename mmt>
 bool tile_shape(uint32_t m, uint32_t n, uint32_t k) {
-    constexpr uint32_t M_TILE = mmt::M_BLOCK * 64, N_TILE = mmt::N_BLOCK * 64, K_TILE = 64;
+    constexpr uint32_t M_TILE = mmt::M_BLOCK * 64, N_TILE = mmt::N_BLOCK * 64, K_TILE = mmt::K_STEP;
     constexpr uint32_t DIM_MAX = static_cast<uint32_t>(INT_MAX);
     return m != 0 && n != 0 && k != 0 && m % M_TILE == 0 && n % N_TILE == 0 && k % K_TILE == 0 &&
            m <= DIM_MAX && n <= DIM_MAX && k <= DIM_MAX;
@@ -532,9 +590,10 @@ bool tile_shape(uint32_t m, uint32_t n, uint32_t k) {
 
 // A row-major `[rows, cols]` operand view; building it encodes its TMA tensor map into host memory
 // (nothing is allocated on the device). Can throw.
-in_gl in_view(const void* p, uint32_t rows, uint32_t cols) {
-    return in_gl{static_cast<fp8e4m3*>(const_cast<void*>(p)), nullptr, nullptr, size_t(rows),
-                 size_t(cols)};
+template <typename GL = in_gl>
+GL in_view(const void* p, uint32_t rows, uint32_t cols) {
+    return GL{static_cast<fp8e4m3*>(const_cast<void*>(p)), nullptr, nullptr, size_t(rows),
+              size_t(cols)};
 }
 out_gl out_view(void* p, uint32_t rows, uint32_t cols) {
     return out_gl{static_cast<bf16*>(p), nullptr, nullptr, size_t(rows), size_t(cols)};
@@ -564,7 +623,8 @@ int launch_abt(const void* a, const void* a_scale, const void* b, const void* b_
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        typename mmt::layout::globals G{in_view(a, m, k), in_view(b, n, k), out_view(c, m, n),
+        using A = typename mmt::layout::a_gl;
+        typename mmt::layout::globals G{in_view<A>(a, m, k), in_view<A>(b, n, k), out_view(c, m, n),
                                         scale_view(a_scale, m), scale_view(b_scale, n)};
         return launch<mmt>(G, stream);
     } catch (...) {
@@ -576,13 +636,14 @@ template <typename mmt, typename rule>
 int launch_gate_up(const void* a, const void* a_scale, const void* gate, const void* gate_scale,
                    const void* up, const void* up_scale, void* c, uint32_t m, uint32_t n,
                    uint32_t k, void* stream) {
-    if (!tile_shape<rule>(m, n, k)) {
+    if (!tile_shape<rule>(m, n, k) || !tile_shape<mmt>(m, n, k)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        typename mmt::layout::globals G{in_view(a, m, k),        in_view(gate, n, k),
-                                        in_view(up, n, k),       out_view(c, m, n),
+        using A = typename mmt::layout::a_gl;
+        typename mmt::layout::globals G{in_view<A>(a, m, k),     in_view<A>(gate, n, k),
+                                        in_view<A>(up, n, k),    out_view(c, m, n),
                                         scale_view(a_scale, m),  scale_view(gate_scale, n),
                                         scale_view(up_scale, n)};
         return launch<mmt>(G, stream);
@@ -612,6 +673,86 @@ int launch_expert(const void* a, const void* a_scale, const void* b, const void*
     return launch<mmt>(G, stream);
 }
 
+// The K step a dense launch takes (FP8 S8 G1): 128 where `k` is a multiple of 128, else 64.
+uint32_t k_step_of(uint32_t k) { return k % 128 == 0 ? 128 : 64; }
+
+// A template argument as a value, for the dispatch lambdas below.
+template <int V> constexpr std::integral_constant<int, V> ic{};
+
+// The plain GEMM at `n_tile` (256 or 64) and `k_step` (64 or 128).
+int gemm_at(const void* a, const void* a_scale, const void* b, const void* b_scale, void* c,
+            uint32_t m, uint32_t n, uint32_t k, uint32_t n_tile, uint32_t k_step, void* stream) {
+    const auto at = [&](auto nb, auto ks) {
+        using mmt = gemm_fp8_mmt<decltype(nb)::value, decltype(ks)::value>;
+        return launch_abt<mmt>(a, a_scale, b, b_scale, c, m, n, k, stream);
+    };
+    if (n_tile == 256) {
+        return k_step == 128 ? at(ic<4>, ic<128>) : at(ic<4>, ic<64>);
+    }
+    return k_step == 128 ? at(ic<1>, ic<128>) : at(ic<1>, ic<64>);
+}
+
+// The gate/up GEMM at `act` (0 or 1), `N_BLOCK` and `K_STEP`, under `rule`'s shape and its own.
+template <int N_BLOCK, int K_STEP, typename rule>
+int gate_up_at(const void* a, const void* a_scale, const void* gate, const void* gate_scale,
+               const void* up, const void* up_scale, void* c, uint32_t m, uint32_t n, uint32_t k,
+               uint32_t act, void* stream) {
+    return act == 0 ? launch_gate_up<gate_up_silu_fp8_mmt<N_BLOCK, K_STEP>, rule>(
+                          a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream)
+                    : launch_gate_up<gate_up_gelu_fp8_mmt<N_BLOCK, K_STEP>, rule>(
+                          a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream);
+}
+
+// The gate/up GEMM at `n_tile` (128, 64 or 192 columns per accumulator) and `k_step`, under
+// `rule`'s shape (the plain GEMM's) and the instance's own; 192 only at K step 128.
+template <typename rule>
+int gate_up_tiled(const void* a, const void* a_scale, const void* gate, const void* gate_scale,
+                  const void* up, const void* up_scale, void* c, uint32_t m, uint32_t n,
+                  uint32_t k, uint32_t act, uint32_t n_tile, uint32_t k_step, void* stream) {
+    const auto at = [&](auto nb, auto ks) {
+        return gate_up_at<decltype(nb)::value, decltype(ks)::value, rule>(
+            a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, act, stream);
+    };
+    if (n_tile == 192) {
+        return k_step == 128 ? at(ic<3>, ic<128>) : SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    if (n_tile == 64) {
+        return k_step == 128 ? at(ic<1>, ic<128>) : at(ic<1>, ic<64>);
+    }
+    return k_step == 128 ? at(ic<2>, ic<128>) : at(ic<2>, ic<64>);
+}
+
+// The grouped GEMM at `mmt`'s K step: `count` (2 or 3) members, each under `mmt`'s shape rule.
+template <typename mmt>
+int launch_group(const void* a, const void* a_scale, const void* const* b,
+                 const void* const* b_scale, void* const* c, const uint32_t* n, uint32_t m,
+                 uint32_t k, uint32_t count, void* stream) {
+    if (count < 2 || count > 3) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!tile_shape<mmt>(m, n[i], k)) {
+            return SCRATCHY_CUDA_ERR_SHAPE;
+        }
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        using A = typename mmt::a_gl;
+        const uint32_t last = count - 1;
+        const auto weight = [&](uint32_t i) { return in_view<A>(b[i], n[i], k); };
+        const auto out = [&](uint32_t i) { return out_view(c[i], m, n[i]); };
+        const auto ws = [&](uint32_t i) { return scale_view(b_scale[i], n[i]); };
+        typename mmt::layout::globals G{in_view<A>(a, m, k),
+                                        weight(0), weight(1), weight(last),
+                                        out(0), out(1), out(last),
+                                        scale_view(a_scale, m), ws(0), ws(1), ws(last),
+                                        int(count)};
+        return launch<mmt>(G, stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
 }  // namespace
 
 // The kernels' one-time setup: allow every instance of this file `GEMM_FP8_SMEM_BYTES` of dynamic
@@ -620,24 +761,9 @@ int launch_expert(const void* a, const void* a_scale, const void* b, const void*
 //
 // 0 = done; any other value = the cudaError_t of the first call that failed.
 extern "C" int scratchy_cuda_gemm_fp8_prepare(void) {
-    cudaError_t e = smem_attr<gemm_fp8_abt_mmt>();
+    cudaError_t e = dense_smem_attrs<64>();
     if (e == cudaSuccess) {
-        e = smem_attr<gemm_col64_fp8_abt_mmt>();
-    }
-    if (e == cudaSuccess) {
-        e = smem_attr<gemm_group_fp8_abt_mmt>();
-    }
-    if (e == cudaSuccess) {
-        e = smem_attr<gate_up_silu_fp8_mmt>();
-    }
-    if (e == cudaSuccess) {
-        e = smem_attr<gate_up_gelu_fp8_mmt>();
-    }
-    if (e == cudaSuccess) {
-        e = smem_attr<gate_up_silu_col64_fp8_mmt>();
-    }
-    if (e == cudaSuccess) {
-        e = smem_attr<gate_up_gelu_col64_fp8_mmt>();
+        e = dense_smem_attrs<128>();
     }
     if (e == cudaSuccess) {
         e = smem_attr<expert_gemm_fp8_mmt>();
@@ -678,7 +804,8 @@ extern "C" int scratchy_cuda_gemm_fp8_prepare(void) {
 // [m]` and `b_scale [n]` f32, `c` bf16. At `col64` 0, `m`, `n` and `k` must be non-zero multiples
 // of 128, 256 and 64; at `col64` 1, of 128, 64 and 64 (the 64-column tiles); none above INT_MAX,
 // `col64` 0 or 1, all checked before any pointer is touched. On an `n` both take, each output
-// element is the same bits. `a` and `b` must be 16-byte-aligned device pointers, the scales
+// element is the same bits. The K step is 128 where `k` is a multiple of 128, else 64 (FP8 S8
+// G1): the same bits. `a` and `b` must be 16-byte-aligned device pointers, the scales
 // 8-byte-aligned, `c` 16-byte-aligned and overlapping no input. `scratchy_cuda_gemm_fp8_prepare`
 // must have succeeded on the current device. The launch is asynchronous on `stream`.
 extern "C" int scratchy_cuda_gemm_fp8_abt(const void* a, const void* a_scale, const void* b,
@@ -688,46 +815,31 @@ extern "C" int scratchy_cuda_gemm_fp8_abt(const void* a, const void* a_scale, co
     if (col64 > 1) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
-    return col64 == 1
-               ? launch_abt<gemm_col64_fp8_abt_mmt>(a, a_scale, b, b_scale, c, m, n, k, stream)
-               : launch_abt<gemm_fp8_abt_mmt>(a, a_scale, b, b_scale, c, m, n, k, stream);
+    return gemm_at(a, a_scale, b, b_scale, c, m, n, k, col64 == 1 ? 64 : 256, k_step_of(k), stream);
 }
 
 // As `scratchy_cuda_gemm_fp8_abt` at `col64` 0 for `count` (2 or 3) members of one `a [m, k]`
 // and `a_scale [m]`: member `i` is `c[i] [m, n[i]] = bf16((a · b[i]ᵀ) · b_scale[i][n] ·
 // a_scale[m])`, each `n[i]` a non-zero multiple of 256 at most INT_MAX (with the shared `m` and
 // `k` under the plain GEMM's rule), checked before any pointer is touched. Each member's output is
-// the bits of its own `scratchy_cuda_gemm_fp8_abt`. `scratchy_cuda_gemm_fp8_prepare` must have
-// succeeded on the current device.
+// the bits of its own `scratchy_cuda_gemm_fp8_abt`, at its K step. `scratchy_cuda_gemm_fp8_prepare`
+// must have succeeded on the current device.
 extern "C" int scratchy_cuda_gemm_group_fp8_abt(const void* a, const void* a_scale,
                                                 const void* const* b, const void* const* b_scale,
                                                 void* const* c, const uint32_t* n, uint32_t m,
                                                 uint32_t k, uint32_t count,
                                                 void* stream /* cudaStream_t; null = default */) {
-    using mmt = gemm_group_fp8_abt_mmt;
     if (count < 2 || count > 3) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     for (uint32_t i = 0; i < count; i++) {
-        if (!tile_shape<mmt>(m, n[i], k)) {
+        if (!tile_shape<group_fp8_mmt<64>>(m, n[i], k)) {
             return SCRATCHY_CUDA_ERR_SHAPE;
         }
     }
-    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
-    try {
-        const uint32_t last = count - 1;
-        const auto weight = [&](uint32_t i) { return in_view(b[i], n[i], k); };
-        const auto out = [&](uint32_t i) { return out_view(c[i], m, n[i]); };
-        const auto ws = [&](uint32_t i) { return scale_view(b_scale[i], n[i]); };
-        typename mmt::layout::globals G{in_view(a, m, k),
-                                        weight(0), weight(1), weight(last),
-                                        out(0), out(1), out(last),
-                                        scale_view(a_scale, m), ws(0), ws(1), ws(last),
-                                        int(count)};
-        return launch<mmt>(G, stream);
-    } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
-    }
+    return k_step_of(k) == 128
+               ? launch_group<group_fp8_mmt<128>>(a, a_scale, b, b_scale, c, n, m, k, count, stream)
+               : launch_group<group_fp8_mmt<64>>(a, a_scale, b, b_scale, c, n, m, k, count, stream);
 }
 
 // The fp8 gate/up GEMM: `c [m, n] = bf16(act(g, u))`, `g = (a · gateᵀ) · gate_scale[n] ·
@@ -737,7 +849,9 @@ extern "C" int scratchy_cuda_gemm_group_fp8_abt(const void* a, const void* a_sca
 // `act` and `col64` 0 or 1, all checked before any pointer is touched. Each accumulator is the
 // value `scratchy_cuda_gemm_fp8_abt` rounds. Pointers as `scratchy_cuda_gemm_fp8_abt`'s; `gate`
 // and `up` `[n, k]`, `c` overlapping no input. `scratchy_cuda_gemm_fp8_prepare` must have
-// succeeded on the current device.
+// succeeded on the current device. Its tile is 128 columns per accumulator, at `col64` 192 where
+// `n` is a multiple of 192 at K step 128 and 64 elsewhere, at `scratchy_cuda_gemm_fp8_abt`'s K
+// step (FP8 S8 G1).
 extern "C" int scratchy_cuda_gate_up_gemm_fp8(const void* a, const void* a_scale, const void* gate,
                                               const void* gate_scale, const void* up,
                                               const void* up_scale, void* c, uint32_t m,
@@ -746,16 +860,63 @@ extern "C" int scratchy_cuda_gate_up_gemm_fp8(const void* a, const void* a_scale
     if (act > 1 || col64 > 1) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
+    const uint32_t k_step = k_step_of(k);
     if (col64 == 1) {
-        return act == 0 ? launch_gate_up<gate_up_silu_col64_fp8_mmt, gemm_col64_fp8_abt_mmt>(
-                              a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream)
-                        : launch_gate_up<gate_up_gelu_col64_fp8_mmt, gemm_col64_fp8_abt_mmt>(
-                              a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream);
+        const uint32_t n_tile = n % 192 == 0 && k_step == 128 ? 192 : 64;
+        return gate_up_tiled<gemm_col64_fp8_abt_mmt>(a, a_scale, gate, gate_scale, up, up_scale, c,
+                                                     m, n, k, act, n_tile, k_step, stream);
     }
-    return act == 0 ? launch_gate_up<gate_up_silu_fp8_mmt, gemm_fp8_abt_mmt>(
-                          a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream)
-                    : launch_gate_up<gate_up_gelu_fp8_mmt, gemm_fp8_abt_mmt>(
-                          a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream);
+    return gate_up_tiled<gemm_fp8_abt_mmt>(a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k,
+                                           act, 128, k_step, stream);
+}
+
+// Test support (`tests/gemm_fp8.rs`, FP8 S8 G1): `scratchy_cuda_gemm_fp8_abt` at column tile
+// `n_tile` (256, or 64: `col64` 1's) and K step `k_step` (64, or 128 with `k` a multiple of 128),
+// under that tile's shape rule. Each element is the same bits at every form. Return codes as that
+// launcher's.
+extern "C" int scratchy_cuda_gemm_fp8_variant(const void* a, const void* a_scale, const void* b,
+                                              const void* b_scale, void* c, uint32_t m,
+                                              uint32_t n, uint32_t k, uint32_t n_tile,
+                                              uint32_t k_step,
+                                              void* stream /* cudaStream_t; null = default */) {
+    if ((n_tile != 256 && n_tile != 64) || (k_step != 64 && k_step != 128)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    return gemm_at(a, a_scale, b, b_scale, c, m, n, k, n_tile, k_step, stream);
+}
+
+// Test support (FP8 S8 G1): `scratchy_cuda_gemm_group_fp8_abt` at K step `k_step` (64, or 128
+// with `k` a multiple of 128). Return codes and rule otherwise as that launcher's.
+extern "C" int scratchy_cuda_gemm_group_fp8_variant(const void* a, const void* a_scale,
+                                                    const void* const* b,
+                                                    const void* const* b_scale, void* const* c,
+                                                    const uint32_t* n, uint32_t m, uint32_t k,
+                                                    uint32_t count, uint32_t k_step,
+                                                    void* stream /* cudaStream_t; null = default */) {
+    if (k_step == 128) {
+        return launch_group<group_fp8_mmt<128>>(a, a_scale, b, b_scale, c, n, m, k, count, stream);
+    }
+    if (k_step == 64) {
+        return launch_group<group_fp8_mmt<64>>(a, a_scale, b, b_scale, c, n, m, k, count, stream);
+    }
+    return SCRATCHY_CUDA_ERR_SHAPE;
+}
+
+// Test support (FP8 S8 G1): `scratchy_cuda_gate_up_gemm_fp8` at `n_tile` columns per accumulator
+// (128, 64, or 192 at K step 128 only) and K step `k_step` (64, or 128 with `k` a multiple of 128),
+// `m` a multiple of 128 and `n` of `n_tile`. Each element is the same bits at every form. Return codes as that
+// launcher's.
+extern "C" int scratchy_cuda_gate_up_gemm_fp8_variant(
+    const void* a, const void* a_scale, const void* gate, const void* gate_scale, const void* up,
+    const void* up_scale, void* c, uint32_t m, uint32_t n, uint32_t k, uint32_t act,
+    uint32_t n_tile, uint32_t k_step, void* stream /* cudaStream_t; null = default */) {
+    if (act > 1 || (n_tile != 128 && n_tile != 64 && n_tile != 192) ||
+        (k_step != 64 && k_step != 128)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // The 64-column GEMM's rule (`m` a multiple of 128, `n` and `k` of 64); the tile's own on top.
+    return gate_up_tiled<gemm_col64_fp8_abt_mmt>(a, a_scale, gate, gate_scale, up, up_scale, c, m,
+                                                 n, k, act, n_tile, k_step, stream);
 }
 
 // The grouped expert GEMM over an fp8 bank (`expert_gemm_bf16.cu`'s, FP8 S3): for every live

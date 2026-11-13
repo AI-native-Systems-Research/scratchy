@@ -32,8 +32,8 @@ use common::numerics::{bf16_inputs, mismatched_bits};
 use half::bf16;
 use scratchy_target_cuda::kernels::{
     Fp8Operand, KernelError, expert_gemm_fp8, expert_gemm_fp8_variant, gate_up_gemm_fp8,
-    gemm_fp8_abt, gemm_group_fp8_abt, gemm_narrow_fp8_abt, gemm_narrow_group_fp8_abt,
-    quant_rows_fp8,
+    gate_up_gemm_fp8_variant, gemm_fp8_abt, gemm_fp8_variant, gemm_group_fp8_abt,
+    gemm_group_fp8_variant, gemm_narrow_fp8_abt, gemm_narrow_group_fp8_abt, quant_rows_fp8,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
@@ -1110,6 +1110,307 @@ fn the_p3_expert_gemm_times_are_recorded() {
                     "P3_TIME {what} round={round} m_tile={m_tile} k_step={k_step}: {us:.1} us \
                      ({} computed rows for 16384 pairs)",
                     own.len() * m_tile as usize
+                );
+            }
+        }
+    }
+}
+
+// ── FP8 S8 G1: the dense fp8 GEMMs at K step 128 and the 192-column gate/up ──
+
+/// The rows of a 2,048-token prefill.
+const G1_M: u32 = 2048;
+
+/// The dense fp8 GEMMs of the three models' 2,048-row prefill (every `GemmFp8` of their tapes, all
+/// on the 256-column tile): `(n, k, what)`.
+const G1_GEMMS: [(u32, u32, &str); 7] = [
+    (5120, 17408, "27B down"),
+    (5120, 6144, "27B o_proj / out_proj"),
+    (2048, 4096, "35B o_proj"),
+    (2048, 512, "35B shared expert down"),
+    (2816, 2112, "Gemma dense down"),
+    (2816, 4096, "Gemma sliding o_proj"),
+    (2816, 8192, "Gemma global o_proj"),
+];
+
+/// Their grouped GEMMs: `(k, members' n, what)`.
+const G1_GROUPS: [(u32, &[u32], &str); 5] = [
+    (5120, &[10240, 6144], "27B GDN qkvz + ba"),
+    (5120, &[12288, 1024, 1024], "27B q/k/v"),
+    (2048, &[8192, 512, 512], "35B q/k/v"),
+    (2816, &[4096, 2048, 2048], "Gemma sliding q/k/v"),
+    (2816, &[8192, 1024], "Gemma global q/kv"),
+];
+
+/// Their gate/up GEMMs: `(n, k, act, today's n_tile, col64, what)`.
+const G1_GATE_UPS: [(u32, u32, u32, u32, bool, &str); 3] = [
+    (17408, 5120, 0, 128, false, "27B MLP, SwiGLU"),
+    (512, 2048, 0, 128, false, "35B shared expert, SwiGLU"),
+    (2112, 2816, 1, 64, true, "Gemma dense MLP, GeGLU (col64)"),
+];
+
+/// A `[rows, cols]` e4m3 operand with per-row scales, from splitmix64 bytes: fast at the 2,048-row
+/// shapes, where the bf16 quantization's host cost would dominate.
+fn g1_operand(device: &CudaDevice, rows: u32, cols: u32, seed: u64) -> Fp8Buf {
+    let (r, c) = (rows as usize, cols as usize);
+    Fp8Buf::new(
+        device,
+        &e4m3_weights(r * c, seed),
+        &weight_scales(r, seed ^ 0x5CA1E),
+    )
+}
+
+/// The forms a dense GEMM over `k` takes besides today's (K step 64): K step 128 where `k` is a
+/// multiple of 128.
+fn g1_k_steps(k: u32) -> &'static [u32] {
+    if k.is_multiple_of(128) {
+        &[64, 128]
+    } else {
+        &[64]
+    }
+}
+
+/// FP8 S8 G1: at every dense fp8 GEMM shape of the three models' 2,048-row prefill, each form (K
+/// step 128; the gate/up's 192-column tile) and the production launcher are today's kernel (K step
+/// 64, today's column tile) bit for bit, the output's tail untouched, as `G1_BITS` lines.
+#[test]
+fn the_dense_fp8_gemms_at_k_128_and_192_columns_are_todays_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let mut report = |what: &str, form: String, bad: usize, tail: bool| {
+        let ok = bad == 0 && tail;
+        eprintln!(
+            "G1_BITS {what} {form}: mismatched_bits={bad} tail_intact={tail} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    };
+    for (n, k, what) in G1_GEMMS {
+        let a = g1_operand(&device, G1_M, k, 0x61A0 ^ u64::from(k));
+        let b = g1_operand(&device, n, k, 0x61B0 ^ u64::from(n));
+        let len = G1_M as usize * n as usize;
+        let run = |n_tile: u32, k_step: u32| {
+            run_out(&device, len, |c| {
+                // SAFETY: as `run_gemm`'s.
+                unsafe {
+                    gemm_fp8_variant(
+                        a.op(),
+                        b.op(),
+                        c,
+                        (G1_M, n, k),
+                        (n_tile, k_step),
+                        std::ptr::null_mut(),
+                    )
+                }
+            })
+            .expect("a dense GEMM form")
+        };
+        let today = run(256, 64);
+        for &k_step in g1_k_steps(k) {
+            let got = run(256, k_step);
+            let form = format!("n={n} k={k} n_tile=256 k_step={k_step}");
+            report(what, form, mismatched_bits(&got.0, &today.0), got.1);
+        }
+        let prod = run_gemm(&device, (&a, &b), (G1_M, n, k), false).expect("the launcher");
+        let form = format!("n={n} k={k} launcher");
+        report(what, form, mismatched_bits(&prod.0, &today.0), prod.1);
+    }
+    for (k, ns, what) in G1_GROUPS {
+        let a = g1_operand(&device, G1_M, k, 0x61C0 ^ u64::from(k));
+        let ws: Vec<Fp8Buf> = (ns.iter().enumerate())
+            .map(|(i, &n)| g1_operand(&device, n, k, 0x61D0 ^ i as u64))
+            .collect();
+        let run = |k_step: Option<u32>| -> Vec<Vec<u16>> {
+            let outs: Vec<DeviceBuffer> = (ns.iter())
+                .map(|&n| {
+                    DeviceBuffer::upload(&device, &vec![SENTINEL; (G1_M * n) as usize]).expect("c")
+                })
+                .collect();
+            let members: Vec<(Fp8Operand, *mut c_void, u32)> = (ws.iter().zip(&outs).zip(ns))
+                .map(|((w, c), &n)| (w.op(), c.ptr(), n))
+                .collect();
+            // SAFETY: as `gemm_group_fp8_members_are_their_single_gemm`'s.
+            unsafe {
+                match k_step {
+                    Some(ks) => gemm_group_fp8_variant(
+                        a.op(),
+                        &members,
+                        (G1_M, k),
+                        ks,
+                        std::ptr::null_mut(),
+                    ),
+                    None => gemm_group_fp8_abt(a.op(), &members, (G1_M, k), std::ptr::null_mut()),
+                }
+            }
+            .expect("a group form");
+            outs.iter()
+                .map(|c| c.download().expect("download"))
+                .collect()
+        };
+        let today = run(Some(64));
+        let mut forms: Vec<(String, Option<u32>)> = (g1_k_steps(k).iter())
+            .map(|&ks| (format!("k_step={ks}"), Some(ks)))
+            .collect();
+        forms.push(("launcher".to_string(), None));
+        for (form, k_step) in forms {
+            let got = run(k_step);
+            let bad = (got.iter().zip(&today))
+                .map(|(g, t)| mismatched_bits(g, t))
+                .sum();
+            report(what, format!("k={k} n={ns:?} {form}"), bad, true);
+        }
+    }
+    for (n, k, act, today_tile, col64, what) in G1_GATE_UPS {
+        let a = g1_operand(&device, G1_M, k, 0x61E0 ^ u64::from(k));
+        let (g, u) = (
+            g1_operand(&device, n, k, 0x61F0 ^ u64::from(n)),
+            g1_operand(&device, n, k, 0x6200 ^ u64::from(n)),
+        );
+        let len = G1_M as usize * n as usize;
+        let run = |form: Option<(u32, u32)>| {
+            run_out(&device, len, |c| {
+                // SAFETY: as `gate_up_gemm_fp8_matches_the_f64_reference`'s.
+                unsafe {
+                    match form {
+                        Some((n_tile, k_step)) => gate_up_gemm_fp8_variant(
+                            (a.op(), g.op(), u.op()),
+                            c,
+                            (G1_M, n, k),
+                            (act, n_tile, k_step),
+                            std::ptr::null_mut(),
+                        ),
+                        None => gate_up_gemm_fp8(
+                            (a.op(), g.op(), u.op()),
+                            c,
+                            (G1_M, n, k),
+                            (act, col64),
+                            std::ptr::null_mut(),
+                        ),
+                    }
+                }
+            })
+            .expect("a gate/up form")
+        };
+        let today = run(Some((today_tile, 64)));
+        let mut forms: Vec<Option<(u32, u32)>> = (g1_k_steps(k).iter())
+            .map(|&ks| Some((today_tile, ks)))
+            .collect();
+        if n.is_multiple_of(192) && k.is_multiple_of(128) {
+            forms.push(Some((192, 128)));
+        }
+        forms.push(None);
+        for form in forms {
+            let got = run(form);
+            let name = match form {
+                Some((t, ks)) => format!("n={n} k={k} n_tile={t} k_step={ks}"),
+                None => format!("n={n} k={k} launcher"),
+            };
+            report(what, name, mismatched_bits(&got.0, &today.0), got.1);
+        }
+    }
+    assert!(pass, "a dense fp8 GEMM form is not today's bits");
+}
+
+/// Recorded, not asserted (G1's gate reads it): each dense fp8 GEMM shape of the three models'
+/// 2,048-row prefill, today's form (K step 64, today's column tile) against K step 128 and the
+/// gate/up's 192-column tile, as `G1_TIME` lines, two rounds (A, B, A, B).
+#[test]
+fn the_g1_dense_fp8_gemm_times_are_recorded() {
+    let device = h100();
+    let line = |what: &str, round: u32, form: String, us: f64| {
+        eprintln!("G1_TIME {what} round={round} {form}: {us:.1} us");
+    };
+    for (n, k, what) in G1_GEMMS {
+        let a = g1_operand(&device, G1_M, k, 0x6300);
+        let b = g1_operand(&device, n, k, 0x6301);
+        let c = DeviceBuffer::upload(&device, &vec![0u16; (G1_M * n) as usize]).expect("c");
+        for round in 1..=2 {
+            for &k_step in g1_k_steps(k) {
+                let us = event_time(|| {
+                    // SAFETY: as `run_gemm`'s.
+                    unsafe {
+                        gemm_fp8_variant(
+                            a.op(),
+                            b.op(),
+                            c.ptr(),
+                            (G1_M, n, k),
+                            (256, k_step),
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("a dense GEMM form");
+                });
+                line(
+                    what,
+                    round,
+                    format!("n={n} k={k} n_tile=256 k_step={k_step}"),
+                    us,
+                );
+            }
+        }
+    }
+    for (k, ns, what) in G1_GROUPS {
+        let a = g1_operand(&device, G1_M, k, 0x6310);
+        let ws: Vec<Fp8Buf> = (ns.iter().enumerate())
+            .map(|(i, &n)| g1_operand(&device, n, k, 0x6311 ^ i as u64))
+            .collect();
+        let outs: Vec<DeviceBuffer> = (ns.iter())
+            .map(|&n| DeviceBuffer::upload(&device, &vec![0u16; (G1_M * n) as usize]).expect("c"))
+            .collect();
+        let members: Vec<(Fp8Operand, *mut c_void, u32)> = (ws.iter().zip(&outs).zip(ns))
+            .map(|((w, c), &n)| (w.op(), c.ptr(), n))
+            .collect();
+        for round in 1..=2 {
+            for &k_step in g1_k_steps(k) {
+                let us = event_time(|| {
+                    // SAFETY: as `gemm_group_fp8_members_are_their_single_gemm`'s.
+                    unsafe {
+                        gemm_group_fp8_variant(
+                            a.op(),
+                            &members,
+                            (G1_M, k),
+                            k_step,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("a group form");
+                });
+                line(what, round, format!("k={k} n={ns:?} k_step={k_step}"), us);
+            }
+        }
+    }
+    for (n, k, act, today_tile, _, what) in G1_GATE_UPS {
+        let a = g1_operand(&device, G1_M, k, 0x6320);
+        let (g, u) = (
+            g1_operand(&device, n, k, 0x6321),
+            g1_operand(&device, n, k, 0x6322),
+        );
+        let c = DeviceBuffer::upload(&device, &vec![0u16; (G1_M * n) as usize]).expect("c");
+        let mut forms: Vec<(u32, u32)> =
+            (g1_k_steps(k).iter()).map(|&ks| (today_tile, ks)).collect();
+        if n.is_multiple_of(192) && k.is_multiple_of(128) {
+            forms.push((192, 128));
+        }
+        for round in 1..=2 {
+            for &(n_tile, k_step) in &forms {
+                let us = event_time(|| {
+                    // SAFETY: as `gate_up_gemm_fp8_matches_the_f64_reference`'s.
+                    unsafe {
+                        gate_up_gemm_fp8_variant(
+                            (a.op(), g.op(), u.op()),
+                            c.ptr(),
+                            (G1_M, n, k),
+                            (act, n_tile, k_step),
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("a gate/up form");
+                });
+                line(
+                    what,
+                    round,
+                    format!("n={n} k={k} n_tile={n_tile} k_step={k_step}"),
+                    us,
                 );
             }
         }
