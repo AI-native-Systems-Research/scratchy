@@ -51,6 +51,9 @@ changed() {
                 echo macos=true
                 return
                 ;;
+            # The Triton kernels sit beside the spyre crates, in no crate; only listed crates
+            # (the spyre target and the triton ones) read them.
+            targets/spyre/kernels/*) continue ;;
         esac
         while IFS= read -r dir; do
             case "$file" in "$dir"/*) owner=$dir; break ;; esac
