@@ -13,7 +13,8 @@ exists, not adding to it.
 cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b
 ```
 
-`metal` and `spyre` are mutually exclusive. Add
+`metal` and `spyre` are mutually exclusive (and `cuda`, which builds FP8 models
+only: add `quant/fp8-dynamic-per-channel`). Add
 `serve` for the HTTP server
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
@@ -103,7 +104,8 @@ cargo build -p scratchy-cli --features metal,model/granite-3.1-2b-instruct,quant
 
 **A selected quant preset REPLACES a model's dense/bf16 emission — it does
 not add to it.** If any preset both survives Cargo-feature scoping and is
-claimable on the active backend (metal only claims `mlx-affine-*`/`nvfp4` —
+claimable on the active backend (metal only claims `mlx-affine-*`/`nvfp4`;
+cuda requires `fp8-dynamic-per-channel` and refuses every other preset —
 see `quant_preset_active` in `crates/compiler/macros/src/config.rs`), every selected model in that arch
 gets its quant variant(s) *instead of* dense. A preset that wouldn't
 actually synthesize on the active backend can never suppress dense, so a

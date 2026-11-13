@@ -254,6 +254,24 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
+/// Arches the cuda backend lowers: every op of their prefill canonicals has a CUDA kernel. Each
+/// model of one emits its per-bucket `static` CUDA tapes (`CUDA_TAPES`).
+///
+/// Listed per arch, built per stem, and under `fp8-dynamic-per-channel` only ([`CUDA_PRESETS`]):
+/// CUDA serves FP8 models only (#978). Not every config of a listed arch lowers (a tiny parity
+/// config's GEMMs sit off the tiles), so the arch-wide `model/<arch>` panics at build time naming
+/// that refusal. Build one FP8 checkpoint's stem with the preset: `model/qwen3.8-27b-text-only`
+/// (the bare stem selects the vision arch), `model/qwen3.6-35b-a3b` or `model/gemma-4-26b-a4b-it`,
+/// each with `quant/fp8-dynamic-per-channel`.
+///
+/// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
+/// by name below rather than silently dropped.
+const CUDA_CAPABLE: &[&str] = &["qwen3-5", "qwen3-5-moe", "gemma4-moe"];
+/// The quant presets the cuda backend builds, and the only ones: CUDA serves FP8 models only
+/// (#978), so a cuda build that would compile a model dense, or under a preset CUDA has no
+/// kernels for, is refused below.
+const CUDA_PRESETS: &[&str] = &["fp8-dynamic-per-channel"];
+
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
 fn config_shape(path: &Path) -> Option<(String, u64, u64, u64)> {
@@ -375,13 +393,15 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
+    // Under `cuda`, every arch whose `arch-<name>` feature is on, whether or not cuda lowers it.
+    let mut selected: Vec<String> = Vec::new();
 
     // The backend law, stated once: `src/lib.rs`'s arch gates read `scratchy_backend`,
     // which this script sets exactly when a backend feature is on — so an arch compiles
     // under a backend iff its `arch-<name>` feature and that backend are on, with no
     // per-arch spelling left to drift.
     println!("cargo::rustc-check-cfg=cfg(scratchy_backend)");
-    if cfg!(feature = "metal") || cfg!(feature = "spyre") {
+    if cfg!(feature = "metal") || cfg!(feature = "spyre") || cfg!(feature = "cuda") {
         println!("cargo::rustc-cfg=scratchy_backend");
     }
 
@@ -453,6 +473,14 @@ fn main() {
             if !scope.arch_compiled(&arch) {
                 return None;
             }
+            // Under `cuda`, only the arches the cuda backend lowers (#978); the others are
+            // refused by name below when none of the selected arches is one.
+            if cfg!(feature = "cuda") {
+                selected.push(arch.clone());
+                if !CUDA_CAPABLE.contains(&arch.as_str()) {
+                    return None;
+                }
+            }
             let mod_name = arch.replace('-', "_");
             let configs_dir = manifest.join("configs").join(&arch);
             Some((dsl_path.clone(), mod_name, configs_dir))
@@ -474,6 +502,20 @@ fn main() {
         .iter()
         .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &enabled_presets))
         .collect();
+    // CUDA builds FP8 models only (#978): every selected CUDA arch compiles under exactly
+    // `CUDA_PRESETS`, never dense (no preset) and never under a preset with no CUDA kernels.
+    // Refused here, before any expansion.
+    if cfg!(feature = "cuda") {
+        for (_, mod_name, cfg) in &targets {
+            let q = enabled_quants(&cfg.join("quantizations.json"), &enabled_presets);
+            if q.is_empty() || q.iter().any(|p| !CUDA_PRESETS.contains(&p.as_str())) {
+                panic!(
+                    "CUDA builds FP8 models only: add quant/fp8-dynamic-per-channel and no other \
+                     quant preset (arch `{mod_name}` would compile with presets {q:?})"
+                );
+            }
+        }
+    }
     let scope = scope.with_quants(quant_union.iter().cloned());
 
     // Emit arches in parallel. compile_carrier is itself rayon-parallel over
@@ -521,6 +563,18 @@ fn main() {
     #[cfg(not(feature = "hf-completions"))]
     let hf_ids = Vec::<String>::new();
     write_hf_registry_file(&out_dir, &hf_ids);
+
+    // Under `cuda`, a build that named models none of which the cuda backend lowers would
+    // otherwise reach the "no models selected" panic below, which blames the wrong thing.
+    if cfg!(feature = "cuda")
+        && !selected.is_empty()
+        && !selected.iter().any(|a| CUDA_CAPABLE.contains(&a.as_str()))
+    {
+        panic!(
+            "the cuda backend lowers none of the selected architectures \
+             (CUDA_CAPABLE = {CUDA_CAPABLE:?}); selected: {selected:?}"
+        );
+    }
 
     // scratchy-models has no default model features (deliberately — see
     // `default = []` in Cargo.toml) — a build naming zero `<stem>`/`<arch>`/

@@ -1006,6 +1006,19 @@ impl WeightTable {
             .any(|p| p.len() > prefix.len() && p.iter().zip(prefix).all(|(s, t)| s == t))
     }
 
+    /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp` for
+    /// `mlp.shared_expert.gate_proj`): the bundles whose shared expert the DSL states as ops of
+    /// its own, so neither a MoE struct loader nor a target's expert combine may add it again (the
+    /// single-owner rule). Ascending.
+    pub fn shared_expert_bases(&self) -> Vec<String> {
+        (self.entries.iter())
+            .filter_map(|p| p.first().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|b| self.has_subtree(&[b, "shared_expert"]))
+            .collect()
+    }
+
     /// Every weight the program reads, in interning order.
     pub fn ids(&self) -> impl Iterator<Item = WeightId> + use<> {
         (0..self.entries.len() as u32).map(WeightId)

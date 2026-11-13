@@ -921,7 +921,7 @@ pub struct LoweredBucket {
     /// runtime never re-derives. Read only by metal's codegen — under
     /// `spyre` the tape path writes this field but never reads it, and
     /// that is EXPECTED.
-    #[cfg_attr(feature = "spyre", expect(dead_code))]
+    #[cfg_attr(not(feature = "metal"), expect(dead_code))]
     pub barriers: Vec<bool>,
 }
 

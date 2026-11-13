@@ -24,6 +24,9 @@ vision = ["dep:scratchy-vision"]
 # `ChainStepHandle` / `MetalChainBody` surface. `MetalDtype` is named from
 # `scratchy-tensors`; `RuntimeBindings` is erased behind `MetalRuntimeHandle`.
 metal = ["scratchy-ir/metal", "dep:objc2", "dep:objc2-metal"]
+# NVIDIA CUDA: the ir gate only. No toolchain and no target crate — like spyre, the compiler names
+# no CUDA type.
+cuda = ["scratchy-ir/cuda"]
 # Spyre (KTIR): host-pure KTIR emit via scratchy-subtile + the ir spyre gate.
 # Deliberately does NOT pull any target crate — the compiler is decoupled
 # from every target crate; spyre rides the compiler-owned arch registry +

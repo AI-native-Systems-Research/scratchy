@@ -194,7 +194,8 @@ pub struct QuantizationConfig {
     /// Suffix-match against a weight's dotted path — each entry
     /// that matches keeps that weight in `StorageFormat::Dense`.
     /// HF's canonical use: `["lm_head"]` to leave the tied or
-    /// untied output projection unquantized.
+    /// untied output projection unquantized. An entry spelled
+    /// `re:<pattern>` is a regex instead ([`ignore_entry_matches`]).
     pub modules_to_not_convert: Vec<String>,
 }
 
@@ -1357,6 +1358,37 @@ pub fn affine_embed_bits(method: &QuantMethod, embed_role: &str) -> Option<u32> 
     }
 }
 
+/// Whether the `ignore` entry `excl` names a weight: a plain entry by suffix of its dotted DSL path,
+/// a `re:<pattern>` entry (compressed-tensors) by its checkpoint `module` path
+/// ([`ignore_regex_matches`]).
+pub fn ignore_entry_matches(excl: &str, dotted: &str, module: impl FnOnce() -> String) -> bool {
+    match excl.strip_prefix("re:") {
+        Some(pattern) => ignore_regex_matches(pattern, &module()),
+        None => dotted.ends_with(excl),
+    }
+}
+
+/// The checkpoint prefixes the weight loader reads under another's name (`scratchy_layers::weights`'
+/// aliasing): a VL wrapper's decoder in either ordering, and HF's vision tower.
+const LOADER_PREFIX_ALIASES: &[(&str, &str)] = &[
+    ("language_model.model.", "model.language_model."),
+    ("model.language_model.", "language_model.model."),
+    ("vision_tower.", "model.visual."),
+];
+
+/// Whether a compressed-tensors `ignore` entry `re:<pattern>` names `module`, a weight's checkpoint
+/// path as the compiled loader reads it: Python's `re.match`, anchored at the start only. The
+/// pattern may name the module by any of the loader's aliases of it ([`LOADER_PREFIX_ALIASES`]).
+pub fn ignore_regex_matches(pattern: &str, module: &str) -> bool {
+    let re = regex::Regex::new(&format!("^(?:{pattern})")).unwrap_or_else(|e| {
+        panic!("quantization_config.ignore entry `re:{pattern}` is not a valid regex: {e}")
+    });
+    re.is_match(module)
+        || (LOADER_PREFIX_ALIASES.iter()).any(|&(from, to)| {
+            (module.strip_prefix(from)).is_some_and(|rest| re.is_match(&format!("{to}{rest}")))
+        })
+}
+
 pub fn storage_format_for_weight(
     program: &Program,
     fuf: &Fuf,
@@ -1370,8 +1402,11 @@ pub fn storage_format_for_weight(
 
     let dotted: String = program.weights.path(id).join(".");
     let embed_role = embed_table_role(program, fuf);
+    // A regex entry names the module by its full checkpoint path, per unrolled layer.
+    let module =
+        || crate::codegen::safetensors_prefix(program.weight_naming(), &model.arch, id, index);
     for excl in &qc.modules_to_not_convert {
-        if dotted.ends_with(excl) {
+        if ignore_entry_matches(excl, &dotted, module) {
             return StorageFormat::Dense;
         }
     }
@@ -3022,6 +3057,109 @@ mod tests {
         );
         assert!(!sym.same_storage_format(&asym));
         assert!(sym.same_storage_format(&sym.clone()));
+    }
+
+    /// axteam/Qwen3.8-27B-FP8-dynamic's whole `ignore` list, verbatim: each regex keeps what the
+    /// checkpoint stores bf16 dense and leaves every fp8 projection quantized, on the paths the
+    /// compiled loader reads (`language_model.model.…`) and on HF's own (`model.language_model.…`).
+    #[test]
+    fn axteams_regex_ignores_match_as_compressed_tensors_does() {
+        let ignore: Vec<String> = serde_json::from_str(
+            r#"["lm_head", "re:.*embed_tokens.*", "re:(model\\.)?visual\\..*",
+                "re:.*\\bmtp\\..*", "re:.*mtp\\.layers\\..*", "re:.*\\.gate$",
+                "re:.*shared_expert_gate$", "re:.*norm.*", "re:.*linear_attn\\.conv1d.*",
+                "re:.*linear_attn\\.A_log$", "re:.*linear_attn\\.dt_bias$"]"#,
+        )
+        .unwrap();
+        assert_eq!(ignore.len(), 11);
+        let ignored = |dotted: &str, module: &str| {
+            (ignore.iter()).any(|e| ignore_entry_matches(e, dotted, || module.to_string()))
+        };
+        let l = "language_model.model.layers.3";
+        for (dotted, module) in [
+            ("lm_head", "lm_head".to_string()),
+            (
+                "embed_tokens",
+                "language_model.model.embed_tokens".to_string(),
+            ),
+            (
+                "blocks.0.attn.qkv",
+                "vision_tower.blocks.0.attn.qkv".to_string(),
+            ),
+            (
+                "blocks.0.attn.qkv",
+                "model.visual.blocks.0.attn.qkv".to_string(),
+            ),
+            ("fc", "mtp.fc".to_string()),
+            ("mlp.gate_proj", "mtp.layers.0.mlp.gate_proj".to_string()),
+            ("mlp.gate", format!("{l}.mlp.gate")),
+            (
+                "mlp.shared_expert_gate",
+                format!("{l}.mlp.shared_expert_gate"),
+            ),
+            ("input_layernorm", format!("{l}.input_layernorm")),
+            ("self_attn.q_norm", format!("{l}.self_attn.q_norm")),
+            ("linear_attn.norm", format!("{l}.linear_attn.norm")),
+            ("linear_attn.conv1d", format!("{l}.linear_attn.conv1d")),
+            ("linear_attn.A_log", format!("{l}.linear_attn.A_log")),
+            ("linear_attn.dt_bias", format!("{l}.linear_attn.dt_bias")),
+        ] {
+            assert!(ignored(dotted, &module), "{module} must stay dense");
+        }
+        for (dotted, module) in [
+            ("self_attn.q_proj", format!("{l}.self_attn.q_proj")),
+            ("self_attn.o_proj", format!("{l}.self_attn.o_proj")),
+            ("mlp.gate_proj", format!("{l}.mlp.gate_proj")),
+            ("mlp.down_proj", format!("{l}.mlp.down_proj")),
+            (
+                "linear_attn.in_proj_qkv",
+                format!("{l}.linear_attn.in_proj_qkv"),
+            ),
+            (
+                "linear_attn.in_proj_a",
+                format!("{l}.linear_attn.in_proj_a"),
+            ),
+            (
+                "linear_attn.in_proj_b",
+                format!("{l}.linear_attn.in_proj_b"),
+            ),
+            ("linear_attn.out_proj", format!("{l}.linear_attn.out_proj")),
+            (
+                "mlp.gate_proj",
+                "model.language_model.layers.3.mlp.gate_proj".to_string(),
+            ),
+        ] {
+            assert!(!ignored(dotted, &module), "{module} must stay fp8");
+        }
+    }
+
+    /// Qwen3.6-35B-A3B-FP8-dynamic's MTP entry, `re:^mtp.*`: anchored at the start, so it names
+    /// the head's own modules and no decoder module whose path merely contains `mtp`.
+    #[test]
+    fn a_regex_ignore_is_anchored_at_the_start() {
+        let mtp = |module: &str| ignore_entry_matches("re:^mtp.*", "", || module.to_string());
+        assert!(mtp("mtp.fc"));
+        assert!(mtp("mtp.layers.0.mlp.experts"));
+        assert!(!mtp("language_model.model.layers.0.mlp.gate"));
+        assert!(!mtp("language_model.mtp.fc"));
+        // `re.match` is not `re.fullmatch`: a prefix match is enough.
+        assert!(ignore_entry_matches("re:lm", "", || "lm_head".to_string()));
+    }
+
+    /// A plain entry keeps the suffix rule on the DSL path, never read as a regex, and never
+    /// reads the checkpoint path.
+    #[test]
+    fn a_plain_ignore_keeps_the_suffix_rule() {
+        let unread = || -> String { panic!("a plain entry reads no checkpoint path") };
+        assert!(ignore_entry_matches("router.proj", "router.proj", unread));
+        assert!(ignore_entry_matches("mlp.gate", "mlp.gate", unread));
+        assert!(!ignore_entry_matches(
+            "mlp.gate",
+            "mlp.shared_expert_gate",
+            unread
+        ));
+        assert!(!ignore_entry_matches("mlp.gate", "mlp.gate_proj", unread));
+        assert!(!ignore_entry_matches(".*gate", "mlp.gate", unread));
     }
 
     #[test]

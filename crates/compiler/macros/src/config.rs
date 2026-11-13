@@ -1180,7 +1180,7 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 
 /// [`Scope::arch_compiled`] under the features `on` reports.
 fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
-    on(&format!("arch-{arch}")) && (on("metal") || on("spyre"))
+    on(&format!("arch-{arch}")) && (on("metal") || on("spyre") || on("cuda"))
 }
 
 /// Every arch dir under `configs/`.
@@ -3644,7 +3644,8 @@ mod tests {
         };
         assert!(arch_compiled_with(&arch, with("metal")));
         assert!(arch_compiled_with(&arch, with("spyre")));
-        // Both backends off: not compiled, whatever the arch feature.
+        assert!(arch_compiled_with(&arch, with("cuda")));
+        // Every backend off: not compiled, whatever the arch feature.
         let neither = {
             let f = feature.clone();
             move |feat: &str| feat == f

@@ -27,6 +27,16 @@ metal = ["scratchy-ir/metal",
     "dep:scratchy-target-metal-compiler",
     "scratchy-forward-compiler/metal",
 ]
+# NVIDIA CUDA: the lowering and the emission live in `scratchy-target-cuda-compiler`, which this
+# feature links as the `target-emitter` (below). The macro's source names only that key.
+cuda = ["target-emitter", "scratchy-ir/cuda",
+    "scratchy-forward-compiler/cuda",
+]
+# ⭐ THE TARGET-EMITTER SEAM. With this on, `emit_model` hands every model to
+# `target_emitter::emit::emit_model(&scratchy_subtile::handoff::TargetModelInput)` and splices the
+# tokens it returns into the model's module. `target_emitter` is a dependency KEY, not a crate:
+# the backend feature that turns this on decides which target compiler crate it is.
+target-emitter = ["dep:target-emitter"]
 # Spyre (IBM AIU / KTIR): no GPU dispatch codegen — under this feature the
 # macro emits the real model's KTIR (via scratchy-subtile, a non-optional dep)
 # at build time and the spyre worker runs it. Forwards into the compiler's
@@ -78,6 +88,8 @@ syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 serde_json = { workspace = true }
+# A compressed-tensors `ignore` entry spelled `re:<pattern>` is a regex (`storage_format_for_weight`).
+regex = "1"
 rayon = { workspace = true }
 # `Implementation::fan_out` returns
 # `Vec<Instruction>` typed at proc-macro time, killing the
@@ -98,6 +110,10 @@ scratchy-target-metal = { path = "../../targets/metal", optional = true }
 # crate depends on it, never the reverse, which is what let the lowering leave
 # `compiler/macros` at all.
 scratchy-target-metal-compiler = { path = "../../targets/metal/compiler", optional = true }
+# The target compiler behind the `target-emitter` seam: CUDA's compile-time lowering, on the target
+# side of the same edge. The neutral key is what the source names; this line is where the backend
+# is chosen.
+target-emitter = { package = "scratchy-target-cuda-compiler", path = "../../targets/cuda/compiler", optional = true }
 # KTIR emission lives in the SPYRE target crate (M3): target-specific
 # emission belongs to its target, and the macro bakes the bundle at
 # expansion, so it consumes the emitter from there.

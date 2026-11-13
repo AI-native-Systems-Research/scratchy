@@ -19,6 +19,10 @@
 
 use std::path::Path;
 
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!("features 'cuda' and 'metal' are mutually exclusive — enable exactly one backend");
+#[cfg(all(feature = "cuda", feature = "spyre"))]
+compile_error!("features 'cuda' and 'spyre' are mutually exclusive — enable exactly one backend");
 #[cfg(all(feature = "metal", feature = "spyre"))]
 compile_error!("features 'metal' and 'spyre' are mutually exclusive — enable exactly one backend");
 
@@ -499,6 +503,44 @@ impl CompileMode {
     };
 }
 
+/// What the target-emitter seam was handed, while [`target_model_inputs`] is collecting it.
+#[cfg(feature = "target-emitter")]
+static TARGET_INPUTS: std::sync::Mutex<Option<Vec<scratchy_subtile::handoff::TargetModelInput>>> =
+    std::sync::Mutex::new(None);
+
+/// Keep a copy of `input` when [`target_model_inputs`] is collecting; nothing otherwise.
+#[cfg(feature = "target-emitter")]
+pub(crate) fn record_target_input(input: &scratchy_subtile::handoff::TargetModelInput) {
+    let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(inputs) = inputs.as_mut() {
+        inputs.push(input.clone());
+    }
+}
+
+/// [`compile_carrier`], returning every [`scratchy_subtile::handoff::TargetModelInput`] it
+/// handed the target-emitter seam, one per emitted model, instead of the tokens: so a test can
+/// check what a target emitted against what that target lowers from the same canonicals.
+#[cfg(feature = "target-emitter")]
+pub fn target_model_inputs(
+    carrier: PythonCarrier,
+    models_dir: &std::path::Path,
+    scope: &Scope,
+) -> Result<Vec<scratchy_subtile::handoff::TargetModelInput>, CarrierError> {
+    let collecting = |on: bool| {
+        let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        if on {
+            *inputs = Some(Vec::new());
+            Vec::new()
+        } else {
+            inputs.take().unwrap_or_default()
+        }
+    };
+    collecting(true);
+    let compiled = compile_carrier(carrier, models_dir, None, scope);
+    let inputs = collecting(false);
+    compiled.map(|_| inputs)
+}
+
 /// A carrier pipeline failure. [`CarrierError::Config`] carries the failing config's stem
 /// as a FIELD — the build script names the config without parsing message text, and
 /// compile_carrier is called once per ARCH, so this (not the build script's own wrap) is
@@ -743,7 +785,7 @@ pub fn compile_carrier(
         })
         .map_err(CarrierError::Arch)?;
 
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
+    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "spyre")))]
     compile_error!(
         "scratchy-forward-compiler-macro requires a backend feature: 'cuda', 'metal', or 'spyre'"
     );
