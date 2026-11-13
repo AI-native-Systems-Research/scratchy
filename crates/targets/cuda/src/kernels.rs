@@ -1236,6 +1236,33 @@ unsafe extern "C" {
         op: u32,
         stream: *mut c_void,
     ) -> i32;
+    // FP8 S8 P3(b): the fused expert gate + up + act, and the live rows' quantize of its output.
+    fn scratchy_cuda_expert_gate_up_gemm_fp8(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        offsets: *const c_void,
+        tile_expert: *const c_void,
+        c: *mut c_void,
+        max_tiles: u32,
+        inter: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        act: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_quant_fp8(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        offsets: *const c_void,
+        rows: u32,
+        cols: u32,
+        experts: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_expert_gemm_bf16_prepare() -> i32;
     fn scratchy_cuda_expert_gemm_e128_bf16_prepare() -> i32;
     fn scratchy_cuda_expert_gemm_e128_col64_bf16_prepare() -> i32;
@@ -4271,6 +4298,82 @@ pub unsafe fn expert_gemm_fp8_m64(
             dims: [max_tiles, n, k, expert_rows],
         },
     )
+}
+
+/// The MoE prefill's fused expert gate + up + act over an fp8 bank (FP8 S8 P3(b),
+/// `kernels/gemm_fp8.cu`'s `expert_gate_up_template`): for every live 64-row tile `t` of the
+/// sorted pair rows `a` (e4m3 and its rows' scales, `max_tiles · 64` rows, a sort at 64-row tiles),
+/// `e = tile_expert[t]`, `c[64t .., :] = bf16(OP(bf16(gate), bf16(up)))`, `gate` and `up`
+/// [`expert_gemm_fp8_m64`]'s bits for the bank's gate and up on those rows: today's two GEMMs then
+/// [`silu_mul_bf16`] / [`gelu_mul_bf16`], bit for bit; rows past the live tiles not written. `b` is
+/// expert 0's gate rows of the bank `[experts, expert_rows, k]` (the gate's `inter` rows, then the
+/// up's) with its scales; `act` a [`crate::step::GatedOp`] code. One launch, asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] before any pointer is touched unless `max_tiles` is
+/// non-zero, `experts` 128 or 256, `inter` a non-zero multiple of 64, `k` of 128, `expert_rows` at
+/// least `2 · inter`, `act` a code, and `max_tiles · 64 · max(inter, k)` and `experts ·
+/// expert_rows · k` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// As [`expert_gemm_fp8_m64`]'s, `c` `[max_tiles · 64, inter]` bf16; the bank's buffer extends past
+/// its gate/up scales by `inter` f32 (`step::fp8_moe_layout`'s down scales follow them).
+pub unsafe fn expert_gate_up_gemm_fp8(
+    (a, b): (Fp8Operand, Fp8Operand),
+    (offsets, tile_expert): (*const c_void, *const c_void),
+    c: *mut c_void,
+    (max_tiles, inter, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    act: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_expert_gate_up_gemm_fp8(
+            a.0,
+            a.1,
+            b.0,
+            b.1,
+            offsets,
+            tile_expert,
+            c,
+            max_tiles,
+            inter,
+            k,
+            experts,
+            expert_rows,
+            act,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "expert_gate_up_gemm_fp8",
+            dims: [max_tiles, inter, k, expert_rows],
+        },
+    )
+}
+
+/// The live rows' quantize of the fused expert gate + up + act's output (FP8 S8 P3(b),
+/// `kernels/act_quant_fp8.cu`): rows `r < offsets[experts]` of `x [rows, cols]` bf16 into `q
+/// [rows, cols]` e4m3 and `scale [rows]` f32, [`quant_rows_fp8`] of each, so [`expert_act_quant_fp8`]
+/// of the gate and up `x` was formed from, bit for bit; no other row written. Refused as
+/// [`expert_act_quant_fp8`]. Asynchronous.
+///
+/// # Safety
+///
+/// As [`expert_act_quant_fp8`]'s, `x` in place of `gate` and `up`.
+pub unsafe fn expert_quant_fp8(
+    (x, offsets): (*const c_void, *const c_void),
+    (q, scale): (*mut c_void, *mut c_void),
+    (rows, cols, experts): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_expert_quant_fp8(x, q, scale, offsets, rows, cols, experts, stream)
+    };
+    check(code, KernelError::RowShape { rows, cols })
 }
 
 /// The MoE prefill's act + quantize over its live rows (FP8 S8 P1, `kernels/act_quant_fp8.cu`):

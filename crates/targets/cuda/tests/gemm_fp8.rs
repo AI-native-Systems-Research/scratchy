@@ -31,9 +31,10 @@ use common::fp8::{e4m3_value, quantize_rows};
 use common::numerics::{bf16_inputs, mismatched_bits};
 use half::bf16;
 use scratchy_target_cuda::kernels::{
-    Fp8Operand, KernelError, expert_gemm_fp8, expert_gemm_fp8_variant, gate_up_gemm_fp8,
-    gemm_fp8_abt, gemm_group_fp8_abt, gemm_narrow_fp8_abt, gemm_narrow_group_fp8_abt,
-    quant_rows_fp8,
+    Fp8Operand, KernelError, expert_act_quant_fp8, expert_gate_up_gemm_fp8, expert_gemm_fp8,
+    expert_gemm_fp8_variant, expert_quant_fp8, gate_up_gemm_fp8, gelu_mul_bf16, gemm_fp8_abt,
+    gemm_group_fp8_abt, gemm_narrow_fp8_abt, gemm_narrow_group_fp8_abt, quant_rows_fp8,
+    silu_mul_bf16,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
@@ -1112,6 +1113,342 @@ fn the_p3_expert_gemm_times_are_recorded() {
                     own.len() * m_tile as usize
                 );
             }
+        }
+    }
+}
+
+// ── FP8 S8 P3(b): the fused expert gate + up + act ──────────────────────────────
+
+/// The routed experts' gate/up of the 35B and Gemma: `(experts, inter, hidden, act, n_tile, what)`,
+/// `act` a `GatedOp` code and `n_tile` today's gate/up column tile.
+const P3B_SHAPES: [(u32, u32, u32, u32, u32, &str); 2] = [
+    (256, 512, 2048, 0, 256, "qwen3.6"),
+    (128, 704, 2816, 1, 64, "gemma"),
+];
+
+/// A bank `[experts, 2 · inter, hidden]` e4m3 with its `[experts, 2 · inter]` scales, the scales
+/// followed by `inter` more f32 (the weight buffer's down scales follow them, which the fused
+/// kernel's ragged block may read); its gate's and its up's operands as the worker gives them.
+struct P3bBank {
+    bank: Fp8Buf,
+    inter: usize,
+    hidden: usize,
+}
+
+impl P3bBank {
+    fn new(
+        device: &CudaDevice,
+        (experts, inter, hidden): (usize, usize, usize),
+        seed: u64,
+    ) -> Self {
+        let rows = experts * 2 * inter;
+        let mut scales = weight_scales(rows, seed ^ 0x51);
+        scales.extend(vec![0.0f32; inter]);
+        Self {
+            bank: Fp8Buf::new(device, &e4m3_weights(rows * hidden, seed), &scales),
+            inter,
+            hidden,
+        }
+    }
+
+    fn gate(&self) -> Fp8Operand {
+        self.bank.op()
+    }
+
+    fn up(&self) -> Fp8Operand {
+        let (q, s) = self.bank.op();
+        (
+            q.wrapping_byte_add(self.inter * self.hidden),
+            s.wrapping_byte_add(self.inter * 4),
+        )
+    }
+}
+
+/// `rows` sorted e4m3 rows over `hidden` (random, a +0 row with the zero row's scale every 7: the
+/// sort's padding rows).
+fn p3b_rows(device: &CudaDevice, rows: usize, hidden: usize, seed: u64) -> Fp8Buf {
+    let (_, mut q, mut s) = activation(rows, hidden, seed);
+    for r in (0..rows).step_by(7) {
+        q[r * hidden..(r + 1) * hidden].fill(0);
+        s[r] = 1.0 / (448.0 * 512.0);
+    }
+    Fp8Buf::new(device, &q, &s)
+}
+
+/// One chain's outputs over `max_tiles` 64-row tiles: the act (bf16, from sentinels) and its
+/// quantization (bytes and scales, from `0xA5`).
+struct P3bOut {
+    act: DeviceBuffer,
+    q: DeviceBuffer,
+    s: DeviceBuffer,
+}
+
+impl P3bOut {
+    fn new(device: &CudaDevice, rows: usize, inter: usize) -> Self {
+        Self {
+            act: DeviceBuffer::upload(device, &vec![SENTINEL; rows * inter]).expect("act"),
+            q: DeviceBuffer::upload_bytes(device, &vec![0xA5; rows * inter]).expect("q"),
+            s: DeviceBuffer::upload_bytes(device, &vec![0xA5; rows * 4]).expect("s"),
+        }
+    }
+}
+
+/// Today's chain on `a`: the gate's and the up's expert GEMMs (64-row tiles, K step 128), the act
+/// over every row into `out.act`, and the act + quantize over the live rows into `out.q`, `out.s`.
+fn p3b_today(
+    (a, bank): (&Fp8Buf, &P3bBank),
+    (ob, tb): (&DeviceBuffer, &DeviceBuffer),
+    (max_tiles, experts, act, n_tile): (u32, u32, u32, u32),
+    (gate, up): (&DeviceBuffer, &DeviceBuffer),
+    out: &P3bOut,
+) {
+    let (i, h) = (bank.inter as u32, bank.hidden as u32);
+    let rows = max_tiles * 64;
+    let null = std::ptr::null_mut();
+    let index = (ob.ptr().cast_const(), tb.ptr().cast_const());
+    // SAFETY: `a` holds `rows · h` bytes and `rows` f32, the bank `E · 2i · h` bytes and its
+    // scales, the index regions `E + 1` and `max_tiles` u32 (the live tiles below E), the outputs
+    // `rows · i` elements, all cudaMalloc'd and disjoint; null is the default stream.
+    unsafe {
+        for (w, c) in [(bank.gate(), gate), (bank.up(), up)] {
+            expert_gemm_fp8_variant(
+                (a.op(), w),
+                index,
+                c.ptr(),
+                (max_tiles, i, h, experts, 2 * i),
+                (n_tile, 64, 128),
+                null,
+            )
+            .expect("an expert GEMM");
+        }
+        match act {
+            0 => silu_mul_bf16(gate.ptr(), up.ptr(), out.act.ptr(), (rows, i), null),
+            _ => gelu_mul_bf16(gate.ptr(), up.ptr(), out.act.ptr(), (rows, i), null),
+        }
+        .expect("the act");
+        expert_act_quant_fp8(
+            (gate.ptr(), up.ptr(), ob.ptr().cast_const()),
+            (out.q.ptr(), out.s.ptr()),
+            (rows, i, experts),
+            act,
+            null,
+        )
+        .expect("the act + quantize");
+    }
+}
+
+/// P3(b)'s: the fused gate + up + act into `out.act`, then the live rows' quantize of it.
+fn p3b_fused(
+    (a, bank): (&Fp8Buf, &P3bBank),
+    (ob, tb): (&DeviceBuffer, &DeviceBuffer),
+    (max_tiles, experts, act): (u32, u32, u32),
+    out: &P3bOut,
+) {
+    let (i, h) = (bank.inter as u32, bank.hidden as u32);
+    let null = std::ptr::null_mut();
+    // SAFETY: as `p3b_today`'s; the bank's scales extend `inter` f32 past its `E · 2i`.
+    unsafe {
+        expert_gate_up_gemm_fp8(
+            (a.op(), bank.gate()),
+            (ob.ptr().cast_const(), tb.ptr().cast_const()),
+            out.act.ptr(),
+            (max_tiles, i, h, experts, 2 * i),
+            act,
+            null,
+        )
+        .expect("the fused gate + up + act");
+        expert_quant_fp8(
+            (out.act.ptr().cast_const(), ob.ptr().cast_const()),
+            (out.q.ptr(), out.s.ptr()),
+            (max_tiles * 64, i, experts),
+            null,
+        )
+        .expect("the live rows' quantize");
+    }
+}
+
+fn p3b_bytes(b: &DeviceBuffer) -> Vec<u8> {
+    (b.download().expect("download").iter())
+        .flat_map(|h| h.to_le_bytes())
+        .collect()
+}
+
+/// FP8 S8 P3(b): the fused expert gate + up + act is today's two expert GEMMs then the act, bit for
+/// bit on every live row (pair rows and +0 padding rows), and its live rows' quantize is today's
+/// act + quantize, bytes and scales; every row past the live tiles never written. At the 35B's
+/// geometry (n 512, four exact 128-column blocks) and Gemma's (n 704: its sixth block ragged), on
+/// 9 live 64-row tiles of 12 (experts 0, the last and a repeated one among them) and on 0 live
+/// tiles, as `P3B_BITS` lines.
+#[test]
+fn the_fused_expert_gate_up_is_the_two_gemms_and_the_act_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (experts, inter, hidden, act, n_tile, what) in P3B_SHAPES {
+        let (eu, iu, hu) = (experts as usize, inter as usize, hidden as usize);
+        let bank = P3bBank::new(&device, (eu, iu, hu), 0x0FB0 ^ u64::from(hidden));
+        let max_tiles = 12usize;
+        let rows = max_tiles * 64;
+        let a = p3b_rows(&device, rows, hu, 0x0FB1 ^ u64::from(inter));
+        for owners in [vec![3usize, 3, 0, eu - 1, 7, 7, 7, eu - 1, 1], vec![]] {
+            let (offsets, tile_expert) = p3_index(&owners, max_tiles, 64, eu);
+            let (ob, tb) = (up_u32(&device, &offsets), up_u32(&device, &tile_expert));
+            let live = owners.len() * 64;
+            let bf = |n: usize| DeviceBuffer::upload(&device, &vec![SENTINEL; n]).expect("buf");
+            let (gate, up) = (bf(rows * iu), bf(rows * iu));
+            let (today, fused) = (
+                P3bOut::new(&device, rows, iu),
+                P3bOut::new(&device, rows, iu),
+            );
+            let dims = (max_tiles as u32, experts, act, n_tile);
+            p3b_today((&a, &bank), (&ob, &tb), dims, (&gate, &up), &today);
+            p3b_fused(
+                (&a, &bank),
+                (&ob, &tb),
+                (max_tiles as u32, experts, act),
+                &fused,
+            );
+            let (ta, fa) = (
+                today.act.download().expect("act"),
+                fused.act.download().expect("act"),
+            );
+            let bad_act = mismatched_bits(&fa[..live * iu], &ta[..live * iu]);
+            let (tq, fq, ts, fs) = (
+                p3b_bytes(&today.q),
+                p3b_bytes(&fused.q),
+                p3b_bytes(&today.s),
+                p3b_bytes(&fused.s),
+            );
+            let bad_q = (fq[..live * iu].iter().zip(&tq[..live * iu]))
+                .filter(|(x, y)| x != y)
+                .count();
+            let bad_s = (fs[..live * 4].iter().zip(&ts[..live * 4]))
+                .filter(|(x, y)| x != y)
+                .count();
+            let dead = fa[live * iu..].iter().all(|&v| v == SENTINEL)
+                && fq[live * iu..rows * iu].iter().all(|&v| v == 0xA5)
+                && fs[live * 4..rows * 4].iter().all(|&v| v == 0xA5);
+            let ok = bad_act == 0 && bad_q == 0 && bad_s == 0 && dead;
+            eprintln!(
+                "P3B_BITS {what} experts={experts} n={inter} k={hidden} live_tiles={}: \
+                 act mismatched_bits={bad_act} q mismatched_bytes={bad_q} \
+                 scale mismatched_bytes={bad_s} dead_rows_untouched={dead} {}",
+                owners.len(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the fused expert gate + up + act is not today's chain"
+    );
+}
+
+/// The fused launcher refuses what it does not take, before any pointer is touched, as
+/// `P3B_REFUSED` lines: `k` not a multiple of 128, `inter` not of 64, `expert_rows` below `2 ·
+/// inter`, an expert count it has no instance for, and `act` above 1.
+#[test]
+fn the_fused_expert_gate_up_refuses_what_it_does_not_take() {
+    let null = std::ptr::null();
+    let mut pass = true;
+    for (what, dims, act) in [
+        ("k 2112", (4u32, 512u32, 2112u32, 256u32, 1024u32), 0u32),
+        ("inter 520", (4, 520, 2048, 256, 1040), 0),
+        ("expert_rows 1000", (4, 512, 2048, 256, 1000), 0),
+        ("experts 64", (4, 512, 2048, 64, 1024), 0),
+        ("act 2", (4, 512, 2048, 256, 1024), 2),
+        ("max_tiles 0", (0, 512, 2048, 256, 1024), 0),
+    ] {
+        // SAFETY: every case is refused before any pointer is touched.
+        let got = unsafe {
+            expert_gate_up_gemm_fp8(
+                ((null, null), (null, null)),
+                (null, null),
+                std::ptr::null_mut(),
+                dims,
+                act,
+                std::ptr::null_mut(),
+            )
+        };
+        let ok = matches!(got, Err(KernelError::MoeShape { .. }));
+        eprintln!("P3B_REFUSED {what}: {got:?} {}", verdict(ok));
+        pass &= ok;
+    }
+    assert!(pass, "the fused expert gate + up took a shape it refuses");
+}
+
+/// Recorded, not asserted (P3(b)'s gate reads it): at a 2,048-token prefill (16,384 pairs, uniform
+/// over the experts, its 64-row sort), today's gate + up + act (the two expert GEMMs and P1's act +
+/// quantize) against P3(b)'s (the fused GEMM and the live rows' quantize), as `P3B_TIME` lines,
+/// two rounds (A, B, A, B), at the 35B's and Gemma's geometries.
+#[test]
+fn the_fused_expert_gate_up_times_are_recorded() {
+    let device = h100();
+    for (experts, inter, hidden, act, n_tile, what) in P3B_SHAPES {
+        let (eu, iu, hu) = (experts as usize, inter as usize, hidden as usize);
+        let mut state = 0x0FB8u64 ^ u64::from(hidden);
+        let mut counts = vec![0usize; eu];
+        for _ in 0..2048 * 8 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            counts[((z ^ (z >> 31)) % experts as u64) as usize] += 1;
+        }
+        let owners: Vec<usize> = (0..eu)
+            .flat_map(|e| std::iter::repeat_n(e, counts[e].div_ceil(64)))
+            .collect();
+        let max_tiles = owners.len();
+        let rows = max_tiles * 64;
+        let bank = P3bBank::new(&device, (eu, iu, hu), 0x0FB9);
+        let a = p3b_rows(&device, rows, hu, 0x0FBA);
+        let (offsets, tile_expert) = p3_index(&owners, max_tiles, 64, eu);
+        let (ob, tb) = (up_u32(&device, &offsets), up_u32(&device, &tile_expert));
+        let bf = |n: usize| DeviceBuffer::upload(&device, &vec![0u16; n]).expect("buf");
+        let (gate, up) = (bf(rows * iu), bf(rows * iu));
+        let (today, fused) = (
+            P3bOut::new(&device, rows, iu),
+            P3bOut::new(&device, rows, iu),
+        );
+        let (i, h) = (inter, hidden);
+        for round in 1..=2 {
+            let t0 = event_time(|| {
+                // SAFETY: as `p3b_today`'s, without the act over every row (production's chain).
+                unsafe {
+                    for (w, c) in [(bank.gate(), &gate), (bank.up(), &up)] {
+                        expert_gemm_fp8_variant(
+                            (a.op(), w),
+                            (ob.ptr().cast_const(), tb.ptr().cast_const()),
+                            c.ptr(),
+                            (max_tiles as u32, i, h, experts, 2 * i),
+                            (n_tile, 64, 128),
+                            std::ptr::null_mut(),
+                        )
+                        .expect("an expert GEMM");
+                    }
+                    expert_act_quant_fp8(
+                        (gate.ptr(), up.ptr(), ob.ptr().cast_const()),
+                        (today.q.ptr(), today.s.ptr()),
+                        (rows as u32, i, experts),
+                        act,
+                        std::ptr::null_mut(),
+                    )
+                    .expect("the act + quantize");
+                }
+            });
+            let t1 = event_time(|| {
+                p3b_fused(
+                    (&a, &bank),
+                    (&ob, &tb),
+                    (max_tiles as u32, experts, act),
+                    &fused,
+                )
+            });
+            eprintln!(
+                "P3B_TIME {what} round={round}: today gate+up+act_quant {t0:.1} us, fused \
+                 gate_up+quant {t1:.1} us ({:.2}x; {rows} computed rows for 16384 pairs)",
+                t0 / t1
+            );
         }
     }
 }
