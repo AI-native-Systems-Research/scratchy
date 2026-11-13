@@ -1316,7 +1316,8 @@ pub fn slice_source_all_ranks<E: SliceElement, T: World>(
         }
         SourceShard::RowBlocks { block } => {
             let b = block.get() as usize;
-            out.iter_mut().for_each(|v| *v = Vec::with_capacity(b * cols));
+            out.iter_mut()
+                .for_each(|v| *v = Vec::with_capacity(b * cols));
             for (r, v) in out.iter_mut().enumerate() {
                 for i in r * b..(r + 1) * b {
                     if i < rows {

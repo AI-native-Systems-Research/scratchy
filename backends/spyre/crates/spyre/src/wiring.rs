@@ -3203,24 +3203,98 @@ mod tp_slice_tests {
             heads: std::num::NonZeroU32::new(2).unwrap(),
         };
         let cases = [
-            Case { bytes: &disk, elem: 1, whole: (2, 4), is_gemm: true, shard: SourceShard::Rows },
-            Case { bytes: &disk, elem: 1, whole: (2, 4), is_gemm: true, shard: SourceShard::Cols },
-            Case { bytes: &disk, elem: 1, whole: (2, 4), is_gemm: true, shard: SourceShard::Whole },
-            Case { bytes: &row, elem: 2, whole: (1, 4), is_gemm: false, shard: SourceShard::Cols },
-            Case { bytes: &row, elem: 2, whole: (1, 4), is_gemm: false, shard: SourceShard::Whole },
-            Case { bytes: &padded, elem: 1, whole: (2, 3), is_gemm: true, shard: block },
-            Case { bytes: &padded, elem: 1, whole: (2, 3), is_gemm: true, shard: SourceShard::RowBlocks { block: std::num::NonZeroU32::new(2).unwrap() } },
-            Case { bytes: &wide, elem: 1, whole: (2, 8), is_gemm: false, shard: SourceShard::Cols },
-            Case { bytes: &wide, elem: 1, whole: (2, 8), is_gemm: false, shard: SourceShard::Rows },
-            Case { bytes: &wide, elem: 1, whole: (2, 8), is_gemm: false, shard: SourceShard::Partial },
-            Case { bytes: &wide, elem: 1, whole: (4, 4), is_gemm: false, shard: heads },
+            Case {
+                bytes: &disk,
+                elem: 1,
+                whole: (2, 4),
+                is_gemm: true,
+                shard: SourceShard::Rows,
+            },
+            Case {
+                bytes: &disk,
+                elem: 1,
+                whole: (2, 4),
+                is_gemm: true,
+                shard: SourceShard::Cols,
+            },
+            Case {
+                bytes: &disk,
+                elem: 1,
+                whole: (2, 4),
+                is_gemm: true,
+                shard: SourceShard::Whole,
+            },
+            Case {
+                bytes: &row,
+                elem: 2,
+                whole: (1, 4),
+                is_gemm: false,
+                shard: SourceShard::Cols,
+            },
+            Case {
+                bytes: &row,
+                elem: 2,
+                whole: (1, 4),
+                is_gemm: false,
+                shard: SourceShard::Whole,
+            },
+            Case {
+                bytes: &padded,
+                elem: 1,
+                whole: (2, 3),
+                is_gemm: true,
+                shard: block,
+            },
+            Case {
+                bytes: &padded,
+                elem: 1,
+                whole: (2, 3),
+                is_gemm: true,
+                shard: SourceShard::RowBlocks {
+                    block: std::num::NonZeroU32::new(2).unwrap(),
+                },
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (2, 8),
+                is_gemm: false,
+                shard: SourceShard::Cols,
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (2, 8),
+                is_gemm: false,
+                shard: SourceShard::Rows,
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (2, 8),
+                is_gemm: false,
+                shard: SourceShard::Partial,
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (4, 4),
+                is_gemm: false,
+                shard: heads,
+            },
         ];
-        for Case { bytes, elem, whole, is_gemm, shard } in cases {
+        for Case {
+            bytes,
+            elem,
+            whole,
+            is_gemm,
+            shard,
+        } in cases
+        {
             macro_rules! pin {
                 ($t:ty) => {{
-                    let all = cut_source_bytes_all_ranks::<$t>(
-                        shard, 7, bytes, elem, whole, is_gemm,
-                    );
+                    let all =
+                        cut_source_bytes_all_ranks::<$t>(shard, 7, bytes, elem, whole, is_gemm);
                     for r in ranks::<$t>() {
                         let per = cut_source_bytes::<$t>(shard, r, 7, bytes, elem, whole, is_gemm);
                         let got = match &all {
@@ -3234,7 +3308,8 @@ mod tp_slice_tests {
                             Err(e) => Err(e.clone()),
                         };
                         assert_eq!(
-                            got, per,
+                            got,
+                            per,
                             "{shard:?} elem {elem} whole {whole:?} gemm {is_gemm}: rank {}",
                             r.get()
                         );

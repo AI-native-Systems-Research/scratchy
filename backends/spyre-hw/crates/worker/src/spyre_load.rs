@@ -460,9 +460,8 @@ fn scatter_cut_all_ranks(
     whole: &'static scratchy_target_spyre::wiring::Wiring,
     bound: &[scratchy_target_spyre::BoundWeight],
     shares: Vec<HostBytes>,
-) -> ExecutorResult<
-    scratchy_target_spyre::bundle_code::collective::PerRank<World, Vec<HostBytes>>,
-> {
+) -> ExecutorResult<scratchy_target_spyre::bundle_code::collective::PerRank<World, Vec<HostBytes>>>
+{
     use rayon::prelude::*;
     use scratchy_target_spyre::wiring::AllRanksCut;
     let cut: ExecutorResult<Vec<Vec<HostBytes>>> = bound
@@ -477,16 +476,20 @@ fn scatter_cut_all_ranks(
             })?;
             let elem = bw.tensor.dtype().size_bytes();
             let cut = forward
-                .slice_source_bytes_all_ranks(bw.id, bytes.as_slice(), elem, whole_shape, bw.is_gemm)
+                .slice_source_bytes_all_ranks(
+                    bw.id,
+                    bytes.as_slice(),
+                    elem,
+                    whole_shape,
+                    bw.is_gemm,
+                )
                 .map_err(|e| werr(format!("the scatter cut: {e}")))?;
             let ranks =
                 <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS as usize;
             Ok(match cut {
                 // One backing serves every rank: a View's handle clones free, the one
                 // non-mmap source copies per rank.
-                AllRanksCut::Whole => (0..ranks)
-                    .map(|_| bytes.shared_clone())
-                    .collect(),
+                AllRanksCut::Whole => (0..ranks).map(|_| bytes.shared_clone()).collect(),
                 // Rank 0 holds the value, every other rank zeros of the same extent.
                 AllRanksCut::Partial => {
                     let mut out: Vec<HostBytes> = (0..ranks)
@@ -559,10 +562,7 @@ fn sharded_bundle(
 /// outlives every walk (the allocator drops with `gw`, after the join). A VIEW clones its
 /// keepalive handle — free; an OWNED buffer has no handle, so this binding copies
 /// (measured: one 16 MiB synthesized buffer per model, ~6 ms).
-fn share_from_store(
-    src: &[u8],
-    alloc: Option<&mut SpyreAllocator>,
-) -> HostBytes {
+fn share_from_store(src: &[u8], alloc: Option<&mut SpyreAllocator>) -> HostBytes {
     match alloc {
         Some(alloc) => alloc
             .share(src.as_ptr(), src.len())
