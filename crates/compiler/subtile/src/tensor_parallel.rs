@@ -1237,6 +1237,101 @@ pub fn slice_source<E: SliceElement, T: World>(
     }
 }
 
+/// ⭐ THE SLICE LAW FOR EVERY RANK AT ONCE, cut in ONE pass over `full` in SOURCE
+/// ORDER: `out[r]` is exactly `slice_source(full, shape, shard, Rank::of::<r>())`
+/// (pinned by test, for every law and world), but each source element is READ exactly
+/// once however wide the world is. The per-rank cuts each walk the whole source, so
+/// `W` of them at once re-read every source page `W` times — a sharded boot's weight
+/// cut over a file-backed checkpoint measured at tp/8 as 8 concurrent strided walks
+/// over the same pages, the weights window's whole residual. Here one walk in source
+/// order feeds every rank's output buffer: for a `Cols` cut each row's bytes are read
+/// left to right once, each rank's contiguous block appended to its own buffer; the
+/// block laws are the same walk with their zero tails written, not read.
+pub fn slice_source_all_ranks<E: SliceElement, T: World>(
+    full: &[E],
+    shape: SourceShape,
+    shard: SourceShard,
+) -> Vec<Vec<E>> {
+    let (rows, cols) = (shape.rows as usize, shape.cols as usize);
+    let w = T::RANKS as usize;
+    debug_assert_eq!(full.len(), rows * cols, "source buffer vs its shape");
+    let mut out = vec![Vec::new(); w];
+    match shard {
+        SourceShard::Whole => out.iter_mut().for_each(|v| *v = full.to_vec()),
+        SourceShard::Partial => {
+            out[0] = full.to_vec();
+            for v in &mut out[1..] {
+                *v = vec![E::ZERO; full.len()];
+            }
+        }
+        // Contiguous row blocks: each rank's share is one range of the source.
+        SourceShard::Rows => {
+            let lr = rows / w * cols;
+            for (r, v) in out.iter_mut().enumerate() {
+                *v = full[r * lr..(r + 1) * lr].to_vec();
+            }
+        }
+        // One row at a time, each rank's contiguous column block in rank order.
+        SourceShard::Cols => {
+            let lc = cols / w;
+            out.iter_mut()
+                .for_each(|v| *v = Vec::with_capacity(rows * lc));
+            for i in 0..rows {
+                let row = &full[i * cols..(i + 1) * cols];
+                for (r, v) in out.iter_mut().enumerate() {
+                    v.extend_from_slice(&row[r * lc..(r + 1) * lc]);
+                }
+            }
+        }
+        // One token's head rows at a time, each rank's head block in rank order.
+        SourceShard::HeadRows { heads } => {
+            let h = heads.get() as usize;
+            let lh = h / w;
+            out.iter_mut()
+                .for_each(|v| *v = Vec::with_capacity(rows * cols / w));
+            for t in 0..rows / h {
+                for (r, v) in out.iter_mut().enumerate() {
+                    let first = t * h + r * lh;
+                    v.extend_from_slice(&full[first * cols..(first + lh) * cols]);
+                }
+            }
+        }
+        SourceShard::ColBlocks { block } => {
+            let b = block.get() as usize;
+            out.iter_mut()
+                .for_each(|v| *v = Vec::with_capacity(rows * b));
+            for i in 0..rows {
+                let row = &full[i * cols..(i + 1) * cols];
+                for (r, v) in out.iter_mut().enumerate() {
+                    // Rank r's block `[r·b, (r+1)·b)`, its tail past the width ZERO — the
+                    // block laws' own zero is WRITTEN, never read out of the source.
+                    let start = r * b;
+                    let real = cols.saturating_sub(start).min(b);
+                    if real > 0 {
+                        v.extend_from_slice(&row[start..start + real]);
+                    }
+                    v.resize(v.len() + b - real, E::ZERO);
+                }
+            }
+        }
+        SourceShard::RowBlocks { block } => {
+            let b = block.get() as usize;
+            out.iter_mut()
+                .for_each(|v| *v = Vec::with_capacity(b * cols));
+            for (r, v) in out.iter_mut().enumerate() {
+                for i in r * b..(r + 1) * b {
+                    if i < rows {
+                        v.extend_from_slice(&full[i * cols..(i + 1) * cols]);
+                    } else {
+                        v.resize(v.len() + cols, E::ZERO);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// ⭐ WHAT A COLLECTIVE MEANS — its value on every rank, given every rank's buffers in ABSOLUTE
 /// RANK ORDER (`ranks[r]` is rank `r`'s). An [`SubOp::AllReduce`] sums its operand over the ranks
 /// in that order; an [`SubOp::AllGather`] concatenates their column blocks in that order. The one
@@ -1906,6 +2001,64 @@ mod tests {
             ),
             Some((&w, SourceShard::Cols, SourceShard::Rows))
         );
+    }
+
+    /// ⭐ THE ALL-RANKS CUT IS THE PER-RANK CUT, for every rank, over every law and world —
+    /// the one-pass scatter cut may change HOW the bytes are read, never WHICH bytes each
+    /// rank holds. Shapes cover every law's arithmetic: even splits, a head split that
+    /// divides, and both padded block laws with a zero tail past the source.
+    #[test]
+    fn the_all_ranks_cut_is_the_per_rank_cut_for_every_rank() {
+        let laws = [
+            SourceShard::Whole,
+            SourceShard::Partial,
+            SourceShard::Rows,
+            SourceShard::Cols,
+            SourceShard::HeadRows {
+                heads: NonZeroU32::new(4).unwrap(),
+            },
+            SourceShard::ColBlocks {
+                block: NonZeroU32::new(3).unwrap(),
+            },
+            SourceShard::RowBlocks {
+                block: NonZeroU32::new(3).unwrap(),
+            },
+        ];
+        // [rows, cols]: 6 rows of 8 columns (even splits at 2 and 4, 4 heads of 2 rows),
+        // and both padded-block orientations ([5, 8] / [8, 5], block 3) so the last
+        // rank's block runs past the source.
+        let cases = [
+            (SourceShape { rows: 6, cols: 8 }, 2),
+            (SourceShape { rows: 6, cols: 8 }, 4),
+            (SourceShape { rows: 5, cols: 8 }, 2),
+            (SourceShape { rows: 8, cols: 5 }, 4),
+        ];
+        for (shape, w) in cases {
+            for law in laws {
+                let full = fill((shape.rows * shape.cols) as usize, shape.cols * 7 + w);
+                macro_rules! check {
+                    ($t:ty) => {{
+                        let all = slice_source_all_ranks::<f32, $t>(&full, shape, law);
+                        assert_eq!(all.len() as u32, <$t as World>::RANKS);
+                        for r in ranks::<$t>() {
+                            assert_eq!(
+                                all[r.get() as usize],
+                                slice_source(&full, shape, law, r),
+                                "{law:?} at {:?} × {} ranks: rank {}'s share differs",
+                                shape,
+                                <$t as World>::RANKS,
+                                r.get()
+                            );
+                        }
+                    }};
+                }
+                match w {
+                    2 => check!(TpWorld<2>),
+                    4 => check!(TpWorld<4>),
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 
     /// The padded laws cut whole buffers into blocks and zero what lies past the source.

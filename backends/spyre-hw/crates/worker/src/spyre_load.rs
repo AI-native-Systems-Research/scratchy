@@ -426,43 +426,97 @@ fn apply_weight_scale_folds(
 #[cfg(feature = "spyre-hw")]
 type WorldForward = scratchy_target_spyre::wiring::TpForward<World>;
 
-/// ⭐ ONE RANK'S SHARE OF THE CHECKPOINT. The generated loader binds every weight whole; a rank of
-/// a sharded world stages only its slice of each, by the law the analysis derived for that source
-/// ([`scratchy_target_spyre::wiring::TpForward::slice_source_bytes`]). `whole` is the one-rank
-/// wiring, whose shapes are the tensors' as they sit in the checkpoint.
+/// ⭐ EVERY BOUND WEIGHT'S BYTES, SHARED FROM THE ALLOCATOR'S STORE — one pass on the owning
+/// thread, before the scatter cut's threads read the views: a VIEW of the weight's mmap
+/// (free), a copy of the one non-mmap source. The share, never a take, is the law the
+/// staging walks already follow: the store's entries outlive every cut and every walk
+/// (the allocator drops with `gw`, after the fan-out joins).
 #[cfg(feature = "spyre-hw")]
-pub(crate) struct RankCut {
-    pub(crate) forward: &'static WorldForward,
-    pub(crate) me: scratchy_target_spyre::bundle_code::collective::Rank<World>,
-    pub(crate) whole: &'static scratchy_target_spyre::wiring::Wiring,
+fn share_bound_weights(
+    bound: &[scratchy_target_spyre::BoundWeight],
+    alloc: &mut SpyreAllocator,
+) -> Vec<HostBytes> {
+    bound
+        .iter()
+        .map(|bw| share_from_store(gpu_tensor_bytes(&bw.tensor), Some(&mut *alloc)))
+        .collect()
 }
 
+/// ⭐ EVERY RANK'S SHARE OF EVERY BOUND WEIGHT, CUT IN ONE PASS OVER THE CHECKPOINT. The
+/// generated loader binds every weight whole; a rank of a sharded world stages only its
+/// slice of each, by the law the analysis derived for that source
+/// ([`scratchy_target_spyre::wiring::TpForward::slice_source_bytes_all_ranks`]) — cut here
+/// for EVERY rank at once, one thread per weight, each source read exactly once in source
+/// order. The per-rank cuts this replaces each walked the whole source, and every rank
+/// without the allocator's store slot materialized each whole tensor before cutting
+/// (`src.to_vec()` — at tp/8 that was 7 whole-model host copies plus 8 concurrent strided
+/// walks over the same file-backed pages, the weights window's whole residual).
+///
+/// [`AllRanksCut::Whole`] and [`AllRanksCut::Partial`] keep the SHARED view — every rank's
+/// share is the same bytes, so one backing serves every rank's handle.
 #[cfg(feature = "spyre-hw")]
-impl RankCut {
-    fn cut(
-        &self,
-        id: u32,
-        bytes: HostBytes,
-        elem: usize,
-        is_gemm: bool,
-    ) -> ExecutorResult<HostBytes> {
-        let &whole = self.whole.tensor_shapes.get(id as usize).ok_or_else(|| {
-            werr(format!(
-                "source {id} has no one-rank shape to cut rank {}'s share from",
-                self.me.get()
-            ))
-        })?;
-        // The cut OWNS its product — the slicing laws build each rank's share as a fresh
-        // buffer — and reads the VIEW to build it: only the rank's share is ever copied, so
-        // a sharded leg stages 1/world of the checkpoint per rank instead of materializing
-        // the whole model once per rank (measured at tp/8: the whole-tensor materialization
-        // was 8 full-model host copies, ~1 s of boot, all bandwidth-bound and serialized).
-        let cut = self
-            .forward
-            .slice_source_bytes(self.me, id, bytes.as_slice(), elem, whole, is_gemm)
-            .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))?;
-        Ok(HostBytes::Owned(cut))
+fn scatter_cut_all_ranks(
+    forward: &'static WorldForward,
+    whole: &'static scratchy_target_spyre::wiring::Wiring,
+    bound: &[scratchy_target_spyre::BoundWeight],
+    shares: Vec<HostBytes>,
+) -> ExecutorResult<scratchy_target_spyre::bundle_code::collective::PerRank<World, Vec<HostBytes>>>
+{
+    use rayon::prelude::*;
+    use scratchy_target_spyre::wiring::AllRanksCut;
+    let cut: ExecutorResult<Vec<Vec<HostBytes>>> = bound
+        .par_iter()
+        .zip(shares)
+        .map(|(bw, bytes)| {
+            let &whole_shape = whole.tensor_shapes.get(bw.id as usize).ok_or_else(|| {
+                werr(format!(
+                    "source {} has no one-rank shape to cut the ranks' shares from",
+                    bw.id
+                ))
+            })?;
+            let elem = bw.tensor.dtype().size_bytes();
+            let cut = forward
+                .slice_source_bytes_all_ranks(
+                    bw.id,
+                    bytes.as_slice(),
+                    elem,
+                    whole_shape,
+                    bw.is_gemm,
+                )
+                .map_err(|e| werr(format!("the scatter cut: {e}")))?;
+            let ranks =
+                <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS as usize;
+            Ok(match cut {
+                // One backing serves every rank: a View's handle clones free, the one
+                // non-mmap source copies per rank.
+                AllRanksCut::Whole => (0..ranks).map(|_| bytes.shared_clone()).collect(),
+                // Rank 0 holds the value, every other rank zeros of the same extent.
+                AllRanksCut::Partial => {
+                    let mut out: Vec<HostBytes> = (0..ranks)
+                        .map(|_| HostBytes::Owned(vec![0u8; bytes.len()]))
+                        .collect();
+                    out[0] = bytes.shared_clone();
+                    out
+                }
+                AllRanksCut::Split(v) => v.into_iter().map(HostBytes::Owned).collect(),
+            })
+        })
+        .collect();
+    let cut = cut?;
+    // Weight-major → rank-major, moving every share into its rank's walk order.
+    let w = <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS as usize;
+    let mut per_rank: Vec<Vec<HostBytes>> = Vec::with_capacity(w);
+    per_rank.resize_with(w, || Vec::with_capacity(cut.len()));
+    for weight in cut {
+        for (r, share) in weight.into_iter().enumerate() {
+            per_rank[r].push(share);
+        }
     }
+    Ok(
+        scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
+            std::mem::take(&mut per_rank[me.get() as usize])
+        }),
+    )
 }
 
 /// The sharded forward `f`, in the shape the card loader reads a model's bundle in: its decode
@@ -500,6 +554,23 @@ fn sharded_bundle(
     })))
 }
 
+/// A whole tensor's bytes out of the allocator's store. ⭐ SHARE, NEVER TAKE — the take
+/// removed the store's entry and freed an OWNED buffer at this binding, sound only while
+/// staging was the buffer's last reader, an ordering the serial rank walk once guaranteed.
+/// Under [`each_rank_parallel`] every rank's walk reads the whole tensors at once, so
+/// NOTHING may free one mid-fan-out: the share leaves the entry in the store, where it
+/// outlives every walk (the allocator drops with `gw`, after the join). A VIEW clones its
+/// keepalive handle — free; an OWNED buffer has no handle, so this binding copies
+/// (measured: one 16 MiB synthesized buffer per model, ~6 ms).
+fn share_from_store(src: &[u8], alloc: Option<&mut SpyreAllocator>) -> HostBytes {
+    match alloc {
+        Some(alloc) => alloc
+            .share(src.as_ptr(), src.len())
+            .unwrap_or_else(|| HostBytes::Owned(src.to_vec())),
+        None => HostBytes::Owned(src.to_vec()),
+    }
+}
+
 pub(crate) fn stage_bound_weights(
     bound: &[scratchy_target_spyre::BoundWeight],
     // ⛔ FOR PLACEMENT EXISTENCE ONLY — never for names. The K-split branches
@@ -510,16 +581,19 @@ pub(crate) fn stage_bound_weights(
     // emptied every completion in `22a8f469`. Asked of the GENERATED wiring
     // now, which carries the same per-id extents the manifest did.
     wiring: &scratchy_target_spyre::wiring::Wiring,
-    // A rank of a sharded world stages its share of each tensor; `None` stages it whole.
-    #[cfg(feature = "spyre-hw")] cut: Option<&RankCut>,
-    // The allocator that owns the bound tensors' buffers: staging SHARES each buffer — a VIEW
-    // clones its keepalive handle (free), an OWNED buffer copies. The share, never a take, is the
-    // LAW: a take removes the store's entry and the buffer frees at this binding, which is sound
-    // only if staging is that buffer's last reader — an ordering the serial rank walk once
-    // guaranteed and [`each_rank_parallel`] removed (every rank's walk reads the whole tensors at
-    // once). The share leaves the entry in the store, where it outlives every walk: the allocator
-    // drops with `gw`, after the fan-out joins. `None` copies every buffer — a sharded world's
-    // ranks other than the one whose input slot the allocator rides.
+    // ⭐ THIS RANK'S PRE-CUT SHARE OF EACH BOUND WEIGHT, in bound order, one entry per weight,
+    // moved as the walk reaches it: the scatter cut ([`scatter_cut_all_ranks`]) built every
+    // rank's share in ONE pass over the checkpoint, before this walk. `None` (a one-rank
+    // world, the emulator) stages each weight whole out of the allocator's store.
+    #[cfg(feature = "spyre-hw")] mut shares: Option<std::vec::IntoIter<HostBytes>>,
+    // The allocator that owns the bound tensors' buffers, for the `shares = None` whole
+    // staging: staging SHARES each buffer — a VIEW clones its keepalive handle (free), an
+    // OWNED buffer copies. The share, never a take, is the LAW: a take removes the store's
+    // entry and the buffer frees at this binding, which is sound only if staging is that
+    // buffer's last reader — an ordering the serial rank walk once guaranteed and
+    // [`each_rank_parallel`] removed. The share leaves the entry in the store, where it
+    // outlives every walk: the allocator drops with `gw`, after the fan-out joins. A rank
+    // walking its pre-cut shares passes `None` — its bytes are already in hand.
     mut alloc: Option<&mut SpyreAllocator>,
 ) -> ExecutorResult<Vec<StagedWeight>> {
     let _t_load = std::time::Instant::now();
@@ -558,31 +632,18 @@ pub(crate) fn stage_bound_weights(
         // and nothing else. `raw_name` survives only for the card path's size diagnostic below.
         #[cfg(feature = "spyre-hw")]
         let raw_name = scratchy_target_spyre::bundle_code::PlaceId::Act((s_id) as u32);
-        let bytes = {
-            let src = gpu_tensor_bytes(&bw.tensor);
-            let (ptr, len) = (src.as_ptr(), src.len());
-            match alloc.as_deref_mut() {
-                // ⭐ SHARE, NEVER TAKE — the take removed the store's entry and freed an OWNED
-                // buffer at this binding, sound only while staging was the buffer's last
-                // reader, an ordering the serial rank walk once guaranteed. Under
-                // [`each_rank_parallel`] every rank's walk reads the whole tensors at once, so
-                // NOTHING may free one mid-fan-out: the share leaves the entry in the store,
-                // where it outlives every walk (the allocator drops with `gw`, after the join).
-                // A VIEW clones its keepalive handle — free; an OWNED buffer has no handle, so
-                // this binding copies (measured: one 16 MiB synthesized buffer per model, ~6 ms).
-                Some(alloc) => alloc
-                    .share(ptr, len)
-                    .unwrap_or_else(|| HostBytes::Owned(src.to_vec())),
-                None => HostBytes::Owned(src.to_vec()),
-            }
-        };
-        let dt = bw.tensor.dtype();
-        // A card rank of a sharded world stages its share; the emulator serves one card, whole.
+        // ⭐ THE PRE-CUT SHARE FIRST — the scatter cut already read the checkpoint once and
+        // built this rank's share; the walk never touches the whole tensor again. A walk
+        // with no pre-cut (a one-rank world, the emulator) stages the tensor whole out of
+        // the allocator's store.
         #[cfg(feature = "spyre-hw")]
-        let bytes = match cut {
-            Some(c) => c.cut(bw.id, bytes, dt.size_bytes(), is_gemm)?,
-            None => bytes,
+        let bytes = match shares.as_mut().and_then(Iterator::next) {
+            Some(b) => b,
+            None => share_from_store(gpu_tensor_bytes(&bw.tensor), alloc.as_deref_mut()),
         };
+        #[cfg(not(feature = "spyre-hw"))]
+        let bytes = share_from_store(gpu_tensor_bytes(&bw.tensor), alloc.as_deref_mut());
+        let dt = bw.tensor.dtype();
         // The sengraph emits every GEMM `MatMul` with `transpose_b=false`, so the
         // bound `ModelInput` must be the logical `[in, out] = [k, n]` (= on-disk
         // `Wᵀ`). The on-disk safetensors buffer is `[out, in] = [n, k]`, recorded
@@ -1051,29 +1112,25 @@ impl SpyreWorker {
                 })
             }
             Some(forward) => {
-                let last =
-                    <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS - 1;
-                // ⭐ EVERY RANK'S STAGING WALK AT ONCE — one thread per rank
-                // (`each_rank_parallel`): each rank's cut reads the whole checkpoint tensors and
-                // writes its own share into its own shadow, so the walks are independent (measured
-                // at tp/8: 4.0 s as eight sequential walks, each ~the single-card wall). The
-                // allocator rides the LAST rank's input slot — the one unique resource crossing
-                // the fan-out as exactly one rank's input, never a shared `&mut`. Its staging
-                // SHARES every buffer and never takes: a take could free a buffer under the other
-                // ranks' concurrent reads, so every walk reads buffers the store keeps alive
-                // past their join.
-                let mut alloc_slot = Some(gw.allocator_mut());
-                let inputs =
-                    scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
-                        (me.get() == last).then(|| alloc_slot.take()).flatten()
-                    });
-                scratchy_target_spyre_card::sdsc_runner::each_rank_parallel(inputs, |me, alloc| {
-                    let cut = RankCut {
-                        forward,
-                        me,
-                        whole: &one_rank.decode,
-                    };
-                    stage_bound_weights(&bound, &wirings.decode, Some(&cut), alloc)
+                // ⭐ ONE PASS OVER THE CHECKPOINT, THEN EVERY RANK'S WALK AT ONCE. The scatter
+                // cut reads each source exactly once, in source order, one thread per weight,
+                // and hands every rank its shares ([`scatter_cut_all_ranks`] — the per-rank
+                // cuts it replaces each walked the whole source, and the ranks without the
+                // allocator's store slot materialized each whole tensor first). Each rank's
+                // walk then stages its own shares into its own shadow — independent (measured
+                // at tp/8: 4.0 s as eight sequential walks, each ~the single-card wall) — one
+                // thread per rank (`each_rank_parallel`), its shares crossing as its own
+                // input, never a shared `&mut`.
+                let shares = share_bound_weights(&bound, gw.allocator_mut());
+                let t_cut = std::time::Instant::now();
+                let cut = scatter_cut_all_ranks(forward, &one_rank.decode, &bound, shares)?;
+                tracing::info!(
+                    "[weights] scatter cut every rank's share of {} weight(s) took {:.2}s",
+                    bound.len(),
+                    t_cut.elapsed().as_secs_f64()
+                );
+                scratchy_target_spyre_card::sdsc_runner::each_rank_parallel(cut, |_me, shares| {
+                    stage_bound_weights(&bound, &wirings.decode, Some(shares.into_iter()), None)
                 })?
             }
         };

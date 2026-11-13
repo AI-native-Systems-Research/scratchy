@@ -2093,6 +2093,38 @@ impl<T: crate::bundle_code::collective::World> TpForward<T> {
             })?;
         cut_source_bytes::<T>(shard, me, id, full, elem, whole, is_gemm)
     }
+
+    /// ⭐ EVERY RANK'S SHARE OF SOURCE `id` FROM ONE PASS OVER ITS BYTES — the all-ranks
+    /// form of [`Self::slice_source_bytes`], the same slice law and the same refusals,
+    /// cut by [`scratchy_subtile::tensor_parallel::slice_source_all_ranks`] so each
+    /// source byte is read exactly once however wide the world is. The per-rank cuts each
+    /// walk the whole source (`W` concurrent boots re-read every checkpoint page `W`
+    /// times over — measured at tp/8 as the weights window's whole residual), and the
+    /// ranks without the allocator's store slot had to materialize every whole tensor
+    /// before cutting; this cut reads the mmap view once, in source order, and builds
+    /// every rank's share from that single read. [`AllRanksCut::Whole`] and
+    /// [`AllRanksCut::Partial`] name the shared-backing laws the caller serves from one
+    /// handle instead of `W` copies.
+    ///
+    /// # Errors
+    /// [`SliceRefusal`], by name.
+    pub fn slice_source_bytes_all_ranks(
+        &self,
+        id: u32,
+        full: &[u8],
+        elem: usize,
+        whole: (u32, u32),
+        is_gemm: bool,
+    ) -> Result<AllRanksCut, SliceRefusal> {
+        let shard = *self
+            .sources
+            .get(id as usize)
+            .ok_or(SliceRefusal::NotASource {
+                id,
+                sources: self.sources.len(),
+            })?;
+        cut_source_bytes_all_ranks::<T>(shard, id, full, elem, whole, is_gemm)
+    }
 }
 
 /// [`TpForward::slice_source_bytes`] once the source's law is known.
@@ -2172,6 +2204,107 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
         4 => Ok(cut::<4, T>(full, shape, shard, me)),
         bytes => Err(SliceRefusal::Element { id, bytes }),
     }
+}
+
+/// ⭐ EVERY RANK'S SHARE OF A SOURCE, from ONE pass over its bytes — the all-ranks form
+/// of [`SliceRefusal`]'s cut. `Whole` and `Partial` name the laws whose every-rank share
+/// is the SAME bytes (all of it, or the value on rank 0 and zeros elsewhere), so the
+/// caller can hand every rank one shared backing instead of the `W` copies the per-rank
+/// cut builds; `Split` carries each rank's own buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AllRanksCut {
+    /// Every rank holds all of it — one backing serves every rank.
+    Whole,
+    /// Rank 0 holds the value and every other rank zeros (as many bytes as the source).
+    Partial,
+    /// `shares[r]` is rank `r`'s share.
+    Split(Vec<Vec<u8>>),
+}
+
+/// [`TpForward::slice_source_bytes_all_ranks`] once the source's law is known.
+fn cut_source_bytes_all_ranks<T: crate::bundle_code::collective::World>(
+    shard: SourceShard,
+    id: u32,
+    full: &[u8],
+    elem: usize,
+    whole: (u32, u32),
+    is_gemm: bool,
+) -> Result<AllRanksCut, SliceRefusal> {
+    use scratchy_subtile::subtile_ir::SourceShape;
+    use scratchy_subtile::tensor_parallel::slice_source_all_ranks;
+    if shard == SourceShard::Whole {
+        return Ok(AllRanksCut::Whole);
+    }
+    let (rows, cols) = whole;
+    let want = rows as usize * cols as usize * elem;
+    if full.len() != want {
+        return Err(SliceRefusal::Size {
+            id,
+            bytes: full.len(),
+            want,
+        });
+    }
+    let w = T::RANKS;
+    let divides = match shard {
+        SourceShard::Whole
+        | SourceShard::Partial
+        | SourceShard::ColBlocks { .. }
+        | SourceShard::RowBlocks { .. } => true,
+        SourceShard::Rows => rows.is_multiple_of(w),
+        SourceShard::Cols => cols.is_multiple_of(w),
+        SourceShard::HeadRows { heads } => {
+            heads.get().is_multiple_of(w) && rows.is_multiple_of(heads.get())
+        }
+    };
+    if !divides {
+        return Err(SliceRefusal::Indivisible {
+            id,
+            shard,
+            rows,
+            cols,
+        });
+    }
+    if shard == SourceShard::Partial {
+        return Ok(AllRanksCut::Partial);
+    }
+    // The bytes' own layout: a gemm weight's disk order is the transpose of its logical
+    // one — the same mapping the per-rank cut applies, rank-independent.
+    let (shape, shard) = if is_gemm {
+        let disk = SourceShape {
+            rows: cols,
+            cols: rows,
+        };
+        match shard {
+            SourceShard::Rows => (disk, SourceShard::Cols),
+            SourceShard::Cols => (disk, SourceShard::Rows),
+            SourceShard::ColBlocks { block } => (disk, SourceShard::RowBlocks { block }),
+            SourceShard::RowBlocks { block } => (disk, SourceShard::ColBlocks { block }),
+            // The caller serves Whole and Partial from one shared backing, in either
+            // byte order.
+            SourceShard::Whole | SourceShard::Partial => (disk, shard),
+            SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
+        }
+    } else {
+        (SourceShape { rows, cols }, shard)
+    };
+    fn cut<const N: usize, T: crate::bundle_code::collective::World>(
+        full: &[u8],
+        shape: SourceShape,
+        shard: SourceShard,
+    ) -> Vec<Vec<u8>> {
+        let (elems, _) = full.as_chunks::<N>();
+        slice_source_all_ranks::<[u8; N], T>(elems, shape, shard)
+            .into_iter()
+            .map(Vec::into_flattened)
+            .collect()
+    }
+    let split = match elem {
+        1 => cut::<1, T>(full, shape, shard),
+        2 => cut::<2, T>(full, shape, shard),
+        4 => cut::<4, T>(full, shape, shard),
+        bytes => return Err(SliceRefusal::Element { id, bytes }),
+    };
+    Ok(AllRanksCut::Split(split))
 }
 
 impl Wiring {
@@ -3036,5 +3169,155 @@ mod tp_slice_tests {
             cut_source_bytes::<W4>(SourceShard::Cols, r0, 3, &[0; 12], 1, (2, 6), false),
             Err(SliceRefusal::Indivisible { .. })
         ));
+    }
+
+    /// ⭐ THE ALL-RANKS CUT IS THE PER-RANK CUT, at the bytes, over the same fixtures the
+    /// per-rank law is pinned on — every law, both orientations, both element widths,
+    /// every world under test. The one-pass scatter cut may change HOW the source is
+    /// read, never WHICH bytes a rank holds.
+    #[test]
+    fn the_all_ranks_cut_is_the_per_rank_cut_at_the_bytes() {
+        /// One law over one source: its bytes, element width, one-rank shape, whether it
+        /// is a gemm weight (disk order transposed), and the law itself.
+        struct Case<'a> {
+            bytes: &'a [u8],
+            elem: usize,
+            whole: (u32, u32),
+            is_gemm: bool,
+            shard: SourceShard,
+        }
+        // Logical [k=2, n=4] gemm (disk [n=4, k=2]), a [1, 4] two-byte norm row, a
+        // padded [k=2, n=3] gemm (ColBlocks/RowBlocks), and a [2, 8] row-pair.
+        let disk: Vec<u8> = (0..4u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let row: Vec<u8> = (0..8).collect();
+        let padded: Vec<u8> = (0..3u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let wide: Vec<u8> = (0..16).collect();
+        let block = SourceShard::ColBlocks {
+            block: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let heads = SourceShard::HeadRows {
+            heads: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let cases = [
+            Case {
+                bytes: &disk,
+                elem: 1,
+                whole: (2, 4),
+                is_gemm: true,
+                shard: SourceShard::Rows,
+            },
+            Case {
+                bytes: &disk,
+                elem: 1,
+                whole: (2, 4),
+                is_gemm: true,
+                shard: SourceShard::Cols,
+            },
+            Case {
+                bytes: &disk,
+                elem: 1,
+                whole: (2, 4),
+                is_gemm: true,
+                shard: SourceShard::Whole,
+            },
+            Case {
+                bytes: &row,
+                elem: 2,
+                whole: (1, 4),
+                is_gemm: false,
+                shard: SourceShard::Cols,
+            },
+            Case {
+                bytes: &row,
+                elem: 2,
+                whole: (1, 4),
+                is_gemm: false,
+                shard: SourceShard::Whole,
+            },
+            Case {
+                bytes: &padded,
+                elem: 1,
+                whole: (2, 3),
+                is_gemm: true,
+                shard: block,
+            },
+            Case {
+                bytes: &padded,
+                elem: 1,
+                whole: (2, 3),
+                is_gemm: true,
+                shard: SourceShard::RowBlocks {
+                    block: std::num::NonZeroU32::new(2).unwrap(),
+                },
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (2, 8),
+                is_gemm: false,
+                shard: SourceShard::Cols,
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (2, 8),
+                is_gemm: false,
+                shard: SourceShard::Rows,
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (2, 8),
+                is_gemm: false,
+                shard: SourceShard::Partial,
+            },
+            Case {
+                bytes: &wide,
+                elem: 1,
+                whole: (4, 4),
+                is_gemm: false,
+                shard: heads,
+            },
+        ];
+        for Case {
+            bytes,
+            elem,
+            whole,
+            is_gemm,
+            shard,
+        } in cases
+        {
+            macro_rules! pin {
+                ($t:ty) => {{
+                    let all =
+                        cut_source_bytes_all_ranks::<$t>(shard, 7, bytes, elem, whole, is_gemm);
+                    for r in ranks::<$t>() {
+                        let per = cut_source_bytes::<$t>(shard, r, 7, bytes, elem, whole, is_gemm);
+                        let got = match &all {
+                            Ok(AllRanksCut::Split(v)) => Ok(v[r.get() as usize].clone()),
+                            Ok(AllRanksCut::Whole) => Ok(bytes.to_vec()),
+                            Ok(AllRanksCut::Partial) => Ok(if r.get() == 0 {
+                                bytes.to_vec()
+                            } else {
+                                vec![0u8; bytes.len()]
+                            }),
+                            Err(e) => Err(e.clone()),
+                        };
+                        assert_eq!(
+                            got,
+                            per,
+                            "{shard:?} elem {elem} whole {whole:?} gemm {is_gemm}: rank {}",
+                            r.get()
+                        );
+                    }
+                }};
+            }
+            pin!(W2);
+            pin!(W4);
+        }
     }
 }

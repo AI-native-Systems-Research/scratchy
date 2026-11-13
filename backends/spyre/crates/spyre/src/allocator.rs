@@ -99,6 +99,25 @@ impl HostBytes {
             } => backing[offset..offset + len].to_vec(),
         }
     }
+
+    /// The SAME bytes as another handle: a `View` clones its keepalive (free — the
+    /// backing is shared, never copied), an `Owned` copies. THE PER-RANK HANDLE OF A
+    /// `Whole` SOURCE: every rank of a sharded world holds all of it, so one backing
+    /// serves every rank's handle and the copy is only ever the non-mmap source's own.
+    pub fn shared_clone(&self) -> HostBytes {
+        match self {
+            HostBytes::Owned(v) => HostBytes::Owned(v.clone()),
+            HostBytes::View {
+                backing,
+                offset,
+                len,
+            } => HostBytes::View {
+                backing: Arc::clone(backing),
+                offset: *offset,
+                len: *len,
+            },
+        }
+    }
 }
 
 /// Host-memory "device" allocator for Spyre/KTIR.
