@@ -35,14 +35,14 @@ your model and your quant — every build names its own scope, and naming zero
 models is a build-time panic rather than a silent empty binary:
 
 ```bash
-cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
+cargo build -F model/llama-3.2-3b,quant/mlx --release
 
 ./target/release/scr chat mlx-community/Llama-3.2-3B-Instruct-4bit \
     -q "why is the sky blue?"
 ```
 
-Pick exactly one backend: `-Fmetal` (macOS) or
-`-Fspyre` (Spyre toolkit). See [Building](BUILD.md) for the full feature-scoping
+Each target is its own binary over one common CLI: `scr` (macOS, the default package) or
+`spyre` (`-p scratchy-target-spyre-cli`, Spyre toolkit). See [Building](BUILD.md) for the full feature-scoping
 mechanics.
 
 ## License

@@ -262,10 +262,10 @@ pub fn page(assets: &Published) -> Result<String, String> {
                 }
             })}
 
-            {section("Targets", Some(rsx! { "Pick one backend per build; they are mutually exclusive." }), rsx! {
+            {section("Targets", Some(rsx! { "Each target is its own binary over one common CLI." }), rsx! {
                 Grid { gutter: Gutter::Cards,
-                    {target("-Fspyre", "IBM Spyre AIU · requires the Spyre build toolkit")}
-                    {target("-Fmetal", "Apple Silicon · requires macOS")}
+                    {target("spyre", "IBM Spyre AIU · requires the Spyre build toolkit")}
+                    {target("scr", "Apple Silicon · requires macOS")}
                 }
             })}
 
@@ -279,7 +279,7 @@ pub fn page(assets: &Published) -> Result<String, String> {
                     p { "Apple Silicon · Llama 3.2 3B · MLX 4-bit" }
                     CodeSnippet {
                         span { class: "c-cm", "# compile a server specialized for exactly this triple" }
-                        "\ncargo build -F metal,model/llama-3.2-3b,quant/mlx --release\n\n"
+                        "\ncargo build -F model/llama-3.2-3b,quant/mlx --release\n\n"
                         span { class: "c-cm", "# run it" }
                         "\n./target/release/scr chat mlx-community/Llama-3.2-3B-Instruct-4bit \\\n    -q "
                         span { class: "c-s", "\"why is the sky blue?\"" }
