@@ -510,8 +510,8 @@ fn scatter_cut_all_ranks(
         }
     }
     Ok(
-        scratchy_target_spyre::bundle_code::collective::PerRank::try_from_fn(|me| {
-            Ok(std::mem::take(&mut per_rank[me.get() as usize]))
+        scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
+            std::mem::take(&mut per_rank[me.get() as usize])
         }),
     )
 }
@@ -637,7 +637,7 @@ pub(crate) fn stage_bound_weights(
         // with no pre-cut (a one-rank world, the emulator) stages the tensor whole out of
         // the allocator's store.
         #[cfg(feature = "spyre-hw")]
-        let bytes = match shares.as_deref_mut().and_then(Iterator::next) {
+        let bytes = match shares.as_mut().and_then(Iterator::next) {
             Some(b) => b,
             None => share_from_store(gpu_tensor_bytes(&bw.tensor), alloc.as_deref_mut()),
         };
@@ -1130,7 +1130,7 @@ impl SpyreWorker {
                     t_cut.elapsed().as_secs_f64()
                 );
                 scratchy_target_spyre_card::sdsc_runner::each_rank_parallel(cut, |_me, shares| {
-                    stage_bound_weights(&bound, &wirings.decode, Some(shares), None)
+                    stage_bound_weights(&bound, &wirings.decode, Some(shares.into_iter()), None)
                 })?
             }
         };
