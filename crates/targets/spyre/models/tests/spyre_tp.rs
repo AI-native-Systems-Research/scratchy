@@ -12,7 +12,7 @@
 
 #![cfg(all(
     any(feature = "tp-2", feature = "tp-4", feature = "tp-8"),
-    model = "granite-3.1-2b-instruct"
+    compiled_model = "granite::granite_3_1_2b_instruct"
 ))]
 
 use scratchy_target_spyre::bundle_code::collective::{Build, World};

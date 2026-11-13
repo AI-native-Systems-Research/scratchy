@@ -72,36 +72,26 @@ impl ScopeMetadata {
     pub fn scope(&self) -> Scope {
         Scope::from_feature_flags(self.features.iter().cloned(), self.mtp, self.mtp_heads)
     }
+}
 
-    /// The model stems this scope selects by name (`<stem>` features), for a crate exposing them
-    /// as `cfg(model = "<stem>")`.
-    pub fn stem_cfgs(&self) {
-        println!("cargo::rustc-check-cfg=cfg(model, values(any()))");
-        let configs = self.root.join("configs");
-        let Ok(arches) = std::fs::read_dir(&configs) else {
-            return;
-        };
-        let on: HashSet<&str> = self.features.iter().map(String::as_str).collect();
-        for arch in arches.flatten() {
-            for config in std::fs::read_dir(arch.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let path = config.path();
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if path.extension().is_some_and(|e| e == "json")
-                    && on.contains(
-                        scratchy_forward_compiler_macro::config::feature_env_name(stem).as_str(),
-                    )
-                {
-                    println!("cargo::rustc-cfg=model=\"{stem}\"");
-                }
+/// The model variants one arch's emission compiled, as `<arch>::<variant>` paths: its top-level
+/// `pub mod`s, less the shared `__` items. Read off the emission itself, so it is exactly what a
+/// path into the crate can name — a selected quant preset replaces a model's dense variant when its
+/// target claims the preset, and only the pipeline knows which.
+fn compiled_variants(tokens: &TokenStream, mod_name: &str) -> Vec<String> {
+    let top: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    top.windows(3)
+        .filter_map(|w| match w {
+            [
+                TokenTree::Ident(vis),
+                TokenTree::Ident(kw),
+                TokenTree::Ident(name),
+            ] if *vis == "pub" && *kw == "mod" && !name.to_string().starts_with("__") => {
+                Some(format!("{mod_name}::{name}"))
             }
-        }
-    }
+            _ => None,
+        })
+        .collect()
 }
 
 /// One models build: the target, the scope, where its output goes.
@@ -264,6 +254,11 @@ fn emit_arch(
             }
             CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
         });
+    // Each compiled variant as `cfg(compiled_model = "<arch>::<variant>")`, so code naming one
+    // (a test pinning one model) gates on exactly that module existing.
+    for variant in compiled_variants(&tokens, mod_name) {
+        println!("cargo::rustc-cfg=compiled_model=\"{variant}\"");
+    }
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
     let found = ((build.inspect)(&tokens).into_iter())
@@ -283,6 +278,7 @@ pub fn build(build: &ModelsBuild<'_>) -> Built {
     // The target the emitted code is compiled for, as the cfg it gates its target's own items on.
     // Its values are open: any target names itself.
     println!("cargo::rustc-check-cfg=cfg(scratchy_target, values(any()))");
+    println!("cargo::rustc-check-cfg=cfg(compiled_model, values(any()))");
     println!(
         "cargo::rustc-cfg=scratchy_target=\"{}\"",
         build.emitter.name()

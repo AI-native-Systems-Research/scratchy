@@ -13,8 +13,6 @@ fn main() {
         println!("cargo:rerun-if-env-changed={name}");
     }
     let metadata = ScopeMetadata::from_dep_env();
-    // Each selected stem as `cfg(model = "<stem>")`, for the tests that pin one model.
-    metadata.stem_cfgs();
     // A `superdsc-dump` build hands the bake THIS build script's output directory — the one place
     // that knows it — so each baked bundle's dxp input lands beside the device images; any other
     // build writes no dump.

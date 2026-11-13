@@ -26,7 +26,7 @@
 //! both asserted, so a recognition that silently widened or narrowed is a failure either
 //! way.
 
-#![cfg(model = "granite-3.1-2b-instruct")]
+#![cfg(compiled_model = "granite::granite_3_1_2b_instruct")]
 
 /// The phases a granite bake carries, with the wiring each one lowered — decode always, the
 /// batched-prefill program when the bake made one.
