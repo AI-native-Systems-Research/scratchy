@@ -299,10 +299,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     /// that owns the owner, in ladder order.
     pub fn build_borrowing_with_consts(
         cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
-        code: &'static crate::bundle_code::BundleCode<'static, T>,
+        code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         borrowed: &[i64],
-        load_consts: &[(u32, crate::wiring::LoadConst)],
+        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
@@ -380,7 +380,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     /// owner-first laws order the ladder's DEVICE half, not this one.
     fn build_inner(
         cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
-        code: &'static crate::bundle_code::BundleCode<'static, T>,
+        code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         staged: Staged<'_, T>,
         borrowed: &[i64],
