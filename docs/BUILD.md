@@ -14,7 +14,8 @@ cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b
 ```
 
 `metal` and `spyre` are mutually exclusive (and `cuda`, which builds FP8 models
-only: add `quant/fp8-dynamic-per-channel`). Add
+only: add `quant/fp8-dynamic-per-channel`; see
+[`cuda` and `nvcc`](#cuda-and-nvcc--the-nvidia-h100-backend)). Add
 `serve` for the HTTP server
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
@@ -164,6 +165,104 @@ cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec
 No `spec/*` feature named = only the heads inside their targets' checkpoints
 and the targets' default published drafters compile (with `metal`); a spyre
 build compiles none.
+
+## `cuda` and `nvcc` — the NVIDIA H100 backend
+
+`scratchy-cli` has two CUDA features:
+
+- **`cuda`** — the CUDA engine with no toolchain. It expands the selected
+  models to their CUDA tapes and type-checks everything, on any host (a Mac
+  included), but links no kernel: `--device cuda` is claimed and refused with
+  the command that rebuilds with kernels.
+- **`nvcc`** — `cuda` plus the H100 kernels and the worker that runs them. It
+  needs Linux with `nvcc` from CUDA 12.8 or newer on `PATH`; the build stops
+  with a clear message when `nvcc` is missing or older. The kernels compile
+  for `sm_90a` only (Hopper with its architecture-specific instructions: the
+  warpgroup tensor-core MMA, WGMMA, and the tensor memory accelerator, TMA),
+  so the binary runs on an H100 and refuses any other GPU at start.
+
+`cuda` builds FP8 models only: name `quant/fp8-dynamic-per-channel` with one
+of `model/qwen3.8-27b-text-only`, `model/qwen3.6-35b-a3b` or
+`model/gemma-4-26b-a4b-it`. Any other `cuda` build panics at build time.
+[`MODELS.md`](MODELS.md#cuda-the-three-fp8-models) lists their checkpoints
+and what the backend does not support yet.
+
+```bash
+cargo build --release -p scratchy-cli \
+    --features nvcc,serve,model/qwen3.6-35b-a3b,quant/fp8-dynamic-per-channel
+scr serve RedHatAI/Qwen3.6-35B-A3B-FP8-dynamic --device cuda --kv-cache-dtype fp8
+```
+
+### The kernels and ThunderKittens
+
+The kernels are `crates/targets/cuda/kernels/*.cu`, the way metal keeps its
+shaders under `shaders/`. Every one is written with
+[ThunderKittens](https://github.com/HazyResearch/ThunderKittens),
+HazyResearch's header-only CUDA C++20 tile library (MIT license). It is
+vendored, unmodified, at one pinned commit in
+`crates/targets/cuda/kernels/thunderkittens/`; its `PROVENANCE.md` gives the
+commit, the license, the commands that check the copy against upstream, and
+how to re-pin. Nothing fetches it at build time.
+
+Under `nvcc`, `crates/targets/cuda/build.rs` compiles each kernel with the
+flags of ThunderKittens' own `kernels/common.mk` (`-std=c++20 -O3
+--use_fast_math -DKITTENS_SM90`, `-gencode arch=compute_90a,code=sm_90a`, and
+the vendored `include/` and `prototype/` as `-I` paths), and archives the
+objects into one static library the crate links. Without `nvcc` the build
+script spawns nothing and links nothing.
+
+### What CI checks without a GPU
+
+CI never builds `nvcc`. The linux-workspace job's "CUDA scaffold" step runs,
+with no CUDA toolkit and no GPU:
+
+- clippy (`-D warnings`) on `scratchy-target-cuda` and
+  `scratchy-target-cuda-compiler`, on the macro under `cuda`, and on
+  `scratchy-models` with each of the three FP8 models;
+- the tests of `scratchy-target-cuda` and `scratchy-target-cuda-compiler`
+  (the lowering and the tape checks);
+- `kernels_use_thunderkittens`, a check of the kernels' source text: every
+  kernel takes its data as ThunderKittens views and moves and computes it with
+  ThunderKittens operations (no raw pointers, no hand-written warp shuffles
+  or atomics, inline PTX only from a short allowlist), and the few operations
+  ThunderKittens lacks live in `kernels/scratchy_ops.cuh`;
+- `cuda_tapes_27b_fp8`, `cuda_tapes_35b_fp8` and `cuda_tapes_gemma4_fp8`,
+  which expand each model to its CUDA tapes and check them against what the
+  CUDA compiler lowers.
+
+So CI proves the tapes and the kernel source rules, not the kernels. A kernel
+change is verified only by running the GPU tests below on an H100.
+
+### Running the GPU tests
+
+Each GPU test is a `[[test]]` of `crates/targets/cuda/Cargo.toml` (and of the
+worker crate's) with `required-features = ["nvcc"]`, so a build without
+`nvcc` never compiles it. On an H100 host with CUDA 12.8+:
+
+```bash
+# One suite: a kernel's output against a CPU reference or a bit-exact twin.
+cargo test --release -p scratchy-target-cuda --features nvcc --test gemm_fp8 -- --test-threads=1
+# Every GPU suite of the target crate, then the worker's.
+cargo test --release -p scratchy-target-cuda --features nvcc -- --test-threads=1
+cargo test --release -p scratchy-target-cuda-worker --features nvcc -- --test-threads=1
+```
+
+The H100 runs pass `--test-threads=1`, so one test has the GPU at a time.
+
+To run a suite under NVIDIA's `compute-sanitizer` (it ships with the CUDA
+toolkit), build the test binary without running it, take its path from
+cargo's `Executable` line (newer cargo puts it under `target/release/build/`,
+not `deps/`), and run it under each tool:
+
+```bash
+cargo test --release -p scratchy-target-cuda --features nvcc --test moe --no-run 2>&1 | grep Executable
+compute-sanitizer --tool memcheck  <that path> --test-threads=1   # out-of-bounds and misaligned accesses
+compute-sanitizer --tool racecheck <that path> --test-threads=1   # shared-memory races
+compute-sanitizer --tool synccheck <that path> --test-threads=1   # barrier misuse
+```
+
+The sanitizers make a kernel much slower, so run them on one suite or one
+test at a time.
 
 ## `turboquant` — KV cache compression, fixed at build time
 

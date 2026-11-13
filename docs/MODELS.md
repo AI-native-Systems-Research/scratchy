@@ -302,6 +302,52 @@ Open work (each item, with its measurements, in the module docs of
 - **The M5 Max at the current build**, and `--num-speculative-tokens`,
   which a head ignores.
 
+## CUDA: the three FP8 models
+
+The CUDA backend (an NVIDIA H100; see
+[`BUILD.md`](BUILD.md#cuda-and-nvcc--the-nvidia-h100-backend) for the build)
+compiles three models, each only as `quant/fp8-dynamic-per-channel`: FP8
+(e4m3) weights with one scale per output channel, and activations quantized
+per token at run time.
+
+| feature | config | checkpoint |
+|---|---|---|
+| `model/qwen3.8-27b-text-only` | `configs/qwen3-5/qwen3.8-27b.json` | `axteam/Qwen3.8-27B-FP8-dynamic` |
+| `model/qwen3.6-35b-a3b` | `configs/qwen3-5-moe/qwen3.6-35b-a3b.json` | `RedHatAI/Qwen3.6-35B-A3B-FP8-dynamic` |
+| `model/gemma-4-26b-a4b-it` | `configs/gemma4-moe/gemma-4-26b-a4b-it.json` | `RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic` |
+
+The 27B compiles its text decoder only (the `-text-only` stem is the base
+arch's copy of the vision arch's config). Each model's
+`<stem>-fp8-dynamic-per-channel.overrides.json` holds what its FP8 checkpoint
+changes from the dense config. The checkpoint's `quantization_config` is
+checked at load: a block-quantized checkpoint (`weight_block_size`) or one
+with a KV cache scheme is refused, with the field named.
+
+```bash
+cargo build --release -p scratchy-cli \
+    --features nvcc,serve,model/gemma-4-26b-a4b-it,quant/fp8-dynamic-per-channel
+scr serve RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic --device cuda --kv-cache-dtype fp8
+```
+
+What the backend does not support yet. Each is refused with a message naming
+what to change, never silently ignored:
+
+- **One GPU.** It runs on device 0, which must be an H100; there is no
+  tensor parallelism.
+- **One sequence at a time.** The worker sets `max_num_seqs` to 1. A prompt
+  prefills in steps of up to 4,096 tokens (the compiled step sizes are 1, 512,
+  1,024, 2,048 and 4,096 tokens), and the KV cache holds 8,192 tokens a
+  sequence.
+- **Greedy sampling only.** A request is refused at admission unless it
+  samples at temperature 0, with no repetition, frequency or presence
+  penalty, one completion, no logprobs, and nothing that moves the argmax (a
+  logit bias, an allowed-token list, bad words, a grammar). Top-k, top-p and
+  min-p pass, since at temperature 0 they keep the argmax.
+- **An FP8 KV cache.** `--kv-cache-dtype` takes `auto`, `fp8` or `fp8_e4m3`;
+  scales computed at run time (`--calculate-kv-scales`) are refused. The
+  weights' dtype is `auto` (bf16).
+- **No speculative decoding, LoRA adapters or pooling.**
+
 ## Recipe for a new model architecture
 
 All arches share the one `scratchy-models` crate (`crates/models/arch/`) —
