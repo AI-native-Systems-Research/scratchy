@@ -44,6 +44,9 @@ pub(crate) fn werr(msg: impl Into<String>) -> ExecutorError {
 /// rank 0" and the refusal under `rank 0` — the line that named the bug — never reached any
 /// log. This joins the chain's messages on one line so the terminal states the failure in
 /// plain words, per the same law that bans unnamed failed terminals.
+// ⛔ HW-ONLY: both callers build SuperDSC dxp sessions (spyre_load's card path), which the
+// emulator builds its own way — under `spyre-emu` alone the function would be dead code.
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn werr_chain(msg: &str, e: &anyhow::Error) -> ExecutorError {
     let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
     werr(format!("{msg}: {}", chain.join(" — ")))
