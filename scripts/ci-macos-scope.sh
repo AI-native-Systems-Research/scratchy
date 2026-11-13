@@ -5,30 +5,33 @@
 #       Prints `macos=false` when every file the diff touches belongs to one of these crates, so a
 #       PR that changes only them skips both macOS jobs; `macos=true` otherwise. A file belongs to
 #       the deepest crate directory holding it, and a file in no crate (Cargo.lock, .github/, docs)
-#       needs the macOS jobs.
+#       needs the macOS jobs. So does the spyre workspace's own Cargo.toml and Cargo.lock: the KTIR
+#       crates the tests job runs inherit their dependencies from them.
 #   ci-macos-scope.sh lock
 #       Run last in each macOS job. Fails if the job compiled one of these crates: a new dependency
 #       edge into one turns the macOS jobs red, instead of letting a PR that changes only that crate
 #       skip the jobs that build it. CI's rust-cache drops every workspace crate's build output
-#       before saving, so a workspace crate's `.fingerprint` entry is one this job compiled.
+#       before saving, so a workspace crate's `.fingerprint` entry is one this job compiled. The
+#       crates are the spyre workspace's (targets/spyre); the check reads both workspaces' build
+#       output, since the macOS tests job builds the KTIR crates in the spyre one.
 set -euo pipefail
 
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
 # ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
-MACOS_UNBUILT='crates/targets/spyre
-crates/targets/spyre/builder
-crates/targets/spyre/bundle
-crates/targets/spyre/compiler
-crates/targets/spyre/flex-rs
-crates/targets/spyre/triton/splice
-crates/targets/spyre/triton/triton-frontend
-crates/targets/spyre/triton/triton-ktir
-crates/targets/spyre/triton/triton-ktir-superdsc
-crates/targets/spyre/triton/triton-numeric'
+MACOS_UNBUILT='targets/spyre
+targets/spyre/builder
+targets/spyre/bundle
+targets/spyre/compiler
+targets/spyre/flex-rs
+targets/spyre/triton/splice
+targets/spyre/triton/triton-frontend
+targets/spyre/triton/triton-ktir
+targets/spyre/triton/triton-ktir-superdsc
+targets/spyre/triton/triton-numeric'
 
 changed() {
     # Every crate directory, deepest first, so the first one holding a file is its owner:
-    # ktir-core's files are ktir-core's, though they sit under crates/targets/spyre too.
+    # ktir-core's files are ktir-core's, though they sit under targets/spyre too.
     local crates
     crates=$(git ls-files '*/Cargo.toml' | sed 's|/Cargo.toml$||' \
         | awk -F/ '{ print NF "\t" $0 }' | sort -rn | cut -f2-)
@@ -42,6 +45,13 @@ changed() {
     local file owner dir
     while IFS= read -r file; do
         owner=""
+        case "$file" in
+            targets/spyre/Cargo.toml | targets/spyre/Cargo.lock)
+                echo "the macOS jobs build the spyre workspace's KTIR crates: $file" >&2
+                echo macos=true
+                return
+                ;;
+        esac
         while IFS= read -r dir; do
             case "$file" in "$dir"/*) owner=$dir; break ;; esac
         done <<<"$crates"
@@ -56,22 +66,28 @@ changed() {
 }
 
 lock() {
-    # The listed directories' package names, from cargo's own manifest paths.
-    local metadata packages names dir name
+    # The listed directories' package names, from cargo's own manifest paths in the spyre
+    # workspace; the build output checked is both workspaces'.
+    local metadata spyre packages names dir name
     metadata=$(cargo metadata --no-deps --format-version 1)
+    spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path targets/spyre/Cargo.toml)
     packages=$(jq -r --arg root "$PWD/" \
-        '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' <<<"$metadata")
+        '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' <<<"$spyre")
     names=""
     while IFS= read -r dir; do
         name=$(awk -F'\t' -v dir="$dir" '$1 == dir { print $2 }' <<<"$packages")
         if [ -z "$name" ]; then
-            echo "scripts/ci-macos-scope.sh lists $dir, which holds no workspace crate" >&2
+            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre workspace crate" >&2
             exit 1
         fi
         names="$names${names:+|}$name"
     done <<<"$MACOS_UNBUILT"
     local compiled
-    compiled=$(find "$(jq -r .target_directory <<<"$metadata")" -mindepth 3 -maxdepth 3 -type d \
+    local dirs=()
+    for dir in "$(jq -r .target_directory <<<"$metadata")" "$(jq -r .target_directory <<<"$spyre")"; do
+        [ -d "$dir" ] && dirs+=("$dir")
+    done
+    compiled=$(find "${dirs[@]}" -mindepth 3 -maxdepth 3 -type d \
         -path '*/.fingerprint/*' \
         | grep -E "/\.fingerprint/($names)-[0-9a-f]{16}\$" || true)
     if [ -n "$compiled" ]; then

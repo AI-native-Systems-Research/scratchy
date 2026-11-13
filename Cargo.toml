@@ -19,38 +19,11 @@ members = [
     "crates/tensors",
     "crates/layers",
     "crates/compiler/ir",
-    "crates/targets/spyre",
-    "crates/targets/spyre/bundle",
-    "crates/targets/spyre/builder",
-    "crates/targets/spyre/worker",
-    "crates/targets/spyre/compiler",
-    "crates/targets/spyre/models",
-    "crates/targets/spyre/cli",
-    # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE from
-    # the lowering rather than reached through a text round trip.
-    "crates/targets/spyre/ktir/ktir-core",
-    "crates/targets/spyre/ktir/ktir-emulator",
-    "crates/targets/spyre/ktir/ktir-optimizer",
-    # KTIR -> SuperDSC as a leaf: the typed SuperDSC IR, with no scratchy dependency, so a
-    # third-party KTIR producer can consume the lowering.
-    "crates/targets/spyre/ktir/ktir-superdsc",
-    # The Triton front end, re-hosted from triton-spyre (see crates/targets/spyre/triton/PROVENANCE.md):
-    # Triton.py -> TTIR -> KTIR, pure Rust, so kernels are authored in Triton and compiled at
-    # #[forward] expansion time like the torch carriers are (#112).
-    "crates/targets/spyre/triton/triton-frontend",
-    "crates/targets/spyre/triton/triton-ktir",
-    "crates/targets/spyre/triton/triton-numeric",
-    "crates/targets/spyre/triton/triton-ktir-superdsc",
-    # The splice: a SubtileTape node whose KTIR comes from a Triton kernel, not the Rust
-    # builder. A leaf between the tape types and the ladder, so scratchy-target-spyre
-    # hooks it in without a second copy of the lowering.
-    "crates/targets/spyre/triton/splice",
     "crates/models/arch",
     "crates/models/build",
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",
-    "crates/targets/spyre/tp",
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/frontend",
@@ -159,11 +132,6 @@ toktrie_hf_tokenizers = { version = "1.6" }
 byteorder = "1"
 
 # Tensor ops
-# BLAS source of choice (spyre-emu's cblas backend) — version centralized here
-# so a bump can't land on only one of the crate's several feature-gated
-# dependency sites (target-specific + non-default-features) like it did in
-# https://github.com/AI-native-Systems-Research/scratchy/pull/59.
-blas-src = { version = "0.14", default-features = false }
 safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
 half = "2.7"
 memmap2 = "0.9"
@@ -217,7 +185,6 @@ scratchy-serving-engine = { path = "crates/serving/engine" }
 scratchy-serving-api = { path = "crates/serving/api" }
 scratchy-serving-worker = { path = "crates/serving/worker" }
 scratchy-target-metal-worker = { path = "crates/targets/metal/worker" }
-scratchy-target-spyre-worker = { path = "crates/targets/spyre/worker" }
 scratchy-core-model = { path = "crates/core/model" }
 # We own Hub downloads (that crate's manifest says why). Do not reach for the
 # `hf-hub` crate to avoid it: 1.0 depends on hf-xet non-optionally — no
@@ -261,9 +228,6 @@ debug = "line-tables-only"
 [profile.dev.package.scratchy-target-metal-models]
 debug = 0
 
-[profile.dev.package.scratchy-target-spyre-models]
-debug = 0
-
 # Proc-macros (and their dependencies) execute AT COMPILE TIME. The wavefront
 # codegen pipeline (solver, region tiling, per-model×variant emit) runs on
 # EVERY build. At the default dev opt-level that pipeline is the DOMINANT
@@ -292,11 +256,6 @@ debug = 0
 # overrides back to -O3 + fat LTO for the shipping build.
 opt-level = 1
 
-# Spyre's compiled models: the same emitted dispatch glue, the same reasoning.
-[profile.release.package.scratchy-target-spyre-models]
-debug = 0
-opt-level = 1
-
 [profile.release-dist]
 inherits = "release"
 strip = true
@@ -306,7 +265,4 @@ codegen-units = 1
 # Keep the model code fully optimized in the shipping build (release inherits
 # opt-level = 1 above; undo it here).
 [profile.release-dist.package.scratchy-target-metal-models]
-opt-level = 3
-
-[profile.release-dist.package.scratchy-target-spyre-models]
 opt-level = 3

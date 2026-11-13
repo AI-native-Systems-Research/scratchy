@@ -63,9 +63,10 @@ easier case.
 Install a recent [Rust toolchain](https://rustup.rs/). Then, pick your
 target by its CLI: `scr` (Apple Silicon, the workspace's default
 package) requires macOS 26.2 or newer (and its Xcode SDK); `spyre`
-(`-p scratchy-target-spyre-cli`) requires the Spyre build toolkit. Both
-run the same commands. For example, you can compile `scr` with the
-Llama 3.2 3B models and the MLX 4-bit quant
+builds from its own workspace, `targets/spyre` (`-Fspyre-hw` there
+requires the Spyre build toolkit). Both run the same commands. For
+example, you can compile `scr` with the Llama 3.2 3B models and the
+MLX 4-bit quant
 ([feature flags](https://doc.rust-lang.org/cargo/reference/features.html)):
 
 ```bash

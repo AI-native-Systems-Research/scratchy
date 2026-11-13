@@ -197,6 +197,7 @@ break:
 ```bash
 # Format (fmt job) — cheap, run it always
 cargo fmt --all -- --check
+cargo fmt --manifest-path targets/spyre/Cargo.toml --all -- --check
 
 # macOS / metal job
 cargo clippy -p scratchy-target-metal-models \
@@ -206,14 +207,15 @@ cargo clippy -p scratchy-target-metal-models \
 # is the only lint coverage the build-time HF query gets). Needs network.
 cargo clippy -p scratchy-models --features smollm2-135m,hf-completions -- -D warnings
 
-# Linux / workspace job
-SCRATCHY_SKIP_SENDNN_CXX=1 \
+# Linux / workspace job: the root workspace, then the spyre one (targets/spyre)
 cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
   --exclude scratchy-target-metal \
   --exclude scratchy-target-metal-cli \
   --exclude scratchy-target-metal-compiler \
   --exclude scratchy-target-metal-models \
   --exclude scratchy-target-metal-worker -- -D warnings
+(cd targets/spyre && SCRATCHY_SKIP_SENDNN_CXX=1 \
+  cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings)
 
 # e2e smoke, as CI runs it
 cargo test -p scratchy-e2e -p scratchy-target-metal-models \
@@ -224,7 +226,7 @@ cargo test -p scratchy-e2e -p scratchy-target-metal-models \
 Both `all`-scoped clippy runs are the full-scope case: every config, every arch.
 Expect them to be slow and RAM-heavy — that's CI-scale cost, not a regression.
 
-Note the `--exclude`s on the workspace gate are all required: every metal crate
+Note the `--exclude`s on the root workspace gate are all required: every metal crate
 depends unconditionally on Apple-only
 `objc2`, and `--workspace` builds every member as a root regardless of
 `--features`, so excluding only some still drags `objc2` onto Linux.
