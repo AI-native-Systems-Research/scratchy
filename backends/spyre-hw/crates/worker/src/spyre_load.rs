@@ -2393,7 +2393,7 @@ impl SpyreWorker {
                 let mut ss = SuperDscSession::new(
                     cards,
                     code,
-                    scratchy_target_spyre::sdsc_runner::SessionDims {
+                    scratchy_target_spyre_card::sdsc_runner::SessionDims {
                         vocab,
                         kv_dim,
                         num_blocks,

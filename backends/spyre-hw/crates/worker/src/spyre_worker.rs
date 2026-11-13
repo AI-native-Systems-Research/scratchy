@@ -49,7 +49,6 @@ pub(crate) fn werr_chain(msg: &str, e: &anyhow::Error) -> ExecutorError {
     werr(format!("{msg}: {}", chain.join(" — ")))
 }
 
-
 /// Host-only KTIR serving worker.
 pub struct SpyreWorker {
     pub(crate) config: WorkerConfig,
