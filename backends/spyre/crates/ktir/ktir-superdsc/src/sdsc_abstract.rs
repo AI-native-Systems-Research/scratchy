@@ -5249,23 +5249,32 @@ impl PagedKvPool {
     /// bake would refuse — the rung set is exactly what the bake ships.
     pub const PACKED_WINDOW_MAX_WIDTH: u32 = SchedulerBlockTokens::REFERENCE.get();
 
-    /// ⭐ THE PACKED PREFIX RUNGS `(width, seqs)` — every power-of-two request count the reserved
-    /// window-tid space holds, at the width each of the prefix ladder's own points names for that
-    /// count. Ascending by product.
+    /// ⭐ THE PACKED PREFIX RUNGS `(width, seqs)` — at each width the prefix ladder's own points
+    /// name, every request count the reserved window-tid space holds whose product lands on a
+    /// point the ladder already bakes. Ascending by product.
     ///
     /// A wave of k cache-hit continuation tails (the concurrent-prefill bench's k ~59-row tails)
     /// rode the SOLO prefix ladder one serialized chunk at a time — k fixed costs, k weight
     /// streams. A packed rung runs them as ONE prefix-capable chunk: the attention's one compiled
     /// module spliced once per window, every window binding its own three step tables at its own
     /// reserved tids (`reserved_tids::paged_window_tid`), so the batch is the SPLICE's, not the
-    /// scheduler's and not a second lowering. The product lands on a point the solo ladder already
-    /// bakes ([`prefix_rungs`](Self::prefix_rungs) over the same `baked`), so a packed rung's
-    /// graph rows, its KV sweep and its pool are the point's own — no new geometry, only the pair.
+    /// scheduler's and not a second lowering.
     ///
-    /// ⛔ THE COUNTS ARE THE RESERVED TID SPACE'S OWN — every power of two from 2 to
-    /// [`PAGED_MAX_WINDOWS`](crate::reserved_tids::PAGED_MAX_WINDOWS), no more: a pair asking for
-    /// more windows than the region holds is a bake bug the tid mint's own assert names. The
-    /// widths are held to
+    /// The WIDTHS are the prefix points' own — each `m` a point names at a count `s` the tid
+    /// space holds (`m/s` in the band) — so the prefix ladder's geometry picks the window widths.
+    /// The COUNTS are graded, every value `2..=PAGED_MAX_WINDOWS` and not only powers of two: a
+    /// wave's live count is whatever the scheduler hands the step, and a rung exists only at the
+    /// powers of two when a 3-tail leftover staged the `(128, 4)` rung's whole 512 baked rows for
+    /// 384 real (MEASURED, the warm conc-8 cachetest cell: the tails=3 launch's device exec was
+    /// byte-for-byte the tails=4 launch's). A count whose product is no point the ladder bakes
+    /// contributes nothing — the product constraint keeps a packed rung's graph rows, its KV sweep
+    /// and its pool a point's own, and its body dedups with the solo rung at the same rows (the
+    /// seam-fp law: equal row products share seam graphs), so grading adds pairs, never geometry.
+    ///
+    /// ⛔ THE COUNTS ARE CAPPED BY THE RESERVED TID SPACE — never past
+    /// [`PAGED_MAX_WINDOWS`](crate::reserved_tids::PAGED_MAX_WINDOWS): a pair asking for more
+    /// windows than the region holds is a bake bug the tid mint's own assert names. The widths
+    /// are held to
     /// [`PACKED_WINDOW_MIN_WIDTH`](Self::PACKED_WINDOW_MIN_WIDTH)..=[`PACKED_WINDOW_MAX_WIDTH`](Self::PACKED_WINDOW_MAX_WIDTH)
     /// — the floor because a narrower window is descriptors-not-bytes (the solo rung serves one
     /// narrow tail better), the ceiling because wider refused at the bake (measured, see the
@@ -5273,22 +5282,36 @@ impl PagedKvPool {
     /// table asks only for rungs that bake.
     ///
     /// EMPTY exactly when `baked` is (nothing prefix-capable bakes at all), and otherwise never
-    /// empty — every point ≥ one page names at least `(page/2, 2)`, which the band always holds.
+    /// empty — every point ≥ one page names at least `(page/2, 2)`, whose product is the page
+    /// itself, a point `baked` holds by [`prefix_rungs`](Self::prefix_rungs)'s own admission.
     pub fn packed_prefix_rungs(baked: &[u32]) -> Vec<(u32, u32)> {
-        let mut v = Vec::new();
-        for &m in &Self::prefix_rungs(baked) {
-            let mut seqs = 2u32;
-            while seqs <= crate::reserved_tids::PAGED_MAX_WINDOWS {
-                if m.is_multiple_of(seqs) {
-                    let w = m / seqs;
-                    if (Self::PACKED_WINDOW_MIN_WIDTH..=Self::PACKED_WINDOW_MAX_WIDTH).contains(&w)
-                    {
-                        v.push((w, seqs));
+        let band = Self::PACKED_WINDOW_MIN_WIDTH..=Self::PACKED_WINDOW_MAX_WIDTH;
+        // The widths a prefix point names at a count the tid space holds.
+        let mut widths: Vec<u32> = Self::prefix_rungs(baked)
+            .iter()
+            .copied()
+            .flat_map(|m| {
+                (2..=crate::reserved_tids::PAGED_MAX_WINDOWS).filter_map(move |s| {
+                    if m.is_multiple_of(s) {
+                        Some(m / s)
+                    } else {
+                        None
                     }
+                })
+            })
+            .filter(|w| band.contains(w))
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        let mut v = Vec::new();
+        for &w in &widths {
+            for s in 2..=crate::reserved_tids::PAGED_MAX_WINDOWS {
+                if baked.contains(&(w * s)) {
+                    v.push((w, s));
                 }
-                seqs *= 2;
             }
         }
+        v.sort_by_key(|&(w, s)| (w * s, std::cmp::Reverse(w)));
         v
     }
 

@@ -130,18 +130,30 @@ fn the_prefix_ladder_is_the_page_and_the_window() {
     assert!(PagedKvPool::prefix_rungs(&[]).is_empty());
 }
 
-/// ⭐ THE PACKED TABLE IS PRODUCTS AT THE PREFIX LADDER'S OWN POINTS: every power-of-two count the
-/// reserved window-tid space holds, at the width the point names for that count — the granite
-/// ladder's page and window, and a sub-blocked model's own single point alike. The pairs the
-/// concurrent-prefill bench rides are here by name: 8 ~59-row tails take `(64, 8)`.
+/// ⭐ THE PACKED TABLE IS PRODUCTS AT THE LADDER'S OWN POINTS: at each width the prefix points
+/// name, every count the reserved window-tid space holds whose product the ladder bakes — graded,
+/// not power-of-two, because a wave's live count is whatever the scheduler hands the step. The
+/// pairs the concurrent-prefill bench rides are here by name: 8 ~59-row tails take `(64, 8)`, a
+/// 3-tail leftover takes `(128, 3)` instead of staging `(128, 4)`'s whole 512 rows.
 #[test]
 fn the_packed_table_is_products_at_the_ladder_s_own_points() {
     let granite = [7u32, 128, 256, 384, 512];
     assert_eq!(
         PagedKvPool::packed_prefix_rungs(&granite),
-        vec![(128, 2), (64, 4), (32, 8), (128, 4), (64, 8)]
+        vec![
+            (64, 2),
+            (32, 4),
+            (128, 2),
+            (64, 4),
+            (32, 8),
+            (128, 3),
+            (64, 6),
+            (128, 4),
+            (64, 8)
+        ]
     );
-    // A sub-blocked model's single 128-row point packs the same way.
+    // A sub-blocked model's single 128-row point packs the same way — its ladder holds no
+    // intermediate products, so grading adds nothing.
     assert_eq!(
         PagedKvPool::packed_prefix_rungs(&[7, 63, 128]),
         vec![(64, 2), (32, 4), (16, 8)]
@@ -149,17 +161,17 @@ fn the_packed_table_is_products_at_the_ladder_s_own_points() {
     // A ladder whose page rung did not lower packs its window point alone.
     assert_eq!(
         PagedKvPool::packed_prefix_rungs(&[7, 128, 384, 512]),
-        vec![(128, 4), (64, 8)]
+        vec![(64, 2), (128, 3), (64, 6), (128, 4), (64, 8)]
     );
     // Nothing prefix-capable baked ⇒ no packed rungs.
     assert!(PagedKvPool::packed_prefix_rungs(&[]).is_empty());
 }
 
 /// ⛔ THE TABLE'S OWN LAWS, over every pair it can name: each product is a point the SOLO ladder
-/// bakes (a packed rung's graph rows, sweep and pool are the point's own), each count is a power
-/// of two the reserved tid space holds, and each width is inside the measured band — the floor
-/// where a window is descriptors-not-bytes, the ceiling where the bake measured wider windows
-/// refusing (`(256, 2)` is excluded by name: its width is past one scheduler block).
+/// bakes (a packed rung's graph rows, sweep and pool are the point's own), each count is a value
+/// the reserved tid space holds, and each width is inside the measured band — the floor where a
+/// window is descriptors-not-bytes, the ceiling where the bake measured wider windows refusing
+/// (`(256, 2)` is excluded by name: its width is past one scheduler block).
 #[test]
 fn every_packed_pair_is_a_count_the_tid_space_holds_at_a_width_that_bakes() {
     let min = PagedKvPool::PACKED_WINDOW_MIN_WIDTH;
@@ -172,15 +184,14 @@ fn every_packed_pair_is_a_count_the_tid_space_holds_at_a_width_that_bakes() {
         &[96u32][..],
         &[128u32, 512][..],
     ] {
-        let points = PagedKvPool::prefix_rungs(&baked);
         for &(w, s) in &PagedKvPool::packed_prefix_rungs(&baked) {
             assert!(
-                points.contains(&(w * s)),
+                baked.contains(&(w * s)),
                 "baked {baked:?}: ({w}, {s})'s product is not a ladder point"
             );
             assert!(
-                s >= 2 && s.is_power_of_two() && s <= ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS,
-                "baked {baked:?}: ({w}, {s})'s count is not a power of two the tid space holds"
+                s >= 2 && s <= ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS,
+                "baked {baked:?}: ({w}, {s})'s count is not one the tid space holds"
             );
             assert!(
                 (min..=max).contains(&w),
@@ -188,7 +199,7 @@ fn every_packed_pair_is_a_count_the_tid_space_holds_at_a_width_that_bakes() {
             );
         }
         // The excluded pair, by name, for the ladders that reach the window.
-        if points.contains(&512) {
+        if baked.contains(&512) {
             assert!(
                 !PagedKvPool::packed_prefix_rungs(&baked).contains(&(256, 2)),
                 "baked {baked:?}: (256, 2) is past the measured width ceiling and must not bake"
