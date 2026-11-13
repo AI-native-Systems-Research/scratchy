@@ -65,7 +65,10 @@ target via [feature
 flag](https://doc.rust-lang.org/cargo/reference/features.html):
 `-Fmetal` requires macOS 26.2
 or newer (and its Xcode SDK);
-`-Fspyre` requires the Spyre build toolkit.  For example, you can
+`-Fspyre` requires the Spyre build toolkit;
+`-Fnvcc` builds the NVIDIA H100 backend, for three FP8 models, and requires
+Linux with CUDA 12.8 or newer (see
+[`docs/BUILD.md`](docs/BUILD.md#cuda-and-nvcc--the-nvidia-h100-backend)).  For example, you can
 compile support for Apple Silicon, the Llama 3.2 3B models, and the
 MLX 4-bit quant:
 
