@@ -52,7 +52,7 @@ to the zone when it makes the zone's claim, wherever it lives.
   - Today: `crates/serving/scheduler/`, `crates/serving/engine/`.
 - **End to end.** A real server answering real requests: serving, streaming, the quantization
   paths, multimodal, speculative decoding, LoRA, pooling, telemetry.
-  - Today: `crates/e2e/`.
+  - Today: `crates/targets/metal/e2e/` (it serves through `scr`).
 - **The allocator.** `crates/targets/spyre/flex-rs/` is T5 by default (#8's open question).
   Move a test out only on purpose, in its own PR, never as a side effect of another.
 

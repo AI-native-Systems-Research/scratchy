@@ -13,9 +13,9 @@ members = [
     "crates/core/hf-hub-downloader",
     "crates/serving/transport",
     "crates/benches",
-    "crates/benches/power-sampler",
+    "crates/targets/metal/power-sampler",
     "crates/cli/scr",
-    "crates/e2e",
+    "crates/targets/metal/e2e",
     "crates/tensors",
     "crates/layers",
     "crates/compiler/ir",
@@ -66,8 +66,8 @@ members = [
 # (and goose's git fetch) never touches this workspace's Cargo.lock, and a
 # plain `cargo build`/`cargo update` here never needs network access to the
 # goose fork. Build/run it via `cargo run -p scratchy-tui` from
-# crates/cli/tui, which has its own Cargo.lock.
-exclude = ["crates/cli/tui"]
+# crates/targets/metal/tui, which has its own Cargo.lock.
+exclude = ["crates/targets/metal/tui"]
 
 [workspace.package]
 version = "0.1.0"

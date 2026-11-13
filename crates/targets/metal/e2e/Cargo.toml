@@ -42,7 +42,7 @@ scratchy-core-common = { workspace = true }
 scratchy-serving-api = { workspace = true }
 # Metal backend — used only to probe Metal 4 availability so GPU-only e2e tests
 # skip on hosted CI runners (paravirtual GPU without Metal 4).
-scratchy-target-metal = { path = "../targets/metal", optional = true }
+scratchy-target-metal = { path = "..", optional = true }
 scratchy-target-metal-worker = { workspace = true, optional = true }
 spnl-core = { workspace = true, optional = true, features = ["rag"] }
 

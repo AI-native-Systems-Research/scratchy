@@ -392,7 +392,7 @@ reference.
 Add `testdata/<arch>_<size>.json` generated from Python vLLM on the
 same prompts the existing goldens use. Add a
 `test_metal_correctness_<arch>_<size>` in
-`crates/e2e/tests/e_correctness.rs`. Verify the test passes on
+`crates/targets/metal/e2e/tests/e_correctness.rs`. Verify the test passes on
 Metal before claiming the arch is landed:
 
 ```

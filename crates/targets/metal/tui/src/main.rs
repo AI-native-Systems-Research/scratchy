@@ -5,10 +5,9 @@
 //! UI. Separate from the `scr` CLI/workspace because goose (this crate's
 //! agent brain) is a git dependency not published to crates.io.
 
-// Anchor the target's worker crate into the link: the engine resolves the device through the
+// Anchor the metal worker crate into the link: the engine serves through the
 // `WorkerFactory` registry and never names a concrete worker, so without this reference the
 // linker may drop the factory's `inventory::submit!`.
-#[cfg(feature = "metal")]
 extern crate scratchy_target_metal_worker as _;
 
 use clap::Parser;

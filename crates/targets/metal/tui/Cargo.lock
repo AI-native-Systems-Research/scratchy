@@ -4719,8 +4719,6 @@ dependencies = [
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
  "scratchy-subtile",
- "scratchy-target-metal",
- "scratchy-target-metal-compiler",
  "scratchy-tensors",
  "serde_json",
  "syn 3.0.4",
@@ -4925,6 +4923,9 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "scratchy-forward-compiler",
+ "scratchy-forward-compiler-frontend",
+ "scratchy-forward-compiler-macro",
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",
@@ -4947,6 +4948,7 @@ dependencies = [
  "scratchy-models-build",
  "scratchy-quantizations",
  "scratchy-target-metal",
+ "scratchy-target-metal-compiler",
  "scratchy-tensors",
 ]
 

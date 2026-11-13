@@ -236,7 +236,7 @@ async fn test_qwen2_5_vl_bug3_same_image_twice_cached_prefix() {
     let (_server, client) = start_qwen2_5_vl().await;
 
     let png_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/assets/deployment/streamlit-chat.png");
+        .join("../../../../docs/assets/deployment/streamlit-chat.png");
     let png_bytes =
         std::fs::read(&png_path).expect("streamlit-chat.png must exist for Bug 3 reproducer");
     use base64::Engine;

@@ -14,10 +14,6 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Standalone `scr-tui` binary: terminal UI driving goose's core Agent with scratchy as an in-process provider."
 
-[features]
-# Backend is chosen at build time — the TUI itself is backend-agnostic.
-metal = ["dep:scratchy-target-metal-worker"]
-
 [[bin]]
 name = "scr-tui"
 path = "src/main.rs"
@@ -30,32 +26,31 @@ goose = { git = "https://github.com/aaif-goose/goose.git", rev = "f9c7aaccde4834
 goose-provider-types = { git = "https://github.com/aaif-goose/goose.git", rev = "f9c7aaccde4834810dfd13d5efa8f0d39ba28a20", default-features = false }
 # scratchy's engine, reached by path across the workspace boundary — this
 # crate gets its own Cargo.lock entry for it, independent of the root
-# workspace's lock. No backend feature here: the consumer selects
-# metal (see [features]). The telemetry features light up the
+# workspace's lock. The telemetry features light up the
 # observability hooks throughout the engine.
-scratchy-serving-api = { path = "../../serving/api", features = [
+scratchy-serving-api = { path = "../../../serving/api", features = [
     "forward-telemetry",
     "sampler-telemetry",
     "live-stats",
 ] }
-# The metal worker: links the `WorkerFactory` the engine resolves `--device metal` to, with the
-# telemetry hooks lit in the target.
-scratchy-target-metal-worker = { path = "../../targets/metal/worker", optional = true, features = [
+# The metal worker: the `WorkerFactory` the engine serves through (`main.rs` anchors it), with
+# the telemetry hooks lit in the target.
+scratchy-target-metal-worker = { path = "../worker", features = [
     "forward-telemetry",
     "sampler-telemetry",
 ] }
 # Shared low-level types — the telemetry seams the TUI reads directly.
-scratchy-core-common = { path = "../../core/common", features = [
+scratchy-core-common = { path = "../../../core/common", features = [
     "forward-telemetry",
     "sampler-telemetry",
 ] }
-# `scr-tui` is its own top-level binary now (not linked into `scr`), so —
-# same as scratchy-cli — it must name its own model build scope. `model`
-# is a local rename of the scratchy-models dependency edge, so
-# `--features metal,model/smollm2-135m` reaches straight into scratchy-models'
+# `scr-tui` is its own top-level binary (not linked into `scr`), so — same
+# as `scr` — it must name its own model build scope. `model` is a local
+# rename of the scratchy-models dependency edge, so
+# `--features model/smollm2-135m` reaches straight into scratchy-models'
 # own arch-*/<stem>/<arch>/all features. No default scope: naming zero models
 # is a build-time panic there, not a silently empty binary.
-model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
+model = { package = "scratchy-models", path = "../../../models/arch", optional = true, default-features = false }
 clap = { version = "4", features = ["derive"] }
 rmcp = "3"
 anyhow = "1"
@@ -72,7 +67,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 libc = "0.2"
 
-# Quant-preset build scope (see scratchy-cli's `quant` for the full
+# Quant-preset build scope (see `scr`'s `quant`, crates/targets/metal/cli, for the full
 # rationale) — the same instance scratchy-models' build script reads the
 # enabled presets from, so `--features quant/mlx-affine-b4-g32` reaches it.
-quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
+quant = { package = "scratchy-quantizations", path = "../../../models/quantization", optional = true, default-features = false }

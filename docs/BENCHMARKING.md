@@ -129,7 +129,7 @@ nothing is self-reported.
 - **`evicted`** — KiB that left the page cache when a FROZEN repetition's
   eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
 - **`power`** — whole-run energy, from the workspace's own
-  [`scratchy-power-sampler`](../crates/benches/power-sampler) binary: Apple's
+  [`scratchy-power-sampler`](../crates/targets/metal/power-sampler) binary: Apple's
   IOReport energy counters (no root, no third-party tool),
   sampled at 1 Hz from before the first build to after the last server is
   down, so the number covers everything the run cost — the same window for
