@@ -1147,13 +1147,20 @@ fn emit_superdsc_wiring(
 /// `const`-constructed value inside `inventory::submit!`, which the runtime looks up by fingerprint.
 /// Every quantity stays in its own type from the lowering that computed it to the launch that reads it.
 ///
-/// ## The device image is `include_bytes!`
+/// ## The device image is `include_bytes!`, packed
 ///
 /// One model's rung ladder is ~100-290 MB of device code, and that many tokens would not survive the
-/// macro, let alone `prettyplease` — so each image is written to `OUT_DIR` and referenced by
+/// macro, let alone `prettyplease` — so the images are written to `OUT_DIR` and referenced by
 /// `include_bytes!`. That is a mechanism for getting BYTES into a binary, not a serialization format:
 /// nothing parses it, at build time or after. `OUT_DIR` is cargo's own per-build directory for the crate
 /// being expanded, and every arch crate has a `build.rs`, so it is set here.
+///
+/// The bytes are the metal AOT precedent's packed form (`crates/targets/metal/src/aot.rs`, `pack`):
+/// ONE dictionary trained on every image the build bakes, each DISTINCT image one zstd frame against
+/// it, all frames in one blob. Measured on granite-3.1-8b fp8, the images are ~97% redundant —
+/// 156 MB of distinct device code packs to single-digit MB. A launch group's token names its frame's
+/// ROW in the one `BakedImages` static; the card crate decompresses at the door that uploads it, so
+/// the card receives byte-identical bytes and nothing between here and there parses anything.
 #[cfg_attr(not(feature = "spyre-lower"), allow(unused_variables))]
 fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // ⭐⭐⭐ WHAT IS INVENTORIED DEPENDS ON THE DEVICE, AND ONLY ON THE DEVICE.
@@ -1217,6 +1224,9 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // programs, so they share one set of `const` items rather than each carrying its own copy.
     let mut interner = crate::ktir_tokens::ProgramInterner::default();
     let mut places_interner = PlacesInterner::default();
+    // ⭐ ONE IMAGE INTERNER FOR THE WHOLE EMISSION — both worlds' groups share one blob, one
+    // dictionary, one row table, exactly as they share the programs and placement tables above.
+    let mut image_interner = ImageInterner::default();
     let n_bundles = alone.len() + sharded.len();
     let world_alone = quote! { ::scratchy_target_spyre::bundle_code::collective::TpWorld<1> };
     // The binary's own `Build` — `SUPERDSC_TP`'s assertion holds it to the world baked here.
@@ -1224,18 +1234,18 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     bundle_items(
         &alone,
         &world_alone,
-        &images,
         &mut interner,
         &mut places_interner,
+        &mut image_interner,
         &mut out,
         (&mut n_groups, &mut n_bytes),
     );
     bundle_items(
         &sharded,
         &world_build,
-        &images,
         &mut interner,
         &mut places_interner,
+        &mut image_interner,
         &mut out,
         (&mut n_groups, &mut n_bytes),
     );
@@ -1264,14 +1274,26 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
         }
     }
     // The programs are `const` items and the placement tables `static`s; both precede the
-    // `inventory::submit!`s that name them.
+    // `inventory::submit!`s that name them. The packed images are one more `static` of the same
+    // kind: `__SDSC_IMAGES`, the one table every launch group's `BakedImage::Baked` names.
     let programs = interner.items();
     let tables = places_interner.items();
+    let (images_static, packed) = image_interner.pack(&images);
     let preamble = crate::ktir_tokens::preamble();
-    out = quote! { #preamble #(#programs)* #(#tables)* #out };
+    out = quote! { #preamble #(#programs)* #(#tables)* #images_static #out };
+    let packed_note = if packed.frames > 0 {
+        format!(
+            " packed to {:.1} MB in {} zstd frame(s) against a {:.0} KB dictionary",
+            packed.blob_bytes as f64 / 1048576.0,
+            packed.frames,
+            packed.dict_bytes as f64 / 1024.0,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
         "[spyre-superdsc] baked {} bundle(s) / {n_groups} launch group(s) / {} distinct program(s) \
-         / {:.1} MB of device code into the binary as Rust structs",
+         / {:.1} MB of device code{packed_note} into the binary as Rust structs",
         n_bundles,
         interner.items().len(),
         n_bytes as f64 / 1048576.0,
@@ -1284,9 +1306,9 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
 fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     bundles: &[scratchy_target_spyre::bundle_code::BundleCode<'static, T>],
     world: &proc_macro2::TokenStream,
-    images: &std::path::Path,
     interner: &mut crate::ktir_tokens::ProgramInterner,
     places_interner: &mut PlacesInterner,
+    image_interner: &mut ImageInterner,
     out: &mut proc_macro2::TokenStream,
     (n_groups, n_bytes): (&mut usize, &mut usize),
 ) {
@@ -1300,7 +1322,7 @@ fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
             .map(|(i, g)| {
                 *n_groups += 1;
                 *n_bytes += g.init_binary.len();
-                launch_tokens(g, i, &b.fp, images, interner)
+                launch_tokens(g, i, interner, image_interner)
             })
             .collect::<Vec<_>>();
         let reroll = match &b.reroll {
@@ -1737,15 +1759,15 @@ fn layout_tokens(
 }
 
 /// ONE LAUNCH: its address shifts and its compiled program, as a single value. The device image is
-/// written to `OUT_DIR` and referenced by `include_bytes!`; everything else is a literal.
+/// a row of the emission's one packed image table (see [`ImageInterner`]); everything else is a
+/// literal.
 fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     // `'static` because a baked program's operations live in the arena, which outlives the whole
     // expansion — the tokens borrow it rather than copying it.
     g: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchGroup<'static, T>,
     index: usize,
-    fp: &str,
-    images: &std::path::Path,
     interner: &mut crate::ktir_tokens::ProgramInterner,
+    image_interner: &mut ImageInterner,
 ) -> proc_macro2::TokenStream {
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchGroup {
         kv,
@@ -1822,8 +1844,34 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         None => quote! { ::std::option::Option::None },
     };
     let jbp = proc_macro2::Literal::u64_unsuffixed(*job_bin_ptr);
-    // Launch order is the slice position, so the image path is keyed by it.
-    let image = out_dir_bytes(images, &format!("{fp}/group_{index}.bin"), init_binary);
+    // ⭐ THE IMAGE, AS ITS BUILD'S ONE PACKED TABLE — metal's AOT precedent: one dictionary over the
+    // whole build, one frame per DISTINCT image, the row minted here and the frame written at the
+    // splice by `ImageInterner::pack`. An empty image (dxp compiled a group to a job plan alone)
+    // carries no row: it stays raw bytes, so a build with no images gets no blob, no dictionary,
+    // and no static.
+    let image = match init_binary {
+        scratchy_target_spyre::bundle_code::BakedImage::Raw(c) if c.is_empty() => quote! {
+            ::scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                ::std::borrow::Cow::Borrowed(&[])
+            )
+        },
+        scratchy_target_spyre::bundle_code::BakedImage::Raw(c) => {
+            let row = image_interner.image(c.as_ref());
+            let row = proc_macro2::Literal::u32_unsuffixed(row);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::BakedImage::Baked {
+                    images: &__SDSC_IMAGES,
+                    row: #row,
+                }
+            }
+        }
+        // The arena's groups are built by `into_code` from dxp's output, raw — a `Baked` image here
+        // would mean an already-emitted group was re-emitted, which the interners exist to prevent.
+        // This names it at the bake rather than emitting a frame of a frame.
+        scratchy_target_spyre::bundle_code::BakedImage::Baked { .. } => {
+            panic!("[spyre-superdsc] launch group {index}: re-emitting an already-baked image")
+        }
+    };
     // The correction flits are kilobytes at most (a 128-byte flit per symbolic address), so they go out
     // as a byte literal rather than a second file.
     let corr = correction
@@ -1859,29 +1907,135 @@ fn f32_bits(v: f32) -> proc_macro2::TokenStream {
     quote! { f32::from_bits(#bits) }
 }
 
-/// Write `bytes` under `OUT_DIR` and return the `include_bytes!` that reads them back at compile time.
-///
-/// An empty image (dxp compiled a group to a job plan alone) needs no file.
-fn out_dir_bytes(images: &std::path::Path, rel: &str, bytes: &[u8]) -> proc_macro2::TokenStream {
-    if bytes.is_empty() {
-        return quote! { ::std::borrow::Cow::Borrowed(&[]) };
+/// ⭐ THE EMISSION'S ONE IMAGE TABLE — the interner for device images, as [`PlacesInterner`] is for
+/// placement tables: minted row-by-row during the walk, materialized once at the splice. The packing
+/// is the metal AOT precedent (`crates/targets/metal/src/aot.rs`, `pack`): one dictionary trained on
+/// every image the build bakes — near-copies share their bytes through it — and each distinct image
+/// one zstd frame against it, all frames in one `include_bytes!`'d blob.
+#[derive(Default)]
+struct ImageInterner {
+    /// DISTINCT images by their exact bytes — the map IS the store, and the value is the row a
+    /// launch group's token names. Content addressing is the whole point: bundles dxp compiled to
+    /// the same image share one frame (measured on granite-3.1-8b fp8: 456 groups, 356 distinct
+    /// images), exactly as bundles with one placement table share one static. The bytes are copied
+    /// out of the arena here — the one cost of content addressing — and live only for the expansion.
+    index: std::collections::HashMap<Vec<u8>, u32>,
+}
+
+/// What `ImageInterner::pack` wrote, for the bake's own report.
+struct PackedImages {
+    frames: usize,
+    blob_bytes: u64,
+    dict_bytes: u64,
+}
+
+impl ImageInterner {
+    /// The row for `bytes`, minted on first sight.
+    fn image(&mut self, bytes: &[u8]) -> u32 {
+        if let Some(row) = self.index.get(bytes) {
+            return *row;
+        }
+        let row = self.index.len() as u32;
+        self.index.insert(bytes.to_vec(), row);
+        row
     }
-    let dst = images.join(rel);
-    if let Some(parent) = dst.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&dst, bytes) {
-        panic!(
-            "[spyre-superdsc] writing the device image to {}: {e} — it is `include_bytes!`d into the \
-             binary, so there is no fallback",
-            dst.display()
-        );
-    }
-    let lit = proc_macro2::Literal::string(&format!("/superdsc-code/{rel}"));
-    quote! {
-        ::std::borrow::Cow::Borrowed(
-            ::core::include_bytes!(::core::concat!(::core::env!("OUT_DIR"), #lit)) as &[u8]
-        )
+
+    /// Materialize the table: train the dictionary over every distinct image, compress each to a
+    /// frame, write the blob and the dictionary under `dir`, and return the one `static` every
+    /// `BakedImage::Baked` names. No images, no output: an emulator build emits nothing.
+    fn pack(self, dir: &std::path::Path) -> (proc_macro2::TokenStream, PackedImages) {
+        if self.index.is_empty() {
+            return (
+                proc_macro2::TokenStream::new(),
+                PackedImages {
+                    frames: 0,
+                    blob_bytes: 0,
+                    dict_bytes: 0,
+                },
+            );
+        }
+        // First-seen order: the row a launch group's token already names is this position.
+        let mut rows: Vec<(&Vec<u8>, &u32)> = self.index.iter().collect();
+        rows.sort_by_key(|(_, row)| **row);
+        // ── Metal's `pack` constants, verbatim in meaning ──
+        // The dictionary holds at most this much: the bytes a build's images share.
+        const DICTIONARY: usize = 1 << 20;
+        // The samples the dictionary is trained on are the images cut to this size, so one image
+        // alone is samples enough.
+        const SAMPLE: usize = 4 << 10;
+        // The level to compress at: the dictionary carries the shared bytes, and higher levels save
+        // under a fifth more for several times the build time.
+        const LEVEL: i32 = 3;
+        let all: Vec<u8> = rows.iter().flat_map(|(b, _)| b.iter().copied()).collect();
+        let samples: Vec<usize> = all.chunks(SAMPLE).map(<[u8]>::len).collect();
+        // Training on too few bytes for a dictionary leaves it empty: each frame then stands alone.
+        let dictionary =
+            zstd::dict::from_continuous(&all, &samples, DICTIONARY).unwrap_or_default();
+        use rayon::prelude::*;
+        let frames: Vec<(Vec<u8>, usize)> = rows
+            .par_iter()
+            .map(|(image, _)| {
+                zstd::bulk::Compressor::with_dictionary(LEVEL, &dictionary)
+                    .and_then(|mut c| c.compress(image))
+                    .unwrap_or_else(|e| panic!("[spyre-superdsc] compress a device image: {e}"))
+            })
+            .zip(rows.par_iter().map(|(image, _)| image.len()))
+            .collect();
+        let mut blob: Vec<u8> = Vec::with_capacity(frames.iter().map(|(f, _)| f.len()).sum());
+        let row_tokens: Vec<proc_macro2::TokenStream> = frames
+            .iter()
+            .map(|(frame, len)| {
+                let offset = proc_macro2::Literal::u32_unsuffixed(blob.len() as u32);
+                blob.extend_from_slice(frame);
+                let frame_len = proc_macro2::Literal::u32_unsuffixed(frame.len() as u32);
+                let len = proc_macro2::Literal::u32_unsuffixed(*len as u32);
+                quote! {
+                    ::scratchy_target_spyre::bundle_code::BakedFrame {
+                        offset: #offset,
+                        frame_len: #frame_len,
+                        len: #len,
+                    }
+                }
+            })
+            .collect();
+        let write = |name: &str, bytes: &[u8]| {
+            // The directory is ours to make: nothing else writes under it anymore (the per-group
+            // files that used to create it are gone), and a first build has no OUT_DIR subtree.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                panic!(
+                    "[spyre-superdsc] creating the packed image directory {}: {e}",
+                    dir.display()
+                );
+            }
+            let dst = dir.join(name);
+            if let Err(e) = std::fs::write(&dst, bytes) {
+                panic!(
+                    "[spyre-superdsc] writing the packed device images to {}: {e} — they are \
+                     `include_bytes!`d into the binary, so there is no fallback",
+                    dst.display()
+                );
+            }
+        };
+        write("images.bin", &blob);
+        write("images.dict", &dictionary);
+        let stats = PackedImages {
+            frames: frames.len(),
+            blob_bytes: blob.len() as u64,
+            dict_bytes: dictionary.len() as u64,
+        };
+        let tokens = quote! {
+            static __SDSC_IMAGES: ::scratchy_target_spyre::bundle_code::BakedImages =
+                ::scratchy_target_spyre::bundle_code::BakedImages {
+                    blob: ::core::include_bytes!(::core::concat!(
+                        ::core::env!("OUT_DIR"), "/superdsc-code/images.bin"
+                    )) as &[u8],
+                    dictionary: ::core::include_bytes!(::core::concat!(
+                        ::core::env!("OUT_DIR"), "/superdsc-code/images.dict"
+                    )) as &[u8],
+                    frames: &[#(#row_tokens),*],
+                };
+        };
+        (tokens, stats)
     }
 }
 

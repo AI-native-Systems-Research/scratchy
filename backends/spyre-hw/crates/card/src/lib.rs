@@ -4,6 +4,10 @@
 //! runtime; nothing in `scratchy-target-spyre` depends on it, so the shared target (lowering, bake,
 //! emulator) builds without it.
 
+/// The bake's packed device images, decoded — the metal AOT precedent's load half. Compression runs
+/// in the compiler at expansion; this is the door that turns a frame back into the bytes the card
+/// receives.
+pub mod baked_image;
 /// Run a bundle this binary did not bake — see the module docs.
 pub mod bundle_run;
 /// #603 PR2 — one launch's compute CBs as data: the submit walk's arithmetic

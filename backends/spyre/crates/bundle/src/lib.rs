@@ -458,6 +458,124 @@ pub struct LaunchProgram<'a> {
     pub lx_pin_window_bytes: Option<u64>,
 }
 
+/// ⭐ THE BUILD'S WHOLE IMAGE SET, AS ITS BINARY HOLDS IT — one blob of zstd frames, one dictionary
+/// every frame is compressed against, and each frame's extent and decompressed size.
+///
+/// The metal AOT precedent is `crates/targets/metal/src/aot.rs`'s `pack`: one dictionary trained on
+/// every metallib the build bakes, each metallib one frame against it, because the images are
+/// near-copies of one another and the dictionary carries the bytes they share. Measured on
+/// granite-3.1-8b fp8: 156 MB of distinct device images is ~97% redundant — one blob of frames
+/// against one dictionary is single-digit MB.
+///
+/// ⛔ A LEAF OF BYTES, DELIBERATELY. This crate is named by both ends of the pipeline and depends on
+/// nothing either end owns; zstd DECODING is card-runtime behavior, so it lives in the card crate
+/// (`backends/spyre-hw/crates/card`), which digests `dictionary` once and decompresses `blob`'s
+/// frames against it. Nothing here knows a decoder exists.
+///
+/// One `static` of this type per `#[forward]` expansion names the whole set; a launch group's
+/// [`BakedImage`] points at it with a row.
+pub struct BakedImages {
+    /// Every frame, concatenated. A frame is `[offset, offset + frame_len)` — one zstd window
+    /// compressed against `dictionary`.
+    pub blob: &'static [u8],
+    /// The dictionary `blob`'s frames are compressed against — trained at the bake on every image
+    /// the build baked. Raw bytes: the card crate prepares the decoder.
+    pub dictionary: &'static [u8],
+    /// One row per DISTINCT image the build baked, in first-seen order. A row's index is the row
+    /// a launch group's `BakedImage::Baked` names.
+    pub frames: &'static [BakedFrame],
+}
+
+/// ONE DISTINCT IMAGE'S EXTENT IN ITS BUILD'S [`BakedImages`] BLOB — where the frame is, how long
+/// it is, and the image's size once decompressed. All three are baked facts; the decompress door
+/// checks the third and names both numbers when they disagree (the metal precedent's
+/// `BakedMetallib::decompress` check).
+pub struct BakedFrame {
+    /// The frame's offset into `BakedImages::blob`.
+    pub offset: u32,
+    /// The frame's length in bytes.
+    pub frame_len: u32,
+    /// The image's size, decompressed — the quantity every launch and window math names.
+    pub len: u32,
+}
+
+/// A LAUNCH GROUP'S DEVICE IMAGE, IN ONE OF ITS TWO PROVENANCES.
+///
+/// `Raw` is the image as bytes: the bake's arena copy (built by `into_code` from what dxp wrote),
+/// the dev runner's file read, an empty image for a group dxp compiled to a job plan alone. `Baked`
+/// is the binary's copy: one row of its build's [`BakedImages`] — a zstd frame, decompressed at the
+/// card door that uploads it. The card receives byte-identical bytes either way; which arm holds
+/// them is a statement about WHERE they live, not what they are.
+// NOT `Eq`: `Raw` carries an image's bytes, and an image is not a set of exact float-free bytes —
+// two bakes of one model agree in content, not in allocation.
+#[derive(Clone)]
+pub enum BakedImage<'a> {
+    /// The image as bytes. `Cow`, as every other baked slice in this crate: borrowed from the bake's
+    /// `'static` arena when the lowering built it, owned when a file read or a test supplied it.
+    Raw(Cow<'a, [u8]>),
+    /// The image as its build's compressed row: `images` is the one `static` `BakedImages` the
+    /// expansion emitted, `row` its frame's index in `images.frames`.
+    Baked {
+        images: &'static BakedImages,
+        row: u32,
+    },
+}
+
+impl PartialEq for BakedImage<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Byte equality, as the `Cow<'a, [u8]>` this replaces compared.
+            (Self::Raw(a), Self::Raw(b)) => a == b,
+            // Same table, same row — the blob is not diffed: two statics of one build are one
+            // table, and content equality across arms is a decompression, not a comparison.
+            (Self::Baked { images: a, row: ar }, Self::Baked { images: b, row: br }) => {
+                std::ptr::eq(a, b) && ar == br
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for BakedImage<'_> {
+    /// An empty `Raw` image — the same default the `Cow<'a, [u8]>` this replaces had, for the same
+    /// reason: a defaulted launch group is one dxp compiled to a job plan alone.
+    fn default() -> Self {
+        Self::Raw(Cow::Borrowed(&[]))
+    }
+}
+
+impl<'a> BakedImage<'a> {
+    /// The image's size, decompressed — the one quantity every consumer names: the H2D window, the
+    /// allocation extent, the readback diff. `Raw` holds the bytes so it measures them; `Baked`
+    /// holds the baked `len` so it reads it.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Raw(c) => c.len(),
+            Self::Baked { images, row } => images.frames[*row as usize].len as usize,
+        }
+    }
+
+    /// `len() == 0` — a group dxp compiled to a job plan alone carries no image.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for BakedImage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the bytes: a `Baked` image's frame is megabytes of the blob, and a `Raw` one is the
+        // whole image. The provenance and the length are the identity a reader wants.
+        match self {
+            Self::Raw(c) => f.debug_struct("Raw").field("len", &c.len()).finish(),
+            Self::Baked { images, row } => f
+                .debug_struct("Baked")
+                .field("row", row)
+                .field("len", &images.frames[*row as usize].len)
+                .finish(),
+        }
+    }
+}
+
 /// ONE LAUNCH: a contiguous run of up to `group_size()` trips that dxp compiled into a single device
 /// program, together with the address shifts the launch applies to it.
 ///
@@ -482,8 +600,9 @@ pub struct LaunchGroup<'a, T: ktir_superdsc::collective::Tp> {
     /// direct; on a card the device image below is compiled FROM these, and is their artifact
     /// rather than a second source of truth.
     pub programs: Cow<'a, [LaunchProgram<'a>]>,
-    /// dxp's device image. Empty for a group dxp compiled to a job plan alone.
-    pub init_binary: Cow<'a, [u8]>,
+    /// dxp's device image, in one of its two provenances ([`BakedImage`]): the bake's raw bytes, or
+    /// the binary's compressed row. Empty for a group dxp compiled to a job plan alone.
+    pub init_binary: BakedImage<'a>,
     /// The device VA execution starts at. The launch passes `job_bin_ptr - PROG_OFFSET_BASE` as the
     /// bootstrap OFFSET (flex bounds the seg7 translation to the program allocation's size).
     pub job_bin_ptr: u64,
@@ -910,14 +1029,14 @@ mod tests {
                 LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
                     kv: KvShifts::default(),
                     programs: Cow::Borrowed(PROGS_A),
-                    init_binary: Cow::Borrowed(&[1, 2, 3]),
+                    init_binary: BakedImage::Raw(Cow::Borrowed(&[1, 2, 3])),
                     job_bin_ptr: 64,
                     correction: Cow::Borrowed(&[]),
                 },
                 LaunchGroup {
                     kv: KvShifts::default(),
                     programs: Cow::Borrowed(PROGS_B),
-                    init_binary: Cow::Borrowed(&[4]),
+                    init_binary: BakedImage::Raw(Cow::Borrowed(&[4])),
                     job_bin_ptr: 128,
                     correction: Cow::Borrowed(&[]),
                 },
@@ -932,7 +1051,10 @@ mod tests {
         assert_eq!(code.groups[1].programs[0].func.name, "b");
         assert_eq!(code.groups[1].programs[0].func.grid, (2, 1, 1));
         assert_eq!(code.groups[0].job_bin_ptr, 64);
-        assert_eq!(code.groups[1].init_binary.as_ref(), &[4]);
+        assert_eq!(
+            code.groups[1].init_binary,
+            BakedImage::Raw(Cow::Borrowed(&[4]))
+        );
     }
 
     /// ⭐ A LADDER OF ONE RUNG IS A LADDER — every position up to its sweep runs that rung — and a

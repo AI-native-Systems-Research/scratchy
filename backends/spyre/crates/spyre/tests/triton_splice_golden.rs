@@ -885,7 +885,7 @@ fn spliced_node_group(
             // a program without a stated window is refused, never silently charged.
             lx_pin_window_bytes: Some(0),
         }]),
-        init_binary: Cow::Borrowed(&[]),
+        init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
         job_bin_ptr: 0,
         correction: Cow::Borrowed(&[]),
     }
@@ -952,7 +952,7 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
                 // a program without a stated window is refused, never silently charged.
                 lx_pin_window_bytes: Some(0),
             }]),
-            init_binary: Cow::Borrowed(&[]),
+            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
             correction: Cow::Borrowed(&[]),
         };
@@ -1066,7 +1066,7 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
                 // a program without a stated window is refused, never silently charged.
                 lx_pin_window_bytes: Some(0),
             }]),
-            init_binary: Cow::Borrowed(&[]),
+            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
             correction: Cow::Borrowed(&[]),
         };
@@ -1377,7 +1377,7 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
                 // a program without a stated window is refused, never silently charged.
                 lx_pin_window_bytes: Some(0),
             }]),
-            init_binary: Cow::Borrowed(&[]),
+            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
             correction: Cow::Borrowed(&[]),
         };
@@ -1766,7 +1766,7 @@ fn execute_fp8_program(
                 // a program without a stated window is refused, never silently charged.
                 lx_pin_window_bytes: Some(0),
             }]),
-            init_binary: Cow::Borrowed(&[]),
+            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
             correction: Cow::Borrowed(&[]),
         };
@@ -3036,7 +3036,9 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
                         args: Cow::Owned(args),
                         lx_pin_window_bytes: Some(0),
                     }]),
-                    init_binary: Cow::Borrowed(&[]),
+                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                        Cow::Borrowed(&[]),
+                    ),
                     job_bin_ptr: 0,
                     correction: Cow::Borrowed(&[]),
                 }
@@ -3344,7 +3346,9 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
                         args: Cow::Owned(args),
                         lx_pin_window_bytes: Some(0),
                     }]),
-                    init_binary: Cow::Borrowed(&[]),
+                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                        Cow::Borrowed(&[]),
+                    ),
                     job_bin_ptr: 0,
                     correction: Cow::Borrowed(&[]),
                 }
