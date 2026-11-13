@@ -25,6 +25,8 @@ hf-completions = ["model/hf-completions"]
 # process must not run it) and `spyre bundle run` are this tier's.
 spyre-hw = [
   "scratchy-target-spyre-worker/spyre-hw",
+  # The device compile: the bake turns every rung into device images (`dxp_standalone`).
+  "scratchy-target-spyre-models/spyre-hw",
   # `spyre bundle run`: the card's executor, directly.
   "dep:scratchy-target-spyre-card",
 ]
@@ -40,6 +42,8 @@ path = "src/main.rs"
 scratchy-cli = { workspace = true, features = ["model"] }
 # The spyre worker: the `WorkerFactory` the engine serves through. `main.rs` anchors it.
 scratchy-target-spyre-worker = { workspace = true }
+# The compiled models, named here only so a card binary turns on their device compile.
+scratchy-target-spyre-models = { path = "../models" }
 # `spyre bundle run` ONLY: launching a bundle this binary did not bake needs the card's executor
 # directly. Reachable only under `spyre-hw`.
 scratchy-target-spyre-card = { path = "../card", optional = true }

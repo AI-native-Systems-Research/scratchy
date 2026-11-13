@@ -2126,7 +2126,7 @@ mod pad_clamp_tests {
         // this pin checks is the same mint every launch reads.
         let rows_in = LaunchRows::Sequence {
             blocks: &[],
-            rows: scratchy_target_spyre::paged_step::StepRows { start: 10, real: 4 },
+            rows: scratchy_target_spyre::paged_step::StepRows::new(10, 4).expect("four real rows"),
         };
         let binds = sample_binds(
             seat,

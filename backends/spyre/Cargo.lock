@@ -3189,6 +3189,7 @@ dependencies = [
  "scratchy-models",
  "scratchy-quantizations",
  "scratchy-target-spyre-card",
+ "scratchy-target-spyre-models",
  "scratchy-target-spyre-worker",
  "scratchy-tp",
  "tokio",
