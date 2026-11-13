@@ -18,12 +18,13 @@ set -euo pipefail
 MACOS_UNBUILT='crates/targets/spyre
 crates/targets/spyre/builder
 crates/targets/spyre/bundle
+crates/targets/spyre/compiler
 crates/targets/spyre/flex-rs
-crates/triton/splice
-crates/triton/triton-frontend
-crates/triton/triton-ktir
-crates/triton/triton-ktir-superdsc
-crates/triton/triton-numeric'
+crates/targets/spyre/triton/splice
+crates/targets/spyre/triton/triton-frontend
+crates/targets/spyre/triton/triton-ktir
+crates/targets/spyre/triton/triton-ktir-superdsc
+crates/targets/spyre/triton/triton-numeric'
 
 changed() {
     # Every crate directory, deepest first, so the first one holding a file is its owner:

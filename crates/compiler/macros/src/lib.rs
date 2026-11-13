@@ -17,11 +17,6 @@
 //! constants, proving the pipeline actually executes at compile
 //! time.
 
-use std::path::Path;
-
-#[cfg(all(feature = "metal", feature = "spyre"))]
-compile_error!("features 'metal' and 'spyre' are mutually exclusive — enable exactly one backend");
-
 use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
@@ -33,17 +28,14 @@ use scratchy_forward_compiler_frontend::{
 };
 mod arch_spec;
 mod cfg;
-mod codegen;
-mod config;
-/// The baked program, as const tokens — see its own header.
-#[cfg(feature = "spyre")]
-mod ktir_tokens;
+pub mod codegen;
+pub mod config;
 pub use config::{Scope, selected_config_paths, total_models_emitted};
-mod emit;
-mod fuf;
+pub mod emit;
+pub mod fuf;
 mod interpreter_codegen;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
-mod quantization;
+pub mod quantization;
 /// The front end, exposed for the `scratchy-forwards` build driver in
 /// scratchy-models.
 pub use parse_python::{PythonCarrier, parse_python_file};
@@ -62,26 +54,28 @@ pub use render::render_tokens;
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
 #[cfg(test)]
 mod checkpoint_tests;
+/// Real-config fixtures for tests here and in the target compilers: an arch's configs, one
+/// `(stem, preset)` variant, and its program and fused graph through the real passes.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
 #[cfg(test)]
 mod frontend_tests;
 mod rows_lowering;
-mod shape;
-mod to_wavefront;
+pub mod shape;
+pub mod target;
+pub mod to_wavefront;
 mod tp_lowering;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod typed_bodies;
 mod typed_shapes;
 #[cfg(test)]
 mod typed_shapes_tests;
-// ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
-//
-// It used to be gated `all(feature = "spyre", not(feature = "metal"))` because metal derived
-// the same set inline from `tape_groups` — a cfg that selects between two bodies, which keeps
-// both. The target being a compile-time singleton is what makes ONE body viable: there is no
-// second target in the build to compromise for. Packing gate/up into a single `__fused__`
+// ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target: one body, since
+// the target is a compile-time singleton — there is no second target in the build to
+// compromise for. Packing gate/up into a single `__fused__`
 // buffer is metal's kernel ABI, so it arrives as a bool argument rather than a second walk.
-mod weight_bindings;
-mod weight_vocab;
+pub mod weight_bindings;
+pub mod weight_vocab;
 
 mod vision_glue;
 mod workload;
@@ -470,7 +464,7 @@ struct CompileMode {
     apply_mm_splice: bool,
     /// True for `#[forward]`, false for `#[vision_forward]`. Gates
     /// emission of the arch-level dispatcher (`enum Weights`,
-    /// `ScratchyArchRegistration` inventory submission, per-variant
+    /// target registry submission, per-variant
     /// HF-bounds accessors). Vision encoders reach their compiled
     /// `Weights` via the hand-written `ScratchyMmRegistration` in
     /// each VL crate's `vision.rs`; HF `architectures` strings like
@@ -524,14 +518,19 @@ impl std::fmt::Display for CarrierError {
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
 ///
-/// `dump_dir`: where a spyre bake writes each bundle's dxp input — the build script's own output
-/// directory when its build asked for the dump (`superdsc-dump`), else `None` (no dump). The caller
-/// is the one place that knows the directory, so the bake never reads the environment for it.
+/// `dump_dir`: where a dumping bake writes each bundle's backend-compiler input — the build
+/// script's own output directory when its build asked for the dump, else `None` (no dump). The
+/// caller is the one place that knows the directory, so the bake never reads the environment for
+/// it.
+///
+/// `emitter`: the target this build compiles for ([`target::TargetEmitter`]) — what it emits for a
+/// model is its own.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
     dump_dir: Option<&std::path::Path>,
     scope: &Scope,
+    emitter: &dyn target::TargetEmitter,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -743,11 +742,6 @@ pub fn compile_carrier(
         })
         .map_err(CarrierError::Arch)?;
 
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    compile_error!(
-        "scratchy-forward-compiler-macro requires a backend feature: 'cuda', 'metal', or 'spyre'"
-    );
-
     // Stable rebuild-on-JSON-change: emit `const _: &str =
     // include_str!("<abs path>");` for every file the macro read.
     // Rustc treats `include_str!` paths as source-dependency inputs
@@ -770,11 +764,11 @@ pub fn compile_carrier(
     if quantizations_path.exists() {
         tracked_paths.insert(quantizations_path);
     }
-    // The Triton splice's kernels need NO entry here: the splice
-    // `include_str!`s every `.py` it compiles (its registry rows),
+    // A target's spliced kernels need NO entry here: the splice
+    // `include_str!`s every source it compiles (its registry rows),
     // which is cargo's own dependency edge — editing a kernel
-    // rebuilds the splice and every caller, on spyre builds only,
-    // with a missing kernel a compile error rather than a silent
+    // rebuilds the splice and every caller, on the builds that splice
+    // it, with a missing kernel a compile error rather than a silent
     // fs miss. (The read_dir block this replaces tracked the
     // directory for EVERY backend and could silently track nothing
     // on a read error — the stale-bake bug it existed to prevent.)
@@ -1104,6 +1098,7 @@ pub fn compile_carrier(
             mode.emit_arch_dispatch,
             canonical_affine_rows,
             dump_dir,
+            emitter,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);
@@ -1178,7 +1173,7 @@ pub fn compile_carrier(
     hf_arches.dedup();
 
     // Vision encoders intentionally skip the arch-dispatcher emission
-    // (no `enum Weights`, no `ScratchyArchRegistration` inventory). The
+    // (no `enum Weights`, no registry row). The
     // hand-written `ScratchyMmRegistration` in each VL crate's
     // `vision.rs` claims its HF arch string and constructs the
     // multimodal forward over the macro-emitted per-variant
@@ -1552,14 +1547,25 @@ pub fn compile_carrier(
             #head_tokens
         };
 
+        let gguf_spec = config::load_gguf_spec(models_dir)
+            .map_err(|e| {
+                syn::Error::new(
+                    name_span,
+                    format!(
+                        "quantizations.json gguf spec in {}: {e}",
+                        models_dir.display()
+                    ),
+                )
+            })
+            .map_err(CarrierError::Arch)?;
         emit_arch_dispatcher(
             &arch_ident,
             &hf_arches,
             &arch_dispatch_arms,
-            models_dir,
-            name_span,
+            gguf_spec.as_ref(),
             gdn_runtime_config_tokens,
             head_registration,
+            emitter,
         )
         .map_err(CarrierError::Arch)?
     } else {
@@ -1574,19 +1580,11 @@ pub fn compile_carrier(
     // `#[forward] fn llama() { ... }`, the caller accesses
     // `scratchy_models::llama::Weights` directly (no
     // `::arch::` / `::llama::` / etc.).
+    let facade = emitter.facade();
     Ok(quote! {
-        #[cfg(feature = "metal")]
+        // The target's runtime crate, which the emitted code names its types through.
         #[allow(unused_imports)]
-        use ::scratchy_target_metal as __gpu;
-        // Spyre: the host target re-exports the neutral surface (`weights`
-        // defaulted to `SpyreAllocator`, `LoadStream`, `BackendAllocator`) the
-        // emitted load/fingerprint code names through `crate::__gpu::…`.
-        #[cfg(feature = "spyre")]
-        #[allow(unused_imports)]
-        use ::scratchy_target_spyre as __gpu;
-        #[cfg(not(any(feature = "metal", feature = "spyre")))]
-        #[allow(unused_imports)]
-        use ::scratchy_layers as __gpu;
+        use #facade as __gpu;
 
         // Rebuild-on-change for every JSON the macro read.
         #(#tracked)*
@@ -1676,10 +1674,11 @@ fn emit_arch_dispatcher(
     arch_ident: &Ident,
     hf_arches: &[String],
     arms: &[DispatchArm],
-    models_dir: &Path,
-    error_span: Span,
+    // The arch's `quantizations.json` GGUF spec (`config::load_gguf_spec`).
+    gguf_spec: Option<&config::GgufSpec>,
     gdn_runtime_config_tokens: proc_macro2::TokenStream,
     head_registration: proc_macro2::TokenStream,
+    emitter: &dyn target::TargetEmitter,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if arms.is_empty() {
         return Ok(quote! {});
@@ -1721,89 +1720,6 @@ fn emit_arch_dispatcher(
     };
     let kv_codec_arms = canonical_const_arms(quote! { KV_CODEC });
     let kv_cache_layers_arms = canonical_const_arms(quote! { KV_CACHE_LAYERS });
-
-    // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
-    // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
-    // (the worker downcasts it). Emitted inside the `#[cfg(feature = "spyre")]`
-    // `ktir_bundle` override, so under metal these tokens are cfg'd out.
-    let ktir_bundle_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::KTIR_BUNDLE
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
-
-    // Per-variant arms for `ScratchyWeights::superdsc_weights()` — the
-    // GENERATED source-id → `Weights` FIELD binding. Unlike `ktir_bundle`
-    // these arms BIND the inner weights (`(w)`, not `(_)`): the whole point is
-    // to reach real fields, which is why this cannot be a lookup table in the
-    // worker.
-    let superdsc_weight_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => #model_ident::superdsc_weights(w),
-            }
-        })
-        .collect();
-
-    // Per-variant arms for `ScratchyWeights::sengraph_bundle()` — the same
-    // per-variant const the registration fn-pointer serves, reachable from the
-    // LOADED model so the bundle and the weights cannot come from two
-    // different variant matches.
-    let superdsc_embed_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => #model_ident::superdsc_embed(w),
-            }
-        })
-        .collect();
-
-    let superdsc_wiring_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::SUPERDSC_WIRINGS
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
-
-    let superdsc_tp_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::SUPERDSC_TP
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
-
-    let sengraph_bundle_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::SENGRAPH_BUNDLE
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
 
     // Distinct tp values across all arms, in ascending order. One
     // `inventory::submit!` per value; one match arm in `Weights::load`
@@ -2016,22 +1932,13 @@ fn emit_arch_dispatcher(
         .collect();
 
     // GGUF spec (per-arch). Loaded once: drives both
-    // (a) the `gguf_archs` field of `ScratchyArchRegistration` (every arch
+    // (a) the `gguf_archs` field of `ArchRegistration` (every arch
     //     with a `"ggml"` entry claims its gguf tag for dispatch), and
     // (b) the optional `scratchy_quantizations::gguf::register!` emission below (only
     //     the canonical owner per gguf_arch tag — `register_spec=false`
     //     opts out for non-canonical claimants like Mistral or
     //     deepseek-v3-flat).
-    let gguf_spec = config::load_gguf_spec(models_dir).map_err(|e| {
-        syn::Error::new(
-            error_span,
-            format!(
-                "quantizations.json gguf spec in {}: {e}",
-                models_dir.display()
-            ),
-        )
-    })?;
-    let gguf_arch_lits: Vec<proc_macro2::Literal> = match &gguf_spec {
+    let gguf_arch_lits: Vec<proc_macro2::Literal> = match gguf_spec {
         Some(spec) => vec![proc_macro2::Literal::string(
             spec.gguf_arch
                 .clone()
@@ -2064,135 +1971,79 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-tp inventory submission. Each closure passes its own tp
-    // constant into `Weights::load(...)`; the matching arm there
-    // walks only the tp-N variants. The submit! block is a static
-    // initializer — N submissions at compile time, walked once at
-    // runtime by `scratchy_forward_compiler::try_load(arch_hint, tp_world_size)`.
-    // The registration's `ktir_bundle` accessor — spyre's forward representation
-    // (the peer of the metal `FORWARD_TABLE`). Under spyre it returns the
-    // embedded `KTIR_BUNDLE` const as a neutral `&dyn Any` (the cfg-free registry
-    // can't name the spyre `KtirBundle`); under metal the forward runs
-    // through device kernels, so there's no bundle and the field is `None`.
-    //
-    // An arch registers MANY distinct base models (llama-2-13b … llama-3.2-3b),
-    // each with its own `KTIR_BUNDLE` (different layer count). Pick the ONE whose
-    // `fingerprint_matches` accepts the live checkpoint — the same per-variant
-    // sniff `Weights::load` uses (read-only, so the worker keeps its tensors).
-    // Quant variants of one base model share that base's bundle (shims re-export
-    // it), so any matching arm returns the right const. Own-target gating
-    // (parallel to how metal gates its `FORWARD_TABLE` / `METAL_BUCKETS`):
-    // `KTIR_BUNDLE` / `fingerprint_matches` only exist under this arch's spyre
-    // feature, so the `Some` arm can only compile there; other backends emit `None`.
-    #[cfg(feature = "spyre")]
-    let ktir_bundle_field = {
-        let bundle_match_arms: Vec<proc_macro2::TokenStream> = arms
-            .iter()
-            .map(|a| {
-                let model_ident = &a.model_ident;
-                quote! {
-                    if #model_ident::fingerprint_matches(__gw, __hf) {
-                        return ::core::option::Option::Some(
-                            &#model_ident::KTIR_BUNDLE
-                                as &'static (dyn ::core::any::Any
-                                    + ::core::marker::Send
-                                    + ::core::marker::Sync),
-                        );
-                    }
-                }
-            })
-            .collect();
+    // Per-tp inventory submission, into the target's own registry row (`MetalArchRegistration`
+    // under metal), each wrapping the shared `ArchRegistration` over its
+    // `dyn <Target>Weights`. Each closure passes its own tp constant into `Weights::load(...)`;
+    // the matching arm there walks only the tp-N variants. The submit! block is a static
+    // initializer — N submissions at compile time, walked once at runtime by the target's
+    // `try_load(arch_hint, tp_world_size)`.
+    let arch_row = |tp_lit: &proc_macro2::Literal, weights_trait: proc_macro2::TokenStream| {
         quote! {
-            ktir_bundle: ::core::option::Option::Some(
-                |__handle: ::scratchy_forward_compiler::GpuWeightsHandle<'_>,
-                 __hf: ::scratchy_forward_compiler::HfFingerprint<'_>| {
-                    // Recover the concrete `&mut GpuWeights` the same way
-                    // `try_load` does; `fingerprint_matches` only sniffs
-                    // shapes (its `&mut` reborrows to `&`), never `take`s a
-                    // tensor — so the worker keeps them all.
-                    let __gw: &mut crate::__gpu::weights::GpuWeights =
-                        unsafe { __handle.as_mut() };
-                    #(#bundle_match_arms)*
-                    ::core::option::Option::None
+            ::scratchy_forward_compiler::ArchRegistration {
+                arch_name: #arch_name_lit,
+                hf_arches: &[#(#hf_arch_lits),*],
+                gguf_archs: &[#(#gguf_arch_lits),*],
+                tp_world_size: #tp_lit,
+                // The registry fn-pointer names the allocator-erased
+                // `GpuWeightsHandle`; recover the concrete
+                // `&mut GpuWeights<BackendAllocator>` the per-variant
+                // `Weights::load` needs before calling it. Non-capturing
+                // so it coerces to the `ArchTryLoadFn` fn-pointer.
+                try_load: |__gw_handle: ::scratchy_forward_compiler::GpuWeightsHandle<'_>, stream, max_model_len, tp_rank, hf| {
+                    let gw: &mut crate::__gpu::weights::GpuWeights =
+                        unsafe { __gw_handle.as_mut() };
+                    Weights::load(
+                        gw, stream, max_model_len, hf, #tp_lit, tp_rank,
+                    ).map(|opt| {
+                        opt.map(|w| ::std::boxed::Box::new(w)
+                            as ::std::boxed::Box<dyn #weights_trait>)
+                    })
                 },
-            ),
+            }
         }
     };
-    #[cfg(not(feature = "spyre"))]
-    let ktir_bundle_field = quote! { ktir_bundle: ::core::option::Option::None, };
-    // Peer accessor for the `--target sendnn` bundle (the baked `SENGRAPH_BUNDLE`).
-    #[cfg(feature = "spyre")]
-    let sengraph_bundle_field = {
-        // Same per-variant fingerprint walk as `ktir_bundle` above, and for
-        // the same reason: an arch registers MANY base models, each with its
-        // own bundle. This used to hand back `arms.first()` unconditionally,
-        // so a build carrying granite-3.1-2b AND -8b served the 2b's bundle
-        // for both — caught only by the loader's shape guard.
-        let sengraph_match_arms: Vec<proc_macro2::TokenStream> = arms
-            .iter()
-            .map(|a| {
-                let model_ident = &a.model_ident;
-                quote! {
-                    if #model_ident::fingerprint_matches(__gw, __hf) {
-                        return ::core::option::Option::Some(
-                            &#model_ident::SENGRAPH_BUNDLE
-                                as &'static (dyn ::core::any::Any
-                                    + ::core::marker::Send
-                                    + ::core::marker::Sync),
-                        );
-                    }
-                }
-            })
-            .collect();
-        quote! {
-            sengraph_bundle: ::core::option::Option::Some(
-                |__handle: ::scratchy_forward_compiler::GpuWeightsHandle<'_>,
-                 __hf: ::scratchy_forward_compiler::HfFingerprint<'_>| {
-                    let __gw: &mut crate::__gpu::weights::GpuWeights =
-                        unsafe { __handle.as_mut() };
-                    #(#sengraph_match_arms)*
-                    ::core::option::Option::None
-                },
-            ),
-        }
-    };
-    #[cfg(not(feature = "spyre"))]
-    let sengraph_bundle_field = quote! { sengraph_bundle: ::core::option::Option::None, };
     let inventory_submits: Vec<proc_macro2::TokenStream> = tp_values
         .iter()
         .map(|tp| {
             let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
+            let metal_row = arch_row(&tp_lit, quote! { ::scratchy_target_metal::MetalWeights });
             quote! {
-                #[cfg(any(feature = "metal", feature = "spyre"))]
+                #[cfg(scratchy_target = "metal")]
                 ::scratchy_forward_compiler::inventory::submit! {
-                    ::scratchy_forward_compiler::ScratchyArchRegistration {
-                        arch_name: #arch_name_lit,
-                        hf_arches: &[#(#hf_arch_lits),*],
-                        gguf_archs: &[#(#gguf_arch_lits),*],
-                        tp_world_size: #tp_lit,
-                        // The registry fn-pointer names the allocator-erased
-                        // `GpuWeightsHandle`; recover the concrete
-                        // `&mut GpuWeights<BackendAllocator>` the per-variant
-                        // `Weights::load` needs before calling it. Non-capturing
-                        // so it coerces to the `ArchTryLoadFn` fn-pointer.
-                        try_load: |__gw_handle: ::scratchy_forward_compiler::GpuWeightsHandle<'_>, stream, max_model_len, tp_rank, hf| {
-                            let gw: &mut crate::__gpu::weights::GpuWeights =
-                                unsafe { __gw_handle.as_mut() };
-                            Weights::load(
-                                gw, stream, max_model_len, hf, #tp_lit, tp_rank,
-                            ).map(|opt| {
-                                opt.map(|w| ::std::boxed::Box::new(w)
-                                    as ::std::boxed::Box<dyn ::scratchy_forward_compiler::ScratchyWeights>)
-                            })
-                        },
-                        #ktir_bundle_field
-                        #sengraph_bundle_field
-                        head: #head_registration,
-                    }
+                    ::scratchy_target_metal::MetalArchRegistration(#metal_row)
                 }
             }
         })
         .collect();
+    // The target's loaded-model surface: its trait impl for `Weights`, and its registry rows.
+    let dispatch_variants: Vec<(Ident, Ident)> = arms
+        .iter()
+        .map(|a| (pascal_case(&a.model_ident), a.model_ident.clone()))
+        .collect();
+    let target_loaded_model = emitter.loaded_model(&target::DispatchCx {
+        variants: &dispatch_variants,
+        arch_rows: &|weights_trait| {
+            tp_values
+                .iter()
+                .map(|tp| {
+                    arch_row(
+                        &proc_macro2::Literal::u8_unsuffixed(*tp),
+                        weights_trait.clone(),
+                    )
+                })
+                .collect()
+        },
+    });
+    // The arch's target-neutral facts — one row whatever target compiled it.
+    let arch_facts = quote! {
+        ::scratchy_forward_compiler::inventory::submit! {
+            ::scratchy_forward_compiler::ArchFacts {
+                arch_name: #arch_name_lit,
+                hf_arches: &[#(#hf_arch_lits),*],
+                head: #head_registration,
+            }
+        }
+    };
 
     Ok(quote! {
         /// One variant per compiled model config. Holds that
@@ -2200,12 +2051,10 @@ fn emit_arch_dispatcher(
         /// backends — the variant's per-canonical `Weights` struct
         /// itself is cfg-mutex'd internally (metal fields gated
         /// `cfg(feature = "metal")`).
-        #[cfg(any(feature = "metal", feature = "spyre"))]
         pub enum Weights {
             #(#variants),*
         }
 
-        #[cfg(any(feature = "metal", feature = "spyre"))]
         impl Weights {
             #(#accessor_methods)*
 
@@ -2245,7 +2094,7 @@ fn emit_arch_dispatcher(
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
         /// must be the live backend device.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             w: &Weights,
@@ -2263,15 +2112,15 @@ fn emit_arch_dispatcher(
         ///
         /// # Safety
         /// Same as [`forward`].
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_with_metal_followup(
             w: &Weights,
             ctx: &crate::__gpu::ForwardCtx,
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_forward_compiler::GpuExecutionFailed> {
+            followup: ::core::option::Option<::scratchy_target_metal::model::MetalForwardFollowup<'_>>,
+        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_target_metal::model::GpuExecutionFailed> {
             match w {
                 #(#forward_with_followup_arms)*
             }
@@ -2282,17 +2131,17 @@ fn emit_arch_dispatcher(
         ///
         /// # Safety
         /// Same as [`forward`].
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub unsafe fn forward_onto<'w>(
             w: &'w Weights,
             ctx: &crate::__gpu::ForwardCtx,
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+            encoder: &::scratchy_target_metal::model::ProtocolObject<
+                dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
             >,
         ) -> ::core::result::Result<
-            ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>,
+            ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>,
             ::std::string::String,
         > {
             match w {
@@ -2303,19 +2152,19 @@ fn emit_arch_dispatcher(
         /// Phase 6 spec-decode K-step chain dispatcher. One MTL4 CB,
         /// caller drives K bucket forwards + per-iter argmax +
         /// chain_advance from inside `body`. See
-        /// `::scratchy_forward_compiler::MetalChainBody` for the body signature.
+        /// `::scratchy_target_metal::model::MetalChainBody` for the body signature.
         ///
         /// # Safety
         /// Same as [`forward`]; additionally, `body` must not retain
         /// any references to the encoder past its return.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_chain_with_encoder(
             w: &Weights,
             ctx: &crate::__gpu::ForwardCtx,
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            body: ::scratchy_forward_compiler::MetalChainBody<'_>,
+            body: ::scratchy_target_metal::model::MetalChainBody<'_>,
         ) -> ::core::result::Result<(), ::std::string::String> {
             match w {
                 #(#forward_chain_arms)*
@@ -2331,7 +2180,6 @@ fn emit_arch_dispatcher(
         // `inventory::submit!` adds this arch to the global registry.
         // No hand-written central list anywhere.
 
-        #[cfg(any(feature = "metal", feature = "spyre"))]
         impl ::scratchy_forward_compiler::ScratchyWeights for Weights {
             fn arch_name(&self) -> &'static str { #arch_name_lit }
             fn num_hidden_layers(&self) -> u64 { self.num_hidden_layers() }
@@ -2341,13 +2189,7 @@ fn emit_arch_dispatcher(
             fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
-            #[cfg(feature = "metal")]
-            fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
-                match self {
-                    #(#kv_codec_arms)*
-                }
-            }
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             fn kv_cache_layers(&self) -> ::core::option::Option<&'static [u32]> {
                 match self {
                     #(#kv_cache_layers_arms)*
@@ -2355,88 +2197,19 @@ fn emit_arch_dispatcher(
             }
 
             #gdn_runtime_config_tokens
+        }
 
-            // Spyre: hand the host worker the embedded KTIR bundle for the
-            // fingerprint-matched variant — each variant names its module's
-            // `KTIR_BUNDLE` const (baked into the binary by the macro). Returned
-            // as a neutral `&dyn Any` (the cfg-free trait can't name the spyre
-            // `KtirBundle`); the worker downcasts it back. No disk read.
-            #[cfg(feature = "spyre")]
-            fn ktir_bundle(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#ktir_bundle_arms)*
-                })
+        #[cfg(scratchy_target = "metal")]
+        impl ::scratchy_target_metal::MetalWeights for Weights {
+            fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
+                match self {
+                    #(#kv_codec_arms)*
+                }
             }
 
-            // Spyre: the generated source-id → weight-field binding. Emitted
-            // per model because only generated code can name a generated
-            // field — the same reason metal's forward reads `wm.q_proj`
-            // instead of resolving a string.
-            #[cfg(feature = "spyre")]
-            fn superdsc_weights(
-                &self,
-            ) -> Option<::anyhow::Result<Vec<::scratchy_forward_compiler::BoundWeight>>> {
-                Some(match self {
-                    #(#superdsc_weight_arms)*
-                })
-            }
-
-            // Spyre: the launch wiring, emitted as a static instead of a JSON
-            // string the worker parses back into the same shape.
-            #[cfg(feature = "spyre")]
-            fn superdsc_wiring(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#superdsc_wiring_arms)*
-                })
-            }
-
-            // Spyre: the sharded worlds, beside the one-rank wiring — a `&'static [TpForward]`.
-            #[cfg(feature = "spyre")]
-            fn superdsc_tp(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#superdsc_tp_arms)*
-                })
-            }
-
-            // Spyre: the embedding table, taken out of the weight store by the
-            // generated loader and therefore only reachable from the field.
-            #[cfg(feature = "spyre")]
-            fn superdsc_embed(
-                &self,
-            ) -> Option<::anyhow::Result<::scratchy_target_spyre::GpuTensor>> {
-                Some(match self {
-                    #(#superdsc_embed_arms)*
-                })
-            }
-
-            // Spyre: the embedded sendnn bundle for THIS loaded variant — so
-            // the bundle and the weights come from one match, not two walks.
-            #[cfg(feature = "spyre")]
-            fn sengraph_bundle(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#sengraph_bundle_arms)*
-                })
-            }
-
-            // Device-runtime forward methods — metal only (the trait gates
-            // them off under spyre, whose forward runs through the KTIR bundle).
-            // The cfg-free trait takes the neutral `ForwardCtxHandle` /
-            // `ForwardDeviceHandle` (so it names no metal type); recover
-            // the concrete `&ForwardCtx` / `&mut GpuDevice` here before
-            // delegating to the per-arch free fns, which keep concrete types.
-            #[cfg(feature = "metal")]
+            // The trait takes the neutral `ForwardCtxHandle` / `ForwardDeviceHandle`; recover
+            // the concrete `&ForwardCtx` / `&mut GpuDevice` here before delegating to the
+            // per-arch free fns, which keep concrete types.
             unsafe fn forward(
                 &self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
@@ -2448,15 +2221,13 @@ fn emit_arch_dispatcher(
                 unsafe { forward(self, ctx, device, num_tokens) }
             }
 
-            #[cfg(feature = "metal")]
             unsafe fn forward_backbone(
                 &self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
             ) -> crate::__gpu::OwnedTensor {
-                #[cfg(feature = "metal")]
-                {
+                    {
                     let _ = (ctx, device, num_tokens);
                     unimplemented!(
                         "metal forward_backbone — pipeline-parallel intermediate \
@@ -2466,14 +2237,12 @@ fn emit_arch_dispatcher(
             }
 
 
-            #[cfg(feature = "metal")]
             fn metal_dtype(&self) -> ::scratchy_target_metal::interpreter::metal::MetalDtype {
                 match self {
                     #(#metal_dtype_arms)*
                 }
             }
 
-            #[cfg(feature = "metal")]
             fn metal_off_tape(
                 &self,
             ) -> &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync) {
@@ -2482,7 +2251,6 @@ fn emit_arch_dispatcher(
                 }
             }
 
-            #[cfg(feature = "metal")]
             fn metal_rungs(
                 &self,
             ) -> &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync) {
@@ -2491,14 +2259,12 @@ fn emit_arch_dispatcher(
                 }
             }
 
-            #[cfg(feature = "metal")]
             fn metal_hosted(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
                 match self {
                     #(#metal_hosted_arms)*
                 }
             }
 
-            #[cfg(feature = "metal")]
             fn metal_host(
                 &self,
                 guest: ::std::boxed::Box<dyn ::core::any::Any>,
@@ -2508,37 +2274,34 @@ fn emit_arch_dispatcher(
                 }
             }
 
-            #[cfg(feature = "metal")]
             unsafe fn forward_with_metal_followup(
                 &self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
-                followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-            ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_forward_compiler::GpuExecutionFailed> {
+                followup: ::core::option::Option<::scratchy_target_metal::model::MetalForwardFollowup<'_>>,
+            ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_target_metal::model::GpuExecutionFailed> {
                 let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
                 let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
                 unsafe { forward_with_metal_followup(self, ctx, device, num_tokens, followup) }
             }
 
-            #[cfg(feature = "metal")]
             fn metal_rope_rows(&self, positions: &[u32]) -> ::core::option::Option<::std::vec::Vec<u8>> {
                 match self {
                     #(#metal_rope_rows_arms)*
                 }
             }
 
-            #[cfg(feature = "metal")]
             unsafe fn metal_forward_onto<'w>(
                 &'w self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
-                encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                encoder: &::scratchy_target_metal::model::ProtocolObject<
+                    dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
                 >,
             ) -> ::core::result::Result<
-                ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>,
+                ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>,
                 ::std::string::String,
             > {
                 let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
@@ -2546,13 +2309,12 @@ fn emit_arch_dispatcher(
                 unsafe { forward_onto(self, ctx, device, num_tokens, encoder) }
             }
 
-            #[cfg(feature = "metal")]
             unsafe fn metal_chain_with_encoder(
                 &self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
-                body: ::scratchy_forward_compiler::MetalChainBody<'_>,
+                body: ::scratchy_target_metal::model::MetalChainBody<'_>,
             ) -> ::core::result::Result<(), ::std::string::String> {
                 let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
                 let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
@@ -2560,21 +2322,24 @@ fn emit_arch_dispatcher(
             }
         }
 
-        // One `ScratchyArchRegistration` per distinct tp value across
+
+        // One target registry row per distinct tp value across
         // the compiled (variant, tp) tuples. Each closure passes its
         // own tp constant into `Weights::load(...)` so the matching
         // arm there walks only the tp-N variants. Only tp = 1 is
         // emitted, so this expands to a single submission with
         // `tp_world_size: 1u8`.
         #(#inventory_submits)*
+        #target_loaded_model
+        #arch_facts
 
         // One `BackboneDumpRegistration` per arch, fanning out over
         // every (model, tp) variant via `dump_rows`. Independent of
-        // the per-tp `ScratchyArchRegistration` above — `scr model
+        // the per-tp registry rows above — `scr model
         // info` walks this registry separately, with no runtime GPU
         // or weight loading. Gated on either backend feature so the
         // metal CLI sees compiled-in metal arches too.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         ::scratchy_forward_compiler::inventory::submit! {
             ::scratchy_forward_compiler::BackboneDumpRegistration {
                 arch_name: #arch_name_lit,

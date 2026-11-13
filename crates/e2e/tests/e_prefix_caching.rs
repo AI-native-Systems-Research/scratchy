@@ -7,7 +7,7 @@
 //! output — exercising the full path from HTTP → scheduler (with cached
 //! prefix lookup) → worker (token slicing) → model → response.
 //!
-//! MLX tests use `device=metal` with the worker-level prefix cache pool.
+//! The tests run on the binary's linked backend, with the worker-level prefix cache pool.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_prefix_caching -- --ignored`
 
@@ -26,9 +26,8 @@ fn greedy_completion(prompt: &str, max_tokens: u32) -> CompletionRequest {
     }
 }
 
-async fn start_cpu_server() -> (TestServer, Client) {
+async fn start_server() -> (TestServer, Client) {
     let server = TestServer::builder(TestModels::SMOLLM)
-        .with_device("cpu")
         .with_dtype("f32")
         .start()
         .await
@@ -41,7 +40,7 @@ async fn start_cpu_server() -> (TestServer, Client) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_prefix_caching_same_prompt_twice() {
-    let (_server, client) = start_cpu_server().await;
+    let (_server, client) = start_server().await;
 
     // Prompt long enough that at least 1 full block (16 tokens) is cached.
     let prompt = "The history of artificial intelligence began in the 1950s when researchers first explored the concept of machines that could think and reason about";
@@ -66,7 +65,7 @@ async fn test_prefix_caching_same_prompt_twice() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_prefix_caching_many_repeats() {
-    let (_server, client) = start_cpu_server().await;
+    let (_server, client) = start_server().await;
 
     let prompt = "The capital of France is";
     let request = greedy_completion(prompt, 5);
@@ -93,7 +92,6 @@ async fn test_prefix_caching_many_repeats() {
 #[cfg(target_os = "macos")]
 async fn start_metal_server() -> (TestServer, Client) {
     let server = TestServer::builder(TestModels::SMOLLM)
-        .with_device("metal")
         .start()
         .await
         .expect("server should start");
@@ -180,7 +178,7 @@ fn long_chat_request() -> scratchy_serving_api::protocol::ChatCompletionRequest 
 /// Send the same long prompt twice and assert the SECOND request reports a
 /// prefix-cache hit through `usage.prompt_tokens_details.cached_tokens`.
 #[cfg(target_os = "macos")]
-async fn assert_reports_cached_tokens(client: &Client, device: &str) {
+async fn assert_reports_cached_tokens(client: &Client, label: &str) {
     let request = long_chat_request();
 
     // A fresh TestServer means a fresh block pool, so the first request is the
@@ -222,7 +220,7 @@ async fn assert_reports_cached_tokens(client: &Client, device: &str) {
         "identical bodies must tokenize to the same prompt length"
     );
     eprintln!(
-        "[prefix-cache/{device}] prompt={} cold_cached={} warm_cached={} reuse={:.1}%",
+        "[prefix-cache/{label}] prompt={} cold_cached={} warm_cached={} reuse={:.1}%",
         warm.usage.prompt_tokens,
         cold_cached,
         warm_cached,
@@ -230,9 +228,7 @@ async fn assert_reports_cached_tokens(client: &Client, device: &str) {
     );
 }
 
-/// Metal arm. There is no CPU arm: `device = "cpu"` has no backend in any
-/// build ("No backend available for device 'cpu'"), which is also why this
-/// file's older `start_cpu_server` tests cannot run.
+/// On the binary's linked backend (metal).
 ///
 /// On the hosted `macos-26` CI runner this would SKIP — paravirtual GPU, no
 /// Metal 4 — so CI only lints this file; the assertions execute on a real GPU,
@@ -243,7 +239,6 @@ async fn assert_reports_cached_tokens(client: &Client, device: &str) {
 async fn test_prefix_cache_reports_cached_tokens_metal() {
     scratchy_e2e::skip_if_no_gpu!();
     let server = TestServer::builder(TestModels::SMOLLM)
-        .with_device("metal")
         .start()
         .await
         .expect("server should start");
@@ -299,7 +294,6 @@ mod gdn {
 
     async fn start(model: &str) -> (TestServer, Client) {
         let server = TestServer::builder(model)
-            .with_device("metal")
             .with_max_num_seqs(4)
             .with_args(&["--max-num-batched-tokens", &BUDGET.to_string()])
             .with_timeout(Duration::from_secs(600))

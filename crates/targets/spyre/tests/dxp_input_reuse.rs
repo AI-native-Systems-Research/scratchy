@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use ktir_superdsc::emit;
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
 use scratchy_target_spyre::dxp_cache::{DxpCache, DxpIdentity, GroupDigest};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use scratchy_target_spyre::superdsc_bake::CompiledGroup;

@@ -111,9 +111,9 @@ with open(f"{out}/reqs-c4.jsonl", "w") as f:
         }) + "\n")
 PY
     for i in $(seq 1 "$RUNS"); do
-        "$SCR" batch -m "$MODEL" --device metal \
+        "$SCR" batch -m "$MODEL" \
             -i "$COH/reqs.jsonl" -o "$COH/out-$i.jsonl" >/dev/null 2>&1
-        "$SCR" batch -m "$MODEL" --device metal \
+        "$SCR" batch -m "$MODEL" \
             -i "$COH/reqs-c4.jsonl" -o "$COH/out-c4-$i.jsonl" >/dev/null 2>&1
     done
     python3 - "$COH" "$RUNS" <<'PY'
@@ -154,7 +154,7 @@ if [ "$SKIP_PARITY" = 0 ]; then
     PARITY="$OUT_DIR/parity.txt"
     : > "$PARITY"
     check() { # prompt expected_keyword
-        got=$("$SCR" chat -m "$MODEL" --device metal --temperature 0.0 \
+        got=$("$SCR" chat -m "$MODEL" --temperature 0.0 \
                   --max-tokens 800 -q "$1" 2>/dev/null \
               | grep -v -E '^(2026-|Using model:)' | tr -d '\n')
         echo "prompt: $1" >> "$PARITY"
@@ -180,7 +180,7 @@ if [ "$SKIP_BENCH" = 0 ]; then
     : > "$BENCH"
     for bs in 1 2 4 8; do
         echo "-- conc $bs (in 32 / out 128)" | tee -a "$BENCH"
-        "$SCR" bench latency -m "$MODEL" --device metal \
+        "$SCR" bench latency -m "$MODEL" \
             --num-iters 10 --num-iters-warmup 3 \
             --input-len 32 --output-len 128 --batch-size "$bs" \
             --gpu-memory-utilization 0.95 2>/dev/null \
@@ -188,7 +188,7 @@ if [ "$SKIP_BENCH" = 0 ]; then
     done
     for ctx in 512 2048 4096; do
         echo "-- ctx $ctx (conc 1 / out 128)" | tee -a "$BENCH"
-        "$SCR" bench latency -m "$MODEL" --device metal \
+        "$SCR" bench latency -m "$MODEL" \
             --num-iters 5 --num-iters-warmup 2 \
             --input-len "$ctx" --output-len 128 --batch-size 1 \
             --gpu-memory-utilization 0.95 2>/dev/null \

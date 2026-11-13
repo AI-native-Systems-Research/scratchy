@@ -12,8 +12,8 @@
 //! ⭐ THE WORLD IS THE TYPE `T` — one world, named once by the build's `tp/N`, for the analysis that
 //! sharded the forward and for every bundle that runs it. Nothing here reads a world back.
 
+use ktir_superdsc::superdsc_opspec::{DataFormat, Fp16};
 use scratchy_subtile::lower::LoweringInput;
-use scratchy_subtile::superdsc_opspec::{DataFormat, Fp16};
 use scratchy_subtile::tensor_parallel::{self, ShardRefusal, ShardedForward, SplitGranule};
 
 use crate::bundle_code::collective::{
@@ -106,11 +106,11 @@ mod tests {
     /// The extent pair every `lower_graph_*` call below states for its graph: these fixtures are
     /// ONE request of ONE row (m=1, no AttnDecode — the pair still must describe the graph it is
     /// handed, and it does: one row, one request).
-    fn one_row_one_request() -> scratchy_subtile::sdsc_abstract::QueryExtent {
-        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+    fn one_row_one_request() -> ktir_superdsc::sdsc_abstract::QueryExtent {
+        ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
                 .expect("the fixtures' row count is nonzero"),
-            scratchy_subtile::sdsc_abstract::RungCap::ONE,
+            ktir_superdsc::sdsc_abstract::RungCap::ONE,
         )
         .expect("one row at one request fits a u32")
     }

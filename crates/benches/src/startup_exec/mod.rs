@@ -1434,7 +1434,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     anyhow::ensure!(
         ex.mode != Mode::Cli || child.has_placeholder(),
         "--mode cli needs a {{prompt}} placeholder in --child-cmd, e.g.\n  \
-         --child-cmd \"target/release/scr chat -m M --device metal -q {{prompt}} \
+         --child-cmd \"target/release/scr chat -m M -q {{prompt}} \
          --max-tokens {{output_len}}\""
     );
     // Server mode polls `--port` for readiness while the child listens on

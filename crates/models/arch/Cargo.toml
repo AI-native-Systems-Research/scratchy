@@ -7,6 +7,10 @@ description = "Model architectures — one crate; scratchy-forwards.rs drives th
 # Named build script (not build.rs) so the process shows as
 # `build-script-scratchy-forwards` instead of the opaque `build-script-build`.
 build = "scratchy-forwards.rs"
+# The model scope this crate's features select, published to the build scripts of the crates
+# that depend on it (`DEP_SCRATCHY_MODELS_*`): a target's models crate compiles the same
+# selection with its own emitter.
+links = "scratchy-models"
 
 [features]
 # Deliberately empty. Every model + quant preset is fully opt-in — no
@@ -674,9 +678,10 @@ all = [
 # `crates/cli/scr/Cargo.toml` can alias that crate `quant` (distinct from
 # this crate's `model` alias — Cargo forbids aliasing the SAME crate under
 # two names, which is exactly why quant scope needed its own crate).
-# `scratchy-forwards.rs` (this crate's build script) calls
-# `scratchy_quantizations::enabled_presets()` — via the [build-dependencies]
-# edge below — to compute the quant scope (the union of enabled presets),
+# `scratchy-forwards.rs` (this crate's build script) reads the presets
+# scratchy-quantizations publishes (`DEP_SCRATCHY_QUANTIZATIONS_PRESETS`,
+# from the regular dependency below) to compute the quant scope (the union
+# of enabled presets),
 # intersected per-arch against that arch's own quantizations.json (an arch
 # that doesn't declare a preset just ignores it).
 
@@ -702,42 +707,13 @@ mtp = ["mtp-heads"]
 # ride the backend.
 metal = [
     "scratchy-forward-compiler-macro/metal",
-    "scratchy-forward-compiler/metal",
     "dep:scratchy-target-metal",
     "scratchy-vision?/metal",
 ]
-# A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
-# THE CARD'S LOWERING, no device compile (see the macro crate's `spyre-lower`): the step CI runs to
-# see a card-only lowering defect without a card.
-spyre-lower = ["spyre", "scratchy-forward-compiler-macro/spyre-lower"]
-spyre-hw = ["spyre-lower", "scratchy-forward-compiler-macro/spyre-hw"]
-# WRITE EACH BAKED BUNDLE'S dxp INPUT under this crate's OUT_DIR (`superdsc-dump/<fp>/`), for diffing
-# against a known-good dump. Read by the build script, which passes its own OUT_DIR into the bake
-# (`compile_carrier`'s `dump_dir`); off by default, and it changes nothing the bake lowers.
-superdsc-dump = ["spyre"]
-# THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
-# an emu build refuses to compile a bundle whose emulator run diverges from the
-# reference semantics at the probe.
-spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
 # TurboQuant KV compression for every metal model whose geometry the codec
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
 # other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.
 turboquant = ["scratchy-forward-compiler-macro/turboquant"]
-# A W-RANK TENSOR-PARALLEL WORLD baked beside every selected model's one-rank forward (see
-# scratchy-forward-compiler-macro's `tp-<W>`). Off here like every other scope; reached from the
-# CLI as `tp/<W>` through scratchy-tp.
-# ⛔ BOTH COPIES OF THE WORLD CRATE: the macro is a proc-macro, compiled for the HOST, and cargo
-# does not unify its dependencies' features with the binary's — so the runtime's
-# `scratchy-target-spyre` is named here too, or its `Build` stays a world of one while the bake
-# shards for `N`. The baked code asserts the two agree (`#[forward]`'s `SUPERDSC_TP`).
-tp-2 = ["scratchy-forward-compiler-macro/tp-2", "scratchy-target-spyre?/tp-2"]
-tp-4 = ["scratchy-forward-compiler-macro/tp-4", "scratchy-target-spyre?/tp-4"]
-tp-8 = ["scratchy-forward-compiler-macro/tp-8", "scratchy-target-spyre?/tp-8"]
-spyre = [
-    "scratchy-forward-compiler-macro/spyre",
-    "scratchy-forward-compiler/spyre",
-    "dep:scratchy-target-spyre",
-]
 # Shell tab-completion over REAL HuggingFace model ids. Off by default, and
 # deliberately so: the build script resolves the candidate list by querying
 # huggingface.co (one tag search per compiled arch, then one `config.json` per
@@ -758,7 +734,6 @@ scratchy-tensors = { path = "../../tensors" }
 scratchy-quantizations = { path = "../quantization" }
 scratchy-forward-compiler = { path = "../../compiler" }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
-scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
 scratchy-vision = { path = "../vision", optional = true }
 half = { workspace = true, optional = true }
 anyhow = { workspace = true }
@@ -769,22 +744,13 @@ scratchy-core-model = { workspace = true }
 # macro). The backend feature is forwarded onto this build-dep above.
 [build-dependencies]
 scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
-# Same crate as the regular dependency above, ALSO as a build-dependency:
-# scratchy-forwards.rs calls `scratchy_quantizations::enabled_presets()` to
-# read quant scope (see the `[features]` comment near the removed
-# `quant-<preset>` block above — quant scope moved off this crate so it can
-# get its own `quant` CLI alias, distinct from `model`).
-scratchy-quantizations = { path = "../quantization" }
-# Baking the selected models' tokenizers (`bake_tokenizers`): the baker itself, and where the Hub
-# cache holding their blobs lives.
-scratchy-core-model = { workspace = true }
-hf-hub-downloader = { workspace = true }
-# `proc-macro2` for the token re-rooting. The emitted file never
-# round-trips through an AST (see scratchy-forwards.rs for the numbers).
+# The shared models build driver: every selected arch through the pipeline, with the target's
+# emitter (metal's, under `metal`).
+scratchy-models-build = { path = "../build" }
+# `proc-macro2` for reading metal's tables off the emitted tokens.
 proc-macro2 = "1"
 serde_json = { workspace = true }
-# Emit arches in parallel (scratchy-forwards.rs), nested with the pipeline's own
-# per-model rayon fan-out.
+# The registry's Hub queries fan out on rayon (`hf_registry_build.rs`).
 rayon = { workspace = true }
 # Build-time HF Hub query (`hf_registry_build.rs`): for every architecture tag
 # enabled models actually compile with, ask huggingface.co which repos claim

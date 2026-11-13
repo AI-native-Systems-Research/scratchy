@@ -156,11 +156,11 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::ExpertCombine { .. }
         // The token draw's idx stick: the kernel reads the widened logits row, its noise
         // and temperature, and the nine staged tables and writes its OWN stick — a fresh
-        // buffer, never an alias of any operand. Metal never mints the sampler (the mint
-        // is the spyre bake's), but the rule table is exhaustive by law, and the stick's
+        // buffer, never an alias of any operand. Metal never mints the sampler (it keeps
+        // the host pick), but the rule table is exhaustive by law, and the stick's
         // colour is FRESH whichever target runs it.
         | L::Sample { .. }
-        // The chained head's pair (the spyre chain mint's; metal never constructs
+        // The chained head's pair (a device-side chain mint's; metal never constructs
         // them): the gather writes its own [1, hidden] row, the stage its own stick
         // copy — fresh buffers both, the persistent placement is not an arena colour
         // at all.

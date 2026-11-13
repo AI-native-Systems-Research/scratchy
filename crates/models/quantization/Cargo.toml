@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Shared quantization preset definitions + GGUF (llama.cpp) format support. Presets live in `presets/`; GGUF format-level code in the `gguf` module."
+# `build.rs` publishes the enabled presets to every direct dependent's build script, as
+# `DEP_SCRATCHY_QUANTIZATIONS_PRESETS`.
+links = "scratchy-quantizations"
 
 [features]
 # Compile-time build scope for quant-preset variant synthesis (which quant
@@ -18,13 +21,10 @@ description = "Shared quantization preset definitions + GGUF (llama.cpp) format 
 # on scratchy-models — the `quant` alias already carries that meaning;
 # `quant/quant-fp8-dynamic-per-channel` would just stutter.
 #
-# scratchy-models depends on this crate as BOTH a regular dependency
-# (runtime preset loading) and a build-dependency (`scratchy-forwards.rs`
-# calls `enabled_presets()` below to compute which variants to synthesize,
-# instead of reading its own now-nonexistent `CARGO_FEATURE_QUANT_*`).
-# Cargo unifies a package-owned feature reference like `metal =
-# ["scratchy-quantizations/mlx-affine-b4-g32"]` across BOTH edges
-# regardless of dependency kind — verified empirically, not assumed.
+# Every edge to this crate is an ordinary dependency, so a `quant/<preset>`
+# from a CLI and a `scratchy-quantizations/<preset>` from scratchy-models'
+# own features land on ONE build of it, the build whose `build.rs` publishes
+# the presets `scratchy-forwards.rs` synthesizes variants for.
 awq-gemm = []
 bnb-nf4-dq = []
 ct-int4-sym = []

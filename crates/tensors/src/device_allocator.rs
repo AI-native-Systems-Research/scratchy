@@ -11,8 +11,8 @@
 //!   "transfer" is a `memcpy(buffer.contents() + offset, src, len)`
 //!   — same-RAM copy, no DMA.
 //!
-//! - **Spyre impl** (`SpyreAllocator`) holds host memory the worker stages
-//!   onto the card.
+//! - **Staged impl** (device memory that is not host-visible) holds host
+//!   memory the worker stages onto the device.
 
 use anyhow::Result;
 use std::path::Path;
@@ -92,7 +92,7 @@ pub trait DeviceAllocator: Send + Sync {
 
     /// `bytes` of device memory the host writes in place, from where
     /// [`alloc_and_copy_host`] would copy to: `None` when the device's
-    /// memory is not host-visible (spyre), so a caller fills host
+    /// memory is not host-visible, so a caller fills host
     /// memory and copies it instead. Metal's unified memory is.
     ///
     /// # Safety
@@ -111,7 +111,7 @@ pub trait DeviceAllocator: Send + Sync {
     // `dyn DeviceAllocator`, so associated types are fine.
 
     /// The host→device stream this allocator queues transfers on
-    /// (`()` under metal and spyre).
+    /// (`()` under every backend).
     type Stream;
 
     /// The device-memory handle this allocator hands out and tracks

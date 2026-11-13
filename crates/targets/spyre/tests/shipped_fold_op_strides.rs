@@ -12,10 +12,10 @@
 //! on either of my two readings. Recording the numbers here so the next attempt starts from measured
 //! semantics instead of a comment.
 
+use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
-use scratchy_subtile::addr::DevOff;
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, QueryRowCount,
     RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
 };
@@ -25,7 +25,7 @@ const STICK: u32 = 64; // the fold sweeps one 64-slot block at a time
 const NQH: u32 = 32;
 const MQ: u32 = 8; // a bs=8 decode batch: the rows ARE requests
 const GQA: u32 = 4;
-const POOL_PAGE_SLOTS: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get();
+const POOL_PAGE_SLOTS: u32 = ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get();
 
 fn act(n: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
@@ -149,9 +149,7 @@ fn print_what_the_shipped_fold_score_op_addresses() {
         "sc_shipped",
         MatM::of_query_rows(QueryRowCount::of_mq(MQ)),
         MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
-            HD,
-        )),
+        MatK::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(HD)),
         // The batch axis carries both operands' head strides, so the head-outermost walk it derives
         // (`mb_dev * in` for the read, `mb_dev * out` for the write) is checked against where the heads
         // really are: `qs` is the token stream (`mq*hd` apart) and `sc` is head-major (`mq*stick`).
@@ -162,7 +160,7 @@ fn print_what_the_shipped_fold_score_op_addresses() {
             OperandPlacement::of_token_stream(
                 QueryRowCount::of_mq(MQ),
                 NQH,
-                scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(HD),
+                ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(HD),
                 0,
                 0,
                 0,

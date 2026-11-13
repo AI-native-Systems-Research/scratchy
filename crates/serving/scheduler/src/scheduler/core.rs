@@ -731,7 +731,7 @@ impl SimpleBlockTracker {
         tracker
     }
 
-    /// ⭐⭐⭐ DECLARE THAT THIS BACKEND APPENDS EVERY ROW AT ONE SHARED SLOT — the spyre paged pool.
+    /// ⭐⭐⭐ DECLARE THAT THIS BACKEND APPENDS EVERY ROW AT ONE SHARED SLOT — a shared-write-slot paged pool.
     ///
     /// The allocator then sizes every request by the STEP'S REACH rather than by its own token count, which
     /// is what lets the HOST own every page a batched launch writes. Without it the worker has to cover
@@ -1997,7 +1997,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // [`KvExtent`] rather than being spelled here, because "spelled here" is how the second of the
         // three sites that need them ends up sizing by tokens while the first sizes by slots.
         //
-        // `kv_extent` is `None` for every backend whose KV is token-addressed (metal), and both
+        // `kv_extent` is `None` for every backend whose KV is token-addressed, and both
         // lines are then exactly the arithmetic they always were.
         // The block size is HELD as its type — this site once re-minted it from the
         // `usize` field with an `expect`; the field is the minted value now.
@@ -2050,7 +2050,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             // batched step appends every row at a shared slot — there its very first write lands at the
             // batch's slot, which can be far past its own tokens, and the page for it was never allocated.
             // The worker has been covering that page from a reserve of its own, which is the last reason a
-            // per-request KV row exists down there. `kv_pool_reach` is `None` on metal, so this is the
+            // per-request KV row exists down there. `kv_pool_reach` is `None` on token-addressed KV, so this is the
             // same arithmetic it always was for them.
             // ⛔⛔⛔ ONE ARM, BECAUSE THE NESTED MATCH HAD A HOLE IN IT AND THE HOLE WAS THE BUG.
             //
@@ -2063,7 +2063,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             // The pool reach and the step reach are the same KIND of fact (how deep the shared write slot
             // goes), so they belong in one `max`, and the absent one is `NONE` rather than a separate branch
             // that forgets the other. `reach` is `NONE` on every token-addressed backend, so this is the same
-            // arithmetic metal always had.
+            // arithmetic those backends always had.
             None => scratchy_core_common::KvSlotSpan::NONE.blocks_this_step(
                 block,
                 self.kv_pool_reach
@@ -4683,7 +4683,7 @@ mod tests {
         assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
     }
 
-    /// Distinct prompts one at a time, as the Metal grid sends them, each 4 blocks. A worker
+    /// Distinct prompts one at a time, as the bench grid sends them, each 4 blocks. A worker
     /// that maps its KV on first use (`KvBacking::OnFirstUse`) maps it through the highest block ID
     /// handed out, so with caching on that is what the requests have needed: a cached block it has
     /// backed goes before one it would have to map, not 4 fresh blocks per request across the pool.
@@ -8374,7 +8374,7 @@ mod tests {
     /// #330's traffic through a gemma-4 scheduler on a 27,000-block pool: r1 (1,418/300) with three
     /// 2,000-token prompts decoding long replies; once r1 ends, 256 more steps, then r1's prompt
     /// again. Under [`KvBacking::OnFirstUse`] the worker reports each step what it has mapped,
-    /// growing like metal's stores (128 blocks at least, doubling). Returns what the resend reused.
+    /// growing like on-first-use stores do (128 blocks at least, doubling). Returns what the resend reused.
     fn resend_while_others_decode(stores: HybridKvStores, backing: KvBacking) -> u32 {
         let pool = 27_000;
         let mut sched = gemma4_scheduler(pool, 256, stores, true, backing);
@@ -8437,8 +8437,8 @@ mod tests {
         // #330: lowest ID first handed an ended request's freed blocks to the next ones the others
         // asked for, so its prompt sent again reused nothing. With every block allocated up front
         // it now reuses all but its last partial block under either layout. With blocks mapped as
-        // the pool reaches them, the cache only lives in what is mapped: on metal's layout for
-        // Gemma 4 (`GlobalApart`), the TurboQuant store's last doubling holds the others' new
+        // the pool reaches them, the cache only lives in what is mapped: on the global-apart
+        // layout for Gemma 4 (`GlobalApart`), the TurboQuant store's last doubling holds the others' new
         // global blocks and the prompt is reused too. Shared, the others' growth needs the space
         // r1's cache holds, which is evicted before the pool maps more.
         for stores in BOTH_STORES {

@@ -8,10 +8,10 @@ description = "The tensor-parallel world as a type: `TpWorld<N>` and its ranks. 
 [lib]
 
 # ⛔ A LEAF WITH NO DEPENDENCIES. The shared sharding analysis (`scratchy-subtile`,
-# every target) and the spyre collective protocol (`ktir-superdsc`, which has no scratchy
-# dependency) both name the world, so it lives below both: one type, never a number handed between
-# them. A target's own limits on a world (the card's sids) are that target's, stated as a trait
-# over this one in its own crate.
+# every target) and a target's collective protocol (which may have no scratchy dependency) both
+# name the world, so it lives below both: one type, never a number handed between them. A
+# target's own limits on a world are that target's, stated as a trait over this one in its own
+# crate.
 [features]
 # ⭐ THE BUILD'S ONE WORLD — `tp/N` from the CLI reaches here, and [`Build`] is `TpWorld<N>`; naming
 # none is a world of one, naming two is a build error. The ONE selection: the `#[forward]` macro

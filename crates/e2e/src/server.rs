@@ -59,7 +59,6 @@ impl TestServer {
             tensor_parallel_size: 1,
             pipeline_parallel_size: 1,
             dtype: None,
-            device: None,
             spawn: should_spawn(),
             max_num_seqs: None,
             prefix_caching: true,
@@ -110,7 +109,6 @@ pub struct TestServerBuilder {
     disable_async_scheduling: bool,
     runner: String,
     dtype: Option<String>,
-    device: Option<String>,
     tensor_parallel_size: usize,
     pipeline_parallel_size: usize,
     spawn: bool,
@@ -193,12 +191,6 @@ impl TestServerBuilder {
         self
     }
 
-    /// Override the device (e.g. "cpu", "metal", "spyre").
-    pub fn with_device(mut self, device: &str) -> Self {
-        self.device = Some(device.to_string());
-        self
-    }
-
     /// Enable or disable child-process spawning mode.
     /// When enabled, the server runs as a separate OS process so GPU memory
     /// is fully reclaimed on drop.
@@ -251,9 +243,6 @@ impl TestServerBuilder {
 
         let dtype = self.dtype.as_deref().unwrap_or("auto");
         cmd.arg("--dtype").arg(dtype);
-
-        let device = self.device.as_deref().unwrap_or("auto");
-        cmd.arg("--device").arg(device);
 
         if self.tensor_parallel_size > 1 {
             cmd.arg("--tensor-parallel-size")
@@ -357,10 +346,8 @@ impl TestServerBuilder {
             .unwrap_or_else(|| "auto".to_string());
         let runner = self.runner.clone();
         let dtype = self.dtype.clone().unwrap_or_else(|| "auto".to_string());
-        let device = self.device.clone().unwrap_or_else(|| "auto".to_string());
         let config = scratchy_serving_api::init::VllmConfig {
             model: model.clone(),
-            device,
             dtype,
             max_num_seqs: Some(self.max_num_seqs.unwrap_or(256)),
             enable_prefix_caching: self.prefix_caching,

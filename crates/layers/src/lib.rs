@@ -2,8 +2,8 @@
 //! Backend-neutral neural-network layer types.
 //!
 //! Holds the layer *type definitions* and their *pure* accessors (the surface
-//! the metal interpreter and `WeightAccessors` match on) so both
-//! `targets/{metal,spyre}` can name them without a circular dependency. Runtime
+//! the metal interpreter and `WeightAccessors` match on) so every target
+//! crate can name them without a circular dependency. Runtime
 //! methods (kernel-calling `forward`, `GpuWeights`-bound `load`) stay in the
 //! target crates as extension traits — this crate names no backend.
 

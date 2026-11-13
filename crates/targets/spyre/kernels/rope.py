@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """THE ROPE SPLICE'S KERNEL — Granite's split-half NeoX `rotate_half`, adapted from the
-numerically validated fixture `crates/triton/test-fixtures/rope.py` (rope_q32/rope_kv8
+numerically validated fixture `crates/targets/spyre/triton/test-fixtures/rope.py` (rope_q32/rope_kv8
 in `triton-numeric`'s executed configs).
 
     q_embed = q * cos + rotate_half(q) * sin

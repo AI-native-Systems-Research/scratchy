@@ -1590,7 +1590,7 @@ pub fn lower_decode_to_wavefront(
                 // many sources as it has tensors, each naming the bundle's `(id, index)` plus
                 // WHICH tensor (`BundleTensor`). The single-tensor `Weight` binding this arm
                 // used to push had shape `[1,1]` and bound NOTHING a worker could stage, which
-                // is why the spyre weight-bindings walk refused the kind.
+                // is why a staging target's weight-bindings walk refused the kind.
                 //
                 // Shapes are the STACKED ON-DISK extents (the expert axis folded into rows,
                 // the same fold `weight_source` gives a rank-3 `[E, r, c]`), stated from the
@@ -1822,7 +1822,7 @@ pub fn lower_decode_to_wavefront(
                 // Read at the same site every other model-const scalar is (the
                 // parsed `scalars` table, which hoists nested `text_config`),
                 // and carried on the op so the tape holds it — metal/cuda bake
-                // it into kernels and spyre binds it as a registry const.
+                // it into kernels and a target may bind it as a registry const.
                 let cap = bx
                     .model
                     .scalars

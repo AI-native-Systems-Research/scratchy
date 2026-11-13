@@ -3,7 +3,7 @@
 //! ⭐⭐⭐ THE ONE TEST THAT SPANS THE WORKER/SCHEDULER SEAM FOR KV EXTENT.
 //!
 //! Two facts have to hold TOGETHER for prefix caching to be correct on a backend whose keys do not sit
-//! at their token positions (the spyre paged pool, which appends a whole batch AT ONE SLOT per step and
+//! at their token positions (a paged pool that appends a whole batch AT ONE SHARED SLOT per step and
 //! therefore leaves a masked hole in every request shorter than its batch-mates):
 //!
 //! 1. blocks are allocated for the SLOT SPAN — or the worker writes past the last block it was given;
@@ -24,7 +24,7 @@ use scratchy_serving_scheduler::scheduler::core::{KVCacheManagerOps, SimpleBlock
 
 const BLOCK: usize = 256;
 
-/// The tracker as the spyre pool declares it, with a step reach already set — the state every batched
+/// The tracker as a shared-write-slot pool declares it, with a step reach already set — the state every batched
 /// decode step allocates in.
 fn batched_tracker(step_reach: u32) -> SimpleBlockTracker {
     let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"))
@@ -88,7 +88,7 @@ fn a_hole_bearing_request_is_allocated_by_slots_and_cached_by_its_contiguous_pre
 }
 
 /// ⛔ THE CONTROL: with no extent reported — every backend whose KV is token-addressed — both rules are
-/// exactly the arithmetic they always were. A regression here is a change to metal behaviour.
+/// exactly the arithmetic they always were. A regression here is a change to their behaviour.
 #[test]
 fn a_backend_that_reports_nothing_is_allocated_and_cached_by_its_token_count() {
     let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
@@ -181,7 +181,8 @@ fn a_shallow_request_under_a_deep_step_reach_holds_blocks_for_the_reach() {
     );
 
     // ⛔ THE CONTROL, IN THE SAME TEST: a tracker that did NOT declare the capability must be untouched by
-    // any reach. This is metal, and a regression here is a change to its allocation.
+    // any reach. This is every token-addressed backend, and a regression here is a change to their
+    // allocation.
     let mut plain =
         SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     plain.set_kv_pool_reach(KvSlotSpan::new(697));
@@ -229,7 +230,7 @@ fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write(
     req.num_output_placeholders = STEPS_IN_FLIGHT;
 
     // ⭐ AND THE EXPECTED PAGE COUNT IS THE WORKER'S OWN RULE, NOT A CONSTANT THIS TEST PICKED:
-    // `RowPages::holding(batch_slot + 1)` is `ceil((end + 1) / POOL_PAGE_SLOTS)`.
+    // the pages a row holding `batch_slot + 1` slots needs are `ceil((end + 1) / page_slots)`.
     let current_end = (REPORTED_SLOTS + STEPS_IN_FLIGHT) as usize;
     let launch_needs = (current_end + 1).div_ceil(BLOCK);
     assert_eq!(
@@ -280,8 +281,8 @@ fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write(
         "an up-to-date report and an aged one describing the SAME state must allocate the same"
     );
 
-    // ⛔ AND THE TOKEN-ADDRESSED CONTROL: metal reports no extent at all, so nothing here can reach
-    // them. A regression on this line is a change to their allocation.
+    // ⛔ AND THE TOKEN-ADDRESSED CONTROL: a token-addressed backend reports no extent at all, so
+    // nothing here can reach them. A regression on this line is a change to their allocation.
     let mut plain =
         SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     plain.set_step_reach(KvSlotSpan::new((current_end + 1) as u32));
@@ -326,7 +327,7 @@ fn a_new_request_is_allocated_for_the_step_reach_before_any_pool_reach_exists() 
          the token-count answer that left the worker serving page 2 from its own reserve"
     );
 
-    // The control again: undeclared, so the reach is inert and this is the metal answer.
+    // The control again: undeclared, so the reach is inert and this is the token-addressed answer.
     let mut plain =
         SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     plain.set_step_reach(KvSlotSpan::new(698));

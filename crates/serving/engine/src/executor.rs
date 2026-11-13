@@ -144,7 +144,7 @@ pub struct ModelRunnerOutput {
     /// ⭐ WHAT THE WORKER'S KV ACTUALLY LOOKS LIKE, per request — the slots its blocks must cover and
     /// the leading tokens a token-indexed prefix cache may claim ([`scratchy_core_common::KvExtent`]).
     ///
-    /// Empty for every backend whose KV sits at its token positions (metal): there the span IS the
+    /// Empty for every backend whose KV sits at its token positions: there the span IS the
     /// token count and the whole computed prefix is cacheable, so the scheduler's own arithmetic is
     /// already right and reporting would be a second source for it.
     ///
@@ -164,11 +164,11 @@ pub struct ModelRunnerOutput {
     /// already deep, its write page is past every block the host gave it, and the worker must serve that
     /// page from a reserve of its own. This number is what lets the HOST own that page instead.
     ///
-    /// `None` for every backend whose KV is token-addressed (metal): there the write slot IS the token
+    /// `None` for every backend whose KV is token-addressed: there the write slot IS the token
     /// count and a new request's own allocation already covers it.
     pub kv_pool_reach: Option<scratchy_core_common::KvSlotSpan>,
     /// HOW MANY BLOCKS OF EACH KV STORE THE WORKER HAS BACKED WITH MEMORY after this step. `Some` only from
-    /// a worker that declared [`scratchy_core_common::KvBacking::OnFirstUse`] (metal), for the allocator to
+    /// a worker that declared [`scratchy_core_common::KvBacking::OnFirstUse`], for the allocator to
     /// spend the prefix cache's free blocks before a block that would map more.
     pub kv_backed: Option<scratchy_core_common::KvBackedBlocks>,
 
@@ -412,8 +412,8 @@ pub trait Executor: Send {
 
     /// ⭐⭐⭐ HOW THE WORKER ADDRESSES ITS KV — asked ONCE, when the engine builds the block tracker.
     ///
-    /// Forwarded from [`crate::worker::Worker::kv_addressing`]. `ByToken` for metal; the spyre paged
-    /// path shares one write slot per batched step, and the scheduler must know that BEFORE it allocates for
+    /// Forwarded from [`crate::worker::Worker::kv_addressing`]. `ByToken` for token-addressed KV; a paged
+    /// pool may share one write slot per batched step, and the scheduler must know that BEFORE it allocates for
     /// the first step. Asked of the executor rather than passed through `EngineCoreConfig` because the
     /// worker is the thing that knows, and a config field is one more place for the answer to be wrong.
     fn kv_addressing(&self) -> scratchy_core_common::KvAddressing {
@@ -480,7 +480,7 @@ pub trait Executor: Send {
 
     /// ⭐ RUN THE CALLING THREAD WHERE THIS EXECUTOR'S DEVICES WANT THE THREAD THAT DRIVES THEM:
     /// the first act of the thread that runs the decode loop (the pipelined client's executor
-    /// thread, `scr serve`'s). A spyre worker answers with its cards' NUMA node. Default: nothing
+    /// thread, `scr serve`'s). A multi-card worker answers with its cards' NUMA node. Default: nothing
     /// to place.
     fn pin_driving_thread(&self) -> EngineResult<()> {
         Ok(())

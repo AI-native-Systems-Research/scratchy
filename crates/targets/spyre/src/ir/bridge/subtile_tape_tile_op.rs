@@ -11,9 +11,9 @@
 //! naming the node, never a silently-wrong `TileOp`.
 
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
+use ktir_superdsc::superdsc_opspec::{Df, ItDim};
 use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, SubtileNode};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape};
-use scratchy_subtile::superdsc_opspec::{Df, ItDim};
 
 /// One `Instr::Compute`, lowered: the tape instruction's node id (so a caller can still find which
 /// SubtileIR node this came from) plus the `TileOp`(s) derived from it. MOST `SubOp` kinds decompose

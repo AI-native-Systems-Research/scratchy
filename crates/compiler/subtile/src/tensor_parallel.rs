@@ -71,8 +71,9 @@ use crate::subtile_ir::{RopeForm, RowScale, SourceShape, SubOp, SubtileIR, Tenso
 pub use scratchy_tp_world::{Build, PerRank, Rank, TpWorld, World, ranks};
 
 /// The smallest column block a target can split a tensor at — a TARGET FACT the shared pass takes
-/// as input (spyre: one 64-element stick; a target with no layout granule: 1). A split whose
-/// per-rank extent is not a whole number of granules is not taken: the op is replicated instead.
+/// as input (a stick-laid-out target: one 64-element stick; a target with no layout granule: 1). A
+/// split whose per-rank extent is not a whole number of granules is not taken: the op is
+/// replicated instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SplitGranule(NonZeroU32);
 

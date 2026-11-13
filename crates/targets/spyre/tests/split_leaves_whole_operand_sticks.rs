@@ -32,12 +32,12 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands;
-use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY};
-use scratchy_subtile::superdsc_opspec::Df;
+use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY};
+use ktir_superdsc::superdsc_opspec::Df;
 
 /// The split the emitter chose for one matmul, as `{axis: cores}`.
 fn splits(m: u32, n: u32, k: u32, df: Df) -> std::collections::BTreeMap<String, u32> {
-    let spec = matmul_opspec_off_operands::<scratchy_subtile::superdsc_opspec::Fp16>(
+    let spec = matmul_opspec_off_operands::<ktir_superdsc::superdsc_opspec::Fp16>(
         MatM::of_token_rows(m),
         MatN::of_out_features(n),
         MatK::of_in_features(k),

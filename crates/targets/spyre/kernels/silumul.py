@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scratchy's Triton silu-mul kernel — the SECOND SPLICED KERNEL.
 
-BODY PROVENANCE: derived from `crates/triton/test-fixtures/swiglu_mlp.py`'s activation
+BODY PROVENANCE: derived from `crates/targets/spyre/triton/test-fixtures/swiglu_mlp.py`'s activation
 body (deltas 5/6/8 there) — the same four-op chain (`e = exp(-g)` → `s = g / (1+e)` →
 `h = s * u`) that fixture card-validated through this repo's KTIR→SuperDSC lowering,
 stated standalone over whole-region tiles the way the builder's own

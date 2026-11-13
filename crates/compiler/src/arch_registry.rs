@@ -1,176 +1,164 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Cross-arch load registry: the `inventory`-driven
-//! `ScratchyArchRegistration` / `try_load` seam every `#[forward] fn <arch>()`
-//! registers through, plus its multimodal sibling
-//! (`ScratchyMmRegistration` / `try_load_mm`).
+//! Cross-arch load registry: the `inventory`-driven [`ArchRegistration`] / [`try_load`] seam
+//! every compiled arch registers through, the target-neutral [`ArchFacts`] every compiled arch
+//! states, and the multimodal sibling (`ScratchyMmRegistration` / `try_load_mm`).
 //!
-//! The per-arch loaders fill the concrete `GpuWeights<A>` weight-store, a type
-//! this cfg-free crate cannot name (it has no backend allocator). The registry
-//! fn-pointers therefore take the allocator-erased
-//! [`scratchy_tensors::GpuWeightsHandle`]; the generic [`try_load`] /
-//! [`try_load_mm`] entry points are monomorphized over the concrete
-//! `GpuWeights<A>` at the worker call site (where `A` is the backend
-//! allocator), build the handle, and pass it through the fn-pointer. The
-//! macro-emitted closure recovers the concrete `&mut GpuWeights<A>` from the
-//! handle before calling the per-variant `Weights::load`. This keeps the
-//! registry — and the `#[forward]` macro's `inventory::submit!` target — free
-//! of any backend coupling, so it can live below the neutral `ScratchyWeights`
-//! contract the compiler owns.
+//! ⭐ THE ROW IS SHARED, THE REGISTRY IS THE TARGET'S. A loaded model is a target's own trait
+//! object (`dyn <Target>Weights`, extending [`ScratchyWeights`]), so the loader fn-pointer's
+//! return type is the target's, and so is the inventory it is collected in: each target crate
+//! wraps [`ArchRegistration`] in a type of its own, collects that, and implements
+//! [`TargetRegistration`] for it. [`try_load`] is the one walk every target runs, generic over
+//! that wrapper. (A shared generic row cannot be collected per target directly: `inventory`'s
+//! `Collect` is a foreign trait, and an impl of it for `ArchRegistration<dyn LocalTrait>` is an
+//! orphan.)
+//!
+//! The per-arch loaders fill the concrete `GpuWeights<A>` weight-store, a type this crate cannot
+//! name (it has no backend allocator). The registry fn-pointers therefore take the
+//! allocator-erased [`scratchy_tensors::GpuWeightsHandle`]; [`try_load`] is monomorphized over
+//! the concrete `GpuWeights<A>` at the worker call site (where `A` is the backend allocator),
+//! builds the handle, and passes it through the fn-pointer. The emitted closure recovers the
+//! concrete `&mut GpuWeights<A>` from the handle before calling the per-variant `Weights::load`.
 
-// MM sibling registry names `scratchy-vision` (`MmMetadata`) + device-runtime
-// types, neither available under spyre; the text-side registry below is
-// allocator-generic + vision-free, so it compiles under spyre too.
 #[cfg(feature = "vision")]
 use crate::mm::MultimodalForward;
 use crate::{HeadRegistration, HfFingerprint, ScratchyWeights};
 use scratchy_tensors::{DeviceAllocator, GpuWeightsHandle, LoadStream};
 
-/// One registration per `#[forward] fn <arch>()`. The macro
-/// emits an `inventory::submit!` block that constructs this.
-/// `try_load` function-pointer signature — extracted as a type
-/// alias so the registration struct doesn't trip clippy's
-/// `type_complexity` lint.
+/// The loader fn-pointer of one [`ArchRegistration`], returning the target's loaded model `W`
+/// (a `dyn <Target>Weights`). Extracted as an alias so the row doesn't trip clippy's
+/// `type_complexity`.
 ///
-/// The weight parameter is the allocator-erased [`GpuWeightsHandle`] — the
-/// macro-emitted closure recovers the concrete `&mut GpuWeights<A>` the
-/// per-variant `Weights::load` loaders need. The stream parameter is the
-/// backend-neutral [`LoadStream`] (`()` on metal and spyre), so the signature
-/// is identical across backends and a new target slots into the same registry.
-pub type ArchTryLoadFn = fn(
+/// The weight parameter is the allocator-erased [`GpuWeightsHandle`] — the emitted closure
+/// recovers the concrete `&mut GpuWeights<A>` the per-variant `Weights::load` loaders need. The
+/// stream parameter is the backend-neutral [`LoadStream`], so the signature is the same for
+/// every target.
+pub type ArchTryLoadFn<W> = fn(
     GpuWeightsHandle<'_>,
     LoadStream,
     usize, // max_model_len — runtime value (CLI --max-model-len or HF config fallback)
     u8,    // tp_rank — runtime value, must be < tp_world_size
     HfFingerprint<'_>,
-) -> ::anyhow::Result<Option<Box<dyn ScratchyWeights>>>;
+) -> ::anyhow::Result<Option<Box<W>>>;
 
-/// `ktir_bundle` accessor signature — extracted as a type alias (like
-/// [`ArchTryLoadFn`]) so the registration struct doesn't trip
-/// `clippy::type_complexity`. The struct is not cfg-gated, so this type is
-/// compiled under every backend (the field is just `None` off spyre). Same
-/// erased-handle + fingerprint inputs as the per-variant `fingerprint_matches`;
-/// returns the matched variant's KTIR bundle as a neutral `&dyn Any`.
-pub type ArchKtirBundleFn = fn(
-    GpuWeightsHandle<'_>,
-    HfFingerprint<'_>,
-) -> Option<&'static (dyn ::core::any::Any + Send + Sync)>;
-
-pub struct ScratchyArchRegistration {
-    /// The arch's identifier — `"llama"`, `"qwen2"`, … — from
-    /// the carrier fn name. Used in logs.
+/// One registration per compiled `(arch, tp_world_size)`, inside the target's own row type.
+pub struct ArchRegistration<W: ?Sized + 'static> {
+    /// The arch's identifier — `"llama"`, `"qwen2"`, … — from the carrier fn name. Used in logs.
     pub arch_name: &'static str,
-    /// HF `architectures` strings this arch claims to handle.
-    /// Harvested by the macro from the union of every compiled
-    /// model's `config.json` `architectures: [..]` field.
+    /// HF `architectures` strings this arch claims to handle. Harvested from the union of every
+    /// compiled model's `config.json` `architectures: [..]` field.
     pub hf_arches: &'static [&'static str],
-    /// GGUF `general.architecture` tags this arch claims to handle.
-    /// Family-level — multiple forward arches can claim the same
-    /// gguf tag (`"deepseek2"` covers V2, V3-LoRA, V3-flat;
-    /// `"llama"` covers Llama and Mistral). The dispatcher tries
-    /// each claimant in turn and the per-variant
-    /// `fingerprint_matches` discriminates by bounds.
+    /// GGUF `general.architecture` tags this arch claims to handle. Family-level — multiple
+    /// forward arches can claim the same gguf tag (`"deepseek2"` covers V2, V3-LoRA, V3-flat;
+    /// `"llama"` covers Llama and Mistral). The dispatcher tries each claimant in turn and the
+    /// per-variant `fingerprint_matches` discriminates by bounds.
     ///
-    /// Populated by the macro from the arch's `quantizations.json`
-    /// `ggml.gguf_arch` field (defaults to `arch_name` when the
-    /// entry is bare). Empty for arches without a `"ggml"`
-    /// quantization preset.
+    /// Populated from the arch's `quantizations.json` `ggml.gguf_arch` field (defaults to
+    /// `arch_name` when the entry is bare). Empty for arches without a `"ggml"` preset.
     pub gguf_archs: &'static [&'static str],
-    /// Compile-time tensor-parallel world size this registration
-    /// covers. The macro emits one `ScratchyArchRegistration` per
-    /// `(arch, tp_world_size)` tuple — at task #7's outer-loop
-    /// fanout that's `{1, 2, 4, 8}` per arch; until then every
-    /// emitted registration is `tp_world_size = 1`. The top-level
-    /// `try_load` matches on this so the runtime tp size picks
-    /// the right pre-compiled variant set.
+    /// Compile-time tensor-parallel world size this registration covers — one registration per
+    /// `(arch, tp_world_size)` the build baked. [`try_load`] matches on it, so the runtime tp
+    /// size picks the right pre-compiled variant set.
     pub tp_world_size: u8,
-    /// Try to load the arch's compiled variants. Internally
-    /// iterates per-variant fingerprint sniffs. Returns
-    /// `Ok(Some(..))` on a variant hit, `Ok(None)` when the arch
-    /// matched by name but no compiled variant's fingerprint
-    /// sniff accepted the live `GpuWeights` (caller should fall
-    /// back to a hand-written path), or `Err(..)` only on a
-    /// genuine load failure (I/O, shape mismatch inside a matched
-    /// variant, …).
-    pub try_load: ArchTryLoadFn,
-    /// Read-only accessor for this arch's embedded KTIR bundle — spyre's forward
-    /// representation (the peer of metal's `METAL_BUCKETS`). `Some` under
-    /// `-Fspyre`, `None` under metal (whose
-    /// forward runs through device kernels, not a bundle). Returned as a neutral
-    /// `&dyn Any` (this cfg-free crate cannot name the spyre `KtirBundle`); the
-    /// spyre worker downcasts it.
-    ///
-    /// Takes the same `(GpuWeightsHandle, HfFingerprint)` a variant's
-    /// `fingerprint_matches` needs and returns the bundle of the ONE variant
-    /// whose fingerprint accepts the live checkpoint — an arch like `llama`
-    /// registers many distinct base models (llama-2-13b … llama-3.2-3b), each
-    /// with its own bundle + layer count, so a by-arch "canonical" pick would
-    /// hand back the wrong model's bundle. Only READS `gw` (shape sniffing),
-    /// leaving every tensor for the worker to stream into the KTIR runner.
-    pub ktir_bundle: Option<ArchKtirBundleFn>,
+    /// Try to load the arch's compiled variants. Internally iterates per-variant fingerprint
+    /// sniffs. Returns `Ok(Some(..))` on a variant hit, `Ok(None)` when the arch matched by
+    /// name but no compiled variant's fingerprint sniff accepted the live `GpuWeights`, or
+    /// `Err(..)` only on a genuine load failure (I/O, shape mismatch inside a matched variant).
+    pub try_load: ArchTryLoadFn<W>,
+}
+
+impl<W: ?Sized> ArchRegistration<W> {
+    /// Whether this row claims the checkpoint architecture `arch_hint` at `tp_world_size`.
+    pub fn claims(&self, arch_hint: &str, tp_world_size: u8) -> bool {
+        (self.hf_arches.contains(&arch_hint) || self.gguf_archs.contains(&arch_hint))
+            && self.tp_world_size == tp_world_size
+    }
+}
+
+/// A target's registration row: the type its crate collects (`inventory::collect!`), wrapping
+/// the shared [`ArchRegistration`] over the target's loaded-model trait object.
+pub trait TargetRegistration: inventory::Collect {
+    /// The target's loaded model: `dyn <Target>Weights`.
+    type Weights: ?Sized + ScratchyWeights + 'static;
+    /// The shared row.
+    fn arch(&self) -> &ArchRegistration<Self::Weights>;
+}
+
+/// What every compiled arch states about itself, whatever target compiled it: the facts a
+/// server reads before (or without) loading a model. One per arch.
+pub struct ArchFacts {
+    /// The arch's identifier, as in its [`ArchRegistration`]s.
+    pub arch_name: &'static str,
+    /// HF `architectures` strings this arch claims, as in its [`ArchRegistration`]s.
+    pub hf_arches: &'static [&'static str],
     /// `Some` for a multi-token-prediction head (its forward reads `target_hidden`): the facts a
     /// loader needs before the head loads. `None` for every other arch.
     pub head: Option<HeadRegistration>,
-    /// Read-only accessor for this arch's embedded **sendnn** bundle (the
-    /// `--target sendnn` silicon path; peer of [`Self::ktir_bundle`]). `Some`
-    /// under `-Fspyre`. Returned as a neutral `&dyn Any` the spyre worker
-    /// downcasts to `SengraphBundle`.
-    pub sengraph_bundle: Option<ArchKtirBundleFn>,
 }
 
-inventory::collect!(ScratchyArchRegistration);
+inventory::collect!(ArchFacts);
 
-/// Resolve the embedded KTIR bundle for the checkpoint in `gw`, read-only.
-/// Walks registrations claiming `arch_hint` for `tp_world_size == 1` (spyre is
-/// single-rank) and, within the matching arch, returns the bundle of the ONE
-/// compiled variant whose `fingerprint_matches` accepts the live weights — the
-/// same per-variant sniff `try_load` uses, so bundle selection and weight-load
-/// variant selection can never diverge. Only reads `gw` (no `take`), so the
-/// worker keeps every tensor to stream into the runner. Returns `None` when no
-/// compiled spyre variant matches (e.g. the model wasn't built into this binary).
-#[cfg(feature = "spyre")]
-pub fn resolve_ktir_bundle<A: DeviceAllocator>(
+/// Outcome of [`try_load`]. The two miss cases are DISTINCT, and callers want different
+/// diagnostics for them:
+///
+/// * [`ArchLoad::ArchNotCompiled`] — nothing claims this HF arch at this tp size. The build
+///   genuinely has no implementation, so "unsupported arch" is the honest answer.
+/// * [`ArchLoad::NoVariantMatched`] — the arch IS compiled, but no compiled variant's
+///   fingerprint accepted the live `GpuWeights`: none of its `(stem, preset)` pairs describes
+///   THIS checkpoint. Reporting that as "unsupported arch" sends the reader hunting for a
+///   missing backend when the actual fix is the build's model/quant scope or a
+///   `quantizations.json` entry.
+///
+/// Returning them as data rather than a collapsed `Option` is what lets every caller map each to
+/// its own error without re-deriving the registry filter.
+pub enum ArchLoad<W: ?Sized> {
+    Loaded(Box<W>),
+    ArchNotCompiled,
+    NoVariantMatched,
+}
+
+/// Top-level architecture loader over the target registry `R`. Walks every row of `R`; the first
+/// whose `hf_arches` list contains `arch_hint` AND whose `tp_world_size` matches the runtime
+/// `tp_world_size` wins and attempts to load. See [`ArchLoad`] for the two miss cases.
+///
+/// Generic over the backend allocator `A`: the worker passes its concrete `&mut GpuWeights<A>`
+/// and `A` is inferred. The borrow is wrapped in a [`GpuWeightsHandle`] (allocator-erased)
+/// before being threaded through the fn-pointer; the emitted closure recovers the same concrete
+/// type.
+pub fn try_load<R: TargetRegistration, A: DeviceAllocator>(
     gw: &mut scratchy_layers::weights::GpuWeights<A>,
+    stream: LoadStream,
     arch_hint: &str,
+    tp_world_size: u8,
+    tp_rank: u8,
+    max_model_len: usize,
     hf: HfFingerprint<'_>,
-) -> Option<&'static (dyn ::core::any::Any + Send + Sync)> {
+) -> ::anyhow::Result<ArchLoad<R::Weights>> {
     let handle = GpuWeightsHandle::new(gw);
-    inventory::iter::<ScratchyArchRegistration>()
-        .filter(|reg| {
-            (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
-                && reg.tp_world_size == 1
-        })
-        .find_map(|reg| reg.ktir_bundle.and_then(|f| f(handle, hf)))
-}
-
-/// Resolve the embedded sendnn bundle (the `--target sendnn` path) for an arch
-/// by name. Peer of [`resolve_ktir_bundle`]; the spyre worker downcasts the
-/// returned `&dyn Any` to `SengraphBundle`.
-#[cfg(feature = "spyre")]
-pub fn resolve_sengraph_bundle<A: DeviceAllocator>(
-    gw: &mut scratchy_layers::weights::GpuWeights<A>,
-    arch_hint: &str,
-    hf: HfFingerprint<'_>,
-) -> Option<&'static (dyn ::core::any::Any + Send + Sync)> {
-    // 🛑 Takes the checkpoint fingerprint for the SAME reason
-    // `resolve_ktir_bundle` does, and it used to not.
+    // Walk every registration that claims this HF arch identifier for this TP world size. A
+    // variant hit and an `Err` terminate; a registration whose variants all rejected the live
+    // `GpuWeights` falls through to the next claimant — required when more than one
+    // registration claims the same HF arch (e.g. the `deepseek-v3` LoRA-Q variants alongside the
+    // `deepseek-v3-flat` direct-Q variants for `DeepseekV3ForCausalLM` checkpoints with
+    // `q_lora_rank=null`, and the `mistral` arch claiming `LlamaForCausalLM` as an alias for
+    // GGUFs whose `general.architecture = "llama"` flattens Llama-2 and Mistral together).
     //
-    // This picked `arms.first()` — the first variant REGISTERED for the
-    // arch, unconditionally. With one model compiled that is right by
-    // accident. With two sizes of one arch it is a coin flip: a build with
-    // both granite-3.1-2b and granite-3.1-8b compiled in (same arch, two
-    // size tiers) then ran the 8b against the 2B's bundle, and
-    // load_weights refused with
-    // "q_proj.weight is 16777216 bytes but the manifest declares
-    // 2048*2048*1 = 4194304" — the 8b's real weights (4096²) against the
-    // 2b's manifest (2048²). The guard caught it; without it the bundle
-    // mismatch would have been garbage tokens.
-    let handle = GpuWeightsHandle::new(gw);
-    inventory::iter::<ScratchyArchRegistration>()
-        .filter(|reg| {
-            (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
-                && reg.tp_world_size == 1
-        })
-        .find_map(|reg| reg.sengraph_bundle.and_then(|f| f(handle, hf)))
+    // `claimed` is what separates the two miss cases: it records that SOME registration owned
+    // the arch name even though every one of its variants declined the checkpoint.
+    let mut claimed = false;
+    for reg in inventory::iter::<R>()
+        .map(TargetRegistration::arch)
+        .filter(|reg| reg.claims(arch_hint, tp_world_size))
+    {
+        claimed = true;
+        if let Some(weights) = (reg.try_load)(handle, stream, max_model_len, tp_rank, hf)? {
+            return Ok(ArchLoad::Loaded(weights));
+        }
+    }
+    Ok(if claimed {
+        ArchLoad::NoVariantMatched
+    } else {
+        ArchLoad::ArchNotCompiled
+    })
 }
 
 // ── Multimodal sibling surface ────────────────────────────────
@@ -178,7 +166,7 @@ pub fn resolve_sengraph_bundle<A: DeviceAllocator>(
 // `MultimodalForward` is a sibling trait, NOT a default-method
 // extension on `ScratchyWeights`. Text-only arches don't
 // implement it. Discovery uses a sibling inventory row so the
-// text-side `ScratchyArchRegistration` stays untouched and
+// text-side `ArchRegistration` stays untouched and
 // text-only arches never need to know MM exists. The gpu worker
 // calls `try_load_mm` after `try_load` succeeds; an arch with
 // no MM submission yields `Ok(None)` and the worker proceeds
@@ -204,7 +192,7 @@ pub type MmTryLoadFn = fn(
 
 /// Sibling registration row. One per arch that ships a vision
 /// encoder. `hf_arches` and `gguf_archs` follow the same rules
-/// as [`ScratchyArchRegistration`] but the keys typically only
+/// as [`ArchRegistration`] but the keys typically only
 /// list the multimodal-conditional-generation variants
 /// (e.g. `Qwen2VLForConditionalGeneration`, NOT plain
 /// `Qwen2ForCausalLM`).
@@ -245,83 +233,6 @@ pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static ScratchyMmRe
         hf_arches
             .iter()
             .any(|a| reg.hf_arches.contains(&a.as_str()))
-    })
-}
-
-/// Outcome of [`try_load`]. The two miss cases are DISTINCT, and callers want
-/// different diagnostics for them:
-///
-/// * [`ArchLoad::ArchNotCompiled`] — nothing claims this HF arch at this tp
-///   size. The build genuinely has no implementation, so "unsupported arch" is
-///   the honest answer and a hand-written fallback is the right next move.
-/// * [`ArchLoad::NoVariantMatched`] — the arch IS compiled, but no compiled
-///   variant's fingerprint accepted the live `GpuWeights`: none of its
-///   `(stem, preset)` pairs describes THIS checkpoint. Reporting that as
-///   "unsupported arch" sends the reader hunting for a missing backend when the
-///   actual fix is the build's model/quant scope or a `quantizations.json`
-///   entry.
-///
-/// Returning them as data rather than a collapsed `Option` is what lets every
-/// caller — the metal main and draft paths, spyre — map each to its own
-/// error without re-deriving the registry filter.
-pub enum ArchLoad {
-    Loaded(Box<dyn ScratchyWeights>),
-    ArchNotCompiled,
-    NoVariantMatched,
-}
-
-/// Top-level architecture loader. Walks every `#[forward]`-registered
-/// arch; the first whose `hf_arches` list contains `arch_hint`
-/// AND whose `tp_world_size` matches the runtime `tp_world_size`
-/// wins and attempts to load. See [`ArchLoad`] for the two miss cases.
-///
-/// Generic over the backend allocator `A`: the worker passes its concrete
-/// `&mut GpuWeights<A>` and `A` is inferred. The borrow is wrapped in a
-/// [`GpuWeightsHandle`] (allocator-erased) before being threaded through the
-/// fn-pointer; the macro-emitted closure recovers the same concrete type.
-///
-/// Until task #7's outer-loop fanout lands, every emitted
-/// registration is at `tp_world_size = 1`, so callers passing
-/// `tp_world_size > 1` always see [`ArchLoad::ArchNotCompiled`] (and fall
-/// back) — matching the current behavior, since the gpu worker already gates
-/// eligibility on `!use_tp`.
-pub fn try_load<A: DeviceAllocator>(
-    gw: &mut scratchy_layers::weights::GpuWeights<A>,
-    stream: LoadStream,
-    arch_hint: &str,
-    tp_world_size: u8,
-    tp_rank: u8,
-    max_model_len: usize,
-    hf: HfFingerprint<'_>,
-) -> ::anyhow::Result<ArchLoad> {
-    let handle = GpuWeightsHandle::new(gw);
-    // Walk every registration that claims this HF arch identifier for this TP
-    // world size. A variant hit and an `Err` terminate; a registration whose
-    // variants all rejected the live `GpuWeights` falls through to the next
-    // claimant — required when more than one registration claims the same HF
-    // arch (e.g. the `deepseek-v3` LoRA-Q variants alongside the
-    // `deepseek-v3-flat` direct-Q variants for `DeepseekV3ForCausalLM`
-    // checkpoints with `q_lora_rank=null`, and the `mistral` arch claiming
-    // `LlamaForCausalLM` as an alias for GGUFs whose
-    // `general.architecture = "llama"` flattens Llama-2 and Mistral together).
-    //
-    // `claimed` is what separates the two miss cases: it records that SOME
-    // registration owned the arch name even though every one of its variants
-    // declined the checkpoint.
-    let mut claimed = false;
-    for reg in inventory::iter::<ScratchyArchRegistration>().filter(|reg| {
-        (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
-            && reg.tp_world_size == tp_world_size
-    }) {
-        claimed = true;
-        if let Some(weights) = (reg.try_load)(handle, stream, max_model_len, tp_rank, hf)? {
-            return Ok(ArchLoad::Loaded(weights));
-        }
-    }
-    Ok(if claimed {
-        ArchLoad::NoVariantMatched
-    } else {
-        ArchLoad::ArchNotCompiled
     })
 }
 

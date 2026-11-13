@@ -192,7 +192,7 @@ impl Commit {
 }
 
 /// One sequence the step gives a token, as the acceptance reads it
-/// (`scratchy_target_metal::dflash2::VerifyLane`, less what the worker knows of its request).
+/// (the worker's verify lane, less what the worker knows of its request).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockLane {
     /// Its index in the step.

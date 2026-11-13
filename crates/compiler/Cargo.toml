@@ -8,30 +8,8 @@ license.workspace = true
 default = []
 # Multimodal/vision capability: pulls `scratchy-vision` and surfaces the MM
 # arch registry (`ScratchyMmRegistration` / `try_load_mm` / `resolve_mm_metadata`)
-# + `MultimodalForward`. A CAPABILITY gate, not a target one — metal enables
-# it today; spyre opts in the same way when it grows a vision path.
+# + `MultimodalForward`. A CAPABILITY gate, not a target one.
 vision = ["dep:scratchy-vision"]
-# Metal backend on Apple Silicon. Surfaces the `Instruction` enum +
-# `CanonicalParams` trait so the Metal interpreter
-# (`interpreter::metal`) can lower a per-bucket tape into
-# `LoweredMetalTape` for ICB recording. Phase 5.A's lowering pass is
-# pure CPU — but Phase 5.B's `pipelines.rs` (specialized pipeline
-# cache) and the upcoming worker/pool pieces (5.C/5.D/5.E) wrap
-# metal-rs types. This crate no longer depends on `scratchy-target-metal`
-# (the interpreter re-export was severed so the metal target can depend UP on
-# this compiler); the `objc2*` deps stay because `dispatcher.rs` names
-# `objc2`/`objc2_metal` types directly in the `MetalForwardFollowup` /
-# `ChainStepHandle` / `MetalChainBody` surface. `MetalDtype` is named from
-# `scratchy-tensors`; `RuntimeBindings` is erased behind `MetalRuntimeHandle`.
-metal = ["scratchy-ir/metal", "dep:objc2", "dep:objc2-metal"]
-# Spyre (KTIR): host-pure KTIR emit via scratchy-subtile + the ir spyre gate.
-# Deliberately does NOT pull any target crate — the compiler is decoupled
-# from every target crate; spyre rides the compiler-owned arch registry +
-# scratchy-layers `GpuWeights`, and the host `SpyreAllocator` comes from
-# `scratchy-target-spyre` at the worker.
-spyre-hw = ["spyre"]
-spyre = ["scratchy-ir/spyre", "dep:scratchy-subtile", "scratchy-subtile/spyre"]
-# SuperDSC perf path (rides on spyre). Cargo feature, not an env var.
 
 # Pulls in the Hub downloader, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
@@ -39,13 +17,13 @@ spyre = ["scratchy-ir/spyre", "dep:scratchy-subtile", "scratchy-subtile/spyre"]
 # ordinary library build fast.
 probe = ["dep:hf-hub-downloader", "dep:clap", "dep:ureq", "dep:serde"]
 
+# Target-neutral: the model-facts trait, the shared registry row and walk, the head registry. No
+# target feature and no target dependency — each target crate depends on this one and extends it.
 [dependencies]
 # Backend-neutral tensor core.
 scratchy-tensors = { path = "../tensors" }
 # The cfg-free `Instruction` enum + `WeightAccessors` trait live here so
-# the proc-macro and both backends share one neutral definition. Feature
-# toggles (metal/spyre) gate the same variants/methods this crate
-# gates, kept in sync via the passthroughs above.
+# the forward pipeline and every target share one neutral definition.
 scratchy-ir = { path = "ir" }
 # Backend-neutral weight-store container (`weights::GpuWeights<A>`) named by the
 # cross-arch load registry (`arch_registry`). The registry's generic `try_load`
@@ -54,51 +32,10 @@ scratchy-ir = { path = "ir" }
 # `scratchy_tensors::GpuWeightsHandle`. Acyclic — scratchy-layers deps only
 # tensors + quantizations + core-model, none of which dep this crate.
 scratchy-layers = { path = "../layers" }
-# Note: NO dependency on scratchy-forward-compiler-macro here. The reverse
-# direction (macro → scratchy-forward-compiler) is what's needed so that
-# `Implementation::fan_out` can return `Vec<Instruction>` typed
-# at proc-macro time.
-# Consumers of the proc-macro import it directly:
-#   `use scratchy_forward_compiler_macro::{forward, vision_forward};`
-# rather than going through scratchy-forward-compiler.
-# Single source of truth for the reactive (chunked) KV pool
-# granularity (`BLOCKS_PER_CHUNK`). The metal lowering reads it to set
-# the chunk-table `[[function_constant]]` on the hand-written KV
-# kernels so they agree with the macro-generated `SynthPreAttn`, which
-# bakes the same const via this crate. Metal-only (see `metal` feature).
 # `scratchy-vision` (backend-neutral vision host glue) supplies
 # `MmMetadata` for the dispatcher's `ScratchyMmRegistration`. Optional and
 # pulled in by the `vision` feature; the crate itself is backend-dep-free.
 scratchy-vision = { path = "../models/vision", optional = true }
-# NOTE: no `scratchy-target-metal` dependency. The metal interpreter lives in
-# that crate, but this compiler names none of its types — `MetalDtype` comes
-# from `scratchy-tensors` and `RuntimeBindings` is erased behind
-# `scratchy_tensors::MetalRuntimeHandle`. Dropping the edge lets the metal
-# target depend UP on this crate.
-# The subtile IR (SubtileIR + tape lowering): host-pure, no backend deps.
-# Optional, pulled in by `spyre` (KTIR emit).
-scratchy-subtile = { path = "subtile", optional = true }
-objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true, default-features = false, features = [
-    "std",
-    "MTLAllocation",
-    "MTLBuffer",
-    "MTLResource",
-    # MTL4 surfaces for the in-progress migration off the
-    # MTLCommandBuffer + Serial-encoder + ICB pattern. Probed at
-    # runtime via `device.newMTL4CommandQueue()`; falls back to MTL3
-    # on macOS 14 or absent driver support.
-    "MTL4ArgumentTable",
-    "MTL4BufferRange",
-    "MTL4CommandAllocator",
-    "MTL4CommandBuffer",
-    "MTL4CommandEncoder",
-    "MTL4CommandQueue",
-    "MTL4ComputeCommandEncoder",
-    "MTL4ComputePipeline",
-    "MTL4CommitFeedback",
-    "block2",
-] }
 anyhow = { workspace = true }
 inventory = { workspace = true }
 # Optional deps used only by the `probe-weights` bin under the

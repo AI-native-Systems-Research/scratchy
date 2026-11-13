@@ -370,7 +370,7 @@ them:
 
 ```bash
 pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
-pkill -TERM -f ' chat -m .* --device metal'    # the parity gate's scratchy side
+pkill -TERM -f '(^|/)scr chat -m '    # the parity gate's scratchy side
 sleep 10
 pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
 lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # whatever server the run started

@@ -8,7 +8,7 @@
 //
 // Dumped at commit 1261b4e83c21f38d72a90f4c3168d2b51850cb38, where
 //   crates/targets/spyre/kernels/sample_fwd.py was last changed in 7b202a1711f34e7c69d5fb5acaa3aa3fedb73661, and
-//   crates/triton/splice was last changed in 7b202a1711f34e7c69d5fb5acaa3aa3fedb73661.
+//   crates/targets/spyre/triton/splice was last changed in 7b202a1711f34e7c69d5fb5acaa3aa3fedb73661.
 // This fixture pins THAT sampler: a later change to either does not reach the emulator test
 // until this file is regenerated. Regenerate from the repo root with:
 //   cp crates/targets/spyre/ktir/ktir-emulator/tests/fixtures/sampler_granite/regenerate.rs \

@@ -81,10 +81,7 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
 }
 
 /// `d`'s value under `bounds`; `None` if it names a bound `bounds` lacks.
-pub(crate) fn eval_closed_dim(
-    d: &Dim,
-    bounds: &std::collections::BTreeMap<String, u64>,
-) -> Option<u64> {
+pub fn eval_closed_dim(d: &Dim, bounds: &std::collections::BTreeMap<String, u64>) -> Option<u64> {
     match d {
         Dim::Lit(n) => Some(*n),
         Dim::Bound(name) => bounds.get(name).copied(),

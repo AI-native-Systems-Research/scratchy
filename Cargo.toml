@@ -22,6 +22,10 @@ members = [
     "crates/targets/spyre",
     "crates/targets/spyre/bundle",
     "crates/targets/spyre/builder",
+    "crates/targets/spyre/worker",
+    "crates/targets/spyre/compiler",
+    "crates/targets/spyre/models",
+    "crates/targets/spyre/cli",
     # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE from
     # the lowering rather than reached through a text round trip.
     "crates/targets/spyre/ktir/ktir-core",
@@ -30,28 +34,30 @@ members = [
     # KTIR -> SuperDSC as a leaf: the typed SuperDSC IR, with no scratchy dependency, so a
     # third-party KTIR producer can consume the lowering.
     "crates/targets/spyre/ktir/ktir-superdsc",
-    # The Triton front end, re-hosted from triton-spyre (see crates/triton/PROVENANCE.md):
+    # The Triton front end, re-hosted from triton-spyre (see crates/targets/spyre/triton/PROVENANCE.md):
     # Triton.py -> TTIR -> KTIR, pure Rust, so kernels are authored in Triton and compiled at
     # #[forward] expansion time like the torch carriers are (#112).
-    "crates/triton/triton-frontend",
-    "crates/triton/triton-ktir",
-    "crates/triton/triton-numeric",
-    "crates/triton/triton-ktir-superdsc",
+    "crates/targets/spyre/triton/triton-frontend",
+    "crates/targets/spyre/triton/triton-ktir",
+    "crates/targets/spyre/triton/triton-numeric",
+    "crates/targets/spyre/triton/triton-ktir-superdsc",
     # The splice: a SubtileTape node whose KTIR comes from a Triton kernel, not the Rust
     # builder. A leaf between the tape types and the ladder, so scratchy-target-spyre
     # hooks it in without a second copy of the lowering.
-    "crates/triton/splice",
+    "crates/targets/spyre/triton/splice",
     "crates/models/arch",
+    "crates/models/build",
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",
-    "crates/models/tp",
+    "crates/targets/spyre/tp",
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/frontend",
     "crates/compiler/subtile",
     "crates/targets/metal",
     "crates/targets/metal/compiler",
+    "crates/targets/metal/worker",
 ]
 # scratchy-tui pulls goose from git (not published to crates.io) and stands
 # entirely on its own as the `scr-tui` binary — excluded so its resolution
@@ -65,7 +71,6 @@ exclude = ["crates/cli/tui"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/vllm-project/vllm"
 
 [workspace.dependencies]
 # Type-level unsigned integers: a dim's number as a type, so a law between dims is a bound rustc
@@ -124,7 +129,6 @@ dirs = "7"
 rayon = "1"
 
 # Collections / utilities
-indexmap = { version = "2", features = ["serde"] }
 bytes = "1"
 rand = "0.9"
 
@@ -210,6 +214,8 @@ scratchy-serving-scheduler = { path = "crates/serving/scheduler" }
 scratchy-serving-engine = { path = "crates/serving/engine" }
 scratchy-serving-api = { path = "crates/serving/api" }
 scratchy-serving-worker = { path = "crates/serving/worker" }
+scratchy-target-metal-worker = { path = "crates/targets/metal/worker" }
+scratchy-target-spyre-worker = { path = "crates/targets/spyre/worker" }
 scratchy-core-model = { path = "crates/core/model" }
 # We own Hub downloads (that crate's manifest says why). Do not reach for the
 # `hf-hub` crate to avoid it: 1.0 depends on hf-xet non-optionally — no
@@ -221,8 +227,7 @@ scratchy-vision = { path = "crates/models/vision" }
 scratchy-forward-compiler = { path = "crates/compiler" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
-scratchy-cli = { path = "crates/cli/scr" }
-scratchy-e2e = { path = "crates/e2e" }
+scratchy-cli = { path = "crates/cli/scr", default-features = false }
 
 [profile.release]
 
@@ -253,6 +258,9 @@ debug = "line-tables-only"
 [profile.dev.package.scratchy-models]
 debug = 0
 
+[profile.dev.package.scratchy-target-spyre-models]
+debug = 0
+
 # Proc-macros (and their dependencies) execute AT COMPILE TIME. The wavefront
 # codegen pipeline (solver, region tiling, per-model×variant emit) runs on
 # EVERY build. At the default dev opt-level that pipeline is the DOMINANT
@@ -281,6 +289,11 @@ debug = 0
 # overrides back to -O3 + fat LTO for the shipping build.
 opt-level = 1
 
+# Spyre's compiled models: the same emitted dispatch glue, the same reasoning.
+[profile.release.package.scratchy-target-spyre-models]
+debug = 0
+opt-level = 1
+
 [profile.release-dist]
 inherits = "release"
 strip = true
@@ -290,4 +303,7 @@ codegen-units = 1
 # Keep the model code fully optimized in the shipping build (release inherits
 # opt-level = 1 above; undo it here).
 [profile.release-dist.package.scratchy-models]
+opt-level = 3
+
+[profile.release-dist.package.scratchy-target-spyre-models]
 opt-level = 3

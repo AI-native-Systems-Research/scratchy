@@ -99,11 +99,11 @@ pub trait Worker: Send {
 
     /// Maximum sequence length (tokens) this backend's paged-attention kernels
     /// can ADDRESS with the cache [`Self::initialize_cache`] built, when that
-    /// binds before the pool's own `num_gpu_blocks × block_size` (spyre: what
+    /// binds before the pool's own `num_gpu_blocks × block_size` (a fixed pool: what
     /// the pool funds per request and the prefix mask baked). The engine caps
     /// `max_model_len` to the smaller of the two, so an over-long prompt is
     /// rejected, not silently truncated by the kernel. `None` = the pool binds
-    /// first (metal sizes each block-table row to hold it). Valid after
+    /// first (a budget-sized pool sizes each block-table row to hold it). Valid after
     /// `initialize_cache`.
     fn kv_max_addressable_tokens(&self) -> Option<usize> {
         None
@@ -113,12 +113,12 @@ pub trait Worker: Send {
     /// pool is a FIXED-SIZE resident allocation rather than a memory-budget-derived
     /// one. The uniform `compute_num_blocks` sizes `num_gpu_blocks` from the memory
     /// budget (`determine_available_memory`), which can exceed a backend whose pool
-    /// is a baked, fixed number of physical blocks. The spyre/sendnn PAGED path has
-    /// a resident on-card KV pool of exactly `nblk` blocks of `block_size`=64 slots;
+    /// is a baked, fixed number of physical blocks. A baked PAGED path has
+    /// a resident on-device KV pool of exactly `nblk` blocks of `block_size` slots;
     /// the scheduler's block allocator MUST NOT hand out a block id ≥ `nblk` (it
     /// would index past the pool → silent KV corruption / on-card fault). When this
     /// returns `Some(n)` the engine sets `num_gpu_blocks = min(computed, n)`. `None`
-    /// = no cap (metal sizes the pool from the memory budget). Valid after
+    /// = no cap (the pool is sized from the memory budget). Valid after
     /// `load_model`.
     fn kv_cache_num_blocks_override(&self) -> Option<usize> {
         None
@@ -126,7 +126,7 @@ pub trait Worker: Send {
 
     /// Bytes one block of `block` tokens costs in this worker's KV pool,
     /// when that is not the dense row the engine derives from the HF config
-    /// (`layers × 2 × kv_heads × head_dim × dtype`): a metal model built with
+    /// (`layers × 2 × kv_heads × head_dim × dtype`): a model built with
     /// TurboQuant stores packed codes, and a hybrid-SWA model's block is a page
     /// in each group-shared tensor plus its TurboQuant global store. The engine
     /// sizes `num_gpu_blocks` from the memory budget by this instead. `None` =
@@ -144,19 +144,19 @@ pub trait Worker: Send {
     /// HARD CAP on the scheduler's `max_num_seqs`, if the backend can only DECODE a bounded number of
     /// sequences in one batched step.
     ///
-    /// ⛔ IT EXISTS BECAUSE SPYRE'S LADDER IS BAKED. Spyre picks a decode width from a discrete ladder
-    /// (`BATCH_RUNGS`), takes the smallest entry `>= live`, and falls back to a slower correct path when
-    /// nothing is wide enough. A ladder fixed at BAKE time cannot grow to meet `max_num_seqs`, so the
+    /// ⛔ IT EXISTS BECAUSE A BAKED DECODE-WIDTH LADDER CANNOT GROW. A backend with one picks a decode
+    /// width from a discrete ladder of rungs, takes the smallest entry `>= live`, and falls back to a
+    /// slower correct path when nothing is wide enough. A ladder fixed at BAKE time cannot grow to meet `max_num_seqs`, so the
     /// backend holds *"the fast path always covers the configured concurrency"* from the other end: it
     /// reports the widest width it can batch and the scheduler admits no more than that.
     ///
-    /// It also ANSWERS an unset `--max-num-seqs`, which is why metal reports here too: when the
+    /// It also ANSWERS an unset `--max-num-seqs`, which is why a budget-sized backend reports here too: when the
     /// caller named nothing, a worker that resolved a memory-affordable default (the GDN slot count, the
     /// device tier) hands the scheduler the value it actually built its pools at, so
     /// `WorkerCreateConfig::max_num_seqs = None` never resolves to two different numbers in one process.
     ///
     /// ⭐ CAPPING, NOT REFUSING — no backend should refuse a `max_num_seqs`. Exceeding
-    /// the ladder is a THROUGHPUT cliff, not a correctness bound: spyre's own fallback is one launch per
+    /// the ladder is a THROUGHPUT cliff, not a correctness bound: a baked ladder's own fallback is one launch per
     /// request (~93 µs each) and stays correct. The cap keeps a run on the batched path instead of
     /// silently dropping it onto the slow one; it is not protecting against corruption.
     ///
@@ -180,12 +180,12 @@ pub trait Worker: Send {
     /// An explicit ask is identical on every rank by construction and is
     /// never re-clamped here — capping-is-not-validating applies across
     /// ranks too. The default no-op serves backends whose width is fixed at
-    /// BAKE time (spyre: `BATCH_RUNGS` ignores it entirely).
+    /// BAKE time (a baked rung ladder ignores it entirely).
     fn align_max_num_seqs(&mut self, _width: usize) {}
 
     /// ⭐⭐⭐ HOW THIS WORKER ADDRESSES ITS KV — a CAPABILITY, declared before it runs a step.
     ///
-    /// `ByToken` (the default) is every backend whose key `n` sits at slot `n`: metal. A worker whose
+    /// `ByToken` (the default) is every backend whose key `n` sits at slot `n`. A worker whose
     /// batched step appends EVERY row at one shared slot returns `OneSharedWriteSlot`, and the scheduler then
     /// sizes each request by the step's reach rather than by its own token count — which is what lets the host
     /// own every page the launch writes instead of the worker covering them from a reserve of its own.
@@ -237,13 +237,13 @@ pub trait Worker: Send {
 
     /// Whether this worker's DECODE path implements the hybrid sliding-window
     /// KV layout — separate paged cache groups per sliding window, addressed by
-    /// the `sliding_groups` per-request block tables. Metal wires this; a
+    /// the `sliding_groups` per-request block tables. A per-group decode wires this; a
     /// decode that reads a single block table for EVERY layer must run on the
     /// uniform single-pool layout instead (correct for any context up to the
     /// sliding window). When this returns false the scheduler keeps
     /// gemma4 (and other hybrid-SWA arches) on the uniform pool so the worker's
     /// single-block-table decode never reads a sliding layer's KV from the
-    /// global group's blocks. Default true (metal + uniform arches).
+    /// global group's blocks. Default true (per-group decodes + uniform arches).
     fn supports_hybrid_swa_kv(&self) -> bool {
         true
     }
@@ -303,7 +303,7 @@ pub trait Worker: Send {
     }
 
     /// Mutable access to the worker's spec-decode backend. Default
-    /// returns `None`; metal `MetalWorker` overrides to return
+    /// returns `None`; a worker with a spec-decode backend overrides to return
     /// `Some(&mut *self as &mut dyn SpecDecodeBackend)` so the
     /// engine-side `DraftModelProposer` can issue lockstep prefill +
     /// K-step decode calls against it.
@@ -490,8 +490,8 @@ mod tests {
     use super::*;
 
     /// A worker that answers an unset `--max-num-seqs` with a fixed width
-    /// and tracks what `align_max_num_seqs` told it — the shape metal workers
-    /// present after `load_model` resolves the flag.
+    /// and tracks what `align_max_num_seqs` told it — the shape a budget-sized worker
+    /// presents after `load_model` resolves the flag.
     struct WidthWorker {
         width: Option<usize>,
         aligned_to: Vec<usize>,

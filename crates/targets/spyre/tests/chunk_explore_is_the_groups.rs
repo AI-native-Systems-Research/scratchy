@@ -17,12 +17,12 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
     SharedKernelBmmForm, matmul_opspec_off_operands_phys_gathered,
 };
+use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use ktir_superdsc::superdsc_opspec::{
     DataFormat, Df, EntryBase, Fp8, Fp16, GatherIndex, GatherRun, KernelAxis, PageExtent, Role,
     SdscFoldSet,
 };
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
 use scratchy_target_spyre::dxp_cache::GroupDigest;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, GroupId, SealedGroup};

@@ -18,10 +18,10 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
-use scratchy_subtile::sdsc_abstract::QueryExtent;
+use ktir_superdsc::sdsc_abstract::QueryExtent;
+use ktir_superdsc::superdsc_opspec::{DataFormat, DeviceTileLayout};
 use scratchy_subtile::subtile_ir::chain_slab_entries;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
-use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
 /// reconnaissance set. These ops never become SuperDSC tiles — the host threads
@@ -1587,7 +1587,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
@@ -1677,7 +1677,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The graph's query extents, minted by the bake — threaded to the registry and node walks
     // below, never re-derived from graph rows: a walk that minted its own pair would agree
     // with the graph yet state the wrong per-request width the day a packed prefill arrives.
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -2145,7 +2145,7 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     // The graph's query extents, minted by the bake — threaded to the node walk, never
     // re-derived from graph rows (see [`graph_wiring`]'s own parameter note).
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<
     std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
     SuperDscError,

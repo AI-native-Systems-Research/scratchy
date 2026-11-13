@@ -44,11 +44,11 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 /// The extent pair every lowering call here states for its graph: one request of the
 /// graph's own `m` rows — the S=1 prefill pair. None of these graphs carries an
 /// `AttnDecode`; the pair still must describe the graph it is handed, and it does.
-fn superdsc_pair_of_one_request(m: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
-    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(m)
+fn superdsc_pair_of_one_request(m: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
+    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(m)
             .expect("the fixture's row count is nonzero"),
-        scratchy_subtile::sdsc_abstract::RungCap::ONE,
+        ktir_superdsc::sdsc_abstract::RungCap::ONE,
     )
     .expect("one request's rows fit a u32")
 }

@@ -327,7 +327,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 /// answer nothing again (#587). Used by [`serve`] as the `axum::serve`
 /// graceful-shutdown future so the server loop RETURNS on a catchable signal
 /// instead of being terminated by the default disposition — which lets the
-/// engine/worker teardown run (`InprocClient::Drop -> worker.shutdown()`), ending the Metal
+/// engine/worker teardown run (`InprocClient::Drop -> worker.shutdown()`), ending the device
 /// residency set and releasing system-wired GPU memory deterministically.
 ///
 /// Note: `kill -9` (SIGKILL) is uncatchable and bypasses this entirely — the
@@ -574,11 +574,10 @@ async fn is_sleeping_endpoint(
 ///
 /// Returns current GPU memory usage (for testing sleep/wake).
 async fn gpu_memory_endpoint() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use scratchy_serving_worker::worker_factory::WorkerFactory;
-    // Query whichever backend is registered for this build; backends that can't
-    // report device memory (or a no-GPU build) yield zeros.
-    let (free, total) = inventory::iter::<&dyn WorkerFactory>()
-        .find_map(|f| f.device_memory_free_total())
+    // Query the backend this binary links; one that can't report device memory yields zeros.
+    let (free, total) = scratchy_serving_worker::worker_factory::linked_factory()
+        .ok()
+        .and_then(|f| f.device_memory_free_total())
         .unwrap_or((0, 0));
     let used = total.saturating_sub(free);
     Ok(Json(serde_json::json!({

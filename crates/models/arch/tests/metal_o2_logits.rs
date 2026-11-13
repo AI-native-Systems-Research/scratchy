@@ -31,9 +31,7 @@ use std::sync::Arc;
 
 use scratchy_core_config::{LayerKvGeometry, compact_kv_layer_to_tensor, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
-use scratchy_forward_compiler::{
-    ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
-};
+use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value};
 use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
 use scratchy_target_metal::interpreter::metal::{
     BLOCKS_PER_CHUNK, MetalDtype, MetalRungs, TerminalReads,
@@ -45,6 +43,7 @@ use scratchy_target_metal::{
     DType, ForwardCtx, ForwardCtxHandle, ForwardDeviceHandle, GpuDevice, GpuTensor, MetalAllocator,
     MetalMem, PoolMem, TensorView, detect_device,
 };
+use scratchy_target_metal::{MetalWeights, try_load};
 use sha2::{Digest, Sha256};
 
 /// How the baked tapes are played for one step. The tape itself is fixed at expansion; this picks
@@ -52,7 +51,7 @@ use sha2::{Digest, Sha256};
 /// prompts and required to give identical bytes.
 #[derive(Clone, Copy, Debug)]
 enum ExecPath {
-    /// One MTL4 dispatch per tape command (`ScratchyWeights::forward_with_metal_followup`).
+    /// One MTL4 dispatch per tape command (`MetalWeights::forward_with_metal_followup`).
     Dispatch,
 }
 
@@ -205,7 +204,7 @@ fn snapshot_dir(repo: &str) -> PathBuf {
 
 /// A loaded model plus the runtime state one sequence needs.
 struct Loaded {
-    model: Box<dyn ScratchyWeights>,
+    model: Box<dyn MetalWeights>,
     gpu: GpuDevice,
     kv: KvCachePool,
     /// Backing buffers of `kv`'s chunks; must outlive the pool.
@@ -264,9 +263,9 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
         // (stem, preset) pair describes this checkpoint.
         miss => {
             let linked: Vec<&str> = scratchy_forward_compiler::inventory::iter::<
-                scratchy_forward_compiler::ScratchyArchRegistration,
+                scratchy_target_metal::MetalArchRegistration,
             >()
-            .map(|r| r.arch_name)
+            .map(|r| r.0.arch_name)
             .collect();
             let why = match miss {
                 ArchLoad::ArchNotCompiled => "this build compiles no variant of that arch",

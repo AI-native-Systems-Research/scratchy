@@ -25,14 +25,14 @@
 //! `maxDimSizes_` / the per-core start addresses out of the op the builder emitted. A lock that
 //! recomputes the address it checks is testing its own arithmetic.
 
+use ktir_superdsc::addr::{DevOff, Head, Idx, Nest, Row, Shape, Slabs};
 use ktir_superdsc::emit;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_placed};
-use scratchy_subtile::addr::{DevOff, Head, Idx, Nest, Row, Shape, Slabs};
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     KernelTag, Lanes, MatK, MatM, MatN, MatY, OperandPlacement, PagedKvPool, QueryRowCount,
     RowBlockedTag, StickLayout, Stk,
 };
-use scratchy_subtile::superdsc_opspec::Df;
+use ktir_superdsc::superdsc_opspec::Df;
 
 const NKVH: u32 = 8;
 const STICK: u32 = 64;

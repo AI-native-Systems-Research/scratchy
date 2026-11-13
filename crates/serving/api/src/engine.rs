@@ -1136,8 +1136,8 @@ impl AsyncEngine {
         request: protocol::ChatCompletionRequest,
     ) -> ServeResult<(String, String, mpsc::UnboundedReceiver<StreamDelta>)> {
         // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE). The device side is instrumented down to the
-        // microsecond by SCRATCHY_SDSC_PHASE_TIME, but everything BEFORE `submit_time` — chat-template
-        // render + tokenize — was invisible, and on SuperDSC that gap is a third of TTFT. This stamps
+        // microsecond by the worker's own phase timer, but everything BEFORE `submit_time` — chat-template
+        // render + tokenize — was invisible, and that gap has measured a third of TTFT. This stamps
         // arrival so the `[ttft-host] prep=` line below can price it; the matching
         // `submit_to_first_token=` line is emitted where the first token lands. prep + submit_to_first
         // accounts for everything except HTTP/SSE framing and the client's own handling.
@@ -2201,7 +2201,7 @@ impl AsyncEngine {
 
         // ⭐ #916 — THE DRAIN DOOR, WIRED INTO THE SERVER'S OWN EXECUTOR
         // THREAD. Without it a worker that defers a pure decode's collect
-        // (spyre) has no thread to knock: `execute_model` drained every step
+        // has no thread to knock: `execute_model` drained every step
         // in-call, so step N+1 was submitted only after N landed — card depth
         // 1, ~15% idle measured on the a2 lanes. The door is the same shape
         // the pipelined client hands its executor (`InprocClient::
@@ -2574,7 +2574,7 @@ impl AsyncEngine {
         // ⛔ A PROMPT LONGER THAN THE MODEL'S CONTEXT IS REJECTED HERE, ALONE.
         //
         // `max_model_len` is already capped to what the backend's paged attention can ADDRESS
-        // (`init_cache` -> `Worker::kv_max_addressable_tokens`; spyre logs
+        // (`init_cache` -> `Worker::kv_max_addressable_tokens`; a fixed pool logs e.g.
         // "Capping max_model_len 131072 -> 1536"). Nothing compared a request against it, so an over-long
         // prompt was ADMITTED and only discovered deep in the worker — measured on granite-3.1-8b: a
         // 1986-token request in a 1536-token model came back `status=200` with ZERO tokens while the
@@ -3867,7 +3867,7 @@ enum ExecutorResult {
 /// `serve` returning, which can drop the loop's task before its own tail
 /// runs). [`Drop`] closes the channel first — the executor thread's cue to
 /// run `executor.shutdown()` (see `executor_thread_loop`) — then joins, so
-/// the worker shutdown the thread performs (the metal aligned-sidecar
+/// the worker shutdown the thread performs (an aligned-sidecar
 /// drain, the GPU residency release) completes before whatever dropped this
 /// proceeds. The sender is `Option` only so `Drop` can take it; the thread
 /// handle likewise. Mirrors the `InprocClient` pipeline's own
@@ -3907,7 +3907,7 @@ fn executor_thread_loop(
     mut rx: tokio::sync::mpsc::Receiver<ExecutorWork>,
     tx: tokio::sync::mpsc::Sender<ExecutorResult>,
 ) {
-    // First act: run where the executor's devices want their driver (a spyre worker: its cards'
+    // First act: run where the executor's devices want their driver (a multi-card worker: its cards'
     // NUMA node). A refusal ends the thread by name, through the same teardown as every exit.
     if let Err(e) = executor.pin_driving_thread() {
         error!("executor thread: {e}");
@@ -3963,7 +3963,7 @@ fn executor_thread_loop(
     // racing the loop's own wake-and-break (its tail sends `Shutdown`
     // only if it gets to run first), so the executor thread used to see a
     // closed channel and exit silently, skipping `worker.shutdown()`.
-    // Measured consequence: the metal worker's aligned-sidecar drain never
+    // Measured consequence: the worker's aligned-sidecar drain never
     // ran — the background writer was killed mid-write and its build
     // discarded, so every launch re-paid the cold realign copy (#411) —
     // and the wired GPU residency was left to the kernel's intermittent
@@ -7401,7 +7401,7 @@ mod tests {
         }
     }
 
-    /// A spyre-shaped executor: every step DEFERS once the engine has handed it a drain door —
+    /// A deferring executor: every step DEFERS once the engine has handed it a drain door —
     /// the resolver knocks the door, then parks on the step's `DrainCell` — and `drain_until`
     /// answers the queue's oldest unfilled cell, the order a device's steps land in. With no
     /// door it resolves in the call (depth 1), which is what `scr serve`'s loop did before it
@@ -7438,7 +7438,7 @@ mod tests {
             let output = self.inner.execute_model(scheduler_output)?;
             let Some(door) = self.door.clone() else {
                 // No door, no deferral: the step's tokens resolve in the call, the card runs
-                // at depth 1 — spyre's pure decode on `scr serve` before the wiring.
+                // at depth 1 — a deferring worker's pure decode on `scr serve` before the wiring.
                 return Ok(output);
             };
             let tokens = output.sampled_token_ids.into_iter().flatten().collect();
@@ -7491,7 +7491,7 @@ mod tests {
         }
 
         /// A shutdown never leaves a resolver parked: every step still in flight is answered
-        /// with its failure, as spyre's shutdown error-fills its in-flight cells.
+        /// with its failure, as a deferring worker's shutdown error-fills its in-flight cells.
         fn shutdown(&mut self) {
             for (cell, _, step) in self.pending.iter().filter(|(c, _, _)| !c.is_filled()) {
                 cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
@@ -7570,7 +7570,7 @@ mod tests {
 
     /// The server's step loop hands its executor the drain door, so a deferred step's resolver
     /// can knock and the step BEHIND it is already executing — depth 2, not the in-call drain
-    /// that kept a deferring worker (spyre's pure decode on `scr serve`) at depth 1. Without
+    /// that kept a deferring worker's pure decode on `scr serve` at depth 1. Without
     /// the wiring the executor is never handed a door, so it never defers and no resolver is
     /// ever answered — both assertions below fail on that base.
     ///

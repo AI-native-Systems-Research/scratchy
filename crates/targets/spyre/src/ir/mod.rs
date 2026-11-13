@@ -34,7 +34,7 @@
 //!    computation hasn't settled on yet.
 //!
 //! `island::subtile_tape` and `island::sdsc_op` are THIN RE-EXPORT SHIMS pointing at their real,
-//! pre-existing definitions (`scratchy_subtile::subtile_tape`, `scratchy_subtile::superdsc_opspec`/
+//! pre-existing definitions (`scratchy_subtile::subtile_tape`, `ktir_superdsc::superdsc_opspec`/
 //! `crate::lower_subtile_tape_to_superdsc::EmittedOp`) — those types are NOT owned by this tree and are
 //! shared with code outside it (the cuda megakernel pipeline reads `SubtileTape` directly). Only
 //! `island::tile_op` and `island::tiled_op` are new types that live here for real.

@@ -223,12 +223,6 @@ impl LLMBuilder {
         }
     }
 
-    /// Set the device ("cpu", "metal", "spyre", "auto").
-    pub fn device(mut self, device: impl Into<String>) -> Self {
-        self.config.device = device.into();
-        self
-    }
-
     /// Set the drafts a speculative step proposes: with the target's compiled
     /// multi-token-prediction head, `0` turns it off.
     pub fn num_speculative_tokens(mut self, k: usize) -> Self {
@@ -243,7 +237,7 @@ impl LLMBuilder {
     }
 
     /// Set the KV cache dtype ("auto", "fp16", "turboquant", "fp8_e4m3").
-    /// On metal the codec is fixed when the model is built (the `turboquant`
+    /// On a backend that bakes the codec it is fixed when the model is built (the `turboquant`
     /// feature): "auto" takes it, "fp16" / "turboquant" assert it and the
     /// engine refuses to start on a mismatch — assert "fp16" where a lossless
     /// KV cache is required (relocatable spans / rope-on-read transparency).
@@ -426,14 +420,13 @@ impl LLM {
     /// Internal constructor from a fully-specified config.
     fn from_config(mut config: VllmConfig) -> Result<Self> {
         // Disable prefix caching for any backend whose worker can't honor it
-        // (spyre keeps a per-request KV cache — see `WorkerFactory::
+        // (e.g. one that keeps a per-request KV cache — see `WorkerFactory::
         // supports_prefix_caching`). Otherwise the scheduler reports a cached
         // prefix the worker has no KV for and the forward desyncs. Done here,
         // before the scheduler/cache are built from `config`.
         if config.enable_prefix_caching
-            && inventory::iter::<&dyn scratchy_serving_engine::worker_factory::WorkerFactory>()
-                .find(|f| f.matches(&config.device))
-                .is_some_and(|f| !f.supports_prefix_caching())
+            && scratchy_serving_engine::worker_factory::linked_factory()
+                .is_ok_and(|f| !f.supports_prefix_caching())
         {
             config.enable_prefix_caching = false;
         }
@@ -1065,7 +1058,7 @@ impl LLM {
 
         // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE). `scr chat <model>` runs IN-PROCESS through here,
         // not through the HTTP server, so none of the server-side timers see it. The device side is
-        // priced to the microsecond by SCRATCHY_SDSC_PHASE_TIME; this prices everything around it, so
+        // priced to the microsecond by the worker's own phase timer; this prices everything around it, so
         // render+tokenize+submit+to_first_token accounts for the whole of the CLI's reported TTFT.
         let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
         let _t_render = std::time::Instant::now();
@@ -1172,7 +1165,7 @@ impl LLM {
                     first_token_at.get_or_insert(std::time::Instant::now());
                 }
                 if ttft_phase && all_token_ids.is_empty() && !output.new_token_ids.is_empty() {
-                    // `to_first_token` is queue + prefill forward(s) + sample; the SDSC phase lines
+                    // `to_first_token` is queue + prefill forward(s) + sample; the worker's phase lines
                     // sit inside it, so the difference is the engine/scheduler overhead around them.
                     eprintln!(
                         "[ttft-host] render={:.2}  tokenize={:.2}  submit={:.2}  to_first_token={:.2}  \
@@ -1369,7 +1362,6 @@ mod tests {
     fn test_builder_defaults() {
         let builder = LLMBuilder::new("test-model");
         assert_eq!(builder.config.model, "test-model");
-        assert_eq!(builder.config.device, "auto");
         assert_eq!(builder.config.dtype, "auto");
         // Unset by default: the BACKEND decides the width (resolve_max_num_seqs), not a CLI literal.
         assert_eq!(builder.config.max_num_seqs, None);
@@ -1380,14 +1372,12 @@ mod tests {
     #[test]
     fn test_builder_chaining() {
         let builder = LLMBuilder::new("test-model")
-            .device("cpu")
             .dtype("float16")
             .max_model_len(2048)
             .max_num_seqs(32)
             .block_size(8)
             .gpu_memory_utilization(0.5);
 
-        assert_eq!(builder.config.device, "cpu");
         assert_eq!(builder.config.dtype, "float16");
         assert_eq!(builder.config.max_model_len, Some(2048));
         assert_eq!(builder.config.max_num_seqs, Some(32));

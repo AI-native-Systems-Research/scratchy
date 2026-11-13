@@ -133,9 +133,6 @@ fn get_build_features() -> String {
     if cfg!(feature = "metal") {
         features.push("metal");
     }
-    if cfg!(feature = "spyre") {
-        features.push("spyre");
-    }
     if cfg!(feature = "guided-decoding") {
         features.push("guided-decoding");
     }

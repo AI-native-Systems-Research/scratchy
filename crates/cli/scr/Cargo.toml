@@ -31,7 +31,7 @@ default = ["chat", "model?/hf-completions"]
 
 # The in-process ENGINE (local model inference), no HTTP server: `scr chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
-# feature, so no axum), which brings scratchy-serving-worker with it.
+# feature, so no axum). A backend feature adds the target's worker.
 chat = ["dep:scratchy-serving-api"]
 # The OpenAI/Anthropic HTTP server ON TOP of the engine: `scr serve` (and the
 # offline `batch` command). Adds axum/tower via scratchy-serving-api/serve.
@@ -50,14 +50,13 @@ bench = ["scratchy-bench"]
 # The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
 # serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
 bench-datasets = ["bench", "scratchy-bench/datasets"]
-# `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
+# `dep:scratchy-forward-compiler` surfaces
 # `BackboneDumpRegistration` + `Instruction::normalize` so
-# `scr model info` works on metal builds. Backends enable the ENGINE (via scratchy-serving-api/
-# <backend>), not the HTTP server — a backend is only meaningful with local
+# `scr model info` works on metal builds. Backends enable the ENGINE and their target's worker,
+# not the HTTP server — a backend is only meaningful with local
 # inference.
 #
-# `metal` is `metal-base` with two scratchy-models features on, both off for
-# spyre. They are named here, not as features of this crate:
+# `metal` is `metal-base` with two scratchy-models features on. They are named here, not as features of this crate:
 # `model/<feature>` already reaches every scratchy-models feature (see
 # `tests/arch_feature_passthrough.rs`).
 #
@@ -76,43 +75,19 @@ bench-datasets = ["bench", "scratchy-bench/datasets"]
 #
 # `metal-base` alone builds the same engine with a dense KV cache and no MTP
 # heads; add `model/mtp-heads` back for drafting over a dense cache.
-metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+metal-base = ["dep:scratchy-serving-api", "dep:scratchy-target-metal-worker", "dep:scratchy-forward-compiler"]
 metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
-# IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
-# GPU toolchain and NO device — neither a card nor the host emulator. On its own it
-# builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
-# get something that can actually run a model.
-spyre = ["scratchy-serving-api/spyre"]
-# ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
-# REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
-# not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never
-# true, so a real-card build silently shipped WITHOUT the guard and rustc reported an
-# `unexpected cfg value`. The emulator does not imply it.
-spyre-hw = [
-  "spyre",
-  "scratchy-serving-api/spyre-hw",
-  # `scr bundle run`: the executor and the bundle types, directly.
-  "dep:scratchy-target-spyre",
-  "scratchy-target-spyre/spyre-hw",
-]
-spyre-emu = ["scratchy-serving-api/spyre-emu"]
-# The FFI link route is a property of the LINKED ARCHIVES, not a feature
-# of this crate: flex-rs's build script links libflex_shim.a and
-# libsenlib_oco.a statically from SENLIB_STATIC_LIB_DIR at build, so a
-# spyre-hw binary embeds them — the executable itself is the record of
-# what ran, and an internal artifact. The former `--features spyre-hw,oco-so`
-# chain is gone with the path dependency that forwarded it.
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
 # build grammar support into a non-`serve` binary.
-guided-decoding = ["scratchy-serving-api?/guided-decoding"]
+guided-decoding = ["scratchy-serving-api?/guided-decoding", "scratchy-target-metal-worker?/guided-decoding"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
 # its `scratchy-vision`/`image` deps optional-and-on, forwards
-# `scratchy-forward-compiler/vision` + `scratchy-serving-worker/vision`
-# (which enables it on whichever backend target is active), so a plain
+# `scratchy-forward-compiler/vision`, and the metal worker's `vision`
+# when that target is linked, so a plain
 # `chat` build (no `multimodal`) never compiles image/png/zune-jpeg/etc.
-multimodal = ["scratchy-serving-api?/multimodal"]
+multimodal = ["scratchy-serving-api?/multimodal", "scratchy-target-metal-worker?/vision"]
 tls = ["scratchy-serving-api?/tls"]
 metrics = ["scratchy-serving-api?/metrics"]
 # EXPERIMENTAL, off by default, and deliberately not a `scr serve` flag: see
@@ -137,15 +112,19 @@ rag = ["scratchy-serving-api?/rag"]
 # (`default-features = false` below) — naming zero is a build-time panic,
 # not a silently empty binary.
 
+# The shared commands, as a library a target's own binary runs them through.
+[lib]
+name = "scratchy_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "scr"
 path = "src/main.rs"
 
 [dependencies]
-# `scr bundle run` ONLY. Every other spyre path in this binary goes through the serving crates;
-# launching a bundle this binary did not bake needs the executor and the bundle types directly, and
-# those live in the target crate. Optional, and reachable only under `spyre-hw`.
-scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
+# The target's worker: the `WorkerFactory` the engine serves through. The engine never names a
+# concrete worker, so `main.rs` anchors it with an `extern crate ... as _`.
+scratchy-target-metal-worker = { workspace = true, optional = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-serving-api = { workspace = true, optional = true }
@@ -154,13 +133,17 @@ scratchy-forward-compiler = { path = "../../compiler", optional = true }
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
 # Purely for CLI feature-reachability, like `quant` below: `--features spec/mtp`
 # compiles the MTP head of every selected model that has one. scratchy-spec's
-# features forward to scratchy-models (this same `model` instance), so this is
-# a regular-dependency edge, not a build-dependency one.
+# features forward to scratchy-models (this same `model` instance).
 spec = { package = "scratchy-spec", path = "../../models/spec", optional = true }
-# Purely for CLI feature-reachability, like `spec`: `--features tp/2` bakes the two-rank
-# tensor-parallel world of every selected model. scratchy-tp's features forward to scratchy-models
-# (this same `model` instance).
-tp = { package = "scratchy-tp", path = "../../models/tp", optional = true }
+# Purely for CLI feature-reachability — nothing here calls into
+# scratchy-quantizations directly. Quant-preset build scope (no `quant-`
+# text prefix on the feature names — the alias already says that) lives on
+# that crate, not on `model` (scratchy-models), because Cargo forbids
+# aliasing one crate under two different names — `model` and `quant` have
+# to be two different crates. scratchy-models depends on this same crate
+# and its build script reads the enabled presets from it, so
+# `--features quant/mlx-affine-b4-g32` lands on the instance it reads.
+quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -174,19 +157,6 @@ libc = { workspace = true }
 # and `scr complete` are always built, and ureq is already in the tree via
 # hf-hub-downloader, so they cost no additional crates.
 ureq = { workspace = true }
-
-# Purely for CLI feature-reachability — nothing here calls into
-# scratchy-quantizations directly. Quant-preset build scope (no `quant-`
-# text prefix on the feature names — the alias already says that) lives on
-# that crate, not on `model` (scratchy-models), because Cargo forbids
-# aliasing one crate under two different names — `model` and `quant` have
-# to be two different crates. scratchy-models already depends on this same
-# crate as BOTH a regular dependency (runtime preset loading) and a
-# build-dependency (its own build script reads compile-time quant scope
-# from it); this build-dependency edge unifies with that one so
-# `--features quant/mlx-affine-b4-g32` reaches the same instance.
-[build-dependencies]
-quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

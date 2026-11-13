@@ -528,8 +528,8 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// (`{"name", "parameters"}`), with the array's brackets and commas never text.
 ///
 /// ⛔ BUT ONLY A REPLY IN THAT SHAPE IS READ AS ONE. A worker applies a grammar best-effort: it
-/// decodes unconstrained, with a warning, when the grammar won't compile, and the Spyre worker
-/// applies none. A reply is the grammar's only if it opens with `[` and then `{`, as the grammar
+/// decodes unconstrained, with a warning, when the grammar won't compile, and a worker without
+/// grammar support applies none. A reply is the grammar's only if it opens with `[` and then `{`, as the grammar
 /// writes it (an unconstrained reply may put whitespace before either); any other, Mistral's
 /// `[TOOL_CALLS]` and a pythonic
 /// `[f(…)]` among them, is read by `fallback`, the engine's own parser, as `"auto"` would read it,
@@ -3168,7 +3168,7 @@ mod tests {
     }
 
     /// A reply the grammar didn't shape, as when a worker decodes unconstrained because the grammar
-    /// won't compile, or applies none (Spyre), is the engine's parser's to read, as `"auto"`
+    /// won't compile, or applies none (no grammar support), is the engine's parser's to read, as `"auto"`
     /// would read it, whole or streamed. With no engine parser, it is text. Either way its calls
     /// and text are kept, never dropped as the array's punctuation would be.
     #[test]

@@ -61,11 +61,11 @@ use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, Pa
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's
 /// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
-fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
-    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
         std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
             .expect("a fixture pool has heads"),
-        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
             u32::try_from(hd).expect("a fixture head width fits a u32"),
         ),
     )

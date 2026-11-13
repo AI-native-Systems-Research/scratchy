@@ -918,10 +918,10 @@ pub struct LoweredBucket {
     /// means a concurrency-aware backend (today: metal MTL4
     /// encoder) must serialize the dispatched instance against
     /// every prior instance in the bucket. Computed at macro time —
-    /// runtime never re-derives. Read only by metal's codegen — under
-    /// `spyre` the tape path writes this field but never reads it, and
+    /// runtime never re-derives. Read only by metal's codegen — in a
+    /// build without it the tape path writes this field but never reads it, and
     /// that is EXPECTED.
-    #[cfg_attr(feature = "spyre", expect(dead_code))]
+    #[cfg_attr(not(feature = "metal"), expect(dead_code))]
     pub barriers: Vec<bool>,
 }
 

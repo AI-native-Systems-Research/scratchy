@@ -1,0 +1,549 @@
+// SPDX-License-Identifier: Apache-2.0
+//! ⭐⭐⭐ THE PROGRAM, AS CONST TOKENS.
+//!
+//! A launch group carries the `IRFunction`s it runs, and `#[forward]` bakes them into the binary
+//! through `inventory::submit!`. That is what these emit: every operation, attribute, operand and
+//! nested region rendered as a Rust literal of `ktir-core`'s own types.
+//!
+//! ⛔ NOTHING IS SERIALIZED AND NOTHING IS PARSED. The value the lowering constructed and the value
+//! the device executes are the same value; these tokens are how it survives the compile, not an
+//! interchange format. There is no text form of a program at any point.
+//!
+//! ⭐ THE ENUM SPELLINGS ARE THE COMPILER'S TO CHECK. A variant is emitted by its own `Debug` name
+//! and lands in the generated source as a path, so a variant that does not exist is a build error
+//! at the use site rather than a string nobody validates.
+
+use quote::quote;
+
+/// ⭐ THE ALIASES THE RENDERED PROGRAMS USE. Every operation names its kind, its operands' `Ssa`,
+/// its attribute keys and its result type, so a fully-qualified path per reference is the dominant
+/// cost of the emission: `::scratchy_target_spyre::ktir::ir::Ssa` is nine tokens and forty
+/// characters wrapping one integer, and there are over a million of them.
+///
+/// MEASURED on llama-3.2-1b: 266,503 rendered operations. Aliasing collapses each path to a single
+/// token, which is a ~5x cut in both the generated source's size and the token count rustc parses
+/// and name-resolves.
+pub fn preamble() -> proc_macro2::TokenStream {
+    quote! {
+        #[allow(unused_imports)]
+        use ::scratchy_target_spyre::ktir::{
+            affine::{
+                AffineExpr as __KExpr, AffineMap as __KMap, AffineSet as __KSet,
+                Constraint as __KConstraint, ConstraintKind as __KSetKind,
+            },
+            attrkey::AttrKey as __KAttrKey,
+            dtypes::DType as __KDTy,
+            ir::{Attr as __KAttr, IRFunction as __KFn, Operation as __KOp, Ssa as __KSsa},
+            irtype::IrType as __KTy,
+            opkind::OpKind as __KOpKind,
+        };
+        #[allow(unused_imports)]
+        use ::scratchy_target_spyre::bundle_code::{
+            Elementwise as __KElem, LaunchProgram as __KProg, PlaceId as __KPlace,
+            Program as __KProgram, SynthRole as __KRole,
+        };
+        #[allow(unused_imports)]
+        use ::std::borrow::Cow::Borrowed as __KCow;
+    }
+}
+
+fn variant(name: String) -> proc_macro2::TokenStream {
+    let id = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
+    quote! { #id }
+}
+
+fn ssa(s: ktir_core::ir::Ssa) -> proc_macro2::TokenStream {
+    let n = proc_macro2::Literal::u32_unsuffixed(s.0);
+    quote! { __KSsa(#n) }
+}
+
+fn dtype(d: ktir_core::dtypes::DType) -> proc_macro2::TokenStream {
+    let v = variant(format!("{d:?}"));
+    quote! { __KDTy::#v }
+}
+
+fn opkind(k: ktir_core::opkind::OpKind) -> proc_macro2::TokenStream {
+    let v = variant(format!("{k:?}"));
+    quote! { __KOpKind::#v }
+}
+
+fn attrkey(k: ktir_core::attrkey::AttrKey) -> proc_macro2::TokenStream {
+    let v = variant(format!("{k:?}"));
+    quote! { __KAttrKey::#v }
+}
+
+/// ⛔ ±inf AND NaN ARE LEGAL VALUES AND ILLEGAL LITERALS. `Literal::f64_unsuffixed` asserts
+/// `is_finite`, but the programs the splice bakes carry real non-finite constants from TWO
+/// measured sources: the attention chain's `tl.max` lowers through `tt.reduce` →
+/// `ArithMaxnumf`, whose accumulator seed is `f32::NEG_INFINITY` (`to_ktir.rs`'s
+/// `combiner_identity`) — MEASURED: the `spyre,model/llama-3.2-1b` bake panicked at that
+/// assert, the first `#[forward]` expansion with attention, because the golden tests
+/// construct IR at runtime and never run the token bake — and the router chain's softmax
+/// `-inf` row-max init and argsort `+inf` NaN-sanitize are the same kind of constant
+/// (MEASURED: the gemma-4-26b parity-tiny build panicked at `f.is_finite()` on one). The
+/// non-finite spellings render as the std consts, which are the same f64s in a `const`-legal
+/// form; everything finite stays a literal.
+fn float(f: f64) -> proc_macro2::TokenStream {
+    if f.is_finite() {
+        let l = proc_macro2::Literal::f64_unsuffixed(f);
+        quote! { #l }
+    } else if f.is_nan() {
+        quote! { f64::NAN }
+    } else if f.is_sign_positive() {
+        quote! { f64::INFINITY }
+    } else {
+        quote! { f64::NEG_INFINITY }
+    }
+}
+
+fn ints(v: &[i64]) -> proc_macro2::TokenStream {
+    let it = v.iter().map(|i| proc_macro2::Literal::i64_unsuffixed(*i));
+    quote! { &[#(#it),*] }
+}
+
+fn ir_type(t: ktir_core::irtype::IrType<'_>) -> proc_macro2::TokenStream {
+    use ktir_core::irtype::IrType;
+    match t {
+        IrType::Tensor { dims, elem } => {
+            let (d, e) = (ints(dims), dtype(elem));
+            quote! { __KTy::Tensor { dims: #d, elem: #e } }
+        }
+        IrType::MemRef { dims, elem } => {
+            let (d, e) = (ints(dims), dtype(elem));
+            quote! { __KTy::MemRef { dims: #d, elem: #e } }
+        }
+        IrType::AccessTile { dims } => {
+            let d = ints(dims);
+            quote! { __KTy::AccessTile { dims: #d } }
+        }
+        IrType::Index => quote! { __KTy::Index },
+        IrType::Scalar(e) => {
+            let e = dtype(e);
+            quote! { __KTy::Scalar(#e) }
+        }
+    }
+}
+
+fn affine_expr(e: &ktir_core::affine::AffineExpr<'_>) -> proc_macro2::TokenStream {
+    use ktir_core::affine::AffineExpr as E;
+    let path = quote! { __KExpr };
+    match e {
+        E::Dim(i) => {
+            let i = proc_macro2::Literal::usize_unsuffixed(*i);
+            quote! { #path::Dim(#i) }
+        }
+        E::Sym(i) => {
+            let i = proc_macro2::Literal::usize_unsuffixed(*i);
+            quote! { #path::Sym(#i) }
+        }
+        E::Const(c) => {
+            let c = proc_macro2::Literal::i64_unsuffixed(*c);
+            quote! { #path::Const(#c) }
+        }
+        E::Ref(s) => quote! { #path::Ref(#s) },
+        E::Neg(a) => {
+            let a = affine_expr(a);
+            quote! { #path::Neg(&#a) }
+        }
+        E::Add(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::Add(&#a, &#b) }
+        }
+        E::Sub(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::Sub(&#a, &#b) }
+        }
+        E::Mul(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::Mul(&#a, &#b) }
+        }
+        E::FloorDiv(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::FloorDiv(&#a, &#b) }
+        }
+        E::Mod(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::Mod(&#a, &#b) }
+        }
+        E::Max(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::Max(&#a, &#b) }
+        }
+        E::Min(a, b) => {
+            let (a, b) = (affine_expr(a), affine_expr(b));
+            quote! { #path::Min(&#a, &#b) }
+        }
+    }
+}
+
+fn affine_map(m: &ktir_core::affine::AffineMap<'_>) -> proc_macro2::TokenStream {
+    let nd = proc_macro2::Literal::usize_unsuffixed(m.num_dims);
+    let ns = proc_macro2::Literal::usize_unsuffixed(m.num_syms);
+    let ex = m.exprs.iter().map(affine_expr);
+    quote! {
+        __KMap {
+            num_dims: #nd,
+            num_syms: #ns,
+            exprs: &[#(#ex),*],
+        }
+    }
+}
+
+/// A tile's constraint set, as literal tokens — the same shape [`affine_map`] emits,
+/// over the set's constraints instead of its result exprs.
+///
+/// ⭐ A TRITON-PRODUCED PROGRAM CARRIES THEM. The deleted builder's programs state a tile's
+/// coordinate set by its ABSENCE ("the full one", the arm below used to refuse), because
+/// `KtirFunc` never minted a partial window. The Triton ladder's
+/// `convert_ttir_to_ktdp` DOES: every `tt.make_tensor_descriptor` becomes a
+/// `ktdp.construct_memory_view` with a `CoordinateSet` range set, and every block load
+/// an `AccessTileSet`. Those attributes are part of the program the splice bakes, so
+/// the serializer states them rather than panicking on them. The MoE router's gathers
+/// state theirs the same way (an UNCONSTRAINED full box — the tile's own shape is the
+/// space); a set with real constraints is the same rendering.
+fn affine_set(s: &ktir_core::affine::AffineSet<'_>) -> proc_macro2::TokenStream {
+    let nd = proc_macro2::Literal::usize_unsuffixed(s.num_dims);
+    let ns = proc_macro2::Literal::usize_unsuffixed(s.num_syms);
+    let cs = s.constraints.iter().map(|c| {
+        let e = affine_expr(&c.expr);
+        let k = match c.kind {
+            ktir_core::affine::ConstraintKind::GreaterEq => quote! { __KSetKind::GreaterEq },
+            ktir_core::affine::ConstraintKind::Equal => quote! { __KSetKind::Equal },
+        };
+        quote! { __KConstraint { expr: #e, kind: #k } }
+    });
+    quote! {
+        __KSet {
+            num_dims: #nd,
+            num_syms: #ns,
+            constraints: &[#(#cs),*],
+        }
+    }
+}
+
+fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
+    use ktir_core::ir::Attr as A;
+    let path = quote! { __KAttr };
+    match a {
+        A::Int(i) => {
+            let i = proc_macro2::Literal::i64_unsuffixed(*i);
+            quote! { #path::Int(#i) }
+        }
+        A::Float(f) => {
+            let f = float(*f);
+            quote! { #path::Float(#f) }
+        }
+        A::IntList(v) => {
+            let v = ints(v);
+            quote! { #path::IntList(#v) }
+        }
+        A::Str(s) => quote! { #path::Str(#s) },
+        A::StrList(v) => {
+            let it = v.iter();
+            quote! { #path::StrList(&[#(#it),*]) }
+        }
+        A::Bool(b) => quote! { #path::Bool(#b) },
+        A::FloatList(v) => {
+            let it = v.iter().map(|f| float(*f));
+            quote! { #path::FloatList(&[#(#it),*]) }
+        }
+        A::Dtype(d) => {
+            let d = dtype(*d);
+            quote! { #path::Dtype(#d) }
+        }
+        A::Op(k) => {
+            let k = opkind(*k);
+            quote! { #path::Op(#k) }
+        }
+        A::Ssas(v) => {
+            let it = v.iter().map(|s| ssa(*s));
+            quote! { #path::Ssas(&[#(#it),*]) }
+        }
+        A::AffineMap(m) => {
+            let m = affine_map(m);
+            quote! { #path::AffineMap(#m) }
+        }
+        A::AffineMapList(v) => {
+            let it = v.iter().map(affine_map);
+            quote! { #path::AffineMapList(&[#(#it),*]) }
+        }
+        // An affine SET — see [`affine_set`]: the Triton ladder's tiles carry them, so
+        // they are stated; a producer whose set is the FULL coordinate set omits the
+        // attribute, and that absence means the same thing it always meant.
+        A::AffineSet(s) => {
+            let s = affine_set(s);
+            quote! { #path::AffineSet(#s) }
+        }
+    }
+}
+
+fn operation(op: &ktir_core::ir::Operation<'static>) -> proc_macro2::TokenStream {
+    let result = match op.result {
+        Some(r) => {
+            let r = ssa(r);
+            quote! { Some(#r) }
+        }
+        None => quote! { None },
+    };
+    let kind = opkind(op.op_type);
+    let operands = op.operands.iter().map(|s| ssa(*s));
+    let attrs = op.attributes.iter().map(|(k, v)| {
+        let (k, v) = (attrkey(*k), attr(v));
+        quote! { (#k, #v) }
+    });
+    let rty = match op.result_type {
+        Some(t) => {
+            let t = ir_type(t);
+            quote! { Some(#t) }
+        }
+        None => quote! { None },
+    };
+    let regions = op.regions.iter().map(|r| {
+        let ops = r.iter().map(operation);
+        quote! { &[#(#ops),*] as &[_] }
+    });
+    quote! {
+        __KOp {
+            result: #result,
+            op_type: #kind,
+            operands: &[#(#operands),*],
+            attributes: &[#(#attrs),*],
+            result_type: #rty,
+            regions: &[#(#regions),*],
+        }
+    }
+}
+
+/// One program of a launch group: its function, and which placed tensor each parameter carries.
+/// ⭐⭐⭐ ONE `const` PER DISTINCT PROGRAM, REFERENCED BY EVERY LAUNCH THAT RUNS IT.
+///
+/// A program is BUNDLE-INVARIANT: what a launch varies is the ADDRESSES it binds
+/// (`LaunchProgram::args`), never the operations. So the same `IRFunction` is reached by every rung
+/// of the decode ladder, every prefill rung, and every layer that shares a class — and rendering
+/// its operations inline at each of those sites emits the identical item once per site.
+///
+/// MEASURED on llama-3.2-1b: 33 distinct programs reached from 1,668 launches — 80 copies each —
+/// which rendered inline is a 337 MB generated source that rustc chews through single-threaded for
+/// ~25 minutes. Interning is not a size optimization on top of a working emission; at that scale
+/// the inline form is not a viable emission.
+#[derive(Default)]
+pub struct ProgramInterner {
+    /// Structural hash of the `IRFunction` → its index in `items`. `Operation` hashes by value —
+    /// kind, operands, attributes, result type and nested regions — so two entries collapse only
+    /// when the programs really are the same program.
+    seen: std::collections::HashMap<u64, usize>,
+    items: Vec<proc_macro2::TokenStream>,
+}
+
+impl ProgramInterner {
+    /// The `const` items to place at the top of the emission, in definition order.
+    pub fn items(&self) -> &[proc_macro2::TokenStream] {
+        &self.items
+    }
+
+    fn ident(&mut self, f: &ktir_core::ir::IRFunction<'static>) -> proc_macro2::Ident {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f.hash(&mut h);
+        let key = h.finish();
+        let n = self.items.len();
+        let idx = *self.seen.entry(key).or_insert(n);
+        let id = proc_macro2::Ident::new(
+            &format!("__KTIR_PROG_{idx}"),
+            proc_macro2::Span::call_site(),
+        );
+        if idx == n {
+            let body = function_tokens(f);
+            self.items.push(quote! {
+                const #id: __KFn<'static> = #body;
+            });
+        }
+        id
+    }
+}
+
+/// The function itself — every operation, rendered once.
+fn function_tokens(f: &ktir_core::ir::IRFunction<'static>) -> proc_macro2::TokenStream {
+    let name = f.name;
+    let args = f.arguments.iter().map(|(s, t)| {
+        let (s, t) = (ssa(*s), ir_type(*t));
+        quote! { (#s, #t) }
+    });
+    let ops = f.operations.iter().map(operation);
+    let (gx, gy, gz) = f.grid;
+    let [gx, gy, gz] = [gx, gy, gz].map(proc_macro2::Literal::usize_unsuffixed);
+    quote! {
+        __KFn {
+            name: #name,
+            arguments: &[#(#args),*],
+            operations: &[#(#ops),*],
+            grid: (#gx, #gy, #gz),
+            return_type: None,
+        }
+    }
+}
+
+/// ⭐ THE CARRIED KIND, AS TOKENS. [`LaunchProgram::program`] is a pure carry the hw runtime never
+/// reads, but the emitted `__KProg` literals must still FILL it — a struct literal with a missing
+/// field is an E0063 wall (2770 of them on the first compile that reached the emitted source).
+/// Unit variants ride the module's own Debug-name idiom; the three payload variants render their
+/// fields explicitly, unsuffixed, the same as every other literal here.
+///
+/// ⛔ NO `_` ARM: a new `Program` variant is a compile error at THIS match, the same
+/// completeness law `Elementwise::ALL`'s `declared_index` states — an emitter that silently
+/// dropped a new kind would lower it as nothing and the doors would never see it.
+fn program_kind_tokens(
+    p: &scratchy_target_spyre::bundle_code::Program,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::bundle_code::Program;
+    match p {
+        Program::Elementwise(e) => {
+            let v = variant(format!("{e:?}"));
+            quote! { __KProgram::Elementwise(__KElem::#v) }
+        }
+        Program::SiluMul => quote! { __KProgram::SiluMul },
+        Program::RmsNorm => quote! { __KProgram::RmsNorm },
+        Program::RmsNormUnit => quote! { __KProgram::RmsNormUnit },
+        Program::TanhSoftCap => quote! { __KProgram::TanhSoftCap },
+        Program::ScalarWeightMul => quote! { __KProgram::ScalarWeightMul },
+        Program::Reshape => quote! { __KProgram::Reshape },
+        Program::ScalarMul => quote! { __KProgram::ScalarMul },
+        Program::Matmul => quote! { __KProgram::Matmul },
+        Program::Sample => quote! { __KProgram::Sample },
+        Program::LmLast => quote! { __KProgram::LmLast },
+        Program::BlockCopy => quote! { __KProgram::BlockCopy },
+        Program::Rope => quote! { __KProgram::Rope },
+        Program::PagedAttn => quote! { __KProgram::PagedAttn },
+        Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
+        Program::Transpose => quote! { __KProgram::Transpose },
+        Program::EmbedRowGather { k } => {
+            let k = proc_macro2::Literal::u32_unsuffixed(*k);
+            quote! { __KProgram::EmbedRowGather { k: #k } }
+        }
+        Program::ChainStage {
+            pad_vocab,
+            table_rows,
+            k,
+            hidden,
+        } => {
+            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(*pad_vocab);
+            let table_rows = proc_macro2::Literal::u32_unsuffixed(*table_rows);
+            let k = proc_macro2::Literal::u32_unsuffixed(*k);
+            let hidden = proc_macro2::Literal::u32_unsuffixed(*hidden);
+            quote! {
+                __KProgram::ChainStage {
+                    pad_vocab: #pad_vocab,
+                    table_rows: #table_rows,
+                    k: #k,
+                    hidden: #hidden,
+                }
+            }
+        }
+        Program::WindowedRmsNorm { unit } => {
+            quote! { __KProgram::WindowedRmsNorm { unit: #unit } }
+        }
+    }
+}
+
+pub fn program_tokens(
+    p: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchProgram<'static>,
+    interner: &mut ProgramInterner,
+) -> proc_macro2::TokenStream {
+    let func = interner.ident(&p.func);
+    let prog = program_kind_tokens(&p.program);
+    let binds = p.args.iter().map(|(s, id)| {
+        let (s, id) = (ssa(*s), place_id_tokens(*id));
+        quote! { (#s, #id) }
+    });
+    // ⭐ THE PIN WINDOW THIS PROGRAM RUNS UNDER — the bundle layout's own `lx_window_fits`
+    // budget, carried as `Some(bytes)` exactly as the bake stamped it. `None` (no window was
+    // ever proven) round-trips as `None`: the resident fused path refuses it at load, and the
+    // refusal must survive the bake → inventory → worker trip.
+    let lxpw = match p.lx_pin_window_bytes {
+        Some(b) => {
+            let lit = proc_macro2::Literal::u64_unsuffixed(b);
+            quote! { ::core::option::Option::Some(#lit) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    quote! {
+        __KProg {
+            func: #func,
+            program: #prog,
+            args: __KCow(&[#(#binds),*]),
+            lx_pin_window_bytes: #lxpw,
+        }
+    }
+}
+
+/// The identity a parameter's address is bound through.
+fn place_id_tokens(
+    id: scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::PlaceId,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::PlaceId;
+    match id {
+        PlaceId::Act(t) => {
+            let t = proc_macro2::Literal::u32_unsuffixed(t);
+            quote! { __KPlace::Act(#t) }
+        }
+        PlaceId::Synth { of, role } => {
+            let of = proc_macro2::Literal::u32_unsuffixed(of);
+            let r = synth_role_tokens(role);
+            quote! { __KPlace::Synth { of: #of, role: #r } }
+        }
+        PlaceId::OpLocal { of, role } => {
+            let of = proc_macro2::Literal::u32_unsuffixed(of);
+            let r = crate::bake::op_local_role_tokens(&role);
+            quote! { __KPlace::OpLocal { of: #of, role: #r } }
+        }
+    }
+}
+
+fn synth_role_tokens(
+    role: scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::SynthRole,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::SynthRole as R;
+    let path = quote! { __KRole };
+    // The four INDEXED roles carry a block number; every other is a unit variant, emitted by name.
+    match role {
+        R::Blk(i) => {
+            let i = proc_macro2::Literal::u32_unsuffixed(i);
+            quote! { #path::Blk(#i) }
+        }
+        R::Acc(i) => {
+            let i = proc_macro2::Literal::u32_unsuffixed(i);
+            quote! { #path::Acc(#i) }
+        }
+        R::LBlk(i) => {
+            let i = proc_macro2::Literal::u32_unsuffixed(i);
+            quote! { #path::LBlk(#i) }
+        }
+        R::LAcc(i) => {
+            let i = proc_macro2::Literal::u32_unsuffixed(i);
+            quote! { #path::LAcc(#i) }
+        }
+        // The amax partial slot — indexed like the four above; the catch-all below would render
+        // `FqAmaxP(2)` from Debug, which is not an ident.
+        R::FqAmaxP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::FqAmaxP(#j) }
+        }
+        // The long-reduce partial slot — indexed like the four above, same reason.
+        R::ReducePartial(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::ReducePartial(#j) }
+        }
+        R::GatherKtLx(i) => {
+            let i = proc_macro2::Literal::u32_unsuffixed(i);
+            quote! { #path::GatherKtLx(#i) }
+        }
+        R::GatherVLx(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(h);
+            quote! { #path::GatherVLx(#h) }
+        }
+        other => {
+            let v = variant(format!("{other:?}"));
+            quote! { #path::#v }
+        }
+    }
+}

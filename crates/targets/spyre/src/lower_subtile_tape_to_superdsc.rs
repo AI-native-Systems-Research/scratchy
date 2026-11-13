@@ -69,17 +69,17 @@ pub use crate::lower_subtile_tape_to_ktir::{
 // the generated path must resolve through here. `KtirNode` is NOT re-exported: its only callers are in
 // this crate and they name the leaf directly.
 pub use ktir_superdsc::ktir_node::ActiveCap;
+use ktir_superdsc::superdsc_opspec::DataFormat;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR};
-use scratchy_subtile::superdsc_opspec::DataFormat;
 use std::collections::BTreeMap;
 
 // Re-export the hardware constants from the typed core so the whole emitter
 // shares ONE source of truth (the typed witnesses live in `superdsc_opspec`).
 // (`DataFormat` itself is brought into scope by the main `use` block above.)
-pub use scratchy_subtile::superdsc_opspec::ACTIVE_CORELETS;
+pub use ktir_superdsc::superdsc_opspec::ACTIVE_CORELETS;
 /// fp16 data format alias (the default). `Fp32` is used only by the fp32-SFP-merge split-K path;
 /// `SenInt8` only by the packed-int8 (SENINT8) quant weight path.
-pub use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Fp32, SenInt8};
+pub use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, Fp32, SenInt8};
 
 // Per-tensor dtype (`wordLength` / `stickSize_` / `dataFormat_`) is now the arg's typed [`Df`]
 // (`ArgView::df`), NOT a `_fp8`/`_fp32`/`_senint8` name substring. The old `word_length_for` /
@@ -598,7 +598,7 @@ pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The graph's query extents, minted by the bake — threaded, never re-derived here:
     // a registry walk that minted its own pair from graph rows would agree with the
     // graph yet state the wrong per-request width the day a packed prefill arrives.
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     let mut registry = scalar_registry(ir);
@@ -746,7 +746,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
     // The graph's query extents, minted by the bake — threaded to the registry walk below,
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -4085,9 +4085,9 @@ pub struct GateRung<'a> {
     /// so the gate stages the step against the reach the bundle was baked with.
     pub active_cap: ActiveCap,
     /// The rung's query extents — the pair the bake minted for the graph under test
-    /// ([`scratchy_subtile::sdsc_abstract::QueryExtent`]), so the gate lowers the
+    /// ([`ktir_superdsc::sdsc_abstract::QueryExtent`]), so the gate lowers the
     /// graph's nodes under the SAME extents the bundle was baked with.
-    pub query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    pub query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
     /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
     /// ranks at once ([`numeric_gate_sharded`]).
@@ -4995,7 +4995,7 @@ struct ShardedGate<'a, T: ktir_superdsc::collective::Tp, F: RopeForm> {
     fp: &'a str,
     cap: u32,
     active_cap: ActiveCap,
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
     scope: String,
 }
@@ -7449,11 +7449,11 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
 // from `scr chat` via the AoT bake — never a hand CLI.
 // ───────────────────────────────────────────────────────────────────────────
 
-// `SuperDscError` now lives in the shared leaf module [`scratchy_subtile::superdsc_error`]
+// `SuperDscError` now lives in the shared leaf module [`ktir_superdsc::superdsc_error`]
 // so the typed core (`superdsc_opspec::WorkPlan::time_tile_for_lx`) and this wire
 // module raise the SAME build-time error without a module cycle. Re-exported here
 // so every existing `superdsc::SuperDscError` path keeps resolving.
-pub use scratchy_subtile::superdsc_error::SuperDscError;
+pub use ktir_superdsc::superdsc_error::SuperDscError;
 
 // ⛔ `ds_name` IS GONE, AND ITS ABSENCE IS THE ONE-PATH INVARIANT MADE VISIBLE. It was the stable
 // per-tensor SuperDSC dataspace name taken from a `TensorRegion` (`t{id}`, collapsing the region), and
@@ -8315,7 +8315,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8342,16 +8342,16 @@ mod tests {
     // `KernelTag` names a WEIGHT-tile stick layout, which only the SuperDSC assemblers take — and
     // after the retarget those assemblers are reached from tests alone, so the import belongs here
     // rather than in the lowering's own prelude.
-    use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+    use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
 
     /// The extent pair the lowering calls below state for their graphs: one request of
     /// the graph's own row count — the S=1 prefill pair. None of these fixtures carries
     /// an `AttnDecode`; the pair still must describe the graph it is handed, and it does.
-    fn one_request_of(rows: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
-        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rows)
+    fn one_request_of(rows: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
+        ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(rows)
                 .expect("the fixture's row count is nonzero"),
-            scratchy_subtile::sdsc_abstract::RungCap::ONE,
+            ktir_superdsc::sdsc_abstract::RungCap::ONE,
         )
         .expect("one request's rows fit a u32")
     }
@@ -8362,7 +8362,7 @@ mod tests {
     // bundle layout it hands in, the folds it asks for), and moving them would have moved two test
     // rosters at once.
     use ktir_superdsc::emit::{emit_sdsc, rb, scaling_factor_const_fp32, sen169_bits};
-    use scratchy_subtile::superdsc_opspec::{
+    use ktir_superdsc::superdsc_opspec::{
         ItDim, OpFunc, OpInfo, Scale, SdscFoldSet, StickExtent, WorkPlan,
     };
 
@@ -9054,12 +9054,12 @@ mod tests {
             Some("y"),
             "a batch=16 matmul must carry a real y dim"
         );
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
-            one: scratchy_subtile::superdsc_opspec::EpilogueSpec {
+        op.attach_fused_epilogue(ktir_superdsc::superdsc_opspec::EpilogueSpecs {
+            one: ktir_superdsc::superdsc_opspec::EpilogueSpec {
                 operand_name: "mask".to_string(),
                 offset_elems: 0,
-                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
+                op_func: ktir_superdsc::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[("mb", ktir_superdsc::superdsc_opspec::Scale::RedNonStick)],
                 broadcast_batch: true,
             },
         });
@@ -9126,12 +9126,12 @@ mod tests {
             "a batch=1 matmul must carry no y dim at all"
         );
         // broadcast_batch: true must NOT panic despite there being no "y" to mark.
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
-            one: scratchy_subtile::superdsc_opspec::EpilogueSpec {
+        op.attach_fused_epilogue(ktir_superdsc::superdsc_opspec::EpilogueSpecs {
+            one: ktir_superdsc::superdsc_opspec::EpilogueSpec {
                 operand_name: "mask".to_string(),
                 offset_elems: 0,
-                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
+                op_func: ktir_superdsc::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[("mb", ktir_superdsc::superdsc_opspec::Scale::RedNonStick)],
                 broadcast_batch: true,
             },
         });
@@ -9158,11 +9158,11 @@ mod tests {
             1,
             "test assumes an untiled matmul (attach_fused_epilogue's precondition)"
         );
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
-            one: scratchy_subtile::superdsc_opspec::EpilogueSpec {
+        op.attach_fused_epilogue(ktir_superdsc::superdsc_opspec::EpilogueSpecs {
+            one: ktir_superdsc::superdsc_opspec::EpilogueSpec {
                 operand_name: "mask".to_string(),
                 offset_elems: 0,
-                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                op_func: ktir_superdsc::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                 broadcast_dims: &[],
                 broadcast_batch: false,
             },
@@ -9267,7 +9267,7 @@ mod tests {
             };
             (node, ir)
         };
-        let lower_at = |extent: scratchy_subtile::sdsc_abstract::QueryExtent| {
+        let lower_at = |extent: ktir_superdsc::sdsc_abstract::QueryExtent| {
             let m = extent.graph_rows().get();
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
@@ -9283,10 +9283,10 @@ mod tests {
         };
         let lower = |m: u32| lower_at(one_request_of(m));
         let packed_rung_of = |w: u32, s: u32| {
-            scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-                scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(w)
+            ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+                ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(w)
                     .expect("the fixture's width is nonzero"),
-                scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(s)
+                ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(s)
                     .expect("the fixture's request count fits a u32"),
             )
             .expect("the pair's product fits a u32")
@@ -10651,7 +10651,7 @@ mod tests {
 mod fingerprint_tests {
     use super::*;
     use ktir_superdsc::emit::rb;
-    use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+    use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
 
     /// ⭐ A BUNDLE IS ITS DESCRIPTORS. Two ops alike in every field the fingerprint hashed before —
     /// name, `time`, KTIR program and bindings (here none) — but lowered to different descriptors are

@@ -80,7 +80,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let reasoning_parser_name = args.reasoning_parser.clone();
 
     print_banner(env!("CARGO_PKG_VERSION"), &model);
-    info!("Device: {}, dtype: {}", args.device, args.dtype);
+    info!("dtype: {}", args.dtype);
     if let Some(ref spec_model) = args.speculative_model {
         if spec_model == "ngram" {
             info!(
@@ -110,7 +110,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     //    during model download / weight loading).
     let config = VllmConfig {
         model,
-        device: args.device.clone(),
         dtype: args.dtype.clone(),
         max_model_len: args.max_model_len,
         max_num_seqs: args.max_num_seqs,

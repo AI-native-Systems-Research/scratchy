@@ -3,11 +3,10 @@
 
 //! Backend-neutral worker construction via an `inventory` registry.
 //!
-//! Each backend (metal, spyre) registers a `WorkerFactory` with
-//! `inventory::submit!` in `scratchy-serving-worker`. `create_worker`
-//! (in `scratchy-serving-api`) selects the first factory whose
-//! [`WorkerFactory::matches`] accepts the device string, then calls
-//! [`WorkerFactory::create`] — no `#[cfg]` arms in the dispatch.
+//! Each backend registers a `WorkerFactory` with
+//! `inventory::submit!` in its target's worker crate, and a binary links exactly one target's
+//! worker, so [`linked_factory`] is THE factory: `create_worker` (in `scratchy-serving-api`) calls
+//! its [`WorkerFactory::create`] — no `#[cfg]` arms in the dispatch, and no device to select.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,10 +17,10 @@ use scratchy_core_model::weight::HfModelConfig;
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::worker::Worker;
 
-/// Configuration for a `MetalWorker` / `SpyreWorker`.
+/// Configuration for a backend's worker.
 ///
-/// Backend-neutral: lives in this neutral module (not the metal-gated
-/// `gpu_worker`) so the dispatch path — the `WorkerFactory` trait below and
+/// Backend-neutral: lives in this neutral module (not a target's
+/// worker crate) so the dispatch path — the `WorkerFactory` trait below and
 /// `create_worker` — compiles for every target, including ones without a GPU.
 #[derive(Debug, Clone)]
 pub struct WorkerCreateConfig {
@@ -87,7 +86,7 @@ pub struct WorkerCreateConfig {
     pub verify_seqs: VerifySeqs,
     /// Optional dtype override for the draft model's weights ("auto",
     /// "bfloat16", "float16", …). `None` inherits the target's dtype.
-    /// Currently passed through but the metal path always coerces to
+    /// Currently passed through, but the draft path coerces to
     /// bf16 to match the target — accepted for CLI parity with Python.
     pub draft_model_dtype: Option<String>,
 }
@@ -128,14 +127,11 @@ pub type WorkerCreationResult = (Box<dyn Worker>, HfModelConfig, Option<PathBuf>
 /// A progress callback the factory may wire into the worker during load.
 pub type ProgressCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
-/// A backend's worker constructor, registered via `inventory::submit!`.
-///
-/// Exactly one backend factory compiles per build (metal XOR spyre — they
-/// are `#[cfg]`-mutex), so `matches` overlap on `"auto"` carries no
-/// runtime ambiguity.
+/// A backend's worker constructor, registered via `inventory::submit!`. A binary links exactly
+/// one: the worker crate of its target ([`linked_factory`]).
 pub trait WorkerFactory: Sync {
-    /// Whether this backend handles the given device string.
-    fn matches(&self, device: &str) -> bool;
+    /// The target's name, for what the engine reports about its backend.
+    fn name(&self) -> &'static str;
 
     /// Construct → init → load → extract for this backend, returning the
     /// worker plus the metadata `initialize_core` needs.
@@ -153,7 +149,7 @@ pub trait WorkerFactory: Sync {
     }
 
     /// Recommended max working-set size (bytes) for the active backend, if the
-    /// backend exposes one (e.g. Metal's `recommendedMaxWorkingSetSize`).
+    /// backend exposes one (e.g. a device's recommended max working-set size).
     fn recommended_working_set_size(&self) -> Option<u64> {
         None
     }
@@ -165,8 +161,8 @@ pub trait WorkerFactory: Sync {
     }
 
     /// Whether this backend supports the engine's cross-request prefix cache.
-    /// `true` for the paged-KV GPU backend (metal). A backend whose worker
-    /// keeps a per-request KV cache (spyre — no shared/paged KV) cannot honor a
+    /// `true` for a paged-KV backend. A backend whose worker
+    /// keeps a per-request KV cache (no shared/paged KV) cannot honor a
     /// scheduler-reported cached prefix it has no KV for, so it returns `false`
     /// and the engine disables prefix caching for it.
     fn supports_prefix_caching(&self) -> bool {
@@ -177,10 +173,8 @@ pub trait WorkerFactory: Sync {
     /// decides it. `None` = the configured `--block-size` stands, which is every budget-sized GPU pool.
     ///
     /// ⛔ ASKED HERE BECAUSE THE ANSWER IS A BAKED CONSTANT OF THE POOL, and the engine cannot hold a
-    /// copy of it. `effective_block_size` used to answer with a literal `64` under
-    /// `#[cfg(feature = "spyre")]`, describing a pool (`[nblk, 64, nkv, hd]`) that has since been
-    /// replaced by one whose page is `PagedKvPool::POOL_PAGE_SLOTS` — two spellings of one quantity, four
-    /// crates apart, with a comment as the only thing claiming they agreed. The scheduler computes
+    /// copy of it: that would be two spellings of one quantity, crates apart, with a comment as the
+    /// only thing claiming they agreed. The scheduler computes
     /// `slot = block_id * block_size + offset` and the worker resolves `block_id` to a pool page, so a
     /// disagreement is not a policy difference: it is the scheduler and the worker naming different
     /// cells for one token, silently.
@@ -190,6 +184,31 @@ pub trait WorkerFactory: Sync {
 }
 
 inventory::collect!(&'static dyn WorkerFactory);
+
+/// THE factory this binary serves through: the one its target's worker crate registered. A binary
+/// links exactly one target's worker, so there is no device to choose; none (a binary that anchors
+/// no worker crate, or a linker that dropped its registration) or several (two targets linked into
+/// one binary) is a build defect, reported as such.
+pub fn linked_factory() -> anyhow::Result<&'static dyn WorkerFactory> {
+    let mut linked = inventory::iter::<&dyn WorkerFactory>();
+    let Some(factory) = linked.next() else {
+        anyhow::bail!(
+            "No inference backend is linked into this binary: no `WorkerFactory` is registered. \
+             A binary serves through the worker crate of its target, which it links and anchors \
+             with an `extern crate ... as _` so the linker keeps the factory's \
+             `inventory::submit!`."
+        );
+    };
+    if let Some(other) = linked.next() {
+        anyhow::bail!(
+            "Two inference backends are linked into this binary (`{}` and `{}`): a binary links \
+             exactly one target's worker.",
+            factory.name(),
+            other.name()
+        );
+    }
+    Ok(*factory)
+}
 
 pub use scratchy_core_model::hub::DownloadObserver;
 

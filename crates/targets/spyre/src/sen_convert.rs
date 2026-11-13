@@ -332,7 +332,7 @@ mod tests {
             -1.0e-8,
             f32::MAX,
         ]);
-        vals.push(scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG);
+        vals.push(ktir_superdsc::sdsc_abstract::ATTN_MASK_NEG);
         let mut s: u32 = 0x9E37_79B9;
         for _ in 0..(1 << 20) {
             s ^= s << 13;

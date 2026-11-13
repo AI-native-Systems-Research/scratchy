@@ -19,12 +19,14 @@ use crate::weights_manifest::WeightsManifest;
 use scratchy_forward_compiler_frontend::typed_emit;
 
 /// A DSL body (no decorator), classified as a decoder's, typed against `manifest` and traced.
+#[cfg(test)]
 pub(crate) fn trace_body(src: &str, manifest: &WeightsManifest) -> (Program, Inferred) {
     let ast = crate::parse_python::parse_body(src).expect("parse DSL");
     trace_ast(&ast, src, manifest)
 }
 
 /// [`trace_body`] for a body's parsed `ast` (`src` its text, for the emitted comments).
+#[cfg(test)]
 pub(crate) fn trace_ast(
     ast: &crate::ast::Ast,
     src: &str,

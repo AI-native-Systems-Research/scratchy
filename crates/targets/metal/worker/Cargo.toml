@@ -1,0 +1,39 @@
+[package]
+name = "scratchy-target-metal-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The metal worker: the serving `Worker` over the metal target, registered as a `WorkerFactory`"
+
+[features]
+default = []
+# Observability seams — the hooks live in the metal target; core-common carries the shared half.
+forward-telemetry = ["scratchy-target-metal/forward-telemetry", "scratchy-core-common/forward-telemetry"]
+sampler-telemetry = ["scratchy-target-metal/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
+# Multimodal capability, forwarded from `scr`'s `multimodal` feature.
+vision = ["scratchy-target-metal/vision"]
+guided-decoding = ["scratchy-serving-engine/guided-decoding", "scratchy-serving-worker/guided-decoding"]
+
+[dependencies]
+scratchy-target-metal = { path = ".." }
+scratchy-serving-worker = { workspace = true }
+scratchy-serving-engine = { workspace = true }
+scratchy-serving-scheduler = { workspace = true }
+scratchy-core-common = { workspace = true }
+scratchy-core-config = { workspace = true }
+scratchy-core-model = { workspace = true }
+scratchy-forward-compiler = { path = "../../../compiler" }
+scratchy-models = { path = "../../../models/arch", default-features = false, features = ["metal"] }
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandQueue", "MTLDevice", "MTLResource", "MTL4ArgumentTable"] }
+half = { workspace = true }
+tokenizers = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
+safetensors = { workspace = true }

@@ -22,7 +22,7 @@ scratchy-core-common = { path = "../../core/common" }
 scratchy-layers = { path = "../../layers" }
 scratchy-quantizations = { path = "../../models/quantization" }
 scratchy-ir = { path = "../../compiler/ir", features = ["metal"] }
-# The SHARED front end. Metal lowers the same `SubtileTape` spyre lowers — see
+# The SHARED front end. Metal lowers the same `SubtileTape` every target lowers — see
 # `src/from_tape.rs`. Target-specific lowering lives in the TARGET crate, which is why
 # this edge exists rather than a `metal_*` module inside the compiler.
 scratchy-subtile = { path = "../../compiler/subtile" }
@@ -31,7 +31,7 @@ scratchy-subtile = { path = "../../compiler/subtile" }
 # compiler's `metal` feature). Acyclic — the compiler no longer depends on this
 # crate (the interpreter re-export was severed), so this is the inverted edge
 # mirroring the cuda target's compiler dependency.
-scratchy-forward-compiler = { path = "../../compiler", features = ["metal"] }
+scratchy-forward-compiler = { path = "../../compiler" }
 # Pure-CPU vision host glue (VisionConfig / cu_seqlens / patch permute / window
 # dispatch) consumed by the relocated `vision_arch` module. Clean leaf.
 # Optional: gated by the `vision` feature above, not compiled into a
@@ -40,6 +40,8 @@ scratchy-vision = { path = "../../models/vision", optional = true }
 anyhow = "1"
 tracing = "0.1"
 memmap2 = "0.9"
+# The metal arch registry (`model::MetalArchRegistration`) every compiled arch submits to.
+inventory = { workspace = true }
 # Baked metallibs are embedded as zstd frames against one dictionary trained on the build's
 # metallibs (`aot::pack`), and decompressed when their library loads (`BakedMetallib`).
 zstd = { version = "0.14", default-features = false, features = ["zdict_builder"] }

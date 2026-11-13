@@ -7,6 +7,11 @@
 //! [`Client`] for sending HTTP requests, and assertion helpers for
 //! validating OpenAI-compatible responses.
 
+// Anchor the metal worker into the link: the in-process server resolves `--device` through the
+// `WorkerFactory` registry and never names a concrete worker.
+#[cfg(feature = "metal")]
+extern crate scratchy_target_metal_worker as _;
+
 pub mod assertions;
 pub mod client;
 pub mod server;

@@ -229,8 +229,8 @@ pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;
 pub mod dflash2;
-/// Metal lowered from the SHARED `SubtileTape` — the same artifact spyre lowers. Lives here,
-/// in the target crate, beside spyre's `lower_subtile_tape_to_superdsc`.
+/// Metal lowered from the SHARED `SubtileTape` — the same artifact every target lowers. Lives
+/// here, in the target crate: target-specific lowering never lives in the shared compiler.
 pub mod from_tape;
 pub mod grammar_mask;
 pub mod logprobs;
@@ -260,6 +260,9 @@ pub mod weights_metal;
 pub use weights_metal::MetalWeightsExt;
 pub mod metal_allocator;
 pub mod metal_mem;
+// A loaded model as metal runs it (`MetalWeights`), and the registry its loaders live in.
+pub mod model;
+pub use model::{MetalArchRegistration, MetalWeights, try_load};
 pub mod mtl4_dispatch;
 pub mod off_tape;
 pub mod owned_metal;

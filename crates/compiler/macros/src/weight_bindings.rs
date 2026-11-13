@@ -12,19 +12,19 @@
 //! target inherits it by construction rather than by re-deriving it.
 //!
 //! ⛔ WHY THIS EXISTS AT ALL. Without it the accessor set had one producer and
-//! it was target-locked: metal's instruction-stream bridge. Under spyre it is
-//! empty, so the emitted `Weights` struct carried NO weight fields — verified
+//! it was target-locked: metal's instruction-stream bridge. Under any other
+//! target it is empty, so the emitted `Weights` struct carried NO weight fields — verified
 //! in generated output:
 //!
 //! ```ignore
 //! pub struct Weights { pub rotary: RotaryCache }   // that is all
 //! ```
 //!
-//! and the spyre worker consequently re-found all 362 granite tensors at
+//! and that target's worker consequently re-found all 362 granite tensors at
 //! RUNTIME by string-formatting `"{disk}.weight"` off a JSON manifest. That
 //! string rule cannot express a bare `nn.Parameter` (gemma-4's `layer_scalar`,
 //! which has no `.weight` suffix) or a non-default decoder root
-//! (`model.language_model`), which is why gemma-4 could not run on spyre. The
+//! (`model.language_model`), which is why gemma-4 could not run there. The
 //! fix is not a better string rule; it is emitting the fields at all.
 
 use crate::classified::{Program, UnrollIndex, WeightId};
@@ -44,11 +44,11 @@ use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 /// that field's sources by splitting the name on `__fused__` — so the wrong answer is not a
 /// wrong flag, it is a field that resolves to no safetensors key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum MlpPacking {
+pub enum MlpPacking {
     /// ONE buffer holding both, named `{gate}__fused__{up}` — metal's fused-MLP kernel reads a
     /// single packed weight.
     Packed,
-    /// Two weights. Spyre's MLP is two matmuls plus a `SiluMul`, with no packed-buffer kernel.
+    /// Two weights: an MLP of two matmuls plus a `SiluMul`, with no packed-buffer kernel.
     Split,
 }
 
@@ -59,7 +59,7 @@ pub(crate) enum MlpPacking {
 /// wrong does not mis-name anything; it emits a `load` body that calls `load_affine_dequant` on
 /// a dense `Embedding`, which does not compile. That is the good case.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum EmbedStorage {
+pub enum EmbedStorage {
     Dense,
     AffineQuant,
 }
@@ -75,7 +75,7 @@ pub(crate) enum EmbedStorage {
 /// It is data, per CLAUDE.md: target facts are const tables the shared passes take as INPUT,
 /// never logic and never a second walk.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct WeightAbi {
+pub struct WeightAbi {
     pub mlp: MlpPacking,
     pub embed: EmbedStorage,
 }
@@ -255,248 +255,6 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
     })
 }
 
-/// Emit `superdsc_weights(&Weights) -> Vec<(u32, GpuTensor)>` — the id → FIELD
-/// binding, as generated code.
-///
-/// ⛔ THIS IS THE PIECE THAT LETS THE STRING PATH DIE. The worker's
-/// `load_weights` re-found every tensor at runtime by building
-/// `"{disk}.weight"` and asking the weight store for it, because nothing told
-/// it which struct field a source id meant. Only GENERATED code can name a
-/// GENERATED field, so this is emitted per model — the same reason metal's
-/// forward reads `wm.q_proj` rather than looking a name up.
-///
-/// ⛔ AND IT IS A `match` OVER REAL FIELDS, NOT A TABLE OF NAMES. A name here
-/// would just be the disk-key rule again in another spelling, with the same
-/// inability to express a bare `nn.Parameter` or a non-default decoder root.
-/// Because the arms are field accesses, a weight the struct does not have is a
-/// COMPILE error in generated code, not a `weight not found` at model load.
-/// ⭐ SPYRE ONLY, AND NAMED AS SUCH. This emits `superdsc_weights` — the id→field match the
-/// SuperDSC worker binds through. Metal reaches its weights by the accessor set alone and has no
-/// such function, so under metal this is dead rather than wrong.
-#[cfg(feature = "spyre")]
-pub(crate) fn emit_weight_bindings(
-    lowered: &LoweredDecode,
-    program: &Program,
-    tw: &TapeWeights,
-) -> Result<proc_macro2::TokenStream, String> {
-    use quote::quote;
-    // Function-scoped because every user is in this spyre-gated body: a
-    // module-level import would be dead under `-Fmetal` (b76516bab).
-    use scratchy_subtile::handoff::BundleTensor;
-    // Accessor name → how to reach that field on `w`. The three group shapes
-    // are the struct emitter's own (`Unindexed` ⇒ `w.base`,
-    // `LayeredContiguous` ⇒ `w.base[L]`, `LayeredSparse` ⇒ `w.base_L`), keyed
-    // by accessor name so one map covers all three.
-    let groups = crate::codegen::group_accessors_by_base(&tw.accessors);
-    let mut access: std::collections::BTreeMap<String, proc_macro2::TokenStream> =
-        Default::default();
-    for g in &groups {
-        let base = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
-        match g.kind {
-            crate::codegen::AccessorGroupKind::Unindexed => {
-                for (_, acc) in &g.entries {
-                    access.insert(acc.name.to_string(), quote! { w.#base });
-                }
-            }
-            crate::codegen::AccessorGroupKind::LayeredContiguous => {
-                for (idx, acc) in &g.entries {
-                    let l = proc_macro2::Literal::usize_unsuffixed(
-                        idx.map(|u| u.0 as usize).unwrap_or(0),
-                    );
-                    access.insert(acc.name.to_string(), quote! { w.#base[#l] });
-                }
-            }
-            crate::codegen::AccessorGroupKind::LayeredSparse => {
-                for (_, acc) in &g.entries {
-                    let f = &acc.name;
-                    access.insert(acc.name.to_string(), quote! { w.#f });
-                }
-            }
-        }
-    }
-
-    // Which externals are a GEMM's operand-1 — the fact that decides staged
-    // shape orientation. Computed HERE, from the tape, because it cannot be
-    // recovered downstream: a per-channel fp8 `weight_scale` is 2-D on disk
-    // and is NOT a gemm operand, so a rank test would mis-orient it.
-    let gemm_operands: std::collections::HashSet<usize> = lowered
-        .input
-        .ops
-        .iter()
-        .filter(|od| matches!(od.op, SubOp::MatmulTile { .. }))
-        .filter_map(|od| match od.inputs.get(1) {
-            Some(InputRef::Ext(e)) => Some(*e),
-            _ => None,
-        })
-        .collect();
-
-    let mut arms: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (i, b) in lowered.bindings().iter().enumerate() {
-        // Which tensor inside the field the source binds — `None` for the field's own
-        // primary tensor, `Some(..)` for a tensor of a MULTI-TENSOR bundle.
-        let mut bundle_tensor = None;
-        let (id, index, is_scale) = match b {
-            SourceBinding::Weight { id, index } => (WeightId(*id), *index, false),
-            SourceBinding::WeightScale { id, index } => (WeightId(*id), *index, true),
-            SourceBinding::BundleTensor { id, index, tensor } => {
-                bundle_tensor = Some(*tensor);
-                (WeightId(*id), *index, false)
-            }
-            _ => continue,
-        };
-        let name = crate::emit::weight_field_name(program, id, index).to_string();
-        let Some(expr) = access.get(&name) else {
-            return Err(format!(
-                "weight_bindings: source {i} binds `{name}`, which the Weights struct has no field \
-                 for — the accessor walk and the binding walk disagree"
-            ));
-        };
-        let kind = tw
-            .kind_of_field
-            .get(&name)
-            .ok_or_else(|| format!("weight_bindings: no kind recorded for field `{name}`"))?;
-        // How to reach the TENSOR inside the field. Per-kind, because the field
-        // types differ — a norm holds one tensor, a quantized linear holds a
-        // code tensor and a scale under a variant.
-        let tensor = match (kind, is_scale) {
-            (WeightKind::Fp8, false) => {
-                quote! { ::scratchy_target_spyre::wiring::fp8_weight(&#expr) }
-            }
-            (WeightKind::Fp8, true) => {
-                quote! { ::scratchy_target_spyre::wiring::fp8_scale(&#expr) }
-            }
-            (WeightKind::Linear, _) => {
-                quote! { ::scratchy_target_spyre::wiring::linear_weight(&#expr)? }
-            }
-            (WeightKind::RmsNorm | WeightKind::LayerNorm | WeightKind::Embedding, _) => {
-                quote! { #expr.weight }
-            }
-            // A MoE bundle's tensor: `bundle_tensor` names WHICH one (the source's own
-            // `BundleTensor`), and the wiring accessors are per-(kind, tensor) — one free
-            // function per combination, so an unmodelled combination is a MISSING arm here
-            // rather than a wrong-tensor guess.
-            (WeightKind::GemmaRouter, false) => match bundle_tensor {
-                Some(BundleTensor::RouterGate) => {
-                    quote! { ::scratchy_target_spyre::wiring::gemma_router_gate(&#expr) }
-                }
-                Some(BundleTensor::RouterPerExpertScale) => {
-                    quote! { ::scratchy_target_spyre::wiring::gemma_router_per_expert_scale(&#expr) }
-                }
-                Some(BundleTensor::RouterScale) => {
-                    quote! { ::scratchy_target_spyre::wiring::gemma_router_scale(&#expr) }
-                }
-                other => {
-                    return Err(format!(
-                        "weight_bindings: GemmaRouter field `{name}` binds bundle tensor \
-                         {other:?}, which is not a router tensor — the source and the field \
-                         kind disagree"
-                    ));
-                }
-            },
-            (WeightKind::GemmaSwitchGlu, false) => match bundle_tensor {
-                Some(BundleTensor::ExpertGateW) => {
-                    quote! { ::scratchy_target_spyre::wiring::switch_glu_gate_w(&#expr) }
-                }
-                Some(BundleTensor::ExpertGateS) => {
-                    quote! { ::scratchy_target_spyre::wiring::switch_glu_gate_s(&#expr) }
-                }
-                Some(BundleTensor::ExpertUpW) => {
-                    quote! { ::scratchy_target_spyre::wiring::switch_glu_up_w(&#expr) }
-                }
-                Some(BundleTensor::ExpertUpS) => {
-                    quote! { ::scratchy_target_spyre::wiring::switch_glu_up_s(&#expr) }
-                }
-                Some(BundleTensor::ExpertDownW) => {
-                    quote! { ::scratchy_target_spyre::wiring::switch_glu_down_w(&#expr) }
-                }
-                Some(BundleTensor::ExpertDownS) => {
-                    quote! { ::scratchy_target_spyre::wiring::switch_glu_down_s(&#expr) }
-                }
-                other => {
-                    return Err(format!(
-                        "weight_bindings: SwitchGluExperts field `{name}` binds bundle tensor \
-                         {other:?}, which is not an expert tensor — the source and the field \
-                         kind disagree"
-                    ));
-                }
-            },
-            (other, _) => {
-                return Err(format!(
-                    "weight_bindings: no staged-tensor accessor for weight kind {other:?} (field \
-                     `{name}`) — add its arm rather than letting the source bind nothing"
-                ));
-            }
-        };
-        // ⭐ A BUNDLE TENSOR'S GEMM-NESS IS THE TENSOR'S OWN FACT. `gemm_operands` reads
-        // `MatmulTile` operand-1 positions, which an expansion op never occupies — its matmuls are
-        // `ExpertMatmul`/`RouterLogits`, and their weight operands sit at other positions. A gemm
-        // bundle tensor (the router's `[E,hidden]` projection, the experts' `[E·out,in]` codes) is
-        // staged by the SAME on-disk-`[n,k]`-verbatim + device-width contract every other gemm
-        // weight is, so it must carry the flag its own `BundleTensor::is_gemm_operand()` states —
-        // the same fact the JSON manifest emits for the same source, so the two cannot disagree.
-        let is_gemm = match bundle_tensor {
-            Some(t) => t.is_gemm_operand(),
-            None => gemm_operands.contains(&i),
-        };
-        let i = proc_macro2::Literal::u32_unsuffixed(i as u32);
-        arms.push(quote! {
-            out.push(::scratchy_forward_compiler::BoundWeight {
-                id: #i,
-                tensor: #tensor,
-                is_gemm: #is_gemm,
-            });
-        });
-    }
-
-    // ── The embedding table ──
-    //
-    // ⛔ NOT ONE OF THE SOURCES ABOVE. The tape starts at the ALREADY-EMBEDDED
-    // hidden row, so the gather `embed_tokens[token]` is the host's job and the
-    // table binds to no launch source. The worker still needs it, and after
-    // `try_load` it lives in `Weights` (the generated loader took it out of the
-    // weight store), so it cannot be re-read by name from `gw` afterwards — it
-    // has to be handed over from the field.
-    let embed_field = tw
-        .kind_of_field
-        .iter()
-        .find(|(_, k)| matches!(k, WeightKind::Embedding))
-        .map(|(name, _)| syn::Ident::new(name, proc_macro2::Span::call_site()));
-    let embed_fn = match embed_field {
-        Some(f) => quote! {
-            /// The embedding table, for the host-side token gather.
-            pub fn superdsc_embed(w: &Weights) -> ::anyhow::Result<::scratchy_target_spyre::GpuTensor> {
-                Ok(w.#f.weight)
-            }
-        },
-        None => {
-            let stem = "this model";
-            quote! {
-                pub fn superdsc_embed(_w: &Weights) -> ::anyhow::Result<::scratchy_target_spyre::GpuTensor> {
-                    ::anyhow::bail!("{}: no embedding table in the generated Weights", #stem)
-                }
-            }
-        }
-    };
-
-    Ok(quote! {
-        #embed_fn
-
-        /// Every weight source of this model, bound to a `Weights` FIELD.
-        ///
-        /// Generated: each entry NAMES a field, so a source the struct cannot
-        /// satisfy fails to compile here rather than failing to resolve a
-        /// string at model load.
-        #[allow(clippy::vec_init_then_push)]
-        pub fn superdsc_weights(
-            w: &Weights,
-        ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_forward_compiler::BoundWeight>> {
-            let mut out = ::std::vec::Vec::new();
-            #(#arms)*
-            Ok(out)
-        }
-    })
-}
-
 /// The struct FIELD type for a weight kind.
 ///
 /// ⛔ `weight_kind_rust_type` yields the ACCESSOR type `&T` — a borrow of the
@@ -520,13 +278,10 @@ fn field_type(kind: &WeightKind) -> Result<proc_macro2::TokenStream, String> {
 /// a field (`.weight` on a norm, a variant match on a quantized linear) and
 /// re-deriving it by string-matching the emitted type would be a second answer
 /// to a question already settled here.
-pub(crate) struct TapeWeights {
+pub struct TapeWeights {
     pub accessors: Vec<WeightAccessor>,
     /// Emitted field name → kind. Keyed by the accessor's own name, so it works
     /// for every group shape (`base`, `base[L]`, `base_L`).
-    ///
-    /// Read only by [`emit_weight_bindings`], which is spyre's.
-    #[cfg(feature = "spyre")]
     pub kind_of_field: std::collections::BTreeMap<String, WeightKind>,
 }
 
@@ -536,7 +291,7 @@ pub(crate) struct TapeWeights {
 /// One entry per distinct `(base, layer)`: a weight bound by several ops (a
 /// norm read twice, a tied head) is ONE field, deduped here rather than by the
 /// consumer.
-pub(crate) fn from_tape(
+pub fn from_tape(
     lowered: &LoweredDecode,
     program: &Program,
     // ⭐ THE TARGET FACTS, TAKEN AS INPUT. Packing was the ONLY thing the two accessor sets
@@ -660,7 +415,6 @@ pub(crate) fn from_tape(
 
     Ok(TapeWeights {
         accessors: by_field.into_values().collect(),
-        #[cfg(feature = "spyre")]
         kind_of_field,
     })
 }
@@ -745,9 +499,9 @@ mod tests {
 
     /// ⭐⭐ THE ONE THING THE TWO PRODUCERS EVER DISAGREED ABOUT, AS A TEST.
     ///
-    /// Metal's kernel reads gate and up from ONE packed buffer; spyre binds two weights. That
-    /// is a target-ABI fact, so it is an ARGUMENT — and this pins both answers from one walk,
-    /// which is the whole reason the inline metal producer could be deleted.
+    /// Metal's kernel reads gate and up from ONE packed buffer; a split-MLP target binds two
+    /// weights. That is a target-ABI fact, so it is an ARGUMENT — and this pins both answers from
+    /// one walk, which is the whole reason the inline metal producer could be deleted.
     ///
     /// The packed name is load-bearing, not cosmetic: the emitted load body recovers the
     /// sources by splitting it on `__fused__`, so a different spelling is a field that resolves
@@ -833,7 +587,7 @@ mod tests {
 
     /// ⭐ THE PROPERTY THE WHOLE GENERATED LOADER RESTS ON: one field per
     /// DISTINCT `(weight, layer)`, and a weight bound by several ops is ONE
-    /// field. Before this walk existed the accessor set was empty under spyre
+    /// field. Before this walk existed the accessor set was empty off metal
     /// and the worker re-found every tensor by string, so "did we derive a
     /// field for each bound weight" is the invariant worth pinning.
     #[test]
@@ -938,10 +692,7 @@ mod tests {
     /// Note the leading `&` is NOT here: `weight_kind_rust_type` yields the ACCESSOR type `&T`,
     /// and `field_type` strips the borrow to get the type the struct FIELD holds.
     ///
-    /// ⛔ READ FROM THE ACCESSOR, NOT FROM `kind_of_field`. The kind map is
-    /// `#[cfg(feature = "spyre")]` — it is read only by the spyre binding emitter — so asserting
-    /// through it made this test vanish under metal, where the property it checks is equally
-    /// true. `rust_type` is a 1:1 encoding of the same `WeightKind` and exists on both.
+    /// Read from the accessor: `rust_type` is a 1:1 encoding of the field's `WeightKind`.
     fn ty_of(tw: &TapeWeights, name: &str) -> Option<String> {
         tw.accessors
             .iter()

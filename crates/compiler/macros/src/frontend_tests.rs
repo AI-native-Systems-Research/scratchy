@@ -119,6 +119,7 @@ mod parse_python {
             &configs_dir,
             None,
             &crate::Scope::stems(&[("qwen3", "qwen3-0.6b")]),
+            &crate::target::Metal,
         )
         .expect("python-costume pipeline");
 

@@ -2,7 +2,7 @@
 
 //! ⭐⭐⭐ A WAVE OF LONG PROMPTS ON THE SHARED-WRITE-SLOT POOL ADMITS EVERY REQUEST — the serve-level
 //! property #694 broke, driven through the real `Scheduler` with the worker's KV report modelled the way
-//! the spyre worker computes it.
+//! a shared-write-slot worker computes it.
 //!
 //! In the lib, not `tests/`: CI runs this crate as `cargo test -p scratchy-serving-scheduler --lib`.
 //!
@@ -34,15 +34,15 @@ const ROWS: usize = 4;
 /// `--max-model-len 12288` at 4 launch rows: 48 pages a row, the pool's 192 offered blocks.
 const POOL_BLOCKS: usize = 192;
 const MAX_MODEL_LEN: usize = 12288;
-/// The token budget the spyre serve ran at (the generic default — the worker names no prefill ceiling).
+/// The token budget the measured serve ran at (the generic default — the worker names no prefill ceiling).
 const BUDGET: usize = 2048;
 
 /// HOW THE WORKER DESCRIBES ITS KV after a step, as the scheduler receives it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WorkerReport {
-    /// Every backend whose keys sit at their token positions (cuda, metal): it reports nothing.
+    /// Every backend whose keys sit at their token positions: it reports nothing.
     TokenAddressed,
-    /// The spyre paged pool (`spyre_exec.rs`, `ReqState::kv_extent`): EVERY live request — the worker
+    /// A shared-write-slot paged pool: EVERY live request — the worker
     /// keeps every request it has been sent until the scheduler names it finished — is reported at the
     /// pool's future write bound, `max over live of max(history end, prompt)`, with its contiguous prefix
     /// as the cacheable run.
@@ -67,7 +67,7 @@ fn wave_request(id: usize) -> Request {
     )
 }
 
-/// The spyre worker's per-request history end after a step: the prompt positions it has computed while
+/// A shared-write-slot worker's per-request history end after a step: the prompt positions it has computed while
 /// prefilling, then one slot per decode step at the shared write slot — every live row writes there, so
 /// a request that has started decoding sits at the pool's write cursor.
 fn history_end(r: &Request, pool_cursor: u32) -> u32 {

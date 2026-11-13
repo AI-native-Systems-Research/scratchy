@@ -1,0 +1,16 @@
+[package]
+name = "scratchy-models-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The models build driver: every selected arch's DSL carrier through the shared pipeline, for the target whose emitter the calling build script hands it"
+
+# A build-dependency of each target's models crate (`scratchy-models` for metal; every other target
+# has its own). Target-neutral: the target is the `TargetEmitter` the caller passes.
+[dependencies]
+scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
+scratchy-core-model = { workspace = true }
+hf-hub-downloader = { workspace = true }
+proc-macro2 = "1"
+serde_json = { workspace = true }
+rayon = { workspace = true }

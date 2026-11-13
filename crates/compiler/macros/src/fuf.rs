@@ -91,6 +91,10 @@ impl Fuf {
         self.nodes.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     /// Populate the `storage` field on every `FufInput::Weight` by
     /// running [`crate::quantization::storage_format_for_weight`]
     /// over the model's config. `fuf::unroll` emits every Weight

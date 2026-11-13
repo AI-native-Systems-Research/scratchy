@@ -334,9 +334,9 @@ pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
 }
 
 /// The un-truncated FNV-1a state behind [`fnv_seed`] — a PER-REQUEST seed for a
-/// draw whose per-position salt lives somewhere else (the spyre seat stages one
-/// seed per request and lets the card's noise hash mix the position in, so the
-/// request-level seed must not already depend on it). Same basis, same prime,
+/// draw whose per-position salt lives somewhere else (a device-side draw that
+/// stages one seed per request and lets the device's noise hash mix the position
+/// in, so the request-level seed must not already depend on it). Same basis, same prime,
 /// same "not `DefaultHasher`" law; the only difference is that nothing is cut
 /// off.
 pub fn fnv_seed64(req_id: &str) -> u64 {

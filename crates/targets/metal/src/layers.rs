@@ -110,8 +110,8 @@ impl RmsNormOps for RmsNorm {
         // checkpoint (e.g. unsloth/Llama-3.2-1B-Instruct) ships BF16 gains;
         // reading those as F16 mis-scales every gain → garbage output. When
         // the model pinned a scale dtype, `take_as_dtype` converts only on a
-        // genuine mismatch (the mlx zero-copy path is untouched). cuda/spyre
-        // never pin it — they cast the gain at load themselves.
+        // genuine mismatch (the mlx zero-copy path is untouched). A backend
+        // that casts the gain at load itself never pins it.
         let weight = match weights.rmsnorm_scale_dtype() {
             Some(dt) => weights
                 .take_as_dtype(&weight_name, dt)

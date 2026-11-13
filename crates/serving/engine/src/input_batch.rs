@@ -85,7 +85,8 @@ per_slot_fields! {
     req_ids: String,
     /// How many of this request's tokens are in the KV block pool. Every step
     /// [`InputBatch::prepare_inputs`] builds sets it to the scheduler's `num_computed_tokens`, and
-    /// [`InputBatch::commit_step`] advances it past the step — what spyre reads in between.
+    /// [`InputBatch::commit_step`] advances it past the step — what a backend that chunks its own
+    /// prefill reads in between.
     tokens_in_pool: usize,
     /// Block table (full/global KV-cache group block ids), REPLACED wholesale each step.
     block_tables: Vec<usize>,
@@ -168,7 +169,7 @@ pub struct InputBatch {
     /// `prompt_len` vec, because a stored length is a second store of one quantity.
     prompt: Vec<Vec<u32>>,
     /// Everything sampled since, in order, per slot. `prompt ++ generated` IS the token history — what
-    /// every step reads its chunk from, and the samplers their seed position (and metal its penalty
+    /// every step reads its chunk from, and the samplers their seed position (and the penalty samplers their
     /// histories) — and [`Self::token_at`] is the one place the boundary arithmetic lives.
     generated: Vec<Vec<u32>>,
     /// Per slot, the tokens sampled by steps still on the device, which follow `generated`.
@@ -404,7 +405,7 @@ impl InputBatch {
     /// SET how many of this request's tokens are in the KV pool — for a backend that advances it from
     /// inside its own forward rather than through [`Self::commit_step`].
     ///
-    /// ⛔ THE SPYRE PATH DOES NOT CALL `commit_step`: it chunks a prefill itself and knows how far it got
+    /// ⛔ A BACKEND THAT CHUNKS A PREFILL ITSELF DOES NOT CALL `commit_step`: it knows how far it got
     /// only after the chunk loop, so the count is written here and this is the ONE store of it. Without
     /// this setter the field kept its admission value forever on that path — a number in a shared store
     /// that was quietly wrong for one backend, which is how a second store starts.

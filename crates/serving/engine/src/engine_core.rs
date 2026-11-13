@@ -536,7 +536,7 @@ impl EngineCore {
 
         // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE). Printed only for a PREFILL step (>1 scheduled
         // token), so decode is unaffected and the line appears once per request — the step that IS
-        // time-to-first-token. Subtracting the worker's own `predict_total` (SCRATCHY_SDSC_PHASE_TIME)
+        // time-to-first-token. Subtracting the worker's own `predict_total` (its phase timer)
         // from `execute` gives the executor overhead OUTSIDE the device forward, which is the last
         // unmeasured term in the TTFT budget.
         let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
@@ -2742,7 +2742,7 @@ mod tests {
         assert_eq!(*handed.lock().unwrap(), [2, 0]);
     }
 
-    /// A [`NoopExecutor`] whose worker keeps recurrent-state snapshots (a GDN hybrid on metal).
+    /// A [`NoopExecutor`] whose worker keeps recurrent-state snapshots (a GDN hybrid).
     struct SnapshottingExecutor(NoopExecutor);
 
     impl Executor for SnapshottingExecutor {

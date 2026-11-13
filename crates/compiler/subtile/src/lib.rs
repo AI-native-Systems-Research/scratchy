@@ -21,30 +21,12 @@ pub mod ops;
 pub mod fixtures;
 pub mod lower;
 /// The dataflow facts one persistent kernel needs to play a tape: waits, units, coherence.
-/// SubtileIR → KTIR (IBM Spyre target). The macro calls it under `-Fspyre`.
-/// ALSO needed by `-Fsuperdsc`: `emit_bundle` builds the source/dim manifest via
-/// `lower_graph_to_ktir`, which the sdsc bundle embeds — so gate on either.
-/// Off the SAME fused tape as the KTIR lowering; emits the TILE-LEVEL,
-/// work-divided SuperDSC (SDSC) bundle DeepTools' `dxp_standalone --bundle`
-/// compiles — the perf path that OWNS the 32-core work-division. (The old
-/// `lower_subtile_tape_to_sengraph` peer was DELETED — sengraph is a dead end.)
 /// The head-dim value→const door whose arms the build script generated from
 /// `crates/models/arch/*/configs/*.json`, typed on `scratchy_ir::model_facts::HeadDim`. Always
 /// compiled: the value side of the geometry is the facts' own [`Attention`], threaded from the
 /// bake, whatever the target (scratchy_ir::model_facts::Attention).
 pub mod model_geometry;
 pub mod subtile_ir;
-// ⭐ THE SuperDSC DEVICE FACTS, FROM THE `ktir-superdsc` LEAF CRATE: the typed SuperDSC IR
-// (`superdsc_opspec`/`superdsc_error`), `sdsc_abstract`, and the `addr` build-time address
-// interpreter that PROVES the emitted SDSC attention computes the SubtileIR math
-// (`softmax(q·kᵀ·scale+mask)·v`) over the real device addresses, so a translation bug is a
-// `cargo build` panic rather than an on-card discovery. Re-exported so the Spyre lowering and
-// worker name them as `scratchy_subtile::sdsc_abstract::…`.
-//
-// ⛔ GATED ON `spyre`, WITH THE DEPENDENCY. Nothing a metal or cuda build compiles names these, so
-// those builds leave the whole `ktir-superdsc`/`ktir-core` graph out.
-#[cfg(feature = "spyre")]
-pub use ktir_superdsc::{addr, sdsc_abstract, superdsc_error, superdsc_opspec};
 // ⛔ UNGATED, AND THAT IS THE POINT. The re-roll machinery (`reroll_subtile_tape` /
 // `lower_dag_to_tape` / the `OpenLoop`/`CloseLoop` tape) is THE shared artifact: the
 // SuperDSC emitter (which re-rolls the layer loop so dxp compiles ONE small body

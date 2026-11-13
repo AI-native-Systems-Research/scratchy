@@ -57,7 +57,6 @@ async fn run_metal_correctness_test_prefix_match(
 ) {
     let golden = load_golden_refs(golden_key);
     let server = TestServer::builder(model)
-        .with_device("metal")
         .with_args(&["--max-model-len", "2048"])
         .start()
         .await

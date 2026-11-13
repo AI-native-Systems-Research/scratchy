@@ -14,8 +14,8 @@
 //! So before converting these to a named-axis `Nest` view, this pins that the two spellings agree over a
 //! sweep that INCLUDES the cases where the coincidences break: hd > stick, nkvh > 1, sl > 0, j > 0. If the
 //! conversion changes any emitted address, this test says so instead of a card run saying it three bakes later.
-use scratchy_subtile::addr::{Idx, Nest, Row};
-use scratchy_subtile::superdsc_opspec::Df;
+use ktir_superdsc::addr::{Idx, Nest, Row};
+use ktir_superdsc::superdsc_opspec::Df;
 
 /// The kv stream is rank-2 `[mq, nkvh*hd]`; kv-head `kvh`'s slab `sl` is the column `kvh*hd + sl*stick`,
 /// and sub-block `j` is the row window `[j*stick, ...)`. Named axes put both products inside the law.
@@ -24,14 +24,14 @@ fn nest_form(mq: u32, nkvh: u32, hd: u32, j: u32, kvh: u32, sl: u32, stick: u32)
     Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16)
         .view()
         .at(Idx::<Row>::n(j * stick))
-        .at(Idx::<scratchy_subtile::addr::Head>::n(kvh))
+        .at(Idx::<ktir_superdsc::addr::Head>::n(kvh))
         .slab(sl)
         .dev()
         .into_raw_elems()
 }
 
 fn hand_form(mq: u32, nkvh: u32, hd: u32, j: u32, kvh: u32, sl: u32, stick: u32) -> u32 {
-    scratchy_subtile::addr::rc_of(mq, nkvh * hd, j * stick, kvh * hd + sl * stick, Df::Fp16)
+    ktir_superdsc::addr::rc_of(mq, nkvh * hd, j * stick, kvh * hd + sl * stick, Df::Fp16)
         .into_raw_elems()
 }
 
@@ -74,7 +74,7 @@ fn the_nest_view_reproduces_the_hand_summed_kv_stream_address() {
 /// transposition is undetectable by construction. Pinned before conversion for the same reason as the kv
 /// stream: at one stick every slab term is 0.
 fn ident_hand(hd: u32, s: u32, stick: u32) -> u32 {
-    scratchy_subtile::addr::rc_of(hd, hd, s * stick, s * stick, Df::Fp16).into_raw_elems()
+    ktir_superdsc::addr::rc_of(hd, hd, s * stick, s * stick, Df::Fp16).into_raw_elems()
 }
 
 fn ident_nest(hd: u32, s: u32, stick: u32) -> u32 {

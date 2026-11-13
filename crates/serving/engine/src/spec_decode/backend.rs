@@ -26,7 +26,7 @@
 //! Lifecycle methods ([`SpecDecodeBackend::load_secondary_model`],
 //! [`SpecDecodeBackend::allocate_kv_pool`]) let the draft-model proposer
 //! manage its second model + KV pool through the backend without leaking
-//! `MTLBuffer` details.
+//! device-buffer details.
 
 use std::error::Error;
 use std::fmt;
@@ -102,7 +102,7 @@ impl Error for BackendError {}
 ///
 /// All fields are host-owned slices. The backend is responsible for
 /// uploading them to device buffers in whatever format its kernels expect
-/// (Metal `MTLBuffer` shared-storage, etc.). The
+/// (e.g. shared-storage device buffers). The
 /// engine never sees `ForwardCtx` or any other backend-specific input
 /// bundle.
 ///
@@ -238,8 +238,8 @@ pub trait SpecDecodeBackend {
     ///
     /// Default impl loops `forward_argmax_blocking` so future backends
     /// remain correct without per-backend chain wiring — but
-    /// each iter still pays one commit + one host wait. The Metal
-    /// override (Phase 6) collapses both costs to one.
+    /// each iter still pays one commit + one host wait. A backend's
+    /// chained override (Phase 6) collapses both costs to one.
     ///
     /// `req_iter0` contains the iter-0 inputs (input_ids = seed bonus
     /// tokens, positions/slot_mapping/seqused_k computed for iter 0).

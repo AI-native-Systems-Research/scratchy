@@ -7,15 +7,6 @@
 //! inference stack. No CLI dependency needed — just construct a [`VllmConfig`]
 //! and call [`initialize_stack`].
 
-// Anchor the worker crate into the link so its `WorkerFactory`
-// `inventory::submit!` registrations (MetalWorkerFactory / SpyreWorkerFactory
-// in scratchy_serving_worker) are NOT garbage-collected by the
-// linker. `create_worker` never NAMES a concrete worker, so without this explicit reference the registry
-// could come up empty at runtime. `create_worker` still bails loudly if it
-// does (empty-registry assertion) — this anchor is the belt to that bail's
-// suspenders.
-extern crate scratchy_serving_worker as _;
-
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,13 +29,13 @@ use crate::chat_template::ChatTemplate;
 use crate::engine::AsyncEngine;
 use crate::tokenizer::Tokenizer;
 
-// vllm-mlx has been removed. The metal path lives entirely in
-// scratchy-target-metal (`MetalWorker`).
+// No external inference runtime sits behind this path: each backend's worker
+// lives in its own target crate and registers a `WorkerFactory`.
 // If you hit `ExecutorError::ArchNotSupported` at runtime, the fix is
 // to add the missing arch / quantization overlay to
 // `crates/models/arch/configs/<arch>/quantizations.json` (or land
-// the matching backend Impl in `crates/scratchy-forward-compiler-macro/src/metal/`)
-// — NOT to bring back MLX.
+// the matching opcode lowering in the target's emitter)
+// — NOT to wrap an external runtime.
 
 /// Re-export so callers that build a [`VllmConfig`] (e.g. the TUI) can name
 /// the observer trait for `download_observer` without depending on
@@ -58,8 +49,6 @@ pub use scratchy_serving_engine::worker_factory::DownloadObserver;
 pub struct VllmConfig {
     /// Model path or HuggingFace model ID (required).
     pub model: String,
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    pub device: String,
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     pub dtype: String,
     /// Maximum model context length (None = use config.json).
@@ -80,7 +69,7 @@ pub struct VllmConfig {
     /// Speculative model: `"ngram"` selects the n-gram proposer; any other value names a draft
     /// checkpoint (local path or HuggingFace repo ID) — a multi-token-prediction head published
     /// apart from its target, or a standalone draft model. `None` drafts with the target's
-    /// compiled multi-token-prediction head when the build has one (metal), else disables
+    /// compiled multi-token-prediction head when the build has one, else disables
     /// speculative decoding.
     pub speculative_model: Option<String>,
     /// Number of speculative tokens to propose per step.
@@ -139,7 +128,6 @@ impl Default for VllmConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
-            device: "auto".to_string(),
             dtype: "auto".to_string(),
             max_model_len: None,
             max_num_seqs: None,
@@ -149,7 +137,7 @@ impl Default for VllmConfig {
             gguf_file: None,
             speculative_model: None,
             // K=2 is the empirical sweet spot for draft-model spec
-            // decode on Apple Silicon when the target dominates
+            // decode on the unified-memory GPUs measured, when the target dominates
             // (e.g. 8B+1B). See `scr/src/args.rs` for the bench
             // distribution that led to this default.
             num_speculative_tokens: 2,
@@ -227,12 +215,11 @@ fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
 /// resolves `block_id` to a pool page, so the two MUST agree or they name different cells for one
 /// token — silent KV corruption, no fault raised.
 ///
-/// 🛑 THIS FUNCTION USED TO BE THE DISAGREEMENT. It answered with a literal `64` under
-/// `#[cfg(feature = "spyre")]` and a comment justifying it by the shape of a pool that had since been
-/// rebuilt: "the PagedAttn ops HARD-CODE `block_size`=64 (the pool is `[nblk, 64, nkv, hd]`)". The
-/// superdsc pool's page is `PagedKvPool::POOL_PAGE_SLOTS` = 256. The mismatch was inert only because the
-/// worker IGNORED the scheduler's block ids and allocated pages from a free list of its own — which is
-/// the same "two allocators for one resource" that made prefix caching impossible. Ask the backend.
+/// 🛑 THE BACKEND'S POOL IS THE ONLY SOURCE OF A NON-DEFAULT BLOCK SIZE. A literal here, justified by
+/// the shape of a pool, goes stale the moment that pool's page changes, and the mismatch stays inert
+/// only while the worker IGNORES the scheduler's block ids and allocates pages from a free list of its
+/// own — the same "two allocators for one resource" that makes prefix caching impossible. Ask the
+/// backend.
 ///
 /// 🛑 ONE MINT, ONE VALUE, END TO END. The configured size is minted ONCE, as [`KvBlockTokens`], at
 /// the door where the CLI's number is read ([`initialize_core`]) — the zero refusal lives there, by
@@ -243,9 +230,9 @@ fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
 /// [`Worker::kv_block_bytes`] — two mints of one value, a guard apiece. There is no second
 /// mint below the door now: `init_cache`, `compute_kv_blocks` and `Worker::kv_block_bytes`
 /// all take the type, so block == page holds because there is ONE value, not two mints of one.
-fn effective_block_size(configured: KvBlockTokens, device: &str) -> KvBlockTokens {
-    inventory::iter::<&dyn WorkerFactory>()
-        .find(|f| f.matches(device))
+fn effective_block_size(configured: KvBlockTokens) -> KvBlockTokens {
+    linked_factory()
+        .ok()
         .and_then(|f| f.required_block_size())
         .unwrap_or(configured)
 }
@@ -400,16 +387,15 @@ const TEMPLATE_TURN_TERMINATORS: &[&str] = &[
 // Worker creation result now lives in `scratchy-serving-worker` alongside
 // the `WorkerFactory` trait and `Box<dyn Worker>`/`HfModelConfig` it names.
 use scratchy_serving_worker::worker_factory::{
-    Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, WorkerFactory,
+    Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, linked_factory,
 };
 
 /// Create the appropriate worker via the `WorkerFactory` inventory registry.
 ///
-/// Builds the shared [`WorkerCreateConfig`] once, then selects the first
-/// registered backend factory whose `matches` accepts `config.device` and
-/// calls its `create`. The per-backend construct→init→load→extract logic
-/// lives in `scratchy_serving_worker` (`MetalWorkerFactory` /
-/// `SpyreWorkerFactory`); there are no `#[cfg]` backend arms here.
+/// Builds the shared [`WorkerCreateConfig`] once, then calls the `create` of the one factory this
+/// binary links ([`linked_factory`]). The per-backend construct→init→load→extract logic
+/// lives in each target's worker crate (its registered `WorkerFactory`);
+/// there are no `#[cfg]` backend arms here.
 ///
 /// Returns `(worker, hf_config, model_dir, dtype)`.
 fn create_worker(
@@ -470,40 +456,10 @@ fn create_worker(
         }) as ProgressCallback
     });
 
-    // Empty registry — distinct from the per-device "no backend" error below,
-    // which means a backend IS registered but doesn't claim this device string.
-    // The common cause is simply a build with no GPU backend feature; the rarer
-    // cause is the linker GC'ing the registration.
-    if inventory::iter::<&dyn WorkerFactory>().next().is_none() {
-        anyhow::bail!(
-            "No inference backend is compiled into this binary. Rebuild with a \
-             backend feature:\n    --features metal   (Apple Silicon)\n    --features \
-             spyre   (IBM Spyre)\ne.g. `cargo build --release \
-             -p scratchy-cli --features metal`.\n(If you DID build with a \
-             backend, an empty registry instead means the linker GC'd its \
-             `inventory::submit!` — ensure scratchy-serving-worker stays linked via \
-             an `extern crate ... as _` anchor.)"
-        );
-    }
-
-    let factory = inventory::iter::<&dyn WorkerFactory>()
-        .find(|f| f.matches(&config.device))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No backend available for device '{}'. \
-                 Build with --features metal (Apple Silicon) or --features spyre (IBM Spyre).",
-                config.device
-            )
-        })?;
-
-    factory.create(worker_config, progress_cb)
+    linked_factory()?.create(worker_config, progress_cb)
 }
 
 /// Initialize cache on the worker and compute block counts.
-///
-/// On CPU, `gpu_memory_utilization` is ignored and a default of 50% is used
-/// instead (matching Python vLLM's `DEFAULT_CPU_MEM_UTILIZATION`). This
-/// prevents allocating most of system RAM for KV cache on CPU-only hosts.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn init_cache(
     mut worker: Box<dyn Worker>,
@@ -511,7 +467,6 @@ fn init_cache(
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     gpu_memory_utilization: f64,
-    device: &str,
     kv_cache_dtype: &str,
     declared_max_model_len: Option<usize>,
     max_model_len: usize,
@@ -527,34 +482,12 @@ fn init_cache(
         .determine_available_memory()
         .context("failed to determine available memory")?;
 
-    // For Metal workers, determine_available_memory already returns
-    // the KV cache budget with gpu_memory_utilization baked in (matching
-    // Python vLLM: total * util - non_kv_cache). On Metal `total` is further
-    // capped at `maxBufferLength` (the real wireable ceiling) and util is
-    // applied inside the worker, so the returned value is the FINAL KV budget
-    // — do NOT re-apply utilization here (that double-shrinks KV). Spyre is the
-    // same case on both its tiers (see [`kv_budget_is_prebaked`]). Only CPU
-    // gets the returned value as raw free memory and applies util locally.
-    let is_gpu_prebaked = kv_budget_is_prebaked(device, cfg!(feature = "spyre"));
-    let is_cpu = device_is_cpu(device, cfg!(feature = "spyre"));
-
-    let (kv_cache_bytes, utilization) = if is_gpu_prebaked {
-        // Worker already computed: total * util - non_kv_cache (capped at
-        // maxBufferLength on Metal).
-        (available_memory, gpu_memory_utilization)
-    } else if is_cpu {
-        const DEFAULT_CPU_MEM_UTILIZATION: f64 = 0.5;
-        info!(
-            "CPU device: using {:.0}% of system memory for KV cache (override with --gpu-memory-utilization)",
-            DEFAULT_CPU_MEM_UTILIZATION * 100.0
-        );
-        let bytes = (available_memory as f64 * DEFAULT_CPU_MEM_UTILIZATION) as usize;
-        (bytes, DEFAULT_CPU_MEM_UTILIZATION)
-    } else {
-        // Metal or other GPU — apply utilization to raw free memory.
-        let bytes = (available_memory as f64 * gpu_memory_utilization) as usize;
-        (bytes, gpu_memory_utilization)
-    };
+    // Every worker's `determine_available_memory` is the FINAL KV budget, utilization already
+    // applied by the worker (a budget-sized pool: `total × util − non_kv_cache`, capped at the
+    // device's max buffer length; a fixed on-device pool: its region-capped size, or an emulator's
+    // host-RAM allowance) — the
+    // `WorkerFactory` contract. Re-applying utilization here would double-shrink KV.
+    let (kv_cache_bytes, utilization) = (available_memory, gpu_memory_utilization);
 
     let (mut num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
         kv_cache_bytes,
@@ -566,11 +499,11 @@ fn init_cache(
         worker.kv_block_bytes(block_size),
         worker.supports_hybrid_swa_kv(),
     );
-    // Fixed-size resident KV pool cap (spyre/sendnn PAGED CB): the on-card pool is
+    // Fixed-size resident KV pool cap (a baked PAGED pool): the on-device pool is
     // exactly `nblk` blocks, so the scheduler's block allocator must not exceed it
     // (else it hands out a block id past the pool → silent KV corruption). The
     // uniform `compute_num_blocks` sizes from the memory budget and can be larger;
-    // clamp it. `None` for metal (budget-sized pools).
+    // clamp it. `None` for budget-sized pools.
     if let Some(cap) = worker.kv_cache_num_blocks_override()
         && cap < num_gpu_blocks
     {
@@ -591,8 +524,8 @@ fn init_cache(
     // resolves to `min(max_model_len, affordable)`, and that resolution is logged at
     // info: it is the designed default, not a shortfall. The scheduler admits a prompt
     // only if its blocks fit the whole pool (`num_gpu_blocks × block_size` tokens), and
-    // the backend's kernels address no further than `kv_max_addressable_tokens` (metal
-    // hybrid SWA: the sliding class's block-table row; spyre: what its pool funds and its
+    // the backend's kernels address no further than `kv_max_addressable_tokens` (a
+    // hybrid-SWA pool: the sliding class's block-table row; a fixed pool: what it funds and its
     // mask baked) — the affordable is the narrower of the two.
     let pool_tokens = num_gpu_blocks * block_size.get();
     let reach = worker.kv_max_addressable_tokens();
@@ -788,13 +721,17 @@ fn draft_head(
 ///   head arch this build compiled — it embeds and decodes through the target's own embedding
 ///   and lm_head (the worker lends them), so its token IDs are the target's by construction —
 ///   else a standalone draft model, checked against the target (`validate_target_draft_pair`:
-///   vocab/tokenizer alignment, and on metal a rough memory budget).
-/// - none, on metal: the target's compiled multi-token-prediction head, when this build compiled
+///   vocab/tokenizer alignment, and, where the backend reports a working set, a rough memory budget).
+/// - none: the target's compiled multi-token-prediction head, when this build compiled
 ///   one for the target and its tensors are found ([`target_head`]); the head is a fact of the
 ///   compiled model. `--num-speculative-tokens 0` turns it off.
 fn resolve_speculative_decoding(config: &VllmConfig) -> Result<Speculation> {
     let speculation = match config.speculative_model.as_deref() {
-        None if !cfg!(feature = "metal") || config.num_speculative_tokens == 0 => Speculation::Off,
+        None if !scratchy_forward_compiler::compiles_any_head()
+            || config.num_speculative_tokens == 0 =>
+        {
+            Speculation::Off
+        }
         None => match target_head(config)? {
             Some((head, draft)) => Speculation::Head { head, draft },
             None => Speculation::Off,
@@ -945,8 +882,8 @@ fn published_head(
 ///   * `sha256(target/tokenizer.json) == sha256(draft/tokenizer.json)`
 ///     (the cheapest "same tokenizer" assertion that survives metadata
 ///     differences like padding-token whitespace).
-///   * On metal builds: weight bytes + a coarse KV estimate fit under
-///     `recommendedMaxWorkingSetSize`.
+///   * Where the backend reports a recommended max working-set size: weight
+///     bytes + a coarse KV estimate fit under it.
 ///
 /// Files that don't exist locally trigger `resolve_model_path`'s normal
 /// HF download path — so a misconfigured draft URL surfaces here, not
@@ -1130,7 +1067,7 @@ fn spec_decode_memory_budget_check(
     };
     // Reserve at least 40% of the gpu-memory-utilization budget for KV +
     // activations. Empirically the runtime sizes KV against
-    // `(working_set - currentAllocatedSize) * gpu_memory_utilization`,
+    // `(working_set - allocated) * gpu_memory_utilization`,
     // so weights consuming >60% leaves KV starved.
     let weight_budget = (total as f64 * config.gpu_memory_utilization * 0.6).round() as u64;
 
@@ -1141,7 +1078,7 @@ fn spec_decode_memory_budget_check(
     if total_w > weight_budget {
         anyhow::bail!(
             "estimated combined weight footprint {} > {} (60% of \
-             recommendedMaxWorkingSetSize × gpu_memory_utilization={:.2}). \
+             the device's recommended working set × gpu_memory_utilization={:.2}). \
              Breakdown: target_weights={}, draft_weights={}. \
              Either pick a smaller draft, reduce --gpu-memory-utilization, \
              or run on a machine with more unified memory.",
@@ -1167,7 +1104,9 @@ fn spec_decode_memory_budget_check(
 /// Recommended working-set size (bytes) from whichever backend factory is
 /// registered in this build, without naming a specific backend crate.
 fn backend_recommended_working_set_size() -> Option<u64> {
-    inventory::iter::<&dyn WorkerFactory>().find_map(|f| f.recommended_working_set_size())
+    linked_factory()
+        .ok()
+        .and_then(|f| f.recommended_working_set_size())
 }
 
 fn weight_bytes_on_disk(dir: &std::path::Path) -> u64 {
@@ -1233,10 +1172,7 @@ fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
 /// (`WorkerFactory::supports_prefix_caching`) — what the worker is created with,
 /// so it reserves recurrent-state snapshots only for an engine that will use them.
 fn requested_prefix_caching(config: &VllmConfig) -> bool {
-    config.enable_prefix_caching
-        && !inventory::iter::<&dyn scratchy_serving_engine::worker_factory::WorkerFactory>()
-            .find(|f| f.matches(&config.device))
-            .is_some_and(|f| !f.supports_prefix_caching())
+    config.enable_prefix_caching && !linked_factory().is_ok_and(|f| !f.supports_prefix_caching())
 }
 
 /// ⭐ THE ONE RULE FOR WHETHER THE ENGINE SERVES CACHED PREFIXES, at every `EngineCoreConfig` site.
@@ -1292,19 +1228,18 @@ fn prefix_caching(
     // ⛔⛔⛔ AND WHEN A BACKEND REFUSES, THE REFUSAL MUST NAME A PROPERTY OF THE BACKEND — NOT A
     // FEATURE SWITCHED OFF SO A TEST WOULD PASS.
     //
-    // The comment that used to sit here said the spyre pool "cannot support it BY CONSTRUCTION"
-    // because `PageRun::physical(lp) = row * pages_per_row + lp` gave every row an exclusive page
-    // stripe. The striping was real; "by construction" was not — it described OUR construction, a
-    // layout picked so one launch could stride the whole batch. The device's actual limit is that it
-    // has no indirect addressing, which forbids nothing here. That `row *` term was also exactly the
-    // "request concept below the host" the KV design forbids, so prefix caching was never a separate
-    // feature to decline: it was blocked by a defect in the pool's addressing.
+    // A paged pool whose `PageRun::physical(lp) = row * pages_per_row + lp` gives every row an
+    // exclusive page stripe cannot share a prefix — but that is OUR construction, a layout picked so
+    // one launch can stride the whole batch, not a property of the device: a device without indirect
+    // addressing forbids nothing here. That `row *` term is also exactly the "request concept below
+    // the host" the KV design forbids, so prefix caching is never a separate feature to decline: a
+    // stripe like it is a defect in the pool's addressing.
     //
-    // ⭐ IT IS SUPPORTED NOW (`SpyreWorkerFactory::supports_prefix_caching`), by three changes that
+    // ⭐ A PAGED POOL SUPPORTS IT (`WorkerFactory::supports_prefix_caching`) by three properties that
     // between them make a shared prefix real rather than promised:
     //   1. a request's pages ARE the scheduler's `block_ids` (`install_host_blocks` + `BlockTable`,
-    //      whose only constructor takes host ids), so the worker's own free-list allocator — a second
-    //      allocator over the scheduler's pool, and the actual blocker — no longer exists;
+    //      whose only constructor takes host ids), so the worker keeps no free-list allocator of its
+    //      own — a second allocator over the scheduler's pool, and the actual blocker;
     //   2. the block size and the block COUNT come from the pool that addresses them
     //      (`WorkerFactory::required_block_size`, `Worker::kv_cache_num_blocks_override`), so a block
     //      id is a page and never one the pool lacks;
@@ -1318,7 +1253,7 @@ fn prefix_caching(
         info!(
             "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
              would skip the prefill for a prefix the worker holds no KV for",
-            config.device
+            linked_factory().map_or("linked", |f| f.name())
         );
     }
     effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
@@ -1406,9 +1341,11 @@ fn resolve_max_num_seqs(
 }
 
 /// Total device memory + name from whichever backend factory is registered in
-/// this build (metal XOR spyre), without naming a specific backend crate.
+/// this build (exactly one backend links), without naming a specific backend crate.
 fn backend_device_total_bytes_and_name() -> Option<(u64, String)> {
-    inventory::iter::<&dyn WorkerFactory>().find_map(|f| f.device_total_bytes_and_name())
+    linked_factory()
+        .ok()
+        .and_then(|f| f.device_total_bytes_and_name())
 }
 
 /// Shared by [`initialize_stack`] (async server path) and
@@ -1466,7 +1403,7 @@ fn initialize_core(
     // The backend's own page size when it declares one, so the scheduler's block allocator
     // (slot = block_id * block_size + offset) addresses the same slots the pool uses. The same
     // resolved value reaches `create_worker`'s WorkerCreateConfig — one value, not two mints.
-    let block_size = effective_block_size(configured, &config.device);
+    let block_size = effective_block_size(configured);
 
     let (mut worker, hf_config, model_dir, model_dtype) =
         create_worker(config, speculation, model_path, progress, block_size)?;
@@ -1507,7 +1444,6 @@ fn initialize_core(
         &hf_config,
         model_dtype,
         config.gpu_memory_utilization,
-        &config.device,
         &config.kv_cache_dtype,
         config.max_model_len,
         max_model_len,
@@ -1575,7 +1511,7 @@ fn initialize_core(
 
     // Device-specific `max_num_batched_tokens` default — no flat constant on any
     // backend. On backends that prune a compiled prefill-bucket ladder
-    // target-reactively (Metal today), the largest resident bucket the device
+    // target-reactively, the largest resident bucket the device
     // just selected IS the right per-device default, and a single forward can
     // never exceed it (no NoBucketFits). On backends without ladder pruning,
     // fall back to the device-aware default (queries device mem/name). An explicit
@@ -1605,8 +1541,8 @@ fn initialize_core(
     };
     // Sliding-window models: the sliding groups free out-of-window blocks once
     // per scheduler step (chunk), so a chunk holds up to `window + chunk` tokens
-    // of sliding KV transiently before the next step frees the tail. On the
-    // lazy-commit metal substrate that transient set is what commits, so the
+    // of sliding KV transiently before the next step frees the tail. On a
+    // lazy-commit substrate that transient set is what commits, so the
     // prefill chunk bounds peak KV. Cap it well above the window (small chunks
     // are correct but force one forward per `cap` tokens → slow prefill);
     // measured ~234 MiB at 18k / chunk 512, scaling ~linearly in the chunk, so
@@ -1621,15 +1557,15 @@ fn initialize_core(
         max_num_batched_tokens
     };
     // The concurrency the scheduler will actually admit under. A backend whose decode-width ladder is
-    // BAKED (spyre's `BATCH_RUNGS`) cannot grow it to cover `max_num_seqs`, so it
+    // BAKED (a fixed rung ladder) cannot grow it to cover `max_num_seqs`, so it
     // reports its widest batchable width and the scheduler is held to it, so the fast path covers the
-    // configured concurrency. Past the ladder a backend still runs CORRECTLY (spyre degrades to one launch per request), so
-    // this is a throughput guard, never a correctness one — which is why it caps rather than refusing.
+    // configured concurrency. Past the ladder a backend still runs CORRECTLY (e.g. degrading to one
+    // launch per request), so this is a throughput guard, never a correctness one — which is why it caps rather than refusing.
     let max_num_seqs = resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, is_offline);
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
             // Resolved above: the device-selected prefill bucket on pruning
-            // backends (Metal), else the device-aware default.
+            // backends, else the device-aware default.
             max_num_batched_tokens,
             max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
@@ -1683,12 +1619,12 @@ fn initialize_core(
     })
 }
 
-/// Metal and spyre each run a model on exactly one device: refuse tensor /
-/// pipeline parallelism up front rather than silently serving on one device.
+/// Every worker runs a model on exactly one device: refuse tensor / pipeline parallelism up front
+/// rather than silently serving on one device.
 fn refuse_multi_device(config: &VllmConfig) -> Result<()> {
     if config.tensor_parallel_size > 1 || config.pipeline_parallel_size > 1 {
         anyhow::bail!(
-            "multi-device serving is not supported: metal and spyre run on one device \
+            "multi-device serving is not supported: a worker runs on one device \
              (got --tensor-parallel-size {}, --pipeline-parallel-size {})",
             config.tensor_parallel_size,
             config.pipeline_parallel_size,
@@ -2171,32 +2107,6 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
     num_blocks.max(16)
 }
 
-/// ⭐ DOES THIS RUN'S WORKER HAND `init_cache` A FINAL KV BUDGET — one with utilization
-/// already baked in (metal: `total × util − non_kv_cache`), or one where utilization
-/// is deliberately absent (spyre: the card tier's region-capped pool budget, the emulator
-/// tier's flat host-RAM allowance — different shapes, but the triage question is the same
-/// one: is the worker's number final? For both spyre tiers it is)? For those the returned
-/// number IS the budget and must reach `compute_kv_blocks` whole — re-applying utilization
-/// would double-shrink KV. Only a CPU worker returns raw free memory for the engine to
-/// scale.
-///
-/// The spyre arm tripped on `spyre-hw` alone until the emulator's fall-through was caught
-/// in review: a spyre tier landing in the CPU branch gets its budget halved by that
-/// branch's 50%, which sized the 2b card run's scheduler at 204 blocks against a 544-page
-/// pool. `spyre_backend` is a PARAMETER, not a cfg read, so one unit test can hold every
-/// tier at once; the call site passes the api crate's plain `spyre` feature — the common
-/// parent of `spyre-hw` and `spyre-emu`, so BOTH tiers trip it, never only the card.
-fn kv_budget_is_prebaked(device: &str, spyre_backend: bool) -> bool {
-    (cfg!(feature = "metal") && device != "cpu") || (spyre_backend && device != "cpu")
-}
-
-/// Is this run on the CPU worker, whose `determine_available_memory` is raw free memory
-/// the engine scales by utilization? `device == "auto"` is CPU only when NO gpu backend
-/// was compiled in.
-fn device_is_cpu(device: &str, spyre_backend: bool) -> bool {
-    device == "cpu" || (device == "auto" && !cfg!(feature = "metal") && !spyre_backend)
-}
-
 /// Compute the KV-cache block count AND the hybrid SWA layout, if any.
 ///
 /// Both layouts spend the WHOLE KV budget, as vLLM does: the scheduler admits
@@ -2235,7 +2145,7 @@ fn compute_kv_blocks(
             kv_cache_dtype,
         ),
     };
-    // Only metal wires the `sliding_groups` decode. A worker that reads a single
+    // Not every worker wires the `sliding_groups` decode. A worker that reads a single
     // block table for every layer passes `allow_hybrid=false` so gemma4 (and any
     // hybrid-SWA arch) stays on the uniform single pool.
     if !allow_hybrid {
@@ -2333,31 +2243,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_spyre_tier_hands_init_cache_a_final_budget() {
-        // BOTH spyre tiers — the card AND the emulator — must be prebaked and must never
-        // take the CPU branch. The emulator's budget is a different SHAPE (a flat
-        // host-RAM allowance; no paged pool, no stride, no override — the engine's
-        // dense-row estimate is all it divides by), but the triage question is the same
-        // one and a tier that falls through gets its budget halved by the CPU branch's
-        // 50%. Keyed on the plain `spyre` parent at the call site so neither tier can be
-        // added back without this holding.
-        for device in ["auto", "spyre"] {
-            assert!(
-                kv_budget_is_prebaked(device, true),
-                "the spyre tier must be prebaked (device {device})"
-            );
-            assert!(
-                !device_is_cpu(device, true),
-                "the spyre tier must not take the CPU branch (device {device})"
-            );
-        }
-        // An explicit CPU ask stays CPU even on a spyre build — the worker is chosen by
-        // the factory match on the device string, not by the feature list.
-        assert!(device_is_cpu("cpu", true));
-        assert!(!kv_budget_is_prebaked("cpu", true));
-    }
-
-    #[test]
     fn a_recurrent_hybrid_is_prefix_cached_only_with_snapshots() {
         assert!(
             effective_prefix_caching(true, false, false),
@@ -2380,10 +2265,8 @@ mod tests {
     /// as asked.
     #[test]
     fn every_entry_point_decides_prefix_caching_by_one_rule() {
-        let config = VllmConfig {
-            device: "test-no-backend".to_string(),
-            ..VllmConfig::default()
-        };
+        // The unit-test binary links no worker, so no backend narrows what the config asks.
+        let config = VllmConfig::default();
         let hybrid = ["Qwen3_5ForConditionalGeneration".to_string()];
         let llama = ["LlamaForCausalLM".to_string()];
         let snapshots = scratchy_serving_scheduler::scheduler::SnapshotBudget {
@@ -2593,7 +2476,7 @@ mod tests {
         // gemma-4-26b's sliding page: 16 tokens × 8 KV heads × (256 K + 256 V) × 2 B.
         let page = 16 * 8 * 512 * 2;
         let group_size = 5;
-        // ~ what the metal worker reports: the shared pages + the TurboQuant global store.
+        // ~ what a hybrid-SWA TurboQuant worker reports: the shared pages + the TurboQuant global store.
         let block_bytes = page * group_size + 297_472;
         for budget in [3usize << 30, 22 << 30] {
             let bs = KvBlockTokens::new(16).expect("16 > 0");
@@ -2631,7 +2514,6 @@ mod tests {
     #[test]
     fn test_scratchy_core_config_default() {
         let config = VllmConfig::default();
-        assert_eq!(config.device, "auto");
         assert_eq!(config.dtype, "auto");
         assert_eq!(config.max_num_seqs, None);
         assert_eq!(config.block_size, 16);

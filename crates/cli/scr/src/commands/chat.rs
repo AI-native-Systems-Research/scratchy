@@ -176,7 +176,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
 
     let t0 = std::time::Instant::now();
 
-    let mut builder = LLM::builder(model).device(&args.device).dtype(&args.dtype);
+    let mut builder = LLM::builder(model).dtype(&args.dtype);
     // Chat is strictly sequential — one blocking chat_stream call at a
     // time (REPL, -q, multi-prompt, and --bench alike), so exactly one
     // sequence is ever running. Declare that instead of inheriting the
@@ -331,8 +331,8 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         // #32 tuning, step 1 — the pipelined step's host-segment table, at chat
         // end, only under --bench. The gate never leaves the CLI: the worker
         // accumulates unconditionally (a Duration add cannot cost a 24 ms step)
-        // and hands the table to whoever asks; every non-spyre backend answers
-        // None by type.
+        // and hands the table to whoever asks; a backend that records no
+        // pipelined step answers None by type.
         if args.bench
             && let Some(table) = scratchy_serving_api::step_segment_table()
         {

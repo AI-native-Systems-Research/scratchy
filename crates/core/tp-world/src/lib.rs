@@ -15,7 +15,7 @@ extern crate alloc;
 use core::marker::PhantomData;
 
 /// A tensor-parallel world. Its one implementor is [`TpWorld<N>`]; a target states its own limits
-/// on a world as a trait over this one (spyre's `ktir_superdsc::collective::Tp`).
+/// on a world as a trait over this one (its collective protocol's own world bound).
 pub trait World:
     Copy
     + Clone

@@ -19,7 +19,6 @@ use crate::datasets;
 /// Build an [`LLM`] from throughput bench args.
 fn create_llm(args: &BenchThroughputArgs, model: &str) -> Result<LLM> {
     let mut builder = LLMBuilder::new(model)
-        .device(&args.device)
         .dtype(&args.dtype)
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)
