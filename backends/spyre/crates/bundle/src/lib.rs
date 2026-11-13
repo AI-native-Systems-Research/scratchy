@@ -1051,7 +1051,10 @@ mod tests {
         assert_eq!(code.groups[1].programs[0].func.name, "b");
         assert_eq!(code.groups[1].programs[0].func.grid, (2, 1, 1));
         assert_eq!(code.groups[0].job_bin_ptr, 64);
-        assert_eq!(code.groups[1].init_binary, BakedImage::Raw(Cow::Borrowed(&[4])));
+        assert_eq!(
+            code.groups[1].init_binary,
+            BakedImage::Raw(Cow::Borrowed(&[4]))
+        );
     }
 
     /// ⭐ A LADDER OF ONE RUNG IS A LADDER — every position up to its sweep runs that rung — and a

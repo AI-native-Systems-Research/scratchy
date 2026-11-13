@@ -3036,7 +3036,9 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
                         args: Cow::Owned(args),
                         lx_pin_window_bytes: Some(0),
                     }]),
-                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
+                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                        Cow::Borrowed(&[]),
+                    ),
                     job_bin_ptr: 0,
                     correction: Cow::Borrowed(&[]),
                 }
@@ -3344,7 +3346,9 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
                         args: Cow::Owned(args),
                         lx_pin_window_bytes: Some(0),
                     }]),
-                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
+                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                        Cow::Borrowed(&[]),
+                    ),
                     job_bin_ptr: 0,
                     correction: Cow::Borrowed(&[]),
                 }

@@ -1947,7 +1947,11 @@ impl ImageInterner {
         if self.index.is_empty() {
             return (
                 proc_macro2::TokenStream::new(),
-                PackedImages { frames: 0, blob_bytes: 0, dict_bytes: 0 },
+                PackedImages {
+                    frames: 0,
+                    blob_bytes: 0,
+                    dict_bytes: 0,
+                },
             );
         }
         // First-seen order: the row a launch group's token already names is this position.
@@ -1965,7 +1969,8 @@ impl ImageInterner {
         let all: Vec<u8> = rows.iter().flat_map(|(b, _)| b.iter().copied()).collect();
         let samples: Vec<usize> = all.chunks(SAMPLE).map(<[u8]>::len).collect();
         // Training on too few bytes for a dictionary leaves it empty: each frame then stands alone.
-        let dictionary = zstd::dict::from_continuous(&all, &samples, DICTIONARY).unwrap_or_default();
+        let dictionary =
+            zstd::dict::from_continuous(&all, &samples, DICTIONARY).unwrap_or_default();
         use rayon::prelude::*;
         let frames: Vec<(Vec<u8>, usize)> = rows
             .par_iter()

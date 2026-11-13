@@ -22,7 +22,9 @@ static DICTS: Mutex<Option<HashMap<usize, &'static zstd::dict::DecoderDictionary
 /// The dictionary `bytes` name, prepared for decoding. First use digests it; every later frame of
 /// the same build shares it.
 fn prepared(bytes: &'static [u8]) -> &'static zstd::dict::DecoderDictionary<'static> {
-    let mut dicts = DICTS.lock().expect("the baked-image dictionary table is not poisoned");
+    let mut dicts = DICTS
+        .lock()
+        .expect("the baked-image dictionary table is not poisoned");
     dicts
         .get_or_insert_with(HashMap::new)
         .entry(bytes.as_ptr() as usize)
@@ -47,7 +49,8 @@ pub fn decompress(images: &BakedImages, row: u32) -> Result<Vec<u8>, String> {
     if bytes.len() != frame.len as usize {
         return Err(format!(
             "baked image {row}: {} bytes decompressed, {} baked",
-            bytes.len(), frame.len
+            bytes.len(),
+            frame.len
         ));
     }
     Ok(bytes)
