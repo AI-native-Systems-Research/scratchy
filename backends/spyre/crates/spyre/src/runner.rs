@@ -555,7 +555,7 @@ mod tests {
                 // fixture program mints no LX pins, so its window is zero.
                 lx_pin_window_bytes: Some(0),
             }]),
-            init_binary: std::borrow::Cow::Borrowed(&[]),
+            init_binary: bundle::BakedImage::Raw(std::borrow::Cow::Borrowed(&[])),
             job_bin_ptr: 0,
             correction: std::borrow::Cow::Borrowed(&[]),
         };

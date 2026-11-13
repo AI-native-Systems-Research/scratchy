@@ -29,6 +29,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The bake's packed device images, decoded — the load half of the metal AOT precedent
+# (`crates/targets/metal/src/tape/lowered.rs`, `BakedMetallib::decompress`). The bytes live as data
+# in `scratchy-spyre-bundle`; decoding is card-runtime behavior, so it lives here. Decode only: the
+# dictionary is TRAINED in the compiler crate, which carries the `zdict_builder` feature.
+zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # EXAMPLES ONLY. `bundle_run_dev` installs a subscriber so flex's completion thread has somewhere to

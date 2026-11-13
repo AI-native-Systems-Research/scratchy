@@ -6,6 +6,10 @@
 
 /// Run a bundle this binary did not bake — see the module docs.
 pub mod bundle_run;
+/// The bake's packed device images, decoded — the metal AOT precedent's load half. Compression runs
+/// in the compiler at expansion; this is the door that turns a frame back into the bytes the card
+/// receives.
+pub mod baked_image;
 /// #603 PR2 — one launch's compute CBs as data: the submit walk's arithmetic
 /// single-sourced (`launch_site`), the plan/render twin, and the prepare-time
 /// byte-identical parity gate.

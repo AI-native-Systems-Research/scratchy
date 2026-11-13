@@ -488,7 +488,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         groups.push(scratchy_target_spyre::bundle_code::LaunchGroup {
             kv: Default::default(),
             programs: std::borrow::Cow::Owned(Vec::new()),
-            init_binary: std::borrow::Cow::Owned(gimg),
+            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                std::borrow::Cow::Owned(gimg),
+            ),
             job_bin_ptr: gc.job_bin_ptr,
             correction: std::borrow::Cow::Owned(gc.correction),
         });
