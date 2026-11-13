@@ -135,6 +135,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "GateUpTcFp8",
                 "ExpertGateUpTcFp8",
                 "ExpertActQuantFp8",
+                "ExpertGateUpGemmFp8",
                 "RmsNormQuantFp8",
                 "AddRmsNormQuantFp8",
             ],
@@ -462,6 +463,9 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
         return Err(ModelRefusal::NothingLowered);
     }
     model.weights = weight_table(input, &mut model.tapes)?;
+    for tape in &mut model.tapes {
+        tape.steps = crate::canonical::fold_expert_gate_up(std::mem::take(&mut tape.steps));
+    }
     Ok(model)
 }
 
@@ -698,7 +702,9 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::GemvGroupFp8(_) => None,
         // Read through their parts ([`CudaStep::parts`]): the two GEMMs (or expert GEMVs) each
         // fold.
-        CudaStep::GateUpAct(_) | CudaStep::ExpertGateUpAct(_) => None,
+        CudaStep::GateUpAct(_)
+        | CudaStep::ExpertGateUpAct(_)
+        | CudaStep::ExpertGateUpGemmFp8(_) => None,
         // The tensor-core decode GEMVs (FP8 S8 T2) read their weights as their CUDA-core twins
         // do; a tensor-core gate/up's first part is itself, so it names its gate's (its second
         // part, the up's GEMV, the up's).
