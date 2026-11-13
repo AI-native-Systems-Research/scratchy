@@ -48,13 +48,9 @@ scratchy-target-spyre = { path = "..", optional = true }
 # features). `quant` and `tp` likewise: `--features quant/<preset>`, `--features tp/<W>`.
 model = { package = "scratchy-models", path = "../../../models/arch", default-features = false }
 tp = { package = "scratchy-tp", path = "../tp", optional = true }
+quant = { package = "scratchy-quantizations", path = "../../../models/quantization", default-features = false }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
 libc = { workspace = true }
-
-# Purely for CLI feature reachability: the HOST build of scratchy-quantizations, whose features
-# scratchy-models' build script reads the enabled presets from.
-[build-dependencies]
-quant = { package = "scratchy-quantizations", path = "../../../models/quantization", default-features = false }

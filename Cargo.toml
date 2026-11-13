@@ -71,7 +71,6 @@ exclude = ["crates/cli/tui"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/vllm-project/vllm"
 
 [workspace.dependencies]
 # Type-level unsigned integers: a dim's number as a type, so a law between dims is a bound rustc
@@ -130,7 +129,6 @@ dirs = "7"
 rayon = "1"
 
 # Collections / utilities
-indexmap = { version = "2", features = ["serde"] }
 bytes = "1"
 rand = "0.9"
 
@@ -230,7 +228,6 @@ scratchy-forward-compiler = { path = "crates/compiler" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
 scratchy-cli = { path = "crates/cli/scr", default-features = false }
-scratchy-e2e = { path = "crates/e2e" }
 
 [profile.release]
 

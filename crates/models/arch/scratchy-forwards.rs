@@ -127,9 +127,9 @@ fn main() {
     // dynamic read (`cfg!` cannot loop over the stem list, and a hand-restated
     // probe table would be a second copy of Cargo.toml): the `CARGO_FEATURE_*`
     // names cargo itself sets for the enabled features of the crate whose
-    // build script this is. The quant presets come from
-    // `scratchy_quantizations::enabled_presets()` — the `quant/*` feature flags read by `cfg!`
-    // in the crate that owns them.
+    // build script this is. The quant presets come from the crate that owns their feature flags:
+    // scratchy-quantizations' build script publishes its `enabled_presets()`, and cargo hands
+    // them to this script, its direct dependent, as `DEP_SCRATCHY_QUANTIZATIONS_PRESETS`.
     let metadata = ScopeMetadata {
         root: manifest.clone(),
         features: std::env::vars()
@@ -137,8 +137,10 @@ fn main() {
             .collect(),
         mtp: cfg!(feature = "mtp"),
         mtp_heads: cfg!(feature = "mtp-heads"),
-        presets: scratchy_quantizations::enabled_presets()
-            .into_iter()
+        presets: std::env::var("DEP_SCRATCHY_QUANTIZATIONS_PRESETS")
+            .expect("scratchy-quantizations publishes its presets (`links` metadata)")
+            .split(',')
+            .filter(|p| !p.is_empty())
             .map(str::to_string)
             .collect(),
     };

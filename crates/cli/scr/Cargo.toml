@@ -133,9 +133,17 @@ scratchy-forward-compiler = { path = "../../compiler", optional = true }
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
 # Purely for CLI feature-reachability, like `quant` below: `--features spec/mtp`
 # compiles the MTP head of every selected model that has one. scratchy-spec's
-# features forward to scratchy-models (this same `model` instance), so this is
-# a regular-dependency edge, not a build-dependency one.
+# features forward to scratchy-models (this same `model` instance).
 spec = { package = "scratchy-spec", path = "../../models/spec", optional = true }
+# Purely for CLI feature-reachability — nothing here calls into
+# scratchy-quantizations directly. Quant-preset build scope (no `quant-`
+# text prefix on the feature names — the alias already says that) lives on
+# that crate, not on `model` (scratchy-models), because Cargo forbids
+# aliasing one crate under two different names — `model` and `quant` have
+# to be two different crates. scratchy-models depends on this same crate
+# and its build script reads the enabled presets from it, so
+# `--features quant/mlx-affine-b4-g32` lands on the instance it reads.
+quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -149,19 +157,6 @@ libc = { workspace = true }
 # and `scr complete` are always built, and ureq is already in the tree via
 # hf-hub-downloader, so they cost no additional crates.
 ureq = { workspace = true }
-
-# Purely for CLI feature-reachability — nothing here calls into
-# scratchy-quantizations directly. Quant-preset build scope (no `quant-`
-# text prefix on the feature names — the alias already says that) lives on
-# that crate, not on `model` (scratchy-models), because Cargo forbids
-# aliasing one crate under two different names — `model` and `quant` have
-# to be two different crates. scratchy-models already depends on this same
-# crate as BOTH a regular dependency (runtime preset loading) and a
-# build-dependency (its own build script reads compile-time quant scope
-# from it); this build-dependency edge unifies with that one so
-# `--features quant/mlx-affine-b4-g32` reaches the same instance.
-[build-dependencies]
-quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

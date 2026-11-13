@@ -72,8 +72,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 libc = "0.2"
 
-# Quant-preset build scope (see scratchy-cli's build-dependencies for the
-# full rationale) — unifies with scratchy-models' own build-dependency edge to
-# the same crate so `--features quant/mlx-affine-b4-g32` reaches it.
-[build-dependencies]
+# Quant-preset build scope (see scratchy-cli's `quant` for the full
+# rationale) — the same instance scratchy-models' build script reads the
+# enabled presets from, so `--features quant/mlx-affine-b4-g32` reaches it.
 quant = { package = "scratchy-quantizations", path = "../../models/quantization", optional = true, default-features = false }

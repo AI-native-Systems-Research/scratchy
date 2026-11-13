@@ -47,10 +47,6 @@ anyhow = { workspace = true }
 # The shared models build driver, and the emitter it runs spyre's models through.
 scratchy-models-build = { path = "../../../models/build" }
 scratchy-target-spyre-compiler = { path = "../compiler" }
-# Purely for feature reachability: `-p <this crate> --features scratchy-quantizations/<preset>`
-# reaches the HOST build of scratchy-quantizations through this edge, the build `scratchy-models`'
-# build script reads the enabled presets from (host builds share one feature set).
-scratchy-quantizations = { path = "../../../models/quantization" }
 
 [dev-dependencies]
 scratchy-subtile = { path = "../../../compiler/subtile" }
