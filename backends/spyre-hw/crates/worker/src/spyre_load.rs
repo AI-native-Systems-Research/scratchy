@@ -453,11 +453,13 @@ impl RankCut {
             ))
         })?;
         // The cut OWNS its product — the slicing laws build each rank's share as a fresh
-        // buffer — so a viewed source materializes here: ONE copy on a sharded leg (the
-        // load used to pay the alias's place twice — the take's copy and the cut's).
+        // buffer — and reads the VIEW to build it: only the rank's share is ever copied, so
+        // a sharded leg stages 1/world of the checkpoint per rank instead of materializing
+        // the whole model once per rank (measured at tp/8: the whole-tensor materialization
+        // was 8 full-model host copies, ~1 s of boot, all bandwidth-bound and serialized).
         let cut = self
             .forward
-            .slice_source_bytes(self.me, id, bytes.into_vec(), elem, whole, is_gemm)
+            .slice_source_bytes(self.me, id, bytes.as_slice(), elem, whole, is_gemm)
             .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))?;
         Ok(HostBytes::Owned(cut))
     }
@@ -1919,7 +1921,7 @@ impl SpyreWorker {
                                 &spill_tids,
                             )
                         }
-                        .map_err(|e| werr(format!("build SuperDSC PREFILL dxp session: {e}")))?;
+                        .map_err(|e| werr_chain("build SuperDSC PREFILL dxp session", &e))?;
                         info!(
                             "[spyre-worker] sendnn: SUPERDSC PREFILL session ready (bundle {}, \
                              m={prefill_m}, {:.2}s) — batched prompt prefill enabled",
@@ -1947,9 +1949,10 @@ impl SpyreWorker {
                 // from the prefill path is inside TTFT wherever in the chunk loop it sits. Overlapping
                 // at startup is what makes it free rather than merely moved.
                 //
-                // The thread only CREATES sessions (`SuperDscSession` is `Send`); the `alias_seg_from`
-                // calls stay on this thread after the join, because they need `&ss` and are a pointer
-                // swap, not work.
+                // The fan-out threads only BUILD the rungs' HOST halves (`SuperDscSession` is
+                // `Send`); their `prepare`s run in one wave below, after the owner has allocated,
+                // and the `alias_seg_from` calls stay on this thread after it, because they need
+                // `&ss` and are a pointer swap, not work.
                 let ladder: Vec<(
                     usize,
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
@@ -1967,42 +1970,18 @@ impl SpyreWorker {
                             .map(|c| (rm, c))
                     })
                     .collect();
-                let _t_sess = std::time::Instant::now();
-                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
-                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
-                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
-                // buffer is ever made.
-                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
-                // decode kernel's walk reads; every other session's kernels read none.
-                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
-                    .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
-                let mut ss = SuperDscSession::new(
-                    cards,
-                    code,
-                    scratchy_target_spyre_card::sdsc_runner::SessionDims {
-                        vocab,
-                        kv_dim,
-                        num_blocks,
-                    },
-                    Some(weights),
-                    wirings.decode.load_consts,
-                    &pool_statics,
-                    &spill_tids,
-                )
-                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
-                // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
-                // placement in it, so where peers' sends land is the allocator's answer for THIS
-                // session's region — pointed before any step, and checked equal on every rank.
-                ss.point_landing_slots(cards)
-                    .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
-                // ⛔ THE LADDER STARTS ONLY ONCE THE OWNER HAS ALLOCATED. A rung build allocates on
-                // every card, and a background build racing the owner's allocation lands the owner's
-                // weight segment — and the receive window placed in it — at an address that differs
-                // card to card (MEASURED at tp/2 with the world's prefill ladder: windows at
-                // 0x98fb19980 and 0xa01b0b480, refused at load). Started here, every card has made the
-                // same allocations in the same order when its window is placed, so the world's windows
-                // sit at one address by the load order itself, and the rungs still build while the
-                // load goes on.
+                // ⛔ THE LADDER'S HOST HALF SPAWNS HERE, BEFORE THE OWNER — ITS DEVICE HALF DOES
+                // NOT. A rung's build is two halves: the HOST half
+                // (`SuperDscSession::build_borrowing_with_consts` — `Executor::load`, the binds,
+                // the staging walk) touches NO device state, so it may run while the owner builds;
+                // the DEVICE half (`prepare` — the stream, the program and tensor-segment
+                // allocations, the H2Ds, the sync) is everything the owner-first laws order, and
+                // ALL of it runs in one wave after the owner has allocated (the join below).
+                // Spawning the host halves here hides the ladder's whole ~0.5 s of per-bundle work
+                // inside the owner's ~1 s build instead of paying it after it (MEASURED 2b fp8,
+                // nickm3, 2026-11-11: the three fan-outs summed 0.51 + 0.27 + 0.09 s, all
+                // sequential after the owner's build; every device interaction they had now sits
+                // in the wave).
                 let _t_ladder = std::time::Instant::now();
                 // FANNED OUT. One thread building 20 rungs serially is ~6s, and that cost is per
                 // BUNDLE (re-roll + ~1558 placements), not per weight byte — so it is the SAME for
@@ -2011,31 +1990,10 @@ impl SpyreWorker {
                 // is why 2b's startup barely moved while 8b's fell by two thirds. Splitting the rungs
                 // across threads removes the cost instead of hiding it.
                 //
-                // The rungs are independent: each is a `new_borrowing` on its own bundle dir with no
+                // The rungs are independent: each is a `build_borrowing_with_consts` on its own bundle dir with no
                 // shared state, and every `alias_seg_from` still happens later on the owning thread.
                 // Capped at the smaller of the rung count and the core count, so a short ladder does
                 // not spawn threads it cannot use.
-                // ⛔⛔⛔ THE REGION seg1 LANDS IN DECIDES THE DECODE MODE, AND THAT ORDER IS
-                // WORTH 1 ms PER TOKEN.
-                //
-                // MEASURED 2026-08-14, granite-3.1-2b fp8, 16 runs of one prompt: mean ITL is BIMODAL —
-                // 25.4-25.7 ms or 26.4-26.7 ms, a 1.0 ms gap with NOTHING between, and the whole per-token
-                // histogram shifts rather than a few tokens being slow. `SCRATCHY_SDSC_SEGADDR_DIAG` correlated
-                // it 16 for 16 with one thing: which device region seg1 — the WEIGHTS, read by every layer on
-                // every token — landed in.
-                //     seg1 in region 0x04…  ->  7 runs, ALL 25.4-25.7 ms
-                //     seg1 in 0x10…/0x14…   ->  9 runs, ALL 26.4-26.7 ms
-                // seg2 (the KV pool) showed NO correlation — region 0x14 appears in both modes. Decode is
-                // bandwidth-bound on the weights, so where they land is the whole difference.
-                //
-                // The ladder used to be spawned FIRST, so this session's ~2.6 GB seg1 raced twenty rung
-                // allocations across ~18 threads for whichever region the allocator hands out first — and the
-                // session that serves EVERY TOKEN lost that race 9 times in 16. Allocating it first makes the
-                // fast placement the deterministic one. The rungs ALIAS seg1 from it anyway
-                // (`alias_seg_from`, after the join), so they never wanted a region of their own.
-                //
-                // ⛔ THE LADDER STILL BUILDS IN PARALLEL. This reorders WHO ALLOCATES FIRST; it does not
-                // serialize startup, and the aliasing after the join is unchanged.
                 let ladder_join = {
                     // The prefill wiring's staged constants, staged by every rung through its own
                     // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
@@ -2077,7 +2035,7 @@ impl SpyreWorker {
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
-                                            let r = SuperDscSession::new_borrowing_with_consts(
+                                            let r = SuperDscSession::build_borrowing_with_consts(
                                                 cards,
                                                 rcode,
                                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -2098,24 +2056,32 @@ impl SpyreWorker {
                             .collect();
                         workers
                             .into_iter()
-                            .flat_map(|w| w.join().unwrap_or_default())
+                            .flat_map(|w| match w.join() {
+                                Ok(v) => v,
+                                // A panicked worker re-panics HERE with its own payload — the
+                                // original message and location. `unwrap_or_default` would
+                                // swallow it and silently serve a ladder missing that worker's
+                                // rungs.
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
                             .collect::<Vec<_>>()
                     })
                 };
                 // ── PREFIX-CAPABLE PREFILL LADDER ── the bundles a continuation chunk (start>0)
                 // runs on. Every ladder rung above is prefix-FREE, so these are the ONLY prefill
-                // bundles that can attend resident KV. Borrows seg1+seg2 like the rungs, and is
-                // built AFTER the decode session so it cannot affect decode's weight-region
-                // placement. A rung that fails to load is a LOAD ERROR — every rung the bake
-                // shipped must load.
-                // ⭐ THE FAN-OUT IS SPAWNED HERE, WITH THE PREFILL LADDER'S — a prefix rung is the
-                // same kind of build the prefill rungs are (an independent `new_borrowing` over a
-                // static bundle, after the owner's allocation and landing slots), so it shares the
-                // prefill fan-out's window instead of paying its own after that fan-out's join
-                // (MEASURED 2b fp8, nickm3, 2026-11-11: the three fan-outs ran sequentially —
-                // prefill 0.51 s, prefix 0.27 s, decode 0.09 s — a summed ~0.9 s of boot; fused,
-                // the wall is the slowest single build). The adoption and every refusal run on
-                // THIS thread at the join below, in ladder order.
+                // bundles that can attend resident KV. Borrows seg1+seg2 like the rungs; its host
+                // half builds with the prefill ladder's (before the owner) and its prepare rides
+                // the same wave, so it cannot affect decode's weight-region placement. A rung
+                // that fails to load is a LOAD ERROR — every rung the bake shipped must load.
+                // ⭐ THE FAN-OUT IS SPAWNED WITH THE PREFILL LADDER'S, BEFORE THE OWNER — a
+                // prefix rung is the same kind of build the prefill rungs are (an independent
+                // host-half `build_borrowing_with_consts` over a static bundle, whose device
+                // half waits for the owner), so it shares the prefill fan-out's window instead
+                // of paying its own after that fan-out's join (MEASURED 2b fp8, nickm3,
+                // 2026-11-11: the three fan-outs ran sequentially — prefill 0.51 s, prefix
+                // 0.27 s, decode 0.09 s — a summed ~0.9 s of boot; fused, the wall is the
+                // slowest single build). The adoption and every refusal run on THIS thread at
+                // the join below, in ladder order.
                 // A validated, UNBUILT prefix rung: the static bundle the background build
                 // needs, held until the fan-out below. The sentinel refusal stays on THIS
                 // thread — it is a manifest/wiring fact, not a build result.
@@ -2142,7 +2108,8 @@ impl SpyreWorker {
                 }
                 // ── BUILD THE PREFIX RUNGS IN PARALLEL ── one thread per rung (a handful at
                 // most), inside a detached thread joined at the adoption site below. The jobs
-                // are independent `new_borrowing` builds over static bundles; `spill_tids` and
+                // are independent host-half `build_borrowing_with_consts` builds over static bundles;
+                // `spill_tids` and
                 // the pool are CLONED into the thread — a detached spawn cannot borrow this
                 // frame.
                 let prefix_join = {
@@ -2167,7 +2134,7 @@ impl SpyreWorker {
                                         let spill = spill.clone();
                                         let pool = pool.clone();
                                         scope.spawn(move || {
-                                            SuperDscSession::new_borrowing_with_consts(
+                                            SuperDscSession::build_borrowing_with_consts(
                                                 cards,
                                                 job.rcode,
                                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -2344,7 +2311,8 @@ impl SpyreWorker {
                 }
                 // ── BUILD THE DECODE RUNGS IN PARALLEL ── one thread per rung, inside a
                 // detached thread joined at the adoption site below. The jobs are independent
-                // `new_borrowing` builds over static bundles; `spill_tids` is CLONED into the
+                // host-half `build_borrowing_with_consts` builds over static bundles; `spill_tids` is
+                // CLONED into the
                 // thread — a detached spawn cannot borrow this frame.
                 let decode_join = {
                     let spill = spill_tids.clone();
@@ -2360,7 +2328,7 @@ impl SpyreWorker {
                                     .map(|job| {
                                         let spill = spill.clone();
                                         scope.spawn(move || {
-                                            SuperDscSession::new_borrowing_with_consts(
+                                            SuperDscSession::build_borrowing_with_consts(
                                                 cards,
                                                 job.rcode,
                                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -2410,6 +2378,40 @@ impl SpyreWorker {
                         (decode_jobs, built)
                     })
                 };
+
+                let _t_sess = std::time::Instant::now();
+                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
+                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
+                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
+                // buffer is ever made. It runs WHILE the ladder fan-outs above build their host halves:
+                // those touch no device state, and this session's allocations are what the ladder's
+                // device half (the prepare wave below) waits for.
+                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
+                // decode kernel's walk reads; every other session's kernels read none.
+                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
+                    .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
+                let mut ss = SuperDscSession::new(
+                    cards,
+                    code,
+                    scratchy_target_spyre_card::sdsc_runner::SessionDims {
+                        vocab,
+                        kv_dim,
+                        num_blocks,
+                    },
+                    Some(weights),
+                    wirings.decode.load_consts,
+                    &pool_statics,
+                    &spill_tids,
+                )
+                .map_err(|e| werr_chain("build SuperDSC dxp session", &e))?;
+                // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
+                // placement in it, so where peers' sends land is the allocator's answer for THIS
+                // session's region — pointed before any step, and checked equal on every rank. The
+                // ladder's host halves allocate nothing, so they may already be running: every card
+                // has made the same allocations (the anchor's, then this session's) when the window
+                // is placed, exactly as before the split.
+                ss.point_landing_slots(cards)
+                    .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
 
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
@@ -2514,24 +2516,193 @@ impl SpyreWorker {
                 // after the join; the narrow ones arrive from the background thread.
                 let mut prefill_ladder: Vec<(usize, SuperDscSession)> = Vec::new();
                 let mut _n_ladder = 0usize;
-                // JOIN: the background creates are done (or finishing); alias each onto the decode
-                // session's regions here, on the thread that owns `ss`.
-                for (rm, built) in ladder_join.join().unwrap_or_default() {
-                    match built {
-                        Ok(mut rs) => {
-                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
-                                panic!(
-                                    "prefill ladder rung m={rm}: {e} — every rung the bake \
-                                     shipped must load"
-                                );
-                            }
+                // ── JOIN THE HOST BUILDS, THEN RUN THE LADDER'S DEVICE HALF IN ONE WAVE ── the
+                // three fan-outs above built during the owner's window, and their sessions arrive
+                // here UNPREPARED (host plans plus staged bytes, nothing on the card): this is
+                // where the card first hears about them.
+                // ⛔ THE LADDER'S DEVICE PHASE STARTS ONLY ONCE THE OWNER HAS ALLOCATED. A rung
+                // prepare allocates on every card, and a background prepare racing the owner's
+                // allocation lands the owner's weight segment — and the receive window placed in
+                // it — at an address that differs card to card (MEASURED at tp/2 with the world's
+                // prefill ladder: windows at 0x98fb19980 and 0xa01b0b480, refused at load).
+                // Started here, every card has made the same allocations in the same order when
+                // its window is placed, so the world's windows sit at one address by the load
+                // order itself — and the rungs' host halves still built while the owner did.
+                // ⛔⛔⛔ THE REGION seg1 LANDS IN DECIDES THE DECODE MODE, AND THAT ORDER IS
+                // WORTH 1 ms PER TOKEN.
+                //
+                // MEASURED 2026-08-14, granite-3.1-2b fp8, 16 runs of one prompt: mean ITL is BIMODAL —
+                // 25.4-25.7 ms or 26.4-26.7 ms, a 1.0 ms gap with NOTHING between, and the whole per-token
+                // histogram shifts rather than a few tokens being slow. `SCRATCHY_SDSC_SEGADDR_DIAG` correlated
+                // it 16 for 16 with one thing: which device region seg1 — the WEIGHTS, read by every layer on
+                // every token — landed in.
+                //     seg1 in region 0x04…  ->  7 runs, ALL 25.4-25.7 ms
+                //     seg1 in 0x10…/0x14…   ->  9 runs, ALL 26.4-26.7 ms
+                // seg2 (the KV pool) showed NO correlation — region 0x14 appears in both modes. Decode is
+                // bandwidth-bound on the weights, so where they land is the whole difference.
+                //
+                // The ladder's rungs used to be WHOLE builds spawned first, so this session's ~2.6 GB
+                // seg1 raced twenty rung allocations across ~18 threads for whichever region the
+                // allocator hands out first — and the session that serves EVERY TOKEN lost that race
+                // 9 times in 16. Allocating it first makes the fast placement the deterministic one.
+                // The rungs ALIAS seg1 from it anyway (`alias_seg_from`, after this wave), so they
+                // never wanted a region of their own.
+                //
+                // ⛔ THE LADDER STILL BUILDS IN PARALLEL — and now BEFORE the owner, because its
+                // host half allocates nothing. This wave reorders WHO ALLOCATES FIRST; it does not
+                // serialize startup, and the aliasing after it is unchanged.
+                let _t_wave = std::time::Instant::now();
+                let ladder_built = match ladder_join.join() {
+                    Ok(v) => v,
+                    // A panicked fan-out thread re-panics HERE with its own payload —
+                    // the original message and location, not a replacement string.
+                    Err(p) => std::panic::resume_unwind(p),
+                };
+                let _t_ladder_join = _t_wave.elapsed();
+                let (prefix_jobs, prefix_built_sessions) = match prefix_join.join() {
+                    Ok(v) => v,
+                    Err(p) => std::panic::resume_unwind(p),
+                };
+                let _t_prefix_join = _t_wave.elapsed();
+                let (decode_jobs, decode_built_sessions) = match decode_join.join() {
+                    Ok(v) => v,
+                    Err(p) => std::panic::resume_unwind(p),
+                };
+                let _t_joins = _t_wave.elapsed();
+                let (ladder_prepared, prefix_prepared, decode_prepared) =
+                    std::thread::scope(|scope| {
+                        fn joined<R>(hs: Vec<std::thread::ScopedJoinHandle<'_, R>>) -> Vec<R> {
+                            hs.into_iter()
+                                .map(|h| match h.join() {
+                                    Ok(r) => r,
+                                    Err(p) => std::panic::resume_unwind(p),
+                                })
+                                .collect()
+                        }
+                        // One thread per session, all three families at once — the wave's
+                        // concurrency is its SESSION count, the width a one-card boot already
+                        // rides, and each session's ranks prepare in rank order on its own
+                        // thread (`prepare_in_rank_order`) so the thread count stays there:
+                        // fanned per rank, tp/8's wave was 264 prepare threads on one host
+                        // driver path and paid 3755 ms for ~a tenth of that in device work.
+                        let hl: Vec<_> = ladder_built
+                            .into_iter()
+                            .map(|(rm, built)| {
+                                scope.spawn(move || {
+                                    (
+                                        rm,
+                                        built.and_then(|mut rs| {
+                                            rs.prepare_in_rank_order()?;
+                                            Ok(rs)
+                                        }),
+                                    )
+                                })
+                            })
+                            .collect();
+                        let hp: Vec<_> = prefix_jobs
+                            .iter()
+                            .zip(prefix_built_sessions)
+                            .map(|(job, built)| {
+                                scope.spawn(move || {
+                                    built.and_then(|mut ps| {
+                                        ps.prepare_in_rank_order().map_err(|e| {
+                                        (job.pmq, format!(
+                                            "prefix-capable prefill m={} session prepare failed: \
+                                             {e} — every rung the bake shipped must load",
+                                            job.pmq
+                                        ))
+                                    })?;
+                                        Ok(ps)
+                                    })
+                                })
+                            })
+                            .collect();
+                        let hd: Vec<_> = decode_jobs
+                            .iter()
+                            .zip(decode_built_sessions)
+                            .map(|(job, built)| {
+                                scope.spawn(move || {
+                                    built.and_then(|mut ds| {
+                                        ds.prepare_in_rank_order().map_err(|e| {
+                                        (job.rn, format!(
+                                            "decode batch rung seqs={} FAILED to prepare ({e}) — \
+                                             every rung the bake shipped must load",
+                                            job.rn
+                                        ))
+                                    })?;
+                                        Ok(ds)
+                                    })
+                                })
+                            })
+                            .collect();
+                        (joined(hl), joined(hp), joined(hd))
+                    });
+                let _t_all = _t_wave.elapsed();
+                info!(
+                    "[spyre-worker] sendnn: ladder device half: {} session(s) prepared in {:.0} ms \
+                     (joins: ladder {:.0} / prefix {:.0} / decode {:.0} + prepare scope {:.0} ms — \
+                     join time past zero is host halves that outran the owner's window)",
+                    ladder_prepared.len() + prefix_prepared.len() + decode_prepared.len(),
+                    _t_all.as_secs_f64() * 1e3,
+                    _t_ladder_join.as_secs_f64() * 1e3,
+                    _t_prefix_join.as_secs_f64() * 1e3,
+                    _t_joins.as_secs_f64() * 1e3,
+                    (_t_all - _t_joins).as_secs_f64() * 1e3,
+                );
+                // ADOPTION: alias each onto the decode session's regions. The alias is
+                // host work on the BORROWER's own segment table (pointer swaps) plus, when
+                // the layout spilled a weight tail, that borrower's own device copy — the
+                // owner is only ever READ here — so the rungs adopt in parallel, one thread
+                // per session, the same width the prepare wave above already rode. The
+                // refusals are still reported in ladder order on this thread: every thread
+                // returns its failure as a value, and the walk below panics on the first
+                // one in rung order, byte-identical to the serial loop it replaces.
+                let ladder_adopted: Vec<(usize, Result<SuperDscSession, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = ladder_prepared
+                            .into_iter()
+                            .map(|(rm, built)| {
+                                let ss = &ss;
+                                let spill = &spill_images;
+                                scope.spawn(move || {
+                                    (
+                                        rm,
+                                        built
+                                            .map_err(|e| {
+                                                format!(
+                                                    "create failed: {e} — every rung the bake \
+                                                     shipped must load"
+                                                )
+                                            })
+                                            .and_then(|mut rs| {
+                                                adopt_from_owner(&mut rs, ss, spill)
+                                                    .map_err(|e| {
+                                                        format!(
+                                                            "{e} — every rung the bake \
+                                                             shipped must load"
+                                                        )
+                                                    })
+                                                    .map(|()| rs)
+                                            }),
+                                    )
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
+                    });
+                for (rm, adopted) in ladder_adopted {
+                    match adopted {
+                        Ok(rs) => {
                             _n_ladder += 1;
                             prefill_ladder.push((rm, rs));
                         }
-                        Err(e) => panic!(
-                            "prefill ladder rung m={rm}: create failed: {e} — every rung the \
-                             bake shipped must load"
-                        ),
+                        Err(msg) => panic!("prefill ladder rung m={rm}: {msg}"),
                     }
                 }
                 // The TOP rung is `prefill_ss` itself — built and aliased above, never on the
@@ -2541,8 +2712,9 @@ impl SpyreWorker {
                 }
                 prefill_ladder.sort_by_key(|(m, _)| *m);
                 debug!(
-                    "[timing] prefill ladder: {} rung(s) ready in {:.2}s wall — built in parallel on \
-                     background threads while the decode session staged",
+                    "[timing] prefill ladder: {} rung(s) ready in {:.2}s wall — host halves built on \
+                     background threads while the owner session built, device halves in the wave \
+                     after it",
                     _n_ladder,
                     _t_ladder.elapsed().as_secs_f64(),
                 );
@@ -2552,34 +2724,57 @@ impl SpyreWorker {
                     prefill_ladder.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
                     prefill_ladder.last().map(|(m, _)| *m).unwrap_or(0),
                 );
-                // ── PREFIX-CAPABLE PREFILL LADDER ── the join. The jobs and their fan-out were
-                // spawned with the prefill ladder's, right after the owner allocated (see
-                // `prefix_join` above); this waits for them and adopts, on this thread, in
-                // ladder order.
-                let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
-                let (prefix_jobs, prefix_built_sessions) = match prefix_join.join() {
-                    Ok(v) => v,
-                    // A panicked fan-out thread re-panics HERE with its own payload — the
-                    // original message and location, not a replacement string.
-                    Err(p) => std::panic::resume_unwind(p),
-                };
-                for (job, built) in prefix_jobs.into_iter().zip(prefix_built_sessions) {
-                    let mut ps = built.unwrap_or_else(|(_, m)| panic!("{m}"));
-                    adopt_from_owner(&mut ps, &ss, &spill_images).unwrap_or_else(|e| {
-                        panic!(
-                            "prefix-capable prefill m={}: {e} — every rung the bake shipped \
-                             must load",
-                            job.pmq
-                        )
+                // ── PREFIX-CAPABLE PREFILL LADDER ── the adoption. The fan-out was spawned with
+                // the prefill ladder's, before the owner (host halves only); its prepare ran in
+                // the wave above. The adoption runs one thread per session, reading the owner
+                // only; refusals and "ready" logs land in ladder order on this thread.
+                let prefix_adopted: Vec<(u32, &'static str, Result<SuperDscSession, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = prefix_jobs
+                            .into_iter()
+                            .zip(prefix_prepared)
+                            .map(|(job, built)| {
+                                let ss = &ss;
+                                let spill = &spill_images;
+                                let pmq = job.pmq;
+                                let fp: &'static str = &job.rcode.fp;
+                                scope.spawn(move || {
+                                    (
+                                        pmq,
+                                        fp,
+                                        built.map_err(|(_, m)| m).and_then(|mut ps| {
+                                            adopt_from_owner(&mut ps, ss, spill)
+                                                .map_err(|e| {
+                                                    format!(
+                                                        "prefix-capable prefill m={pmq}: {e} — \
+                                                         every rung the bake shipped must load"
+                                                    )
+                                                })
+                                                .map(|()| ps)
+                                        }),
+                                    )
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
                     });
+                let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
+                for (pmq, fp, adopted) in prefix_adopted {
+                    let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
                     info!(
                         "[spyre-worker] sendnn: prefix-capable prefill session ready (m={}, \
                          bundle {}) — used for start>0 chunks",
-                        job.pmq, job.rcode.fp
+                        pmq, fp
                     );
-                    prefix_built.push((job.pmq as usize, ps));
+                    prefix_built.push((pmq as usize, ps));
                 }
-                let mut prefill_prefix = PrefixLadder::of_built(prefix_built);
+                let prefill_prefix = PrefixLadder::of_built(prefix_built);
                 if prefill_prefix.is_empty() {
                     warn!(
                         "[spyre-worker] sendnn: no prefix-capable prefill session built — continuation \
@@ -2599,68 +2794,81 @@ impl SpyreWorker {
                 // rung the bake shipped must load, so a binary whose batch decode silently runs
                 // elsewhere can never serve.
                 let mut decode_ladder: Vec<DecodeRung> = Vec::new();
-                // The jobs and their fan-out were spawned with the prefill ladder's (see
-                // `decode_join` above); this is the join, and the adoption below runs on this
-                // thread, in ladder order.
-                let (decode_jobs, decode_built_sessions) = match decode_join.join() {
-                    Ok(v) => v,
-                    // A panicked fan-out thread re-panics HERE with its own payload — the
-                    // original message and location, not a replacement string.
-                    Err(p) => std::panic::resume_unwind(p),
-                };
-                for (job, built) in decode_jobs.into_iter().zip(decode_built_sessions) {
-                    let mut rs = built.unwrap_or_else(|(_, m)| panic!("{m}"));
-                    adopt_from_owner(&mut rs, &ss, &spill_images).unwrap_or_else(|e| {
-                        panic!(
-                            "decode batch rung seqs={}: {e} — every rung the bake shipped must \
-                             load",
-                            job.rn
-                        )
+                // The jobs and their fan-out were spawned with the prefill ladder's, before the
+                // owner (see `decode_join` above); their prepare ran in the wave above, and the
+                // adoption below runs one thread per session, reading the owner only —
+                // refusals and "ready" logs land in ladder order on this thread.
+                let decode_adopted: Vec<(usize, usize, usize, Result<DecodeRung, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = decode_jobs
+                            .into_iter()
+                            .zip(decode_prepared)
+                            .map(|(job, built)| {
+                                let ss = &ss;
+                                let spill = &spill_images;
+                                let rn = job.rn;
+                                let rung_width = job.rung_width;
+                                let (lrows, lwidth) = (job.logits.rows, job.logits.width);
+                                scope.spawn(move || {
+                                    (
+                                        rn,
+                                        lrows,
+                                        lwidth,
+                                        built.map_err(|(_, m)| m).and_then(|mut rs| {
+                                            adopt_from_owner(&mut rs, ss, spill)
+                                                .map_err(|e| {
+                                                    format!(
+                                                        "decode batch rung seqs={rn}: {e} — \
+                                                         every rung the bake shipped must load"
+                                                    )
+                                                })
+                                                .map(|()| DecodeRung {
+                                                    seqs: rung_width,
+                                                    // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY
+                                                    // MORE — both are per-BODY and this is
+                                                    // per-bundle; see `DecodeRung`. The launch
+                                                    // asks `sess.step_body(start)`, which is the
+                                                    // selector itself. And no `logits` — the
+                                                    // geometry's only runtime reader was the host
+                                                    // readback the submit/collect split deleted;
+                                                    // the load-time refusal above is what stays.
+                                                    sess: rs,
+                                                })
+                                        }),
+                                    )
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
                     });
+                for (rn, lrows, lwidth, adopted) in decode_adopted {
+                    let rung = adopted.unwrap_or_else(|m| panic!("{m}"));
                     info!(
                         "[spyre-worker] sendnn: decode batch rung seqs={} ready \
                          (logits [{}, {}])",
-                        job.rn, job.logits.rows, job.logits.width
+                        rn, lrows, lwidth
                     );
-                    decode_ladder.push(DecodeRung {
-                        seqs: job.rung_width,
-                        // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
-                        // per-BODY and this is per-bundle; see `DecodeRung`. The launch
-                        // asks `sess.step_body(start)`, which is the selector itself.
-                        // And no `logits` — the geometry's only runtime reader was the
-                        // host readback the submit/collect split deleted; the load-time
-                        // refusal above is what stays.
-                        sess: rs,
-                    });
+                    decode_ladder.push(rung);
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
-                // ⭐ FAULT THE CHUNK SESSIONS' ACTIVATION SHADOWS IN AT LOAD, so a request's first
-                // binds write into pages already mapped (see `materialize_activation_shadow`) — the
-                // sessions a first request runs on.
-                {
-                    let _t = std::time::Instant::now();
-                    let mut shadow_bytes = 0u64;
-                    let mut fault =
-                        |sess: &mut SuperDscSession, rows: usize| -> ExecutorResult<()> {
-                            shadow_bytes += sess.materialize_activation_shadow().map_err(|e| {
-                                werr(format!("the {rows}-row session's activation shadow: {e}"))
-                            })?;
-                            Ok(())
-                        };
-                    for (rows, sess) in prefill_ladder.iter_mut() {
-                        fault(sess, *rows)?;
-                    }
-                    for (rows, sess) in prefill_prefix.rungs_mut() {
-                        fault(sess, rows)?;
-                    }
-                    fault(&mut ss, 1)?;
-                    info!(
-                        "[spyre-worker] sendnn: chunk sessions' activation shadows faulted in at load \
-                         ({} KB, {:.0} ms)",
-                        shadow_bytes >> 10,
-                        _t.elapsed().as_secs_f64() * 1e3,
-                    );
-                }
+                // ⭐ THE ACTIVATION SHADOWS' PAGES FAULT AT THE WRITE THAT FIRST TOUCHES THEM. The
+                // load faults only what it wrote (the staging walks, the keyed binds); a request's
+                // first bind faults its own pages at its own moment, and only those. The eager door
+                // that used to live here (#673) faulted every chunk session's WHOLE shadow at load —
+                // born at 18-38 ms over 115-160 MB, but the ladder's reservations grew ~12x and
+                // rank with the world: measured 2026-11-12 on nickm5, 1.3 GB / 642 ms at k=1 and
+                // 10.9 GB / 3.5 s at tp/8, 86% of it per-request bind space no load-time write ever
+                // touches — and the host fault path is SERIALIZED at ~2 GB/s no matter the thread
+                // count (a 36-thread fault of 10 GB ran at the same 1.5 GB/s one thread does), so
+                // the bytes cannot be faulted faster, only fewer. A first ~1k request binds ~3-5 MB
+                // per session — milliseconds of demand faults — against seconds of every boot and
+                // 10.9 GB of RSS the door cost at tp/8.
                 let sb = SuperDscBundle {
                     decode: ss,
                     decode_rungs: decode_ladder,

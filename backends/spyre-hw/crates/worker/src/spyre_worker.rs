@@ -38,6 +38,20 @@ pub(crate) fn werr(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::WorkerExecution(msg.into())
 }
 
+/// ⭐ `werr` OVER A WHOLE `anyhow` CHAIN — `{e}` (Display) states only the error's own top
+/// context, so a `werr(format!("…: {e}"))` built over a context-wrapped error swallows every
+/// cause under it: the tp/8 boot failure of 2026-11-12 surfaced as far as "…dxp session:
+/// rank 0" and the refusal under `rank 0` — the line that named the bug — never reached any
+/// log. This joins the chain's messages on one line so the terminal states the failure in
+/// plain words, per the same law that bans unnamed failed terminals.
+// ⛔ HW-ONLY: both callers build SuperDSC dxp sessions (spyre_load's card path), which the
+// emulator builds its own way — under `spyre-emu` alone the function would be dead code.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn werr_chain(msg: &str, e: &anyhow::Error) -> ExecutorError {
+    let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+    werr(format!("{msg}: {}", chain.join(" — ")))
+}
+
 /// Host-only KTIR serving worker.
 pub struct SpyreWorker {
     pub(crate) config: WorkerConfig,

@@ -2064,7 +2064,10 @@ impl std::error::Error for SliceRefusal {}
 impl<T: crate::bundle_code::collective::World> TpForward<T> {
     /// ⭐ THE BYTES RANK `me` STAGES FOR SOURCE `id`: its share of the whole checkpoint tensor
     /// `full`, cut by the slice law the analysis derived for that source ([`Self::sources`]) —
-    /// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it.
+    /// `scratchy_subtile::tensor_parallel::slice_source`, the one implementation of it. `full`
+    /// is BORROWED: the cut reads the rank's share out of it and builds only that, so a viewed
+    /// checkpoint (the mmap) is never materialized whole — a sharded leg once copied the whole
+    /// model once per rank here (measured at tp/8: 8 full-model host copies, ~1 s of the boot).
     ///
     /// `whole` is the source's one-rank shape (the one-rank wiring's `tensor_shapes`) and `elem`
     /// its element width. A gemm weight sits on disk as `[n, k]`, the transpose of its logical
@@ -2076,7 +2079,7 @@ impl<T: crate::bundle_code::collective::World> TpForward<T> {
         &self,
         me: crate::bundle_code::collective::Rank<T>,
         id: u32,
-        full: Vec<u8>,
+        full: &[u8],
         elem: usize,
         whole: (u32, u32),
         is_gemm: bool,
@@ -2097,7 +2100,7 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
     shard: SourceShard,
     me: crate::bundle_code::collective::Rank<T>,
     id: u32,
-    full: Vec<u8>,
+    full: &[u8],
     elem: usize,
     whole: (u32, u32),
     is_gemm: bool,
@@ -2105,7 +2108,7 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
     use scratchy_subtile::subtile_ir::SourceShape;
     use scratchy_subtile::tensor_parallel::slice_source;
     if shard == SourceShard::Whole {
-        return Ok(full);
+        return Ok(full.to_vec());
     }
     let (rows, cols) = whole;
     let want = rows as usize * cols as usize * elem;
@@ -2164,9 +2167,9 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
         slice_source(elems, shape, shard, rank).into_flattened()
     }
     match elem {
-        1 => Ok(cut::<1, T>(&full, shape, shard, me)),
-        2 => Ok(cut::<2, T>(&full, shape, shard, me)),
-        4 => Ok(cut::<4, T>(&full, shape, shard, me)),
+        1 => Ok(cut::<1, T>(full, shape, shard, me)),
+        2 => Ok(cut::<2, T>(full, shape, shard, me)),
+        4 => Ok(cut::<4, T>(full, shape, shard, me)),
         bytes => Err(SliceRefusal::Element { id, bytes }),
     }
 }
@@ -2941,7 +2944,8 @@ mod tp_slice_tests {
         let disk: Vec<u8> = (0..4u8)
             .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
             .collect();
-        let cut = |shard, me| cut_source_bytes::<W2>(shard, me, 7, disk.clone(), 1, (2, 4), true);
+        let cut =
+            |shard, me| cut_source_bytes::<W2>(shard, me, 7, disk.as_slice(), 1, (2, 4), true);
         assert_eq!(cut(SourceShard::Rows, r0), Ok(vec![0, 10, 20, 30]));
         assert_eq!(cut(SourceShard::Rows, r1), Ok(vec![1, 11, 21, 31]));
         assert_eq!(cut(SourceShard::Cols, r0), Ok(vec![0, 1, 10, 11]));
@@ -2950,7 +2954,7 @@ mod tp_slice_tests {
         // A two-byte element moves as one: a norm row [1, 4] split by columns.
         let row: Vec<u8> = (0..8).collect();
         assert_eq!(
-            cut_source_bytes::<W2>(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
+            cut_source_bytes::<W2>(SourceShard::Cols, r1, 3, row.as_slice(), 2, (1, 4), false),
             Ok(vec![4, 5, 6, 7])
         );
     }
@@ -2968,7 +2972,7 @@ mod tp_slice_tests {
         let block = SourceShard::ColBlocks {
             block: std::num::NonZeroU32::new(2).unwrap(),
         };
-        let cut = |me| cut_source_bytes::<W2>(block, me, 7, disk.clone(), 1, (2, 3), true);
+        let cut = |me| cut_source_bytes::<W2>(block, me, 7, disk.as_slice(), 1, (2, 3), true);
         assert_eq!(cut(r0), Ok(vec![0, 1, 10, 11]));
         assert_eq!(cut(r1), Ok(vec![20, 21, 0, 0]));
     }
@@ -2978,7 +2982,7 @@ mod tp_slice_tests {
     fn a_cut_it_cannot_make_is_refused() {
         let r0 = Rank::<W2>::of::<0>();
         assert_eq!(
-            cut_source_bytes::<W2>(SourceShard::Cols, r0, 1, vec![0; 6], 1, (2, 4), false),
+            cut_source_bytes::<W2>(SourceShard::Cols, r0, 1, &[0; 6], 1, (2, 4), false),
             Err(SliceRefusal::Size {
                 id: 1,
                 bytes: 6,
@@ -2986,7 +2990,7 @@ mod tp_slice_tests {
             })
         );
         assert_eq!(
-            cut_source_bytes::<W2>(SourceShard::Cols, r0, 1, vec![0; 3], 1, (1, 3), false),
+            cut_source_bytes::<W2>(SourceShard::Cols, r0, 1, &[0; 3], 1, (1, 3), false),
             Err(SliceRefusal::Indivisible {
                 id: 1,
                 shard: SourceShard::Cols,
@@ -2995,14 +2999,14 @@ mod tp_slice_tests {
             })
         );
         assert_eq!(
-            cut_source_bytes::<W2>(SourceShard::Rows, r0, 1, vec![0; 24], 3, (2, 4), true),
+            cut_source_bytes::<W2>(SourceShard::Rows, r0, 1, &[0; 24], 3, (2, 4), true),
             Err(SliceRefusal::Element { id: 1, bytes: 3 })
         );
         let heads = SourceShard::HeadRows {
             heads: std::num::NonZeroU32::new(2).unwrap(),
         };
         assert_eq!(
-            cut_source_bytes::<W2>(heads, r0, 1, vec![0; 8], 1, (2, 4), true),
+            cut_source_bytes::<W2>(heads, r0, 1, &[0; 8], 1, (2, 4), true),
             Err(SliceRefusal::HeadSplitGemm { id: 1 })
         );
     }
@@ -3014,7 +3018,7 @@ mod tp_slice_tests {
         let row: Vec<u8> = (0..16).collect();
         let got: Vec<Vec<u8>> = ranks::<W4>()
             .map(|r| {
-                cut_source_bytes::<W4>(SourceShard::Cols, r, 3, row.clone(), 1, (2, 8), false)
+                cut_source_bytes::<W4>(SourceShard::Cols, r, 3, row.as_slice(), 1, (2, 8), false)
                     .unwrap()
             })
             .collect();
@@ -3029,7 +3033,7 @@ mod tp_slice_tests {
         );
         let r0 = Rank::<W4>::of::<0>();
         assert!(matches!(
-            cut_source_bytes::<W4>(SourceShard::Cols, r0, 3, vec![0; 12], 1, (2, 6), false),
+            cut_source_bytes::<W4>(SourceShard::Cols, r0, 3, &[0; 12], 1, (2, 6), false),
             Err(SliceRefusal::Indivisible { .. })
         ));
     }
