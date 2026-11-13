@@ -33,7 +33,7 @@ use crate::charts::{
     ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
-use crate::{Site, slug};
+use crate::{Site, slug, thousands};
 use data::{At, Cell, Model, RequestTiming, Run, Scenario};
 use datasets::{MapAt, MapRow, MapSquare, SummaryMap};
 use numbers::{
@@ -730,6 +730,52 @@ pub(super) fn parity_info() -> Element {
              word further behind means scratchy loaded the model wrong, so that model is not timed at all."
         },
     )
+}
+
+/// The speed-up helper scratchy's server ran for a model, for its run line: "speed-up helper:
+/// DFlash2, guessing 7 tokens a step", or none; None where the run did not record it.
+pub(super) fn helper(m: &Model) -> Option<String> {
+    let s = m.spec_decode.as_ref()?;
+    let Some(drafter) = s.drafter.as_deref() else {
+        return Some("speed-up helper: none".to_string());
+    };
+    let name = match drafter {
+        "dflash2" => "DFlash2",
+        "mtp" => "MTP",
+        other => other,
+    };
+    Some(match s.drafts_per_step {
+        Some(n) => format!("speed-up helper: {name}, guessing {n} tokens a step"),
+        None => format!("speed-up helper: {name}"),
+    })
+}
+
+/// What [`helper`] means, and where the server ran none, its own words why.
+pub(super) fn helper_info(m: &Model) -> Element {
+    let why = (m.spec_decode.as_ref()).and_then(|s| s.why.as_deref());
+    info(
+        "",
+        rsx! {
+            "Speculative decoding: a small, fast helper (DFlash2, or the model's own \
+             multi-token-prediction head, MTP) guesses the next few tokens, and the model checks \
+             them all in one step. Each guess it keeps is a token it did not make one at a time; a \
+             wrong guess costs that step's extra work. scratchy runs a helper by itself where it finds \
+             one for the model; oMLX and mlx-lm guess nothing by default, so where scratchy has one, \
+             its numbers are with it and theirs without."
+            if let Some(why) = why { p { "The server: {why}" } }
+        },
+    )
+}
+
+/// How many of a cell's guessed tokens scratchy's helper kept, of how many: "74% of 1,229"; None
+/// where it guessed none.
+pub(super) fn kept(d: Option<&data::Drafts>) -> Option<String> {
+    let d = d.filter(|d| d.draft_tokens > 0)?;
+    let share = 100.0 * d.accepted_tokens as f64 / d.draft_tokens as f64;
+    Some(format!(
+        "{share:.0}% of {}",
+        thousands(d.draft_tokens as usize)
+    ))
 }
 
 fn info(label: &str, body: Element) -> Element {
@@ -2393,10 +2439,10 @@ pub(super) fn over_time_charts(
 pub(super) const HEAT_LABELS: usize = 12;
 
 /// One overview heat map's ratios, at its run's [`glance_answer`]: the rival, and each square's
-/// (users, prompt, how many times faster scratchy is).
+/// (users, prompt, how many times faster scratchy is, and scratchy's guesses kept).
 struct GlanceGrid {
     rival: Engine,
-    cells: Vec<(u32, u32, Option<f64>)>,
+    cells: Vec<(u32, u32, Option<f64>, Option<data::Drafts>)>,
     /// Each ratioless square's reason, where its cell gives one ([`why`]).
     why: Vec<(u32, u32, String)>,
 }
@@ -2422,7 +2468,10 @@ impl GlanceGrid {
             if r.is_none() && said.contains(TTFT_TOO_SOON) {
                 why.push((u, i, said));
             }
-            cells.push((u, i, r));
+            let drafts = g
+                .at(Some(Engine::Scratchy), (u, i))
+                .and_then(|c| c.spec_decode);
+            cells.push((u, i, r, drafts));
         }
         Ok(GlanceGrid { rival, cells, why })
     }
@@ -2649,22 +2698,26 @@ pub(super) fn grid_glance(id: &str, machines: &BTreeMap<&str, MachineRuns>) -> E
                         continue;
                     };
                     for (p, &i) in shape(chip).prompts.iter().enumerate() {
-                        let ratio = match &grids[&(chip, stem, gm.name)] {
-                            Ok(g) => {
-                                match g.cells.iter().find(|&&(cu, ci, _)| (cu, ci) == (u, i)) {
-                                    Some(&(_, _, Some(r))) => Ok((r, g.rival.label().to_string())),
-                                    // Where its cell says why, as a first token timed too soon.
-                                    _ => Err((g.why.iter())
-                                        .find(|(wu, wi, _)| (*wu, *wi) == (u, i))
-                                        .map_or("no ratio".to_string(), |(_, _, w)| w.clone())),
-                                }
+                        let grid = grids[&(chip, stem, gm.name)].as_ref();
+                        let cell =
+                            (grid.ok()).and_then(|g| g.cells.iter().find(|c| (c.0, c.1) == (u, i)));
+                        let ratio = match (grid, cell) {
+                            (Ok(g), Some(&(_, _, Some(r), _))) => {
+                                Ok((r, g.rival.label().to_string()))
                             }
-                            Err(why) => Err(why.to_string()),
+                            // Where its cell says why, as a first token timed too soon.
+                            (Ok(g), _) => Err((g.why.iter())
+                                .find(|(wu, wi, _)| (*wu, *wi) == (u, i))
+                                .map_or("no ratio".to_string(), |(_, _, w)| w.clone())),
+                            (Err(why), _) => Err(why.to_string()),
                         };
-                        let tip = vec![
-                            format!("{stem} on {chip}"),
-                            format!("{} · {i} prompt tokens · {}", gm.name, users_at(u)),
+                        let tip = [
+                            Some(format!("{stem} on {chip}")),
+                            Some(format!("{} · {i} prompt tokens · {}", gm.name, users_at(u))),
+                            (cell.and_then(|c| kept(c.3.as_ref())))
+                                .map(|k| format!("helper kept {k} guessed tokens")),
                         ];
+                        let tip = tip.into_iter().flatten().collect();
                         squares.insert((m, r, k, p), MapSquare { ratio, tip });
                         heat_map.insert((m, r, k, p), (chip, stem, gm.name));
                     }
@@ -2999,6 +3052,67 @@ mod tests {
             4
         );
         assert!(html.contains("Mamba-2 on Apple M3 Pro: not run yet."));
+    }
+
+    /// A run that recorded scratchy's speed-up helper says which it ran, in each pair's run line,
+    /// and how many of its guesses each cell kept: in the summary squares' tooltips, Random's and a
+    /// dataset's, and in the dataset's detail table. A run that did not, as every published one so
+    /// far, shows none of it. A server that found a helper it could not use says why.
+    #[test]
+    fn a_run_says_which_speed_up_helper_scratchy_ran_and_what_it_kept() {
+        use super::data::{Drafts, SpecDecode};
+        use super::datasets::{RANDOM, section};
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(section("rag", &machines, &machines));
+        assert!(!html.contains("speed-up helper") && !html.contains("guesses kept"));
+        let drafts = Drafts {
+            draft_tokens: 1229,
+            accepted_tokens: 283,
+        };
+        let m = &mut runs[0].models[0];
+        m.spec_decode = Some(SpecDecode {
+            drafter: Some("dflash2".into()),
+            repo: Some("mlx-community/Qwen3.6-35B-A3B-DFlash2-4bit".into()),
+            drafts_per_step: Some(7),
+            why: None,
+        });
+        // Prompt counts on the RAG cells, so the summary has squares to draw.
+        for (cells, ours) in [(m.tasks.as_mut(), true), (m.tasks_omlx.as_mut(), false)] {
+            for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                c.prompt_tokens = Some(vec![Some(3200); n]);
+                c.spec_decode = ours.then_some(drafts);
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(section("rag", &machines, &machines));
+        assert!(html.contains("speed-up helper: DFlash2, guessing 7 tokens a step"));
+        assert!(html.contains(">guesses kept<"), "the detail table's column");
+        assert!(html.contains(">23% of 1,229<"), "a cell's guesses kept");
+        assert!(html.contains("helper kept 23% of 1,229 guessed tokens, over the cell"));
+        runs[0].models[0].spec_decode = Some(SpecDecode {
+            drafter: None,
+            repo: None,
+            drafts_per_step: None,
+            why: Some("this build compiled no head for qwen3; serving without drafting.".into()),
+        });
+        let machines = super::index(&runs);
+        let html = render(section("rag", &machines, &machines));
+        assert!(html.contains("speed-up helper: none"));
+        assert!(html.contains("The server: this build compiled no head for qwen3"));
+        // Random's squares: a grid cell's guesses kept.
+        let mut runs = fixtures(&["apple-m4-max-2026-10-29T013115Z-8385aba7.json"]);
+        for c in runs[0]
+            .models
+            .iter_mut()
+            .flat_map(|m| m.scaling.iter_mut().flatten())
+        {
+            c.spec_decode = Some(drafts);
+        }
+        let machines = super::index(&runs);
+        let html = render(section(RANDOM, &machines, &machines));
+        assert!(html.contains("helper kept 23% of 1,229 guessed tokens<"));
     }
 
     /// A summary square against a cell most of whose requests failed has no ratio: it says why.
