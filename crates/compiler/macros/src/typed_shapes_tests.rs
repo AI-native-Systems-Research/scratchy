@@ -477,7 +477,8 @@ fn head_facts(
     model: &crate::config::ModelParams,
 ) -> scratchy_ir::model_facts::ModelFacts {
     let width = crate::codegen::target_width(program, inferred);
-    crate::codegen::fill_canonical_params(model, 1, false, &Default::default(), Some(width)).0
+    crate::codegen::fill_canonical_params(model, 1, false, &Default::default(), Some(width), false)
+        .0
 }
 
 /// An in-checkpoint head reads its target's lent lm_head through `as_dim`: its own width stated as

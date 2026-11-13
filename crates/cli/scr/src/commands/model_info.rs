@@ -28,8 +28,8 @@ use scratchy_forward_compiler::{
 
 use crate::args::{ColorWhen, ModelInfoArgs};
 
-// Inventory submissions for `scratchy_models` are kept alive by
-// `scratchy-serving-worker::gpu_worker`'s `extern crate scratchy_models as _;`,
+// Inventory submissions of the compiled models are kept alive by the linked worker's
+// `extern crate` of its target's models crate,
 // which the CLI binary transitively pulls in.
 
 pub async fn run_info(args: ModelInfoArgs) -> anyhow::Result<()> {

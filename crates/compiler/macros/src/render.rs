@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn render_is_token_identical_to_to_string() {
         let src = r#"
-            #[cfg(feature = "metal")]
+            #[cfg(feature = "some_target")]
             pub static TAPE: &[Cmd] = &[
                 Cmd { kernel: KernelId::Gemm, m: 512u32, dims: Some(D { n: 1, k: -2 }) },
                 Cmd { kernel: KernelId::Add, m: 1u32, dims: None },

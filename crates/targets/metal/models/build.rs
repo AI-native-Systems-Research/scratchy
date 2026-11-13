@@ -58,7 +58,7 @@ fn write_metal_models(out_dir: &Path, models: &[String]) {
 fn write_metal_bake(out_dir: &Path) {
     let mut rendered = String::with_capacity(1 << 20);
     scratchy_forward_compiler_macro::render_tokens(
-        scratchy_forward_compiler_macro::metal_bake_module(),
+        scratchy_target_metal_compiler::static_tape::bake_module(),
         &mut rendered,
     );
     write_if_changed(&out_dir.join("metal_bake.rs"), &rendered);
@@ -76,7 +76,9 @@ fn main() {
     let built = scratchy_models_build::build(&ModelsBuild {
         metadata: &metadata,
         out_dir: &out_dir,
-        emitter: &scratchy_forward_compiler_macro::target::Metal,
+        emitter: &scratchy_target_metal_compiler::Metal {
+            turboquant: cfg!(feature = "turboquant"),
+        },
         dump_dir: None,
         inspect: &metal_tape_models,
     });

@@ -10,7 +10,7 @@ default = []
 # TurboQuant KV compression, fixed per model at build time: every model whose geometry the codec
 # takes (`scratchy_layers::turboquant::codec_for`) is emitted with `KV_CODEC = TurboQuant`, the rest
 # stay dense and are named in the build output. Nothing selects it at runtime.
-turboquant = ["scratchy-forward-compiler-macro/turboquant"]
+turboquant = []
 # The vision towers' runtime surface. A scope that selects a vision arch (`scratchy-models`'
 # `vision`, which every `arch-<X>-vl` turns on) needs it: the build script refuses that scope
 # without it, rather than fail inside the emitted tower.
@@ -33,9 +33,11 @@ scratchy-core-model = { workspace = true }
 anyhow = { workspace = true }
 
 [build-dependencies]
-# The shared models build driver, and the emitter it runs metal's models through.
+# The shared models build driver, the emitter it runs metal's models through, and the renderer the
+# crate-root bake module goes through.
 scratchy-models-build = { path = "../../../models/build" }
-scratchy-forward-compiler-macro = { path = "../../../compiler/macros", features = ["metal"] }
+scratchy-forward-compiler-macro = { path = "../../../compiler/macros" }
+scratchy-target-metal-compiler = { path = "../compiler" }
 # Reading metal's tables off the emitted tokens.
 proc-macro2 = "1"
 

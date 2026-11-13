@@ -469,9 +469,8 @@ pub enum OpKind {
     /// Embed output — same semantics as the pre-refactor
     /// `Instruction::Embed::eval` inline splice.
     ///
-    /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which is
-    /// metal-gated: the op exists on that target only.
-    #[cfg(feature = "metal")]
+    /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which runs
+    /// only for a target that splices: the op exists on such a target only.
     MmEmbedSplice,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
@@ -794,7 +793,6 @@ impl OpKind {
             Self::AllGather => "all_gather",
             // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
             // doc-comment. No DSL surface.
-            #[cfg(feature = "metal")]
             Self::MmEmbedSplice => "mm_embed_splice",
             // Lowering-pass-only op kind — see `OpKind::LoadRows` doc-comment. No DSL surface.
             Self::LoadRows(_) => "load_rows",

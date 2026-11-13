@@ -30,6 +30,11 @@ pub trait MetalWeights: ScratchyWeights {
     /// it was built.
     fn kv_codec(&self) -> KvCodec;
 
+    /// The loaded variant's `CanonicalParams::KV_CACHE_LAYERS`: the layers that hold KV when not
+    /// every layer does (a recurrent hybrid's attention layers). The worker's KV pool holds
+    /// tensors for these only and sizes its budget by them. `None`: every layer holds KV.
+    fn kv_cache_layers(&self) -> Option<&'static [u32]>;
+
     /// # Safety
     /// All tensors in `ctx` must be valid GPU memory; `device`
     /// must be the live device. Same invariants as each

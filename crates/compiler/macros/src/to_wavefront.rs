@@ -746,7 +746,6 @@ pub fn lower_decode_to_wavefront(
             // the splice's output slot so downstream tiles read the
             // same `EmbeddedHidden` source. No op is emitted
             // — this op is structurally absent from the megakernel.
-            #[cfg(feature = "metal")]
             OpKind::MmEmbedSplice => {
                 let upstream = bx.input_at(tile, 0)?;
                 let producer = match upstream {
