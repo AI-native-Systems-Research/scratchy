@@ -71,6 +71,4 @@ fn main() {
     // archive at this link: dependent first, provider after (static-archive
     // resolution is left-to-right).
     println!("cargo:rustc-link-search=native={}", dir.display());
-    println!("cargo:rustc-link-lib=static=flex_shim");
-    println!("cargo:rustc-link-lib=static=senlib_oco");
 }
