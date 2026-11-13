@@ -37,7 +37,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The shared commands (`scratchy_cli::run`), with model-name completion.
-scratchy-cli = { path = "../../../cli/scr", default-features = false, features = ["model"] }
+scratchy-cli = { workspace = true, features = ["model"] }
 # The spyre worker: the `WorkerFactory` the engine serves through. `main.rs` anchors it.
 scratchy-target-spyre-worker = { workspace = true }
 # `spyre bundle run` ONLY: launching a bundle this binary did not bake needs the executor and the

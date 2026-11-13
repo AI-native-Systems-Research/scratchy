@@ -229,7 +229,7 @@ scratchy-vision = { path = "crates/models/vision" }
 scratchy-forward-compiler = { path = "crates/compiler" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
-scratchy-cli = { path = "crates/cli/scr" }
+scratchy-cli = { path = "crates/cli/scr", default-features = false }
 scratchy-e2e = { path = "crates/e2e" }
 
 [profile.release]
