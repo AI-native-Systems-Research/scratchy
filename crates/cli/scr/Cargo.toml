@@ -3,7 +3,7 @@ name = "scratchy-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The scratchy CLI's common core: every command, its arguments and `run`, shared by each target's binary (`scr` on metal, `spyre` on IBM Spyre)"
+description = "The scratchy CLI's common core: every command, its arguments and `run`, shared by each target's binary (`scr` on Apple silicon, `spyre` on IBM Spyre)"
 
 # A library, no binary: each target's CLI crate (`crates/targets/<target>/cli`) parses its command
 # line, links its target's worker and runs these commands through `scratchy_cli::run`. Nothing here

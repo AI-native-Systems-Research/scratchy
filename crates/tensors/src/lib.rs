@@ -38,7 +38,7 @@ pub type LoadStream = ();
 /// Backend-neutral opaque handle for the ambient forward-args bundle the
 /// `ScratchyWeights::forward*` trait methods take.
 ///
-/// The concrete bundle (`scratchy_target_metal::ForwardCtx`) names the
+/// A target's concrete bundle (its `ForwardCtx`) names the
 /// backend-coupled `KvCachePool` / `GdnStatePool` types, so it cannot live in
 /// the cfg-free dispatcher. Threading this opaque, lifetime-carrying newtype
 /// through the trait (the same neutralization [`LoadStream`] applies to the
@@ -79,7 +79,7 @@ impl<'a> ForwardCtxHandle<'a> {
 
 /// Backend-neutral opaque handle for the live device the
 /// `ScratchyWeights::forward*` trait methods launch on. The concrete device
-/// (`scratchy_target_metal::GpuDevice`) wraps the queue/allocator and must
+/// (a target's `GpuDevice`) wraps the queue/allocator and must
 /// not move into the leaf, so the trait names this newtype instead and the
 /// per-arch `impl ScratchyWeights` recovers `&mut GpuDevice` via
 /// [`ForwardDeviceHandle::as_mut`]. Same object-safety story as

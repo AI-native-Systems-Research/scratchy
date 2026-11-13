@@ -304,7 +304,7 @@ fn carriers(arch: &std::path::Path) -> Vec<(String, bool)> {
 
 /// Every config's bounds as the config loader derives them, one `carrier/config name=value` line
 /// each: a snapshot to compare across a change to how bounds are derived. A report, not run by
-/// default: `cargo test -p scratchy-forward-compiler-macro --features metal --lib bounds_snapshot
+/// default: `cargo test -p scratchy-forward-compiler-macro --lib bounds_snapshot
 /// -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -829,7 +829,7 @@ fn fixture_groups(fixture: &serde_json::Value) -> crate::bundles::GroupSizes {
 }
 
 /// Every derived bundle is the checkpoint's: each bundle of each fixture — the header of a
-/// checkpoint a metal loader takes — read by the bundle table's names and storage, the loaders'
+/// checkpoint a loader takes — read by the bundle table's names and storage, the loaders'
 /// own (`bundles::role_in_checkpoint` over `scratchy_tensors::bundle_roles`: MLX-affine banks
 /// pre-stacked or per expert, a fused shared gate/up, a conv's singleton axis), equals the bundle
 /// the model's config derives, under its bounds; and a fixture names every bundle its model

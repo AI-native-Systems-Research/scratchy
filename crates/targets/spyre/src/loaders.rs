@@ -10,8 +10,8 @@
 //!
 //! Spyre is a HOST backend (fp16), so these helpers are allocator-generic over
 //! `A: DeviceAllocator` (the host `SpyreAllocator` is the concrete `A`), exactly
-//! like the neutral `scratchy_layers::loaders`. RmsNorm mirrors metal's
-//! keep-dtype choice (spyre is fp16 like metal). The quant loaders are
+//! like the neutral `scratchy_layers::loaders`. RmsNorm mirrors the GPU target's
+//! keep-dtype choice (spyre is fp16 like it). The quant loaders are
 //! kernel-bound and not yet wired on the host path; their `*Ops` constructors
 //! `anyhow::bail!` at runtime, so the signatures type-check (every model
 //! variant's load body compiles) while a bf16 checkpoint never calls them.
@@ -47,7 +47,7 @@ fn as_str_refs(paths: &[String]) -> Vec<&str> {
 
 /// Spyre-divergent layered RMSNorm load: `RmsNorm::load` routes through
 /// `take_keep_dtype` so the on-disk gain dtype reaches the host verbatim
-/// (mirroring metal — spyre is fp16; the cuda variant load-time-casts to bf16),
+/// (mirroring the GPU target — spyre is fp16; the cuda variant load-time-casts to bf16),
 /// so it cannot be neutral.
 pub fn load_layered_rms_norm(
     gw: &mut GpuWeights,
@@ -124,7 +124,7 @@ pub fn load_layered_rms_norm_vision(
 /// Stream-free CPU-concat then one direct-write pack per layer via
 /// [`LinearLayer::load_dense_concat_packed`]. The spyre pack plans the
 /// destination buffer then byte-copies each source tensor in, so it's kept
-/// per-target (sibling of metal's direct-write pack).
+/// per-target (sibling of the GPU target's direct-write pack).
 pub fn load_layered_linear_dense_concat_packed(
     gw: &mut GpuWeights,
     n_layers: u32,

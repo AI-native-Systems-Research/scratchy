@@ -956,7 +956,7 @@ impl ModelFacts {
     pub const fn parts(self) -> FactsParts {
         self.0
     }
-    /// The metal element dtype.
+    /// The activation element dtype.
     pub const fn act_dtype(self) -> ActDtype {
         self.0.act_dtype
     }

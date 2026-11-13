@@ -3,7 +3,7 @@
 //!
 //! Supports parsing PEFT-format adapter_config.json.
 //! Actual weight loading is backend-specific; no backend wires LoRA today
-//! (the metal path through `MetalWorker` doesn't yet).
+//! (not every target's worker does yet).
 
 use std::path::Path;
 

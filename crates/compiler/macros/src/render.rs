@@ -7,7 +7,7 @@
 //! about is LINE STRUCTURE — `TokenStream::to_string()` yields one 77 MB
 //! line and rustc's span/line-column bookkeeping collapses on it.
 //!
-//! Measured on `-Fmetal --release` with the default scope (5 small llama
+//! Measured on a `--release` build with the then-default scope (5 small llama
 //! configs, llama-3.2-3b among the emitted variants), build script vs
 //! `scratchy-models` rustc:
 //!

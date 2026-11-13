@@ -6,7 +6,7 @@
 //! enum holds them behind `AffineQuant` / `Nvfp4` variants, so they must live
 //! below it in a backend-neutral crate. Their `load()` constructors (against
 //! the `WeightSource` seam) and the `e4m3_to_f32` decode stay in
-//! `scratchy-target-metal`, which owns the runtime; this crate names no backend.
+//! the target that owns the runtime; this crate names no backend.
 
 use scratchy_tensors::GpuTensor;
 
@@ -14,7 +14,7 @@ use scratchy_tensors::GpuTensor;
 // AffineQuantLinear (MLX-native int4 affine)
 // ---------------------------------------------------------------------------
 
-/// MLX-native affine INT4 quantized linear layer (Metal backend only).
+/// MLX-native affine INT4 quantized linear layer.
 ///
 /// Storage layout matches `mlx-community` affine checkpoints exactly:
 /// weights packed `[N, ceil(K*bits/32)]` U32 (bits=3 packs a continuous
@@ -27,7 +27,7 @@ use scratchy_tensors::GpuTensor;
 /// bias. The optional fp linear-layer bias (when models like Phi-3 / some
 /// Qwen2 variants ship it) lives in `linear_bias` separately.
 ///
-/// No `forward()` method on this type — Metal forwards go through the
+/// No `forward()` method on this type — a target's forwards go through the
 /// macro-emitted `Instruction<W>` stream and dispatch via the worker
 /// resolver, not direct method calls.
 pub struct AffineQuantLinear {
@@ -61,7 +61,7 @@ impl AffineQuantLinear {
 // Nvfp4Linear — NVIDIA ModelOpt NVFP4 4-bit linear
 // ---------------------------------------------------------------------------
 
-/// NVIDIA ModelOpt NVFP4 4-bit quantized linear (Metal-only).
+/// NVIDIA ModelOpt NVFP4 4-bit quantized linear.
 ///
 /// On disk: `.weight` is `uint8 [N, K/2]` (two packed E2M1 codes per byte,
 /// low nibble = even element), `.weight_scale` is `float8_e4m3 [N, K/16]`
@@ -75,7 +75,7 @@ impl AffineQuantLinear {
 /// No per-group bias (NVFP4 is symmetric); `linear_bias` is the optional
 /// fp linear-layer bias, distinct from any quantization offset.
 ///
-/// As with `AffineQuantLinear`, there's no `forward()` here — Metal forwards
+/// As with `AffineQuantLinear`, there's no `forward()` here — a target's forwards
 /// go through the macro-emitted `Instruction` stream and the worker resolver.
 pub struct Nvfp4Linear {
     /// Packed E2M1 weights, shape `[N, K/2]`, dtype `U8`.
@@ -119,7 +119,7 @@ impl Nvfp4Linear {
 /// dequant via `affine_embed_<dtype>_gs_<gs>_b_<bits>`. The macro emits this
 /// type instead of `Embedding` when `model.embed_tokens` carries
 /// `(weight=U32, scales, biases)` safetensors keys. Tied lm_head reuses
-/// the same buffer triple (GpuTensor is Copy under metal — it's a thin
+/// the same buffer triple (GpuTensor is Copy — it's a thin
 /// pointer wrapper) via `LinearLayer::AffineQuant`.
 pub struct AffineQuantEmbedding {
     /// Packed quantized weights, shape `[vocab_size, ceil(hidden*bits/32)]`,

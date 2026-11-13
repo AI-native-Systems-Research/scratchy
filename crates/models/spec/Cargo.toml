@@ -17,7 +17,7 @@ description = "Speculative-decoding build scope: which drafters compile alongsid
 # inside their targets' checkpoints and each target's default published
 # drafter (Gemma 4 26B-A4B's assistant at MLX 4-bit g32), which `scr` already
 # compiles —
-# `-p scratchy-target-metal-cli --features model/gemma-4-26b-a4b-it,spec/mtp`.
+# `--features model/gemma-4-26b-a4b-it,spec/mtp` on `scr`.
 mtp = ["scratchy-models/mtp"]
 
 [dependencies]

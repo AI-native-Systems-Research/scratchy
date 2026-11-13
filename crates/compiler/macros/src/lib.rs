@@ -69,7 +69,7 @@ mod typed_shapes_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target: one body, since
 // the target is a compile-time singleton — there is no second target in the build to
 // compromise for. Packing gate/up into a single `__fused__`
-// buffer is metal's kernel ABI, so it arrives as a bool argument rather than a second walk.
+// buffer is a target's kernel ABI, so it arrives as a bool argument rather than a second walk.
 pub mod weight_bindings;
 pub mod weight_vocab;
 
@@ -270,9 +270,9 @@ fn dedup_tp_sig(tp_world_size: u8) -> String {
 
 /// Global, target-reactive prefill/decode bucket ladder. Every `#[forward]`
 /// arch that does not explicitly override `workloads` compiles THIS ladder
-/// (for the Metal codegen). The full ladder is always emitted;
+/// (for a target's bucketed codegen). The full ladder is always emitted;
 /// the affordable subset is chosen per device at load time by
-/// `select_prefill_bucket` (Metal prunes its colored arena). Mirrors the llama arch's historical ladder.
+/// `select_prefill_bucket` (a target prunes its colored arena). Mirrors the llama arch's historical ladder.
 ///
 /// Flat 8 → 64 on purpose: filling 16/32 rungs in here helped MoE (gemma-4:
 /// conc-12 TPOT 140.8 → 85.1 ms, dead expert compute at padded rows) but
@@ -1285,7 +1285,7 @@ pub fn compile_carrier(
         // Per-variant `rope_on_read` arms — spans / position-independent KV.
         // Rope-on-read is the universal default for rope-using models; this
         // mirrors the `ROPE_ON_READ` CanonicalParams const (both derive from
-        // `fuf_uses_rotary`) and is what the metal worker reads to decide it is
+        // `fuf_uses_rotary`) and is what the worker reads to decide it is
         // safe to OR bit 31 into block_table/slot_mapping. No-rope variants get
         // the trait default (false); emitted only when some variant ropes.
         let rope_on_read_tokens = {
@@ -1774,8 +1774,8 @@ fn emit_arch_dispatcher(
         None => vec![],
     };
 
-    // Per-tp inventory submission, into the target's own registry row (`MetalArchRegistration`
-    // under metal), each wrapping the shared `ArchRegistration` over its
+    // Per-tp inventory submission, into the target's own registry row (each
+    // target's own), each wrapping the shared `ArchRegistration` over its
     // `dyn <Target>Weights`. Each closure passes its own tp constant into `Weights::load(...)`;
     // the matching arm there walks only the tp-N variants. The submit! block is a static
     // initializer — N submissions at compile time, walked once at runtime by the target's

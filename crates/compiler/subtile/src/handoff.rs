@@ -5,14 +5,14 @@
 //! `scratchy-forward-compiler-macro`, which DEPENDS ON the target crates — so nothing on the
 //! target side could refer to them, and any lowering that needed them was forced to live in the
 //! shared compiler crate no matter whose logic it was. That dependency direction is the reason
-//! metal's lowering sat in `compiler/macros` instead of under `targets/metal`.
+//! a target's lowering once sat in `compiler/macros` instead of under its target.
 //!
 //! None of it is target-specific: a `TileId` names a FUF tile, a `SlotMap` is a coloring keyed
 //! on one, a `SourceBinding` says what a graph source is bound to, and a `LoweredDecode` is the
 //! op list plus the provenance a target needs to bind weights to it.
 //!
 //! ⛔ NO `syn` HERE. `WeightSlot` stayed behind precisely because its `base` is a `syn::Ident`,
-//! and this crate is compiled into the metal RUNTIME. A target lowering hands back
+//! and this crate is compiled into a target's RUNTIME. A target lowering hands back
 //! `(WeightKind, String)` and the macro crate mints the `Ident`.
 
 use crate::lower::LoweringInput;
@@ -28,7 +28,7 @@ pub struct TileId(pub u32);
 /// [`SourceBinding::BundleTensor`] names.
 ///
 /// ⭐ THE SHARED SUBSET ONLY. A variant belongs here when MORE THAN ONE target binds that
-/// tensor off the bundle — a staging target binds each as its own weight and metal reads it
+/// tensor off the bundle — a staging target binds each as its own weight and another reads it
 /// through its own `WeightTensor` at lowering, so both must agree on the vocabulary. A
 /// tensor exactly one target reads (a shared-expert slab, a GDN table) stays that target's
 /// own enum and never appears here.
@@ -116,7 +116,7 @@ pub enum WeightKind {
     /// `WeightAccessors::gated_delta_net_at`.
     GatedDeltaNet,
     CosSin,
-    /// Metal-only: MLX-affine int4 quantized embedding. Resolves to
+    /// MLX-affine int4 quantized embedding. Resolves to
     /// `WeightAccessors::affine_quant_embedding_at`.
     AffineQuantEmbedding,
     /// Per-layer attention-sink logits (`[num_attention_heads]`,
@@ -247,7 +247,7 @@ pub enum SourceBinding {
     ///
     /// The `tensor` vocabulary is the SHARED one — the subset of a bundle's tensors that more
     /// than one target binds ([`BundleTensor`]). A target-only tensor stays the target's own
-    /// fact (metal's `WeightTensor` is its superset, with shared-expert and GDN arms); nothing
+    /// fact (a target's own tensor vocabulary is its superset, with shared-expert and GDN arms); nothing
     /// here may name a tensor only one target reads.
     BundleTensor {
         id: u32,
@@ -499,7 +499,7 @@ impl WeightKind {
     /// The Rust type an accessor of this kind resolves to.
     ///
     /// ⭐ ONE SOURCE OF TRUTH. The macro crate parses tokens from this to emit the per-arch
-    /// `WeightAccessors` impl; metal's compiler compares accessor GROUP SIGNATURES against it.
+    /// `WeightAccessors` impl; a target's compiler compares accessor GROUP SIGNATURES against it.
     /// Two hand-kept copies of the same mapping is how a kind comes to mean one type on one
     /// side and a different one on the other, with nothing to catch it.
     ///
@@ -537,7 +537,7 @@ impl WeightKind {
 /// One weight slot consumed by an op instance: which `WeightAccessors` method the per-arch
 /// match arm goes under (`kind`), and the user-source accessor method name it calls (`base`).
 ///
-/// ⛔ `base` IS A `String`, NOT A `syn::Ident`. This crate is linked into the metal RUNTIME, and
+/// ⛔ `base` IS A `String`, NOT A `syn::Ident`. This crate is linked into a target's RUNTIME, and
 /// an `Ident` would drag `syn` in with it. The macro crate mints the identifier at emission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeightSlot {

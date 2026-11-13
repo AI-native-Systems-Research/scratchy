@@ -240,7 +240,7 @@ struct Builder<'a> {
     /// directly (an in-graph `Concat`-tile of an identical `[1, head_dim]` row
     /// crashes the DeepTools partitioner; see `guard_known_crash_patterns`).
     /// GQA needs two widths (Q: `n_q_heads*hd`, K: `n_kv_heads*hd`). The eval /
-    /// ktir / metal consumers read the first `head_dim` and broadcast, so a
+    /// every target's consumers read the first `head_dim` and broadcast, so a
     /// wider source is backward-compatible for them.
     cos_sin: BTreeMap<(u32, bool), (usize, usize)>,
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
@@ -677,7 +677,7 @@ pub fn lower_decode_to_wavefront(
 
     // Topological walk over `fuf.nodes`. The bridge's resolver looks
     // up each input's producer in `bx.produced`, so a tile must be
-    // visited only AFTER every tile-input it references. Metal's
+    // visited only AFTER every tile-input it references. A target's
     // post-fusion FUF happens to be stored in ascending-id topo order
     // (which is why the original `for node in &fuf.nodes` loop
     // sufficed), but cuda's fusion pass reorders ids — so we must
@@ -858,7 +858,7 @@ pub fn lower_decode_to_wavefront(
                     // qfp8ch quant + matmulfp8 (fp8×fp8→fp16) + `a_scale·w_scale` dequant. Feed it the
                     // per-channel `weight_scale` as the 3rd input; the worker loads the 1-byte weight + scale.
                     Some(crate::quantization::StorageFormat::Fp8 { .. }) => GemmWeight::Fp8Dynamic,
-                    // MLX-affine packed weights — the format every 4-bit metal checkpoint
+                    // MLX-affine packed weights — the format every 4-bit MLX checkpoint
                     // ships. `k` is the activation's column count, checked here against the
                     // group so a weight whose groups do not tile K cannot be lowered.
                     Some(crate::quantization::StorageFormat::Affine { bits, group_size }) => {
@@ -1820,8 +1820,8 @@ pub fn lower_decode_to_wavefront(
                 // are the capping ones, so it is present whenever this arm runs.
                 // Read at the same site every other model-const scalar is (the
                 // parsed `scalars` table, which hoists nested `text_config`),
-                // and carried on the op so the tape holds it — metal/cuda bake
-                // it into kernels and a target may bind it as a registry const.
+                // and carried on the op so the tape holds it — a target may bake
+                // it into kernels or bind it as a registry const.
                 let cap = bx
                     .model
                     .scalars

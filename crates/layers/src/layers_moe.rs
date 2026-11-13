@@ -51,13 +51,13 @@ pub struct MoeRouting<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// AffineFusedMoELayer (metal: MLX-affine int4 experts + dense BF16 router)
+// AffineFusedMoELayer (MLX-affine int4 experts + dense BF16 router)
 // ---------------------------------------------------------------------------
 
-/// MLX-affine int4 fused MoE layer (Metal-only at runtime).
+/// MLX-affine int4 fused MoE layer.
 ///
 /// Mirrors the binding shape consumed by `lower_moe_step` in
-/// `scratchy-forward-compiler/src/interpreter/metal/lowering.rs`:
+/// a target's MoE lowering:
 /// * `router_gate` — dense `[num_experts, hidden_size]` BF16/F16 — fed
 ///   to the routing Gemm.
 /// * `expert_{gate,up}_{w,scales,biases}` — stacked per-expert affine
@@ -143,7 +143,7 @@ impl ExpertBits {
 // Gemma-4 MoE (gemma_moe op): separate router + router-less SwitchGLU experts
 // ---------------------------------------------------------------------------
 
-/// Gemma-4-26B-A4B router weight bundle (base `router`, Metal-only at runtime).
+/// Gemma-4-26B-A4B router weight bundle (base `router`).
 ///
 /// Three on-disk leaves under `...layers.N.router`:
 /// * `router.proj` — `[num_experts, hidden]` **8-bit** MLX-affine; dequantized
@@ -167,8 +167,8 @@ pub struct GemmaRouterLayer {
     pub hidden_size: usize,
 }
 
-/// Gemma-4-26B-A4B SwitchGLU expert weight bundle (base `experts.switch_glu`,
-/// Metal-only at runtime). Same stacked-per-expert MLX-affine int4 layout as
+/// Gemma-4-26B-A4B SwitchGLU expert weight bundle (base `experts.switch_glu`).
+/// Same stacked-per-expert MLX-affine int4 layout as
 /// [`AffineFusedMoELayer`]'s routed experts, but with NO router gate (the router
 /// is the separate [`GemmaRouterLayer`] bundle) and `gate/up/down_proj` naming
 /// directly under `...layers.N.experts.switch_glu` (NOT `switch_mlp`).
@@ -210,8 +210,7 @@ pub struct SwitchGluExpertsLayer {
 // per-expert LINEAR biases
 // ---------------------------------------------------------------------------
 
-/// gpt-oss (20b / 120b) fused MoE weight bundle (base `mlp`, Metal-only at
-/// runtime).
+/// gpt-oss (20b / 120b) fused MoE weight bundle (base `mlp`).
 ///
 /// Distinct from [`AffineFusedMoELayer`] — which it otherwise mirrors in its
 /// expert storage — in three ways the gpt-oss forward needs:
@@ -267,34 +266,34 @@ pub struct GptOssMoELayer {
 }
 
 // ---------------------------------------------------------------------------
-// FusedMoELayer (enum: Affine for metal)
+// FusedMoELayer (enum: Affine)
 // ---------------------------------------------------------------------------
 
 /// Unified fused-MoE layer. Mirrors the [`crate::LinearLayer`]
 /// precedent: one public enum that holds the per-backend storage. The
 /// macro-emitted `WeightAccessors::fused_moe_at` returns a reference
 /// to this type, and the per-target Impls match on the variant they
-/// expect (the Metal `MetalFusedMoeImpl` fires on MLX-affine int4
+/// expect (the affine MoE lowering takes MLX-affine int4
 /// checkpoints).
 pub enum FusedMoELayer {
-    /// MLX-affine int4 MoE (Metal-only). Per-expert (W, scales,
+    /// MLX-affine int4 MoE. Per-expert (W, scales,
     /// biases) triples + dense fp router; lowered to a 10-step ICB
     /// decomposition by `lower_moe_step`.
     Affine(Box<AffineFusedMoELayer>),
 }
 
 // ---------------------------------------------------------------------------
-// AffineSharedFusedMoELayer (metal: MLX-affine int4 Qwen-MoE family)
+// AffineSharedFusedMoELayer (MLX-affine int4 Qwen-MoE family)
 // ---------------------------------------------------------------------------
 
-/// MLX-affine int4 fused MoE + shared expert layer (Metal-only at runtime).
+/// MLX-affine int4 fused MoE + shared expert layer.
 ///
 /// Same stacked-per-expert affine layout as [`AffineFusedMoELayer`]
 /// (Qwen naming: `gate_proj/up_proj/down_proj`), plus optional shared
 /// expert tail used by Qwen2-MoE / Qwen3-MoE.
 ///
 /// `shared_*` fields are `None` when `shared_intermediate_size == 0`
-/// (Qwen3-MoE-30B-A3B-Instruct ships shared_inter=0). The Metal
+/// (Qwen3-MoE-30B-A3B-Instruct ships shared_inter=0). A target's
 /// lowering pass conditions its shared-expert tail on the same flag,
 /// so an absent shared expert is structurally consistent — the
 /// lowered tape doesn't reference these slots.
@@ -334,7 +333,7 @@ pub struct AffineSharedFusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
-// SharedFusedMoELayer (enum: Affine for metal)
+// SharedFusedMoELayer (enum: Affine)
 // ---------------------------------------------------------------------------
 
 pub enum SharedFusedMoELayer {

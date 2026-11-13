@@ -13,7 +13,7 @@
 //!
 //! `cpu_golden` (from `scratchy-forward-compiler`) is the host *calculator* the
 //! validation computes with — not the correctness *oracle* (that is
-//! scratchy-target-metal non-mega at temp=0).
+//! a target's non-mega forward at temp=0).
 
 // First, so the pattern it generates (`expansion_ops!`) is in textual scope for every module.
 #[macro_use]
@@ -30,9 +30,9 @@ pub mod subtile_ir;
 // ⛔ UNGATED, AND THAT IS THE POINT. The re-roll machinery (`reroll_subtile_tape` /
 // `lower_dag_to_tape` / the `OpenLoop`/`CloseLoop` tape) is THE shared artifact: the
 // SuperDSC emitter (which re-rolls the layer loop so dxp compiles ONE small body
-// bundle instead of the 30×-unrolled monster) and metal both lower from it. Gating it
-// on a target-only feature made it INVISIBLE to a metal build, which is a large part
-// of why metal forked upstream of it instead. Its non-test code depends only on
+// bundle instead of the 30×-unrolled monster) and every target lower from it. Gating it
+// on a target-only feature made it INVISIBLE to every other target, which is a large part
+// of why one forked upstream of it instead. Its non-test code depends only on
 // `subtile_ir`, which is always compiled, so carrying it unconditionally pulls in no
 // target-only modules.
 /// The compiler -> target handoff types (`TileId`, `SlotMap`, `SourceBinding`,
@@ -58,7 +58,7 @@ pub mod tensor_parallel;
 /// THE HOST TAPE — the program as data: the ordered host-side sequence of
 /// kernel launches, transfers and CPU steps that a compiled bundle's kernels
 /// are only the pieces of. Distinct from [`subtile_tape`] (the compiler's
-/// rerolled op tape) and from metal's instruction tape.
+/// rerolled op tape) and from a target's instruction tape.
 ///
 /// UNGATED: it is plain data plus one generic loop, with no dependency on any
 /// emitter — every target's player is the same function over it.

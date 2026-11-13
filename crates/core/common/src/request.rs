@@ -57,13 +57,13 @@ impl BlockKind {
 /// Sparse map of block index to [`BlockKind`] for span-aware block hashing.
 pub type BlockAnnotations = BTreeMap<usize, BlockKind>;
 
-/// Per-block RoPE flags for metal spans (rope-on-read).
+/// Per-block RoPE flags for spans (rope-on-read).
 ///
 /// Returns `(is_relocatable, is_unrotated)` where **`is_unrotated ==
 /// is_relocatable`**: under rope-on-read, a `BlockKind::Relocatable`
 /// (span) block has its K stored WITHOUT RoPE by `rope_append`, and the
 /// paged attention kernels re-rope it to each reader's position on read.
-/// So a relocatable block IS an unrotated block — the flag the metal KV
+/// So a relocatable block IS an unrotated block — the flag a target's KV
 /// pool mirrors to the GPU (`block_is_unrotated`) for the kernels' gate.
 pub fn compute_block_flags_rope_on_read(
     annotations: &BlockAnnotations,
@@ -478,7 +478,7 @@ pub struct Request {
     pub cache_breakpoints: Vec<u32>,
 
     /// ⭐ WHAT THE WORKER'S KV LOOKS LIKE FOR THIS REQUEST — reported back every step by backends whose
-    /// keys do not sit at their token positions, and `None` for the ones where they do (metal).
+    /// keys do not sit at their token positions, and `None` for the ones where they do.
     ///
     /// Two things depend on it, and both are wrong-output bugs when it is missing on a backend that
     /// needs it:
@@ -834,7 +834,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // compute_block_flags_rope_on_read (metal spans) tests
+    // compute_block_flags_rope_on_read (spans) tests
     // -----------------------------------------------------------------------
 
     #[test]

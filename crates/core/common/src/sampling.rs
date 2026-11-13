@@ -285,7 +285,7 @@ impl Default for SamplingParams {
 /// non-greedy rows. Identical for every backend — only the kernel dispatch that
 /// consumes it differs. The worker gathers it from request state (see the GPU
 /// worker base) and hands it to the backend's sampler (e.g.
-/// `scratchy_target_metal::sampling::PendingSampler::prepare`). Every `Vec` is
+/// a target's pending-sampler preparation). Every `Vec` is
 /// length `njobs` except the two token-id arrays, which are `njobs * max_*_len`
 /// row-major, padded with `vocab` (the penalty kernel ignores id == vocab).
 #[derive(Debug, Default, Clone)]

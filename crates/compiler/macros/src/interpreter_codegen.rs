@@ -781,7 +781,7 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let a = lit_u32(a);
             quote! { Free(#a) }
         }
-        // Metal-only variants — only emitted on metal builds by the
+        // Variants only one target emits, in its
         // per-arch lowering. The macro-static slice emission walks
         // them through this same path; emit field-for-field literals.
         I::LinearBiasAdd(a, b, c, d, e) => {
@@ -915,10 +915,10 @@ pub struct LoweredBucket {
     /// into `instances`.
     pub weight_slots: Vec<Vec<WeightSlot>>,
     /// One `barrier_before` flag per entry in `instances`. `true`
-    /// means a concurrency-aware backend (today: metal MTL4
+    /// means a concurrency-aware backend (e.g. an MTL4
     /// encoder) must serialize the dispatched instance against
     /// every prior instance in the bucket. Computed at macro time —
-    /// runtime never re-derives. Read only by metal's codegen — in a
+    /// runtime never re-derives. Read only by a target's codegen — in a
     /// build without it the tape path writes this field but never reads it, and
     /// that is EXPECTED.
     pub barriers: Vec<bool>,

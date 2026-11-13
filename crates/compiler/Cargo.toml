@@ -48,8 +48,8 @@ ureq = { version = "3", optional = true, features = ["rustls"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
 # `half::f16` / `half::bf16` are part of the `cpu_golden::affine_dequantize_b4_*`
-# public surface (Metal int4 reference path); also used by metal interpreter
-# tests for f32 ↔ f16 conversion when allocating + reading back Metal buffers
+# public surface (the int4 reference path); also used by a target's interpreter
+# tests for f32 ↔ f16 conversion when allocating + reading back device buffers
 # in numerical-correctness checks.
 
 [[bin]]

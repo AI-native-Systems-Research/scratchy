@@ -34,7 +34,7 @@
 //!
 //! `cpu_golden` (in `scratchy-forward-compiler`) is the deterministic f32 substrate
 //! the player computes with — not the correctness *oracle* (that is
-//! scratchy-target-metal non-mega at temp=0).
+//! a target's non-mega forward at temp=0).
 
 #![allow(dead_code)]
 
@@ -1102,7 +1102,7 @@ pub struct DraftConvRows<'a> {
     pub residual: Option<&'a [f32]>,
 }
 
-/// Splash's `draft_conv_phase` (runtime/metal/kernels/decode/draft.metal) on the host: over each
+/// Splash's `draft_conv_phase` (its decode draft kernel) on the host: over each
 /// lane's block of `SPLASH_DRAFT_QUERY_ROWS` rows, channel `c` of row `r` is
 /// `x[r][c]·(base[2s][c] + dyn[r][2s·g + c/16]) + x[r-1][c]·(base[2s+1][c] + dyn[r][(2s+1)·g + c/16])`
 /// (the second term only past a block's first row), `s` the stage and `g` the channel groups,
@@ -4876,11 +4876,11 @@ pub fn lower_region(
 /// of the original output's `cols`).
 ///
 /// Operates on a built `SubtileIR<F>` rather than inside
-/// [`lower_region`] because the Metal `mega::serialize` backend
+/// [`lower_region`] because the `mega::serialize` backend
 /// shares `lower_region` with the CUDA pipeline and only the CUDA
 /// path's `lower_subtile_tape_to_tk_tape` knows the new SubOps. The
 /// CUDA codegen probe runs `lower_region` then `decompose_rmsnorm`;
-/// the Metal path leaves it whole.
+/// the other path leaves it whole.
 ///
 /// Tensor renumbering: the inv_rms tensor for each replaced RmsNorm
 /// is appended at the end of `tensors`, so existing `TensorId`
@@ -5586,7 +5586,7 @@ mod tests {
     ///
     /// Pins the rewrite's
     /// node count + per-tile predecessor edges. lower_region itself
-    /// is unchanged (Metal mega::serialize-compatible); the CUDA
+    /// is unchanged (mega::serialize-compatible); the CUDA
     /// codegen probe applies decompose_rmsnorm before
     /// `lower_dag_to_tape`.
     #[test]

@@ -73,7 +73,7 @@
 //!       * `dialects/math.rs:93` — `exp` is `|x| x.exp()`.
 //!       * there is NO sigmoid op in the emulator at all: a grep for `sigmoid` over
 //!         `ktir-emulator/src/` finds only a comment naming an activation code
-//!         (`metal.rs:3453` "Activation: 0 none, 1 relu, 2 tanh, 3 exp, 4 sigmoid"), and the
+//!         (its GPU offload's "Activation: 0 none, 1 relu, 2 tanh, 3 exp, 4 sigmoid"), and the
 //!         dialect registration table (`math.rs:37-77`) has no entry. The fixtures spell the
 //!         sigmoid out (`swiglu_mlp.py` delta 5: widen / `tl.exp` / truncate / `tl.fdiv`), so its
 //!         cost here is one f32 `exp` plus the f16 rounds of the written-out chain — NOT

@@ -3,8 +3,8 @@
 
 //! On-disk cache locations, defined once for the whole workspace.
 //!
-//! Both the metal aligned-weight sidecar writer
-//! (`scratchy_target_metal::metal_allocator`) and the `scr model cache`
+//! Both a target's aligned-weight sidecar writer
+//! (its allocator) and the `model cache`
 //! tooling resolve cache paths through here, so the two can never drift.
 
 use std::path::PathBuf;

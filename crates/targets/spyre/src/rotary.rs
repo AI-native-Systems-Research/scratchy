@@ -3,7 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 //! Rotary positional embedding cache — Spyre (host/KTIR) runtime half.
 //!
-//! Spyre is a host fp16 backend (like metal): the RoPE cos/sin cache is built
+//! Spyre is a host fp16 backend (like the GPU target): the RoPE cos/sin cache is built
 //! on CPU from the model config and uploaded through the active
 //! [`scratchy_tensors::WeightSource`] allocator — there is no GPU stream and no
 //! kernel. The neutral [`RotaryCache`] type, the rope-scaling config structs,
@@ -11,7 +11,7 @@
 //! `scratchy-layers` (re-exported below); the macro-emitted spyre `load` body
 //! calls those inherent constructors directly (`RotaryCache::new_from_gpuweights`,
 //! `…::new_partial_from_gpuweights`, `…::new_proportional_from_gpuweights`),
-//! exactly as the metal `load` body does.
+//! exactly as the GPU target's `load` body does.
 //!
 //! The macro additionally brings [`CudaRotaryExt`] into scope
 //! (`use crate::__gpu::rotary::CudaRotaryExt as _;`) so the load body's

@@ -11,7 +11,7 @@
 //!
 //! ⛔ NAMING, BECAUSE THIS REPO ALREADY HAS THREE "TAPE"S:
 //!   - `subtile_tape::SubtileTape` — the rerolled per-wavefront op tape (compiler IR)
-//!   - `targets/metal/src/tape/` — metal's INSTRUCTION tape
+//!   - a target's own INSTRUCTION tape
 //!   - THIS — the HOST tape: what the host does, in order, to run a forward.
 //!
 //! # Every step is a kernel; the site says who launches it

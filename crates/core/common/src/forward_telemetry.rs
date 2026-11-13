@@ -3,7 +3,7 @@
 
 //! Live forward-pass kernel tape — a lock-free, opt-in observability seam.
 //!
-//! A backend (e.g. the Metal interpreter) records the *sequence of GPU
+//! A backend (e.g. a target's interpreter) records the *sequence of GPU
 //! kernels it dispatches* for one full model forward into a [`ForwardRecord`]
 //! and [`publish`](ForwardTelemetry::publish)es it once per token. A UI pulls
 //! the latest record on its own cadence via [`latest`](ForwardTelemetry::latest).

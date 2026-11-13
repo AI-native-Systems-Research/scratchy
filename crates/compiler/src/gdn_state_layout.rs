@@ -17,7 +17,7 @@
 //! * ssm_state is the recurrent delta-rule state matrix `S[head_v, head_k]`
 //!   per value head.
 //!
-//! Like `PagedKvLayout` (now in `scratchy-target-metal` alongside the
+//! Like `PagedKvLayout` (now in a target's crate alongside the
 //! `cpu_golden` oracle) this lives at the crate root (not feature-gated) so
 //! the GPU pool sizing and the per-request slot allocator share one
 //! definition.

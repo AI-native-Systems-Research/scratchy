@@ -12,7 +12,7 @@ default = []
 
 [dependencies]
 # `RowsExtern` — which host-staged buffer a `LoadRows` reads — is one type across every IR: the
-# `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
+# `Instruction`, this crate's `SubOp`, a target's step. scratchy-ir never reaches back here.
 scratchy-ir = { path = "../ir" }
 # The tensor-parallel world as a type: `tensor_parallel::shard` is generic over it, and a target's
 # collective protocol names the same type.
@@ -35,10 +35,10 @@ serde_json = { workspace = true }
 # (test-only — no non-test code references scratchy-forward-compiler). It
 # lives in dev-dependencies so this crate's normal graph has NO edge to
 # scratchy-forward-compiler: that lets `scratchy-forward-compiler` depend on
-# this crate (the GPU subtile Executor lives in its metal interpreter and
-# consumes `metal_tape`) without a cycle. Cargo permits the dev-only
+# this crate (the GPU subtile Executor lives in a target's interpreter and
+# consumes its tape) without a cycle. Cargo permits the dev-only
 # back-edge. scratchy-forward-compiler builds backend-agnostic here (no
-# metal feature), so the tests stay host-runnable on any platform.
+# target feature), so the tests stay host-runnable on any platform.
 scratchy-forward-compiler = { path = ".." }
 # `tests/value_door_ratchet.rs` parses the compiler, tensor, layer, target and triton crates'
 # source to count #1094's remaining law asserts and value→type doors. The versions are the

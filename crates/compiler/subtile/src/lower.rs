@@ -45,7 +45,7 @@ pub enum GemmWeight {
     /// MLX-affine packed weight (`bits` codes per element, one scale+bias per
     /// `group_size` elements of K). Matmul inputs stay arity-2 `[act, weight]`: the
     /// scales and biases resolve from the SAME weight source under different tensor
-    /// roles, so they are not separate IR operands. Metal realizes it with the qmv
+    /// roles, so they are not separate IR operands. A target realizes it with the qmv
     /// family at decode and qmm_t at prefill. See [`AffineInt4`] for what is checked.
     Affine { affine: AffineInt4 },
 }
@@ -113,7 +113,7 @@ impl AffineInt4 {
         if group_size == 0 || k == 0 || !k.is_multiple_of(group_size) {
             return None;
         }
-        // Membership mirrors the metal qmv kernel families (b_2, b_3, b_4, b_8);
+        // Membership mirrors the qmv kernel families (b_2, b_3, b_4, b_8);
         // a const fn cannot iterate a table, so state it directly.
         if !matches!(bits, 2 | 3 | 4 | 8) {
             return None;

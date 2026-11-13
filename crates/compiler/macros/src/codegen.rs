@@ -208,7 +208,7 @@ fn translate_digit_suffix(seg: &str) -> String {
 enum FieldLoad {
     /// `Embedding::load(gw, prefix)`.
     Embedding(String),
-    /// MLX-affine int4 quantized embedding (Metal-only). Reads
+    /// MLX-affine int4 quantized embedding. Reads
     /// `<prefix>.{weight,scales,biases}` and CPU-dequantizes to BF16
     /// at load time so the rest of the forward path sees a normal
     /// dense embedding. Used by every `mlx-community/*-4bit` checkpoint
@@ -225,12 +225,12 @@ enum FieldLoad {
     },
     /// Affine-quant embedding loaded into a DENSE `Embedding` by host/CPU
     /// dequant: `Embedding::load_affine_dequant(gw, prefix, group_size, bits)`.
-    /// Chosen when the embed ACCESSOR is a dense `Embedding` (not the metal
+    /// Chosen when the embed ACCESSOR is a dense `Embedding` (not the
     /// `AffineQuantEmbedding`) yet the on-disk storage is Affine — the
     /// storage-agnostic path `EmbedRefImpl` takes on a host-dequant target (the
     /// host worker dequantizes the embed weight), so the loaded field type matches the
     /// dense accessor. Distinct from [`Self::EmbeddingAffine`], which keeps the
-    /// packed `AffineQuantEmbedding` for metal's fused gather+dequant kernel.
+    /// packed `AffineQuantEmbedding` for a fused gather+dequant kernel.
     EmbeddingAffineDequant {
         prefix: String,
         group_size: u32,
@@ -252,7 +252,7 @@ enum FieldLoad {
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
     LinearConcat(Vec<String>),
-    /// MLX-affine int4 quantized linear (Metal-only), single source.
+    /// MLX-affine int4 quantized linear, single source.
     /// `group_size` and `bits` come from `quantization_config`. Under
     /// INT4 P2 emits `LinearLayer::load_affine_dequant_as_dense`
     /// (CPU dequant at load → Dense BF16). Under P3 will flip to
@@ -262,16 +262,16 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
         /// In-features (K) the arch manifest declares for this linear.
-        /// The metal loader asserts the on-disk packed `.weight` width is
+        /// The loader asserts the on-disk packed `.weight` width is
         /// `ceil(K*bits/32)`, rejecting a checkpoint quantized at different
         /// bits/group_size than this build's preset (else geometry is
         /// silently mis-derived from the on-disk shape).
         in_features: u32,
     },
-    /// Fused-concat MLX-affine int4 quantized linear (Metal-only).
+    /// Fused-concat MLX-affine int4 quantized linear.
     /// `gate_proj` + `up_proj` (and q/k/v) ship as separate affine
     /// triples in mlx-community 4bit repos; the forward DSL fuses
-    /// them into one `gate_up_proj` / `qkv_proj` linear so the metal
+    /// them into one `gate_up_proj` / `qkv_proj` linear so the
     /// `FusedGateUpSiluMul` impl pool matches the standard pattern.
     /// Emits `LinearLayer::load_affine_dequant_concat_as_dense`
     /// (CPU dequant per prefix, byte-concat along dim 0, alloc once).
@@ -280,7 +280,7 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
         /// Shared in-features (K) across the fused sources (gate_up / qkv all
-        /// share K). The metal loader asserts each prefix's on-disk packed
+        /// share K). The loader asserts each prefix's on-disk packed
         /// `.weight` width is `ceil(K*bits/32)`. See [`FieldLoad::LinearAffine`].
         in_features: u32,
     },
@@ -293,12 +293,12 @@ enum FieldLoad {
         bits: u32,
         in_features: u32,
     },
-    /// NVFP4 int4 quantized linear (Metal-only), single source. Emits
+    /// NVFP4 int4 quantized linear, single source. Emits
     /// `LinearLayer::load_nvfp4_quant` (forward-time `nvfp4_qmv` /
     /// `nvfp4_qmm_t`). `group_size` from `quantization_config` (16);
     /// bits is always 4.
     LinearNvfp4 { prefix: String, group_size: u32 },
-    /// Fused-concat NVFP4 int4 quantized linear (Metal-only). `qkv_proj`
+    /// Fused-concat NVFP4 int4 quantized linear. `qkv_proj`
     /// / `gate_up_proj` ship as separate NVFP4 triples in ModelOpt
     /// checkpoints; the forward DSL fuses them. Emits
     /// `LinearLayer::load_nvfp4_quant_concat` (per-prefix fold, byte-
@@ -429,7 +429,7 @@ enum FieldLoad {
     /// Mixtral-style fused MoE — no shared expert. Dispatches to
     /// `FusedMoELayer::load` (Dense BF16 expert weights, cuda) or
     /// `FusedMoELayer::load_affine` (MLX-affine int4 expert weights,
-    /// metal) based on `affine`. Mixtral uses HF's
+    /// on device) based on `affine`. Mixtral uses HF's
     /// `block_sparse_moe.experts.{e}.{w1,w2,w3}` layout.
     FusedMoe {
         prefix: String,
@@ -439,7 +439,7 @@ enum FieldLoad {
         hidden_size: usize,
         /// `Some((group_size, bits))` when the macro detected
         /// `StorageFormat::Affine` on the MoE source weight — emits
-        /// the Metal `load_affine` call site, `bits` each routed-expert
+        /// the `load_affine` call site, `bits` each routed-expert
         /// projection's own width. `None` → Dense BF16 path → cuda
         /// `load` call site.
         affine: Option<(u32, crate::quantization::ExpertBits)>,
@@ -452,7 +452,7 @@ enum FieldLoad {
         gate_bits: Option<u32>,
     },
     /// Qwen-MoE-style fused MoE + shared expert. Cuda Dense via
-    /// `SharedFusedMoELayer::load`, metal MLX-affine int4 via
+    /// `SharedFusedMoELayer::load`, MLX-affine int4 via
     /// `SharedFusedMoELayer::load_affine`. Qwen2-MoE / Qwen3-MoE use
     /// HF's `experts.{e}.{gate,up,down}_proj` naming.
     SharedFusedMoe {
@@ -491,7 +491,7 @@ enum FieldLoad {
     },
     /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op, base
     /// `experts.switch_glu`). Dispatches to `SwitchGluExpertsLayer::load`
-    /// (metal-only). Always MLX-affine int4 (`group_size`, `bits`).
+    /// Always MLX-affine int4 (`group_size`, `bits`).
     GemmaSwitchGlu {
         prefix: String,
         num_experts: usize,
@@ -502,7 +502,7 @@ enum FieldLoad {
         bits: u32,
     },
     /// gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`). Dispatches
-    /// to `GptOssMoELayer::load` (metal-only). One bundle carries the
+    /// to `GptOssMoELayer::load`. One bundle carries the
     /// affine router gate at `{prefix}.router` (dequantized at
     /// `gate_bits` — gpt-oss-2Bit quantizes the router at the preset's
     /// own width), the F32 router bias, the pre-stacked affine experts,
@@ -514,7 +514,7 @@ enum FieldLoad {
         intermediate_size: usize,
         hidden_size: usize,
         /// `Some((group_size, bits))` when the experts are MLX-affine —
-        /// the only storage with a metal realization. `None` tolerated
+        /// the only storage an expert kernel takes. `None` tolerated
         /// for the dense/verbatim config (never runtime-selected).
         affine: Option<(u32, u32)>,
         /// Router `{prefix}.router` dequant bit-width, resolved through
@@ -981,7 +981,7 @@ fn storage_requirement_error(
 }
 
 /// Did the solver keep the `embed_tokens` of `accessors` as the packed `AffineQuantEmbedding`
-/// (metal's fused gather+dequant) or dequantize it to a dense `Embedding` (the host-dequant path)?
+/// (a fused gather+dequant kernel reads) or dequantize it to a dense `Embedding` (the host-dequant path)?
 /// A tied `lm_head` follows that representation.
 fn embed_is_affine_repr(accessors: &[WeightAccessor]) -> bool {
     accessors.iter().any(|a| {
@@ -1027,7 +1027,7 @@ fn plan_field_load(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     // Whether the `embed_tokens` accessor the solver picked is the packed
-    // `AffineQuantEmbedding` representation (metal's fused gather+dequant) vs a
+    // `AffineQuantEmbedding` representation (a fused gather+dequant kernel reads) vs a
     // dense `Embedding` (the host-dequant path). A tied `lm_head`
     // must follow the embedding's REPRESENTATION, not the raw on-disk storage:
     // when the embed is dense, the tied head reuses its dense weight; only when
@@ -1068,7 +1068,7 @@ fn plan_field_load(
     // `Embedding` (carries packed U32 weight + F16 scales + F16
     // affine offsets); the field_load arm always routes to
     // `EmbeddingAffine` since the storage is known-Affine by
-    // construction (`MetalAffineEmbedImpl::matches` gates on
+    // construction (its weight-binding pass gates on
     // `StorageFormat::Affine`).
     let is_affine_quant_embedding = ty.ends_with("::AffineQuantEmbedding")
         || ty == "AffineQuantEmbedding"
@@ -1387,9 +1387,9 @@ fn plan_field_load(
         let (num_experts, hidden_size, intermediate_size) = dims.bank(accessor);
         let top_k = routed_top_k(model);
         // Probe storage format: if expert weights are MLX-affine int4
-        // (mlx-community 4bit Mixtral / Qwen-MoE), emit the metal
+        // (mlx-community 4bit Mixtral / Qwen-MoE), emit the affine
         // `load_affine` call site; otherwise emit cuda `load`.
-        // Same check the `MetalFusedMoeImpl::matches` uses via
+        // Same check the expert kernels key on via
         // `affine_gs_bits`. Source weights all share storage format
         // (the macro asserts this elsewhere for AffineQuantLinear).
         // Resolved at this accessor's layer index — MLX mixed/dynamic quant
@@ -1422,7 +1422,7 @@ fn plan_field_load(
         let top_k = routed_top_k(model);
         let shared_expert_intermediate_size = dims.shared.unwrap_or(0);
         let only_src = accessor.source_weights[0].0;
-        // Single-owner rule (mirrors `MetalSharedFusedMoeImpl::fan_out`):
+        // Single-owner rule (as the shared-expert MoE lowering does):
         // when the DSL claims `<moe>.shared_expert.*` leaves in the
         // manifest, the struct loader must not also load them — zero the
         // internal shared width so `load_affine`/dense load skip the
@@ -1510,7 +1510,7 @@ fn plan_field_load(
         let only_idx = accessor.source_weights[0].1;
         // The mlx-4bit checkpoint is the real runtime path (Affine gs/bits).
         // The verbatim BF16/Dense config also reaches here; it never becomes
-        // the runtime-selected specialization on metal but must still codegen,
+        // the runtime-selected specialization but must still codegen,
         // so default to the mlx checkpoint's g64/b4 rather than panicking
         // (same tolerance as the GemmaRouter group_size default above).
         let (group_size, bits) = match crate::quantization::storage_format_for_weight(
@@ -1553,7 +1553,7 @@ fn plan_field_load(
         // Op-keyed arm (the `GptOssMoe` op selects it), so like GemmaSwitchGlu
         // it MUST tolerate the Dense/verbatim config and default its storage
         // params rather than panic — that config never becomes the
-        // runtime-selected specialization on metal.
+        // runtime-selected specialization.
         let only_src = accessor.source_weights[0].0;
         let only_idx = accessor.source_weights[0].1;
         let affine = match crate::quantization::storage_format_for_weight(
@@ -1659,7 +1659,7 @@ fn plan_field_load(
         {
             let prefix = prefixes.into_iter().next().unwrap();
             // The loader follows the ACCESSOR type the solver picked, so the
-            // built field matches the struct field. A metal `AffineQuantEmbedding`
+            // built field matches the struct field. An `AffineQuantEmbedding`
             // accessor keeps the packed bundle (`EmbeddingAffine`); a dense
             // `Embedding` accessor with Affine storage — the storage-agnostic
             // path `EmbedRefImpl` takes on a host-dequant target — dequantizes host-side.
@@ -1679,7 +1679,7 @@ fn plan_field_load(
         }
         // If the accessor type is AffineQuantEmbedding but the source
         // weight is NOT Affine, the macro / impl pairing is broken —
-        // MetalAffineEmbedImpl should only fire on Affine sources.
+        // an affine embedding accessor only binds Affine sources.
         if is_affine_quant_embedding {
             let got =
                 crate::quantization::storage_format_for_weight(program, fuf, only_src, None, model);
@@ -1688,7 +1688,7 @@ fn plan_field_load(
                 storage_requirement_error(
                     model,
                     accessor,
-                    "Affine (MetalAffineEmbedImpl::matches should have rejected this)",
+                    "Affine (an affine embedding accessor binds only Affine sources)",
                     &format!("{got:?}"),
                 )
             );
@@ -1741,7 +1741,7 @@ fn plan_field_load(
             // representation. The tied lm_head's `source_weights` resolves
             // to the embed_tokens weight ID — but it must follow the embed's
             // REPRESENTATION: only when the embed kept the affine triple
-            // (`embed_is_affine_repr`, i.e. metal) does the tied head read
+            // (`embed_is_affine_repr`) does the tied head read
             // its `scales`/`biases`. When the embed was dequantized to a dense
             // `Embedding` (the host-dequant path) the tied head reuses the dense
             // weight, so `affine` stays `None`.
@@ -2001,7 +2001,7 @@ pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
-// `pub(crate)`: also consulted by `MetalRopeAppendNormedImpl::applies_to`
+// `pub(crate)`: also consulted by a target's normed rope-append lowering
 // (the synth norm prologue is only bit-correct for offset-0 models).
 pub(crate) fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
     // Read the parsed `bounds` table (booleans land there as 0/1, and
@@ -3093,7 +3093,7 @@ fn emit_weights_struct(
     program: &Program,
     fuf: &Fuf,
     // The accessor set, from the SHARED TAPE. `None` (no tape lowered
-    // for this variant — a shim, or metal's first pass before the
+    // for this variant — a shim, or a target's first pass before the
     // front-end swap) emits a `Weights` with no accessor fields.
     tape_accessors: Option<&[WeightAccessor]>,
     // The fields' typed handles (none for a shim, whose `Weights` is its canonical's).
@@ -3640,7 +3640,7 @@ fn emit_weights_struct(
         })
     });
 
-    // The RoPE tables are `OnceLock`s: a target builds them at load, or (metal) when its pool
+    // The RoPE tables are `OnceLock`s: a target builds them at load, or (one whose pool is built after load) when its pool
     // is built (`build_rope_tables`), for the positions the KV cache's block table reaches.
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
@@ -3696,14 +3696,14 @@ fn emit_weights_struct(
         quote! {}
     };
 
-    // Stream-free metal counterpart to `rotary_load`. The
+    // The stream-free rotary load. The
     // `*_from_gpuweights` constructors cover every rope family the
     // cuda path emits — basic, Llama3, LongRoPE, YaRN, partial rotary
     // (combined with each scaling where the family allows it), and
     // the Gemma4 proportional-global class handled above — so the
-    // metal match below is exhaustive with no refusal arm.
+    // match below is exhaustive with no refusal arm.
     //
-    // Cache dtype is `BF16` to match the rest of the metal stack:
+    // Cache dtype is `BF16` to match the rest of the stack:
     // `CanonicalParams::ACT_DTYPE` defaults to bf16, the
     // `rope_append_bf16_specialized` shader binds `cos_sin` as
     // `device const bfloat*`, and Llama-3.x weights ship bf16 on
@@ -3717,7 +3717,7 @@ fn emit_weights_struct(
     // `max_model_len` (a chat context of 4-8K on Llama-3.2's 131072 builds
     // 16-32× fewer), capped by `__rope_rows`, the most a request can reach:
     // `max_position_embeddings`. Whatever builds the tables binds `__rope_rows`
-    // ahead of these loads: a target's `load`, or metal's `build_rope_tables`,
+    // ahead of these loads: a target's `load`, or a target's `build_rope_tables`,
     // whose `max_model_len` is also capped at the block table's reach.
     let rope_rows: TokenStream = if uses_rotary || uses_rotary_local {
         let max_pos = *model
@@ -4899,14 +4899,14 @@ fn emit_unindexed_let(
             group_size,
             bits,
         } => {
-            // MLX-affine int4 quantized embedding (Metal-only). P6 lift:
+            // MLX-affine int4 quantized embedding. P6 lift:
             // load the packed U32 weight + F16 scales + F16 affine
             // offsets verbatim into an `AffineQuantEmbedding` bundle;
             // the forward path emits `Instruction::AffineEmbed`, which
             // dispatches the fused `affine_embed_*_gs_*_b_4` gather +
             // dequant kernel (saves ~vocab * hidden * 1.5 bytes of
             // BF16 arena vs the old load-time CPU-dequant fallback).
-            // No sharded variant — single-GPU is the only metal target.
+            // No sharded variant — an affine embedding loads on one device.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
@@ -5027,14 +5027,14 @@ fn emit_unindexed_let(
             bits,
             in_features,
         } => {
-            // MLX-affine int4 (Metal-only). No sharded variant —
-            // single-GPU is the only metal target initially. No
+            // MLX-affine int4. No sharded variant —
+            // an affine linear loads on one device. No
             // GGUF fallback — affine and ggml are disjoint storage
             // formats.
             //
             // INT4 P3/P4 forward-time path (post-C4b): keeps the
             // packed / scales / biases on device so the solver's
-            // `MetalAffineQmmImpl` can drive qmv (decode) / qmm_t
+            // affine kernels can drive qmv (decode) / qmm_t
             // (prefill) kernels per `Instruction::AffineQmm`.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
@@ -5100,7 +5100,7 @@ fn emit_unindexed_let(
             }
         }
         FieldLoad::LinearNvfp4 { prefix, group_size } => {
-            // NVFP4 int4 (Metal-only), single source. Keeps packed E2M1
+            // NVFP4 int4, single source. Keeps packed E2M1
             // weight + folded F16 scales on device for the forward-time
             // `nvfp4_qmv` / `nvfp4_qmm_t` kernels via
             // `Instruction::Nvfp4Qmm`.
@@ -5145,7 +5145,7 @@ fn emit_unindexed_let(
                 // carrying the packed U32 weight + F16 scales + F16
                 // affine offsets; the lm_head reads those same
                 // buffers via `LinearLayer::AffineQuant`. `GpuTensor`
-                // is Copy on metal (raw pointer wrapper), so the
+                // is Copy (a raw pointer wrapper), so the
                 // buffer triple is shared with the embedding's
                 // forward-time gather kernel without ownership
                 // gymnastics. `in_features = hidden_size`,
@@ -5578,7 +5578,7 @@ fn emit_unindexed_let(
             let hidden_size = *hidden_size;
             // Op-keyed arm: the Dense/verbatim config reaches here too and
             // must still codegen (it is never the runtime-selected
-            // specialization on metal), so default its storage params —
+            // specialization), so default its storage params —
             // the GemmaSwitchGlu tolerance.
             let (group_size, bits) = affine.unwrap_or((64, 4));
             let gate_bits = gate_bits.unwrap_or(bits);
@@ -6037,7 +6037,7 @@ fn emit_layered_load_body(
             let inf_lit = proc_macro2::Literal::u32_unsuffixed(*in_features);
             // INT4 P3/P4 forward-time path (post-C4b): per-layer
             // AffineQuant LinearLayers kept on device for the qmv /
-            // qmm_t dispatchers `MetalAffineQmmImpl` emits. When the group
+            // qmm_t kernels. When the group
             // is MLX-native mixed-bit (OptiQ), route to the per-layer
             // loader with the gathered bits slice; both paths thread the
             // manifest in_features so the loader's packed-width guard fires.
@@ -6763,7 +6763,7 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims)
 /// new kind is a single-site change (adding a variant without a row
 /// here is a non-exhaustive-match build error).
 pub(crate) fn weight_kind_rust_type(kind: &crate::weight_vocab::WeightKind) -> TokenStream {
-    // The mapping itself lives on `WeightKind` (`scratchy_subtile::handoff`) so metal's
+    // The mapping itself lives on `WeightKind` (`scratchy_subtile::handoff`) so a target's
     // compiler reads the SAME table when it compares accessor group signatures. Here it only
     // becomes tokens.
     kind.rust_type_name()
@@ -6875,7 +6875,7 @@ pub fn emit_weight_accessors_impl(
                         key,
                         slot.base.to_string(),
                     ));
-                    // `WeightSlot::base` is a `String` (it crosses into the metal compiler
+                    // `WeightSlot::base` is a `String` (it crosses into a target's compiler
                     // crate, which must not pull `syn`); the identifier is minted HERE, at the
                     // one place that emits tokens for it.
                     let base = quote::format_ident!("{}", slot.base);
@@ -7150,8 +7150,8 @@ pub fn emit_weight_accessors_impl(
     // Emit the impl unconditionally — `CanonicalParams: WeightAccessors`
     // is an unconditional bound, so leaving this behind a feature gate
     // would surface as `Weights: WeightAccessors not satisfied` in any
-    // arch whose own `metal` feature is empty
-    // or absent (e.g. phi3 which declares `metal = []`).
+    // arch whose target emits no accessor of a kind
+    // (the trait defaults cover those).
     // The trait methods all return cross-backend types from
     // `scratchy_layers::layers{,_moe}` plus `GpuTensor` from
     // `scratchy-tensors` — both available regardless of backend feature.
@@ -7275,7 +7275,7 @@ pub fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
     // terminates in `Mul(gemm_out, scalar)` rather than the lm_head Gemm
     // itself. That is still a DECODER: walk past the scalar multiply to the
     // Gemm, exactly as the AllGather arm below walks past tp>1's collective.
-    // Misreading it as an encoder bakes `METAL_VOCAB_SIZE = hidden_size`, and
+    // Misreading it as an encoder bakes a logits width of `hidden_size`, and
     // the argmax kernel then scans only the first `hidden_size` of
     // `vocab_size` logits — greedy decode picks low-id tokens (asterisks and
     // single characters) while sampling, which does not use that kernel,
@@ -7481,7 +7481,7 @@ fn kv_codec_for(
 /// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
 /// group through its own constructor (an attention through `Attention::of`, a GDN through
 /// `Gdn::of`: their laws bounds on their numbers as types), so the emitted const re-checks each
-/// law when rustc type-checks it. The one serializer of the value the fill built (and the metal
+/// law when rustc type-checks it. The one serializer of the value the fill built (and a target's
 /// bake read).
 fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_ir::model_facts::{
@@ -7820,7 +7820,7 @@ pub(crate) fn fill_canonical_params(
     // Vision 2D-RoPE pairing convention (`vision_rope_style` config
     // key, validated at parse): absent/"neox_hw" → false (Qwen),
     // "interleaved_xy" → true (MoonViT / LocateAnything). Selects the
-    // metal `vision_rope_2d[_interleaved]` entry point at lowering.
+    // interleaved or split 2D vision rope at lowering.
     let vision_rope_interleaved =
         matches!(model.arch.rope_style.as_deref(), Some("interleaved_xy"));
 
@@ -7949,7 +7949,7 @@ pub(crate) fn fill_canonical_params(
     let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
     let v_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(v_head_dim);
     let qk_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_head_dim);
-    // Rotary dim for the metal rope kernel's `ROT_DIM` fn-const. Mirrors
+    // Rotary dim for the rope kernel's `ROT_DIM` fn-const. Mirrors
     // the rope-cache builder (codegen.rs ~2758): `partial_rotary_factor
     // * head_dim` for partial-rope arches (Qwen3.5: 0.25*256 = 64), else
     // the full `head_dim`. Without this the impl falls back to the trait
@@ -7967,7 +7967,7 @@ pub(crate) fn fill_canonical_params(
     // global 512×1kv proportional-rope-128). Config keys
     // `global_head_dim` / `num_global_key_value_heads` /
     // `global_partial_rotary_factor` feed the GLOBAL_* consts read by
-    // the full-attention metal lowering arms; absent keys fall back to
+    // the full-attention lowering arms; absent keys fall back to
     // the base values (uniform models unchanged).
     let global_head_dim: u32 = model
         .bounds
@@ -8016,7 +8016,7 @@ pub(crate) fn fill_canonical_params(
     );
     // Proportional rope marker — same predicate that routes the
     // rotary cache builder to `new_proportional_from_gpuweights`.
-    // Drives the metal rope kernel's pairing offset (lane i pairs
+    // Drives the rope kernel's pairing offset (lane i pairs
     // with i + head_dim/2, not i + rot_dim/2).
     let rope_proportional = global_rot_dim != global_head_dim
         && model.scalars.contains_key("global_partial_rotary_factor");
@@ -8061,7 +8061,7 @@ pub(crate) fn fill_canonical_params(
     };
     let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
 
-    // SCALE_DTYPE override — only matters under `--features metal`.
+    // SCALE_DTYPE override — only matters to a target whose kernels read it.
     // mlx-community 4bit convention (probed across cached HF snapshots):
     // Llama-3.x / Qwen2.5 / SmolLM ship F16 scales+biases+norm gains,
     // Qwen3 family ships BF16. Default in the trait is F16; emit a
@@ -8090,7 +8090,7 @@ pub(crate) fn fill_canonical_params(
         is_bf16_scale || is_nvfp4
     };
 
-    // TurboQuant KV bit-width policy (Metal). 3-bit (~4.7x) is validated
+    // TurboQuant KV bit-width policy. 3-bit (~4.7x) is validated
     // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
     // activations) degrades at 3-bit and needs 4-bit. Promote arches to 3 here
     // as the validation sweep confirms them.
@@ -8202,7 +8202,7 @@ pub(crate) fn fill_canonical_params(
         let kv_layers = (kv_layers.proper_subset(num_hidden_layers))
             .map(|layers| mf::KvLayers::new(Vec::leak(layers.to_vec())));
         mf::ModelFacts::new(mf::FactsParts {
-            // No arch overrides the metal element dtype.
+            // No arch overrides the activation dtype.
             act_dtype: mf::ActDtype::Bf16,
             scale_dtype: match scale_dtype_is_bf16 {
                 true => mf::ScaleDtype::Bf16,
@@ -10555,7 +10555,7 @@ mod fingerprint_tests {
     /// granite divides logits by `logits_scaling` (terminal `Mul` with a
     /// scalar operand); gemma2/gemma-4 apply `final_logit_softcapping`
     /// (terminal `TanhSoftCap`); command-r has `logit_scale`. Reading any of
-    /// them as an ENCODER bakes `METAL_VOCAB_SIZE = hidden_size`, and the
+    /// them as an ENCODER bakes a logits width of `hidden_size`, and the
     /// argmax kernel then scans `hidden_size` of `vocab_size` logits — 2048
     /// of granite's 49155 — so greedy decode can only reach low-id tokens and
     /// emits `" * **P*h*o*t*o*s*y*n*t*h*e*"`. Sampling does not use that

@@ -2,7 +2,7 @@
 //! Backend-neutral neural-network layer types.
 //!
 //! Holds the layer *type definitions* and their *pure* accessors (the surface
-//! the metal interpreter and `WeightAccessors` match on) so every target
+//! a target's interpreter and `WeightAccessors` match on) so every target
 //! crate can name them without a circular dependency. Runtime
 //! methods (kernel-calling `forward`, `GpuWeights`-bound `load`) stay in the
 //! target crates as extension traits — this crate names no backend.
@@ -20,7 +20,7 @@ pub mod weights;
 // Neutral tensor-core *modules* re-exported so this crate can serve as the
 // backend-less `__gpu` alias target the forward-compiler macro emits against for
 // arches compiled without a backend feature (e.g. phi3 / deepseek under
-// `--features metal`). Those builds reference the tensor core only by module
+// a target build). Those builds reference the tensor core only by module
 // path (`__gpu::tensor::…` / `__gpu::dtype::DType`), so mirroring the modules
 // (not the bare type names, which would collide with the targets' own glob
 // re-exports) is sufficient.

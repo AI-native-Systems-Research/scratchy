@@ -65,7 +65,7 @@ impl ScaleDtype {
 
     /// The on-device element dtype the `_s_<scale>_` kernel arm binds the
     /// scale/gain pointer as. A loader that must guarantee the gain buffer
-    /// matches the kernel's `T_scale` (e.g. metal's RMSNorm gain, which is
+    /// matches the kernel's `T_scale` (e.g. an RMSNorm gain, which is
     /// read through a `device const T_scale*`) converts the on-disk tensor
     /// to this dtype.
     pub fn as_dtype(self) -> crate::DType {
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn scale_dtype_maps_to_matching_element_dtype() {
-        // The metal RMSNorm gain loader (`take_as_dtype`) relies on this
+        // A target's RMSNorm gain loader (`take_as_dtype`) relies on this
         // mapping to convert a gain to the dtype the `_s_<scale>_` kernel
         // arm binds. A mismatch here would re-introduce the bf16-gain-read-
         // as-f16 garbage bug on standard HF bf16 checkpoints.

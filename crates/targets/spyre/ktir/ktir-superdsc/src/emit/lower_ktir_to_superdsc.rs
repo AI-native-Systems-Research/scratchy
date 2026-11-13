@@ -4421,7 +4421,7 @@ mod pointwise_width_caps {
 /// ⛔ NOT A PARAMETER SCAN. It was: the program loaded its scale from the reserved tid so this body
 /// could find the tid among the parameters. `subtile→superdsc`'s own KTIR states the value inline
 /// (`st.splat(f64::from(scale), dims)`), and a bound load in its place is a `TensorExtract` the
-/// emulator's Metal offload cannot treat as a resident tile — MEASURED as 51 of 216 `map window`
+/// emulator's GPU offload cannot treat as a resident tile — MEASURED as 51 of 216 `map window`
 /// refusals, every one of them falling back to the interpreter. The device is unaffected either way:
 /// the descriptor below still multiplies by the bound `[1,1]` const at this slot.
 pub fn scalarmul<T: crate::collective::Tp>(

@@ -409,7 +409,7 @@ impl RotaryCache {
     /// Partial-rotary (and full, when `rotary_dim == head_dim`) cos/sin
     /// cache, built on CPU and uploaded through `weights`' allocator. Builds a `[max_pos, rotary_dim]`
     /// cache where `rotary_dim = partial_rotary_factor * head_dim` (e.g.
-    /// Qwen3.5: `0.25 * 256 = 64`). The metal rope kernels read it
+    /// Qwen3.5: `0.25 * 256 = 64`). The rope kernels read it
     /// with `ROT_DIM = rotary_dim` and pass the trailing
     /// `head_dim - rotary_dim` channels through unrotated. Covers
     /// no-scaling and Llama3 scaling; LongRoPE and YaRN have their own
@@ -450,7 +450,7 @@ impl RotaryCache {
 
         let cos_sin_cache = upload_cos_sin(weights, &inv_freqs, max_pos, rotary_dim, dtype)?;
 
-        // Split `cos_cache` / `sin_cache` are wgpu-only — every metal
+        // Split `cos_cache` / `sin_cache` are wgpu-only — every
         // kernel reads the unified `cos_sin_cache` above. Building +
         // uploading two ~32 MB caches that nothing reads costs ~30-50ms
         // on Llama-3.2-3B at max_pos = 131072, so skip them.

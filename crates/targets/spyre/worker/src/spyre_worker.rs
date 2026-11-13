@@ -87,7 +87,7 @@ pub struct SpyreWorker {
     pub(crate) seating: Option<(crate::spyre_types::RungId, Vec<String>)>,
     /// ⭐ THE HOST'S PER-REQUEST BLOCK TABLE, IN THE STRUCT THE ENGINE ALREADY DEFINES FOR IT.
     ///
-    /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what metal
+    /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what the GPU target
     /// stores its block tables in; its `update_blocks` carries the rule a private copy in this
     /// worker got wrong — *"The scheduler ships the FULL table each step, so this REPLACES (not
     /// appends)"*. This path used to keep its own `Vec<usize>` per request (and before that, pages the
@@ -101,7 +101,7 @@ pub struct SpyreWorker {
     /// WHAT FRACTION OF THE CARD THIS RUN MAY SPEND — `--gpu-memory-utilization`, as the CLI gave it.
     ///
     /// ⛔ SPYRE IGNORED THIS FLAG ENTIRELY, because its KV budget was a constant and a constant has no
-    /// fraction to take. Metal sizes from `total_memory * utilization`, so the flag meant
+    /// fraction to take. The GPU target sizes from `total_memory * utilization`, so the flag meant
     /// something on one backend and not the other.
     pub(crate) gpu_memory_utilization: f64,
 }

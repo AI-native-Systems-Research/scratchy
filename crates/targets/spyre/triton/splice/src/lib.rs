@@ -155,7 +155,7 @@ pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
         // consumer that re-reads it — dumps, the numeric reference, a second target —
         // would see a different tensor). The kernel states the addf over the load;
         // the door states the SAME add against the offset's registry const, so the
-        // descriptor computes the formula the program runs — metal's own
+        // descriptor computes the formula the program runs — the GPU target's own
         // `ScalarOffsetRmsNorm` (whose kernel applies `weight + offset`) is the
         // precedent shape.
         GainConvention::OnePlusScale => TritonKernelRow::Spliced {
@@ -195,7 +195,7 @@ pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
         // lowered (`codegen`'s `no superdsc bundle` gate) and no consumer realizes an
         // affine contraction on this path, so nothing constructs this node on the spyre
         // path. The arm is the compile-time enumeration — a realization lands here
-        // WITH its kernel (metal's qmv family is the precedent shape).
+        // WITH its kernel (the GPU target's qmv family is the precedent shape).
         GemmWeight::Affine { .. } => TritonKernelRow::Refused(
             "the affine weight scheme: the wavefront lowering skips affine presets before \
              a tape is lowered, so no node of this shape is constructed on the spyre path. \
@@ -462,7 +462,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
              routing changed, and the fix is a family function plus a kernel",
         ),
         // A DFlash2 drafter's ops and its target's capture: Splash's kernels, ported as
-        // Metal opcode lowerings alone.
+        // the GPU target's opcode lowerings alone.
         SubOp::CaptureHidden { .. }
         | SubOp::DraftConv { .. }
         | SubOp::DraftAttention { .. }
@@ -471,7 +471,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::DraftWindowLoad
         | SubOp::DraftSelect => TritonKernelRow::Refused(
             "a DFlash2 drafter's op (or its target's capture): its kernels are Splash's, \
-             lowered on Metal alone — a spyre drafter needs its kernels first",
+             lowered on the GPU target alone — a spyre drafter needs its kernels first",
         ),
     }
 }

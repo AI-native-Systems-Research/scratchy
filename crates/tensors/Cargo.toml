@@ -9,7 +9,7 @@ description = "Backend-neutral GPU tensor core for scratchy: GpuTensor descripto
 
 [dependencies]
 anyhow = { workspace = true }
-# For DeviceAllocator::register_mmap's signature (the metal zero-copy alias path
+# For DeviceAllocator::register_mmap's signature (a target's zero-copy alias path
 # registers the safetensors mmap; the trait's default impl ignores it). Pure-CPU, no backend.
 memmap2 = { workspace = true }
 # A dim's number as a type (`typed::Dim::Num`), a law between dims a bound on those numbers.

@@ -542,7 +542,7 @@ pub enum OpKind {
     /// carrying the 4-bit GeGLU experts). Routing = folded-temperature
     /// softmax over the top-k scores × per-expert-scale; experts use
     /// GeGLU (not SiLU). No shared expert. Output = `expert_in` shape.
-    /// Metal-only; claimed by `MetalGemmaMoeImpl`.
+    /// lowered by a target's Gemma MoE arm.
     GemmaMoe,
     /// gpt-oss fused MoE block (`GptOssForCausalLM`, 20b / 120b). DSL
     /// form: `h = gptoss_moe(x, mlp[layer])` — like [`OpKind::Moe`] it
@@ -553,7 +553,7 @@ pub enum OpKind {
     /// experts are SwiGLU-OAI (`y = (clamp(u,±7)+1)·min(g,7)·
     /// sigmoid(1.702·g)`) with per-expert LINEAR biases on gate/up/down.
     /// Resolves to a `GptOssMoELayer` at base `mlp`. Shape-preserving.
-    /// Metal-only; claimed by `MetalGptOssMoeImpl`.
+    /// lowered by a target's gpt-oss MoE arm.
     GptOssMoe,
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). One coarse op
     /// orchestrating the surviving `gdn_*` kernels: causal conv1d(+SiLU) →

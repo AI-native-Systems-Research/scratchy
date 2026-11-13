@@ -9,7 +9,7 @@
 //! resolves under any backend.
 //!
 //! Genuinely backend-divergent loaders (the RmsNorm keep-dtype split, the
-//! direct-write `load_dense_concat_packed`, metal's MLX-affine variants) stay in the target crates.
+//! direct-write `load_dense_concat_packed`, a target's MLX-affine variants) stay in the target crates.
 
 use anyhow::Result;
 use scratchy_tensors::DeviceAllocator;

@@ -2343,7 +2343,7 @@ pub(crate) fn dump_wavefront_mega(
     inferred: &scratchy_forward_compiler_macro::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
-    // (spliced into the per-model module); empty under metal.
+    // (spliced into the per-model module); empty under every other target.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
     // Where the bake writes each bundle's dxp input, when the build asked (`superdsc-dump`): the
     // build script's own output directory, passed down from `compile_carrier`'s caller.
@@ -2375,7 +2375,7 @@ pub(crate) fn dump_wavefront_mega(
     // — see `lower_subtile_tape_to_ktir`).
     //
     // ⭐ THE KV POOL IS THE MODEL'S OWN CONTEXT. A KTIR bundle is a static-shape graph, so the
-    // resident cache is a baked dimension (the metal target takes `decode_position` as a
+    // resident cache is a baked dimension (the GPU target takes `decode_position` as a
     // runtime arg over a host-allocated cache instead): every layer's K and V pools hold the
     // model's `max_position_embeddings` token slots — vLLM's own default `max_model_len` — in whole
     // scheduler pages, as much of it as one device region holds (below). Nothing else caps it and
@@ -2466,7 +2466,7 @@ pub(crate) fn dump_wavefront_mega(
         // wired) genuinely has NO superdsc bundle — skip THIS preset (return no bundle). This
         // is NOT the silent-green bug the panic below guards against: DENSE models never hit
         // UnsupportedWeight, so a dense regression still panics; only quant presets are skipped.
-        // The bridge now lowers MLX-affine gemms (for the metal static-tape
+        // The bridge now lowers MLX-affine gemms (for the GPU target's static-tape
         // path); the superdsc emitter here still has no affine
         // realization — skip the preset exactly as the bridge's refusal used
         // to, rather than letting a packed weight flow into a dense-only
@@ -4178,7 +4178,7 @@ pub(crate) fn dump_wavefront_mega(
                 // `gk.result_tensor`, `gk.tensor_shapes`, `gk.attn_mask` and — the
                 // one that matters — `lwd.bindings()`, already the `SourceBinding`
                 // ENUM, become values of spyre's OWN types (`wiring::Wiring`),
-                // exactly as metal is handed statics of the metal runtime's types.
+                // exactly as every target is handed statics of its runtime's types.
                 // ONE walk states them: a second, stringified copy of the same
                 // bindings (the old `manifest.json`) and the check that the two
                 // agreed are gone with it — a fact stated once cannot disagree.
@@ -5538,7 +5538,7 @@ pub(crate) fn dump_wavefront_mega(
         ktir_bundle_out.extend(superdsc_bundle_tokens(model));
         // The typed launch wiring, spliced into the SAME per-model module that
         // holds `Weights` — so the binding of a source to a weight can be
-        // generated code naming a real field, the way metal's forward names
+        // generated code naming a real field, the way the GPU target's forward names
         // `wm.q_proj`, instead of a disk-key string resolved at load.
         {
             let (dec, pre) = &*wiring_tokens.borrow();

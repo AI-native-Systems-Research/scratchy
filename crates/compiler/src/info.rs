@@ -1233,7 +1233,7 @@ impl InstructionInfo for Instruction {
                     F::RopeCosSin,
                 ],
             ),
-            // MLX-affine int4 family. `AffineQmm` is the metal-only
+            // MLX-affine int4 family. `AffineQmm` is the
             // quantized matmul; the variant is unconditional on
             // `Instruction<W>` so info.rs must cover it under every
             // backend. `SiluMul` is the
@@ -1258,7 +1258,7 @@ impl InstructionInfo for Instruction {
                     F::WeightShape { n, k },
                 ],
             ),
-            // NVFP4 int4 family — same metal-only shape as `AffineQmm`.
+            // NVFP4 int4 family — same shape as `AffineQmm`.
             Instruction::Nvfp4Qmm(
                 in_slot,
                 out_slot,
@@ -1349,7 +1349,7 @@ impl InstructionInfo for Instruction {
                 vec![F::Slot(gate_slot), F::Slot(up_slot), F::Slot(out_slot)],
             ),
             // Fused gather+dequant for MLX `*-4bit` checkpoints (P6,
-            // metal-only at runtime; the neutral normalize projection
+            // one target at runtime; the neutral normalize projection
             // covers it on every backend).
             Instruction::AffineEmbed(out_slot, _group_size, _bits) => (
                 "AffineEmbed",

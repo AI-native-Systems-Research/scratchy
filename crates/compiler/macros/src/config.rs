@@ -429,7 +429,7 @@ pub enum ConfigError {
         limit: serde_json::Value,
     },
     /// A config's quant spec carries per-module (mixed-bit, OptiQ/DWQ) affine
-    /// overrides that this backend cannot lower (only metal reads the
+    /// overrides that this target cannot lower (a target that does reads the
     /// per-tensor widths back: `unpack_moe_expert_bits` /
     /// `affine_gather_qmv_symbol`). Raised at the ONE place the quant spec is
     /// decided — `parse_quantization` — naming the config and WHICH tensors
@@ -541,7 +541,7 @@ pub fn load_dir_vision(
 /// Process-wide count of models actually forward-expanded (dense bases +
 /// synthesized quant variants), across every arch directory processed so
 /// far. `scratchy-models` has no default model/quant features (deliberately
-/// — a plain `-Fmetal` with nothing else selected should fail loudly, not
+/// — a target build with no model selected should fail loudly, not
 /// silently link a binary with zero models). Call once, after every
 /// `load_dir`/`load_dir_vision` invocation has run (i.e. from
 /// `scratchy-forwards.rs` after its `par_iter` over arches completes).
@@ -825,7 +825,7 @@ fn load_dir_mode(
         |arch_name: &str, stem: &str| -> bool { scope.model_selected(arch_name, stem) };
     // A head (an arch registering under an identity of its own, `hf_architectures`) compiles beside
     // the targets it drafts for: one that ships inside its targets' checkpoints (`checkpoint_of`)
-    // under scratchy-models' `mtp-heads` feature (which `metal` turns on, and `mtp` implies), on
+    // under scratchy-models' `mtp-heads` feature (which `scr` turns on, and `mtp` implies), on
     // every selected config of those arches that carries it — its config is the target's own
     // file; one published as a checkpoint of its own (`head_targets`), on each of its configs
     // whose target is selected ([`compiled_head_targets`]): under `mtp-heads` the one its target
@@ -852,8 +852,8 @@ fn load_dir_mode(
     // What the heads compiled beside a target config bake into it: the most drafts one of them
     // carries a sequence (its verify steps hold that many), and the layers whose outputs one reads
     // (`target_capture_layers`, its arch.json: a path into its own config), which the target
-    // captures. A head that does not compile in this build ([`Scope::arch_compiled`]: a metal-only
-    // drafter under cuda) bakes nothing into it.
+    // captures. A head that does not compile in this build ([`Scope::arch_compiled`]: one target's
+    // drafter under another) bakes nothing into it.
     let head_facts = |stem: &str, json: &serde_json::Value| -> Result<HeadFacts, ConfigError> {
         let mut facts = HeadFacts::default();
         if !mtp_heads || !spec.hf_architectures.is_empty() {
@@ -1038,13 +1038,13 @@ fn load_dir_mode(
     // identical Impl-set signatures share one emitted body. Without
     // that dedup, N sizes × M presets quickly blow up release-build
     // LLVM work.
-    // Under `--features metal` we skip quant variants metal can't claim
-    // (awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml) —
+    // A target skips the quant variants it does not lower (`TargetEmitter::lowers_preset`, e.g.
+    // awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml on one) —
     // their on-disk layouts route through `MarlinFusedGateUpSiluMul` /
-    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that the metal
-    // impl pool has no claimants for, so the solver explodes with
+    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that its
+    // kernels have no claimants for, so its lowering would explode with
     // `UnclaimedTile` on the first quant tile. A preset being
-    // skipped this way on metal means it was never `quant_preset_active`
+    // skipped this way means it was never `quant_preset_active`
     // in the first place, so it also never suppressed the dense base
     // above — dense only drops out for a preset that actually synthesizes.
     //
@@ -1052,7 +1052,7 @@ fn load_dir_mode(
     // exception: their codegen materializes a Dense `LinearLayer` at
     // load time via `LinearLayer::load_affine_dequant_as_dense`, so
     // the forward path remains the existing bf16 Gemm path that the
-    // metal impl pool already claims. The preset-filter inside the
+    // kernels already claim. The preset-filter inside the
     // overlay loop below keeps unclaimable presets out while still
     // synthesizing the affine variant.
     let quantizations_path = dir.join("quantizations.json");
@@ -1086,10 +1086,9 @@ fn load_dir_mode(
         };
 
         for preset_name in &presets {
-            // Quant feature scoping (the scope's `quants`) + backend claimability
-            // (metal only claims mlx-affine-*/nvfp4 as those route through
-            // Dense/MetalNvfp4QmmImpl — see
-            // `quant_preset_active`'s definition above for the full backend
+            // Quant feature scoping (the scope's `quants`) + the target's lowering (`TargetEmitter::lowers_preset`
+            // — see
+            // `quant_preset_active`'s definition above for the full
             // reasoning, shared with the dense-suppression pre-check so the
             // two can't drift apart).
             if !quant_preset_active(preset_name) {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// The MoE loader `*Ops` mirror metal's multi-arg `load` signatures.
+// The MoE loader `*Ops` mirror the GPU target's multi-arg `load` signatures.
 #![allow(clippy::too_many_arguments)]
 //! Spyre (KTIR) MoE (Mixture of Experts) load surface.
 //!
@@ -7,15 +7,15 @@
 //! MoE *load* here is a clean runtime `bail!` — a bf16 (non-MoE) checkpoint
 //! never reaches these methods, but the `#[forward]` macro's shared
 //! `Weights::load` body names them by exact path for every model variant, so
-//! they must compile with the metal trait + method *signatures* verbatim.
+//! they must compile with the GPU target's trait + method *signatures* verbatim.
 //!
 //! The MoE type *definitions* (bare field bags) + the pure `MoeRouting` borrow
 //! bundle + `select_moe_block_m` live in the cfg-free `scratchy-layers` crate;
 //! re-exported here via the glob below so `crate::__gpu::layers_moe::<T>` paths
 //! resolve. The kernel-bound `load_*` runtime methods are per-type `*Ops`
-//! extension traits, matching `scratchy-target-metal/src/layers_moe.rs`.
+//! extension traits, matching the GPU target's `layers_moe.rs`.
 //!
-//! Trait + method names/signatures are kept identical to the metal peer
+//! Trait + method names/signatures are kept identical to the GPU peer
 //! (the macro emits `crate::__gpu::layers_moe::<Type>::<method>(...)` by exact
 //! path) — the only divergence is the body, which bails instead of allocating
 //! and stacking expert weights.
@@ -23,7 +23,7 @@
 pub use scratchy_layers::layers_moe::*;
 
 // ---------------------------------------------------------------------------
-// FusedMoELayer (enum: Affine for metal — not built here)
+// FusedMoELayer (enum: Affine on a GPU — not built here)
 // ---------------------------------------------------------------------------
 
 pub trait FusedMoEOps {
@@ -87,7 +87,7 @@ impl FusedMoEOps for FusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
-// SharedFusedMoELayer (enum: Dense for cuda, Affine for metal)
+// SharedFusedMoELayer (enum: Dense or Affine, per target)
 // ---------------------------------------------------------------------------
 
 pub trait SharedFusedMoEOps {
@@ -191,7 +191,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
     /// * **MLX-affine 8-bit** (`Some` — mlx-community 4bit): `router.proj` is
     ///   an affine `{weight, scales, biases}` triple, dequantized to dense
     ///   `[E, hidden]` via the shared `affine_dequant_b4_to_dtype` (the same
-    ///   numerics metal's `take_affine_dequant_b4` uses) and packed from
+    ///   numerics the GPU target's `take_affine_dequant_b4` uses) and packed from
     ///   host.
     ///
     /// A checkpoint whose disk layout disagrees with the compiled variant
