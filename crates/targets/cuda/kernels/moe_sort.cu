@@ -134,8 +134,8 @@ __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_count_ker(
     warp::store(g.chunk_hist, cnt, {0, 0, c, 0});
 }
 
-// (b): one warp.
-template <int EXPERTS>
+// (b): one warp, each run padded to `TILE` rows.
+template <int EXPERTS, int TILE = TILE_ROWS>
 __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_offsets_ker(
     const __grid_constant__ sort_globals g) {
     __shared__ sv_int<EXPERTS> scan;
@@ -152,11 +152,11 @@ __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_offsets_ker(
     warp::store(scan, run);
     __syncwarp();
     if (warp::laneid() == 0) {
-        const int total = scratchy::ops::exclusive_scan_sv<scratchy::ops::tile_pad>(scan);
+        const int total = scratchy::ops::exclusive_scan_sv<scratchy::ops::tile_pad_at<TILE>>(scan);
         g.offsets[{0, 0, 0, EXPERTS}] = total;
         for (int e = 0; e < EXPERTS; ++e) {
             const int end = e + 1 < EXPERTS ? scan[e + 1] : total;
-            for (int t = scan[e] / TILE_ROWS; t < end / TILE_ROWS; ++t) {
+            for (int t = scan[e] / TILE; t < end / TILE; ++t) {
                 g.tile_expert[{0, 0, 0, t}] = e;
             }
         }
@@ -330,9 +330,9 @@ int launch_sort(const sort_globals& G, uint32_t chunks, uint32_t pair_ctas, cuda
     return static_cast<int>(cudaLaunchKernel(moe_sort_scatter_ker, grid, block, args, 0, s));
 }
 
-// The e4m3 sort at `EXPERTS` (P1): the sort's counts and offsets on `G`, then the e4m3 scatter on
-// `F`.
-template <int EXPERTS>
+// The e4m3 sort at `EXPERTS` (P1): the sort's counts and offsets on `G` (runs padded to `TILE`
+// rows), then the e4m3 scatter on `F`.
+template <int EXPERTS, int TILE>
 int launch_sort_fp8(const sort_globals& G, const sort_fp8_globals& F, uint32_t chunks,
                     uint32_t pair_ctas, cudaStream_t s) {
     static_assert(EXPERTS % WARPS == 0, "the padding CTAs hold whole warps of experts");
@@ -342,7 +342,7 @@ int launch_sort_fp8(const sort_globals& G, const sort_fp8_globals& F, uint32_t c
     if (err != cudaSuccess) {
         return static_cast<int>(err);
     }
-    err = cudaLaunchKernel(moe_sort_offsets_ker<EXPERTS>, dim3(1), warp, args, 0, s);
+    err = cudaLaunchKernel(moe_sort_offsets_ker<EXPERTS, TILE>, dim3(1), warp, args, 0, s);
     if (err != cudaSuccess) {
         return static_cast<int>(err);
     }
@@ -376,6 +376,14 @@ extern "C" int scratchy_cuda_moe_sort_prepare(void) {
         return static_cast<int>(e);
     }
     if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_scatter_fp8_ker);
+        e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_SMALL, 64>);
+        e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_LARGE, 64>);
         e != cudaSuccess) {
         return static_cast<int>(e);
     }
@@ -449,27 +457,29 @@ extern "C" int scratchy_cuda_moe_sort(const void* x, const void* topk_idx, void*
 // row and scale, each live tile's padding row +0 bytes with `fp8_scale(0)`, every other row
 // unwritten. `xq` and `rows` 16-byte aligned, the scales 4-byte aligned; no output overlaps another
 // or an input.
-extern "C" int scratchy_cuda_moe_sort_fp8(const void* xq, const void* x_scale, const void* topk_idx,
-                                          void* chunk_hist, void* counts, void* offsets,
-                                          void* tile_expert, void* pos, void* rows,
-                                          void* row_scale, uint32_t m, uint32_t experts,
-                                          uint32_t top_k, uint32_t hidden, uint32_t max_tiles,
-                                          void* stream /* cudaStream_t; null = default */) {
+namespace {
+
+// The e4m3 sort's launcher at `TILE`-row tiles: the rule, the views and the launches.
+template <int TILE>
+int sort_fp8(const void* xq, const void* x_scale, const void* topk_idx, void* chunk_hist,
+             void* counts, void* offsets, void* tile_expert, void* pos, void* rows, void* row_scale,
+             uint32_t m, uint32_t experts, uint32_t top_k, uint32_t hidden, uint32_t max_tiles,
+             void* stream) {
     const uint64_t pairs = uint64_t(m) * uint64_t(top_k);
     const uint64_t runs = pairs < uint64_t(experts) ? pairs : uint64_t(experts);
-    const uint64_t bound = (pairs + uint64_t(TILE_ROWS - 1) * runs) / uint64_t(TILE_ROWS);
+    const uint64_t bound = (pairs + uint64_t(TILE - 1) * runs) / uint64_t(TILE);
     const bool counted = experts == uint32_t(EXPERTS_SMALL) || experts == uint32_t(EXPERTS_LARGE);
     if (m == 0 || !counted || top_k == 0 || top_k > MAX_TOP_K || hidden == 0 ||
         hidden % (2 * VEC) != 0 || pairs > uint64_t(INT_MAX) ||
         uint64_t(m) * uint64_t(hidden) > uint64_t(INT_MAX) || uint64_t(max_tiles) < bound ||
-        uint64_t(max_tiles) * uint64_t(TILE_ROWS) * uint64_t(hidden) > uint64_t(INT_MAX)) {
+        uint64_t(max_tiles) * uint64_t(TILE) * uint64_t(hidden) > uint64_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
         const uint32_t chunks = uint32_t((pairs + uint64_t(CHUNK) - 1) / uint64_t(CHUNK));
         const uint32_t pair_ctas = uint32_t((pairs + uint64_t(WARPS) - 1) / uint64_t(WARPS));
-        const size_t capacity = size_t(max_tiles) * size_t(TILE_ROWS);
+        const size_t capacity = size_t(max_tiles) * size_t(TILE);
         // No view carries a TMA type, so building them encodes nothing. (a) and (b) read neither
         // row view; the e4m3 buffers stand in for them.
         row_gl xg{static_cast<bf16*>(const_cast<void*>(xq)), nullptr, nullptr, size_t(m),
@@ -503,10 +513,38 @@ extern "C" int scratchy_cuda_moe_sort_fp8(const void* xq, const void* x_scale, c
             int(pair_ctas)};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
         if (experts == uint32_t(EXPERTS_SMALL)) {
-            return launch_sort_fp8<EXPERTS_SMALL>(G, F, chunks, pair_ctas, s);
+            return launch_sort_fp8<EXPERTS_SMALL, TILE>(G, F, chunks, pair_ctas, s);
         }
-        return launch_sort_fp8<EXPERTS_LARGE>(G, F, chunks, pair_ctas, s);
+        return launch_sort_fp8<EXPERTS_LARGE, TILE>(G, F, chunks, pair_ctas, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+}  // namespace
+
+extern "C" int scratchy_cuda_moe_sort_fp8(const void* xq, const void* x_scale, const void* topk_idx,
+                                          void* chunk_hist, void* counts, void* offsets,
+                                          void* tile_expert, void* pos, void* rows,
+                                          void* row_scale, uint32_t m, uint32_t experts,
+                                          uint32_t top_k, uint32_t hidden, uint32_t max_tiles,
+                                          void* stream /* cudaStream_t; null = default */) {
+    return sort_fp8<TILE_ROWS>(xq, x_scale, topk_idx, chunk_hist, counts, offsets, tile_expert,
+                               pos, rows, row_scale, m, experts, top_k, hidden, max_tiles, stream);
+}
+
+// FP8 S8 P3(a): `scratchy_cuda_moe_sort_fp8` with each expert's run padded to 64 rows (an fp8 bank's
+// tile, `op_abi::CUDA_FP8_EXPERT_TILE_ROWS`): `max_tiles` counts 64-row tiles, `rows` and
+// `row_scale` hold `max_tiles · 64` rows, `tile_expert` names each 64-row tile's expert, and the
+// bound is `(P + 63 · min(E, P)) / 64`. Each pair's sorted row is still its token's e4m3 row and
+// scale; each live tile's padding row +0 bytes with the zero row's scale.
+extern "C" int scratchy_cuda_moe_sort_fp8_m64(const void* xq, const void* x_scale,
+                                              const void* topk_idx, void* chunk_hist, void* counts,
+                                              void* offsets, void* tile_expert, void* pos,
+                                              void* rows, void* row_scale, uint32_t m,
+                                              uint32_t experts, uint32_t top_k, uint32_t hidden,
+                                              uint32_t max_tiles,
+                                              void* stream /* cudaStream_t; null = default */) {
+    return sort_fp8<64>(xq, x_scale, topk_idx, chunk_hist, counts, offsets, tile_expert, pos, rows,
+                        row_scale, m, experts, top_k, hidden, max_tiles, stream);
 }

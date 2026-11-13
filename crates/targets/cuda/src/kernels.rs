@@ -130,6 +130,24 @@ unsafe extern "C" {
         n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_expert_gemm_fp8_variant(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        offsets: *const c_void,
+        tile_expert: *const c_void,
+        c: *mut c_void,
+        max_tiles: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        n_tile: u32,
+        m_tile: u32,
+        k_step: u32,
+        stream: *mut c_void,
+    ) -> i32;
     // FP8 S8 W4c: the one-row rope append (`kernels/rope_append_bf16.cu`).
     fn scratchy_cuda_rope_append_fp8(
         q: *const c_void,
@@ -1018,6 +1036,40 @@ unsafe extern "C" {
         top_k: u32,
         hidden: u32,
         max_tiles: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_moe_sort_fp8_m64(
+        xq: *const c_void,
+        x_scale: *const c_void,
+        topk_idx: *const c_void,
+        chunk_hist: *mut c_void,
+        counts: *mut c_void,
+        offsets: *mut c_void,
+        tile_expert: *mut c_void,
+        pos: *mut c_void,
+        rows: *mut c_void,
+        row_scale: *mut c_void,
+        m: u32,
+        experts: u32,
+        top_k: u32,
+        hidden: u32,
+        max_tiles: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gemm_fp8_m64(
+        a: *const c_void,
+        a_scale: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        offsets: *const c_void,
+        tile_expert: *const c_void,
+        c: *mut c_void,
+        max_tiles: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_expert_act_quant_fp8_prepare() -> i32;
@@ -3769,6 +3821,97 @@ pub unsafe fn moe_sort_fp8(
     )
 }
 
+/// [`moe_sort_fp8`] with each expert's run padded to 64 rows (FP8 S8 P3(a), an fp8 bank's tile
+/// [`crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS`]): `max_tiles` counts 64-row tiles (`tape::
+/// moe_tiles_at`'s bound at 64), `rows` and `row_scale` hold `max_tiles · 64` rows, `tile_expert`
+/// names each 64-row tile's expert. Refused as [`moe_sort_fp8`] at that bound (`kernel:
+/// "moe_sort_fp8_m64"`).
+///
+/// # Safety
+///
+/// As [`moe_sort_fp8`]'s, with `rows` `max_tiles · 64 · hidden` bytes and `row_scale` `max_tiles ·
+/// 64` f32.
+pub unsafe fn moe_sort_fp8_m64(
+    (xq, x_scale, topk_idx): (*const c_void, *const c_void, *const c_void),
+    regions: SortRegions,
+    (rows, row_scale): (*mut c_void, *mut c_void),
+    (m, experts, top_k, hidden, max_tiles): (u32, u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_moe_sort_fp8_m64(
+            xq,
+            x_scale,
+            topk_idx,
+            regions.chunk_hist,
+            regions.counts,
+            regions.offsets,
+            regions.tile_expert,
+            regions.pos,
+            rows,
+            row_scale,
+            m,
+            experts,
+            top_k,
+            hidden,
+            max_tiles,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "moe_sort_fp8_m64",
+            dims: [m, top_k, hidden, max_tiles],
+        },
+    )
+}
+
+/// [`expert_gemm_fp8`] at 64-row tiles (FP8 S8 P3(a)): `max_tiles` and `tile_expert` count a
+/// [`moe_sort_fp8_m64`]'s 64-row tiles, K step 128 when `k` is a multiple of 128, else 64. Each pair
+/// row is [`expert_gemm_fp8`]'s bits on the same row. Refused as that launcher (`kernel:
+/// "expert_gemm_fp8_m64"`).
+///
+/// # Safety
+///
+/// As [`expert_gemm_fp8`]'s, with `a` `max_tiles · 64 · k` bytes and as many f32 scales.
+pub unsafe fn expert_gemm_fp8_m64(
+    (a, b): (Fp8Operand, Fp8Operand),
+    (offsets, tile_expert): (*const c_void, *const c_void),
+    c: *mut c_void,
+    (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    n_tile: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above.
+    let code = unsafe {
+        scratchy_cuda_expert_gemm_fp8_m64(
+            a.0,
+            a.1,
+            b.0,
+            b.1,
+            offsets,
+            tile_expert,
+            c,
+            max_tiles,
+            n,
+            k,
+            experts,
+            expert_rows,
+            n_tile,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "expert_gemm_fp8_m64",
+            dims: [max_tiles, n, k, expert_rows],
+        },
+    )
+}
+
 /// The MoE prefill's act + quantize over its live rows (FP8 S8 P1, `kernels/act_quant_fp8.cu`):
 /// rows `r < offsets[experts]` of `bf16(OP(gate, up))` (`gate`, `up [rows, cols]` bf16, the expert
 /// GEMMs' outputs), quantized into `q [rows, cols]` e4m3 and `scale [rows]` f32: [`silu_mul_bf16`]
@@ -4272,6 +4415,54 @@ pub unsafe fn expert_gemm_fp8(
         code,
         KernelError::MoeShape {
             kernel: "expert_gemm_fp8",
+            dims: [max_tiles, n, k, expert_rows],
+        },
+    )
+}
+
+/// Test support for `tests/moe.rs` only (FP8 S8 P3(a)): [`expert_gemm_fp8`] at row tile `m_tile`
+/// (128, today's, at K step 64; or 64) and K step `k_step` (64, or 128 with `k` a multiple of 128),
+/// `max_tiles` and `tile_expert` counting `m_tile`-row tiles. Each pair row is the same bits at
+/// every form. No `CudaStep` uses it. Refused as that launcher, and unless the form is one of
+/// those three.
+///
+/// # Safety
+///
+/// As [`expert_gemm_fp8`]'s, with `a` `max_tiles · m_tile · k` bytes and as many f32 scales.
+#[doc(hidden)]
+pub unsafe fn expert_gemm_fp8_variant(
+    (a, b): (Fp8Operand, Fp8Operand),
+    (offsets, tile_expert): (*const c_void, *const c_void),
+    c: *mut c_void,
+    (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    (n_tile, m_tile, k_step): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above.
+    let code = unsafe {
+        scratchy_cuda_expert_gemm_fp8_variant(
+            a.0,
+            a.1,
+            b.0,
+            b.1,
+            offsets,
+            tile_expert,
+            c,
+            max_tiles,
+            n,
+            k,
+            experts,
+            expert_rows,
+            n_tile,
+            m_tile,
+            k_step,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "expert_gemm_fp8_variant",
             dims: [max_tiles, n, k, expert_rows],
         },
     )

@@ -31,8 +31,9 @@ use common::fp8::{e4m3_value, quantize_rows};
 use common::numerics::{bf16_inputs, mismatched_bits};
 use half::bf16;
 use scratchy_target_cuda::kernels::{
-    Fp8Operand, KernelError, expert_gemm_fp8, gate_up_gemm_fp8, gemm_fp8_abt, gemm_group_fp8_abt,
-    gemm_narrow_fp8_abt, gemm_narrow_group_fp8_abt, quant_rows_fp8,
+    Fp8Operand, KernelError, expert_gemm_fp8, expert_gemm_fp8_variant, gate_up_gemm_fp8,
+    gemm_fp8_abt, gemm_group_fp8_abt, gemm_narrow_fp8_abt, gemm_narrow_group_fp8_abt,
+    quant_rows_fp8,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
@@ -907,4 +908,210 @@ fn the_fp8_kernel_times_are_recorded() {
          x, one write of q; recorded, not asserted)",
         bytes / us / 1e6
     );
+}
+
+// ── FP8 S8 P3(a): the expert GEMM at 64-row tiles and K step 128 ────────
+
+/// The routed experts' four GEMMs (`expert_gemm_fp8_is_the_dense_fp8_gemm_per_expert_tile`'s):
+/// `(experts, expert_rows, n, k, n_tile, what)`.
+const P3_SHAPES: [(u32, u32, u32, u32, u32, &str); 4] = [
+    (256, 1024, 512, 2048, 256, "qwen3.6 gate"),
+    (256, 2048, 2048, 512, 256, "qwen3.6 down"),
+    (128, 1408, 704, 2816, 64, "gemma gate"),
+    (128, 2816, 2816, 704, 256, "gemma down"),
+];
+
+/// A sort's `offsets` (`[E + 1]`, its entry `E` the live rows) and `tile_expert` (`[max_tiles]`)
+/// for live tiles of `tile` rows owned by `owners`, in order.
+fn p3_index(
+    owners: &[usize],
+    max_tiles: usize,
+    tile: usize,
+    experts: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; experts + 1];
+    for &e in owners {
+        for o in &mut offsets[e + 1..] {
+            *o += tile as u32;
+        }
+    }
+    let mut tile_expert = vec![u32::MAX; max_tiles];
+    for (t, &e) in owners.iter().enumerate() {
+        tile_expert[t] = e as u32;
+    }
+    (offsets, tile_expert)
+}
+
+/// One expert GEMM at `(m_tile, k_step)` over `max_tiles` tiles of `a`, into a fresh output.
+fn p3_run(
+    device: &CudaDevice,
+    (a, bank): (&Fp8Buf, &Fp8Buf),
+    (offsets, tile_expert): (&[u32], &[u32]),
+    (n, k, experts, expert_rows, n_tile): (u32, u32, u32, u32, u32),
+    (m_tile, k_step): (u32, u32),
+) -> (Vec<u16>, bool) {
+    let (ob, tb) = (up_u32(device, offsets), up_u32(device, tile_expert));
+    let max_tiles = tile_expert.len() as u32;
+    let rows = max_tiles as usize * m_tile as usize;
+    run_out(device, rows * n as usize, |c| {
+        // SAFETY: `a` holds at least rows·k bytes and rows f32, the bank E·rows_e·k bytes and
+        // E·rows_e f32, the index regions E+1 and max_tiles u32 (the live tiles below E), `c`
+        // rows·n + TAIL bf16, all cudaMalloc'd and disjoint; null is the default stream.
+        unsafe {
+            expert_gemm_fp8_variant(
+                (a.op(), bank.op()),
+                (ob.ptr().cast_const(), tb.ptr().cast_const()),
+                c,
+                (max_tiles, n, k, experts, expert_rows),
+                (n_tile, m_tile, k_step),
+                std::ptr::null_mut(),
+            )
+        }
+    })
+    .expect("an expert GEMM variant")
+}
+
+/// FP8 S8 P3(a): the expert GEMM at 64-row tiles, K step 64 and (where `k` is a multiple of 128)
+/// 128, is today's (128-row tiles, K step 64), bit for bit on every live row: on today's 128-row
+/// layout with each tile named twice as two 64-row tiles, and on a 64-row layout of 5 live tiles
+/// against the dense fp8 GEMM of each tile's rows. Dead tiles are never written. At the four routed
+/// GEMMs of the 35B and Gemma, as `P3_BITS` lines.
+#[test]
+fn the_expert_gemm_at_64_row_tiles_and_k_128_is_todays_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (experts, expert_rows, n, k, n_tile, what) in P3_SHAPES {
+        let (eu, ru, nu, ku) = (
+            experts as usize,
+            expert_rows as usize,
+            n as usize,
+            k as usize,
+        );
+        let bank_q = e4m3_weights(eu * ru * ku, 0x0F60 ^ u64::from(k));
+        let bank_s = weight_scales(eu * ru, 0x0F61 ^ u64::from(n));
+        let bank = Fp8Buf::new(&device, &bank_q, &bank_s);
+        let rows = 13 * 64;
+        let (_, aq, a_s) = activation(rows, ku, 0x0F62 ^ u64::from(k));
+        let a = Fp8Buf::new(&device, &aq, &a_s);
+        let dims = (n, k, experts, expert_rows, n_tile);
+        // Today's: 4 live 128-row tiles of 6.
+        let owners = [3usize, 3, 0, eu - 1];
+        let (o128, t128) = p3_index(&owners, 6, 128, eu);
+        let (today, _) = p3_run(&device, (&a, &bank), (&o128, &t128), dims, (128, 64));
+        let live = 4 * 128 * nu;
+        let k_steps: &[u32] = if k % 128 == 0 { &[64, 128] } else { &[64] };
+        for &k_step in k_steps {
+            // The same rows as 8 live 64-row tiles of 12.
+            let owners64: Vec<usize> = owners.iter().flat_map(|&e| [e, e]).collect();
+            let (o64, t64) = p3_index(&owners64, 12, 64, eu);
+            let (got, tail) = p3_run(&device, (&a, &bank), (&o64, &t64), dims, (64, k_step));
+            let bad = mismatched_bits(&got[..live], &today[..live]);
+            let dead = got[live..].iter().all(|&v| v == SENTINEL);
+            // A 64-row layout: 5 live tiles, each against the dense GEMM of its 64 rows (and the
+            // next 64, the dense GEMM's 128-row tile).
+            let owners5 = [3usize, 3, 3, 0, eu - 1];
+            let (o5, t5) = p3_index(&owners5, 12, 64, eu);
+            let (got5, tail5) = p3_run(&device, (&a, &bank), (&o5, &t5), dims, (64, k_step));
+            let mut bad5 = 0usize;
+            for (t, &e) in owners5.iter().enumerate() {
+                let a_t = Fp8Buf::new(
+                    &device,
+                    &aq[t * 64 * ku..][..128 * ku],
+                    &a_s[t * 64..][..128],
+                );
+                let w = Fp8Buf::new(
+                    &device,
+                    &bank_q[e * ru * ku..][..nu * ku],
+                    &bank_s[e * ru..][..nu],
+                );
+                let dense =
+                    run_gemm(&device, (&a_t, &w), (128, n, k), n_tile == 64).expect("dense");
+                bad5 += mismatched_bits(&got5[t * 64 * nu..][..64 * nu], &dense.0[..64 * nu]);
+            }
+            let dead5 = got5[5 * 64 * nu..].iter().all(|&v| v == SENTINEL);
+            let ok = bad == 0 && dead && tail && bad5 == 0 && dead5 && tail5;
+            eprintln!(
+                "P3_BITS {what} experts={experts} n={n} k={k} m_tile=64 k_step={k_step}: \
+                 vs_today mismatched_bits={bad} 64_row_layout mismatched_bits={bad5} \
+                 dead_tiles_untouched={} tails_intact={} {}",
+                dead && dead5,
+                tail && tail5,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "an expert GEMM form is not today's bits");
+}
+
+/// Recorded, not asserted (P3(a)'s gate reads it): the routed GEMMs of a 2,048-token prefill
+/// (16,384 pairs, uniform over the experts), today's (128-row tiles, K step 64) against 64-row
+/// tiles at K step 64 and 128, each on its own sort padding, as `P3_TIME` lines, two rounds (A, B,
+/// A, B), with the computed rows of each.
+#[test]
+fn the_p3_expert_gemm_times_are_recorded() {
+    let device = h100();
+    for (experts, expert_rows, n, k, n_tile, what) in P3_SHAPES {
+        let (eu, ru, ku) = (experts as usize, expert_rows as usize, k as usize);
+        // 16,384 picks over the experts (a splitmix64 stream), counted per expert.
+        let mut state = 0x0F70u64 ^ u64::from(k);
+        let mut counts = vec![0usize; eu];
+        for _ in 0..2048 * 8 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            counts[((z ^ (z >> 31)) % experts as u64) as usize] += 1;
+        }
+        let owners = |tile: usize| -> Vec<usize> {
+            (0..eu)
+                .flat_map(|e| std::iter::repeat_n(e, counts[e].div_ceil(tile)))
+                .collect()
+        };
+        let (own128, own64) = (owners(128), owners(64));
+        let rows = (own64.len() * 64).max(own128.len() * 128);
+        let bank = Fp8Buf::new(
+            &device,
+            &e4m3_weights(eu * ru * ku, 0x0F71),
+            &weight_scales(eu * ru, 0x0F72),
+        );
+        let a = Fp8Buf::new(
+            &device,
+            &e4m3_weights(rows * ku, 0x0F73),
+            &weight_scales(rows, 0x0F74),
+        );
+        let k_steps: &[u32] = if k % 128 == 0 { &[64, 128] } else { &[64] };
+        let mut forms: Vec<(u32, u32, &Vec<usize>)> = vec![(128, 64, &own128)];
+        forms.extend(k_steps.iter().map(|&ks| (64, ks, &own64)));
+        for round in 1..=2 {
+            for &(m_tile, k_step, own) in &forms {
+                let (offsets, tile_expert) = p3_index(own, own.len(), m_tile as usize, eu);
+                let (ob, tb) = (up_u32(&device, &offsets), up_u32(&device, &tile_expert));
+                let c = DeviceBuffer::upload(
+                    &device,
+                    &vec![0u16; own.len() * m_tile as usize * n as usize],
+                )
+                .expect("C");
+                let us = event_time(|| {
+                    // SAFETY: as `p3_run`'s.
+                    unsafe {
+                        expert_gemm_fp8_variant(
+                            (a.op(), bank.op()),
+                            (ob.ptr().cast_const(), tb.ptr().cast_const()),
+                            c.ptr(),
+                            (own.len() as u32, n, k, experts, expert_rows),
+                            (n_tile, m_tile, k_step),
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("an expert GEMM variant")
+                });
+                eprintln!(
+                    "P3_TIME {what} round={round} m_tile={m_tile} k_step={k_step}: {us:.1} us \
+                     ({} computed rows for 16384 pairs)",
+                    own.len() * m_tile as usize
+                );
+            }
+        }
+    }
 }

@@ -279,11 +279,25 @@ pub struct MoeSortTape {
 /// The pairs, max tiles and padded rows of `bucket_m` tokens routed to `top_k` of `experts`:
 /// `(P, ⌊(P + 127·min(experts, P)) / 128⌋, 128 · max_tiles)`. `None` on overflow.
 pub const fn moe_tiles(bucket_m: u32, experts: u32, top_k: u32) -> Option<(u32, u32, u64)> {
+    moe_tiles_at(bucket_m, experts, top_k, CUDA_EXPERT_TILE_ROWS)
+}
+
+/// [`moe_tiles`] at row tile `t` (FP8 S8 P3(a): an fp8 bank's 64): `(P, ⌊(P + (t−1)·min(experts,
+/// P)) / t⌋, t · max_tiles)`.
+pub const fn moe_tiles_at(
+    bucket_m: u32,
+    experts: u32,
+    top_k: u32,
+    tile_rows: u32,
+) -> Option<(u32, u32, u64)> {
     let Some(pairs) = bucket_m.checked_mul(top_k) else {
         return None;
     };
     let n = if experts < pairs { experts } else { pairs };
-    let t = CUDA_EXPERT_TILE_ROWS as u64;
+    let t = tile_rows as u64;
+    if t == 0 {
+        return None;
+    }
     let tiles = (pairs as u64 + (t - 1) * n as u64) / t;
     if tiles > u32::MAX as u64 {
         return None;
@@ -296,10 +310,20 @@ pub const fn moe_tiles(bucket_m: u32, experts: u32, top_k: u32) -> Option<(u32, 
 /// `pos` and `rows`, then `gate`, `up`, `act` and `down`. `None` on overflow.
 pub fn moe_region_bytes(
     bucket_m: u32,
-    (experts, top_k, hidden, inter): (u32, u32, u32, u32),
+    geometry: (u32, u32, u32, u32),
     sorted: bool,
 ) -> Option<Vec<u64>> {
-    let (pairs, tiles, rows) = moe_tiles(bucket_m, experts, top_k)?;
+    moe_region_bytes_at(bucket_m, geometry, sorted, CUDA_EXPERT_TILE_ROWS)
+}
+
+/// [`moe_region_bytes`] at row tile `tile_rows` (FP8 S8 P3(a): an fp8 bank's 64).
+pub fn moe_region_bytes_at(
+    bucket_m: u32,
+    (experts, top_k, hidden, inter): (u32, u32, u32, u32),
+    sorted: bool,
+    tile_rows: u32,
+) -> Option<Vec<u64>> {
+    let (pairs, tiles, rows) = moe_tiles_at(bucket_m, experts, top_k, tile_rows)?;
     let bf16 = |r: u64, c: u32| r.checked_mul(u64::from(c))?.checked_mul(CUDA_ACT_BYTES);
     let m = u64::from(bucket_m);
     let mut out = vec![
@@ -1826,7 +1850,8 @@ impl CudaTape {
     }
 
     /// The MoE scratch, when the tape has one: its geometry one the kernels take and its bucket's
-    /// (`tile_rows` [`CUDA_EXPERT_TILE_ROWS`], `max_tiles` and sortedness the bucket's pairs'),
+    /// (`tile_rows` [`CUDA_EXPERT_TILE_ROWS`], or an fp8 bank's [`crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS`];
+    /// `max_tiles` and sortedness the bucket's pairs' at it),
     /// each region aligned, inside the arena, after the previous one, sized by the geometry
     /// ([`moe_region_bytes`]), and overlapping no region the forward fills. Returns the scratch's
     /// span.
@@ -1839,19 +1864,27 @@ impl CudaTape {
             return Ok(None);
         };
         let sorted = self.bucket_m.checked_mul(moe.top_k) >= Some(crate::op_abi::CUDA_SORTED_PAIRS);
-        let tiles = moe_tiles(self.bucket_m, moe.experts, moe.top_k).map(|(_, t, _)| t);
+        let tiles =
+            moe_tiles_at(self.bucket_m, moe.experts, moe.top_k, moe.tile_rows).map(|(_, t, _)| t);
         let geometry = (moe.experts, moe.top_k, moe.hidden, moe.inter);
+        // The tile rows are the bank's (FP8 S8 P3(a)): an fp8 bank's 64 when a step is one of its
+        // expert steps, else 128.
+        let fp8 = self.steps.iter().any(|s| match s {
+            CudaStep::ExpertSortFp8(_) | CudaStep::ExpertActQuant(_) => true,
+            CudaStep::ExpertGemm(g) => matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own),
+            _ => false,
+        });
         if moe.experts == 0
             || moe.top_k == 0
             || moe.top_k > moe.experts
-            || moe.tile_rows != CUDA_EXPERT_TILE_ROWS
+            || moe.tile_rows != crate::op_abi::expert_tile_rows(fp8)
             || moe.sort.is_some() != sorted
             || Some(moe.max_tiles) != if sorted { tiles } else { Some(0) }
         {
             return Err(TapeError::MoeGeometry);
         }
-        let mut want =
-            moe_region_bytes(self.bucket_m, geometry, sorted).ok_or(TapeError::MoeGeometry)?;
+        let mut want = moe_region_bytes_at(self.bucket_m, geometry, sorted, moe.tile_rows)
+            .ok_or(TapeError::MoeGeometry)?;
         if moe.router_norm.is_some() {
             let bytes = u64::from(self.bucket_m) * u64::from(moe.hidden) * CUDA_ACT_BYTES;
             want.push(bytes);
@@ -2236,7 +2269,10 @@ impl CudaTape {
                     _ => None,
                 });
                 let fp8 = matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
-                if g.proj != ExpertProjection::Down && sort_fp8 != Some(fp8) {
+                // P3(a): an fp8 bank's rows are 64-row tiles, a bf16 bank's 128-row ones.
+                if (g.proj != ExpertProjection::Down && sort_fp8 != Some(fp8))
+                    || moe.tile_rows != crate::op_abi::expert_tile_rows(fp8)
+                {
                     return Err(geometry);
                 }
                 let a = match (s.quantized_input(), last) {
@@ -2321,10 +2357,9 @@ impl CudaTape {
             // offsets, over the capacity rows at the bank's intermediate width.
             CudaStep::ExpertActQuant(t) => {
                 let sort = moe.sort.ok_or(geometry)?;
-                let capacity = moe
-                    .max_tiles
-                    .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS);
+                let capacity = moe.max_tiles.checked_mul(moe.tile_rows);
                 if t.experts != moe.experts
+                    || moe.tile_rows != crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS
                     || (Some(t.act.rows), t.act.cols) != (capacity, moe.inter)
                     || t.act.out != moe.act.offset
                 {

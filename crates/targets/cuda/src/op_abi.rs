@@ -505,6 +505,20 @@ pub const CUDA_SORTED_PAIRS: u32 = 64;
 /// row tile (`step::GEMM_BF16_TILE.0`), so every tile belongs to exactly one expert.
 pub const CUDA_EXPERT_TILE_ROWS: u32 = 128;
 
+/// An fp8 bank's row tile (FP8 S8 P3(a)): its sort pads each expert's run to 64 rows and its expert
+/// GEMM takes 64-row tiles (`kernels/gemm_fp8.cu`'s `M_BLOCK` 1), so a half-full 128-row tile costs
+/// half the rows. A bf16 bank keeps [`CUDA_EXPERT_TILE_ROWS`].
+pub const CUDA_FP8_EXPERT_TILE_ROWS: u32 = 64;
+
+/// The row tile of a bank: [`CUDA_FP8_EXPERT_TILE_ROWS`] for an fp8 one, else
+/// [`CUDA_EXPERT_TILE_ROWS`].
+pub const fn expert_tile_rows(fp8: bool) -> u32 {
+    match fp8 {
+        true => CUDA_FP8_EXPERT_TILE_ROWS,
+        false => CUDA_EXPERT_TILE_ROWS,
+    }
+}
+
 const _: () = assert!(CUDA_EXPERT_TILE_ROWS == crate::step::GEMM_BF16_TILE.0);
 
 // ── Tiling ──────────────────────────────────────────────────────────

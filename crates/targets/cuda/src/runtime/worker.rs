@@ -2982,7 +2982,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         }
     }
 
-    /// Enqueue the e4m3 sort (FP8 S8 P1, `kernels::moe_sort_fp8`): `x` the token rows' quantization
+    /// Enqueue the e4m3 sort (FP8 S8 P1, at an fp8 bank's 64-row tiles: `kernels::moe_sort_fp8_m64`): `x` the token rows' quantization
     /// in the quant scratch, `rows` the sorted e4m3 rows, each e4m3 then its scales.
     fn expert_sort_fp8(
         s: &ExpertSortBf16,
@@ -2996,7 +2996,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let (Some(_), Some(capacity)) = (
             s.layout(),
             s.max_tiles
-                .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS),
+                .checked_mul(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS),
         ) else {
             return Err(refused);
         };
@@ -3013,7 +3013,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // f32 (`validate`), and `rows` the sorted region's `capacity*hidden` bytes and `capacity`
         // f32 (the e4m3 sort's extents, inside the region's bf16 bytes).
         unsafe {
-            kernels::moe_sort_fp8(
+            kernels::moe_sort_fp8_m64(
                 (xq, x_scale, slot(s.topk_idx).cast_const()),
                 regions,
                 (rows.cast_mut(), row_scale.cast_mut()),
@@ -3098,7 +3098,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             // and `rows` f32 (`validate`), and the bank `fp8_moe_layout`'s bytes, expert 0's
             // e4m3 block and scale row inside it.
             return unsafe {
-                kernels::expert_gemm_fp8(
+                kernels::expert_gemm_fp8_m64(
                     (Self::fp8_rows(&slot, a, rows, k), b),
                     (
                         slot(g.offsets).cast_const(),

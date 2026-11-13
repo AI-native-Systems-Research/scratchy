@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 
 use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, RopePairing, SourceBinding};
-use scratchy_subtile::lower::GemmWeightKind;
+use scratchy_subtile::lower::{ExpertWeight, GemmWeightKind};
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertProj;
 use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, TensorShape, ValidatedGraph, lower_region};
@@ -30,8 +30,8 @@ use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
-    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FOLD_PROJECTIONS,
-    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
+    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FOLD_PROJECTIONS, CUDA_FP8_EXPERT_TILE_ROWS,
+    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions, expert_tile_rows,
 };
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
@@ -41,7 +41,7 @@ use scratchy_target_cuda::step::{
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
-    MoeTape, RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles, overlap,
+    MoeTape, RotaryTable, TapeInput, WeightIx, moe_region_bytes_at, moe_tiles_at, overlap,
 };
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step};
@@ -1892,7 +1892,8 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
                     }
                     _ => None,
                 });
-                let capacity = down.and_then(|d| d.max_tiles.checked_mul(CUDA_EXPERT_TILE_ROWS));
+                let capacity =
+                    down.and_then(|d| d.max_tiles.checked_mul(CUDA_FP8_EXPERT_TILE_ROWS));
                 if let (Some(d), Some(rows)) = (down, capacity)
                     && (act.rows, act.cols) == (rows, d.inter)
                 {
@@ -2185,6 +2186,9 @@ pub struct MoeGeometry {
     /// Whether the block's router reads a pre-norm of its own (Gemma's `RouterNorm`), which the
     /// scratch then holds in its router-norm rows.
     pub router_norm: bool,
+    /// Whether the bank is fp8 (its gate `ExpertMatmul`'s weight), whose sort and expert GEMM take
+    /// 64-row tiles (FP8 S8 P3(a), `op_abi::expert_tile_rows`).
+    pub fp8: bool,
 }
 
 /// The canonical's MoE geometry, or `None` when it has no MoE op: the experts of its first
@@ -2197,8 +2201,12 @@ fn moe_geometry(plan: &CudaPlan) -> Option<MoeGeometry> {
         _ => None,
     })?;
     let mut rest = tape_steps(plan);
-    let (top_k, inter) = rest.find_map(|s| match s.node.op {
-        SubOp::ExpertMatmul { proj, n, k, .. } if proj != ExpertProj::Down => Some((k.get(), n)),
+    let (top_k, inter, fp8) = rest.find_map(|s| match s.node.op {
+        SubOp::ExpertMatmul {
+            proj, n, k, weight, ..
+        } if proj != ExpertProj::Down => {
+            Some((k.get(), n, matches!(weight, ExpertWeight::Fp8Dynamic)))
+        }
         _ => None,
     })?;
     let hidden = tape_steps(plan).find_map(|s| match s.node.op {
@@ -2212,6 +2220,7 @@ fn moe_geometry(plan: &CudaPlan) -> Option<MoeGeometry> {
         hidden,
         inter,
         router_norm,
+        fp8,
     })
 }
 
@@ -2225,8 +2234,12 @@ fn moe_scratch(
 ) -> Result<MoeTape, ArenaRefusal> {
     let sorted = bucket_m.checked_mul(g.top_k) >= Some(CUDA_SORTED_PAIRS);
     let geometry = (g.experts, g.top_k, g.hidden, g.inter);
-    let bytes = moe_region_bytes(bucket_m, geometry, sorted).ok_or(ArenaRefusal::TooLarge)?;
-    let (_, tiles, _) = moe_tiles(bucket_m, g.experts, g.top_k).ok_or(ArenaRefusal::TooLarge)?;
+    // Only a sorted bucket plays tiles; an unsorted one keeps the tape check's 128.
+    let tile_rows = expert_tile_rows(g.fp8 && sorted);
+    let bytes =
+        moe_region_bytes_at(bucket_m, geometry, sorted, tile_rows).ok_or(ArenaRefusal::TooLarge)?;
+    let (_, tiles, _) =
+        moe_tiles_at(bucket_m, g.experts, g.top_k, tile_rows).ok_or(ArenaRefusal::TooLarge)?;
     let mut spans = Vec::with_capacity(bytes.len());
     for b in bytes {
         spans.push(ArenaSpan {
@@ -2264,7 +2277,7 @@ fn moe_scratch(
         top_k: g.top_k,
         hidden: g.hidden,
         inter: g.inter,
-        tile_rows: CUDA_EXPERT_TILE_ROWS,
+        tile_rows,
         max_tiles: if sorted { tiles } else { 0 },
         logits: head[0],
         topk_idx: head[1],

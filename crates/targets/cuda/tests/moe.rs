@@ -20,11 +20,13 @@ use scratchy_target_cuda::kernels::{
     gemv_bf16_abt, moe_combine_bf16, moe_route_bf16, moe_sort,
 };
 use scratchy_target_cuda::kernels::{
-    expert_act_quant_fp8, gelu_mul_bf16, moe_sort_fp8, quant_rows_fp8, silu_mul_bf16,
+    expert_act_quant_fp8, gelu_mul_bf16, moe_sort_fp8, moe_sort_fp8_m64, quant_rows_fp8,
+    silu_mul_bf16,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 use scratchy_target_cuda::step::sort_index_regions;
 use scratchy_target_cuda::tape::moe_tiles;
+use scratchy_target_cuda::tape::moe_tiles_at;
 
 /// Extra output elements past the shape, which a kernel must leave untouched.
 const TAIL: usize = 4096;
@@ -3080,4 +3082,140 @@ fn the_p1_moe_times_are_recorded() {
             );
         }
     }
+}
+
+// ── FP8 S8 P3(a): the e4m3 sort at 64-row tiles ───────────────────────────────
+
+/// FP8 S8 P3(a): the e4m3 sort at 64-row tiles. Against the host's counting sort: the counts; the
+/// offsets, each run padded to 64 rows; each 64-row tile's expert; each pair's sorted row, its
+/// token's e4m3 row and scale (the token rows' `quant_rows_fp8`), byte for byte; each padding row
+/// +0 bytes with the zero row's scale; every row past the live tiles unwritten. At both models'
+/// geometries, m = 512 and 2,048, uniform and skewed routings, as `P3_SORT` lines.
+#[test]
+fn the_e4m3_sort_at_64_row_tiles_is_the_counting_sort_of_its_quantized_rows() {
+    let device = h100();
+    // The zero row's scale, as `quant_rows_fp8` gives it.
+    let zero = up(&device, &vec![0u16; 16 * 64]);
+    let (zq, zs) = (
+        up_bytes(&device, &vec![P1_SENTINEL; 16 * 64]),
+        up_bytes(&device, &[0; 64]),
+    );
+    p1_quant(&zero, (&zq, &zs), (16, 64));
+    let zero_scale = down_bytes(&zs)[..4].to_vec();
+    let mut pass = true;
+    for shape in P1_SHAPES {
+        let (e_n, h) = (shape.experts, shape.hidden);
+        for m in [512usize, 2048] {
+            let skewed: Vec<u32> = (0..m * TOP_K)
+                .map(|p| (e_n - 1 - p % TOP_K) as u32)
+                .collect();
+            for (case, topk_idx) in [
+                ("uniform", p1_picks(m, e_n, 0x0F80 ^ m as u64)),
+                ("skewed", skewed),
+            ] {
+                let (pairs, max_tiles, _) =
+                    moe_tiles_at(m as u32, e_n as u32, TOP_K as u32, 64).expect("tiles");
+                let regions = sort_index_regions(pairs, e_n as u32, max_tiles)
+                    .expect("regions")
+                    .map(|b| b as usize);
+                let capacity = max_tiles as usize * 64;
+                let x = up(&device, &bf16_inputs(m * h, 0x0F81 ^ m as u64));
+                let bytes = |n: usize| up_bytes(&device, &vec![P1_SENTINEL; n]);
+                let (xq, xs) = (bytes(m * h), bytes(m * 4));
+                p1_quant(&x, (&xq, &xs), (m, h));
+                let index = up_u32(&device, &vec![u32::MAX; regions[5] / 4]);
+                let (rq, rs) = (bytes(capacity * h), bytes(capacity * 4));
+                let tk = up_u32(&device, &topk_idx);
+                let at = |i: usize| index.ptr().wrapping_byte_add(regions[i]);
+                // SAFETY: `xq` holds m·h bytes and `xs` m f32, `tk` m·TOP_K u32 below E, the index
+                // regions `sort_index_regions`' at this geometry, `rq` capacity·h bytes and `rs`
+                // capacity f32, each its own allocation; null is the default stream.
+                unsafe {
+                    moe_sort_fp8_m64(
+                        (xq.ptr(), xs.ptr(), tk.ptr()),
+                        SortRegions {
+                            chunk_hist: at(0),
+                            counts: at(1),
+                            offsets: at(2),
+                            tile_expert: at(3),
+                            pos: at(4),
+                        },
+                        (rq.ptr(), rs.ptr()),
+                        (m as u32, e_n as u32, TOP_K as u32, h as u32, max_tiles),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("moe_sort_fp8_m64");
+                let idx = down_u32(&index);
+                let region = |i: usize, len: usize| idx[regions[i] / 4..][..len].to_vec();
+                let (counts, offsets) = (region(1, e_n), region(2, e_n + 1));
+                let (tile_expert, pos) = (region(3, max_tiles as usize), region(4, m * TOP_K));
+                let mut want_counts = vec![0u32; e_n];
+                for &e in &topk_idx {
+                    want_counts[e as usize] += 1;
+                }
+                let mut want_offsets = vec![0u32; e_n + 1];
+                for e in 0..e_n {
+                    want_offsets[e + 1] = want_offsets[e] + want_counts[e].div_ceil(64) * 64;
+                }
+                let live = want_offsets[e_n] as usize;
+                let tiles_ok = (0..e_n).all(|e| {
+                    (want_offsets[e] as usize / 64..want_offsets[e + 1] as usize / 64)
+                        .all(|t| tile_expert[t] == e as u32)
+                });
+                let (xqb, xsb, rqb, rsb) = (
+                    down_bytes(&xq),
+                    down_bytes(&xs),
+                    down_bytes(&rq),
+                    down_bytes(&rs),
+                );
+                let mut bad_rows = 0usize;
+                for (p, &r) in pos.iter().enumerate() {
+                    let (r, t) = (r as usize, p / TOP_K);
+                    bad_rows += usize::from(
+                        r >= live
+                            || rqb[r * h..][..h] != xqb[t * h..][..h]
+                            || rsb[r * 4..][..4] != xsb[t * 4..][..4],
+                    );
+                }
+                let mut bad_pad = 0usize;
+                for e in 0..e_n {
+                    for r in
+                        (want_offsets[e] + want_counts[e]) as usize..want_offsets[e + 1] as usize
+                    {
+                        bad_pad += usize::from(
+                            rqb[r * h..][..h].iter().any(|&b| b != 0)
+                                || rsb[r * 4..][..4] != zero_scale[..],
+                        );
+                    }
+                }
+                let dead = rqb[live * h..capacity * h]
+                    .iter()
+                    .all(|&b| b == P1_SENTINEL)
+                    && rsb[live * 4..capacity * 4]
+                        .iter()
+                        .all(|&b| b == P1_SENTINEL);
+                let ok = counts == want_counts
+                    && offsets == want_offsets
+                    && tiles_ok
+                    && bad_rows == 0
+                    && bad_pad == 0
+                    && dead;
+                eprintln!(
+                    "P3_SORT {} m={m} {case}: live_rows={live} capacity={capacity} counts_ok={} \
+                     offsets_ok={} tiles_ok={tiles_ok} mismatched_pair_rows={bad_rows} \
+                     bad_padding_rows={bad_pad} dead_rows_untouched={dead} {}",
+                    shape.name,
+                    counts == want_counts,
+                    offsets == want_offsets,
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "the e4m3 sort at 64-row tiles is not the counting sort of its rows"
+    );
 }
