@@ -297,9 +297,7 @@ impl Worker for SpyreWorker {
                     .block_table(&nr.req_id)
                     .map(|t| {
                         t.iter()
-                            .map(|&b| {
-                                scratchy_target_spyre::paged_step::page_of_block(b as u32)
-                            })
+                            .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -379,9 +377,7 @@ impl Worker for SpyreWorker {
                     input_batch
                         .token_at(id, p)
                         .map(|t| t as usize)
-                        .ok_or_else(|| {
-                            werr(format!("prefill wave: req {id} has no token at {p}"))
-                        })
+                        .ok_or_else(|| werr(format!("prefill wave: req {id} has no token at {p}")))
                 })
                 .collect::<ExecutorResult<_>>()?;
             let blocks: Vec<u32> = input_batch
@@ -403,48 +399,51 @@ impl Worker for SpyreWorker {
             });
             waved.insert(id.clone());
         }
-        // ⭐ THE PREFILL WAVE — every gathered tail in ONE launch on the packed rung that
-        // holds them (`packed_rung_for`: the smallest product holding the widest tail and
-        // the live count, first fit on the count). One weight stream, one launch, one
-        // readback of `s` picks — request `r`'s own answer from window `r`. A wave of fewer
-        // than two is not a wave: a lone tail would pay `s − 1` empty windows for nothing,
-        // so it and every wave no rung holds run the solo chunk loop.
+        // ⭐ THE PREFILL WAVE — every gathered tail in as few launches as the packed table
+        // holds (`packed_fill`: the rung seating the most tails at the widest tail's width,
+        // the whole wave when one rung holds it). One weight stream per launch, one readback
+        // of `s` picks — request `r`'s own answer from window `r`. The wave runs WIDEST TAILS
+        // FIRST so each group's rung is chosen by the widest tail it carries and the narrow
+        // leftovers pack on narrower rungs at higher counts. A wave of fewer than two is not
+        // a wave: a lone tail would pay `s − 1` empty windows for nothing, so it and every
+        // tail wider than every window run the solo chunk loop.
         #[cfg(feature = "spyre-hw")]
         {
-            let rung = if wave.len() >= 2 {
-                let max_tail = wave.iter().map(|t| t.toks.len()).max().unwrap_or(0);
+            wave.sort_by_key(|t| std::cmp::Reverse(t.toks.len()));
+            let mut rest: &[PackedTail] = &wave;
+            while rest.len() >= 2 {
+                let widest = rest[0].toks.len();
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
-                sb.prefill_prefix.packed_rung_for(max_tail, wave.len())
-            } else {
-                None
-            };
-            if let Some(rung) = rung {
+                let Some((rung, seats)) = sb.prefill_prefix.packed_fill(widest, rest.len()) else {
+                    break;
+                };
                 let sh = Shared {
                     embed_tokens: &model.embed_tokens,
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
+                let (group, tail) = rest.split_at(seats);
                 let picks =
-                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, &wave, input_batch)?;
-                for (t, pick) in wave.iter().zip(picks) {
+                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
+                for (t, pick) in group.iter().zip(picks) {
                     order.push(t.id.clone());
                     sampled.push(pick);
                 }
-            } else {
-                // No rung holds the wave (or it is not one): every gathered tail runs the
-                // solo chunk loop, exactly as before — a selection, never a refusal.
-                for t in wave {
-                    let req = requests
-                        .get_mut(&t.id)
-                        .ok_or_else(|| werr(format!("unknown wave req {}", t.id)))?;
-                    let s =
-                        run_request_step(model, req, &t.id, input_batch, t.start, t.toks.len())?;
-                    order.push(t.id.clone());
-                    sampled.push(s);
-                }
-                waved.clear();
+                rest = tail;
             }
+            // Fewer than two left, or a tail wider than every window: every remaining tail
+            // runs the solo chunk loop, exactly as before — a selection, never a refusal.
+            for t in rest {
+                let req = requests
+                    .get_mut(&t.id)
+                    .ok_or_else(|| werr(format!("unknown wave req {}", t.id)))?;
+                let s = run_request_step(model, req, &t.id, input_batch, t.start, t.toks.len())?;
+                order.push(t.id.clone());
+                sampled.push(s);
+            }
+            // ⛔ `waved` STAYS SET: every gathered tail ran above — packed or solo — and the
+            // per-request loop below must not run the cached ones a second time.
         }
         // ── BATCHED DECODE ────────────────────────────────────────────────────────────────────────
         // Every cached request scheduled for exactly ONE GENERATED token is a decode step, and those

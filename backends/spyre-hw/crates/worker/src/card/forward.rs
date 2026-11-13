@@ -422,14 +422,12 @@ pub(crate) fn run_card_launch(
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
             // draw the last real row would).
-            (SeatLaws::Prompt { draw }, LaunchRows::Sequence { rows, .. }) => {
-                (0..seat_width.get())
-                    .map(|r| RowLaw {
-                        draw,
-                        step: rows.pos(r) as u32,
-                    })
-                    .collect()
-            }
+            (SeatLaws::Prompt { draw }, LaunchRows::Sequence { rows, .. }) => (0..seat_width.get())
+                .map(|r| RowLaw {
+                    draw,
+                    step: rows.pos(r) as u32,
+                })
+                .collect(),
             // A DECODE: live row `s` runs its own request's draw at its own position, and a pad row
             // runs live 0's ([`pad_law_of`]).
             (SeatLaws::Batch { draws }, LaunchRows::Batch { .. }) => {

@@ -236,7 +236,7 @@ pub(crate) struct PrefixRungBuilt {
 /// ONE CHOICE OF [`PrefixLadder`] RUNG, made once per chunk and carried — the chunk's cap, its padded
 /// write, its session and the baked row count its K/V extent is proven against all read THIS value, so
 /// they cannot come from two choices. No public constructor: only [`PrefixLadder::rung_for`] and
-/// [`PrefixLadder::packed_rung_for`] mint one.
+/// [`PrefixLadder::packed_fill`] mint one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrefixRung {
     index: usize,
@@ -277,7 +277,7 @@ impl PrefixLadder {
     /// rows the prompt still has, else the widest solo (the chunk is then capped at its width). A
     /// packed rung cannot serve one chunk: its graph is s windows' rows and its answer rows are
     /// r·width apart, so a lone tail on it would compute s−1 empty windows — the wave front gathers
-    /// tails and picks [`Self::packed_rung_for`] instead. `None` only when no solo rung baked.
+    /// tails and picks [`Self::packed_fill`] instead. `None` only when no solo rung baked.
     pub(crate) fn rung_for(&self, rows_left: usize) -> Option<PrefixRung> {
         let index = self
             .0
@@ -291,28 +291,41 @@ impl PrefixLadder {
         })
     }
 
-    /// ⭐ THE RUNG A WAVE OF `live` CONTINUATION TAILS RUNS ON — the packed rung of the smallest
-    /// PRODUCT that holds both halves of the wave: `width` at least the widest tail's rows (every
-    /// window pads its own tail to its rung's width) and `seqs` at least the live count (every tail
-    /// rides its own window). First fit on the count breaks product ties toward the rung whose
-    /// count is nearest the wave's — the fewest padded windows. `None` when no packed rung holds
-    /// the wave; the caller then runs the tails as solo chunks (a selection, never a refusal).
-    pub(crate) fn packed_rung_for(
+    /// ⭐ THE RUNG AND GROUP SIZE A WAVE'S NEXT GROUP RUNS ON — the packed rung that seats the
+    /// MOST tails of the `live` the wave still holds (capped at the rung's own `seqs`), at
+    /// `width` at least the widest tail's rows (every window pads its own tail to its rung's
+    /// width). Product ties break toward the smaller rung, then the smaller count — the fewest
+    /// padded windows — so when ONE rung holds the whole wave this is that rung exactly (the
+    /// smallest product holding both halves). A wave larger than every rung FILLS RUNGS: the
+    /// caller launches group after group, widest tails first, and no tail waits on the whole
+    /// wave fitting one rung. `None` when no packed rung seats even two tails at the widest
+    /// tail's width (a tail wider than every window); the caller then runs the tails as solo
+    /// chunks (a selection, never a refusal).
+    pub(crate) fn packed_fill(
         &self,
         max_tail_width: usize,
         live: usize,
-    ) -> Option<PrefixRung> {
+    ) -> Option<(PrefixRung, usize)> {
         let (index, rung) = self
             .0
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.seqs > 1 && r.width >= max_tail_width && r.seqs >= live)
-            .min_by_key(|(_, r)| (r.width * r.seqs, r.seqs))?;
-        Some(PrefixRung {
-            index,
-            width: rung.width,
-            seqs: rung.seqs,
-        })
+            .filter(|(_, r)| r.seqs > 1 && r.width >= max_tail_width)
+            .max_by_key(|(_, r)| {
+                (
+                    r.seqs.min(live),
+                    std::cmp::Reverse(r.width * r.seqs),
+                    std::cmp::Reverse(r.seqs),
+                )
+            })?;
+        Some((
+            PrefixRung {
+                index,
+                width: rung.width,
+                seqs: rung.seqs,
+            },
+            rung.seqs.min(live),
+        ))
     }
 
     /// The session of a rung THIS ladder chose.
