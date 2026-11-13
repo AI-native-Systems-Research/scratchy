@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow};
 
 use flex_rs::address::ByteSize;
 use flex_rs::memory_region::MemoryType;
-use scratchy_target_spyre::runtime::{DevAddr, Stream};
+use scratchy_target_spyre_card::runtime::{DevAddr, Stream};
 
 /// The window step of `zero_seg`'s walk, mirrored here so the probe exercises
 /// the same single-chunk shapes the loader submits.
@@ -55,10 +55,11 @@ fn pattern_bytes(len: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let card =
-        scratchy_target_spyre::runtime::WorldCards::<ktir_superdsc::collective::TpWorld<1>>::open_all()
-            .map_err(anyhow::Error::msg)?
-            .into_first();
+    let card = scratchy_target_spyre_card::runtime::WorldCards::<
+        ktir_superdsc::collective::TpWorld<1>,
+    >::open_all()
+    .map_err(anyhow::Error::msg)?
+    .into_first();
     let stream = Stream::create(&card).context("stream create")?;
     let total = WINDOW + TAIL;
     let dev = DevAddr::alloc(&card, ByteSize(total), MemoryType::Tensor)

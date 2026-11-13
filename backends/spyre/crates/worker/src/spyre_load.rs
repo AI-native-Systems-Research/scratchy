@@ -798,16 +798,16 @@ impl SpyreWorker {
         // address — no index arithmetic, and nothing in the environment chooses the set.
         #[cfg(feature = "spyre-hw")]
         let card_open = {
-            let table = scratchy_target_spyre::runtime::CardTable::enumerate()
+            let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
                 .map_err(|e| werr(format!("Spyre card table: {e}")))?;
-            let world = scratchy_target_spyre::runtime::WorldCards::<World>::claim(&table)
+            let world = scratchy_target_spyre_card::runtime::WorldCards::<World>::claim(&table)
                 .map_err(|e| werr(e.to_string()))?;
             info!("[spyre-worker] this world's cards: {}", world.describe());
             let world = std::sync::Arc::new(world);
             scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::from_fn(|r| {
                 let world = std::sync::Arc::clone(&world);
                 std::thread::spawn(move || {
-                    scratchy_target_spyre::runtime::CardRuntime::<World>::open(
+                    scratchy_target_spyre_card::runtime::CardRuntime::<World>::open(
                         world.per_rank().get(r),
                     )
                 })
@@ -1065,7 +1065,7 @@ impl SpyreWorker {
                     scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
                         (me.get() == last).then(|| alloc_slot.take()).flatten()
                     });
-                scratchy_target_spyre::sdsc_runner::each_rank_parallel(inputs, |me, alloc| {
+                scratchy_target_spyre_card::sdsc_runner::each_rank_parallel(inputs, |me, alloc| {
                     let cut = RankCut {
                         forward,
                         me,
@@ -1298,7 +1298,7 @@ impl SpyreWorker {
         let pool_stride_bytes_v: Option<u64>;
         // Where the shared host threads run, read from the cards when they join (below).
         #[cfg(feature = "spyre-hw")]
-        let world_cpus_v: scratchy_target_spyre::runtime::WorldCpus;
+        let world_cpus_v: scratchy_target_spyre_card::runtime::WorldCpus;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1365,8 +1365,8 @@ impl SpyreWorker {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
-                let pool_need_bytes =
-                    code.layout.segment_bytes[scratchy_target_spyre::superdsc_exec::SEG_KV.get()];
+                let pool_need_bytes = code.layout.segment_bytes
+                    [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()];
                 let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
@@ -1456,8 +1456,9 @@ impl SpyreWorker {
                 // ⭐ THIS THREAD BUILDS EVERY SESSION, so it runs where the world's shared work
                 // runs before the first one is built: each session's host copies and the
                 // activation shadows faulted in below are allocated and first touched there.
-                let world_cpus =
-                    scratchy_target_spyre::runtime::WorldCpus::of(cards.values().map(|c| c.cpus()));
+                let world_cpus = scratchy_target_spyre_card::runtime::WorldCpus::of(
+                    cards.values().map(|c| c.cpus()),
+                );
                 world_cpus
                     .pin_current_thread()
                     .map_err(|e| werr(format!("the load thread: {e}")))?;
@@ -1469,10 +1470,10 @@ impl SpyreWorker {
                 // session below loads against one link per card (`Executor::load` refuses a bundle
                 // whose window is elsewhere, and a sharded one on an unlinked card).
                 if let Some(window) =
-                    scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
+                    scratchy_target_spyre_card::superdsc_exec::RankSeat::baked_window(code)
                         .map_err(|e| werr(format!("bundle {fp}: {e}")))?
                 {
-                    scratchy_target_spyre::runtime::link_peers(cards, window)
+                    scratchy_target_spyre_card::runtime::link_peers(cards, window)
                         .map_err(|e| werr(e.to_string()))?;
                     info!(
                         "[spyre-worker] linked {} cards over device p2p RDMA, window {window:?}: {}",
@@ -1508,7 +1509,9 @@ impl SpyreWorker {
                     + seg_bytes
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| *i != scratchy_target_spyre::superdsc_exec::SEG_KV.get())
+                        .filter(|(i, _)| {
+                            *i != scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()
+                        })
                         .map(|(_, b)| *b)
                         .sum::<u64>();
                 // ⛔⛔⛔ AND THE SPILLED WEIGHT TAIL IS CHARGED ONCE PER SESSION, NOT ONCE.
@@ -1550,8 +1553,8 @@ impl SpyreWorker {
                 // config whose ladders do not fit dies at build rather than running degraded.
                 let (anchor_live_bytes, anchor_spare_bytes) = match prefill_code {
                     Some(pc) => {
-                        let weight = scratchy_target_spyre::superdsc_exec::SEG_WEIGHT.get();
-                        let kv = scratchy_target_spyre::superdsc_exec::SEG_KV.get();
+                        let weight = scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT.get();
+                        let kv = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
                         let live: u64 = pc
                             .layout
                             .segment_bytes
@@ -1593,8 +1596,8 @@ impl SpyreWorker {
                 // second derivation of `prefill_m`). The prefix-capable prefill and the decode
                 // batch rungs build soft after the join and are charged for the same reason: their
                 // allocations are real whenever they succeed.
-                let seg_weight = scratchy_target_spyre::superdsc_exec::SEG_WEIGHT.get();
-                let seg_kv = scratchy_target_spyre::superdsc_exec::SEG_KV.get();
+                let seg_weight = scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT.get();
+                let seg_kv = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
                 let non_resident =
                     |lay: &scratchy_target_spyre::bundle_code::BundleLayout<'static>| {
                         lay.segment_bytes
@@ -1892,7 +1895,7 @@ impl SpyreWorker {
                             SuperDscSession::new_reserving(
                                 cards,
                                 pcode,
-                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
                                     vocab,
                                     kv_dim,
                                     num_blocks,
@@ -1905,7 +1908,7 @@ impl SpyreWorker {
                             SuperDscSession::new_borrowing_with_consts(
                                 cards,
                                 pcode,
-                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
                                     vocab,
                                     kv_dim,
                                     num_blocks,
@@ -1976,7 +1979,7 @@ impl SpyreWorker {
                 let mut ss = SuperDscSession::new(
                     cards,
                     code,
-                    scratchy_target_spyre::sdsc_runner::SessionDims {
+                    scratchy_target_spyre_card::sdsc_runner::SessionDims {
                         vocab,
                         kv_dim,
                         num_blocks,
@@ -2077,7 +2080,7 @@ impl SpyreWorker {
                                             let r = SuperDscSession::new_borrowing_with_consts(
                                                 cards,
                                                 rcode,
-                                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
                                                     vocab,
                                                     kv_dim,
                                                     num_blocks,
@@ -2156,8 +2159,8 @@ impl SpyreWorker {
                         // Spawn EVERY rung first, join in a second pass — a `map` that joins
                         // inside the closure is lazy, so it would run each build to completion
                         // before the next thread exists. The prefill ladder's own shape.
-                        let built: Vec<Result<SuperDscSession, (u32, String)>> =
-                            std::thread::scope(|scope| {
+                        let built: Vec<Result<SuperDscSession, (u32, String)>> = std::thread::scope(
+                            |scope| {
                                 let handles: Vec<_> = prefix_jobs
                                     .iter()
                                     .map(|job| {
@@ -2167,7 +2170,7 @@ impl SpyreWorker {
                                             SuperDscSession::new_borrowing_with_consts(
                                                 cards,
                                                 job.rcode,
-                                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
                                                     vocab,
                                                     kv_dim,
                                                     num_blocks,
@@ -2202,7 +2205,8 @@ impl SpyreWorker {
                                         Err(p) => std::panic::resume_unwind(p),
                                     })
                                     .collect()
-                            });
+                            },
+                        );
                         info!(
                             "[spyre-worker] sendnn: prefix rung fan-out: {} rung(s) built in {:.0} ms",
                             prefix_jobs.len(),
@@ -2359,7 +2363,7 @@ impl SpyreWorker {
                                             SuperDscSession::new_borrowing_with_consts(
                                                 cards,
                                                 job.rcode,
-                                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
                                                     vocab,
                                                     kv_dim,
                                                     num_blocks,

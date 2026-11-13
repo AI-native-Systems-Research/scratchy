@@ -6,6 +6,7 @@ resolver = "2"
 default-members = ["crates/cli"]
 members = [
     "crates/spyre",
+    "crates/card",
     "crates/bundle",
     "crates/builder",
     "crates/worker",

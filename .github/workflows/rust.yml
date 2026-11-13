@@ -559,19 +559,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
-      # The card surface: what `src/lib.rs` gates on `spyre-hw` (superdsc_exec and the device
-      # runtime) compiles under no other step — the one above lints `spyre-emu`, and the
-      # linux-workspace clippy builds the target featureless — so it rotted between card
-      # runs, and #299's E0277s reached main green (#553). Lib only: the examples need a card
-      # host. Check-only, so the FFI archives are not needed (SCRATCHY_SKIP_SENDNN_CXX=1 keeps
-      # the build script from emitting its static-link directives, exactly as in the
-      # linux-workspace job); flex-rs, the declarations crate, is linted with it — it is an
-      # in-tree path dependency, so it is a member of the spyre workspace. The worker's hw surface can't
-      # join: its scratchy-models build script would need the archives.
+      # The card surface: the card runtime (scratchy-target-spyre-card: superdsc_exec and the
+      # device runtime) and the target's `spyre-hw` device compile, linted at -D warnings — it
+      # rotted between card runs once, and #299's E0277s reached main green (#553). Lib only: the
+      # examples need a card host. Check-only, so the FFI archives are not needed
+      # (SCRATCHY_SKIP_SENDNN_CXX=1 keeps the build script from emitting its static-link
+      # directives); flex-rs, the declarations crate, is linted with it. The worker's hw surface
+      # can't join: its models build script would need the device compiler.
       - name: Clippy (spyre-hw card surface)
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo clippy -p scratchy-target-spyre -p flex-rs --features scratchy-target-spyre/spyre-hw -- -D warnings
+        run: cargo clippy -p scratchy-target-spyre-card -p flex-rs -- -D warnings
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
       # The spyre worker's modules compile under no other CI job:
@@ -697,12 +695,12 @@ jobs:
   # (`git grep -l 'compile_fail,E' -- crates backends`):
   #   scratchy-tensors       src/typed.rs
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
-  #   scratchy-target-spyre  src/runtime.rs     (gated on `spyre-hw`)
+  #   scratchy-target-spyre-card  src/runtime.rs
   # ktir-core's former E0080 wrong-copy fixture is deleted: it asserted a
   # `31` it declared inside itself, which proves only that `assert!` fails
   # in const context. ktir-core stays on the line below — it has no
   # doctests left, so the run is a no-op for it and covers the rest.
-  # `spyre-hw` pulls flex-rs, whose FFI archives are absent on this runner;
+  # The card crate pulls flex-rs, whose FFI archives are absent on this runner;
   # the link directives are skipped as in the check-only jobs. Nothing links
   # them: the crate's only runnable doctests are these compile_fail ones.
   #
@@ -729,7 +727,7 @@ jobs:
         working-directory: backends/spyre
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo +nightly test --doc -p ktir-core -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
+        run: cargo +nightly test --doc -p ktir-core -p scratchy-target-spyre-card
 
   fmt:
     name: Format

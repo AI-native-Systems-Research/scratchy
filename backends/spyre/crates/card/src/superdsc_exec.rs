@@ -8,12 +8,12 @@
 //! logits out — weights and KV are NEVER re-uploaded. That residency is the whole perf point.
 //!
 //! fp16 is the device-native SEN169 (`senfp169`), not IEEE fp16: every 2-byte element converts
-//! IEEE→sen on H2D and sen→IEEE on D2H ([`crate::sen_convert`]).
+//! IEEE→sen on H2D and sen→IEEE on D2H ([`scratchy_target_spyre::sen_convert`]).
 //!
 //! ⛔ WHAT LIVES WHERE. Nothing here computes a KV address: which request an op touches, how many
-//! passes its group takes and what that shifts each segment base by are all [`crate::fold_plan`]'s,
+//! passes its group takes and what that shifts each segment base by are all [`scratchy_target_spyre::fold_plan`]'s,
 //! which owns the page maps and the write cursors. The bundle's own shape is
-//! [`crate::bundle_code`]'s, byte conversion is [`crate::sen_convert`]/[`crate::stage_weight`]'s, and the card
+//! [`scratchy_target_spyre::bundle_code`]'s, byte conversion is [`scratchy_target_spyre::sen_convert`]/[`scratchy_target_spyre::stage_weight`]'s, and the card
 //! surface is [`crate::runtime`]'s. This module is the sequencing: what to allocate, what to launch, in what
 //! order, with which base.
 
@@ -27,16 +27,18 @@ use flex_rs::memory_region::MemoryType;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
-use crate::allocator::HostBytes;
-use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::cb_plan;
-use crate::fold_plan::{self, OpKv};
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
     H2dPin, HwError, PeerLink, Stream,
 };
-use crate::sen_convert;
-use crate::stage_weight::{
+use scratchy_target_spyre::allocator::HostBytes;
+use scratchy_target_spyre::bundle_code::{
+    self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols,
+};
+use scratchy_target_spyre::fold_plan::{self, OpKv};
+use scratchy_target_spyre::sen_convert;
+use scratchy_target_spyre::stage_weight::{
     Element, RetileWalk, WalkArm, stage_weight_per_element, stage_weight_permuted,
     stage_weight_rows,
 };
@@ -132,8 +134,9 @@ fn pages_of(len: usize) -> usize {
 pub(crate) enum HostBufError {
     /// `mmap` refused the allocation.
     Map { errno: std::io::Error },
-    /// `mremap` refused the growth (Linux; other targets grow by copy, which cannot fail
-    /// this way).
+    /// `mremap` refused the growth. Linux only: other targets grow by copy, which cannot fail
+    /// this way, so the variant does not exist there.
+    #[cfg(target_os = "linux")]
     Remap { errno: std::io::Error },
 }
 
@@ -141,6 +144,7 @@ impl std::fmt::Display for HostBufError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Map { errno } => write!(f, "mmap refused the host shadow: {errno}"),
+            #[cfg(target_os = "linux")]
             Self::Remap { errno } => write!(f, "mremap refused the host shadow's growth: {errno}"),
         }
     }
@@ -1205,7 +1209,7 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     ///
     /// ⭐ BY PROVENANCE, NOT ALWAYS OWNED: a weight staged off the page cache holds a
     /// [`HostBytes::View`] of its mmap (the load's zero-copy alias — see
-    /// [`crate::allocator::HostBytes`]); activations and built tables hold `Owned` buffers.
+    /// [`scratchy_target_spyre::allocator::HostBytes`]); activations and built tables hold `Owned` buffers.
     /// Staging is the weights' last reader and walks byte slices, so a view serves as directly
     /// as a copy and drops its keepalive when the entry leaves this map.
     bound: BTreeMap<bundle::PlaceId, HostBytes>,
@@ -2134,7 +2138,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if !self.prepared {
             bail!("materialize_activation_shadow before prepare — the shadow is sized at prepare");
         }
-        let seg = crate::lower_subtile_tape_to_superdsc::SegRole::Activation.segment();
+        let seg =
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::SegRole::Activation.segment();
         let shadow = self
             .seg_host
             .get_mut(seg)
@@ -2267,7 +2272,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     }
 
     /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
-    /// [`load_consts`](crate::wiring::Wiring::load_consts) list, bound ONCE at
+    /// [`load_consts`](scratchy_target_spyre::wiring::Wiring::load_consts) list, bound ONCE at
     /// load, before prepare (each is a function of the graph alone, so
     /// re-binding per step would re-upload constants). Must be called before
     /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
@@ -2298,7 +2303,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// stick head was never staged and reads ZERO (Finding 1: a rows=1 kind
     /// staged into a rows=N rung left every row past 0 with a zero hash
     /// multiplier). Refuse it by name, both directions, never serve it.
-    pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
+    pub fn bind_load_consts(
+        &mut self,
+        consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
+    ) -> Result<()> {
         if self.prepared {
             bail!(
                 "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
@@ -2434,7 +2442,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// time) and it gets NO host shadow, which deletes the ~10 GB a 2b model allocated,
     /// memset, and held in RSS for the session's whole life.
     fn host_owned_seg(&self, i: usize) -> bool {
-        use crate::lower_subtile_tape_to_superdsc::SegRole;
+        use scratchy_target_spyre::lower_subtile_tape_to_superdsc::SegRole;
         i == SegRole::Weight.segment()
             || i == SegRole::Activation.segment()
             || i == SegRole::Logits.segment()
@@ -3572,7 +3580,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let mut folds_any = false;
         for c in 0..self.n_classes() {
             let ls = self.list_sel_for(sel, c);
-            gathers_any |= crate::wiring::GathersKv::of_launch_groups(
+            gathers_any |= scratchy_target_spyre::wiring::GathersKv::of_launch_groups(
                 self.list(ls).iter().map(|o| o.kv.gathered),
             )
             .get();
@@ -3581,7 +3589,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         Ok(StepBody {
             sel,
             swept: self.body_swept(sel),
-            gathers: crate::wiring::GathersKv::of_launch_groups([gathers_any]),
+            gathers: scratchy_target_spyre::wiring::GathersKv::of_launch_groups([gathers_any]),
             folds: folds_any,
             // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
             // rung carries the same number, so the body's own artifact is as good a seat as any.
@@ -4107,11 +4115,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             op.code.job_bin_ptr,
             // A flit IS a stick: 128 B (`sys-arch-spec/sysdef.cpp bytesPerStick`), the unit QGI and
             // HMI report their addresses in.
-            bootstrap / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
+            bootstrap
+                / u64::from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES),
             base + bootstrap,
             prog.total_size().as_u64(),
             prog.total_size().as_u64()
-                / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
+                / u64::from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES),
         );
         let _ = writeln!(out, "[segaddr] {who} {}", self.prog_image_report(op, prog));
         eprint!("{out}");
@@ -4187,8 +4196,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     fn prog_image_report(&self, op: &OpProg<T>, prog: &DevAddr) -> String {
         use std::fmt::Write as _;
         let baked: &[u8] = &op.code.init_binary;
-        let stick = usize::try_from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES)
-            .expect("STICK_BYTES fits usize");
+        let stick =
+            usize::try_from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES)
+                .expect("STICK_BYTES fits usize");
         let Ok(stream) = self.stream_ref() else {
             return "progimg: no stream — nothing to read back".to_string();
         };
@@ -4942,7 +4952,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // one row, so it is unchanged.
             let lo = lp.offset;
             let row = (self.vocab.0 as u64 * 2).min(lp.size);
-            let len = crate::lower_subtile_tape_to_superdsc::align128(row).min(tot - lo);
+            let len =
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::align128(row).min(tot - lo);
             // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
             // whole-region read, which is what this always did.
             let win = (len < tot)
@@ -5905,7 +5916,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // and the same two facts predict's window relies on hold here by the
         // same cargo-build guard (`audit_layout_addresses`): the offset is
         // 128-aligned and offset+size stays inside the region.
-        let len = crate::lower_subtile_tape_to_superdsc::align128(want).min(tot - p.offset);
+        let len = scratchy_target_spyre::lower_subtile_tape_to_superdsc::align128(want)
+            .min(tot - p.offset);
         // A multi-chunk region has no addressable sub-window; fall back to the
         // whole-region read, exactly as predict does.
         let win = (len < tot)
@@ -6234,7 +6246,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     ///
     /// # Errors
     /// An unprepared session, or the link's refusal ([`crate::runtime::point_landing_slots`]).
-    #[cfg(feature = "spyre-hw")]
     pub fn point_landing_slots(&self) -> Result<()> {
         if self.seat_window()?.is_none() {
             return Ok(());
@@ -6246,7 +6257,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     }
 
     /// The receive window this session's bundle bakes, `None` in a world of one.
-    #[cfg(feature = "spyre-hw")]
     fn seat_window(&self) -> Result<Option<bundle::collective::RecvWindow<T>>> {
         RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
     }
@@ -6393,7 +6403,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// grid (`PrefixMaskShape` / `MaskBlocks`), not by this. `None` when the bundle placed no mask, or when
     /// the placement is not a whole number of pages — either way the caller must refuse rather than guess.
     pub fn pmask_slots(&self) -> Option<usize> {
-        let nm = bundle::PlaceId::Act(crate::lower_subtile_tape_to_superdsc::ATTN_MASK_TID);
+        let nm = bundle::PlaceId::Act(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
+        );
         let slots = (self.places.get(&nm)?.size / 2) as usize;
         let per_page = ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
@@ -6497,7 +6509,7 @@ enum SuffixLaunch {
 pub struct StepBody {
     sel: BodySel,
     swept: Option<SweptCols>,
-    gathers: crate::wiring::GathersKv,
+    gathers: scratchy_target_spyre::wiring::GathersKv,
     folds: bool,
     lx_op_local_bytes: u64,
     lx_prob_pin_bytes: u64,
@@ -6517,7 +6529,7 @@ impl StepBody {
 
     /// ⭐ WHETHER **THIS** BODY READS ITS KV THROUGH A GATHERED SCRATCH — off the body's own launch
     /// groups (`bundle::KvShifts::gathered`).
-    pub const fn gathers(self) -> crate::wiring::GathersKv {
+    pub const fn gathers(self) -> scratchy_target_spyre::wiring::GathersKv {
         self.gathers
     }
 

@@ -37,7 +37,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, STICK_BYTES};
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, STICK_BYTES};
 
 /// One `placements.json` entry.
 #[derive(Debug, serde::Deserialize)]
@@ -386,7 +386,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     }
     println!("  {} launch group(s)", group_dirs.len());
     // ── The layout the executor indexes ──
-    let mut segment_bytes = [0u64; crate::bundle_code::NUM_SEGMENTS];
+    let mut segment_bytes = [0u64; scratchy_target_spyre::bundle_code::NUM_SEGMENTS];
     for (i, b) in pf.segment_bytes.iter().enumerate() {
         if i >= segment_bytes.len() {
             bail!(
@@ -397,10 +397,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         }
         segment_bytes[i] = *b;
     }
-    let places: Vec<crate::bundle_code::Placement> = pf
+    let places: Vec<scratchy_target_spyre::bundle_code::Placement> = pf
         .places
         .iter()
-        .map(|p| crate::bundle_code::Placement {
+        .map(|p| scratchy_target_spyre::bundle_code::Placement {
             id: ktir_superdsc::place::PlaceId::Act(p.tid),
             segment: p.segment,
             bank: p.bank,
@@ -419,11 +419,11 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         .map(|p| p.tid)
         .collect();
 
-    let layout = crate::bundle_code::BundleLayout {
+    let layout = scratchy_target_spyre::bundle_code::BundleLayout {
         segment_bytes,
         weight_bank_bytes: std::borrow::Cow::Owned(Vec::new()),
         // No weight tail to spill: a single-kernel bundle's parameters are one region each.
-        weight_tail: crate::bundle_code::WeightTail::InPlace,
+        weight_tail: scratchy_target_spyre::bundle_code::WeightTail::InPlace,
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(Vec::new()),
         // The producer's scalar registry. `layout::for_node` fills it for an rmsnorm epsilon or a
@@ -464,15 +464,18 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);
-    let mut groups: Vec<crate::bundle_code::LaunchGroup<'static, Alone>> = Vec::new();
+    let mut groups: Vec<scratchy_target_spyre::bundle_code::LaunchGroup<'static, Alone>> =
+        Vec::new();
     for gd in &group_dirs {
         let gcode = gd.join("spyreCodeDir");
         let gimg = std::fs::read(gcode.join("init_binary.bin"))
             .with_context(|| format!("{}: no init_binary.bin", gcode.display()))?;
         let gplan = std::fs::read_to_string(gcode.join("spyrecode.json"))
             .with_context(|| format!("{}: no spyrecode.json", gcode.display()))?;
-        let gc =
-            crate::bundle_code::correction::parse_spyrecode(&format!("{}", gd.display()), &gplan)?;
+        let gc = scratchy_target_spyre::bundle_code::correction::parse_spyrecode(
+            &format!("{}", gd.display()),
+            &gplan,
+        )?;
         println!(
             "    {}: init_binary {} B, job_bin_ptr 0x{:x}, {} flit(s)",
             gd.file_name()
@@ -482,7 +485,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             gc.job_bin_ptr,
             gc.correction.len()
         );
-        groups.push(crate::bundle_code::LaunchGroup {
+        groups.push(scratchy_target_spyre::bundle_code::LaunchGroup {
             kv: Default::default(),
             programs: std::borrow::Cow::Owned(Vec::new()),
             init_binary: std::borrow::Cow::Owned(gimg),
@@ -493,8 +496,8 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
 
     // `Executor::load` takes `&'static` because a baked bundle IS static data in the binary. This one
     // came off disk, so it is leaked deliberately: the process runs one bundle and exits.
-    let code: &'static crate::bundle_code::BundleCode<'static, Alone> =
-        Box::leak(Box::new(crate::bundle_code::BundleCode {
+    let code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, Alone> =
+        Box::leak(Box::new(scratchy_target_spyre::bundle_code::BundleCode {
             fp: std::borrow::Cow::Owned(
                 dir.file_name()
                     .map(|s| s.to_string_lossy().to_string())
@@ -728,7 +731,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         .map_or(0, |m| m + 1);
     exec.declare_sources(n_sources, std::iter::empty());
 
-    for s in 0..crate::bundle_code::NUM_SEGMENTS {
+    for s in 0..scratchy_target_spyre::bundle_code::NUM_SEGMENTS {
         if let Some(seg) = crate::superdsc_exec::SegIdx::checked(s as i64) {
             print!("{} ", exec.seg_bytes(seg));
         }
@@ -785,12 +788,12 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         };
         exec.bind_weight(
             ktir_superdsc::place::PlaceId::Act(*tid),
-            crate::allocator::HostBytes::Owned(bytes),
+            scratchy_target_spyre::allocator::HostBytes::Owned(bytes),
         );
     }
 
     exec.stage_weights()?;
-    for s in 0..crate::bundle_code::NUM_SEGMENTS {
+    for s in 0..scratchy_target_spyre::bundle_code::NUM_SEGMENTS {
         if let Some(seg) = crate::superdsc_exec::SegIdx::checked(s as i64) {
             print!("{} ", exec.seg_bytes(seg));
         }
@@ -801,7 +804,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     // What the executor actually has per segment, printed rather than assumed: a read-back goes
     // through the segment's host shadow, so a zero here explains an empty output and a nonzero one
     // moves the question to the launch.
-    for s in 0..crate::bundle_code::NUM_SEGMENTS {
+    for s in 0..scratchy_target_spyre::bundle_code::NUM_SEGMENTS {
         if let Some(seg) = crate::superdsc_exec::SegIdx::checked(s as i64) {
             print!("{} ", exec.seg_bytes(seg));
         }
@@ -928,7 +931,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // which goes through `read_tensor`, was 0.9119 on the same launch. 1.714 is not a numeric
         // defect, it is a different exponent bias read through the wrong codec.
         let mut ieee = vec![0u8; b - a];
-        crate::sen_convert::sen_to_ieee_bytes(&whole[a..b], &mut ieee);
+        scratchy_target_spyre::sen_convert::sen_to_ieee_bytes(&whole[a..b], &mut ieee);
         // And the same stick-major refusal a bound tensor gets: a synthetic wider than one 64-lane
         // stick is addressed `[cols/64][rows][64]` too, so reading it row-major is a plausible wrong
         // answer. See `dev_order`.

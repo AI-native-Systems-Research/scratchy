@@ -22,15 +22,15 @@ use anyhow::{Result, anyhow, bail};
 use flex_rs::control_block_wire::ControlBlockWire;
 use flex_rs::scheduler::RunPlace;
 
-use crate::bundle_code::NUM_SEGMENTS;
-use crate::bundle_code::collective::{
-    CbStep, Rank, Sid, TpConsume, TpSend, WINDOW_SEGMENT, group_steps,
-};
-use crate::fold_plan::{self, OpKv};
 use crate::runtime::{
     BatchedCb, BatchedCompute, ByteSize, DevAddr, RdmaEnd, RdmaSend, Stream, prog_offset_base,
 };
 use crate::superdsc_exec::{LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT};
+use scratchy_target_spyre::bundle_code::NUM_SEGMENTS;
+use scratchy_target_spyre::bundle_code::collective::{
+    CbStep, Rank, Sid, TpConsume, TpSend, WINDOW_SEGMENT, group_steps,
+};
+use scratchy_target_spyre::fold_plan::{self, OpKv};
 
 /// The base one segment's tensors resolve against for this launch — the weight
 /// BANK's region for the weight segment (bank 0 IS `seg_addr[WEIGHT]`; bank
@@ -592,13 +592,13 @@ pub(crate) fn render_canvas<T: ktir_superdsc::collective::Tp>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle_code::collective::{
-        CollectiveKind, CutPayload, LandingSlot, Payload, Rank, Tp, TpWorld, WindowCut, WireBytes,
-        World, fragments, ranks,
-    };
     use crate::runtime::Chunk0;
     use flex_rs::address::{ByteOffset, RegionId};
     use flex_rs::memory_region::DomainId;
+    use scratchy_target_spyre::bundle_code::collective::{
+        CollectiveKind, CutPayload, LandingSlot, Payload, Rank, Tp, TpWorld, WindowCut, WireBytes,
+        World, fragments, ranks,
+    };
 
     /// One launch over seven distinct segment bases, region `10 + segment`.
     fn launch() -> BatchedCompute {
@@ -620,7 +620,7 @@ mod tests {
     fn consume<T: Tp>(me: Rank<T>) -> TpConsume<T> {
         TpConsume {
             kind: CollectiveKind::AllReduce,
-            operand: crate::bundle_code::PlaceId::Act(7),
+            operand: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
             fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
             plays_at: me,
             cut: WindowCut::of_collective(0),

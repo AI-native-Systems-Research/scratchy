@@ -26,15 +26,18 @@ use std::sync::{Arc, Mutex};
 // card refuses or misaligning a window.
 const _: () = {
     assert!(
-        crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
+        scratchy_target_spyre::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
             == flex_rs::scheduler::P2P_RDMA_WINDOW_SIZE
     );
     assert!(
-        crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES
+        scratchy_target_spyre::bundle_code::collective::FLIT_BYTES
+            == flex_rs::control_block_wire::Flits::BYTES
     );
 };
 
-use crate::bundle_code::collective::{PerRank, Rank, RecvWindow, Sid, WINDOW_SEGMENT};
+use scratchy_target_spyre::bundle_code::collective::{
+    PerRank, Rank, RecvWindow, Sid, WINDOW_SEGMENT,
+};
 
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
@@ -245,12 +248,12 @@ pub fn prog_offset_base() -> u64 {
 /// ```compile_fail,E0603
 /// // `POOL_BUDGET_BYTES = 8 GiB` cannot be reconstituted: the tuple field is private, so a
 /// // literal has no way into the type the budget arithmetic demands.
-/// let _budget = scratchy_target_spyre::runtime::CardMemory(8 * 1024 * 1024 * 1024);
+/// let _budget = scratchy_target_spyre_card::runtime::CardMemory(8 * 1024 * 1024 * 1024);
 /// ```
 ///
 /// ```compile_fail,E0308
 /// // ...and it cannot be smuggled in as a bare integer either.
-/// fn wants_the_card(_: scratchy_target_spyre::runtime::CardMemory) {}
+/// fn wants_the_card(_: scratchy_target_spyre_card::runtime::CardMemory) {}
 /// wants_the_card(8 * 1024 * 1024 * 1024);
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -260,8 +263,9 @@ pub struct CardMemory(u64);
 // (it may depend on neither end of the pipeline), so it states `MAX_SEGMENT_BYTES` itself; this is
 // the only crate that sees both, and it refuses to compile if they ever diverge — the build-time
 // segment guard would otherwise silently stop matching what the card can serve.
-const _: () =
-    assert!(crate::bundle_code::MAX_SEGMENT_BYTES == flex_rs::allocator::MAX_REGION_BYTES);
+const _: () = assert!(
+    scratchy_target_spyre::bundle_code::MAX_SEGMENT_BYTES == flex_rs::allocator::MAX_REGION_BYTES
+);
 
 impl CardMemory {
     /// The card's TOTAL capacity in bytes — the number to REPORT, not the number to size an
@@ -522,7 +526,7 @@ impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
     /// [`ClaimRefusal`], by name.
     pub fn claim(table: &CardTable) -> Result<Self, ClaimRefusal> {
         let cards = table.cards();
-        let needed = <T as crate::bundle_code::collective::World>::RANKS;
+        let needed = <T as scratchy_target_spyre::bundle_code::collective::World>::RANKS;
         if cards.len() < needed as usize {
             return Err(ClaimRefusal::TooFewCards {
                 needed,
@@ -1503,7 +1507,7 @@ pub struct RdmaSend {
     pub sid: u8,
     /// The peer's BAT index.
     pub dest_tid: u8,
-    pub bytes: crate::bundle_code::collective::WireBytes,
+    pub bytes: scratchy_target_spyre::bundle_code::collective::WireBytes,
     pub source: RdmaEnd,
     pub window: RdmaEnd,
     /// This message's place in its send's run.
@@ -1855,7 +1859,7 @@ pub fn point_landing_slots<T: ktir_superdsc::collective::Tp>(
     if link.landing.get().is_some() {
         return Ok(());
     }
-    let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    let cap = scratchy_target_spyre::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
     for (from, (slot, off)) in link
         .me
         .peers()
@@ -2057,7 +2061,7 @@ mod tests {
 #[cfg(test)]
 mod world_cards_tests {
     use super::{CardTable, ClaimRefusal, WorldCards};
-    use crate::bundle_code::collective::{Rank, TpWorld};
+    use scratchy_target_spyre::bundle_code::collective::{Rank, TpWorld};
 
     fn table(pcis: &[&str]) -> CardTable {
         CardTable::of(

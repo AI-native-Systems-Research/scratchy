@@ -16,7 +16,7 @@ use crate::spyre_types::SuperDscSession;
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::sdsc_runner::StepLogits;
+use scratchy_target_spyre_card::sdsc_runner::StepLogits;
 
 #[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
@@ -33,7 +33,7 @@ use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 /// session's executor can finish the read.
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SubmittedDecode {
-    pub(crate) read: scratchy_target_spyre::superdsc_exec::DeferredRead,
+    pub(crate) read: scratchy_target_spyre_card::superdsc_exec::DeferredRead,
     /// The launch's own typed width ([`SeatWidth`]) the submit half minted.
     pub(crate) rows: SeatWidth,
     /// The idx stick's own row size in i32 words — the seat's typed readback
@@ -60,7 +60,7 @@ pub(crate) enum BatchOut {
 /// read as its peek handle — `fired()` is the whole of its surface, so asking
 /// "is the card still busy" is a latch read, never a wait.
 #[cfg(feature = "spyre-hw")]
-static PRIOR_READ: std::sync::Mutex<Option<scratchy_target_spyre::runtime::ReadPeek>> =
+static PRIOR_READ: std::sync::Mutex<Option<scratchy_target_spyre_card::runtime::ReadPeek>> =
     std::sync::Mutex::new(None);
 
 /// ⭐ THE DEPTH ROW'S OWN COUNT: decode submissions outstanding, incremented at

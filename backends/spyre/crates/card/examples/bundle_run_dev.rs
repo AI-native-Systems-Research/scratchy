@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bring-up driver for [`scratchy_target_spyre::bundle_run`], so iterating on it does not rebuild
+//! Bring-up driver for [`scratchy_target_spyre_card::bundle_run`], so iterating on it does not rebuild
 //! the whole CLI.
 //!
 //! ```bash
@@ -44,5 +44,5 @@ fn main() -> anyhow::Result<()> {
             inputs.push(a.clone());
         }
     }
-    scratchy_target_spyre::bundle_run::run(std::path::Path::new(dir), &inputs, &outputs)
+    scratchy_target_spyre_card::bundle_run::run(std::path::Path::new(dir), &inputs, &outputs)
 }

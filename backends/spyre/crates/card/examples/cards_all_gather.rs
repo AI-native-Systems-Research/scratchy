@@ -41,8 +41,8 @@ use flex_rs::scheduler::{
 use flex_rs::senlib_ffi::pci_addr_for_region;
 use flex_rs::stream::{RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
 use scratchy_target_spyre::bundle_code::collective::TpWorld;
-use scratchy_target_spyre::runtime::CardRuntime as AnyCard;
-use scratchy_target_spyre::runtime::{CardTable, WorldCards};
+use scratchy_target_spyre_card::runtime::CardRuntime as AnyCard;
+use scratchy_target_spyre_card::runtime::{CardTable, WorldCards};
 
 /// A raw flex-level probe: the cards are driven below the world-typed p2p link, so they are opened
 /// as one card's runtime each.
@@ -163,7 +163,7 @@ fn main() -> Result<()> {
     // ── The cards: the first N of this host's card table, each a world of one (this probe drives
     //    its own link and sends, not a tensor-parallel world). ──
     let table =
-        scratchy_target_spyre::runtime::CardTable::enumerate().map_err(|e| anyhow!("{e}"))?;
+        scratchy_target_spyre_card::runtime::CardTable::enumerate().map_err(|e| anyhow!("{e}"))?;
     let have = table.cards().len();
     ensure!(
         n >= 2 && n <= have,

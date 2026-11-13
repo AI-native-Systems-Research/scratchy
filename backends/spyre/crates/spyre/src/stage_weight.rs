@@ -197,7 +197,7 @@ pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, ele
 /// of consecutive host elements, so the walk computes one host offset per ROW (dot product
 /// excluding the innermost axis) and copies/converts the whole row — an odometer step per row,
 /// not per element.
-pub(crate) fn stage_weight_rows(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, elem: Element) {
+pub fn stage_weight_rows(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, elem: Element) {
     let total = walk.total_elems();
     let inner = walk.inner();
     let mut coord = vec![0u64; walk.axes.len()];
@@ -238,12 +238,7 @@ pub(crate) fn stage_weight_rows(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_
 /// The per-element arm — the reference walk: a dot product and an odometer step per element.
 /// What every walk reduces to when no faster law holds (gather/broadcast structure, gapped or
 /// repeated strides).
-pub(crate) fn stage_weight_per_element(
-    host: &[u8],
-    dev: &mut [u8],
-    walk: RetileWalk<'_>,
-    elem: Element,
-) {
+pub fn stage_weight_per_element(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, elem: Element) {
     let total = walk.total_elems();
     let mut coord = vec![0u64; walk.axes.len()];
     match elem {
@@ -282,7 +277,7 @@ pub(crate) fn stage_weight_per_element(
 ///
 /// `order` is the arm's own host-scan axis order ([`crate::bundle_code::WalkArm::Permutation`],
 /// u8 axis indices); `stage_weight_tiled` derives it for callers without a bundle.
-pub(crate) fn stage_weight_permuted(
+pub fn stage_weight_permuted(
     host: &[u8],
     dev: &mut [u8],
     axes: &[(u64, u64)],

@@ -41,7 +41,7 @@ use flex_rs::iommu::PfIommuMapper;
 use flex_rs::memory_region::MemoryType;
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{RuntimeStreamMode, RuntimeStreamPriority};
-use scratchy_target_spyre::runtime::DevAddr;
+use scratchy_target_spyre_card::runtime::DevAddr;
 
 /// One page-multiple megabyte per slot: the aligned stride equals the
 /// request, so the capacity arithmetic in the assertions below is exact.
@@ -80,10 +80,11 @@ fn arc_from_dev(dev: &DevAddr) -> Result<Arc<CompositeAddress>> {
 
 fn main() -> Result<()> {
     // Real bring-up: card open, card-derived topology/allocator, scheduler, `RuntimeContext`.
-    let card =
-        scratchy_target_spyre::runtime::WorldCards::<ktir_superdsc::collective::TpWorld<1>>::open_all()
-            .map_err(anyhow::Error::msg)?
-            .into_first();
+    let card = scratchy_target_spyre_card::runtime::WorldCards::<
+        ktir_superdsc::collective::TpWorld<1>,
+    >::open_all()
+    .map_err(anyhow::Error::msg)?
+    .into_first();
     let rt = card.context().clone();
     let stream_id = rt
         .create_stream(

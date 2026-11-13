@@ -25,9 +25,8 @@ hf-completions = ["model/hf-completions"]
 # process must not run it) and `spyre bundle run` are this tier's.
 spyre-hw = [
   "scratchy-target-spyre-worker/spyre-hw",
-  # `spyre bundle run`: the executor and the bundle types, directly.
-  "dep:scratchy-target-spyre",
-  "scratchy-target-spyre/spyre-hw",
+  # `spyre bundle run`: the card's executor, directly.
+  "dep:scratchy-target-spyre-card",
 ]
 # THE EMULATOR — a sibling of the card, not its absence.
 spyre-emu = ["scratchy-target-spyre-worker/spyre-emu"]
@@ -41,9 +40,9 @@ path = "src/main.rs"
 scratchy-cli = { workspace = true, features = ["model"] }
 # The spyre worker: the `WorkerFactory` the engine serves through. `main.rs` anchors it.
 scratchy-target-spyre-worker = { workspace = true }
-# `spyre bundle run` ONLY: launching a bundle this binary did not bake needs the executor and the
-# bundle types directly, and those live in the target crate. Reachable only under `spyre-hw`.
-scratchy-target-spyre = { path = "../spyre", optional = true }
+# `spyre bundle run` ONLY: launching a bundle this binary did not bake needs the card's executor
+# directly. Reachable only under `spyre-hw`.
+scratchy-target-spyre-card = { path = "../card", optional = true }
 # THE MODEL SCOPE, for CLI feature reachability: `--features model/<stem>` selects through
 # scratchy-models' own features, as `scr`'s `model` alias does (the same package, so the same
 # features). `quant` and `tp` likewise: `--features quant/<preset>`, `--features tp/<W>`.

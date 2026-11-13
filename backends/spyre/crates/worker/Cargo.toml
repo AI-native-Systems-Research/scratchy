@@ -10,7 +10,7 @@ default = []
 # A CARD, any revision — the SDK and the builder, over the shared machinery below. It does NOT pull
 # `spyre-emu`/ktir-emulator, whose `metal` feature drags in Apple-only objc2 and would break a Linux
 # card build.
-spyre-hw = ["dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre-hw", "scratchy-target-spyre/spyre-hw", "scratchy-target-spyre-models/spyre-hw"]
+spyre-hw = ["dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre-hw", "dep:scratchy-target-spyre-card", "scratchy-target-spyre/spyre-hw", "scratchy-target-spyre-models/spyre-hw"]
 # THE EMULATOR — a SIBLING of the card, not its absence. Same bundles, same launch sequence; what
 # differs is the device underneath. Forwards into the models crate so the bake-time
 # numeric gate runs on every emu build (see scratchy-target-spyre-compiler's `spyre-emu`).
@@ -18,12 +18,14 @@ spyre-emu = ["scratchy-target-spyre/spyre-emu", "scratchy-target-spyre-models/sp
 # A W-RANK TENSOR-PARALLEL WORLD: the bake shards every model W ways (scratchy-target-spyre-models/tp-<W>) and
 # this worker runs every rank in one process, one card each, linked by device p2p RDMA. A build that
 # names no world serves one card. Reached from the CLI as `tp/<W>`.
-tp-2 = ["spyre-hw", "scratchy-target-spyre-models/tp-2", "scratchy-target-spyre/tp-2"]
-tp-4 = ["spyre-hw", "scratchy-target-spyre-models/tp-4", "scratchy-target-spyre/tp-4"]
-tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/tp-8"]
+tp-2 = ["spyre-hw", "scratchy-target-spyre-models/tp-2", "scratchy-target-spyre/tp-2", "scratchy-target-spyre-card/tp-2"]
+tp-4 = ["spyre-hw", "scratchy-target-spyre-models/tp-4", "scratchy-target-spyre/tp-4", "scratchy-target-spyre-card/tp-4"]
+tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/tp-8", "scratchy-target-spyre-card/tp-8"]
 
 [dependencies]
 scratchy-target-spyre = { path = "../spyre" }
+# The card runtime (the resident executor, its session, the cards): the `spyre-hw` run path's.
+scratchy-target-spyre-card = { path = "../card", optional = true }
 scratchy-serving-worker = { workspace = true }
 scratchy-serving-engine = { workspace = true }
 scratchy-serving-scheduler = { workspace = true }

@@ -48,7 +48,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use scratchy_target_spyre::runtime::{CardRuntime as AnyCard, DevAddr, HwError, Stream};
+use scratchy_target_spyre_card::runtime::{CardRuntime as AnyCard, DevAddr, HwError, Stream};
 
 /// A one-card probe: the card's runtime is a world of one's.
 type CardRuntime = AnyCard<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
@@ -154,7 +154,7 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let card = scratchy_target_spyre::runtime::WorldCards::<
+    let card = scratchy_target_spyre_card::runtime::WorldCards::<
         scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
     >::open_all()
     .map_err(|e| anyhow!("{e}"))?

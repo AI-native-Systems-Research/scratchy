@@ -22,9 +22,6 @@ pub use ktir_core as ktir;
 /// (`::scratchy_target_spyre::bundle_code::BundleCode { … }`), so its tokens depend on the target crate
 /// rather than on where the types happen to live.
 pub use scratchy_spyre_bundle as bundle_code;
-/// Run a bundle this binary did not bake — see the module docs.
-#[cfg(feature = "spyre-hw")]
-pub mod bundle_run;
 /// dxp's compiled groups, kept across builds under a key that names the compiler as well as the input.
 pub mod dxp_cache;
 /// Where a launched op reads and writes KV: the shim launch loop's per-op, per-page offset
@@ -65,11 +62,6 @@ pub mod tile_op {
 pub mod subtile_tape_to_tile_ir {
     pub use crate::ir::bridge::subtile_tape_tile_op::*;
 }
-/// #603 PR2 — one launch's compute CBs as data: the submit walk's arithmetic
-/// single-sourced (`launch_site`), the plan/render twin, and the prepare-time
-/// byte-identical parity gate. Behind `spyre-hw` with its consumers.
-#[cfg(feature = "spyre-hw")]
-pub(crate) mod cb_plan;
 /// THE FORWARD TAPE — one decode step as ordered steps rather than a function
 /// body: which host kernels run, what each fills, and where the single device
 /// launch sits. The LAUNCHER is the worker's (it owns the session).
@@ -80,23 +72,11 @@ pub mod paged_step;
 /// (it links the emulator). Emit/weight-load paths use [`manifest`] alone.
 #[cfg(feature = "spyre-emu")]
 pub mod runner;
-/// The typed card surface over flex-rs: streams, device addresses, launches, and the card's
-/// memory capacity — `Arc<RuntimeContext>`-backed handles, no C ABI. Behind `spyre-hw` (it
-/// links the SDK via flex-rs's cxx-shim).
-#[cfg(feature = "spyre-hw")]
-pub mod runtime;
-/// The worker-facing session wrapper over [`superdsc_exec`] (f32 in, f32 logits out).
-#[cfg(feature = "spyre-hw")]
-pub mod sdsc_runner;
 /// IEEE-fp16 ⟷ SEN169 (DLF16) device-format conversion + the device-tile weight staging walk —
 /// ported verbatim from the shim's C++ (which now calls these via `extern "C"`, same link unit).
 /// Pure bit arithmetic: no SDK dependency, no feature gate, tested on any host.
 pub mod sen_convert;
 pub mod stage_weight;
-/// The resident SuperDSC executor: allocate the bundle's program + weights + KV pool once, then
-/// launch each per-op kernel against the shared resident segments. The `--target sendnn` run path.
-#[cfg(feature = "spyre-hw")]
-pub mod superdsc_exec;
 /// The per-model launch wiring as spyre's OWN types, emitted by `#[forward]`
 /// as a `static` — the typed replacement for parsing `manifest.json` at load.
 pub mod wiring;

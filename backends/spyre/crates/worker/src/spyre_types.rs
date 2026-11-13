@@ -27,14 +27,14 @@ pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
 /// loader opens them once and hands out `&'static Cards`; see `load_inner`).
 #[cfg(feature = "spyre-hw")]
 pub(crate) type SuperDscSession =
-    scratchy_target_spyre::sdsc_runner::SuperDscSession<'static, World>;
+    scratchy_target_spyre_card::sdsc_runner::SuperDscSession<'static, World>;
 
 /// The build's cards, one per rank of [`World`] — OWNED here, once, for the process; every session
 /// borrows them.
 #[cfg(feature = "spyre-hw")]
 pub(crate) type Cards = scratchy_target_spyre::bundle_code::collective::PerRank<
     World,
-    scratchy_target_spyre::runtime::CardRuntime<World>,
+    scratchy_target_spyre_card::runtime::CardRuntime<World>,
 >;
 
 /// One layer's KV pools: the K and V cache tensors its paged attention gathers from and its KV
@@ -531,7 +531,7 @@ pub(crate) struct Loaded {
     /// join) and the decode-loop thread (pinned as its first act, `Worker::pin_driving_thread`):
     /// the node every card sits on, or rank 0's when they span nodes.
     #[cfg(feature = "spyre-hw")]
-    pub(crate) world_cpus: scratchy_target_spyre::runtime::WorldCpus,
+    pub(crate) world_cpus: scratchy_target_spyre_card::runtime::WorldCpus,
 }
 
 /// Per-request generation state the worker keeps beside `InputBatch`.

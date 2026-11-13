@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `spyre bundle run` — the CLI face of [`scratchy_target_spyre::bundle_run`].
+//! `spyre bundle run` — the CLI face of [`scratchy_target_spyre_card::bundle_run`].
 //!
 //! The work lives in the spyre target crate, because the executor, the bundle types and the device
 //! libraries are there. This is argument plumbing and nothing else.
@@ -48,7 +48,7 @@ pub struct BundleRunArgs {
 
 pub fn run(command: BundleCommand) -> Result<()> {
     match command.command {
-        BundleSubcommand::Run(args) => scratchy_target_spyre::bundle_run::run(
+        BundleSubcommand::Run(args) => scratchy_target_spyre_card::bundle_run::run(
             std::path::Path::new(&args.dir),
             &args.input,
             &args.output,

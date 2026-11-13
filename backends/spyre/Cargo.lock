@@ -3135,7 +3135,6 @@ name = "scratchy-target-spyre"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "flex-rs",
  "half",
  "inventory",
  "ktir-core",
@@ -3157,8 +3156,25 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tracing",
- "tracing-subscriber",
  "triton-ktir-superdsc",
+]
+
+[[package]]
+name = "scratchy-target-spyre-card"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flex-rs",
+ "half",
+ "ktir-superdsc",
+ "libc",
+ "scratchy-spyre-bundle",
+ "scratchy-target-spyre",
+ "scratchy-tensors",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3172,7 +3188,7 @@ dependencies = [
  "scratchy-cli",
  "scratchy-models",
  "scratchy-quantizations",
- "scratchy-target-spyre",
+ "scratchy-target-spyre-card",
  "scratchy-target-spyre-worker",
  "scratchy-tp",
  "tokio",
@@ -3236,6 +3252,7 @@ dependencies = [
  "scratchy-serving-worker",
  "scratchy-subtile",
  "scratchy-target-spyre",
+ "scratchy-target-spyre-card",
  "scratchy-target-spyre-models",
  "scratchy-tensors",
  "serde_json",
