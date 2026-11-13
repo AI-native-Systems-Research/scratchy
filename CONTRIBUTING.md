@@ -197,7 +197,7 @@ break:
 ```bash
 # Format (fmt job) — cheap, run it always
 cargo fmt --all -- --check
-cargo fmt --manifest-path targets/spyre/Cargo.toml --all -- --check
+cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
 
 # macOS / metal job
 cargo clippy -p scratchy-target-metal-models \
@@ -207,14 +207,14 @@ cargo clippy -p scratchy-target-metal-models \
 # is the only lint coverage the build-time HF query gets). Needs network.
 cargo clippy -p scratchy-models --features smollm2-135m,hf-completions -- -D warnings
 
-# Linux / workspace job: the root workspace, then the spyre one (targets/spyre)
+# Linux / workspace job: the root workspace, then the spyre one (backends/spyre)
 cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
   --exclude scratchy-target-metal \
   --exclude scratchy-target-metal-cli \
   --exclude scratchy-target-metal-compiler \
   --exclude scratchy-target-metal-models \
   --exclude scratchy-target-metal-worker -- -D warnings
-(cd targets/spyre && SCRATCHY_SKIP_SENDNN_CXX=1 \
+(cd backends/spyre && SCRATCHY_SKIP_SENDNN_CXX=1 \
   cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings)
 
 # e2e smoke, as CI runs it

@@ -12,26 +12,26 @@
 #       edge into one turns the macOS jobs red, instead of letting a PR that changes only that crate
 #       skip the jobs that build it. CI's rust-cache drops every workspace crate's build output
 #       before saving, so a workspace crate's `.fingerprint` entry is one this job compiled. The
-#       crates are the spyre workspace's (targets/spyre); the check reads both workspaces' build
+#       crates are the spyre workspace's (backends/spyre); the check reads both workspaces' build
 #       output, since the macOS tests job builds the KTIR crates in the spyre one.
 set -euo pipefail
 
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
 # ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
-MACOS_UNBUILT='targets/spyre/crates/spyre
-targets/spyre/crates/builder
-targets/spyre/crates/bundle
-targets/spyre/crates/compiler
-targets/spyre/crates/flex-rs
-targets/spyre/crates/triton/splice
-targets/spyre/crates/triton/triton-frontend
-targets/spyre/crates/triton/triton-ktir
-targets/spyre/crates/triton/triton-ktir-superdsc
-targets/spyre/crates/triton/triton-numeric'
+MACOS_UNBUILT='backends/spyre/crates/spyre
+backends/spyre/crates/builder
+backends/spyre/crates/bundle
+backends/spyre/crates/compiler
+backends/spyre/crates/flex-rs
+backends/spyre/crates/triton/splice
+backends/spyre/crates/triton/triton-frontend
+backends/spyre/crates/triton/triton-ktir
+backends/spyre/crates/triton/triton-ktir-superdsc
+backends/spyre/crates/triton/triton-numeric'
 
 changed() {
     # Every crate directory, deepest first, so the first one holding a file is its owner:
-    # ktir-core's files are ktir-core's, though they sit under targets/spyre too.
+    # ktir-core's files are ktir-core's, though they sit under backends/spyre too.
     local crates
     crates=$(git ls-files '*/Cargo.toml' | sed 's|/Cargo.toml$||' \
         | awk -F/ '{ print NF "\t" $0 }' | sort -rn | cut -f2-)
@@ -46,14 +46,14 @@ changed() {
     while IFS= read -r file; do
         owner=""
         case "$file" in
-            targets/spyre/Cargo.toml | targets/spyre/Cargo.lock)
+            backends/spyre/Cargo.toml | backends/spyre/Cargo.lock)
                 echo "the macOS jobs build the spyre workspace's KTIR crates: $file" >&2
                 echo macos=true
                 return
                 ;;
             # The Triton kernels sit beside the spyre crates, in no crate; only listed crates
             # (the spyre target and the triton ones) read them.
-            targets/spyre/kernels/*) continue ;;
+            backends/spyre/kernels/*) continue ;;
         esac
         while IFS= read -r dir; do
             case "$file" in "$dir"/*) owner=$dir; break ;; esac
@@ -73,7 +73,7 @@ lock() {
     # workspace; the build output checked is both workspaces'.
     local metadata spyre packages names dir name
     metadata=$(cargo metadata --no-deps --format-version 1)
-    spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path targets/spyre/Cargo.toml)
+    spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre/Cargo.toml)
     packages=$(jq -r --arg root "$PWD/" \
         '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' <<<"$spyre")
     names=""

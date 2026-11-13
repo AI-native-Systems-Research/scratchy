@@ -62,10 +62,10 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
-- Spyre is its own workspace, `targets/spyre` (its own `Cargo.lock` and
-  `target/`, its crates under `targets/spyre/crates/`), reaching the shared
+- Spyre is its own workspace, `backends/spyre` (its own `Cargo.lock` and
+  `target/`, its crates under `backends/spyre/crates/`), reaching the shared
   crates by path into the root's `crates/`. Build its CLI,
-  `spyre`, from there: `cd targets/spyre && cargo build --release
+  `spyre`, from there: `cd backends/spyre && cargo build --release
   --features spyre-emu,model/granite-3.1-2b-instruct` (`spyre-hw` on a card host).
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature — a plain `chat`-only build never
@@ -80,7 +80,7 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
 --exclude scratchy-target-metal --exclude scratchy-target-metal-cli --exclude scratchy-target-metal-compiler
 --exclude scratchy-target-metal-models --exclude scratchy-target-metal-worker
 -- -D warnings` at the root, then the same `--workspace` clippy (no excludes) in
-`targets/spyre` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
+`backends/spyre` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
 check/clippy don't link the C++ shim). All five metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
 CLI, compiler, models and worker crates via their own edges to scratchy-target-metal — and `--workspace`
@@ -106,7 +106,7 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
       --exclude scratchy-target-metal-compiler \
       --exclude scratchy-target-metal-models \
       --exclude scratchy-target-metal-worker -- -D warnings &&
-    cd targets/spyre &&
+    cd backends/spyre &&
     cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings'
 ```
 The macOS metal CI job runs locally via `scripts/act-local.sh` when present.

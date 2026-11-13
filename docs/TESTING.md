@@ -41,7 +41,7 @@ to the zone when it makes the zone's claim, wherever it lives.
   the samplers. Floating-point agreement with a reference is an empirical claim about hardware.
   - Today: `crates/targets/metal/tests/` and the metal crate's own kernel unit tests;
     the `tools/vision_parity/` oracles;
-    `targets/spyre/crates/spyre/tests/element_torchspyre_parity.rs`.
+    `backends/spyre/crates/spyre/tests/element_torchspyre_parity.rs`.
 - **The wire surface.** What clients we don't control send and expect back: chat templates,
   tool and reasoning parsers, SSE streaming, the OpenAI- and Anthropic-compatible request and
   response shapes, their error codes. Compatibility with the world is an empirical claim, and
@@ -53,7 +53,7 @@ to the zone when it makes the zone's claim, wherever it lives.
 - **End to end.** A real server answering real requests: serving, streaming, the quantization
   paths, multimodal, speculative decoding, LoRA, pooling, telemetry.
   - Today: `crates/targets/metal/e2e/` (it serves through `scr`).
-- **The allocator.** `targets/spyre/crates/flex-rs/` is T5 by default (#8's open question).
+- **The allocator.** `backends/spyre/crates/flex-rs/` is T5 by default (#8's open question).
   Move a test out only on purpose, in its own PR, never as a side effect of another.
 
 ## What weakening a protected test means

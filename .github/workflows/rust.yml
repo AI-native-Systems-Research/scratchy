@@ -23,7 +23,7 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # Linux / amd64 — whole-workspace lint, of both workspaces: the root one's
-  # Linux-buildable members, and the Spyre target's own (targets/spyre).
+  # Linux-buildable members, and the Spyre target's own (backends/spyre).
   #
   # Metal is Apple-only, so the root workspace is linted here without it; the
   # spyre workspace is linted at one model. The runner has no Spyre card, so
@@ -49,7 +49,7 @@ jobs:
           key: linux-workspace
           workspaces: |
             . -> target
-            targets/spyre -> target
+            backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy. The
@@ -86,7 +86,7 @@ jobs:
       # Every arch's forward is linted by the macOS job; granite is the one the card builds
       # use.
       - name: Clippy (spyre workspace)
-        working-directory: targets/spyre
+        working-directory: backends/spyre
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
         run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings
@@ -95,7 +95,7 @@ jobs:
       # struct's typed handles must cover an fp8 linear too, or every fp8 build panics
       # at expansion. One model, the expansion only.
       - name: Check the fp8 preset expands
-        working-directory: targets/spyre
+        working-directory: backends/spyre
         run: cargo check -p scratchy-target-spyre-models --features scratchy-models/granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel
 
       # e_otel.rs, which needs `otel` and runs on any backend, type-checked
@@ -114,7 +114,7 @@ jobs:
         run: cargo clippy -p scratchy-cli --features claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
       - name: Lint the spyre binary's targets
-        working-directory: targets/spyre
+        working-directory: backends/spyre
         run: cargo clippy -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
 
@@ -329,7 +329,7 @@ jobs:
           key: macos-metal-tests
           workspaces: |
             . -> target
-            targets/spyre -> target
+            backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # `all` is model stems only, so the macos-metal-clippy job never turns
@@ -362,11 +362,11 @@ jobs:
       # the executor's public surface, both real design calls). Excluding
       # them from `cargo test` here does not skip any test coverage.
       - name: KTIR emulator tests
-        working-directory: targets/spyre
+        working-directory: backends/spyre
         run: cargo test -p ktir-emulator --features metal --lib --tests
 
       - name: KTIR optimizer tests
-        working-directory: targets/spyre
+        working-directory: backends/spyre
         run: cargo test -p ktir-optimizer
 
       # The Metal matrix's energy sampler on macOS 26; power-sampler-macos-27 runs it on 27.
@@ -481,7 +481,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: targets/spyre
+        working-directory: backends/spyre
     steps:
       - uses: actions/checkout@v7
       # 2026-11-11: a Canonical/Azure DNS outage (actions/runner-images#15297)
@@ -503,7 +503,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-spyre-emu
-          workspaces: targets/spyre -> target
+          workspaces: backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (openblas-system)
         run: cargo clippy -p ktir-emulator --no-default-features --features optimizer,openblas-system -- -D warnings
@@ -536,7 +536,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: targets/spyre
+        working-directory: backends/spyre
     steps:
       - uses: actions/checkout@v7
       # Same mirror hardening as linux-spyre-emu (the BLAS job's comment).
@@ -555,7 +555,7 @@ jobs:
           key: linux-spyre-triton
           workspaces: |
             . -> target
-            targets/spyre -> target
+            backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
@@ -673,14 +673,14 @@ jobs:
       SCRATCHY_SKIP_SENDNN_CXX: "1"
     defaults:
       run:
-        working-directory: targets/spyre
+        working-directory: backends/spyre
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-spyre-lower
-          workspaces: targets/spyre -> target
+          workspaces: backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lower every card rung (no device compile)
         run: cargo check -p scratchy-target-spyre-models --features spyre-lower,${{ matrix.model.features }}
@@ -694,7 +694,7 @@ jobs:
   # rustdoc checks the code ("Some expected error codes were not found").
   #
   # Covers every crate with a `compile_fail,E` doctest
-  # (`git grep -l 'compile_fail,E' -- crates targets`):
+  # (`git grep -l 'compile_fail,E' -- crates backends`):
   #   scratchy-tensors       src/typed.rs
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
   #   scratchy-target-spyre  src/runtime.rs     (gated on `spyre-hw`)
@@ -721,12 +721,12 @@ jobs:
           key: nightly-compile-fail-codes
           workspaces: |
             . -> target
-            targets/spyre -> target
+            backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Doctests (compile_fail error codes)
         run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal
       - name: Doctests (compile_fail error codes, spyre workspace)
-        working-directory: targets/spyre
+        working-directory: backends/spyre
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
         run: cargo +nightly test --doc -p ktir-core -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
@@ -740,10 +740,10 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-      # site/ and targets/spyre are their own workspaces, so the root --all above never
+      # site/ and backends/spyre are their own workspaces, so the root --all above never
       # reaches them.
       - run: cargo fmt --manifest-path site/Cargo.toml --all -- --check
-      - run: cargo fmt --manifest-path targets/spyre/Cargo.toml --all -- --check
+      - run: cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
 
   scripts:
     name: Python scripts
