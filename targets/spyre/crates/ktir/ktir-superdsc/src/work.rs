@@ -1,0 +1,1797 @@
+// SPDX-License-Identifier: Apache-2.0
+//! THE WORK DIVISION — how one op's iteration space is cut across the card's cores.
+//!
+//! ⭐ ONE MODULE, WHICH IS THE POINT. These items sat at eight scattered sites inside the
+//! 10,284-line `lower_subtile_tape_to_superdsc.rs` with 85 in-file call sites, which is exactly why
+//! an earlier pass deferred them: cutting eight holes in a file that was itself mid-move creates
+//! merge surface for code about to move again. They are pure arithmetic over types this crate
+//! already owns — [`ItDim`], [`WorkPlan`], the generation's core count — so they are one module here and nothing
+//! else changed.
+//!
+//! ⛔ THE SPYRE MODEL, NOT THE KTIR EMITTER'S. 256 MB/core span and a 64-element fp16 stick; the
+//! `pick_k`/`n_block` formulas in the KTIR emitter are H100's and are the wrong hardware.
+
+use crate::device_gen::DeviceGen;
+use crate::superdsc_opspec::{CoreBudget, DataFormat, Df, Fp16, ItDim, WorkPlan};
+use std::collections::BTreeMap;
+
+/// Corelets per compute tile — READ from the baked generation's table
+/// (`<Baked as DeviceGen>::CORELETS`, the vendor's own default, under its
+/// citation).
+pub const CORELETS_PER_CORE: u32 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORELETS;
+/// One stick's bytes — the baked generation's flit (`FLIT_BYTES`, under its
+/// citation): a stick is one flit wide.
+pub const STICK_BYTES: u32 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES as u32;
+/// The fp16 stick width — the device's own stick-law derivation
+/// (`DataFormat`'s doc), not a literal.
+pub const FP16_ELEMS_PER_STICK: u32 = <Fp16 as DataFormat>::ELEMS_PER_STICK;
+pub const MAX_SPAN_BYTES: u64 = 256 * 1024 * 1024;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Work-division (the core NEW logic — the whole point of this emitter).
+// Ported from torch-spyre torch_spyre/_inductor/work_division.py. We use the
+// SPYRE 256MB/core span + 64-fp16 stick model — NOT the KTIR emitter's H100
+// pick_k/n_block formulas (wrong hardware).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Largest divisor of `size` that does not exceed `max_cores` (so the split is
+/// always even). `core_split(384, 32) = 32`; `core_split(320, 32) = 16` (320 =
+/// 2^6·5, largest divisor ≤32 is 16). Mirrors work_division.py `core_split`.
+pub fn core_split(size: u32, max_cores: u32) -> u32 {
+    let mut i = max_cores.min(size.max(1));
+    while i >= 1 {
+        if size.is_multiple_of(i) {
+            return i;
+        }
+        i -= 1;
+    }
+    1
+}
+
+/// The cores a gather or scatter of `entries` index entries divides over: the most, at most
+/// `max_cores`, that split the entries evenly into runs each dividing `stick` (the entries one index
+/// register holds) — so no core's run straddles two sticks of the table
+/// (`emit::index_stick_starts`). At most `stick` entries it is [`core_split`]: one entry a core.
+/// `None` when no division does (more entries than `max_cores` sticks).
+pub fn index_core_split(entries: u32, max_cores: u32, stick: u32) -> Option<u32> {
+    (1..=max_cores.min(entries.max(1)))
+        .rev()
+        .find(|&c| entries.is_multiple_of(c) && stick.is_multiple_of(entries / c))
+}
+
+/// ⭐⭐⭐ THE ONE-ROW MATMUL'S CORE FILL — `(out, in)` cores for a matmul whose `mb` is one row, both in
+/// WHOLE STICKS of their own axis: the most cores that fit `max_cores`, and among those the widest
+/// `out` (so the reduction fan-in is the smallest that fills the machine).
+///
+/// ⛔ WHY AN OUT-ONLY SPLIT IS NOT ENOUGH. At one row the matmul is a pure weight stream, and the card
+/// streams at its ~149 GB/s HBM read ceiling ONLY when all 32 cores read. MEASURED on the card, one
+/// granite-3.1-8b fp16 projection per launch, device exec cycles off the response blocks:
+///
+/// | weight `[k, n]`        | out-only split | GB/s  | this fill      | GB/s  |
+/// |------------------------|----------------|-------|----------------|-------|
+/// | gate/up `[4096,12800]` | out25 (25 c)   | 126.0 | in4·out8 (32)  | 147.2 |
+/// | k/v `[4096,1024]`      | out16 (16 c)   |  89.2 | in2·out16 (32) | 145.9 |
+/// | down `[12800,4096]`    | out32          | 149.0 | out32 (same)   | 149.0 |
+///
+/// and the rate does not scale linearly with the cores reading: 8 and 16 cores both plateau near
+/// 88 GB/s, and only all 32 reach the ~149 GB/s ceiling (`T = 4.7 µs + bytes / 148.1 GB/s` over
+/// 18 32-core streams). So the fill aims at all 32. 200 sticks (12800) has no divisor in 26..=32 and
+/// 16 sticks (1024) none above 16, which is the whole of why those two are slow: the cost is the
+/// stick count's arithmetic, not the shape.
+///
+/// ⭐ THE PARTITION STAYS EXACT. `out` divides the output stick count and `in` divides the reduction
+/// stick count, so each axis is cut into equal whole-stick slices that tile it with no remainder; the
+/// output is DISJOINT over `out` and SHARED over `in`, which is the reduction split `emit_sdsc_tiled`
+/// already admits (its disjoint-write guard is relaxed exactly for a split `in` the output does not
+/// carry), dxp PSUM-accumulating the partials. Kani: `kani_proofs::the_one_row_fill_*`.
+///
+/// When `out` alone already fills `max_cores` (or nothing larger exists) this returns `(out, 1)` —
+/// the out-only split, byte-identical to what one row emitted before the fill.
+pub fn one_row_core_fill(out_sticks: u32, in_sticks: u32, max_cores: u32) -> (u32, u32) {
+    let mut best = (core_split(out_sticks, max_cores), 1u32);
+    let mut o = 1u32;
+    while o <= out_sticks.min(max_cores) {
+        if out_sticks.is_multiple_of(o) {
+            let mut i = 1u32;
+            while i <= in_sticks.min(max_cores / o) {
+                if in_sticks.is_multiple_of(i) && (o * i, o) > (best.0 * best.1, best.0) {
+                    best = (o, i);
+                }
+                i += 1;
+            }
+        }
+        o += 1;
+    }
+    best
+}
+
+/// Stick count for an extent on the stick axis: ceil(size / 64) for fp16.
+pub fn stick_count(elems: u32) -> u32 {
+    elems.div_ceil(FP16_ELEMS_PER_STICK)
+}
+
+/// The core split of one op's `[rows, cols]` output: `row_cores × stick_cores`, each core owning a
+/// contiguous row-chunk × stick-chunk. CANONICAL here (subtile) so the emitter and the Kani-verifying tower
+/// (`scratchy-sdsc`, which RE-EXPORTS this + proves it disjoint+covering) share ONE definition — no
+/// duplicate brain. Output dims are split largest-first (rows vs stick-count), each by `core_split`; a
+/// reduction dim is never split. `row_cores * stick_cores ≤` the generation's cores. (Was ported from `distribute_cores`,
+/// which the pointwise/reduce ops already use — so making matmul use THIS makes the whole emit one split.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreSplit {
+    pub row_cores: u32,
+    pub stick_cores: u32,
+}
+
+impl CoreSplit {
+    /// Distribute up to the BAKED generation's ([`Baked`]) cores over `[rows, cols]`: split the
+    /// larger output extent first (rows by row-count, cols by stick-count), each by `core_split`,
+    /// with the cores left after the first. The Kani proofs name the generation they prove through
+    /// [`Self::plan_capped`].
+    pub fn plan(rows: u32, cols: u32) -> CoreSplit {
+        // ⭐ THE CAP IS THE BAKED GENERATION'S CORE COUNT, AND IT IS THE ONLY CAP — the same const
+        // the bake reads, so what the proofs check and what the emitter does are the same expression.
+        Self::plan_capped(rows, cols, <crate::device_gen::Baked as DeviceGen>::CORES)
+    }
+
+    /// The PURE planning math (no env, no I/O): distribute up to `cap` cores over `[rows, cols]`,
+    /// splitting the larger output extent first. Kani-provable — the only loop (`core_split`) is
+    /// bounded by the concrete `cap`. `plan` = this with the env-derived cap.
+    pub fn plan_capped(rows: u32, cols: u32, cap: u32) -> CoreSplit {
+        let sc = stick_count(cols);
+        let (first_is_rows, big, small) = if rows >= sc {
+            (true, rows, sc)
+        } else {
+            (false, sc, rows)
+        };
+        let big_split = core_split(big, cap);
+        let small_split = core_split(small, (cap / big_split).max(1));
+        if first_is_rows {
+            CoreSplit {
+                row_cores: big_split,
+                stick_cores: small_split,
+            }
+        } else {
+            CoreSplit {
+                row_cores: small_split,
+                stick_cores: big_split,
+            }
+        }
+    }
+
+    pub fn ncores(&self) -> u32 {
+        self.row_cores * self.stick_cores
+    }
+
+    /// The half-open region `(r0, r1, c0, c1)` (rows, cols) owned by core `(cr, cs)` of an `[R,C]` output.
+    /// Row chunks are even (`core_split`); stick chunks even in STICK units, last stick's cols clamp to `C`.
+    pub fn region(&self, cr: u32, cs: u32, rows: u32, cols: u32) -> (u32, u32, u32, u32) {
+        let r_chunk = rows / self.row_cores;
+        let r0 = cr * r_chunk;
+        let r1 = if cr + 1 == self.row_cores {
+            rows
+        } else {
+            r0 + r_chunk
+        };
+        let sc = stick_count(cols);
+        let s_chunk = sc / self.stick_cores;
+        let s0 = cs * s_chunk;
+        let s1 = if cs + 1 == self.stick_cores {
+            sc
+        } else {
+            s0 + s_chunk
+        };
+        let c0 = (s0 * FP16_ELEMS_PER_STICK).min(cols);
+        let c1 = (s1 * FP16_ELEMS_PER_STICK).min(cols);
+        (r0, r1, c0, c1)
+    }
+}
+
+/// ⭐ A WHOLE fp16-STICK COUNT — `bump_sticks_to_splittable`'s "`n64` MUST be a 64-multiple"
+/// contract was a doc comment a non-fp16-basis width could silently violate; it is the TYPE
+/// now. The pad's arithmetic (`sticks = n64 / 64`, `core_split`, the `<=` occupancy tests) is
+/// only meaningful over a whole-stick count: handed 32 — one fp32 stick, not a whole fp16
+/// one — it computed 0 sticks, `core_split(0)` = 1, and both pad arms' `<=` tests passed at
+/// zero, so the sampler's `[rows,1]` fp32 inv_t reserved 0 bytes ("t728 has size 0 in seg3",
+/// run 7) where the device would have read 2^27 flits. ONE CLASS, ONE LAW with the
+/// 2026-10-24 u32 chain-stick incident: a width that is not whole fp16 sticks is not the
+/// pad's to touch — it reserves its TRUE df-stick-whole bytes, unpadded.
+pub struct Fp16Sticks(u32);
+
+impl Fp16Sticks {
+    /// ⭐ SOME ONLY FOR A NONZERO 64-MULTIPLE — this constructor never rounds, so the bump's
+    /// zero-stick arm is unreachable by type: a caller cannot hand the pad a sub-stick width
+    /// and have it silently floor. `None` is not an error — it is the statement "this width is
+    /// not the pad's to touch," and the caller reserves the width's own bytes instead
+    /// ([`row_footprint_bytes`]' None arm).
+    pub fn exact(width: u32) -> Option<Self> {
+        if width != 0 && width.is_multiple_of(FP16_ELEMS_PER_STICK) {
+            Some(Self(width / FP16_ELEMS_PER_STICK))
+        } else {
+            None
+        }
+    }
+
+    /// The rounding constructor for callers that state a LOGICAL width: ceil to whole sticks.
+    /// A fixed point at every 64-multiple — `DeviceWidth::for_output`/`for_pointwise` already
+    /// round to 64 before calling, so their numbers do not move.
+    pub fn from_elems(elems: u32) -> Self {
+        Self(elems.div_ceil(FP16_ELEMS_PER_STICK))
+    }
+}
+
+/// Pad a whole-fp16-stick OUTPUT/KERNEL width so its STICK COUNT is core-splittable to the util floor
+/// (≥8 cores). A PRIME/awkward stick count (the granite lm_head: `49216/64 = 769`, prime) has
+/// `core_split(769, 32) = 1` ⇒ the gemm strands on ONE core (the util-floor #11 guard / the build-#3
+/// failure). Rounding the stick count UP to a multiple of 8 makes `core_split(8k, 32) ≥ 8` (8 | 8k). A
+/// no-op when the count is already splittable (all granite weights except the lm_head). SHARED by the
+/// emitter (applied when the matmul's MACs cross the util-floor) and the worker's weight zero-pad, so the
+/// staged buffer width matches the emitted device width by construction. The 64-multiple contract is
+/// [`Fp16Sticks`]'s type — a width that is not whole fp16 sticks never reaches this pad (see
+/// [`row_footprint_bytes`]).
+pub fn bump_sticks_to_splittable(sticks: Fp16Sticks) -> u32 {
+    let sticks = sticks.0;
+    let n64 = sticks * FP16_ELEMS_PER_STICK;
+    let cur = core_split(sticks, crate::device_gen::BUILD_CORES);
+    if cur >= crate::device_gen::BUILD_CORES {
+        return n64; // already fills the machine
+    }
+    // ── FULL-OCCUPANCY PAD ───────────────────────────────────────────────────────────────────────
+    // The floor of 8 below fills the UTIL FLOOR, not the machine. granite's lm_head is the case that
+    // matters: vocab 49155 → 769 sticks, which is PRIME, so the ≥8 rule pads to 776 = 8·97 and
+    // `core_split(776,32)` is 8. MEASURED in the emitted suffix: the lm_head matmul is 97 trips of
+    // out=512, every one on 8 of 32 cores, with a wordLength=2 (fp16) kernel — i.e. the single
+    // largest tensor in the model (2048·49664·2 B ≈ 203 MB/token, ~7.7% of all weight bytes) streams
+    // through a quarter of the machine.
+    //
+    // Rounding to a multiple of the core count instead makes `core_split` exact: 800 = 32·25 ⇒ 32 cores.
+    // A matmul this shape is BANDWIDTH-bound in its core count, so 4× the cores is worth 3.1% more
+    // bytes (+24 sticks). The emitter's own util-floor guard calls under-occupancy "the 1.45×
+    // sengraph regression this emitter exists to fix" — this raises that floor to the whole machine.
+    //
+    // The ≤1/8 padding test keeps this from firing where it would BACKFIRE: k_proj/v_proj are 8
+    // sticks (n=512), and padding those to 32 would quadruple their weight to buy 4× cores — a wash
+    // at best. Only a wide, awkward width (lm_head) passes.
+    //
+    // ⭐ AND ONLY WHERE THE UNPADDED SPLIT LEAVES MOST OF THE MACHINE IDLE. The pad is weight bytes, and
+    // at decode every weight byte is streamed every step: it buys cores, and cores are only worth bytes
+    // while the gemm strands on a fraction of the machine. The lm_head's prime 769 sticks split onto ONE
+    // core (8 after the floor pad) — 4% more bytes for 4× the cores. granite-3.1-8b's gate/up (12800 =
+    // 200 sticks) already split onto 25 of 32: the pad was +12% of the model's largest weights, streamed
+    // every token, to buy the last 7 cores. Below half the machine the pad pays; at or above it the
+    // unpadded split stands.
+    //
+    // MEASURED, and the bytes were the smaller half of it: a keyed GROUP_TIME split of one 10k-context
+    // 8b decode step put the whole 49 ms the pad cost in the MLP group. 224 sticks on 32 cores is 7
+    // sticks a core — a prime — so each of gate and up was time-tiled into 7 one-stick trips, where
+    // 200 sticks on 25 cores is 8 a core and runs 4 two-stick trips.
+    let full = sticks.next_multiple_of(crate::device_gen::BUILD_CORES);
+    if cur * 2 < crate::device_gen::BUILD_CORES && (full - sticks) * 8 <= sticks {
+        return full * FP16_ELEMS_PER_STICK;
+    }
+    if cur >= crate::device_gen::BUILD_UTIL_FLOOR_CORES {
+        n64
+    } else {
+        // The floor: round up to a stick count that divides over the generation's util-floor cores.
+        sticks.next_multiple_of(crate::device_gen::BUILD_UTIL_FLOOR_CORES) * FP16_ELEMS_PER_STICK
+    }
+}
+
+/// ⭐ THE PER-ROW DEVICE FOOTPRINT — the single derivation the layout's `nbytes` multiplies by
+/// rows (the fp8 k-pad row widening stays at that call site: it is a ROWS fact, not a width
+/// one). Extracted pure so the reservation law is provable where the card constants live:
+///   * a tensor's width is stated at its OWN `Df`'s stick basis — whole sticks at that df,
+///     never a partial stick, never floored (Kani: `(a)`);
+///   * the reservation is whole 128 B sticks, whatever the df (Kani: `(b)`);
+///   * a width that IS whole fp16 sticks takes the occupancy pad — byte-identical to every
+///     fp16 and fp8 placement, whose stick multiples are 64-multiples (Kani: `(c)`);
+///   * a width that is NOT whole fp16 sticks (fp32's and u32's 32-element sticks) reserves
+///     its TRUE df-stick-whole bytes, UNPADDED — the pad is a core-split law for STREAMED
+///     widths, and a sub-stick column is never core-split (Kani: `(d)`). The exact
+///     reservation makes `size / rows` the row stride the staging writes at.
+pub fn row_footprint_bytes(cols: u32, df: Df) -> u64 {
+    let width = cols.next_multiple_of(df.elems_per_stick());
+    let body = match Fp16Sticks::exact(width) {
+        Some(sticks) => bump_sticks_to_splittable(sticks) as u64,
+        None => width as u64,
+    };
+    body * df.word_length() as u64
+}
+
+/// The contraction-K width of an fp8 W8A8 matmul's ACTIVATION and WEIGHT, rounded to a whole
+/// 128-elem SEN143_FP8 stick. ⭐ THE K-AXIS TWIN OF [`DeviceWidth`]'s N law — and the FIRST fp8
+/// model with a non-legal K is what forced it: gemma-4-26b's dense GeGLU DOWN gemm contracts
+/// `k = 2112 = 16.5 sticks`, which `qfp8ch`'s convert guard refuses (`assert_df_stick_multiple`:
+/// a sub-stick tile is rejected by the dxp scheduler, L3DlOpsScheduler:1040). Every earlier fp8
+/// model was legal by luck (granite 2048/11008, g8b 4096/12800, g12b 3840/15360 — all multiples
+/// of 128).
+///
+/// THE CONTRACT, SAME AS `DeviceWidth`'s: the fp8 quantize chain (`cl`/`afp8`), the packed
+/// RetileDescriptor (`[n/64, k/2, 64, 2]`), the layout's weight `nbytes`, and the worker's
+/// staged buffer ALL take their K from this one function, so the shared contraction k cannot
+/// drift between activation and weight. A no-op for every 128-aligned width — granite and the
+/// 12b are byte-identical under it.
+///
+/// ⛔ THE PAD LANES ARE ZERO BY EMISSION, NOT BY SEGMENT INIT. The chain that reaches the
+/// contraction writes `cl`'s `[m, k]` logical window and the pad window is zero-FILLED by the
+/// chain's own emission (a `sub(448,448)` broadcast) — see `matmul_fp8_descriptors`. Segments
+/// zero-init once at prepare, but intermediates RE-USE bytes across steps: a stale pad lane
+/// (last step's activation, or a NaN from a prior consumer) reaching the clamp would pass
+/// through `maximum/minimum` UNCHANGED (NaN-propagation), then `0 · NaN = NaN` in the
+/// contraction — the zero-fill is a correctness requirement, not belt-and-braces.
+pub fn fp8_k_pad(k: u32) -> u32 {
+    k.next_multiple_of(crate::superdsc_opspec::Df::Fp8.elems_per_stick())
+}
+
+/// ⭐ THE PACKED fp8 KERNEL'S OWN STICK GRANULARITY, PER AXIS. A packed W8A8 weight does NOT stage
+/// as a flat 128-elem-squared fp8 tensor: its RetileDescriptor is `[N/64, K/2, 64, 2]` — one
+/// 128-byte stick carries **64 N-columns × 2 K-bytes** (`gen_fp8_kernel_out_fold`'s 8×8 N-subtile,
+/// `gen_fp8_kernel_in_fold`'s 2-pack, `fp8_kernel_stage_off`'s `(n/64)·(K·64) + (n%64) + (i/2)·128
+/// + (i%2)·64` address law). So the kernel's OUT axis is legal at any 64-multiple and its K axis
+/// at any even count — NOT the flat [`StickExtent::<Fp8>`] 128-law.
+///
+/// ⛔ THIS IS THE LAW THE 26b N-WALL EXPOSED. gemma-4-26b's dense GeGLU GATE/UP projection has
+/// `n = 2112 = 33 × 64` — LEGAL to the retile's own `N%64==0` guard and to every addressing
+/// consumer, but refused by `per_core_addr`'s validation, which modeled every fp8 operand as a
+/// flat 128-stick tensor. Inert on every earlier fp8 model (granite/g8b/g12b n all 128-aligned
+/// by luck). This const pair is the ONE statement of the real law; the retile guard and the
+/// per-core validation both take their granularity from here so they cannot diverge again.
+pub const FP8_PACKED_KERNEL_OUT_GRAN: u32 = 64;
+/// The packed kernel's K (in) axis granularity — 2-packed fp8 per fp16-width slot.
+pub const FP8_PACKED_KERNEL_IN_GRAN: u32 = 2;
+
+// ⛔ THE EXPERT SLAB CUT IS GONE — `expert_slab_chunks`/`expert_slab_subpages` (the LX-fit
+// chunk and sub-page sizing of the MoE weight gather) existed only for the hand-written
+// per-op MoE card lowering, which is deleted: the MoE lowers only from `kernels/moe.py`
+// through KTIR. The chunk-major bank law they stated lives on where the token-plane
+// descriptor states it (`superdsc_opspec`'s token-plane form doc).
+
+// ⭐ THE UTIL-FLOOR CORE COUNT is the generation's [`DeviceGen::UTIL_FLOOR_CORES`]: the minimum cores a
+// FLOP-heavy matmul (`macs ≥ 2^20`) may be split onto, read by `DeviceWidth::for_matmul`'s windowed drop
+// test, guard #11's refusal in the emitter and `out_width_the_weight_holds`' floor test in the bridge.
+
+/// A matmul OUTPUT/KERNEL **device stick width** — 64-aligned, and (for a FLOP-heavy gemm) core-splittable
+/// to ≥8 cores — BY CONSTRUCTION. TYPE-SAFE LOCK-DOWN of the padding/alignment invariant: the SOLE
+/// constructor [`DeviceWidth::for_output`] applies the padding rule ONCE, so the emitter's `n_dev`, the
+/// kernel `RetileDescriptor`, and the worker's weight zero-pad CANNOT diverge — a raw `u32` is unusable
+/// where a `DeviceWidth` is required (any mismatch is unconstructable, not caught at runtime by the shim).
+/// The bump fires ONLY for `macs ≥ 2^20` so a small op (RoPE-rotate `[.,128]`) is NOT over-padded to 512;
+/// every real WEIGHT matmul crosses that threshold for ANY `m ≥ 1`, so the worker (which stages at m=1)
+/// and the emitter (prefill m=seq / decode m=1) always agree. Invariant Kani-proven (`kani_proofs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceWidth(u32);
+
+impl DeviceWidth {
+    /// The device width of a WHOLE-FUNCTION matmul output — the ONE decision both the
+    /// intermediate's reservation and the emitter's `n_dev` take (issue 201 item 4: two sites
+    /// computed the same fact differently and over-reserved 8× on granite tiled_k).
+    ///
+    /// `windowed = true` is the whole-function door's minted-intermediate arm: the padded weight
+    /// columns would be read from the CALLER'S parameter windows (`for_output`'s staged-buffer
+    /// contract does not exist there), so the util-floor bump is dropped when the LOGICAL width
+    /// already meets the floor. ⛔ ONLY THE FLOOR BUP IS DROPPED — the rounding to a whole
+    /// 64-stick STAYS (issue 201 item 5): an unaligned `n` with a ≥8-core split still emits at
+    /// `n.next_multiple_of(64)`, so it cannot fall into the per-core stick guard that a raw
+    /// `n_dev = n` would hit. `UTIL_FLOOR_CORES` is the floor both the drop test and guard #11
+    /// use — named once, not three hard-coded `8`s.
+    pub fn for_matmul(m: u32, logical_n: u32, k: u32, windowed: bool) -> DeviceWidth {
+        if windowed {
+            let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
+            if n64 > logical_n
+                && CoreSplit::plan(m, logical_n).ncores()
+                    >= crate::device_gen::BUILD_UTIL_FLOOR_CORES
+            {
+                // The logical width already meets the util floor the bump was buying — and its
+                // stick rounding is kept by returning `n64`, not `logical_n`.
+                return DeviceWidth(n64);
+            }
+        }
+        DeviceWidth::for_output(m, logical_n, k)
+    }
+
+    /// The device width of a matmul output `[m, logical_n]` with contraction `k`: round `logical_n` up to a
+    /// 64-stick, then (only if `m·n64·k ≥ 2^20`) bump the stick count to ≥8-splittable.
+    pub fn for_output(m: u32, logical_n: u32, k: u32) -> DeviceWidth {
+        let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
+        let macs = m as u64 * n64 as u64 * k as u64;
+        DeviceWidth(if macs >= (1 << 20) {
+            bump_sticks_to_splittable(Fp16Sticks::from_elems(n64))
+        } else {
+            n64
+        })
+    }
+
+    /// The device width of a POINTWISE op's tensor `[·, logical_n]` (a ScalarMul/elementwise on the padded
+    /// logits): round to a 64-stick, then bump a prime/awkward stick count to ≥8-splittable UNCONDITIONALLY.
+    /// This EQUALS `for_output(m, logical_n, k)` for any producer matmul with `macs ≥ 2^20` (every real
+    /// producer of a padded tensor — lm_head/o_proj/down_proj), so a pointwise CONSUMER addresses the exact
+    /// same device layout its matmul PRODUCER emitted. (Kani: `devwidth_pointwise_matches_matmul`.)
+    pub fn for_pointwise(logical_n: u32) -> DeviceWidth {
+        DeviceWidth(bump_sticks_to_splittable(Fp16Sticks::from_elems(
+            logical_n.next_multiple_of(FP16_ELEMS_PER_STICK),
+        )))
+    }
+
+    /// The device width of a dtype-CONVERT's slab `[·, logical_cols]` — round up to a whole
+    /// 64-element device stick and STOP. ⭐ THE β LAW (front-b-noise, auditor ruling 2026-10-27):
+    /// a crossed convert's minted `[B, 1]` intermediate (the sampler's gate chain) sweeps the
+    /// 64-ELEMENT device width — the α cell's base bake measured our own `PlanCorelets` refusing a
+    /// 32-element tile ("innermost/stick dimension is a multiple of the 64-element stick width"),
+    /// and `convert_opspec`'s own basis is the 64-elem fp16 stick — so the ONE width the door
+    /// sweeps, the mint's reservation, and the gate table's placement all take is ceil-to-64.
+    /// A fixed point at every 64-multiple: byte-identical for every convert ever emitted (all
+    /// full-row-width). ⛔ NO splittable bump — the util floor is a matmul-OUTPUT occupancy law;
+    /// a convert's slab has no floor to meet, and `row_footprint_bytes`'s fp16 pad would bump a
+    /// one-stick sweep to 8 sticks (2048 B/row) for no device reason at all.
+    pub fn for_convert(logical_cols: u32) -> DeviceWidth {
+        DeviceWidth(logical_cols.next_multiple_of(FP16_ELEMS_PER_STICK))
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Distribute up to `max_cores` across an op's iteration space (Pass 3 of the
+/// planner: split OUTPUT dims first by decreasing size, then at most ONE
+/// reduction dim with the cores that remain). Returns the split map (dim →
+/// >1-split) — the `splitter` shape consumed by [`WorkPlan::divide`], which adds
+/// > the (b)/(f) proof on top. Pass 2 (matmul cost model) refines this; this
+/// > baseline already beats the sengraph auto-split (which leaves ~31 idle).
+///
+/// Example (the real `sdsc_bmm_autoBuffer.json`): dims mb=384(out), out=384(out),
+/// in=64(reduction) → split `out` 2 and `mb` 16 → 32 cores
+/// (`numWkSlicesPerDim_:{out:2, mb:16}`), reduction `in` left unsplit.
+pub fn distribute_cores(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str, u32> {
+    let mut splits: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let mut remaining = max_cores;
+
+    // ── ROW (mb/free) dim FIRST — unify with the matmul's mb-first partition (`matmul_split_map` ⭐). ──
+    // A FLAT (row-major, `mq_flat_activation`) mq>1 activation lives in HBM row-major: the per-core start
+    // is `r·cols` and the coordInfo walks the row's features CONTIGUOUSLY (stick-groups `eps` apart). If
+    // instead the OUT dim is split and mb is left WHOLE (the old largest-first order), a core owns one
+    // 64-stick across ALL rows but the walk still advances each row by `eps` — so row `r` of out-core `c`
+    // lands at `(c+r)·eps` (ROW-MIXING: scalarmul wrote only `mb+out/eps−1` of `mb·out/eps` stick-groups,
+    // measured `nz=3968=(c+r)·64`). Splitting `mb` first makes each core own WHOLE rows (≤1 row/core for
+    // mq ≤ cores), so the flat start alone places the row and there is no mb-stride to mis-walk — the
+    // SAME reason the matmul (mb-split) is correct while the pointwise (out-split) was not. Byte-identical
+    // at mb==1 (decode: `core_split(1,·)=1`, falls through to the out loop) and for single-stick ops (a
+    // 1-stick `out` can't split, so mb was split anyway). NOTE: mq > cores leaves >1 row/core → the
+    // mb-walk row-mixing returns; that regime needs the per-tensor flat `stride_map` (see
+    // `element_arrangement_design.md`), not just the split.
+    if let Some(mb) = dims
+        .iter()
+        .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
+    {
+        let split = core_split(mb.size, remaining);
+        if split > 1 {
+            splits.insert(mb.name, split);
+            remaining /= split;
+        }
+    }
+
+    // Then the remaining OUTPUT dims, largest extent first (most parallelism, no PSUM merge).
+    let mut outs: Vec<&ItDim> = dims
+        .iter()
+        .filter(|d| !d.is_reduction && d.name != "mb")
+        .collect();
+    outs.sort_by_key(|d| std::cmp::Reverse(d.size));
+    for d in outs {
+        if remaining <= 1 {
+            break;
+        }
+        // Stick dims split by STICK COUNT at the dim's OPERAND format (fp16=64, fp8/int8=128) —
+        // NOT a hardcoded 64. A fp8-output op (the qfp8ch activation quantizer) whose stick dim is
+        // split at the fp16 64-basis hands a core a 64-wide slab = HALF a 128-fp8 stick (dxp
+        // `L3DlOpsScheduler:1070`). Deriving from `df` keeps each core ≥1 whole DF-stick. fp16
+        // dims are byte-identical (df.elems_per_stick()==64==the old stick_count basis).
+        let basis = if d.is_stick {
+            d.size.div_ceil(d.df.elems_per_stick())
+        } else {
+            d.size
+        };
+        let split = core_split(basis, remaining);
+        if split > 1 {
+            splits.insert(d.name, split);
+            remaining /= split;
+        }
+    }
+
+    // NO reduction-dim split. Splitting the reduced dim makes each core compute a
+    // PARTIAL result that must accumulate into the SAME output address — but the
+    // #50 per-core addressing gives those cores one shared output byte with no
+    // confirmed PSUM-accumulate semantic for a standalone reduce (unlike matmul,
+    // which rides its own `matmul_split_map`). That is exactly the collision the
+    // #50 build guard rejects (observed: RMSNorm mean `[1,576]→[1,1]` over 32
+    // cores → all write 0x4_0000_0000). So an op routed through `distribute_cores`
+    // (reduce / pointwise / silu) splits ONLY its disjoint OUTPUT dims; a reduce
+    // whose output is one stick (decode m=1) correctly lands on 1 core (it is tiny
+    // — the 211 matmuls are where the 32-core win lives). Cross-core PSUM reduce is
+    // a future optimization that needs the accumulate addressing, not this path.
+    splits
+}
+
+/// ⭐ A REDUCE's REDUCED STICK AXIS ACROSS THE CORES, every other dim whole — the largest divisor of
+/// the reduced axis's stick count within the core budget, so every core's run is whole sticks. Reached
+/// only through `reduce::ReduceDivision::ReducedAxis`, whose op's template combines the per-core
+/// partials. A reduction with no reduced stick axis takes no split.
+pub fn distribute_cores_reduced_axis(
+    dims: &[ItDim],
+    max_cores: u32,
+) -> BTreeMap<&'static str, u32> {
+    let mut splits = BTreeMap::new();
+    if let Some(d) = dims.iter().find(|d| d.is_reduction && d.is_stick) {
+        let sticks = d.size.div_ceil(d.df.elems_per_stick()).max(1);
+        let split = core_split(sticks, max_cores);
+        if split > 1 {
+            splits.insert(d.name, split);
+        }
+    }
+    splits
+}
+
+/// ⭐⭐⭐ HOW AN ELEMENTWISE OP's CORES ARE SPENT — rows first or sticks first, decided by the op's operand
+/// layout and nothing else. See [`EwDivision::of`].
+///
+/// [`distribute_cores`] spends its cores on `mb` first, and for a FLAT row-major operand that is a
+/// correctness law (its own note: an out-split core mis-walks the rows, measured `nz=3968`). A STICK-MAJOR
+/// rank-2 operand is the other way round: its bytes are `[out/64][mb][64]`, so a core holding ALL rows of
+/// a run of sticks reads one CONTIGUOUS block, while a core holding a run of rows reads `cols/64` strided
+/// one-row bursts. MEASURED in isolation (#549's sweep, the real `mulsilu_o461` descriptor and placement,
+/// one CB, 32 cores): a `[256, 8192]` mul ran 249.8 µs at 50.4 GB/s rows-first and 121.8 µs at 103.3 GB/s
+/// sticks-first, flat across width at the copy band; `[256, 2048]` 50.0 → 30.3 µs. `out:8 × mb:4` lands on
+/// the `out:32` line, so it is the stick axis taking its share first that matters, not `mb` going unsplit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EwDivision {
+    /// THE LAW: whichever of the two below the op's operands call for ([`Self::resolve`]). Every
+    /// elementwise door passes this, except for the two ops below that state their division outright.
+    Law,
+    /// [`distribute_cores`]: `mb` first, then the other output dims largest-first. Stated outright only by
+    /// an op whose own addressing is keyed on `mb` being the split axis (the gathered-row leg, whose index
+    /// enumerates `mb` in whole entries).
+    RowsFirst,
+    /// [`distribute_cores_sticks_first`]: the stick dim's whole-stick split first, then `mb`. Stated
+    /// outright by a decode batch chunk's `esub` and `exp`. Their shared core-local `cesub` is sized under
+    /// it, so both ops keep it (`attn`'s `ChunkBufs::sm_division_of`).
+    SticksFirst,
+    /// ⭐ `n` ROW GROUPS, one a core ([`row_groups`]) — the division a walk's scratchpad plan chooses
+    /// ([`crate::emit::lx_plan`]) when its ops divide as its batched contractions do: torch-spyre's
+    /// decode trip runs every op on one core per kv head, the head's query rows together, so each
+    /// intermediate stays in that core's LX from the op that writes it to the ops that read it.
+    Groups(u32),
+}
+
+/// [`EwDivision::Groups`]: `mb` split into `n` groups of `mb / n` rows, one a core — or, past the core
+/// budget, as many cores as divide `n` evenly ([`core_split`]), each holding that many consecutive
+/// groups (a decode batch's `J · B · KV` blocks over 32 cores, 8 blocks a core). [`distribute_cores`]
+/// for an op whose rows the groups do not divide.
+pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static str, u32> {
+    let cores = core_split(n, max_cores);
+    match dims
+        .iter()
+        .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
+    {
+        Some(mb) if cores > 1 && mb.size.is_multiple_of(n) => BTreeMap::from([(mb.name, cores)]),
+        _ => distribute_cores(dims, max_cores),
+    }
+}
+
+impl EwDivision {
+    /// ⭐ THE BUDGET THIS DIVISION SPENDS — the one place the byte law and the windowed-stick law
+    /// are applied, over the op's own [`TileOp`] declaration.
+    ///
+    /// **The byte law.** The two divisions the elementwise law chooses between
+    /// ([`Self::RowsFirst`], [`Self::SticksFirst`]) are free choices of how to spread the op, so
+    /// they spend the cores its bytes pay for ([`CoreBudget::for_bytes`] on
+    /// [`TileOp::operand_bytes`]): a decode-sized op runs on the few cores whose fixed cost it
+    /// needs, not on all of them.
+    ///
+    /// **The windowed-stick law.** A WINDOWED operand — one whose declared `mb` device extent
+    /// exceeds the op's swept rows, the row-band/batched-decode form
+    /// ([`crate::addr::RowWindow::parent_rows`], declared at
+    /// [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
+    /// crosses a column plane: its own stick-major layout coincides with the parent's inside that
+    /// plane. A MULTI-STICK core must walk the parent's inter-plane stride (`parent_rows·lanes`
+    /// between column planes), and nothing states that stride without `backGapCore_` — so a
+    /// windowed operand's per-core stick count is 1, and the budget is the op's swept
+    /// whole-stick count, clamped to at least one core. A windowed op whose swept stick count
+    /// exceeds the generation's cores is REFUSED by name — a windowed operand too wide for one
+    /// stick a core — never silently clamped past the law. [`Self::Groups`] is a correctness law
+    /// of its own — one row group a core, so each core's LX holds the intermediates its group
+    /// reads — and keeps every core ([`CoreBudget::whole`]). [`Self::Law`] is not a division
+    /// until it is resolved, and spends what its resolution spends.
+    ///
+    /// [`TensorArg::with_device_extent`]: crate::superdsc_opspec::TensorArg::with_device_extent
+    pub fn budget(self, op: &crate::ir::island::tile_op::TileOp) -> Result<CoreBudget, String> {
+        match self {
+            EwDivision::Law | EwDivision::RowsFirst | EwDivision::SticksFirst => {
+                if op.windowed() {
+                    let sticks = op.swept_sticks();
+                    let cores = crate::device_gen::BUILD_CORES;
+                    if sticks > cores {
+                        return Err(format!(
+                            "a windowed operand too wide for one stick a core: the op sweeps \
+                             {sticks} sticks over {cores} cores — a multi-stick core would have \
+                             to walk the parent's inter-plane stride, which nothing states \
+                             without `backGapCore_`"
+                        ));
+                    }
+                    Ok(CoreBudget::of_cores(sticks.max(1)))
+                } else {
+                    Ok(CoreBudget::for_bytes(op.operand_bytes()))
+                }
+            }
+            EwDivision::Groups(_) => Ok(CoreBudget::whole()),
+        }
+    }
+
+    /// The concrete division. [`Self::Law`] resolves on the operands: `stick_major` is the builder's own
+    /// rank-2 stick-major presentation decision — the SAME value that picks the operands' layout, so the
+    /// layout and the division cannot disagree — and `core_local` is whether any operand is a core-local
+    /// LX pin. Such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
+    /// by [`crate::emit::pointwise_untiled_slice_bytes`], so an op touching one under the law keeps the
+    /// rows-first division those were laid out under. A pin laid out under a stated division is sized
+    /// under that division instead ([`crate::emit::pointwise_untiled_slice_bytes_divided`]), and its ops
+    /// state it. The two concrete divisions resolve to themselves.
+    pub const fn resolve(self, stick_major: bool, core_local: bool) -> EwDivision {
+        match self {
+            EwDivision::Law if stick_major && !core_local => EwDivision::SticksFirst,
+            EwDivision::Law => EwDivision::RowsFirst,
+            concrete => concrete,
+        }
+    }
+
+    /// The splitter this division names, in the shape [`WorkPlan::divide`] takes. [`Self::Law`] is not a
+    /// splitter until it is resolved, so it names the rows-first one — the law's answer when there is
+    /// nothing to resolve it on — and every door resolves before asking.
+    pub fn splitter(self) -> impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
+        move |dims, max_cores| match self {
+            EwDivision::Law | EwDivision::RowsFirst => distribute_cores(dims, max_cores),
+            EwDivision::SticksFirst => distribute_cores_sticks_first(dims, max_cores),
+            EwDivision::Groups(n) => row_groups(dims, max_cores, n),
+        }
+    }
+}
+
+/// ⭐⭐⭐ A GATHERED OP'S WORK DIVISION — the ENTRY axis split over WHOLE ENTRIES and nothing
+/// else, minted by exactly one constructor.
+///
+/// ⛔⛔ ONLY THE ENTRY AXIS (`mb`) MAY CARRY A SPLIT, AND THIS IS THE ONE NUMBER A GATHER'S
+/// CORRECTNESS HANGS ON. dxp derives `skip_addr` as `page × the per-core extents of the
+/// UNPINNED dims` (`getBufferCapacityForNodePerDim`, reproduced by
+/// `zz_skip_addr_computed_from_our_own_emission.rs`), so a split on any other axis DIVIDES what
+/// one index entry covers: every index step then lands a fraction of a row short, from a clean
+/// bake. MEASURED through the gathered pointwise door (the prefill attention kernel's leg t6):
+/// 8 entries on 32 cores left 24 cores for `distribute_cores` to fill, and it split `out`
+/// 4 ways — fluent text assembled from two different rows. dbo also reduces the value tensor's
+/// per-core starts to a single `min` before deriving any address (`computeGatherMetadata`), so
+/// a core owning a COLUMN SLICE of an entry loses that slice and reads the entry from its
+/// start.
+///
+/// ⭐ AND A GATHER LAWFULLY RUNS ON `min(entries, cores)` CORES — fewer cores than the machine
+/// is the CARD-PROVEN shape of both existing gathered doors (`gather_copy_cores`' KV copy and
+/// the gathered matmul arm's re-division), and the vendor's own one-core gather
+/// (`dxp/test/test_gather_1core`) is the `entries == 1` case. The cores the entries cannot
+/// take are LEFT IDLE, never filled by splitting another axis — that filler split is the
+/// wrong-byte shape above, and it is the only way this law can be broken, so the mint refuses
+/// nothing about the core count. The split is [`core_split`]'s largest divisor of `entries`
+/// within the budget — exactly `min(entries, cores)` at every `entries ≤ cores` — so every
+/// core owns one or more WHOLE entries whatever the count. (Ruling 10-20: `entries ≥ cores`
+/// was this door's fill POLICY, not a byte law; the producer's batch-width move stays the
+/// perf move, but a short gather is no longer unconstructible.)
+///
+/// This is the gathered POINTWISE leg's door (the attention legs). The KV copy door
+/// (`gather_copy_cores`) states the mb-only half of this law privately — its entries are
+/// `nkvh·nb·mq` (≥ 8) and a copy may lawfully run on the cores its entries can take; the
+/// gathered matmul arm states it inline over its own re-division. Both cite the same
+/// `skip_addr` derivation; this type is where the law lives for the door that hit it.
+pub struct GatherSplit {
+    splits: BTreeMap<&'static str, u32>,
+}
+
+impl GatherSplit {
+    /// THE ONLY CONSTRUCTOR — the cores distributed over the gather's ENTRIES. `entry_page` is
+    /// the `mb` positions ONE index entry covers; the division is over entries, so no core owns
+    /// a fraction of one. The mint runs on `min(entries, max_cores)` cores (the largest divisor
+    /// of `entries` within the budget — the same number at every `entries ≤ max_cores`) and
+    /// splits NOTHING but `mb`. `Err` names the law that failed: a plan with no `mb` dim for
+    /// the entries to enumerate, or an `mb` that does not divide into whole entries.
+    pub fn over_entries(dims: &[ItDim], max_cores: u32, entry_page: u32) -> Result<Self, String> {
+        let Some(mb) = dims
+            .iter()
+            .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
+        else {
+            return Err(
+                "the op's work plan has no `mb` dim for the entries to enumerate — a gathered \
+                 op's core split is the entry axis alone, and there is none"
+                    .to_string(),
+            );
+        };
+        if entry_page == 0 || mb.size % entry_page != 0 {
+            return Err(format!(
+                "the gather pages `mb` by {entry_page} position(s) and the axis is {} \
+                 positions — an entry would cover a fraction of the axis, and a partial entry \
+                 is an address",
+                mb.size
+            ));
+        }
+        let entries = mb.size / entry_page;
+        let mut splits = BTreeMap::new();
+        let split = core_split(entries, max_cores);
+        if split > 1 {
+            splits.insert(mb.name, split);
+        }
+        Ok(GatherSplit { splits })
+    }
+
+    /// The minted split — `mb` alone. The tiler consumes this verbatim; there is no door that
+    /// hands a gathered op any other division.
+    pub fn splits(&self) -> &BTreeMap<&'static str, u32> {
+        &self.splits
+    }
+}
+
+/// How a pointwise op's cores are divided: the elementwise law ([`EwDivision`]), or a gathered
+/// op's own [`GatherSplit`]. The two are mutually exclusive BY TYPE — a gathered op's division
+/// is not resolved from its operand layout (the elementwise law's input) but minted from its
+/// entries, because only the entry axis may carry a split (see [`GatherSplit`]'s law).
+pub enum CoreDivision {
+    Ew(EwDivision),
+    Gathered(GatherSplit),
+}
+
+#[cfg(test)]
+mod gather_split_tests {
+    use super::{CoreDivision, GatherSplit, ItDim};
+    use crate::superdsc_opspec::Df;
+    use std::collections::BTreeMap;
+
+    /// A tile's `[mb, out, y]` dims — the spelling every pointwise gather states.
+    fn dims(mb: u32, out: u32) -> Vec<ItDim> {
+        let d = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        vec![d("mb", mb, false), d("out", out, true), d("y", 1, false)]
+    }
+
+    /// ⭐ THE SPLIT IS THE ENTRY AXIS ALONE — at the prefill kernel's own current form (32
+    /// entries on 32 cores) the mint is `{mb: 32}` and `out` is carried WHOLE however many
+    /// sticks it spans, because dxp derives `skip_addr` from the per-core extents of the
+    /// unpinned dims and a split `out` shrinks what one index entry covers.
+    #[test]
+    fn the_split_is_the_entry_axis_alone() {
+        let g = GatherSplit::over_entries(&dims(32, 256), 32, 1).expect("32 entries on 32 cores");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 32u32)]),
+            "`mb` takes all the cores; `out` stays whole however many sticks it spans"
+        );
+    }
+
+    /// ⭐ THE RULING (10-20): A GATHER LAWFULLY RUNS ON FEWER CORES THAN THE MACHINE — the
+    /// prefill kernel's earlier 8-entry form is CONSTRUCTIBLE: the mint is `{mb: 8}`, the op
+    /// runs on 8 cores with 24 idle, and `out` is still carried whole. What that form measured
+    /// (`out` split 4 ways) was the FILLER split `distribute_cores` made to spend the idle
+    /// cores — the wrong-byte shape — and `min(entries, cores)` over `mb` alone is the shape
+    /// that keeps `skip_addr` correct at any core count. The batch width stays the perf move;
+    /// it is no longer a correctness refusal.
+    #[test]
+    fn entries_fewer_than_cores_run_on_their_entries() {
+        let g = GatherSplit::over_entries(&dims(8, 256), 32, 1).expect("8 entries on 32 cores");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 8u32)]),
+            "8 whole entries, one per core, `out` never the filler"
+        );
+    }
+
+    /// The vendor's own one-core gather (`dxp/test/test_gather_1core`) is the `entries == 1`
+    /// case: `mb` is UNSPLIT (a split of 1 is no split) and the op runs on one core.
+    #[test]
+    fn one_entry_is_the_vendors_own_one_core_gather() {
+        let g = GatherSplit::over_entries(&dims(1, 256), 32, 1).expect("1 entry on 32 cores");
+        assert!(
+            g.splits().is_empty(),
+            "a single entry leaves `mb` unsplit — one core, one whole entry"
+        );
+    }
+
+    /// At MORE entries than cores the split is [`core_split`]'s largest divisor — every core
+    /// owns one or more WHOLE entries, and `out` still never splits.
+    #[test]
+    fn more_entries_than_cores_split_at_the_largest_divisor() {
+        let g = GatherSplit::over_entries(&dims(64, 256), 32, 1).expect("64 entries on 32 cores");
+        assert_eq!(g.splits(), &BTreeMap::from([("mb", 32u32)]));
+        let g = GatherSplit::over_entries(&dims(48, 256), 32, 1)
+            .expect("48 entries: 24 whole entries per core pair, no other axis touched");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 24u32)]),
+            "the largest divisor within the budget — 48 has no 32, and `out` is not the filler"
+        );
+    }
+
+    /// ⛔ A PARTIAL ENTRY IS AN ADDRESS — an `mb` the page does not divide would leave the last
+    /// index entry covering a fraction of the axis, refused by name.
+    #[test]
+    fn a_partial_entry_is_refused() {
+        let Err(m) = GatherSplit::over_entries(&dims(33, 256), 32, 2) else {
+            panic!("33 positions at 2 per entry is a partial entry");
+        };
+        assert!(
+            m.contains("fraction of the axis"),
+            "names the partial entry: {m}"
+        );
+    }
+
+    /// ⛔ NO `mb`, NO GATHER — a plan with no entry axis for the index to enumerate cannot be
+    /// divided at this door at all.
+    #[test]
+    fn a_plan_with_no_mb_dim_is_refused() {
+        let d = ItDim {
+            name: "out",
+            size: 256,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        };
+        let Err(m) = GatherSplit::over_entries(&[d], 32, 1) else {
+            panic!("no `mb` dim means no entries to enumerate");
+        };
+        assert!(
+            m.contains("no `mb` dim for the entries to enumerate"),
+            "names the missing axis: {m}"
+        );
+    }
+
+    /// THE PAGE DIVIDES POSITIONS INTO ENTRIES — the copy door's own law: at 64 positions and
+    /// 2 per entry the division is over the 32 ENTRIES, so no core owns a fraction of one.
+    #[test]
+    fn the_page_divides_positions_into_entries() {
+        let g = GatherSplit::over_entries(&dims(64, 64), 32, 2).expect("32 whole entries");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 32u32)]),
+            "the split is over entries, not positions"
+        );
+    }
+
+    /// The enum is the door's statement: an ungathered op carries the elementwise law, a
+    /// gathered op carries its minted split — and the two spellings are the only ones.
+    #[test]
+    fn the_enum_carries_either_the_law_or_the_mint() {
+        let g = GatherSplit::over_entries(&dims(32, 256), 32, 1).expect("the mint");
+        match CoreDivision::Gathered(g) {
+            CoreDivision::Gathered(g) => assert_eq!(g.splits(), &BTreeMap::from([("mb", 32u32)])),
+            CoreDivision::Ew(_) => panic!("the minted split round-trips"),
+        }
+    }
+}
+
+/// [`distribute_cores`] with the STICK dim served FIRST — for a stick-major rank-2 elementwise op
+/// ([`EwDivision::SticksFirst`]). Reductions are never split, for [`distribute_cores`]' own reason.
+///
+/// The stick dim takes the LARGEST whole-stick split that, with `mb` splitting the cores it leaves, fills
+/// the most cores; then any other output dim splits what remains, largest first. Each core holds whole
+/// sticks (the basis is the stick COUNT at the dim's own format, as there).
+///
+/// ⛔ NOT "the stick dim's largest split, then `mb`". That greedy order strands cores whenever the stick
+/// count has no divisor near `max_cores`: granite-3.1-8b's second MLP column chunk is 72 sticks, whose
+/// largest divisor ≤ 32 is 24 — and `32 / 24` leaves `mb` one core, so the op would run on 24 cores where
+/// rows-first ran 32. Searching the stick split for the most cores gives `out:8 × mb:4`, which is on the
+/// `out:32` line in #549's sweep. It is also why this can never use FEWER cores than [`distribute_cores`]:
+/// that plan's stick split is one of the candidates, and `mb` given at least as many cores splits at
+/// least as far.
+pub fn distribute_cores_sticks_first(
+    dims: &[ItDim],
+    max_cores: u32,
+) -> BTreeMap<&'static str, u32> {
+    let mut splits: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let outs: Vec<&ItDim> = dims.iter().filter(|d| !d.is_reduction).collect();
+    let stick = outs.iter().copied().find(|d| d.is_stick);
+    let mb = outs.iter().copied().find(|d| d.name == "mb" && !d.is_stick);
+    let mut remaining = max_cores;
+    if let Some(s) = stick {
+        let sticks = s.size.div_ceil(s.df.elems_per_stick());
+        let mb_size = mb.map_or(1, |d| d.size);
+        // The stick split filling the most cores with `mb`; ON A TIE, THE WIDER STICK SPLIT — the most
+        // contiguous sticks per core is what #549's (e) cells measured as the win, so among equal core
+        // counts the plan leans to `out`. 1 is always a candidate (it divides everything), so the search is
+        // never empty. Pinned against the whole candidate set by the exhaustive test.
+        let (ss, ms) = (1..=sticks.min(max_cores))
+            .filter(|c| sticks.is_multiple_of(*c))
+            .map(|c| (c, core_split(mb_size, max_cores / c)))
+            .max_by_key(|&(c, m)| (c * m, c))
+            .unwrap_or((1, 1));
+        if ss > 1 {
+            splits.insert(s.name, ss);
+        }
+        if ms > 1
+            && let Some(d) = mb
+        {
+            splits.insert(d.name, ms);
+        }
+        remaining = max_cores / (ss * ms);
+    }
+    // Then the other output dims (and `mb`, when there is no stick dim), largest first.
+    let mut rest: Vec<&ItDim> = outs
+        .into_iter()
+        .filter(|d| {
+            !splits.contains_key(d.name) && !d.is_stick && !(stick.is_some() && d.name == "mb")
+        })
+        .collect();
+    rest.sort_by_key(|d| std::cmp::Reverse(d.size));
+    for d in rest {
+        if remaining <= 1 {
+            break;
+        }
+        let split = core_split(d.size, remaining);
+        if split > 1 {
+            splits.insert(d.name, split);
+            remaining /= split;
+        }
+    }
+    splits
+}
+
+/// ⭐⭐⭐ A ROW-SPLIT OP'S CORES, SPENT ALONG ITS LAYOUT — the outer of its two row dims first, and
+/// the inner one only once every core holds ONE of the outer.
+///
+/// `rows` is the op's two row dims in its tensors' layout order, outermost first (`["y", "mb"]` for
+/// a `[y, mb, out]` spray, `["mb", "y"]` for `[mb, y, out]`). In this frame a core walks its own
+/// slice as if the slice were the whole tensor: it steps the outer dim by the INNER dim's per-core
+/// extent, not by the tensor's. So a core that holds several of the outer dim must hold ALL of the
+/// inner one, or each of its outer steps lands a fraction of a block short and the cores' writes
+/// pile onto one another. MEASURED on the card: granite-3.1-2b's prompt walk added its `[21, 64]`
+/// mask over `[y = 32, mb = 21]` with `mb` split 21 ways, and the op wrote 52 = 21 + 32 − 1 of its
+/// 672 sticks (each core 32 consecutive sticks from its own row), so the masked slots kept a zero
+/// score and the prompt's softmax came out uniform — the same shape as the flat row-major
+/// `nz=3968` row-mixing [`distribute_cores`] notes. (A stick-major `[mb, out]` op is not this
+/// frame: its out-sticks step at the tensor's row count with `mb` split, card-proven by every
+/// prefill rmsnorm.)
+///
+/// The outer dim takes [`core_split`]'s largest divisor within the budget, and the inner dim the
+/// rest only when that split is the outer dim's whole extent; the stick dim is never split (a
+/// row-split op is one stick wide).
+pub fn distribute_cores_layout_first(
+    rows: [&'static str; 2],
+) -> impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32> {
+    move |dims: &[ItDim], max_cores: u32| {
+        let mut splits = BTreeMap::new();
+        let extent = |name: &str| {
+            dims.iter()
+                .find(|d| d.name == name && !d.is_reduction && !d.is_stick)
+                .map(|d| d.size)
+        };
+        let (Some(outer), Some(inner)) = (extent(rows[0]), extent(rows[1])) else {
+            return splits;
+        };
+        let so = core_split(outer, max_cores);
+        if so > 1 {
+            splits.insert(rows[0], so);
+        }
+        if so == outer {
+            let si = core_split(inner, max_cores / so.max(1));
+            if si > 1 {
+                splits.insert(rows[1], si);
+            }
+        }
+        splits
+    }
+}
+
+/// The law [`distribute_cores_layout_first`] spends cores under, checked on a finished plan: a core
+/// that holds more than one of `rows[0]` (the outer row dim of the op's layout) holds all of
+/// `rows[1]`. `Err` names the per-core extents and the row-mixing they make.
+pub fn layout_walk_is_whole(plan: &WorkPlan, rows: [&'static str; 2]) -> Result<(), String> {
+    let (outer, inner) = (plan.per_core_extent(rows[0]), plan.split_of(rows[1]));
+    if outer > 1 && inner > 1 {
+        return Err(format!(
+            "each core holds {outer} of `{}` and a {inner}-way split of `{}` inside it — a core steps \
+             `{}` by its own slice of `{}`, not the tensor's, so its blocks land short and the cores' \
+             writes overlap (the row-mixing `distribute_cores_layout_first` exists to prevent)",
+            rows[0], rows[1], rows[0], rows[1]
+        ));
+    }
+    Ok(())
+}
+
+/// Per-core slice index along each split dim, for `coreIdToWkSlice_`. Cores are
+/// numbered row-major over the split dims in `splits` insertion order: for
+/// `{out:2, mb:16}`, core c → out = c/16, mb = c%16 (matches the real fixture:
+/// cores 0..15 → out0/mb0..15, cores 16..31 → out1/mb0..15). `splits` is the
+/// [`WorkPlan`]'s validated split map (≤32 by type).
+pub fn core_to_wk_slice(
+    plan: &WorkPlan,
+    all_dims: &[&'static str],
+) -> BTreeMap<String, BTreeMap<&'static str, crate::superdsc_opspec::SliceIndex>> {
+    use crate::superdsc_opspec::SliceIndex;
+    let cores = plan.cores_used().get().max(1);
+    // Split dims in a stable order (largest split first matches the fixture's
+    // outer→inner core numbering: out (×2) outer, mb (×16) inner).
+    let mut split_dims: Vec<(&&'static str, &u32)> = plan.splits().iter().collect();
+    split_dims.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let mut out = BTreeMap::new();
+    for c in 0..cores {
+        let mut idx = c;
+        let mut slice: BTreeMap<&'static str, SliceIndex> = BTreeMap::new();
+        // Inner-most (smallest split) varies fastest. EVERY core's slice index comes from
+        // this one mixed-radix decomposition — cores 2..n are enumerated by the same
+        // digits as cores 0..1, never extrapolated from them.
+        for (name, split) in split_dims.iter().rev() {
+            slice.insert(**name, SliceIndex::of_core_decomposition(idx % **split));
+            idx /= **split;
+        }
+        for d in all_dims {
+            slice.entry(d).or_insert(SliceIndex::UNSPLIT);
+        }
+        out.insert(c.to_string(), slice);
+    }
+    out
+}
+
+/// How a matmul/bmm is split across cores per dim (batch/M/N/K split counts;
+/// product = cores used). The cost-model Pass 2 (vs the generic Pass-3
+/// `distribute_cores`): for the real `sdsc_bmm_autoBuffer.json` (M=384, N=384,
+/// K=64, batch=16) it picks M×16, N×2 (=32), NOT M×32 — balancing the PT array
+/// occupancy + HBM traffic per the analytic cost.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatmulSplit {
+    pub b: u32,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+impl MatmulSplit {
+    pub fn cores(&self) -> u32 {
+        self.b * self.m * self.n * self.k
+    }
+}
+
+fn divisors_upto(size: u32, cap: u32) -> Vec<u32> {
+    (1..=cap.min(size.max(1)))
+        .filter(|d| size.is_multiple_of(*d))
+        .collect()
+}
+
+/// Pass-2 matmul cost-model core split (port of torch-spyre work_division.py
+/// `cost_model_matmul_division`). Enumerates feasible `(b,m,n,k)` split combos
+/// with `b*m*n*k <= max_cores`, prices each with the analytic runtime estimate,
+/// and returns the lowest-cost (ties → most cores, then largest M-split). `m_t`
+/// is the per-core M-tile target (8 rows = the PT array row group).
+pub fn matmul_cost_split(b: u32, m: u32, n: u32, k: u32, max_cores: u32) -> MatmulSplit {
+    let (bf, mf, nf, kf) = (b as f64, m as f64, n as f64, k as f64);
+    let mut best = MatmulSplit {
+        b: 1,
+        m: 1,
+        n: 1,
+        k: 1,
+    };
+    let mut best_cost = f64::INFINITY;
+    for &bs in &divisors_upto(b, max_cores) {
+        for &ms in &divisors_upto(m, max_cores / bs) {
+            for &ns in &divisors_upto(n, max_cores / (bs * ms)) {
+                {
+                    // NO K (reduction / INPUT-stick dim) split. A K-split makes each
+                    // core compute a PARTIAL product that must PSUM-accumulate into
+                    // the SAME output address — but the #50 per-core addressing gives
+                    // those cores one shared output byte with no confirmed accumulate
+                    // semantic on this path, which the #50 disjoint-output build guard
+                    // rejects (observed: decode m=1 matmuls k-split → collide at the
+                    // output segment base). So matmuls FILL cores via OUTPUT splits
+                    // (b/m/n) ONLY. Decode (m=1) small-N matmuls land on fewer cores
+                    // (still multi-core via the n-split); the big matmuls (lm_head /
+                    // MLP, large N) still fill 32. K-split PSUM is a future opt that
+                    // needs the accumulate addressing, not this path.
+                    let ks = 1u32;
+                    let cores = bs * ms * ns * ks;
+                    if cores == 0 || cores > max_cores {
+                        continue;
+                    }
+                    // STICK constraint (proven on-card 2026-06-25): N is the OUTPUT/
+                    // KERNEL stick dim and K the INPUT stick dim — their PER-CORE
+                    // extent must stay a whole multiple of the 64-fp16 stick, else
+                    // the dxp scheduler rejects the tile ("valid lower and upper
+                    // bound", L3DlOpsScheduler.cpp:1040: per-core < the 64 stick
+                    // lBound). M (mb) is not a stick dim, so it may split freely.
+                    if !(n / ns).is_multiple_of(FP16_ELEMS_PER_STICK)
+                        || !(k / ks).is_multiple_of(FP16_ELEMS_PER_STICK)
+                    {
+                        continue;
+                    }
+                    let (mm, nn) = ((m / ms) as f64, (n / ns) as f64);
+                    // PT efficiency falls off when the per-core M tile < 8 rows.
+                    let pt_eff = (1.0_f64)
+                        .min((1.0_f64).max(mm / 8.0) / 8.0)
+                        .sqrt()
+                        .max(1e-3);
+                    let compute = (bf * mf * nf * kf / cores as f64) / (1536.0 * pt_eff);
+                    let hbm = (bf * mf * kf + bf * kf * nf + bf * mf * nf) * 2.0 / (204.8 * 1000.0)
+                        * (1.0_f64).max(mm.max(nn) / 8.0);
+                    let psum = (0.0_f64).max(ks as f64 - 1.0) * bf * mf * nf * 1.4e-4;
+                    let m_target = 8.0;
+                    let tie = ((mm / m_target).log2()).abs() * 50.0;
+                    let cost = (compute + hbm + psum + tie) * (bs as f64).powf(1.4);
+                    // PRIMARY objective: FILL the cores — the whole point of this
+                    // emitter is owning the 32-way split (the sengraph 1.45× was
+                    // under-utilization). So MORE cores always wins; the analytic
+                    // cost only breaks ties between equal-core splits, then prefer
+                    // the larger M-tile. (Earlier the cost was primary, and the
+                    // pt_eff/hbm terms — which reward bigger per-core tiles —
+                    // mis-picked a 24-core split over the 32-core fill.)
+                    let bc = best.cores();
+                    let better = cores > bc
+                        || (cores == bc && cost < best_cost - 1e-9)
+                        || (cores == bc && (cost - best_cost).abs() <= 1e-9 && ms > best.m);
+                    if better {
+                        best_cost = cost;
+                        best = MatmulSplit {
+                            b: bs,
+                            m: ms,
+                            n: ns,
+                            k: ks,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// All positive divisors of `n` ascending (`divisors(12) = [1,2,3,4,6,12]`). torch-spyre
+/// `sympy.divisors`. `n<=0 → [1]`.
+fn divisors(n: u32) -> Vec<u32> {
+    let n = n.max(1);
+    (1..=n).filter(|d| n.is_multiple_of(*d)).collect()
+}
+
+/// FAITHFUL port of torch-spyre `work_division.py::_matmul_split_cost` — the analytic 9-term
+/// hardware cost (µs) of running `[B,M,K]@[B,K,N]` under the split `(b,m,n,k)`. Each axis is
+/// `(size, split)`; sizes are ELEMENTS (M,N,K) / count (B). Lower is better; `inf` if infeasible.
+/// Constants are torch-spyre's verbatim (AIU HW limits + measured kernel-time coefficients) so the
+/// split scratchy picks is the one torch-spyre picks — NOT a rewritten "fill the cores" heuristic.
+#[allow(clippy::too_many_arguments)]
+fn matmul_split_cost(
+    b_axis: (u32, u32),
+    m_axis: (u32, u32),
+    n_axis: (u32, u32),
+    k_axis: (u32, u32),
+    max_cores: u32,
+    shared_weight: bool,
+) -> f64 {
+    const PT_ROWS: f64 = 8.0;
+    const TARGET_PT_PASSES: f64 = 5.0;
+    const TARGET_M_TIE_PASSES: u32 = 4;
+    const PT_EFFICIENCY_EXPONENT: f64 = 0.25;
+    const M_MIN: f64 = 4.0; // PT_ROWS // 2
+    const PEAK_MACS_US_CORE: f64 = 98.304e12 / 2.0 / 32.0 / 1e6; // = 1_536_000.0
+    const HBM_BW_GBS: f64 = 204.8;
+    const DTYPE_BYTES: f64 = 2.0;
+    const PSUM_PER_CORE_ELEM_US: f64 = 1.0e-3;
+    const BMM_PSUM_PER_CORE_ELEM_US: f64 = 1.0e-4;
+    const COHORT_LIMIT: f64 = 8.0;
+    const COHORT_PENALTY_EXPONENT: f64 = 0.75;
+    const M_LANE_UNDERUSE_PENALTY_US: f64 = 10.0;
+    const M_TILE_UNDERFILL_TARGET: f64 = 16.0;
+    const M_TILE_UNDERFILL_PENALTY_US: f64 = 30.0;
+    const TARGET_N_TILE_ELEMS: f64 = 512.0;
+    const WIDE_N_TILE_PENALTY_US: f64 = 25.0;
+    const CORE_UNDERUSE_PENALTY_US: f64 = 150.0;
+    const BMM_BATCH_SPLIT_PENALTY_US: f64 = 10.0;
+    const LARGE_M_TILE_SHAPE_PENALTY_US: f64 = 20.0;
+    const SHARED_DOWN_N_SPLIT_PENALTY_US: f64 = 10.0;
+    const SHARED_NARROW_OUTPUT_REF: f64 = TARGET_N_TILE_ELEMS * COHORT_LIMIT; // 4096
+    const SHARED_N_TILE_TARGET: f64 = TARGET_N_TILE_ELEMS / 4.0; // 128
+
+    let ((big_b, b), (big_m, m), (big_n, n), (big_k, k)) = (b_axis, m_axis, n_axis, k_axis);
+    let cores_used = b * m * n * k;
+    if cores_used == 0 || cores_used > max_cores {
+        return f64::INFINITY;
+    }
+    let (bf, mf, nf, kf) = (big_b as f64, big_m as f64, big_n as f64, big_k as f64);
+    let (bs, ms, ns, ks) = (b as f64, m as f64, n as f64, k as f64);
+
+    // Compute: per-core MACs over peak, derated when the per-core M tile is too short to fill the PT.
+    let m_t = big_m.checked_div(m).map_or(1.0, |t| t as f64);
+    let pt_passes = (1.0f64).max(m_t / PT_ROWS);
+    let pt_eff = (1.0f64).min((pt_passes / TARGET_PT_PASSES).powf(PT_EFFICIENCY_EXPONENT));
+    let compute_us = (bf * mf * nf * kf / cores_used as f64) / (PEAK_MACS_US_CORE * pt_eff);
+
+    // HBM: operands broadcast to the cohort splitting the orthogonal dim; past _COHORT_LIMIT contends.
+    let weight_batches = if shared_weight { 1.0 } else { bf };
+    let bytes_total = (bf * mf * kf + weight_batches * kf * nf + bf * mf * nf) * DTYPE_BYTES;
+    let fanout_split = if shared_weight { ms.max(ns) } else { ns };
+    let cohort_penalty = (1.0f64).max((fanout_split / COHORT_LIMIT).powf(COHORT_PENALTY_EXPONENT));
+    let hbm_us = bytes_total / (HBM_BW_GBS * 1000.0) * cohort_penalty;
+
+    // PSUM: a K-split costs (k-1) partial-sum hops over each core's output tile.
+    let psum_coeff = if shared_weight {
+        PSUM_PER_CORE_ELEM_US
+    } else {
+        BMM_PSUM_PER_CORE_ELEM_US
+    };
+    let output_elems_per_core = (bf * mf * nf) / (1.0f64).max((b * m * n) as f64);
+    let psum_us = (0.0f64).max(ks - 1.0) * output_elems_per_core * psum_coeff;
+
+    // Tie-break: expose enough M lanes to feed the stationary weight, and avoid under-filled M tiles.
+    let target_m = M_MIN.max(
+        ((max_cores / 2) as f64)
+            .min((1.0f64).max((big_m / (TARGET_M_TIE_PASSES * 8)).max(1) as f64)),
+    );
+    let m_lane_underuse_us =
+        (0.0f64).max((target_m / (1.0f64).max(ms)).log2()) * M_LANE_UNDERUSE_PENALTY_US;
+    let m_tile_underfill_us = (0.0f64).max((M_TILE_UNDERFILL_TARGET / (1.0f64).max(m_t)).log2())
+        * M_TILE_UNDERFILL_PENALTY_US;
+
+    // Very wide per-core output tiles lose schedule efficiency.
+    let n_t = if n != 0 { nf / ns } else { nf };
+    let wide_n_us =
+        (0.0f64).max(((1.0f64).max(n_t) / TARGET_N_TILE_ELEMS).log2()) * WIDE_N_TILE_PENALTY_US;
+
+    // Tile-shape preferences (ratios, not op names): true-BMM value split, shared-narrow, shared-down.
+    let filled_m_tile_factor = if m_t >= M_TILE_UNDERFILL_TARGET {
+        1.0
+    } else {
+        0.0
+    };
+    let true_bmm_value_split_us = if shared_weight || n <= 1 {
+        0.0
+    } else {
+        filled_m_tile_factor
+            * (0.0f64).max(((1.0f64).max(kf) / (1.0f64).max(nf)).log2())
+            * ns.log2()
+            * LARGE_M_TILE_SHAPE_PENALTY_US
+    };
+    let shared_narrow_tile_us = if !shared_weight {
+        0.0
+    } else {
+        filled_m_tile_factor
+            * (0.0f64).max((SHARED_NARROW_OUTPUT_REF / (1.0f64).max(nf)).log2())
+            * (0.0f64).max(((1.0f64).max(n_t) / SHARED_N_TILE_TARGET).log2())
+            * (LARGE_M_TILE_SHAPE_PENALTY_US / 4.0)
+    };
+    let shared_down_n_split_us = if !shared_weight || n <= 1 {
+        0.0
+    } else {
+        (0.0f64).max(((1.0f64).max(kf) / (1.0f64).max(nf)).log2())
+            * ns.log2()
+            * SHARED_DOWN_N_SPLIT_PENALTY_US
+    };
+    let large_m_tile_shape_us =
+        true_bmm_value_split_us + shared_narrow_tile_us + shared_down_n_split_us;
+
+    // Prefer using the full core budget (soft).
+    let core_underuse_us =
+        (0.0f64).max((max_cores as f64 / cores_used as f64).log2()) * CORE_UNDERUSE_PENALTY_US;
+
+    // True BMMs: small additive batch-split overhead.
+    let batch_split_us = if shared_weight {
+        0.0
+    } else {
+        (1.0f64).max(bs).log2() * BMM_BATCH_SPLIT_PENALTY_US
+    };
+
+    compute_us
+        + hbm_us
+        + psum_us
+        + m_lane_underuse_us
+        + m_tile_underfill_us
+        + wide_n_us
+        + large_m_tile_shape_us
+        + core_underuse_us
+        + batch_split_us
+}
+
+/// FAITHFUL port of torch-spyre `_cost_model_matmul_planner`: enumerate every `(b,m,n,k)` where `m`
+/// divides M (elements), `n` divides the N stick count, `k` divides the K stick count, `b` divides the
+/// batch, with `b·m·n·k ≤ max_cores`, and pick the split with the LOWEST [`matmul_split_cost`]. `n`/`k`
+/// range over STICK counts (torch-spyre `n_divs = divisors(n_sticks)`), so every per-core N/K slice is a
+/// whole stick by construction. K-split is DISABLED (`k=1`): scratchy has no K-time PSUM-accumulate
+/// addressing (#50), and for the granite projections torch-spyre's own cost model picks `k=1` anyway
+/// (the PSUM penalty dominates), so this is faithful in practice, not a shortcut.
+pub fn matmul_split_plan(
+    m: u32,
+    n_elems: u32,
+    k_elems: u32,
+    batch: u32,
+    stick: u32,
+    max_cores: u32,
+    shared_weight: bool,
+) -> MatmulSplit {
+    let n_sticks = n_elems.div_ceil(stick).max(1);
+    let k_sticks = k_elems.div_ceil(stick).max(1);
+    // K-SPLIT RE-ENABLED (2026-07-28) now that its blocker is fixed. It was disabled because
+    // splitting the reduction dim emitted a DESCRIPTOR THAT CONTRADICTED ITS OWN ADDRESSING for fp8
+    // operands: `gen_fp8_kernel_in_fold` / `gen_fp8_input_in_fold` hardcoded
+    // `{"factor_": 1, "label_": "core_fold"}` for the `in` dim (written under the older invariant
+    // that the reduction is never split), so the coordInfo reconstructed only K/nsplits while
+    // `numWkSlicesPerDim_["in"]` and `per_core_addr` encoded a real nsplits-way split. Both
+    // generators now take `nsplits` and emit it as core_fold, exactly as their fp16 sibling
+    // `gen_coord_info_value` always has, so the descriptor and the addressing agree again.
+    //
+    // This matters for prefill THROUGHPUT, not just tidiness: measured on hardware, prefill is
+    // compute-bound (75.4 GMAC in 82.9 ms = 909 GMAC/s) while decode is weight-bandwidth-bound
+    // (2.43 GB / 29 ms = 84 GB/s). With k unsplit, down_proj runs its whole k=8192 reduction on one
+    // core; the cost model picks (n=8, k=4) for every major granite projection when allowed to.
+    // Only mb>1 is affected -- decode's m=1 takes the out-split-only branch of `matmul_split_map`,
+    // where k is 1 regardless, so decode's emission is unchanged either way.
+    let k_divs = divisors(k_sticks);
+    // NOTE on a DISPROVEN theory, recorded so it is not re-derived: batched prefill is coherent at
+    // prefill_m=31 and 17 (both PRIME) and garbage at 16 (composite), which looks like "the cost
+    // model only mb-splits at composite m, so mb-split is broken". That premise is FALSE. mb-split
+    // is NOT gated by primality or by `m_divs`: matmul_split_map's single-stick branch calls
+    // core_split(mb, max_cores) directly, so at the COHERENT m=31 the per-head attention score/value
+    // matmuls already split mb 31 ways, distribute_cores splits mb 31 ways for every [31,2048]
+    // pointwise op, and decode's attn_krep/vrep split mb 32 ways. mb-splitting is hardware-proven at
+    // both extremes (nsplits=m with 1 row/core, and nsplits=1 with m rows/core), and the emitted
+    // coordInfo + per-core start bytes are byte-identical to IBM's own dxp-validated 8-way mb-split
+    // fixture (deeptools ddc/test/l0_tethering/.../sdsc_alxs_input_MatMul_49.json). Do NOT "fix"
+    // gen_coord_info_value's non-stick alphas or per_core_addr -- they are golden.
+    // What ACTUALLY changes only at m=16 is three inseparable things: gate/up/down pick
+    // {mb:2,out:8,in:2}; those same ops then overflow USABLE_LX_BYTES and take time_tile=2 (the
+    // first fp8 time-tile this backend has ever emitted); and the token-stream pointwise ops gain a
+    // second split dim, {mb:16,out:2}, because core_split(16,32)=16 leaves remaining=2 (at a prime m
+    // remaining is 1 and the loop breaks). Any of those three -- not mb-split per se -- is the
+    // suspect.
+    let (m_divs, n_divs, b_divs) = (
+        divisors(m.max(1)),
+        divisors(n_sticks),
+        divisors(batch.max(1)),
+    );
+    let mut best = MatmulSplit {
+        b: 1,
+        m: 1,
+        n: 1,
+        k: 1,
+    };
+    let mut best_cost = f64::INFINITY;
+    for &bb in &b_divs {
+        for &mm in &m_divs {
+            for &nn in &n_divs {
+                for &kk in &k_divs {
+                    if bb * mm * nn * kk > max_cores {
+                        continue;
+                    }
+                    let c = matmul_split_cost(
+                        (batch.max(1), bb),
+                        (m, mm),
+                        (n_elems, nn),
+                        (k_elems, kk),
+                        max_cores,
+                        shared_weight,
+                    );
+                    if c < best_cost {
+                        best_cost = c;
+                        best = MatmulSplit {
+                            b: bb,
+                            m: mm,
+                            n: nn,
+                            k: kk,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod one_row_fill_tests {
+    use super::{DeviceWidth, one_row_core_fill};
+
+    /// granite-3.1-8b's decode projections, the shapes the table on [`one_row_core_fill`] measured —
+    /// stick counts at the fp16 64-lane basis (`n/64`, `k/64`).
+    #[test]
+    fn the_one_row_fill_reaches_every_core_on_granite_8b() {
+        // gate/up [4096 -> 12800]: 200 out-sticks have no divisor in 26..=32.
+        assert_eq!(one_row_core_fill(200, 64, 32), (8, 4));
+        // k/v [4096 -> 1024]: 16 out-sticks.
+        assert_eq!(one_row_core_fill(16, 64, 32), (16, 2));
+        // q/o [4096 -> 4096] and down [12800 -> 4096]: 64 out-sticks already fill 32.
+        assert_eq!(one_row_core_fill(64, 64, 32), (32, 1));
+        assert_eq!(one_row_core_fill(64, 200, 32), (32, 1));
+        // lm_head, padded to 800 sticks (32 * 25).
+        assert_eq!(one_row_core_fill(800, 64, 32), (32, 1));
+    }
+
+    /// granite-3.1-2b: k/v is 512 wide (8 sticks) — out8 alone is a quarter of the machine.
+    #[test]
+    fn the_one_row_fill_reaches_every_core_on_granite_2b() {
+        assert_eq!(one_row_core_fill(8, 32, 32), (8, 4));
+        assert_eq!(one_row_core_fill(32, 32, 32), (32, 1));
+        assert_eq!(one_row_core_fill(128, 32, 32), (32, 1));
+    }
+
+    /// A one-stick reduction has nothing to give: the out-only split stands exactly as it was.
+    #[test]
+    fn a_one_stick_reduction_keeps_the_out_only_split() {
+        assert_eq!(one_row_core_fill(16, 1, 32), (16, 1));
+        assert_eq!(one_row_core_fill(32, 1, 32), (32, 1));
+    }
+
+    /// The Kani harness's property — the assertions `cargo test` can run on every build.
+    fn assert_exact_fill(os: u32, is: u32) {
+        let (o, i) = one_row_core_fill(os, is, 32);
+        assert!(o >= 1 && i >= 1, "({os},{is})");
+        assert_eq!(
+            os % o,
+            0,
+            "({os},{is}): out factor {o} divides the output sticks"
+        );
+        assert_eq!(
+            is % i,
+            0,
+            "({os},{is}): in factor {i} divides the reduction sticks"
+        );
+        assert!(o * i <= 32, "({os},{is}): {o}x{i} within the core budget");
+        assert!(
+            o * i >= super::core_split(os, 32),
+            "({os},{is}): never fewer cores than the out-only split"
+        );
+    }
+
+    /// Every dense one-row projection's `(out_sticks, in_sticks)` in every checked-in model config —
+    /// q/k/v/o, gate/up/down (dense and MoE expert widths) and the lm_head at its device width —
+    /// at the fp16 64-lane basis and the fp8 128-lane reduction basis. Read from the configs, so a new
+    /// model's widths are covered the moment its config lands.
+    fn config_projection_sticks() -> Vec<(u32, u32)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../../crates/models/arch/configs");
+        let mut pairs = std::collections::BTreeSet::new();
+        let mut files = 0usize;
+        for arch in std::fs::read_dir(&root).expect("the model configs directory") {
+            let arch = arch.expect("a config dir entry").path();
+            if !arch.is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(&arch).expect("a config arch dir") {
+                let f = f.expect("a config file entry").path();
+                if f.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(
+                    &std::fs::read_to_string(&f).expect("a readable config"),
+                ) else {
+                    continue;
+                };
+                // A multimodal config nests its language model; read both levels.
+                for c in [&v, &v["text_config"]] {
+                    let g = |k: &str| c[k].as_u64().map(|x| x as u32);
+                    let Some(h) = g("hidden_size") else { continue };
+                    files += 1;
+                    let heads = g("num_attention_heads").unwrap_or(1).max(1);
+                    let hd = g("head_dim").unwrap_or(h / heads);
+                    let kvh = g("num_key_value_heads").unwrap_or(heads);
+                    let mut outs_from_h = vec![heads * hd, kvh * hd];
+                    let mut ffn = Vec::new();
+                    for k in [
+                        "intermediate_size",
+                        "moe_intermediate_size",
+                        "shared_expert_intermediate_size",
+                    ] {
+                        if let Some(x) = g(k) {
+                            ffn.push(x);
+                        }
+                    }
+                    outs_from_h.extend(ffn.iter().copied());
+                    if let Some(vocab) = g("vocab_size") {
+                        outs_from_h.push(DeviceWidth::for_output(1, vocab, h).get());
+                    }
+                    let mut shapes: Vec<(u32, u32)> = outs_from_h.iter().map(|&n| (n, h)).collect(); // [h -> n]
+                    shapes.push((h, heads * hd)); // o_proj [heads*hd -> h]
+                    shapes.extend(ffn.iter().map(|&f| (h, f))); // down [ffn -> h]
+                    for (n, k) in shapes {
+                        if n == 0 || k == 0 {
+                            continue;
+                        }
+                        let os = n.div_ceil(super::FP16_ELEMS_PER_STICK);
+                        pairs.insert((os, k.div_ceil(64)));
+                        pairs.insert((os, k.div_ceil(128)));
+                    }
+                }
+            }
+        }
+        assert!(
+            files > 100,
+            "read {files} configs — the configs directory moved?"
+        );
+        pairs.into_iter().collect()
+    }
+
+    /// The fill's partition law over EVERY real one-row projection shape in the checked-in configs,
+    /// and over every stick-count pair up to the largest one those configs reach — so the bound is
+    /// the configs' own, not a hand-picked range.
+    #[test]
+    fn the_one_row_fill_partitions_both_axes_exhaustively() {
+        let pairs = config_projection_sticks();
+        for &(os, is) in &pairs {
+            assert_exact_fill(os, is);
+        }
+        // And the dense sweep around them: every output stick count up to the largest a config reaches
+        // (gemma's 262,144-wide vocab is 4096 sticks) against every reduction count up to 64 — the
+        // law reads `in_sticks` only through its divisors <= 32, so 1..=64 holds every distinct
+        // divisor set below the core budget, and the config pairs above hold the real large ones.
+        let max_os = pairs.iter().map(|p| p.0).max().unwrap_or(1);
+        assert!(
+            max_os >= 4096,
+            "largest output axis {max_os} sticks — the vocab widths are missing"
+        );
+        for os in 1..=max_os {
+            for is in 1..=64 {
+                assert_exact_fill(os, is);
+            }
+        }
+    }
+
+    /// MOST CORES FIRST, then the widest `out`: a prime reduction whose only divisor past 1 is itself
+    /// still beats a half-empty machine (31 cores reading against 16).
+    #[test]
+    fn most_cores_wins_before_the_widest_out() {
+        assert_eq!(one_row_core_fill(16, 31, 32), (1, 31));
+        // Ties on cores go to the wider `out` — the smaller reduction fan-in.
+        assert_eq!(one_row_core_fill(32, 64, 32), (32, 1));
+        assert_eq!(one_row_core_fill(8, 64, 32), (8, 4));
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{DeviceWidth, FP16_ELEMS_PER_STICK, one_row_core_fill, row_footprint_bytes};
+    use crate::superdsc_opspec::Df;
+
+    /// ⭐ THE FILL IS AN EXACT PARTITION OF BOTH AXES, AND NEVER WORSE THAN THE OUT-ONLY SPLIT.
+    ///
+    /// For every output and reduction stick count up to the bound: each factor divides its own stick
+    /// count (so the equal whole-stick slices tile the axis with no remainder — disjoint and covering on
+    /// `out`, covering on `in`), the product fits the core budget, and the fill uses at least as many
+    /// cores as the out-only split it replaces.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn the_one_row_fill_partitions_both_axes() {
+        let os: u32 = kani::any();
+        let is: u32 = kani::any();
+        kani::assume((1..=32).contains(&os));
+        kani::assume((1..=32).contains(&is));
+        let (o, i) = one_row_core_fill(os, is, 32);
+        assert!(o >= 1 && i >= 1);
+        assert!(os % o == 0, "out factor divides the output stick count");
+        assert!(is % i == 0, "in factor divides the reduction stick count");
+        assert!(o * i <= 32, "within the core budget");
+        assert!(
+            o * i >= super::core_split(os, 32),
+            "never fewer cores than out-only"
+        );
+    }
+
+    /// ⭐ THE PER-ROW FOOTPRINT NEVER FLOORS, AND PADS ONLY WHOLE fp16 STICKS.
+    ///
+    /// For every column count up to the bound, at every device format:
+    ///   (a) the reservation covers every element's bytes — never floored. The run-7 wall
+    ///       (`t728 has size 0 in seg3`): the sampler's `[rows,1]` fp32 inv_t rounded its width
+    ///       to one fp32 stick (32 elements), `bump_sticks_to_splittable` took those for ZERO
+    ///       fp16 sticks, `core_split(0)` = 1, and both pad arms' `<=` tests passed at zero —
+    ///       0 bytes reserved for a tensor the device then reads as 2^27 flits;
+    ///   (b) the reservation is whole 128 B sticks, whatever the df;
+    ///   (c) at a width that IS whole fp16 sticks, the reservation is exactly the occupancy
+    ///       pad's own result (`DeviceWidth::for_pointwise` — the emitter's device-width law,
+    ///       an independent production path), so every fp16/fp8 placement is byte-identical;
+    ///   (d) at a width that is NOT whole fp16 sticks (fp32's and u32's 32-element sticks),
+    ///       the reservation is the width's own true df-stick-whole bytes, UNPADDED — the pad
+    ///       is a core-split law for STREAMED widths, and a sub-stick column is never
+    ///       core-split (the 2026-10-24 u32 chain-stick class, one law for both incidents).
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn the_row_footprint_never_floors_and_pads_only_whole_fp16_sticks() {
+        let cols: u32 = kani::any();
+        kani::assume((1..=4096).contains(&cols));
+        for df in [
+            Df::Fp16,
+            Df::Fp32,
+            Df::Fp8,
+            Df::SenInt8,
+            Df::Bf16,
+            Df::SenUint32,
+        ] {
+            let fp = row_footprint_bytes(cols, df);
+            let wl = df.word_length() as u64;
+            assert!(
+                fp >= cols as u64 * wl,
+                "(a) never floored: every element's bytes are reserved"
+            );
+            assert!(fp % 128 == 0, "(b) whole 128 B sticks");
+            let width = cols.next_multiple_of(df.elems_per_stick());
+            if width % FP16_ELEMS_PER_STICK == 0 {
+                assert_eq!(
+                    fp,
+                    DeviceWidth::for_pointwise(width).get() as u64 * wl,
+                    "(c) whole-fp16-stick widths keep the occupancy pad's own bytes"
+                );
+            } else {
+                assert_eq!(
+                    fp,
+                    width as u64 * wl,
+                    "(d) a sub-fp16-stick width reserves its true df-stick bytes, unpadded"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_first_tests {
+    use super::{distribute_cores_layout_first, layout_walk_is_whole};
+    use crate::superdsc_opspec::{Df, ItDim, WorkPlan};
+
+    /// A row-split op's `[mb, out, y]` dims at one stick.
+    fn dims(mb: u32, y: u32) -> Vec<ItDim> {
+        let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        vec![
+            dim("mb", mb, false),
+            dim("out", 64, true),
+            dim("y", y, false),
+        ]
+    }
+
+    /// ⭐⭐⭐ THE LAW, AT EVERY SHAPE: for both layouts, every spray count up to llama-70b's 64 query
+    /// heads (and past), and every row count up to the widest prompt chunk, the plan is a valid
+    /// `WorkPlan`, never splits the stick, and leaves no core walking its outer row dim over a split
+    /// inner one.
+    #[test]
+    fn a_row_split_plan_never_walks_its_outer_dim_over_a_split_inner_one() {
+        for rows in [["y", "mb"], ["mb", "y"]] {
+            for y in 1..=96 {
+                for mb in (1..=64).chain([71, 96, 128, 256, 512]) {
+                    let plan = WorkPlan::divide(
+                        &dims(mb, y),
+                        crate::superdsc_opspec::CoreBudget::whole(),
+                        distribute_cores_layout_first(rows),
+                    )
+                    .unwrap_or_else(|e| panic!("{rows:?} y={y} mb={mb}: refused: {e}"));
+                    assert_eq!(plan.split_of("out"), 1, "{rows:?} y={y} mb={mb}: out split");
+                    layout_walk_is_whole(&plan, rows)
+                        .unwrap_or_else(|e| panic!("{rows:?} y={y} mb={mb}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// The card's case: granite-3.1-2b's prompt walk adds its `[21, 64]` mask over `[y = 32,
+    /// mb = 21]`. One spray per core and the 21 rows whole, where the elementwise law had split
+    /// `mb` 21 ways under all 32 sprays (52 of 672 sticks written).
+    #[test]
+    fn the_prompt_mask_spray_takes_one_head_block_per_core() {
+        let divide = |mb: u32, y: u32| {
+            let plan = WorkPlan::divide(
+                &dims(mb, y),
+                crate::superdsc_opspec::CoreBudget::whole(),
+                distribute_cores_layout_first(["y", "mb"]),
+            )
+            .unwrap_or_else(|e| panic!("y={y} mb={mb}: {e}"));
+            (plan.split_of("y"), plan.split_of("mb"))
+        };
+        assert_eq!(divide(21, 32), (32, 1));
+        // The J-slot merge's `[y = 4, mb = 64]`: one spray per core, so its rows split too.
+        assert_eq!(divide(64, 4), (4, 8));
+        // granite-4's 40 query heads: two sprays per core, the rows whole.
+        assert_eq!(divide(21, 40), (20, 1));
+    }
+
+    /// The elementwise law's division at the card's case is the one the check refuses — the
+    /// measured row-mixing, stated as a plan.
+    #[test]
+    fn the_rows_split_under_every_spray_is_refused() {
+        let plan = WorkPlan::divide(
+            &dims(21, 32),
+            crate::superdsc_opspec::CoreBudget::whole(),
+            |_, _| [("mb", 21)].into_iter().collect(),
+        )
+        .expect("a 21-way row split is a valid plan");
+        assert!(layout_walk_is_whole(&plan, ["y", "mb"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod windowed_stick_law_tests {
+    use super::EwDivision;
+    use crate::ir::island::tile_op::{TileOp, TileOpKind};
+    use crate::superdsc_opspec::{CoreBudget, Df, ItDim};
+
+    /// A binary fp16 op's `[mb, out, y]` declaration — `out` the stick axis, `n_operands` = the two
+    /// inputs plus the output.
+    fn op(rows: u32, cols: u32) -> TileOp {
+        let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        TileOp::new(
+            TileOpKind::PointwiseOrReduce { n_operands: 3 },
+            vec![
+                dim("mb", rows, false),
+                dim("out", cols, true),
+                dim("y", 1, false),
+            ],
+            Df::Fp16,
+        )
+    }
+
+    /// ⭐⭐⭐ THE WINDOWED-STICK LAW: a windowed operand's per-core stick count is 1, so the budget
+    /// is the op's swept whole-stick count — one stick a core, never a multi-stick core that would
+    /// have to walk the parent's inter-plane stride. `[1, 512]` fp16 sweeps 8 whole sticks
+    /// (64 elems a stick): 8 cores.
+    #[test]
+    fn a_windowed_op_spends_one_stick_a_core() {
+        let windowed = op(1, 512).with_windowed(true);
+        assert_eq!(
+            EwDivision::Law.budget(&windowed).unwrap().get(),
+            8,
+            "the swept whole-stick count, one stick a core"
+        );
+        assert_eq!(
+            EwDivision::RowsFirst.budget(&windowed).unwrap().get(),
+            8,
+            "the law holds whichever way the free division splits"
+        );
+        assert_eq!(EwDivision::SticksFirst.budget(&windowed).unwrap().get(), 8);
+    }
+
+    /// The same op, NOT windowed, spends the cores its bytes pay for — the windowed fact is the
+    /// only thing that moves the budget, and it is minted from the operand presentation, never
+    /// from the shape alone.
+    #[test]
+    fn the_same_op_unwindowed_spends_by_bytes() {
+        assert_eq!(EwDivision::Law.budget(&op(1, 512)).unwrap().get(), 1);
+        assert_eq!(EwDivision::Law.budget(&op(1, 2048)).unwrap().get(), 4);
+    }
+
+    /// The near-miss: a row band whose declared extent EQUALS the op's swept rows (batch-1) is not
+    /// windowed — `RowWindow::declares_past` says false at the door, so the op mints `windowed:
+    /// false` and spends by bytes like any other op.
+    #[test]
+    fn a_batch_one_band_is_not_windowed() {
+        // declared == swept: the door's `declares_past(rows)` is false, the mint keeps `false`.
+        let batch_one = op(512, 512).with_windowed(false);
+        assert_eq!(EwDivision::Law.budget(&batch_one).unwrap().get(), 32);
+    }
+
+    /// A windowed op whose swept stick count exceeds the generation's cores is REFUSED by name —
+    /// never silently clamped past the law, never spread two sticks to a core.
+    #[test]
+    fn a_windowed_op_wider_than_one_stick_a_core_is_refused_by_name() {
+        let err = EwDivision::Law
+            .budget(&op(1, 4096).with_windowed(true))
+            .unwrap_err();
+        assert!(
+            err.contains("a windowed operand too wide for one stick a core"),
+            "refused by name, got: {err}"
+        );
+    }
+
+    /// A stated division (`Groups`) is a correctness law of the walk's LX plan, windowed or not —
+    /// it keeps every core.
+    #[test]
+    fn a_stated_division_keeps_every_core_windowed_or_not() {
+        assert_eq!(
+            EwDivision::Groups(8)
+                .budget(&op(1, 512).with_windowed(true))
+                .unwrap()
+                .get(),
+            CoreBudget::whole().get()
+        );
+    }
+}

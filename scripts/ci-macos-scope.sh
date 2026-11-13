@@ -18,16 +18,16 @@ set -euo pipefail
 
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
 # ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
-MACOS_UNBUILT='targets/spyre
-targets/spyre/builder
-targets/spyre/bundle
-targets/spyre/compiler
-targets/spyre/flex-rs
-targets/spyre/triton/splice
-targets/spyre/triton/triton-frontend
-targets/spyre/triton/triton-ktir
-targets/spyre/triton/triton-ktir-superdsc
-targets/spyre/triton/triton-numeric'
+MACOS_UNBUILT='targets/spyre/crates/spyre
+targets/spyre/crates/builder
+targets/spyre/crates/bundle
+targets/spyre/crates/compiler
+targets/spyre/crates/flex-rs
+targets/spyre/crates/triton/splice
+targets/spyre/crates/triton/triton-frontend
+targets/spyre/crates/triton/triton-ktir
+targets/spyre/crates/triton/triton-ktir-superdsc
+targets/spyre/crates/triton/triton-numeric'
 
 changed() {
     # Every crate directory, deepest first, so the first one holding a file is its owner:

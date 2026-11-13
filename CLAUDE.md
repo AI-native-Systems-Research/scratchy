@@ -63,7 +63,8 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
 - Spyre is its own workspace, `targets/spyre` (its own `Cargo.lock` and
-  `target/`), reaching the shared crates by path into `crates/`. Build its CLI,
+  `target/`, its crates under `targets/spyre/crates/`), reaching the shared
+  crates by path into the root's `crates/`. Build its CLI,
   `spyre`, from there: `cd targets/spyre && cargo build --release
   --features spyre-emu,model/granite-3.1-2b-instruct` (`spyre-hw` on a card host).
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
