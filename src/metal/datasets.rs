@@ -17,8 +17,9 @@ use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
 use super::{
     ECDF_COLUMN, Entry, HEAT_LABELS, MachineRuns, Series, Sweep, bar_chart, ecdf_chart, engine_key,
-    grid_glance, grid_maps, in_order, lineup, marks_key, over_time_charts, parity, parity_info,
-    previous_run, request_plots, runs_table, served_as, slug, sweep_part, tasks, users_at,
+    grid_glance, grid_maps, helper, helper_info, in_order, kept, lineup, marks_key,
+    over_time_charts, parity, parity_info, previous_run, request_plots, runs_table, served_as,
+    slug, sweep_part, tasks, users_at,
 };
 
 /// A summary square's side: the grid's, so one dataset's map is as small as the grid's are.
@@ -733,6 +734,9 @@ fn provenance(mr: &MachineRuns, stem: &str, chip: &str) -> Element {
                 if let Some(verdict) = parity(m) {
                     " · {verdict} " {parity_info()}
                 }
+                if let Some(helper) = helper(m) {
+                    " · {helper} " {helper_info(m)}
+                }
             }
             if !served.is_empty() {
                 p { "Served as: {served.join(\"; \")}." }
@@ -1030,6 +1034,10 @@ fn summary_map(
                         (a + t > 0).then(|| format!("over {a} and {t} requests"))
                     });
                     let stem = p.as_ref().map_or("", |p| p.stem);
+                    // scratchy's guesses kept over the whole cell: its helper's, not a bucket's.
+                    let helped = (p.as_ref())
+                        .and_then(|p| kept(p.ours.get(&row.users)?.spec_decode.as_ref()))
+                        .map(|k| format!("helper kept {k} guessed tokens, over the cell"));
                     let tip = [
                         Some(format!("{stem} on {chip}")),
                         Some(format!(
@@ -1038,6 +1046,7 @@ fn summary_map(
                             users_at(row.users)
                         )),
                         over,
+                        helped,
                     ];
                     squares.insert(
                         (m, r, k, b),

@@ -3,11 +3,13 @@
 
 use dioxus::prelude::*;
 
+use crate::DASH;
 use crate::carbon::{Fold, Stack, Table, TableCell, TableRow};
 use crate::charts::{RangeGroup, RangeMark, range_dots};
 
 use super::data::{Model, RequestTiming, TaskCell};
 use super::datasets;
+use super::kept;
 use super::numbers::Engine;
 
 /// The engine a model's `dataset` cells are set against: the first rival that measured any of
@@ -143,8 +145,9 @@ fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
 const ENERGY_COVERS: &str = "From the CPU, GPU and ANE energy counters, not DRAM, with the Mac's \
      idle floor of about 1.6 W in it; read once a second, so a cell under about 20 s is coarse.";
 
-/// Each column's header and what it means, shown where it is read ([`Table`]'s definitions).
-fn columns() -> (Vec<String>, Vec<String>) {
+/// Each column's header and what it means, shown where it is read ([`Table`]'s definitions); with
+/// `drafted`, scratchy's guesses kept too, after its own numbers.
+fn columns(drafted: bool) -> (Vec<String>, Vec<String>) {
     let cols = [
         (
             "workload",
@@ -196,9 +199,21 @@ fn columns() -> (Vec<String>, Vec<String>) {
             both engines' answers were about one length.",
         ),
     ];
-    cols.iter()
+    let (mut headers, mut abouts): (Vec<String>, Vec<String>) = cols
+        .iter()
         .map(|(h, a)| (h.to_string(), a.to_string()))
-        .unzip()
+        .unzip();
+    if drafted {
+        headers.insert(6, "guesses kept".to_string());
+        abouts.insert(
+            6,
+            "Of the tokens scratchy's speed-up helper guessed, the share the model kept. Past where \
+             an answer would have ended on its own, guesses are harder: a timed row, forced to its \
+             length, keeps fewer."
+                .to_string(),
+        );
+    }
+    (headers, abouts)
 }
 
 /// A cell's joules a request, an output token, and a right answer where it is scored and shows
@@ -512,7 +527,9 @@ fn table(m: &Model, only: Option<&str>) -> Element {
     cells.sort_by_key(|c| (datasets::order(&c.workload), c.conc));
     // The open-loop note, only where the run timed its cells open loop (`--open-loop`).
     let open_loop = cells.iter().any(|c| c.load.as_deref() == Some("rate"));
-    let (headers, abouts) = columns();
+    // A column of scratchy's guesses kept, only where a run recorded its speed-up helper's.
+    let drafted = cells.iter().any(|c| c.spec_decode.is_some());
+    let (headers, abouts) = columns(drafted);
     rsx! {
         Table {
             headers,
@@ -543,10 +560,13 @@ fn table(m: &Model, only: Option<&str>) -> Element {
                                 TableCell { "{ms(c.median_e2el_ms)}" }
                                 TableCell { "{n(c.answer_tokens())}" }
                                 TableCell { "{n(c.mean_cached_tokens)}" }
+                                if drafted {
+                                    TableCell { {kept(c.spec_decode.as_ref()).unwrap_or_else(|| DASH.to_string())} }
+                                }
                                 TableCell { "{joules(per_request(c))}" }
                                 TableCell { "{joules(per_token(c))}" }
                             } else {
-                                TableCell { colspan: 6, "no answers" }
+                                TableCell { colspan: if drafted { 7 } else { 6 }, "no answers" }
                             }
                             TableCell { "{vs}" }
                             // A rival that mostly failed says so, rather than leave its ratios blank.
@@ -733,6 +753,7 @@ mod tests {
             accuracy_by_group: None,
             borrowed_from: None,
             energy: None,
+            spec_decode: None,
         };
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
         assert_eq!(
@@ -888,6 +909,7 @@ mod tests {
             accuracy_by_group: None,
             borrowed_from: None,
             energy: None,
+            spec_decode: None,
         };
         assert_eq!(accuracy(&cell(0)), Some(0.5));
         assert_eq!(accuracy(&cell(4)), None);

@@ -533,6 +533,10 @@ pub struct Model {
     /// scratchy's answer parted from mlx-lm's top; absent where every answer matched exactly.
     #[serde(default)]
     pub parity_ties: Option<BTreeMap<String, Vec<f64>>>,
+    /// The speed-up helper scratchy's server ran (speculative decoding), as its startup line said;
+    /// None where the run did not record it.
+    #[serde(default)]
+    pub spec_decode: Option<SpecDecode>,
     #[serde(default)]
     pub scaling_limits: Option<Limits>,
     /// Only its presence matters: whether scratchy served anything warm.
@@ -664,6 +668,32 @@ pub struct TaskCell {
     /// None in runs from before cells kept it.
     #[serde(default)]
     pub energy: Option<Energy>,
+    /// How many of its guessed tokens scratchy's speed-up helper kept; None where the server
+    /// guessed none, or the run did not record it.
+    #[serde(default)]
+    pub spec_decode: Option<Drafts>,
+}
+
+/// What scratchy's server drafted with (`scripts/bench_metal_matrix.sh` `spec_decode`): the
+/// helper (`dflash2`, `mtp`), its repo, and the tokens it guesses a step; or none, and the
+/// server's own words why.
+#[derive(Clone, Deserialize, Debug, PartialEq)]
+pub struct SpecDecode {
+    pub drafter: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub drafts_per_step: Option<u32>,
+    #[serde(default)]
+    pub why: Option<String>,
+}
+
+/// A cell's speculative decoding, over its requests: the tokens scratchy's helper guessed, and
+/// those the model kept.
+#[derive(Clone, Copy, Deserialize, Debug, PartialEq)]
+pub struct Drafts {
+    pub draft_tokens: u64,
+    pub accepted_tokens: u64,
 }
 
 /// A cell's energy (`scripts/cell_energy.py`): the CPU, GPU and ANE counters' joules over the
@@ -829,6 +859,8 @@ pub struct Cell {
     /// What its requests cost in energy, over all its repeats; None in runs from before cells
     /// kept it.
     pub energy: Option<Energy>,
+    /// How many of its guessed tokens scratchy's speed-up helper kept, over all its repeats.
+    pub spec_decode: Option<Drafts>,
 }
 
 /// A cell's requests, in the order each repeat sent them: parallel arrays, one entry a request.
@@ -976,6 +1008,8 @@ struct RawCell {
     requests: Option<Requests>,
     #[serde(default)]
     energy: Option<Energy>,
+    #[serde(default)]
+    spec_decode: Option<Drafts>,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -1021,6 +1055,7 @@ impl TryFrom<RawCell> for Cell {
             short: None,
             requests: c.requests,
             energy: c.energy,
+            spec_decode: c.spec_decode,
         })
     }
 }
