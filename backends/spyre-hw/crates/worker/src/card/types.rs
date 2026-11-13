@@ -207,8 +207,8 @@ pub(crate) struct SuperDscBundle {
     pub(crate) prefill_prefix: PrefixLadder,
 }
 
-/// ⭐ THE PREFIX-CAPABLE PREFILL LADDER — the sessions a continuation chunk can run on, ascending by width,
-/// and the ONE place a continuation chunk's width is chosen.
+/// ⭐ THE PREFIX-CAPABLE PREFILL LADDER — the sessions a continuation chunk can run on, ascending by
+/// (width, seqs), and the ONE place a continuation chunk's width is chosen.
 ///
 /// The field is private and [`Self::of_built`] is its only mint, so the entries are exactly the sessions
 /// that were BUILT from baked bundles; [`Self::rung_for`] returns a [`PrefixRung`] naming one of them or
@@ -216,28 +216,45 @@ pub(crate) struct SuperDscBundle {
 ///
 /// ⛔ IT WAS ONE BUNDLE AT THE WIDEST RUNG, and the tail paid for it: granite-3.1-2b's ~2k-token prompt
 /// ran its 52-row tail as a full 512-row chunk, 460 ms against 384 on the 256-row build.
-pub(crate) struct PrefixLadder(Vec<(usize, SuperDscSession)>);
+pub(crate) struct PrefixLadder(Vec<PrefixRungBuilt>);
+
+/// One BUILT rung of [`PrefixLadder`] — its per-request width, its request count (a solo rung's is 1;
+/// a packed rung's is the count of tails its wave batches into one launch), and its session. The
+/// loader mints these from the bundles the bake shipped; the ladder is their only home.
+pub(crate) struct PrefixRungBuilt {
+    pub(crate) width: usize,
+    pub(crate) seqs: usize,
+    pub(crate) sess: SuperDscSession,
+}
 
 /// ONE CHOICE OF [`PrefixLadder`] RUNG, made once per chunk and carried — the chunk's cap, its padded
 /// write, its session and the baked row count its K/V extent is proven against all read THIS value, so
-/// they cannot come from two choices. No public constructor: only [`PrefixLadder::rung_for`] mints one.
+/// they cannot come from two choices. No public constructor: only [`PrefixLadder::rung_for`] and
+/// [`PrefixLadder::packed_rung_for`] mint one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrefixRung {
     index: usize,
     width: usize,
+    seqs: usize,
 }
 
 impl PrefixRung {
     pub(crate) fn width(self) -> usize {
         self.width
     }
+
+    /// The rung's request count — 1 for a solo rung; a packed rung's wave size.
+    pub(crate) fn seqs(self) -> usize {
+        self.seqs
+    }
 }
 
 impl PrefixLadder {
-    /// The ladder of the sessions that built, sorted ascending by width (the manifest's order already,
-    /// stated again here so a caller cannot hand it an unsorted list that `rung_for` would misread).
-    pub(crate) fn of_built(mut rungs: Vec<(usize, SuperDscSession)>) -> PrefixLadder {
-        rungs.sort_by_key(|(m, _)| *m);
+    /// The ladder of the sessions that built, sorted ascending by (width, seqs) (the manifest's
+    /// order already, stated again here so a caller cannot hand it an unsorted list that the
+    /// selections below would misread).
+    pub(crate) fn of_built(mut rungs: Vec<PrefixRungBuilt>) -> PrefixLadder {
+        rungs.sort_by_key(|r| (r.width, r.seqs));
         PrefixLadder(rungs)
     }
 
@@ -245,29 +262,56 @@ impl PrefixLadder {
         self.0.is_empty()
     }
 
-    /// The baked widths, ascending.
-    pub(crate) fn widths(&self) -> Vec<usize> {
-        self.0.iter().map(|(m, _)| *m).collect()
+    /// The baked (width, seqs) pairs, ascending.
+    pub(crate) fn pairs(&self) -> Vec<(usize, usize)> {
+        self.0.iter().map(|r| (r.width, r.seqs)).collect()
     }
 
-    /// ⭐ THE RUNG A CONTINUATION CHUNK RUNS ON — the narrowest that holds the `rows_left` rows the
-    /// prompt still has, else the widest (the chunk is then capped at its width). `None` only for an
-    /// empty ladder.
+    /// ⭐ THE RUNG A CONTINUATION CHUNK RUNS ON — the narrowest SOLO rung that holds the `rows_left`
+    /// rows the prompt still has, else the widest solo (the chunk is then capped at its width). A
+    /// packed rung cannot serve one chunk: its graph is s windows' rows and its answer rows are
+    /// r·width apart, so a lone tail on it would compute s−1 empty windows — the wave front gathers
+    /// tails and picks [`Self::packed_rung_for`] instead. `None` only when no solo rung baked.
     pub(crate) fn rung_for(&self, rows_left: usize) -> Option<PrefixRung> {
         let index = self
             .0
             .iter()
-            .position(|(m, _)| *m >= rows_left)
-            .or_else(|| self.0.len().checked_sub(1))?;
+            .position(|r| r.seqs == 1 && r.width >= rows_left)
+            .or_else(|| self.0.iter().rposition(|r| r.seqs == 1))?;
         Some(PrefixRung {
             index,
-            width: self.0[index].0,
+            width: self.0[index].width,
+            seqs: 1,
+        })
+    }
+
+    /// ⭐ THE RUNG A WAVE OF `live` CONTINUATION TAILS RUNS ON — the packed rung of the smallest
+    /// PRODUCT that holds both halves of the wave: `width` at least the widest tail's rows (every
+    /// window pads its own tail to its rung's width) and `seqs` at least the live count (every tail
+    /// rides its own window). First fit on the count breaks product ties toward the rung whose
+    /// count is nearest the wave's — the fewest padded windows. `None` when no packed rung holds
+    /// the wave; the caller then runs the tails as solo chunks (a selection, never a refusal).
+    pub(crate) fn packed_rung_for(
+        &self,
+        max_tail_width: usize,
+        live: usize,
+    ) -> Option<PrefixRung> {
+        let (index, rung) = self
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.seqs > 1 && r.width >= max_tail_width && r.seqs >= live)
+            .min_by_key(|(_, r)| (r.width * r.seqs, r.seqs))?;
+        Some(PrefixRung {
+            index,
+            width: rung.width,
+            seqs: rung.seqs,
         })
     }
 
     /// The session of a rung THIS ladder chose.
     pub(crate) fn session(&mut self, rung: PrefixRung) -> &mut SuperDscSession {
-        &mut self.0[rung.index].1
+        &mut self.0[rung.index].sess
     }
 }
 
