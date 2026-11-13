@@ -1994,6 +1994,14 @@ impl ImageInterner {
             })
             .collect();
         let write = |name: &str, bytes: &[u8]| {
+            // The directory is ours to make: nothing else writes under it anymore (the per-group
+            // files that used to create it are gone), and a first build has no OUT_DIR subtree.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                panic!(
+                    "[spyre-superdsc] creating the packed image directory {}: {e}",
+                    dir.display()
+                );
+            }
             let dst = dir.join(name);
             if let Err(e) = std::fs::write(&dst, bytes) {
                 panic!(
