@@ -1,5 +1,4 @@
 [package]
-build = "build.rs"
 name = "scratchy-target-spyre-cli"
 version.workspace = true
 edition.workspace = true

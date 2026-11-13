@@ -15,11 +15,12 @@ tp-8 = ["scratchy-target-spyre/tp-8"]
 # The shared target: the bundle types, the lowering's outputs, the weight staging and the wiring
 # the executor launches against. It never depends on this crate.
 scratchy-target-spyre = { path = "../../../spyre/crates/spyre", features = ["spyre-hw"] }
-# In-tree crate: the senlib flex port's PUBLIC face — the C-ABI declarations and the pure-Rust type
-# layer (addressing, control-block words, scheduler) the card surface compiles against. The
-# implementing archives are linked statically at build (see flex-rs/build.rs), so this builds on any
-# host and links the real implementation only where the archives exist.
-flex-rs = { path = "../flex-rs" }
+# THE SEAM (workspace row): senlib-rs's flex-rs — the typed surface (addressing,
+# control-block words, scheduler) AND the native doors over the senlib driver, compiled
+# directly into this graph. Nothing flex-rs lives in this repository; the senlib crates
+# resolve transitively within senlib-rs's workspace, and the export-controlled data
+# compiles in through the workspace's red patch.
+flex-rs = { workspace = true }
 scratchy-spyre-bundle = { path = "../../../spyre/crates/bundle" }
 ktir-superdsc = { path = "../../../spyre/crates/ktir/ktir-superdsc" }
 scratchy-tensors = { path = "../../../../crates/tensors" }

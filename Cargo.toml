@@ -40,7 +40,12 @@ members = [
 # plain `cargo build`/`cargo update` here never needs network access to the
 # goose fork. Build/run it via `cargo run -p scratchy-tui` from
 # crates/targets/metal/tui, which has its own Cargo.lock.
-exclude = ["crates/targets/metal/tui"]
+#
+# backends/spyre-hw is its own workspace by design (the card side, compiled
+# against the senlib-rs checkout that sits beside this tree — a path CI
+# cannot reach): excluded STATED, not accidental, so this root workspace's
+# resolution never grows an edge into it.
+exclude = ["crates/targets/metal/tui", "backends/spyre-hw"]
 
 [workspace.package]
 version = "0.1.0"

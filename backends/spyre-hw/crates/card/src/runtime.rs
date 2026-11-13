@@ -76,12 +76,12 @@ use flex_rs::util::Status;
 /// nickm5 held 8 open and linked at once, 2026-11-06). A one-card process is the same code with
 /// one `CardRuntime`.
 ///
-/// Built by [`CardRuntime::open`]: the card by PCI address (`flex_rs::senlib_ffi::Card::open`),
+/// Built by [`CardRuntime::open`]: the card by PCI address (`flex_rs::card::Card::open`),
 /// its capacity read from the card, then a real `RuntimeContext` over a `Pf` backend and a real
 /// `FlexAllocator` whose address resolution is `FlexAllocatorAddressResolver` (production — see the
 /// `flex_rs::scheduler` module doc).
 pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
-    card: Arc<flex_rs::senlib_ffi::Card>,
+    card: Arc<flex_rs::card::Card>,
     /// ⭐ THE CPUS THIS CARD'S HOST THREADS RUN ON — its NUMA node's, read from sysfs at open
     /// (`flex_rs::numa`). Its response worker, its rank's submit thread and its bring-up thread
     /// each pin themselves to it first.
@@ -127,7 +127,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         let cpus = CardCpus::read(pci).map_err(BringUpError::Placement)?;
         cpus.pin_current_thread().map_err(BringUpError::Pin)?;
         tracing::info!("[spyre-card] card {index} ({pci}): host threads on {cpus}");
-        let card = flex_rs::senlib_ffi::Card::open(pci).map_err(BringUpError::Open)?;
+        let card = flex_rs::card::Card::open(pci).map_err(BringUpError::Open)?;
         // Real single on-card domain, sized off the card's actual HBM capacity and RCU core count —
         // `flex::populateDomainTopology` (`device_memory_topology.cpp`), ported natively as
         // `topology::populate_domain_topology`. A hardcoded placeholder here once mis-sized the
@@ -174,7 +174,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     }
 
     /// The senlib card this runtime drives.
-    pub fn card(&self) -> &Arc<flex_rs::senlib_ffi::Card> {
+    pub fn card(&self) -> &Arc<flex_rs::card::Card> {
         &self.card
     }
 
@@ -186,7 +186,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
 
     /// This card's key in the RB telemetry ring (`flex_rs::rb_telemetry::RbTiming::source`) —
     /// the same identity its hardware submitter records completions under, from the one
-    /// definition both read ([`flex_rs::senlib_ffi::Card::telemetry_key`]).
+    /// definition both read ([`flex_rs::card::Card::telemetry_key`]).
     pub fn telemetry_key(&self) -> usize {
         self.card.telemetry_key()
     }
@@ -1766,7 +1766,7 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
     window: RecvWindow<T>,
 ) -> Result<(), AttachRefusal<T>> {
     let region2: PerRank<T, u64> = PerRank::try_from_fn(|r| {
-        flex_rs::senlib_ffi::pci_addr_for_region(cards.get(r).card.pci(), 2)
+        flex_rs::card::pci_addr_for_region(cards.get(r).card.pci(), 2)
     })
     .map_err(AttachRefusal::PeerRegion)?;
     for (me, c) in cards.iter() {
