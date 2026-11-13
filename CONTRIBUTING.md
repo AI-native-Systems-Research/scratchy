@@ -149,8 +149,8 @@ sent back regardless of how well it works:
 
 #### Build — scope to one model
 
-Pick your target's CLI (`scr` on metal: `-p scratchy-target-metal-cli`; `spyre`:
-`-p scratchy-target-spyre-cli`) and
+Pick your target's CLI (`scr` on metal: `-p scratchy-target-metal-cli`; `spyre`: built in
+its own workspace, `cd backends/spyre && cargo build`) and
 name at least one model. Naming zero models is a **build-time panic**, not a
 silent empty binary.
 
