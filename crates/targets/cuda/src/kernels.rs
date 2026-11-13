@@ -4024,9 +4024,11 @@ pub unsafe fn quant_rows_fp8(
     check(code, KernelError::RowShape { rows, cols })
 }
 
-/// Test support for `tests/quant_rows_fp8.rs` only (FP8 S8 F3): [`quant_rows_fp8`] at `variant`, 0
-/// the FP8 S3 kernel (one warp a 16-row block) and 1 [`quant_rows_fp8`]'s own (eight warps a block),
-/// the same bits. Refused as [`quant_rows_fp8`], or for `variant` above 1. Asynchronous.
+/// Test support for `tests/quant_rows_fp8.rs` only (FP8 S8 F3, P2): [`quant_rows_fp8`] at
+/// `variant`, 0 the FP8 S3 kernel (one warp a 16-row block), 1 [`quant_rows_fp8`]'s own (eight
+/// warps a block), and P2's probe forms, 2 a 16-row block's tiles resident in shared memory (refused
+/// above 5,120 columns) and 3 one CTA a row (refused unless `cols` is a multiple of 256 at most
+/// 17,408); the same bits. Refused as [`quant_rows_fp8`], or for `variant` above 3. Asynchronous.
 ///
 /// Kept: both forms are production ([`quant_rows_fp8`] takes the
 /// one-warp form for many narrow rows).

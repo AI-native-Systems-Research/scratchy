@@ -570,3 +570,155 @@ fn the_one_row_quantize_is_quant_rows_fp8_bit_for_bit() {
     }
     assert!(pass, "Q1 is not quant_rows_fp8's row 0");
 }
+
+// ── FP8 S8 P2: the dense prefill quantize's probe forms ─────────────────────────
+
+/// P2's probe shapes: 2,048 token rows × the dense fp8 `k`s of the three models (2,048, 2,816,
+/// 4,096, 5,120, 6,144, 17,408).
+const P2_ROWS: usize = 2048;
+const P2_KS: [usize; 6] = [2048, 2816, 4096, 5120, 6144, 17408];
+
+/// The forms `cols` is probed at, `(variant, name)`: F3 (the launcher's today), RESIDENT where it
+/// takes the row (at most 5,120 columns), PER ROW.
+fn p2_forms(cols: usize) -> Vec<(u32, &'static str)> {
+    let mut forms = vec![(1, "f3")];
+    if cols <= 5120 {
+        forms.push((2, "resident"));
+    }
+    forms.push((3, "per_row"));
+    forms
+}
+
+/// P2's probe forms (variant 2, a block's tiles resident in shared memory; 3, one CTA a row) are
+/// F3's bits, bytes and scales, at 2,048 rows × every probed `k` on random, padded and edge rows,
+/// and RESIDENT at a partial last tile and a single block, as `P2_BITS` lines; each refuses the
+/// shapes it does not take, as `P2_REFUSED` lines.
+#[test]
+fn the_dense_quantize_probe_forms_are_f3s_bits() {
+    use scratchy_target_cuda::kernels::quant_rows_fp8_variant;
+    let device = h100();
+    let mut pass = true;
+    let shapes = P2_KS
+        .iter()
+        .map(|&k| (P2_ROWS, k))
+        .chain([(16, 320), (48, 5120)]);
+    for (rows, cols) in shapes {
+        for kind in ["random", "padded", "edge"] {
+            let x = DeviceBuffer::upload(&device, &f3_input(kind, rows, cols)).expect("x");
+            let f3 = variant_quant(&device, &x, (rows, cols), 1);
+            for (variant, name) in p2_forms(cols).into_iter().skip(1) {
+                if variant == 3 && !cols.is_multiple_of(256) {
+                    continue;
+                }
+                let (q, s) = variant_quant(&device, &x, (rows, cols), variant);
+                let q_bad = f3.0.iter().zip(&q).filter(|(a, b)| a != b).count();
+                let s_bad = (f3.1.chunks(4).zip(s.chunks(4)))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let ok = q_bad == 0 && s_bad == 0;
+                eprintln!(
+                    "P2_BITS rows={rows} cols={cols} {kind} {name}: mismatched_bytes={q_bad} \
+                     mismatched_scales={s_bad} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    let null = std::ptr::null_mut();
+    for (what, cols, variant) in [
+        ("resident above 20 tiles", 5376u32, 2u32),
+        ("per row at a partial chunk", 320, 3),
+        ("per row above 68 chunks", 17664, 3),
+        ("variant 4", 2048, 4),
+    ] {
+        // SAFETY: every shape here is refused before any pointer is touched.
+        let got = unsafe { quant_rows_fp8_variant(null, (null, null), (16, cols), variant, null) };
+        let ok = got == Err(KernelError::RowShape { rows: 16, cols });
+        eprintln!("P2_REFUSED {what}: {got:?} {}", verdict(ok));
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a P2 probe form is not F3's bits, or took a shape it refuses"
+    );
+}
+
+/// P2's probe: F3, RESIDENT and PER ROW at 2,048 rows × every probed `k` (random rows), read-flush
+/// cold and hot, two rounds (each form in turn, twice), as `TC_TIME` lines, then per `k` and
+/// temperature the fastest form by its better round's median, as `P2_WINNER` lines.
+#[test]
+fn the_dense_quantize_probe_times_are_recorded() {
+    use scratchy_target_cuda::kernels::quant_rows_fp8_variant;
+    let device = h100();
+    let (fr, fc) = (2048usize, 25600usize);
+    let fx = DeviceBuffer::upload_bytes(&device, &vec![0u8; fr * fc * 2]).expect("flush x");
+    let fq = DeviceBuffer::upload_bytes(&device, &vec![0u8; fr * fc]).expect("flush q");
+    let fs = DeviceBuffer::upload_bytes(&device, &vec![0u8; fr * 4]).expect("flush s");
+    let flush = || {
+        // SAFETY: the flush buffers hold their shape; null is the default stream.
+        unsafe {
+            quant_rows_fp8_variant(
+                fx.ptr(),
+                (fq.ptr(), fs.ptr()),
+                (fr as u32, fc as u32),
+                1,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("flush");
+    };
+    for cols in P2_KS {
+        let rows = P2_ROWS;
+        let x = DeviceBuffer::upload(&device, &f3_input("random", rows, cols)).expect("x");
+        let q = DeviceBuffer::upload_bytes(&device, &vec![0u8; rows * cols]).expect("q");
+        let s = DeviceBuffer::upload_bytes(&device, &vec![0u8; rows * 4]).expect("s");
+        let shape = format!("qr_{rows}x{cols}_random");
+        // Per (temperature, form): the best round's median.
+        let mut best: Vec<(&str, &str, f64)> = Vec::new();
+        for round in 1..=2 {
+            for (variant, name) in p2_forms(cols) {
+                let launch = || {
+                    // SAFETY: `x` holds rows·cols bf16, `q` rows·cols bytes and `s` rows f32; null
+                    // is the default stream.
+                    unsafe {
+                        quant_rows_fp8_variant(
+                            x.ptr(),
+                            (q.ptr(), s.ptr()),
+                            (rows as u32, cols as u32),
+                            variant,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("quant_rows_fp8_variant launch");
+                };
+                let cold = timed(flush, launch);
+                let hot = timed(|| {}, launch);
+                for (temp, (med, lo, hi)) in [("readcold", cold), ("hot", hot)] {
+                    eprintln!(
+                        "TC_TIME {temp} {shape} p2_{name}: median={med:.1}us min={lo:.1}us \
+                         max={hi:.1}us {:.2} TB/s (round {round})",
+                        (rows * cols * 3) as f64 / med / 1e6
+                    );
+                    match best.iter_mut().find(|(t, n, _)| (*t, *n) == (temp, name)) {
+                        Some(b) => b.2 = b.2.min(med),
+                        None => best.push((temp, name, med)),
+                    }
+                }
+            }
+        }
+        for temp in ["readcold", "hot"] {
+            let mine: Vec<_> = best.iter().filter(|(t, ..)| *t == temp).collect();
+            let f3 = mine
+                .iter()
+                .find(|(_, n, _)| *n == "f3")
+                .map_or(f64::NAN, |b| b.2);
+            if let Some((_, name, med)) = mine.iter().min_by(|a, b| a.2.total_cmp(&b.2)) {
+                eprintln!(
+                    "P2_WINNER k={cols} {temp}: {name} {med:.1}us (f3 {f3:.1}us, saves {:.1}us)",
+                    f3 - med
+                );
+            }
+        }
+    }
+}
