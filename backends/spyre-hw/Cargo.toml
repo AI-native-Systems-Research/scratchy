@@ -1,13 +1,12 @@
-# The card side of the Spyre target: what runs on a card — its runtime (flex-rs and the resident
-# executor), the worker, and the `spyre` binary (which also runs the emulator). It depends on
-# `../spyre`, the workspace CI builds, by path, and may depend on what CI cannot reach; nothing in
-# `../spyre` depends on it.
+# The card side of the Spyre target: what runs on a card — its runtime (senlib-rs's flex-rs and
+# the resident executor), the worker, and the `spyre` binary (which also runs the emulator). It
+# depends on `../spyre`, the workspace CI builds, by path, and may depend on what CI cannot reach;
+# nothing in `../spyre` depends on it.
 [workspace]
 resolver = "2"
 default-members = ["crates/cli"]
 members = [
     "crates/card",
-    "crates/flex-rs",
     "crates/worker",
     "crates/cli",
     "crates/tp",
@@ -44,6 +43,35 @@ scratchy-serving-scheduler = { path = "../../crates/serving/scheduler" }
 scratchy-serving-worker = { path = "../../crates/serving/worker" }
 
 scratchy-target-spyre-worker = { path = "crates/worker" }
+
+# THE SEAM, by path: senlib-rs's flex-rs is THE one implementation of the card runtime — the
+# typed surface (addressing, control-block words, scheduler) and the native doors over the
+# senlib driver. Nothing flex-rs lives in this repository. The senlib crates it needs
+# (chip/host/driver/boot) resolve transitively within senlib-rs's own workspace.
+#
+# LAYOUT CONTRACT (Linux only — senlib-host is): this tree, the senlib-rs checkout, and the
+# senlib-rs-red checkout sit as siblings under one parent directory; `../../../senlib-rs` from
+# here reaches it. An absent checkout fails the build loudly by path — never a fallback.
+#
+# `snt1p0`: the spyre hardware generation this workspace states its facts for. NO DEFAULT is
+# possible — senlib-rs's law: a build that names no generation does not compile.
+flex-rs = { path = "../../../senlib-rs/crates/flex-rs", features = ["snt1p0"] }
+
+# RED, TRANSITIONAL (user ruling, 2026-11-13): the export-controlled data compiles in FROM
+# SOURCE. Senlib-rs's graph names the stub (same package name and version, names and shapes
+# only) at `crates/export-controlled-stub`; this patch swaps that path edge for red's real
+# crate in this workspace's graph — the one sanctioned mechanism (senlib-rs's own
+# `patches/oco-fixtures.toml` route), stated here instead of per-invocation because this
+# workspace's whole point is the direct-compilation world. The undefined-through/ledger
+# machinery retires with it; the `.so` is restorable later by user ruling. The key is the
+# stub's resolved source — a patch keys on the source URL, which cannot be relative, so it
+# names the canonical pod path `/work/senlib-rs`; a deployment that puts senlib-rs elsewhere
+# resolves flex-rs by the relative path but MISSES this patch, and the build then fails
+# loudly on the stub's unresolved `oco_*` — never a silent fallback. The
+# value is red's crate, whose rlib carries the values — its `so`/`so-static` features are
+# no-ops there. An absent red checkout fails the build loudly — never a fallback to the stub.
+[patch.'file:///work/senlib-rs/crates/export-controlled-stub']
+senlib-rs-export-controlled = { path = "../../../senlib-rs-red/crates/export-controlled" }
 
 # Profiles apply only from a workspace root, so these repeat the root workspace's (its comments
 # say why each is set), plus the two for spyre's own compiled models, which this workspace's

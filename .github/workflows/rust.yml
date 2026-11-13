@@ -87,16 +87,10 @@ jobs:
         working-directory: backends/spyre
         run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings
 
-      # The card workspace (backends/spyre-hw): the card runtime, flex-rs, the worker and the
-      # `spyre` binary. It may come to depend on what this runner cannot fetch; until it does,
-      # it is linted here like the rest. `--workspace` builds flex-rs, whose build script links
-      # the FFI archives (libflex_shim.a + libsenlib_oco.a) from SENLIB_STATIC_LIB_DIR. The
-      # runner has no archives, so skip emitting the link directives — check/clippy don't link.
-      - name: Clippy (spyre-hw workspace)
-        working-directory: backends/spyre-hw
-        env:
-          SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo clippy --workspace --features model/granite-3.1-8b-instruct -- -D warnings
+      # The card workspace (backends/spyre-hw) is NOT linted here: it compiles the
+      # senlib-rs checkout (and, transitionally, senlib-rs-red) that sit beside this
+      # tree on a card host — paths this runner cannot reach, by design. Its gate is
+      # the card leg, on the pod.
 
       # The same model under its fp8 preset (`fp8-dynamic-per-channel`): the weights
       # struct's typed handles must cover an fp8 linear too, or every fp8 build panics
