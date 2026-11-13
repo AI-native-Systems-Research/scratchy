@@ -22,13 +22,32 @@ pub fn cache_base_dir() -> PathBuf {
     PathBuf::from("/tmp")
 }
 
-/// The scratchy metal aligned-weight sidecar cache:
-/// `<cache_base>/scratchy/metal-aligned-weights`. Holds realigned weight
-/// blobs that metal mmaps zero-copy on relaunch.
-pub fn metal_aligned_weights_dir() -> PathBuf {
-    cache_base_dir()
-        .join("scratchy")
-        .join("metal-aligned-weights")
+/// Where every target's aligned-weight sidecar cache lives: `<cache_base>/scratchy`.
+pub fn aligned_weights_root() -> PathBuf {
+    cache_base_dir().join("scratchy")
+}
+
+/// A target's aligned-weight sidecar cache: `<cache_base>/scratchy/<target>-aligned-weights`.
+/// Holds realigned weight blobs the target mmaps zero-copy on relaunch.
+pub fn aligned_weights_dir(target: &str) -> PathBuf {
+    aligned_weights_root().join(format!("{target}-aligned-weights"))
+}
+
+/// Every target's aligned-weight cache under [`aligned_weights_root`], sorted; none when the root
+/// does not exist.
+pub fn aligned_weights_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = (std::fs::read_dir(aligned_weights_root()).into_iter())
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && (p.file_name().and_then(|n| n.to_str()))
+                    .is_some_and(|n| n.ends_with("-aligned-weights"))
+        })
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 #[cfg(test)]
@@ -38,8 +57,8 @@ mod tests {
     #[test]
     fn weights_dir_is_under_cache_base() {
         let base = cache_base_dir();
-        let weights = metal_aligned_weights_dir();
+        let weights = aligned_weights_dir("some-target");
         assert!(weights.starts_with(&base));
-        assert!(weights.ends_with("scratchy/metal-aligned-weights"));
+        assert!(weights.ends_with("scratchy/some-target-aligned-weights"));
     }
 }

@@ -353,7 +353,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let n_slots = num_tensors * 2;
     let calls = std::cell::Cell::new(0usize);
     let mut kv = unsafe {
-        KvCachePool::new_metal_chunked(
+        KvCachePool::new_chunked(
             layers,
             NUM_BLOCKS,
             BLOCK_SIZE,
@@ -378,7 +378,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
             |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
         )
     }
-    .expect("KvCachePool::new_metal_chunked");
+    .expect("KvCachePool::new_chunked");
     if let Some(h) = hybrid.as_ref() {
         kv.set_kv_group_layout(h.num_groups(), h.layer_to_group_u32());
     }

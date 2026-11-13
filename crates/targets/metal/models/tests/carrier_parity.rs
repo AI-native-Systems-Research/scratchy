@@ -390,7 +390,7 @@ mod imp {
                 )
             });
         let mut kv = unsafe {
-            KvCachePool::new_metal_chunked(
+            KvCachePool::new_chunked(
                 layers,
                 NUM_BLOCKS,
                 BLOCK_SIZE,
@@ -431,7 +431,7 @@ mod imp {
                     ))
                 },
             )
-            .expect("KvCachePool::new_metal_chunked")
+            .expect("KvCachePool::new_chunked")
         };
         if let Some(layout) = hybrid.as_ref() {
             kv.set_kv_group_layout(layout.num_groups(), layout.layer_to_group_u32());

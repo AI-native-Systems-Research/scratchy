@@ -5,7 +5,7 @@
 //! `scratchy-layers`; the defaulted alias preserves the
 //! `scratchy_target_metal::kv_cache::KvCachePool` (with `M = PoolMem` =
 //! [`MetalMem`](crate::MetalMem)) path the worker + macro emissions name. Every
-//! method the metal path uses (`new_metal_chunked`, `empty_for_vision`,
+//! method the metal path uses (`new_chunked`, `empty_for_vision`,
 //! `k_layer_mem` / `v_layer_mem`, `k_chunk_table_mem` / `v_chunk_table_mem`) is
 //! a neutral inherent method on the layers pool — no metal extension trait is
 //! needed (unlike the cuda target, whose `driver`-DMA methods ride a

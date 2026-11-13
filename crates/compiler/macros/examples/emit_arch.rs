@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Emit ONE arch's forward, for any arch, on any host — a verification tool.
 //!
-//! `scratchy-models`' build script gates each arch on a backend
-//! (`scratchy_forward_compiler_macro::arch_compiled`, mirroring the
-//! `pub mod` cfgs in its `src/lib.rs`), so on a machine with neither a CUDA
-//! toolchain nor macOS only `llama` and `granite` can be built at all. That
-//! makes the other 23 arches' codegen unverifiable via `cargo check` there,
-//! even though parse → classify → shape → CFG → unroll → schedule → codegen
-//! is entirely target-neutral up to the final emit.
+//! A target's models build compiles an arch only where that target lowers it,
+//! so a host without a given target cannot `cargo check` the arches only it
+//! compiles — even though parse → classify → shape → CFG → unroll → schedule →
+//! codegen is entirely target-neutral up to the target's own emission.
 //!
 //! This driver runs that same pipeline directly — the identical
-//! `parse_python_file` + `compile_carrier` + `render_tokens` sequence
-//! `emit_arch()` uses — with no backend gate, and prints the rendered
-//! emit to stdout. Diffing its output across a refactor proves the
-//! change was semantics-preserving for arches the host cannot compile.
+//! `parse_python_file` + `compile_carrier` + `render_tokens` sequence the
+//! models build uses — under the target of every shared default
+//! (`target::Shared`), and prints the rendered emit to stdout. Diffing its
+//! output across a refactor proves the change was semantics-preserving for
+//! arches the host cannot compile.
 //!
 //! ```text
-//! cargo run -p scratchy-forward-compiler-macro --example emit_arch -- qwen3 "" qwen3-0.6b
+//! cargo run -p scratchy-forward-compiler-macro --features test-support --example emit_arch -- qwen3 "" qwen3-0.6b
 //! ```
 //!
 //! Writes nothing; redirect stdout to capture. Stderr carries progress.
 
+use scratchy_forward_compiler_macro::target::Shared;
 use scratchy_forward_compiler_macro::{Scope, compile_carrier, parse_python_file, render_tokens};
 use std::path::PathBuf;
 
@@ -85,7 +84,7 @@ fn main() {
     let text = std::fs::read_to_string(&dsl_path).expect("read DSL");
     let carrier =
         parse_python_file(&text).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let tokens = compile_carrier(carrier, &configs_dir, None, &scope)
+    let tokens = compile_carrier(carrier, &configs_dir, None, &scope, &Shared)
         .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 
     let mut rendered = String::with_capacity(1 << 20);

@@ -3704,7 +3704,7 @@ fn emit_weights_struct(
     // metal match below is exhaustive with no refusal arm.
     //
     // Cache dtype is `BF16` to match the rest of the metal stack:
-    // `CanonicalParams::METAL_DTYPE` defaults to bf16, the
+    // `CanonicalParams::ACT_DTYPE` defaults to bf16, the
     // `rope_append_bf16_specialized` shader binds `cos_sin` as
     // `device const bfloat*`, and Llama-3.x weights ship bf16 on
     // disk. (The previous codegen pinned this at BF16 too but the
@@ -7627,10 +7627,10 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             }
         }
     };
-    let metal_dtype = match f.metal_dtype() {
-        scratchy_ir::model_facts::MetalDtype::Bf16 => quote! { #m::MetalDtype::Bf16 },
-        scratchy_ir::model_facts::MetalDtype::F16 => quote! { #m::MetalDtype::F16 },
-        scratchy_ir::model_facts::MetalDtype::Int4 => quote! { #m::MetalDtype::Int4 },
+    let act_dtype = match f.act_dtype() {
+        scratchy_ir::model_facts::ActDtype::Bf16 => quote! { #m::ActDtype::Bf16 },
+        scratchy_ir::model_facts::ActDtype::F16 => quote! { #m::ActDtype::F16 },
+        scratchy_ir::model_facts::ActDtype::Int4 => quote! { #m::ActDtype::Int4 },
     };
     let scale_dtype = match f.scale_dtype() {
         scratchy_ir::model_facts::ScaleDtype::Bf16 => quote! { #m::ScaleDtype::Bf16 },
@@ -7660,7 +7660,7 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     }));
     quote! {
         #m::ModelFacts::new(#m::FactsParts {
-            metal_dtype: #metal_dtype,
+            act_dtype: #act_dtype,
             scale_dtype: #scale_dtype,
             hidden: #m::HiddenSize::new(#hidden),
             intermediate: #intermediate,
@@ -8203,7 +8203,7 @@ pub(crate) fn fill_canonical_params(
             .map(|layers| mf::KvLayers::new(Vec::leak(layers.to_vec())));
         mf::ModelFacts::new(mf::FactsParts {
             // No arch overrides the metal element dtype.
-            metal_dtype: mf::MetalDtype::Bf16,
+            act_dtype: mf::ActDtype::Bf16,
             scale_dtype: match scale_dtype_is_bf16 {
                 true => mf::ScaleDtype::Bf16,
                 false => mf::ScaleDtype::F16,
@@ -8912,7 +8912,7 @@ mod tests {
             "GLOBAL_Q_SIZE",
             "ROPE_PROPORTIONAL",
             "ROPE_ON_READ",
-            "METAL_DTYPE",
+            "ACT_DTYPE",
             "HIDDEN_SIZE",
             "VOCAB_SIZE",
             "SCALE_DTYPE",

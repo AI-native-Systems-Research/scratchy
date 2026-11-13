@@ -94,22 +94,22 @@ pub enum BridgeError {
     /// emit (fp8 needs the weight_scale wired as a 3rd Gemm input + 1-byte staging; int4/ggml unwired).
     /// A build-time refusal — NOT a silent mis-lower of a packed weight as dense fp16.
     UnsupportedWeight { tile: TileId, detail: &'static str },
-    /// METAL HAS NO KERNEL for this shape at all — not a gap in the
-    /// bridge, a gap in the backend. Distinct from
+    /// NO KERNEL takes this shape at all — not a gap in the bridge, a gap
+    /// in the kernels. Distinct from
     /// [`Self::UnsupportedWeight`] because the two are handled
     /// differently: this one is TOLERATED the way the runtime-lowering
     /// path tolerated it (the preset bakes an empty variant list and
     /// the pool refuses at load), while a bridge gap must stay fatal
     /// or the front-end swap silently drops a tile.
-    NoMetalRealization { tile: TileId, detail: &'static str },
+    NoKernel { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
     UnrealizedExpertActivation { tile: TileId, act: String },
 }
 
 impl BridgeError {
-    /// See [`Self::NoMetalRealization`].
-    pub fn is_no_metal_realization(&self) -> bool {
-        matches!(self, Self::NoMetalRealization { .. })
+    /// See [`Self::NoKernel`].
+    pub fn is_no_kernel(&self) -> bool {
+        matches!(self, Self::NoKernel { .. })
     }
 }
 
@@ -152,7 +152,7 @@ impl std::fmt::Display for BridgeError {
                  and no kernel implements a third",
                 tile.0
             ),
-            Self::NoMetalRealization { tile, detail } => {
+            Self::NoKernel { tile, detail } => {
                 write!(f, "tile {}: {detail}", tile.0)
             }
             Self::UnrealizedExpertActivation { tile, act } => write!(
@@ -1436,10 +1436,10 @@ pub fn lower_decode_to_wavefront(
                         (*group_size, *bits)
                     }
                     _ => {
-                        return Err(BridgeError::NoMetalRealization {
+                        return Err(BridgeError::NoKernel {
                             tile,
-                            detail: "MoE without affine expert storage has no metal \
-                                     realization (dense MoE is unclaimed on metal)",
+                            detail: "MoE without affine expert storage has no kernel \
+                                     (no expert kernel takes dense expert storage)",
                         });
                     }
                 };
@@ -1754,10 +1754,10 @@ pub fn lower_decode_to_wavefront(
                         (*group_size, *bits)
                     }
                     _ => {
-                        return Err(BridgeError::NoMetalRealization {
+                        return Err(BridgeError::NoKernel {
                             tile,
-                            detail: "gptoss_moe without affine expert storage has no metal \
-                                     realization (dense MoE is unclaimed on metal)",
+                            detail: "gptoss_moe without affine expert storage has no kernel \
+                                     (no expert kernel takes dense expert storage)",
                         });
                     }
                 };

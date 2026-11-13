@@ -377,8 +377,8 @@ impl InstructionInfo for Instruction {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::MetalBiasAdd(in_slot, out_slot, layer, _n, _is_affine) => (
-                "MetalBiasAdd",
+            Instruction::LinearBiasAdd(in_slot, out_slot, layer, _n, _is_affine) => (
+                "LinearBiasAdd",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
@@ -742,7 +742,7 @@ impl InstructionInfo for Instruction {
                     F::LayerKind("SharedFusedMoELayer"),
                 ],
             ),
-            Instruction::MetalFusedMoe(
+            Instruction::AffineFusedMoe(
                 in_slot,
                 out_slot,
                 layer,
@@ -753,7 +753,7 @@ impl InstructionInfo for Instruction {
                 gs,
                 bits,
             ) => (
-                "MetalFusedMoe",
+                "AffineFusedMoe",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
@@ -767,7 +767,7 @@ impl InstructionInfo for Instruction {
                     F::ConstU32(bits),
                 ],
             ),
-            Instruction::MetalSharedFusedMoe(
+            Instruction::AffineSharedFusedMoe(
                 in_slot,
                 out_slot,
                 layer,
@@ -780,7 +780,7 @@ impl InstructionInfo for Instruction {
                 bits,
                 norm_topk_prob,
             ) => (
-                "MetalSharedFusedMoe",
+                "AffineSharedFusedMoe",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),

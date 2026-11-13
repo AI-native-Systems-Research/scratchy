@@ -16,12 +16,12 @@
 // ungated, so this import stays at the module level. `MAX_DIMS` is not
 // root-exported from `scratchy-tensors`, so use the module path.
 use scratchy_tensors::tensor::MAX_DIMS;
-// `MetalDtype` / `ScaleDtype` back the `CanonicalParams::METAL_DTYPE` /
+// `ActDtype` / `ScaleDtype` back the `CanonicalParams::ACT_DTYPE` /
 // `SCALE_DTYPE` consts. They relocated to the cfg-free
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
 pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
-use scratchy_tensors::{MetalDtype, ScaleDtype};
+use scratchy_tensors::{ActDtype, ScaleDtype};
 
 pub mod model_facts;
 
@@ -429,7 +429,7 @@ pub enum Instruction {
     /// .bias` or `LinearLayer::AffineQuant.linear_bias`. `n` is the
     /// bias's broadcast dimension — baked into the specialized
     /// pipeline as `function_constant(0)`.
-    MetalBiasAdd(u32, u32, u32, u32, bool),
+    LinearBiasAdd(u32, u32, u32, u32, bool),
     FusedGateUpSiluMul(u32, u32, u32),
     FusedGateUpGeluMul(u32, u32, u32),
     FusedQkvRopeCache(u32, u32, u32, bool, bool),
@@ -629,9 +629,9 @@ pub enum Instruction {
     /// `scratchy-forward-compiler-macro::metal::moe`) emits this variant when
     /// `profile.backend == Backend::Metal` and the per-expert weight
     /// storage is `Affine`.
-    MetalFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    AffineFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32),
     /// Metal-only Qwen-MoE-style fused MoE + optional shared expert.
-    /// Same rationale as [`Instruction::MetalFusedMoe`]: macro-baked
+    /// Same rationale as [`Instruction::AffineFusedMoe`]: macro-baked
     /// shape for the Metal lowering arm.
     ///
     /// Tuple fields: `(in_slot, out_slot, layer, num_experts, top_k,
@@ -646,12 +646,12 @@ pub enum Instruction {
     ///
     /// Softmax order is fixed by variant identity: Qwen-MoE does
     /// `softmax → topk → take_along_axis(scores)`.
-    MetalSharedFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, bool),
+    AffineSharedFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, bool),
     /// Metal-only Gemma-4 fused MoE block (the `gemma_moe` op). Routes off
     /// the post-attention residual (`router_in`, input 0) and runs the
     /// selected GeGLU experts on the pre-FF2-normed input (`expert_in`,
     /// input 1), summing by the routed weights. Distinct from
-    /// [`Instruction::MetalSharedFusedMoe`] in three ways the lowering needs:
+    /// [`Instruction::AffineSharedFusedMoe`] in three ways the lowering needs:
     /// a leading RMSNorm of `router_in` by the router gain, a softmax
     /// TEMPERATURE of `hidden_size^-0.5` applied to the gathered top-k scores
     /// BEFORE the softmax, a per-expert-scale gather-multiply after it, and
@@ -910,7 +910,7 @@ impl KvOffsets {
 }
 
 /// Pack the three routed-expert projection bit-widths (gate / up / down)
-/// into the single `bits` field of [`Instruction::MetalSharedFusedMoe`].
+/// into the single `bits` field of [`Instruction::AffineSharedFusedMoe`].
 ///
 /// MLX dynamic/mixed quant (Qwen3.5 OptiQ) gives each routed-expert
 /// projection its OWN bit-width, and they can differ WITHIN one layer
@@ -1156,7 +1156,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// Element dtype the metal backend should run this canonical in.
     /// Picks between the `_f16_specialized` / `_bf16_specialized`
     /// shader symbols and matching MPS GEMM data type. Default
-    /// `MetalDtype::Bf16` matches every modern HF Llama / Qwen /
+    /// `ActDtype::Bf16` matches every modern HF Llama / Qwen /
     /// Phi / Mistral checkpoint (`torch_dtype: bfloat16` on disk).
     /// Per-canonical macro
     /// overrides set this from the model config's `torch_dtype`.
@@ -1165,7 +1165,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// range over deep layer chains and produced incoherent outputs
     /// on Llama-3.x. The default is `Bf16` now; arches that ship
     /// fp16 on disk (rare) override.
-    const METAL_DTYPE: MetalDtype = Self::FACTS.metal_dtype();
+    const ACT_DTYPE: ActDtype = Self::FACTS.act_dtype();
 
     /// `hidden_size` (residual-stream width) — distinct from
     /// `Q_SIZE = num_q_heads * head_dim`. On Llama / Qwen2.5 these

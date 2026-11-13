@@ -1544,7 +1544,7 @@ pub fn bake_bucket_tapes(
         };
         for tq_heads in heads {
             let variant = TapeVariant { cap, tq_heads };
-            pool.name_kernels(tape.commands, mc.metal_dtype(), variant)?;
+            pool.name_kernels(tape.commands, mc.act_dtype(), variant)?;
             let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
             let addressing_toks =
                 tok("addressing", crate::const_tokens::const_tokens(&addressing))?;

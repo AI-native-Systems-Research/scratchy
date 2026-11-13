@@ -253,7 +253,7 @@ fn argsort_f32_qwen3_5_moe_topk_bn64() {
 
 #[test]
 fn argsort_f16_qwen3_5_moe_topk_bn64() {
-    // E=256 f16 — the W::METAL_DTYPE=F16 router path at bn=64.
+    // E=256 f16 — the W::ACT_DTYPE=F16 router path at bn=64.
     run_case(
         ArgsortDType::F16,
         /*rows=*/ 9,
@@ -265,7 +265,7 @@ fn argsort_f16_qwen3_5_moe_topk_bn64() {
 
 #[test]
 fn argsort_bf16_qwen3_5_moe_topk_bn64() {
-    // E=256 bf16 — the W::METAL_DTYPE=Bf16 router path at bn=64
+    // E=256 bf16 — the W::ACT_DTYPE=Bf16 router path at bn=64
     // (Qwen3.x MLX checkpoints carry bf16 scales → bf16 router probs).
     run_case(
         ArgsortDType::Bf16,

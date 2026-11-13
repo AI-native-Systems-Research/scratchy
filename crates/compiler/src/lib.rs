@@ -43,15 +43,15 @@ pub use info::{
 // `scratchy-ir` crate; re-exported here so the macro path
 // `::scratchy_forward_compiler::Instruction` keeps resolving.
 pub use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets, RowsExtern};
-// Routed-expert per-projection bit packing for `MetalSharedFusedMoe`
+// Routed-expert per-projection bit packing for `AffineSharedFusedMoe`
 // (OptiQ mixed 4/8-bit). Re-exported so the macro codegen can pack and
 // the metal lowering can unpack via the same convention.
 pub use scratchy_ir::{pack_moe_expert_bits, unpack_moe_expert_bits};
 // `CanonicalParams` + `WeightAccessors` are cross-backend — the
 // metal interpreter (`interpreter::metal::worker::resolve_weight`)
 // invokes both. Both live in the cfg-free `scratchy-ir` crate (`CanonicalParams`'s
-// `METAL_DTYPE` / `SCALE_DTYPE` consts name the relocated
-// `scratchy_tensors::{MetalDtype, ScaleDtype}` enums), so the
+// `ACT_DTYPE` / `SCALE_DTYPE` consts name the relocated
+// `scratchy_tensors::{ActDtype, ScaleDtype}` enums), so the
 // re-exports are unconditional and the macro path
 // `::scratchy_forward_compiler::CanonicalParams` keeps resolving.
 pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors, model_facts};

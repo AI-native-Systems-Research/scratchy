@@ -939,7 +939,7 @@ mod tests {
             5632,
             2048,
             0.125,
-            scratchy_ir::model_facts::MetalDtype::Bf16,
+            scratchy_ir::model_facts::ActDtype::Bf16,
         );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
@@ -963,7 +963,7 @@ mod tests {
             8192,
             3072,
             0.088388347,
-            scratchy_ir::model_facts::MetalDtype::Bf16,
+            scratchy_ir::model_facts::ActDtype::Bf16,
         );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
@@ -990,7 +990,7 @@ mod tests {
             8192,
             2048,
             0.125,
-            scratchy_ir::model_facts::MetalDtype::Bf16,
+            scratchy_ir::model_facts::ActDtype::Bf16,
         );
         const KV_LORA_RANK: usize = 0;
         const QK_NOPE_HEAD_DIM: usize = 0;
@@ -998,7 +998,7 @@ mod tests {
         const V_HEAD_DIM: usize = 0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
-        const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
+        const ACT_DTYPE: crate::interpreter::metal::MetalDtype =
             crate::interpreter::metal::MetalDtype::Bf16;
     }
     impl scratchy_ir::WeightAccessors for Llama32_1BProbe {}

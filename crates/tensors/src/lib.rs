@@ -23,7 +23,7 @@ pub mod weight_source;
 
 pub use device_allocator::{DeviceAllocator, PoolMemory};
 pub use dtype::DType;
-pub use lowering_dtype::{MetalDtype, ScaleDtype};
+pub use lowering_dtype::{ActDtype, ScaleDtype};
 pub use owned_tensor::OwnedTensor;
 pub use raw_mem::RawGpuMem;
 pub use tensor::{GpuTensor, TensorView};
@@ -155,43 +155,5 @@ impl<'a> GpuWeightsHandle<'a> {
     #[inline]
     pub unsafe fn as_mut<T>(self) -> &'a mut T {
         &mut *(self.ptr as *mut T)
-    }
-}
-
-/// Backend-neutral opaque handle for the Metal worker's per-forward
-/// `RuntimeBindings` (input-id /
-/// position / KV-cache / GDN buffers). `RuntimeBindings` is a metal-rs struct
-/// in `scratchy-target-metal`, so the cfg-free dispatcher's `MetalChainBody`
-/// type cannot name it directly without re-coupling the compiler to the metal
-/// target. Threading this thin pointer through the closure keeps the chain
-/// body signature target-free; the worker that constructs the body and the
-/// macro-emitted `forward_chain_with_encoder` that invokes it both name the
-/// concrete `RuntimeBindings` and agree on the recovered type. Same
-/// object-safety / lifetime story as [`ForwardCtxHandle`] (shared borrow).
-#[derive(Clone, Copy)]
-pub struct MetalRuntimeHandle<'a> {
-    ptr: *const core::ffi::c_void,
-    _marker: core::marker::PhantomData<&'a ()>,
-}
-
-impl<'a> MetalRuntimeHandle<'a> {
-    /// Wrap a borrow of the concrete `RuntimeBindings` as the neutral handle.
-    #[inline]
-    pub fn new<T>(runtime: &'a T) -> Self {
-        Self {
-            ptr: runtime as *const T as *const core::ffi::c_void,
-            _marker: core::marker::PhantomData,
-        }
-    }
-
-    /// Recover the concrete `RuntimeBindings` reference.
-    ///
-    /// # Safety
-    /// `T` must be the exact concrete type the handle was built from with
-    /// [`Self::new`] (the worker's body closure and the macro-emitted chain
-    /// caller agree on `scratchy_target_metal::interpreter::metal::RuntimeBindings`).
-    #[inline]
-    pub unsafe fn as_ref<T>(self) -> &'a T {
-        &*(self.ptr as *const T)
     }
 }

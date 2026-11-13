@@ -5,7 +5,7 @@
 //! `tests/golden_gen_qwen3_py.py` (the oracle — same text, same weights,
 //! same inputs) which dumps `logits.bin` + the inputs. This test builds
 //! the SAME state on the metal side (real checkpoint through the
-//! macro-emitted `load`, a `KvCachePool::new_metal_chunked` pool, an
+//! macro-emitted `load`, a `KvCachePool::new_chunked` pool, an
 //! identity-layout block table) and runs the macro-emitted `forward`,
 //! then compares logits numerically.
 //!
@@ -144,7 +144,7 @@ fn qwen3_py_carrier_parity() {
     // the worker's job; a fully-eager pool with initial_chunks =
     // usize::MAX covers the one chunk our 8 tokens touch).
     let kv = unsafe {
-        KvCachePool::new_metal_chunked(
+        KvCachePool::new_chunked(
             LAYERS,
             NUM_BLOCKS,
             BLOCK_SIZE,
@@ -175,7 +175,7 @@ fn qwen3_py_carrier_parity() {
                 ))
             },
         )
-        .expect("KvCachePool::new_metal_chunked")
+        .expect("KvCachePool::new_chunked")
     };
     // The chunk-address tables start zeroed — the worker fills them with
     // each chunk's GPU virtual address right after pool construction

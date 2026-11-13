@@ -1213,7 +1213,7 @@ impl MetalAllocator {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         canon.hash(&mut h);
-        let dir = scratchy_core_common::cache::metal_aligned_weights_dir();
+        let dir = scratchy_core_common::cache::aligned_weights_dir("metal");
         let stem = path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())

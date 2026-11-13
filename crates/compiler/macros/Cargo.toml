@@ -55,3 +55,8 @@ serde_json = { workspace = true }
 # The front end's test fixtures, for this crate's tests.
 [dev-dependencies]
 scratchy-forward-compiler-frontend = { path = "../frontend", features = ["test-support"] }
+
+# Emits through `target::Shared`, the test-support target.
+[[example]]
+name = "emit_arch"
+required-features = ["test-support"]

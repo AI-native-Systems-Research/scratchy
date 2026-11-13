@@ -135,7 +135,7 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// Caller must ensure the metal device is initialized on this
     /// thread.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn new_metal_chunked(
+    pub unsafe fn new_chunked(
         num_layers: usize,
         num_blocks: usize,
         block_size: usize,
@@ -166,7 +166,7 @@ impl<M: PoolMemory> KvCachePool<M> {
     ) -> Result<Self> {
         assert!(blocks_per_chunk > 0, "blocks_per_chunk must be non-zero");
         if dtype.is_fp8() {
-            anyhow::bail!("new_metal_chunked: FP8 cache dtype is not supported");
+            anyhow::bail!("new_chunked: FP8 cache dtype is not supported");
         }
         let num_chunks = num_blocks.div_ceil(blocks_per_chunk);
         let elem = dtype.size_bytes();
@@ -235,7 +235,7 @@ impl<M: PoolMemory> KvCachePool<M> {
         let ceiling_mb =
             (2 * num_tensors * num_blocks * per_block_elems * elem) as f64 / (1024.0 * 1024.0);
         tracing::info!(
-            "KvCachePool(metal chunked, reactive): {num_layers} layers / {num_tensors} physical \
+            "KvCachePool(chunked, reactive): {num_layers} layers / {num_tensors} physical \
              tensors, {initial_chunks}/{num_chunks} chunks resident at init ({initial_mb:.0} MB) — \
              grows on demand up to {num_blocks} blocks ({ceiling_mb:.0} MB ceiling) at \
              {blocks_per_chunk} blocks/chunk ({dtype})"
@@ -264,7 +264,7 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// Per-layer K chunk-address *table* backing memory (the buffer the
     /// kernels bind at the `KvCacheK` slot — a device array of chunk
     /// gpuAddresses, not the cache data). Empty unless built via
-    /// [`Self::new_metal_chunked`].
+    /// [`Self::new_chunked`].
     pub fn k_chunk_table_mem(&self, layer: usize) -> &M {
         &self.k_chunk_tables[self.layer_to_tensor[layer]]
     }
@@ -328,7 +328,7 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// 64-bit GPU virtual address of a chunk buffer — the caller
     /// supplies it (`|m| m.buffer().gpuAddress()`) so this crate needs
     /// no objc2-metal dependency. Call once after
-    /// [`Self::new_metal_chunked`] and (in later phases) again whenever
+    /// [`Self::new_chunked`] and (in later phases) again whenever
     /// the chunk set changes.
     pub fn fill_chunk_tables(&self, gpu_addr: impl Fn(&M) -> u64) {
         for tensor in 0..self.num_tensors {
@@ -515,7 +515,7 @@ mod group_shared_tests {
 
     fn build(num_layers: usize, map: Option<Vec<usize>>) -> KvCachePool<MockMem> {
         unsafe {
-            KvCachePool::<MockMem>::new_metal_chunked(
+            KvCachePool::<MockMem>::new_chunked(
                 num_layers,
                 64,
                 16,

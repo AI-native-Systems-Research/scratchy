@@ -222,7 +222,7 @@ fn metal_off_tape_tokens(
     });
     let keys = OffTape::keys(
         LogitsWidth(width),
-        mc.metal_dtype(),
+        mc.act_dtype(),
         block_size,
         head,
         mc.spec_drafts().is_some(),
@@ -765,7 +765,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             // fallback.
             Err(e) => {
                 assert!(
-                    e.is_no_metal_realization(),
+                    e.is_no_kernel(),
                     "[m2-flip] {stem} m={m}: the shared tape refused a DECLARED pilot ({e:?}) — \
                      with the solve off there is no fallback",
                 );
@@ -1635,7 +1635,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                             #rot_dim_lit2 as usize,
                             #rope_theta_lit,
                             [#t_lit, #h_lit, #w_lit],
-                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.metal_dtype(),
+                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.act_dtype(),
                         ),
                     )
                 }
@@ -2617,7 +2617,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                         let vocab = METAL_VOCAB_SIZE as usize;
                         let shape = [rows, vocab];
                         let bytes = rows * vocab * 2; // bf16/f16 — both 2 bytes
-                        let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.metal_dtype() {
+                        let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.act_dtype() {
                             ::scratchy_target_metal::interpreter::metal::MetalDtype::F16 =>
                                 crate::__gpu::dtype::DType::F16,
                             ::scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 =>

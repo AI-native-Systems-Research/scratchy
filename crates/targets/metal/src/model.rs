@@ -8,20 +8,50 @@
 //! newtypes; the per-arch impl recovers the concrete `&ForwardCtx` / `&mut GpuDevice` from them.
 //! Object-safe (no associated types), so `Box<dyn MetalWeights>` is a plain trait object.
 
+use crate::interpreter::metal::MetalDtype;
 use scratchy_forward_compiler::{
     ArchLoad, ArchRegistration, HfFingerprint, KvCodec, ScratchyWeights, TargetRegistration,
 };
 use scratchy_tensors::{
-    DeviceAllocator, ForwardCtxHandle, ForwardDeviceHandle, LoadStream, MetalDtype, OwnedTensor,
+    DeviceAllocator, ForwardCtxHandle, ForwardDeviceHandle, LoadStream, OwnedTensor,
 };
 
 /// The objc2 types the emitted forward glue names, so an arch crate needs no direct
 /// `objc2`/`objc2_metal` dependency.
 pub use objc2::runtime::ProtocolObject;
 pub use objc2_metal::{MTL4ComputeCommandEncoder, MTLBuffer};
-/// The allocator-erased handle to the worker's per-forward `RuntimeBindings`, which a
-/// [`MetalChainBody`] receives.
-pub use scratchy_tensors::MetalRuntimeHandle;
+/// The erased handle to the worker's per-forward `RuntimeBindings` (input-id / position /
+/// KV-cache / GDN buffers), which a [`MetalChainBody`] receives: the worker that constructs the
+/// body and the emitted `forward_chain_with_encoder` that invokes it both name the concrete
+/// `RuntimeBindings` and agree on the recovered type. Same object-safety / lifetime story as
+/// `ForwardCtxHandle` (shared borrow).
+#[derive(Clone, Copy)]
+pub struct MetalRuntimeHandle<'a> {
+    ptr: *const core::ffi::c_void,
+    _marker: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> MetalRuntimeHandle<'a> {
+    /// Wrap a borrow of the concrete `RuntimeBindings` as the handle.
+    #[inline]
+    pub fn new<T>(runtime: &'a T) -> Self {
+        Self {
+            ptr: runtime as *const T as *const core::ffi::c_void,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Recover the concrete `RuntimeBindings` reference.
+    ///
+    /// # Safety
+    /// `T` must be the exact concrete type the handle was built from with
+    /// [`Self::new`] (the worker's body closure and the emitted chain caller agree on
+    /// `crate::interpreter::metal::RuntimeBindings`).
+    #[inline]
+    pub unsafe fn as_ref<T>(self) -> &'a T {
+        unsafe { &*(self.ptr as *const T) }
+    }
+}
 
 /// A loaded model's metal surface. Every metal-compiled arch's `Weights` implements it beside
 /// [`ScratchyWeights`].
@@ -83,7 +113,7 @@ pub trait MetalWeights: ScratchyWeights {
     /// exists — it was sized without the guest.
     fn metal_host(&self, guest: Box<dyn core::any::Any>) -> Result<(), String>;
 
-    /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
+    /// The model's `CanonicalParams::ACT_DTYPE`, so the worker can size
     /// its KV cache without monomorphizing on `W`.
     fn metal_dtype(&self) -> MetalDtype;
 

@@ -485,7 +485,7 @@ pub struct ServeArgs {
     pub no_prefix_caching: bool,
 
     /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3" (FP8).
-    /// FP8 halves KV cache memory, doubling capacity. On metal the KV codec is
+    /// FP8 halves KV cache memory, doubling capacity. Where the target's KV codec is
     /// fixed when the binary is built (the `turboquant` feature): "auto" takes
     /// it, and "fp16" / "turboquant" assert it — a mismatch refuses to start.
     #[arg(long, default_value = "auto")]

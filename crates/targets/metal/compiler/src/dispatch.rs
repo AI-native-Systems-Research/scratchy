@@ -117,7 +117,7 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
         })
         .collect();
 
-    // Per-variant `CanonicalParams::METAL_DTYPE` reads.
+    // Per-variant `CanonicalParams::ACT_DTYPE` reads.
     let metal_dtype_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|a| {
@@ -125,7 +125,7 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
             let model_ident = &a.model_ident;
             quote! {
                 Weights::#variant_ident(_) => <#model_ident::Weights as
-                    ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE,
+                    ::scratchy_forward_compiler::CanonicalParams>::ACT_DTYPE,
             }
         })
         .collect();
