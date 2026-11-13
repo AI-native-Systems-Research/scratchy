@@ -755,30 +755,6 @@ impl PagedStep {
         rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
     }
 
-    /// ⭐ THE REQUEST BLOCK'S PITCH — the stride the step's three tables (page table, mask stack,
-    /// query rows) repeat each request's block at within their placements: request `r`'s copy of
-    /// every one of them sits `r · P` bytes past its placement's start, so ONE shift of the
-    /// activation segment — `r · P` plus the walk's own `t · card_walk_step` — selects request
-    /// `r`'s block in all three at once (the card's seven bound addresses hold one base per
-    /// segment, so the tables cannot take an address each; the pitch is how one base serves them
-    /// all).
-    ///
-    /// `P` is the largest of the three PER-REQUEST sizes — each table's placement is its own
-    /// region, so the pitch only has to keep one request's block clear of the next's within a
-    /// region — aligned up to a whole 128-byte stick, so every request's block starts where both
-    /// the int32 sticks and the mask's fp16 sticks tile. At one request (`S = 1`, every rung
-    /// today) the pitch is never added and nothing moves.
-    pub fn card_request_pitch(self) -> u64 {
-        let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
-        let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
-        let w = u64::from(self.extent.per_request().get());
-        let slots = u64::from(self.page_slots);
-        let page_table = u64::from(self.pages) * self.card_walk_step();
-        let mask = u64::from(self.pages) * w * slots * 2;
-        let query_rows = sticks(w);
-        page_table.max(mask).max(query_rows).div_ceil(128) * 128
-    }
-
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
     /// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) int32
     /// words, the run the decode walk's chained index copies per page.
@@ -830,30 +806,33 @@ impl PagedStep {
                 ]);
             }
             None => {
-                // ⭐ THE SEQUENCE TABLES' OWN REGION EACH, SIZED FOR THE RUNG'S WHOLE CAPACITY:
-                // one request's block (the per-request size — the pool's whole walk, as ever) plus
-                // `(S - 1) · card_request_pitch()` for the requests behind it, so request `r`'s
-                // copy sits `r · P` past the region's start ([`Self::card_request_pitch`]) and the
-                // regions stay disjoint by their own packing order (write rows, page table, mask,
-                // query rows — the three tables contiguous and last in the segment). At one
-                // request the spare is zero and every size is the per-request one — the layout
-                // every rung today bakes, byte for byte.
+                // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID — window `r`'s three tables (page
+                // table, mask stack, query rows) at
+                // [`ktir_superdsc::reserved_tids::paged_window_tid`] `r`, each its own region
+                // sized the ONE-REQUEST size (the pool's whole walk, as ever), the windows
+                // packed in window order after the write rows. Window 0's tids ARE the step's
+                // own sentinels, so at one request the rows are exactly today's — same tids,
+                // same sizes, same order, byte for byte.
                 let w = u64::from(self.extent.per_request().get());
-                let spare =
-                    (u64::from(self.extent.requests().get()) - 1) * self.card_request_pitch();
-                v.extend([
-                    (
-                        self.page_table,
-                        CardSeat::Step,
-                        u64::from(self.pages) * self.card_walk_step() + spare,
-                    ),
-                    (
-                        self.mask,
-                        CardSeat::Step,
-                        u64::from(self.pages) * w * slots * 2 + spare,
-                    ),
-                    (self.query_rows, CardSeat::Step, sticks(w) + spare),
-                ]);
+                let windows = u64::from(self.extent.requests().get());
+                let window_tid = |r: u64, table: u32| {
+                    ktir_superdsc::reserved_tids::paged_window_tid(r as u32, table)
+                };
+                for r in 0..windows {
+                    v.extend([
+                        (
+                            window_tid(r, 1),
+                            CardSeat::Step,
+                            u64::from(self.pages) * self.card_walk_step(),
+                        ),
+                        (
+                            window_tid(r, 2),
+                            CardSeat::Step,
+                            u64::from(self.pages) * w * slots * 2,
+                        ),
+                        (window_tid(r, 0), CardSeat::Step, sticks(w)),
+                    ]);
+                }
             }
         }
         if self.reads_kv_row_pool() {

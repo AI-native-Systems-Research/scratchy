@@ -446,7 +446,7 @@ pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 9] = [
+pub const RESERVED_REGIONS: [TidRegion; 10] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -518,6 +518,16 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
         base: TP_RECV_TID,
         slots: TP_WINDOW_CUTS * TP_MAX_WORLD,
     },
+    // ⭐ THE PACKED PREFILL'S WINDOW TABLES — see [`paged_window_tid`]. Below `tp_recv`'s floor,
+    // in tids no artifact has ever carried: the FIRST window's tids are the `paged_step`
+    // sentinels (window 0 IS the step's own tables, the `rope_p_class_tid(0) == ROPE_P_TID`
+    // law), so the region holds only the windows PAST the first, three tables each, bounded by
+    // [`PAGED_MAX_WINDOWS`].
+    TidRegion {
+        name: "paged_window",
+        base: PAGED_WINDOW_BASE,
+        slots: PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1),
+    },
 ];
 
 /// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first block
@@ -552,6 +562,51 @@ pub const fn tp_recv_block_tid(cut: u32, sender: u32) -> u32 {
         "a sender past the widest reserved world"
     );
     TP_RECV_TID - (cut * TP_MAX_WORLD + sender)
+}
+
+/// Base of the RESERVED tid block for a PACKED PREFILL's window tables — the first tid below
+/// `tp_recv`'s floor, which nothing has been baked against (the `tp_recv` precedent: the next gap
+/// below the lowest region).
+pub const PAGED_WINDOW_BASE: u32 = TP_RECV_TID - (TP_WINDOW_CUTS * TP_MAX_WORLD);
+
+/// How many per-request tables a packed prefill window owns: the query row index, the page index
+/// table, and the mask stack — the same three the `paged_step` sentinels name for window 0.
+pub const PAGED_WINDOW_TABLES: u32 = 3;
+
+/// The widest packed capacity the window tids are reserved for. The bake's packed rung table is
+/// bounded by this the way `tp_recv`'s slots are bounded by [`TP_MAX_WORLD`]: a pair asking for
+/// more windows than this is a bake bug the tid mint's own assert names, never a wrap onto
+/// another region's tids.
+pub const PAGED_MAX_WINDOWS: u32 = 8;
+
+/// ⭐ A PACKED PREFILL WINDOW'S TABLES — window `r`'s copy of one of the three per-request tables
+/// the attention reads. **Window 0 IS the sentinels**: `paged_window_tid(0, ·)` answers
+/// `PAGED_QUERY_ROWS_TID` / `PAGED_PAGE_TABLE_TID` / `PAGED_MASK_TID`, the step's own reserved
+/// tids, exactly as `rope_p_class_tid(0) == ROPE_P_TID` — so a one-window (solo) rung binds the
+/// tids it has always bound and its bundle is byte-identical. The windows past the first count
+/// DOWN from [`PAGED_WINDOW_BASE`], three tids each, bounded by [`PAGED_MAX_WINDOWS`].
+///
+/// Which table a window's slot names:
+/// `0` the query row index, `1` the page index table, `2` the mask stack — the order the
+/// `paged_step` region numbers its own sentinels in, so the two spellings of "the step's three
+/// tables" agree by construction.
+pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
+    assert!(table < PAGED_WINDOW_TABLES, "a window has three tables");
+    match window {
+        0 => match table {
+            0 => PAGED_QUERY_ROWS_TID,
+            1 => PAGED_PAGE_TABLE_TID,
+            _ => PAGED_MASK_TID,
+        },
+        w => {
+            assert!(
+                w < PAGED_MAX_WINDOWS,
+                "a packed rung asked for a window past PAGED_MAX_WINDOWS — the bake's packed \
+                 table outgrew the reserved tid space"
+            );
+            PAGED_WINDOW_BASE - ((w - 1) * PAGED_WINDOW_TABLES + table)
+        }
+    }
 }
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
@@ -617,6 +672,7 @@ const _: () = {
     let _ = SENTINELS_ARE_INSIDE_THEIR_REGION;
     let _ = RESERVED_REGIONS_ARE_DISJOINT;
     let _ = EVERY_NAMED_REGION_RESOLVES;
+    let _ = PAGED_WINDOW_0_IS_THE_SENTINELS;
 };
 
 /// ⭐⭐⭐ EVERY NAME THIS MODULE ADDRESSES A REGION BY, RESOLVED AT COMPILE TIME.
@@ -632,6 +688,29 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
     assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
+    assert!(reserved_region("paged_window").base == PAGED_WINDOW_BASE);
+};
+
+/// ⭐ WINDOW 0 IS THE SENTINELS — the law a solo rung's byte-identity stands on. Every window
+/// tid the family mints at window 0 must answer the `paged_step` sentinel of the same table, and
+/// the windows past the first must stay inside the region (the `paged_window_tid` asserts run at
+/// call sites; this pins the LAW at the table, so a region edit that broke either fails the build
+/// here rather than at whichever bake first minted a window).
+pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
+    assert!(paged_window_tid(0, 0) == PAGED_QUERY_ROWS_TID);
+    assert!(paged_window_tid(0, 1) == PAGED_PAGE_TABLE_TID);
+    assert!(paged_window_tid(0, 2) == PAGED_MASK_TID);
+    // The region's floor holds the LAST window's LAST table, and nothing past it.
+    let r = reserved_region("paged_window");
+    assert!(
+        paged_window_tid(PAGED_MAX_WINDOWS - 1, PAGED_WINDOW_TABLES - 1) == r.floor(),
+        "the widest window's last table is not the paged_window region's floor — the region \
+         does not hold every window the tid mint admits"
+    );
+    assert!(
+        r.floor() > PAGED_WINDOW_BASE - PAGED_WINDOW_TABLES * PAGED_MAX_WINDOWS,
+        "the paged_window region runs into tids below its own widest use"
+    );
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {

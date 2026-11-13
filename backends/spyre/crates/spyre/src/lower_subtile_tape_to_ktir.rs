@@ -1170,7 +1170,10 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 query_rows,
                 scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
             ) {
-                Ok(e) => Ops(vec![e]),
+                // ⭐ THE PREFILL FAMILY — a packed rung's attention lowers to one op per window
+                // (the splice's own law), so the family extends the op list whole; a solo rung's
+                // family is the one op it has always extended.
+                Ok(family) => Ops(family),
                 Err(reason) => Unhandled(reason),
             }
         }

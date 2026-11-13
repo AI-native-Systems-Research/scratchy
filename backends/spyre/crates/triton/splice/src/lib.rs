@@ -2046,6 +2046,17 @@ pub use triton_ktir_superdsc::layout::allocate_paged_cache;
 /// node over their operands, in their order: `[query, query_row_index, k_pages, v_pages,
 /// page_index_table, (kv_row_pool,) mask_stack, out]`, or the batch's `[query, rep_row_ids, k_pages,
 /// v_pages, chunk_page_ids, mask_by_chunk, out]`.
+///
+/// ⭐ THE PREFILL FAMILY — a packed prefill rung's pair (`per_request w`, `requests S > 1`) lowers
+/// to `S` rebinds of the ONE compiled module: every constexpr of a window's program
+/// (`NUM_TOKENS = w·S`, `PADDED_QUERY_LEN = w`, geometry, `SCALE`, `NUM_BLOCKS`) is identical
+/// across windows, so the module is one object and a window differs only in which buffers its
+/// `query_row_index`, `page_index_table` and `mask_stack` name — window `r`'s are
+/// [`ktir_superdsc::reserved_tids::paged_window_tid`], window 0's being the step's own sentinels
+/// (so a solo rung's family is the one op it has always baked, byte for byte). The windows are
+/// `S` ordinary ops over the graph's absolute rows — the outputs are disjoint by construction
+/// (window `r` scatters rows `r·w .. r·w+w` through its own query row index), the kvwrite stays
+/// the one whole-graph program, and nothing below the splice knows a window exists.
 pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -2059,7 +2070,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // agreement check below refuses a mint that does not describe the graph being lowered.
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     paged_rows: PagedRows,
-) -> Result<EmittedOp<T>, String> {
+) -> Result<Vec<EmittedOp<T>>, String> {
     let batch = paged_rows == PagedRows::Batch;
     let decode = !batch && node.output.region.rows.len == 1;
     let row = if batch {
@@ -2252,7 +2263,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         )?;
         let mut e = EmittedOp::bare(format!("attn_s{}", node.id.index()));
         e.ktir = Some(k);
-        return Ok(e);
+        return Ok(vec![e]);
     }
     let mut pointers = vec![
         ("query", "*fp16"),
@@ -2302,35 +2313,83 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
-    // ⭐ THE BINDINGS ARE THE REQUEST SHIFT'S WHOLE REACH. A launch serving several requests
-    // relaunches this program's whole group span once per request (`fold_plan`'s request law),
-    // shifting the activation segment by one table pitch — so the activation-segment operands the
-    // span reads must be EXACTLY the per-request tables the host stages at that pitch
-    // (`query_row_index`, `page_index_table`, `mask_stack`), and nothing else. The list below is
-    // that law stated literally: `query`/`out` are the graph's own rows (gathered and scattered
-    // through `query_row_index` — absolute rows, never shifted), the pools are append-only KV, and
-    // the three reserved-tid buffers are the tables. A new activation-segment operand added here
-    // is a new table the host must stage per request — it does not ride the shift for free.
-    let mut bindings = vec![
-        t(&node.inputs[0]),
-        BufferId::new(tids.query_rows),
-        t(&node.inputs[1]),
-        t(&node.inputs[2]),
-        BufferId::new(tids.page_table),
-    ];
-    if decode {
-        bindings.push(BufferId::new(tids.kv_row_pool));
+    // ⭐ THE WINDOW FAMILY — a prefill pair's capacity is how many one-sequence programs the one
+    // compiled module is rebind to; every other arm (the batch's and the one-row decode's) is one
+    // window by its own pair (a decode rung's capacity names QUERY ROWS, which its rows==1 graph
+    // cannot split, and a batch carries its requests inside one launch), so `windows` is 1 there
+    // without a guard of its own. A capacity past the reserved tid space is REFUSED BY NAME — the
+    // bake's packed table outgrew what the region holds, a bake bug, never a wrap onto another
+    // region's tids.
+    let windows = if decode {
+        1
+    } else {
+        let s = query_rows.requests().get();
+        if s > ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
+            return Err(format!(
+                "triton splice: AttnDecode t{}: a packed prefill of {s} window(s) — the reserved \
+                 tid space holds {} (PAGED_MAX_WINDOWS); the bake's packed table outgrew it",
+                node.output.tensor.index(),
+                ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS,
+            ));
+        }
+        s
+    };
+    // ⭐ THE BINDINGS ARE THE WINDOW'S WHOLE REACH. A window's activation-segment operands are
+    // EXACTLY its three per-request tables (`query_row_index`, `page_index_table`, `mask_stack`)
+    // at its own window tid, and nothing else — the list below is that law stated literally:
+    // `query`/`out` are the graph's own rows (gathered and scattered through `query_row_index` —
+    // absolute rows, window `r`'s being `r·w .. r·w+w`, never shifted), the pools are append-only
+    // KV, and the decode-only `kv_row_pool` stays the step's own (decode never packs). A new
+    // activation-segment operand added here is a new table the host must stage per window — it
+    // does not ride for free.
+    let KtirNode { func, program, .. } = positional;
+    let mut out = Vec::with_capacity(windows as usize);
+    for r in 0..windows {
+        let window = |table: u32| {
+            BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, table))
+        };
+        let mut bindings = vec![
+            t(&node.inputs[0]),
+            window(0),
+            t(&node.inputs[1]),
+            t(&node.inputs[2]),
+            window(1),
+        ];
+        if decode {
+            bindings.push(BufferId::new(tids.kv_row_pool));
+        }
+        bindings.extend([window(2), t(&node.output)]);
+        let name = if r == 0 {
+            format!("attn_s{}", node.id.index())
+        } else {
+            format!("attn_s{}_w{}", node.id.index(), r)
+        };
+        if func.arguments.len() != bindings.len() {
+            return Err(format!(
+                "triton splice: {name} compiled to {} parameters but the node states {} \
+                 bindings — the kernel's parameter list diverged from the row's contract",
+                func.arguments.len(),
+                bindings.len()
+            ));
+        }
+        let k = KtirNode {
+            func: ktir_core::ir::IRFunction {
+                name: Arena::global().str(name.clone()),
+                ..func
+            },
+            program,
+            bindings,
+            mask: Some(window(2)),
+            node_out_tid: None,
+            answer_rows: None,
+            minted: Default::default(),
+            lx_plan: Default::default(),
+        };
+        let mut e = EmittedOp::bare(name);
+        e.ktir = Some(k);
+        out.push(e);
     }
-    bindings.extend([BufferId::new(tids.mask), t(&node.output)]);
-    let k = rebind(
-        positional,
-        format!("attn_s{}", node.id.index()),
-        bindings,
-        Some(BufferId::new(tids.mask)),
-    )?;
-    let mut e = EmittedOp::bare(format!("attn_s{}", node.id.index()));
-    e.ktir = Some(k);
-    Ok(e)
+    Ok(out)
 }
 
 /// THE KV WRITE'S SPLICE — the scatter half of a `RopeAppend`: compile spyre-inference's
