@@ -319,12 +319,17 @@ act on each one as it appears:
 **On a build failure:** check whether it's a regression on `main` or a
 problem on this Mac. Rebuild the same features at the commit of the newest
 run on the site. The features are on the log's `--- build -F <features>`
-line.
+line. `scr` is the metal CLI crate's binary; a commit from before
+`crates/targets/metal/cli` existed builds it from `scratchy-cli` under `metal`.
 
 ```bash
 sha=$(ls site/data/metal/*.json | xargs -n1 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["generated_utc"], d["repo"]["sha"])' | sort | tail -1 | cut -d' ' -f2)
 git worktree add /tmp/scratchy-known-good "$sha"
-(cd /tmp/scratchy-known-good && cargo build --release -p scratchy-cli --features <features>)
+(cd /tmp/scratchy-known-good && if [ -d crates/targets/metal/cli ]; then
+   cargo build --release -p scratchy-target-metal-cli --features <features>
+ else
+   cargo build --release -p scratchy-cli --features metal,<features>
+ fi)
 git worktree remove /tmp/scratchy-known-good
 ```
 

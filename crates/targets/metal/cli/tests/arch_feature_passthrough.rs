@@ -8,7 +8,7 @@
 //! gone: the `scratchy-models` dependency edge is locally renamed to `model`
 //! (`model = { package = "scratchy-models", ... }`), and Cargo's `pkg/feature` CLI syntax resolves
 //! against that local name and activates the (optional) dependency itself —
-//! so `-p scratchy-cli --features model/granite-3.1-2b-instruct` already
+//! so `-p scratchy-target-metal-cli --features model/granite-3.1-2b-instruct` already
 //! reaches scratchy-models' own features directly, with nothing to forward by
 //! hand. This test fails loudly if that duplication creeps back.
 //!
@@ -82,8 +82,8 @@ fn entries(array: &str) -> Vec<String> {
 /// belongs here ONLY if this crate's declaration does more than forward to
 /// scratchy-models. A feature that only forwards (`x = ["model?/x"]`) is
 /// never admitted, whatever it names — a model scope or a capability alike:
-/// name the dependency feature where it is used instead (`metal` names
-/// `model?/mtp-heads`, `default` names `model?/hf-completions`), and
+/// name the dependency feature where it is used instead (`default` names
+/// `model/mtp-heads` and `model/hf-completions`), and
 /// [`no_feature_of_this_crate_only_forwards_to_scratchy_models`] fails on one.
 const SHARED_NON_SCOPE_FEATURES: &[&str] = &["default"];
 
@@ -112,7 +112,7 @@ fn no_feature_of_this_crate_only_forwards_to_scratchy_models() {
 
     assert!(
         forwarders.is_empty(),
-        "crates/cli/scr/Cargo.toml declares feature(s) {forwarders:?} that only \
+        "crates/targets/metal/cli/Cargo.toml declares feature(s) {forwarders:?} that only \
          forward to scratchy-models — `model/<feature>` already reaches them. \
          Name the dependency feature where it is used instead."
     );
@@ -121,7 +121,7 @@ fn no_feature_of_this_crate_only_forwards_to_scratchy_models() {
 #[test]
 fn scratchy_models_is_aliased_model_with_no_hand_forwarded_scope_features() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR unset");
-    let models_toml = Path::new(&manifest_dir).join("../../models/arch/Cargo.toml");
+    let models_toml = Path::new(&manifest_dir).join("../../../models/arch/Cargo.toml");
     let cli_toml = Path::new(&manifest_dir).join("Cargo.toml");
 
     let models_src = std::fs::read_to_string(&models_toml)
@@ -131,7 +131,7 @@ fn scratchy_models_is_aliased_model_with_no_hand_forwarded_scope_features() {
 
     assert!(
         cli_src.contains("model = { package = \"scratchy-models\""),
-        "crates/cli/scr/Cargo.toml must declare the scratchy-models dependency \
+        "crates/targets/metal/cli/Cargo.toml must declare the scratchy-models dependency \
          as `model = {{ package = \"scratchy-models\", ... }}` — that local rename \
          is what makes `--features model/<scratchy-models-feature>` work directly \
          from this crate's build line without a hand-forwarded passthrough feature."
@@ -146,7 +146,7 @@ fn scratchy_models_is_aliased_model_with_no_hand_forwarded_scope_features() {
 
     assert!(
         reintroduced.is_empty(),
-        "crates/cli/scr/Cargo.toml re-declares scratchy-models feature(s) \
+        "crates/targets/metal/cli/Cargo.toml re-declares scratchy-models feature(s) \
          {reintroduced:?} — these duplicate what `model/<feature>` (the `model` \
          dependency alias) already reaches directly. Remove them instead of \
          hand-forwarding."

@@ -67,9 +67,9 @@ echo "results -> ${OUT_DIR}"
 VLLM_BIN="${VLLM_RS_DIR}/target/release/scr"
 
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
-    echo "building scr (release, Fmetal,bench)..."
-    cargo build --release --bin scr \
-        --features metal,bench,model/llama-3.2-3b,model/llama-3.2-1b
+    echo "building scr (release, bench)..."
+    cargo build --release -p scratchy-target-metal-cli \
+        --features bench,model/llama-3.2-3b,model/llama-3.2-1b
 fi
 
 if [[ ! -x "${VLLM_BIN}" ]]; then

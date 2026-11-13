@@ -21,8 +21,8 @@
 #                                   [--mlx-python PATH]
 #
 # Needs one build first (metal, this checkpoint's model + quant scope):
-#   cargo build --release -p scratchy-cli \
-#     --features metal,bench,model/glm-4.5-air,quant/mlx-affine-b3-g64-qembed
+#   cargo build --release -p scratchy-target-metal-cli \
+#     --features bench,model/glm-4.5-air,quant/mlx-affine-b3-g64-qembed
 #
 # Results land under bench_results/glm45-air-3bit/<timestamp>/.
 

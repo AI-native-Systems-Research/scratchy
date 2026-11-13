@@ -33,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       model-scope:
-        description: scratchy-cli model feature scope for the smoke build
+        description: scr model feature scope for the smoke build
         default: model/qwen3.6-35b-a3b
 
 permissions:
@@ -64,7 +64,7 @@ jobs:
       - name: Build
         env:
           MODEL_SCOPE: ${{ github.event_name == 'release' && 'model/all' || inputs.model-scope }}
-        run: cargo build --release -p scratchy-cli --features metal,bench,serve,multimodal,quant/mlx,"$MODEL_SCOPE"
+        run: cargo build --release -p scratchy-target-metal-cli --features bench,serve,multimodal,quant/mlx,"$MODEL_SCOPE"
 
       # Import the Developer ID Application certificate into an ephemeral
       # keychain. MACOS_SIGNING_IDENTITY is a repo *variable* (not secret):

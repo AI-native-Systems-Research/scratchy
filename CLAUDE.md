@@ -28,10 +28,10 @@ a build selects live in ONE crate, **`scratchy-models`** (`crates/models/arch/`)
 each target compiles that selection in its own models crate
 (`crates/targets/<target>/models`). Quant presets live on a separate crate,
 **`scratchy-quantizations`** (`crates/models/quantization/`) — two crates
-because Cargo won't alias one crate under two names, and `scratchy-cli`
+because Cargo won't alias one crate under two names, and each target's CLI
 needs both `model` and `quant` as short CLI aliases. Speculative-decoding
 drafters are a third alias on a third crate, **`scratchy-spec`**
-(`crates/models/spec/`): `metal` already compiles the MTP head of every
+(`crates/models/spec/`): `scr` already compiles the MTP head of every
 selected model whose checkpoint carries one, and its default drafter published
 as a model of its own (Gemma 4 26B-A4B's assistant at MLX 4-bit g32, under
 `quant/mlx`) (`mtp-heads`), and `spec/mtp` adds the other published drafters
@@ -46,14 +46,16 @@ every quant preset gets its own `<preset>` feature (`quant/<preset>`,
 
 ## Build
 ```bash
-# The CLI you run. Pick ONE backend: metal (macOS) or spyre. Add serve for HTTP.
+# The CLI you run: each target is its own binary — `scr` on metal (macOS), `spyre` on IBM Spyre —
+# over the common CLI core (`scratchy-cli`). Add serve for HTTP.
 # Name at least one model — this fails loudly (build-time panic) otherwise.
-cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
+cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
+cargo build --release -p scratchy-target-spyre-cli --features spyre-emu,model/granite-3.1-2b-instruct
 ```
 - No default model/quant scope, so every build names its own — no
   `--no-default-features` dance needed to narrow to one specific model, just
   name that one model and nothing else. Widen with e.g.
-  `--features metal,model/qwen2.5-7b` or `--features metal,model/all`
+  `--features model/qwen2.5-7b` or `--features model/all`
   (CI's scope).
 - **When iterating/verifying a change, scope to exactly the one model you
   need to keep the build fast**: `-Fmodel/<stem>` (e.g. `-Fmodel/llama-3.2-1b`
@@ -61,10 +63,9 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
-- `metal` and `spyre` are mutually exclusive.
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
-  opt-in via the `multimodal` feature on `scratchy-cli` (on by default
-  there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
+  opt-in via the `multimodal` feature — a plain `chat`-only build never
+  compiles image/png/zune-jpeg/etc., and a scope naming a vision arch needs it.
 - List cached models with `scr model ls`; run a model in-process with
   `scr chat -m <model> -q "..."` (no image arg — images need the
   HTTP server, i.e. the `serve` feature + `scr serve ... --kv-cache-dtype ...`).
@@ -72,12 +73,12 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
 ## Verify like CI before opening a build / deps / codegen PR
 `.github/workflows/rust.yml`: the **linux-workspace** job runs
 `cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct
---exclude scratchy-target-metal --exclude scratchy-target-metal-compiler
+--exclude scratchy-target-metal --exclude scratchy-target-metal-cli --exclude scratchy-target-metal-compiler
 --exclude scratchy-target-metal-models --exclude scratchy-target-metal-worker
 -- -D warnings` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
-check/clippy don't link the C++ shim). All four metal crates are excluded because
+check/clippy don't link the C++ shim). All five metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
-compiler, models and worker crates via their own edges to scratchy-target-metal — and `--workspace`
+CLI, compiler, models and worker crates via their own edges to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
 some of them still drags `objc2` onto Linux); the **macOS** job
 runs `cargo clippy -p scratchy-target-metal-models --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings`
@@ -96,6 +97,7 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
     rustup component add clippy >/dev/null 2>&1
     cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
       --exclude scratchy-target-metal \
+      --exclude scratchy-target-metal-cli \
       --exclude scratchy-target-metal-compiler \
       --exclude scratchy-target-metal-models \
       --exclude scratchy-target-metal-worker -- -D warnings'

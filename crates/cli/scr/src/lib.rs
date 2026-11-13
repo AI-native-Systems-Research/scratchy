@@ -60,7 +60,6 @@ pub async fn run<C: clap::CommandFactory>(command: Commands) -> anyhow::Result<(
                         commands::cache::run_cache_inspect(args).await
                     }
                 },
-                #[cfg(feature = "metal")]
                 ModelSubcommand::Info(args) => commands::model_info::run_info(args).await,
                 #[cfg(feature = "model")]
                 ModelSubcommand::Names(args) => commands::model::run_model_names(args).await,

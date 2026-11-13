@@ -27,7 +27,7 @@ without it they can't reproduce you on different hardware. What should they see?
 -->
 
 ```bash
-cargo build --release -p scratchy-cli --features metal,model/smollm2-135m
+cargo build --release -p scratchy-target-metal-cli --features model/smollm2-135m
 ```
 
 ## No-regression proof

@@ -149,12 +149,13 @@ sent back regardless of how well it works:
 
 #### Build — scope to one model
 
-Pick exactly one backend (`metal`, `spyre` — mutually exclusive) and
+Pick your target's CLI (`scr` on metal: `-p scratchy-target-metal-cli`; `spyre`:
+`-p scratchy-target-spyre-cli`) and
 name at least one model. Naming zero models is a **build-time panic**, not a
 silent empty binary.
 
 ```bash
-cargo build --release -p scratchy-cli --features metal,model/smollm2-135m
+cargo build --release -p scratchy-target-metal-cli --features model/smollm2-135m
 ```
 
 **When iterating, scope to the single smallest model that exercises your
@@ -209,6 +210,7 @@ cargo clippy -p scratchy-models --features smollm2-135m,hf-completions -- -D war
 SCRATCHY_SKIP_SENDNN_CXX=1 \
 cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
   --exclude scratchy-target-metal \
+  --exclude scratchy-target-metal-cli \
   --exclude scratchy-target-metal-compiler \
   --exclude scratchy-target-metal-models \
   --exclude scratchy-target-metal-worker -- -D warnings
@@ -222,10 +224,10 @@ cargo test -p scratchy-e2e -p scratchy-target-metal-models \
 Both `all`-scoped clippy runs are the full-scope case: every config, every arch.
 Expect them to be slow and RAM-heavy — that's CI-scale cost, not a regression.
 
-Note the two `--exclude`s on the workspace gate are both required: `scratchy-target-metal`
-and `scratchy-target-metal-compiler` each depend unconditionally on Apple-only
+Note the `--exclude`s on the workspace gate are all required: every metal crate
+depends unconditionally on Apple-only
 `objc2`, and `--workspace` builds every member as a root regardless of
-`--features`, so excluding one still drags `objc2` onto Linux.
+`--features`, so excluding only some still drags `objc2` onto Linux.
 
 The x86_64 workspace gate reproduces in a container (see [`CLAUDE.md`](CLAUDE.md)
 for the full `docker run`); Apple Silicon runs it amd64-emulated — slow but

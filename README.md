@@ -61,16 +61,15 @@ easier case.
 ## Getting Started
 
 Install a recent [Rust toolchain](https://rustup.rs/). Then, pick your
-target via [feature
-flag](https://doc.rust-lang.org/cargo/reference/features.html):
-`-Fmetal` requires macOS 26.2
-or newer (and its Xcode SDK);
-`-Fspyre` requires the Spyre build toolkit.  For example, you can
-compile support for Apple Silicon, the Llama 3.2 3B models, and the
-MLX 4-bit quant:
+target by its CLI: `scr` (Apple Silicon, the workspace's default
+package) requires macOS 26.2 or newer (and its Xcode SDK); `spyre`
+(`-p scratchy-target-spyre-cli`) requires the Spyre build toolkit. Both
+run the same commands. For example, you can compile `scr` with the
+Llama 3.2 3B models and the MLX 4-bit quant
+([feature flags](https://doc.rust-lang.org/cargo/reference/features.html)):
 
 ```bash
-cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
+cargo build -F model/llama-3.2-3b,quant/mlx --release
 ```
 
 By default, only the simple `scr chat` CLI command is compiled
@@ -86,7 +85,7 @@ Note the convention for selecting models and quants:
   (`model/<arch>` for every config in an arch, `model/all` for everything).
 - `quant/<preset>` — compiles that quantization instead of dense/bf16
   (e.g. `quant/mlx` for every MLX affine int4 preset at once).
-- Multi-token prediction is **on with `metal`**: every selected model whose
+- Multi-token prediction is **on in `scr`**: every selected model whose
   checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
   selected model whose drafter is published as a model of its own (Gemma 4
   26B-A4B's assistant at MLX 4-bit g32, under `quant/mlx`, downloaded from
@@ -98,11 +97,11 @@ Note the convention for selecting models and quants:
   this build can actually run (`scr completions zsh --install`). **On by default**;
   it resolves that list against huggingface.co at build time, so an air-gapped
   build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
-- TurboQuant KV-cache compression is **on with `metal`**, for every model
+- TurboQuant KV-cache compression is **on in `scr`**, for every model
   whose geometry takes it (the build names the ones that stay dense); off for
   spyre, and fixed at build time: `--kv-cache-dtype` can only assert
-  it. `metal-base` in place of `metal` builds the same engine with a dense KV
-  cache and no MTP heads (`metal-base,model/mtp-heads` keeps MTP).
+  it. `--no-default-features --features chat` builds the same engine with a
+  dense KV cache and no MTP heads (add `model/mtp-heads` to keep MTP).
 
 ### Prebuilt binary (Homebrew)
 

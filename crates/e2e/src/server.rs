@@ -524,28 +524,18 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
                 cmd.env_remove(&key);
             }
         }
-        cmd.arg("build").arg("-p").arg("scratchy-cli");
+        // `scr` is the metal CLI crate's binary.
+        cmd.arg("build").arg("-p").arg("scratchy-target-metal-cli");
         if is_release {
             cmd.arg("--release");
-        }
-
-        // Forward feature flags from env if set by the test build.
-        // The E2E test Cargo invocation sets these features on vllm-e2e,
-        // but we need them on scratchy-cli too.
-        let mut features = Vec::new();
-        if cfg!(feature = "metal") {
-            features.push("metal");
-        }
-        if !features.is_empty() {
-            cmd.arg("--features").arg(features.join(","));
         }
 
         eprintln!("[E2E] Building scr binary: {:?}", cmd);
         let status = cmd
             .status()
-            .context("failed to run cargo build for scratchy-cli")?;
+            .context("failed to run cargo build for scratchy-target-metal-cli")?;
         if !status.success() {
-            anyhow::bail!("cargo build -p scratchy-cli failed with {status}");
+            anyhow::bail!("cargo build -p scratchy-target-metal-cli failed with {status}");
         }
     }
 
@@ -565,7 +555,7 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
     }
 
     anyhow::bail!(
-        "Could not find the scr binary after build. Set VLLM_TEST_BINARY or build with `cargo build -p scratchy-cli`."
+        "Could not find the scr binary after build. Set VLLM_TEST_BINARY or build with `cargo build -p scratchy-target-metal-cli`."
     )
 }
 

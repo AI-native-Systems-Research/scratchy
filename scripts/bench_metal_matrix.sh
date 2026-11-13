@@ -1763,12 +1763,12 @@ PY
     [[ -n "${GRID_CONC_LIST}" ]] || GRID_CONC_LIST=${BASE_CONC}
 
     # metrics: scratchy's /metrics, whose speculative-decoding counters each cell reads (therm_now).
-    feats="metal,serve,metrics,bench-datasets,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
+    feats="serve,metrics,bench-datasets,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
     build_secs=""; bytes=""; built=1
     if (( ! SKIP_BUILD )); then
         echo "--- build -F ${feats}"
         t0=$(date +%s)
-        if cargo build --release -p scratchy-cli --features "${feats}" >"${RAW}/build-${stem}.log" 2>&1; then
+        if cargo build --release -p scratchy-target-metal-cli --features "${feats}" >"${RAW}/build-${stem}.log" 2>&1; then
             build_secs=$(( $(date +%s) - t0 ))
             bytes=$(stat -f%z "${BIN}")
             echo "    ${build_secs}s · $((bytes/1024/1024)) MiB"

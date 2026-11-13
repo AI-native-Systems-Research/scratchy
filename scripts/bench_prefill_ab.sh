@@ -51,14 +51,14 @@
 #   scripts/bench_prefill_ab.sh --pr 597 --reps 4 \
 #     [--remote upstream] [--base-ref main] \
 #     [--model mlx-community/Qwen3.6-35B-A3B-4bit] \
-#     [--features 'metal,model/qwen3.6-35b-a3b,quant/mlx,serve,claude'] \
+#     [--features 'model/qwen3.6-35b-a3b,quant/mlx,serve,claude'] \
 #     [--shapes long,short,batch,64,512,1024,2048,4096] [--prompt-file f] \
 #     [--template-pad 32]
 
 set -euo pipefail
 
 MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
-FEATURES='metal,model/qwen3.6-35b-a3b,quant/mlx,serve,claude'
+FEATURES='model/qwen3.6-35b-a3b,quant/mlx,serve,claude'
 REPS=4
 SHAPES=long,short,batch,64,512,1024,2048,4096
 BASE_BIN=
@@ -330,8 +330,14 @@ elif [ -n "$PR" ]; then
     fi
     echo "building $1 at $sha ($2)" >&2
     wait_machine_quiet || exit 1
+    # `scr` is the metal CLI crate's binary; a ref from before that crate builds it from
+    # scratchy-cli under its `metal` feature.
+    local pkg=scratchy-target-metal-cli feats=$FEATURES
+    if [ ! -d "$wt/crates/targets/metal/cli" ]; then
+      pkg=scratchy-cli feats="metal,$FEATURES"
+    fi
     (cd "$wt" && CARGO_TARGET_DIR="$AB/$1-target" \
-       cargo build -F "$FEATURES" --release -p scratchy-cli) >&2
+       cargo build -F "$feats" --release -p "$pkg") >&2
   }
   build_ref base "$BASE_REF"
   build_ref cand "$CAND_REF"

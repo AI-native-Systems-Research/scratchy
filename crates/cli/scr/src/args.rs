@@ -222,7 +222,6 @@ pub enum ModelSubcommand {
     /// scratchy variants. Optional positional filters AND-substring
     /// match against `<arch>/<variant_stem>` — e.g.
     /// `scr model info llama 3.2 awq`.
-    #[cfg(feature = "metal")]
     Info(ModelInfoArgs),
     /// Print compiled-in HuggingFace model ids for shell tab completion
     /// (one per line), optionally filtered by prefix. Sourced from
@@ -282,7 +281,6 @@ pub enum NamesSource {
     Stems,
 }
 
-#[cfg(feature = "metal")]
 #[derive(Parser, Debug)]
 pub struct ModelInfoArgs {
     /// Color/style output. `auto` uses ANSI when stdout is a tty
@@ -296,7 +294,6 @@ pub struct ModelInfoArgs {
     pub filters: Vec<String>,
 }
 
-#[cfg(feature = "metal")]
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 pub enum ColorWhen {
     #[default]

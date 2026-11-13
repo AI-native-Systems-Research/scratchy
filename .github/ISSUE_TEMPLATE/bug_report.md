@@ -15,7 +15,7 @@ labels: bug
 a repro without the exact `--features` is not reproducible.
 
 ```bash
-cargo build --release -p scratchy-cli --features <backend>,model/<stem>
+cargo build --release -p scratchy-target-<target>-cli --features model/<stem>   # <target>: metal (scr) or spyre (+ spyre-emu / spyre-hw)
 # then:
 ```
 

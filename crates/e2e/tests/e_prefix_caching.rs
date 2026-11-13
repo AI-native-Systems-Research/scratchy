@@ -266,7 +266,7 @@ async fn test_prefix_cache_reports_cached_tokens_metal() {
 // `gdn::qwen3_6`, `mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit` for `gdn::nemotron_3_nano`.
 // Run against a prebuilt server so its flags apply, one test at a time:
 //
-//   cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
+//   cargo build --release -p scratchy-target-metal-cli --features serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
 //   VLLM_TEST_SPAWN=1 VLLM_TEST_BINARY=$PWD/target/release/scr cargo test -p scratchy-e2e \
 //     -p scratchy-models --features e2e,metal,scratchy-models/smollm2-135m \
 //     --test e_prefix_caching gdn::qwen3_6 -- --ignored --test-threads=1 --nocapture

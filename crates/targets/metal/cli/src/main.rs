@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! `scr` — the scratchy CLI, serving on metal.
+//! `scr` — the scratchy CLI on Apple silicon: the common CLI core's commands (`scratchy_cli`),
+//! served through the metal worker.
 //!
 //! Usage:
 //!   scr serve --model <path-or-hf-id>
 //!   scr bench --model <path-or-hf-id>
 //!   scr model convert --input <dir> --output <dir>
 
-// Anchor the target's worker crate into the link: the engine serves through the `WorkerFactory`
+// Anchor the metal worker crate into the link: the engine serves through the `WorkerFactory`
 // registry and never names a concrete worker, so without this reference the linker may drop the
 // factory's `inventory::submit!`.
-#[cfg(feature = "metal-base")]
 extern crate scratchy_target_metal_worker as _;
 
 use clap::Parser;

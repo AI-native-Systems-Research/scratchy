@@ -3295,7 +3295,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "dotenvy",
  "libc",
  "scratchy-bench",
  "scratchy-core-common",
@@ -3303,10 +3302,7 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-models",
- "scratchy-quantizations",
  "scratchy-serving-api",
- "scratchy-spec",
- "scratchy-target-metal-worker",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3670,6 +3666,21 @@ dependencies = [
  "serde_json",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "scratchy-target-metal-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "scratchy-cli",
+ "scratchy-models",
+ "scratchy-quantizations",
+ "scratchy-spec",
+ "scratchy-target-metal-worker",
+ "tokio",
 ]
 
 [[package]]

@@ -30,7 +30,7 @@ set -uo pipefail
 MODEL="${MODEL:-mlx-community/granite-3.3-8b-instruct-4bit}"
 BIN="${BIN:-./target/release/scr}"
 OUT="${OUT:-$(mktemp -d)}"
-[ -x "$BIN" ] || { echo "⛔ no binary at $BIN — cargo build --release --features metal,model/granite-3.3-8b-instruct --bin scr"; exit 2; }
+[ -x "$BIN" ] || { echo "⛔ no binary at $BIN — cargo build --release -p scratchy-target-metal-cli --features model/granite-3.3-8b-instruct"; exit 2; }
 
 python3 - "$OUT" <<'PY'
 import json, sys

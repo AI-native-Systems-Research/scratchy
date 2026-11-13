@@ -80,6 +80,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct
           --exclude scratchy-target-metal
+          --exclude scratchy-target-metal-cli
           --exclude scratchy-target-metal-compiler
           --exclude scratchy-target-metal-models
           --exclude scratchy-target-metal-worker
@@ -100,11 +101,11 @@ jobs:
           --features e2e,otel,scratchy-models/granite-3.1-8b-instruct
           --test e_otel -- -D warnings
 
-      # scratchy-cli's own test targets (its unit tests and
-      # tests/arch_feature_passthrough.rs), and the `spyre` binary over them, type-checked and
-      # linted: no other step builds them. None is backend-specific, so they're linted here
-      # rather than on macOS, whose tests job is the longer one.
-      - name: Lint scratchy-cli's test targets and the spyre binary
+      # The common CLI core's test targets (its unit tests), and the `spyre` binary over them,
+      # type-checked and linted: no other step builds them. The core is target-neutral, so it's
+      # linted here rather than on macOS, whose tests job is the longer one; `scr` (the metal
+      # binary) is linted there.
+      - name: Lint the CLI core's test targets and the spyre binary
         run: cargo clippy -p scratchy-cli -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
 
@@ -423,13 +424,21 @@ jobs:
       # here is that the files compile and lint clean; run them on a real GPU.
       # `--tests` type-checks every e2e test target, and, since `-p
       # scratchy-target-metal-models` is what names the model, that crate's own
-      # lib and integration tests at that model. e_otel.rs and scratchy-cli's test
+      # lib and integration tests at that model. e_otel.rs and the CLI core's test
       # targets are linted in the linux-workspace job. `--keep-going` reports
       # every failing test target, not just those in flight at the first failure.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-target-metal-models
           --features e2e,metal,scratchy-models/smollm2-135m
           --tests --keep-going -- -D warnings
+
+      # `scr`, the metal binary over the common CLI core, with every core command compiled in
+      # (`claude` pulls `serve`), linted with its test targets; then its manifest test
+      # (`arch_feature_passthrough`: no hand-forwarded model-scope feature creeps back).
+      - name: Lint and test scr
+        run: |
+          cargo clippy -p scratchy-target-metal-cli --features claude,model/smollm2-135m --all-targets -- -D warnings
+          cargo test -p scratchy-target-metal-cli --features model/smollm2-135m --test arch_feature_passthrough
 
       # See the clippy job's last step.
       - name: Compiled no crate macos-scope skips for

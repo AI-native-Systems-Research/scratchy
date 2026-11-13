@@ -547,14 +547,15 @@ later turn's TTFT as a ratio of turn 1's.
 Everything above assumes real hardware, but the harness itself is process
 management, not inference: it spawns a child, waits for a port or a line of
 stdout, samples `getrusage`, and tears the process group down afterwards. None of
-that needs a backend, and the crate is built so that it doesn't — `default = []`,
-`metal` is a pure pass-through to `scratchy-serving-api`, and there is no
-backend `cfg` in the crate. So the full test suite and the `scr` binary carrying
-`bench startup --exec` both build on any Linux or macOS box:
+that needs a backend, and the crate is built so that it doesn't — `default = []`
+and there is no backend `cfg` in the crate. So the full test suite builds on any
+Linux or macOS box, and so does the common CLI core carrying `bench startup
+--exec` (a binary links one target: `scr`, on a Mac, renders it too):
 
 ```bash
 cargo test -p scratchy-bench --features datasets   # the whole suite; no GPU
 cargo build -p scratchy-cli --no-default-features --features bench
+cargo build -p scratchy-target-metal-cli --no-default-features --features bench,model/smollm2-135m
 ./target/debug/scr bench startup --help   # renders the `--exec` section
 ```
 
