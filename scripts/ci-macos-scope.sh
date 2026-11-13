@@ -12,8 +12,11 @@
 #       edge into one turns the macOS jobs red, instead of letting a PR that changes only that crate
 #       skip the jobs that build it. CI's rust-cache drops every workspace crate's build output
 #       before saving, so a workspace crate's `.fingerprint` entry is one this job compiled. The
-#       crates are the spyre workspace's (backends/spyre); the check reads both workspaces' build
-#       output, since the macOS tests job builds the KTIR crates in the spyre one.
+#       crates are the spyre workspace's (backends/spyre); the check reads that workspace's and the
+#       root's build output, since the macOS tests job builds the KTIR crates in the spyre one. The
+#       card workspace's (backends/spyre-hw) entries are checked by `changed` only: no runner can
+#       resolve that workspace (its flex-rs path dep reaches the senlib-rs checkout beside the
+#       tree), so no runner can compile its crates — the fingerprint check for them is vacuous.
 set -euo pipefail
 
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
@@ -23,7 +26,6 @@ backends/spyre-hw/crates/card
 backends/spyre-hw/crates/builder
 backends/spyre/crates/bundle
 backends/spyre/crates/compiler
-backends/spyre-hw/crates/flex-rs
 backends/spyre/crates/triton/splice
 backends/spyre/crates/triton/triton-frontend
 backends/spyre/crates/triton/triton-ktir
@@ -73,27 +75,33 @@ changed() {
 
 lock() {
     # The listed directories' package names, from cargo's own manifest paths in the spyre
-    # workspaces; the build output checked is every workspace's.
-    local metadata spyre spyre_hw packages names dir name
+    # workspace; the build output checked is the root and spyre workspaces'.
+    #
+    # The card workspace (backends/spyre-hw) is deliberately NOT read here: it resolves
+    # flex-rs from the senlib-rs checkout beside this tree, and even `cargo metadata
+    # --no-deps` loads member dependency manifests — so no runner, this job included,
+    # can resolve that workspace at all, which also means no runner can COMPILE a
+    # spyre-hw crate: its entries in MACOS_UNBUILT stay for `changed`'s skip logic, and
+    # their fingerprint check is vacuous by construction.
+    local metadata spyre packages names dir name
     metadata=$(cargo metadata --no-deps --format-version 1)
     spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre/Cargo.toml)
-    spyre_hw=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre-hw/Cargo.toml)
     packages=$(jq -r --arg root "$PWD/" \
         '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' \
-        <<<"$spyre$spyre_hw")
+        <<<"$spyre")
     names=""
     while IFS= read -r dir; do
+        case "$dir" in backends/spyre-hw/*) continue ;; esac
         name=$(awk -F'\t' -v dir="$dir" '$1 == dir { print $2 }' <<<"$packages")
         if [ -z "$name" ]; then
-            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre or spyre-hw workspace crate" >&2
+            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre workspace crate" >&2
             exit 1
         fi
         names="$names${names:+|}$name"
     done <<<"$MACOS_UNBUILT"
     local compiled
     local dirs=()
-    for dir in "$(jq -r .target_directory <<<"$metadata")" "$(jq -r .target_directory <<<"$spyre")" \
-        "$(jq -r .target_directory <<<"$spyre_hw")"; do
+    for dir in "$(jq -r .target_directory <<<"$metadata")" "$(jq -r .target_directory <<<"$spyre")"; do
         [ -d "$dir" ] && dirs+=("$dir")
     done
     compiled=$(find "${dirs[@]}" -mindepth 3 -maxdepth 3 -type d \
