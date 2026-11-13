@@ -5,7 +5,7 @@
 #
 # usage: page_gather_sweep_run.sh <sweep-root> <tree-with-bundle_run_dev> <log>
 #   <sweep-root>  the directory of cell dirs (each: group_0/, placements.json, cell.json)
-#   <tree>        a warm pod checkout's backends/spyre, with target/release/examples/bundle_run_dev built from
+#   <tree>        a warm pod checkout's backends/spyre-hw, with target/release/examples/bundle_run_dev built from
 #                 the SAME commit the dump test ran at
 #   <log>         the verdict log (one line per cell, appended — the run is resumable: a cell
 #                 whose verdict line is already in the log is skipped)

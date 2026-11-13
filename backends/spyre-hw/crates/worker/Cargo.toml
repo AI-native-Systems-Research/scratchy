@@ -25,7 +25,7 @@ tp-4 = ["spyre-hw", "scratchy-target-spyre-models/tp-4", "scratchy-target-spyre/
 tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/tp-8", "scratchy-target-spyre-card/tp-8"]
 
 [dependencies]
-scratchy-target-spyre = { path = "../spyre" }
+scratchy-target-spyre = { path = "../../../spyre/crates/spyre" }
 # The card runtime (the resident executor, its session, the cards): the `spyre-hw` run path's.
 scratchy-target-spyre-card = { path = "../card", optional = true }
 scratchy-serving-worker = { workspace = true }
@@ -36,13 +36,13 @@ scratchy-core-model = { workspace = true }
 scratchy-forward-compiler = { path = "../../../../crates/compiler" }
 # The selected models, compiled for spyre: their loaders and baked bundles, found through the
 # `SpyreArchRegistration` rows they submit.
-scratchy-target-spyre-models = { path = "../models" }
+scratchy-target-spyre-models = { path = "../../../spyre/crates/models" }
 # Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
 # staged weight width == the emitted device width by construction.
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
 # The SuperDSC device facts (`sdsc_abstract`, `superdsc_opspec`): the laws the staging and the
 # session setters mint their values through.
-ktir-superdsc = { path = "../ktir/ktir-superdsc" }
+ktir-superdsc = { path = "../../../spyre/crates/ktir/ktir-superdsc" }
 # Spyre rides the neutral seam directly: GpuWeights from scratchy-layers, DType from
 # scratchy-tensors.
 scratchy-layers = { path = "../../../../crates/layers" }

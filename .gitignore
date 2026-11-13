@@ -6,6 +6,7 @@
 /crates/targets/metal/tui/target/
 # backends/spyre is its own workspace too (see its Cargo.toml).
 /backends/spyre/target/
+/backends/spyre-hw/target/
 **/*.rs.bk
 /bench_results/
 .claude/worktrees/

@@ -150,7 +150,7 @@ sent back regardless of how well it works:
 #### Build — scope to one model
 
 Pick your target's CLI (`scr` on metal: `-p scratchy-target-metal-cli`; `spyre`: built in
-its own workspace, `cd backends/spyre && cargo build`) and
+its own workspace, `cd backends/spyre-hw && cargo build`) and
 name at least one model. Naming zero models is a **build-time panic**, not a
 silent empty binary.
 
@@ -198,6 +198,7 @@ break:
 # Format (fmt job) — cheap, run it always
 cargo fmt --all -- --check
 cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
+cargo fmt --manifest-path backends/spyre-hw/Cargo.toml --all -- --check
 
 # macOS / metal job
 cargo clippy -p scratchy-target-metal-models \
@@ -207,15 +208,17 @@ cargo clippy -p scratchy-target-metal-models \
 # is the only lint coverage the build-time HF query gets). Needs network.
 cargo clippy -p scratchy-models --features smollm2-135m,hf-completions -- -D warnings
 
-# Linux / workspace job: the root workspace, then the spyre one (backends/spyre)
+# Linux / workspace job: the root workspace, then spyre's two (backends/spyre, backends/spyre-hw)
 cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
   --exclude scratchy-target-metal \
   --exclude scratchy-target-metal-cli \
   --exclude scratchy-target-metal-compiler \
   --exclude scratchy-target-metal-models \
   --exclude scratchy-target-metal-worker -- -D warnings
-(cd backends/spyre && SCRATCHY_SKIP_SENDNN_CXX=1 \
+(cd backends/spyre && \
   cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings)
+(cd backends/spyre-hw && SCRATCHY_SKIP_SENDNN_CXX=1 \
+  cargo clippy --workspace --features model/granite-3.1-8b-instruct -- -D warnings)
 
 # e2e smoke, as CI runs it
 cargo test -p scratchy-e2e -p scratchy-target-metal-models \

@@ -14,14 +14,14 @@ tp-8 = ["scratchy-target-spyre/tp-8"]
 [dependencies]
 # The shared target: the bundle types, the lowering's outputs, the weight staging and the wiring
 # the executor launches against. It never depends on this crate.
-scratchy-target-spyre = { path = "../spyre", features = ["spyre-hw"] }
+scratchy-target-spyre = { path = "../../../spyre/crates/spyre", features = ["spyre-hw"] }
 # In-tree crate: the senlib flex port's PUBLIC face — the C-ABI declarations and the pure-Rust type
 # layer (addressing, control-block words, scheduler) the card surface compiles against. The
 # implementing archives are linked statically at build (see flex-rs/build.rs), so this builds on any
 # host and links the real implementation only where the archives exist.
 flex-rs = { path = "../flex-rs" }
-scratchy-spyre-bundle = { path = "../bundle" }
-ktir-superdsc = { path = "../ktir/ktir-superdsc" }
+scratchy-spyre-bundle = { path = "../../../spyre/crates/bundle" }
+ktir-superdsc = { path = "../../../spyre/crates/ktir/ktir-superdsc" }
 scratchy-tensors = { path = "../../../../crates/tensors" }
 libc = { workspace = true }
 half = { workspace = true }

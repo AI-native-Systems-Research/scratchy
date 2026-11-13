@@ -19,11 +19,11 @@ set -euo pipefail
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
 # ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
 MACOS_UNBUILT='backends/spyre/crates/spyre
-backends/spyre/crates/card
-backends/spyre/crates/builder
+backends/spyre-hw/crates/card
+backends/spyre-hw/crates/builder
 backends/spyre/crates/bundle
 backends/spyre/crates/compiler
-backends/spyre/crates/flex-rs
+backends/spyre-hw/crates/flex-rs
 backends/spyre/crates/triton/splice
 backends/spyre/crates/triton/triton-frontend
 backends/spyre/crates/triton/triton-ktir
@@ -55,6 +55,8 @@ changed() {
             # The Triton kernels sit beside the spyre crates, in no crate; only listed crates
             # (the spyre target and the triton ones) read them.
             backends/spyre/kernels/*) continue ;;
+            # The card workspace's own manifest and lock: no macOS job builds that workspace.
+            backends/spyre-hw/Cargo.toml | backends/spyre-hw/Cargo.lock) continue ;;
         esac
         while IFS= read -r dir; do
             case "$file" in "$dir"/*) owner=$dir; break ;; esac
@@ -71,24 +73,27 @@ changed() {
 
 lock() {
     # The listed directories' package names, from cargo's own manifest paths in the spyre
-    # workspace; the build output checked is both workspaces'.
-    local metadata spyre packages names dir name
+    # workspaces; the build output checked is every workspace's.
+    local metadata spyre spyre_hw packages names dir name
     metadata=$(cargo metadata --no-deps --format-version 1)
     spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre/Cargo.toml)
+    spyre_hw=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre-hw/Cargo.toml)
     packages=$(jq -r --arg root "$PWD/" \
-        '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' <<<"$spyre")
+        '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' \
+        <<<"$spyre$spyre_hw")
     names=""
     while IFS= read -r dir; do
         name=$(awk -F'\t' -v dir="$dir" '$1 == dir { print $2 }' <<<"$packages")
         if [ -z "$name" ]; then
-            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre workspace crate" >&2
+            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre or spyre-hw workspace crate" >&2
             exit 1
         fi
         names="$names${names:+|}$name"
     done <<<"$MACOS_UNBUILT"
     local compiled
     local dirs=()
-    for dir in "$(jq -r .target_directory <<<"$metadata")" "$(jq -r .target_directory <<<"$spyre")"; do
+    for dir in "$(jq -r .target_directory <<<"$metadata")" "$(jq -r .target_directory <<<"$spyre")" \
+        "$(jq -r .target_directory <<<"$spyre_hw")"; do
         [ -d "$dir" ] && dirs+=("$dir")
     done
     compiled=$(find "${dirs[@]}" -mindepth 3 -maxdepth 3 -type d \
