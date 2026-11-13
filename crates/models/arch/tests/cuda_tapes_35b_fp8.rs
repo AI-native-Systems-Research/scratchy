@@ -92,10 +92,10 @@ const QUANT_COLS: [u32; 3] = [512, 2048, 4096];
 /// Per prefill bucket: the quant scratch's offset (the bf16 tape's arena total) and bytes (the
 /// largest expert write, `[max_tiles·128, 2048]` e4m3 then its f32 scales).
 const QUANT_SCRATCH: [(u32, u64, u64); 4] = [
-    (512, 772_613_632, 2_099_200),
-    (1024, 1_179_007_488, 4_198_400),
-    (2048, 1_991_795_456, 8_396_800),
-    (4096, 3_617_371_392, 16_793_600),
+    (512, 588_064_256, 2_099_200),
+    (1024, 994_458_368, 4_198_400),
+    (2048, 1_807_246_592, 8_396_800),
+    (4096, 3_432_823_040, 16_793_600),
 ];
 const EXPERT_WEIGHT: Option<MoeWeight> = Some(MoeWeight::Fp8Bundle);
 const TABLE_LEN: usize = 707;

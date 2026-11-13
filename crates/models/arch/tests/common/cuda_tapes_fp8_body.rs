@@ -229,7 +229,7 @@ fn every_tape_has_the_fp8_steps() {
 }
 
 /// The quant writes of every prefill tape: each sits right before the fp8 GEMM that reads it,
-/// quantizes all `m` rows of that GEMM's `k` columns (an expert GEMM's: all `max_tiles·128`) from a
+/// quantizes all `m` rows of that GEMM's `k` columns (an expert GEMM's: all `max_tiles·64`) from a
 /// bf16 colour or the MoE scratch's rows, and writes the one quant scratch, the arena's last
 /// region: every write starts at its offset, the largest is its size, and it ends the arena. A
 /// reader with no write right before it reads the quantization still live in the scratch: the last
@@ -252,7 +252,7 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
                 "m={m} step {i}: the next step reads what it wrote"
             );
             let rows = match tape.steps.get(i + 1) {
-                Some(CudaStep::ExpertGemm(g)) => g.max_tiles * 128,
+                Some(CudaStep::ExpertGemm(g)) => g.max_tiles * 64,
                 _ => m,
             };
             assert_eq!((q.q.0, q.rows), (at, rows), "m={m} step {i}: its region, rows");
