@@ -4000,7 +4000,8 @@ pub type Fp8Operand = (*const c_void, *const c_void);
 /// Launch the per-token dynamic e4m3 quantization (`kernels/quant_rows_fp8.cu`, FP8 S3): for every
 /// row `r` of `x [rows, cols]` bf16, `scale[r] = max(amax_r / 448, 1 / (448·512))` and `q[r, c] =
 /// e4m3_satfinite(clamp(x[r, c] / scale[r], ±448))`, vLLM v0.31.0's per-token formula with its
-/// division. Asynchronous.
+/// division. A CTA a row (FP8 S8 P2) when `cols` is a multiple of 256 from 2,048 to 17,408, else
+/// F3's 16-row blocks; the same bits. Asynchronous.
 ///
 /// Refused with [`KernelError::RowShape`], before any pointer is touched, unless `rows` is a
 /// non-zero multiple of 16, `cols` of 64 (`step::GEMM_FP8_K_MULTIPLE`) and `rows · cols` at most
@@ -4025,10 +4026,11 @@ pub unsafe fn quant_rows_fp8(
 }
 
 /// Test support for `tests/quant_rows_fp8.rs` only (FP8 S8 F3, P2): [`quant_rows_fp8`] at
-/// `variant`, 0 the FP8 S3 kernel (one warp a 16-row block), 1 [`quant_rows_fp8`]'s own (eight
-/// warps a block), and P2's probe forms, 2 a 16-row block's tiles resident in shared memory (refused
-/// above 5,120 columns) and 3 one CTA a row (refused unless `cols` is a multiple of 256 at most
-/// 17,408); the same bits. Refused as [`quant_rows_fp8`], or for `variant` above 3. Asynchronous.
+/// `variant`, 0 the FP8 S3 kernel (one warp a 16-row block), 1 F3 (eight warps a block,
+/// [`quant_rows_fp8`]'s where the per-row form does not take the row), and P2's forms, 2 a 16-row
+/// block's tiles resident in shared memory (refused above 5,120 columns) and 3 one CTA a row
+/// ([`quant_rows_fp8`]'s from 2,048 to 17,408 columns; refused unless `cols` is a multiple of 256
+/// at most 17,408); the same bits. Refused as [`quant_rows_fp8`], or for `variant` above 3. Asynchronous.
 ///
 /// Kept: both forms are production ([`quant_rows_fp8`] takes the
 /// one-warp form for many narrow rows).

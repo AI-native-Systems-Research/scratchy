@@ -286,12 +286,15 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
 
 }  // namespace
 
-// ── P2: two probe forms of the dense prefill quantize (FP8 S8 P2, timing first) ──
+// ── P2: the dense prefill quantize, a CTA a row (FP8 S8 P2) ──
 //
 // At 2,048 token rows F3 is one CTA a 16-row block, 128 CTAs (one partial wave) of 192 KiB, each
 // walking its tiles twice through a 2-stage ring: its time grows with `cols` (~65 µs at 5,120 on
-// the 27B). Two forms with F3's ops in F3's order, so its bytes and scales; test-only (variants 2
-// and 3 of `scratchy_cuda_quant_rows_fp8_variant`) until a probe picks one per shape:
+// the 27B). Two forms with F3's ops in F3's order, so its bytes and scales (variants 2 and 3 of
+// `scratchy_cuda_quant_rows_fp8_variant`). P2's probe on the H100 (2,048 rows, read-cold) had PER
+// ROW fastest at every `cols` it measured, 2,048 to 17,408 (2,048: 22.8 → 15.6 µs; 5,120: 47.2 →
+// 23.2; 17,408: 140.7 → 51.7), so the launcher runs it there (`per_row_takes`); RESIDENT stays a
+// test form:
 //   - RESIDENT (variant 2): a CTA of 8 warps a 16-row block, its tiles loaded once, in one TMA
 //     burst, and kept in shared memory (warp `w` loads tiles `w, w + 8, …`): pass 1 and pass 2 both
 //     read shared memory. At most 20 tiles (5,120 columns, 160 KiB) plus one e4m3 staging tile a
@@ -305,6 +308,11 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
 //     `warp::copy` to `rt_fp8e4m3` writes). `cols` a multiple of 256, at most 17,408.
 // The amax is exact in any order, and every element meets the same `fp8_quant_pre_nz` call and the
 // same e4m3 rounding, so both are F3's bits.
+//
+// `per_row_takes`: a row of whole 256-column chunks (the converting vector store writes whole
+// chunks) in the measured range. Narrower rows (the 35B's 512, its experts' pair rows) and rows
+// with a partial chunk (Gemma's 2,112, its experts' 704) keep F3, and F3's one-warp form at
+// `narrow_many`: the probe did not measure them.
 
 namespace {
 
@@ -383,6 +391,12 @@ constexpr int PER_ROW_THREADS = PER_ROW_WARPS * kittens::WARP_THREADS;
 // The longest row's chunks (17,408 / 256), and a warp's share of them.
 constexpr int PER_ROW_MAX_CHUNKS = 68;
 constexpr int PER_ROW_WARP_CHUNKS = (PER_ROW_MAX_CHUNKS + PER_ROW_WARPS - 1) / PER_ROW_WARPS;
+
+// Whether the launcher runs the per-row form on a row of `cols` (the comment above).
+bool per_row_takes(uint32_t cols) {
+    return cols % uint32_t(COLS) == 0 && cols >= 2048 &&
+           cols <= uint32_t(PER_ROW_MAX_CHUNKS) * uint32_t(COLS);
+}
 
 using row_chunk_sv = sv_bf<COLS>;
 using row_chunk_rv = rv_fl<COLS>;
@@ -479,9 +493,10 @@ extern "C" int scratchy_cuda_quant_rows_fp8_prepare(void) {
 }
 
 // Test support: `scratchy_cuda_quant_rows_fp8` at `variant` (0 `quant_rows_fp8_ker`, one warp a
-// 16-row block, FP8 S3's form; 1 the launcher's: `quant_rows_fp8_wide_ker` at `wide_warps`, or
-// FP8 S3's form at `narrow_many`; P2's probe forms, 2 RESIDENT, refused above 20 tiles a row, and
-// 3 PER ROW, refused unless `cols` is a multiple of 256 at most 17,408), the same bits.
+// 16-row block, FP8 S3's form; 1 F3: `quant_rows_fp8_wide_ker` at `wide_warps`, or FP8 S3's form
+// at `narrow_many`, the launcher's where the per-row form does not take the row; P2's forms, 2
+// RESIDENT, refused above 20 tiles a row, and 3 PER ROW, the launcher's at `per_row_takes`,
+// refused unless `cols` is a multiple of 256 at most 17,408), the same bits.
 extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void* scale,
                                                     uint32_t rows, uint32_t cols, uint32_t variant,
                                                     void* stream /* cudaStream_t */) {
@@ -552,12 +567,13 @@ extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void
 // to `rows` f32 (4-byte aligned), neither overlapping `x` nor each other.
 // `scratchy_cuda_quant_rows_fp8_prepare` must have succeeded on the current device. The launch is
 // asynchronous on `stream`; the caller owns it and synchronizes. It runs
-// `quant_rows_fp8_wide_ker` (F3), whose bits are `quant_rows_fp8_ker`'s, or `quant_rows_fp8_ker`
-// itself at `narrow_many`.
+// `quant_rows_fp8_per_row_ker` (P2) at `per_row_takes`, else `quant_rows_fp8_wide_ker` (F3), or
+// `quant_rows_fp8_ker` itself at `narrow_many`; all three give `quant_rows_fp8_ker`'s bits.
 extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale, uint32_t rows,
                                             uint32_t cols,
                                             void* stream /* cudaStream_t; null = default */) {
-    return scratchy_cuda_quant_rows_fp8_variant(x, q, scale, rows, cols, 1, stream);
+    const uint32_t variant = per_row_takes(cols) ? 3 : 1;
+    return scratchy_cuda_quant_rows_fp8_variant(x, q, scale, rows, cols, variant, stream);
 }
 
 // ── Q1: the one-row form (the decode bucket's `QuantRowsFp8`) ──
