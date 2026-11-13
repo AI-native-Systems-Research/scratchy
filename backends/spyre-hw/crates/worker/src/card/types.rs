@@ -219,11 +219,17 @@ pub(crate) struct SuperDscBundle {
 pub(crate) struct PrefixLadder(Vec<PrefixRungBuilt>);
 
 /// One BUILT rung of [`PrefixLadder`] — its per-request width, its request count (a solo rung's is 1;
-/// a packed rung's is the count of tails its wave batches into one launch), and its session. The
-/// loader mints these from the bundles the bake shipped; the ladder is their only home.
+/// a packed rung's is the count of tails its wave batches into one launch), its own meta, and its
+/// session. The loader mints these from the bundles the bake shipped; the ladder is their only home.
 pub(crate) struct PrefixRungBuilt {
     pub(crate) width: usize,
     pub(crate) seqs: usize,
+    /// ⭐ THE RUNG'S OWN WIRING'S META — a solo rung binds the prefill graph's (every solo rung
+    /// the same tensor ids), a packed rung its OWN pair's cell (its extent pair, its `s`-row
+    /// seat, its own consts are the pair's, no representative's). The wave front launches
+    /// through it beside the session, so a launch's wiring and its session cannot come from
+    /// two rungs.
+    pub(crate) meta: crate::spyre_types::BundleMeta,
     pub(crate) sess: SuperDscSession,
 }
 
@@ -312,6 +318,17 @@ impl PrefixLadder {
     /// The session of a rung THIS ladder chose.
     pub(crate) fn session(&mut self, rung: PrefixRung) -> &mut SuperDscSession {
         &mut self.0[rung.index].sess
+    }
+
+    /// ⭐ THE WAVE FRONT'S ONE DOOR — the rung's own meta and its own session, borrowed
+    /// together, so a packed launch's wiring and the session that runs it cannot come from
+    /// two rungs.
+    pub(crate) fn packed_parts(
+        &mut self,
+        rung: PrefixRung,
+    ) -> (&crate::spyre_types::BundleMeta, &mut SuperDscSession) {
+        let cell = &mut self.0[rung.index];
+        (&cell.meta, &mut cell.sess)
     }
 }
 

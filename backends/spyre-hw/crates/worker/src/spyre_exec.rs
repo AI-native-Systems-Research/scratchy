@@ -232,6 +232,16 @@ impl Worker for SpyreWorker {
         let mut sampled: Vec<Option<u32>> = Vec::new();
 
         // New requests = (chunked) prefill: register the prompt + empty KV cache.
+        //
+        // ⭐ THE WAVE GATHERS BEFORE ANY REQUEST RUNS. A multi-token chunk — a cache-hit tail
+        // (`start > 0`), or a fresh prompt's whole step — is a candidate for the PREFILL WAVE
+        // below: the packed rung is chosen for the wave AS A WHOLE (the widest tail and the
+        // live count together), so no candidate can be committed to the solo path before
+        // that selection. A wave no packed rung holds — a tail wider than every window, a
+        // count past every capacity, or fewer than two of them — runs the solo chunk loop,
+        // exactly as before: a selection, never a refusal.
+        #[cfg(feature = "spyre-hw")]
+        let mut wave: Vec<PackedTail> = Vec::new();
         for nr in &scheduler_output.scheduled_new_reqs {
             let n = scheduler_output
                 .num_scheduled_tokens
@@ -245,9 +255,10 @@ impl Worker for SpyreWorker {
                 ReqState {
                     // ⭐ THE DRAW, DECIDED ONCE AT ADMISSION and staged per step by every seat the
                     // request's rows run through — the prompt-final chunk's, the solo decode loop's,
-                    // the batch's. Cached steps never see sampling params again, so this is the one
-                    // door. A request this path cannot serve honestly (a knob with no card leg) is
-                    // refused here, naming the knob — on both tiers, which mint the same draw.
+                    // the batch's, the wave's. Cached steps never see sampling params again, so this
+                    // is the one door. A request this path cannot serve honestly (a knob with no
+                    // card leg) is refused here, naming the knob — on both tiers, which mint the
+                    // same draw.
                     draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref()).map_err(werr)?,
                 },
             );
@@ -265,6 +276,43 @@ impl Worker for SpyreWorker {
                 nr.block_ids.first().cloned().unwrap_or_default(),
                 nr.num_computed_tokens,
             );
+            #[cfg(feature = "spyre-hw")]
+            if n > 1 {
+                let draw = requests.get(&nr.req_id).expect("just inserted").draw;
+                let prompt_len = input_batch.prompt_len(&nr.req_id);
+                let toks: Vec<usize> = (start..start + n)
+                    .map(|p| {
+                        input_batch
+                            .token_at(&nr.req_id, p)
+                            .map(|t| t as usize)
+                            .ok_or_else(|| {
+                                werr(format!(
+                                    "prefill wave: req {} has no token at {p}",
+                                    nr.req_id
+                                ))
+                            })
+                    })
+                    .collect::<ExecutorResult<_>>()?;
+                let blocks: Vec<u32> = input_batch
+                    .block_table(&nr.req_id)
+                    .map(|t| {
+                        t.iter()
+                            .map(|&b| {
+                                scratchy_target_spyre::paged_step::page_of_block(b as u32)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                wave.push(PackedTail {
+                    id: nr.req_id.clone(),
+                    start,
+                    toks,
+                    blocks,
+                    draw,
+                    finishes: start + n >= prompt_len,
+                });
+                continue;
+            }
             let req = requests.get_mut(&nr.req_id).expect("just inserted");
             let s = run_request_step(model, req, &nr.req_id, input_batch, start, n)?;
             order.push(nr.req_id.clone());
@@ -308,6 +356,96 @@ impl Worker for SpyreWorker {
                 input_batch.set_tokens_in_pool(id, computed);
             }
         }
+        // ⭐ THE WAVE'S OTHER HALF — the CACHED continuation chunks (`n > 1` past a computed
+        // prefix), gathered AFTER the grant install above so each rides the blocks this
+        // step's grant named. They leave the per-request loop below (`waved`), exactly as
+        // the decode batch's requests leave it (`batched`).
+        #[cfg(feature = "spyre-hw")]
+        let mut waved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        #[cfg(feature = "spyre-hw")]
+        for (i, id) in cr.req_ids.iter().enumerate() {
+            let n = scheduler_output
+                .num_scheduled_tokens
+                .get(id)
+                .copied()
+                .unwrap_or(0);
+            let start = cr.num_computed_tokens.get(i).copied().unwrap_or(0) as usize;
+            if n <= 1 || !requests.contains_key(id) {
+                continue;
+            }
+            let prompt_len = input_batch.prompt_len(id);
+            let toks: Vec<usize> = (start..start + n)
+                .map(|p| {
+                    input_batch
+                        .token_at(id, p)
+                        .map(|t| t as usize)
+                        .ok_or_else(|| {
+                            werr(format!("prefill wave: req {id} has no token at {p}"))
+                        })
+                })
+                .collect::<ExecutorResult<_>>()?;
+            let blocks: Vec<u32> = input_batch
+                .block_table(id)
+                .map(|t| {
+                    t.iter()
+                        .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let draw = requests.get(id).expect("checked contains_key").draw;
+            wave.push(PackedTail {
+                id: id.clone(),
+                start,
+                toks,
+                blocks,
+                draw,
+                finishes: start + n >= prompt_len,
+            });
+            waved.insert(id.clone());
+        }
+        // ⭐ THE PREFILL WAVE — every gathered tail in ONE launch on the packed rung that
+        // holds them (`packed_rung_for`: the smallest product holding the widest tail and
+        // the live count, first fit on the count). One weight stream, one launch, one
+        // readback of `s` picks — request `r`'s own answer from window `r`. A wave of fewer
+        // than two is not a wave: a lone tail would pay `s − 1` empty windows for nothing,
+        // so it and every wave no rung holds run the solo chunk loop.
+        #[cfg(feature = "spyre-hw")]
+        {
+            let rung = if wave.len() >= 2 {
+                let max_tail = wave.iter().map(|t| t.toks.len()).max().unwrap_or(0);
+                let SendnnSession::SuperDsc(sb) = &mut model.session;
+                sb.prefill_prefix.packed_rung_for(max_tail, wave.len())
+            } else {
+                None
+            };
+            if let Some(rung) = rung {
+                let sh = Shared {
+                    embed_tokens: &model.embed_tokens,
+                    hidden: model.hidden,
+                    vocab: model.vocab,
+                };
+                let SendnnSession::SuperDsc(sb) = &mut model.session;
+                let picks =
+                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, &wave, input_batch)?;
+                for (t, pick) in wave.iter().zip(picks) {
+                    order.push(t.id.clone());
+                    sampled.push(pick);
+                }
+            } else {
+                // No rung holds the wave (or it is not one): every gathered tail runs the
+                // solo chunk loop, exactly as before — a selection, never a refusal.
+                for t in wave {
+                    let req = requests
+                        .get_mut(&t.id)
+                        .ok_or_else(|| werr(format!("unknown wave req {}", t.id)))?;
+                    let s =
+                        run_request_step(model, req, &t.id, input_batch, t.start, t.toks.len())?;
+                    order.push(t.id.clone());
+                    sampled.push(s);
+                }
+                waved.clear();
+            }
+        }
         // ── BATCHED DECODE ────────────────────────────────────────────────────────────────────────
         // Every cached request scheduled for exactly ONE GENERATED token is a decode step, and those
         // are the whole reason the weight set gets streamed over and over: each used to be its own
@@ -320,9 +458,9 @@ impl Worker for SpyreWorker {
         // (`batched_decode_head_major`); the paged step each stages is built from the requests' own
         // block tables and positions.
         //
-        // A continuation chunk (n > 1) is not a decode step and keeps the per-request path below;
-        // a DECODE step never does — one request is the W=1 OWNER here, and a live count past the
-        // widest rung refuses below.
+        // A continuation chunk (n > 1) is not a decode step — the wave above took it, or (no rung
+        // holding) the per-request path below did; a DECODE step never takes either — one request
+        // is the W=1 OWNER here, and a live count past the widest rung refuses below.
         #[cfg(feature = "spyre-hw")]
         let mut batched: std::collections::HashSet<String> = std::collections::HashSet::new();
         #[cfg(feature = "spyre-hw")]
@@ -605,7 +743,7 @@ impl Worker for SpyreWorker {
         }
         for (i, req_id) in cr.req_ids.iter().enumerate() {
             #[cfg(feature = "spyre-hw")]
-            if batched.contains(req_id) {
+            if batched.contains(req_id) || waved.contains(req_id) {
                 continue;
             }
             let n = scheduler_output

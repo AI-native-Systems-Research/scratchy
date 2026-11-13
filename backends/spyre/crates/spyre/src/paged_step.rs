@@ -1956,6 +1956,48 @@ mod tests {
         assert!(s.on_body(0, PagedRows::Sequence, 8).is_none());
     }
 
+    /// ⭐ THE PACKED LAUNCH'S EXTENT — the wiring's OWN stated pair, kept verbatim: a packed
+    /// rung's wiring is not a representative of a tape baked at several widths (the bake
+    /// minted `(w, s)` for that rung), and a wave launch IS that pair, so nothing is
+    /// re-derived but the walk — from the sweep of the body the session selected, the same
+    /// walk laws `on_body` holds. A SOLO pair is not a packed rung's and names no step.
+    #[test]
+    fn a_packed_launch_keeps_the_wirings_own_pair() {
+        let packed = PagedStep {
+            rows: 6,
+            extent: pair(3, 2),
+            ..step()
+        };
+        let body = packed.on_body_packed(8).unwrap();
+        assert_eq!((body.rows, body.walk, body.reach()), (6, 2, 8));
+        assert_eq!(
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
+            (3, 2),
+            "the wiring's own pair, verbatim — the launch IS the pair"
+        );
+        let solo = PagedStep {
+            rows: 3,
+            extent: pair(3, 1),
+            ..step()
+        };
+        assert!(
+            solo.on_body_packed(8).is_none(),
+            "a solo rung's wiring is no packed rung's — a wave on it names no step"
+        );
+        assert!(
+            packed.on_body_packed(6).is_none(),
+            "not whole pages"
+        );
+        assert!(packed.on_body_packed(0).is_none());
+        assert!(
+            packed.on_body_packed(20).is_none(),
+            "past the pool"
+        );
+    }
+
     #[test]
     fn a_step_past_the_request_s_blocks_is_refused() {
         let s = step();

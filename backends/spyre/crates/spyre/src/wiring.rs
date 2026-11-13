@@ -889,6 +889,23 @@ impl PagedStep {
                 ..self
             })
     }
+
+    /// ⭐ THE PACKED LAUNCH'S EXTENT — the wiring's OWN stated pair, kept verbatim.
+    ///
+    /// A packed rung's wiring is not a representative of a tape baked at several widths: the
+    /// bake minted the pair `(w, s)` for THIS rung ([`QueryExtent`]'s own law), and a wave
+    /// launch IS that pair — `s` requests of `w` rows each, neither the one request of
+    /// [`Self::on_body`]'s `Sequence` law nor the one-row-per-request of its `Batch` law, so
+    /// there is no pair to re-derive from the launch's rows. Only the walk is the launch's to
+    /// derive, from the sweep of the body the session selected — exactly `on_body`'s own law.
+    pub fn on_body_packed(self, swept: u32) -> Option<PagedStep> {
+        let walk = swept / self.page_slots;
+        (self.extent.requests().get() > 1
+            && walk > 0
+            && swept.is_multiple_of(self.page_slots)
+            && walk <= self.pages)
+            .then_some(PagedStep { walk, ..self })
+    }
 }
 
 /// Where a paged step's card source sits ([`PagedStep::card_placements`]).

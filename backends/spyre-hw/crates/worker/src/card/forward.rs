@@ -68,6 +68,15 @@ pub(crate) enum LaunchRows<'a> {
     /// A decode batch: one token per live sequence, in slot order; the rung's rows past them are
     /// padding, written at the null slot (`paged_step::batch_sources`).
     Batch { seqs: &'a [BatchSeq<'a>] },
+    /// ⭐ A WAVE OF CONTINUATION TAILS on a packed rung — `steps` dense from window 0 (request
+    /// `r` rides window `r`), each request's window `width` rows wide: the rung's own
+    /// per-request width, the fact every row law below divides by. The windows past the live
+    /// requests are the rung's EMPTY slots (`paged_step::card_step_sources`'s empty-slot law:
+    /// their writes reach no request's cache and their answers are read by nobody).
+    Packed {
+        steps: &'a [scratchy_target_spyre::paged_step::RequestStep<'a>],
+        width: usize,
+    },
 }
 
 impl LaunchRows<'_> {
@@ -77,35 +86,44 @@ impl LaunchRows<'_> {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.end() - 1,
             LaunchRows::Batch { seqs } => seqs.iter().map(|q| q.pos).max().unwrap_or(0),
+            // The deepest position ANY request reaches — the body the session selects must
+            // walk to every request's keys, not one of them.
+            LaunchRows::Packed { steps, .. } => {
+                steps.iter().map(|s| s.rows.end()).max().unwrap_or(1) - 1
+            }
         }
     }
 
-    fn paged_rows(&self) -> scratchy_target_spyre::paged_step::PagedRows {
-        match self {
-            LaunchRows::Sequence { .. } => scratchy_target_spyre::paged_step::PagedRows::Sequence,
-            LaunchRows::Batch { .. } => scratchy_target_spyre::paged_step::PagedRows::Batch,
-        }
-    }
-
-    /// The live rows — a sequence's real tokens, or a batch's sequences.
+    /// The live rows — a sequence's real tokens, a batch's sequences, or a wave's every
+    /// request's real rows (the count its concatenated host seeds carry).
     fn live(&self) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.real.get(),
             LaunchRows::Batch { seqs } => seqs.len(),
+            LaunchRows::Packed { steps, .. } => steps.iter().map(|s| s.rows.real.get()).sum(),
         }
     }
 
     /// Bound row `r`'s position. A pad row's is a live row's: a sequence's pad row repeats its last
     /// real token (`StepRows::pos`), a batch's repeats live 0 (its write lands at the null slot, so
-    /// what it computes is never read).
+    /// what it computes is never read). A wave's row `r` is window `r / width`'s row
+    /// `r % width` — its own request's position, a pad row clamped to its request's last real
+    /// one; an EMPTY window's rows take live 0's last real position, the same clamp the
+    /// decode's pad rows take.
     fn pos(&self, r: usize) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.pos(r),
             LaunchRows::Batch { seqs } => seqs.get(r).unwrap_or(&seqs[0]).pos,
+            LaunchRows::Packed { steps, width } => match steps.get(r / width) {
+                Some(req) => req.rows.pos(r % width),
+                None => steps[0].rows.pos(width - 1),
+            },
         }
     }
 
-    /// The live row a bound row `r` takes its token from.
+    /// The live row a bound row `r` takes its token from. A wave's row takes its own
+    /// window's, clamped to its request's last real row; an empty window's rows take live
+    /// 0's last real row, so the seed law's `t[live_of(r)]` always names a real token.
     fn live_of(&self, r: usize) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => r.min(rows.real.get() - 1),
@@ -115,6 +133,17 @@ impl LaunchRows<'_> {
                 } else {
                     0
                 }
+            }
+            LaunchRows::Packed { steps, width } => {
+                let q = r / width;
+                let mut base = 0;
+                for (i, req) in steps.iter().enumerate() {
+                    if i == q {
+                        return base + (r % width).min(req.rows.real.get() - 1);
+                    }
+                    base += req.rows.real.get();
+                }
+                steps[0].rows.real.get() - 1
             }
         }
     }
@@ -217,16 +246,32 @@ pub(crate) fn run_card_launch(
             ))
         })?
         .get();
-    let step = b
+    let paged = b
         .wiring
         .paged
-        .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?
-        .on_body(width.get(), rows_in.paged_rows(), swept)
-        .ok_or_else(|| {
-            werr(format!(
-                "card launch: the body sweeps {swept} slot(s), which is no walk of this bundle's pool"
-            ))
-        })?;
+        .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
+    // ⭐ THE EXTENT LAW IS THE LAUNCH'S OWN KIND — a sequence launch re-derives its pair from
+    // its rows, a decode batch from its count, and a WAVE keeps the packed rung's wiring's
+    // own pair (`on_body_packed`): the bake minted `(w, s)` for that rung, and the wave IS
+    // that pair, so there is nothing to re-derive.
+    let step = match &rows_in {
+        LaunchRows::Sequence { .. } => paged.on_body(
+            width.get(),
+            scratchy_target_spyre::paged_step::PagedRows::Sequence,
+            swept,
+        ),
+        LaunchRows::Batch { .. } => paged.on_body(
+            width.get(),
+            scratchy_target_spyre::paged_step::PagedRows::Batch,
+            swept,
+        ),
+        LaunchRows::Packed { .. } => paged.on_body_packed(swept),
+    }
+    .ok_or_else(|| {
+        werr(format!(
+            "card launch: the body sweeps {swept} slot(s), which is no walk of this bundle's pool"
+        ))
+    })?;
     let card = match &rows_in {
         LaunchRows::Sequence { blocks, rows } => {
             // One request's list: a sequence launch is one request today — the packing that
@@ -241,6 +286,12 @@ pub(crate) fn run_card_launch(
         }
         LaunchRows::Batch { seqs } => {
             scratchy_target_spyre::paged_step::card_batch_sources(&step, seqs)
+        }
+        // ⭐ THE WAVE'S OWN STEPS, one window per request — `card_step_sources` stages each
+        // request's three tables at its window's own tids and the empty slots past the live
+        // ones as no request's.
+        LaunchRows::Packed { steps, .. } => {
+            scratchy_target_spyre::paged_step::card_step_sources(&step, steps)
         }
     }
     .map_err(|e| werr(format!("card launch at {seq_pos}: paged step: {e}")))?;
@@ -367,21 +418,42 @@ pub(crate) fn run_card_launch(
     // (the pair is `Copy` — a reference and a `Copy` width — so this binding
     // copies it and the pick match below binds its own copy of the same one)
     if let Some((seat, seat_width)) = seat_launch {
-        let laws: Vec<RowLaw<'_>> = match seat_laws {
+        let laws: Vec<RowLaw<'_>> = match (seat_laws, &rows_in) {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
             // draw the last real row would).
-            SeatLaws::Prompt { draw } => (0..seat_width.get())
-                .map(|r| RowLaw {
-                    draw,
-                    step: rows_in.pos(r) as u32,
-                })
-                .collect(),
+            (SeatLaws::Prompt { draw }, LaunchRows::Sequence { rows, .. }) => {
+                (0..seat_width.get())
+                    .map(|r| RowLaw {
+                        draw,
+                        step: rows.pos(r) as u32,
+                    })
+                    .collect()
+            }
             // A DECODE: live row `s` runs its own request's draw at its own position, and a pad row
             // runs live 0's ([`pad_law_of`]).
-            SeatLaws::Batch { draws } => {
+            (SeatLaws::Batch { draws }, LaunchRows::Batch { .. }) => {
                 let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s) as u32).collect();
                 batch_seat_laws(draws, &live_pos, seat_width.get())?
+            }
+            // ⭐ A WAVE OF TAILS: seat row `r` is request `r`'s folded answer row — its law is
+            // request `r`'s draw at request `r`'s LAST position, and a pad seat row (an empty
+            // window's answer) runs live 0's, the pad clamp.
+            (SeatLaws::Packed { draws }, LaunchRows::Packed { steps, .. }) => {
+                let last: Vec<u32> = steps.iter().map(|s| (s.rows.end() - 1) as u32).collect();
+                batch_seat_laws(draws, &last, seat_width.get())?
+            }
+            // ⭐ THE LAWS AND THE LAUNCH'S ROWS ARE PAIRED — the enum's own law. A mismatch is
+            // refused where the seat is staged, never silently resolved: staging one
+            // request's Prompt laws over a wave's windows would draw every window with one
+            // request's seed, and a Batch's per-row laws over a wave would salt every seat
+            // row with request 0's positions.
+            _ => {
+                return Err(werr(
+                    "card launch: the seat laws do not match the launch's rows — Prompt laws on a \
+                     sequence, Batch laws on a decode, Packed laws on a wave"
+                        .to_string(),
+                ));
             }
         };
         acts_i32.extend(sample_binds(seat, seat_width, &laws)?);
@@ -768,12 +840,13 @@ fn batch_seat_laws<'a>(
     Ok(laws)
 }
 
-/// ⭐ THE SEAT LAWS ONE LAUNCH RUNS ITS ROWS UNDER — the two shapes a caller
-/// can know them in, and ONLY those two: a prompt-final chunk serves ONE
-/// request whose rows are consecutive positions of one sequence, and a decode
-/// batch serves one request PER LIVE ROW. The variant must match the launch's
-/// own arm (`per_request`); a mismatch is refused where the seat is staged,
-/// never silently resolved.
+/// ⭐ THE SEAT LAWS ONE LAUNCH RUNS ITS ROWS UNDER — the three shapes a caller
+/// can know them in, and ONLY those three: a prompt-final chunk serves ONE
+/// request whose rows are consecutive positions of one sequence, a decode
+/// batch serves one request PER LIVE ROW, and a wave of tails serves one
+/// request PER WINDOW. The variant must match the launch's own rows (the
+/// staging match refuses every other pairing); a mismatch is refused where
+/// the seat is staged, never silently resolved.
 pub(crate) enum SeatLaws<'a> {
     /// A prompt-final chunk: every baked row runs `draw` — real row `i` at its
     /// own position `start + i`, and a pad row at the last real position it
@@ -786,6 +859,14 @@ pub(crate) enum SeatLaws<'a> {
     /// draw at that request's own position. A padding slot runs LIVE 0'S LAW
     /// ([`pad_law_of`], the pad clamp); its pick is never read.
     Batch {
+        draws: &'a [Option<&'a SampledDraw>],
+    },
+    /// ⭐ A WAVE OF TAILS: one law per REQUEST, in window order — seat row `r`
+    /// is request `r`'s folded answer row, so it runs request `r`'s draw at
+    /// request `r`'s LAST position (the row the lm-head fold takes). A pad seat
+    /// row — an empty window's answer — runs live 0's law ([`pad_law_of`]); its
+    /// pick is never read.
+    Packed {
         draws: &'a [Option<&'a SampledDraw>],
     },
 }
@@ -1316,6 +1397,119 @@ pub(crate) fn superdsc_forward_chunk(
         Some(ts) => ChunkOut::Tokens(ts),
         None => ChunkOut::Prompt,
     })
+}
+
+/// ⭐ ONE REQUEST OF A PREFILL WAVE — the tokens this step forwards for it (its cache-hit
+/// tail, or a fresh prompt's whole step), its KV blocks as pool pages, its draw, and whether
+/// this step finishes its prompt (the request whose pick the wave's readback carries). Owned
+/// whole: the gatherer builds it before any request runs, so nothing of the executor's
+/// borrows rides the wave.
+pub(crate) struct PackedTail {
+    pub(crate) id: String,
+    pub(crate) start: usize,
+    pub(crate) toks: Vec<usize>,
+    pub(crate) blocks: Vec<u32>,
+    pub(crate) draw: Option<SampledDraw>,
+    pub(crate) finishes: bool,
+}
+
+/// ⭐ A WAVE OF CONTINUATION TAILS, ONE LAUNCH — the packed rung's own front.
+///
+/// The scheduler hands one step several requests whose prompts share a cached prefix (or
+/// several fresh prompts that fit a window each); the solo path runs each as its own chunk,
+/// paying the rung's fixed cost — the weight streams and the launch — once per tail. The wave
+/// batches them onto ONE packed rung `(w, s)`: request `r` rides window `r` — rows
+/// `r·w .. r·w+w` of the rung's graph — staging its own three tables at its own window tids
+/// ([`card_step_sources`]), seeding its rows with its own tokens, its KV writes naming its
+/// own cache slots, and the rung's minted sampler picking one token per window.
+///
+/// The suffix runs for EVERY window — one tape, one launch, no per-window skip — so the
+/// readback carries `s` picks and only the finishing requests' are kept: a mid-prompt
+/// request's pick is computed and never read. The caller's selection (a rung that holds the
+/// widest tail and the live count, or none) is a SELECTION, never a refusal: a wave no rung
+/// holds runs the solo path.
+pub(crate) fn superdsc_forward_packed(
+    sh: &Shared<'_>,
+    prefix: &mut PrefixLadder,
+    rung: PrefixRung,
+    tails: &[PackedTail],
+    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
+) -> ExecutorResult<Vec<Option<u32>>> {
+    let (meta, sess) = prefix.packed_parts(rung);
+    let (w, s) = (rung.width(), rung.seqs());
+    // ⭐ REQUEST `r`'S OWN STEP — its tail's rows from its own start, at most the window's
+    // width (the selection held the widest tail), in its own pages.
+    let steps: Vec<scratchy_target_spyre::paged_step::RequestStep<'_>> = tails
+        .iter()
+        .map(|t| {
+            Ok(scratchy_target_spyre::paged_step::RequestStep {
+                blocks: &t.blocks,
+                rows: StepRows::new(t.start, t.toks.len()).ok_or_else(|| {
+                    werr("a wave tail of zero real rows — the gatherer staged no tail".to_string())
+                })?,
+            })
+        })
+        .collect::<ExecutorResult<_>>()?;
+    // ⭐ THE SEEDS, CONCATENATED — one token per live row, window order: request `r`'s rows
+    // take request `r`'s tokens ([`LaunchRows::live_of`]'s window law).
+    let seeds: Vec<usize> = tails.iter().flat_map(|t| t.toks.iter().copied()).collect();
+    let draws: Vec<Option<&SampledDraw>> = tails.iter().map(|t| t.draw.as_ref()).collect();
+    let width = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows((w * s) as u32)
+        .ok_or_else(|| werr("the packed rung bakes zero rows".to_string()))?;
+    let picked = match run_card_launch(
+        LaunchRows::Packed {
+            steps: &steps,
+            width: w,
+        },
+        sh,
+        sess,
+        meta,
+        width,
+        SamplerLaws {
+            seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&seeds),
+            want_logits: LogitsWanted::LastRow,
+            laws: SeatLaws::Packed { draws: &draws },
+        },
+    )? {
+        BatchOut::Done(picked) => picked.ok_or_else(|| {
+            werr(
+                "the packed launch picked no tokens — its minted draw never ran, and every \
+                 window's answer is the readback's to carry"
+                    .to_string(),
+            )
+        })?,
+        BatchOut::Deferred(_) => {
+            return Err(werr(
+                "a packed prefill deferred its read — only a decode can".to_string(),
+            ));
+        }
+    };
+    if picked.len() != s {
+        return Err(werr(format!(
+            "the packed rung (w={w}, s={s}) picked {} token(s) — one per window, never another \
+             count",
+            picked.len()
+        )));
+    }
+    tracing::debug!(
+        "PREFILL_PATH=packed rung_w={w} rung_s={s} tails={} rows={}",
+        tails.len(),
+        seeds.len()
+    );
+    // ⭐ THE BOOKKEEPING, PER REQUEST — its pool count always, its pick iff this step
+    // finished its prompt (the pick is request `r`'s own: seat row `r`, window `r`).
+    let mut out = Vec::with_capacity(tails.len());
+    for (r, t) in tails.iter().enumerate() {
+        tokens.set_tokens_in_pool(&t.id, t.start + t.toks.len());
+        if t.finishes {
+            let tok = picked[r];
+            tokens.push_generated(&t.id, tok);
+            out.push(Some(tok));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
 }
 
 /// Run the prompt tokens `toks` at absolute positions `start..start+toks.len()` on the card's

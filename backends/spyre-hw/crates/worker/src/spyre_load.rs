@@ -1358,6 +1358,39 @@ impl SpyreWorker {
         // Where the shared host threads run, read from the cards when they join (below).
         #[cfg(feature = "spyre-hw")]
         let world_cpus_v: scratchy_target_spyre_card::runtime::WorldCpus;
+        // ⭐ THE ONE META MINT — stated once above every session the loader builds (the
+        // prefix ladder's adoption below mints each rung's own beside its build), so no
+        // BundleMeta in this file is spelled a second time.
+        #[allow(unused_variables)]
+        let mk_meta =
+            |p: Parsed, prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
+                BundleMeta {
+                    #[cfg(not(feature = "spyre-hw"))]
+                    prog,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    paged: p.paged,
+                    capacity: p.capacity,
+                    m_cap: p.m_cap,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    embed_src: p.embed_src,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    cos_srcs: p.cos_srcs,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    sin_srcs: p.sin_srcs,
+                    result_id: p.result_id,
+                    layers: p.layers,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    output_ids: p.output_ids,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    scalarmul_scales: p.scalarmul_scales,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    phase: wiring.phase,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    sample_seat: wiring.sample_seat,
+                    #[cfg(feature = "spyre-hw")]
+                    wiring,
+                }
+            };
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -2149,18 +2182,15 @@ impl SpyreWorker {
                     pmq: u32,
                     seqs: u32,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                    consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
+                    /// ⭐ THE RUNG'S OWN WIRING — a SOLO rung's the prefill graph's, a PACKED
+                    /// rung's its OWN pair's cell. The job's consts (the general mint's nine
+                    /// tables, each bundle's own seg3 copy — a packed rung's uniform
+                    /// `[rows, 1]` tables stage at the product's rows, the decode ladder's
+                    /// law) and the adopted rung's meta both read this one cell, so the
+                    /// lookup is stated once.
+                    wiring: &'static scratchy_target_spyre::wiring::Wiring,
                 }
                 let pool_for_prefix = prefill_pool_statics(wirings)?;
-                // The general mint's nine tables, each bundle's own seg3 copy — a SOLO rung
-                // stages the prefill wiring's list; a PACKED rung its OWN pair's cell (its
-                // uniform `[rows, 1]` tables stage at the product's rows — the decode
-                // ladder's law, one const list per baked rung).
-                let prefix_consts = wirings
-                    .prefill
-                    .as_ref()
-                    .unwrap_or(&wirings.decode)
-                    .load_consts;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
                 for &(pmq, seqs, psent) in g0.prefill_prefix {
                     if pmq <= 1 || psent.is_empty() {
@@ -2175,14 +2205,14 @@ impl SpyreWorker {
                                  resolve — every rung the bake shipped must load"
                             )
                         });
-                    let consts = if seqs == 1 {
-                        prefix_consts
+                    let wiring = if seqs == 1 {
+                        wirings.prefill.as_ref().unwrap_or(&wirings.decode)
                     } else {
                         wirings
                             .packed_prefill
                             .iter()
                             .find(|&&(w, s, _)| w == pmq && s == seqs)
-                            .map(|(_, _, wiring)| wiring.load_consts)
+                            .map(|cell| &cell.2)
                             .unwrap_or_else(|| {
                                 panic!(
                                     "the packed prefix rung (w={pmq}, s={seqs}) baked no wiring \
@@ -2194,7 +2224,7 @@ impl SpyreWorker {
                         pmq,
                         seqs,
                         rcode: pcode2,
-                        consts,
+                        wiring,
                     });
                 }
                 // ── BUILD THE PREFIX RUNGS IN PARALLEL ── one thread per rung (a handful at
@@ -2228,7 +2258,7 @@ impl SpyreWorker {
                                                     num_blocks,
                                                 },
                                                 &[1, 2],
-                                                job.consts,
+                                                job.wiring.load_consts,
                                                 &pool,
                                                 &spill,
                                             )
@@ -2813,8 +2843,13 @@ impl SpyreWorker {
                 // the prefill ladder's, before the owner (host halves only); its prepare ran in
                 // the wave above. The adoption runs one thread per session, reading the owner
                 // only; refusals and "ready" logs land in ladder order on this thread.
-                let prefix_adopted: Vec<(u32, u32, &'static str, Result<SuperDscSession, String>)> =
-                    std::thread::scope(|scope| {
+                let prefix_adopted: Vec<(
+                    u32,
+                    u32,
+                    &'static str,
+                    &'static scratchy_target_spyre::wiring::Wiring,
+                    Result<SuperDscSession, String>,
+                )> = std::thread::scope(|scope| {
                         let handles: Vec<_> = prefix_jobs
                             .into_iter()
                             .zip(prefix_prepared)
@@ -2824,11 +2859,13 @@ impl SpyreWorker {
                                 let pmq = job.pmq;
                                 let seqs = job.seqs;
                                 let fp: &'static str = &job.rcode.fp;
+                                let wiring = job.wiring;
                                 scope.spawn(move || {
                                     (
                                         pmq,
                                         seqs,
                                         fp,
+                                        wiring,
                                         built.map_err(|(_, m)| m).and_then(|mut ps| {
                                             adopt_from_owner(&mut ps, ss, spill)
                                                 .map_err(|e| {
@@ -2852,8 +2889,11 @@ impl SpyreWorker {
                             .collect()
                     });
                 let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
-                for (pmq, seqs, fp, adopted) in prefix_adopted {
+                for (pmq, seqs, fp, wiring, adopted) in prefix_adopted {
                     let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
+                    // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its consts
+                    // staged — the wave front's launch reads it, never a representative's.
+                    let meta = mk_meta(wiring_to_parsed(wiring)?, 0, wiring);
                     info!(
                         "[spyre-worker] sendnn: prefix-capable prefill session ready (w={}, s={}, \
                          bundle {}) — a start>0 chunk runs on the smallest solo rung that holds \
@@ -2863,6 +2903,7 @@ impl SpyreWorker {
                     prefix_built.push(PrefixRungBuilt {
                         width: pmq as usize,
                         seqs: seqs as usize,
+                        meta,
                         sess: ps,
                     });
                 }
@@ -2985,37 +3026,6 @@ impl SpyreWorker {
         // forward; keep these for the BundleMeta (decode/prefill phase index).
         #[cfg(feature = "spyre-hw")]
         let (decode_prog_base, prefill_prog) = (1usize, Some(0usize));
-
-        #[allow(unused_variables)]
-        let mk_meta =
-            |p: Parsed, prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
-                BundleMeta {
-                    #[cfg(not(feature = "spyre-hw"))]
-                    prog,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    paged: p.paged,
-                    capacity: p.capacity,
-                    m_cap: p.m_cap,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    embed_src: p.embed_src,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    cos_srcs: p.cos_srcs,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    sin_srcs: p.sin_srcs,
-                    result_id: p.result_id,
-                    layers: p.layers,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    output_ids: p.output_ids,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    scalarmul_scales: p.scalarmul_scales,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    phase: wiring.phase,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    sample_seat: wiring.sample_seat,
-                    #[cfg(feature = "spyre-hw")]
-                    wiring,
-                }
-            };
 
         // Model-level dims (identical across cap buckets) from the first decode parse.
         let hidden = dparsed.hidden;
