@@ -51,8 +51,15 @@ scratchy-target-spyre-card = { path = "../card", optional = true }
 # scratchy-models' own features, as `scr`'s `model` alias does (the same package, so the same
 # features). `quant` and `tp` likewise: `--features quant/<preset>`, `--features tp/<W>`.
 model = { package = "scratchy-models", path = "../../../../crates/models/arch", default-features = false }
-tp = { package = "scratchy-tp", path = "../tp", optional = true }
 quant = { package = "scratchy-quantizations", path = "../../../../crates/models/quantization", default-features = false }
+# THE TP ALIAS: it exists solely so `--features tp/<W>` can name the sharded worlds
+# the bake emits (its features forward to scratchy-target-spyre-worker's `tp-<W>`).
+# Optional, and anchored in `main.rs` (`extern crate tp as _`): the anchor is what
+# keeps resolver v2 forwarding the alias's features to the real build — a
+# platform-specific dep inactive for the target (a cfg(false) home, tried first,
+# never activates) has its features dropped, silently baking one card. The anchor
+# is also what marks the alias used, keeping cargo::unused_dependencies silent.
+tp = { package = "scratchy-tp", path = "../tp", optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow = { workspace = true }
