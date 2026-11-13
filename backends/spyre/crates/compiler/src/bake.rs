@@ -212,7 +212,7 @@ type DecodeRungEntry = (
 fn ladder_lits(
     prefill_rungs: &[(u32, String)],
     decode_rungs: &[DecodeRungEntry],
-    prefill_prefix_rungs: &[(u32, String)],
+    prefill_prefix_rungs: &[(u32, u32, String)],
 ) -> (
     Vec<proc_macro2::TokenStream>,
     Vec<proc_macro2::TokenStream>,
@@ -231,7 +231,22 @@ fn ladder_lits(
             })
             .collect()
     };
-    let prefix = mq_rungs(prefill_prefix_rungs);
+    // The prefix ladder's rungs are (width, seqs, fp) pairs — a solo rung carries
+    // seqs == 1, a packed one its own count. Sorted by (width, seqs) so the
+    // worker's first-fit walk over the list is deterministic bake to bake.
+    let prefix = {
+        let mut rungs = prefill_prefix_rungs.to_vec();
+        rungs.sort_by_key(|(w, s, _)| (*w, *s));
+        rungs
+            .iter()
+            .map(|(w, s, fp)| {
+                let w = proc_macro2::Literal::u32_unsuffixed(*w);
+                let s = proc_macro2::Literal::u32_unsuffixed(*s);
+                let fp = sentinel(fp);
+                quote! { (#w, #s, #fp) }
+            })
+            .collect()
+    };
     let prefill = if prefill_rungs.len() > 1 {
         mq_rungs(prefill_rungs)
     } else {
@@ -2718,10 +2733,11 @@ pub(crate) fn dump_wavefront_mega(
         // wiring is kept (both agree on every field below — the prefill bundle
         // differs only in row count, which is not a term here).
         #[allow(clippy::type_complexity)]
-        let wiring_tokens: std::cell::RefCell<(
-            Option<proc_macro2::TokenStream>,
-            Option<proc_macro2::TokenStream>,
-        )> = std::cell::RefCell::new((None, None));
+        let wiring_tokens: std::cell::RefCell<WiringCells> = std::cell::RefCell::new(WiringCells {
+            decode: None,
+            prefill: None,
+            packed_prefill: Vec::new(),
+        });
         // (label, fold set sorted by tid) of the first program that walked — every
         // later program must reproduce it exactly. See the census doc below.
         type WeightFoldCensus = Option<(String, Vec<(u32, f32)>)>;
@@ -2761,12 +2777,13 @@ pub(crate) fn dump_wavefront_mega(
         // left every row past 0 reading zero).
         let superdsc_decode_rungs: std::cell::RefCell<Vec<DecodeRungEntry>> =
             std::cell::RefCell::new(Vec::new());
-        // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full
+        // The PREFIX-CAPABLE ladder `[(width, seqs, body_fp)]` — the prefill bundles baked with a full
         // resident-prefix sweep. Every prefix-free rung is baked ActiveCap::NONE because a start==0 chunk
         // has nothing resident to attend, which drops 308 of 710 ops/layer. A CONTINUATION chunk (start>0)
-        // does have resident KV, so it runs on the smallest of these that holds it. See
+        // does have resident KV, so it runs on the smallest of these that holds it; a PACKED rung
+        // (`seqs > 1`) batches that many tails of at most `width` rows each into one chunk. See
         // `manifest::SengraphBundleGroup::prefill_prefix`.
-        let superdsc_prefill_prefix_rungs: std::cell::RefCell<Vec<(u32, String)>> =
+        let superdsc_prefill_prefix_rungs: std::cell::RefCell<Vec<(u32, u32, String)>> =
             std::cell::RefCell::new(Vec::new());
         // ⭐⭐⭐ THE MODEL'S TIED LM-HEAD TABLE, AS THE FIRST BAKE RECOGNIZED IT — the
         // ⭐ THE WEIGHT-SEGMENT PARITY LEDGER — one `(bundle label, bank0 bytes, extra
@@ -2799,16 +2816,21 @@ pub(crate) fn dump_wavefront_mega(
             fp: &'w std::cell::RefCell<Option<String>>,
             prefill_fp: &'w std::cell::RefCell<Option<String>>,
             prefill_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
-            prefill_prefix_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
+            prefill_prefix_rungs: &'w std::cell::RefCell<Vec<(u32, u32, String)>>,
             decode_rungs: &'w std::cell::RefCell<Vec<DecodeRungEntry>>,
-            wiring: &'w std::cell::RefCell<WiringPair>,
+            wiring: &'w std::cell::RefCell<WiringCells>,
             fold_census: &'w std::cell::RefCell<WeightFoldCensus>,
             weight_seg_ledger: &'w std::cell::RefCell<Vec<(String, u64, Vec<u64>)>>,
         }
-        type WiringPair = (
-            Option<proc_macro2::TokenStream>,
-            Option<proc_macro2::TokenStream>,
-        );
+        /// One world's wiring cells: the decode and prefill slots (single, last successful bake
+        /// wins) and the packed prefix rungs' OWN cells — one `(width, seqs)` pair each, joined
+        /// by pair (a second bake of a pair must be the same wiring, never a silent overwrite).
+        #[derive(Clone)]
+        struct WiringCells {
+            decode: Option<proc_macro2::TokenStream>,
+            prefill: Option<proc_macro2::TokenStream>,
+            packed_prefill: Vec<(u32, u32, proc_macro2::TokenStream)>,
+        }
         let one_rank = WorldBake {
             fp: &superdsc_fp,
             prefill_fp: &superdsc_prefill_fp,
@@ -2825,7 +2847,11 @@ pub(crate) fn dump_wavefront_mega(
         let tp_prefill_rungs = std::cell::RefCell::new(Vec::new());
         let tp_prefill_prefix_rungs = std::cell::RefCell::new(Vec::new());
         let tp_decode_rungs = std::cell::RefCell::new(Vec::new());
-        let tp_wiring: std::cell::RefCell<WiringPair> = std::cell::RefCell::new((None, None));
+        let tp_wiring: std::cell::RefCell<WiringCells> = std::cell::RefCell::new(WiringCells {
+            decode: None,
+            prefill: None,
+            packed_prefill: Vec::new(),
+        });
         let tp_fold_census = std::cell::RefCell::new(None);
         let tp_weight_seg_ledger = std::cell::RefCell::new(Vec::new());
         let sharded_world = WorldBake {
@@ -2843,8 +2869,13 @@ pub(crate) fn dump_wavefront_mega(
         // shared state at all, and can run on any thread, while the expansion still sees exactly the
         // writes, in exactly the order, that a serial loop made.
         enum BakeEffect {
+            // ⭐ A PREFIX RUNG, SOLO OR PACKED — the pair is the rung's own `(width, seqs)`: a solo
+            // rung carries `seqs == 1`; a packed rung (the products of
+            // `PagedKvPool::packed_prefix_rungs`) carries `seqs > 1` and its fp names the bundle
+            // lowered at `width · seqs` rows with its sampler folded to `seqs` rows.
             PrefillPrefixRung {
-                mq: u32,
+                width: u32,
+                seqs: u32,
                 fp: String,
             },
             PrefillRung {
@@ -2895,13 +2926,20 @@ pub(crate) fn dump_wavefront_mega(
         }
         /// What one bake returns: its sengraph json and launch groups.
         type BakeOut = (String, GroupGraphs);
-        /// Which half of `wiring_tokens` a bake's wiring lands in, if either.
+        /// Which of `wiring_tokens`' cells a bake's wiring lands in, if either.
         enum WiringSlot {
             Decode,
             Prefill,
+            // ⭐ A PACKED PREFIX RUNG'S OWN CELL — keyed by the pair, never a overwrite of the solo
+            // prefill slot: a packed rung's wiring is numbered by its own graph's tensor ids
+            // (lowered at `width · seqs` rows), so it cannot ride the solo prefill wiring.
+            PackedPrefill { width: u32, seqs: u32 },
         }
-        // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
-        // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
+        // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the rung's PER-REQUEST width —
+        // one request's query rows, NOT the graph's (a packed rung's graph is `mq · prefill_seqs`
+        // rows of `prefill_seqs` requests). `None` = decode.
+        // `prefill_seqs`: how many requests the prefill rung packs — 1 for every solo rung, the
+        // pair's count for a packed one (`PagedKvPool::packed_prefix_rungs`).
         // ⭐ ONE BAKE BODY, STAMPED PER WORLD. A bake's ops, launch groups and bundle are its
         // world's types and a closure cannot be generic, so the body is stated ONCE here and
         // instantiated for each world this expansion bakes: the one-rank forward's (`TpWorld<1>`)
@@ -2915,6 +2953,7 @@ pub(crate) fn dump_wavefront_mega(
              cap: u32,
              seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
+             prefill_seqs: u32,
              // The resident-prefix sweep this bundle is baked for. Decode always FULL.
              // A PREFILL chunk with start==0 has no resident prefix, so it bakes NONE
              // (nb=0) and skips 308 of 710 ops/layer; continuation chunks need FULL.
@@ -2939,8 +2978,9 @@ pub(crate) fn dump_wavefront_mega(
                 let rows_are_requests = !is_prefill;
                 // ⭐ THE QUERY'S EXTENT PAIR, MINTED ONCE FROM THE RUNG — the rung's own
                 // `(per-request width, requests)`, never a division of the graph's rows. A
-                // prefill chunk is ONE request however many positions it spans (its pair is
-                // `(mq, ONE)`); a decode rung's every row is a request's one token (its pair
+                // prefill rung is `prefill_seqs` request(s) of `mq` positions each (a solo
+                // chunk's pair is `(mq, ONE)`; a packed rung's is `(mq, seqs)`, its graph the
+                // product); a decode rung's every row is a request's one token (its pair
                 // is `(1 row, decode_rows)`). The attention splice spends the pair as the
                 // kernel's two extents and checks its held product against the graph it
                 // lowers — the one place the mint and the graph are proven to agree.
@@ -2961,7 +3001,7 @@ pub(crate) fn dump_wavefront_mega(
                 // many positions), a symbolic decode batch from its symbol's template,
                 // a concrete decode rung from `decode_rows`.
                 let (per_request, requests) = match (prefill_mq, seq_sym) {
-                    (Some(mq), _) => (mq, 1u32),
+                    (Some(mq), _) => (mq, prefill_seqs),
                     (None, Some((_, width))) => (1u32, width),
                     (None, None) => (1u32, decode_rows),
                 };
@@ -4195,8 +4235,14 @@ pub(crate) fn dump_wavefront_mega(
                                             if let Some(mq) = prefill_mq.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
                                             // A PREFIX-CAPABLE prefill rung: continuation chunks
                                             // (start>0) run on these, since they DO have resident KV to
-                                            // attend — each on the smallest rung that holds it.
-                                            fx.push(BakeEffect::PrefillPrefixRung { mq, fp: bfp });
+                                            // attend — each on the smallest rung that holds it. The
+                                            // pair rides the effect: solo rungs carry seqs == 1,
+                                            // packed ones their own count.
+                                            fx.push(BakeEffect::PrefillPrefixRung {
+                                                width: mq,
+                                                seqs: prefill_seqs,
+                                                fp: bfp,
+                                            });
                                             prefill_fp_stamped = true;
                                         } else if let Some(mq) = prefill_mq {
                                             // Ladder rung (deduped on mq: a rebake of the same width
@@ -4373,7 +4419,19 @@ pub(crate) fn dump_wavefront_mega(
                     // the widest rung that actually lowered (`commit_bake` applies the
                     // calls' effects in that order however the rungs were baked).
                     let slot = if is_prefill {
-                        prefill_fp_stamped.then_some(WiringSlot::Prefill)
+                        // ⭐ A PACKED RUNG'S WIRING IS ITS OWN CELL, keyed by the pair — never the
+                        // solo prefill slot, which the widest SOLO rung that lowered owns (the
+                        // ascending-commit law above): a packed rung's graph is lowered at
+                        // `width · seqs` rows and numbered by its own tensor ids, so riding the
+                        // solo slot would stage the wrong program's bindings for every chunk.
+                        if prefill_seqs > 1 {
+                            prefill_fp_stamped.then(|| WiringSlot::PackedPrefill {
+                                width: prefill_mq.unwrap_or(0),
+                                seqs: prefill_seqs,
+                            })
+                        } else {
+                            prefill_fp_stamped.then_some(WiringSlot::Prefill)
+                        }
                     } else if seq_sym.is_none() && decode_rows == primary_m {
                         Some(WiringSlot::Decode)
                     } else {
@@ -4405,11 +4463,12 @@ pub(crate) fn dump_wavefront_mega(
         let commit_bake = |world: &WorldBake<'_>, lwd: &BakeTape, fx: Vec<BakeEffect>| {
             for e in fx {
                 match e {
-                    // Deduped on mq like the prefix-free ladder: a rebake of a width must not double-enter.
-                    BakeEffect::PrefillPrefixRung { mq, fp } => {
+                    // Deduped on the pair like the prefix-free ladder: a rebake of a rung must not
+                    // double-enter.
+                    BakeEffect::PrefillPrefixRung { width, seqs, fp } => {
                         let mut r = world.prefill_prefix_rungs.borrow_mut();
-                        if !r.iter().any(|(m, _)| *m == mq) {
-                            r.push((mq, fp));
+                        if !r.iter().any(|&(w, s, _)| w == width && s == seqs) {
+                            r.push((width, seqs, fp));
                         }
                     }
                     // Ladder rung (deduped on mq: a rebake of the same width must not double-enter).
@@ -4472,12 +4531,36 @@ pub(crate) fn dump_wavefront_mega(
                         let mut bound = registry_bound.borrow_mut();
                         match slot {
                             Some(WiringSlot::Prefill) => {
-                                s.1 = Some(w);
+                                s.prefill = Some(w);
                                 bound.1 = Some(gk.scalarmul_scales.clone());
                             }
                             Some(WiringSlot::Decode) => {
-                                s.0 = Some(w);
+                                s.decode = Some(w);
                                 bound.0 = Some(gk.scalarmul_scales.clone());
+                            }
+                            // ⭐ THE PAIR'S CELL, JOINED — a second bake of the same pair must be
+                            // the SAME wiring (the pair names one graph), never a silent
+                            // overwrite: a mismatch is a bake bug, named with both bakes' pair.
+                            Some(WiringSlot::PackedPrefill { width, seqs }) => {
+                                match s
+                                    .packed_prefill
+                                    .iter_mut()
+                                    .find(|(w_, s_, _)| *w_ == width && *s_ == seqs)
+                                {
+                                    Some((_, _, prev)) => {
+                                        // Token streams carry no equality: rendered to strings,
+                                        // the same test every codegen comparison of emitted
+                                        // tokens makes.
+                                        if prev.to_string() != w.to_string() {
+                                            panic!(
+                                                "[spyre] the packed prefix rung ({width}, {seqs}) \
+                                                 baked two different wirings — the pair names one \
+                                                 graph, so one of the bakes lowered another"
+                                            );
+                                        }
+                                    }
+                                    None => s.packed_prefill.push((width, seqs, w)),
+                                }
                             }
                             None => {}
                         }
@@ -4504,6 +4587,7 @@ pub(crate) fn dump_wavefront_mega(
              cap: u32,
              seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
+             prefill_seqs: u32,
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
              decode_rows: u32| {
                 let (r, fx) = emit_bundle_deferred(
@@ -4512,6 +4596,7 @@ pub(crate) fn dump_wavefront_mega(
                     cap,
                     seq_sym,
                     prefill_mq,
+                    prefill_seqs,
                     active_cap,
                     decode_rows,
                     None,
@@ -4533,6 +4618,7 @@ pub(crate) fn dump_wavefront_mega(
             prefix_len.get(),
             None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
             None, // decode path (Store + PagedAttnCompute) -- no prefill width
+            1,    // no prefill rung: no packed count to state
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
             primary_m,
         );
@@ -4645,6 +4731,7 @@ pub(crate) fn dump_wavefront_mega(
                 prefix_len.get(),
                 None,
                 None,
+                1,
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                 primary_m,
                 Some(&sf.sources),
@@ -4714,6 +4801,7 @@ pub(crate) fn dump_wavefront_mega(
                             // `seq_sym` / `prefill_mq`: decode, so neither applies.
                             None,
                             None,
+                            1,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             seqs,
                         );
@@ -4747,6 +4835,7 @@ pub(crate) fn dump_wavefront_mega(
                                 prefix_len.get(),
                                 None,
                                 None,
+                                1,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 seqs,
                                 Some(&sf_b.sources),
@@ -5062,6 +5151,7 @@ pub(crate) fn dump_wavefront_mega(
                             Some(("s0", pl))
                         },
                         Some(pl), // prefill path (SDPA + Store), ladder rung m=pl
+                        1,        // a ladder rung is one request's chunk
                         // ⛔ ZERO PREFIX BLOCKS, AND THAT IS ONLY RIGHT FOR THE FIRST CHUNK.
                         // `ActiveCap::NONE` is documented as valid ONLY where `start == 0`, but
                         // `manifest.rs`'s `KtirBundle::prefill` is a single `Option` and
@@ -5204,8 +5294,9 @@ pub(crate) fn dump_wavefront_mega(
                             prefix_len.get(),
                             None,
                             Some(m),
-                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             1, // a prompt chunk is one request
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                            1,
                         );
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
                         // continuation chunk on a sharded session runs on ITS world's prefix rung.
@@ -5238,6 +5329,7 @@ pub(crate) fn dump_wavefront_mega(
                                 prefix_len.get(),
                                 None,
                                 Some(m),
+                                1,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 1,
                                 Some(&sf_p.sources),
@@ -5251,14 +5343,92 @@ pub(crate) fn dump_wavefront_mega(
                     ),
                 }
             }
+            // ⭐⭐ THE PACKED RUNGS — `PagedKvPool::packed_prefix_rungs`, the same ladder's
+            // products at more than one sequence. A cache-hit tail is a whole continuation
+            // chunk (start>0) of its own; a wave of k concurrent tails is ONE launch of a
+            // (w, s) rung — s windows of w rows over s requests' resident prefixes, the
+            // attention spliced s times at window-local tables (the U1 unroll). The rung's
+            // graph is the PRODUCT's (w·s rows, lowered here), its per-request width stated
+            // by the pair, not divided back out of the rows.
+            for &(w, s) in &ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(
+                &baked,
+            ) {
+                match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
+                    fuf,
+                    inferred,
+                    decode_bounds,
+                    &bridge,
+                    scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
+                    w * s,
+                ) {
+                    Ok(lwd_p) => {
+                        let lwd_p = bake_tape(stem, lwd_p);
+                        emit_bundle(
+                            &lwd_p,
+                            format!("ktir_prefill_{stem_id}"),
+                            prefix_len.get(),
+                            None,
+                            Some(w),
+                            s,
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                            1,
+                        );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a wave on a sharded session
+                        // runs on ITS world's packed rung.
+                        if let Some(decode_cuts) = tp_sources.as_deref() {
+                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                                scratchy_target_spyre::bundle_code::collective::Build,
+                                _,
+                            >(
+                                &lwd_p,
+                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                &[],
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank packed prefill \
+                                     (w={w}, s={s}) is malformed — {e:?}"
+                                )
+                            });
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!(
+                                    "ktir_prefill_tp{TP_WORLD}_{stem_id} packed (w={w}, s={s})"
+                                ),
+                                (decode_bindings, decode_cuts),
+                                (lwd_p.bindings(), &sf_p.sources),
+                            );
+                            let (_, fx) = emit_bundle_deferred_sharded(
+                                &tp_lwd,
+                                format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
+                                prefix_len.get(),
+                                None,
+                                Some(w),
+                                s,
+                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                1,
+                                Some(&sf_p.sources),
+                            );
+                            commit_bake(&sharded_world, &tp_lwd, fx);
+                        }
+                    }
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: packed prefill rung (w={w}, s={s}) NOT \
+                         LOWERED — {e}. Every rung the bake was asked for must lower"
+                    ),
+                }
+            }
             // ⛔⛔⛔ THE PREFIX LADDER MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP. A mid-prompt continuation
             // chunk runs at the widest rung's width (it is capped there and the step-back leaves it room), so
             // a prefix ladder that stops short would put a mid-prompt chunk on a bundle narrower than its rows
             // — a refusal on the card. Checked on what BAKED, not on the widths asked for.
+            // The SOLO half of the ladder: rungs with seqs == 1 (a packed rung is a
+            // different program at the same product, never a wider solo rung).
             let prefix: Vec<u32> = superdsc_prefill_prefix_rungs
                 .borrow()
                 .iter()
-                .map(|(m, _)| *m)
+                .filter(|&&(_, s, _)| s == 1)
+                .map(|&(w, _, _)| w)
                 .collect();
             if let Err(e) = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
                 &baked, &prefix,
@@ -5275,6 +5445,38 @@ pub(crate) fn dump_wavefront_mega(
                 )
             {
                 panic!("[spyre-superdsc] {stem}: {e}");
+            }
+            // ⛔⛔⛔ AND THE PACKED TABLE SHIPS WHOLE. A wave of k tails runs on the smallest
+            // packed rung that holds (widest tail, live count); a pair that did not bake is
+            // silent — the wave falls to serialized solo chunks, the 878.7 ms this exists to
+            // kill. Checked against the table, on what BAKED, both directions.
+            let packed_baked: Vec<(u32, u32)> = {
+                let r = superdsc_prefill_prefix_rungs.borrow();
+                let mut v: Vec<(u32, u32)> =
+                    r.iter().filter(|&&(_, s, _)| s > 1).map(|&(w, s, _)| (w, s)).collect();
+                v.sort_unstable();
+                v
+            };
+            let packed_asked =
+                ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked);
+            let missing: Vec<String> = packed_asked
+                .iter()
+                .filter(|p| !packed_baked.contains(p))
+                .map(|(w, s)| format!("(w={w}, s={s})"))
+                .collect();
+            let stray: Vec<String> = packed_baked
+                .iter()
+                .filter(|p| !packed_asked.contains(p))
+                .map(|(w, s)| format!("(w={w}, s={s})"))
+                .collect();
+            if !missing.is_empty() || !stray.is_empty() {
+                panic!(
+                    "[spyre-superdsc] {stem}: the packed prefix table did not ship whole — \
+                     missing [{}], baked but not asked [{}]. Every rung the bake was asked for \
+                     must lower, and nothing else may enter the table",
+                    missing.join(", "),
+                    stray.join(", ")
+                );
             }
         }
 
@@ -5384,6 +5586,7 @@ pub(crate) fn dump_wavefront_mega(
                         prefix_len.get(),
                         Some(("s0", decode_mq)),
                         None,
+                        1,
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                         // The CB sengraph's rows are a batch SYMBOL the DEM resolves at runtime, not
                         // a baked request count.
@@ -5695,12 +5898,26 @@ pub(crate) fn dump_wavefront_mega(
         // generated code naming a real field, the way the GPU target's forward names
         // `wm.q_proj`, instead of a disk-key string resolved at load.
         {
-            let (dec, pre) = &*wiring_tokens.borrow();
-            if let Some(dec) = dec {
-                let pre = match pre {
+            let cells = wiring_tokens.borrow();
+            if let Some(dec) = &cells.decode {
+                let pre = match &cells.prefill {
                     Some(p) => quote! { ::core::option::Option::Some(#p) },
                     None => quote! { ::core::option::Option::None },
                 };
+                // ⭐ THE PACKED CELLS — one wiring per (width, seqs) pair, sorted so the
+                // static is deterministic bake to bake. A pair whose bake failed stamps no
+                // cell (the wiring stamp is gated on `prefill_fp_stamped`), and the packed
+                // table guard above already refused that bake; nothing else may appear.
+                let mut packed = cells.packed_prefill.clone();
+                packed.sort_by_key(|(w, s, _)| (*w, *s));
+                let packed_lits: Vec<_> = packed
+                    .iter()
+                    .map(|(w, s, wt)| {
+                        let w = proc_macro2::Literal::u32_unsuffixed(*w);
+                        let s = proc_macro2::Literal::u32_unsuffixed(*s);
+                        quote! { (#w, #s, #wt) }
+                    })
+                    .collect();
                 ktir_bundle_out.extend(quote! {
                     /// The launch wiring for this model, emitted by `#[forward]`.
                     /// Replaces parsing `manifest.json` at model load.
@@ -5708,6 +5925,7 @@ pub(crate) fn dump_wavefront_mega(
                         ::scratchy_target_spyre::wiring::Wirings {
                             decode: #dec,
                             prefill: #pre,
+                            packed_prefill: &[#(#packed_lits),*],
                         };
                 });
             }
@@ -5722,7 +5940,15 @@ pub(crate) fn dump_wavefront_mega(
                 tp_wiring.borrow().clone(),
                 tp_sources.as_ref(),
             ) {
-                (Some(fp), (Some(wiring), prefill_wiring), Some(sources)) => {
+                (
+                    Some(fp),
+                    WiringCells {
+                        decode: Some(wiring),
+                        prefill: prefill_wiring,
+                        packed_prefill: tp_packed,
+                    },
+                    Some(sources),
+                ) => {
                     let fp = proc_macro2::Literal::string(&fp);
                     // The prefill bundle and its wiring ship together or not at all, as the
                     // one-rank world's do.
@@ -5750,6 +5976,18 @@ pub(crate) fn dump_wavefront_mega(
                             &tp_decode_rungs.borrow(),
                             &tp_prefill_prefix_rungs.borrow(),
                         );
+                    // The sharded world's OWN packed cells, sorted beside the one-rank
+                    // world's — a rank launches its own shard of the pair's graph.
+                    let mut tp_packed_sorted = tp_packed;
+                    tp_packed_sorted.sort_by_key(|(w, s, _)| (*w, *s));
+                    let tp_packed_lits: Vec<_> = tp_packed_sorted
+                        .iter()
+                        .map(|(w, s, wt)| {
+                            let w = proc_macro2::Literal::u32_unsuffixed(*w);
+                            let s = proc_macro2::Literal::u32_unsuffixed(*s);
+                            quote! { (#w, #s, #wt) }
+                        })
+                        .collect();
                     let sources = sources.iter().map(|s| match s {
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
                         S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
@@ -5803,6 +6041,7 @@ pub(crate) fn dump_wavefront_mega(
                             wirings: ::scratchy_target_spyre::wiring::Wirings {
                                 decode: #wiring,
                                 prefill: #prefill_wiring,
+                                packed_prefill: &[#(#tp_packed_lits),*],
                             },
                             sources: &[#(#sources),*],
                             world: ::core::marker::PhantomData,

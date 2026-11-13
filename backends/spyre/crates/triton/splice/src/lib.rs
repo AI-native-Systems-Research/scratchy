@@ -2314,13 +2314,13 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE WINDOW FAMILY — a prefill pair's capacity is how many one-sequence programs the one
-    // compiled module is rebind to; every other arm (the batch's and the one-row decode's) is one
-    // window by its own pair (a decode rung's capacity names QUERY ROWS, which its rows==1 graph
-    // cannot split, and a batch carries its requests inside one launch), so `windows` is 1 there
-    // without a guard of its own. A capacity past the reserved tid space is REFUSED BY NAME — the
-    // bake's packed table outgrew what the region holds, a bake bug, never a wrap onto another
-    // region's tids.
-    let windows = if decode {
+    // compiled module is rebind to. Every OTHER arm is one window by its own pair: a batch's rows
+    // are one request's one token each (`paged_rows == Batch`), so its capacity names QUERY ROWS a
+    // rows==1 graph cannot split and the batch carries inside one launch; a one-row decode is the
+    // same pair at capacity 1. Only the SEQUENCE arm with rows > 1 packs. A capacity past the
+    // reserved tid space is REFUSED BY NAME — the bake's packed table outgrew what the region
+    // holds, a bake bug, never a wrap onto another region's tids.
+    let windows = if batch || decode {
         1
     } else {
         let s = query_rows.requests().get();

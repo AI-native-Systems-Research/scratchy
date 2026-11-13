@@ -1689,8 +1689,10 @@ impl SpyreWorker {
                         .sum::<u64>()
                     + g0.prefill_prefix
                         .iter()
-                        .filter(|(pmq, _)| *pmq > 1)
-                        .filter_map(|(_, psent)| psent.strip_prefix(SUPERDSC_SENTINEL))
+                        // U3 seam: a PACKED rung (seqs > 1) is not built yet — its bytes join
+                        // this budget when its selection lands (one PR; see the load loop).
+                        .filter(|&(pmq, seqs, _)| seqs == 1 && pmq > 1)
+                        .filter_map(|(_, _, psent)| psent.strip_prefix(SUPERDSC_SENTINEL))
                         .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .map(|rc| non_resident(&rc.layout))
                         .sum::<u64>();
@@ -2148,8 +2150,15 @@ impl SpyreWorker {
                 }
                 let pool_for_prefix = prefill_pool_statics(wirings)?;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
-                for &(pmq, psent) in g0.prefill_prefix {
+                for &(pmq, seqs, psent) in g0.prefill_prefix {
                     if pmq <= 1 || psent.is_empty() {
+                        continue;
+                    }
+                    // U3 seam: a PACKED rung (seqs > 1) batches that many cache-hit tails into
+                    // one launch; its own build and selection land with the packed selection
+                    // (one PR). Until then it is skipped here — a wave falls to its solo
+                    // rungs, which is what main does today.
+                    if seqs > 1 {
                         continue;
                     }
                     let pcode2 = psent

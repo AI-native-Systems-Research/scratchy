@@ -261,8 +261,8 @@ pub struct SengraphBundleGroup {
     /// reading ZERO on a wider rung (Finding 1, 2026-10-27). The worker
     /// refuses at load if a rung's kind rows ≠ the rung's rows.
     pub decode_rungs: &'static [(RungSeqs, SweptCols, BundleSentinel, RungLoadConsts)],
-    /// PREFIX-CAPABLE PREFILL LADDER `[(mq, sentinel)]`, ascending — the bundles baked with a full
-    /// resident-prefix sweep, for chunks with `start > 0`. EMPTY ⇒ none baked.
+    /// PREFIX-CAPABLE PREFILL LADDER `[(width, seqs, sentinel)]`, ascending — the bundles baked with a
+    /// full resident-prefix sweep, for chunks with `start > 0`. EMPTY ⇒ none baked.
     ///
     /// Every [`prefill_rungs`](Self::prefill_rungs) entry is baked PREFIX-FREE: a chunk at `start == 0`
     /// has no resident KV to attend, so its 4 prefix blocks would be masked out in full — 308 of the
@@ -277,7 +277,15 @@ pub struct SengraphBundleGroup {
     /// ran a full 512-row chunk: granite-3.1-2b's ~2k-token prompt took 460 ms against 384 ms at 256 rows
     /// (a 512-row continuation group runs 2.08 ms/launch against 1.62 at 256), the whole tail paid as a
     /// window. A ladder lets the tail run at the page it fits.
-    pub prefill_prefix: &'static [(u32, &'static str)],
+    ///
+    /// ⭐ THE PAIR `(width, seqs)`: a SOLO rung carries `seqs == 1` and is exactly the ladder above; a
+    /// PACKED rung (`seqs > 1`, the products of
+    /// [`PagedKvPool::packed_prefix_rungs`](crate::sdsc_abstract::PagedKvPool::packed_prefix_rungs))
+    /// batches `seqs` continuation tails of at most `width` rows each into ONE chunk — the attention's
+    /// one compiled module spliced once per window, every window binding its own step tables at its own
+    /// reserved tids. A wave of k cache-hit tails rides the smallest product that holds both its widest
+    /// tail and its live count instead of running k serialized chunks.
+    pub prefill_prefix: &'static [(u32, u32, &'static str)],
 }
 
 /// The per-model sendnn bundle. With the layer-group split it is a vector of

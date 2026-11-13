@@ -1948,6 +1948,14 @@ pub struct Wirings {
     pub decode: Wiring,
     /// `None` when the model bakes no batched-prefill program.
     pub prefill: Option<Wiring>,
+    /// ⭐ THE PACKED PREFIX RUNGS' OWN WIRINGS `[(width, seqs, Wiring)]` — one per
+    /// `(width, seqs)` pair the bake shipped (`PagedKvPool::packed_prefix_rungs`'s table), each
+    /// numbered by ITS OWN graph's tensor ids and carrying its own staged constants: a packed
+    /// rung's graph is lowered at `width · seqs` rows with its sampler folded to `seqs` rows, so
+    /// neither the solo prefill wiring nor the decode one can stage it. The worker picks the
+    /// entry whose pair matches the rung it loaded. EMPTY ⇒ no packed rungs baked (every model
+    /// whose ladder bakes none, and every build before the packed table existed).
+    pub packed_prefill: &'static [(u32, u32, Wiring)],
 }
 
 /// How each rank loads a source — the shared analysis's slice law, re-exported so the tokens
@@ -1979,7 +1987,7 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
         crate::manifest::BundleSentinel,
         crate::manifest::RungLoadConsts,
     )],
-    pub prefill_prefix: &'static [(u32, &'static str)],
+    pub prefill_prefix: &'static [(u32, u32, &'static str)],
     /// Their launch wirings, numbered by the rank-local forwards' own tensor ids.
     pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.

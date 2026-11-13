@@ -1741,8 +1741,21 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows)
-                {
+                // ⭐ THE SAME ARM THE PRODUCER PASS TAKES (`paged_rows`, handed in by the bake) — the
+                // one-derivation law. This walk was hardcoded `rows_are_requests = false` from before
+                // the extent pair existed, so it lowered a decode batch's attention through the
+                // SEQUENCE arm while the emitted program took the batch's: the wiring's `NodeArgs`
+                // named the prefill spelling of the step tables for a program that reads the batch's,
+                // and the prefill arm's window family (a packed rung's one-op-per-window unroll)
+                // refused a symbolic batch's 96-request pair outright. The wiring's programs and the
+                // shipped ones must come from ONE lowering of each node.
+                let ops = match lower_one_node::<T, F>(
+                    node,
+                    ir,
+                    ActiveCap::FULL,
+                    paged_rows == scratchy_triton_splice::PagedRows::Batch,
+                    query_rows,
+                ) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -1803,7 +1816,12 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
-    let mut mask: Option<(u32, u32)> = None;
+    // ⭐ THE MASK FAMILY, not one mask: a packed rung's attention is spliced once per
+    // window and window r's program binds its OWN mask stack (`paged_window_tid(r, ·)`),
+    // so the walk collects every `(tid, capacity)` the programs bound — one per window at
+    // most, all over the one K pool — and the check below names the family the rung's
+    // own windows state. A solo rung's family is the single sentinel it always bound.
+    let mut masks: Vec<(u32, u32)> = Vec::new();
     // ⭐ THE MERGED ARRANGEMENT FACTS — every parameter any program's propagation marked, in
     // node order, merged BEFORE the load-const list and the seat are derived so those two
     // derivations state the arrangement the bake actually emits (the one-derivation law).
@@ -1814,14 +1832,16 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     for lowered in per_node {
         for (args, m, marks) in lowered? {
             if let Some(m) = m {
-                if mask.is_some_and(|prev| prev != m) {
+                if let Some(&(_, prev_cap)) = masks.iter().find(|&&(_, c)| c != m.1) {
                     return Err(SuperDscError(format!(
-                        "the attention mask must be uniform across layers (one shared prefix \
-                         capacity), but {:?} and {m:?} were both emitted",
-                        mask.unwrap()
+                        "the attention masks must share one prefix capacity (one K pool), but \
+                         {prev_cap} and {} were both emitted",
+                        m.1
                     )));
                 }
-                mask = Some(m);
+                if !masks.contains(&m) {
+                    masks.push(m);
+                }
             }
             staggered.extend(marks);
             nodes.push(args);
@@ -1832,15 +1852,43 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
     let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows)?;
-    let attn_mask = match (mask, paged) {
-        (Some((mid, cap)), Some(p)) => {
+    let attn_mask = match (masks.first().copied(), paged) {
+        (Some((_, cap)), Some(p)) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own
             // statement, not entries of this tid-indexed list).
-            if mid != p.mask {
+            // ⭐ THE MASK IS THE ARM'S OWN FAMILY: the batched kernel reads the step's per-chunk
+            // masks (`tids.chunk_masks`), one table for its one window; the sequence kernels
+            // read window r's own mask stack (`paged_window_tid(r, mask)` — window 0 IS the
+            // step's sentinel `tids.mask`), one per window of the rung's pair. The programs
+            // must have bound EXACTLY that family: a missing window's mask is staged by
+            // nothing, a tid outside the family is a mask staged onto another table.
+            let batch = paged_rows == scratchy_triton_splice::PagedRows::Batch;
+            let windows = if batch {
+                1
+            } else {
+                query_rows.requests().get()
+            };
+            let expected: std::collections::BTreeSet<u32> = if batch {
+                std::iter::once(p.chunk_masks).collect()
+            } else {
+                (0..windows)
+                    .map(|r| ktir_superdsc::reserved_tids::paged_window_tid(r, 2))
+                    .collect()
+            };
+            let bound: std::collections::BTreeSet<u32> = masks.iter().map(|&(tid, _)| tid).collect();
+            if bound != expected {
+                let show = |s: &std::collections::BTreeSet<u32>| {
+                    s.iter()
+                        .map(|t| format!("t{t}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 return Err(SuperDscError(format!(
-                    "the attention binds its mask at t{mid} but the paged step names t{} — the \
-                     step's sources have one set of ids",
-                    p.mask
+                    "the attention binds its masks at [{}] but the paged step's {} window(s) \
+                     name [{}] — the step's sources have one family of ids",
+                    show(&bound),
+                    windows,
+                    show(&expected)
                 )));
             }
             if cap as usize != p.capacity() {
@@ -1850,12 +1898,14 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     p.capacity()
                 )));
             }
-            Some(mid)
+            // Window 0's tid, the family's first — proven bound above; the family past
+            // window 0 is `paged_window_tid`'s own law, stated once in reserved_tids.
+            Some(if batch { p.chunk_masks } else { p.mask })
         }
         (None, None) => None,
-        (mask, paged) => {
+        (masks, paged) => {
             return Err(SuperDscError(format!(
-                "the attention programs bind a mask {mask:?} while the graph's paged step is \
+                "the attention programs bind masks {masks:?} while the graph's paged step is \
                  {paged:?} — the two are one statement of one attention"
             )));
         }

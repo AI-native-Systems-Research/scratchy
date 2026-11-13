@@ -5231,6 +5231,67 @@ impl PagedKvPool {
         }
     }
 
+    /// ⭐ THE FLOOR OF A PACKED WINDOW'S WIDTH — the narrowest per-request width a packed
+    /// `(width, seqs)` prefix rung is baked at.
+    ///
+    /// A window narrower than this is a bundle whose descriptors dominate its bytes: the packed
+    /// rung exists to batch k cache-hit tails into ONE chunk, and at a handful of rows per window
+    /// the fixed per-op cost the packing shares is larger than the rows it carries — a single
+    /// narrow tail runs cheaper on the SOLO rung of the same width. 8 rows is one eighth of a
+    /// scheduler block, the point where a wave of 8 windows still sweeps a whole block of real
+    /// tokens.
+    pub const PACKED_WINDOW_MIN_WIDTH: u32 = 8;
+
+    /// ⛔ THE CEILING OF A PACKED WINDOW'S WIDTH — MEASURED, NOT DERIVED. Widths past one
+    /// scheduler block refused at the bake when the packed table was first cut (the nuked line's
+    /// measurement, 2026-11-11: `(192, 2)` and `(256, 2)` refused to lower; every width ≤ 128
+    /// baked at every count), so the table stops at the block width and never asks for a rung the
+    /// bake would refuse — the rung set is exactly what the bake ships.
+    pub const PACKED_WINDOW_MAX_WIDTH: u32 = SchedulerBlockTokens::REFERENCE.get();
+
+    /// ⭐ THE PACKED PREFIX RUNGS `(width, seqs)` — every power-of-two request count the reserved
+    /// window-tid space holds, at the width each of the prefix ladder's own points names for that
+    /// count. Ascending by product.
+    ///
+    /// A wave of k cache-hit continuation tails (the concurrent-prefill bench's k ~59-row tails)
+    /// rode the SOLO prefix ladder one serialized chunk at a time — k fixed costs, k weight
+    /// streams. A packed rung runs them as ONE prefix-capable chunk: the attention's one compiled
+    /// module spliced once per window, every window binding its own three step tables at its own
+    /// reserved tids (`reserved_tids::paged_window_tid`), so the batch is the SPLICE's, not the
+    /// scheduler's and not a second lowering. The product lands on a point the solo ladder already
+    /// bakes ([`prefix_rungs`](Self::prefix_rungs) over the same `baked`), so a packed rung's
+    /// graph rows, its KV sweep and its pool are the point's own — no new geometry, only the pair.
+    ///
+    /// ⛔ THE COUNTS ARE THE RESERVED TID SPACE'S OWN — every power of two from 2 to
+    /// [`PAGED_MAX_WINDOWS`](crate::reserved_tids::PAGED_MAX_WINDOWS), no more: a pair asking for
+    /// more windows than the region holds is a bake bug the tid mint's own assert names. The
+    /// widths are held to
+    /// [`PACKED_WINDOW_MIN_WIDTH`](Self::PACKED_WINDOW_MIN_WIDTH)..=[`PACKED_WINDOW_MAX_WIDTH`](Self::PACKED_WINDOW_MAX_WIDTH)
+    /// — the floor because a narrower window is descriptors-not-bytes (the solo rung serves one
+    /// narrow tail better), the ceiling because wider refused at the bake (measured, see the
+    /// const). A point that names no width in that band for a count contributes nothing: the
+    /// table asks only for rungs that bake.
+    ///
+    /// EMPTY exactly when `baked` is (nothing prefix-capable bakes at all), and otherwise never
+    /// empty — every point ≥ one page names at least `(page/2, 2)`, which the band always holds.
+    pub fn packed_prefix_rungs(baked: &[u32]) -> Vec<(u32, u32)> {
+        let mut v = Vec::new();
+        for &m in &Self::prefix_rungs(baked) {
+            let mut seqs = 2u32;
+            while seqs <= crate::reserved_tids::PAGED_MAX_WINDOWS {
+                if m.is_multiple_of(seqs) {
+                    let w = m / seqs;
+                    if (Self::PACKED_WINDOW_MIN_WIDTH..=Self::PACKED_WINDOW_MAX_WIDTH).contains(&w)
+                    {
+                        v.push((w, seqs));
+                    }
+                }
+                seqs *= 2;
+            }
+        }
+        v
+    }
+
     /// ⭐ WHICH PREFIX RUNG A CONTINUATION CHUNK AT `want` RUNS ON — the index into `widths` (ascending, the
     /// rungs that built) of the smallest width that holds the rest of the prompt AS PLACED at that width,
     /// else the widest (the chunk is then capped at it and the prompt continues). `None` only for an empty
