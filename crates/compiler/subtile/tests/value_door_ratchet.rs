@@ -30,8 +30,15 @@ const LAW_ASSERTS: usize = 31;
 /// The value→type doors left: value constructors beside a typed one, and value→const match arms.
 const VALUE_DOORS: usize = 10;
 
-/// The crates scanned, under the workspace's `crates/`.
-const ROOTS: &[&str] = &["compiler", "tensors", "layers", "targets"];
+/// The crates scanned, from the repository root: the root workspace's compiler, tensor, layer and
+/// target crates, and the spyre backend's own workspace (its crates left `crates/targets` with it).
+const ROOTS: &[&str] = &[
+    "crates/compiler",
+    "crates/tensors",
+    "crates/layers",
+    "crates/targets",
+    "backends/spyre/crates",
+];
 
 /// The directories whose files are not library code.
 const SKIPPED_DIRS: &[&str] = &["tests", "benches", "examples", "target"];
@@ -51,24 +58,24 @@ struct Sites {
 
 #[test]
 fn law_asserts_and_value_doors_only_go_down() {
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut files = Vec::new();
     for root in ROOTS {
-        rust_files(&crates.join(root), &mut files);
+        let dir = repo.join(root);
+        assert!(
+            dir.is_dir(),
+            "{root}: no such directory under {}",
+            repo.display()
+        );
+        rust_files(&dir, &mut files);
     }
     files.sort();
-    assert!(
-        !files.is_empty(),
-        "no Rust files under {}",
-        crates.display()
-    );
 
     let mut sites = Sites::default();
     for path in &files {
-        let rel = path.strip_prefix(&crates).map_or_else(
-            |_| path.display().to_string(),
-            |p| format!("crates/{}", p.display()),
-        );
+        let rel = path
+            .strip_prefix(&repo)
+            .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{rel}: {e}"));
         let file = syn::parse_file(&text).unwrap_or_else(|e| panic!("{rel} does not parse: {e}"));
         scan_items(&file.items, &rel, &mut sites);
