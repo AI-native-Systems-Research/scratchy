@@ -1,5 +1,6 @@
-//! Architectural guard: target-specific `cfg` gates (any target under `crates/targets/`, or the
-//! removed `cuda`) are a code smell this workspace forbids outside of dedicated test code.
+//! Architectural guard: target-specific `cfg` gates (any target under `crates/targets/` or
+//! `backends/`, or the removed `cuda`) are a code smell this workspace forbids outside of dedicated
+//! test code.
 //!
 //! Principle, not a file list: a backend is selected by which target crate the
 //! binary links (unconditional `dep:` + a feature on the *binary*), and dispatch
@@ -39,15 +40,24 @@ fn has_word(hay: &str, needle: &str) -> bool {
     false
 }
 
-/// The targets' names: each directory under `crates/targets/`, read off the tree so a new target
-/// is checked without a word here, and the removed CUDA backend's, so it does not creep back.
+/// Where the targets live, from the repository root: the root workspace's target crates, and the
+/// backends that are workspaces of their own (spyre's left `crates/targets` with its workspace).
+const TARGET_HOMES: &[&str] = &["crates/targets", "backends"];
+
+/// The targets' names: each directory under a [`TARGET_HOMES`] entry, read off the tree so a new
+/// target is checked without a word here, and the removed CUDA backend's, so it does not creep
+/// back. A home that is gone fails here, rather than its targets silently leaving the check.
 fn target_names() -> Vec<String> {
-    let targets = workspace_root().join("crates/targets");
-    let mut names: Vec<String> = (fs::read_dir(&targets).expect("crates/targets").flatten())
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect();
-    names.push("cuda".to_string());
+    let mut names = vec!["cuda".to_string()];
+    for home in TARGET_HOMES {
+        let dir = workspace_root().join(home);
+        let entries = fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        names.extend(
+            (entries.flatten())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string)),
+        );
+    }
     names
 }
 

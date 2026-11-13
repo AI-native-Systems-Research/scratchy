@@ -46,11 +46,10 @@ every quant preset gets its own `<preset>` feature (`quant/<preset>`,
 
 ## Build
 ```bash
-# The CLI you run: each target is its own binary — `scr` on metal (macOS), `spyre` on IBM Spyre —
-# over the common CLI core (`scratchy-cli`). Add serve for HTTP.
+# The CLI you run: each target is its own binary — `scr` on metal (macOS), `spyre` on IBM Spyre
+# (its own workspace, below) — over the common CLI core (`scratchy-cli`). Add serve for HTTP.
 # Name at least one model — this fails loudly (build-time panic) otherwise.
 cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
-cargo build --release -p scratchy-target-spyre-cli --features spyre-emu,model/granite-3.1-2b-instruct
 ```
 - No default model/quant scope, so every build names its own — no
   `--no-default-features` dance needed to narrow to one specific model, just
@@ -63,6 +62,11 @@ cargo build --release -p scratchy-target-spyre-cli --features spyre-emu,model/gr
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
+- Spyre is its own workspace, `backends/spyre` (its own `Cargo.lock` and
+  `target/`, its crates under `backends/spyre/crates/`), reaching the shared
+  crates by path into the root's `crates/`. Build its CLI,
+  `spyre`, from there: `cd backends/spyre && cargo build --release
+  --features spyre-emu,model/granite-3.1-2b-instruct` (`spyre-hw` on a card host).
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature — a plain `chat`-only build never
   compiles image/png/zune-jpeg/etc., and a scope naming a vision arch needs it.
@@ -75,7 +79,8 @@ cargo build --release -p scratchy-target-spyre-cli --features spyre-emu,model/gr
 `cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct
 --exclude scratchy-target-metal --exclude scratchy-target-metal-cli --exclude scratchy-target-metal-compiler
 --exclude scratchy-target-metal-models --exclude scratchy-target-metal-worker
--- -D warnings` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
+-- -D warnings` at the root, then the same `--workspace` clippy (no excludes) in
+`backends/spyre` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
 check/clippy don't link the C++ shim). All five metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
 CLI, compiler, models and worker crates via their own edges to scratchy-target-metal — and `--workspace`
@@ -100,7 +105,9 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
       --exclude scratchy-target-metal-cli \
       --exclude scratchy-target-metal-compiler \
       --exclude scratchy-target-metal-models \
-      --exclude scratchy-target-metal-worker -- -D warnings'
+      --exclude scratchy-target-metal-worker -- -D warnings &&
+    cd backends/spyre &&
+    cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings'
 ```
 The macOS metal CI job runs locally via `scripts/act-local.sh` when present.
 

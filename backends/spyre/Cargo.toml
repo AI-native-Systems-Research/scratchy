@@ -1,0 +1,111 @@
+# The Spyre target is its own workspace, apart from the root one: nothing in the root workspace
+# depends on it, and phase 2 lifts this directory out as its own repository. Its crates are under
+# `crates/`, as the root's are; it reaches the shared ones by path into the root's `crates/`.
+[workspace]
+resolver = "2"
+default-members = ["crates/cli"]
+members = [
+    "crates/spyre",
+    "crates/bundle",
+    "crates/builder",
+    "crates/worker",
+    "crates/compiler",
+    "crates/models",
+    "crates/cli",
+    "crates/tp",
+    # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE
+    # from the lowering rather than reached through a text round trip.
+    "crates/ktir/ktir-core",
+    "crates/ktir/ktir-emulator",
+    "crates/ktir/ktir-optimizer",
+    # KTIR -> SuperDSC as a leaf: the typed SuperDSC IR, with no scratchy dependency, so a
+    # third-party KTIR producer can consume the lowering.
+    "crates/ktir/ktir-superdsc",
+    # The Triton front end, re-hosted from triton-spyre (see crates/triton/PROVENANCE.md):
+    # Triton.py -> TTIR -> KTIR, pure Rust, so kernels are authored in Triton and compiled at
+    # #[forward] expansion time like the torch carriers are (#112).
+    "crates/triton/triton-frontend",
+    "crates/triton/triton-ktir",
+    "crates/triton/triton-numeric",
+    "crates/triton/triton-ktir-superdsc",
+    # The splice: a SubtileTape node whose KTIR comes from a Triton kernel, not the Rust builder.
+    # A leaf between the tape types and the ladder, so scratchy-target-spyre hooks it in without a
+    # second copy of the lowering.
+    "crates/triton/splice",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# The same requirements as the root workspace's rows of the same names (its comments say why).
+[workspace.dependencies]
+anyhow = "1"
+# BLAS source of choice (spyre-emu's cblas backend) — version centralized here
+# so a bump can't land on only one of ktir-emulator's several feature-gated
+# dependency sites (target-specific + non-default-features) like it did in
+# https://github.com/AI-native-Systems-Research/scratchy/pull/59.
+blas-src = { version = "0.14", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+half = "2.7"
+inventory = "0.3"
+libc = "0.2"
+memmap2 = "0.9"
+rayon = "1"
+safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
+# The shared crates, from the root workspace.
+scratchy-cli = { path = "../../crates/cli/scr", default-features = false }
+scratchy-core-common = { path = "../../crates/core/common" }
+scratchy-core-model = { path = "../../crates/core/model" }
+scratchy-serving-engine = { path = "../../crates/serving/engine" }
+scratchy-serving-scheduler = { path = "../../crates/serving/scheduler" }
+scratchy-serving-worker = { path = "../../crates/serving/worker" }
+
+scratchy-target-spyre-worker = { path = "crates/worker" }
+
+# Profiles apply only from a workspace root, so these repeat the root workspace's (its comments
+# say why each is set), plus the two for spyre's own compiled models.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.scratchy-models]
+debug = 0
+
+[profile.dev.package.scratchy-target-spyre-models]
+debug = 0
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
+
+[profile.release.package.scratchy-models]
+debug = 0
+opt-level = 1
+
+# Spyre's compiled models: the same emitted dispatch glue as scratchy-models, the same reasoning.
+[profile.release.package.scratchy-target-spyre-models]
+debug = 0
+opt-level = 1
+
+[profile.release-dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release-dist.package.scratchy-models]
+opt-level = 3
+
+[profile.release-dist.package.scratchy-target-spyre-models]
+opt-level = 3
