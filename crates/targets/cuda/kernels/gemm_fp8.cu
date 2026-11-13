@@ -515,6 +515,141 @@ struct expert_template {
     };
 };
 
+// FP8 S8 P3(b): the expert gate, the expert up and their act in ONE grouped GEMM, on
+// `expert_template`'s task walk at P3(a)'s 64-row tiles and K step 128. A task is a live 64-row
+// tile `t` (`e = tile_expert[t]`) and a 128-column block `j` of the act: one consumer warpgroup
+// runs the gate's and the up's WGMMAs off the same A stage, into two `rt_fl<16, 128>`
+// accumulators (the dense `gate_up_template`'s consumer). The bank is one `[E, 2I, k]` view
+// (`B`: expert `e`'s gate rows `0 .. I`, then its up rows), so block `j`'s gate is its 64-row tiles
+// `2j, 2j + 1` and its up `I/64 + 2j, I/64 + 2j + 1` (`up_tiles` = `I / 64`).
+//
+// THE BITS ARE TODAY'S CHAIN'S: each accumulator is `expert_template`'s value at that element (the
+// same `k32` WGMMAs in the same K order, at any M or N tile), `scale_acc`'d, then rounded to bf16
+// and widened back in registers (`warp::copy` to `rt_bf` and back: the convertor today's GEMM
+// store rounds with), so the gate and the up are the two GEMMs' bf16 outputs; then `OP` by TK's
+// `bin_map` in f32 (`silu_mul_bf16` / `gelu_mul_bf16`'s op, its float2 form the float one on each
+// half) and the store's one rounding: `act = bf16(OP(bf16(gate), bf16(up)))`. The one-rounding act
+// (no rounding before `OP`) moves bits: P3(c), not this kernel.
+//
+// GEMMA'S RAGGED BLOCK: `I = 704` is 5.5 blocks. The 6th block's second gate tile is the expert's
+// up rows `0 .. 64` and its second up tile is past the expert's `2I` rows (TMA's zero fill: the
+// box's row dimension bounds the expert's depth, TK-1's R1); both feed only columns `704 .. 768`,
+// whose 64-column store the epilogue skips (`C`'s columns end at `I`, a multiple of 64). The up's
+// scales are read from a view offset by `I` (`U_scale`), so that block's last 64 scales of the last
+// expert lie past the bank's gate/up scales, inside the weight buffer (its down scales follow,
+// `step::fp8_moe_layout`), and scale only those unstored columns. `k` a multiple of 128.
+template<int K_STEP>
+struct expert_gate_up_layout {
+    using k_tile = st_fp8e4m3<64, K_STEP>;
+    using a_gl = gl<fp8e4m3, 1, 1, -1, -1, k_tile>;
+    // `[experts, 2 · inter, k]`: expert `e`'s gate then up rows are depth `e`.
+    using expert_gl = gl<fp8e4m3, 1, -1, -1, -1, k_tile>;
+    using expert_scale_gl = gl<float, 1, 1, -1, -1>;
+    using idx_gl = gl<int, 1, 1, -1, -1>;
+    struct globals {
+        a_gl A;
+        expert_gl B;
+        out_gl C;
+        scale_gl A_scale;
+        // `[experts, 2 · inter]`, from the gate's first scale and from the up's.
+        expert_scale_gl G_scale;
+        expert_scale_gl U_scale;
+        idx_gl offsets;
+        idx_gl tile_expert;
+        // `inter / 64`: the up's first 64-row tile of an expert.
+        int up_tiles;
+    };
+    struct input_block    { k_tile a, g[2], u[2]; };
+    struct finish_block   { out_tile c[2]; };
+    struct common_state   { int2 coord; int expert; };
+    struct consumer_state { rt_fl<16, 128> gate, up; };
+};
+template<typename OP, int _EXPERTS, int _K_STEP=128>
+struct expert_gate_up_template {
+    static constexpr int EXPERTS = _EXPERTS, M_BLOCK = 1, N_BLOCK = 2, K_STEP = _K_STEP;
+    using layout = expert_gate_up_layout<K_STEP>;
+    using wide_tile = st_bf<64, 128>;
+    using b_stack_tile = st_fp8e4m3<128, K_STEP>;
+    static constexpr int NUM_CONSUMER_WARPS=4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        const int max_tiles = args.globals.C.rows() / 64;
+        const int live = min(args.globals.offsets[{0, 0, 0, EXPERTS}] / 64, max_tiles);
+        const int Cblocks = (args.globals.C.cols() + 127) / 128;
+        const int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id >= live * Cblocks) {  // past the last live task: no more work to do
+            args.num_iters = -1;
+            return;
+        }
+        const int t = task_id % live;
+        args.common.expert = args.globals.tile_expert[{0, 0, 0, t}];
+        args.num_iters = args.globals.A.cols()/K_STEP;
+        args.common.coord = {t, (task_id / live)*N_BLOCK};
+    }
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>(); // decrease registers for producers
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::laneid() == 0) {
+                tma::expect(args.inputs_arrived, args.input);
+                tma::load_async(args.input.a, args.globals.A, {args.common.coord.x, args.iter},
+                                args.inputs_arrived);
+                for(int i = 0; i < N_BLOCK; i++) {
+                    tma::load_async(args.input.g[i], args.globals.B,
+                                    {0, args.common.expert, args.common.coord.y+i, args.iter},
+                                    args.inputs_arrived);
+                    tma::load_async(args.input.u[i], args.globals.B,
+                                    {0, args.common.expert,
+                                     args.globals.up_tiles+args.common.coord.y+i, args.iter},
+                                    args.inputs_arrived);
+                }
+            }
+        }
+    };
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>(); // increase registers for consumers
+            kittens::warp::zero(args.state.gate);
+            kittens::warp::zero(args.state.up);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            warpgroup::mma_ABt(args.state.gate, args.input.a,
+                               reinterpret_cast<b_stack_tile&>(args.input.g));
+            warpgroup::mma_ABt(args.state.up, args.input.a,
+                               reinterpret_cast<b_stack_tile&>(args.input.u));
+            warpgroup::mma_async_wait();
+            if (warp::laneid() == 0) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            scale_acc(args.state.gate, args.globals.G_scale, args.common.expert,
+                      args.common.coord.y, args.globals.A_scale, args.common.coord.x);
+            scale_acc(args.state.up, args.globals.U_scale, args.common.expert,
+                      args.common.coord.y, args.globals.A_scale, args.common.coord.x);
+            // The two GEMMs' bf16 outputs, widened back (exact).
+            rt_bf<16, 128> r;
+            kittens::warp::copy(r, args.state.gate);
+            kittens::warp::copy(args.state.gate, r);
+            kittens::warp::copy(r, args.state.up);
+            kittens::warp::copy(args.state.up, r);
+            kittens::warp::bin_map<OP>(args.state.gate, args.state.gate, args.state.up);
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c), args.state.gate);
+            warpgroup::sync(4);
+            if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
+                // The ragged block's columns past `I`: never stored.
+                if (args.common.coord.y + i < args.globals.C.cols() / 64) {
+                    tma::store_async(args.globals.C, args.finish.c[i],
+                                     {args.common.coord.x, args.common.coord.y+i});
+                    tma::store_async_read_wait(); // wait that store is finished before reusing finish memory
+                }
+            }
+            kittens::warp::zero(args.state.gate);
+            kittens::warp::zero(args.state.up);
+            if (warp::laneid() == 0) arrive(args.finish_finished);
+        }
+    };
+};
+
+
 // The plain GEMM at 256 (`N_BLOCK` 4) or 64 (1) output columns a tile, and the grouped GEMM, each
 // at K step 64 and 128.
 template <int N_BLOCK, int K_STEP> using gemm_fp8_mmt = matmul_template<2, N_BLOCK, 8, K_STEP>;
@@ -542,6 +677,13 @@ using expert_gemm_e128_m64_k64_fp8_mmt = expert_template<EXPERTS_SMALL, 4, 1, 64
 using expert_gemm_e128_m64_k128_fp8_mmt = expert_template<EXPERTS_SMALL, 4, 1, 128>;
 using expert_gemm_e128_col64_m64_k64_fp8_mmt = expert_template<EXPERTS_SMALL, 1, 1, 64>;
 using expert_gemm_e128_col64_m64_k128_fp8_mmt = expert_template<EXPERTS_SMALL, 1, 1, 128>;
+// FP8 S8 P3(b): the fused expert gate + up + act, each expert count and act.
+using expert_gate_up_silu_fp8_mmt = expert_gate_up_template<scratchy::ops::silu_mul, EXPERTS_LARGE>;
+using expert_gate_up_gelu_fp8_mmt = expert_gate_up_template<scratchy::ops::gelu_tanh_mul, EXPERTS_LARGE>;
+using expert_gate_up_e128_silu_fp8_mmt =
+    expert_gate_up_template<scratchy::ops::silu_mul, EXPERTS_SMALL>;
+using expert_gate_up_e128_gelu_fp8_mmt =
+    expert_gate_up_template<scratchy::ops::gelu_tanh_mul, EXPERTS_SMALL>;
 
 // `gemm_bf16.cu`'s: the whole H100 budget minus the 1024 bytes `lcf` reserves for alignment.
 constexpr int GEMM_FP8_SMEM_BYTES = kittens::MAX_SHARED_MEMORY - 1024;
@@ -753,6 +895,32 @@ int launch_group(const void* a, const void* a_scale, const void* const* b,
     }
 }
 
+// The fused expert gate + up + act's launch, the shape already checked. Can throw.
+template <typename mmt>
+int launch_expert_gate_up(const void* a, const void* a_scale, const void* b, const void* b_scale,
+                          const void* offsets, const void* tile_expert, void* c, uint64_t rows,
+                          uint32_t inter, uint32_t k, uint32_t max_tiles, uint32_t expert_rows,
+                          void* stream) {
+    using layout = typename mmt::layout;
+    float* scales = static_cast<float*>(const_cast<void*>(b_scale));
+    typename layout::expert_gl Bg{static_cast<fp8e4m3*>(const_cast<void*>(b)), nullptr,
+                                  size_t(mmt::EXPERTS), size_t(expert_rows), size_t(k)};
+    typename layout::expert_scale_gl Gs{scales, nullptr, nullptr, size_t(mmt::EXPERTS),
+                                        size_t(expert_rows)};
+    typename layout::expert_scale_gl Us{scales + inter, nullptr, nullptr, size_t(mmt::EXPERTS),
+                                        size_t(expert_rows)};
+    typename layout::idx_gl Og{static_cast<int*>(const_cast<void*>(offsets)), nullptr, nullptr,
+                               size_t(1), size_t(mmt::EXPERTS + 1)};
+    typename layout::idx_gl Tg{static_cast<int*>(const_cast<void*>(tile_expert)), nullptr,
+                               nullptr, size_t(1), size_t(max_tiles)};
+    typename layout::a_gl Ag{static_cast<fp8e4m3*>(const_cast<void*>(a)), nullptr, nullptr,
+                             size_t(rows), size_t(k)};
+    typename layout::globals G{Ag, Bg, out_view(c, uint32_t(rows), inter),
+                               scale_view(a_scale, uint32_t(rows)), Gs, Us, Og, Tg,
+                               int(inter / 64)};
+    return launch<mmt>(G, stream);
+}
+
 }  // namespace
 
 // The kernels' one-time setup: allow every instance of this file `GEMM_FP8_SMEM_BYTES` of dynamic
@@ -791,6 +959,18 @@ extern "C" int scratchy_cuda_gemm_fp8_prepare(void) {
     }
     if (e == cudaSuccess) {
         e = smem_attr<expert_gemm_e128_col64_m64_k128_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gate_up_silu_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gate_up_gelu_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gate_up_e128_silu_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gate_up_e128_gelu_fp8_mmt>();
     }
     return static_cast<int>(e);
 }
@@ -1033,4 +1213,50 @@ extern "C" int scratchy_cuda_expert_gemm_fp8_m64(const void* a, const void* a_sc
     return scratchy_cuda_expert_gemm_fp8_variant(a, a_scale, b, b_scale, offsets, tile_expert, c,
                                                  max_tiles, n, k, experts, expert_rows, n_tile, 64,
                                                  k_step, stream);
+}
+
+// FP8 S8 P3(b): the fused expert gate + up + act over an fp8 bank (`expert_gate_up_template`): for
+// every live 64-row tile `t` of the sorted pair rows (`max_tiles` and `tile_expert` counting a
+// sort's 64-row tiles, `scratchy_cuda_moe_sort_fp8_m64`), `e = tile_expert[t]`,
+// `c[64t .., :] = bf16(OP(bf16(gate), bf16(up)))`, `gate` and `up` the bits
+// `scratchy_cuda_expert_gemm_fp8_m64` gives for the bank's gate and up on those rows, `OP` 0
+// `silu_mul`, 1 `gelu_tanh_mul`: today's two GEMMs then `silu_mul_bf16` / `gelu_mul_bf16`, bit for
+// bit. `b` points at expert 0's gate rows of `[E, expert_rows, k]` e4m3 (`expert_rows` at least
+// `2 · inter`: the gate's `inter` rows, then the up's) and `b_scale` at expert 0's row of `[E,
+// expert_rows]` f32; `a` is `[max_tiles · 64, k]` e4m3 and `a_scale` its rows' f32; `c` is
+// `[max_tiles · 64, inter]` bf16, its rows past the live tiles never written. Refused before any
+// pointer is touched: `max_tiles` zero; `experts` not 128 or 256; `inter` zero or not a multiple of
+// 64; `k` zero or not a multiple of 128; `expert_rows` below `2 · inter`; `act` above 1;
+// `max_tiles · 64 · max(inter, k)` or `E · expert_rows · k` above INT_MAX. The tensors 16-byte
+// aligned, the scales 8-byte aligned, `c` overlapping no input. Return codes as
+// `scratchy_cuda_gemm_fp8_abt`'s. `scratchy_cuda_gemm_fp8_prepare` must have succeeded.
+extern "C" int scratchy_cuda_expert_gate_up_gemm_fp8(
+    const void* a, const void* a_scale, const void* b, const void* b_scale, const void* offsets,
+    const void* tile_expert, void* c, uint32_t max_tiles, uint32_t inter, uint32_t k,
+    uint32_t experts, uint32_t expert_rows, uint32_t act,
+    void* stream /* cudaStream_t; null = default */) {
+    const uint64_t rows = uint64_t(max_tiles) * 64;
+    const uint64_t wide = inter > k ? inter : k;
+    if (max_tiles == 0 || (experts != uint32_t(EXPERTS_LARGE) && experts != uint32_t(EXPERTS_SMALL)) ||
+        inter == 0 || inter % 64 != 0 || k == 0 || k % 128 != 0 ||
+        uint64_t(expert_rows) < 2 * uint64_t(inter) || act > 1 ||
+        rows * wide > uint64_t(INT_MAX) ||
+        uint64_t(experts) * uint64_t(expert_rows) * uint64_t(k) > uint64_t(INT_MAX)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const auto go = [&](auto mmt) {
+            return launch_expert_gate_up<decltype(mmt)>(a, a_scale, b, b_scale, offsets,
+                                                        tile_expert, c, rows, inter, k, max_tiles,
+                                                        expert_rows, stream);
+        };
+        if (experts == uint32_t(EXPERTS_LARGE)) {
+            return act == 0 ? go(expert_gate_up_silu_fp8_mmt{}) : go(expert_gate_up_gelu_fp8_mmt{});
+        }
+        return act == 0 ? go(expert_gate_up_e128_silu_fp8_mmt{})
+                        : go(expert_gate_up_e128_gelu_fp8_mmt{});
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }

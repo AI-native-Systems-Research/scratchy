@@ -35,9 +35,10 @@ use scratchy_target_cuda::op_abi::{
 };
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
-    ExpertActQuantFp8, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertProjection, GDN_SEQUENCE_BYTES,
-    GateUpKernel, GateUpTcFp8, GatedOp, MoeWeight, QuantChainError, QuantRowsFp8, RmsNormBf16,
-    RmsNormQuantFp8, gdn_scratch, gemv_tc_takes, norm_row_takes, quant_chain,
+    ExpertActQuantFp8, ExpertGateUpGemmFp8, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertProjection,
+    GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp, MoeWeight, QuantChainError,
+    QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, gdn_scratch, gemv_tc_takes, norm_row_takes,
+    quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -1910,6 +1911,62 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
         }
     }
     steps
+}
+
+/// An fp8 bank's prefill gate, up and act + quantize, as the MoE lowering emits them (the three
+/// adjacent, on the same sorted rows, index regions and bank, the act over the two GEMMs'
+/// regions), as one step (FP8 S8 P3(b), [`ExpertGateUpGemmFp8`]) where the fused GEMM takes the
+/// shape: `hidden` a multiple of 128, `inter` of 64, 128 or 256 experts. Its bits are the three's;
+/// the quant scratch holds what it held. Every other step is as it was. Run on a model's tapes
+/// after its weight table merged the indices naming one checkpoint tensor (`emit::lower_model`):
+/// the gate's and the up's bank are then one index exactly when they are one tensor.
+pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
+    let fp8 = |g: &ExpertGemmBf16| matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
+    let fuses = |gate: &ExpertGemmBf16, up: &ExpertGemmBf16, act: &ExpertActQuantFp8| {
+        let shared = |g: &ExpertGemmBf16| {
+            (
+                g.a,
+                g.bundle,
+                g.weight,
+                g.offsets,
+                g.tile_expert,
+                (g.max_tiles, g.experts, g.hidden, g.inter),
+            )
+        };
+        let capacity = gate.max_tiles.checked_mul(CUDA_FP8_EXPERT_TILE_ROWS);
+        fp8(gate)
+            && (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up)
+            && shared(gate) == shared(up)
+            && (act.act.gate, act.act.up, act.offsets) == (gate.c, up.c, gate.offsets)
+            && capacity == Some(act.act.rows)
+            && act.act.cols == gate.inter
+            && gate.hidden.is_multiple_of(128)
+            && gate.inter.is_multiple_of(64)
+            && matches!(gate.experts, 128 | 256)
+    };
+    let mut out = Vec::with_capacity(steps.len());
+    let mut i = 0;
+    while i < steps.len() {
+        if let [
+            CudaStep::ExpertGemm(gate),
+            CudaStep::ExpertGemm(up),
+            CudaStep::ExpertActQuant(act),
+            ..,
+        ] = steps[i..]
+            && fuses(&gate, &up, &act)
+        {
+            out.push(CudaStep::ExpertGateUpGemmFp8(ExpertGateUpGemmFp8 {
+                gate,
+                up,
+                act,
+            }));
+            i += 3;
+            continue;
+        }
+        out.push(steps[i]);
+        i += 1;
+    }
+    out
 }
 
 /// A one-row norm or add-norm whose `y` the next step quantizes, with that quant write folded in

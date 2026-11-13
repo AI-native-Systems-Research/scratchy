@@ -39,14 +39,14 @@ use crate::kernels::{self, DecodeSplit, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16,
-    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GemmBf16, GroupMember,
-    LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16,
-    PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes,
-    attn_decode_split, fp8_moe_layout, fp8_weight, gdn_scan_is_recurrent, gemv_splits,
-    norm_row_takes,
+    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpGemmFp8,
+    ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
+    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16,
+    GatherLastRowBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
+    MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16,
+    RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    attn_decode_scratch_bytes, attn_decode_split, fp8_moe_layout, fp8_weight,
+    gdn_scan_is_recurrent, gemv_splits, norm_row_takes,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -2076,6 +2076,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
+                    CudaStep::ExpertGateUpGemmFp8(t) => {
+                        Self::expert_gate_up_fp8(&t, slot, weights, stream)
+                    }
                     CudaStep::ExpertGemv(g) => {
                         Self::expert_gemv(&g, slot, partials, weights, stream)
                     }
@@ -3070,6 +3073,57 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let w = weights[bundle.0 as usize].ptr();
         let at = |o: u64| Some(w.wrapping_byte_add(usize::try_from(o).ok()?).cast_const());
         Some(((at(part)?, at(scale)?), rows))
+    }
+
+    /// Enqueue an fp8 bank's prefill gate + up + act + quantize (FP8 S8 P3(b)): the fused grouped
+    /// GEMM over the sorted e4m3 rows, its act into the gate's region, then the live rows' quantize
+    /// of that act into the act step's `q_act`.
+    fn expert_gate_up_fp8(
+        t: &ExpertGateUpGemmFp8,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let g = t.gate;
+        let refused = || KernelError::MoeShape {
+            kernel: "expert_gate_up_gemm_fp8",
+            dims: [g.max_tiles, g.inter, g.hidden, 0],
+        };
+        let Some((a, rows, k)) = CudaStep::ExpertGemm(g).fp8_expert_rows() else {
+            return Err(refused());
+        };
+        let Some((b, expert_rows)) = Self::fp8_expert_slab(
+            weights,
+            (g.bundle, g.weight),
+            ExpertProjection::Gate,
+            (g.experts, g.hidden, g.inter),
+        ) else {
+            return Err(refused());
+        };
+        let (q, scale) = Self::fp8_rows(&slot, t.act.q_act, t.act.act.rows, t.act.act.cols);
+        // SAFETY: as `expert_gemm`'s fp8 arm, for the sorted rows (`rows*k` e4m3 bytes and `rows`
+        // f32), the bank (`fp8_moe_layout`'s bytes: its down scales follow the gate/up scales),
+        // the index regions and the gate's region (`rows*inter` bf16, the act's), then as the
+        // `ExpertActQuant` arm's for the act and the quant scratch (`validate`).
+        unsafe {
+            kernels::expert_gate_up_gemm_fp8(
+                (Self::fp8_rows(&slot, a, rows, k), b),
+                (
+                    slot(g.offsets).cast_const(),
+                    slot(g.tile_expert).cast_const(),
+                ),
+                slot(g.c),
+                (g.max_tiles, g.inter, k, g.experts, expert_rows),
+                t.act.op.code(),
+                stream.0,
+            )?;
+            kernels::expert_quant_fp8(
+                (slot(g.c).cast_const(), slot(t.act.offsets).cast_const()),
+                (q.cast_mut(), scale.cast_mut()),
+                (t.act.act.rows, t.act.act.cols, t.act.experts),
+                stream.0,
+            )
+        }
     }
 
     /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_tiled_bf16`) over the sorted rows at

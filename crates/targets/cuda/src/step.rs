@@ -85,6 +85,12 @@ pub enum CudaStep {
     /// P1), in place of the act over every sorted row and a [`Self::QuantRowsFp8`] of them
     /// (`kernels/act_quant_fp8.cu`, `scratchy_cuda_expert_act_quant_fp8`).
     ExpertActQuant(ExpertActQuantFp8),
+    /// An fp8 bank's prefill gate, up and act + quantize (FP8 S8 P3(b)) in two launches: the fused
+    /// grouped GEMM (`kernels/gemm_fp8.cu`'s `expert_gate_up_template`), which writes the act into
+    /// the gate's region, then the live rows' quantize of it into the act's `q_act`
+    /// (`kernels/act_quant_fp8.cu`). The bits of its parts, [`Self::ExpertGemm`] of the gate and of
+    /// the up then [`Self::ExpertActQuant`]; the up's region is not written.
+    ExpertGateUpGemmFp8(ExpertGateUpGemmFp8),
     /// One projection of every sorted pair, lowered from `SubOp::ExpertMatmul` of a sorted bucket:
     /// one grouped GEMM over the expert-padded tiles (`kernels/expert_gemm_bf16.cu`).
     ExpertGemm(ExpertGemmBf16),
@@ -1761,6 +1767,14 @@ impl ExpertActQuantFp8 {
     }
 }
 
+/// [`CudaStep::ExpertGateUpGemmFp8`]: the chain it folds, each step as lowered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGateUpGemmFp8 {
+    pub gate: ExpertGemmBf16,
+    pub up: ExpertGemmBf16,
+    pub act: ExpertActQuantFp8,
+}
+
 /// Which projection of a MoE bundle an expert step computes; its weights for expert `e` are
 /// `[n, k]` bf16 at [`ExpertProjection::slab`]'s bytes into the bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -2100,6 +2114,7 @@ impl CudaStep {
             | Self::ExpertSort(_)
             | Self::ExpertSortFp8(_)
             | Self::ExpertActQuant(_)
+            | Self::ExpertGateUpGemmFp8(_)
             | Self::ExpertGemm(_)
             | Self::ExpertCombine(_)
             | Self::GateScale(_)
@@ -2171,6 +2186,7 @@ impl CudaStep {
             | Self::ExpertSort(_)
             | Self::ExpertSortFp8(_)
             | Self::ExpertActQuant(_)
+            | Self::ExpertGateUpGemmFp8(_)
             | Self::ExpertGemm(_)
             | Self::ExpertGemv(_)
             | Self::ExpertCombine(_)
@@ -2240,6 +2256,7 @@ impl CudaStep {
             | Self::ExpertSort(_)
             | Self::ExpertSortFp8(_)
             | Self::ExpertActQuant(_)
+            | Self::ExpertGateUpGemmFp8(_)
             | Self::ExpertGemm(_)
             | Self::ExpertGemv(_)
             | Self::ExpertCombine(_)
@@ -2345,6 +2362,7 @@ impl CudaStep {
         match *self {
             Self::QuantRowsFp8(q) => Some(q),
             Self::ExpertActQuant(t) => Some(t.quant_write()),
+            Self::ExpertGateUpGemmFp8(t) => Some(t.act.quant_write()),
             Self::GateUpTcFp8(t) => Some(t.quant_write()),
             Self::ExpertGateUpTcFp8(t) => t.quant_write(),
             Self::RmsNormQuantFp8(t) => Some(t.quant_write()),
@@ -2367,6 +2385,14 @@ impl CudaStep {
                 Some(g.kernel.step(g.gate)),
                 Some(g.kernel.step(g.up)),
                 Some(g.act.step(g.activation())),
+            ];
+        }
+        // The prefill's fused expert gate + up + act (FP8 S8 P3(b)): the chain it folds.
+        if let Self::ExpertGateUpGemmFp8(t) = self {
+            return [
+                Some(Self::ExpertGemm(t.gate)),
+                Some(Self::ExpertGemm(t.up)),
+                Some(Self::ExpertActQuant(t.act)),
             ];
         }
         if let Self::ExpertGateUpAct(g) = self {
@@ -2458,6 +2484,8 @@ impl CudaStep {
             Self::GemmGroup(g) | Self::GemmNarrowGroup(g) | Self::GemvGroup(g) => {
                 Self::Gemm(g.member(g.first)).extents()
             }
+            // Its parts' ([`Self::parts`]), each checked as the step it is; here the gate's.
+            Self::ExpertGateUpGemmFp8(t) => Self::ExpertGemm(t.gate).extents(),
             Self::GemmGroupFp8(g)
             | Self::GemmNarrowGroupFp8(g)
             | Self::GemvGroupFp8(g)
@@ -3541,6 +3569,10 @@ impl CudaStep {
             | Self::GdnDecode(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
+            | Self::ExpertGateUpGemmFp8(ExpertGateUpGemmFp8 {
+                gate: ExpertGemmBf16 { bundle, .. },
+                ..
+            })
             | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. })
             | Self::ExpertGemvTcFp8(ExpertGemvBf16 { bundle, .. })
             | Self::ExpertGateUpAct(ExpertGateUpActBf16 {
@@ -3624,6 +3656,9 @@ impl CudaStep {
                 fold: GateUpActBf16 { gate, up, .. },
                 ..
             }) => vec![&mut gate.b, &mut up.b],
+            Self::ExpertGateUpGemmFp8(ExpertGateUpGemmFp8 { gate, up, .. }) => {
+                vec![&mut gate.bundle, &mut up.bundle]
+            }
             Self::ExpertGateUpAct(ExpertGateUpActBf16 { gate, up, .. })
             | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
                 fold: ExpertGateUpActBf16 { gate, up, .. },

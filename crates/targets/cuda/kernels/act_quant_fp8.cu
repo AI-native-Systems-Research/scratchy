@@ -290,8 +290,11 @@ extern "C" int scratchy_cuda_expert_act_quant_fp8_prepare(void) {
     if (e != cudaSuccess) {
         return static_cast<int>(e);
     }
-    return static_cast<int>(
-        cudaFuncGetAttributes(&attr, expert_act_quant_fp8_ker<scratchy::ops::gelu_tanh_mul>));
+    e = cudaFuncGetAttributes(&attr, expert_act_quant_fp8_ker<scratchy::ops::gelu_tanh_mul>);
+    if (e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return static_cast<int>(cudaFuncGetAttributes(&attr, expert_act_quant_fp8_ker<base_ops::copy2>));
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
@@ -334,6 +337,48 @@ extern "C" int scratchy_cuda_expert_act_quant_fp8(const void* gate, const void* 
                                         : expert_act_quant_fp8_ker<scratchy::ops::gelu_tanh_mul>;
         return static_cast<int>(
             cudaLaunchKernel(ker, grid, block, args, 0, static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// C++ exception was caught; any other value = the launch's cudaError_t.
+//
+// FP8 S8 P3(b): rows `r < offsets[experts]` of `x [rows, cols]` bf16 (the fused expert gate + up +
+// act's output, `scratchy_cuda_expert_gate_up_gemm_fp8`), quantized into `q [rows, cols]` e4m3 and
+// `scale [rows]` f32: `expert_act_quant_fp8_ker` at TK's `base_ops::copy2` (`OP(g, u) = u`, so
+// the act it forms is `x`'s value, widened and rounded back exactly), `x` its gate and its up. So
+// each live row is `quant_rows_fp8` of that row, and equals `scratchy_cuda_expert_act_quant_fp8`
+// of the gate and the up `x` was formed from. Refused as `scratchy_cuda_expert_act_quant_fp8` (but
+// `op`). Asynchronous.
+extern "C" int scratchy_cuda_expert_quant_fp8(const void* x, void* q, void* scale,
+                                              const void* offsets, uint32_t rows, uint32_t cols,
+                                              uint32_t experts,
+                                              void* stream /* cudaStream_t; null = default */) {
+    if (rows == 0 || cols == 0 || cols % COL_MULTIPLE != 0 || experts == 0 ||
+        uint64_t(rows) * cols > uint64_t(INT_MAX) || x == nullptr || q == nullptr ||
+        scale == nullptr || offsets == nullptr) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const auto b = [](const void* p) { return static_cast<bf16*>(const_cast<void*>(p)); };
+        expert_act_quant_globals G{
+            expert_act_gl{b(x), nullptr, nullptr, size_t(rows), size_t(cols)},
+            expert_act_gl{b(x), nullptr, nullptr, size_t(rows), size_t(cols)},
+            q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(rows), size_t(cols)},
+            scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(rows)},
+            expert_idx_gl{static_cast<int*>(const_cast<void*>(offsets)), nullptr, nullptr, nullptr,
+                          size_t(experts) + 1},
+            int(rows),
+            int(cols),
+            int(experts)};
+        void* args[] = {&G};
+        const dim3 grid{(rows + uint32_t(WARPS) - 1) / uint32_t(WARPS)}, block{uint32_t(THREADS)};
+        return static_cast<int>(cudaLaunchKernel(expert_act_quant_fp8_ker<base_ops::copy2>, grid,
+                                                 block, args, 0,
+                                                 static_cast<cudaStream_t>(stream)));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

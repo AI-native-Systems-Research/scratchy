@@ -55,9 +55,9 @@ const DECODE_QUANT_READERS: usize = 180;
 const PREFILL_STEPS: [(&str, usize); 23] = [
     ("AttnPrefill", 30),
     ("Embed", 1),
-    ("ExpertActQuant", 30),
     ("ExpertCombine", 30),
-    ("ExpertGemm", 90),
+    ("ExpertGateUpGemmFp8", 30),
+    ("ExpertGemm", 30),
     ("ExpertSortFp8", 30),
     ("GateUpAct", 30),
     ("GatherLastRow", 1),
