@@ -1361,12 +1361,11 @@ impl SpyreWorker {
         // ⭐ THE ONE META MINT — stated once above every session the loader builds (the
         // prefix ladder's adoption below mints each rung's own beside its build), so no
         // BundleMeta in this file is spelled a second time.
-        #[allow(unused_variables)]
         let mk_meta =
-            |p: Parsed, prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
+            |p: Parsed, _prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
                 BundleMeta {
                     #[cfg(not(feature = "spyre-hw"))]
-                    prog,
+                    prog: _prog,
                     #[cfg(not(feature = "spyre-hw"))]
                     paged: p.paged,
                     capacity: p.capacity,
