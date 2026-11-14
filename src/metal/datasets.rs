@@ -75,7 +75,7 @@ const DATASETS: [Dataset; 9] = [
         buckets: buckets::MUSIQUE,
         ..plain(
             "rag",
-            "MuSiQue, timed",
+            "MuSiQue",
             "multi-document QA, MuSiQue: a question over its passages",
         )
     },
