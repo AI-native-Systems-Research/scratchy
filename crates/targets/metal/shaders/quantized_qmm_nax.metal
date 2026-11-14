@@ -240,7 +240,9 @@ METAL_FUNC void qmm_t_nax_impl(
     if (y_row >= M || y_col >= N) return;
 
     // ── Valid sub-tile extents for M/N tail handling ────────────────
-    const short sgp_sm = is_producer ? short(SM) : min(short(SM), short(M - (y_row + tm)));
+    // The rows left are counted in int and only the clamped count narrows: a grouped bake's
+    // padded rows pass 32,767 (512 experts), and a short of them wrapped negative (#1205).
+    const short sgp_sm = is_producer ? short(SM) : short(min(int(SM), M - (y_row + tm)));
     const bool is_unaligned_sm = (sgp_sm != short(SM));
 
     const short tgp_bn = aligned_N ? short(BN) : short(min(BN, N - y_col));
@@ -834,7 +836,7 @@ METAL_FUNC void gemm_t_nax_impl(
     const int y_col = int(tgid.x) * BN;
     if (y_row >= M || y_col >= N) return;
 
-    const short sgp_sm = min(short(SM), short(M - (y_row + tm)));
+    const short sgp_sm = short(min(int(SM), M - (y_row + tm)));  // int first, as above (#1205)
     const bool  is_unaligned_sm = (sgp_sm != short(SM));
     const short tgp_bn = short(min(BN, N - y_col));
     const bool  is_unaligned_bn = (tgp_bn != short(BN));
