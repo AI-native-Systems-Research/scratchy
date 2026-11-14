@@ -5350,9 +5350,7 @@ pub(crate) fn dump_wavefront_mega(
             // attention spliced s times at window-local tables (the U1 unroll). The rung's
             // graph is the PRODUCT's (w·s rows, lowered here), its per-request width stated
             // by the pair, not divided back out of the rows.
-            for &(w, s) in &ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(
-                &baked,
-            ) {
+            for &(w, s) in &ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked) {
                 match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     inferred,
@@ -5376,20 +5374,21 @@ pub(crate) fn dump_wavefront_mega(
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD — a wave on a sharded session
                         // runs on ITS world's packed rung.
                         if let Some(decode_cuts) = tp_sources.as_deref() {
-                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
-                                scratchy_target_spyre::bundle_code::collective::Build,
-                                _,
-                            >(
-                                &lwd_p,
-                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                                &[],
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank packed prefill \
-                                     (w={w}, s={s}) is malformed — {e:?}"
+                            let (tp_lwd, sf_p) =
+                                scratchy_subtile::tensor_parallel::shard_lowered::<
+                                    scratchy_target_spyre::bundle_code::collective::Build,
+                                    _,
+                                >(
+                                    &lwd_p,
+                                    scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                    &[],
                                 )
-                            });
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "[spyre-tp] {stem}: the {TP_WORLD}-rank packed prefill \
+                                     (w={w}, s={s}) is malformed — {e:?}"
+                                    )
+                                });
                             refuse_if_staged_cut_apart(
                                 stem,
                                 &format!(
@@ -5452,8 +5451,11 @@ pub(crate) fn dump_wavefront_mega(
             // kill. Checked against the table, on what BAKED, both directions.
             let packed_baked: Vec<(u32, u32)> = {
                 let r = superdsc_prefill_prefix_rungs.borrow();
-                let mut v: Vec<(u32, u32)> =
-                    r.iter().filter(|&&(_, s, _)| s > 1).map(|&(w, s, _)| (w, s)).collect();
+                let mut v: Vec<(u32, u32)> = r
+                    .iter()
+                    .filter(|&&(_, s, _)| s > 1)
+                    .map(|&(w, s, _)| (w, s))
+                    .collect();
                 v.sort_unstable();
                 v
             };

@@ -2345,9 +2345,8 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let KtirNode { func, program, .. } = positional;
     let mut out = Vec::with_capacity(windows as usize);
     for r in 0..windows {
-        let window = |table: u32| {
-            BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, table))
-        };
+        let window =
+            |table: u32| BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, table));
         let mut bindings = vec![
             t(&node.inputs[0]),
             window(0),

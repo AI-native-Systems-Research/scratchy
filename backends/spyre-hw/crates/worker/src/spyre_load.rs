@@ -2850,7 +2850,7 @@ impl SpyreWorker {
                     &'static scratchy_target_spyre::wiring::Wiring,
                     Result<SuperDscSession, String>,
                 )> = std::thread::scope(|scope| {
-                        let handles: Vec<_> = prefix_jobs
+                    let handles: Vec<_> = prefix_jobs
                             .into_iter()
                             .zip(prefix_prepared)
                             .map(|(job, built)| {
@@ -2880,14 +2880,14 @@ impl SpyreWorker {
                                 })
                             })
                             .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| match h.join() {
-                                Ok(r) => r,
-                                Err(p) => std::panic::resume_unwind(p),
-                            })
-                            .collect()
-                    });
+                    handles
+                        .into_iter()
+                        .map(|h| match h.join() {
+                            Ok(r) => r,
+                            Err(p) => std::panic::resume_unwind(p),
+                        })
+                        .collect()
+                });
                 let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
                 for (pmq, seqs, fp, wiring, adopted) in prefix_adopted {
                     let ps = adopted.unwrap_or_else(|m| panic!("{m}"));

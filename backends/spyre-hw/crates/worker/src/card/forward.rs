@@ -1079,9 +1079,7 @@ pub(crate) fn collect_decode_tokens(
     // still differing is a row computed wrong.
     if let Some((hread, row_tid, pad_vocab)) = &sub.dbg_seat {
         match session.finish_deferred_read_raw(hread) {
-            Ok(b) => {
-                log_decode_top2(&b, sub.rows.get(), *pad_vocab, sub.vocab, &toks, *row_tid)
-            }
+            Ok(b) => log_decode_top2(&b, sub.rows.get(), *pad_vocab, sub.vocab, &toks, *row_tid),
             Err(e) => {
                 tracing::debug!("DECODE_READBACK t{row_tid}: the seat read failed: {e}")
             }
@@ -1094,7 +1092,14 @@ pub(crate) fn collect_decode_tokens(
 /// each row's argmax and second-best over the step's f16 logits, through the
 /// same stick law the prefill-final readback argmaxes by (the row's pick rides
 /// in `toks`, the card's own draw). One debug line per row, per step.
-fn log_decode_top2(bytes: &[u8], rows: usize, pad_vocab: usize, vocab: usize, toks: &[u32], tid: u32) {
+fn log_decode_top2(
+    bytes: &[u8],
+    rows: usize,
+    pad_vocab: usize,
+    vocab: usize,
+    toks: &[u32],
+    tid: u32,
+) {
     const FP16_ELEMS_PER_STICK: usize =
         <ktir_superdsc::superdsc_opspec::Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
             as usize;
