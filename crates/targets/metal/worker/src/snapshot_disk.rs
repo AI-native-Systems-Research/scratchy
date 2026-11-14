@@ -15,7 +15,7 @@
 //! ⛔ A SPILL COSTS ITS STEP ONE COPY, NOT A WRITE. The step that evicts a snapshot is the
 //! prefill of the request whose save took its slot, so a write in that step is time to its first
 //! token. Its slot is copied into a staging buffer, and a thread of its own writes that to the
-//! file. A fill waits for every write still under way: the disk slot it reads may be one.
+//! file. A fill waits only for a write still under way to the disk slot it reads.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -23,11 +23,11 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use objc2_metal::MTLBuffer as _;
+use objc2_metal::{MTLBuffer as _, MTLDevice as _, MTLResourceOptions};
 use scratchy_target_metal::argmax::Buffer;
 use scratchy_target_metal::device_metal::Device;
 use scratchy_target_metal::dflash2::{WindowCopy, encode_window_copies};
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_zeroed};
+use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::residency::MetalResidencySet;
 
 /// One snapshot slot's bytes in one GDN state store: `(buffer, offset, bytes)`
@@ -101,8 +101,11 @@ impl SnapshotDisk {
         if self.writes.len() >= MAX_WRITES {
             self.reap(|_| true);
         }
-        let staging = self.staging(device);
-        copy(device, residency, regions, &staging, self.slot_bytes, true)?;
+        let staging = self.staging(device)?;
+        if let Err(e) = copy(device, residency, regions, &staging, self.slot_bytes, true) {
+            self.spare.push(staging);
+            return Err(e);
+        }
         let (file, len, at) = (
             self.file.clone(),
             self.slot_bytes,
@@ -134,14 +137,15 @@ impl SnapshotDisk {
         disk: usize,
         key: u64,
     ) -> Result<bool, String> {
-        self.reap(|_| true);
+        // Only a write to this disk slot is in the way: another spill of this step writes another.
+        self.reap(|w| w.done.is_finished() || w.disk == disk);
         let Some((held, window)) = self.held.get(disk).copied().flatten() else {
             return Err(format!("disk slot {disk} holds no snapshot"));
         };
         if held != key {
             return Err(format!("disk slot {disk} holds another prefix's snapshot"));
         }
-        let staging = self.staging(device);
+        let staging = self.staging(device)?;
         // SAFETY: `staging` is a shared buffer of `slot_bytes` that no write or copy holds.
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(
@@ -158,9 +162,15 @@ impl SnapshotDisk {
         copied.map(|()| window)
     }
 
-    /// A staging buffer no write holds: a spare one, else a new one.
-    fn staging(&mut self, device: &Device) -> Buffer {
-        (self.spare.pop()).unwrap_or_else(|| shared_zeroed(device, self.slot_bytes))
+    /// A staging buffer no write holds: a spare one, else a new one — not zeroed, since every move
+    /// writes all of it before it reads any. At most [`MAX_WRITES`] writes' and a fill's.
+    fn staging(&mut self, device: &Device) -> Result<Buffer, String> {
+        if let Some(spare) = self.spare.pop() {
+            return Ok(spare);
+        }
+        let shared = MTLResourceOptions::StorageModeShared;
+        (device.newBufferWithLength_options(self.slot_bytes, shared))
+            .ok_or_else(|| format!("a staging buffer of {} bytes", self.slot_bytes))
     }
 
     /// Wait for the writes `which` picks and take their staging buffers back. A disk slot whose
