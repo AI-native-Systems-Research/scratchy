@@ -57,7 +57,7 @@ const fn plain(key: &'static str, label: &'static str, about: &'static str) -> D
         scored: None,
         sampled: false,
         turns: 1,
-        buckets: buckets::WHOLE,
+        buckets: buckets::BUCKETS,
     }
 }
 
@@ -72,7 +72,7 @@ const DATASETS: [Dataset; 9] = [
     Dataset {
         scored: Some("rag-accuracy"),
         sampled: true,
-        buckets: buckets::MUSIQUE,
+        buckets: buckets::BUCKETS,
         ..plain(
             "rag",
             "MuSiQue, timed",
@@ -81,7 +81,7 @@ const DATASETS: [Dataset; 9] = [
     },
     Dataset {
         sampled: true,
-        buckets: buckets::MUSIQUE,
+        buckets: buckets::BUCKETS,
         ..plain(
             "rag-spans",
             "RAG, passage reuse",
@@ -113,7 +113,7 @@ const DATASETS: [Dataset; 9] = [
     ),
     Dataset {
         sampled: true,
-        buckets: buckets::MUSIQUE,
+        buckets: buckets::BUCKETS,
         ..plain(
             "rag-accuracy",
             "MuSiQue, scored",
@@ -997,21 +997,22 @@ fn summary_map(
         }
         rows
     };
-    let bs = of(dataset).map_or(buckets::WHOLE, |d| d.buckets);
+    let bs = of(dataset).map_or(buckets::BUCKETS, |d| d.buckets);
     // A square's ratio, how many times faster scratchy is, or why it has none.
-    let ratio = |p: Option<&Pair>, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
+    let ratio = |p: Option<&Pair>, row: &Row, b: usize| -> Result<(f64, String), String> {
         let p = p.ok_or("not run")?;
         let rival = p.rival.ok_or("scratchy alone so far")?;
         let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
         let (Some(ours), Some(theirs)) = (ours, theirs) else {
-            return Err("not run at this load");
+            return Err("not run at this load".into());
         };
         if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
-            return Err("most requests failed");
+            return Err("most requests failed".into());
         }
         let a = buckets::median_in(ours, bs, row.timing, b);
         let t = buckets::median_in(theirs, bs, row.timing, b);
-        let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
+        let sides = [("scratchy", *ours, a), (rival.label(), *theirs, t)];
+        let r = tasks::times(a, t, true).ok_or_else(|| no_ratio_why(sides, bs, row.timing, b))?;
         let from = (theirs.borrowed_from.as_ref())
             .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
         Ok((r, format!("{}{from}", rival.label())))
@@ -1051,7 +1052,7 @@ fn summary_map(
                     squares.insert(
                         (m, r, k, b),
                         MapSquare {
-                            ratio: ratio(p.as_ref(), row, b).map_err(str::to_string),
+                            ratio: ratio(p.as_ref(), row, b),
                             tip: tip.into_iter().flatten().collect(),
                         },
                     );
@@ -1088,6 +1089,32 @@ fn summary_map(
     // square furthest from ×1, so its shades read apart.
     map.labelled = ratio_labels(&map.ratios(), HEAT_LABELS);
     map.render(&format!("{id}-summary-scale"))
+}
+
+/// Why a summary square has no ratio, naming the side it is missing: the engine that sent no
+/// request this long, or one whose requests this long kept no `timing` (a one-token answer has no
+/// TPOT); no requests this long, where neither engine sent one.
+fn no_ratio_why(
+    sides: [(&str, &TaskCell, Option<f64>); 2],
+    bs: buckets::Buckets,
+    timing: RequestTiming,
+    b: usize,
+) -> String {
+    let sent = sides.map(|(_, c, _)| buckets::sent_in(c, bs, b));
+    if sent == [0, 0] {
+        return "no requests this long".to_string();
+    }
+    let missing: Vec<String> = (sides.iter().zip(sent))
+        .filter(|((_, _, v), _)| v.is_none())
+        .map(|((name, _, _), n)| {
+            let (t, s) = (timing.title(), if n == 1 { "" } else { "s" });
+            match n {
+                0 => format!("{name} sent no request this long"),
+                n => format!("{name} timed none of its {n} request{s} this long ({t})"),
+            }
+        })
+        .collect();
+    missing.join("; ")
 }
 
 /// One machine and model's cells of a dataset, scratchy's and its rival's, by users count.

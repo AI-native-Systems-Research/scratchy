@@ -11,19 +11,17 @@ use super::numbers::median;
 /// one prompt size: a range would not fit over its square.
 pub type Buckets = &'static [(&'static str, u32)];
 
-/// MuSiQue's: four, as the random-token map has four prompt sizes, at about the quartiles of its
-/// prompts (most run 2k to 3.3k tokens): split at round 512s, a quarter of the squares had no
-/// request; split here, about one in twenty.
-pub const MUSIQUE: Buckets = &[
-    ("<2.3k", 2300),
-    ("2.3k+", 2550),
-    ("2.55k+", 2850),
-    ("2.85k+", u32::MAX),
+/// Every dataset's buckets, the same four, their bounds 500 prompt tokens apart: under 2.4k, 2.9k
+/// and 3.4k, and over. They split MuSiQue's prompts from its 5th to its 95th percentile (1.88k to
+/// 3.82k on its dev set) evenly, about 28%, 37%, 22% and 12% of them; at the matrix's 48 requests a
+/// cell, 99% of squares rest on 3 or more a side. One set for every dataset, so a column means the
+/// same prompt length on each.
+pub const BUCKETS: Buckets = &[
+    ("<2.4k", 2400),
+    ("2.4k+", 2900),
+    ("2.9k+", 3400),
+    ("3.4k+", u32::MAX),
 ];
-
-/// One bucket of every prompt, for a dataset with no buckets of its own yet: a square is its
-/// cell's whole median.
-pub const WHOLE: Buckets = &[("all prompts", u32::MAX)];
 
 /// The bucket of `buckets` a prompt of `tokens` falls in: its index.
 pub fn bucket(buckets: Buckets, tokens: u32) -> usize {
@@ -44,6 +42,14 @@ pub fn in_bucket(c: &TaskCell, buckets: Buckets, timing: RequestTiming, at: usiz
         .filter_map(|(p, v)| Some((p.filter(|&p| bucket(buckets, p) == at)?, (*v)?)))
         .map(|(_, v)| v)
         .collect()
+}
+
+/// How many of a cell's requests bucket `at` of `buckets` holds, timed or not: what tells a bucket
+/// with no request from one whose requests kept no `timing` (a TPOT of a one-token answer).
+pub fn sent_in(c: &TaskCell, buckets: Buckets, at: usize) -> usize {
+    (c.prompt_tokens.iter().flatten().flatten())
+        .filter(|&&p| bucket(buckets, p) == at)
+        .count()
 }
 
 /// The median of a cell's requests' `timing` in bucket `at` of `buckets`; None with none there.
@@ -79,15 +85,38 @@ mod tests {
         .unwrap()
     }
 
-    /// A prompt goes in the first bucket it is under; one past the last bound in the last.
+    /// Every dataset's buckets are the same four, 500 prompt tokens apart: under 2.4k, 2.9k and
+    /// 3.4k, and over. A prompt goes in the first it is under, one past the last bound in the last.
     #[test]
     fn a_prompt_falls_in_one_bucket() {
-        assert_eq!(bucket(MUSIQUE, 1500), 0);
-        assert_eq!(bucket(MUSIQUE, 2300), 1, "a bound starts the next bucket");
-        assert_eq!(bucket(MUSIQUE, 2700), 2);
-        assert_eq!(bucket(MUSIQUE, 2850), 3);
-        assert_eq!(bucket(MUSIQUE, 9000), 3, "the last is unbounded");
-        assert_eq!(bucket(WHOLE, 9000), 0, "one bucket holds every prompt");
+        let labels: Vec<&str> = BUCKETS.iter().map(|&(l, _)| l).collect();
+        assert_eq!(labels, ["<2.4k", "2.4k+", "2.9k+", "3.4k+"]);
+        let bounds: Vec<u32> = BUCKETS.iter().map(|&(_, b)| b).take(3).collect();
+        let even = bounds.windows(2).all(|w| w[1] - w[0] == 500);
+        assert!(even, "evenly spaced");
+        assert_eq!(bucket(BUCKETS, 2399), 0);
+        assert_eq!(bucket(BUCKETS, 2400), 1, "a bound starts the next bucket");
+        assert_eq!(bucket(BUCKETS, 2899), 1);
+        assert_eq!(bucket(BUCKETS, 2900), 2);
+        assert_eq!(bucket(BUCKETS, 3399), 2);
+        assert_eq!(bucket(BUCKETS, 3400), 3);
+        assert_eq!(bucket(BUCKETS, 9000), 3, "the last is unbounded");
+    }
+
+    /// A bucket's requests sent, timed or not: what tells no request this long from requests
+    /// none of whose timing was kept.
+    #[test]
+    fn a_bucket_counts_its_requests_sent() {
+        let c = cell(
+            &[Some(3000), Some(3100), Some(3500), None],
+            &[Some(100.0), Some(200.0), Some(300.0), Some(400.0)],
+            &[None, None, Some(30.0), None],
+        );
+        assert_eq!(sent_in(&c, BUCKETS, 2), 2);
+        let timed = in_bucket(&c, BUCKETS, RequestTiming::Tpot, 2);
+        assert!(timed.is_empty(), "none timed");
+        assert_eq!(sent_in(&c, BUCKETS, 3), 1);
+        assert_eq!(sent_in(&c, BUCKETS, 0), 0);
     }
 
     /// A bucket's median is over its own requests, those with a prompt count and a value: a
@@ -95,24 +124,26 @@ mod tests {
     #[test]
     fn a_buckets_median_is_over_its_own_requests() {
         let c = cell(
-            &[Some(1900), Some(2900), Some(2950), None, Some(3000)],
+            &[Some(3000), Some(3100), Some(3200), None, Some(3500)],
             &[Some(100.0), Some(300.0), Some(500.0), Some(900.0), None],
             &[Some(10.0), Some(20.0), Some(40.0), Some(90.0), Some(50.0)],
         );
-        assert_eq!(median_in(&c, MUSIQUE, RequestTiming::Ttft, 0), Some(100.0));
         assert_eq!(
-            median_in(&c, MUSIQUE, RequestTiming::Ttft, 3),
-            Some(400.0),
-            "300 and 500"
+            median_in(&c, BUCKETS, RequestTiming::Ttft, 2),
+            Some(300.0),
+            "100, 300 and 500"
         );
         assert_eq!(
-            median_in(&c, MUSIQUE, RequestTiming::Tpot, 3),
-            Some(40.0),
-            "20, 40 and 50"
+            median_in(&c, BUCKETS, RequestTiming::Tpot, 2),
+            Some(20.0),
+            "10, 20 and 40"
         );
-        assert_eq!(median_in(&c, MUSIQUE, RequestTiming::E2el, 0), Some(200.0));
+        let failed = median_in(&c, BUCKETS, RequestTiming::Ttft, 3);
+        assert_eq!(failed, None, "its one failed");
+        assert_eq!(median_in(&c, BUCKETS, RequestTiming::Tpot, 3), Some(50.0));
+        assert_eq!(median_in(&c, BUCKETS, RequestTiming::E2el, 2), Some(600.0));
         assert_eq!(
-            median_in(&c, MUSIQUE, RequestTiming::Ttft, 1),
+            median_in(&c, BUCKETS, RequestTiming::Ttft, 1),
             None,
             "none that long"
         );
@@ -127,6 +158,6 @@ mod tests {
         }))
         .unwrap();
         assert!(!bucketed(&old));
-        assert!(in_bucket(&old, MUSIQUE, RequestTiming::Ttft, 0).is_empty());
+        assert!(in_bucket(&old, BUCKETS, RequestTiming::Ttft, 0).is_empty());
     }
 }
