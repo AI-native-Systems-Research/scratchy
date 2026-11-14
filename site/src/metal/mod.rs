@@ -3759,6 +3759,47 @@ mod tests {
         );
     }
 
+    /// MuSiQue's 1-user cell answers on its own, for the decode it times; above 1 user its
+    /// answers are forced (#1208). Each row says which, the section is plain "MuSiQue", and the
+    /// 1-user cell's handful of scored tasks is no accuracy row: the accuracy cell's are.
+    #[test]
+    fn musiques_one_user_cell_is_named_natural_and_is_no_accuracy_row() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let tasks = runs[0].models[0].tasks.as_mut().unwrap();
+        for c in tasks
+            .iter_mut()
+            .filter(|c| c.workload == "rag" && c.conc == 1)
+        {
+            c.timed_answers = false;
+            c.accuracy = Some(0.375);
+            c.num_tasks = Some(8);
+        }
+        tasks.push(
+            serde_json::from_value(serde_json::json!({
+                "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
+                "accuracy": 0.48, "thinking_answers": 0, "capped_answers": 0,
+                "median_ttft_ms": 4000.0,
+            }))
+            .unwrap(),
+        );
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(
+            html.contains(">MuSiQue, natural answers<"),
+            "the 1-user row"
+        );
+        assert!(html.contains(">MuSiQue, timed<"), "the rows above 1 user");
+        assert!(
+            !html.contains("MuSiQue, timed multi-document"),
+            "the section is MuSiQue's, not its timed cells'"
+        );
+        assert!(html.contains("48% ±4.9"), "the accuracy cell's row");
+        assert!(
+            !html.contains("38%"),
+            "the 1-user cell is no accuracy row or dot"
+        );
+    }
+
     /// MuSiQue's accuracy cell keeps its timings as a row of the detail table, beside the cells
     /// at each users count, and its accuracy, by hop count, in the accuracy table.
     #[test]

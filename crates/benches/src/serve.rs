@@ -1852,6 +1852,13 @@ fn ran_to_cap(
     }
 }
 
+/// A dataset request's time per output token: its decode, first chunk to last, over the tokens
+/// after the first. None where the whole answer came in one chunk, which has no interval to time:
+/// a short answer a drafting engine sends at once read as 0 ms, which no decode is (#1212).
+fn task_tpot(r: &RequestResult, tokens: usize) -> Option<f64> {
+    (tokens > 1 && r.chunks > 1).then(|| (r.e2el - r.ttft) / (tokens - 1) as f64)
+}
+
 /// An answer's tokens: the server's usage count, or counted from its text where it sent none (a
 /// span query's stream carries no usage).
 fn answer_tokens(r: &RequestResult, count_tokens: &dyn Fn(&str) -> usize) -> usize {
@@ -1937,8 +1944,7 @@ fn task_metrics(
     let e2el = sorted(ok.iter().map(|(r, _)| r.e2el).collect());
     let tpot = sorted(
         (ok.iter())
-            .filter(|(r, _)| answer_tokens(r) > 1)
-            .map(|(r, _)| (r.e2el - r.ttft) / (answer_tokens(r) - 1) as f64)
+            .filter_map(|(r, _)| task_tpot(r, answer_tokens(r)))
             .collect(),
     );
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
@@ -2056,8 +2062,7 @@ fn add_task_percentiles(
             "tpot",
             sorted(
                 (ok.iter())
-                    .filter(|r| answer_tokens(r) > 1)
-                    .map(|r| (r.e2el - r.ttft) / (answer_tokens(r) - 1) as f64)
+                    .filter_map(|r| task_tpot(r, answer_tokens(r)))
                     .collect(),
             ),
         ),
@@ -2094,7 +2099,7 @@ fn add_task_requests(
     json["ttfts_ms"] = serde_json::json!(results.iter().map(|r| ok(r, r.ttft)).collect::<Vec<_>>());
     json["e2els_ms"] = serde_json::json!(results.iter().map(|r| ok(r, r.e2el)).collect::<Vec<_>>());
     // Each request's prompt, as the server counted it, and its decode: so the cell can be read by
-    // prompt length. None where it failed, sent no count, or answered a single token.
+    // prompt length. None where it failed, sent no count, or answered in one chunk.
     json["prompt_tokens"] = serde_json::json!(
         (results.iter())
             .map(|r| r.prompt_tokens.filter(|_| r.success))
@@ -2104,7 +2109,7 @@ fn add_task_requests(
         (results.iter())
             .map(|r| {
                 let n = answer_tokens(r, count_tokens);
-                (r.success && n > 1).then(|| ms((r.e2el - r.ttft) / (n - 1) as f64))
+                r.success.then(|| task_tpot(r, n)).flatten().map(ms)
             })
             .collect::<Vec<_>>()
     );
@@ -2503,7 +2508,7 @@ mod tests {
 
     /// A cell keeps each request's prompt tokens, as the server counted them, and its time per
     /// output token: so its requests can be read by prompt length, its prefill and decode alike.
-    /// None where a request failed, sent no count, or answered one token.
+    /// None where a request failed, sent no count, answered one token, or answered in one chunk.
     #[test]
     fn a_cell_keeps_each_requests_prompt_length_and_decode() {
         let words = |t: &str| t.split_whitespace().count();
@@ -2511,17 +2516,27 @@ mod tests {
         let mut ok = req(5, 5, 0.1, 0.5);
         ok.prompt_tokens = Some(1800);
         // A span answer: no usage, so its 3 tokens come from its text.
-        let mut span = req(0, 1, 0.2, 0.4);
+        let mut span = req(0, 3, 0.2, 0.4);
         span.generated_text = "a b c".into();
         let one = req(1, 1, 0.1, 0.1);
+        // Six tokens in one chunk, then an empty closing chunk: no interval to time (#1212).
+        let at_once = req(6, 1, 0.3, 0.4);
         let failed = RequestResult::failed(1.5, 2.0, "boom".into());
         let mut j = serde_json::json!({});
-        add_task_requests(&mut j, &[ok, span, one, failed], f64::INFINITY, &words);
+        add_task_requests(
+            &mut j,
+            &[ok, span, one, at_once, failed],
+            f64::INFINITY,
+            &words,
+        );
         assert_eq!(
             j["prompt_tokens"],
-            serde_json::json!([1800, null, null, null])
+            serde_json::json!([1800, null, null, null, null])
         );
-        assert_eq!(j["tpots_ms"], serde_json::json!([100.0, 100.0, null, null]));
+        assert_eq!(
+            j["tpots_ms"],
+            serde_json::json!([100.0, 100.0, null, null, null])
+        );
     }
 
     /// A timed cell's answers are forced to one length, so none is scored: it records no accuracy,
@@ -3054,6 +3069,27 @@ mod tests {
         // mlx_lm.server holding back 128 undecodable tokens: one empty final
         // chunk, TTFT == E2EL — would read as TPOT 0 ms.
         assert!(is_unstreamed(&req(128, 1, 6.1, 6.1)));
+    }
+
+    /// A dataset answer that came in one chunk has no decode interval: no TPOT, not 0 ms. A
+    /// drafting engine sends a short answer at once (#1212); the forced 64-token answers never did.
+    #[test]
+    fn a_one_chunk_answer_has_no_task_tpot() {
+        assert_eq!(
+            task_tpot(&req(6, 1, 0.3, 0.3), 6),
+            None,
+            "six tokens in one chunk"
+        );
+        assert_eq!(
+            task_tpot(&req(1, 1, 0.3, 0.3), 1),
+            None,
+            "a one-token answer"
+        );
+        let t = task_tpot(&req(6, 2, 0.30, 0.32), 6).expect("two chunks are timed");
+        assert!(
+            (t - 0.004).abs() < 1e-9,
+            "first to last chunk over the tokens after the first"
+        );
     }
 
     #[test]
