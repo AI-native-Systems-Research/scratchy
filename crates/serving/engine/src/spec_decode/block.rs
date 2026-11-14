@@ -404,11 +404,22 @@ impl DraftGate {
         };
     }
 
-    /// A cycle `req_id` drafted came back with none of its drafts to verify: the verify budget
-    /// chose its newest token alone, or its step was past the budget. The drafter's pass paid for
-    /// one token — a cycle of one row, heard as any other, so a probe's verdict is never missing.
+    /// A cycle `req_id` drafted came back with none of its drafts to verify because its verify
+    /// budget chose its newest token alone: the drafter's pass paid for one token — a cycle of one
+    /// row, heard as any other, so a probe's verdict is never missing.
     pub fn verified_nothing(&mut self, req_id: &str) {
         self.observe(req_id, 1, 1);
+    }
+
+    /// A cycle `req_id` drafted whose drafts the next step dropped (it ran past the budget): it
+    /// says nothing of what the drafter guesses, so it is no evidence, and a probe it was is tried
+    /// again at the next step that drafts.
+    pub fn dropped(&mut self, req_id: &str) {
+        if let Some(s) = self.seqs.get_mut(req_id)
+            && let Lane::Probing { backoff } = s.lane
+        {
+            s.lane = Lane::Paused { wait: 0, backoff };
+        }
     }
 
     /// Whether `req_id` drafts at this step, one call a step it decodes in, before the step's
@@ -856,6 +867,26 @@ mod tests {
             (0..3).map(|_| gate.drafts("a")).collect::<Vec<_>>(),
             [false, false, true],
             "a probe that verified nothing: twice the wait"
+        );
+    }
+
+    /// A cycle whose drafts a step past the budget dropped is no evidence: a drafting lane drafts
+    /// on, and a probe it cut short is tried again at the next step, its wait unchanged.
+    #[test]
+    fn a_dropped_cycle_is_no_evidence_and_its_probe_is_tried_again() {
+        let mut gate = gate();
+        gate.dropped("a");
+        assert!(gate.drafts("a") && gate.drafts("a"), "drafting on");
+        gate.observe("a", 4, 1);
+        assert!(!gate.drafts("a"), "a miss: paused a step");
+        assert!(gate.drafts("a"), "its probe");
+        gate.dropped("a");
+        assert!(gate.drafts("a"), "the probe again, at once");
+        gate.observe("a", 4, 1);
+        assert_eq!(
+            (0..3).map(|_| gate.drafts("a")).collect::<Vec<_>>(),
+            [false, false, true],
+            "its verdict doubles the wait it had"
         );
     }
 

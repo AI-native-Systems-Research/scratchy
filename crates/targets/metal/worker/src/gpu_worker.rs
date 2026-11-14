@@ -5104,6 +5104,9 @@ struct BlockStep {
 struct Cycle {
     candidates: Vec<u32>,
     q_probs: Vec<f32>,
+    /// The drafts its verify budget chose for the next verify to check: 0 when it chose the
+    /// newest token alone.
+    chosen: u32,
 }
 
 /// A ring slot a request (Splash's `DFlashDraftRing` a lane): taken at its first step, given back
@@ -8142,15 +8145,21 @@ impl Worker for MetalWorker {
                         &mut d.gate,
                     )
                     .map_err(|e| ExecutorError::WorkerExecution(format!("DFlash2: {e}")))?;
-                // A cycle drafted for a request that verifies none of its drafts this step — its
-                // verify budget chose its newest token alone, or the step was past the budget — is
-                // heard as such (after the gate was asked, as every cycle is), and dropped: the
-                // next cycle the request verifies is a later step's.
+                // A cycle drafted for a request that verifies none of its drafts this step goes,
+                // heard after the gate was asked, as every cycle is: when its verify budget chose
+                // the newest token alone, the drafter's pass paid for one token, a miss; when its
+                // drafts were dropped (the step past the budget), nothing was learned of the text,
+                // and a probe it cuts short is tried again.
                 for r in &req_ids_in_order {
                     let verifies = (scheduler_output.scheduled_spec_decode_tokens.get(r))
                         .is_some_and(|t| !t.is_empty());
-                    if !verifies && d.cycles.remove(r).is_some() {
-                        d.gate.verified_nothing(r);
+                    if verifies {
+                        continue;
+                    }
+                    match d.cycles.remove(r) {
+                        Some(cycle) if cycle.chosen == 0 => d.gate.verified_nothing(r),
+                        Some(_) => d.gate.dropped(r),
+                        None => {}
                     }
                 }
                 match passes {
@@ -8279,9 +8288,11 @@ impl Worker for MetalWorker {
                             let Cycle {
                                 candidates,
                                 q_probs,
+                                ..
                             } = cycle.unwrap_or(Cycle {
                                 candidates: vec![u32::MAX; candidates_a_lane],
                                 q_probs: vec![0.0; candidates_a_lane],
+                                chosen: 0,
                             });
                             step.candidates.extend(candidates);
                             step.q_probs.extend(q_probs);
@@ -9174,6 +9185,9 @@ impl Worker for MetalWorker {
                             let cycle = Cycle {
                                 candidates: head_outcome.candidates[span(candidates)].to_vec(),
                                 q_probs: head_outcome.q_probs[span(candidates)].to_vec(),
+                                chosen: (head_outcome.verify_rows.get(lane).copied())
+                                    .unwrap_or(1)
+                                    .saturating_sub(1),
                             };
                             d.cycles.insert(req_ids_in_order[l.step].clone(), cycle);
                         }
