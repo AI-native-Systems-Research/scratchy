@@ -766,7 +766,9 @@ impl ReasoningParser for Gemma4ReasoningParser {
         state.scan_carry(&mut reasoning, &mut content);
         ExtractedReasoning {
             reasoning: non_empty(reasoning.trim()),
-            content: non_empty(content.trim()),
+            // The scanner's content as the stream sends it: trimming it dropped a reply's last "\n"
+            // (a cut at max_tokens) from the non-streaming response only.
+            content: (!content.trim().is_empty()).then_some(content),
         }
     }
 
@@ -2303,6 +2305,20 @@ mod gemma4_tests {
         let r = p.extract_reasoning("< |channel>thought\ndeliberating\n< channel|>answer");
         assert_eq!(r.reasoning.as_deref(), Some("deliberating"));
         assert_eq!(r.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn content_keeps_its_trailing_newline_as_streaming_does() {
+        // A reply cut at max_tokens whose last token is "\n" (Gemma 4, a bash answer): the
+        // non-streaming extract returned it without the "\n" while the stream kept it. The content
+        // is the scanner's, the same in both paths; only whitespace-only content is none.
+        let p = Gemma4ReasoningParser;
+        let pieces = ["Use `wc`:", "\n", "```bash", "\n", "wc -l *.txt", "\n"];
+        let out: String = pieces.concat();
+        let r = p.extract_reasoning(&out);
+        assert_eq!(r.content.as_deref(), Some(out.as_str()));
+        assert_eq!(stream(&pieces).1, out);
+        assert_eq!(p.extract_reasoning("\n\n").content, None);
     }
 
     #[test]
