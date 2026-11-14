@@ -2878,14 +2878,20 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     .expect("128 rows fit a u32");
     let e = splice(packed)
         .unwrap_or_else(|e| panic!("the packed (64, 2) mint splices the 128-row graph: {e}"));
-    // One window: the splice's wave is the mint itself, not the mint re-cut.
-    assert_eq!(e.len(), 1, "the packed (64, 2) mint emits one window");
+    // The wave is one window per request the mint names — the module is one, rebound
+    // per window at its own reserved tid — and every window is the prefill walk's
+    // own program.
+    assert_eq!(
+        e.len(),
+        2,
+        "the packed (64, 2) mint emits one window per request"
+    );
     assert!(
-        e[0]
+        e.iter().all(|w| w
             .ktir
             .as_ref()
-            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn)),
-        "the packed mint is the prefill walk's own program"
+            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn))),
+        "every window of the packed mint is the prefill walk's own program"
     );
     // The S=1 mint of the SAME graph — one request of all 128 rows — still splices.
     splice(pair_of_one_request(128))
