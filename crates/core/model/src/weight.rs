@@ -200,7 +200,7 @@ impl SafeTensorsIndex {
 /// preflight reject downloads that would actually succeed. We query the
 /// important-usage capacity on macOS and fall back to `statvfs` (accurate on
 /// Linux and when the macOS query fails).
-fn available_space(dir: &Path) -> Option<u64> {
+pub fn available_space(dir: &Path) -> Option<u64> {
     #[cfg(target_os = "macos")]
     if let Some(bytes) = macos::available_for_important_usage(dir) {
         return Some(bytes);
