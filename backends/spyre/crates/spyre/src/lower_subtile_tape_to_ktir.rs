@@ -1875,7 +1875,8 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     .map(|r| ktir_superdsc::reserved_tids::paged_window_tid(r, 2))
                     .collect()
             };
-            let bound: std::collections::BTreeSet<u32> = masks.iter().map(|&(tid, _)| tid).collect();
+            let bound: std::collections::BTreeSet<u32> =
+                masks.iter().map(|&(tid, _)| tid).collect();
             if bound != expected {
                 let show = |s: &std::collections::BTreeSet<u32>| {
                     s.iter()

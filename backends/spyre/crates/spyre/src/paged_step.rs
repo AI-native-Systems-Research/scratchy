@@ -1400,10 +1400,7 @@ mod tests {
                 );
             }
         }
-        assert_ne!(
-            mask, &logical,
-            "two sticks a row: not the row-major bytes"
-        );
+        assert_ne!(mask, &logical, "two sticks a row: not the row-major bytes");
         let b = PagedStep {
             page_slots: 128,
             ..batch()
@@ -1600,9 +1597,7 @@ mod tests {
         };
         let (trip, slots, nkvh) = (s.card_walk_step() as usize, 4, 2);
         assert_eq!(trip, 3 * 128);
-        let wtid = |r: u32, table: u32| {
-            ktir_superdsc::reserved_tids::paged_window_tid(r, table)
-        };
+        let wtid = |r: u32, table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r, table);
         let a = [2u32, 3];
         let b = [1u32, 0, 3];
         let ra = StepRows {
@@ -1687,7 +1682,11 @@ mod tests {
         };
         for r in 0..2u32 {
             assert_eq!(size(wtid(r, 1)), 4 * 3 * 128, "window {r}'s page table");
-            assert_eq!(size(wtid(r, 2)), (4 * 3 * 4 * 2) as u64, "window {r}'s mask");
+            assert_eq!(
+                size(wtid(r, 2)),
+                (4 * 3 * 4 * 2) as u64,
+                "window {r}'s mask"
+            );
             assert_eq!(size(wtid(r, 0)), 128, "window {r}'s query rows");
         }
         assert_eq!(
@@ -1716,9 +1715,7 @@ mod tests {
             ..step()
         };
         let trip = s.card_walk_step() as usize;
-        let wtid = |r: u32, table: u32| {
-            ktir_superdsc::reserved_tids::paged_window_tid(r, table)
-        };
+        let wtid = |r: u32, table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r, table);
         let a = [2u32, 3];
         let ra = StepRows {
             start: 5,
@@ -1780,8 +1777,7 @@ mod tests {
             "the live window's page table is the one-request law's"
         );
         assert_eq!(
-            &card.masks[0].1,
-            &solo.masks[0].1,
+            &card.masks[0].1, &solo.masks[0].1,
             "the live window's mask is the one-request law's"
         );
         assert_eq!(
@@ -1843,9 +1839,7 @@ mod tests {
             extent: pair(3, 2),
             ..step()
         };
-        let wtid = |r: u32, table: u32| {
-            ktir_superdsc::reserved_tids::paged_window_tid(r, table)
-        };
+        let wtid = |r: u32, table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r, table);
         let own = |s: &PagedStep, tid: u32| {
             s.card_placements()
                 .iter()
@@ -1987,15 +1981,9 @@ mod tests {
             solo.on_body_packed(8).is_none(),
             "a solo rung's wiring is no packed rung's — a wave on it names no step"
         );
-        assert!(
-            packed.on_body_packed(6).is_none(),
-            "not whole pages"
-        );
+        assert!(packed.on_body_packed(6).is_none(), "not whole pages");
         assert!(packed.on_body_packed(0).is_none());
-        assert!(
-            packed.on_body_packed(20).is_none(),
-            "past the pool"
-        );
+        assert!(packed.on_body_packed(20).is_none(), "past the pool");
     }
 
     #[test]
