@@ -576,17 +576,22 @@ impl BlockDrafter {
         // ⛔ THE GATE IS ASKED ONLY ON A STEP THAT CAN DRAFT A BLOCK — within the budget, every lane
         // fitting. A step past either drafts nothing whatever the gate says, and asking it there
         // would count a wait down, or turn a paused lane into a probe, for a cycle no step drafts:
-        // a probe that never comes back to be heard. Asked, every lane's gate counts its wait down
-        // a step, and the block drafts for all of them while any one's drafting pays: a lane
-        // drafts its whole block or none.
+        // a probe that never comes back to be heard.
+        //
+        // ⛔ AND ONLY FOR ONE LANE. Its break-even is a lane's own cycle against its own plain step;
+        // lanes drafting together share the drafter's pass and their target's fixed reads, a
+        // batch's economics the gate does not price — charged as if each lane's own, it paused
+        // lanes whose drafting paid (qwen3.6-35b-a3b, `--max-num-seqs 4`, forced MuSiQue at 4
+        // users: 6% slower end to end than drafting every step). A step of several lanes drafts as
+        // it always has; their verifies are still heard, so a lane alone again decides on them.
         let can_draft = self.budget.drafts_at(step.req_ids.len()) > 0
             && !lanes.is_empty()
             && (lanes.iter()).all(|l| self.fits(l, block_rows));
         let drafts = can_draft
-            && (lanes.iter())
-                .map(|l| gate.drafts(&step.req_ids[l.step]))
-                .collect::<Vec<bool>>()
-                .contains(&true);
+            && match &lanes[..] {
+                [lane] => gate.drafts(&step.req_ids[lane.step]),
+                _ => true,
+            };
         let block = (drafts || cycle).then(|| self.block(step, lanes, drafts));
         Ok(Some(BlockPasses {
             rebuild,
@@ -867,6 +872,31 @@ mod tests {
             (0..3).map(|_| gate.drafts("a")).collect::<Vec<_>>(),
             [false, false, true],
             "a probe that verified nothing: twice the wait"
+        );
+    }
+
+    /// Lanes drafting together draft as they always have, whatever their gates say — the gate
+    /// prices one lane's cycle — and a paused lane's wait is not counted down beside others.
+    #[test]
+    fn a_step_of_several_lanes_drafts_whatever_the_gate_says() {
+        let two = Step {
+            req_ids: vec!["a".into(), "b".into()],
+            input_ids: vec![7, 8],
+            positions: vec![30, 12],
+            cu: vec![0, 1, 2],
+            history: vec![31, 13],
+            sampled: SampledRows::of(&[0, 1, 2], |_| false).expect("rows"),
+        };
+        let mut gate = gate();
+        gate.observe("a", 8, 1);
+        gate.observe("b", 8, 1);
+        assert!(
+            drafts_block(&DRAFTER, &two, &mut gate),
+            "both paused, drafted"
+        );
+        assert!(
+            !drafts_block(&DRAFTER, &verifying("a"), &mut gate),
+            "alone again, a's pause is still ahead of it"
         );
     }
 
