@@ -117,6 +117,7 @@ not the CI arch):
 docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
   -e SCRATCHY_SKIP_SENDNN_CXX=1 rust:1-bookworm bash -c '
     rustup component add clippy >/dev/null 2>&1
+    scripts/ci-senlib-stub.sh &&
     cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
       --exclude scratchy-target-metal \
       --exclude scratchy-target-metal-cli \
@@ -125,9 +126,7 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
       --exclude scratchy-target-metal-worker -- -D warnings &&
     cd backends/spyre &&
     cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings &&
-    cd .. &&
-    scripts/ci-senlib-stub.sh &&
-    cd spyre-hw &&
+    cd ../spyre-hw &&
     cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli --all-targets \
       --features spyre-emu,model/granite-3.1-8b-instruct -- -D warnings'
 ```

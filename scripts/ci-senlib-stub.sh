@@ -17,10 +17,27 @@
 # run on a card host beside the real checkout — never here.
 #
 # Idempotent: rewrites the same bytes, so a job may call it before any step.
+#
+# ⛔ AND ONLY ITS OWN BYTES: the sibling path this writes is exactly where the layout
+# contract puts the REAL checkout on a card host, so a real tree there is a refusal,
+# not an overwrite. A checkout is real if it carries git metadata, or if its flex-rs
+# has source (the stub's lib.rs is empty by construction — a non-empty one is code
+# this script did not write).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 stub="$root/../senlib-rs"
+
+if [[ -e "$stub/.git" ]]; then
+  echo "refusing: $stub is a git checkout — the real senlib-rs, not a stub's home." >&2
+  echo "this script synthesizes the CI-only sibling; it never writes over a real tree." >&2
+  exit 1
+fi
+if [[ -s "$stub/crates/flex-rs/src/lib.rs" ]]; then
+  echo "refusing: $stub/crates/flex-rs/src/lib.rs has source — a real senlib-rs, not a stub's home." >&2
+  echo "this script synthesizes the CI-only sibling; it never writes over a real tree." >&2
+  exit 1
+fi
 
 mkdir -p "$stub/crates/flex-rs/src"
 
