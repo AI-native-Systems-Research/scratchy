@@ -2222,6 +2222,7 @@ mod tests {
             slot_bytes: 0,
             unit_slots: std::num::NonZeroUsize::MIN,
             max_slots: 4,
+            disk_slots: 0,
         };
         assert!(config.enable_prefix_caching, "on by default");
         assert!(

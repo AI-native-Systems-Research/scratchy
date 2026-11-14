@@ -308,6 +308,9 @@ pub struct RecurrentStateOps {
     pub cached_kv: Vec<CachedKvOp>,
     /// The memory KV and the snapshots hand each other this step (see [`SharedMemoryOps`]).
     pub memory: SharedMemoryOps,
+    /// The snapshots this step moves between device memory and the disk tier (see
+    /// [`SnapshotDiskOps`]).
+    pub disk: SnapshotDiskOps,
 }
 
 impl RecurrentStateOps {
@@ -317,6 +320,39 @@ impl RecurrentStateOps {
             && self.saves.is_empty()
             && self.cached_kv.is_empty()
             && self.memory.is_empty()
+            && self.disk.is_empty()
+    }
+}
+
+/// One snapshot moved between device snapshot slot `slot` and disk slot `disk`: the state of the
+/// prefix whose chain hash is `key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMove {
+    pub slot: usize,
+    pub disk: usize,
+    pub key: u64,
+}
+
+/// ⭐ THE SNAPSHOTS ONE STEP MOVES BETWEEN DEVICE MEMORY AND THE DISK TIER. A snapshot evicted from
+/// device memory is written out to the disk tier, and a hit on one there is read back into a slot.
+/// Without the disk tier, a pool of snapshots smaller than the prompts a workload comes back to
+/// keeps none of them: LRU evicts each one just before it is needed again.
+///
+/// The worker writes every spill first: before this step's memory ops release a unit and before
+/// anything this step rewrites a slot. It reads every fill after the memory ops map and before the
+/// forward that restores from the slot. The scheduler never names a disk slot in a spill that a
+/// fill reads in the same step, so this order is the one the scheduler decided in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDiskOps {
+    /// Device slots written out to disk slots: snapshots leaving device memory.
+    pub spills: Vec<SnapshotMove>,
+    /// Disk slots read back into device slots: snapshots a request restores this step.
+    pub fills: Vec<SnapshotMove>,
+}
+
+impl SnapshotDiskOps {
+    pub fn is_empty(&self) -> bool {
+        self.spills.is_empty() && self.fills.is_empty()
     }
 }
 

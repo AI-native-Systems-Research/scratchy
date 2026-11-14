@@ -23,7 +23,7 @@ use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
 use scratchy_serving_scheduler::scheduler::SnapshotBudget;
 use scratchy_serving_scheduler::scheduler::output::{
-    KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
+    KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotMove, SnapshotUnit, StateSnapshotOp,
 };
 use tracing::info;
 
@@ -147,6 +147,9 @@ pub struct MetalWorker {
     /// The first snapshot slot: past the live ones, at the first slot every GDN state buffer
     /// starts on a whole sparse tile (`SparseStores::with_tail`).
     gdn_snapshots_from: usize,
+    /// The snapshots' disk tier (`SnapshotDiskOps`): `None` without snapshot slots, or without
+    /// disk space for one.
+    gdn_snapshot_disk: Option<crate::snapshot_disk::SnapshotDisk>,
     /// How KV and the snapshots share the KV budget, and what of it is mapped (`SharedKv`).
     /// `None` without snapshots.
     shared_kv: Option<SharedKv>,
@@ -964,6 +967,7 @@ impl MetalWorker {
             gdn_snapshot_keys: Vec::new(),
             gdn_state_stores: None,
             gdn_snapshots_from: 0,
+            gdn_snapshot_disk: None,
             shared_kv: None,
             kv_cached_through: HashMap::new(),
             model_dir: None,
@@ -2844,6 +2848,62 @@ impl MetalWorker {
         Ok((entries.iter().flat_map(|e| e.words()).collect(), codes))
     }
 
+    /// ⭐ MOVE SNAPSHOTS BETWEEN THEIR SLOTS AND THE DISK TIER (`SnapshotDiskOps`): out to disk
+    /// (`spill`), or back into their slots. A spill reads a ready snapshot, which no step in
+    /// flight writes: its own step came back before it was ready. A fill waits for every step in
+    /// flight, since one scheduled before this may still read the slot it rewrites. A fill that
+    /// fails leaves its slot keyed to nothing, so a restore from it is refused rather than run on
+    /// what the slot held.
+    fn move_snapshots(&mut self, moves: &[SnapshotMove], spill: bool) -> ExecutorResult<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let bad = |what: String| ExecutorError::WorkerExecution(format!("snapshot disk: {what}"));
+        if !spill {
+            for step in &self.in_flight {
+                (step.done.wait()).map_err(|e| bad(format!("a step in flight: {e}")))?;
+            }
+        }
+        let t = std::time::Instant::now();
+        let (Some(disk), Some(stores), Some(gpu)) = (
+            self.gdn_snapshot_disk.as_mut(),
+            self.gdn_state_stores.as_ref(),
+            self.gpu_device.as_ref(),
+        ) else {
+            return Err(bad("moves for a worker with no disk tier".into()));
+        };
+        let (device, residency) = (&*gpu.device, gpu.allocator.residency());
+        let mut windows = (self.dflash2.as_mut()).and_then(|d| d.snapshot_windows.as_mut());
+        for m in moves {
+            let regions = stores.block_regions(self.gdn_snapshots_from + m.slot);
+            let window = windows.as_deref_mut().and_then(|w| w.saved.get_mut(m.slot));
+            if spill {
+                if self.gdn_snapshot_keys.get(m.slot) != Some(&Some(m.key)) {
+                    let s = m.slot;
+                    return Err(bad(format!("slot {s} holds another prefix than it spills")));
+                }
+                let saved = window.is_some_and(|w| *w);
+                (disk.spill(device, residency, &regions, m.disk, m.key, saved))
+                    .map_err(|e| bad(format!("slot {} out to disk: {e}", m.slot)))?;
+                continue;
+            }
+            self.gdn_snapshot_keys[m.slot] = None;
+            let saved = (disk.fill(device, residency, &regions, m.disk, m.key))
+                .map_err(|e| bad(format!("slot {} back from disk: {e}", m.slot)))?;
+            if let Some(w) = window {
+                *w = saved;
+            }
+            self.gdn_snapshot_keys[m.slot] = Some(m.key);
+        }
+        info!(
+            "ScratchyWorker(metal): {} state snapshots {} disk in {:.1} ms",
+            moves.len(),
+            if spill { "out to" } else { "back from" },
+            t.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(())
+    }
+
     /// ⭐ APPLY THE MEMORY THIS STEP MOVES BETWEEN KV AND THE SNAPSHOTS (`SharedMemoryOps`):
     /// releases first — they make the room a map in the same step takes — and only once every
     /// step in flight is done, since one scheduled before this may still read what is released;
@@ -3148,6 +3208,7 @@ impl MetalWorker {
             slot_bytes: slot_bytes as u64,
             unit_slots: unit,
             max_slots: self.gdn_snapshot_cap,
+            disk_slots: (self.gdn_snapshot_disk.as_ref()).map_or(0, |d| d.slots()),
         };
         Ok(SharedKv {
             budget,
@@ -7220,6 +7281,20 @@ impl Worker for MetalWorker {
                     saved: vec![false; self.gdn_snapshot_cap],
                 });
             }
+            // A snapshot a slot is taken from goes to disk, where a hit reads it back.
+            let slot_bytes: usize = layout.iter().map(|&(bytes, _)| bytes).sum();
+            self.gdn_snapshot_disk = (self.gdn_snapshot_cap > 0)
+                .then(|| crate::snapshot_disk::SnapshotDisk::new(slot_bytes))
+                .flatten();
+            if let Some(disk) = &self.gdn_snapshot_disk {
+                info!(
+                    "ScratchyWorker(metal): up to {} state snapshots × {:.1} MiB on disk beside \
+                     the {} slots, written as a slot is taken from one and read back on a hit",
+                    disk.slots(),
+                    slot_bytes as f64 / 1_048_576.0,
+                    self.gdn_snapshot_cap,
+                );
+            }
             self.gdn_state = Some(gdn_pool);
             self.gdn_state_stores = Some(stores);
             self.gdn_snapshots_from = snapshots_from;
@@ -7834,8 +7909,13 @@ impl Worker for MetalWorker {
             // A batch is active again — cancel any pending idle-shrink timer.
             self.kv_idle_since = None;
         }
-        // The memory KV and the snapshots hand each other this step, before anything reads it.
+        // The memory KV and the snapshots hand each other this step, before anything reads it:
+        // the snapshots leaving for disk first, out of slots the step releases or rewrites, then
+        // those coming back, into slots it maps (`SnapshotDiskOps`).
+        let disk = &scheduler_output.recurrent_state.disk;
+        self.move_snapshots(&disk.spills, true)?;
         self.apply_shared_memory(&scheduler_output.recurrent_state.memory)?;
+        self.move_snapshots(&disk.fills, false)?;
         // Nothing scheduled — an idle batch, or every live request skipped, preempted or finished
         // this step: nothing runs.
         if scheduler_output.total_num_scheduled_tokens == 0 {

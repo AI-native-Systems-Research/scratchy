@@ -552,7 +552,10 @@ impl EngineCore {
         // ⛔ NOTHING SCHEDULED AND NOTHING RETIRED, with requests still outstanding. Naming it
         // `Stalled` rather than handing back an empty map is what forces every caller to say what
         // it does about that — see [`StepOutcome`].
-        if !model_executed && scheduler_output.finished_req_ids.is_empty() {
+        if !model_executed
+            && scheduler_output.finished_req_ids.is_empty()
+            && scheduler_output.recurrent_state.is_empty()
+        {
             return Ok(StepOutcome::Stalled);
         }
 
@@ -629,7 +632,12 @@ impl EngineCore {
         // Still return the output if there are finished request IDs to clean up,
         // even when no tokens are scheduled. The executor needs to see these IDs
         // to release per-request resources (KV cache buffers, token buffers, etc.).
-        if sched.total_num_scheduled_tokens == 0 && sched.finished_req_ids.is_empty() {
+        // Likewise memory or snapshots it moves: the scheduler counts them moved — a snapshot
+        // read back from disk for a request that was not admitted after all is a hit for the next.
+        if sched.total_num_scheduled_tokens == 0
+            && sched.finished_req_ids.is_empty()
+            && sched.recurrent_state.is_empty()
+        {
             return None;
         }
         Some(sched)
@@ -2772,6 +2780,7 @@ mod tests {
                 slot_bytes: 0,
                 unit_slots: std::num::NonZeroUsize::MIN,
                 max_slots: 4,
+                disk_slots: 0,
             })
         }
     }

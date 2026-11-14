@@ -28,7 +28,8 @@ pub use self::core::Scheduler;
 pub use interface::{PauseState, SchedulerInterface};
 pub use output::{
     CachedKvOp, CachedRequestData, KvGranule, NewRequestData, RecurrentAdmissionOp,
-    RecurrentStateOps, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
+    RecurrentStateOps, SchedulerOutput, SharedMemoryOps, SnapshotDiskOps, SnapshotMove,
+    SnapshotUnit, StateSnapshotOp,
 };
 pub use recurrent_state::SnapshotBudget;
 pub use request_queue::{
