@@ -325,7 +325,10 @@ impl CycleCosts {
 /// [`Self::observe`]s the cycle that step verifies: whatever the gate decides on a cycle's
 /// evidence takes effect a step late. A probe therefore drafts one cycle and waits for its verdict
 /// ([`Lane::Probing`]), and a lane that stops paying has one more cycle in flight, whose evidence
-/// counts but does not double the wait a second time.
+/// counts but does not double the wait a second time. A probe's verdict is never missing: the gate
+/// is asked only on a step that can draft a block ([`BlockDrafter::passes`]), and a cycle that
+/// comes back with none of its drafts to verify is heard as the miss it is
+/// ([`Self::verified_nothing`]).
 #[derive(Debug)]
 pub struct DraftGate {
     costs: CycleCosts,
@@ -399,6 +402,13 @@ impl DraftGate {
                 }
             }
         };
+    }
+
+    /// A cycle `req_id` drafted came back with none of its drafts to verify: the verify budget
+    /// chose its newest token alone, or its step was past the budget. The drafter's pass paid for
+    /// one token — a cycle of one row, heard as any other, so a probe's verdict is never missing.
+    pub fn verified_nothing(&mut self, req_id: &str) {
+        self.observe(req_id, 1, 1);
     }
 
     /// Whether `req_id` drafts at this step, one call a step it decodes in, before the step's
@@ -552,14 +562,20 @@ impl BlockDrafter {
         // A cycle's commit reads a retained count a lane: every sequence is one, in one commit.
         commits[0].cycle &= commits.len() == 1 && lanes.len() == commits[0].steps.len();
         let cycle = commits[0].cycle;
-        // Every lane's gate is asked — each counts its wait down a step — and the block drafts for
-        // all of them while any one's drafting pays: a lane drafts its whole block or none.
-        let gated: Vec<bool> = (lanes.iter())
-            .map(|l| gate.drafts(&step.req_ids[l.step]))
-            .collect();
-        let drafts = self.budget.drafts_at(step.req_ids.len()) > 0
-            && (lanes.iter()).all(|l| self.fits(l, block_rows))
-            && gated.contains(&true);
+        // ⛔ THE GATE IS ASKED ONLY ON A STEP THAT CAN DRAFT A BLOCK — within the budget, every lane
+        // fitting. A step past either drafts nothing whatever the gate says, and asking it there
+        // would count a wait down, or turn a paused lane into a probe, for a cycle no step drafts:
+        // a probe that never comes back to be heard. Asked, every lane's gate counts its wait down
+        // a step, and the block drafts for all of them while any one's drafting pays: a lane
+        // drafts its whole block or none.
+        let can_draft = self.budget.drafts_at(step.req_ids.len()) > 0
+            && !lanes.is_empty()
+            && (lanes.iter()).all(|l| self.fits(l, block_rows));
+        let drafts = can_draft
+            && (lanes.iter())
+                .map(|l| gate.drafts(&step.req_ids[l.step]))
+                .collect::<Vec<bool>>()
+                .contains(&true);
         let block = (drafts || cycle).then(|| self.block(step, lanes, drafts));
         Ok(Some(BlockPasses {
             rebuild,
@@ -764,6 +780,83 @@ mod tests {
             .expect("a valid plan")
             .expect("planned");
         assert!(passes.block.expect("a block").drafts, "its probe drafts");
+    }
+
+    /// `id` verifying a block of 8 rows at positions 40..48, its next block drafted from 48.
+    fn verifying(id: &str) -> Step {
+        Step {
+            req_ids: vec![id.into()],
+            input_ids: (500..508).collect(),
+            positions: (40..48).collect(),
+            cu: vec![0, 8],
+            history: vec![41],
+            sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
+        }
+    }
+
+    /// Whether `drafter`'s passes over `step` draft a next block.
+    fn drafts_block(drafter: &BlockDrafter, step: &Step, gate: &mut DraftGate) -> bool {
+        let ids: Vec<&str> = step.req_ids.iter().map(String::as_str).collect();
+        (drafter.passes(&step.rows(), &plan(&ids), &[], gate))
+            .expect("a valid plan")
+            .and_then(|p| p.block)
+            .is_some_and(|b| b.drafts)
+    }
+
+    /// A step that cannot draft a block — past BLOCK_LANES sequences, or a lane whose next block
+    /// would pass the context — does not ask the gate: a paused lane whose wait ran out keeps its
+    /// probe for the next step that can draft, instead of probing with no cycle to be heard.
+    #[test]
+    fn a_step_that_cannot_draft_leaves_a_paused_lane_s_probe() {
+        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
+        let wide = Step {
+            req_ids: five,
+            input_ids: vec![7; 5],
+            positions: vec![30; 5],
+            cu: (0..=5).collect(),
+            history: vec![31; 5],
+            sampled: SampledRows::of(&[0, 1, 2, 3, 4, 5], |_| false).expect("rows"),
+        };
+        let mut paused = gate();
+        paused.observe("s0", 8, 1);
+        assert!(
+            !drafts_block(&DRAFTER, &verifying("s0"), &mut paused),
+            "its pause"
+        );
+        for _ in 0..3 {
+            assert!(
+                !drafts_block(&DRAFTER, &wide, &mut paused),
+                "past the budget"
+            );
+        }
+        let short = BlockDrafter {
+            max_model_len: 50,
+            ..DRAFTER
+        };
+        assert!(
+            !drafts_block(&short, &verifying("s0"), &mut paused),
+            "its block would pass the context"
+        );
+        assert!(
+            drafts_block(&DRAFTER, &verifying("s0"), &mut paused),
+            "its probe, at the first step that can draft"
+        );
+    }
+
+    /// A drafted cycle that comes back with none of its drafts verified is a miss — the drafter's
+    /// pass for one token — and a probe's verdict like any other.
+    #[test]
+    fn a_cycle_that_verifies_nothing_is_heard_as_a_miss() {
+        let mut gate = gate();
+        gate.verified_nothing("a");
+        assert!(!gate.drafts("a"), "a drafting lane's miss pauses it");
+        assert!(gate.drafts("a"), "its probe");
+        gate.verified_nothing("a");
+        assert_eq!(
+            (0..3).map(|_| gate.drafts("a")).collect::<Vec<_>>(),
+            [false, false, true],
+            "a probe that verified nothing: twice the wait"
+        );
     }
 
     struct Step {

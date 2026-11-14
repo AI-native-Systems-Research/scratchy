@@ -8142,6 +8142,17 @@ impl Worker for MetalWorker {
                         &mut d.gate,
                     )
                     .map_err(|e| ExecutorError::WorkerExecution(format!("DFlash2: {e}")))?;
+                // A cycle drafted for a request that verifies none of its drafts this step — its
+                // verify budget chose its newest token alone, or the step was past the budget — is
+                // heard as such (after the gate was asked, as every cycle is), and dropped: the
+                // next cycle the request verifies is a later step's.
+                for r in &req_ids_in_order {
+                    let verifies = (scheduler_output.scheduled_spec_decode_tokens.get(r))
+                        .is_some_and(|t| !t.is_empty());
+                    if !verifies && d.cycles.remove(r).is_some() {
+                        d.gate.verified_nothing(r);
+                    }
+                }
                 match passes {
                     Some(passes) => {
                         let mut slots_of = |steps: &[usize]| {
