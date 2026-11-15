@@ -561,11 +561,9 @@ impl Attention {
             softcap,
             window,
             match rope {
-                Some((pairing, kv_rope)) => Some(Rope::new(
-                    pairing,
-                    kv_rope,
-                    <M as MropeOf<B::Rot>>::SECTION,
-                )),
+                Some((pairing, kv_rope)) => {
+                    Some(Rope::new(pairing, kv_rope, <M as MropeOf<B::Rot>>::SECTION))
+                }
                 None => None,
             },
         )
