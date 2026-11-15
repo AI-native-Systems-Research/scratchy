@@ -5,12 +5,14 @@
 //! of the same request (each document a span its cache can be reused from wherever it sits), its
 //! answer cap, and how its answer is scored ([`crate::scoring`]). The dataset benchmarks
 //! (`scr bench multihop`, `hotpotqa`, `musique`, `msmarco`, `longbench`) build their in-process
-//! requests from it, and `scr bench serve --dataset-name rag|rag-spans|longbench` sends the same
-//! tasks over HTTP, so both send byte-for-byte the same prompts. Each loader keeps only its parsing.
+//! requests from it, its plain messages and its span query the same prompt, so their comparison
+//! is of the span cache alone. Each loader keeps only its parsing.
 //!
-//! Every engine gets the same messages, so the comparison is of the same prompts. The span form
-//! is scratchy's own (`POST /v1/query/execute`): it is timed as a row of its own, never in place
-//! of the plain one.
+//! `scr bench serve --dataset-name rag|rag-spans|longbench` sends the same tasks over HTTP, the
+//! plain ones as [`Task::served_messages`]: consecutive messages of one role merged as oMLX merges
+//! them, so every engine's model reads the same prompt. The span form is scratchy's own
+//! (`POST /v1/query/execute`), each document its own turn: it is timed as a row of its own, never
+//! in place of the plain one.
 
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
@@ -207,6 +209,37 @@ impl Task {
             Score::Contains { .. } => RAG_TIMED_TOKENS.min(self.max_tokens),
             _ => self.max_tokens,
         }
+    }
+
+    /// The plain request's messages as `bench serve` sends them to every engine: a user or
+    /// assistant message following one of its own role joined to it, the two contents by a blank
+    /// line, an empty content adding nothing. That is what oMLX makes of consecutive messages of a
+    /// role before its chat template sees them (`_merge_consecutive_roles`, `omlx/api/utils.py`),
+    /// where scratchy, like the checkpoint's own template, renders each as its own turn. Sent
+    /// unmerged, a RAG task's documents reach the two engines' models as different prompts (on
+    /// MuSiQue, scratchy's 60 to 100 tokens longer); sent merged, every engine reads the one oMLX
+    /// does. The in-process plain request keeps [`Self::messages`], so it stays the same prompt as
+    /// the span query it is compared with.
+    pub(crate) fn served_messages(&self) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(self.messages.len());
+        for m in &self.messages {
+            let text = m["content"].as_str().unwrap_or_default();
+            match out.last_mut() {
+                Some(prev)
+                    if prev["role"] == m["role"]
+                        && matches!(m["role"].as_str(), Some("user" | "assistant")) =>
+                {
+                    let joined = match prev["content"].as_str().unwrap_or_default() {
+                        "" => text.to_string(),
+                        before if text.is_empty() => before.to_string(),
+                        before => format!("{before}\n\n{text}"),
+                    };
+                    prev["content"] = serde_json::Value::String(joined);
+                }
+                _ => out.push(m.clone()),
+            }
+        }
+        out
     }
 
     /// The plain request's messages as the in-process engine takes them.
@@ -434,13 +467,21 @@ mod tests {
             t.messages[1]["content"],
             "Document 0 (Paris): Capital of France."
         );
-        let spans = t.spans_input.unwrap();
+        let spans = t.spans_input.clone().unwrap();
         assert_eq!(
             spans["cross"][1]["plus"][0]["user"],
             t.messages[1]["content"]
         );
         assert_eq!(spans["cross"][2]["user"], "What is the capital?");
         assert_eq!(t.max_tokens, RAG_MAX_TOKENS);
+        let served = t.served_messages();
+        assert_eq!(served.len(), 2, "served: system, then one user message");
+        assert_eq!(served[0], t.messages[0]);
+        assert_eq!(served[1]["role"], "user");
+        assert_eq!(
+            served[1]["content"],
+            "Document 0 (Paris): Capital of France.\n\nWhat is the capital?"
+        );
     }
 
     /// The requests each dataset benchmark built by hand before it built them from a [`Task`],
@@ -460,6 +501,27 @@ mod tests {
         }
         msgs.push(("user".to_string(), question.to_string()));
         msgs
+    }
+
+    /// Messages as oMLX hands them to the chat template (`_merge_consecutive_roles`,
+    /// `omlx/api/utils.py`): a user or assistant message following one of its own role joins it,
+    /// the two contents joined by a blank line, an empty content taking nothing and an empty one
+    /// before it taking the new one's place.
+    fn merged_as_omlx(msgs: Vec<(String, String)>) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (role, content) in msgs {
+            match out.last_mut() {
+                Some((prev, text)) if *prev == role && (role == "user" || role == "assistant") => {
+                    if !text.is_empty() && !content.is_empty() {
+                        *text = format!("{text}\n\n{content}");
+                    } else if !content.is_empty() {
+                        *text = content;
+                    }
+                }
+                _ => out.push((role, content)),
+            }
+        }
+        out
     }
 
     fn old_spans(
@@ -490,8 +552,10 @@ mod tests {
     }
 
     /// Every dataset benchmark sends, through the shared [`Task`], byte for byte the plain messages
-    /// and the span query it built by hand before: for each wording (documents by title, passages
-    /// by URL), over documents with punctuation, unicode, quotes and braces, none, one and several.
+    /// and the span query it built by hand before, and `bench serve` sends every engine those
+    /// messages as oMLX merges them, with nothing left for oMLX to merge: for each wording
+    /// (documents by title, passages by URL), over documents with punctuation, unicode, quotes and
+    /// braces, none, one and several, and an empty question.
     #[test]
     fn the_benchmarks_send_the_prompts_they_built_by_hand() {
         let texts = [
@@ -529,6 +593,20 @@ mod tests {
                         new_plain,
                         old_plain(prompt.system, label, docs, question),
                         "{label} plain"
+                    );
+                    let served: Vec<(String, String)> = (t.served_messages().iter())
+                        .map(|m| {
+                            (
+                                m["role"].as_str().unwrap().into(),
+                                m["content"].as_str().unwrap().into(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(served, merged_as_omlx(new_plain.clone()), "{label} served");
+                    assert_eq!(
+                        merged_as_omlx(served.clone()),
+                        served,
+                        "{label}: nothing left for oMLX to merge"
                     );
                     assert_eq!(t.chat_messages().len(), new_plain.len());
                     assert_eq!(
