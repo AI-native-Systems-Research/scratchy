@@ -14,6 +14,10 @@
 // factory's `inventory::submit!`.
 extern crate scratchy_target_metal_worker as _;
 
+// The drafter scope's alias, `--features spec/<drafter>`: it carries no code, and nothing else in
+// the build depends on it, so cargo::unused_dependencies flags it unless the binary names it.
+extern crate spec as _;
+
 use clap::Parser;
 use scratchy_cli::args::Cli;
 
