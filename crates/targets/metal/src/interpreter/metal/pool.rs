@@ -2664,6 +2664,36 @@ mod tests {
         }
     }
 
+    /// The prompt-scoring tile's terminal slot holds every one of its rows' logits whatever a step
+    /// samples, and so its arena prices them; any other bucket's holds the sampled rows'. With
+    /// one sampled row a step, the 64-row bucket's logits are 64 rows, a 512-row bucket's one.
+    #[test]
+    fn the_scoring_tile_prices_every_rows_logits() {
+        use crate::tape::ids::DecodeRows;
+        use crate::tape::lowered::{LogitsRows, RowTile};
+        let row_bytes = 1000;
+        let sized = |bucket_m: u32| {
+            let spec = MetalBucketSpec {
+                logits_row_bytes: row_bytes,
+                ..*test_spec(bucket_m, true)
+            };
+            let tape = LoweredMetalTape {
+                logits_rows: LogitsRows::Sampled { tile: RowTile::Row },
+                ..synthetic_tape(bucket_m)
+            };
+            (
+                spec.logits_held(Some(DecodeRows(1))),
+                spec.slot_bytes(&tape, Some(DecodeRows(1))),
+            )
+        };
+        let (held, slots) = sized(PROMPT_SCORING_ROWS);
+        assert_eq!(held, None, "the tile holds every row");
+        assert_eq!(slots[0], u64::from(PROMPT_SCORING_ROWS) * row_bytes);
+        let (held, slots) = sized(512);
+        assert_eq!(held, Some(DecodeRows(1)));
+        assert_eq!(slots[0], TEST_ARENA_BYTES[0].max(row_bytes));
+    }
+
     /// A step's logits fit its bucket's buffer only if every row its tape writes does. A 96-row
     /// bucket tiled by 64 (NAX) whose buffer is sized for 40 sampled rows holds one tile, 64 rows:
     /// a step sampling 64 rows passes that count, but the matmul over every row runs
