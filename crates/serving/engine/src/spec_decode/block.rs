@@ -377,9 +377,7 @@ impl BlockDrafter {
             // row of gets that row's token; one it samples none of runs a prompt chunk short of
             // its end.
             let sampled = |r: usize| step.sampled.index(i, r as u32);
-            // Stated, not inferred from every row being sampled: a sequence scoring its prompt
-            // chunk samples every row too, and verifies nothing.
-            let verifies = rows.len() > 1 && step.sampled.verifies(i);
+            let verifies = rows.len() > 1 && rows.clone().all(|r| sampled(r).is_some());
             commits[0].cycle &= verifies && saves.is_empty();
             let first_row = match verifies {
                 true => rows.start,

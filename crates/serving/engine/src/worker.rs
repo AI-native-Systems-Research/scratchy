@@ -248,14 +248,12 @@ pub trait Worker: Send {
         true
     }
 
-    /// The most prompt rows one step of this worker scores for `prompt_logprobs` — its logits
-    /// hold that many rows a step, and it fills `ModelRunnerOutput::prompt_logprobs_dict` for a
-    /// request that asks. `None` (the default): it scores no prompt rows, and a request asking for
-    /// prompt logprobs is refused rather than answered with none (#874). The scheduler runs such a
-    /// request's prompt in steps of its own, at most this many tokens each
-    /// (`SchedulerConfig::prompt_scoring_rows`).
-    fn prompt_scoring_rows(&self) -> Option<std::num::NonZeroUsize> {
-        None
+    /// Whether this worker scores a prompt's rows for `prompt_logprobs`: it fills
+    /// `ModelRunnerOutput::prompt_logprobs_dict` for a request that asks, which takes the lm_head
+    /// over every prompt row, not only the rows a step samples. `false` (the default): a request
+    /// asking for prompt logprobs is refused rather than answered with none (#874).
+    fn scores_prompts(&self) -> bool {
+        false
     }
 
     /// Check whether the worker is healthy.

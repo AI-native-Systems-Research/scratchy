@@ -120,13 +120,12 @@ pub struct SchedulerConfig {
     #[serde(default)]
     pub use_pp: bool,
 
-    /// The most prompt rows one step can score for `prompt_logprobs`, as the backend reports it
-    /// (`Worker::prompt_scoring_rows`): its logits hold that many rows a step. A request asking for
-    /// prompt logprobs runs its prompt in steps of its own, at most this many tokens each, with no
-    /// prefix-cache hit (a cached row has no logits this step). `None`: the backend scores no
-    /// prompt rows, and such a request is scheduled as any other.
+    /// Whether the backend scores a prompt's rows for `prompt_logprobs`
+    /// (`Worker::scores_prompts`): a request asking for them takes no prefix-cache hit, as a
+    /// cached row's final hidden states are not the step's. `false`: such a request is refused
+    /// before it is scheduled.
     #[serde(default)]
-    pub prompt_scoring_rows: Option<std::num::NonZeroUsize>,
+    pub scores_prompts: bool,
 }
 
 fn one() -> usize {
@@ -225,7 +224,7 @@ impl Default for SchedulerConfig {
             stream_interval: 1,
             num_lookahead_tokens: 0,
             use_pp: false,
-            prompt_scoring_rows: None,
+            scores_prompts: false,
         }
     }
 }

@@ -2513,6 +2513,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
                 reads: ctx.reads,
+                backbone_rows: ctx.backbone_rows,
             };
             ::core::result::Result::Ok(run(&inputs))
         }

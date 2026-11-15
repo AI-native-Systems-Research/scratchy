@@ -189,7 +189,7 @@ pub struct InitializedSyncStack {
     pub block_size: usize,
     /// Model-recommended sampling defaults (`generation_config.json`).
     pub generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
-    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::prompt_scoring_rows`).
+    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::scores_prompts`).
     pub scores_prompts: bool,
 }
 
@@ -594,8 +594,8 @@ struct InitializedCore {
     max_model_len: usize,
     model_dir: Option<std::path::PathBuf>,
     hf_config: HfModelConfig,
-    /// The worker's `prompt_scoring_rows`: `Some` when it scores prompt rows.
-    prompt_scoring_rows: Option<std::num::NonZeroUsize>,
+    /// The worker's `scores_prompts`.
+    scores_prompts: bool,
 }
 
 /// The speculative decoding a run does: `--speculative-model` and this build's compiled heads,
@@ -1467,9 +1467,9 @@ fn initialize_core(
     // And the snapshots of the model's recurrent state it can keep, which decide whether a
     // recurrent-hybrid model may be prefix cached at all.
     let worker_snapshots = worker.snapshot_budget();
-    // And the prompt rows a step of it scores for `prompt_logprobs`, which the scheduler caps a
-    // scoring request's prompt chunks to and the API refuses the field without.
-    let prompt_scoring_rows = worker.prompt_scoring_rows();
+    // And whether it scores a prompt's rows for `prompt_logprobs`: the scheduler takes no
+    // prefix-cache hit for such a request, and the API refuses the field without it.
+    let scores_prompts = worker.scores_prompts();
 
     info!(
         "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
@@ -1585,7 +1585,7 @@ fn initialize_core(
             enable_chunked_prefill: true,
             async_scheduling: Some(use_async_scheduling),
             num_lookahead_tokens: speculation.drafts(config),
-            prompt_scoring_rows,
+            scores_prompts,
             ..Default::default()
         },
         max_model_len,
@@ -1630,7 +1630,7 @@ fn initialize_core(
         max_model_len,
         model_dir,
         hf_config,
-        prompt_scoring_rows,
+        scores_prompts,
     })
 }
 
@@ -1702,7 +1702,7 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         max_model_len: core.max_model_len,
         block_size: config.block_size,
         generation_defaults,
-        scores_prompts: core.prompt_scoring_rows.is_some(),
+        scores_prompts: core.scores_prompts,
     })
 }
 
@@ -1808,7 +1808,7 @@ pub fn initialize_stack(
         config.chat_template.as_deref(),
     )?;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
-    engine.set_scores_prompts(core.prompt_scoring_rows.is_some());
+    engine.set_scores_prompts(core.scores_prompts);
     if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);
     }

@@ -407,7 +407,7 @@ pub struct AsyncEngine {
     >,
     model_name: String,
     max_model_len: usize,
-    /// Whether the worker scores prompt rows (`Worker::prompt_scoring_rows`, set at init through
+    /// Whether the worker scores prompt rows (`Worker::scores_prompts`, set at init through
     /// [`Self::set_scores_prompts`]); a request asking for prompt logprobs is refused when it does
     /// not ([`Self::check_prompt_logprobs`]).
     computes_prompt_logprobs: bool,
@@ -491,7 +491,7 @@ impl AsyncEngine {
         }
     }
 
-    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::prompt_scoring_rows`).
+    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::scores_prompts`).
     pub fn set_scores_prompts(&mut self, scores: bool) {
         self.computes_prompt_logprobs = scores;
     }

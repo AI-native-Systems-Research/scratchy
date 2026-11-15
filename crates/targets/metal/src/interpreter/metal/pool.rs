@@ -150,12 +150,30 @@ pub struct MetalBucketSpec {
     pub weight_bytes: crate::tape::step::WeightBytes,
 }
 
+/// ⭐ THE PROMPT-SCORING TILE: the bucket whose lm_head play scores a prompt's rows for
+/// `prompt_logprobs`, this many at a time ([`ForwardReads::LmHead`]). Its terminal slot holds the
+/// logits of every one of its rows whatever a step samples ([`MetalBucketSpec::logits_held`]): a
+/// compile-time tile, in the arena the memory budget prices.
+pub const PROMPT_SCORING_ROWS: u32 = 64;
+
 impl MetalBucketSpec {
+    /// The most rows of logits the bucket's terminal slot holds when no step samples more than
+    /// `sampled` rows (`None`: every row): `sampled`, or every row on the prompt-scoring tile
+    /// ([`PROMPT_SCORING_ROWS`]).
+    pub fn logits_held(&self, sampled: Option<DecodeRows>) -> Option<DecodeRows> {
+        match self.bucket_m == PROMPT_SCORING_ROWS {
+            true => None,
+            false => sampled,
+        }
+    }
+
     /// Each arena slot's bytes when this bucket runs `tape` and no step samples more than
     /// `sampled` rows (`None`: every row): the terminal slot holds what the tape writes of the
-    /// logits ([`LoweredMetalTape::logits_slot_rows`]) beside what else it holds.
+    /// logits ([`LoweredMetalTape::logits_slot_rows`], at [`Self::logits_held`]) beside what else
+    /// it holds.
     pub fn slot_bytes(&self, tape: &LoweredMetalTape, sampled: Option<DecodeRows>) -> Vec<u64> {
-        let logits = self.logits_row_bytes * u64::from(tape.logits_slot_rows(sampled));
+        let logits =
+            self.logits_row_bytes * u64::from(tape.logits_slot_rows(self.logits_held(sampled)));
         let mut bytes = self.arena_bytes.to_vec();
         if let Some(terminal) = bytes.get_mut(self.terminal_slot as usize) {
             *terminal = (*terminal).max(logits);
@@ -1095,7 +1113,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         let sampled = inputs.sampled_row_count();
         let tape = &self.bucket_tapes[bucket.picked().index()];
-        match tape.logits_overflow(self.decode_rows, sampled) {
+        match tape.logits_overflow(spec.logits_held(self.decode_rows), sampled) {
             Some(overflow) => Err(ForwardError::TooManySampledRows { sampled, overflow }),
             None => Ok(bucket),
         }
@@ -1501,6 +1519,22 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
+        // An lm_head play's input: the final hidden states it scores, in the bucket's backbone
+        // slot (kept allocated in full and shared, as the host reads it by pointer), before any of
+        // its commands is encoded.
+        if let Some(rows) = inputs.backbone_rows {
+            let slot = &guard.worker.arena[bucket.row().backbone_slot as usize];
+            let at = crate::sparse_arena::host_ptr(slot);
+            if at.is_null() || slot.length() < rows.len() {
+                return Err(ForwardError::BackboneRowsUnwritable {
+                    bytes: rows.len(),
+                    slot_bytes: slot.length(),
+                });
+            }
+            // SAFETY: the slot is host-visible and holds `rows.len()` bytes (checked above), and the
+            // worker checked out of the pool is the only one encoding against it.
+            unsafe { std::ptr::copy_nonoverlapping(rows.as_ptr(), at.cast::<u8>(), rows.len()) };
+        }
         let runtime = &guard.runtime;
         let tail = tail.map(|f| move |enc: &_, worker: &_, b: &_| f(enc, worker, runtime, b));
 
@@ -3031,6 +3065,7 @@ mod tests {
                 device_inputs: &[],
                 deferred: None,
                 reads,
+                backbone_rows: None,
             };
             pool.bucket_for(&inputs).map(|b| b.picked().index())
         };
@@ -3115,6 +3150,7 @@ mod tests {
             device_inputs: &[],
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         }
     }
 
@@ -3179,6 +3215,7 @@ mod tests {
             device_inputs: &[],
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         // Closure runs *while* the worker is checked out — assertion
         // is that we got it (not on numerical correctness; that's
@@ -3279,6 +3316,7 @@ mod tests {
                 device_inputs,
                 deferred: Some(&deferral),
                 reads: ForwardReads::Outputs,
+                backbone_rows: None,
             };
             let before = input_ids();
             let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
@@ -3360,6 +3398,7 @@ mod tests {
             device_inputs: &[],
             deferred: Some(&deferral),
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
         let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
@@ -3417,6 +3456,7 @@ mod tests {
             device_inputs: &[token],
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
         let reached: Vec<&Buffer> = (writes.ops.iter())
@@ -3499,6 +3539,7 @@ mod tests {
             device_inputs,
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         let first = [
             DeviceInput::head((*src).clone(), 0, 8, DeviceInputInto::Positions),
@@ -3604,6 +3645,7 @@ mod tests {
             device_inputs: &[],
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
@@ -3648,6 +3690,7 @@ mod tests {
             device_inputs: &[],
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         match pool.forward(&inputs, |_, _| ()) {
             Err(ForwardError::NoBucketFits {
@@ -3702,6 +3745,7 @@ mod tests {
             device_inputs: &[],
             deferred: None,
             reads: ForwardReads::Outputs,
+            backbone_rows: None,
         };
         let err = pool
             .forward(&inputs, |_, _| ())

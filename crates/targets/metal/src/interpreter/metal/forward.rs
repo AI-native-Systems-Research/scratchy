@@ -146,6 +146,9 @@ pub struct ForwardInputs<'a> {
     pub deferred: Option<&'a Deferral>,
     /// What the caller reads of this forward.
     pub reads: ForwardReads,
+    /// An lm_head play's input ([`ForwardReads::LmHead`]): final hidden states, row-major in the
+    /// model dtype, written into the bucket's backbone slot before it plays. `None` elsewhere.
+    pub backbone_rows: Option<&'a [u8]>,
 }
 
 impl ForwardInputs<'_> {
@@ -200,6 +203,10 @@ pub enum ForwardReads {
     /// restored (Splash `DFlashDraft::addContextRebuild`): its tape plays only the window's load
     /// and the ring writers after it, over the window's rows.
     Rebuild,
+    /// Its logits alone, over final hidden states the caller writes into the bucket's backbone
+    /// slot (`ForwardInputs::backbone_rows`): its tape plays only the lm_head half. A prompt's
+    /// rows, scored for `prompt_logprobs` a tile at a time after its prefill.
+    LmHead,
 }
 
 /// A forward the host commits without waiting for it, so the next one is queued while it runs. Its
@@ -525,6 +532,9 @@ pub enum ForwardError {
     /// either needs to chunk the step or the model loader needs to
     /// add a wider bucket.
     NoBucketFits { num_tokens: u32, max_bucket: u32 },
+    /// An lm_head play's final hidden states (`ForwardInputs::backbone_rows`) do not fit the
+    /// bucket's backbone slot, or the slot is not host-visible (a guest's, a sparse one).
+    BackboneRowsUnwritable { bytes: usize, slot_bytes: usize },
     /// One of the input slices was bigger than its runtime buffer.
     /// The runtime buffer was sized at `RuntimeFactory` invocation —
     /// either the factory under-sized it for this bucket or the
@@ -577,6 +587,11 @@ impl std::fmt::Display for ForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ZeroTokens => write!(f, "MetalWorkerPool::forward: num_tokens == 0"),
+            Self::BackboneRowsUnwritable { bytes, slot_bytes } => write!(
+                f,
+                "an lm_head play's {bytes} bytes of final hidden states do not fit its bucket's \
+                 host-visible backbone slot ({slot_bytes} bytes)"
+            ),
             Self::NoBucketFits {
                 num_tokens,
                 max_bucket,

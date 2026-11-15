@@ -254,6 +254,7 @@ fn qwen3_py_carrier_parity() {
         device_inputs: &[],
         deferred: None,
         reads: scratchy_target_metal::ForwardReads::Outputs,
+        backbone_rows: None,
     };
     let _ = null_view; // completeness placeholder, unused fields are None
 
