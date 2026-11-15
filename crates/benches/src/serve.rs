@@ -1907,7 +1907,7 @@ fn task_body(
         };
         let mut b = serde_json::json!({
             "model": client.model,
-            "messages": t.messages,
+            "messages": t.served_messages(),
             "max_tokens": max_tokens,
             "stream": true,
             "stream_options": {"include_usage": true},
@@ -2423,7 +2423,12 @@ mod tests {
         .unwrap();
         let (client, t) = (task_client(), rag("Paris"));
         let chat = task_body(&client, &args, &t, false);
-        assert_eq!(chat["messages"], serde_json::json!(t.messages));
+        assert_eq!(chat["messages"], serde_json::json!(t.served_messages()));
+        assert_eq!(
+            chat["messages"].as_array().map(Vec::len),
+            Some(2),
+            "the system message, then the documents and the question as one user message"
+        );
         assert_eq!(chat["max_tokens"], crate::workloads::RAG_MAX_TOKENS);
         assert_eq!(chat["stream"], true);
         assert_eq!(chat["stream_options"]["include_usage"], true);
