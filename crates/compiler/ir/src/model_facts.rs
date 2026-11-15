@@ -426,12 +426,14 @@ pub enum RopePairing {
     Proportional,
 }
 
-/// Where the keys are rotated.
+/// Where the keys are rotated. A model's own facts state [`Self::OnRead`] exactly when its forward
+/// ropes: rope-on-read is every rope model's KV, not an opt-in (`CanonicalParams::ROPE_ON_READ`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KvRope {
-    /// At the KV write.
+    /// At the KV write. What a model with no rope states: its keys are never rotated, so nothing
+    /// is rotated on read.
     AtWrite,
-    /// On each read of the cache.
+    /// On each read of the cache: every model whose forward ropes.
     OnRead,
 }
 
