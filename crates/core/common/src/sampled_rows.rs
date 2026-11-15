@@ -4,8 +4,9 @@
 //! The rows a step samples (Python vLLM's `logits_indices`): the one definition of a step's
 //! sampled rows the serving engine schedules and a backend's forward defaults to.
 
-/// The rows a step samples: each sequence's last, or — a sequence verifying drafts — every one of
-/// its rows, each of which can be its newest. A sequence's sampled rows are its last rows, so
+/// The rows a step samples: each sequence's last, or every one of its rows — a sequence verifying
+/// drafts, each of which can be its newest, or one scoring its prompt chunk (`prompt_logprobs`),
+/// each of which is scored. A sequence's sampled rows are its last rows, so
 /// sampled row `j` of sequence `i` is step row `cu_seqlens_q[i + 1] - (count_i - j)`. The logits
 /// the forward leaves, and every row read off them (argmax, sampler, grammar mask), are these
 /// rows', in order.
@@ -16,6 +17,9 @@ pub struct SampledRows {
     /// Cumulative sampled rows per sequence, `num_seqs + 1` long, strictly ascending: sequence
     /// `i`'s are `cu[i]..cu[i + 1]`, at least one.
     cu: Vec<u32>,
+    /// Per sequence: it verifies drafts. A sequence sampling every row does that, or scores its
+    /// prompt — which only this tells apart.
+    verifies: Vec<bool>,
 }
 
 /// A step's sequence of no rows: it has no last row to sample, so no step holds one.
@@ -38,26 +42,50 @@ impl std::error::Error for EmptySequence {}
 
 impl SampledRows {
     /// The sampled rows of the step whose sequences' rows `cu_seqlens_q` bounds: every row of a
-    /// sequence `every_row(i)` holds, the last of any other. Refused for a sequence of no rows.
+    /// sequence `verifies(i)` holds (its drafts'), the last of any other. Refused for a sequence of
+    /// no rows.
     pub fn of(
         cu_seqlens_q: &[u32],
-        every_row: impl Fn(usize) -> bool,
+        verifies: impl Fn(usize) -> bool,
+    ) -> Result<Self, EmptySequence> {
+        Self::of_step(cu_seqlens_q, verifies, |_| false)
+    }
+
+    /// [`Self::of`] for a step whose sequences may also score their prompt chunks: every row of a
+    /// sequence `verifies(i)` or `scores(i)` holds, the last of any other.
+    pub fn of_step(
+        cu_seqlens_q: &[u32],
+        verifies: impl Fn(usize) -> bool,
+        scores: impl Fn(usize) -> bool,
     ) -> Result<Self, EmptySequence> {
         let mut rows = Vec::new();
         let mut cu = vec![0];
+        let mut verifying = Vec::new();
         for (i, seq) in cu_seqlens_q.windows(2).enumerate() {
             let (start, end) = (seq[0], seq[1]);
             if end <= start {
                 return Err(EmptySequence { seq: i });
             }
-            let first = match every_row(i) {
+            let verifies = verifies(i);
+            let first = match verifies || scores(i) {
                 true => start,
                 false => end - 1,
             };
             rows.extend(first..end);
             cu.push(rows.len() as u32);
+            verifying.push(verifies);
         }
-        Ok(Self { rows, cu })
+        Ok(Self {
+            rows,
+            cu,
+            verifies: verifying,
+        })
+    }
+
+    /// Whether sequence `i` verifies drafts: its sampled rows are its drafts' (not a scored
+    /// prompt chunk's).
+    pub fn verifies(&self, i: usize) -> bool {
+        self.verifies[i]
     }
 
     /// Each sampled row's step row, ascending.
@@ -122,5 +150,27 @@ mod tests {
             let refused = SampledRows::of(&[0, 1, 1, 4], |_| every_row);
             assert_eq!(refused, Err(EmptySequence { seq: 1 }));
         }
+    }
+
+    /// A sequence scoring its prompt chunk samples every row as a verify does, and only
+    /// `verifies` tells them apart: a step of a verify (rows 0..=2), a scoring chunk (3..=6) and a
+    /// decode (7).
+    #[test]
+    fn a_scored_chunk_samples_every_row_and_verifies_nothing() {
+        let cu = [0, 3, 7, 8];
+        let sampled = SampledRows::of_step(&cu, |i| i == 0, |i| i == 1).expect("no empty sequence");
+        assert_eq!(sampled.rows(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            (0..3).map(|i| sampled.verifies(i)).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(
+            sampled.last_of(1),
+            6,
+            "the scored chunk's last row is its newest"
+        );
+        // Without scoring, the same step samples the chunk's last row alone.
+        let plain = SampledRows::of(&cu, |i| i == 0).expect("no empty sequence");
+        assert_eq!(plain.rows(), &[0, 1, 2, 6, 7]);
     }
 }

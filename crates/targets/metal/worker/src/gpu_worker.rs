@@ -6312,12 +6312,11 @@ impl Worker for MetalWorker {
     }
 
     fn prompt_scoring_rows(&self) -> Option<std::num::NonZeroUsize> {
-        // A scoring step's every prompt row is a sampled row, and the logits hold the rows a decode
-        // or verify step brings (`decode_rows`). A drafter reads the rows a step samples as its
-        // own inputs, so a run that drafts scores no prompt rows.
-        let drafts =
-            self.mtp_drafter.is_some() || self.dflash2.is_some() || self.draft_model.is_some();
-        self.logprobs_kernels.as_ref().filter(|_| !drafts)?;
+        // A scoring chunk's every row is a sampled row, and the logits hold the rows a decode or
+        // verify step brings (`decode_rows`). A drafter's passes find a scoring row's next token
+        // in the prompt, as a prefill row's, and tell its rows from a verify's (`SampledRows::
+        // verifies`).
+        self.logprobs_kernels.as_ref()?;
         let rows = self.gpu_device.as_ref()?.max_decode_rows?;
         std::num::NonZeroUsize::new(rows.0 as usize)
     }
@@ -8052,9 +8051,10 @@ impl Worker for MetalWorker {
         // The rows the step samples: every row of a request verifying drafts or scoring its prompt,
         // any other's last. The forward's logits, its argmax and every row read off them are
         // theirs, in order.
-        let sampled_rows = ::scratchy_serving_engine::spec_decode::SampledRows::of(
+        let sampled_rows = ::scratchy_serving_engine::spec_decode::SampledRows::of_step(
             &cu_seqlens_u32[..=num_reqs],
-            |i| !prepared.req_inputs[i].spec_token_ids.is_empty() || scores_prompt[i],
+            |i| !prepared.req_inputs[i].spec_token_ids.is_empty(),
+            |i| scores_prompt[i],
         )
         .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();

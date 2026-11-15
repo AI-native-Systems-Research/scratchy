@@ -639,8 +639,8 @@ impl EngineCore {
     /// beside its own; leading, when the executor pipelines and `sched` is one request that
     /// verifies drafts and drafts again, with nothing waiting: its next step's drafts are then
     /// placeholders, so that step can be scheduled now. A request whose steps need the host between
-    /// them — a grammar's state, an image's, its logprobs — leads nothing; the executor defers
-    /// every step this marks.
+    /// them — a grammar's state, an image's, its logprobs or prompt logprobs — leads nothing; the
+    /// executor defers every step this marks.
     fn mark_pipeline(&mut self, sched: &mut SchedulerOutput) {
         let mut ids = sched.num_scheduled_tokens.iter();
         let (Some((req_id, &scheduled)), None) = (ids.next(), ids.next()) else {
@@ -656,7 +656,8 @@ impl EngineCore {
         };
         let on_device = request.sampling_params.guided_grammar.is_none()
             && request.mm_data.is_none()
-            && request.sampling_params.logprobs.is_none();
+            && request.sampling_params.logprobs.is_none()
+            && request.sampling_params.prompt_logprobs.is_none();
         if on_device
             && sched.draft_req_ids.contains(req_id)
             && sched.scheduled_spec_decode_tokens.contains_key(req_id)
