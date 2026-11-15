@@ -950,7 +950,12 @@ impl AsyncEngine {
                     .get_next_output_text(true, false),
                 None => placeholder_text(&state.generated_token_ids),
             };
-            warn_if_empty_text(child_id, &text, &state.generated_token_ids);
+            warn_if_empty_text(
+                child_id,
+                &text,
+                &state.generated_token_ids,
+                !(sampling_params.ignore_eos || sampling_params.seal),
+            );
 
             let chat_logprobs = if state.logprobs.is_empty() {
                 None
@@ -1394,7 +1399,12 @@ impl AsyncEngine {
                     .get_next_output_text(true, false),
                 None => placeholder_text(&state.generated_token_ids),
             };
-            warn_if_empty_text(child_id, &text, &state.generated_token_ids);
+            warn_if_empty_text(
+                child_id,
+                &text,
+                &state.generated_token_ids,
+                !(sampling_params.ignore_eos || request.seal),
+            );
 
             let completion_logprobs = if state.logprobs.is_empty() {
                 None
@@ -4407,36 +4417,89 @@ fn placeholder_text(token_ids: &[u32]) -> String {
     s
 }
 
+/// What a finished request's generated ids can mean when every one of them rendered to nothing.
+///
+/// `decode_next` returns `""` for any id that decodes to nothing under `skip_special_tokens`
+/// (`string.len() > prefix.len()` fails), so fifty SPECIAL ids render as fifty nothings — a
+/// detokenizer fault is not among the readings. The last id is set aside: it may be the one that
+/// ended the request (EOS, or one of its `stop_token_ids`), which renders to nothing by design —
+/// whatever the finish reason says, since EOS on the step that reaches `max_tokens` finishes it
+/// `"length"`. A reply that is that id alone is the model answering with nothing. Which special ids
+/// the rest can be depends on one fact of the request: whether EOS ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyText {
+    /// EOS ends the request at its first one, so none of the ids before the last is EOS: the
+    /// sampler is landing on NON-EOS special ids, the logits are junk, a BACKEND bug.
+    NonEosSpecialIds,
+    /// The request generated past any EOS the model chose (`ignore_eos`, or `seal` padding to its
+    /// block), and EOS renders to nothing too. The ids may be the model's EOS repeated: the model
+    /// ending its answer at its first token, which `ignore_eos` only extends (nemotron-3-super does
+    /// this on random-token prompts — its greedy first token there is `<|im_end|>`, as mlx-lm's is,
+    /// #937). The ids against the startup log's `EOS token IDs` tell that from junk logits.
+    EosNotExcluded,
+}
+
+impl EmptyText {
+    /// The reading of a finished request's ids, or `None` when its text is not empty or no id is
+    /// left once the last is set aside. `eos_ends_it`: EOS finishes this request (it neither
+    /// ignores EOS nor seals past it).
+    fn of(text: &str, token_ids: &[u32], eos_ends_it: bool) -> Option<Self> {
+        let judged = token_ids.split_last().map_or(&[][..], |(_, before)| before);
+        if !text.is_empty() || judged.is_empty() {
+            return None;
+        }
+        Some(match eos_ends_it {
+            true => Self::NonEosSpecialIds,
+            false => Self::EosNotExcluded,
+        })
+    }
+}
+
 /// ⛔⛔⛔ TOKENS THAT RENDER TO NOTHING ARE A MUTE FAILURE, AND THE IDS ARE THE WHOLE DIAGNOSIS.
 ///
-/// A request can finish with `completion_tokens: 50`, `finish_reason: "length"` and `"text": ""`. That is
-/// not a detokenizer fault: `decode_next` returns `""` for any id that decodes to nothing under
-/// `skip_special_tokens` (`string.len() > prefix.len()` fails), so fifty SPECIAL ids render as fifty
-/// nothings. EOS is excluded by construction — it would have stopped generation at the first token with
-/// `finish_reason: "stop"` — so a long empty completion means the sampler is landing on non-EOS special
-/// ids, i.e. the logits are junk. That is a BACKEND bug, and the response body cannot express it: the ids
-/// never reach the client, so the failure reads as "the server returned nothing".
+/// A request can finish with `completion_tokens: 50`, `finish_reason: "length"` and `"text": ""`
+/// ([`EmptyText`] says what its ids can be). The response body cannot express it: the ids never
+/// reach the client, so the failure reads as "the server returned nothing".
 ///
 /// So say the ids. Once per finished request, only when text is empty and tokens exist, bounded so a long
 /// generation cannot flood the log. Whoever reads this next gets in one line what cost this session many
 /// rounds of inference: WHICH ids, and whether they are one id repeated (a stuck argmax) or a spread.
-pub(crate) fn warn_if_empty_text(request_id: &str, text: &str, token_ids: &[u32]) {
-    if !text.is_empty() || token_ids.is_empty() {
+pub(crate) fn warn_if_empty_text(
+    request_id: &str,
+    text: &str,
+    token_ids: &[u32],
+    eos_ends_it: bool,
+) {
+    let Some(reading) = EmptyText::of(text, token_ids, eos_ends_it) else {
         return;
-    }
+    };
     const SHOW: usize = 16;
     let head: Vec<u32> = token_ids.iter().take(SHOW).copied().collect();
     let all_same = token_ids.windows(2).all(|w| w[0] == w[1]);
-    warn!(
-        request_id = %request_id,
-        completion_tokens = token_ids.len(),
-        first_ids = ?head,
-        all_ids_identical = all_same,
-        "generated tokens rendered to EMPTY text — every id decoded to nothing under \
-         skip_special_tokens, so these are non-EOS SPECIAL ids and the sampler's logits are suspect \
-         (a backend problem, not detokenization). `all_ids_identical` distinguishes a stuck argmax from \
-         a spread of special ids."
-    );
+    match reading {
+        EmptyText::NonEosSpecialIds => warn!(
+            request_id = %request_id,
+            completion_tokens = token_ids.len(),
+            first_ids = ?head,
+            all_ids_identical = all_same,
+            "generated tokens rendered to EMPTY text — every id decoded to nothing under \
+             skip_special_tokens, and EOS would have stopped the request, so these are non-EOS \
+             SPECIAL ids and the sampler's logits are suspect (a backend problem, not \
+             detokenization). `all_ids_identical` distinguishes a stuck argmax from a spread of \
+             special ids."
+        ),
+        EmptyText::EosNotExcluded => warn!(
+            request_id = %request_id,
+            completion_tokens = token_ids.len(),
+            first_ids = ?head,
+            all_ids_identical = all_same,
+            "generated tokens rendered to EMPTY text past EOS (ignore_eos or seal) — every id \
+             decoded to nothing under skip_special_tokens. If `first_ids` is an EOS id from the \
+             startup log's `EOS token IDs` repeated, the model ended its answer at its first token \
+             and the request kept going (not a backend problem); any other special id means the \
+             sampler's logits are suspect."
+        ),
+    }
 }
 
 /// Merge default and per-request chat template kwargs.
@@ -4472,6 +4535,29 @@ mod tests {
         assert_eq!((text.as_str(), marks), ("abc—d", vec![2, 7]));
         let (text, marks) = super::take_cache_breakpoints("plain".into());
         assert_eq!((text.as_str(), marks), ("plain", vec![]));
+    }
+
+    /// Empty text from generated ids convicts the logits only when EOS ends the request: past
+    /// EOS (`ignore_eos`, `seal`) the ids may be the model's own EOS repeated (#937). The last id
+    /// may be the one that ended the request and is set aside, so a reply that is that id alone is
+    /// no reading, as are text and no ids.
+    #[test]
+    fn empty_text_convicts_the_logits_only_when_eos_ends_the_request() {
+        use super::EmptyText;
+        let eos_run = [11, 11, 11];
+        assert_eq!(
+            EmptyText::of("", &eos_run, true),
+            Some(EmptyText::NonEosSpecialIds)
+        );
+        assert_eq!(
+            EmptyText::of("", &eos_run, false),
+            Some(EmptyText::EosNotExcluded)
+        );
+        for eos_ends_it in [true, false] {
+            assert_eq!(EmptyText::of("", &[11], eos_ends_it), None);
+            assert_eq!(EmptyText::of("hi", &eos_run, eos_ends_it), None);
+            assert_eq!(EmptyText::of("", &[], eos_ends_it), None);
+        }
     }
 
     use super::*;
