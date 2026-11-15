@@ -81,6 +81,13 @@ impl SnapshotDisk {
         })
     }
 
+    /// Disk slot `disk` holds nothing a fill may read: its spill failed.
+    pub(crate) fn forget(&mut self, disk: usize) {
+        if let Some(held) = self.held.get_mut(disk) {
+            *held = None;
+        }
+    }
+
     /// How many snapshots the tier holds.
     pub(crate) fn slots(&self) -> usize {
         self.held.len()
@@ -112,12 +119,22 @@ impl SnapshotDisk {
             (disk * self.slot_bytes) as u64,
         );
         let from = staging.contents().as_ptr() as usize;
-        let done = std::thread::spawn(move || {
-            // SAFETY: `from` is the contents of a shared buffer of `len` bytes, which this write's
-            // `Write` holds — out of `spare`, so no copy touches it — until it is joined.
-            let bytes = unsafe { std::slice::from_raw_parts(from as *const u8, len) };
-            file.write_all_at(bytes, at)
-        });
+        let spawned = std::thread::Builder::new()
+            .name("snapshot-spill".into())
+            .spawn(move || {
+                // SAFETY: `from` is the contents of a shared buffer of `len` bytes, which this
+                // write's `Write` holds — out of `spare`, so no copy touches it — until it is
+                // joined.
+                let bytes = unsafe { std::slice::from_raw_parts(from as *const u8, len) };
+                file.write_all_at(bytes, at)
+            });
+        let done = match spawned {
+            Ok(done) => done,
+            Err(e) => {
+                self.spare.push(staging);
+                return Err(format!("a thread to write disk slot {disk}: {e}"));
+            }
+        };
         self.held[disk] = Some((key, window));
         self.writes.push_back(Write {
             disk,
@@ -241,4 +258,55 @@ fn copy(
     encode_window_copies(batch.encoder(), &copies);
     batch.commit(true);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scratchy_target_metal::mtl4_dispatch::{read_slice, shared_zeroed};
+
+    /// A snapshot across two stores goes out to disk and comes back byte for byte. A disk slot
+    /// whose spill failed, or that holds another prefix, is no fill: the worker reports it rather
+    /// than restore what the slot held.
+    #[test]
+    fn a_snapshot_comes_back_as_it_went_out_and_no_other_does() {
+        let Some(device) = scratchy_target_metal::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let residency = MetalResidencySet::new(&device);
+        let (a, b) = (shared_zeroed(&device, 1024), shared_zeroed(&device, 1024));
+        let _pinned = (residency.pin(a.clone()), residency.pin(b.clone()));
+        residency.commit();
+        let regions: Vec<Region> = vec![(a.clone(), 256, 256), (b.clone(), 0, 768)];
+        let fill_with = |byte: u8| {
+            for buffer in [&a, &b] {
+                // SAFETY: a shared buffer of 1024 bytes no GPU work touches now.
+                unsafe {
+                    std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), byte, 1024)
+                };
+            }
+        };
+        let mut disk = SnapshotDisk::new(1024).expect("a disk tier");
+        fill_with(0xab);
+        (disk.spill(&device, &residency, &regions, 1, 7, true)).expect("spill");
+        fill_with(0);
+        let window = (disk.fill(&device, &residency, &regions, 1, 7)).expect("fill");
+        assert!(window, "its window comes back with it");
+        let (a_bytes, b_bytes) = (read_slice::<u8>(&a, 1024), read_slice::<u8>(&b, 1024));
+        assert!(a_bytes[256..512].iter().all(|&x| x == 0xab));
+        assert!(
+            (a_bytes[..256].iter().chain(&a_bytes[512..])).all(|&x| x == 0),
+            "nothing else"
+        );
+        assert!(b_bytes[..768].iter().all(|&x| x == 0xab));
+        assert!(b_bytes[768..].iter().all(|&x| x == 0));
+
+        let fill =
+            |disk: &mut SnapshotDisk, d, key| disk.fill(&device, &residency, &regions, d, key);
+        assert!(fill(&mut disk, 1, 8).is_err(), "another prefix's");
+        assert!(fill(&mut disk, 0, 7).is_err(), "never written");
+        disk.forget(1);
+        assert!(fill(&mut disk, 1, 7).is_err(), "its spill failed");
+    }
 }

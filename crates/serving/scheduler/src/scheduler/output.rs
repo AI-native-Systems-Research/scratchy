@@ -333,6 +333,17 @@ pub struct SnapshotMove {
     pub key: u64,
 }
 
+/// A snapshot read back from disk slot `disk` into device snapshot slot `slot`, for request
+/// `req_id` to restore: the state of the prefix whose chain hash is `key`. Like a save, it is hit by
+/// other requests only once its step comes back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFill {
+    pub req_id: String,
+    pub slot: usize,
+    pub disk: usize,
+    pub key: u64,
+}
+
 /// ⭐ THE SNAPSHOTS ONE STEP MOVES BETWEEN DEVICE MEMORY AND THE DISK TIER. A snapshot evicted from
 /// device memory is written out to the disk tier, and a hit on one there is read back into a slot.
 /// Without the disk tier, a pool of snapshots smaller than the prompts a workload comes back to
@@ -346,8 +357,9 @@ pub struct SnapshotMove {
 pub struct SnapshotDiskOps {
     /// Device slots written out to disk slots: snapshots leaving device memory.
     pub spills: Vec<SnapshotMove>,
-    /// Disk slots read back into device slots: snapshots a request restores this step.
-    pub fills: Vec<SnapshotMove>,
+    /// Disk slots read back into device slots: snapshots a request restores this step. One the
+    /// worker fails to read back it reports (`ModelRunnerOutput::failed_fills`).
+    pub fills: Vec<SnapshotFill>,
 }
 
 impl SnapshotDiskOps {

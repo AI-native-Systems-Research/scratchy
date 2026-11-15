@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
-use super::output::{SnapshotDiskOps, SnapshotMove};
+use super::output::{SnapshotDiskOps, SnapshotFill, SnapshotMove};
 
 /// ⭐ HOW A RECURRENT MODEL'S SNAPSHOTS SHARE THE KV BUDGET, as its worker lays the memory out
 /// (#495): KV is mapped and released [`Self::kv_granule_blocks`] blocks at a time and snapshots
@@ -175,6 +175,12 @@ impl StateSnapshots {
         self.disk.by_key.contains_key(&key)
     }
 
+    /// Whether a hit on `key` reads its snapshot back from disk: it is there, and in no slot — a
+    /// fill whose step has not come back is not read back twice.
+    pub(crate) fn fillable(&self, key: u64) -> bool {
+        self.on_disk(key) && !self.by_key.contains_key(&key)
+    }
+
     /// Whether any snapshot for `key` exists, ready or not, in a slot or on disk — one prefix is
     /// snapshotted once.
     pub(crate) fn contains(&self, key: u64) -> bool {
@@ -192,9 +198,9 @@ impl StateSnapshots {
     }
 
     /// ⭐ READ `key`'s SNAPSHOT BACK FROM THE DISK TIER INTO `slot`, for `reader` to restore this
-    /// step, evicting what the slot held. Ready at once: the worker reads every fill before the
-    /// step's forward, and every later step runs after it. A fill the worker fails leaves the
-    /// slot keyed to nothing on the worker, which refuses a restore from it.
+    /// step, evicting what the slot held. `reader`'s restore reads it in this step, after the
+    /// worker's fill. Every other request waits for the step to come back
+    /// ([`Self::commit`]), as for a save. A fill that fails is forgotten ([`Self::forget_fill`]).
     pub(crate) fn fill(&mut self, slot: usize, key: u64, reader: &str) {
         let step = self.step;
         let Some(&d) = self.disk.by_key.get(&key) else {
@@ -209,17 +215,32 @@ impl StateSnapshots {
         self.slots[slot] = Some(Snapshot {
             key,
             position,
-            ready: true,
-            writer: None,
+            ready: false,
+            writer: Some(reader.to_owned()),
             last_used: step,
             pinned: step,
             reader: Some(reader.to_owned()),
         });
         self.by_key.insert(key, slot);
-        self.disk
-            .ops
-            .fills
-            .push(SnapshotMove { slot, disk: d, key });
+        self.disk.ops.fills.push(SnapshotFill {
+            req_id: reader.to_owned(),
+            slot,
+            disk: d,
+            key,
+        });
+    }
+
+    /// ⛔ `fill` NEVER CAME BACK, OR CAME BACK FAILED: forget its snapshot, in its slot and on disk.
+    /// The next hit on its prefix resumes cold, as it would with no disk tier.
+    pub(crate) fn forget_fill(&mut self, fill: &SnapshotFill) {
+        let held = |c: &Snapshot| c.key == fill.key && c.writer.as_deref() == Some(&fill.req_id);
+        if self.slots[fill.slot].as_ref().is_some_and(held) {
+            self.slots[fill.slot] = None;
+            self.by_key.remove(&fill.key);
+        }
+        if let Some(&d) = self.disk.by_key.get(&fill.key) {
+            self.disk.forget(d);
+        }
     }
 
     /// The snapshots this step moved between device memory and the disk tier.
@@ -595,6 +616,15 @@ mod tests {
         assert_eq!(reserve(&mut snaps, 1, 16, "b"), Some(0));
     }
 
+    fn fill(req_id: &str, slot: usize, disk: usize, key: u64) -> SnapshotFill {
+        SnapshotFill {
+            req_id: req_id.into(),
+            slot,
+            disk,
+            key,
+        }
+    }
+
     /// `key`'s snapshot at `position`, saved by `writer` and reported back.
     fn saved(snaps: &mut StateSnapshots, key: u64, position: u32, writer: &str) -> usize {
         let slot = reserve(snaps, key, position, writer).unwrap();
@@ -626,18 +656,12 @@ mod tests {
         snaps.fill(slot, 7, "c");
         assert_eq!(
             snaps.ready_slot(7),
-            Some(slot),
-            "ready in the step that reads it"
+            None,
+            "a hit for no other request before its step comes back"
         );
+        assert!(!snaps.fillable(7), "nor read back twice");
         let ops = snaps.take_disk_ops();
-        assert_eq!(
-            ops.fills,
-            vec![SnapshotMove {
-                slot,
-                disk: 0,
-                key: 7
-            }]
-        );
+        assert_eq!(ops.fills, vec![fill("c", slot, 0, 7)]);
         assert_eq!(
             ops.spills,
             vec![SnapshotMove {
@@ -648,6 +672,12 @@ mod tests {
             "the snapshot the fill takes the slot of, past the disk slot it reads"
         );
         assert_eq!(snaps.victim("d"), None, "a fill is read this step");
+        snaps.commit(slot, 7, "c");
+        assert_eq!(
+            snaps.ready_slot(7),
+            Some(slot),
+            "a hit once its step came back"
+        );
         snaps.tick();
         snaps.place(slot, 9, 160, "d");
         assert!(
@@ -677,14 +707,7 @@ mod tests {
         snaps.take_disk_ops();
         snaps.fill(slot, 7, "c");
         let ops = snaps.take_disk_ops();
-        assert_eq!(
-            ops.fills,
-            vec![SnapshotMove {
-                slot,
-                disk: 0,
-                key: 7
-            }]
-        );
+        assert_eq!(ops.fills, vec![fill("c", slot, 0, 7)]);
         assert!(ops.spills.is_empty());
         assert!(!snaps.contains(8));
         assert!(snaps.on_disk(7));
@@ -718,5 +741,27 @@ mod tests {
             "nor is it spilled on its way out of its slot"
         );
         assert_eq!(snaps.take_disk_ops().spills.len(), 1, "7's alone");
+    }
+
+    /// A fill the worker could not read back, or whose step never came back, is forgotten in its
+    /// slot and on disk: the next request for its prefix finds nothing to resume from.
+    #[test]
+    fn a_failed_fill_is_forgotten_in_its_slot_and_on_disk() {
+        let mut snaps = StateSnapshots::new(1, 2);
+        let slot = saved(&mut snaps, 7, 112, "a");
+        saved(&mut snaps, 8, 144, "b");
+        snaps.fill(slot, 7, "c");
+        let ops = snaps.take_disk_ops();
+        snaps.forget_fill(&ops.fills[0]);
+        snaps.commit(slot, 7, "c");
+        assert_eq!(snaps.ready_slot(7), None, "a late commit readies nothing");
+        assert!(!snaps.contains(7) && !snaps.fillable(7));
+        assert!(snaps.on_disk(8), "the snapshot the fill spilled stays");
+        snaps.tick();
+        assert_eq!(
+            reserve(&mut snaps, 7, 112, "d"),
+            Some(slot),
+            "the prefix is saved anew"
+        );
     }
 }
