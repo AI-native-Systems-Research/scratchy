@@ -169,14 +169,6 @@ pub trait WorkerFactory: Sync {
         true
     }
 
-    /// Whether this backend's workers fill `ModelRunnerOutput::prompt_logprobs_dict`: a
-    /// log-probability for every prompt token, which takes the lm_head over every prompt row, not
-    /// only the rows a step samples. `false` unless a backend computes them; the API refuses a
-    /// request asking for `prompt_logprobs` then, rather than answer it with none (#874).
-    fn computes_prompt_logprobs(&self) -> bool {
-        false
-    }
-
     /// THE BLOCK SIZE THIS BACKEND'S KV IS ADDRESSED BY, when the backend — not the CLI — is what
     /// decides it. `None` = the configured `--block-size` stands, which is every budget-sized GPU pool.
     ///

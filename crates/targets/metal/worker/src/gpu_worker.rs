@@ -250,6 +250,15 @@ pub struct MetalWorker {
     logprobs_step: Option<LogprobsStep>,
     /// The raw logits rows a grammar-masked step's logprobs score, grown to the widest step.
     logprobs_raw: Option<scratchy_target_metal::residency::Pinned>,
+    /// A scoring step's prompt entries and their scores, and its rows' next prompt tokens, grown
+    /// to the widest step.
+    prompt_logprobs_buffer: Option<scratchy_target_metal::residency::Pinned>,
+    /// This step's prompt logprobs entries, set by `execute_model` for the target forward to score.
+    prompt_logprobs_step: Option<PromptLogprobsStep>,
+    /// Each scoring request's prompt logprobs so far, from its second prompt token: handed to the
+    /// engine whole with its last prompt chunk, the step that emits its first token.
+    prompt_logprobs_acc:
+        std::collections::HashMap<String, Vec<scratchy_core_common::LogprobsOutput>>,
     /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: the rest
     /// of the target's lm_head, for the steps that draft over all of it ([`vocab_suffix_draft`]).
     draft_vocab_suffix: Option<
@@ -1001,6 +1010,9 @@ impl MetalWorker {
             logprobs_buffer: None,
             logprobs_step: None,
             logprobs_raw: None,
+            prompt_logprobs_buffer: None,
+            prompt_logprobs_step: None,
+            prompt_logprobs_acc: Default::default(),
             draft_vocab_suffix: None,
             mtp_drafter: None,
             dflash2: None,
@@ -2142,9 +2154,11 @@ impl MetalWorker {
                             && !self.mm_data_buffers.contains_key(req_id)
                             && !constrained(req_id)
                     }))
-            // A step scoring logprobs reads them back before the next one.
+            // A step scoring logprobs reads them back before the next one, and so does a request
+            // scoring its prompt's rows (the next step reuses the buffer they land in).
             && !sched.num_scheduled_tokens.keys().any(|req_id| {
-                (self.sampling_params_map.get(req_id)).is_some_and(|p| p.logprobs.is_some())
+                (self.sampling_params_map.get(req_id))
+                    .is_some_and(|p| p.logprobs.is_some() || p.prompt_logprobs.is_some())
             })
     }
 
@@ -2191,6 +2205,45 @@ impl MetalWorker {
             }
         }
         Ok(Some(out))
+    }
+
+    /// Add the step's prompt logprobs to each scoring request's so far: an entry a prompt position,
+    /// the prompt token there and its request's `prompt_logprobs` top tokens.
+    fn read_prompt_logprobs(&mut self, req_ids: &[String]) -> ExecutorResult<()> {
+        use scratchy_core_common::{LogprobsOutput, TokenLogprob};
+        let (Some(step), Some(buffer)) = (
+            self.prompt_logprobs_step.take(),
+            self.prompt_logprobs_buffer.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let token = |t: &scratchy_target_metal::logprobs::TokenScore| TokenLogprob {
+            token_id: t.token,
+            logprob: t.logprob,
+            rank: t.rank,
+        };
+        for (e, score) in step.entries.iter().zip(step.layout.read(buffer)) {
+            let req_id = &req_ids[e.req];
+            if score.emitted.token != e.token {
+                return Err(ExecutorError::WorkerExecution(format!(
+                    "prompt logprobs of {req_id} at {}: scored token {}, prompt {}",
+                    e.position, score.emitted.token, e.token
+                )));
+            }
+            // At most the kernel's `TOP`, as `logprobs`.
+            let top = (self.sampling_params_map.get(req_id))
+                .and_then(|p| p.prompt_logprobs)
+                .map_or(0, |n| n.max(0) as usize);
+            let scored = self.prompt_logprobs_acc.entry(req_id.clone()).or_default();
+            // Position `p`'s entry is the request's `p`-th (position 0 has none): a re-scored
+            // position replaces what it had.
+            scored.truncate(e.position - 1);
+            scored.push(LogprobsOutput {
+                sampled: token(&score.emitted),
+                top_logprobs: score.top.iter().take(top).map(token).collect(),
+            });
+        }
+        Ok(())
     }
 
     /// Wait for the oldest step still on the device and append the tokens it
@@ -4122,6 +4175,17 @@ impl MetalWorker {
             ),
             _ => None,
         };
+        // This step's prompt logprobs: a scoring request's prompt rows, the target's.
+        let prompt_logprobs = match model {
+            ModelHandle::TARGET => prompt_logprobs_pass(
+                self.prompt_logprobs_step.as_ref(),
+                self.logprobs_kernels.as_ref(),
+                &mut self.prompt_logprobs_buffer,
+                &mtl_device,
+                &residency,
+            ),
+            _ => None,
+        };
         // A block drafter's cycle buffer, for the step's lanes.
         if let (Some(Then::Block(step)), Some(d)) = (then, self.dflash2.as_mut()) {
             let rows = d.drafter.budget.drafts as u64 + 1;
@@ -4346,6 +4410,11 @@ impl MetalWorker {
                 // argmax can only pick a grammar-valid token. The mask emits
                 // its own pre-barrier (forward-write -> mask-read); argmax's
                 // pre-barrier then orders mask-write -> argmax-read.
+                // The prompt rows' logprobs, at the prompt tokens after them: off the logits as the
+                // forward left them, before anything below writes a row.
+                if let Some((pass, tokens)) = &prompt_logprobs {
+                    pass.encode(&logprobs_device, enc, logits_addr, *tokens)?;
+                }
                 if let Some(pass) = &logprobs {
                     pass.set_aside(enc, logits_buf);
                 }
@@ -5761,6 +5830,87 @@ fn logprobs_pass(
     })
 }
 
+/// A scoring step's prompt logprobs entries: each scored logits row with its request's index, the
+/// prompt position it predicts, and that position's prompt token, which the row is scored at.
+struct PromptLogprobsStep {
+    entries: Vec<PromptEntry>,
+    layout: scratchy_target_metal::logprobs::LogprobsLayout,
+}
+
+/// One prompt row a scoring step scores: logits row `row` of request `req` predicts prompt token
+/// `token`, at prompt position `position` (at least 1).
+#[derive(Clone, Copy, Debug)]
+struct PromptEntry {
+    req: usize,
+    row: u32,
+    position: usize,
+    token: u32,
+}
+
+impl PromptLogprobsStep {
+    /// Where the token table sits in the buffer: past the layout, a token a logits row through the
+    /// highest scored one (the kernel reads `tokens[row]`).
+    fn tokens_offset(&self) -> u64 {
+        self.layout.total.next_multiple_of(16)
+    }
+
+    fn total(&self) -> u64 {
+        let rows = self
+            .entries
+            .iter()
+            .map(|e| u64::from(e.row) + 1)
+            .max()
+            .unwrap_or(0);
+        self.tokens_offset() + rows * 4
+    }
+}
+
+/// The step's prompt logprobs pass: `step`'s rows and, at each, the prompt token it is scored at,
+/// written into `buffer` (grown to hold them), and the token table's address. `None` when the step
+/// scores no prompt rows.
+fn prompt_logprobs_pass(
+    step: Option<&PromptLogprobsStep>,
+    kernels: Option<&scratchy_target_metal::logprobs::LogprobsKernels>,
+    buffer: &mut Option<scratchy_target_metal::residency::Pinned>,
+    device: &scratchy_target_metal::mtl4_dispatch::Device,
+    residency: &scratchy_target_metal::residency::MetalResidencySet,
+) -> Option<(LogprobsPass, u64)> {
+    use ::objc2_metal::MTLBuffer as _;
+    let step = step?;
+    let kernels = kernels?;
+    let row_bytes = kernels.row_bytes();
+    let kernels = kernels as *const scratchy_target_metal::logprobs::LogprobsKernels as usize;
+    if reserve_pinned(buffer, device, residency, step.total() as usize) {
+        residency.commit();
+    }
+    let buffer = (**buffer.as_ref()?).clone();
+    let rows: Vec<u32> = step.entries.iter().map(|e| e.row).collect();
+    step.layout.write_rows(&buffer, &rows);
+    // SAFETY: the buffer is host-visible and holds `total` bytes (reserved above), and no command
+    // buffer reads it while the host writes (the step's is encoded after).
+    unsafe {
+        let table = buffer
+            .contents()
+            .as_ptr()
+            .cast::<u8>()
+            .add(step.tokens_offset() as usize)
+            .cast::<u32>();
+        for e in &step.entries {
+            table.add(e.row as usize).write(e.token);
+        }
+    }
+    let tokens = buffer.gpuAddress() + step.tokens_offset();
+    let pass = LogprobsPass {
+        kernels,
+        buffer,
+        layout: step.layout,
+        rows,
+        row_bytes,
+        raw: None,
+    };
+    Some((pass, tokens))
+}
+
 /// The logprobs pass of a target's command buffer: scores its entries once the step's tokens are
 /// final, after the sampler.
 #[derive(Clone)]
@@ -6159,6 +6309,17 @@ impl Worker for MetalWorker {
             .as_ref()
             .and(self.shared_kv.as_ref())
             .map(|s| s.budget)
+    }
+
+    fn prompt_scoring_rows(&self) -> Option<std::num::NonZeroUsize> {
+        // A scoring step's every prompt row is a sampled row, and the logits hold the rows a decode
+        // or verify step brings (`decode_rows`). A drafter reads the rows a step samples as its
+        // own inputs, so a run that drafts scores no prompt rows.
+        let drafts =
+            self.mtp_drafter.is_some() || self.dflash2.is_some() || self.draft_model.is_some();
+        self.logprobs_kernels.as_ref().filter(|_| !drafts)?;
+        let rows = self.gpu_device.as_ref()?.max_decode_rows?;
+        std::num::NonZeroUsize::new(rows.0 as usize)
     }
 
     fn max_num_seqs_override(&self) -> Option<usize> {
@@ -7406,6 +7567,7 @@ impl Worker for MetalWorker {
 
         // ── 1. Lifecycle: drop finished requests ──────────────────
         for req_id in &scheduler_output.finished_req_ids {
+            self.prompt_logprobs_acc.remove(req_id);
             self.annotation_buffers.remove(req_id);
             self.reused_block_buffers.remove(req_id);
             self.kv_cached_through.remove(req_id);
@@ -7876,11 +8038,23 @@ impl Worker for MetalWorker {
 
         let max_seqlen_q = attn.q_lens.iter().copied().max().unwrap_or(0);
         let max_seqlen_k = attn.seq_lens.iter().copied().max().unwrap_or(0);
-        // The rows the step samples: every row of a request verifying drafts, any other's last.
-        // The forward's logits, its argmax and every row read off them are theirs, in order.
+        // A request scoring its prompt (`prompt_logprobs`) whose chunk is in its prompt: the
+        // scheduler runs it alone, at most `prompt_scoring_rows` tokens, so every row of the chunk
+        // fits the step's logits.
+        let scores_prompt: Vec<bool> = (0..num_reqs)
+            .map(|i| {
+                let req_id = &attn.req_ids[i];
+                let start = attn.seq_lens[i] - attn.q_lens[i];
+                (self.sampling_params_map.get(req_id)).is_some_and(|p| p.prompt_logprobs.is_some())
+                    && start < self.input_batch.prompt_len(req_id)
+            })
+            .collect();
+        // The rows the step samples: every row of a request verifying drafts or scoring its prompt,
+        // any other's last. The forward's logits, its argmax and every row read off them are
+        // theirs, in order.
         let sampled_rows = ::scratchy_serving_engine::spec_decode::SampledRows::of(
             &cu_seqlens_u32[..=num_reqs],
-            |i| !prepared.req_inputs[i].spec_token_ids.is_empty(),
+            |i| !prepared.req_inputs[i].spec_token_ids.is_empty() || scores_prompt[i],
         )
         .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
@@ -7915,7 +8089,13 @@ impl Worker for MetalWorker {
                             continue;
                         };
                         let masks = guide.verify_masks(&prepared.req_inputs[i].spec_token_ids);
-                        for (row, allowed) in sampled_rows.of_seq(i).zip(masks) {
+                        // A verify's rows take its masks in order; any other request's one mask is
+                        // its last row's (a scoring chunk samples every row, the last emits).
+                        let masked = match prepared.req_inputs[i].spec_token_ids.is_empty() {
+                            true => sampled_rows.last_of(i)..sampled_rows.last_of(i) + 1,
+                            false => sampled_rows.of_seq(i),
+                        };
+                        for (row, allowed) in masked.zip(masks) {
                             // `None` => no mask applies (terminated, or thinking); leave the row
                             // unmasked.
                             let Some(allowed) = allowed else {
@@ -8434,6 +8614,39 @@ impl Worker for MetalWorker {
         self.logprobs_step = (!logprobs_entries.is_empty()).then(|| LogprobsStep {
             layout: scratchy_target_metal::logprobs::LogprobsLayout::of(logprobs_entries.len()),
             entries: logprobs_entries,
+        });
+        // The prompt rows this step scores: row `j` of a scoring request's chunk sits at prompt
+        // position `start + j` and predicts the token after it — every row whose next token is
+        // still prompt (the last prompt row's is the first generated one, `logprobs`' to score).
+        let mut prompt_entries: Vec<PromptEntry> = Vec::new();
+        for i in (0..num_reqs).filter(|&i| scores_prompt[i]) {
+            let req_id = &attn.req_ids[i];
+            let start = attn.seq_lens[i] - attn.q_lens[i];
+            let prompt_len = self.input_batch.prompt_len(req_id);
+            if start == 0 {
+                self.prompt_logprobs_acc.remove(req_id);
+            }
+            for (j, row) in sampled_rows.of_seq(i).enumerate() {
+                let position = start + j + 1;
+                if position >= prompt_len {
+                    break;
+                }
+                let token = self.input_batch.token_at(req_id, position).ok_or_else(|| {
+                    ExecutorError::WorkerExecution(format!(
+                        "prompt logprobs of {req_id}: no prompt token at {position}"
+                    ))
+                })?;
+                prompt_entries.push(PromptEntry {
+                    req: i,
+                    row: row as u32,
+                    position,
+                    token,
+                });
+            }
+        }
+        self.prompt_logprobs_step = (!prompt_entries.is_empty()).then(|| PromptLogprobsStep {
+            layout: scratchy_target_metal::logprobs::LogprobsLayout::of(prompt_entries.len()),
+            entries: prompt_entries,
         });
         let argmax_vec: Vec<u32> = {
             use ::scratchy_serving_engine::spec_decode::{
@@ -9212,12 +9425,23 @@ impl Worker for MetalWorker {
             };
 
         let logprobs = self.read_logprobs(&req_ids_in_order, &sampled_token_ids)?;
+        self.read_prompt_logprobs(&req_ids_in_order)?;
+        // A scoring request whose chunk ends its prompt — the step that emits its first token, the
+        // one the engine reports — hands over its prompt logprobs whole.
+        let prompt_logprobs_dict = (0..num_reqs)
+            .filter(|&i| scores_prompt[i] && prepared.req_inputs[i].emits_token)
+            .map(|i| {
+                let req_id = req_ids_in_order[i].clone();
+                let scored = self.prompt_logprobs_acc.remove(&req_id).unwrap_or_default();
+                (req_id, scored)
+            })
+            .collect();
         Ok(ModelRunnerOutput {
             req_ids: req_ids_in_order,
             req_id_to_index,
             sampled_token_ids,
             logprobs,
-            prompt_logprobs_dict: std::collections::HashMap::new(),
+            prompt_logprobs_dict,
             // A head's drafts; a draft model's K-step chain runs host-side, its proposer filling
             // `set_spec_token_ids` directly.
             draft_token_ids,

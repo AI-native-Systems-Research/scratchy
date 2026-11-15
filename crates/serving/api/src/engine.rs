@@ -407,9 +407,9 @@ pub struct AsyncEngine {
     >,
     model_name: String,
     max_model_len: usize,
-    /// Whether the linked backend computes prompt logprobs
-    /// ([`WorkerFactory::computes_prompt_logprobs`](scratchy_serving_engine::worker_factory::WorkerFactory::computes_prompt_logprobs));
-    /// a request asking for them is refused when it does not ([`Self::check_prompt_logprobs`]).
+    /// Whether the worker scores prompt rows (`Worker::prompt_scoring_rows`, set at init through
+    /// [`Self::set_scores_prompts`]); a request asking for prompt logprobs is refused when it does
+    /// not ([`Self::check_prompt_logprobs`]).
     computes_prompt_logprobs: bool,
     /// Notified after every engine step so request handlers can check results.
     notify: Arc<Notify>,
@@ -473,8 +473,7 @@ impl AsyncEngine {
             pending_loop: std::sync::Mutex::new(Some((client, rx, embed_rx, control_rx))),
             model_name,
             max_model_len,
-            computes_prompt_logprobs: scratchy_serving_engine::worker_factory::linked_factory()
-                .is_ok_and(|f| f.computes_prompt_logprobs()),
+            computes_prompt_logprobs: false,
             notify: Arc::new(Notify::new()),
             tokenizer: None,
             chat_template: None,
@@ -490,6 +489,11 @@ impl AsyncEngine {
             is_pooling: false,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
+    }
+
+    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::prompt_scoring_rows`).
+    pub fn set_scores_prompts(&mut self, scores: bool) {
+        self.computes_prompt_logprobs = scores;
     }
 
     /// Enable or disable pooling mode.
@@ -4773,6 +4777,26 @@ mod tests {
         assert!(completion(serde_json::json!({})).is_ok());
         assert!(completion(serde_json::json!({"logprobs": 2})).is_ok());
         assert!(chat(serde_json::json!({"logprobs": true, "top_logprobs": 2})).is_ok());
+    }
+
+    /// A backend that scores prompt rows takes the same requests and carries the field through.
+    #[test]
+    fn prompt_logprobs_build_where_the_backend_scores_prompts() {
+        let mut engine = make_test_engine();
+        engine.set_scores_prompts(true);
+        let completion: protocol::CompletionRequest =
+            serde_json::from_value(serde_json::json!({"prompt": "Hello", "prompt_logprobs": 1}))
+                .unwrap();
+        let params = engine
+            .build_sampling_params_from_completion(&completion)
+            .unwrap();
+        assert_eq!(params.prompt_logprobs, Some(1));
+        let chat: protocol::ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "Hi"}], "prompt_logprobs": 0
+        }))
+        .unwrap();
+        let params = engine.build_sampling_params_from_chat(&chat).unwrap();
+        assert_eq!(params.prompt_logprobs, Some(0));
     }
 
     #[test]
