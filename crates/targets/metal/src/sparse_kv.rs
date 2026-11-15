@@ -5,6 +5,7 @@
 //! worker's activations as its buckets reach them ([`crate::sparse_arena`]).
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -27,25 +28,36 @@ pub(crate) const PAGE: MTLSparsePageSize = MTLSparsePageSize::Size64;
 /// ⭐ THE LEAST RUN OF BLOCKS WHOSE BYTES ARE WHOLE SPARSE TILES IN EVERY STORE, each store's
 /// block taking one of `block_bytes`: what a run mapped apart is made of, so releasing one frees
 /// whole tiles and nothing of another ([`SparseStores::map_apart`]). A KV granule, a snapshot
-/// unit.
+/// unit. Refused only when the device maps no sparse tiles at [`PAGE`] ([`sparse_tile`]).
 pub fn whole_tile_blocks(
     device: &ProtocolObject<dyn MTLDevice>,
     block_bytes: impl IntoIterator<Item = usize>,
-) -> std::num::NonZeroUsize {
-    let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
-    let gcd = |mut a: usize, mut b: usize| {
-        while b != 0 {
-            (a, b) = (b, a % b);
+) -> Result<NonZeroUsize, String> {
+    Ok(tile_run(sparse_tile(device)?, block_bytes))
+}
+
+/// The bytes of one sparse tile at [`PAGE`]: the unit every sparse mapping is whole multiples
+/// of. The one place the device's answer becomes a non-zero size; a device that answers zero
+/// maps no sparse tiles at that page size, and is refused rather than divided by.
+pub fn sparse_tile(device: &ProtocolObject<dyn MTLDevice>) -> Result<NonZeroUsize, String> {
+    NonZeroUsize::new(device.sparseTileSizeInBytesForSparsePageSize(PAGE))
+        .ok_or_else(|| format!("the device maps no sparse tiles at {PAGE:?} pages"))
+}
+
+/// [`whole_tile_blocks`]' arithmetic, for a non-zero `tile`. A store whose block takes `b` bytes
+/// fills whole tiles every `tile / gcd(tile, b)` blocks, a divisor of `tile`; the least run whole
+/// in every store is those divisors' lcm, which is `tile / gcd(tile, b₁, b₂, …)`. So the run is a
+/// division of `tile` by a divisor of it: at least one, and at most `tile`. A zero-byte block
+/// fills nothing (`gcd(g, 0) = g`); no blocks at all is a run of one.
+fn tile_run(tile: NonZeroUsize, block_bytes: impl IntoIterator<Item = usize>) -> NonZeroUsize {
+    /// `gcd(a, b)`: non-zero, since it divides the non-zero `a`.
+    fn gcd(a: NonZeroUsize, b: usize) -> NonZeroUsize {
+        match NonZeroUsize::new(b) {
+            None => a,
+            Some(b) => gcd(b, a.get() % b),
         }
-        a
-    };
-    let run = (block_bytes.into_iter())
-        .filter(|&bytes| bytes > 0)
-        .fold(1, |run, bytes| {
-            let per_store = tile / gcd(tile, bytes);
-            run / gcd(run, per_store) * per_store
-        });
-    std::num::NonZeroUsize::new(run).expect("a run of at least one block")
+    }
+    tile.div_ceil(block_bytes.into_iter().fold(tile, gcd))
 }
 
 /// How a [`SparseStores`]' blocks from block 0 are mapped.
@@ -730,6 +742,55 @@ mod tests {
         stores.map_apart(4..6, &mapper).expect("mapped again");
     }
 
+    /// The run is the lcm of every store's whole-tile period, as the fold it replaces computed it
+    /// (`run / gcd(run, per_store) * per_store` over `per_store = tile / gcd(tile, bytes)`): the
+    /// same run for every block-size pair, a zero-byte block and no blocks included.
+    #[test]
+    fn a_run_is_the_least_whole_tile_period_of_every_store() {
+        fn gcd(mut a: usize, mut b: usize) -> usize {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        }
+        let lcm_fold = |tile: usize, bytes: &[usize]| {
+            (bytes.iter().filter(|&&b| b > 0)).fold(1, |run, &b| {
+                let per_store = tile / gcd(tile, b);
+                run / gcd(run, per_store) * per_store
+            })
+        };
+        let tile = NonZeroUsize::new(64 << 10).expect("64 KiB");
+        let sizes = [
+            0,
+            1,
+            3,
+            512,
+            1000,
+            1024,
+            4096,
+            12_288,
+            65_536,
+            98_304,
+            1 << 20,
+        ];
+        for &a in &sizes {
+            for &b in &sizes {
+                let bytes = [a, b];
+                assert_eq!(
+                    tile_run(tile, bytes).get(),
+                    lcm_fold(tile.get(), &bytes),
+                    "{bytes:?}"
+                );
+            }
+        }
+        assert_eq!(
+            tile_run(tile, [512, 1024]).get(),
+            128,
+            "a 64 KiB tile of 512-byte blocks"
+        );
+        assert_eq!(tile_run(tile, []).get(), 1, "no stores: a run of one");
+    }
+
     /// A KV pool sharing its budget maps granules of blocks apart and releases them alone: a run
     /// keeps its writes, a released run mapped again reads zero in a store that must, runs neither
     /// overlap nor start or end mid-tile — but the last, which ends with the pool's blocks — and
@@ -747,7 +808,9 @@ mod tests {
         let layout = [(512, true), (1024, false)];
         let mut stores = SparseStores::apart(&device, &residency, 1000, &layout).expect("stores");
         assert_eq!(
-            whole_tile_blocks(&device, layout.iter().map(|&(bytes, _)| bytes)).get(),
+            whole_tile_blocks(&device, layout.iter().map(|&(bytes, _)| bytes))
+                .expect("a sparse tile")
+                .get(),
             128
         );
         assert!(stores.grow_to(128, &mapper).is_err(), "runs apart only");
