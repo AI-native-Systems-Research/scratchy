@@ -156,9 +156,15 @@ pub(crate) const RAG_TIMED_TOKENS: usize = 64;
 /// ends it, so the cap only bounds a long one.
 pub(crate) const RAG_MAX_TOKENS: usize = 256;
 
-/// A multi-document QA task as the benchmarks send it: the system prompt, each document as its
-/// own user message, then the question. `answers` is every accepted answer, the first the main
-/// one; `max_tokens` the answer cap.
+/// A multi-document QA task as the benchmarks send it: the system prompt, then one user message of
+/// every document and the question, each its own paragraph. `answers` is every accepted answer,
+/// the first the main one; `max_tokens` the answer cap.
+///
+/// One user message, not a message a document: oMLX merges consecutive user messages into one,
+/// joined by a blank line (`_merge_consecutive_roles`, `omlx/api/utils.py`), where scratchy and
+/// the checkpoint's own chat template render each as its own turn. Sent apart, the two engines'
+/// models read different prompts, and their answers can't be compared; sent as the one message
+/// oMLX would make of them, every engine reads the same one.
 pub(crate) fn rag_task(
     prompt: &RagPrompt,
     documents: &[(String, String)],
@@ -169,12 +175,16 @@ pub(crate) fn rag_task(
 ) -> Task {
     let label = prompt.label;
     let doc = |j: usize, source: &str, text: &str| format!("{label} {j} ({source}): {text}");
-    let mut messages = vec![serde_json::json!({"role": "system", "content": prompt.system})];
-    messages.extend(
-        (documents.iter().enumerate())
-            .map(|(j, (t, x))| serde_json::json!({"role": "user", "content": doc(j, t, x)})),
-    );
-    messages.push(serde_json::json!({"role": "user", "content": question}));
+    let user = (documents.iter().enumerate())
+        .map(|(j, (t, x))| doc(j, t, x))
+        .chain(std::iter::once(question.to_string()))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let messages = vec![
+        serde_json::json!({"role": "system", "content": prompt.system}),
+        serde_json::json!({"role": "user", "content": user}),
+    ];
     let docs: Vec<serde_json::Value> = (documents.iter().enumerate())
         .map(|(j, (t, x))| serde_json::json!({"user": doc(j, t, x)}))
         .collect();
@@ -428,16 +438,20 @@ mod tests {
             Rule::OneAnswer,
             RAG_MAX_TOKENS,
         );
-        assert_eq!(t.messages.len(), 3, "system, one document, the question");
+        assert_eq!(
+            t.messages.len(),
+            2,
+            "system, then the document and the question"
+        );
         assert_eq!(t.messages[0]["role"], "system");
         assert_eq!(
             t.messages[1]["content"],
-            "Document 0 (Paris): Capital of France."
+            "Document 0 (Paris): Capital of France.\n\nWhat is the capital?"
         );
         let spans = t.spans_input.unwrap();
         assert_eq!(
             spans["cross"][1]["plus"][0]["user"],
-            t.messages[1]["content"]
+            "Document 0 (Paris): Capital of France."
         );
         assert_eq!(spans["cross"][2]["user"], "What is the capital?");
         assert_eq!(t.max_tokens, RAG_MAX_TOKENS);
@@ -460,6 +474,27 @@ mod tests {
         }
         msgs.push(("user".to_string(), question.to_string()));
         msgs
+    }
+
+    /// Messages as oMLX hands them to the chat template (`_merge_consecutive_roles`,
+    /// `omlx/api/utils.py`): a user or assistant message following one of its own role joins it,
+    /// the two contents joined by a blank line, an empty content taking nothing and an empty one
+    /// before it taking the new one's place.
+    fn merged_as_omlx(msgs: Vec<(String, String)>) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (role, content) in msgs {
+            match out.last_mut() {
+                Some((prev, text)) if *prev == role && (role == "user" || role == "assistant") => {
+                    if !text.is_empty() && !content.is_empty() {
+                        *text = format!("{text}\n\n{content}");
+                    } else if !content.is_empty() {
+                        *text = content;
+                    }
+                }
+                _ => out.push((role, content)),
+            }
+        }
+        out
     }
 
     fn old_spans(
@@ -489,9 +524,11 @@ mod tests {
         })
     }
 
-    /// Every dataset benchmark sends, through the shared [`Task`], byte for byte the plain messages
-    /// and the span query it built by hand before: for each wording (documents by title, passages
-    /// by URL), over documents with punctuation, unicode, quotes and braces, none, one and several.
+    /// Every dataset benchmark sends, through the shared [`Task`], byte for byte the span query it
+    /// built by hand before, and the plain messages it built by hand as oMLX merges them — so oMLX,
+    /// which merges, and every engine that doesn't read the same prompt: for each wording
+    /// (documents by title, passages by URL), over documents with punctuation, unicode, quotes and
+    /// braces, none, one and several, and an empty question.
     #[test]
     fn the_benchmarks_send_the_prompts_they_built_by_hand() {
         let texts = [
@@ -527,8 +564,13 @@ mod tests {
                         .collect();
                     assert_eq!(
                         new_plain,
-                        old_plain(prompt.system, label, docs, question),
+                        merged_as_omlx(old_plain(prompt.system, label, docs, question)),
                         "{label} plain"
+                    );
+                    assert_eq!(
+                        merged_as_omlx(new_plain.clone()),
+                        new_plain,
+                        "{label}: nothing left for oMLX to merge"
                     );
                     assert_eq!(t.chat_messages().len(), new_plain.len());
                     assert_eq!(

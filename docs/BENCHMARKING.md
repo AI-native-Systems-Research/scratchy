@@ -466,6 +466,17 @@ end-to-end rows (2u, 4u) compare total time, which only means something over equ
 accuracy cell (`rag-accuracy`) and the span query (`rag-spans`, scratchy's own row, which could
 never be forced) answer on their own as before.
 
+**The same prompt on every engine:** a multi-document QA task (MuSiQue, HotpotQA,
+2WikiMultihopQA, MS MARCO) goes as a system message and **one** user message holding every
+document and then the question, each its own paragraph. oMLX merges consecutive user messages
+into one, joined by a blank line (`_merge_consecutive_roles`, `omlx/api/utils.py`), where scratchy
+renders each as its own turn, as the checkpoint's chat template does. Sent a document a message,
+as the bench did before, the two engines' models read different prompts: scratchy's 60 to 100
+tokens longer on MuSiQue (a turn's template tokens, about 20 times), and differently laid out.
+On granite-4.2-3b, its answers ran 85 tokens on average against oMLX's 54, 21 of 100 hit the
+256-token cap against 10. Sent as the one message oMLX would make of them, scratchy's ran 55 and
+11. Accuracy and answer length in runs before this change carry that difference.
+
 A request whose whole answer arrives in one chunk has no time between tokens, so it has no
 TPOT: `bench serve` leaves it out rather than recording 0 ms. Natural answers are short, and a
 drafting engine can send one in a single chunk; counted as 0 ms, those requests pulled its median
