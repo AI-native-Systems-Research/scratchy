@@ -2862,6 +2862,11 @@ pub struct PlayLive {
     /// (`ForwardReads::Rebuild`): the window's load and the ring writers after it, never the
     /// commit's rows before its window.
     pub rebuild: bool,
+    /// The lm_head half alone (`ForwardReads::LmHead`): the result matmul and the sampled rows
+    /// around it, over the final hidden states the bucket's backbone slot holds — a prompt's rows
+    /// scored for `prompt_logprobs`, a tile at a time, after its prefill. Off for every backbone
+    /// command.
+    pub lm_head: bool,
 }
 
 impl PlayLive {
@@ -2870,6 +2875,7 @@ impl PlayLive {
         cache_writes: true,
         result: true,
         rebuild: true,
+        lm_head: true,
     };
 
     /// Whether a forward its caller reads `reads` of plays the command.
@@ -2882,6 +2888,7 @@ impl PlayLive {
             R::CacheWrites => self.cache_writes,
             R::Result => self.result,
             R::Rebuild => self.rebuild,
+            R::LmHead => self.lm_head,
         }
     }
 
@@ -2891,6 +2898,7 @@ impl PlayLive {
             cache_writes: self.cache_writes || other.cache_writes,
             result: self.result || other.result,
             rebuild: self.rebuild || other.rebuild,
+            lm_head: self.lm_head || other.lm_head,
         }
     }
 }

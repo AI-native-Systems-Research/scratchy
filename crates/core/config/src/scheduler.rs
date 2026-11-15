@@ -119,6 +119,13 @@ pub struct SchedulerConfig {
     /// `CachedRequestData` so non-last PP stages can embed the correct tokens.
     #[serde(default)]
     pub use_pp: bool,
+
+    /// Whether the backend scores a prompt's rows for `prompt_logprobs`
+    /// (`Worker::scores_prompts`): a request asking for them takes no prefix-cache hit, as a
+    /// cached row's final hidden states are not the step's. `false`: such a request is refused
+    /// before it is scheduled.
+    #[serde(default)]
+    pub scores_prompts: bool,
 }
 
 fn one() -> usize {
@@ -217,6 +224,7 @@ impl Default for SchedulerConfig {
             stream_interval: 1,
             num_lookahead_tokens: 0,
             use_pp: false,
+            scores_prompts: false,
         }
     }
 }

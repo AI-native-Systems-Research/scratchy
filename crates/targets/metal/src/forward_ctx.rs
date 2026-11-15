@@ -140,6 +140,9 @@ pub struct ForwardCtx<'a> {
     pub deferred: Option<&'a crate::interpreter::metal::Deferral>,
     /// What the caller reads of this forward.
     pub reads: crate::interpreter::metal::ForwardReads,
+    /// An lm_head play's input (`ForwardReads::LmHead`): final hidden states, row-major in the
+    /// model dtype, written into the bucket's backbone slot before it plays. `None` elsewhere.
+    pub backbone_rows: Option<&'a [u8]>,
 }
 
 // `EmbedPatch` (the multimodal embed-splice descriptor) is a cfg-free type in

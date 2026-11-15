@@ -407,6 +407,10 @@ pub struct AsyncEngine {
     >,
     model_name: String,
     max_model_len: usize,
+    /// Whether the worker scores prompt rows (`Worker::scores_prompts`, set at init through
+    /// [`Self::set_scores_prompts`]); a request asking for prompt logprobs is refused when it does
+    /// not ([`Self::check_prompt_logprobs`]).
+    computes_prompt_logprobs: bool,
     /// Notified after every engine step so request handlers can check results.
     notify: Arc<Notify>,
     /// Optional tokenizer for encoding prompts and decoding outputs.
@@ -469,6 +473,7 @@ impl AsyncEngine {
             pending_loop: std::sync::Mutex::new(Some((client, rx, embed_rx, control_rx))),
             model_name,
             max_model_len,
+            computes_prompt_logprobs: false,
             notify: Arc::new(Notify::new()),
             tokenizer: None,
             chat_template: None,
@@ -484,6 +489,11 @@ impl AsyncEngine {
             is_pooling: false,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
+    }
+
+    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::scores_prompts`).
+    pub fn set_scores_prompts(&mut self, scores: bool) {
+        self.computes_prompt_logprobs = scores;
     }
 
     /// Enable or disable pooling mode.
@@ -3611,11 +3621,29 @@ impl AsyncEngine {
         }
     }
 
+    /// ⛔ `prompt_logprobs` IS REFUSED, NOT ANSWERED WITH NONE, on a backend that computes no
+    /// prompt logprobs: they take the lm_head over every prompt row, and a backend whose steps
+    /// score only the rows they sample would return `null`, which a client scoring prompts by
+    /// likelihood (an eval harness's multiple-choice tasks) reads as an answer (#874). The logprobs
+    /// of generated tokens (`logprobs`, `top_logprobs`) are a separate request field.
+    fn check_prompt_logprobs(&self, asked: Option<u32>) -> ServeResult<()> {
+        match asked {
+            Some(_) if !self.computes_prompt_logprobs => Err(ServeError::Validation(
+                "prompt_logprobs is not supported by this backend: it scores only the rows it \
+                 samples, not every prompt token (the logprobs of generated tokens are, through \
+                 logprobs / top_logprobs)"
+                    .into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Build SamplingParams from a chat completion request.
     fn build_sampling_params_from_chat(
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        self.check_prompt_logprobs(request.prompt_logprobs)?;
         let tools: Vec<&str> = (request.tools.iter().flatten())
             .map(|t| t.function.name.as_str())
             .collect();
@@ -3757,6 +3785,7 @@ impl AsyncEngine {
         &self,
         request: &protocol::CompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        self.check_prompt_logprobs(request.prompt_logprobs)?;
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -4711,6 +4740,63 @@ mod tests {
         let engine = make_test_engine_with_tokenizer();
         assert_eq!(engine.model_name(), "test-model");
         assert!(engine.has_tokenizer());
+    }
+
+    /// A backend that computes no prompt logprobs refuses a request for them with a 400 on both
+    /// endpoints, rather than answering it with `null` (#874); the same request without them, and
+    /// one asking only for the generated tokens' logprobs, builds its params.
+    #[test]
+    fn prompt_logprobs_are_refused_where_the_backend_computes_none() {
+        let engine = make_test_engine();
+        assert!(!engine.computes_prompt_logprobs);
+        let completion = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"prompt": "Hello"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            engine.build_sampling_params_from_completion(&serde_json::from_value(body).unwrap())
+        };
+        let chat = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"messages": [{"role": "user", "content": "Hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            engine.build_sampling_params_from_chat(&serde_json::from_value(body).unwrap())
+        };
+        for refused in [
+            completion(serde_json::json!({"prompt_logprobs": 1})),
+            chat(serde_json::json!({"prompt_logprobs": 0})),
+        ] {
+            match refused {
+                Err(ServeError::Validation(msg)) => {
+                    assert!(msg.contains("prompt_logprobs"), "{msg}")
+                }
+                other => panic!("expected a 400 naming prompt_logprobs, got {other:?}"),
+            }
+        }
+        assert!(completion(serde_json::json!({})).is_ok());
+        assert!(completion(serde_json::json!({"logprobs": 2})).is_ok());
+        assert!(chat(serde_json::json!({"logprobs": true, "top_logprobs": 2})).is_ok());
+    }
+
+    /// A backend that scores prompt rows takes the same requests and carries the field through.
+    #[test]
+    fn prompt_logprobs_build_where_the_backend_scores_prompts() {
+        let mut engine = make_test_engine();
+        engine.set_scores_prompts(true);
+        let completion: protocol::CompletionRequest =
+            serde_json::from_value(serde_json::json!({"prompt": "Hello", "prompt_logprobs": 1}))
+                .unwrap();
+        let params = engine
+            .build_sampling_params_from_completion(&completion)
+            .unwrap();
+        assert_eq!(params.prompt_logprobs, Some(1));
+        let chat: protocol::ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "Hi"}], "prompt_logprobs": 0
+        }))
+        .unwrap();
+        let params = engine.build_sampling_params_from_chat(&chat).unwrap();
+        assert_eq!(params.prompt_logprobs, Some(0));
     }
 
     #[test]

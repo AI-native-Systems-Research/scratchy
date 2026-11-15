@@ -10277,6 +10277,7 @@ mod tests {
                 cache_writes,
                 result: true,
                 rebuild: false,
+                lm_head: false,
             })
             .collect()
     }

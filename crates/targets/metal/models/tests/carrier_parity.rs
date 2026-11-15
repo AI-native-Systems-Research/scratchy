@@ -573,6 +573,7 @@ mod imp {
                 device_inputs: &[],
                 deferred: None,
                 reads: scratchy_target_metal::ForwardReads::Outputs,
+                backbone_rows: None,
             };
 
             // ── RUN the compiled forward (the tape from the .py carrier) ──

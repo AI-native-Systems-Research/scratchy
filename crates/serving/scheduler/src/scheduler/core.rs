@@ -2878,6 +2878,10 @@ pub struct Scheduler {
     /// `async_scheduling` is false, the scheduler populates `new_token_ids`
     /// in `CachedRequestData`.
     use_pp: bool,
+    /// Whether the backend scores a prompt's rows for `prompt_logprobs`
+    /// (`SchedulerConfig::scores_prompts`): a request asking for them then takes no prefix-cache
+    /// hit.
+    scores_prompts: bool,
 
     // -- Request state --
     /// All tracked requests: `req_id -> Request`.
@@ -2927,6 +2931,7 @@ impl Scheduler {
             num_lookahead_tokens: scheduler_config.num_lookahead_tokens,
             async_scheduling,
             use_pp,
+            scores_prompts: scheduler_config.scores_prompts,
 
             requests: HashMap::new(),
             waiting: create_request_queue(policy),
@@ -3618,9 +3623,16 @@ impl SchedulerInterface for Scheduler {
 
                 // Get computed blocks from prefix cache. `cached_blocks[0]` is
                 // the per-logical-block hit list (usize::MAX for misses) —
-                // threaded into allocate_slots so span blocks are SHARED.
-                let (num_cached_tokens, cached_blocks) =
-                    self.kv_cache.get_computed_blocks(&request);
+                // threaded into allocate_slots so span blocks are SHARED. A
+                // request scoring its prompt (`prompt_logprobs`) takes no hit:
+                // a cached row's final hidden states are not this step's, and
+                // every prompt row's are what it scores.
+                let scores =
+                    self.scores_prompts && request.sampling_params.prompt_logprobs.is_some();
+                let (num_cached_tokens, cached_blocks) = match scores {
+                    true => (0, vec![Vec::new()]),
+                    false => self.kv_cache.get_computed_blocks(&request),
+                };
                 // ⭐ RECURRENT STATE: THE KV HIT STANDS ONLY WHERE A SNAPSHOT OF THE STATE DOES.
                 // The plan resumes the request at the deepest snapshot within the hit (or at 0).
                 // The matched blocks past that point stay shared: the request runs their positions
@@ -4028,6 +4040,23 @@ mod tests {
             prompt,
             SamplingParams {
                 max_tokens: Some(100),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    // Helper: a test request over `prompt`, asking for `prompt_logprobs` or not.
+    fn request_over(id: &str, prompt: Vec<u32>, prompt_logprobs: Option<i32>) -> Request {
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(100),
+                prompt_logprobs,
                 ..Default::default()
             },
             1.0,
@@ -4755,6 +4784,31 @@ mod tests {
             tracker.free(&req.request_id);
         }
         assert_eq!(ids, (0..12).collect::<Vec<_>>());
+    }
+
+    /// The same prompt a plain request takes from the prefix cache, a request scoring it
+    /// (`prompt_logprobs`) computes from its first token, every row of it this step's.
+    #[test]
+    fn a_scoring_prompt_takes_no_prefix_cache_hit() {
+        let cfg = SchedulerConfig {
+            scores_prompts: true,
+            ..test_scheduler_config()
+        };
+        let kv = Box::new(SimpleBlockTracker::with_caching(100, kbt(16)));
+        let mut sched = Scheduler::new(&cfg, 8192, kv);
+        let prompt: Vec<u32> = (100..164).collect();
+        sched.add_request(request_over("first", prompt.clone(), None));
+        prefill_and_finish(&mut sched, "first");
+        sched.add_request(request_over("plain", prompt.clone(), None));
+        let out = run_step(&mut sched);
+        assert!(
+            out.num_scheduled_tokens["plain"] < 64,
+            "a plain request takes the cached prefix: {out:?}"
+        );
+        sched.finish_requests(&["plain"], RequestStatus::FinishedStopped);
+        sched.add_request(request_over("scored", prompt, Some(1)));
+        let out = run_step(&mut sched);
+        assert_eq!(out.num_scheduled_tokens.get("scored"), Some(&64), "{out:?}");
     }
 
     #[test]

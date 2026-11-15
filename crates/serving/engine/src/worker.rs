@@ -248,6 +248,14 @@ pub trait Worker: Send {
         true
     }
 
+    /// Whether this worker scores a prompt's rows for `prompt_logprobs`: it fills
+    /// `ModelRunnerOutput::prompt_logprobs_dict` for a request that asks, which takes the lm_head
+    /// over every prompt row, not only the rows a step samples. `false` (the default): a request
+    /// asking for prompt logprobs is refused rather than answered with none (#874).
+    fn scores_prompts(&self) -> bool {
+        false
+    }
+
     /// Check whether the worker is healthy.
     fn check_health(&self) -> ExecutorResult<()> {
         Ok(())

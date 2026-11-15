@@ -279,6 +279,7 @@ mod green_gate {
             device_inputs: &[],
             deferred: None,
             reads: scratchy_target_metal::ForwardReads::Outputs,
+            backbone_rows: None,
         };
 
         // ── RUN the metal vision tower (forward_m_256 workload bucket) ──

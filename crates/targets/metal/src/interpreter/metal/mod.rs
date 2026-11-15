@@ -47,8 +47,8 @@ pub use forward::{
     GpuSpan, InFlight, build_mrope_cos_sin_override, last_gpu_span,
 };
 pub use pool::{
-    FoldBand, MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError,
-    PooledWorker, RuntimeFactory, TqGroup, WorkerGuard, host_guest, pick_rung,
+    FoldBand, MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PROMPT_SCORING_ROWS, PickedRung,
+    PoolBuildError, PooledWorker, RuntimeFactory, TqGroup, WorkerGuard, host_guest, pick_rung,
 };
 pub use runtime::{DraftRuntimeBuffers, RuntimeBindings};
 pub use worker::{

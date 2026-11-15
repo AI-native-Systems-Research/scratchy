@@ -2692,7 +2692,10 @@ impl Assembled {
         let rows: Vec<StepRow> = self.rows.iter().chain(&self.lm_rows).cloned().collect();
         let sigs: Vec<HazardSig> = self.sigs.iter().chain(&self.lm_sigs).cloned().collect();
         let mut live = play_live(&rows, &sigs);
-        let lm = live.split_off(self.rows.len());
+        // The lm_head play runs the lm_head half, every row of it, and nothing of the backbone.
+        let lm = (live.split_off(self.rows.len()).into_iter())
+            .map(|l| PlayLive { lm_head: true, ..l })
+            .collect();
         (live, lm)
     }
 
@@ -2816,6 +2819,7 @@ pub fn play_live(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<PlayLive> {
             cache_writes,
             result,
             rebuild,
+            lm_head: false,
         })
         .collect()
 }
