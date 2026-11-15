@@ -181,6 +181,13 @@ impl StateSnapshots {
         self.on_disk(key) && !self.by_key.contains_key(&key)
     }
 
+    /// Whether `key`'s snapshot is being read back from disk: in a slot, not ready, and on disk —
+    /// which no save is, since a prefix on disk is not saved again.
+    pub(crate) fn filling(&self, key: u64) -> bool {
+        let pending = |&slot: &usize| self.slots[slot].as_ref().is_some_and(|c| !c.ready);
+        self.on_disk(key) && self.by_key.get(&key).is_some_and(pending)
+    }
+
     /// Whether any snapshot for `key` exists, ready or not, in a slot or on disk — one prefix is
     /// snapshotted once.
     pub(crate) fn contains(&self, key: u64) -> bool {
@@ -197,10 +204,11 @@ impl StateSnapshots {
         self.disk.by_key.len()
     }
 
-    /// ⭐ READ `key`'s SNAPSHOT BACK FROM THE DISK TIER INTO `slot`, for `reader` to restore this
-    /// step, evicting what the slot held. `reader`'s restore reads it in this step, after the
-    /// worker's fill. Every other request waits for the step to come back
-    /// ([`Self::commit`]), as for a save. A fill that fails is forgotten ([`Self::forget_fill`]).
+    /// ⭐ READ `key`'s SNAPSHOT BACK FROM THE DISK TIER INTO `slot`, for `reader`, evicting what the
+    /// slot held. Like a save, it is a hit once its step comes back ([`Self::commit`]) — for
+    /// `reader` too, which waits for it ([`Self::filling`]). A fill that fails is forgotten
+    /// ([`Self::forget_fill`]), and `reader` resumes as it would have with no disk tier. No
+    /// request ever runs on a fill that failed.
     pub(crate) fn fill(&mut self, slot: usize, key: u64, reader: &str) {
         let step = self.step;
         let Some(&d) = self.disk.by_key.get(&key) else {
@@ -219,7 +227,7 @@ impl StateSnapshots {
             writer: Some(reader.to_owned()),
             last_used: step,
             pinned: step,
-            reader: Some(reader.to_owned()),
+            reader: None,
         });
         self.by_key.insert(key, slot);
         self.disk.ops.fills.push(SnapshotFill {

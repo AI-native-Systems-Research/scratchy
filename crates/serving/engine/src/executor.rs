@@ -172,9 +172,9 @@ pub struct ModelRunnerOutput {
     /// spend the prefix cache's free blocks before a block that would map more.
     pub kv_backed: Option<scratchy_core_common::KvBackedBlocks>,
     /// ⛔ THE SNAPSHOT SLOTS THE WORKER COULD NOT READ BACK FROM DISK this step (`SnapshotDiskOps`
-    /// fills). The step ran its other requests. The request that restores from such a slot ran on no
-    /// state, and the engine aborts it. The scheduler forgets the snapshot, so the next hit on its
-    /// prefix resumes cold ([`Scheduler::forget_failed_fills`]).
+    /// fills). No request ran on one: the request a fill is for waits for its step. The scheduler
+    /// forgets each, so that request, and the next hit on its prefix, resume cold
+    /// ([`Scheduler::forget_failed_fills`]).
     ///
     /// [`Scheduler::forget_failed_fills`]: scratchy_serving_scheduler::scheduler::Scheduler::forget_failed_fills
     pub failed_fills: Vec<usize>,
