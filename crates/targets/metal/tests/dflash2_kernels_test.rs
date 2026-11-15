@@ -1266,8 +1266,10 @@ fn draft_confidence_ignores_draws() {
         s.run(&gpu, vocab, 1);
         (read::<u32>(&s.tokens, P), read::<f32>(&s.confidence, P))
     };
+    // Seeds spread by a multiplicative hash, wrapping as a hash does (a plain `*` overflows past
+    // seed 2 and panics in a debug build; release wrapped it to these same seeds).
     let runs: Vec<_> = (0..12u64)
-        .map(|seed| run(seed * 0x5851_f42d_4c95_7f2d))
+        .map(|seed| run(seed.wrapping_mul(0x5851_f42d_4c95_7f2d)))
         .collect();
     assert_eq!(
         run(0),
