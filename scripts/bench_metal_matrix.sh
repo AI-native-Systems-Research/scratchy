@@ -329,10 +329,11 @@ ACCURACY_QUICK=100
 ACCURACY_TIMEOUT_S=0
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
-# 48: the summary map splits a cell's requests into four prompt-length buckets (site
-# buckets.rs, 500 tokens apart), and at 8 a bucket held one or two requests or none; at 48, 99%
-# of buckets hold 3 or more and 93% 5 or more (a simulation over MuSiQue's dev set). The random
-# grid's cells send SCALE_NUM_PROMPTS (50) for the same reason.
+# 48: the summary map splits a cell's requests into four prompt-length buckets at about
+# MuSiQue's quartiles (site buckets.rs), and a square's median is over one bucket's requests. At
+# 8, 33% of buckets held 3 or more and 3% 5 or more, so a square swung on one request; at 48,
+# 99.9% hold 3 or more and 99% 5 or more (each small model's prompt lengths over MuSiQue's dev
+# set). The random grid's cells send SCALE_NUM_PROMPTS (50) for the same reason.
 TASK_MIN_PROMPTS=48
 # The least a timed task cell may take a request before its limit: the slowest published, the
 # M5 Max's nemotron-3-super-120b-a12b on oMLX at 2 users, took about 20 s a request.
