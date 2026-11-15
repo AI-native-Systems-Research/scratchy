@@ -7525,14 +7525,17 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             let w = u32_(w.get());
             quote! { #m::AttnWindow::new(#w) }
         }));
-        let pairing = match a.pairing() {
-            RopePairing::Standard => quote! { #m::RopePairing::Standard },
-            RopePairing::Proportional => quote! { #m::RopePairing::Proportional },
-        };
-        let kv_rope = match a.kv_rope() {
-            KvRope::AtWrite => quote! { #m::KvRope::AtWrite },
-            KvRope::OnRead => quote! { #m::KvRope::OnRead },
-        };
+        let rope = opt(a.rope().map(|r| {
+            let pairing = match r.pairing() {
+                RopePairing::Standard => quote! { #m::RopePairing::Standard },
+                RopePairing::Proportional => quote! { #m::RopePairing::Proportional },
+            };
+            let kv_rope = match r.kv_rope() {
+                KvRope::AtWrite => quote! { #m::KvRope::AtWrite },
+                KvRope::OnRead => quote! { #m::KvRope::OnRead },
+            };
+            quote! { (#pairing, #kv_rope) }
+        }));
         let mrope = match a.mrope() {
             Some(s) => {
                 let s = s.get().map(n);
@@ -7545,8 +7548,7 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
                 #m::AttnScale::new(#scale),
                 #softcap,
                 #window,
-                #pairing,
-                #kv_rope,
+                #rope,
             )
         }
     }));
@@ -8140,17 +8142,18 @@ pub(crate) fn fill_canonical_params(
                 (u32::try_from(sliding_window).ok())
                     .and_then(positive)
                     .map(mf::AttnWindow::new),
-                mf::Rope::new(
-                    match rope_proportional {
-                        true => mf::RopePairing::Proportional,
-                        false => mf::RopePairing::Standard,
-                    },
-                    match uses_rotary {
-                        true => mf::KvRope::OnRead,
-                        false => mf::KvRope::AtWrite,
-                    },
-                    model.mrope_section.map(mf::MropeSection::new),
-                ),
+                // A roped model's keys rotate on read (every one: rope-on-read is its KV); a model
+                // without rope states none.
+                uses_rotary.then(|| {
+                    mf::Rope::new(
+                        match rope_proportional {
+                            true => mf::RopePairing::Proportional,
+                            false => mf::RopePairing::Standard,
+                        },
+                        mf::KvRope::OnRead,
+                        model.mrope_section.map(mf::MropeSection::new),
+                    )
+                }),
             )
         });
         let vision = positive(vision_num_heads).map(|heads| {

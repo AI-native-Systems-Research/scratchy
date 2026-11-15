@@ -426,19 +426,20 @@ pub enum RopePairing {
     Proportional,
 }
 
-/// Where the keys are rotated. A model's own facts state [`Self::OnRead`] exactly when its forward
-/// ropes: rope-on-read is every rope model's KV, not an opt-in (`CanonicalParams::ROPE_ON_READ`).
+/// Where a roped attention's keys are rotated. A model without rope has no [`Rope`] at all
+/// ([`Attention::rope`]), so this is never asked of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KvRope {
-    /// At the KV write. What a model with no rope states: its keys are never rotated, so nothing
-    /// is rotated on read.
+    /// At the KV write: `rope_append` stores each key rotated to its own position.
     AtWrite,
-    /// On each read of the cache: every model whose forward ropes.
+    /// On each read of the cache: span (`Relocatable`) blocks store their keys unrotated, and the
+    /// attention re-ropes them to each reader's position. What every roped model's own facts
+    /// state — rope-on-read is a roped model's KV, not an opt-in (`CanonicalParams::ROPE_ON_READ`).
     OnRead,
 }
 
-/// How an attention's keys and queries are rotated: the global class's lane pairing, where the
-/// keys are rotated, and an MRoPE section when the rows' positions are three-dimensional.
+/// How a roped attention's keys and queries are rotated: the global class's lane pairing, where
+/// the keys are rotated, and an MRoPE section when the rows' positions are three-dimensional.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rope {
     pairing: RopePairing,
@@ -455,6 +456,18 @@ impl Rope {
             mrope,
         }
     }
+    /// The global class's lane pairing.
+    pub const fn pairing(self) -> RopePairing {
+        self.pairing
+    }
+    /// Where the keys are rotated.
+    pub const fn kv_rope(self) -> KvRope {
+        self.kv_rope
+    }
+    /// The MRoPE section; `None` on a 1-D rope.
+    pub const fn mrope(self) -> Option<MropeSection> {
+        self.mrope
+    }
 }
 
 /// A decoder's attention: its base class (every layer's, or the sliding layers' on a hybrid) and
@@ -466,7 +479,7 @@ pub struct Attention {
     scale: AttnScale,
     softcap: Option<SoftCap>,
     window: Option<AttnWindow>,
-    rope: Rope,
+    rope: Option<Rope>,
 }
 
 impl Attention {
@@ -485,7 +498,7 @@ impl Attention {
     ///     Class<U2, U256, U64, U16>,
     ///     Class<U2, U256, U64, U16>,
     ///     Mrope<U11, U11, U10>,
-    /// >(AttnScale::new(0.0625), None, None, RopePairing::Standard, KvRope::AtWrite);
+    /// >(AttnScale::new(0.0625), None, None, Some((RopePairing::Standard, KvRope::AtWrite)));
     /// assert_eq!(A.mrope().map(MropeSection::pairs), Some(32));
     /// ```
     ///
@@ -500,7 +513,7 @@ impl Attention {
     ///     Class<U8, U256, U256, U16>,
     ///     Class<U2, U512, U512, U32>,
     ///     NoMrope,
-    /// >(AttnScale::new(1.0), None, None, RopePairing::Proportional, KvRope::AtWrite);
+    /// >(AttnScale::new(1.0), None, None, Some((RopePairing::Proportional, KvRope::AtWrite)));
     /// assert_eq!(A.global().page().get(), 32);
     /// ```
     ///
@@ -514,7 +527,7 @@ impl Attention {
     ///     Class<U2, U256, U64, U16>,
     ///     Class<U2, U256, U64, U16>,
     ///     Mrope<U16, U24, U24>,
-    /// >(AttnScale::new(0.0625), None, None, RopePairing::Standard, KvRope::AtWrite);
+    /// >(AttnScale::new(0.0625), None, None, Some((RopePairing::Standard, KvRope::AtWrite)));
     /// ```
     ///
     /// and a global page that holds other than the sliding page's elements shares no pool with it
@@ -528,7 +541,7 @@ impl Attention {
     ///     Class<U8, U256, U256, U16>,
     ///     Class<U2, U512, U512, U16>,
     ///     NoMrope,
-    /// >(AttnScale::new(1.0), None, None, RopePairing::Proportional, KvRope::AtWrite);
+    /// >(AttnScale::new(1.0), None, None, Some((RopePairing::Proportional, KvRope::AtWrite)));
     /// ```
     pub const fn of<
         Q: Dim,
@@ -539,8 +552,7 @@ impl Attention {
         scale: AttnScale,
         softcap: Option<SoftCap>,
         window: Option<AttnWindow>,
-        pairing: RopePairing,
-        kv_rope: KvRope,
+        rope: Option<(RopePairing, KvRope)>,
     ) -> Self {
         Self::new(
             B::GEOMETRY,
@@ -548,7 +560,14 @@ impl Attention {
             scale,
             softcap,
             window,
-            Rope::new(pairing, kv_rope, <M as MropeOf<B::Rot>>::SECTION),
+            match rope {
+                Some((pairing, kv_rope)) => Some(Rope::new(
+                    pairing,
+                    kv_rope,
+                    <M as MropeOf<B::Rot>>::SECTION,
+                )),
+                None => None,
+            },
         )
     }
 
@@ -561,7 +580,7 @@ impl Attention {
         scale: AttnScale,
         softcap: Option<SoftCap>,
         window: Option<AttnWindow>,
-        rope: Rope,
+        rope: Option<Rope>,
     ) -> Self {
         assert!(
             base.q_heads.get() == global.q_heads.get(),
@@ -622,17 +641,16 @@ impl Attention {
     pub const fn window(self) -> Option<AttnWindow> {
         self.window
     }
-    /// The global class's rope pairing.
-    pub const fn pairing(self) -> RopePairing {
-        self.rope.pairing
+    /// How its keys and queries are rotated; `None` on a model without rope.
+    pub const fn rope(self) -> Option<Rope> {
+        self.rope
     }
-    /// Where the keys are rotated.
-    pub const fn kv_rope(self) -> KvRope {
-        self.rope.kv_rope
-    }
-    /// The MRoPE section; `None` on a 1-D rope.
+    /// The MRoPE section; `None` on a 1-D rope or none.
     pub const fn mrope(self) -> Option<MropeSection> {
-        self.rope.mrope
+        match self.rope {
+            Some(rope) => rope.mrope,
+            None => None,
+        }
     }
 }
 
@@ -1118,7 +1136,7 @@ pub mod raw {
     pub const fn mrope_section(f: ModelFacts) -> Option<[u32; 3]> {
         match f.0.attention {
             Some(Attention {
-                rope: Rope { mrope: Some(s), .. },
+                rope: Some(Rope { mrope: Some(s), .. }),
                 ..
             }) => Some(s.get()),
             _ => None,
@@ -1344,10 +1362,10 @@ pub mod raw {
         matches!(
             f.0.attention,
             Some(Attention {
-                rope: Rope {
+                rope: Some(Rope {
                     pairing: RopePairing::Proportional,
                     ..
-                },
+                }),
                 ..
             })
         )
@@ -1357,10 +1375,10 @@ pub mod raw {
         matches!(
             f.0.attention,
             Some(Attention {
-                rope: Rope {
+                rope: Some(Rope {
                     kv_rope: KvRope::OnRead,
                     ..
-                },
+                }),
                 ..
             })
         )
@@ -1457,7 +1475,7 @@ mod tests {
             AttnScale::new(1.0),
             None,
             None,
-            Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+            None,
         );
     }
 

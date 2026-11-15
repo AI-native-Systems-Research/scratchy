@@ -1146,12 +1146,14 @@ pub trait CanonicalParams: WeightAccessors {
     /// Non-span requests carry an all-zero flag buffer → the per-block
     /// rotation branch is never taken (parity).
     ///
-    /// It is rope PRESENCE, not an opt-in: true for every model whose
-    /// forward ropes ([`model_facts::KvRope::OnRead`], which the macro
-    /// states from the FUF's rotary inputs), false only for a model with
-    /// no rope to rotate (whose lowering omits the rope-on-read constants
-    /// and buffers). The flag test's cost on a non-span decode is guarded
-    /// by the metal target's `rope_on_read_bench_test`.
+    /// Not an opt-in: a roped model's own facts state its keys rotated on
+    /// read ([`model_facts::KvRope::OnRead`] in a present
+    /// [`model_facts::Attention::rope`], which the macro states from the
+    /// FUF's rotary inputs), so this is true for every model whose forward
+    /// ropes. A model without rope states no rope at all, and this is false
+    /// (its lowering omits the rope-on-read constants and buffers). The flag
+    /// test's cost on a non-span decode is guarded by the metal target's
+    /// `rope_on_read_bench_test`.
     const ROPE_ON_READ: bool = model_facts::raw::rope_on_read(Self::FACTS);
 
     /// Element dtype this canonical runs its activations in.
