@@ -1554,6 +1554,7 @@ mod tests {
                 kv_extent: HashMap::new(),
                 kv_pool_reach: None,
                 kv_backed: None,
+                failed_fills: Vec::new(),
                 d2h_resolver: None,
             })
         }

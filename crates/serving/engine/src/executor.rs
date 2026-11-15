@@ -171,6 +171,13 @@ pub struct ModelRunnerOutput {
     /// a worker that declared [`scratchy_core_common::KvBacking::OnFirstUse`], for the allocator to
     /// spend the prefix cache's free blocks before a block that would map more.
     pub kv_backed: Option<scratchy_core_common::KvBackedBlocks>,
+    /// ⛔ THE SNAPSHOT SLOTS THE WORKER COULD NOT READ BACK FROM DISK this step (`SnapshotDiskOps`
+    /// fills). The step ran its other requests. The request that restores from such a slot ran on no
+    /// state, and the engine aborts it. The scheduler forgets the snapshot, so the next hit on its
+    /// prefix resumes cold ([`Scheduler::forget_failed_fills`]).
+    ///
+    /// [`Scheduler::forget_failed_fills`]: scratchy_serving_scheduler::scheduler::Scheduler::forget_failed_fills
+    pub failed_fills: Vec<usize>,
 
     /// Deferred D2H resolver. When present, `sampled_token_ids` contains
     /// placeholders. Call `resolve()` to synchronize the D2H transfer and
@@ -223,6 +230,7 @@ impl ModelRunnerOutput {
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
             d2h_resolver: None,
         }
     }
@@ -295,6 +303,7 @@ impl ModelRunnerOutput {
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
             d2h_resolver: None,
         }
     }
@@ -324,6 +333,7 @@ impl ModelRunnerOutput {
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
             d2h_resolver: None,
         }
     }
@@ -351,6 +361,7 @@ impl ModelRunnerOutput {
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
             d2h_resolver: Some(D2hResolve::Tokens(resolver)),
         }
     }
@@ -599,6 +610,7 @@ impl Executor for NoopExecutor {
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
             d2h_resolver: None,
         })
     }
