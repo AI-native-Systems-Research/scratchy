@@ -290,52 +290,32 @@ async fn test_chat_logprobs() {
     }
 }
 
+/// `prompt_logprobs` is refused with a 400 that names it: the metal backend scores only the rows a
+/// step samples, so it computes no prompt logprobs, and answering with `null` would read as an
+/// answer to a client scoring prompts by likelihood (#874). (This test asserted the logprobs came
+/// back; no backend in the tree computed them, so it could never pass.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_prompt_logprobs() {
     let (_server, client) = start_smollm().await;
 
-    let request = ChatCompletionRequest {
-        messages: vec![user_msg("The capital of France is")],
-        prompt_logprobs: Some(3),
-        max_tokens: Some(5),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-
-    let resp = client.chat_completion(&request).await.unwrap();
-    assert_valid_chat_response(&resp);
-
-    // prompt_logprobs should be present on the choice.
-    let plps = resp.choices[0]
-        .prompt_logprobs
-        .as_ref()
-        .expect("prompt_logprobs should be present");
-
-    // Should have one entry per prompt token. First is None (no prior context).
-    assert!(
-        plps.len() > 1,
-        "prompt_logprobs should have multiple entries"
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "The capital of France is"}],
+        "prompt_logprobs": 3,
+        "max_tokens": 5,
+        "temperature": 0.0,
+    });
+    let resp = client.chat_completion_raw(&body).await.unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(
+        status, 400,
+        "prompt_logprobs should be refused, got {status}: {text}"
     );
     assert!(
-        plps[0].is_none(),
-        "first prompt logprob should be None (no prior context)"
+        text.contains("prompt_logprobs"),
+        "the refusal should name prompt_logprobs: {text}"
     );
-    // Remaining entries should be Some with valid logprobs.
-    for (i, entry) in plps.iter().enumerate().skip(1) {
-        let lp = entry
-            .as_ref()
-            .unwrap_or_else(|| panic!("prompt_logprobs[{i}] should be Some"));
-        assert!(
-            lp.logprob <= 0.0,
-            "logprob should be non-positive, got {}",
-            lp.logprob
-        );
-        assert!(
-            lp.top_logprobs.len() <= 3,
-            "top_logprobs should have at most 3 entries"
-        );
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

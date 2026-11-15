@@ -407,6 +407,10 @@ pub struct AsyncEngine {
     >,
     model_name: String,
     max_model_len: usize,
+    /// Whether the linked backend computes prompt logprobs
+    /// ([`WorkerFactory::computes_prompt_logprobs`](scratchy_serving_engine::worker_factory::WorkerFactory::computes_prompt_logprobs));
+    /// a request asking for them is refused when it does not ([`Self::check_prompt_logprobs`]).
+    computes_prompt_logprobs: bool,
     /// Notified after every engine step so request handlers can check results.
     notify: Arc<Notify>,
     /// Optional tokenizer for encoding prompts and decoding outputs.
@@ -469,6 +473,8 @@ impl AsyncEngine {
             pending_loop: std::sync::Mutex::new(Some((client, rx, embed_rx, control_rx))),
             model_name,
             max_model_len,
+            computes_prompt_logprobs: scratchy_serving_engine::worker_factory::linked_factory()
+                .is_ok_and(|f| f.computes_prompt_logprobs()),
             notify: Arc::new(Notify::new()),
             tokenizer: None,
             chat_template: None,
@@ -3611,11 +3617,29 @@ impl AsyncEngine {
         }
     }
 
+    /// ⛔ `prompt_logprobs` IS REFUSED, NOT ANSWERED WITH NONE, on a backend that computes no
+    /// prompt logprobs: they take the lm_head over every prompt row, and a backend whose steps
+    /// score only the rows they sample would return `null`, which a client scoring prompts by
+    /// likelihood (an eval harness's multiple-choice tasks) reads as an answer (#874). The logprobs
+    /// of generated tokens (`logprobs`, `top_logprobs`) are a separate request field.
+    fn check_prompt_logprobs(&self, asked: Option<u32>) -> ServeResult<()> {
+        match asked {
+            Some(_) if !self.computes_prompt_logprobs => Err(ServeError::Validation(
+                "prompt_logprobs is not supported by this backend: it scores only the rows it \
+                 samples, not every prompt token (the logprobs of generated tokens are, through \
+                 logprobs / top_logprobs)"
+                    .into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Build SamplingParams from a chat completion request.
     fn build_sampling_params_from_chat(
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        self.check_prompt_logprobs(request.prompt_logprobs)?;
         let tools: Vec<&str> = (request.tools.iter().flatten())
             .map(|t| t.function.name.as_str())
             .collect();
@@ -3757,6 +3781,7 @@ impl AsyncEngine {
         &self,
         request: &protocol::CompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        self.check_prompt_logprobs(request.prompt_logprobs)?;
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -4711,6 +4736,43 @@ mod tests {
         let engine = make_test_engine_with_tokenizer();
         assert_eq!(engine.model_name(), "test-model");
         assert!(engine.has_tokenizer());
+    }
+
+    /// A backend that computes no prompt logprobs refuses a request for them with a 400 on both
+    /// endpoints, rather than answering it with `null` (#874); the same request without them, and
+    /// one asking only for the generated tokens' logprobs, builds its params.
+    #[test]
+    fn prompt_logprobs_are_refused_where_the_backend_computes_none() {
+        let engine = make_test_engine();
+        assert!(!engine.computes_prompt_logprobs);
+        let completion = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"prompt": "Hello"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            engine.build_sampling_params_from_completion(&serde_json::from_value(body).unwrap())
+        };
+        let chat = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"messages": [{"role": "user", "content": "Hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            engine.build_sampling_params_from_chat(&serde_json::from_value(body).unwrap())
+        };
+        for refused in [
+            completion(serde_json::json!({"prompt_logprobs": 1})),
+            chat(serde_json::json!({"prompt_logprobs": 0})),
+        ] {
+            match refused {
+                Err(ServeError::Validation(msg)) => {
+                    assert!(msg.contains("prompt_logprobs"), "{msg}")
+                }
+                other => panic!("expected a 400 naming prompt_logprobs, got {other:?}"),
+            }
+        }
+        assert!(completion(serde_json::json!({})).is_ok());
+        assert!(completion(serde_json::json!({"logprobs": 2})).is_ok());
+        assert!(chat(serde_json::json!({"logprobs": true, "top_logprobs": 2})).is_ok());
     }
 
     #[test]
