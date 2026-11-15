@@ -275,11 +275,11 @@ pub fn attention_at(hq: u32, hkv: u32, hd: u32, scale: f32) -> Attention {
         scratchy_ir::model_facts::AttnScale::new(scale),
         None,
         None,
-        scratchy_ir::model_facts::Rope::new(
+        Some(scratchy_ir::model_facts::Rope::new(
             scratchy_ir::model_facts::RopePairing::Standard,
             scratchy_ir::model_facts::KvRope::AtWrite,
             None,
-        ),
+        )),
     )
 }
 
@@ -291,7 +291,7 @@ pub fn one_layer_attention(h: u32, kv: u32, hd: u32) -> Attention {
         AttnScale::new(1.0 / (hd as f32).sqrt()),
         None,
         None,
-        Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+        Some(Rope::new(RopePairing::Standard, KvRope::AtWrite, None)),
     )
 }
 
@@ -306,7 +306,7 @@ pub fn hybrid_attention(base_hd: u32, global_hd: u32) -> Attention {
         AttnScale::new(1.0 / (base_hd as f32).sqrt()),
         None,
         None,
-        Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+        Some(Rope::new(RopePairing::Standard, KvRope::AtWrite, None)),
     )
 }
 

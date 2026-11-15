@@ -1136,19 +1136,24 @@ pub trait CanonicalParams: WeightAccessors {
     /// this. False everywhere else.
     const ROPE_PROPORTIONAL: bool = model_facts::raw::rope_proportional(Self::FACTS);
 
-    /// Spans / position-independent KV caching capability. When true,
-    /// `BlockKind::Relocatable` (span) blocks are stored with K
-    /// UNROTATED by `rope_append`, and the paged attention kernels
-    /// re-rope cached K to each reader's position on read — letting one
-    /// cached span be reused at any position (zero-copy block sharing).
-    /// A compile-time CAPABILITY: when set, the target's lowering binds the
+    /// Spans / position-independent KV caching: `BlockKind::Relocatable`
+    /// (span) blocks are stored with K UNROTATED by `rope_append`, and the
+    /// paged attention kernels re-rope cached K to each reader's position
+    /// on read — letting one cached span be reused at any position
+    /// (zero-copy block sharing). The target's lowering binds the
     /// per-block unrotated-flag buffer + cos_sin into the attention /
     /// rope_append kernels and emits the rope-on-read function constants.
     /// Non-span requests carry an all-zero flag buffer → the per-block
-    /// rotation branch is never taken (parity). When false (default),
-    /// the lowering is byte-identical to the no-spans path (the rope-on-
-    /// read constants/buffers are omitted and dead-eliminate in-shader).
-    /// Set true only for models/deployments that opt into spans.
+    /// rotation branch is never taken (parity).
+    ///
+    /// Not an opt-in: a roped model's own facts state its keys rotated on
+    /// read ([`model_facts::KvRope::OnRead`] in a present
+    /// [`model_facts::Attention::rope`], which the macro states from the
+    /// FUF's rotary inputs), so this is true for every model whose forward
+    /// ropes. A model without rope states no rope at all, and this is false
+    /// (its lowering omits the rope-on-read constants and buffers). The flag
+    /// test's cost on a non-span decode is guarded by the metal target's
+    /// `rope_on_read_bench_test`.
     const ROPE_ON_READ: bool = model_facts::raw::rope_on_read(Self::FACTS);
 
     /// Element dtype this canonical runs its activations in.

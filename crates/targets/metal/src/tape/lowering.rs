@@ -2500,15 +2500,19 @@ fn rope_on_read_params(
     Option<u32>,
     Option<bool>,
 ) {
-    // A model whose keys are rotated at write (or that has no attention) re-ropes nothing.
-    let a = match p.attention() {
-        Some(a) if a.kv_rope() == scratchy_ir::model_facts::KvRope::OnRead => a,
-        _ => return (None, None, None, None),
+    // A model whose keys are rotated at write (or that has no rope, or no attention) re-ropes
+    // nothing.
+    let (a, rope) = match p.attention() {
+        Some(a) => match a.rope() {
+            Some(rope) if rope.kv_rope() == scratchy_ir::model_facts::KvRope::OnRead => (a, rope),
+            _ => return (None, None, None, None),
+        },
+        None => return (None, None, None, None),
     };
     let class = if is_global { a.global() } else { a.base() };
     let (rd, hd) = (class.rot_dim().get(), class.head_dim().get());
     let pair_off =
-        if is_global && a.pairing() == scratchy_ir::model_facts::RopePairing::Proportional {
+        if is_global && rope.pairing() == scratchy_ir::model_facts::RopePairing::Proportional {
             hd / 2
         } else {
             rd / 2
@@ -9897,7 +9901,7 @@ mod tests {
             AttnScale::new(0.125),
             None,
             window.map(AttnWindow::new),
-            Rope::new(RopePairing::Standard, kv_rope, None),
+            Some(Rope::new(RopePairing::Standard, kv_rope, None)),
         )
     }
 
@@ -13459,7 +13463,9 @@ mod tests {
                 (reropes, pass)
             })
             .collect();
-        let ror = a(&tp()).kv_rope() == KvRope::OnRead;
+        let ror = a(&tp())
+            .rope()
+            .is_some_and(|r| r.kv_rope() == KvRope::OnRead);
         assert_eq!(
             staged,
             [
@@ -14003,7 +14009,7 @@ mod tests {
             k: KvOffset::LinearBias(BiasStorage::Dense),
             v: KvOffset::Centered,
         };
-        assert_eq!(a(&tp()).kv_rope(), KvRope::AtWrite);
+        assert_eq!(a(&tp()).rope().map(|r| r.kv_rope()), Some(KvRope::AtWrite));
         assert!(matches!(
             try_lower_tq(
                 &tq_consts(),

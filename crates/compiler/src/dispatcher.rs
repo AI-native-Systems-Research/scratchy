@@ -85,7 +85,8 @@ pub trait ScratchyWeights: Send + Sync {
     /// this to decide whether it is SAFE to OR bit 31 into the block_table
     /// / slot_mapping it uploads (a non-rope-on-read arch's kernels read
     /// those raw, so bit 31 would corrupt the physical block id). Default
-    /// `false`; the macro emits `true` for arches with `ROPE_ON_READ`.
+    /// `false`; the macro emits `true` for every variant whose forward ropes
+    /// (`ROPE_ON_READ`, from the same rotary predicate) — not an opt-in.
     fn rope_on_read(&self) -> bool {
         false
     }

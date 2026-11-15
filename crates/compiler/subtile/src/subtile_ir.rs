@@ -6692,11 +6692,11 @@ mod tests {
                 scratchy_ir::model_facts::AttnScale::new(0.125),
                 None,
                 None,
-                scratchy_ir::model_facts::Rope::new(
+                Some(scratchy_ir::model_facts::Rope::new(
                     scratchy_ir::model_facts::RopePairing::Standard,
                     scratchy_ir::model_facts::KvRope::AtWrite,
                     None,
-                ),
+                )),
             )
         };
         let window = || AttnMask::SlidingWindow {
@@ -6744,11 +6744,11 @@ mod tests {
                 scratchy_ir::model_facts::AttnScale::new(0.125),
                 None,
                 None,
-                scratchy_ir::model_facts::Rope::new(
+                Some(scratchy_ir::model_facts::Rope::new(
                     scratchy_ir::model_facts::RopePairing::Standard,
                     scratchy_ir::model_facts::KvRope::AtWrite,
                     None,
-                ),
+                )),
             )
         };
         // base: 4 q-heads / 1 kv-head / hd 128 ⇒ q width 512, kv width 128.

@@ -80,9 +80,9 @@ pub(crate) fn q_heads(p: &ModelFacts) -> Result<u32, LoweringError> {
     attention(p).map(|a| a.q_heads().get())
 }
 
-/// Whether the attention re-ropes its keys on each read of the cache.
+/// Whether the attention re-ropes its keys on each read of the cache: false without rope.
 pub(crate) fn rope_on_read(p: &ModelFacts) -> Result<bool, LoweringError> {
-    attention(p).map(|a| a.kv_rope() == KvRope::OnRead)
+    attention(p).map(|a| a.rope().is_some_and(|r| r.kv_rope() == KvRope::OnRead))
 }
 
 /// The attention class a layer of `class` reads.
@@ -92,7 +92,10 @@ pub(crate) fn class(p: &ModelFacts, class: AttnClass) -> Result<HeadGeometry, Lo
 
 /// Whether the global class's rope pairs across the head's halves (Gemma 4's proportional rope).
 pub(crate) fn proportional(p: &ModelFacts) -> Result<bool, LoweringError> {
-    attention(p).map(|a| a.pairing() == scratchy_ir::model_facts::RopePairing::Proportional)
+    attention(p).map(|a| {
+        (a.rope())
+            .is_some_and(|r| r.pairing() == scratchy_ir::model_facts::RopePairing::Proportional)
+    })
 }
 
 /// The sliding window as the attention kernels' `ATTN_WINDOW` constant spells it: a signed `int`,
@@ -143,7 +146,7 @@ pub(crate) const fn llama_like(
             AttnScale::new(scale),
             None,
             None,
-            Rope::new(RopePairing::Standard, KvRope::AtWrite, None),
+            Some(Rope::new(RopePairing::Standard, KvRope::AtWrite, None)),
         )),
         vision: None,
         gdn: None,
