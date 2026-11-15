@@ -119,6 +119,14 @@ pub struct SchedulerConfig {
     /// `CachedRequestData` so non-last PP stages can embed the correct tokens.
     #[serde(default)]
     pub use_pp: bool,
+
+    /// The most prompt rows one step can score for `prompt_logprobs`, as the backend reports it
+    /// (`Worker::prompt_scoring_rows`): its logits hold that many rows a step. A request asking for
+    /// prompt logprobs runs its prompt in steps of its own, at most this many tokens each, with no
+    /// prefix-cache hit (a cached row has no logits this step). `None`: the backend scores no
+    /// prompt rows, and such a request is scheduled as any other.
+    #[serde(default)]
+    pub prompt_scoring_rows: Option<std::num::NonZeroUsize>,
 }
 
 fn one() -> usize {
@@ -217,6 +225,7 @@ impl Default for SchedulerConfig {
             stream_interval: 1,
             num_lookahead_tokens: 0,
             use_pp: false,
+            prompt_scoring_rows: None,
         }
     }
 }

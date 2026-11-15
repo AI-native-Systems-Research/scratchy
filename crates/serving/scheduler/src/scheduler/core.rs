@@ -2878,6 +2878,13 @@ pub struct Scheduler {
     /// `async_scheduling` is false, the scheduler populates `new_token_ids`
     /// in `CachedRequestData`.
     use_pp: bool,
+    /// The most prompt rows one step scores for `prompt_logprobs` (`SchedulerConfig::
+    /// prompt_scoring_rows`); `None` when the backend scores none.
+    prompt_scoring_rows: Option<std::num::NonZeroUsize>,
+    /// The last step's scoring request at the head of the queue found no KV for its chunk: this
+    /// step runs the running requests instead (they free blocks as they finish), and the next
+    /// tries it again — a scoring step that admits nothing would otherwise repeat forever.
+    scoring_stalled: bool,
 
     // -- Request state --
     /// All tracked requests: `req_id -> Request`.
@@ -2927,6 +2934,8 @@ impl Scheduler {
             num_lookahead_tokens: scheduler_config.num_lookahead_tokens,
             async_scheduling,
             use_pp,
+            prompt_scoring_rows: scheduler_config.prompt_scoring_rows,
+            scoring_stalled: false,
 
             requests: HashMap::new(),
             waiting: create_request_queue(policy),
@@ -3423,11 +3432,38 @@ impl SchedulerInterface for Scheduler {
 
         let step = self.kv_cache.new_step_starts();
 
+        // ⭐ A REQUEST SCORING ITS PROMPT RUNS ITS PROMPT IN STEPS OF ITS OWN. Its `prompt_logprobs`
+        // need every prompt row's logits, and a step's logits hold `prompt_scoring_rows` rows, so a
+        // scoring chunk takes the step whole, at most that many tokens. A running request still
+        // inside its prompt is this step's only request; else a waiting one at the head of the
+        // queue is admitted into an otherwise empty step. Every other request waits those steps
+        // out, as it waits out a step whose token budget ran short — nothing changes for a step
+        // with no scoring request in it.
+        let scoring_rows = self.prompt_scoring_rows;
+        let scoring_running = scoring_rows.and_then(|_| {
+            (self.running.iter()).position(|r| {
+                r.sampling_params.prompt_logprobs.is_some()
+                    && r.num_computed_tokens < r.num_prompt_tokens
+            })
+        });
+        let scoring_waiting = scoring_rows.is_some()
+            && !std::mem::take(&mut self.scoring_stalled)
+            && scoring_running.is_none()
+            && self.pause_state == PauseState::Unpaused
+            && self.running.len() < self.max_num_running_reqs
+            && (self.waiting.peek_request())
+                .is_some_and(|r| r.sampling_params.prompt_logprobs.is_some());
+
         // ---------------------------------------------------------------
         // Phase 1: Schedule RUNNING requests
         // ---------------------------------------------------------------
         let mut req_index = 0;
         while req_index < self.running.len() && token_budget > 0 {
+            // A scoring step runs its scoring request alone (above).
+            if scoring_waiting || scoring_running.is_some_and(|i| i != req_index) {
+                req_index += 1;
+                continue;
+            }
             let request = &self.running[req_index];
 
             // Async scheduling: skip requests that will certainly hit
@@ -3470,8 +3506,13 @@ impl SchedulerInterface for Scheduler {
                 num_new_tokens = self.long_prefill_token_threshold;
             }
 
-            // Respect token budget.
+            // Respect token budget, and a scoring chunk the rows a step's logits hold.
             num_new_tokens = num_new_tokens.min(token_budget);
+            if scoring_running == Some(req_index)
+                && let Some(rows) = scoring_rows
+            {
+                num_new_tokens = num_new_tokens.min(rows.get());
+            }
 
             // Ensure we don't exceed max model length.
             let max_remaining = self
@@ -3593,7 +3634,10 @@ impl SchedulerInterface for Scheduler {
         // ---------------------------------------------------------------
         // Phase 2: Schedule WAITING requests
         // ---------------------------------------------------------------
-        if preempted_reqs.is_empty() && self.pause_state == PauseState::Unpaused {
+        if preempted_reqs.is_empty()
+            && self.pause_state == PauseState::Unpaused
+            && scoring_running.is_none()
+        {
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.max_num_running_reqs {
                     break;
@@ -3616,11 +3660,24 @@ impl SchedulerInterface for Scheduler {
                 };
                 let request_id = request.request_id.clone();
 
+                // A request scoring its prompt takes a step of its own (`scoring_waiting`): into a
+                // step that already holds a request it goes back to the head of the queue, to be
+                // the next step's. It takes no prefix-cache hit — a cached row has no logits this
+                // step, and every prompt row's are what it asks for.
+                let scoring =
+                    scoring_rows.filter(|_| request.sampling_params.prompt_logprobs.is_some());
+                if scoring.is_some() && !num_scheduled_tokens.is_empty() {
+                    self.waiting.prepend_request(request);
+                    break;
+                }
+
                 // Get computed blocks from prefix cache. `cached_blocks[0]` is
                 // the per-logical-block hit list (usize::MAX for misses) —
                 // threaded into allocate_slots so span blocks are SHARED.
-                let (num_cached_tokens, cached_blocks) =
-                    self.kv_cache.get_computed_blocks(&request);
+                let (num_cached_tokens, cached_blocks) = match scoring {
+                    Some(_) => (0, vec![Vec::new()]),
+                    None => self.kv_cache.get_computed_blocks(&request),
+                };
                 // ⭐ RECURRENT STATE: THE KV HIT STANDS ONLY WHERE A SNAPSHOT OF THE STATE DOES.
                 // The plan resumes the request at the deepest snapshot within the hit (or at 0).
                 // The matched blocks past that point stay shared: the request runs their positions
@@ -3708,6 +3765,9 @@ impl SchedulerInterface for Scheduler {
                 }
 
                 num_new_tokens = num_new_tokens.min(token_budget);
+                if let Some(rows) = scoring {
+                    num_new_tokens = num_new_tokens.min(rows.get());
+                }
                 if num_new_tokens == 0 {
                     // Put the request back.
                     self.waiting.prepend_request(request);
@@ -3812,11 +3872,16 @@ impl SchedulerInterface for Scheduler {
                                 r.num_cached_tokens = num_computed_tokens as i32;
                             }
                         }
+                        // A scoring request's step is its own: nothing joins it.
+                        if scoring.is_some() {
+                            break;
+                        }
                     }
                     None => {
                         // Cannot allocate -- put request back and stop.
                         request.num_computed_tokens = orig_computed;
                         self.waiting.prepend_request(request);
+                        self.scoring_stalled = scoring.is_some();
                         break;
                     }
                 }
@@ -4023,6 +4088,22 @@ mod tests {
     // Helper: create a test request.
     fn make_request(id: &str, num_prompt_tokens: usize) -> Request {
         let prompt: Vec<u32> = (0..num_prompt_tokens as u32).collect();
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(100),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    // Helper: a test request over `prompt`.
+    fn make_request_with_prompt(id: &str, prompt: Vec<u32>) -> Request {
         Request::new(
             id.into(),
             prompt,
@@ -4755,6 +4836,101 @@ mod tests {
             tracker.free(&req.request_id);
         }
         assert_eq!(ids, (0..12).collect::<Vec<_>>());
+    }
+
+    // ----- Prompt scoring (`prompt_logprobs`) -----
+
+    fn scoring_config(rows: usize, batched: usize) -> SchedulerConfig {
+        SchedulerConfig {
+            max_num_batched_tokens: batched,
+            prompt_scoring_rows: std::num::NonZeroUsize::new(rows),
+            ..test_scheduler_config()
+        }
+    }
+
+    fn scoring_request(id: &str, prompt: Vec<u32>) -> Request {
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(100),
+                prompt_logprobs: Some(1),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    /// A request scoring its prompt runs each prompt chunk in a step of its own, no more tokens
+    /// than a step's logits hold, while a prefill already running beside it waits those steps out
+    /// and then goes on.
+    #[test]
+    fn a_scoring_prompt_runs_in_steps_of_its_own() {
+        let mut sched = Scheduler::with_simple_blocks(&scoring_config(16, 256), 8192, 100, kbt(16));
+        sched.add_request(make_request("plain", 600));
+        let out = run_step(&mut sched);
+        assert_eq!(out.num_scheduled_tokens.get("plain"), Some(&256));
+        sched.add_request(scoring_request("scored", (0..40).collect()));
+        for want in [16, 16, 8] {
+            let out = run_step(&mut sched);
+            assert_eq!(
+                out.num_scheduled_tokens,
+                HashMap::from([("scored".to_string(), want)]),
+                "the scoring chunk takes the step whole"
+            );
+        }
+        let out = run_step(&mut sched);
+        assert_eq!(out.num_scheduled_tokens.get("plain"), Some(&256), "{out:?}");
+        assert!(!out.num_scheduled_tokens.contains_key("scored"));
+    }
+
+    /// The same prompt a plain request takes from the prefix cache, a scoring request computes
+    /// from its first token: a cached row has no logits for it to score.
+    #[test]
+    fn a_scoring_prompt_takes_no_prefix_cache_hit() {
+        let kv = Box::new(SimpleBlockTracker::with_caching(100, kbt(16)));
+        let mut sched = Scheduler::new(&scoring_config(64, 256), 8192, kv);
+        let prompt: Vec<u32> = (100..164).collect();
+        sched.add_request(make_request_with_prompt("first", prompt.clone()));
+        prefill_and_finish(&mut sched, "first");
+        sched.add_request(make_request_with_prompt("plain", prompt.clone()));
+        let out = run_step(&mut sched);
+        assert!(
+            out.num_scheduled_tokens["plain"] < 64,
+            "a plain request takes the cached prefix: {out:?}"
+        );
+        sched.finish_requests(&["plain"], RequestStatus::FinishedStopped);
+        sched.add_request(scoring_request("scored", prompt));
+        let out = run_step(&mut sched);
+        assert_eq!(out.num_scheduled_tokens.get("scored"), Some(&64), "{out:?}");
+    }
+
+    /// A scoring request that finds no KV for its chunk does not freeze the running requests: the
+    /// step after the one it could not take runs them, and they make progress.
+    #[test]
+    fn a_scoring_request_without_kv_lets_the_running_requests_run() {
+        // 4 blocks of 16; the plain prefill takes 3, the scoring chunk of 32 needs 2.
+        let mut sched = Scheduler::with_simple_blocks(&scoring_config(32, 48), 8192, 4, kbt(16));
+        sched.add_request(make_request("plain", 64));
+        assert_eq!(
+            run_step(&mut sched).num_scheduled_tokens.get("plain"),
+            Some(&48)
+        );
+        sched.add_request(scoring_request("scored", (0..40).collect()));
+        let out = run_step(&mut sched);
+        assert!(
+            out.num_scheduled_tokens.is_empty(),
+            "no KV for the chunk: {out:?}"
+        );
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.num_scheduled_tokens,
+            HashMap::from([("plain".to_string(), 16)]),
+            "the running request goes on"
+        );
     }
 
     #[test]
