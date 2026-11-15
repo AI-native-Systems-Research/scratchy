@@ -46,7 +46,7 @@ impl SparseBuffer {
     /// A buffer of `bytes`, rounded up to whole tiles, that takes no memory until [`reach`] maps
     /// it. Private: the host never reads it.
     pub fn new(device: &ProtocolObject<dyn MTLDevice>, bytes: u64) -> Result<Arc<Self>, String> {
-        let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+        let tile = crate::sparse_kv::sparse_tile(device)?.get();
         let len = usize::try_from(bytes.max(1))
             .map_err(|_| format!("sparse buffer of {bytes} bytes"))?
             .next_multiple_of(tile);
@@ -102,7 +102,7 @@ pub fn reach(
     // length before it maps past it.
     static STEP: Mutex<()> = Mutex::new(());
     let _step = STEP.lock().expect("sparse step mutex");
-    let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+    let tile = crate::sparse_kv::sparse_tile(device)?.get();
     let mut grow: Vec<(&SparseBuffer, usize, usize)> = Vec::new();
     for &(buffer, bytes) in wants {
         // Clamped first: the length is whole tiles, so rounding up stays within it.
@@ -153,7 +153,9 @@ mod tests {
         };
         let residency = MetalResidencySet::new(&device);
         let mapper = KvMapper::new(&device).expect("mapper");
-        let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+        let tile = crate::sparse_kv::sparse_tile(&device)
+            .expect("a sparse tile")
+            .get();
         let a = SparseBuffer::new(&device, 4 * tile as u64).expect("a");
         let b = SparseBuffer::new(&device, 2 * tile as u64 + 1).expect("b");
         let _pins = [a.buffer().clone(), b.buffer().clone()].map(|x| residency.pin(x));

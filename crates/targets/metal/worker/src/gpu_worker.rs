@@ -2944,11 +2944,17 @@ impl MetalWorker {
 
     /// A snapshot slot's bytes across every GDN state buffer, and the slots a unit of them takes:
     /// the least run every buffer maps on whole tiles (`whole_tile_blocks`). `None` without
-    /// recurrent state, prefix caching or a device.
-    fn snapshot_slot(&self) -> Option<(usize, std::num::NonZeroUsize)> {
-        let cfg = (self.model.as_ref()?.gdn_runtime_config())
-            .filter(|_| self.config.enable_prefix_caching)?;
-        let dev = self.gpu_device.as_ref()?;
+    /// recurrent state, prefix caching or a device; refused on a device that maps no sparse tiles.
+    fn snapshot_slot(&self) -> ExecutorResult<Option<(usize, std::num::NonZeroUsize)>> {
+        let Some(cfg) = (self.model.as_ref())
+            .and_then(|m| m.gdn_runtime_config())
+            .filter(|_| self.config.enable_prefix_caching)
+        else {
+            return Ok(None);
+        };
+        let Some(dev) = self.gpu_device.as_ref() else {
+            return Ok(None);
+        };
         let dims = cfg.state_dims();
         let bytes = GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
             cfg.num_linear_layers(),
@@ -2962,8 +2968,9 @@ impl MetalWorker {
         // `QwenStateStorage::acquire` takes a `DFlashContextWindow` with every cached state).
         let window = self.snapshot_window_bytes();
         let unit =
-            scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm, window]);
-        (bytes > 0).then_some((bytes + window, unit))
+            scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm, window])
+                .map_err(|e| ExecutorError::WorkerInit(format!("snapshot unit: {e}")))?;
+        Ok((bytes > 0).then_some((bytes + window, unit)))
     }
 
     /// A snapshot's DFlash2 context window, in bytes: 0 without a DFlash2 drafter.
@@ -2985,7 +2992,7 @@ impl MetalWorker {
         let model = self.model.as_deref().ok_or_else(|| err("no model"))?;
         let dev = self.gpu_device.as_ref().ok_or_else(|| err("no device"))?;
         let (slot_bytes, unit) = self
-            .snapshot_slot()
+            .snapshot_slot()?
             .ok_or_else(|| err("no snapshot slot"))?;
         let bs = self.config.block_size;
         let turboquant_stores = |m: &dyn scratchy_target_metal::MetalWeights| {
@@ -3019,7 +3026,8 @@ impl MetalWorker {
             }
             None => 0,
         };
-        let granule = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, store_bytes);
+        let granule = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, store_bytes)
+            .map_err(|e| err(&e))?;
         let budget = SnapshotBudget {
             kv_block_bytes: (target_block_bytes(model, bs) + draft_block) as u64,
             kv_granule_blocks: granule,
@@ -7221,11 +7229,12 @@ impl Worker for MetalWorker {
         // every GDN state buffer maps on whole tiles — none is mapped until a save needs it, and the
         // scheduler hands memory between KV and the snapshots as each needs it. Nothing is carved
         // out of the budget for them. A snapshot is a slot like any other, without draft lanes.
-        self.gdn_snapshot_cap = match self.snapshot_slot() {
+        let snapshot_slot = self.snapshot_slot()?;
+        self.gdn_snapshot_cap = match snapshot_slot {
             Some((bytes, unit)) => (available / bytes) / unit * unit.get(),
             None => 0,
         };
-        if let Some((bytes, unit)) = self.snapshot_slot().filter(|_| self.gdn_snapshot_cap > 0) {
+        if let Some((bytes, unit)) = snapshot_slot.filter(|_| self.gdn_snapshot_cap > 0) {
             info!(
                 "ScratchyWorker(metal): up to {} state snapshots × {:.1} MiB, mapped {} at a time \
                  as the prefix cache saves into them, out of the {:.2} GiB KV budget they share",
