@@ -26,7 +26,7 @@ use tracing::warn;
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{
     CachedKvOp, CachedRequestData, NewRequestData, RecurrentAdmissionOp, RecurrentStateOps,
-    SchedulerOutput, SharedMemoryOps, SnapshotDiskOps, StateSnapshotOp, StepId,
+    SchedulerOutput, SharedMemoryOps, SnapshotDiskOps, SnapshotFill, StateSnapshotOp, StepId,
 };
 use super::recurrent_state::{SnapshotBudget, StateSnapshots};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
@@ -263,6 +263,13 @@ pub trait KVCacheManagerOps: Send {
     fn take_snapshot_disk_ops(&mut self) -> SnapshotDiskOps {
         SnapshotDiskOps::default()
     }
+
+    /// The step that carried `fills` came back: the snapshots they read back from disk are hits.
+    fn commit_fills(&mut self, _fills: &[SnapshotFill]) {}
+
+    /// ⛔ `fills` NEVER CAME BACK OR FAILED: forget their snapshots, in their slots and on disk, so
+    /// the next hit on each prefix resumes cold.
+    fn forget_fills(&mut self, _fills: &[SnapshotFill]) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -2652,7 +2659,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             let key = hashes[b - 1];
             let at = match rec.snapshots.ready_slot(key) {
                 Some(slot) => SnapshotAt::Slot(slot),
-                None if rec.snapshots.on_disk(key) => {
+                None if rec.snapshots.fillable(key) => {
                     let mut keep: Vec<usize> = (hashes[..b].iter())
                         .filter_map(|h| self.block_hash_to_id.get(h))
                         .map(|&block| rec.memory.granule_of(block))
@@ -2858,6 +2865,22 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         (self.recurrent.as_mut()).map_or_else(SnapshotDiskOps::default, |rec| {
             rec.snapshots.take_disk_ops()
         })
+    }
+
+    fn commit_fills(&mut self, fills: &[SnapshotFill]) {
+        if let Some(rec) = self.recurrent.as_mut() {
+            for f in fills {
+                rec.snapshots.commit(f.slot, f.key, &f.req_id);
+            }
+        }
+    }
+
+    fn forget_fills(&mut self, fills: &[SnapshotFill]) {
+        if let Some(rec) = self.recurrent.as_mut() {
+            for f in fills {
+                rec.snapshots.forget_fill(f);
+            }
+        }
     }
 }
 
@@ -3395,17 +3418,45 @@ impl Scheduler {
     pub fn commit_step(&mut self, step: &SchedulerOutput) {
         self.kv_cache
             .commit_state_saves(&step.recurrent_state.saves);
+        self.kv_cache.commit_fills(&step.recurrent_state.disk.fills);
         self.kv_cache.commit_written(step.step);
     }
 
     /// ⛔ THE STEP `failed` SCHEDULED NEVER CAME BACK, so the KV it was to write may not exist. Its
     /// blocks went into the prefix cache when it was scheduled, for the steps behind it to hit, and
-    /// now stop being hits ([`KVCacheManagerOps::forget_unwritten`]). Returns the requests that
-    /// cannot run on: the step's own, and any a step behind it admitted onto those blocks. The
-    /// caller aborts them.
+    /// now stop being hits ([`KVCacheManagerOps::forget_unwritten`]). So do the snapshots it was to
+    /// read back from disk. Returns the requests that cannot run on: the step's own, and any a step
+    /// behind it admitted onto those blocks. The caller aborts them.
     pub fn forget_unwritten(&mut self, failed: &SchedulerOutput) -> Vec<String> {
+        self.kv_cache
+            .forget_fills(&failed.recurrent_state.disk.fills);
         let requests: Vec<String> = failed.num_scheduled_tokens.keys().cloned().collect();
         self.kv_cache.forget_unwritten(failed.step, &requests)
+    }
+
+    /// ⛔ STEP `step` CAME BACK, BUT THE WORKER COULD NOT READ BACK THE SNAPSHOTS IN `slots` FROM
+    /// DISK (`ModelRunnerOutput::failed_fills`). Each is forgotten, in its slot and on disk, so the
+    /// next hit on its prefix resumes cold. The request that restored one ran on no state: so does
+    /// every block it registered this step, which stop being hits. Returns the requests that cannot
+    /// run on: those that ran on a failed fill, and any a step behind admitted onto their blocks.
+    /// The caller aborts them before the step's output is read, and only then commits the step.
+    pub fn forget_failed_fills(&mut self, step: &SchedulerOutput, slots: &[usize]) -> Vec<String> {
+        let failed: Vec<SnapshotFill> = (step.recurrent_state.disk.fills.iter())
+            .filter(|f| slots.contains(&f.slot))
+            .cloned()
+            .collect();
+        if failed.is_empty() {
+            return Vec::new();
+        }
+        self.kv_cache.forget_fills(&failed);
+        let ran: Vec<String> = (failed.into_iter())
+            .map(|f| f.req_id)
+            .filter(|r| step.num_scheduled_tokens.contains_key(r))
+            .collect();
+        match ran.is_empty() {
+            true => ran,
+            false => self.kv_cache.forget_unwritten(step.step, &ran),
+        }
     }
 
     ///
@@ -9073,6 +9124,86 @@ mod tests {
         let out = run_step(&mut sched);
         assert!(out.recurrent_state.disk.is_empty(), "a hit in its slot");
         assert_eq!(out.recurrent_state.restores[0].position, 144);
+    }
+
+    /// A scheduler of 1 slot and 2 disk slots where `a`'s snapshot went to disk, then `a2`'s step,
+    /// which reads it back for `a2` to restore.
+    fn reading_back_a() -> (Scheduler, SchedulerOutput) {
+        let mut sched = recurrent_scheduler_over(
+            SnapshotBudget {
+                disk_slots: 2,
+                ..apart(1)
+            },
+            4096,
+        );
+        for (id, seed) in [("a", 1), ("b", 2)] {
+            sched.add_request(prompt_blocks(id, 10, seed));
+            run_step(&mut sched);
+            prefill_and_finish(&mut sched, id);
+        }
+        sched.add_request(prompt_blocks("a2", 10, 1));
+        let out = sched.schedule();
+        assert_eq!(out.recurrent_state.disk.fills.len(), 1);
+        assert_eq!(out.recurrent_state.restores[0].req_id, "a2");
+        (sched, out)
+    }
+
+    /// `a`'s prompt again, after a fill of its snapshot failed: it resumes cold, reads nothing back
+    /// and saves its end anew.
+    fn assert_a_resumes_cold(sched: &mut Scheduler, id: &str) {
+        sched.add_request(prompt_blocks(id, 10, 1));
+        let out = run_step(sched);
+        assert!(
+            out.recurrent_state.restores.is_empty(),
+            "{id} restores nothing"
+        );
+        assert!(
+            out.recurrent_state.disk.fills.is_empty(),
+            "{id} reads nothing back"
+        );
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
+        let saved: Vec<u32> = (out.recurrent_state.saves.iter())
+            .map(|op| op.position)
+            .collect();
+        assert_eq!(saved, vec![144], "{id} saves its end anew");
+    }
+
+    /// ⛔ THE WORKER COULD NOT READ A SNAPSHOT BACK FROM DISK. Its request ran on no state and is
+    /// aborted; the snapshot is forgotten, in its slot and on disk; and the next request for the
+    /// prefix, even one scheduled before the failure came back, resumes cold.
+    #[test]
+    fn recurrent_a_failed_fill_costs_its_request_and_the_prefix_resumes_cold() {
+        let (mut sched, out) = reading_back_a();
+        // Scheduled behind it, before it came back: the fill is no hit yet, nor read back twice.
+        sched.add_request(prompt_blocks("a3", 10, 1));
+        let behind = sched.schedule();
+        assert!(behind.recurrent_state.restores.is_empty());
+        assert!(behind.recurrent_state.disk.fills.is_empty());
+
+        let slot = out.recurrent_state.disk.fills[0].slot;
+        let doomed = sched.forget_failed_fills(&out, &[slot]);
+        assert_eq!(
+            doomed,
+            vec!["a2".to_string()],
+            "the request that ran on the fill alone"
+        );
+        sched.finish_requests(&["a2"], RequestStatus::FinishedAborted);
+        sched.commit_step(&out);
+        sched.commit_step(&behind);
+        prefill_and_finish(&mut sched, "a3");
+        assert_a_resumes_cold(&mut sched, "a4");
+    }
+
+    /// ⛔ THE STEP THAT READ A SNAPSHOT BACK NEVER CAME BACK: the snapshot is forgotten with the
+    /// step's blocks, and the next request for the prefix resumes cold.
+    #[test]
+    fn recurrent_a_fill_whose_step_failed_is_forgotten() {
+        let (mut sched, out) = reading_back_a();
+        let doomed = sched.forget_unwritten(&out);
+        assert!(doomed.contains(&"a2".to_string()));
+        let doomed: Vec<&str> = doomed.iter().map(String::as_str).collect();
+        sched.finish_requests(&doomed, RequestStatus::FinishedAborted);
+        assert_a_resumes_cold(&mut sched, "a3");
     }
 
     #[test]

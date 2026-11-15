@@ -23,7 +23,7 @@ use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
 use scratchy_serving_scheduler::scheduler::SnapshotBudget;
 use scratchy_serving_scheduler::scheduler::output::{
-    KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotMove, SnapshotUnit, StateSnapshotOp,
+    KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
 };
 use tracing::info;
 
@@ -150,6 +150,9 @@ pub struct MetalWorker {
     /// The snapshots' disk tier (`SnapshotDiskOps`): `None` without snapshot slots, or without
     /// disk space for one.
     gdn_snapshot_disk: Option<crate::snapshot_disk::SnapshotDisk>,
+    /// The snapshot slots this step could not read back from disk, for its output
+    /// (`ModelRunnerOutput::failed_fills`).
+    gdn_failed_fills: Vec<usize>,
     /// How KV and the snapshots share the KV budget, and what of it is mapped (`SharedKv`).
     /// `None` without snapshots.
     shared_kv: Option<SharedKv>,
@@ -968,6 +971,7 @@ impl MetalWorker {
             gdn_state_stores: None,
             gdn_snapshots_from: 0,
             gdn_snapshot_disk: None,
+            gdn_failed_fills: Vec::new(),
             shared_kv: None,
             kv_cached_through: HashMap::new(),
             model_dir: None,
@@ -2780,7 +2784,16 @@ impl MetalWorker {
                 rows.push(row);
                 continue;
             }
-            if let Some(op) = ops.restores.iter().find(|op| op.req_id == *req_id) {
+            let restore = ops.restores.iter().find(|op| op.req_id == *req_id);
+            // ⛔ A RESTORE FROM A SNAPSHOT THIS STEP COULD NOT READ BACK FROM DISK: the engine aborts
+            // its request (`failed_fills`), so it runs as a refused row, on no state and saving
+            // none, and the requests beside it run on.
+            if restore.is_some_and(|op| self.gdn_failed_fills.contains(&op.slot)) {
+                row.refused = true;
+                rows.push(row);
+                continue;
+            }
+            if let Some(op) = restore {
                 if op.position != before {
                     let at = op.position;
                     return Err(bad(format!(
@@ -2848,14 +2861,27 @@ impl MetalWorker {
         Ok((entries.iter().flat_map(|e| e.words()).collect(), codes))
     }
 
-    /// ⭐ MOVE SNAPSHOTS BETWEEN THEIR SLOTS AND THE DISK TIER (`SnapshotDiskOps`): out to disk
-    /// (`spill`), or back into their slots. A spill reads a ready snapshot, which no step in
-    /// flight writes: its own step came back before it was ready. A fill waits for every step in
-    /// flight, since one scheduled before this may still read the slot it rewrites. A fill that
-    /// fails leaves its slot keyed to nothing, so a restore from it is refused rather than run on
-    /// what the slot held.
-    fn move_snapshots(&mut self, moves: &[SnapshotMove], spill: bool) -> ExecutorResult<()> {
-        if moves.is_empty() {
+    /// `output`, with the snapshot slots this step could not read back from disk.
+    fn with_failed_fills(&mut self, mut output: ModelRunnerOutput) -> ModelRunnerOutput {
+        output.failed_fills = std::mem::take(&mut self.gdn_failed_fills);
+        output
+    }
+
+    /// ⭐ MOVE SNAPSHOTS BETWEEN THEIR SLOTS AND THE DISK TIER (`SnapshotDiskOps`): `(slot, disk,
+    /// key)` out to disk (`spill`), or back into their slots. A spill reads a ready snapshot, which
+    /// no step in flight writes: its own step came back before it was ready. A fill waits for every
+    /// step in flight, since one scheduled before this may still read the slot it rewrites.
+    ///
+    /// ⛔ A MOVE THAT FAILS FAILS NO STEP. A spill that fails leaves its disk slot holding nothing,
+    /// so a fill from it fails in turn. A fill that fails leaves its slot keyed to nothing, and goes
+    /// back to the engine (`ModelRunnerOutput::failed_fills`): the request that restores from it
+    /// runs on no state (`gdn_step`), and is aborted.
+    fn move_snapshots(
+        &mut self,
+        moves: impl ExactSizeIterator<Item = (usize, usize, u64)>,
+        spill: bool,
+    ) -> ExecutorResult<()> {
+        if moves.len() == 0 {
             return Ok(());
         }
         let bad = |what: String| ExecutorError::WorkerExecution(format!("snapshot disk: {what}"));
@@ -2874,30 +2900,46 @@ impl MetalWorker {
         };
         let (device, residency) = (&*gpu.device, gpu.allocator.residency());
         let mut windows = (self.dflash2.as_mut()).and_then(|d| d.snapshot_windows.as_mut());
-        for m in moves {
-            let regions = stores.block_regions(self.gdn_snapshots_from + m.slot);
-            let window = windows.as_deref_mut().and_then(|w| w.saved.get_mut(m.slot));
+        let mut moved = 0;
+        for (slot, d, key) in moves {
+            let regions = stores.block_regions(self.gdn_snapshots_from + slot);
+            let window = windows.as_deref_mut().and_then(|w| w.saved.get_mut(slot));
             if spill {
-                if self.gdn_snapshot_keys.get(m.slot) != Some(&Some(m.key)) {
-                    let s = m.slot;
-                    return Err(bad(format!("slot {s} holds another prefix than it spills")));
-                }
+                let held = self.gdn_snapshot_keys.get(slot) == Some(&Some(key));
                 let saved = window.is_some_and(|w| *w);
-                (disk.spill(device, residency, &regions, m.disk, m.key, saved))
-                    .map_err(|e| bad(format!("slot {} out to disk: {e}", m.slot)))?;
+                let spilled = match held {
+                    true => disk.spill(device, residency, &regions, d, key, saved),
+                    false => Err("the slot holds another prefix".into()),
+                };
+                match spilled {
+                    Ok(()) => moved += 1,
+                    Err(e) => {
+                        tracing::warn!("snapshot disk: slot {slot} out to disk slot {d}: {e}");
+                        disk.forget(d);
+                    }
+                }
                 continue;
             }
-            self.gdn_snapshot_keys[m.slot] = None;
-            let saved = (disk.fill(device, residency, &regions, m.disk, m.key))
-                .map_err(|e| bad(format!("slot {} back from disk: {e}", m.slot)))?;
-            if let Some(w) = window {
-                *w = saved;
+            self.gdn_snapshot_keys[slot] = None;
+            match disk.fill(device, residency, &regions, d, key) {
+                Ok(saved) => {
+                    if let Some(w) = window {
+                        *w = saved;
+                    }
+                    self.gdn_snapshot_keys[slot] = Some(key);
+                    moved += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("snapshot disk: slot {slot} back from disk slot {d}: {e}");
+                    if let Some(w) = window {
+                        *w = false;
+                    }
+                    self.gdn_failed_fills.push(slot);
+                }
             }
-            self.gdn_snapshot_keys[m.slot] = Some(m.key);
         }
         info!(
-            "ScratchyWorker(metal): {} state snapshots {} disk in {:.1} ms",
-            moves.len(),
+            "ScratchyWorker(metal): {moved} state snapshots {} disk in {:.1} ms",
             if spill { "out to" } else { "back from" },
             t.elapsed().as_secs_f64() * 1e3,
         );
@@ -7913,13 +7955,14 @@ impl Worker for MetalWorker {
         // the snapshots leaving for disk first, out of slots the step releases or rewrites, then
         // those coming back, into slots it maps (`SnapshotDiskOps`).
         let disk = &scheduler_output.recurrent_state.disk;
-        self.move_snapshots(&disk.spills, true)?;
+        self.gdn_failed_fills.clear();
+        self.move_snapshots(disk.spills.iter().map(|m| (m.slot, m.disk, m.key)), true)?;
         self.apply_shared_memory(&scheduler_output.recurrent_state.memory)?;
-        self.move_snapshots(&disk.fills, false)?;
+        self.move_snapshots(disk.fills.iter().map(|f| (f.slot, f.disk, f.key)), false)?;
         // Nothing scheduled — an idle batch, or every live request skipped, preempted or finished
         // this step: nothing runs.
         if scheduler_output.total_num_scheduled_tokens == 0 {
-            return Ok(ModelRunnerOutput::empty());
+            return Ok(self.with_failed_fills(ModelRunnerOutput::empty()));
         }
 
         // ── 4. Prepare flat batch inputs ─────────────────────────
@@ -9262,13 +9305,14 @@ impl Worker for MetalWorker {
         if let Some((done, argmax)) = self.committed.take() {
             self.sampler_logits = None;
             if let Some(committed_chain) = self.committed_chain.take() {
-                return self.commit_speculative(
+                let output = self.commit_speculative(
                     done,
                     argmax,
                     committed_chain,
                     &req_ids_in_order,
                     &q_lens,
-                );
+                )?;
+                return Ok(self.with_failed_fills(output));
             }
             let mut rows = Vec::with_capacity(num_reqs);
             for (i, req_id) in req_ids_in_order.iter().enumerate() {
@@ -9300,7 +9344,7 @@ impl Worker for MetalWorker {
                 }),
             );
             self.in_flight.push_back(step);
-            return Ok(output);
+            return Ok(self.with_failed_fills(output));
         }
         let total_n = argmax_vec.len() as u32;
         let argmax_slice: &[u32] = &argmax_vec;
@@ -9653,6 +9697,7 @@ impl Worker for MetalWorker {
             // already covers the page it writes. Nothing to report.
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: std::mem::take(&mut self.gdn_failed_fills),
             d2h_resolver: None,
         })
     }

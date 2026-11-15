@@ -31,7 +31,7 @@ use scratchy_core_config::SchedulerConfig;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 use scratchy_serving_scheduler::scheduler::{PauseState, Scheduler, SchedulerInterface};
 use scratchy_serving_transport::messages::PauseMode;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{EngineError, EngineResult};
 use crate::executor::{Executor, ModelRunnerOutput};
@@ -891,6 +891,18 @@ impl EngineCore {
         };
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
+        // ⛔ BUT A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK HOLDS NOTHING: the request that
+        // restored it ran on no state, and is aborted before its output is read; the snapshot is
+        // forgotten, so the next hit on its prefix resumes cold.
+        let ran_on_nothing =
+            (self.scheduler).forget_failed_fills(scheduler_output, &model_output.failed_fills);
+        if !ran_on_nothing.is_empty() {
+            warn!(
+                requests = ?ran_on_nothing,
+                "aborting requests whose recurrent-state snapshot could not be read back from disk"
+            );
+            self.abort_requests(&ran_on_nothing);
+        }
         // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
         // BLOCKS REGISTERED WHILE IT WAS SCHEDULED HOLD THEIRS — committed here and not when they
         // were scheduled, because a step that fails never gets here.
@@ -1690,6 +1702,7 @@ mod tests {
                 kv_extent: std::collections::HashMap::new(),
                 kv_pool_reach: None,
                 kv_backed: None,
+                failed_fills: Vec::new(),
             };
 
             let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -1844,6 +1857,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         // Set up engine.
@@ -2300,6 +2314,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2362,6 +2377,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2412,6 +2428,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2820,6 +2837,111 @@ mod tests {
             "{:?}",
             resumed.recurrent_state
         );
+    }
+
+    /// A [`NoopExecutor`] whose worker keeps one snapshot slot and two disk slots, and fails to
+    /// read back every snapshot from disk.
+    struct FailingFillsExecutor(NoopExecutor);
+
+    impl Executor for FailingFillsExecutor {
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.0.set_stop_token_ids(stop_token_ids)
+        }
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            let mut out = self.0.execute_model(scheduler_output)?;
+            let fills = &scheduler_output.recurrent_state.disk.fills;
+            out.failed_fills = fills.iter().map(|f| f.slot).collect();
+            Ok(out)
+        }
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
+            self.0.initialize_cache(gpu, cpu)
+        }
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            self.0.determine_available_memory()
+        }
+        fn shutdown(&mut self) {
+            self.0.shutdown()
+        }
+        fn is_sleeping(&self) -> bool {
+            self.0.is_sleeping()
+        }
+        fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
+            Some(scratchy_serving_scheduler::scheduler::SnapshotBudget {
+                kv_block_bytes: 1,
+                kv_granule_blocks: std::num::NonZeroUsize::MIN,
+                slot_bytes: 0,
+                unit_slots: std::num::NonZeroUsize::MIN,
+                max_slots: 1,
+                disk_slots: 2,
+            })
+        }
+    }
+
+    /// ⛔ A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK COSTS ITS OWN REQUEST, AND NO OTHER:
+    /// that request is aborted, the one decoding beside it runs on, and the next request for the
+    /// prefix resumes cold.
+    #[test]
+    fn a_failed_fill_aborts_only_its_request_and_the_prefix_resumes_cold() {
+        let mut config = make_test_config();
+        config.enable_prefix_caching = true;
+        let mut engine = EngineCore::new(
+            config,
+            Box::new(FailingFillsExecutor(NoopExecutor::new(1024))),
+        );
+        let prompt = |id: &str, seed: u32| {
+            let mut r = make_request(id, 600);
+            r.prompt_token_ids = (0..600).map(|t| seed * 10_000 + t).collect();
+            r.all_token_ids = r.prompt_token_ids.clone();
+            r
+        };
+        let running = |engine: &EngineCore, id: &str| {
+            (engine.scheduler.get_request(id)).is_some_and(|r| !r.status.is_finished())
+        };
+        // `a` saves its prompt's end and finishes.
+        engine.add_request(prompt("a", 1));
+        while running(&engine, "a") {
+            assert!(matches!(
+                engine.step().unwrap(),
+                StepOutcome::Progressed { .. }
+            ));
+        }
+        // `b`'s save takes the one slot: `a`'s snapshot goes to disk.
+        engine.add_request(prompt("b", 2));
+        assert!(matches!(
+            engine.step().unwrap(),
+            StepOutcome::Progressed { .. }
+        ));
+        assert!(running(&engine, "b"), "decoding");
+
+        // `a`'s prompt again, beside `b`'s decode: its snapshot is read back, and that fails.
+        engine.add_request(prompt("a2", 1));
+        let mut sched = engine.scheduler.schedule();
+        assert_eq!(
+            sched.recurrent_state.disk.fills.len(),
+            1,
+            "{:?}",
+            sched.recurrent_state
+        );
+        assert!(sched.num_scheduled_tokens.contains_key("b"));
+        let mut executor = engine.take_executor().unwrap();
+        engine.plan_drafts(&mut sched);
+        let out = executor.execute_model(&sched).unwrap();
+        engine.finalize_step(&sched, &out);
+        assert!(!running(&engine, "a2"), "aborted: it ran on no state");
+        assert!(running(&engine, "b"), "the request beside it runs on");
+
+        engine.add_request(prompt("a3", 1));
+        let next = engine.scheduler.schedule();
+        assert!(
+            next.recurrent_state.restores.is_empty(),
+            "{:?}",
+            next.recurrent_state
+        );
+        assert!(next.recurrent_state.disk.fills.is_empty());
+        assert_eq!(next.num_scheduled_tokens["a3"], 600, "cold");
     }
 
     #[test]
