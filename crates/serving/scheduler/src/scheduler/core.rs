@@ -60,10 +60,24 @@ pub enum SnapshotAt {
     /// A ready snapshot in this slot.
     Slot(usize),
     /// The disk tier, from which holding the plan reads it back into a slot
-    /// ([`KVCacheManagerOps::hold_recurrent_prefix`]). `keep`: the KV granules of the hit it
-    /// resumes over, which the request does not hold until its allocation, and so which the slot's
-    /// memory must not be taken from.
+    /// ([`KVCacheManagerOps::hold_recurrent_prefix`]), for the request to resume from once that
+    /// step comes back. `keep`: the KV granules of the hit it resumes over, which the request
+    /// does not hold until its allocation, and so which the slot's memory must not be taken from.
     Disk { keep: Vec<usize> },
+    /// Being read back from disk, by a step that has not come back.
+    Filling,
+}
+
+/// What holding a plan comes to ([`KVCacheManagerOps::hold_recurrent_prefix`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// Admit the request on this plan: its snapshot is in a slot, or it resumes cold.
+    Admit(RecurrentPrefixPlan),
+    /// ⛔ THE SNAPSHOT IT RESUMES FROM IS BEING READ BACK FROM DISK: it waits, first in line, for
+    /// the step that reads it. No request runs in the step that reads its snapshot back, so none
+    /// runs on one that failed to come back: that one is forgotten, and the request resumes as it
+    /// would have with no disk tier.
+    Wait,
 }
 
 /// Where a request with recurrent state resumes on admission — see
@@ -209,16 +223,17 @@ pub trait KVCacheManagerOps: Send {
     /// Keep what a plan from [`Self::plan_recurrent_prefix`] restores from through this step,
     /// BEFORE the request's blocks are allocated: an allocation may take memory from the
     /// snapshots, and must not take the one the request is about to resume from. A snapshot on
-    /// disk is read back into a slot here; with no slot to be had, the request resumes cold.
+    /// disk is read back into a slot by this step, and the request waits for it ([`Held::Wait`]);
+    /// with no slot to be had, it resumes cold.
     fn hold_recurrent_prefix(
         &mut self,
         _request_id: &str,
         plan: RecurrentPrefixPlan<SnapshotAt>,
-    ) -> RecurrentPrefixPlan {
-        plan.located(|at, _| match at {
+    ) -> Held {
+        Held::Admit(plan.located(|at, _| match at {
             SnapshotAt::Slot(slot) => Some(slot),
-            SnapshotAt::Disk { .. } => None,
-        })
+            SnapshotAt::Disk { .. } | SnapshotAt::Filling => None,
+        }))
     }
 
     /// Commit a plan from [`Self::plan_recurrent_prefix`] for a request that was just admitted.
@@ -2659,6 +2674,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             let key = hashes[b - 1];
             let at = match rec.snapshots.ready_slot(key) {
                 Some(slot) => SnapshotAt::Slot(slot),
+                None if rec.snapshots.filling(key) => SnapshotAt::Filling,
                 None if rec.snapshots.fillable(key) => {
                     let mut keep: Vec<usize> = (hashes[..b].iter())
                         .filter_map(|h| self.block_hash_to_id.get(h))
@@ -2721,7 +2737,8 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             request.request_id,
             tokens,
             match hit {
-                Some((_, SnapshotAt::Disk { .. })) => " from disk",
+                Some((_, SnapshotAt::Disk { .. })) => " once read back from disk",
+                Some((_, SnapshotAt::Filling)) => " once its read from disk comes back",
                 _ => "",
             },
             kv_hit_tokens,
@@ -2742,22 +2759,33 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         &mut self,
         request_id: &str,
         plan: RecurrentPrefixPlan<SnapshotAt>,
-    ) -> RecurrentPrefixPlan {
+    ) -> Held {
         // The restored slot is READ before this step's forward, so it is pinned for the step;
-        // its ancestors only age with it. One on disk is read back into a slot first.
+        // its ancestors only age with it. One on disk is read back into a slot by this step, and
+        // the request waits for it.
         if let Some(rec) = self.recurrent.as_mut() {
             for &slot in &plan.prefix_slots {
                 rec.snapshots.touch(slot);
             }
         }
-        let plan = plan.located(|at, key| match at {
+        let waits = match &plan.restore {
+            Some((SnapshotAt::Filling, _)) => true,
+            Some((SnapshotAt::Disk { keep }, key)) => {
+                self.fill_snapshot(*key, request_id, keep).is_some()
+            }
+            Some((SnapshotAt::Slot(_), _)) | None => false,
+        };
+        if waits {
+            return Held::Wait;
+        }
+        let plan = plan.located(|at, _| match at {
             SnapshotAt::Slot(slot) => Some(slot),
-            SnapshotAt::Disk { keep } => self.fill_snapshot(key, request_id, &keep),
+            SnapshotAt::Disk { .. } | SnapshotAt::Filling => None,
         });
         if let (Some((slot, _)), Some(rec)) = (plan.restore, self.recurrent.as_mut()) {
             rec.snapshots.pin(slot, request_id);
         }
-        plan
+        Held::Admit(plan)
     }
 
     fn admit_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
@@ -2900,9 +2928,9 @@ impl SimpleBlockTracker {
         Some(slot)
     }
 
-    /// ⭐ READ `key`'s SNAPSHOT BACK FROM THE DISK TIER for `reader` to restore this step, into a
-    /// slot ([`Self::snapshot_slot`]) whose memory is not taken from the KV granules `keep` of
-    /// the hit it resumes over. `None` when no slot can be had.
+    /// ⭐ READ `key`'s SNAPSHOT BACK FROM THE DISK TIER for `reader` to restore once the step comes
+    /// back, into a slot ([`Self::snapshot_slot`]) whose memory is not taken from the KV granules
+    /// `keep` of the hit it resumes over. `None` when no slot can be had.
     fn fill_snapshot(&mut self, key: u64, reader: &str, keep: &[usize]) -> Option<usize> {
         let slot = self.snapshot_slot(reader, keep)?;
         self.recurrent.as_mut()?.snapshots.fill(slot, key, reader);
@@ -3435,28 +3463,15 @@ impl Scheduler {
     }
 
     /// ⛔ STEP `step` CAME BACK, BUT THE WORKER COULD NOT READ BACK THE SNAPSHOTS IN `slots` FROM
-    /// DISK (`ModelRunnerOutput::failed_fills`). Each is forgotten, in its slot and on disk, so the
-    /// next hit on its prefix resumes cold. The request that restored one ran on no state: so does
-    /// every block it registered this step, which stop being hits. Returns the requests that cannot
-    /// run on: those that ran on a failed fill, and any a step behind admitted onto their blocks.
-    /// The caller aborts them before the step's output is read, and only then commits the step.
-    pub fn forget_failed_fills(&mut self, step: &SchedulerOutput, slots: &[usize]) -> Vec<String> {
+    /// DISK (`ModelRunnerOutput::failed_fills`). Each is forgotten, in its slot and on disk, before
+    /// the step is committed. No request ran on one ([`Held::Wait`]): the one waiting for it
+    /// resumes as it would have with no disk tier, and so does the next hit on its prefix.
+    pub fn forget_failed_fills(&mut self, step: &SchedulerOutput, slots: &[usize]) {
         let failed: Vec<SnapshotFill> = (step.recurrent_state.disk.fills.iter())
             .filter(|f| slots.contains(&f.slot))
             .cloned()
             .collect();
-        if failed.is_empty() {
-            return Vec::new();
-        }
         self.kv_cache.forget_fills(&failed);
-        let ran: Vec<String> = (failed.into_iter())
-            .map(|f| f.req_id)
-            .filter(|r| step.num_scheduled_tokens.contains_key(r))
-            .collect();
-        match ran.is_empty() {
-            true => ran,
-            false => self.kv_cache.forget_unwritten(step.step, &ran),
-        }
     }
 
     ///
@@ -3794,9 +3809,18 @@ impl SchedulerInterface for Scheduler {
                 // cache holds it (`CachedKvOp`) — a cached block is never rewritten, so every
                 // request that reads it reads the same KV.
                 let kv_hit_tokens = num_cached_tokens;
-                let recurrent = (self.kv_cache)
-                    .plan_recurrent_prefix(&request, num_cached_tokens)
-                    .map(|plan| self.kv_cache.hold_recurrent_prefix(&request_id, plan));
+                let planned = (self.kv_cache).plan_recurrent_prefix(&request, num_cached_tokens);
+                let held =
+                    planned.map(|plan| self.kv_cache.hold_recurrent_prefix(&request_id, plan));
+                let recurrent = match held {
+                    Some(Held::Admit(plan)) => Some(plan),
+                    // Its snapshot is being read back from disk: first in line for the step after.
+                    Some(Held::Wait) => {
+                        self.waiting.prepend_request(request);
+                        break;
+                    }
+                    None => None,
+                };
                 let num_cached_tokens = recurrent
                     .as_ref()
                     .map_or(num_cached_tokens, |plan| plan.tokens);
@@ -9039,6 +9063,19 @@ mod tests {
         assert_eq!(out.recurrent_state.saves[0].position, 592);
     }
 
+    /// Run steps until `id` is admitted: its admission step, and every disk fill on the way.
+    fn admit(sched: &mut Scheduler, id: &str) -> (SchedulerOutput, usize) {
+        let mut fills = 0;
+        for _ in 0..4 {
+            let out = run_step(sched);
+            fills += out.recurrent_state.disk.fills.len();
+            if out.scheduled_new_reqs.iter().any(|r| r.req_id == id) {
+                return (out, fills);
+            }
+        }
+        panic!("{id} never admitted");
+    }
+
     /// ⭐ A WORKLOAD THAT COMES BACK TO MORE PROMPTS THAN THE SLOTS HOLD. Without a disk tier, LRU
     /// evicts each prompt's snapshot just before the prompt comes back, and every one resumes
     /// cold over a full KV hit. With one, each is read back from disk and resumes at its end.
@@ -9049,12 +9086,9 @@ mod tests {
                 .map(|p| {
                     let id = format!("{tag}{p}");
                     sched.add_request(prompt_blocks(&id, 10, p + 1));
-                    let out = run_step(sched);
+                    let (out, fills) = admit(sched, &id);
                     prefill_and_finish(sched, &id);
-                    (
-                        out.scheduled_new_reqs[0].num_computed_tokens,
-                        out.recurrent_state.disk.fills.len(),
-                    )
+                    (out.scheduled_new_reqs[0].num_computed_tokens, fills)
                 })
                 .collect()
         };
@@ -9079,10 +9113,9 @@ mod tests {
         }
     }
 
-    /// A snapshot read back from disk is restored by its request in the step that reads it, and is
-    /// a hit for the next request at once: it is the state the scan stored.
-    #[test]
-    fn recurrent_a_fill_is_restored_in_its_step_and_hit_after() {
+    /// A scheduler of 1 slot and 2 disk slots where `a`'s snapshot went to disk, then `a2`'s first
+    /// step, which reads it back from disk.
+    fn reading_back_a() -> (Scheduler, SchedulerOutput) {
         let mut sched = recurrent_scheduler_over(
             SnapshotBudget {
                 disk_slots: 2,
@@ -9097,26 +9130,46 @@ mod tests {
         }
         // `b`'s save took `a`'s slot: `a`'s snapshot went to disk.
         sched.add_request(prompt_blocks("a2", 10, 1));
-        let out = run_step(&mut sched);
-        let fills = &out.recurrent_state.disk.fills;
-        assert_eq!(fills.len(), 1);
-        assert_eq!(
-            out.recurrent_state.restores,
-            vec![StateSnapshotOp {
-                req_id: "a2".into(),
-                slot: fills[0].slot,
-                position: 144,
-                key: fills[0].key,
-            }]
+        let out = sched.schedule();
+        assert_eq!(out.recurrent_state.disk.fills.len(), 1);
+        (sched, out)
+    }
+
+    /// ⭐ A HIT ON DISK WAITS ONE STEP: the step reads the snapshot back and runs no request on it.
+    /// Once that step comes back, the request resumes from the slot, and so does the next one.
+    #[test]
+    fn recurrent_a_hit_on_disk_resumes_once_its_fill_comes_back() {
+        let (mut sched, out) = reading_back_a();
+        let fill = out.recurrent_state.disk.fills[0].clone();
+        assert!(
+            out.num_scheduled_tokens.is_empty(),
+            "nothing runs on the fill"
         );
+        assert!(out.recurrent_state.restores.is_empty());
         assert_eq!(
             out.recurrent_state.disk.spills,
             vec![SnapshotMove {
-                slot: fills[0].slot,
+                slot: fill.slot,
                 disk: 1,
                 key: out.recurrent_state.disk.spills[0].key,
             }],
             "`b`'s snapshot, out of the slot the fill takes, into the other disk slot"
+        );
+        // Scheduled before the fill came back: it waits still, and reads nothing back twice.
+        let behind = sched.schedule();
+        assert!(behind.num_scheduled_tokens.is_empty());
+        assert!(behind.recurrent_state.disk.is_empty());
+        sched.commit_step(&out);
+        sched.commit_step(&behind);
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores,
+            vec![StateSnapshotOp {
+                req_id: "a2".into(),
+                slot: fill.slot,
+                position: 144,
+                key: fill.key,
+            }]
         );
         assert!(out.recurrent_state.saves.is_empty(), "its end is on disk");
         prefill_and_finish(&mut sched, "a2");
@@ -9126,32 +9179,9 @@ mod tests {
         assert_eq!(out.recurrent_state.restores[0].position, 144);
     }
 
-    /// A scheduler of 1 slot and 2 disk slots where `a`'s snapshot went to disk, then `a2`'s step,
-    /// which reads it back for `a2` to restore.
-    fn reading_back_a() -> (Scheduler, SchedulerOutput) {
-        let mut sched = recurrent_scheduler_over(
-            SnapshotBudget {
-                disk_slots: 2,
-                ..apart(1)
-            },
-            4096,
-        );
-        for (id, seed) in [("a", 1), ("b", 2)] {
-            sched.add_request(prompt_blocks(id, 10, seed));
-            run_step(&mut sched);
-            prefill_and_finish(&mut sched, id);
-        }
-        sched.add_request(prompt_blocks("a2", 10, 1));
-        let out = sched.schedule();
-        assert_eq!(out.recurrent_state.disk.fills.len(), 1);
-        assert_eq!(out.recurrent_state.restores[0].req_id, "a2");
-        (sched, out)
-    }
-
-    /// `a`'s prompt again, after a fill of its snapshot failed: it resumes cold, reads nothing back
+    /// `id`, waiting for a fill that failed, resumes cold: it reads nothing back, restores nothing
     /// and saves its end anew.
-    fn assert_a_resumes_cold(sched: &mut Scheduler, id: &str) {
-        sched.add_request(prompt_blocks(id, 10, 1));
+    fn assert_resumes_cold(sched: &mut Scheduler, id: &str) {
         let out = run_step(sched);
         assert!(
             out.recurrent_state.restores.is_empty(),
@@ -9161,6 +9191,7 @@ mod tests {
             out.recurrent_state.disk.fills.is_empty(),
             "{id} reads nothing back"
         );
+        assert_eq!(out.scheduled_new_reqs[0].req_id, id);
         assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
         let saved: Vec<u32> = (out.recurrent_state.saves.iter())
             .map(|op| op.position)
@@ -9168,42 +9199,37 @@ mod tests {
         assert_eq!(saved, vec![144], "{id} saves its end anew");
     }
 
-    /// ⛔ THE WORKER COULD NOT READ A SNAPSHOT BACK FROM DISK. Its request ran on no state and is
-    /// aborted; the snapshot is forgotten, in its slot and on disk; and the next request for the
-    /// prefix, even one scheduled before the failure came back, resumes cold.
+    /// ⛔ THE WORKER COULD NOT READ A SNAPSHOT BACK FROM DISK. No request ran on it; the snapshot is
+    /// forgotten, in its slot and on disk; and the request that waited for it, like the next one
+    /// for its prefix, resumes cold: a disk error costs latency, not an answer.
     #[test]
-    fn recurrent_a_failed_fill_costs_its_request_and_the_prefix_resumes_cold() {
+    fn recurrent_a_failed_fill_costs_its_waiting_request_a_cold_prefill() {
         let (mut sched, out) = reading_back_a();
-        // Scheduled behind it, before it came back: the fill is no hit yet, nor read back twice.
-        sched.add_request(prompt_blocks("a3", 10, 1));
         let behind = sched.schedule();
-        assert!(behind.recurrent_state.restores.is_empty());
-        assert!(behind.recurrent_state.disk.fills.is_empty());
-
         let slot = out.recurrent_state.disk.fills[0].slot;
-        let doomed = sched.forget_failed_fills(&out, &[slot]);
-        assert_eq!(
-            doomed,
-            vec!["a2".to_string()],
-            "the request that ran on the fill alone"
-        );
-        sched.finish_requests(&["a2"], RequestStatus::FinishedAborted);
+        sched.forget_failed_fills(&out, &[slot]);
         sched.commit_step(&out);
         sched.commit_step(&behind);
-        prefill_and_finish(&mut sched, "a3");
-        assert_a_resumes_cold(&mut sched, "a4");
+        assert_resumes_cold(&mut sched, "a2");
+        prefill_and_finish(&mut sched, "a2");
+        sched.add_request(prompt_blocks("a3", 10, 1));
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores[0].position, 144,
+            "a2's own save serves the prefix again"
+        );
     }
 
-    /// ⛔ THE STEP THAT READ A SNAPSHOT BACK NEVER CAME BACK: the snapshot is forgotten with the
-    /// step's blocks, and the next request for the prefix resumes cold.
+    /// ⛔ THE STEP THAT READ A SNAPSHOT BACK NEVER CAME BACK: the snapshot is forgotten, no request
+    /// is lost with it, and the one that waited for it resumes cold.
     #[test]
     fn recurrent_a_fill_whose_step_failed_is_forgotten() {
         let (mut sched, out) = reading_back_a();
-        let doomed = sched.forget_unwritten(&out);
-        assert!(doomed.contains(&"a2".to_string()));
-        let doomed: Vec<&str> = doomed.iter().map(String::as_str).collect();
-        sched.finish_requests(&doomed, RequestStatus::FinishedAborted);
-        assert_a_resumes_cold(&mut sched, "a3");
+        assert!(
+            sched.forget_unwritten(&out).is_empty(),
+            "no request ran in it"
+        );
+        assert_resumes_cold(&mut sched, "a2");
     }
 
     #[test]

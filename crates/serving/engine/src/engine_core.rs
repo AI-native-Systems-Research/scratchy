@@ -891,17 +891,15 @@ impl EngineCore {
         };
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
-        // ⛔ BUT A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK HOLDS NOTHING: the request that
-        // restored it ran on no state, and is aborted before its output is read; the snapshot is
-        // forgotten, so the next hit on its prefix resumes cold.
-        let ran_on_nothing =
-            (self.scheduler).forget_failed_fills(scheduler_output, &model_output.failed_fills);
-        if !ran_on_nothing.is_empty() {
+        // ⛔ BUT A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK HOLDS NOTHING. No request ran on
+        // it — the one it was read for waits for this step — so it is forgotten before the commit,
+        // and that request resumes cold: a disk error costs it a prefill, not its answer.
+        if !model_output.failed_fills.is_empty() {
             warn!(
-                requests = ?ran_on_nothing,
-                "aborting requests whose recurrent-state snapshot could not be read back from disk"
+                slots = ?model_output.failed_fills,
+                "recurrent-state snapshots not read back from disk: their requests resume cold"
             );
-            self.abort_requests(&ran_on_nothing);
+            (self.scheduler).forget_failed_fills(scheduler_output, &model_output.failed_fills);
         }
         // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
         // BLOCKS REGISTERED WHILE IT WAS SCHEDULED HOLD THEIRS — committed here and not when they
@@ -2839,9 +2837,16 @@ mod tests {
         );
     }
 
+    /// What a [`FailingFillsExecutor`] saw: the fills it failed, and each request's first chunk.
+    #[derive(Default)]
+    struct Seen {
+        failed: usize,
+        first_chunk: HashMap<String, usize>,
+    }
+
     /// A [`NoopExecutor`] whose worker keeps one snapshot slot and two disk slots, and fails to
     /// read back every snapshot from disk.
-    struct FailingFillsExecutor(NoopExecutor);
+    struct FailingFillsExecutor(NoopExecutor, std::sync::Arc<std::sync::Mutex<Seen>>);
 
     impl Executor for FailingFillsExecutor {
         fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
@@ -2854,6 +2859,11 @@ mod tests {
             let mut out = self.0.execute_model(scheduler_output)?;
             let fills = &scheduler_output.recurrent_state.disk.fills;
             out.failed_fills = fills.iter().map(|f| f.slot).collect();
+            let mut seen = self.1.lock().unwrap();
+            seen.failed += fills.len();
+            for (req_id, &n) in &scheduler_output.num_scheduled_tokens {
+                seen.first_chunk.entry(req_id.clone()).or_insert(n);
+            }
             Ok(out)
         }
         fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
@@ -2880,16 +2890,17 @@ mod tests {
         }
     }
 
-    /// ⛔ A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK COSTS ITS OWN REQUEST, AND NO OTHER:
-    /// that request is aborted, the one decoding beside it runs on, and the next request for the
-    /// prefix resumes cold.
+    /// ⛔ A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK COSTS ITS REQUEST A COLD PREFILL, AND
+    /// NOTHING ELSE: that request answers in full, as with no disk tier, and so does the one
+    /// decoding beside it.
     #[test]
-    fn a_failed_fill_aborts_only_its_request_and_the_prefix_resumes_cold() {
+    fn a_failed_fill_costs_its_request_a_cold_prefill_not_its_answer() {
         let mut config = make_test_config();
         config.enable_prefix_caching = true;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
         let mut engine = EngineCore::new(
             config,
-            Box::new(FailingFillsExecutor(NoopExecutor::new(1024))),
+            Box::new(FailingFillsExecutor(NoopExecutor::new(1024), seen.clone())),
         );
         let prompt = |id: &str, seed: u32| {
             let mut r = make_request(id, 600);
@@ -2900,48 +2911,54 @@ mod tests {
         let running = |engine: &EngineCore, id: &str| {
             (engine.scheduler.get_request(id)).is_some_and(|r| !r.status.is_finished())
         };
+        // What each request's client receives: its tokens and how it finished.
+        let mut received: HashMap<String, (usize, Option<FinishReason>)> = HashMap::new();
+        let mut step = |engine: &mut EngineCore| {
+            let StepOutcome::Progressed { outputs, .. } = engine.step().unwrap() else {
+                panic!("a step that does nothing");
+            };
+            for o in outputs.into_values().flat_map(|o| o.outputs) {
+                let r = received.entry(o.request_id).or_default();
+                r.0 += o.new_token_ids.len();
+                r.1 = r.1.or(o.finish_reason);
+            }
+        };
         // `a` saves its prompt's end and finishes.
         engine.add_request(prompt("a", 1));
         while running(&engine, "a") {
-            assert!(matches!(
-                engine.step().unwrap(),
-                StepOutcome::Progressed { .. }
-            ));
+            step(&mut engine);
         }
         // `b`'s save takes the one slot: `a`'s snapshot goes to disk.
         engine.add_request(prompt("b", 2));
-        assert!(matches!(
-            engine.step().unwrap(),
-            StepOutcome::Progressed { .. }
-        ));
+        step(&mut engine);
         assert!(running(&engine, "b"), "decoding");
 
-        // `a`'s prompt again, beside `b`'s decode: its snapshot is read back, and that fails.
+        // `a`'s prompt again, while `b` decodes: a step reads its snapshot back, and that fails.
         engine.add_request(prompt("a2", 1));
-        let mut sched = engine.scheduler.schedule();
+        while running(&engine, "a2") || running(&engine, "b") {
+            step(&mut engine);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.failed, 1);
         assert_eq!(
-            sched.recurrent_state.disk.fills.len(),
-            1,
-            "{:?}",
-            sched.recurrent_state
+            seen.first_chunk["a2"], 600,
+            "a2 prefilled cold, all of its prompt"
         );
-        assert!(sched.num_scheduled_tokens.contains_key("b"));
-        let mut executor = engine.take_executor().unwrap();
-        engine.plan_drafts(&mut sched);
-        let out = executor.execute_model(&sched).unwrap();
-        engine.finalize_step(&sched, &out);
-        assert!(!running(&engine, "a2"), "aborted: it ran on no state");
-        assert!(running(&engine, "b"), "the request beside it runs on");
+        assert_eq!(
+            received["a2"],
+            (16, Some(FinishReason::Length)),
+            "a2's client gets its whole answer"
+        );
+        assert_eq!(received["b"], (16, Some(FinishReason::Length)));
 
         engine.add_request(prompt("a3", 1));
         let next = engine.scheduler.schedule();
-        assert!(
-            next.recurrent_state.restores.is_empty(),
-            "{:?}",
-            next.recurrent_state
-        );
         assert!(next.recurrent_state.disk.fills.is_empty());
-        assert_eq!(next.num_scheduled_tokens["a3"], 600, "cold");
+        assert_eq!(
+            next.recurrent_state.restores.first().map(|op| op.position),
+            Some(592),
+            "a2's own save serves the prefix again"
+        );
     }
 
     #[test]

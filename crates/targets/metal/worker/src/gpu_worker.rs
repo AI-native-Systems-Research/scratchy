@@ -2784,16 +2784,7 @@ impl MetalWorker {
                 rows.push(row);
                 continue;
             }
-            let restore = ops.restores.iter().find(|op| op.req_id == *req_id);
-            // ⛔ A RESTORE FROM A SNAPSHOT THIS STEP COULD NOT READ BACK FROM DISK: the engine aborts
-            // its request (`failed_fills`), so it runs as a refused row, on no state and saving
-            // none, and the requests beside it run on.
-            if restore.is_some_and(|op| self.gdn_failed_fills.contains(&op.slot)) {
-                row.refused = true;
-                rows.push(row);
-                continue;
-            }
-            if let Some(op) = restore {
+            if let Some(op) = ops.restores.iter().find(|op| op.req_id == *req_id) {
                 if op.position != before {
                     let at = op.position;
                     return Err(bad(format!(
@@ -2874,8 +2865,8 @@ impl MetalWorker {
     ///
     /// ⛔ A MOVE THAT FAILS FAILS NO STEP. A spill that fails leaves its disk slot holding nothing,
     /// so a fill from it fails in turn. A fill that fails leaves its slot keyed to nothing, and goes
-    /// back to the engine (`ModelRunnerOutput::failed_fills`): the request that restores from it
-    /// runs on no state (`gdn_step`), and is aborted.
+    /// back to the engine (`ModelRunnerOutput::failed_fills`), which forgets it: no request runs in
+    /// the step that reads its snapshot back, and the one waiting for it resumes cold.
     fn move_snapshots(
         &mut self,
         moves: impl ExactSizeIterator<Item = (usize, usize, u64)>,

@@ -334,8 +334,8 @@ pub struct SnapshotMove {
 }
 
 /// A snapshot read back from disk slot `disk` into device snapshot slot `slot`, for request
-/// `req_id` to restore: the state of the prefix whose chain hash is `key`. Like a save, it is hit by
-/// other requests only once its step comes back.
+/// `req_id`: the state of the prefix whose chain hash is `key`. Like a save, it is a hit only once
+/// its step comes back, for `req_id` too, which waits for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotFill {
     pub req_id: String,
@@ -350,9 +350,9 @@ pub struct SnapshotFill {
 /// keeps none of them: LRU evicts each one just before it is needed again.
 ///
 /// The worker writes every spill first: before this step's memory ops release a unit and before
-/// anything this step rewrites a slot. It reads every fill after the memory ops map and before the
-/// forward that restores from the slot. The scheduler never names a disk slot in a spill that a
-/// fill reads in the same step, so this order is the one the scheduler decided in.
+/// anything this step rewrites a slot. It reads every fill after the memory ops map, before the
+/// forward; no request restores a fill in the step that reads it. The scheduler never names a disk
+/// slot in a spill that a fill reads in the same step, so this order is the one it decided in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotDiskOps {
     /// Device slots written out to disk slots: snapshots leaving device memory.
