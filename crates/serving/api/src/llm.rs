@@ -361,6 +361,9 @@ pub struct LLM {
     /// Model-recommended sampling defaults (`generation_config.json`),
     /// Python vLLM `generation_config="auto"` parity.
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
+    /// Whether the worker scores prompt rows: a generation asking for `prompt_logprobs` is refused
+    /// where it does not, rather than answered with none (#874).
+    scores_prompts: bool,
     /// Set by [`Interrupter::interrupt`]; the running generation reads it between steps.
     interrupt: Arc<AtomicBool>,
 }
@@ -444,6 +447,7 @@ impl LLM {
             max_model_len: stack.max_model_len,
             block_size: stack.block_size,
             generation_defaults: stack.generation_defaults,
+            scores_prompts: stack.scores_prompts,
             interrupt: Arc::default(),
         })
     }
@@ -750,6 +754,21 @@ impl LLM {
         self.generate_impl(prompts, params, true, false, false)
     }
 
+    /// The params a generation runs: `params`, or the model's defaults, valid and asking nothing
+    /// the worker cannot give (`prompt_logprobs` where it scores no prompt rows).
+    fn checked_params(&self, params: Option<SamplingParams>) -> Result<SamplingParams> {
+        let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        anyhow::ensure!(
+            params.prompt_logprobs.is_none() || self.scores_prompts,
+            "prompt_logprobs is not supported by this backend: it scores only the rows it samples, \
+             not every prompt token"
+        );
+        Ok(params)
+    }
+
     fn generate_impl<P: Into<Prompt> + Clone>(
         &mut self,
         prompts: &[P],
@@ -759,10 +778,7 @@ impl LLM {
         volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
         let _generation = self.generation();
-        let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        let params = self.checked_params(params)?;
 
         let n = params.n.max(1) as usize;
         let detokenize = params.detokenize;
@@ -1067,10 +1083,7 @@ impl LLM {
             .map_err(|e| anyhow::anyhow!("chat template render failed: {e}"))?;
         let _d_render = _t_render.elapsed();
 
-        let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        let params = self.checked_params(params)?;
 
         // Tokenize the rendered prompt.
         let _t_tok = std::time::Instant::now();
@@ -1622,8 +1635,31 @@ mod tests {
                 repetition_penalty: None,
                 max_new_tokens: None,
             },
+            scores_prompts: false,
             interrupt: Arc::default(),
         }
+    }
+
+    /// A worker that scores no prompt rows refuses a generation asking for `prompt_logprobs`
+    /// before running anything, rather than answering it with none (#874); the same params
+    /// without them pass.
+    #[test]
+    fn prompt_logprobs_are_refused_where_the_worker_scores_none() {
+        let llm = scripted_llm(vec![], Arc::default());
+        let asks = SamplingParams {
+            prompt_logprobs: Some(1),
+            ..SamplingParams::default()
+        };
+        let err = llm
+            .checked_params(Some(asks.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prompt_logprobs"), "{err}");
+        let plain = SamplingParams {
+            prompt_logprobs: None,
+            ..asks
+        };
+        assert!(llm.checked_params(Some(plain)).is_ok());
     }
 
     #[test]

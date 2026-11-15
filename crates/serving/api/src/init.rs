@@ -189,6 +189,8 @@ pub struct InitializedSyncStack {
     pub block_size: usize,
     /// Model-recommended sampling defaults (`generation_config.json`).
     pub generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
+    /// Whether the worker scores prompt rows for `prompt_logprobs` (`Worker::prompt_scoring_rows`).
+    pub scores_prompts: bool,
 }
 
 /// `num_hidden_layers`, falling through to the nested `text_config`
@@ -1700,6 +1702,7 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         max_model_len: core.max_model_len,
         block_size: config.block_size,
         generation_defaults,
+        scores_prompts: core.prompt_scoring_rows.is_some(),
     })
 }
 
