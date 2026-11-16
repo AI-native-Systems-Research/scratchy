@@ -25,13 +25,13 @@ use scratchy_target_spyre::bundle_code::NUM_SEGMENTS;
 use scratchy_target_spyre::bundle_code::collective::{
     CbStep, Rank, Sid, TpConsume, TpSend, WINDOW_SEGMENT, group_steps,
 };
-use scratchy_target_spyre::fold_plan::{self, OpKv};
+use scratchy_target_spyre::fold_plan;
 
 /// The base one segment's tensors resolve against for this launch — the weight
 /// BANK's region for the weight segment (bank 0 IS `seg_addr[WEIGHT]`; bank
 /// `b ≥ 1` is `banks[b - 1]`), the segment's own region otherwise. Shared by
-/// the walk and the plan build so the bank selection cannot drift between
-/// them. Refusals are the walk's own, verbatim — except that a bank slot which
+/// the walk and the canvas construction so the bank selection cannot drift
+/// between them. Refusals are the walk's own, verbatim — except that a bank slot which
 /// exists but holds no region yet, which the walk's old code only reached as
 /// the later "seg1 has no region", is named HERE as the bank it is (louder,
 /// same unreachable-at-launch corner: prepare refuses a bank with no region
@@ -127,7 +127,7 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
     // bundle) is `seg_addr[SEG_WEIGHT]`, exactly as before.
     // ⭐ AND A COLLECTIVE'S CONSUME TAKES NEITHER: its weight-segment operand is the receive window,
     // one placement in the base region, so `weight_slot` pins it to shift 0 in bank 0 — the one law
-    // the walk and the plan twin both read through this function.
+    // the walk and the canvas construction both read through this function.
     let (weight_shift, weight_bank) = op
         .code
         .kv
