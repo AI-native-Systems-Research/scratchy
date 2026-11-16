@@ -12,9 +12,8 @@ use super::datasets;
 use super::kept;
 use super::numbers::Engine;
 
-/// A cell's name in a table row: its dataset's, MuSiQue's saying how its answers ran. Its 1-user
-/// cell answers on its own, for the decode it times; above 1 user they are forced to one length,
-/// for their total time (#1208).
+/// A cell's name in a table row: its dataset's, MuSiQue's saying how its answers ran. Its cells
+/// answer on their own (#1208, #994); runs before those forced them to one length, and say so.
 pub fn cell_label(c: &TaskCell) -> String {
     match (c.workload.as_str(), c.timed_answers) {
         ("rag", true) => "MuSiQue, timed".to_string(),
@@ -141,13 +140,34 @@ fn ttft_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
 /// despite `ignore_eos`) answers in fewer tokens, and its time is no faster for it.
 const SAME_LENGTH: f64 = 0.10;
 
-/// How many times faster scratchy is to its whole answer than the rival: only where both answered
-/// at about the same length ([`SAME_LENGTH`]), neither mostly ran to its cap, and both say how
-/// long their answers were.
+/// Why two cells' whole answers do not compare, end to end and in energy a request; None where
+/// they do. Answers ending on their own compare at any length: an engine's answer is its own, and
+/// whether it was right is its accuracy (#994). Answers forced to one length compare only where
+/// both ran about that length ([`SAME_LENGTH`]) and neither mostly ran to its cap: an engine that
+/// stops at EOS despite `ignore_eos` answered less than it was asked, and is no faster for it. A
+/// forced cell never compares with one answering on its own; nor a cell most of whose requests
+/// failed.
+pub fn unlike_answers(c: &TaskCell, r: &TaskCell) -> Option<&'static str> {
+    if mostly_failed(c) || mostly_failed(r) {
+        return Some("most requests failed");
+    }
+    match (c.timed_answers, r.timed_answers) {
+        (false, false) => None,
+        (true, true) => {
+            let (a, b) = (c.answer_tokens(), r.answer_tokens());
+            let one = a
+                .zip(b)
+                .is_some_and(|(a, b)| (a - b).abs() <= SAME_LENGTH * a.max(b));
+            (!(one && usable(c) && usable(r))).then_some("answers forced to different lengths")
+        }
+        _ => Some("one engine's answers forced, the other's their own"),
+    }
+}
+
+/// How many times faster scratchy is to its whole answer than the rival, where the two answers
+/// compare ([`unlike_answers`]).
 fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
-    let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
-    let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
-    (close && usable(c) && usable(r))
+    (unlike_answers(c, r).is_none())
         .then(|| times(c.median_e2el_ms, r.median_e2el_ms, true))
         .flatten()
 }
@@ -256,13 +276,10 @@ fn joules(v: Option<f64>) -> String {
     )
 }
 
-/// How many times less energy scratchy spent a request than the rival: as the total time's
-/// ratio is, only where both answered about one length and neither mostly ran to its cap, an
-/// engine that stops early spending less for answering less.
+/// How many times less energy scratchy spent a request than the rival, where the two answers
+/// compare ([`unlike_answers`]), as the total time's ratio is.
 fn energy_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
-    let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
-    let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
-    (close && usable(c) && usable(r))
+    (unlike_answers(c, r).is_none())
         .then(|| times(per_request(c), per_request(r), true))
         .flatten()
 }
@@ -373,8 +390,8 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
             let mut engines = vec![Engine::Scratchy];
             engines.extend(rival_of(m, dataset));
             engines.into_iter().flat_map(move |e| {
-                (e.tasks(m).iter())
-                    .filter(|c| accuracy_cell(c, dataset))
+                accuracy_cells(e.tasks(m), dataset)
+                    .into_iter()
                     .map(move |c| (format!("{} on {chip}", m.stem), e.label(), c))
             })
         })
@@ -472,43 +489,57 @@ fn short_reason(c: &TaskCell) -> String {
 }
 
 /// [`accuracy_table`]'s plot: a group a model, in the order the section reads them, a row a Mac
-/// it ran on, a mark an engine, scratchy first: its accuracy and 95% range, or why it has none.
+/// it ran on (and a users count, where it scored several), a mark an engine, scratchy first: its
+/// accuracy and 95% range, or why it has none.
 fn accuracy_dots(dataset: &str, pairs: &[(&str, &Model)]) -> Vec<RangeGroup> {
     let mut groups: Vec<RangeGroup> = Vec::new();
     for &(chip, m) in pairs {
         let mut engines = vec![Engine::Scratchy];
         engines.extend(rival_of(m, dataset));
-        let marks: Vec<RangeMark> = (engines.iter().zip(["s1", "s2"]))
-            .filter_map(|(&e, class)| {
-                let c = (e.tasks(m).iter()).find(|c| accuracy_cell(c, dataset))?;
-                let at = match (accuracy(c), range(c)) {
-                    (Some(a), Some(r)) => Ok((a, a - r / 100.0, a + r / 100.0)),
-                    (Some(a), None) => Ok((a, a, a)),
-                    _ => Err(short_reason(c)),
-                };
-                let mut tip = vec![
-                    format!("{} on {chip}", m.stem),
-                    format!("accuracy {}", scored(c)),
-                ];
-                tip.extend(by_hops(c).filter(|_| accuracy(c).is_some()));
-                if let Some(n) = c.num_tasks {
-                    tip.push(format!("over {} tasks", crate::thousands(n as usize)));
-                }
-                Some(RangeMark {
-                    class,
-                    name: e.label().to_string(),
-                    at,
-                    tip,
-                })
-            })
+        let mut users: Vec<u32> = (engines.iter())
+            .flat_map(|&e| accuracy_cells(e.tasks(m), dataset))
+            .map(|c| c.conc)
             .collect();
-        if marks.is_empty() {
-            continue;
-        }
-        let row = (chip.to_string(), marks);
-        match groups.iter_mut().find(|(stem, _)| stem == &m.stem) {
-            Some((_, rows)) => rows.push(row),
-            None => groups.push((m.stem.clone(), vec![row])),
+        users.sort_unstable();
+        users.dedup();
+        for &u in &users {
+            let marks: Vec<RangeMark> = (engines.iter().zip(["s1", "s2"]))
+                .filter_map(|(&e, class)| {
+                    let c =
+                        (accuracy_cells(e.tasks(m), dataset).into_iter()).find(|c| c.conc == u)?;
+                    let at = match (accuracy(c), range(c)) {
+                        (Some(a), Some(r)) => Ok((a, a - r / 100.0, a + r / 100.0)),
+                        (Some(a), None) => Ok((a, a, a)),
+                        _ => Err(short_reason(c)),
+                    };
+                    let mut tip = vec![
+                        format!("{} on {chip}", m.stem),
+                        format!("accuracy {}", scored(c)),
+                    ];
+                    tip.extend(by_hops(c).filter(|_| accuracy(c).is_some()));
+                    if let Some(n) = c.num_tasks {
+                        tip.push(format!("over {} tasks", crate::thousands(n as usize)));
+                    }
+                    Some(RangeMark {
+                        class,
+                        name: e.label().to_string(),
+                        at,
+                        tip,
+                    })
+                })
+                .collect();
+            if marks.is_empty() {
+                continue;
+            }
+            let label = match users.len() {
+                1 => chip.to_string(),
+                _ => format!("{chip}, {u} user{}", if u == 1 { "" } else { "s" }),
+            };
+            let row = (label, marks);
+            match groups.iter_mut().find(|(stem, _)| stem == &m.stem) {
+                Some((_, rows)) => rows.push(row),
+                None => groups.push((m.stem.clone(), vec![row])),
+            }
         }
     }
     groups
@@ -526,16 +557,31 @@ fn of_dataset(c: &TaskCell, dataset: &str) -> bool {
     c.workload == dataset || datasets::of(dataset).and_then(|d| d.scored) == Some(&c.workload)
 }
 
-/// Whether a cell's accuracy is one of `dataset`'s accuracy rows: scored, its answers its own,
-/// and where the dataset has a cell run for its accuracy ([`datasets::Dataset::scored`]), that
-/// one: MuSiQue's 1-user timing cell, scored along the way over a handful of tasks, is no
-/// accuracy row (#1208).
-fn accuracy_cell(c: &TaskCell, dataset: &str) -> bool {
-    let scored = datasets::of(dataset).and_then(|d| d.scored);
-    of_dataset(c, dataset)
-        && !c.timed_answers
-        && c.accuracy.is_some()
-        && scored.is_none_or(|s| c.workload == s)
+/// One engine's cells that are `dataset`'s accuracy rows: scored, their answers their own. Where
+/// the dataset has a cell run for its accuracy ([`datasets::Dataset::scored`]) and the engine ran
+/// one, that one: MuSiQue's 1-user timing cell, scored along the way over a handful of tasks, is
+/// no accuracy row (#1208). Where it ran none, its cells drawn from a share of the dev set
+/// (`--task-share`): every MuSiQue cell is timed and scored alike, one a users count (#994).
+fn accuracy_cells<'a>(cells: &'a [TaskCell], dataset: &str) -> Vec<&'a TaskCell> {
+    let graded = |c: &&TaskCell| !c.timed_answers && c.accuracy.is_some();
+    let Some(scored) = datasets::of(dataset).and_then(|d| d.scored) else {
+        return cells
+            .iter()
+            .filter(|c| c.workload == dataset)
+            .filter(graded)
+            .collect();
+    };
+    let own: Vec<&TaskCell> = (cells.iter())
+        .filter(|c| c.workload == scored)
+        .filter(graded)
+        .collect();
+    if !own.is_empty() {
+        return own;
+    }
+    (cells.iter())
+        .filter(|c| c.workload == dataset && c.task_share.is_some())
+        .filter(graded)
+        .collect()
 }
 
 fn table(m: &Model, only: Option<&str>) -> Element {
@@ -661,7 +707,7 @@ mod tests {
 
     /// A dataset cell's energy, where its run kept it: joules a request, an output token and, on
     /// a scored cell that shows its accuracy, a right answer; and how many times less scratchy
-    /// spent a request than the rival, only at about one answer length, as the total time is.
+    /// spent a request than the rival, where the answers compare, as the total time is.
     #[test]
     fn a_dataset_cells_energy_is_a_request_a_token_and_a_right_answer() {
         let cell = |tokens: f64, j: f64, accuracy: Option<f64>| -> TaskCell {
@@ -684,8 +730,20 @@ mod tests {
             energy_times(&ours, &cell(100.0, 60.0, Some(0.5))),
             Some(1.5)
         );
-        // Answers of different lengths: no ratio, as for the total time.
-        assert_eq!(energy_times(&ours, &cell(200.0, 60.0, Some(0.5))), None);
+        // Answers forced to different lengths: no ratio, as for the total time. Answers ending on
+        // their own compare at any length.
+        let forced = |c: TaskCell| TaskCell {
+            timed_answers: true,
+            ..c
+        };
+        assert_eq!(
+            energy_times(&forced(ours.clone()), &forced(cell(200.0, 60.0, Some(0.5)))),
+            None
+        );
+        assert_eq!(
+            energy_times(&ours, &cell(200.0, 60.0, Some(0.5))),
+            Some(1.5)
+        );
         // Not scored, or none right: no figure a right answer.
         assert_eq!(joules(per_right(&cell(100.0, 40.0, None))), "—");
         assert_eq!(joules(per_right(&cell(100.0, 40.0, Some(0.0)))), "—");
@@ -744,10 +802,11 @@ mod tests {
         assert_eq!(right(&c), "47% of 400");
     }
 
-    /// The whole answer's time is set against the rival's only at about the same answer length,
-    /// and neither mostly capped; the first token's always is.
+    /// Answers forced to one length set their whole time against the rival's only where both ran
+    /// about that length and neither mostly capped; answers ending on their own, at any length
+    /// (#994); a forced cell never against one answering on its own. The first token's always is.
     #[test]
-    fn a_total_ratio_needs_answers_of_about_one_length() {
+    fn a_total_ratio_needs_answers_like_for_like() {
         let cell = |tokens: f64, capped: u32| TaskCell {
             workload: "rag".into(),
             conc: 1,
@@ -764,7 +823,7 @@ mod tests {
             num_tasks: Some(8),
             load: None,
             request_rate: None,
-            timed_answers: false,
+            timed_answers: true,
             timed_out: false,
             median_tpot_ms: None,
             output_throughput: None,
@@ -773,6 +832,10 @@ mod tests {
             prompt_tokens: None,
             tpots_ms: None,
             accuracy_by_group: None,
+            task_ids: None,
+            task_groups: None,
+            task_right: None,
+            task_share: None,
             borrowed_from: None,
             energy: None,
             spec_decode: None,
@@ -801,6 +864,29 @@ mod tests {
         let mut unknown = cell(100.0, 0);
         unknown.mean_output_tokens = None;
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
+        let natural = |tokens: f64, capped: u32| TaskCell {
+            timed_answers: false,
+            ..cell(tokens, capped)
+        };
+        assert_eq!(
+            total_times(&natural(100.0, 0), &natural(150.0, 0)),
+            Some(1.0),
+            "their own, any length"
+        );
+        assert_eq!(
+            total_times(&natural(100.0, 0), &natural(100.0, 5)),
+            Some(1.0),
+            "their own, capped or not: accuracy counts a cut-off answer wrong"
+        );
+        assert_eq!(
+            total_times(&natural(100.0, 0), &cell(100.0, 0)),
+            None,
+            "forced against their own"
+        );
+        assert_eq!(
+            unlike_answers(&natural(100.0, 0), &cell(100.0, 0)),
+            Some("one engine's answers forced, the other's their own")
+        );
     }
 
     /// A run's workloads, in the order it ran them.
@@ -929,6 +1015,10 @@ mod tests {
             prompt_tokens: None,
             tpots_ms: None,
             accuracy_by_group: None,
+            task_ids: None,
+            task_groups: None,
+            task_right: None,
+            task_share: None,
             borrowed_from: None,
             energy: None,
             spec_decode: None,

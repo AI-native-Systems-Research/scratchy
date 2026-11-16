@@ -223,10 +223,25 @@ fn borrow_earlier(runs: &mut [Run]) {
             // another's. Only stacked cells are lent and borrowed: an open-loop cell
             // (`--open-loop`) is keyed by its rate step, which is another rate in a quick run and
             // a full one (0.5× against 0.25× at step 1), and its rates are fractions of its own
-            // run's scratchy base. So a run with open-loop cells borrows no rival.
+            // run's scratchy base. So a run with open-loop cells borrows no rival. A MuSiQue cell
+            // drawn from its share of the dev set (`--task-share`) asks the head of that share, a
+            // quick run's the first of a full run's: it is borrowed cut to the head this run's
+            // scratchy cell asked ([`data::TaskCell::head`]).
             let cap = run_task_cap(&run.config);
             let stacked = |c: &data::TaskCell| matches!(c.load.as_deref(), None | Some("users"));
             let open_loop = !(Engine::Scratchy.tasks(m).iter()).all(stacked);
+            type Asked = (String, u32, Option<String>, Option<Vec<String>>);
+            let ours: Vec<Asked> = (Engine::Scratchy.tasks(m).iter())
+                .filter(|c| stacked(c))
+                .map(|c| {
+                    (
+                        c.workload.clone(),
+                        c.conc,
+                        c.task_share.clone(),
+                        c.task_ids.clone(),
+                    )
+                })
+                .collect();
             let sizing = (run.config.scaling.as_ref()).and_then(data::Scaling::task_sizing);
             // And drawn the same way: a run that samples all of MuSiQue's hops asks other tasks
             // than one that took its first 200.
@@ -275,8 +290,22 @@ fn borrow_earlier(runs: &mut [Run]) {
                                     _ => false,
                                 }
                         };
-                        let kept: Vec<data::TaskCell> =
-                            cells.iter().filter(|c| same_tasks(c)).cloned().collect();
+                        // A cell drawn from a share: the head of it this run's scratchy cell
+                        // asked, where both drew from the same share the same way and the lent
+                        // cell asked at least as many.
+                        let lend = |c: &data::TaskCell| -> Option<data::TaskCell> {
+                            let Some(share) = c.task_share.as_ref() else {
+                                return same_tasks(c).then(|| c.clone());
+                            };
+                            let (_, _, _, ids) = (ours.iter()).find(|(w, u, s, _)| {
+                                *w == c.workload && *u == c.conc && s.as_ref() == Some(share)
+                            })?;
+                            let ids = ids.as_ref()?;
+                            (*lent_drawn == drawn && c.task_ids.as_ref()?.starts_with(ids))
+                                .then(|| c.head(ids.len()))
+                                .flatten()
+                        };
+                        let kept: Vec<data::TaskCell> = cells.iter().filter_map(lend).collect();
                         if !kept.is_empty() {
                             *slot = Some(kept);
                         }
@@ -3146,6 +3175,49 @@ mod tests {
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
     }
 
+    /// MuSiQue's cells answer on their own at every users count (#994), and their end-to-end
+    /// squares set the two engines' whole answers side by side at any length: whether a short
+    /// answer was right is the accuracy's to say. Answers forced to one length compare only where
+    /// both ran about that length, as the detail table's total does; a forced cell never against
+    /// one answering on its own.
+    #[test]
+    fn an_end_to_end_square_needs_answers_like_for_like() {
+        let answers = |runs: &mut [Run], ours: (bool, f64), theirs: (bool, f64)| {
+            let m = &mut runs[0].models[0];
+            for (cells, (forced, tokens)) in
+                [(m.tasks.as_mut(), ours), (m.tasks_omlx.as_mut(), theirs)]
+            {
+                for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(3200); n]);
+                    c.timed_answers = forced;
+                    c.mean_output_tokens = Some(tokens);
+                }
+            }
+            let machines = super::index(runs);
+            render(super::datasets::section("rag", &machines, &machines))
+        };
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let html = answers(&mut runs, (false, 22.0), (false, 40.0));
+        assert!(!html.contains("answers forced"), "their own, any length");
+        assert!(html.contains("vs oMLX</strong>"));
+        assert!(html.contains(">MuSiQue, natural answers<"));
+        assert!(!html.contains(">MuSiQue, timed<"), "no row was forced");
+        let html = answers(&mut runs, (false, 22.0), (true, 64.0));
+        assert!(html.contains("one engine&#39;s answers forced, the other&#39;s their own"));
+        let html = answers(&mut runs, (true, 64.0), (true, 40.0));
+        assert!(
+            html.contains("answers forced to different lengths"),
+            "2u and 4u"
+        );
+        assert!(
+            html.contains("vs oMLX</strong>"),
+            "P and D keep their ratios"
+        );
+        let html = answers(&mut runs, (true, 64.0), (true, 62.0));
+        assert!(!html.contains("answers forced"), "within 10%");
+    }
+
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
     /// replaced too: the grid from an older grid run, MuSiQue from the newer MuSiQue-only one, and
     /// the grid's section says which run it is from.
@@ -4228,6 +4300,140 @@ mod tests {
             let lent = !Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty();
             assert_eq!(lent, borrowed, "a run of {quick} against one of 400");
         }
+    }
+
+    /// A MuSiQue cell drawn from its share of the dev set (`--task-share`) is borrowed cut to the
+    /// head this run's scratchy cell asked: a quick run's tasks are the first of a full run's
+    /// share, and the rival's numbers are over those alone. A cell of another share, or one whose
+    /// tasks do not start with this run's, is not borrowed.
+    #[test]
+    fn a_shared_musique_cell_is_borrowed_cut_to_this_runs_head() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        // Request i of a cell: task t<i> (x<i> where `other`), first token at i + 1 ms, right
+        // where i is even.
+        let cell = |n: usize, share: &str, other: bool| {
+            let id = |i: usize| format!("{}{i}", if other { "x" } else { "t" });
+            serde_json::json!({"workload": "rag", "conc": 4, "load": "users",
+                "completed": n, "failed": 0, "num_tasks": n, "timed_answers": false,
+                "accuracy": 0.5, "capped_answers": 0, "thinking_answers": 0,
+                "task_share": share,
+                "task_ids": (0..n).map(id).collect::<Vec<_>>(),
+                "task_groups": (0..n).map(|i| 2 + (i % 3)).collect::<Vec<_>>(),
+                "task_right": (0..n).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+                "ttfts_ms": (0..n).map(|i| (i + 1) as f64).collect::<Vec<_>>(),
+                "e2els_ms": (0..n).map(|i| (i + 1) as f64 * 10.0).collect::<Vec<_>>(),
+                "median_ttft_ms": (n + 1) as f64 / 2.0})
+        };
+        let run = |when: &str, ours: serde_json::Value, theirs: Option<serde_json::Value>| -> Run {
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["generated_utc"] = when.into();
+            v["config"]["scaling"]["task_sample"] = "musique-dev-shares".into();
+            v["models"][0]["tasks"] = serde_json::json!([ours]);
+            if let Some(t) = theirs {
+                v["models"][0]["tasks_omlx_tq"] = serde_json::json!([t]);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let full = || {
+            run(
+                "2026-11-14T12:00:00Z",
+                cell(805, "3/3", false),
+                Some(cell(805, "3/3", false)),
+            )
+        };
+        let borrowed = |quick: serde_json::Value| {
+            let mut runs = vec![run("2026-11-16T12:00:00Z", quick, None), full()];
+            super::borrow_earlier(&mut runs);
+            Engine::OmlxTq.tasks(&runs[0].models[0]).first().cloned()
+        };
+        let lent = borrowed(cell(100, "3/3", false)).expect("the head of the same share");
+        assert_eq!(lent.num_tasks, Some(100));
+        assert_eq!(
+            lent.median_ttft_ms,
+            Some(50.5),
+            "over its first 100 requests"
+        );
+        assert_eq!(lent.accuracy, Some(0.5));
+        assert!(lent.borrowed_from.is_some());
+        assert!(borrowed(cell(100, "2/3", false)).is_none(), "another share");
+        assert!(borrowed(cell(100, "3/3", true)).is_none(), "other tasks");
+    }
+
+    /// A cell cut to its head: its per-request numbers, medians and accuracy over those requests
+    /// alone; its counts of cut-off answers in proportion; what it kept only as a whole, the whole
+    /// cell's. No head longer than the cell, or of nothing.
+    #[test]
+    fn a_cells_head_is_over_its_first_requests() {
+        let c: super::data::TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag", "conc": 4, "completed": 5, "failed": 1, "num_tasks": 6,
+            "capped_answers": 3, "mean_output_tokens": 30.0, "accuracy": 0.5,
+            "task_ids": ["a", "b", "c", "d", "e", "f"],
+            "task_groups": [2, 2, 3, 3, 4, 4],
+            "task_right": [true, false, false, true, true, true],
+            "ttfts_ms": [10.0, 20.0, null, 40.0, 50.0, 60.0],
+            "e2els_ms": [100.0, 200.0, null, 400.0, 500.0, 600.0],
+            "energy": {"soc_j": 600.0, "window_s": 10.0, "j_per_request": 100.0},
+        }))
+        .unwrap();
+        let h = c.head(4).unwrap();
+        assert_eq!(
+            (h.num_tasks, h.completed, h.failed),
+            (Some(4), Some(3), Some(1))
+        );
+        assert_eq!(
+            h.median_ttft_ms,
+            Some(20.0),
+            "10, 20 and 40: the failed one has none"
+        );
+        assert_eq!(h.median_e2el_ms, Some(200.0));
+        assert_eq!(h.accuracy, Some(0.5), "the failed one counted wrong");
+        let by = h.accuracy_by_group.unwrap();
+        assert_eq!((by["2"], by["3"]), (Some(0.5), Some(0.5)));
+        assert!(!by.contains_key("4"), "none of its tasks in the head");
+        assert_eq!(h.capped_answers, Some(2), "3 of 6, in proportion");
+        assert_eq!(h.mean_output_tokens, Some(30.0), "the whole cell's");
+        assert_eq!(h.energy, c.energy, "the whole cell's");
+        assert_eq!(h.task_ids.as_deref().map(<[String]>::len), Some(4));
+        assert!(c.head(7).is_none(), "longer than the cell");
+        assert!(c.head(0).is_none(), "of nothing");
+    }
+
+    /// Every MuSiQue cell drawn from a share of the dev set is timed and scored alike (#994): each
+    /// users count's accuracy is a row of the accuracy table, and a row of its plot.
+    #[test]
+    fn every_shared_musique_cell_is_an_accuracy_row() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        for (cells, base) in [(m.tasks.as_mut(), 0.40), (m.tasks_omlx.as_mut(), 0.30)] {
+            for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                let k = match c.conc {
+                    1 => 1,
+                    2 => 2,
+                    _ => 3,
+                };
+                c.timed_answers = false;
+                c.thinking_answers = Some(0);
+                c.task_share = Some(format!("{k}/3"));
+                c.accuracy = Some(base + 0.01 * f64::from(k));
+                c.num_tasks = Some(100);
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        for a in ["41% ±", "42% ±", "43% ±", "31% ±", "32% ±", "33% ±"] {
+            assert!(html.contains(a), "{a}");
+        }
+        assert!(
+            html.contains("Apple M3 Pro, 1 user<"),
+            "a plot row a users count"
+        );
+        assert!(html.contains("Apple M3 Pro, 4 users<"));
     }
 
     /// A MuSiQue timeline does not join runs that drew its tasks differently: a change of questions
