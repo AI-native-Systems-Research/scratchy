@@ -58,6 +58,39 @@ pub fn bucketed(c: &TaskCell) -> bool {
         .is_some_and(|p| p.iter().any(Option::is_some))
 }
 
+/// A cell's joules a correct answer in bucket `at` of `buckets`: the joules its requests there
+/// took over how many of them were right, a wrong one's joules counted too. A failed request has
+/// no joules of its own: its seconds went to the requests in flight beside it
+/// (`cell_energy.per_request`). None where the cell kept no joules a request, no prompt counts or
+/// no scores, or none there was right.
+pub fn joules_per_right_in(c: &TaskCell, buckets: Buckets, at: usize) -> Option<f64> {
+    let (prompts, joules, right) = (
+        c.prompt_tokens.as_deref()?,
+        c.task_joules.as_deref()?,
+        c.task_right.as_deref()?,
+    );
+    let (spent, rights) = (prompts.iter().zip(joules).zip(right))
+        .filter(|((p, _), _)| p.is_some_and(|p| bucket(buckets, p) == at))
+        .fold((0.0, 0u32), |(spent, rights), ((_, j), r)| {
+            (
+                spent + j.unwrap_or(0.0),
+                rights + u32::from(*r == Some(true)),
+            )
+        });
+    (rights > 0).then(|| spent / f64::from(rights))
+}
+
+/// How many of a cell's requests in bucket `at` of `buckets` were right: what its joules a
+/// correct answer there is over.
+pub fn rights_in(c: &TaskCell, buckets: Buckets, at: usize) -> usize {
+    let (Some(prompts), Some(right)) = (c.prompt_tokens.as_deref(), c.task_right.as_deref()) else {
+        return 0;
+    };
+    (prompts.iter().zip(right))
+        .filter(|(p, r)| p.is_some_and(|p| bucket(buckets, p) == at) && **r == Some(true))
+        .count()
+}
+
 fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
     match timing {
         RequestTiming::Ttft => c.ttfts_ms.as_deref(),
@@ -69,6 +102,37 @@ fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bucket's joules a correct answer: its requests' joules, a wrong or failed one's too, over
+    /// how many were right; none where none was right, or the cell kept no joules a request.
+    #[test]
+    fn a_buckets_joules_per_correct_answer_counts_every_request_it_paid_for() {
+        let mut c: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag", "conc": 2,
+            "prompt_tokens": [2000, 2000, 2000, 3000, 3000],
+            "task_right": [true, false, true, false, false],
+            "task_joules": [4.0, 6.0, 2.0, 5.0, null],
+        }))
+        .unwrap();
+        assert_eq!(
+            joules_per_right_in(&c, MUSIQUE, 0),
+            Some(6.0),
+            "12 J over 2 right"
+        );
+        assert_eq!(rights_in(&c, MUSIQUE, 0), 2);
+        assert_eq!(joules_per_right_in(&c, MUSIQUE, 3), None, "none right");
+        assert_eq!(
+            joules_per_right_in(&c, MUSIQUE, 1),
+            None,
+            "no request there"
+        );
+        c.task_joules = None;
+        assert_eq!(
+            joules_per_right_in(&c, MUSIQUE, 0),
+            None,
+            "no joules a request"
+        );
+    }
 
     fn cell(prompts: &[Option<u32>], ttfts: &[Option<f64>], tpots: &[Option<f64>]) -> TaskCell {
         serde_json::from_value(serde_json::json!({

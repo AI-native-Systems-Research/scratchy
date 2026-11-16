@@ -74,7 +74,7 @@ Then, without `--fail-fast`, so one model's build failure does not stop the
 models after it. A quick run is scratchy alone, so it skips the mlx-lm parity
 gate and needs no mlx venv: each model records `parity_skipped` instead.
 ```bash
-caffeinate -dims ./scripts/bench_metal_matrix.sh --unpinned
+./scripts/bench_metal_matrix.sh --unpinned
 ```
 and go on to step 4. In the closing summary say: the commit benchmarked and
 where it is against upstream `main`, whether the tree was dirty (the JSON
@@ -174,7 +174,7 @@ pmset -g batt | head -1
 sysctl -n hw.memsize | awk '{print $1/2^30 " GB"}'
 osascript -e 'quit app "Ollama"' 2>/dev/null   # the desktop app competes for memory
 sleep 2; pkill -f '/Applications/Ollama.app/'  # quitting the app leaves its `ollama serve` on :11434
-pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'   # leftovers from an earlier run
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve'   # leftovers from an earlier run
 lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 ```
 
@@ -229,7 +229,7 @@ its version. llama.cpp's is its build number:
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --full --fail-fast [--models full] \
+./scripts/bench_metal_matrix.sh --full --fail-fast [--models full] \
   --pin scratchy=<sha> --pin oMLX=9de79bc3 2>&1 | tee ~/metal-matrix-run.log
 echo "exit ${PIPESTATUS[0]}"
 ```
@@ -250,7 +250,7 @@ Smoke run (a few minutes when the builds are cached):
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gpt-oss-20b \
+./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gpt-oss-20b \
   --reps 1 --prime 1 --no-scaling --parity --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
 echo "exit ${PIPESTATUS[0]}"
 ```
@@ -374,10 +374,10 @@ steps, and the `scr bench` and server it started keep running. Stop all of
 them:
 
 ```bash
-pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
+pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve'
 pkill -TERM -f '(^|/)scr chat -m '    # the parity gate's scratchy side
 sleep 10
-pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve'
 lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # whatever server the run started
 ```
 

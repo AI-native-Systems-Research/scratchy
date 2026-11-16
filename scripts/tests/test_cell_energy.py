@@ -20,6 +20,35 @@ def rows(*joules, start=100.0):
     return [[start + i + 1, 1.0, *j] for i, j in enumerate(joules)]
 
 
+class PerRequest(unittest.TestCase):
+    def cell(self, starts, e2els_ms):
+        return {"started_unix_s": 100.0, "ended_unix_s": 104.0,
+                "start_times": starts, "e2els_ms": e2els_ms}
+
+    def test_a_lone_request_takes_every_joule_it_ran_over(self):
+        log = rows((1, 1, 0), (2, 2, 0), (3, 3, 0), (4, 4, 0))
+        j = cell_energy.per_request(self.cell([0.0, 2.0], [2000.0, 2000.0]), log)
+        self.assertEqual(j, [6.0, 14.0])
+
+    def test_requests_in_flight_together_share_a_second_by_their_time_in_it(self):
+        # One request over all 4 s; another over the second half: the last two seconds are
+        # shared, each request half of them.
+        log = rows((2, 0, 0), (2, 0, 0), (2, 0, 0), (2, 0, 0))
+        j = cell_energy.per_request(self.cell([0.0, 2.0], [4000.0, 2000.0]), log)
+        self.assertEqual(j, [6.0, 2.0])
+        self.assertAlmostEqual(sum(j), 8.0, msg="the cell's joules, all of them")
+
+    def test_a_failed_request_has_none(self):
+        log = rows((1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0))
+        j = cell_energy.per_request(self.cell([0.0, 1.0], [4000.0, None]), log)
+        self.assertEqual(j, [4.0, None])
+
+    def test_a_cell_without_request_times_or_log_has_none(self):
+        no_times = {"started_unix_s": 100.0, "ended_unix_s": 104.0}
+        self.assertIsNone(cell_energy.per_request(no_times, rows((1, 0, 0))))
+        self.assertIsNone(cell_energy.per_request(self.cell([0.0], [1000.0]), rows((1, 0, 0), start=500.0)))
+
+
 class Window(unittest.TestCase):
     def test_a_window_takes_the_seconds_inside_it_whole(self):
         log = rows((1, 2, 0), (3, 4, 0), (5, 6, 1), (7, 8, 0))
