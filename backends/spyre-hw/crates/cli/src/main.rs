@@ -23,6 +23,18 @@ extern crate scratchy_target_spyre_worker as _;
 #[cfg(feature = "tp")]
 extern crate tp as _;
 
+/// ⭐ THE ZERO-ALLOC PROOF INSTRUMENT, registered for the whole binary (`alloc-census`
+/// feature): flex-rs's census allocator over the system allocator, so every heap
+/// allocation the serve makes is countable. The worker's serving loop frames the
+/// window — `SCRATCHY_ALLOC_CENSUS_STEPS=N` collected decode steps, reported on
+/// stderr at the Nth (the card crate's `census` module). The allocator forwards
+/// every call verbatim, so the serve's behavior is identical with it on or off;
+/// an unset env var leaves the counters dark.
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC_CENSUS: flex_rs::alloc_census::CensusAllocator<std::alloc::System> =
+    flex_rs::alloc_census::CensusAllocator::new(std::alloc::System);
+
 use clap::{Parser, Subcommand};
 
 /// scratchy on IBM Spyre.

@@ -14,6 +14,10 @@ pub mod bundle_run;
 /// single-sourced (`launch_site`), and the replay canvas as a type
 /// (`WalkCanvas` — one constructor, from the walk's own enumeration).
 pub(crate) mod cb_plan;
+/// The on-card alloc-census window (`alloc-census` feature): flex-rs's zero-alloc
+/// proof instrument, framed around the serving loop's collected decode steps.
+#[cfg(feature = "alloc-census")]
+pub mod census;
 /// The typed card surface over flex-rs: streams, device addresses, launches, and the card's
 /// memory capacity — `Arc<RuntimeContext>`-backed handles, no C ABI. It links the SDK via
 /// flex-rs's cxx-shim.

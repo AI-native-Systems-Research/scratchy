@@ -819,21 +819,33 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         self.lead().defer_read_tensor_ring(id, cap_bytes)
     }
 
-    /// ⭐ #32 (A) — THE LOOP'S ONE FENCE: park on this read's own completion
-    /// (and the shadow's quiet point), then return the bytes the transfer
-    /// brought back (the runner spelling of `Executor::finish_deferred_read_raw`).
-    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+    /// ⭐ #32 (A) — THE LOOP'S ONE FENCE, ZERO-ALLOC: park on this read's own
+    /// completion (and the shadow's quiet point), then hand the landed window
+    /// to `f` BY BORROW — no copy, no fresh Vec per step (the runner spelling
+    /// of `Executor::finish_deferred_read_with`).
+    pub fn finish_deferred_read_with<R>(
+        &mut self,
+        read: &DeferredRead,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
         // Rank 0's read lands behind its step. Every other rank takes only its shadow's quiet point
         // — NEVER a whole-stream drain: each peer's stream already holds the NEXT step the pipelined
         // loop submitted, and draining it would wait that step out too, so the card would idle
         // through every submit (measured at tp/8: busy at 1% of submits, against tp/1's 99%).
-        let bytes = self.lead().finish_deferred_read_raw(read)?;
+        let out = self.lead().finish_deferred_read_with(read, f)?;
         for (r, e) in self.ranks.iter_mut() {
             if r.get() != 0 {
                 e.settle_peer_step()?;
             }
         }
-        Ok(bytes)
+        Ok(out)
+    }
+
+    /// The same fence COMPOSED WITH A COPY — the one-shot owned contract over
+    /// [`Self::finish_deferred_read_with`] (the runner spelling of
+    /// `Executor::finish_deferred_read_raw`).
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        self.finish_deferred_read_with(read, |bytes| bytes.to_vec())
     }
 
     /// Bind `id` as a function of `key` alone, narrowed to f16 here. The next step uploads it, and

@@ -31,6 +31,12 @@ spyre-hw = [
 ]
 # THE EMULATOR — a sibling of the card, not its absence.
 spyre-emu = ["scratchy-target-spyre-worker/spyre-emu"]
+# THE ZERO-ALLOC PROOF INSTRUMENT: registers flex-rs's `CensusAllocator` as this
+# binary's global allocator (main.rs) and turns on the serving loop's census
+# window (the worker's and card crate's features of the same name). Run a serve
+# with `SCRATCHY_ALLOC_CENSUS_STEPS=N` to get the on-card steady-state per-step
+# allocation count. Instrumentation only — no serving behavior changes.
+alloc-census = ["spyre-hw", "scratchy-target-spyre-worker/alloc-census", "flex-rs/alloc-census"]
 
 [[bin]]
 name = "spyre"
@@ -46,6 +52,9 @@ scratchy-target-spyre-models = { path = "../../../spyre/crates/models" }
 # `spyre bundle run` ONLY: launching a bundle this binary did not bake needs the card's executor
 # directly. Reachable only under `spyre-hw`.
 scratchy-target-spyre-card = { path = "../card", optional = true }
+# THE ZERO-ALLOC PROOF INSTRUMENT (`alloc-census` feature): main.rs registers flex-rs's
+# census allocator as this binary's global allocator, which needs the crate named here.
+flex-rs = { workspace = true, optional = true }
 # THE MODEL SCOPE, for CLI feature reachability: `--features model/<stem>` selects through
 # scratchy-models' own features, as `scr`'s `model` alias does (the same package, so the same
 # features). `quant` and `tp` likewise: `--features quant/<preset>`, `--features tp/<W>`.

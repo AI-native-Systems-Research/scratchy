@@ -65,7 +65,7 @@ use flex_rs::scheduler::{
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{
     DeviceId, RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority,
-    SchedulerError, StreamId,
+    SchedulerError, StreamId, UserCallback,
 };
 use flex_rs::topology::populate_domain_topology;
 use flex_rs::util::Status;
@@ -694,18 +694,19 @@ impl ReadSignal {
         }
     }
 
-    /// The closure handed to `launch_d2h` as the op's user callback: set the
-    /// flag and wake the parker. Runs on the scheduler's completion thread,
-    /// touches nothing but this latch, and cannot borrow the transfer's host
-    /// buffer — the buffer outlives the call site by the caller's own laws
-    /// (the ring slot's index, the shadow's seat ownership).
-    fn arm(&self) -> Box<dyn FnOnce() + Send> {
-        let done = self.done.clone();
-        Box::new(move || {
-            let (mtx, cv) = &*done;
-            *mtx.lock().unwrap() = true;
-            cv.notify_all();
-        })
+    /// The latch handed to `launch_d2h`/`launch_h2d` as the op's user callback:
+    /// the signal's own `(flag, condvar)` pair, by `Arc` clone — the LAST
+    /// per-crossing heap allocation on the seam, gone. Firing it (flex-rs's
+    /// `UserCallback::Latch` arm, under the same catch_unwind protection the
+    /// boxed closure got) sets the flag and wakes the parker; it runs on the
+    /// scheduler's completion thread, touches nothing but this latch, and
+    /// cannot borrow the transfer's host buffer — the buffer outlives the call
+    /// site by the caller's own laws (the ring slot's index, the shadow's seat
+    /// ownership). The latch's pair is `ReadSignal`'s own `done` field verbatim
+    /// — the waiter parks on the same pair the callback fires, with no
+    /// intermediary state to agree on.
+    fn arm(&self) -> UserCallback {
+        UserCallback::Latch(self.done.clone())
     }
 
     /// ⭐ #32 (E) — MINT THE PEEK HANDLE: the overlap probe's non-blocking

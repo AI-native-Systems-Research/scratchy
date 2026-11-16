@@ -52,8 +52,11 @@ EOF
 
 cat >"$stub/crates/flex-rs/Cargo.toml" <<'EOF'
 # CI stub (scripts/ci-senlib-stub.sh): the real flex-rs manifest's name, version and
-# the one feature backends/spyre-hw names — and nothing else. No dependencies, so the
+# the features backends/spyre-hw names — and nothing else. No dependencies, so the
 # stub resolves standalone; no source, so nothing can compile against it and pass.
+# `alloc-census` is named by the seat's census wiring (the card crate's feature of
+# the same name forwards to it); the stub carries the NAME only — hollow, like the
+# rest of this tree, and a build that would use it still fails on unresolved imports.
 [package]
 name = "flex-rs"
 version = "0.1.0"
@@ -63,6 +66,7 @@ description = "CI-only stub of senlib-rs's flex-rs: manifest for resolution, no 
 
 [features]
 snt1p0 = []
+alloc-census = []
 EOF
 
 : >"$stub/crates/flex-rs/src/lib.rs"

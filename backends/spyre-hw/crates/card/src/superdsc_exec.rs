@@ -5913,14 +5913,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// pipelined loop had just submitted for overlap — so each per-step drain
     /// fenced a full step anyway and the depth-2 queue bought nothing
     /// (measured 2026-10-25: fence mean = one step ≈ 23.8 ms, ≈ serial tok/s).
-    /// The two signals are the read's own D2H (the bytes this call returns)
-    /// and the LAST H2D a submit enqueued — the shadow's quiet point, taken
-    /// here through the SAME door ([`Self::quiet_shadow`]) every writer of the
-    /// shadow passes through, so the drain and any later bind cannot disagree
-    /// about when the shadow went quiet. Both sit adjacent in the queue at
-    /// depth 2 — the DMAs of the next step's preamble, microseconds behind
-    /// this read — so the park costs the read and not the step, and the steps'
-    /// COMPUTE behind them runs through the drain.
+    /// The two signals are the read's own D2H (the bytes this call hands the
+    /// visitor) and the LAST H2D a submit enqueued — the shadow's quiet point,
+    /// taken here through the SAME door ([`Self::quiet_shadow`]) every writer
+    /// of the shadow passes through, so the drain and any later bind cannot
+    /// disagree about when the shadow went quiet. Both sit adjacent in the
+    /// queue at depth 2 — the DMAs of the next step's preamble, microseconds
+    /// behind this read — so the park costs the read and not the step, and the
+    /// steps' COMPUTE behind them runs through the drain.
     ///
     /// The dead arm is the error escape, and it surfaces the SAME error the
     /// whole-stream wait did by the SAME door: a failed op never fires its
@@ -5928,7 +5928,22 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// sticky-shutdown, `make_completion_callback`'s Err arm), so the signal's
     /// timeout tick hands the park back and the synchronize below — which does
     /// not wait a dead stream, it rethrows — carries the root cause out.
-    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+    ///
+    /// ⭐ ZERO-ALLOC: the landed window is handed to `f` BY BORROW, in place —
+    /// the ring slot's own bytes, or the shadow window's — and the slot is
+    /// recycled only after the visitor returns, so the serving path's stick
+    /// read pays no copy and no fresh Vec per step. `f` takes only the bytes
+    /// (no session access, by signature), so it cannot re-enter the executor
+    /// while a slot is held — the no-reentry law carried by the TYPE. The
+    /// visitor's output crosses by value: it may not borrow the window, or the
+    /// slot's recycle would not compile. [`Self::finish_deferred_read_raw`] is
+    /// this door composed with `.to_vec()` — the one-shot owned contract — so
+    /// the doors cannot drift apart.
+    pub fn finish_deferred_read_with<R>(
+        &mut self,
+        read: &DeferredRead,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
         // The read's own landing, scoped so `dead`'s immutable borrow of `self`
         // ends before the quiet point's mutable half begins.
         let landed = {
@@ -5958,24 +5973,26 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if Diag::get().rb_time {
             self.rb_attribute();
         }
-        // May only return the bytes the transfer actually brought back.
+        // May only hand the visitor the bytes the transfer actually brought back.
         let avail = (read.end - read.offset) as usize;
         let n = (read.size as usize).min(read.cap).min(avail);
         if n == 0 {
             if let Some(slot) = read.ring {
                 self.read_ring_free.push(slot);
             }
-            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
+            return Ok(f(&[])); // a wholly-unreadable placement also has no valid base
         }
         match read.ring {
             Some(slot) => {
                 // The slot holds the WINDOW; the placement's bytes start
                 // `offset − win_start` into it (0 on the own-window arm — the
-                // placement IS the window's start).
+                // placement IS the window's start). The visitor runs while the
+                // slot is still held; the free-list push is a different field,
+                // so the borrows are disjoint.
                 let start = (read.offset - read.win_start) as usize;
-                let bytes = self.read_ring[slot][start..][..n].to_vec();
+                let out = f(&self.read_ring[slot][start..][..n]);
                 self.read_ring_free.push(slot);
-                Ok(bytes)
+                Ok(out)
             }
             None => {
                 // The one-shot landing's window — materialized by the enqueue half
@@ -5988,9 +6005,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         read.seg.get()
                     )
                 })?;
-                Ok(host[read.offset as usize..][..n].to_vec())
+                Ok(f(&host[read.offset as usize..][..n]))
             }
         }
+    }
+
+    /// The stick read's finish half COMPOSED WITH A COPY — the one-shot
+    /// contract (owned bytes) over [`Self::finish_deferred_read_with`]: the
+    /// doors that genuinely need the bytes to outlive the slot (inspection,
+    /// debug readback) buy the Vec; the serving path takes the visitor and
+    /// pays nothing.
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        self.finish_deferred_read_with(read, |bytes| bytes.to_vec())
     }
 
     /// The byte size a [`Executor::read_seg`] of `seg` returns: the DEVICE region's

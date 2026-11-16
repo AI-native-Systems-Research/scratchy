@@ -322,21 +322,20 @@ pub(crate) fn decode_idx_stick(
     idx_row_words: usize,
     vocab: usize,
 ) -> ExecutorResult<Vec<u32>> {
-    let words: Vec<i32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
     // The idx stick's own format decides the stride — the same law every device
     // tensor's host-side address takes (`dev_off_stk`), never a guessed row pitch.
+    // Words are read STRAIGHT off the landed bytes — no intermediate word buffer,
+    // the same zero-alloc law the visitor door that hands these bytes in obeys.
     let stk = <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
     (0..rows)
         .map(|r| {
             let off =
                 ktir_superdsc::sdsc_abstract::dev_off_stk(&[rows, idx_row_words], 1, &[r, 0], stk);
-            token_of_idx_word(r, words.get(off).copied().unwrap_or(-1), vocab)
+            let word = bytes
+                .get(off * 4..off * 4 + 4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            token_of_idx_word(r, word.unwrap_or(-1), vocab)
         })
         .collect()
 }
