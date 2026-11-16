@@ -82,6 +82,11 @@ use flex_rs::util::Status;
 /// `flex_rs::scheduler` module doc).
 pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
     card: Arc<flex_rs::card::Card>,
+    /// ⭐ THIS CARD'S INDEX IN SENLIB'S ENUMERATION, from the [`WorldCard`] the runtime opened —
+    /// the index senlib's own cross-port P2P door ([`flex_rs::card::Card::p2p_create_mapping`])
+    /// resolves peers by. The card OPENS by PCI address, never by index (an index can drift);
+    /// this field only NAMES the card to doors that ask for senlib's enumeration.
+    index: u32,
     /// ⭐ THE CPUS THIS CARD'S HOST THREADS RUN ON — its NUMA node's, read from sysfs at open
     /// (`flex_rs::numa`). Its response worker, its rank's submit thread and its bring-up thread
     /// each pin themselves to it first.
@@ -98,6 +103,7 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardRuntime")
             .field("pci", &self.card.pci())
+            .field("index", &self.index)
             .field("cpus", &self.cpus)
             .field("memory", &self.memory)
             .finish_non_exhaustive()
@@ -166,6 +172,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
         Ok(Self {
             card,
+            index,
             cpus,
             memory,
             rt,
@@ -1688,6 +1695,11 @@ pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
     },
     /// A peer card's region-2 bus address could not be read.
     PeerRegion(String),
+    /// The cross-port P2P route to a peer under another PCIe root could not be established
+    /// ([`flex_rs::card::Card::p2p_route_peer`]). Without it that peer's region-2 address has
+    /// no route from this card, so the world cannot run: this is the load-time refusal of a
+    /// cross-root link that did not attach (#1192).
+    P2pMap { card: String, peer: String, why: String },
     /// A base-address-table entry could not be installed.
     Bat { tid: u8, why: String },
     /// A landing slot's xseg word did not compose, or its `XSEG` entry could not be programmed.
@@ -1708,6 +1720,13 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Display for AttachRefusal<T> {
                  one window"
             ),
             Self::PeerRegion(e) => write!(f, "a peer card's region 2 could not be read: {e}"),
+            Self::P2pMap { card, peer, why } => write!(
+                f,
+                "the cross-port p2p route from the card at {card} to the peer at {peer} could \
+                 not be established: {why} — a peer under another PCIe root has no route to the \
+                 region-2 address the base-address table names until the cross-port IOMMU mapping \
+                 exists"
+            ),
             Self::Bat { tid, why } => write!(f, "base-address-table entry {tid}: {why}"),
             Self::Xseg(e) => write!(f, "programming a landing slot's XSEG entry failed: {e}"),
         }
@@ -1759,6 +1778,14 @@ impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
 /// each of `s`'s landing slots (`Sid::of(s, slot)`) points at that slot of `s`'s block of its own
 /// window. Linking a card again as the same rank for the same window keeps the link it has.
 ///
+/// ⭐ THE CROSS-ROOT ROUTE (#1192): the BAT entry names the peer's region-2 bus address, which a
+/// peer under the same PCIe root is reachable at directly. A peer under another root has no route
+/// to that address until the cross-port P2P IOMMU mapping exists — so linking establishes the
+/// route ([`flex_rs::card::Card::p2p_route_peer`], senlib's
+/// `create_iommu_mapping_for_cross_port_p2p_rdma`) for exactly the cross-root peers, at link,
+/// before the entry that names the address is installed. Same-root pairs take the direct route
+/// they have always taken; nothing about their path changes.
+///
 /// # Errors
 /// [`AttachRefusal`], by name.
 pub fn link_peers<T: ktir_superdsc::collective::Tp>(
@@ -1783,8 +1810,16 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
         // the destination every send names (`cb_plan::base_addr_entry`) — holds that peer card's
         // region-2 PCI address, from senlib's own region-address door (the vendor's
         // `initialize_p2p_address_table` value source), for the card the address names, never an
-        // enumeration order.
+        // enumeration order. The peer's route to that address is established first: a peer under
+        // another PCIe root is unreachable until its cross-port mapping exists.
         for peer in me.peers() {
+            c.card
+                .p2p_route_peer(cards.get(peer).index)
+                .map_err(|why| AttachRefusal::P2pMap {
+                    card: c.card.pci().to_string(),
+                    peer: cards.get(peer).card.pci().to_string(),
+                    why,
+                })?;
             let addr = *region2.get(peer);
             let tid = crate::cb_plan::base_addr_entry(peer);
             c.card
