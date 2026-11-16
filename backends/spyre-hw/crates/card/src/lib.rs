@@ -11,8 +11,8 @@ pub mod baked_image;
 /// Run a bundle this binary did not bake — see the module docs.
 pub mod bundle_run;
 /// #603 PR2 — one launch's compute CBs as data: the submit walk's arithmetic
-/// single-sourced (`launch_site`), the plan/render twin, and the prepare-time
-/// byte-identical parity gate.
+/// single-sourced (`launch_site`), and the replay canvas as a type
+/// (`WalkCanvas` — one constructor, from the walk's own enumeration).
 pub(crate) mod cb_plan;
 /// The typed card surface over flex-rs: streams, device addresses, launches, and the card's
 /// memory capacity — `Arc<RuntimeContext>`-backed handles, no C ABI. It links the SDK via

@@ -29,8 +29,8 @@ use tracing::{debug, info};
 
 use crate::cb_plan;
 use crate::runtime::{
-    BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    H2dPin, HwError, PeerLink, Stream,
+    BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, DevAddr, H2dPin, HwError,
+    PeerLink, Stream,
 };
 use scratchy_target_spyre::allocator::HostBytes;
 use scratchy_target_spyre::bundle_code::{
@@ -447,18 +447,25 @@ struct PendingLaunch {
 /// holding this whole struct for the row table. All plain data, so the
 /// closure is `Send` for free.
 struct StepImageData {
-    canvas: std::sync::Arc<Vec<ControlBlockWire>>,
+    canvas: cb_plan::WalkCanvas,
     /// How many launch rows the canvas concatenates — reported by the derivation line.
     rows: usize,
 }
 
 /// One cached step image — the whole forward (prefix + every body row +
-/// suffix) as ONE canvas, and the host fence the step's single submission carries (the walk's per-row ORs collapse
+/// suffix) as ONE canvas — the walk's own staged batch, by [`cb_plan::WalkCanvas`]'s construction — and the host fence the step's single
+/// submission carries (the walk's per-row ORs collapse
 /// into it; see the flush at the end of `launch_ops_inner`).
 #[derive(Clone)]
 struct StepImage {
     data: std::sync::Arc<StepImageData>,
-    barrier: bool,
+}
+
+impl StepImage {
+    /// The canvas's host fence — stated once, by the walk the canvas renders.
+    fn barrier(&self) -> bool {
+        self.data.canvas.barrier()
+    }
 }
 
 /// What an image is keyed by — WHICH body the ladder picks for this step. Nothing else a launch
@@ -2029,17 +2036,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .is_some_and(|seg| self.seg_aliased[seg.get()])
     }
 
-    /// Does this session still owe an alias for a segment it declared borrowed? While
-    /// true, that segment holds its 128 B placeholder, so no CB may be rendered through
-    /// it — the parity gate waits (see [`Executor::prepare`]) and runs at the alias that
-    /// completes the set ([`Executor::alias_seg_from`]).
-    fn borrow_set_pending(&self) -> bool {
-        self.seg_borrowed
-            .iter()
-            .zip(self.seg_aliased.iter())
-            .any(|(borrowed, aliased)| *borrowed && !*aliased)
-    }
-
     /// Bind a WEIGHT by name, taking ownership of its bytes. Weights are bound before
     /// [`Executor::prepare`], staged once into the resident segments, and their host bytes are
     /// reclaimed there.
@@ -3211,28 +3207,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // out every pre-mapped window, and each guard's own Drop synchronizes before it
         // unpins, so no DMA reads a shadow's iova after its pin is gone on this path, a
         // refused one, or an unwind. Dropping here (rather than at scope end) simply unpins
-        // before the parity gate and the ladder run on.
+        // before the ladder runs on.
         drop(pinned);
-        // ⭐ #603 PR2 2a — THE CB PARITY GATE, before the session becomes loadable: a plan twin
-        // that disagrees with the walk refuses the LOAD here, never a step.
-        //
-        // A BORROWING session cannot be gated here: its borrowed segments still hold the
-        // 128 B placeholders `mark_borrowed` left them, and a placeholder has no renderable
-        // address BY DESIGN (`alias_seg_from` replaces it with the owner's region only after
-        // prepare returns — rendering through it is exactly the un-aliased-read the
-        // placeholder exists to poison). Such a session is gated at the alias that
-        // completes its borrowed set instead; one that never completes its aliases can
-        // never launch (the un-aliased placeholder guard refuses its fold), so no session
-        // escapes the gate.
-        if self.borrow_set_pending() {
-            debug!(
-                "[sdsc-cbplan] parity gate DEFERRED: borrowed segment(s) still on placeholders — \
-                 it runs at the alias that completes the borrowed set"
-            );
-        } else {
-            self.check_cb_plan_parity()?;
-        }
-        lap("cb-parity", &mut t0);
         self.prepared = true;
 
         // ── RECLAIM host memory that is DEAD after prepare (~2× the model in host RSS otherwise).
@@ -3289,145 +3265,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 start.elapsed().as_secs_f64()
             );
         }
-        Ok(())
-    }
-
-    /// ⭐ #603 PR2 STAGE 2a — THE PREPARE-TIME CB PARITY GATE. Every allocated launch list is
-    /// rendered TWO ways — the submit walk's own enumeration (`cb_plan::walk_items`) and the data
-    /// twin (`cb_plan::build_cb_plan` + `CbPlan::render`) — through ONE render door
-    /// (`Stream::render_batch`, the same `build_compute_cb` the submit path runs), and a
-    /// differing byte REFUSES THE LOAD. This is the gate that lets the player replay pre-rendered
-    /// images: it proves, at prepare, that the plan's data twin of the walk is byte-identical, so
-    /// no step ever needs to re-derive (or re-check) what it replays.
-    ///
-    /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
-    /// list that exists by then) and at [`Self::alias_seg_from`] (a borrowing session's segments
-    /// are placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
-    /// borrowed set).
-    fn check_cb_plan_parity(&self) -> Result<()> {
-        let stream = self.stream_ref()?;
-        let mk = |bank: usize, off: [u64; NUM_SEGMENTS], requests| LaunchWhere {
-            byte_off: off,
-            weight_bank: bank,
-            requests,
-        };
-        // One `LaunchWhere` per distinct weight bank the launch table names (a representative
-        // row's shifts — parity is about the twin agreeing, not about covering every shift
-        // value), plus the prefix's and suffix's own banks. A bank with no region is SKIPPED, not
-        // refused: the submit walk would refuse that launch itself, and this gate is about the
-        // plan twin, not the session.
-        let bank_ok = |bank: usize| {
-            if bank == 0 {
-                self.seg_addr[SEG_WEIGHT.get()].is_some()
-            } else {
-                self.weight_bank_addr
-                    .get(bank - 1)
-                    .is_some_and(|a| a.is_some())
-            }
-        };
-        // The launch ROWS: one (tag, bank, shifts) per distinct weight bank the session could
-        // launch.
-        let mut rows: Vec<(String, usize, [u64; NUM_SEGMENTS])> = Vec::new();
-        match self.rolled.as_ref() {
-            // Unrolled: no layer boundary to bank on — bank 0 and zero shifts are the only shape
-            // the walk ever launches this bundle with.
-            None => rows.push(("unrolled".into(), 0, [0; NUM_SEGMENTS])),
-            Some(r) => {
-                if bank_ok(r.prefix_weight_bank) {
-                    rows.push((
-                        format!("prefix-bank{}", r.prefix_weight_bank),
-                        r.prefix_weight_bank,
-                        [0; NUM_SEGMENTS],
-                    ));
-                }
-                if bank_ok(r.suffix_weight_bank) {
-                    rows.push((
-                        format!("suffix-bank{}", r.suffix_weight_bank),
-                        r.suffix_weight_bank,
-                        [0; NUM_SEGMENTS],
-                    ));
-                }
-                let mut seen: Vec<usize> = Vec::new();
-                for &(_class, wbank, woff, kvoff) in &r.launches {
-                    let bank = wbank as usize;
-                    if seen.contains(&bank) || !bank_ok(bank) {
-                        continue;
-                    }
-                    seen.push(bank);
-                    let mut off = [0u64; NUM_SEGMENTS];
-                    off[SEG_WEIGHT.get()] = woff;
-                    off[SEG_KV.get()] = kvoff;
-                    rows.push((format!("launch-row-bank{bank}"), bank, off));
-                }
-            }
-        }
-        // ⭐ EVERY ROW AT ONE REQUEST, AND AGAIN AT TWO — the request half of the relaunch law (a
-        // walking bundle's span repeats once per request, its tables `request · pitch` in) has to
-        // be proven twin-identical too, and no launch states more than one request yet. The
-        // two-request row states a SYNTHETIC pitch: parity is about the walk and its data twin
-        // composing the same request shift, never about this pitch being any model's — the same
-        // standing as the representative bank shifts above.
-        let wheres: Vec<(String, LaunchWhere)> = rows
-            .iter()
-            .flat_map(|(tag, bank, off)| {
-                let two = fold_plan::Requests {
-                    count: 2,
-                    pitch: 4096,
-                };
-                [
-                    (tag.clone(), mk(*bank, *off, fold_plan::Requests::default())),
-                    (format!("{tag}/req2"), mk(*bank, *off, two)),
-                ]
-            })
-            .collect();
-
-        // Every list the session could launch — the class dimension is enumerated whole here, so
-        // a where need not be matched to the classes its rows name (parity reads the same ops
-        // either way). A list whose programs are not allocated yet (the deferred rungs) is
-        // skipped here and gated at its allocation instead.
-        let mut sels: Vec<ListSel> = vec![ListSel::Prefix, ListSel::Suffix];
-        for c in 0..self.body_ops.len() {
-            sels.push(ListSel::Body(c));
-        }
-        for (i, rung) in self.body_rungs.iter().enumerate() {
-            for c in 0..rung.1.len() {
-                sels.push(ListSel::Rung(i, c));
-            }
-        }
-        let mut cbs = 0usize;
-        let mut contexts = 0usize;
-        for sel in sels {
-            let ops = self.list(sel);
-            if ops.is_empty() || !ops.iter().all(|o| o.addr.is_some()) {
-                continue;
-            }
-            for (tag, where_) in &wheres {
-                let label = format!("{sel:?}/{tag}");
-                cbs += cb_plan::parity_check(
-                    ops,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    where_,
-                    &label,
-                    stream,
-                )?;
-                contexts += 1;
-            }
-        }
-        if contexts == 0 {
-            // The gate may not pass vacuously: prepare allocates the prefix and suffix lists
-            // unconditionally and bank 0's region exists by the time this runs, so zero
-            // checkable contexts means the enumeration itself is broken — refuse rather than
-            // "prove" nothing.
-            bail!(
-                "[cbplan] parity gate REFUSED: no (list × launch-row) context was checkable — \
-                 every bank was skipped or no list is allocated"
-            );
-        }
-        debug!(
-            "[sdsc-cbplan] parity gate: {cbs} CB(s) proven byte-identical across {contexts} \
-             (list × launch-row) context(s)"
-        );
         Ok(())
     }
 
@@ -3836,8 +3673,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The request and walk shifts,
                 //    the shifted tensor bases, the weight bank, the program and the bootstrap are
                 //    `cb_plan::launch_site` — the submit walk below, the diag printers it feeds, and
-                //    the CB-plan parity gate (which proves the plan's data twin of exactly this
-                //    computation byte-identical at prepare) all read the ONE function.
+                //    the replay canvas's derivation (which renders exactly this
+                //    computation) all read the ONE function.
                 let site = cb_plan::launch_site(
                     ops,
                     oi,
@@ -3929,14 +3766,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
                 // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
                 // its send and its wait — staged by `cb_plan::site_cbs`, the one function the
-                // parity twin stages through too.
+                // replay canvas stages through too.
                 let cbs = cb_plan::site_cbs(op.site_tp(), site.batched_compute())?;
                 if collect {
                     // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
                     // its handles because the shifted bases and `ta` borrows above are rep-local.
                     // ⭐ And it is built by `LaunchSite::batched_compute` — the ONE constructor
                     // `cb_plan::walk_items` stages through too — so the item the real walk
-                    // submits and the item the parity gate renders cannot drift apart in shape.
+                    // submits and the item the replay canvas renders cannot drift apart in
+                    // shape.
                     let st0 = Instant::now();
                     pending.extend(cbs.into_iter().map(|item| PendingLaunch {
                         item,
@@ -5554,9 +5392,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// stamp the pool-leased tags, and ring ONE doorbell for the step. The
     /// per-step host work is a memcpy, N tag stamps and one submission — no
     /// per-op `launch_site`, no `BatchedCompute` build, no per-rung flush. The
-    /// image is proven at its derivation: `cb_plan::parity_check` per launch
-    /// row (canvas ≡ walk). Nothing a launch addresses moves with the step's
-    /// position, so the canvas IS every step's CBs for that body.
+    /// image is the walk's own staged batch by type (`cb_plan::WalkCanvas` —
+    /// one constructor, from the walk's enumeration). Nothing a launch
+    /// addresses moves with the step's position, so the canvas IS every
+    /// step's CBs for that body.
     ///
     /// Returns `Ok(None)` — the caller takes the walk — when any Diag
     /// instrument is on ([`Diag::is_quiet`] — each one reads walk state). There
@@ -5580,7 +5419,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // The stamp closure stamps the leased tags over the render-time ones.
         let data = std::sync::Arc::clone(&image.data);
         let batch = ComputeWireBatch {
-            canvas: std::sync::Arc::clone(&data.canvas),
+            canvas: std::sync::Arc::clone(data.canvas.cbs()),
             patch: Box::new(move |tags, cbs| {
                 for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
                     cb.set_tag(*tag);
@@ -5590,7 +5429,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let stream = self.stream_ref()?;
         let t1 = Instant::now();
         let cbs = image.data.canvas.len();
-        let r = stream.compute_wires(batch, image.barrier);
+        let r = stream.compute_wires(batch, image.barrier());
         let t2 = Instant::now();
         if let Err(e) = r {
             // The image itself was proven at derivation (per-row gates); a refused submit here is
@@ -5598,7 +5437,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             return Err(anyhow::Error::new(e).context(format!(
                 "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
                  sel={sel:?}, step at {}",
-                image.data.rows, image.barrier, seq_pos.0
+                image.data.rows,
+                image.barrier(),
+                seq_pos.0
             )));
         }
         let mut t = timers();
@@ -5618,8 +5459,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// Derive one step image at its first use — the row sequence is
     /// EXACTLY `launch_forward`'s (that is the merge's one law: the step's
-    /// CBs, in the order the walk would submit them), each row proven by the
-    /// parity gate and rendered at its own `where_`, concatenated into one canvas.
+    /// CBs, in the order the walk would submit them), each row rendered from
+    /// the walk's own enumeration at its own `where_`, concatenated into one canvas.
     fn derive_step_image(&self, sel: BodySel) -> Result<StepImage> {
         let stream = self.stream_ref()?;
         // (list, where) per launch row, mirroring `launch_forward` arm by arm. An empty list
@@ -5670,61 +5511,37 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 ));
             }
         }
-        let mut canvas: Vec<ControlBlockWire> = Vec::new();
+        let mut row_canvases: Vec<cb_plan::WalkCanvas> = Vec::new();
         let mut rows = 0usize;
-        let mut barrier = false;
         for (ls, where_) in specs {
             let ops = self.list(ls);
             if ops.is_empty() {
                 continue;
             }
-            let label = format!("{ls:?}/replay-canvas");
-            cb_plan::parity_check(
-                ops,
-                &self.seg_addr,
-                &self.weight_bank_addr,
-                &where_,
-                &label,
-                stream,
-            )?;
-            let (row_canvas, row_barrier) = cb_plan::render_canvas(
+            row_canvases.push(cb_plan::WalkCanvas::of_walk(
                 ops,
                 &self.seg_addr,
                 &self.weight_bank_addr,
                 &where_,
                 stream,
-            )?;
-            barrier |= row_barrier;
+            )?);
             rows += 1;
-            canvas.extend(row_canvas);
         }
+        let canvas = cb_plan::WalkCanvas::merged(row_canvases);
         if canvas.is_empty() {
             bail!(
                 "replay image derivation REFUSED: sel={sel:?} produced zero CBs — the walk it \
                  mirrors launches nothing, which no body selection can do"
             );
         }
-        // The image's own first CB carries the same EDEP1 the submit path
-        // stamps (`ResponseWorker::prepare_cbs`, the vendor `Finalize` port at
-        // control_block_stream.cpp:423): the replay patch rewrites tags in
-        // place and never touches the CTRL mode bits, so what derivation
-        // stores is what every replay of this image submits — a cached image
-        // must not hold the EDEP0 its rows were rendered with. The
-        // submit-side stamp makes the two agree rather than this one being
-        // load-bearing (a double-set of the same value is fine; a miss is the
-        // defect).
-        canvas[0].set_edep(1);
         debug!(
             "[sdsc-replay] derived image sel={sel:?}: {} CB(s) over {rows} launch row(s), \
-             barrier={barrier}",
-            canvas.len()
+             barrier={}",
+            canvas.len(),
+            canvas.barrier()
         );
         Ok(StepImage {
-            data: std::sync::Arc::new(StepImageData {
-                canvas: std::sync::Arc::new(canvas),
-                rows,
-            }),
-            barrier,
+            data: std::sync::Arc::new(StepImageData { canvas, rows }),
         })
     }
 
@@ -6454,16 +6271,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 self.weight_bank_aliased[b] = true;
             }
         }
-        // ⭐ #603 PR2 2a — A BORROWING SESSION'S PARITY GATE runs HERE, at the alias that
-        // completes its borrowed set: the first moment every segment it declared borrowed
-        // holds a real, renderable address (prepare had to defer it — the placeholders it
-        // rendered through then are poison by contract). A disagreement refuses the
-        // ADOPTION, which the caller already treats as fatal-for-this-session, never a
-        // step. A session with NO borrowed segments gated at prepare and is not re-gated
-        // here (the batched-prefill top rung aliases seg2 post-prepare without borrowing).
-        if self.seg_borrowed.iter().any(|b| *b) && !self.borrow_set_pending() {
-            self.check_cb_plan_parity()?;
-        }
         Ok(())
     }
 
@@ -7099,10 +6906,9 @@ mod tests {
         };
         let dummy = StepImage {
             data: std::sync::Arc::new(StepImageData {
-                canvas: std::sync::Arc::new(Vec::new()),
+                canvas: cb_plan::WalkCanvas::empty(),
                 rows: 0,
             }),
-            barrier: false,
         };
         assert!(
             cache.lookup_cached(&key).is_none(),

@@ -2043,8 +2043,10 @@ impl SpyreWorker {
                 //
                 // The fan-out threads only BUILD the rungs' HOST halves (`SuperDscSession` is
                 // `Send`); their `prepare`s run in one wave below, after the owner has allocated,
-                // and the `alias_seg_from` calls stay on this thread after it, because they need
-                // `&ss` and are a pointer swap, not work.
+                // and the adoptions (`alias_seg_from` onto the owner's regions) run after it,
+                // one thread per session reading the owner — each alias is the placement-equality
+                // proof plus the borrower's own descriptor rebuild and bank alias, never a
+                // pointer swap. See the ADOPTION wave below.
                 let ladder: Vec<(
                     usize,
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,

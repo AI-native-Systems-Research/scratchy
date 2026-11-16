@@ -2,21 +2,16 @@
 //!
 //! The submit walk (`superdsc_exec::launch_ops_inner`) stages a launch sequence whose only
 //! per-launch inputs are the launch row's segment shifts, weight bank and request facts. This
-//! module is that sequence as data — a [`CbPlan`] (one entry per (op, request, relaunch), carrying
-//! exactly `build_compute_cb`'s inputs) plus a render. The ENUMERATION is one function
-//! (`fold_plan::launches`) and the per-launch arithmetic one ([`launch_site`]), both called by the
-//! submit walk, the reference walk and the plan build alike, and the gate below proves the data
-//! twin against the walk anyway.
-//!
-//! ⭐ THE PARITY GATE IS A PREPARE-TIME REFUSAL, NOT A RUNTIME CHECK. A step never pays for it:
-//! `Executor::prepare` renders every allocated launch list two ways — the walk ([`walk_items`]) and
-//! the plan ([`build_cb_plan`] + [`CbPlan::render`]) — through ONE render door
-//! (`crate::runtime::Stream::render_batch`, the same `build_compute_cb` the submit path runs) and
-//! REFUSES TO LOAD on the first differing byte.
+//! module is that sequence's ONE data form — the staged batch ([`walk_items`]) and the replay
+//! canvas ([`WalkCanvas`]) — both built from the ENUMERATION one function states
+//! (`fold_plan::launches`) and the per-launch arithmetic one ([`launch_site`]), the same calls the
+//! submit walk makes. There is no second construction to check against: the canvas type's only
+//! constructor runs the walk, so what the player replays IS the walk by type, never by
+//! comparison.
 //!
 //! ⭐ A STEP'S IMAGE IS ITS CANVAS. Nothing a launch addresses moves with the step's position: a
 //! walk's body shifts by its own trip, every other group launches where the bake placed it. So the
-//! replay player copies a rendered canvas verbatim ([`render_canvas`]) and stamps only the tags.
+//! replay player copies a rendered canvas verbatim ([`WalkCanvas`]) and stamps only the tags.
 
 use anyhow::{Result, anyhow, bail};
 use flex_rs::control_block_wire::ControlBlockWire;
@@ -68,9 +63,9 @@ fn segment_base<'a>(
 
 /// ONE (op, fold pass)'s launch arithmetic — the pure half of the submit walk,
 /// factored out so the walk, the diag printers it feeds, and this module's
-/// parity gate all read ONE computation. Every input arrives as a parameter —
-/// the fold state and the segment bases included — so the prepare-time gate
-/// can drive it with a synthetic session without touching live state, and so
+/// canvas construction all read ONE computation. Every input arrives as a
+/// parameter — the fold state and the segment bases included — so the canvas
+/// can be derived without touching live state, and so
 /// the borrow of `Executor`'s fields lasts exactly one call (the walk's loop
 /// interleaves `&mut self` diag hooks with this arithmetic).
 pub(crate) struct LaunchSite {
@@ -89,9 +84,9 @@ pub(crate) struct LaunchSite {
 impl LaunchSite {
     /// The staged-batch item this site becomes — ONE constructor shared by the
     /// submit walk's collect branch and [`walk_items`], so the item's shape
-    /// cannot drift between the real walk and the parity gate's reference
-    /// side (a field added or dropped in one would be a compile error in the
-    /// other, not a silent divergence the gate cannot see).
+    /// cannot drift between the real walk and the replay canvas (a field
+    /// added or dropped in one would be a compile error in the
+    /// other, not a silent divergence).
     pub(crate) fn batched_compute(&self) -> BatchedCompute {
         BatchedCompute {
             prog: self.prog.clone(),
@@ -207,8 +202,8 @@ pub(crate) struct SiteTp<T: ktir_superdsc::collective::Tp> {
 }
 
 /// ⭐ ONE (op, PASS)'S CONTROL BLOCKS — its launch, and in front of a collective's consume a send to
-/// every peer and a wait on every peer, in the bundle's own order ([`group_steps`]). The submit walk, [`walk_items`] and
-/// [`CbPlan::render`] all stage through this, so the walk and its twin cannot disagree about a
+/// every peer and a wait on every peer, in the bundle's own order ([`group_steps`]). The submit walk and
+/// [`walk_items`] both stage through this, so the walk and the replay canvas cannot disagree about a
 /// collective's CBs any more than about a launch's.
 ///
 /// A send's two endpoints are addressed through THE CONSUME LAUNCH'S OWN SEGMENT BASES: the
@@ -349,244 +344,102 @@ pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
     Ok((items, barrier))
 }
 
-/// ONE (op, relaunch) of a launch sequence — `build_compute_cb`'s inputs as
-/// data. Everything here is a constant of the (list, launch row) the plan was
-/// built for.
-pub(crate) struct CbPlanEntry<T: ktir_superdsc::collective::Tp> {
-    /// Diagnostic identity — the label the walk's own traces print plus the
-    /// request and relaunch — so a parity refusal names its CB.
-    label: String,
-    prog: DevAddr,
-    bootstrap_offset: u64,
-    /// The op's own launch-group facts, carried whole: the render calls the SAME
-    /// `fold_plan::seg_deltas` the walk calls, never a re-derivation.
-    kv: OpKv,
-    request: u32,
-    rep: i64,
-    /// POSITIONAL, one per segment: the base the walk would resolve (the
-    /// weight BANK's region for the weight segment, the segment's own
-    /// otherwise) and the launch row's static shift — stored SEPARATELY, not
-    /// pre-folded, so the render's one combined `shifted(static + delta)` is
-    /// the walk's own arithmetic to the byte (a pre-shifted base would clamp
-    /// differently at the region's end).
-    bases: Vec<(DevAddr, u64)>,
-    /// The collective CBs in front of this entry, staged by the walk's own [`site_cbs`].
-    tp: SiteTp<T>,
+/// ⭐ THE REPLAY CANVAS, AS A TYPE — the walk's own staged batch, rendered
+/// through the one render door. The field is private to this module and the
+/// constructors below are its only producers: a canvas that is not a rendered
+/// walk cannot be written, so there is no second construction to compare
+/// against and no parity left to prove at load — the plan twin this type
+/// replaced was a second statement of the walk, and the boot-time parity gate
+/// that checked it was the compensation for that second statement.
+///
+/// Nothing a launch addresses moves with the step's position (a walk's body
+/// shifts by its own trip; every other group launches where the bake placed
+/// it), so one canvas per launch row IS every step's CBs for that row.
+pub(crate) struct WalkCanvas {
+    cbs: std::sync::Arc<Vec<ControlBlockWire>>,
+    /// The walk's host fence — the OR over every row merged into this canvas.
+    barrier: bool,
 }
 
-/// One launch's CB constructor list — the walk's sequence as data, keyed by
-/// (list, launch row) at build time.
-pub(crate) struct CbPlan<T: ktir_superdsc::collective::Tp> {
-    entries: Vec<CbPlanEntry<T>>,
-    /// The launch's request pitch, recorded at build from the same `where_` the walk reads — the
-    /// render composes each entry's request shift with it, exactly as the walk does live.
-    pitch: u64,
-}
+impl WalkCanvas {
+    /// THE constructor: the walk's own enumeration (`fold_plan::launches`),
+    /// staged by [`walk_items`] and rendered by the same door the submit path
+    /// renders through. A non-empty ops list stages at least one launch, so a
+    /// canvas from this door is never empty.
+    pub(crate) fn of_walk<T: ktir_superdsc::collective::Tp>(
+        ops: &Ops<T>,
+        seg: &[Option<DevAddr>; NUM_SEGMENTS],
+        banks: &[Option<DevAddr>],
+        where_: &LaunchWhere,
+        stream: &Stream,
+    ) -> Result<Self> {
+        let (items, barrier) = walk_items(ops, seg, banks, where_)?;
+        Ok(Self {
+            cbs: std::sync::Arc::new(stream.render_batch(&items, 1)?),
+            barrier,
+        })
+    }
 
-impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
-    /// The staged batch the plan renders to, with the walk's host fence: the same `seg_deltas`
-    /// the walk calls, applied to the entry's recorded (base, static shift) with ONE combined
-    /// `shifted` per segment, exactly as the walk computes it.
-    pub(crate) fn render(&self) -> Result<(Vec<BatchedCb>, bool)> {
-        let mut items = Vec::with_capacity(self.entries.len());
-        for e in &self.entries {
-            let delta = fold_plan::seg_deltas(&e.kv, e.request, e.rep, self.pitch);
-            let mut dyn_off = [0u64; NUM_SEGMENTS];
-            dyn_off[SEG_KV.get()] += delta.kv.0;
-            dyn_off[SEG_MASK.get()] += delta.mask.0;
-            dyn_off[SEG_INTERMEDIATE.get()] += delta.intermediate.0;
-            let mut tensor_allocs = Vec::with_capacity(NUM_SEGMENTS);
-            for (i, (base, static_off)) in e.bases.iter().enumerate() {
-                let sh = *static_off + dyn_off[i];
-                tensor_allocs.push(
-                    if sh > 0
-                        && base.is_single_chunk()
-                        && let Some(s) = base.shifted(ByteSize(sh))
-                    {
-                        s
-                    } else {
-                        base.clone()
-                    },
-                );
-            }
-            items.extend(site_cbs(
-                e.tp,
-                BatchedCompute {
-                    prog: e.prog.clone(),
-                    tensor_allocs,
-                    bootstrap_offset: e.bootstrap_offset,
-                },
-            )?);
+    /// One derivation's rows, concatenated. The merge preserves the invariant
+    /// — a concatenation of rendered walks is a rendered walk — and stamps the
+    /// canvas's first CB with the same EDEP1 the submit path stamps
+    /// (`ResponseWorker::prepare_cbs`, the vendor `Finalize` port at
+    /// control_block_stream.cpp:423): the replay patch rewrites tags in place
+    /// and never touches the CTRL mode bits, so what derivation stores is what
+    /// every replay of this image submits — a cached image must not hold the
+    /// EDEP0 its rows were rendered with. The submit-side stamp makes the two
+    /// agree rather than this one being load-bearing (a double-set of the same
+    /// value is fine; a miss is the defect).
+    pub(crate) fn merged(mut rows: Vec<Self>) -> Self {
+        let mut cbs = Vec::new();
+        let mut barrier = false;
+        for row in rows.drain(..) {
+            cbs.extend(row.cbs.iter().copied());
+            barrier |= row.barrier;
         }
-        Ok((items, !self.entries.is_empty()))
-    }
-
-    /// Which entry, and which of its CBs, the plan's `i`-th CB is — the CBs an entry stages are
-    /// [`entry_cbs`]'s (one per message of each send, one wait per message slot, the launch), so
-    /// a refusal names the send or wait, not just its group.
-    fn cb_label(&self, i: usize) -> String {
-        self.entries
-            .iter()
-            .flat_map(|e| entry_cbs(&e.tp).into_iter().map(move |k| (e, k)))
-            .nth(i)
-            .map_or_else(|| format!("CB {i}"), |(e, k)| format!("{} {k}", e.label))
-    }
-}
-
-/// The kind of every CB [`site_cbs`] stages for `tp`, in order — the same walk, without the
-/// addresses: each send is one CB per message, the waits one CB per message slot over every
-/// peer, then the launch.
-fn entry_cbs<T: ktir_superdsc::collective::Tp>(tp: &SiteTp<T>) -> Vec<&'static str> {
-    let messages = tp.bound.map_or(0, |b| b.send.messages().count());
-    let mut out = Vec::new();
-    let mut waited = false;
-    for step in group_steps(tp.index, tp.consume) {
-        match step {
-            CbStep::Send { .. } => out.extend(std::iter::repeat_n("send", messages)),
-            CbStep::Wait { .. } if !waited => {
-                waited = true;
-                out.extend(std::iter::repeat_n("wait", messages));
-            }
-            CbStep::Wait { .. } => {}
-            CbStep::Launch { .. } => out.push("launch"),
+        if let Some(first) = cbs.first_mut() {
+            first.set_edep(1);
+        }
+        Self {
+            cbs: std::sync::Arc::new(cbs),
+            barrier,
         }
     }
-    out
-}
 
-/// Assemble the plan for one launch call: the (op, request, relaunch) enumeration and every per-CB
-/// input. Built from the same `fold_plan::launches` the walk calls; the bases come from the same
-/// `segment_base` resolution the walk's `launch_site` performs.
-pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
-    ops: &Ops<T>,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
-    where_: &LaunchWhere,
-) -> Result<CbPlan<T>> {
-    let mut entries = Vec::new();
-    let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
-    for l in fold_plan::launches(&kvs, where_.requests.count) {
-        let (oi, op) = (l.op, &ops[l.op]);
-        // WHICH REGION BACKS THE WEIGHT SLOT, AND AT WHAT SHIFT — `weight_slot`, the one law the
-        // walk's `launch_site` reads: the launch's bank and layer shift, except for a collective's
-        // consume, pinned to bank 0 at shift 0 because its weight-segment operand is the window.
-        let (weight_shift, weight_bank) = op
-            .code
-            .kv
-            .weight_slot(where_.byte_off[SEG_WEIGHT.get()], where_.weight_bank);
-        let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
-        let mut bases = Vec::with_capacity(NUM_SEGMENTS);
-        for (i, byte_off) in where_.byte_off.iter().enumerate() {
-            bases.push(if i == SEG_WEIGHT.get() {
-                (wbase.clone(), weight_shift)
-            } else {
-                (segment_base(seg, banks, weight_bank, i)?.clone(), *byte_off)
-            });
-        }
-        entries.push(CbPlanEntry {
-            label: format!("{}/req{}/rep{}", op.label(), l.request, l.rep),
-            prog: op
-                .addr
-                .clone()
-                .ok_or_else(|| anyhow!("op {oi} has no program allocation"))?,
-            bootstrap_offset: op
-                .code
-                .prog_image(prog_offset_base())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "op {oi}: job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x} — it \
-                         names no bootstrap offset at all",
-                        op.code.job_bin_ptr,
-                        prog_offset_base()
-                    )
-                })?
-                .bootstrap(),
-            kv: op.kv,
-            request: l.request,
-            rep: l.rep,
-            bases,
-            tp: op.site_tp(),
-        });
-    }
-    Ok(CbPlan {
-        entries,
-        pitch: where_.requests.pitch,
-    })
-}
-
-/// ⭐ THE 2a GATE. Render one launch both ways — the walk's staged batch and
-/// the CbPlan's — through one render door, and REFUSE on the first differing
-/// byte. Called only from `Executor::prepare` (and the split ladder's lazy
-/// allocation): a mismatch means the plan's data twin of the walk is wrong,
-/// and the player that will replay these images must not load. Returns the
-/// number of CBs proven byte-identical.
-pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
-    ops: &Ops<T>,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
-    where_: &LaunchWhere,
-    label: &str,
-    stream: &Stream,
-) -> Result<usize> {
-    let (walked, walked_barrier) = walk_items(ops, seg, banks, where_)?;
-    let plan = build_cb_plan(ops, seg, banks, where_)?;
-    let (rendered, rendered_barrier) = plan.render()?;
-    if walked.len() != rendered.len() {
-        bail!(
-            "[cbplan] PARITY REFUSED at {label}: the walk stages {} launch(es) but the plan \
-             renders {} — the (op, relaunch) ENUMERATION itself disagrees. The plan is the \
-             walk's data twin; refusing to load rather than replay a wrong image.",
-            walked.len(),
-            rendered.len()
-        );
-    }
-    if walked_barrier != rendered_barrier {
-        bail!(
-            "[cbplan] PARITY REFUSED at {label}: the walk's host-fence OR is \
-             {walked_barrier} but the plan's is {rendered_barrier}"
-        );
-    }
-    // Both sides through the SAME door at the SAME tags: the tag field is a
-    // patch site (2b stamps pool-leased tags), so it cancels in the compare
-    // and what remains — tensor XLAT paddrs and lengths, program, bootstrap —
-    // is everything the device would be handed.
-    let old = stream.render_batch(&walked, 1)?;
-    let new = stream.render_batch(&rendered, 1)?;
-    for (i, (a, b)) in old.iter().zip(new.iter()).enumerate() {
-        if a != b {
-            let (mut at, mut wb, mut pb) = (0, 0u8, 0u8);
-            for (j, (x, y)) in a.to_bytes().iter().zip(b.to_bytes().iter()).enumerate() {
-                if x != y {
-                    (at, wb, pb) = (j, *x, *y);
-                    break;
-                }
-            }
-            bail!(
-                "[cbplan] PARITY REFUSED at {label}: CB {i} of {} ({}) differs — first \
-                 differing wire byte at +{at}: walk {wb:#04x} vs plan {pb:#04x}. The plan's \
-                 data twin of the walk disagrees; refusing to load rather than replay a \
-                 wrong image.",
-                old.len(),
-                plan.cb_label(i)
-            );
+    /// The degenerate zero-row canvas. A derivation never produces one (a
+    /// prepared session's prefix and suffix lists are allocated
+    /// unconditionally, so a derivation merges at least one row); only the
+    /// cardless cache-accounting test holds one, for a payload it never
+    /// replays.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            cbs: std::sync::Arc::new(Vec::new()),
+            barrier: false,
         }
     }
-    Ok(old.len())
-}
 
-/// One launch row's replay canvas — what the player copies verbatim into a step image. Nothing a
-/// launch addresses moves with the step's position (a walk's body shifts by its own trip; every
-/// other group launches where the bake placed it), so the canvas proven by [`parity_check`] at the
-/// row's `where_` IS every step's CBs for that row. Returns the canvas and the row's host fence.
-pub(crate) fn render_canvas<T: ktir_superdsc::collective::Tp>(
-    ops: &Ops<T>,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
-    where_: &LaunchWhere,
-    stream: &Stream,
-) -> Result<(Vec<ControlBlockWire>, bool)> {
-    let (items, barrier) = build_cb_plan(ops, seg, banks, where_)?.render()?;
-    Ok((stream.render_batch(&items, 1)?, barrier))
+    /// The rendered CBs — shared by every replay's submission batch, which
+    /// clones them out to stamp pool-leased tags. Read-only: a caller can
+    /// submit this canvas but can never construct one.
+    pub(crate) fn cbs(&self) -> &std::sync::Arc<Vec<ControlBlockWire>> {
+        &self.cbs
+    }
+
+    /// The walk's host fence over the whole canvas.
+    pub(crate) fn barrier(&self) -> bool {
+        self.barrier
+    }
+
+    /// How many CBs the canvas renders — the player's accounting line.
+    pub(crate) fn len(&self) -> usize {
+        self.cbs.len()
+    }
+
+    /// The zero-row degenerate — true only of [`WalkCanvas::empty`].
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cbs.is_empty()
+    }
 }
 
 #[cfg(test)]
