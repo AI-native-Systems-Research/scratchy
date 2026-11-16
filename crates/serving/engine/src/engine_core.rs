@@ -20,7 +20,7 @@
 //!
 //! Port of: `vllm/v1/engine/core.py::EngineCore`
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use scratchy_core_common::{
@@ -141,8 +141,8 @@ pub struct EngineCoreConfig {
 /// size and the per-group specs `(is_sliding, window_tokens, block_size)`.
 pub type HybridKvConfig = (usize, Vec<(bool, usize, KvBlockTokens)>);
 
-/// Output from a single engine step, grouped by client index.
-pub type StepOutputs = HashMap<u32, EngineCoreOutputs>;
+/// What one engine step hands its one client, `None` when the step produced nothing for it.
+pub type StepOutputs = Option<EngineCoreOutputs>;
 
 /// ⛔⛔⛔ WHAT ONE ENGINE STEP DID — AND THE OUTPUTS ARE ONLY REACHABLE THROUGH THE MATCH.
 ///
@@ -519,7 +519,7 @@ impl EngineCore {
 
     /// Execute one scheduling + execution step.
     ///
-    /// Returns a map of client_index → outputs, and a flag indicating
+    /// Returns the step's client outputs, and a flag indicating
     /// whether the model was actually executed.
     ///
     /// Requires the executor to be present (not taken for async scheduling).
@@ -847,8 +847,8 @@ impl EngineCore {
         // 6. Attach pre-captured scheduler stats to outputs.
         let mut stats = stats;
         stats.spec_decode_stats = spec_decode_stats;
-        for engine_outputs in outputs.values_mut() {
-            engine_outputs.scheduler_stats = Some(stats.clone());
+        if let Some(engine_outputs) = &mut outputs {
+            engine_outputs.scheduler_stats = Some(stats);
         }
 
         outputs
@@ -867,7 +867,19 @@ impl EngineCore {
         model_output: &ModelRunnerOutput,
     ) -> StepOutputs {
         let timestamp = self.timestamp();
-        let mut client_outputs: StepOutputs = HashMap::new();
+        let mut client_outputs: StepOutputs = None;
+        // At most one output per scheduled request and one per request the schedule finished: the
+        // whole step's outputs in one allocation.
+        let (engine_index, capacity) = (
+            self.engine_index,
+            scheduler_output.num_scheduled_tokens.len() + scheduler_output.finished_req_ids.len(),
+        );
+        let opened = || EngineCoreOutputs {
+            engine_index,
+            outputs: Vec::with_capacity(capacity),
+            timestamp,
+            scheduler_stats: None,
+        };
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
         // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
@@ -926,15 +938,10 @@ impl EngineCore {
                     pooler_output: pooler_vec,
                 };
 
-                let engine_outputs = client_outputs
-                    .entry(0)
-                    .or_insert_with(|| EngineCoreOutputs {
-                        engine_index: self.engine_index,
-                        outputs: Vec::new(),
-                        timestamp,
-                        scheduler_stats: None,
-                    });
-                engine_outputs.outputs.push(output);
+                client_outputs
+                    .get_or_insert_with(opened)
+                    .outputs
+                    .push(output);
                 continue;
             }
 
@@ -1071,16 +1078,10 @@ impl EngineCore {
                 pooler_output: None,
             };
 
-            // Route to client_index 0 (default for single-client mode).
-            let engine_outputs = client_outputs
-                .entry(0)
-                .or_insert_with(|| EngineCoreOutputs {
-                    engine_index: self.engine_index,
-                    outputs: Vec::new(),
-                    timestamp,
-                    scheduler_stats: None,
-                });
-            engine_outputs.outputs.push(output);
+            client_outputs
+                .get_or_insert_with(opened)
+                .outputs
+                .push(output);
         }
 
         // Finish requests that hit stop criteria.
@@ -1090,14 +1091,7 @@ impl EngineCore {
 
         // Include already-finished request IDs from the scheduler (e.g. aborts).
         if !scheduler_output.finished_req_ids.is_empty() {
-            let engine_outputs = client_outputs
-                .entry(0)
-                .or_insert_with(|| EngineCoreOutputs {
-                    engine_index: self.engine_index,
-                    outputs: Vec::new(),
-                    timestamp,
-                    scheduler_stats: None,
-                });
+            let engine_outputs = client_outputs.get_or_insert_with(opened);
 
             for req_id in &scheduler_output.finished_req_ids {
                 // Only add if not already included from the loop above.
@@ -1346,6 +1340,7 @@ mod tests {
     use scratchy_core_common::SamplingParams;
     use scratchy_core_common::engine_io::EmbeddingData;
     use scratchy_core_config::SchedulerPolicy;
+    use std::collections::HashMap;
 
     fn make_test_config() -> EngineCoreConfig {
         EngineCoreConfig {
@@ -1414,8 +1409,8 @@ mod tests {
         assert!(model_executed);
 
         // We should have outputs.
-        assert!(!outputs.is_empty());
-        let client_0_outputs = outputs.get(&0).unwrap();
+        assert!(outputs.is_some());
+        let client_0_outputs = outputs.as_ref().unwrap();
         assert!(!client_0_outputs.outputs.is_empty());
         assert_eq!(client_0_outputs.engine_index, 0);
     }
@@ -1429,7 +1424,7 @@ mod tests {
         // Step with no requests.
         let (outputs, model_executed) = engine.step().unwrap().into_tuple();
         assert!(!model_executed);
-        assert!(outputs.is_empty());
+        assert!(outputs.is_none());
     }
 
     #[test]
@@ -1450,7 +1445,7 @@ mod tests {
         let (outputs, model_executed) = engine.step().unwrap().into_tuple();
         assert!(model_executed);
 
-        let client_0 = outputs.get(&0).unwrap();
+        let client_0 = outputs.as_ref().unwrap();
         assert!(client_0.outputs.len() >= 5);
     }
 
@@ -1609,7 +1604,7 @@ mod tests {
         let mut finished = false;
         for _ in 0..10 {
             let (outputs, _) = engine.step().unwrap().into_tuple();
-            if let Some(client_out) = outputs.get(&0) {
+            if let Some(client_out) = outputs.as_ref() {
                 for out in &client_out.outputs {
                     if out.request_id == "req-1" && out.finish_reason.is_some() {
                         assert_eq!(out.finish_reason, Some(FinishReason::Length));
@@ -1642,7 +1637,7 @@ mod tests {
 
         // Step — the first generated token should be 1000 (EOS).
         let (outputs, _) = engine.step().unwrap().into_tuple();
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -1689,7 +1684,7 @@ mod tests {
             };
 
             let outputs = engine.update_from_output(&scheduler_output, &model_output);
-            let req_out = &outputs[&0].outputs[0];
+            let req_out = &outputs.as_ref().unwrap().outputs[0];
             assert_eq!(req_out.new_token_ids, [42, 1000], "{reason:?}");
             assert_eq!(req_out.finish_reason, Some(reason));
         }
@@ -1711,7 +1706,7 @@ mod tests {
         engine.add_request(req);
 
         let (outputs, _) = engine.step().unwrap().into_tuple();
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -1741,7 +1736,7 @@ mod tests {
 
         // Step — even though token 1000 (EOS) is generated, it shouldn't stop.
         let (outputs, _) = engine.step().unwrap().into_tuple();
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -1780,7 +1775,7 @@ mod tests {
         let mut finished = false;
         for _ in 0..10 {
             let (outputs, _) = engine.step().unwrap().into_tuple();
-            if let Some(client_out) = outputs.get(&0) {
+            if let Some(client_out) = outputs.as_ref() {
                 for out in &client_out.outputs {
                     if out.request_id == "req-1" && out.finish_reason.is_some() {
                         assert_eq!(out.finish_reason, Some(FinishReason::Stop));
@@ -1858,7 +1853,7 @@ mod tests {
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
 
         // Check that prompt logprobs are propagated.
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2228,8 +2223,8 @@ mod tests {
         let outputs = engine.finalize_step(&sched, &model_output);
 
         // Should have outputs for client 0.
-        assert!(!outputs.is_empty());
-        let client_0 = outputs.get(&0).unwrap();
+        assert!(outputs.is_some());
+        let client_0 = outputs.as_ref().unwrap();
         assert!(!client_0.outputs.is_empty());
         assert_eq!(client_0.outputs[0].request_id, "req-1");
         assert!(!client_0.outputs[0].new_token_ids.is_empty());
@@ -2301,7 +2296,7 @@ mod tests {
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
 
         // Check the output.
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2361,7 +2356,7 @@ mod tests {
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2411,7 +2406,7 @@ mod tests {
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2441,7 +2436,7 @@ mod tests {
         let (outputs, model_executed) = engine.step().unwrap().into_tuple();
         assert!(model_executed);
 
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2488,7 +2483,7 @@ mod tests {
 
         // Step 1: generates token 1000 (EOS). Sealed request should NOT finish.
         let (outputs, _) = engine.step().unwrap().into_tuple();
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2563,7 +2558,7 @@ mod tests {
 
         // Step 5: token 1004. Total = 8. Block-aligned! Should stop.
         let (outputs5, _) = engine.step().unwrap().into_tuple();
-        let client_out5 = outputs5.get(&0).unwrap();
+        let client_out5 = outputs5.as_ref().unwrap();
         let req_out5 = client_out5
             .outputs
             .iter()
@@ -2612,7 +2607,7 @@ mod tests {
 
         // Step 2: 2 output tokens → 4 total, aligned → stop.
         let (outputs, _) = engine.step().unwrap().into_tuple();
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()
@@ -2652,7 +2647,7 @@ mod tests {
         let mut total_output_tokens = 0u32;
         for _ in 0..10 {
             let (outputs, _) = engine.step().unwrap().into_tuple();
-            if let Some(client_out) = outputs.get(&0) {
+            if let Some(client_out) = outputs.as_ref() {
                 for out in &client_out.outputs {
                     if out.request_id == "s1" {
                         total_output_tokens += out.new_token_ids.len() as u32;
@@ -2696,7 +2691,7 @@ mod tests {
         engine.add_request(req);
 
         let (outputs, _) = engine.step().unwrap().into_tuple();
-        let client_out = outputs.get(&0).unwrap();
+        let client_out = outputs.as_ref().unwrap();
         let req_out = client_out
             .outputs
             .iter()

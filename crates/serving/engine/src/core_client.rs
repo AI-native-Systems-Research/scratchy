@@ -527,7 +527,7 @@ impl EngineCoreClient for InprocClient {
         // finished request. `Progressed` already carries that distinction, so the empty set needs
         // no second encoding, and the `is_empty` pre-check this replaces was the same test twice.
         Ok(StepOutcome::Progressed {
-            outputs: outputs.into_values().next().unwrap_or_default(),
+            outputs: outputs.unwrap_or_default(),
             model_executed,
         })
     }

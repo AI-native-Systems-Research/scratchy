@@ -51,6 +51,10 @@ pub struct IncrementalDetokenizer {
     /// the prompt's render as output (#586). A deliberate divergence from tokenizers'
     /// `step_decode_stream`, which starts it at 0.
     prompt_floor: Option<PromptFloor>,
+    /// The stream's render, decoded anew into this one buffer each token.
+    render: String,
+    /// [`Tokenizer::decode_into`]'s scratch.
+    run: Vec<u8>,
 }
 
 /// The prompt's renders a stream's first delta starts past, when the prompt ends partway through
@@ -131,6 +135,8 @@ impl IncrementalDetokenizer {
             stream_prefix: String::new(),
             stream_prefix_index: 0,
             prompt_floor: None,
+            render: String::new(),
+            run: Vec::new(),
         }
     }
 
@@ -150,8 +156,7 @@ impl IncrementalDetokenizer {
         for (i, &new_token_id) in new_token_ids.iter().enumerate() {
             // Python line 121: self.output_text += self.decode_next(new_token_id)
             let len_before = self.output_text.len();
-            let token_text = self.decode_next(new_token_id);
-            self.output_text.push_str(&token_text);
+            self.decode_next(new_token_id);
             // The token that terminated generation (EOS / a stop token, e.g.
             // gemma's <end_of_turn>) must not surface as visible text.
             if stop_terminated && i == last {
@@ -183,96 +188,88 @@ impl IncrementalDetokenizer {
     /// Python: FastIncrementalDetokenizer.decode_next (line 209-220)
     /// This is a direct port of tokenizers' step_decode_stream function
     /// from /tmp/zoo/tokenizers/tokenizers/src/tokenizer/mod.rs lines 1085-1128
-    fn decode_next(&mut self, next_token_id: u32) -> String {
+    ///
+    /// Appends the token's new text to `output_text`. Every render decodes into a buffer the
+    /// stream keeps ([`Tokenizer::decode_into`]), so a token allocates nothing once they have
+    /// grown to the stream's window.
+    fn decode_next(&mut self, next_token_id: u32) {
         self.token_ids.push(next_token_id);
-
-        // Convert single token to Vec as Python does (line 694)
-        let token_ids = vec![next_token_id];
+        let skip = self.skip_special_tokens;
 
         // EXACT implementation of step_decode_stream from tokenizers library
-        // Line 1100-1106: Initialize prefix if empty and ids not empty
-        if self.stream_prefix.is_empty() && !self.stream_ids.is_empty() {
-            match self
-                .tokenizer
-                .decode(&self.stream_ids, self.skip_special_tokens)
-            {
-                Ok(new_prefix) => {
-                    if new_prefix.ends_with('�') {
-                        // Recorded at the first output token only, when `stream_ids` is the
-                        // prompt: later, the render includes output, which is the delta's own.
-                        if self.num_output_tokens() == 1 {
-                            self.prompt_floor = Some(PromptFloor {
-                                whole: self.whole_prompt_render(),
-                                render: new_prefix,
-                            });
-                        }
-                    } else {
-                        self.stream_prefix = new_prefix;
-                        self.stream_prefix_index = self.stream_ids.len();
-                    }
+        // Line 1100-1106: Initialize prefix if empty and ids not empty. A decode error leaves the
+        // prefix empty: ignored, as during prefix initialization it always was.
+        if self.stream_prefix.is_empty()
+            && !self.stream_ids.is_empty()
+            && (self.tokenizer)
+                .decode_into(
+                    &self.stream_ids,
+                    skip,
+                    &mut self.run,
+                    &mut self.stream_prefix,
+                )
+                .is_ok()
+        {
+            if self.stream_prefix.ends_with('�') {
+                // Not a prefix, which stays empty. Recorded at the first output token only, when
+                // `stream_ids` is the prompt: later, the render includes output, which is the
+                // delta's own.
+                let render = std::mem::take(&mut self.stream_prefix);
+                if self.num_output_tokens() == 1 {
+                    self.prompt_floor = Some(PromptFloor {
+                        whole: self.whole_prompt_render(),
+                        render,
+                    });
                 }
-                Err(_) => {
-                    // Ignore decode errors during prefix initialization
-                }
+            } else {
+                self.stream_prefix_index = self.stream_ids.len();
             }
         }
 
         // Line 1108: Extend ids with new token(s)
-        self.stream_ids.extend(token_ids);
+        self.stream_ids.push(next_token_id);
 
         // Line 1109: Decode all ids
-        let string = match self
-            .tokenizer
-            .decode(&self.stream_ids, self.skip_special_tokens)
+        if (self.tokenizer)
+            .decode_into(&self.stream_ids, skip, &mut self.run, &mut self.render)
+            .is_err()
         {
-            Ok(s) => s,
-            Err(_) => {
-                return String::new();
-            }
-        };
+            return;
+        }
+        let string = &self.render;
 
         // Where the new text starts: past the locked prefix, or, while none could lock, past the
         // prompt's renders ([`PromptFloor`]).
         let floor = if self.stream_prefix.is_empty() {
-            (self.prompt_floor.as_ref()).map_or(0, |f| f.floor(&string))
+            (self.prompt_floor.as_ref()).map_or(0, |f| f.floor(string))
         } else {
             self.stream_prefix.len()
         };
 
-        // Line 1110-1127: Check if we have valid new text
-        if string.len() > floor && !string.ends_with('�') {
-            // Line 1111-1117: Validate prefix
-            if !string.starts_with(&self.stream_prefix) {
-                return String::new();
-            }
-
-            // Line 1119: Extract new text
-            let new_text = string[floor..].to_string();
-            self.prompt_floor = None;
-
-            // Line 1120-1123: Update state
-            let new_prefix_index = self.stream_ids.len() - self.stream_prefix_index;
-            self.stream_ids = self.stream_ids.drain(self.stream_prefix_index..).collect();
-
-            match self
-                .tokenizer
-                .decode(&self.stream_ids, self.skip_special_tokens)
-            {
-                Ok(new_prefix) => {
-                    self.stream_prefix = new_prefix;
-                }
-                Err(_) => {
-                    // Ignore decode errors during prefix update
-                }
-            }
-            self.stream_prefix_index = new_prefix_index;
-
-            // Line 1124: Return new text
-            new_text
-        } else {
-            // Line 1126: No new text yet
-            String::new()
+        // Line 1110-1127: Check if we have valid new text (line 1126: none yet)
+        if string.len() <= floor || string.ends_with('�') {
+            return;
         }
+        // Line 1111-1117: Validate prefix
+        if !string.starts_with(&self.stream_prefix) {
+            return;
+        }
+
+        // Line 1119, 1124: the new text
+        self.output_text.push_str(&string[floor..]);
+        self.prompt_floor = None;
+
+        // Line 1120-1123: Update state. A decode error keeps the old prefix: ignored, as during
+        // prefix update it always was.
+        let new_prefix_index = self.stream_ids.len() - self.stream_prefix_index;
+        self.stream_ids.drain(..self.stream_prefix_index);
+        let _ = (self.tokenizer).decode_into(
+            &self.stream_ids,
+            skip,
+            &mut self.run,
+            &mut self.stream_prefix,
+        );
+        self.stream_prefix_index = new_prefix_index;
     }
 
     /// The render of the prompt (`stream_ids`, before the first output token) cut back to its
@@ -1116,5 +1113,75 @@ mod tests {
             fallback_output_after(&[H, I, 0xC3], &[0xC3, X]),
             "\u{FFFD}x"
         );
+    }
+
+    /// A decode token allocates nothing but its request's own history — the output text and the
+    /// token ids, which grow by doubling — once the stream's buffers have grown to its window
+    /// (#1269): `text` decoded twice, counted on the second pass.
+    fn a_token_allocates_only_its_history(tok: Tokenizer, prompt: &[u32], text: &[u32]) {
+        let mut detok = IncrementalDetokenizer::new(Arc::new(tok), prompt, vec![], 0, false, true);
+        for &id in text {
+            detok.update(&[id], false);
+        }
+        let once = detok.output_text.clone();
+        for &id in text {
+            let history = (detok.token_ids.capacity(), detok.output_text.capacity());
+            let ((), allocations) = crate::alloc_count::allocations(|| {
+                detok.update(&[id], false);
+            });
+            let grew = u64::from(detok.token_ids.capacity() != history.0)
+                + u64::from(detok.output_text.capacity() != history.1);
+            assert_eq!(allocations, grew, "token {id}");
+        }
+        assert_eq!(detok.output_text, once.repeat(2));
+    }
+
+    #[test]
+    fn a_byte_level_token_allocates_only_its_history() {
+        let tok = crate::tokenizer::make_baked_tokenizer(
+            &crate::tokenizer::test_tokenizer_with_added_json(),
+        );
+        let prompt = tok.encode("Hi", false).unwrap();
+        let text = (tok
+            .encode("The quick fox — 中文, é and 🎉!\n", false)
+            .unwrap()
+            .into_iter())
+        .chain([256, 257, 258])
+        .collect::<Vec<_>>();
+        a_token_allocates_only_its_history(tok, &prompt, &text);
+    }
+
+    #[test]
+    fn a_byte_fallback_token_allocates_only_its_history() {
+        use crate::tokenizer::{
+            SENTENCEPIECE_WORDS, make_baked_tokenizer, test_sentencepiece_json,
+        };
+        let word = |w: &str| 256 + SENTENCEPIECE_WORDS.iter().position(|&s| s == w).unwrap() as u32;
+        let special = 256 + SENTENCEPIECE_WORDS.len() as u32;
+        // ▁the ▁quick 中 ▁▁ é a▁b 🎉 ▁ <s>
+        let text = [
+            word("▁the"),
+            word("▁quick"),
+            0xE4,
+            0xB8,
+            0xAD,
+            word("▁▁"),
+            word("é"),
+            word("a▁b"),
+            0xF0,
+            0x9F,
+            0x8E,
+            0x89,
+            word("▁"),
+            special,
+        ];
+        for strip in [true, false] {
+            let prompt = [special, word("▁the")];
+            a_token_allocates_only_its_history(
+                make_baked_tokenizer(&test_sentencepiece_json(strip)),
+                &prompt,
+                &text,
+            );
+        }
     }
 }
