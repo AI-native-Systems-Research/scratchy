@@ -11,15 +11,12 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use scratchy_core_model::baked_tokenizer::pieces::Pieces;
 use scratchy_core_model::baked_tokenizer::{self, Baked, BakedTokenizer};
 use tokenizers::tokenizer::PostProcessor as _;
 use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
 use crate::error::{ServeError, ServeResult};
-
-mod pieces;
-
-use pieces::Pieces;
 
 // ---------------------------------------------------------------------------
 // Tokenizer
@@ -33,9 +30,6 @@ pub struct Tokenizer {
     special_ids: HashSet<u32>,
     /// The EOS token ID, if present.
     eos_token_id: Option<u32>,
-    /// Each token's piece of text, when the decoder joins pieces end to end: what
-    /// [`Self::decode_into`] decodes through.
-    pieces: Option<Pieces>,
 }
 
 /// The `tokenizers` tokenizer a [`Tokenizer`] wraps: parsed from a `tokenizer.json`, or compiled
@@ -43,7 +37,9 @@ pub struct Tokenizer {
 /// differing only in their model, so every method is the same call on either.
 enum Inner {
     File(Box<HfTokenizer>),
-    Baked(Box<Baked>),
+    /// With each token's piece of text, which the build bakes beside it when the decoder joins
+    /// pieces end to end: what [`Tokenizer::decode_into`] decodes through.
+    Baked(Box<Baked>, Option<Pieces<'static>>),
 }
 
 /// `$body`, with `$t` bound to whichever tokenizer `$inner` holds.
@@ -51,7 +47,7 @@ macro_rules! with_inner {
     ($inner:expr, $t:ident => $body:expr) => {
         match $inner {
             Inner::File($t) => $body,
-            Inner::Baked($t) => $body,
+            Inner::Baked($t, _) => $body,
         }
     };
 }
@@ -68,7 +64,12 @@ impl Tokenizer {
             match baked.load() {
                 Ok(tokenizer) => {
                     tracing::info!("Tokenizer compiled in (tokenizer.json {})", baked.digest);
-                    return Ok(Self::new(Inner::Baked(Box::new(tokenizer))));
+                    let pieces = baked.pieces.and_then(|blob| {
+                        (Pieces::parse(blob))
+                            .inspect_err(|e| tracing::warn!("tokenizer.json {}: {e}", baked.digest))
+                            .ok()
+                    });
+                    return Ok(Self::new(Inner::Baked(Box::new(tokenizer), pieces)));
                 }
                 Err(e) => tracing::warn!("{e}; loading {} instead", path.display()),
             }
@@ -110,12 +111,10 @@ impl Tokenizer {
             .token_to_id("</s>")
             .or_else(|| t.token_to_id("<|endoftext|>"))
             .or_else(|| t.token_to_id("<|end_of_text|>")));
-        let pieces = Self::pieces_of(&inner);
         Self {
             inner,
             special_ids,
             eos_token_id,
-            pieces,
         }
     }
 
@@ -167,7 +166,10 @@ impl Tokenizer {
             return;
         }
         self.special_ids = Self::collect_special_ids(&self.inner);
-        self.pieces = Self::pieces_of(&self.inner);
+        // The build baked the pieces of the tokens it saw: this tokenizer's are other now.
+        if let Inner::Baked(_, pieces) = &mut self.inner {
+            *pieces = None;
+        }
     }
 
     /// Encode text into token IDs.
@@ -212,8 +214,8 @@ impl Tokenizer {
     }
 
     /// [`Self::decode`] into `out`, with `run` its scratch. Through the tokens' pieces when the
-    /// decoder joins them end to end, so a caller that keeps both buffers decodes without
-    /// allocating; else through `tokenizers`, leaving `out` as it was when that fails.
+    /// build baked them beside a compiled-in tokenizer, so a caller that keeps both buffers decodes
+    /// without allocating; else through `tokenizers`, leaving `out` as it was when that fails.
     pub fn decode_into(
         &self,
         ids: &[u32],
@@ -221,9 +223,9 @@ impl Tokenizer {
         run: &mut Vec<u8>,
         out: &mut String,
     ) -> ServeResult<()> {
-        match &self.pieces {
-            Some(pieces) => pieces.decode_into(ids, skip_special_tokens, run, out),
-            None => *out = self.decode(ids, skip_special_tokens)?,
+        match &self.inner {
+            Inner::Baked(_, Some(pieces)) => pieces.decode_into(ids, skip_special_tokens, run, out),
+            _ => *out = self.decode(ids, skip_special_tokens)?,
         }
         Ok(())
     }
@@ -266,20 +268,6 @@ impl Tokenizer {
     /// Get the full vocabulary as a token-to-id mapping.
     pub fn get_vocab(&self) -> std::collections::HashMap<String, u32> {
         with_inner!(&self.inner, t => t.get_vocab(true))
-    }
-
-    /// The pieces of every token of `tokenizer`, by id, when its decoder joins them end to end.
-    fn pieces_of(tokenizer: &Inner) -> Option<Pieces> {
-        with_inner!(tokenizer, t => {
-            // Every id that names a token is in the vocabulary, the added tokens with it.
-            let ids = t.get_vocab(true).into_values().max().map_or(0, |id| id + 1);
-            Pieces::of(
-                t.get_decoder(),
-                ids,
-                |id| t.id_to_token(id),
-                |token| t.get_added_vocabulary().is_special_token(token),
-            )
-        })
     }
 
     /// Collect all special token IDs from the tokenizer.
@@ -339,26 +327,40 @@ pub(crate) fn make_test_tokenizer_with_bos() -> Tokenizer {
     Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
 }
 
-/// [`make_test_tokenizer`] with added tokens: a special `<|endoftext|>` (256), and two plain ones
-/// whose characters `ByteLevel`'s decode reads differently — `é` (257) is in its byte map, so it
-/// stands for the one byte `0xE9`, and `中` (258) is not, so it stays its own UTF-8.
+/// `json`'s tokenizer as the build compiles it in ([`baked_tokenizer::bake`]), its piece table
+/// with it.
 #[cfg(test)]
-pub(crate) fn make_test_tokenizer_with_added() -> Tokenizer {
+pub(crate) fn make_baked_tokenizer(json: &serde_json::Value) -> Tokenizer {
+    let bake = baked_tokenizer::bake(&json.to_string(), "test").expect("the fixture bakes");
+    let tables = baked_tokenizer::aligned_copy(&bake.tables);
+    let tokenizer = baked_tokenizer::load("test", tables, &bake.pipeline).expect("the bake loads");
+    let pieces = bake.pieces.map(|blob| {
+        let blob: &'static [u8] = Box::leak(blob.into_boxed_slice());
+        Pieces::parse(blob).expect("its piece table parses")
+    });
+    Tokenizer::new(Inner::Baked(Box::new(tokenizer), pieces))
+}
+
+/// [`make_test_tokenizer`]'s `tokenizer.json` with added tokens: a special `<|endoftext|>` (256),
+/// and two plain ones whose characters `ByteLevel`'s decode reads differently — `é` (257) is in its
+/// byte map, so it stands for the one byte `0xE9`, and `中` (258) is not, so it stays its own UTF-8.
+#[cfg(test)]
+pub(crate) fn test_tokenizer_with_added_json() -> serde_json::Value {
     let mut json = test_tokenizer_json();
     json["added_tokens"] = serde_json::json!([
         added_token(256, "<|endoftext|>", true),
         added_token(257, "é", false),
         added_token(258, "中", false),
     ]);
-    Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
+    json
 }
 
-/// A SentencePiece byte-fallback tokenizer, decoded as Llama 2's and Mistral's are
+/// A SentencePiece byte-fallback `tokenizer.json`, decoded as Llama 2's and Mistral's are
 /// (`Replace("▁", " ")`, `ByteFallback`, `Fuse`, `Strip` of one leading space) or, without
 /// `strip`, as Gemma's. Its ids: `<0x00>`..`<0xFF>` (0..=255); [`SENTENCEPIECE_WORDS`] from 256;
 /// then a special `<s>` and a plain `<extra>`.
 #[cfg(test)]
-pub(crate) fn make_test_sentencepiece_tokenizer(strip: bool) -> Tokenizer {
+pub(crate) fn test_sentencepiece_json(strip: bool) -> serde_json::Value {
     let mut vocab = serde_json::Map::new();
     for b in 0..=255u32 {
         vocab.insert(format!("<0x{b:02X}>"), b.into());
@@ -375,16 +377,15 @@ pub(crate) fn make_test_sentencepiece_tokenizer(strip: bool) -> Tokenizer {
     if strip {
         decoders.push(serde_json::json!({"type": "Strip", "content": " ", "start": 1, "stop": 0}));
     }
-    let json = serde_json::json!({
+    serde_json::json!({
         "version": "1.0",
         "added_tokens": [added_token(256 + words, "<s>", true), added_token(257 + words, "<extra>", false)],
         "model": {"type": "BPE", "vocab": vocab, "merges": [], "byte_fallback": true},
         "decoder": {"type": "Sequence", "decoders": decoders},
-    });
-    Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
+    })
 }
 
-/// [`make_test_sentencepiece_tokenizer`]'s words, from id 256: whole words, spaces alone and
+/// [`test_sentencepiece_json`]'s words, from id 256: whole words, spaces alone and
 /// doubled, a `▁` inside a word, and two that only look like byte tokens — `<0x+A>`, which
 /// `ByteFallback`'s own parse reads as byte `0x0A`, and `<0xé>`, which it cannot read.
 #[cfg(test)]
@@ -518,5 +519,78 @@ mod tests {
         assert!(!ids.is_empty());
         let decoded = tok.decode(&ids, false).unwrap();
         assert_eq!(decoded, text);
+    }
+
+    /// The compiled-in tokenizer of `json` decodes every window of ids through its piece table
+    /// exactly as `tokenizers` decodes it from the file: random windows of up to 12 ids, drawn from
+    /// every id the tokenizer has and two it has not, keeping and skipping special tokens. Byte runs
+    /// that are valid UTF-8, cut short, and invalid all come up.
+    fn decodes_as_the_file_does(json: &serde_json::Value, ids: u32) {
+        let file = Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap());
+        let baked = make_baked_tokenizer(json);
+        assert!(
+            matches!(baked.inner, Inner::Baked(_, Some(_))),
+            "the bake has a piece table"
+        );
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut draw = |n: u32| {
+            state = (state.wrapping_mul(6_364_136_223_846_793_005))
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32 % n
+        };
+        let (mut run, mut out) = (Vec::new(), String::new());
+        for _ in 0..4000 {
+            let len = draw(13);
+            let window: Vec<u32> = (0..len).map(|_| draw(ids + 2)).collect();
+            for skip in [false, true] {
+                let want = file.decode(&window, skip).expect("tokenizers decodes");
+                baked
+                    .decode_into(&window, skip, &mut run, &mut out)
+                    .expect("the pieces decode");
+                assert_eq!(out, want, "ids {window:?}, skip_special_tokens {skip}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_byte_level_window_decodes_as_the_file_does() {
+        decodes_as_the_file_does(&test_tokenizer_with_added_json(), 259);
+    }
+
+    #[test]
+    fn a_byte_fallback_window_decodes_as_the_file_does() {
+        let ids = 258 + SENTENCEPIECE_WORDS.len() as u32;
+        for strip in [true, false] {
+            decodes_as_the_file_does(&test_sentencepiece_json(strip), ids);
+        }
+    }
+
+    /// A tokenizer loaded from its file has no piece table, nor does a compiled-in one whose
+    /// decoder does not join pieces end to end: both decode through `tokenizers`.
+    #[test]
+    fn only_a_baked_end_to_end_decoder_has_a_table() {
+        assert!(matches!(make_test_tokenizer().inner, Inner::File(_)));
+        let json = serde_json::json!({
+            "version": "1.0",
+            "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []},
+            "decoder": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true},
+        });
+        let baked = make_baked_tokenizer(&json);
+        assert!(matches!(baked.inner, Inner::Baked(_, None)));
+        let (mut run, mut out) = (Vec::new(), String::new());
+        baked
+            .decode_into(&[0, 1], false, &mut run, &mut out)
+            .unwrap();
+        assert_eq!(out, baked.decode(&[0, 1], false).unwrap());
+    }
+
+    /// Special tokens registered after the bake drop its piece table: it was baked for the tokens
+    /// the build saw.
+    #[test]
+    fn registering_special_tokens_drops_the_baked_table() {
+        let mut baked = make_baked_tokenizer(&test_tokenizer_with_added_json());
+        assert!(matches!(baked.inner, Inner::Baked(_, Some(_))));
+        baked.register_additional_special_tokens(&["<|image_pad|>".to_string()]);
+        assert!(matches!(baked.inner, Inner::Baked(_, None)));
     }
 }

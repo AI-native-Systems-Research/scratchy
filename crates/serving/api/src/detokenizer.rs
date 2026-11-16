@@ -1138,7 +1138,9 @@ mod tests {
 
     #[test]
     fn a_byte_level_token_allocates_only_its_history() {
-        let tok = crate::tokenizer::make_test_tokenizer_with_added();
+        let tok = crate::tokenizer::make_baked_tokenizer(
+            &crate::tokenizer::test_tokenizer_with_added_json(),
+        );
         let prompt = tok.encode("Hi", false).unwrap();
         let text = (tok
             .encode("The quick fox — 中文, é and 🎉!\n", false)
@@ -1151,7 +1153,9 @@ mod tests {
 
     #[test]
     fn a_byte_fallback_token_allocates_only_its_history() {
-        use crate::tokenizer::{SENTENCEPIECE_WORDS, make_test_sentencepiece_tokenizer};
+        use crate::tokenizer::{
+            SENTENCEPIECE_WORDS, make_baked_tokenizer, test_sentencepiece_json,
+        };
         let word = |w: &str| 256 + SENTENCEPIECE_WORDS.iter().position(|&s| s == w).unwrap() as u32;
         let special = 256 + SENTENCEPIECE_WORDS.len() as u32;
         // ▁the ▁quick 中 ▁▁ é a▁b 🎉 ▁ <s>
@@ -1174,7 +1178,7 @@ mod tests {
         for strip in [true, false] {
             let prompt = [special, word("▁the")];
             a_token_allocates_only_its_history(
-                make_test_sentencepiece_tokenizer(strip),
+                make_baked_tokenizer(&test_sentencepiece_json(strip)),
                 &prompt,
                 &text,
             );

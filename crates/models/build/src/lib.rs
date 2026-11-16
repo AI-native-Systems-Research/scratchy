@@ -453,12 +453,22 @@ fn bake_tokenizers(out_dir: &Path) {
             &out_dir.join(format!("tokenizer-{digest}.json")),
             &bake.pipeline,
         );
+        let pieces = match &bake.pieces {
+            Some(pieces) => {
+                write_if_changed_bytes(&out_dir.join(format!("tokenizer-{digest}.pieces")), pieces);
+                format!(
+                    "Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.pieces\")))"
+                )
+            }
+            None => "None".to_string(),
+        };
         code += &format!(
             "::scratchy_forward_compiler::inventory::submit! {{\n    \
              ::scratchy_core_model::baked_tokenizer::BakedTokenizer {{\n        \
              digest: \"{digest}\",\n        \
              tables: &{owner},\n        \
-             pipeline: include_str!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.json\")),\n    \
+             pipeline: include_str!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.json\")),\n        \
+             pieces: {pieces},\n    \
              }}\n}}\n"
         );
     }

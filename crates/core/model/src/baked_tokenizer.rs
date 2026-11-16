@@ -49,9 +49,13 @@ pub struct BakedTokenizer {
     pub tables: &'static Aligned<[u8]>,
     /// The rest of its `tokenizer.json`, the model stanza replaced by `{"digest": …}`.
     pub pipeline: &'static str,
+    /// Each token's piece of text ([`pieces`]), when its decoder joins pieces end to end.
+    pub pieces: Option<&'static [u8]>,
 }
 
 inventory::collect!(BakedTokenizer);
+
+pub mod pieces;
 
 impl BakedTokenizer {
     /// The tokenizer baked from the `tokenizer.json` with this digest, if the build baked it.
@@ -511,6 +515,8 @@ pub struct Bake {
     pub tables: Vec<u8>,
     /// The rest of the file, its model stanza replaced by `{"digest": …}`.
     pub pipeline: String,
+    /// Each token's piece of text ([`pieces::build`]), when the decoder joins pieces end to end.
+    pub pieces: Option<Vec<u8>>,
 }
 
 /// Text [`bake`] encodes and decodes both ways before it trusts its tables: ASCII words and
@@ -665,9 +671,21 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
     file["model"] = serde_json::json!({ "digest": digest });
     let pipeline = serde_json::to_string(&file).map_err(|e| e.to_string())?;
 
-    // Trust nothing: the baked tokenizer must encode and decode the corpus as the file's does.
+    // Every id that names a token is in the vocabulary, the added tokens with it.
+    let ids_end = (original.get_vocab(true).into_values().max()).map_or(0, |id| id + 1);
+    let pieces = pieces::build(
+        original.get_decoder(),
+        ids_end,
+        |id| original.id_to_token(id),
+        |token| original.get_added_vocabulary().is_special_token(token),
+    );
+
+    // Trust nothing: the baked tokenizer must encode and decode the corpus as the file's does, and
+    // its piece table decode it as the file's does.
     let leaked: &'static [u8] = aligned_copy(&tables);
     let baked = load(digest, leaked, &pipeline)?;
+    let table = pieces.as_deref().map(pieces::Pieces::parse).transpose()?;
+    let (mut run, mut decoded) = (Vec::new(), String::new());
     for text in CORPUS {
         for special in [false, true] {
             let want = original.encode(*text, special).map_err(|e| e.to_string())?;
@@ -678,24 +696,33 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
                 ));
             }
             for skip in [false, true] {
-                let want = original
-                    .decode(want.get_ids(), skip)
-                    .map_err(|e| e.to_string())?;
+                let ids = want.get_ids();
+                let want = original.decode(ids, skip).map_err(|e| e.to_string())?;
                 let got = baked
                     .decode(got.get_ids(), skip)
                     .map_err(|e| e.to_string())?;
                 if want != got {
                     return Err(format!("decodes {text:?} differently"));
                 }
+                if let Some(table) = &table {
+                    table.decode_into(ids, skip, &mut run, &mut decoded);
+                    if decoded != want {
+                        return Err(format!("its piece table decodes {text:?} differently"));
+                    }
+                }
             }
         }
     }
-    Ok(Bake { tables, pipeline })
+    Ok(Bake {
+        tables,
+        pipeline,
+        pieces,
+    })
 }
 
 /// `bytes`, copied to a 4-aligned allocation that lives for the process (a `bake`'s self-check,
 /// once per tokenizer per build; tests).
-fn aligned_copy(bytes: &[u8]) -> &'static [u8] {
+pub fn aligned_copy(bytes: &[u8]) -> &'static [u8] {
     let mut words = vec![0u32; bytes.len().div_ceil(4)];
     // SAFETY: `words` holds at least `bytes.len()` bytes.
     unsafe {
