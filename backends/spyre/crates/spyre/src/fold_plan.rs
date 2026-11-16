@@ -64,8 +64,8 @@ pub struct OpKv {
 /// launch of the batched kernel — its bundle's `per_request` span repeats once, by the same
 /// default), and a request's tables sit at `request · pitch` whatever the pitch is, so at one
 /// request the pitch is never read. A launch serving several is a packed prefill's statement to
-/// make, and it names its pitch with it — the step's own `card_request_pitch`, the same number the
-/// host stages the tables by.
+/// make, and it names its pitch with it — the stride the relaunch shifts the activation segment
+/// by, per request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Requests {
     pub count: u32,

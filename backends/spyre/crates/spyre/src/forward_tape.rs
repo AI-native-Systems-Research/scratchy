@@ -145,8 +145,8 @@ pub fn kernel_values(
                  ZERO, and page 0 is a REAL page — every block would read page 0's keys"
             )
         })?;
-        if card.mask.0 == tid {
-            return Ok(Staged::F32(std::borrow::Cow::Owned(card.mask.1.clone())));
+        if let Some((_, mask)) = card.masks.iter().find(|(m, _)| *m == tid) {
+            return Ok(Staged::F32(std::borrow::Cow::Owned(mask.clone())));
         }
         return card
             .words(tid)
@@ -564,16 +564,18 @@ mod tests {
     };
 
     /// A granite-shaped step: 4 pages of 4 slots, 2 kv heads, a 3-row bundle walking every block.
+    /// The reserved sentinels, as every real wiring's step carries them — window 0's tids in the
+    /// card stagers and the placements ARE these.
     const STEP: crate::wiring::PagedStep = crate::wiring::PagedStep {
-        mask: 9001,
-        page_table: 9002,
-        write_rows: 9003,
-        query_rows: 9004,
-        kv_row_pool: 9005,
-        rep_rows: 9006,
-        chunk_pages: 9007,
-        chunk_masks: 9008,
-        int32_zero: 9009,
+        mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
+        page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
+        write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
+        query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
+        kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
+        rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
+        chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
+        chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
+        int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
         pages: 4,
         page_slots: 4,
         rows: 3,
@@ -658,7 +660,7 @@ mod tests {
             }
         }
         match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
-            Staged::F32(v) => assert_eq!(&v[..], &card.mask.1[..]),
+            Staged::F32(v) => assert_eq!(&v[..], &card.masks[0].1[..]),
             _ => panic!("a mask stack is a value tensor"),
         }
         // The pool's statics are staged at load, so the tape has no step for them.

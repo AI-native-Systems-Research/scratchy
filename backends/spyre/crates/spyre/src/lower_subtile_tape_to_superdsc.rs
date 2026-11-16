@@ -6904,7 +6904,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     // nothing to do. The ladder's ceiling rung IS the body, so this fires on every rolled model.
     let fp = {
         let _pc = crate::pc::Pc::start("fp");
-        bundle_fp(ops, fold, attn_params)
+        bundle_fp(ops, layout, fold, attn_params)
     };
     // ⛔ THE CHECK AND THE EMIT ARE ONE STEP PER FINGERPRINT. Ladder rungs bake in parallel, and two
     // rungs can be one program: a decode batch pads its walk to whole chunks, so at two sequences
@@ -6937,29 +6937,52 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     Ok(fp)
 }
 
-/// This bundle's fingerprint — the SPLIT hash, with an `f` suffix marking the fused variant.
+/// This bundle's fingerprint — the SPLIT hash plus the LAYOUT digest, with an `f` suffix marking the
+/// fused variant.
 ///
 /// ⛔ THE FUSED TWIN'S NAME KEYS OFF THE UNFILTERED OPS. The runtime finds a body's fused twin as
 /// `<split fp>f`, so the base hash must be the split body's, computed before `ops_for_grouping` drops
 /// anything. Hashing the trimmed list is what made the twin unfindable.
 ///
-/// ⛔⛔⛔ AND IT HASHES THE SPLIT-KV CHUNK, BECAUSE THE OPS CANNOT. `ops` are the pre-expansion programs,
-/// and a chunk rung's programs are BIT-IDENTICAL to every other rung's — the attention program sweeps one
-/// page, and the chunk width is a bake fact (`BundleAttnParams::chunk_pages`) the door expands. Hashed
-/// without it, every rung of the chunk ladder fingerprints alike, the content-addressed early-out in
-/// [`emit_bundle`] returns the FIRST rung's body for all of them, and a 16-page context runs a 1-page
-/// chunk: clean bake, no fault, every key past slot 256 silently unread. Appended only when present, so
-/// every bundle without a chunk keeps its fingerprint byte for byte.
+/// ⛔⛔⛔ AND IT DIGESTS THE LAYOUT, BECAUSE THE OPS CANNOT. Two rungs can lower to BIT-IDENTICAL ops
+/// while their layouts differ: a packed prefill's seam bundles (embed, lm-head) are the same programs a
+/// solo rung of the same row-product bakes, but their Activation segments stage a different number of
+/// window tables; a chunk rung's programs sweep one page whatever the chunk width, which is a placement
+/// fact, not an op. Hashed on the ops alone, such rungs fingerprint alike, the content-addressed
+/// early-out in [`emit_bundle`] returns whichever baked FIRST for both, and that bundle's
+/// `bundle_layout.json` — its placements, its segment extents — answers for a bundle it never described:
+/// a clean bake, no fault, and every staged table past the first window's silently misaddressed
+/// (MEASURED, the packed seam races of 16bf65a14a). The digest is over the layout's SERIALIZED form —
+/// placements, segment bytes, weight banks and tail, kernel weights, scale folds, synth reservations —
+/// which is exactly the artifact the fp names, so one fingerprint names one (program set, layout).
+/// Appended only when a layout was given (`None` is the emulator's program-only emit), so a bundle
+/// without one keeps its fingerprint byte for byte.
 fn bundle_fp<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
+    layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> String {
     let _ = attn_params;
     let base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
+    let stamped = match layout {
+        Some(l) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            // ⭐ THE SERIALIZED LAYOUT, NOT A HAND-PICKED SUBSET — every field the bake writes into the
+            // fp's directory is a field two same-ops bundles can differ by, and a digest that listed
+            // them by hand would re-derive the serialization badly. `BundleLayout`'s interior-mutable
+            // fields are `#[serde(skip)]`, so this touches nothing the bake still holds open.
+            serde_json::to_vec(l)
+                .expect("a bundle layout serializes")
+                .hash(&mut h);
+            format!("{base}l{:016x}", h.finish())
+        }
+        None => base,
+    };
     match fold {
-        FoldGrouping::Split => base,
-        FoldGrouping::Fused => format!("{base}f"),
+        FoldGrouping::Split => stamped,
+        FoldGrouping::Fused => format!("{stamped}f"),
     }
 }
 
@@ -7214,7 +7237,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
         )));
     }
 
-    let fp = bundle_fp(ops, fold, attn_params);
+    let fp = bundle_fp(ops, layout, fold, attn_params);
     let kept: Vec<&EmittedOp<T>> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp<T>>;
     let ops: &[EmittedOp<T>] = if kept.len() == ops.len() {
@@ -8015,14 +8038,15 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                     continue;
                 };
                 let in_act = l.placements.get(&tid).is_some_and(|p| p.segment == act);
-                // The sources a trip walks: one sequence's page table and mask stack, or a decode
+                // The sources a trip walks: one sequence's page table and mask stack — or a
+                // PACKED rung's, one per window (`paged_window_tid(r, ·)`; window 0 IS the
+                // step's sentinels, so the family states the solo case too) — or a decode
                 // batch's chunk page ids and chunk masks.
-                let walked = [
-                    step_tids.page_table,
-                    step_tids.mask,
-                    step_tids.chunk_pages,
-                    step_tids.chunk_masks,
-                ];
+                let mut walked = vec![step_tids.chunk_pages, step_tids.chunk_masks];
+                for r in 0..ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
+                    walked.push(ktir_superdsc::reserved_tids::paged_window_tid(r, 1));
+                    walked.push(ktir_superdsc::reserved_tids::paged_window_tid(r, 2));
+                }
                 if in_act && !walked.contains(&tid) {
                     return Err(SuperDscError(format!(
                         "[spyre-superdsc] walk body op '{}' reads t{tid} from the activation \

@@ -1242,10 +1242,10 @@ impl Stream {
     /// 2b patch stage stamps real pool-leased tags there.
     ///
     /// Nothing here rings a doorbell, leases a tag, or touches a queue: the
-    /// images are plain bytes until a caller submits them. The parity gate
-    /// (`superdsc_exec::Executor::prepare`) renders one step's batch both the
-    /// walk way and the CbPlan way THROUGH THIS ONE DOOR, so what it compares
-    /// is exactly what the device would be handed.
+    /// images are plain bytes until a caller submits them. The replay canvas
+    /// (`cb_plan::WalkCanvas`) renders the walk's own staged batch THROUGH
+    /// THIS ONE DOOR, so what it caches is exactly what the device would be
+    /// handed.
     pub fn render_batch(
         &self,
         items: &[BatchedCb],

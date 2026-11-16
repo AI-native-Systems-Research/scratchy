@@ -2615,6 +2615,9 @@ fn the_paged_attention_splices_with_its_contract() {
             continue;
         }
         let spliced = spliced.unwrap_or_else(|e| panic!("splice compiled {at}: {e}"));
+        // One window at one request — the family is the single rebind it always was.
+        assert_eq!(spliced.len(), 1, "{at}: one window at one request");
+        let spliced = &spliced[0];
         // ⛔ THE NAME LAW — `attn_s{id}`.
         assert_eq!(
             spliced.op_name,
@@ -2875,11 +2878,20 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     .expect("128 rows fit a u32");
     let e = splice(packed)
         .unwrap_or_else(|e| panic!("the packed (64, 2) mint splices the 128-row graph: {e}"));
+    // The wave is one window per request the mint names — the module is one, rebound
+    // per window at its own reserved tid — and every window is the prefill walk's
+    // own program.
+    assert_eq!(
+        e.len(),
+        2,
+        "the packed (64, 2) mint emits one window per request"
+    );
     assert!(
-        e.ktir
+        e.iter().all(|w| w
+            .ktir
             .as_ref()
-            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn)),
-        "the packed mint is the prefill walk's own program"
+            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn))),
+        "every window of the packed mint is the prefill walk's own program"
     );
     // The S=1 mint of the SAME graph — one request of all 128 rows — still splices.
     splice(pair_of_one_request(128))
@@ -2979,7 +2991,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             pair_of_one_request(s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
-    programs.push(
+    programs.extend(
         scratchy_triton_splice::lower_attn(
             attn,
             &ir,
@@ -3279,7 +3291,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             batch_pair_of_one_row_each(s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
-    programs.push(
+    programs.extend(
         scratchy_triton_splice::lower_attn(
             attn,
             &ir,
@@ -3716,8 +3728,10 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
                 PagedRows::Sequence,
             )
             .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        spliced
+        assert_eq!(spliced.len(), 1, "one window at one request");
+        spliced[0]
             .ktir
+            .as_ref()
             .expect("spliced op carries its program")
             .func
             .ops_deep()
