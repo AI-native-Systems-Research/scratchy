@@ -957,7 +957,7 @@ pub struct StageRoot(PathBuf);
 /// with `no bundle to compile`. The ordinal is the whole fence: minted once per staging pass, never
 /// repeated in the process, so every delete on the staging path meets a directory its own emit
 /// staged. A same-world double emit of one fp is immune for the same reason.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EmitNs(u64);
 
 impl EmitNs {
