@@ -670,6 +670,11 @@ pub struct TaskCell {
     /// "2/3"), the head of it it asked: None in runs from before, whose cells drew theirs apart.
     #[serde(default)]
     pub task_share: Option<String>,
+    /// Each request's joules, in the order sent: the power log's joules over the cell shared among
+    /// the requests in flight (`scripts/cell_energy.py` `per_request`), so a cell's requests sum
+    /// to its joules. None for a request that failed, and for a cell from before it was recorded.
+    #[serde(default)]
+    pub task_joules: Option<Vec<Option<f64>>>,
     #[serde(default)]
     pub tpots_ms: Option<Vec<Option<f64>>>,
     /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
@@ -791,6 +796,7 @@ impl TaskCell {
             task_ids: cut(&self.task_ids, n),
             task_groups: groups,
             task_right: right,
+            task_joules: cut(&self.task_joules, n),
             ..self.clone()
         })
     }

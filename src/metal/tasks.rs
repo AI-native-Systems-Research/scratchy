@@ -98,13 +98,13 @@ fn mostly_thought(c: &TaskCell) -> bool {
 
 /// Accuracy, where it is like for like: none for a cell most of whose answers opened as
 /// reasoning, ran to their cap (which read as wrong without being answers), or failed.
-fn accuracy(c: &TaskCell) -> Option<f64> {
+pub(super) fn accuracy(c: &TaskCell) -> Option<f64> {
     c.accuracy.filter(|_| !mostly_thought(c) && usable(c))
 }
 
 /// Why a cell shows no accuracy, in its cell: "not scored" for a timed cell, its answers forced
 /// to one length; else what held it back, with how many.
-fn no_accuracy(c: &TaskCell) -> String {
+pub(super) fn no_accuracy(c: &TaskCell) -> String {
     let done = c.completed.unwrap_or(0) as usize;
     let of = |k: Option<u32>| {
         format!(
@@ -147,7 +147,7 @@ const SAME_LENGTH: f64 = 0.10;
 /// stops at EOS despite `ignore_eos` answered less than it was asked, and is no faster for it. A
 /// forced cell never compares with one answering on its own; nor a cell most of whose requests
 /// failed.
-pub fn unlike_answers(c: &TaskCell, r: &TaskCell) -> Option<&'static str> {
+fn unlike_answers(c: &TaskCell, r: &TaskCell) -> Option<&'static str> {
     if mostly_failed(c) || mostly_failed(r) {
         return Some("most requests failed");
     }
@@ -259,7 +259,8 @@ fn per_token(c: &TaskCell) -> Option<f64> {
     e.j_per_output_token
 }
 
-fn per_right(c: &TaskCell) -> Option<f64> {
+/// A cell's joules a right answer, where it shows its accuracy and kept its energy.
+pub(super) fn per_right(c: &TaskCell) -> Option<f64> {
     accuracy(c).filter(|&a| a > 0.0)?;
     c.energy.as_ref().and_then(|e| e.j_per_right_answer)
 }
@@ -836,6 +837,7 @@ mod tests {
             task_groups: None,
             task_right: None,
             task_share: None,
+            task_joules: None,
             borrowed_from: None,
             energy: None,
             spec_decode: None,
@@ -1019,6 +1021,7 @@ mod tests {
             task_groups: None,
             task_right: None,
             task_share: None,
+            task_joules: None,
             borrowed_from: None,
             energy: None,
             spec_decode: None,

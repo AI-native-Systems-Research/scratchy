@@ -3175,47 +3175,94 @@ mod tests {
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
     }
 
-    /// MuSiQue's cells answer on their own at every users count (#994), and their end-to-end
-    /// squares set the two engines' whole answers side by side at any length: whether a short
-    /// answer was right is the accuracy's to say. Answers forced to one length compare only where
-    /// both ran about that length, as the detail table's total does; a forced cell never against
-    /// one answering on its own.
+    /// The summary map's 2u and 4u rows are joules per correct answer: in a bucket, the joules its
+    /// requests took over how many were right, scratchy against its rival. A cell whose answers
+    /// were forced was not scored, so has none; a run that kept no joules a request reads each
+    /// cell's whole, and says so.
     #[test]
-    fn an_end_to_end_square_needs_answers_like_for_like() {
-        let answers = |runs: &mut [Run], ours: (bool, f64), theirs: (bool, f64)| {
+    fn a_users_square_is_joules_per_correct_answer() {
+        // Every prompt in one bucket; every other answer right; scratchy's requests 5 J each,
+        // oMLX's 9: 10 J a right answer against 18, x1.80.
+        let shape = |runs: &mut [Run], forced: bool, joules: bool| {
             let m = &mut runs[0].models[0];
-            for (cells, (forced, tokens)) in
-                [(m.tasks.as_mut(), ours), (m.tasks_omlx.as_mut(), theirs)]
-            {
+            for (cells, j) in [(m.tasks.as_mut(), 5.0), (m.tasks_omlx.as_mut(), 9.0)] {
                 for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
                     let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                     c.prompt_tokens = Some(vec![Some(3200); n]);
                     c.timed_answers = forced;
-                    c.mean_output_tokens = Some(tokens);
+                    c.thinking_answers = Some(0);
+                    c.capped_answers = Some(0);
+                    c.accuracy = Some(0.5);
+                    c.task_right = Some((0..n).map(|k| Some(k % 2 == 0)).collect());
+                    c.task_joules = joules.then(|| vec![Some(j); n]);
+                    c.energy = Some(super::data::Energy {
+                        soc_j: j * n as f64,
+                        window_s: 60.0,
+                        j_per_request: Some(j),
+                        j_per_output_token: None,
+                        j_per_right_answer: Some(j * 4.0),
+                    });
                 }
             }
             let machines = super::index(runs);
             render(super::datasets::section("rag", &machines, &machines))
         };
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
-        let html = answers(&mut runs, (false, 22.0), (false, 40.0));
-        assert!(!html.contains("answers forced"), "their own, any length");
-        assert!(html.contains("vs oMLX</strong>"));
-        assert!(html.contains(">MuSiQue, natural answers<"));
-        assert!(!html.contains(">MuSiQue, timed<"), "no row was forced");
-        let html = answers(&mut runs, (false, 22.0), (true, 64.0));
-        assert!(html.contains("one engine&#39;s answers forced, the other&#39;s their own"));
-        let html = answers(&mut runs, (true, 64.0), (true, 40.0));
+        let html = shape(&mut runs, false, true);
+        assert!(html.contains("Joules per Correct Answer"));
         assert!(
-            html.contains("answers forced to different lengths"),
-            "2u and 4u"
+            !html.contains("End-to-end Latency · "),
+            "no end-to-end square in the map"
         );
         assert!(
-            html.contains("vs oMLX</strong>"),
-            "P and D keep their ratios"
+            html.contains("×1.80 vs oMLX"),
+            "18 J a right answer against 10"
         );
-        let html = answers(&mut runs, (true, 64.0), (true, 62.0));
-        assert!(!html.contains("answers forced"), "within 10%");
+        assert!(
+            html.contains("over 4 and 4 right answers"),
+            "2 users, 8 requests a side"
+        );
+        assert!(
+            html.contains("over 8 and 8 right answers"),
+            "4 users, 16 a side"
+        );
+        // Forced answers: not scored, no ratio.
+        let html = shape(&mut runs, true, true);
+        assert!(html.contains("answers forced to a length, so not scored"));
+        // No joules a request: each cell's whole, 36 J against 20, x1.80, and said so.
+        let html = shape(&mut runs, false, false);
+        assert!(html.contains("each cell&#39;s whole: a side kept no joules a request"));
+        assert!(html.contains("×1.80 vs oMLX"));
+        // A cell the power log missed part of has no energy: no ratio, and its squares say why,
+        // not that its run kept no joules a request.
+        shape(&mut runs, false, true);
+        for c in runs[0].models[0].tasks.iter_mut().flatten() {
+            c.energy = None;
+            c.task_joules = None;
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("no energy on one side"));
+        assert!(!html.contains("each cell&#39;s whole"));
+        // A cell the accuracy table does not score has no joules a correct answer: its square
+        // says why, as the table does, and names the side. Most of scratchy's answers cut off:
+        shape(&mut runs, false, true);
+        for c in runs[0].models[0].tasks.iter_mut().flatten() {
+            c.capped_answers = c.completed;
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("scratchy: cut off: 8 of 8 answers hit the length limit"));
+        assert!(!html.contains("×1.80 vs oMLX"), "no square has a ratio");
+        // Most of oMLX's answered in reasoning:
+        shape(&mut runs, false, true);
+        for c in runs[0].models[0].tasks_omlx.iter_mut().flatten() {
+            c.thinking_answers = c.completed;
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("oMLX: answered in reasoning: 16 of 16"));
+        assert!(!html.contains("×1.80 vs oMLX"), "no square has a ratio");
     }
 
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
