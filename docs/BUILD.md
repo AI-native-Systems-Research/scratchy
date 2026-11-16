@@ -21,7 +21,7 @@ cargo build -p scratchy-target-spyre-cli --release --features spyre-emu,model/gr
 `quant/fp8-dynamic-per-channel` with `model/qwen3.8-27b-text-only`,
 `model/qwen3.6-35b-a3b` or `model/gemma-4-26b-a4b-it`. Its `nvcc` feature needs
 CUDA 12.8+ on `PATH`; without it the binary builds anywhere and refuses to start
-a worker. See [`backends/cuda/README.md`](../backends/cuda/README.md).
+a worker. See [`backends/cuda/README.md`](https://github.com/AI-native-Systems-Research/scratchy/blob/main/backends/cuda/README.md).
 
 Each binary links its one target. Add
 `serve` for the HTTP server
