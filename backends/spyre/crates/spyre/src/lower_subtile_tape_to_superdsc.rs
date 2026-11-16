@@ -8280,11 +8280,16 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     if let Some(bake) = crate::superdsc_bake::global() {
         // ⭐ THIS PASS'S OWN STAGING NAMESPACE, minted once for every group it stages: no other
         // emit — another world's re-emit of this same fp, or a same-world double emit — ever
-        // stages into `e<n>` (the law, with the #1209 interleaving, is `EmitNs`'s own).
+        // stages into `e<n>` (the law, with the #1209 interleaving, is `EmitNs`'s own). The
+        // namespace is the RESULT'S IDENTITY too, not only the directory's: another world's
+        // re-emit compiles its OWN program for the same group, and an id keyed by fp and group
+        // alone filed both under one `results` entry — the #1209 identity race, silent once the
+        // namespace fix let both compiles succeed.
         let ns = crate::superdsc_bake::EmitNs::mint();
         for g in &rendered {
             let id = crate::superdsc_bake::GroupId {
                 fp: fp.to_string(),
+                ns,
                 group: g.group,
             };
             let kv = *shifts.get(g.group as usize).ok_or_else(|| {

@@ -25,7 +25,7 @@ use ktir_superdsc::superdsc_opspec::{
 };
 use scratchy_target_spyre::dxp_cache::GroupDigest;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
-use scratchy_target_spyre::superdsc_bake::{ChunkExplore, GroupId, SealedGroup};
+use scratchy_target_spyre::superdsc_bake::{ChunkExplore, EmitNs, GroupId, SealedGroup};
 
 /// A dense projection as every granite layer emits it: an unbatched fp16 matmul, no gather.
 fn dense_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
@@ -120,6 +120,7 @@ fn submitted(ops: &[emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>]) -> 
         .map(|g| {
             let id = GroupId {
                 fp: "test".to_string(),
+                ns: EmitNs::mint(),
                 group: g.group,
             };
             SealedGroup::of_rendered(std::env::temp_dir(), id, g).explore()
@@ -204,6 +205,7 @@ fn one_gathered_trip_turns_its_group_off_and_no_other() {
         };
         let id = GroupId {
             fp: "test".to_string(),
+            ns: EmitNs::mint(),
             group: g.group,
         };
         assert_eq!(
