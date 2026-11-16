@@ -6912,6 +6912,13 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     // check before either inserted, both staged the same group directory, and the second's cleanup
     // deleted it under the first's compile (dxp: `no bundle to compile`). The second now waits for
     // the first and takes its fingerprint.
+    //
+    // ⛔ AND THE CROSS-WORLD TWIN OF THAT RACE IS CLOSED IN THE STAGING NAMESPACE, NOT HERE (#1209).
+    // A DIFFERENT world's emit of this same fp re-emits BY DESIGN — the collector is per world — and
+    // its groups render world-different digests (the layout is world-typed), so `adopt` misses and it
+    // stages while this emit's dxp children still compile. The fp gate orders the two passes; it
+    // cannot dedup them, and it no longer needs to: each stages under its own `EmitNs`, so neither
+    // ever deletes a directory the other is compiling from.
     let gate = emitting(&fp);
     let _one_emit = gate
         .lock()
@@ -8271,6 +8278,10 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // No dxp (a Mac / cardless `cargo check`) ⇒ nothing to stage, and nothing to stage it FOR. This
     // is a CAPABILITY probe, not a behaviour flag.
     if let Some(bake) = crate::superdsc_bake::global() {
+        // ⭐ THIS PASS'S OWN STAGING NAMESPACE, minted once for every group it stages: no other
+        // emit — another world's re-emit of this same fp, or a same-world double emit — ever
+        // stages into `e<n>` (the law, with the #1209 interleaving, is `EmitNs`'s own).
+        let ns = crate::superdsc_bake::EmitNs::mint();
         for g in &rendered {
             let id = crate::superdsc_bake::GroupId {
                 fp: fp.to_string(),
@@ -8295,7 +8306,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
             }
             {
                 let _pc = crate::pc::Pc::start("stage");
-                let gdir = bake.stage().group_dir(fp, g.group as usize);
+                let gdir = bake.stage().group_dir(ns, fp, g.group as usize);
                 bake.reserve(g.bytes);
                 std::fs::create_dir_all(&gdir).map_err(|e| SuperDscError(e.to_string()))?;
                 for (name, contents) in &g.files {

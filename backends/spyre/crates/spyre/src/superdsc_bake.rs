@@ -943,6 +943,31 @@ pub type Bake = BakeQueue;
 #[derive(Clone, Debug)]
 pub struct StageRoot(PathBuf);
 
+/// The staging namespace ONE EMIT owns — the `e<n>` in `<root>/<fp>/e<n>/group_<i>`.
+///
+/// ⛔ NO TWO EMITS SHARE A STAGING DIRECTORY, WHATEVER THEY SHARE (#1209). Two emits can share a
+/// fingerprint: a bundle re-emitted for another world is the same KTIR under a different `Tp`, and
+/// the fp gate serializes them only to order the check-and-insert. The memo is NO protection there —
+/// its key is the [`GroupDigest`] over the rendered json, and a world renders different concrete
+/// addresses for the same KTIR (a sharded forward's layout places its collective windows where an
+/// unsharded one places nothing), so the second world's groups MISS [`BakeQueue::adopt`] and stage
+/// while the first's dxp children are still compiling the very same directories. Whichever side
+/// settles first then deletes the shared dir — the success read ([`read_compiled`]), the cache hit,
+/// or the pending twin in [`BakeQueue::submit`] — under the other's live compiler, and dxp refuses
+/// with `no bundle to compile`. The ordinal is the whole fence: minted once per staging pass, never
+/// repeated in the process, so every delete on the staging path meets a directory its own emit
+/// staged. A same-world double emit of one fp is immune for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmitNs(u64);
+
+impl EmitNs {
+    /// Mint the next namespace. Monotonic per process; the number names nothing but the pass.
+    pub fn mint() -> EmitNs {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        EmitNs(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 impl StageRoot {
     pub fn resolve() -> StageRoot {
         let base = match std::env::var_os("SCRATCHY_SUPERDSC_STAGE") {
@@ -953,10 +978,15 @@ impl StageRoot {
         StageRoot(base.join(format!("superdsc-stage-{}", std::process::id())))
     }
 
-    /// The staging dir for one group of one bundle — `<root>/<fp>/group_<i>`, so a dxp error message
-    /// names the bundle and group it refused.
-    pub fn group_dir(&self, fp: &str, gi: usize) -> PathBuf {
-        self.0.join(fp).join(format!("group_{gi}"))
+    /// The staging dir for one group of one emit — `<root>/<fp>/e<n>/group_<i>`, so a dxp error
+    /// message still names the bundle and group it refused, and `e<n>` is the emitting pass's own
+    /// [`EmitNs`]: two emits that share an fp never share a directory, so a delete on the staging
+    /// path only ever deletes its own emit's.
+    pub fn group_dir(&self, ns: EmitNs, fp: &str, gi: usize) -> PathBuf {
+        self.0
+            .join(fp)
+            .join(format!("e{}", ns.0))
+            .join(format!("group_{gi}"))
     }
 
     pub fn path(&self) -> &Path {
