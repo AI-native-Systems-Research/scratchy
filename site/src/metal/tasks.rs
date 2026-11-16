@@ -12,9 +12,8 @@ use super::datasets;
 use super::kept;
 use super::numbers::Engine;
 
-/// A cell's name in a table row: its dataset's, MuSiQue's saying how its answers ran. Its 1-user
-/// cell answers on its own, for the decode it times; above 1 user they are forced to one length,
-/// for their total time (#1208).
+/// A cell's name in a table row: its dataset's, MuSiQue's saying how its answers ran. Its cells
+/// answer on their own (#1208, #994); runs before those forced them to one length, and say so.
 pub fn cell_label(c: &TaskCell) -> String {
     match (c.workload.as_str(), c.timed_answers) {
         ("rag", true) => "MuSiQue, timed".to_string(),
@@ -141,13 +140,20 @@ fn ttft_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
 /// despite `ignore_eos`) answers in fewer tokens, and its time is no faster for it.
 const SAME_LENGTH: f64 = 0.10;
 
-/// How many times faster scratchy is to its whole answer than the rival: only where both answered
-/// at about the same length ([`SAME_LENGTH`]), neither mostly ran to its cap, and both say how
-/// long their answers were.
+/// Whether two cells' whole answers compare: both say how long their answers were, they ran about
+/// one length ([`SAME_LENGTH`]), and neither mostly ran to its cap or failed. An engine that
+/// answers in fewer tokens is no faster for it, nor spends less for answering less.
+pub fn one_length(c: &TaskCell, r: &TaskCell) -> bool {
+    let (Some(a), Some(b)) = (c.answer_tokens(), r.answer_tokens()) else {
+        return false;
+    };
+    (a - b).abs() <= SAME_LENGTH * a.max(b) && usable(c) && usable(r)
+}
+
+/// How many times faster scratchy is to its whole answer than the rival, where the two answers
+/// compare ([`one_length`]).
 fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
-    let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
-    let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
-    (close && usable(c) && usable(r))
+    one_length(c, r)
         .then(|| times(c.median_e2el_ms, r.median_e2el_ms, true))
         .flatten()
 }
@@ -256,13 +262,10 @@ fn joules(v: Option<f64>) -> String {
     )
 }
 
-/// How many times less energy scratchy spent a request than the rival: as the total time's
-/// ratio is, only where both answered about one length and neither mostly ran to its cap, an
-/// engine that stops early spending less for answering less.
+/// How many times less energy scratchy spent a request than the rival, where the two answers
+/// compare ([`one_length`]), as the total time's ratio is.
 fn energy_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
-    let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
-    let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
-    (close && usable(c) && usable(r))
+    one_length(c, r)
         .then(|| times(per_request(c), per_request(r), true))
         .flatten()
 }

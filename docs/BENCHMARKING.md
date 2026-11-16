@@ -454,17 +454,29 @@ scratchy is 1.24× to 2.6× faster to its first token at 1 user on every model.
 recorded reply, a shared-prefix question's 32. Answers ending on their own are each engine's own
 length, so their total time is not like for like, and accuracy is not scored on timed cells.
 
-**MuSiQue's 1-user cell answers on its own** (#1208): the cell the page's decode (D) row reads.
-A real MuSiQue answer is about 6 to 12 tokens. Forced to 64, most of each answer was text past
-where the model would have stopped. An engine that drafts tokens ahead (scratchy's MTP heads,
-Splash's DFlash draft) guesses that text far worse than the answer itself: on qwen3.6-35b-a3b at
-1 user, 76% of its drafts were accepted inside the answer and 23% past it. So the cell's TPOT
-measured the padding, and made drafting look slower than decoding without it, when on the real
-answers it is faster (3.5 against 4.6 ms a token). Time per token is a rate, so answers of
-different lengths still compare. Above 1 user, MuSiQue's cells stay forced to 64 tokens: their
-end-to-end rows (2u, 4u) compare total time, which only means something over equal work. The
-accuracy cell (`rag-accuracy`) and the span query (`rag-spans`, scratchy's own row, which could
-never be forced) answer on their own as before.
+**MuSiQue's cells answer on their own**, at every users count. A real MuSiQue answer is about 6
+to 12 tokens, and forcing it to 64 broke two things:
+
+- **The padding was what got timed** (#1208). Most of each forced answer was text past where the
+  model would have stopped. An engine that drafts tokens ahead (scratchy's MTP heads, Splash's
+  DFlash draft) guesses that text far worse than the answer itself: on qwen3.6-35b-a3b at 1 user,
+  76% of its drafts were accepted inside the answer and 23% past it. So TPOT measured the
+  padding, and made drafting look slower than decoding without it, when on the real answers it
+  is faster (3.5 against 4.6 ms a token).
+- **The users fell into rounds** (#994). Answers all one length end the requests that decoded
+  together on one step, so a closed loop's users came back together and stayed that way for the
+  whole cell. A request's TTFT was then its place in its round, not the engine's prefill. On
+  llama-3.2-1b at 4 users, 48 tasks, 25 of 47 requests started within 30 ms of the one before,
+  and TTFT by place in the round ran 394, 786, 804 and 1200 ms (median 804). Answering on their
+  own, the same tasks' answers ran 22 tokens on average, 11 of 47 requests started that close
+  (the first rounds, before the lengths spread them), and TTFT's median was 436 ms.
+
+Time per token is a rate, so answers of different lengths still compare. Every engine runs the
+same model at temperature 0, so their answers run about one length; the page sets two engines'
+end-to-end times and energy a request side by side only where they did. Runs before these
+changes forced the cells above 1 user (#994) and the 1-user cell before #1208, and their rows say
+"MuSiQue, timed". The accuracy cell (`rag-accuracy`) and the span query (`rag-spans`, scratchy's
+own row, which could never be forced) answered on their own throughout.
 
 **The same prompt on every engine:** `bench serve` sends a multi-document QA task (MuSiQue,
 HotpotQA, 2WikiMultihopQA, MS MARCO) as a system message and **one** user message holding every

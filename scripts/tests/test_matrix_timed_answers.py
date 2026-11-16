@@ -3,7 +3,7 @@
 
 """Which of the metal matrix's dataset cells force their answers to length (`--timed-answers`),
 as bench_metal_matrix.sh's task cell sets its flags: those lines run under bash, nothing else of
-the script. MuSiQue's 1-user cell answers on its own, its cells above 1 user are forced (#1208).
+the script. MuSiQue's cells answer on their own at every users count (#1208, #994).
 Standard library only.
 
     python3 -m unittest discover -s scripts/tests
@@ -44,21 +44,18 @@ def flags(workload, conc=1, rate=""):
 
 
 class TimedAnswers(unittest.TestCase):
-    def test_musiques_one_user_cell_answers_on_its_own(self):
-        self.assertNotIn("--timed-answers", flags("rag", conc=1))
-
-    def test_musiques_cells_above_one_user_are_forced(self):
-        for conc in (2, 4):
-            self.assertIn("--timed-answers", flags("rag", conc=conc), conc)
+    def test_musiques_cells_answer_on_their_own_at_every_users_count(self):
+        for conc in (1, 2, 4):
+            self.assertNotIn("--timed-answers", flags("rag", conc=conc), conc)
 
     def test_the_span_and_accuracy_cells_answer_on_their_own(self):
         for w in ("rag-spans", "rag-accuracy"):
             for conc in (1, 4):
                 self.assertNotIn("--timed-answers", flags(w, conc=conc), (w, conc))
 
-    def test_an_open_loop_musique_cell_keeps_its_rate_and_is_forced(self):
+    def test_an_open_loop_musique_cell_keeps_its_rate_and_answers_on_its_own(self):
         # An open-loop rate cell runs at the largest users count.
-        self.assertEqual(flags("rag", conc=4, rate="0.5").split(" | ")[0], "--request-rate 0.5 --timed-answers")
+        self.assertEqual(flags("rag", conc=4, rate="0.5").split(" | ")[0], "--request-rate 0.5")
 
     def test_the_other_datasets_are_still_forced_to_length(self):
         for w in ("sharegpt", "sharegpt-multi-turn", "longbench", "shared-prefix"):

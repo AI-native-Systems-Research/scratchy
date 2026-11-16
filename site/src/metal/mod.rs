@@ -3146,6 +3146,34 @@ mod tests {
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
     }
 
+    /// MuSiQue's cells answer on their own at every users count (#994). An end-to-end square sets
+    /// the two engines' whole answers side by side only where they ran about one length, as the
+    /// detail table's total does; prefill and decode at 1 user compare at any length.
+    #[test]
+    fn an_end_to_end_square_needs_answers_of_about_one_length() {
+        let lengths = |runs: &mut [Run], ours: f64, theirs: f64| {
+            let m = &mut runs[0].models[0];
+            for (cells, tokens) in [(m.tasks.as_mut(), ours), (m.tasks_omlx.as_mut(), theirs)] {
+                for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(3200); n]);
+                    c.timed_answers = false;
+                    c.mean_output_tokens = Some(tokens);
+                }
+            }
+            let machines = super::index(runs);
+            render(super::datasets::section("rag", &machines, &machines))
+        };
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let html = lengths(&mut runs, 22.0, 40.0);
+        assert!(html.contains("answers of different lengths"), "2u and 4u");
+        assert!(html.contains("vs oMLX</strong>"), "P and D keep their ratios");
+        assert!(html.contains(">MuSiQue, natural answers<"));
+        assert!(!html.contains(">MuSiQue, timed<"), "no row was forced");
+        let html = lengths(&mut runs, 22.0, 23.0);
+        assert!(!html.contains("answers of different lengths"), "within 10%");
+    }
+
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
     /// replaced too: the grid from an older grid run, MuSiQue from the newer MuSiQue-only one, and
     /// the grid's section says which run it is from.

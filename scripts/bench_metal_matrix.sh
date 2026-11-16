@@ -1389,12 +1389,14 @@ run_task_cell() { # prefix workload load
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:tasks:$2:${key}" | cksum | cut -d' ' -f1)
     [[ -n "${rate}" ]] && pace=(--request-rate "${rate}")
     # A timed cell forces each answer to its task's length, the same on every engine. MuSiQue's
-    # 1-user cell, the page's decode row, answers on its own (#1208): a real answer is about 6-12
-    # tokens, so forced to 64 most of it was text past where the model stopped, which a drafting
-    # engine guesses far worse than the answer (23% accepted against 76%), and its TPOT timed that.
-    # Above 1 user the cells stay forced, so their end-to-end times compare equal work; the span
-    # and accuracy cells answer on their own as ever.
-    [[ "${w}" == rag-* || ( "${w}" == rag && "${conc}" == 1 ) ]] && timed=0
+    # cells answer on their own, at every users count. A real answer is about 6-12 tokens, so
+    # forced to 64 most of it was text past where the model stopped, which a drafting engine
+    # guesses far worse than the answer (23% accepted against 76%), and its TPOT timed that
+    # (#1208). And answers all one length end the requests that decoded together on one step, so a
+    # closed loop's users came back together and stayed in rounds: at 4 users a request's TTFT
+    # was its place in its round, about 400, 800, 800 and 1200 ms on llama-3.2-1b (#994). Every
+    # engine runs the same model at temperature 0, so their answers run about one length.
+    [[ "${w}" == rag* ]] && timed=0
     (( timed )) && pace+=(--timed-answers)
     case "${w}" in
         sharegpt)              extra=(--dataset-name sharegpt --dataset-path "${SHAREGPT_PATH}" --sharegpt-max-output-len 256) ;;

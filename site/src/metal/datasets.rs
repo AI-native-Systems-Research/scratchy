@@ -328,7 +328,8 @@ fn dataset_summary(
                  same tasks to every engine. Colour is how many times faster scratchy is than the \
                  engine it is set against, its median over the cell's requests against the rival's: \
                  blue faster, red slower, grey within noise. A striped square has no ratio: one engine \
-                 did not run it, or most of its requests failed. Hover or focus a square for its \
+                 did not run it, most of its requests failed, or, end to end, the two engines' \
+                 answers ran different lengths. Hover or focus a square for its \
                  ratio, the engine, and a borrowed rival's run."
             }
             {summary_map(dataset, id, ran, machines, &summary_columns)}
@@ -1008,6 +1009,11 @@ fn summary_map(
         };
         if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
             return Err("most requests failed");
+        }
+        // An end-to-end time is the whole answer's: it compares only over answers of about one
+        // length, as the detail table's total does.
+        if row.timing == RequestTiming::E2el && !tasks::one_length(ours, theirs) {
+            return Err("answers of different lengths");
         }
         let a = buckets::median_in(ours, bs, row.timing, b);
         let t = buckets::median_in(theirs, bs, row.timing, b);
