@@ -5417,68 +5417,98 @@ pub(crate) fn dump_wavefront_mega(
                     ),
                 }
             }
-            // ⛔⛔⛔ THE PREFIX LADDER MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP. A mid-prompt continuation
-            // chunk runs at the widest rung's width (it is capped there and the step-back leaves it room), so
-            // a prefix ladder that stops short would put a mid-prompt chunk on a bundle narrower than its rows
-            // — a refusal on the card. Checked on what BAKED, not on the widths asked for.
-            // The SOLO half of the ladder: rungs with seqs == 1 (a packed rung is a
-            // different program at the same product, never a wider solo rung).
-            let prefix: Vec<u32> = superdsc_prefill_prefix_rungs
-                .borrow()
-                .iter()
-                .filter(|&&(_, s, _)| s == 1)
-                .map(|&(w, _, _)| w)
-                .collect();
-            if let Err(e) = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
-                &baked, &prefix,
-            ) {
-                panic!("[spyre-superdsc] {stem}: {e}");
-            }
-            // ⛔⛔⛔ AND EVERY RUNG BELOW THE TOP THAT WAS ASKED FOR MUST HAVE BAKED. A missing one is silent:
-            // its chunks run on the next wider rung. See `PagedKvPool::prefix_ladder_bakes_every_rung`.
-            if let Err(e) =
-                ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
-                    &asked,
-                    &prefix,
-                    &[],
-                )
-            {
-                panic!("[spyre-superdsc] {stem}: {e}");
-            }
-            // ⛔⛔⛔ AND THE PACKED TABLE SHIPS WHOLE. A wave of k tails runs on the smallest
-            // packed rung that holds (widest tail, live count); a pair that did not bake is
-            // silent — the wave falls to serialized solo chunks, the 878.7 ms this exists to
-            // kill. Checked against the table, on what BAKED, both directions.
-            let packed_baked: Vec<(u32, u32)> = {
-                let r = superdsc_prefill_prefix_rungs.borrow();
-                let mut v: Vec<(u32, u32)> = r
-                    .iter()
-                    .filter(|&&(_, s, _)| s > 1)
-                    .map(|&(w, s, _)| (w, s))
-                    .collect();
-                v.sort_unstable();
-                v
-            };
+            // ⛔⛔⛔ EVERY WORLD'S PREFIX TABLES SHIP WHOLE — the one-rank world's and, when the
+            // bake sharded one, the sharded world's OWN. A rung the bake asked for that a world
+            // silently dropped (an emitter path that returns early instead of failing the build)
+            // leaves that world serving a shorter ladder — its continuation chunks run on the
+            // next wider rung, its waves fall to serialized solo chunks — with nothing anywhere
+            // saying so. Found live (2026-11-16, PR #1255 review finding 2): every sharded
+            // PACKED rung was dropped by the emitter's validate early-return, and a tp/2 build
+            // served a solo-only prefix ladder, byte-identical to main on the dense cell. One
+            // judge over every world's own registries — the law is stated once, the worlds are
+            // the table it walks.
+            //
+            // The SOLO half of each ladder: rungs with seqs == 1 (a packed rung is a
+            // different program at the same product, never a wider solo rung). The prefix
+            // ladder must top out at the prefix-free ladder's own top — a mid-prompt
+            // continuation chunk runs at the widest rung's width (it is capped there and the
+            // step-back leaves it room), so a prefix ladder that stops short would put a
+            // mid-prompt chunk on a bundle narrower than its rows — a refusal on the card.
+            // Every rung below the top that was asked for must have baked — a missing one is
+            // silent: its chunks run on the next wider rung. And the packed table ships
+            // whole: a wave of k tails runs on the smallest packed rung that holds (widest
+            // tail, live count); a pair that did not bake is silent — the wave falls to
+            // serialized solo chunks, the 878.7 ms this exists to kill. All checked against
+            // what BAKED, not the widths asked for, both directions.
             let packed_asked =
                 ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked);
-            let missing: Vec<String> = packed_asked
-                .iter()
-                .filter(|p| !packed_baked.contains(p))
-                .map(|(w, s)| format!("(w={w}, s={s})"))
-                .collect();
-            let stray: Vec<String> = packed_baked
-                .iter()
-                .filter(|p| !packed_asked.contains(p))
-                .map(|(w, s)| format!("(w={w}, s={s})"))
-                .collect();
-            if !missing.is_empty() || !stray.is_empty() {
-                panic!(
-                    "[spyre-superdsc] {stem}: the packed prefix table did not ship whole — \
-                     missing [{}], baked but not asked [{}]. Every rung the bake was asked for \
-                     must lower, and nothing else may enter the table",
-                    missing.join(", "),
-                    stray.join(", ")
-                );
+            let worlds: &[(&str, &WorldBake)] = if tp_sources.is_some() {
+                &[
+                    ("one-rank world", &one_rank),
+                    ("sharded world", &sharded_world),
+                ]
+            } else {
+                &[("one-rank world", &one_rank)]
+            };
+            for (label, world) in worlds {
+                let widths: Vec<u32> = world
+                    .prefill_rungs
+                    .borrow()
+                    .iter()
+                    .map(|(m, _)| *m)
+                    .collect();
+                let prefix: Vec<u32> = world
+                    .prefill_prefix_rungs
+                    .borrow()
+                    .iter()
+                    .filter(|&&(_, s, _)| s == 1)
+                    .map(|&(w, _, _)| w)
+                    .collect();
+                if let Err(e) =
+                    ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
+                        &widths, &prefix,
+                    )
+                {
+                    panic!("[spyre-superdsc] {stem} ({label}): {e}");
+                }
+                if let Err(e) =
+                    ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
+                        &asked,
+                        &prefix,
+                        &[],
+                    )
+                {
+                    panic!("[spyre-superdsc] {stem} ({label}): {e}");
+                }
+                let packed_baked: Vec<(u32, u32)> = {
+                    let r = world.prefill_prefix_rungs.borrow();
+                    let mut v: Vec<(u32, u32)> = r
+                        .iter()
+                        .filter(|&&(_, s, _)| s > 1)
+                        .map(|&(w, s, _)| (w, s))
+                        .collect();
+                    v.sort_unstable();
+                    v
+                };
+                let missing: Vec<String> = packed_asked
+                    .iter()
+                    .filter(|p| !packed_baked.contains(p))
+                    .map(|(w, s)| format!("(w={w}, s={s})"))
+                    .collect();
+                let stray: Vec<String> = packed_baked
+                    .iter()
+                    .filter(|p| !packed_asked.contains(p))
+                    .map(|(w, s)| format!("(w={w}, s={s})"))
+                    .collect();
+                if !missing.is_empty() || !stray.is_empty() {
+                    panic!(
+                        "[spyre-superdsc] {stem} ({label}): the packed prefix table did not ship \
+                         whole — missing [{}], baked but not asked [{}]. Every rung the bake was \
+                         asked for must lower, and nothing else may enter the table",
+                        missing.join(", "),
+                        stray.join(", ")
+                    );
+                }
             }
         }
 
