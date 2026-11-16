@@ -23,6 +23,8 @@ pub use scratchy_serving_worker::step_segs::step_segment_table;
 
 pub mod tokenizer;
 pub use tokenizer::Tokenizer;
+#[cfg(test)]
+mod alloc_count;
 pub mod llm;
 #[cfg(feature = "metrics")]
 pub mod metrics;

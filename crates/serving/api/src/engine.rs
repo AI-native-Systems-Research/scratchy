@@ -4024,7 +4024,7 @@ async fn route_step_outputs(
     outputs: scratchy_serving_engine::engine_core::StepOutputs,
 ) -> Vec<String> {
     let mut stop_string_finished: Vec<String> = Vec::new();
-    for (_, engine_outputs) in outputs {
+    if let Some(engine_outputs) = outputs {
         // Update scheduler gauges from stats.
         #[cfg(feature = "metrics")]
         if let Some(stats) = &engine_outputs.scheduler_stats {

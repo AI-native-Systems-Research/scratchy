@@ -441,7 +441,7 @@ mod tests {
                 model_executed,
             } => {
                 assert!(model_executed);
-                assert!(!outputs.is_empty());
+                assert!(outputs.is_some());
             }
             other => panic!("expected the step to run the model, got {other:?}"),
         }

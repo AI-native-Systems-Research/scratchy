@@ -17,6 +17,10 @@ use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
 use crate::error::{ServeError, ServeResult};
 
+mod pieces;
+
+use pieces::Pieces;
+
 // ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
@@ -29,6 +33,9 @@ pub struct Tokenizer {
     special_ids: HashSet<u32>,
     /// The EOS token ID, if present.
     eos_token_id: Option<u32>,
+    /// Each token's piece of text, when the decoder joins pieces end to end: what
+    /// [`Self::decode_into`] decodes through.
+    pieces: Option<Pieces>,
 }
 
 /// The `tokenizers` tokenizer a [`Tokenizer`] wraps: parsed from a `tokenizer.json`, or compiled
@@ -103,10 +110,12 @@ impl Tokenizer {
             .token_to_id("</s>")
             .or_else(|| t.token_to_id("<|endoftext|>"))
             .or_else(|| t.token_to_id("<|end_of_text|>")));
+        let pieces = Self::pieces_of(&inner);
         Self {
             inner,
             special_ids,
             eos_token_id,
+            pieces,
         }
     }
 
@@ -158,6 +167,7 @@ impl Tokenizer {
             return;
         }
         self.special_ids = Self::collect_special_ids(&self.inner);
+        self.pieces = Self::pieces_of(&self.inner);
     }
 
     /// Encode text into token IDs.
@@ -201,6 +211,23 @@ impl Tokenizer {
             .map_err(|e| ServeError::Engine(format!("Detokenization failed: {e}")))
     }
 
+    /// [`Self::decode`] into `out`, with `run` its scratch. Through the tokens' pieces when the
+    /// decoder joins them end to end, so a caller that keeps both buffers decodes without
+    /// allocating; else through `tokenizers`, leaving `out` as it was when that fails.
+    pub fn decode_into(
+        &self,
+        ids: &[u32],
+        skip_special_tokens: bool,
+        run: &mut Vec<u8>,
+        out: &mut String,
+    ) -> ServeResult<()> {
+        match &self.pieces {
+            Some(pieces) => pieces.decode_into(ids, skip_special_tokens, run, out),
+            None => *out = self.decode(ids, skip_special_tokens)?,
+        }
+        Ok(())
+    }
+
     /// Get the string representation of a single token ID.
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         with_inner!(&self.inner, t => t.id_to_token(id))
@@ -239,6 +266,20 @@ impl Tokenizer {
     /// Get the full vocabulary as a token-to-id mapping.
     pub fn get_vocab(&self) -> std::collections::HashMap<String, u32> {
         with_inner!(&self.inner, t => t.get_vocab(true))
+    }
+
+    /// The pieces of every token of `tokenizer`, by id, when its decoder joins them end to end.
+    fn pieces_of(tokenizer: &Inner) -> Option<Pieces> {
+        with_inner!(tokenizer, t => {
+            // Every id that names a token is in the vocabulary, the added tokens with it.
+            let ids = t.get_vocab(true).into_values().max().map_or(0, |id| id + 1);
+            Pieces::of(
+                t.get_decoder(),
+                ids,
+                |id| t.id_to_token(id),
+                |token| t.get_added_vocabulary().is_special_token(token),
+            )
+        })
     }
 
     /// Collect all special token IDs from the tokenizer.
@@ -296,6 +337,68 @@ pub(crate) fn make_test_tokenizer_with_bos() -> Tokenizer {
         "special_tokens": {"<s>": {"id": "<s>", "ids": [256], "tokens": ["<s>"]}}
     });
     Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
+}
+
+/// [`make_test_tokenizer`] with added tokens: a special `<|endoftext|>` (256), and two plain ones
+/// whose characters `ByteLevel`'s decode reads differently — `é` (257) is in its byte map, so it
+/// stands for the one byte `0xE9`, and `中` (258) is not, so it stays its own UTF-8.
+#[cfg(test)]
+pub(crate) fn make_test_tokenizer_with_added() -> Tokenizer {
+    let mut json = test_tokenizer_json();
+    json["added_tokens"] = serde_json::json!([
+        added_token(256, "<|endoftext|>", true),
+        added_token(257, "é", false),
+        added_token(258, "中", false),
+    ]);
+    Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
+}
+
+/// A SentencePiece byte-fallback tokenizer, decoded as Llama 2's and Mistral's are
+/// (`Replace("▁", " ")`, `ByteFallback`, `Fuse`, `Strip` of one leading space) or, without
+/// `strip`, as Gemma's. Its ids: `<0x00>`..`<0xFF>` (0..=255); [`SENTENCEPIECE_WORDS`] from 256;
+/// then a special `<s>` and a plain `<extra>`.
+#[cfg(test)]
+pub(crate) fn make_test_sentencepiece_tokenizer(strip: bool) -> Tokenizer {
+    let mut vocab = serde_json::Map::new();
+    for b in 0..=255u32 {
+        vocab.insert(format!("<0x{b:02X}>"), b.into());
+    }
+    for (i, word) in SENTENCEPIECE_WORDS.iter().enumerate() {
+        vocab.insert((*word).to_string(), (256 + i).into());
+    }
+    let words = SENTENCEPIECE_WORDS.len() as u32;
+    let mut decoders = vec![
+        serde_json::json!({"type": "Replace", "pattern": {"String": "▁"}, "content": " "}),
+        serde_json::json!({"type": "ByteFallback"}),
+        serde_json::json!({"type": "Fuse"}),
+    ];
+    if strip {
+        decoders.push(serde_json::json!({"type": "Strip", "content": " ", "start": 1, "stop": 0}));
+    }
+    let json = serde_json::json!({
+        "version": "1.0",
+        "added_tokens": [added_token(256 + words, "<s>", true), added_token(257 + words, "<extra>", false)],
+        "model": {"type": "BPE", "vocab": vocab, "merges": [], "byte_fallback": true},
+        "decoder": {"type": "Sequence", "decoders": decoders},
+    });
+    Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
+}
+
+/// [`make_test_sentencepiece_tokenizer`]'s words, from id 256: whole words, spaces alone and
+/// doubled, a `▁` inside a word, and two that only look like byte tokens — `<0x+A>`, which
+/// `ByteFallback`'s own parse reads as byte `0x0A`, and `<0xé>`, which it cannot read.
+#[cfg(test)]
+pub(crate) const SENTENCEPIECE_WORDS: [&str; 9] = [
+    "▁", "▁the", "▁quick", "é", "▁▁", "a▁b", "▁中", "<0x+A>", "<0xé>",
+];
+
+/// A `tokenizer.json` added token.
+#[cfg(test)]
+fn added_token(id: u32, content: &str, special: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "content": content, "single_word": false, "lstrip": false, "rstrip": false,
+        "normalized": false, "special": special
+    })
 }
 
 #[cfg(test)]
