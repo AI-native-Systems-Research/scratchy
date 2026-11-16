@@ -184,13 +184,13 @@ fn every_packed_pair_is_a_count_the_tid_space_holds_at_a_width_that_bakes() {
         &[96u32][..],
         &[128u32, 512][..],
     ] {
-        for &(w, s) in &PagedKvPool::packed_prefix_rungs(&baked) {
+        for &(w, s) in &PagedKvPool::packed_prefix_rungs(baked) {
             assert!(
                 baked.contains(&(w * s)),
                 "baked {baked:?}: ({w}, {s})'s product is not a ladder point"
             );
             assert!(
-                s >= 2 && s <= ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS,
+                (2..=ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS).contains(&s),
                 "baked {baked:?}: ({w}, {s})'s count is not one the tid space holds"
             );
             assert!(
@@ -201,7 +201,7 @@ fn every_packed_pair_is_a_count_the_tid_space_holds_at_a_width_that_bakes() {
         // The excluded pair, by name, for the ladders that reach the window.
         if baked.contains(&512) {
             assert!(
-                !PagedKvPool::packed_prefix_rungs(&baked).contains(&(256, 2)),
+                !PagedKvPool::packed_prefix_rungs(baked).contains(&(256, 2)),
                 "baked {baked:?}: (256, 2) is past the measured width ceiling and must not bake"
             );
         }
