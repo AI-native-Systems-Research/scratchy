@@ -2414,9 +2414,10 @@ impl SpyreWorker {
                     }
                     // FANNED OUT BELOW (the prefill ladder's shape): a rung's build is
                     // ~0.2 s of per-BUNDLE work, and the rungs sit on the load's critical
-                    // path serially. The ADOPTION stays on this thread — aliasing is the
-                    // owner's, the same law as the prefill ladder's post-join
-                    // `alias_seg_from`.
+                    // path serially. Adoptions run one thread per session below, the
+                    // prefix/prefill law — each alias is the placement-equality proof plus
+                    // the borrower's own descriptor rebuild and bank alias, never a
+                    // pointer swap.
                     decode_jobs.push(DecodeRungJob {
                         rn,
                         rung_width,
