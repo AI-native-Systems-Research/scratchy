@@ -59,8 +59,10 @@ pub fn bucketed(c: &TaskCell) -> bool {
 }
 
 /// A cell's joules a correct answer in bucket `at` of `buckets`: the joules its requests there
-/// took over how many of them were right, a failed or wrong one's joules counted too. None where
-/// it kept no joules a request, no prompt counts or no scores, or none there was right.
+/// took over how many of them were right, a wrong one's joules counted too. A failed request has
+/// no joules of its own: its seconds went to the requests in flight beside it
+/// (`cell_energy.per_request`). None where the cell kept no joules a request, no prompt counts or
+/// no scores, or none there was right.
 pub fn joules_per_right_in(c: &TaskCell, buckets: Buckets, at: usize) -> Option<f64> {
     let (prompts, joules, right) = (
         c.prompt_tokens.as_deref()?,

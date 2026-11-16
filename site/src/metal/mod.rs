@@ -3230,8 +3230,19 @@ mod tests {
         assert!(html.contains("answers forced to a length, so not scored"));
         // No joules a request: each cell's whole, 36 J against 20, x1.80, and said so.
         let html = shape(&mut runs, false, false);
-        assert!(html.contains("each cell&#39;s whole: its run kept no joules a request"));
+        assert!(html.contains("each cell&#39;s whole: a side kept no joules a request"));
         assert!(html.contains("×1.80 vs oMLX"));
+        // A cell the power log missed part of has no energy: no ratio, and its squares say why,
+        // not that its run kept no joules a request.
+        shape(&mut runs, false, true);
+        for c in runs[0].models[0].tasks.iter_mut().flatten() {
+            c.energy = None;
+            c.task_joules = None;
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("no energy on one side"));
+        assert!(!html.contains("each cell&#39;s whole"));
     }
 
     /// A section reads each model's newest run that measured its dataset, the runs a newer one

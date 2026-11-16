@@ -329,9 +329,10 @@ fn dataset_summary(
                  is than the engine it is set against: on P and D its median time over the cell's \
                  requests against the rival's, on 2u and 4u the joules its requests took over how many \
                  were right against the rival's. Blue better, red worse, grey within noise. A striped \
-                 square has no ratio: one engine did not run it, most of its requests failed, or its \
-                 answers were forced to a length, so not scored. Hover or focus a square for its \
-                 ratio, the engine, and a borrowed rival's run."
+                 square has no ratio: one engine did not run it, most of its requests failed, its \
+                 answers were forced to a length, so not scored, or one side had no energy reading \
+                 or no right answer there. Hover or focus a square for its ratio, the engine, and a \
+                 borrowed rival's run."
             }
             {summary_map(dataset, id, ran, machines, &summary_columns)}
             {tasks::accuracy_table(dataset, &scored_pairs)}
@@ -1021,6 +1022,9 @@ fn summary_map(
                 if ours.timed_answers || theirs.timed_answers {
                     return Err("answers forced to a length, so not scored");
                 }
+                if ours.energy.is_none() || theirs.energy.is_none() {
+                    return Err("no energy on one side");
+                }
                 match (ours.task_joules.as_ref(), theirs.task_joules.as_ref()) {
                     (Some(_), Some(_)) => (
                         buckets::joules_per_right_in(ours, bs, b),
@@ -1033,7 +1037,7 @@ fn summary_map(
         };
         let r = tasks::times(a, t, true).ok_or(match row.measure {
             Measure::Timing(_) => "no timing on one side",
-            Measure::JoulesPerRight => "no right answer, or no energy, on one side",
+            Measure::JoulesPerRight => "no right answer on one side",
         })?;
         let from = (theirs.borrowed_from.as_ref())
             .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
@@ -1047,10 +1051,11 @@ fn summary_map(
             for (k, &column) in grid.columns.iter().enumerate() {
                 let p = pair(chip, column);
                 for (b, &(bucket, _)) in bs.iter().enumerate() {
+                    let got = ratio(p.as_ref(), row, b);
                     // How many requests each side's median is over, or right answers its joules a
                     // correct answer: a cell sends few, so a square of one or two can turn on a
-                    // single answer, and says so. A run with no joules a request reads each
-                    // cell's whole, and says that.
+                    // single answer, and says so. A square read from each cell's whole, a side
+                    // having no joules a request, says that.
                     let over = p.as_ref().and_then(|p| {
                         let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
                         match row.measure {
@@ -1076,8 +1081,8 @@ fn summary_map(
                                             n(theirs)
                                         ))
                                     }
-                                    false => (ours.is_some() && theirs.is_some()).then(|| {
-                                        "each cell's whole: its run kept no joules a request"
+                                    false => got.is_ok().then(|| {
+                                        "each cell's whole: a side kept no joules a request"
                                             .to_string()
                                     }),
                                 }
@@ -1102,7 +1107,7 @@ fn summary_map(
                     squares.insert(
                         (m, r, k, b),
                         MapSquare {
-                            ratio: ratio(p.as_ref(), row, b).map_err(str::to_string),
+                            ratio: got.map_err(str::to_string),
                             tip: tip.into_iter().flatten().collect(),
                         },
                     );
