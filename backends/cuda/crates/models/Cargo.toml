@@ -1,0 +1,58 @@
+[package]
+name = "scratchy-target-cuda-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The selected models, compiled for CUDA: the model scope `scratchy-models` states, through the shared pipeline with CUDA's emitter"
+
+[dependencies]
+# THE MODEL SCOPE: which models and quant presets — `scratchy-models`' own features, published as
+# its build metadata (`DEP_SCRATCHY_MODELS_*`), which this crate's build script reads.
+scratchy-models = { path = "../../../../crates/models/arch", default-features = false }
+# What the emitted code names: the step and tape types of each model's `static` tapes and the
+# registry its entry is submitted to, and the shared weights struct's types.
+scratchy-target-cuda = { path = "../cuda" }
+scratchy-layers = { path = "../../../../crates/layers" }
+scratchy-tensors = { path = "../../../../crates/tensors" }
+scratchy-forward-compiler = { path = "../../../../crates/compiler" }
+scratchy-quantizations = { path = "../../../../crates/models/quantization" }
+# The recurrent state the emitted code names for an arch that runs a recurrent mixer.
+scratchy-state-decoder-gdn = { path = "../../../../crates/state/decoder/gdn" }
+# The `BakedTokenizer`s the build bakes register against.
+scratchy-core-model = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+# The shared models build driver, the emitter it runs CUDA's models through, and the scope's
+# feature names the build script narrows it by.
+scratchy-models-build = { path = "../../../../crates/models/build" }
+scratchy-forward-compiler-macro = { path = "../../../../crates/compiler/macros" }
+scratchy-target-cuda-compiler = { path = "../compiler" }
+
+[dev-dependencies]
+# tests/cuda_tapes_*_fp8.rs: the canonicals the pipeline hands CUDA's emitter
+# (`target_model_inputs`), recaptured to check the emitted tapes against what CUDA's compiler
+# lowers from them, and the cuda target's own test helper (`#[path]`, not a copy: `chains.rs`),
+# which names these crates.
+scratchy-forward-compiler-macro = { path = "../../../../crates/compiler/macros" }
+scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
+scratchy-target-cuda-compiler = { path = "../compiler", features = ["test-support"] }
+half = { workspace = true }
+# The FP8 tape tests read `tests/fixtures/fp8_headers_*.json`.
+serde_json = { workspace = true }
+
+# The three FP8 checkpoints' emitted CUDA tapes under `fp8-dynamic-per-channel` (FP8 S2): the fp8
+# steps per bucket, the quant writes and the quant scratch's liveness, the weight table, and
+# `check` against each checkpoint's real safetensors headers (`tests/fixtures/fp8_headers_*`), with
+# no toolchain. CUDA builds FP8 models only (#978); the decode fp8 GEMVs are S4's.
+[[test]]
+name = "cuda_tapes_27b_fp8"
+required-features = ["scratchy-models/qwen3.8-27b-text-only", "scratchy-quantizations/fp8-dynamic-per-channel"]
+
+[[test]]
+name = "cuda_tapes_35b_fp8"
+required-features = ["scratchy-models/qwen3.6-35b-a3b", "scratchy-quantizations/fp8-dynamic-per-channel"]
+
+[[test]]
+name = "cuda_tapes_gemma4_fp8"
+required-features = ["scratchy-models/gemma-4-26b-a4b-it", "scratchy-quantizations/fp8-dynamic-per-channel"]
