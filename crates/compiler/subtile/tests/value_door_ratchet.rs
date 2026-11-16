@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The law asserts left: `assert!`/`assert_eq!`/`assert_ne!`/`panic!` in a `fn new`.
-const LAW_ASSERTS: usize = 31;
+const LAW_ASSERTS: usize = 30;
 /// The value→type doors left: value constructors beside a typed one, and value→const match arms.
 const VALUE_DOORS: usize = 10;
 

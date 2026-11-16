@@ -13,7 +13,10 @@
 #       skip the jobs that build it. CI's rust-cache drops every workspace crate's build output
 #       before saving, so a workspace crate's `.fingerprint` entry is one this job compiled. The
 #       crates are the spyre workspace's (backends/spyre); the check reads both workspaces' build
-#       output, since the macOS tests job builds the KTIR crates in the spyre one.
+#       output, since the macOS tests job builds the KTIR crates in the spyre one. The card
+#       workspace (backends/spyre-hw) resolves against the senlib-rs stub every job that runs this
+#       synthesizes first (scripts/ci-senlib-stub.sh), so its metadata reads here like any other
+#       workspace's — and no macOS job compiles its crates, which is what the list states.
 set -euo pipefail
 
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
@@ -23,7 +26,6 @@ backends/spyre-hw/crates/card
 backends/spyre-hw/crates/builder
 backends/spyre/crates/bundle
 backends/spyre/crates/compiler
-backends/spyre-hw/crates/flex-rs
 backends/spyre/crates/triton/splice
 backends/spyre/crates/triton/triton-frontend
 backends/spyre/crates/triton/triton-ktir
@@ -73,7 +75,9 @@ changed() {
 
 lock() {
     # The listed directories' package names, from cargo's own manifest paths in the spyre
-    # workspaces; the build output checked is every workspace's.
+    # workspaces; the build output checked is every workspace's. The card workspace's
+    # metadata reads against the senlib-rs stub the calling job synthesized
+    # (scripts/ci-senlib-stub.sh) — resolution is all `--no-deps` metadata needs.
     local metadata spyre spyre_hw packages names dir name
     metadata=$(cargo metadata --no-deps --format-version 1)
     spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre/Cargo.toml)

@@ -1,0 +1,23 @@
+# THE RED PATCH ROUTE — the card host's one sanctioned way the export-controlled data
+# compiles in from source (user ruling, 2026-11-13). NEVER part of the workspace manifest:
+# a `[patch]` there would make every resolution of backends/spyre-hw — the emulator, CI's
+# checks, a plain `cargo metadata` — demand the red checkout, and red is a card-host fact
+# only. It is activated per-invocation, card host only (the pod, where senlib-rs lives at
+# /work/senlib-rs and red at /work/senlib-rs-red):
+#
+#   cargo --config patches/oco.toml build --release \
+#       --features spyre-hw,model/granite-3.1-2b-instruct
+#
+# (run from backends/spyre-hw). The section key is the STUB's resolved source — senlib-rs's
+# graph names its own `crates/export-controlled-stub` (same package name and version, names
+# and shapes only), and a patch keys on the source it resolves from, which cannot be
+# relative, so it names the canonical pod path. Both crates of the pair carry the same
+# package name and version, so the patch swaps the stub's path edge for red's real crate in
+# that one command's graph: the card build reads real values, and every other build (CI, the
+# emulator, an unpatched check) keeps the stub — which resolves everywhere and links
+# nowhere. A deployment that puts senlib-rs elsewhere resolves flex-rs by the relative path
+# but MISSES this patch, and the build then fails loudly on the stub's unresolved `oco_*` —
+# never a silent fallback. An absent red checkout fails the patched build loudly on this
+# patch's own path — also never a fallback to the stub.
+[patch.'file:///work/senlib-rs/crates/export-controlled-stub']
+senlib-rs-export-controlled = { path = "/work/senlib-rs-red/crates/export-controlled" }

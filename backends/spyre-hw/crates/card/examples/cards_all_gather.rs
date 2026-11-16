@@ -32,13 +32,13 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use flex_rs::address::{ByteOffset, ByteSize, Chunk, CompositeAddress, LogicalAddress};
 use flex_rs::allocator::AllocationDirective;
+use flex_rs::card::pci_addr_for_region;
 use flex_rs::control_block_wire::Flits;
 use flex_rs::dma::{DmaDirection, DmaParams, DmaShaping, HostVirtualAddress};
 use flex_rs::hal_sbf::rdma_xseg;
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, P2PRdmaSendParams, P2PRdmaWaitParams,
 };
-use flex_rs::senlib_ffi::pci_addr_for_region;
 use flex_rs::stream::{RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
 use scratchy_target_spyre::bundle_code::collective::TpWorld;
 use scratchy_target_spyre_card::runtime::CardRuntime as AnyCard;

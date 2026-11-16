@@ -67,11 +67,21 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
   into the root's `crates/`:
   - `backends/spyre` — everything CI builds and tests: the lowering, the bake,
     the compiled models, the KTIR emulator, the Triton front end.
-  - `backends/spyre-hw` — what runs on a card (its runtime, flex-rs), the
-    worker and the `spyre` CLI. It depends on `backends/spyre`, never the
+  - `backends/spyre-hw` — what runs on a card (its runtime, senlib-rs's flex-rs),
+    the worker and the `spyre` CLI. It depends on `backends/spyre`, never the
     reverse, and may depend on what CI cannot reach. Build `spyre` from there:
     `cd backends/spyre-hw && cargo build --release
     --features spyre-emu,model/granite-3.1-2b-instruct` (`spyre-hw` on a card host).
+    **The seam**: the card workspace resolves `flex-rs` by path into a sibling
+    senlib-rs checkout (IBM-internal git) — the tree, the senlib-rs checkout and,
+    on a card host, senlib-rs-red sit as siblings under one parent. Even a
+    missing-optional-dep build (the emulator) refuses to resolve without the
+    sibling; CI runs against a synthesized manifest-only stub
+    (`scripts/ci-senlib-stub.sh`) — enough to resolve, hollow to compile — and the
+    checks that must compile flex-rs live in `scripts/spyre-hw-card-gate.sh`,
+    run on a card host. A card host's link-bearing build applies red's
+    export-controlled values per-invocation: `cargo --config patches/oco.toml …`
+    from `backends/spyre-hw`.
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature — a plain `chat`-only build never
   compiles image/png/zune-jpeg/etc., and a scope naming a vision arch needs it.
@@ -85,9 +95,10 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
 --exclude scratchy-target-metal --exclude scratchy-target-metal-cli --exclude scratchy-target-metal-compiler
 --exclude scratchy-target-metal-models --exclude scratchy-target-metal-worker
 -- -D warnings` at the root, then the same `--workspace` clippy (no excludes) in
-`backends/spyre`, and in `backends/spyre-hw` (`--features model/<stem>`) with
-`SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK; check/clippy don't
-link the C++ shim). All five metal crates are excluded because
+`backends/spyre`, and in `backends/spyre-hw` the resolvable surface (the `spyre`
+binary's targets, the worker's emu clippy and unit tests) against the senlib-rs
+stub; the card workspace's flex-rs-compiling checks
+(`scripts/spyre-hw-card-gate.sh`) gate on a card host. All five metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
 CLI, compiler, models and worker crates via their own edges to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
@@ -106,6 +117,7 @@ not the CI arch):
 docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
   -e SCRATCHY_SKIP_SENDNN_CXX=1 rust:1-bookworm bash -c '
     rustup component add clippy >/dev/null 2>&1
+    scripts/ci-senlib-stub.sh &&
     cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
       --exclude scratchy-target-metal \
       --exclude scratchy-target-metal-cli \
@@ -115,7 +127,8 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
     cd backends/spyre &&
     cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings &&
     cd ../spyre-hw &&
-    cargo clippy --workspace --features model/granite-3.1-8b-instruct -- -D warnings'
+    cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli --all-targets \
+      --features spyre-emu,model/granite-3.1-8b-instruct -- -D warnings'
 ```
 The macOS metal CI job runs locally via `scripts/act-local.sh` when present.
 

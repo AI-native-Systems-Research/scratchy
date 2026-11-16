@@ -979,6 +979,10 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "senlib-boot",
+ "senlib-chip",
+ "senlib-host",
+ "senlib-rs",
  "tracing",
 ]
 
@@ -3040,6 +3044,51 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "senlib-boot"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "senlib-chip",
+ "senlib-host",
+ "senlib-rs",
+ "senlib-rs-export-controlled",
+]
+
+[[package]]
+name = "senlib-chip"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "senlib-errata",
+ "senlib-host",
+]
+
+[[package]]
+name = "senlib-errata"
+version = "0.1.0"
+
+[[package]]
+name = "senlib-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "senlib-rs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "senlib-chip",
+ "senlib-errata",
+ "senlib-host",
+]
+
+[[package]]
+name = "senlib-rs-export-controlled"
+version = "0.1.0"
 
 [[package]]
 name = "seq-macro"

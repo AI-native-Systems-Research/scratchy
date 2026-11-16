@@ -555,7 +555,7 @@ pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
     for (i, (a, b)) in old.iter().zip(new.iter()).enumerate() {
         if a != b {
             let (mut at, mut wb, mut pb) = (0, 0u8, 0u8);
-            for (j, (x, y)) in a.bytes().iter().zip(b.bytes().iter()).enumerate() {
+            for (j, (x, y)) in a.to_bytes().iter().zip(b.to_bytes().iter()).enumerate() {
                 if x != y {
                     (at, wb, pb) = (j, *x, *y);
                     break;

@@ -41,6 +41,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The card workspace (backends/spyre-hw) resolves flex-rs by path into a sibling
+      # senlib-rs checkout (IBM-internal git — a card host fact), so this runner
+      # synthesizes the resolution stub (scripts/ci-senlib-stub.sh): enough for every
+      # step that only RESOLVES the workspace — rust-cache's own `cargo metadata`
+      # probe included, which is why this precedes it — hollow for anything that
+      # would compile flex-rs. The steps that must compile it (the workspace-wide
+      # and card-surface clippy) are scripts/spyre-hw-card-gate.sh, on a card host.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -87,17 +97,6 @@ jobs:
         working-directory: backends/spyre
         run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings
 
-      # The card workspace (backends/spyre-hw): the card runtime, flex-rs, the worker and the
-      # `spyre` binary. It may come to depend on what this runner cannot fetch; until it does,
-      # it is linted here like the rest. `--workspace` builds flex-rs, whose build script links
-      # the FFI archives (libflex_shim.a + libsenlib_oco.a) from SENLIB_STATIC_LIB_DIR. The
-      # runner has no archives, so skip emitting the link directives — check/clippy don't link.
-      - name: Clippy (spyre-hw workspace)
-        working-directory: backends/spyre-hw
-        env:
-          SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo clippy --workspace --features model/granite-3.1-8b-instruct -- -D warnings
-
       # The same model under its fp8 preset (`fp8-dynamic-per-channel`): the weights
       # struct's typed handles must cover an fp8 linear too, or every fp8 build panics
       # at expansion. One model, the expansion only.
@@ -120,6 +119,9 @@ jobs:
       - name: Lint the CLI core's test targets
         run: cargo clippy -p scratchy-cli --features claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
+      # The `spyre` binary's own test targets (its unit tests): no other step builds
+      # them. Resolves against the stub above — plain `spyre` carries no card runtime,
+      # so nothing here compiles flex-rs.
       - name: Lint the spyre binary's targets
         working-directory: backends/spyre-hw
         run: cargo clippy -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct
@@ -283,6 +285,12 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
+      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
+      # (IBM-internal git), synthesized here (scripts/ci-senlib-stub.sh) — before
+      # rust-cache's metadata probe of that workspace, and before the macos-scope
+      # lock() below reads it.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -304,7 +312,9 @@ jobs:
           --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings
 
       # The other half of macos-scope's skip: fails if this job compiled a crate
-      # whose PRs skip it.
+      # whose PRs skip it. lock() reads the card workspace's metadata too, against
+      # the senlib-rs stub synthesized after checkout — resolution is all it
+      # needs, and no macOS job compiles a spyre-hw crate.
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
@@ -328,6 +338,12 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
+      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
+      # (IBM-internal git), synthesized here (scripts/ci-senlib-stub.sh) — before
+      # rust-cache's metadata probe of that workspace, and before the macos-scope
+      # lock() below reads it.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -461,7 +477,7 @@ jobs:
           cargo clippy -p scratchy-target-metal-cli --features claude,model/smollm2-135m --all-targets -- -D warnings
           cargo test -p scratchy-target-metal-cli --features model/smollm2-135m --test arch_feature_passthrough
 
-      # See the clippy job's last step.
+      # See the clippy job's stub step.
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
@@ -546,6 +562,18 @@ jobs:
         working-directory: backends/spyre
     steps:
       - uses: actions/checkout@v7
+      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
+      # (IBM-internal git), so this job synthesizes the resolution stub (scripts/
+      # ci-senlib-stub.sh) — before rust-cache's metadata probe of that workspace.
+      # The worker's emu-path steps below only RESOLVE the workspace — the card
+      # runtime is behind `spyre-hw`, off in all of them — so the stub carries them.
+      # The card workspace's card-surface clippy and the worker's CARD path compile
+      # flex-rs; they are scripts/spyre-hw-card-gate.sh, on a card host. The
+      # working directory is this job's default (backends/spyre); the script and
+      # the sibling it writes live at the repo root.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        working-directory: .
+        run: scripts/ci-senlib-stub.sh
       # Same mirror hardening as linux-spyre-emu (the BLAS job's comment).
       - name: Install OpenBLAS
         run: |
@@ -567,18 +595,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
-      # The card surface: the card runtime (scratchy-target-spyre-card: superdsc_exec and the
-      # device runtime), linted at -D warnings — it rotted between card runs once, and #299's
-      # E0277s reached main green (#553). Lib only: the examples need a card host. Check-only,
-      # so the FFI archives are not needed (SCRATCHY_SKIP_SENDNN_CXX=1 keeps the build script
-      # from emitting its static-link directives); flex-rs, the declarations crate, is linted
-      # with it. The worker's card path below compiles against the lowering alone, so it
-      # needs no device compiler either.
-      - name: Clippy (spyre-hw card surface)
-        working-directory: backends/spyre-hw
-        env:
-          SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo clippy -p scratchy-target-spyre-card -p flex-rs -- -D warnings
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
       # The spyre worker's modules compile under no other CI job:
@@ -606,16 +622,6 @@ jobs:
         working-directory: backends/spyre-hw
         run: cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli
           --features spyre-emu,model/llama-3.2-1b --all-targets -- -D warnings
-      # The worker's CARD path, against the card's lowering (`spyre-lower`): its code is the
-      # same with or without device images, so no device compiler is needed, and the FFI
-      # archives are skipped as in the card-surface step. Its tests are not run: they link
-      # the card runtime.
-      - name: Clippy (spyre worker, card)
-        working-directory: backends/spyre-hw
-        env:
-          SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli
-          --features scratchy-target-spyre-worker/spyre-hw,model/granite-3.1-2b-instruct --all-targets -- -D warnings
       # The spyre-side ktir-superdsc and spyre-bundle crates' TEST targets compile
       # under no other CI step: this job's clippy above is -p scratchy-target-spyre,
       # the triton clippy below is the five re-host crates, and the linux-workspace job's
@@ -742,18 +748,15 @@ jobs:
           workspaces: |
             . -> target
             backends/spyre -> target
-            backends/spyre-hw -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Doctests (compile_fail error codes)
         run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal
       - name: Doctests (compile_fail error codes, spyre workspace)
         working-directory: backends/spyre
         run: cargo +nightly test --doc -p ktir-core
-      - name: Doctests (compile_fail error codes, spyre-hw workspace)
-        working-directory: backends/spyre-hw
-        env:
-          SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo +nightly test --doc -p scratchy-target-spyre-card
+      # The card crate's compile_fail doctests compile flex-rs (IBM-internal, beside
+      # the tree on a card host only), so no runner can run them. They are
+      # scripts/spyre-hw-card-gate.sh's last leg, on a card host.
 
   fmt:
     name: Format
@@ -768,7 +771,12 @@ jobs:
       # above never reaches them.
       - run: cargo fmt --manifest-path site/Cargo.toml --all -- --check
       - run: cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
-      - run: cargo fmt --manifest-path backends/spyre-hw/Cargo.toml --all -- --check
+      # backends/spyre-hw is its own workspace too, but `cargo fmt` there resolves the
+      # workspace's manifests and its flex-rs path dep reaches for the senlib-rs
+      # sibling. rustfmt over the files needs no resolution at all — same config
+      # (the root rustfmt.toml, found by walking up from each file), same edition
+      # the workspace states.
+      - run: rustfmt --check --edition 2024 $(git ls-files 'backends/spyre-hw/*.rs')
 
   scripts:
     name: Python scripts

@@ -53,7 +53,8 @@ to the zone when it makes the zone's claim, wherever it lives.
 - **End to end.** A real server answering real requests: serving, streaming, the quantization
   paths, multimodal, speculative decoding, LoRA, pooling, telemetry.
   - Today: `crates/targets/metal/e2e/` (it serves through `scr`).
-- **The allocator.** `backends/spyre-hw/crates/flex-rs/` is T5 by default (#8's open question).
+- **The allocator.** senlib-rs's `crates/flex-rs/` (linked into this tree's
+  `backends/spyre-hw` workspace by path) is T5 by default (#8's open question).
   Move a test out only on purpose, in its own PR, never as a side effect of another.
 
 ## What weakening a protected test means
