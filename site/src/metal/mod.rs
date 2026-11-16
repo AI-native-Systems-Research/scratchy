@@ -3167,7 +3167,10 @@ mod tests {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let html = lengths(&mut runs, 22.0, 40.0);
         assert!(html.contains("answers of different lengths"), "2u and 4u");
-        assert!(html.contains("vs oMLX</strong>"), "P and D keep their ratios");
+        assert!(
+            html.contains("vs oMLX</strong>"),
+            "P and D keep their ratios"
+        );
         assert!(html.contains(">MuSiQue, natural answers<"));
         assert!(!html.contains(">MuSiQue, timed<"), "no row was forced");
         let html = lengths(&mut runs, 22.0, 23.0);
