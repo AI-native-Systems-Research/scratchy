@@ -6,7 +6,8 @@ use dioxus::prelude::*;
 use crate::DASH;
 use crate::carbon::{Fold, Stack, Table, TableCell, TableRow};
 use crate::charts::{
-    RangeGroup, RangeMark, ScatterAxes, ScatterMark, ScatterPanel, range_dots, range_scatter,
+    Axes, Axis, Chart, ChartOptions, Colour, RangeGroup, RangeMark, ScatterPoint, chart, colour,
+    range_dots,
 };
 
 use super::data::{Model, RequestTiming, TaskCell};
@@ -490,91 +491,76 @@ fn short_reason(c: &TaskCell) -> String {
     }
 }
 
-/// What a right answer cost: a panel a model, a dot each Mac, engine and users count whose scored
-/// cell kept its energy, at its accuracy across (its 95% range the bar) and its joules a request
-/// up, on a log scale; scratchy's and its rival's on one Mac and load joined, and named once. The
-/// dashed lines are joules a right answer, a request's joules over its accuracy: down and to the
-/// right is better. Nothing where no scored cell kept its energy.
+/// Joules against accuracy, one scatter plot: every scored cell that kept its energy a dot, at its
+/// accuracy across and its joules a request up (on a log scale), every model, Mac, engine and
+/// users count. Its colour is its engine; its tooltip names its model, Mac and load. Nothing
+/// where no scored cell kept its energy.
 pub fn joules_accuracy(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
-    let mut panels: Vec<ScatterPanel> = Vec::new();
+    let mut data: Vec<ScatterPoint> = Vec::new();
+    // Each engine's colour in the order engines first appear, scratchy first, never cycled.
+    let mut engines: Vec<&'static str> = vec![Engine::Scratchy.label()];
     for &(chip, m) in pairs {
-        let mut engines = vec![Engine::Scratchy];
-        engines.extend(rival_of(m, dataset));
-        let several = (engines.iter())
-            .flat_map(|&e| accuracy_cells(e.tasks(m), dataset))
-            .map(|c| c.conc)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            > 1;
+        let mut those = vec![Engine::Scratchy];
+        those.extend(rival_of(m, dataset));
         let mac = chip.trim_start_matches("Apple ");
-        for (&e, class) in engines.iter().zip(["s1", "s2"]) {
+        for e in those {
             for c in accuracy_cells(e.tasks(m), dataset) {
                 let (Some(a), Some(j)) = (accuracy(c), per_request(c)) else {
                     continue;
                 };
-                let r = range(c).unwrap_or(0.0) / 100.0;
-                let users = format!("{} user{}", c.conc, if c.conc == 1 { "" } else { "s" });
-                let mut tip = vec![
-                    format!("{} on {chip}, {users}", m.stem),
-                    format!("accuracy {}", scored(c)),
-                    format!("{} J a request", joules(Some(j))),
-                ];
-                tip.extend(per_right(c).map(|r| format!("{} J a right answer", joules(Some(r)))));
-                tip.extend(
-                    (c.borrowed_from.as_ref())
-                        .map(|w| format!("from the run of {}", w.month_day())),
-                );
-                let mark = ScatterMark {
-                    class,
-                    name: e.label().to_string(),
-                    x: (a, (a - r).max(0.0), (a + r).min(1.0)),
-                    y: j,
-                    pair: format!("{chip} {}", c.conc),
-                    label: None,
-                    tip,
-                };
-                let marks = match panels.iter_mut().position(|(stem, _)| stem == &m.stem) {
-                    Some(i) => &mut panels[i].1,
-                    None => {
-                        panels.push((m.stem.clone(), Vec::new()));
-                        &mut panels.last_mut().expect("just pushed").1
-                    }
-                };
-                // Named once a Mac and load: on scratchy's dot, or its rival's where scratchy's
-                // cell showed no accuracy.
-                if !marks.iter().any(|o| o.pair == mark.pair) {
-                    let label = match several {
-                        true => format!("{mac}, {}u", c.conc),
-                        false => mac.to_string(),
-                    };
-                    marks.push(ScatterMark {
-                        label: Some(label),
-                        ..mark
-                    });
-                } else {
-                    marks.push(mark);
+                if !engines.contains(&e.label()) {
+                    engines.push(e.label());
                 }
+                let users = format!("{} user{}", c.conc, if c.conc == 1 { "" } else { "s" });
+                data.push(ScatterPoint {
+                    group: e.label().to_string(),
+                    key: a * 100.0,
+                    value: j,
+                    label: format!("{} on {mac}, {users}", m.stem),
+                });
             }
         }
     }
-    if panels.is_empty() {
+    if data.is_empty() {
         return rsx! {};
     }
-    let axes = ScatterAxes {
-        x: "accuracy",
-        y: "joules a request",
-        ratio: "joules a right answer",
+    let axis = |maps_to, title, scale_type| Axis {
+        maps_to,
+        title,
+        scale_type,
+        ticks: None,
+        include_zero: Some(false),
+        visible: None,
+        domain: None,
+    };
+    let spec = Chart::Scatter {
+        data,
+        options: ChartOptions {
+            color: Some(Colour::Scale {
+                scale: (engines.iter().zip(["s1", "s2", "s3"]))
+                    .map(|(&e, class)| (e, colour(class)))
+                    .collect(),
+            }),
+            hover: None,
+            ..ChartOptions::new(
+                "Joules against accuracy".to_string(),
+                Axes {
+                    bottom: axis("key", "Accuracy (%)", None),
+                    left: axis("value", "Joules a request (log)", Some("log")),
+                },
+                "28rem".to_string(),
+            )
+        },
     };
     rsx! {
         Stack { gap: 3,
             p { style: "contain: inline-size",
-                "What a right answer cost. Each dot is an engine's accuracy, across, with its 95% \
-                 range the bar, and the energy it spent a request, up, on a log scale: scratchy's \
-                 and the engine it is set against joined, on one Mac and load. The dashed lines are \
-                 joules a right answer, a request's joules over its accuracy: down and to the right \
-                 is better. Hover a dot for its numbers; the accuracy table has every one."
+                "Every scored MuSiQue cell is a dot: its accuracy across and the energy it spent a \
+                 request up, on a log scale, for every model, Mac, engine and users count. Its \
+                 colour is its engine; hover a dot for its model, Mac and load. Down and to the \
+                 right is better: fewer joules for more right answers."
             }
-            {range_scatter(&panels, &axes)}
+            {chart(&spec, "Joules a request against accuracy, a dot a scored MuSiQue cell", "width: 100%", None)}
         }
     }
 }

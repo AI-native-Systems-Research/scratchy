@@ -4436,11 +4436,11 @@ mod tests {
         assert!(html.contains("Apple M3 Pro, 4 users<"));
     }
 
-    /// What a right answer cost: a panel a model, a dot an engine and users count whose scored cell
-    /// kept its energy, its numbers in its tooltip, each Mac and load named once; a cell with no
-    /// energy has no dot, and a dataset with none has no plot.
+    /// Joules against accuracy is one scatter plot, a dot every scored cell that kept its energy:
+    /// at its accuracy across and its joules a request up, its engine its colour, its model, Mac
+    /// and load its label. A cell with no energy has no dot, and a dataset with none no plot.
     #[test]
-    fn joules_against_accuracy_is_a_dot_an_engine_and_load() {
+    fn joules_against_accuracy_is_a_dot_a_scored_cell() {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let m = &mut runs[0].models[0];
         for (cells, j, a) in [
@@ -4464,24 +4464,25 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("What a right answer cost"));
-        assert!(html.contains("50.0 J a request") && html.contains("80.0 J a request"));
-        assert!(
-            html.contains("125 J a right answer"),
-            "scratchy's 50 J over 40%"
-        );
-        assert!(
-            html.contains(">M3 Pro, 1u<") && html.contains(">M3 Pro, 4u<"),
-            "named a load"
-        );
-        assert!(
-            !html.contains(">M3 Pro, 2u<"),
-            "2 users kept no energy: no dot"
-        );
         assert_eq!(
-            html.matches(">M3 Pro, 4u<").count(),
+            html.matches("&#34;kind&#34;:&#34;scatter&#34;").count(),
             1,
-            "once a Mac and load"
+            "one plot"
+        );
+        // 1 and 4 users on both engines: four dots.
+        assert_eq!(html.matches("gpt-oss-20b on M3 Pro, ").count(), 4);
+        assert!(html.contains("gpt-oss-20b on M3 Pro, 1 user&#34;"));
+        assert!(
+            html.contains("&#34;key&#34;:40.0,&#34;value&#34;:50.0"),
+            "scratchy's dot"
+        );
+        assert!(
+            html.contains("&#34;key&#34;:30.0,&#34;value&#34;:80.0"),
+            "oMLX's dot"
+        );
+        assert!(
+            !html.contains("on M3 Pro, 2 users"),
+            "2 users kept no energy: no dot"
         );
         // No energy anywhere: no plot.
         let m = &mut runs[0].models[0];
@@ -4494,7 +4495,7 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(!html.contains("What a right answer cost"));
+        assert!(!html.contains("&#34;kind&#34;:&#34;scatter&#34;"));
     }
 
     /// A MuSiQue timeline does not join runs that drew its tasks differently: a change of questions

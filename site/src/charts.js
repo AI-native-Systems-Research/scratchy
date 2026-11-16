@@ -67,7 +67,7 @@
   }
   // Draws one chart in the theme `t`.
   function draw(el, t) {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart, scatter: Charts.ScatterChart };
     var id = el.getAttribute('data-chart-id');
     // The side file's specs arrive parsed; an inline one is its attribute's text.
     var spec = id === null ? JSON.parse(el.getAttribute('data-chart')) : specs[Number(id)];
@@ -107,6 +107,23 @@
       spec.options.bubble.radiusRange = function (size, data) {
         var rs = data.map(function (d) { return d.radius; });
         return [unit * Math.min.apply(null, rs), unit * Math.max.apply(null, rs)];
+      };
+    }
+    // A scatter dot's tooltip headed by what it is (its model, Mac and load), its engine and
+    // numbers under it, to three significant figures.
+    if (spec.kind === 'scatter') {
+      spec.options.tooltip = {
+        groupLabel: 'Engine',
+        valueFormatter: function (value) {
+          return typeof value === 'number' ? String(Number(value.toPrecision(3))) : value;
+        },
+        customHTML: function (data, html) {
+          var d = data && data[0];
+          var head = document.createElement('div');
+          head.style.cssText = 'padding: 0.5rem 0.75rem 0; font-weight: 600';
+          head.textContent = d && d.label ? d.label : '';
+          return head.outerHTML + html;
+        },
       };
     }
     var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, t) });

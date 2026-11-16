@@ -150,6 +150,11 @@ pub enum Chart<'a> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         dashed: Vec<&'static str>,
     },
+    /// Carbon's ScatterChart: a dot a measurement, at its key across and its value up.
+    Scatter {
+        data: Vec<ScatterPoint>,
+        options: ChartOptions<'a>,
+    },
     /// Carbon's BubbleChart: a bubble per spot measurements share, its area their count.
     Bubble {
         data: Vec<BubblePoint<'a>>,
@@ -158,6 +163,16 @@ pub enum Chart<'a> {
         /// [`BubblePoint::radius`].
         unit_radius: f64,
     },
+}
+
+/// One dot of a scatter chart: its series, where along the bottom axis, its value up, and what
+/// it is, which charts.js heads its tooltip with.
+#[derive(Serialize)]
+pub struct ScatterPoint {
+    pub group: String,
+    pub key: f64,
+    pub value: f64,
+    pub label: String,
 }
 
 /// One bubble: its series, where along the bottom axis, its value, and the square root of how
@@ -485,6 +500,7 @@ impl Chart<'_> {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
             | Chart::Combo { options, .. }
+            | Chart::Scatter { options, .. }
             | Chart::Bubble { options, .. } => options,
         }
     }
@@ -1012,238 +1028,6 @@ pub fn range_dots(groups: &[RangeGroup]) -> Element {
     }
 }
 
-/// One mark of a [`range_scatter`]: its series' colour class (the first series a filled dot, the
-/// rest rings, as [`range_dots`] draws them) and name, its x and the range around it (each a share,
-/// 0 to 1), its y (above 0: the y axis is logarithmic), the key that joins it by a thin line to
-/// the marks sharing it, the label written beside it if any (one a pair, not one a mark), and
-/// its tooltip's lines.
-pub struct ScatterMark {
-    pub class: &'static str,
-    pub name: String,
-    pub x: (f64, f64, f64),
-    pub y: f64,
-    pub pair: String,
-    pub label: Option<String>,
-    pub tip: Vec<String>,
-}
-
-/// A [`range_scatter`] panel: its heading and its marks.
-pub type ScatterPanel = (String, Vec<ScatterMark>);
-
-/// What a [`range_scatter`]'s axes and lines say: the x axis's title, the y axis's, and the name
-/// of a constant y / x, the lines through the origin it draws (each labelled with its value).
-pub struct ScatterAxes {
-    pub x: &'static str,
-    pub y: &'static str,
-    pub ratio: &'static str,
-}
-
-/// 1, 2 and 5 times the powers of ten from `lo` to `hi`: the steps a log axis and its ratio lines
-/// are labelled at.
-fn one_two_five(lo: f64, hi: f64) -> Vec<f64> {
-    let mut steps = Vec::new();
-    let mut decade = 10f64.powf(lo.log10().floor());
-    while decade <= hi {
-        for m in [1.0, 2.0, 5.0] {
-            let v = decade * m;
-            if (lo..=hi).contains(&v) {
-                steps.push(v);
-            }
-        }
-        decade *= 10.0;
-    }
-    steps
-}
-
-/// A log axis's extent around values from `lo` to `hi`: the 1-2-5 step below the lowest and the
-/// one above the highest, a step's room either side however the values fall, a value on a step
-/// too: so its two ends are never one.
-fn log_domain(lo: f64, hi: f64) -> (f64, f64) {
-    let below = one_two_five(lo / 10.0, lo).into_iter().rfind(|&v| v < lo);
-    let above = one_two_five(hi, hi * 10.0).into_iter().find(|&v| v > hi);
-    (below.unwrap_or(lo / 2.0), above.unwrap_or(hi * 2.0))
-}
-
-/// A number as an axis or a line prints it: whole above 10, else to its first significant digit
-/// or two.
-fn tick(v: f64) -> String {
-    match v {
-        v if v >= 10.0 => format!("{v:.0}"),
-        v if v >= 1.0 => format!("{v:.1}").trim_end_matches(".0").to_string(),
-        v => format!("{v:.2}").trim_end_matches('0').to_string(),
-    }
-}
-
-/// Points with a range on x, against a log y, a panel a group side by side as [`range_dots`]'
-/// are: each mark a dot at (x, y) with a bar over its x range, the marks sharing a key joined by
-/// a thin line, and dashed lines of a constant y / x through the origin, each labelled with its
-/// value. Down and to the right is better where y is a cost and x a share right: those lines are
-/// the cost of a right one. Plain HTML over an SVG of the lines, as the range plots are, since
-/// Carbon has no interval chart.
-pub fn range_scatter(panels: &[ScatterPanel], axes: &ScatterAxes) -> Element {
-    let grid = Ramp::Gray.at::<20>();
-    let muted = Ramp::Gray.at::<60>();
-    let mut legend: Vec<(&'static str, String)> = Vec::new();
-    for (_, marks) in panels {
-        for m in marks {
-            if !legend.iter().any(|(c, _)| *c == m.class) {
-                legend.push((m.class, m.name.clone()));
-            }
-        }
-    }
-    let first = legend.first().map(|(c, _)| *c);
-    let dot = move |class: &str| {
-        let c = colour(class);
-        match Some(class) == first {
-            true => format!("background: {c}; border: 2px solid {c}"),
-            false => format!("background: light-dark(#ffffff, #161616); border: 2px solid {c}"),
-        }
-    };
-    let panel = |heading: &String, marks: &Vec<ScatterMark>| {
-        // x: the marks' ranges, out to the tenths around them; y: their values, out to the 1-2-5
-        // steps around them, a step's room either side.
-        let (lo, hi) = (marks.iter()).fold((1.0f64, 0.0f64), |(lo, hi), m| {
-            (lo.min(m.x.1), hi.max(m.x.2))
-        });
-        let x0 = ((lo * 10.0).floor() / 10.0).clamp(0.0, 0.9);
-        let x1 = ((hi * 10.0).ceil() / 10.0).clamp(x0 + 0.1, 1.0);
-        let (ylo, yhi) =
-            (marks.iter()).fold((f64::MAX, 0.0f64), |(lo, hi), m| (lo.min(m.y), hi.max(m.y)));
-        let (y0, y1) = log_domain(ylo, yhi);
-        let px = move |x: f64| (x - x0) / (x1 - x0) * 100.0;
-        let py = move |y: f64| (1.0 - (y.ln() - y0.ln()) / (y1.ln() - y0.ln())) * 100.0;
-        let yticks = one_two_five(y0, y1);
-        let xticks: Vec<f64> = (0..=10)
-            .map(|k| f64::from(k) / 10.0)
-            .filter(|x| *x >= x0 - 1e-9 && *x <= x1 + 1e-9)
-            .collect();
-        // A ratio line: its curve from x0 to x1 (y = r x on the log y axis), clipped to the panel,
-        // and its last point in it, where its label goes.
-        let inside = move |r: f64| -> Vec<(f64, f64)> {
-            (0..=48)
-                .map(|k| x0 + (x1 - x0) * f64::from(k) / 48.0)
-                .filter(|&x| x > 0.0 && r * x >= y0 && r * x <= y1)
-                .map(|x| (px(x), py(r * x)))
-                .collect()
-        };
-        // The ratio lines with a quarter of the panel's width in it, not a corner's clip: at most
-        // four, spread over the ones that are.
-        let crossing: Vec<f64> = one_two_five(y0 / x1.max(1e-9), y1 / x0.max(0.01))
-            .into_iter()
-            .filter(|&r| inside(r).len() >= 12)
-            .collect();
-        let stride = crossing.len().div_ceil(4).max(1);
-        let ratios: Vec<f64> = crossing.into_iter().step_by(stride).collect();
-        let curve = move |r: f64| {
-            let pts = inside(r);
-            let d = (pts.iter().enumerate())
-                .map(|(k, (x, y))| format!("{}{x:.2} {y:.2}", if k == 0 { "M" } else { "L" }))
-                .collect::<String>();
-            (d, pts.last().copied())
-        };
-        let by_pair: BTreeMap<&str, Vec<&ScatterMark>> =
-            marks.iter().fold(BTreeMap::new(), |mut by, m| {
-                by.entry(m.pair.as_str()).or_insert_with(Vec::new).push(m);
-                by
-            });
-        let stroke = |c: Themed| format!("stroke: {c}");
-        let ratio_dy = |y: f64| if y < 10.0 { "20%" } else { "-120%" };
-        let label_at = |lo: f64, hi: f64| match hi > 75.0 {
-            false => format!("left: calc({hi:.2}% + 4px); transform: translateY(-50%)"),
-            true => format!("left: calc({lo:.2}% - 4px); transform: translate(-100%, -50%)"),
-        };
-        rsx! {
-            div { style: "display: grid; grid-template-columns: 2.25rem minmax(0, 1fr); grid-template-rows: auto 12rem 1rem auto; column-gap: 0.25rem",
-                div { style: "grid-column: 1 / -1; font-weight: 600; font-size: 0.875rem; margin-bottom: 0.5rem", "{heading}" }
-                div { style: "position: relative; font-size: 0.625rem; color: {muted}",
-                    for t in &yticks {
-                        span { style: "position: absolute; right: 0; top: {py(*t):.2}%; transform: translateY(-50%)", "{tick(*t)}" }
-                    }
-                }
-                div { style: "position: relative; border-left: 1px solid {grid}; border-bottom: 1px solid {grid}",
-                    svg { style: "position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible",
-                        view_box: "0 0 100 100", "preserveAspectRatio": "none", "aria-hidden": "true",
-                        for t in &yticks {
-                            path { d: "M0 {py(*t):.2} L100 {py(*t):.2}", fill: "none", style: "{stroke(grid)}", "stroke-width": "1", "vector-effect": "non-scaling-stroke" }
-                        }
-                        for t in &xticks {
-                            path { d: "M{px(*t):.2} 0 L{px(*t):.2} 100", fill: "none", style: "{stroke(grid)}", "stroke-width": "1", "vector-effect": "non-scaling-stroke" }
-                        }
-                        for r in &ratios {
-                            path { d: "{curve(*r).0}", fill: "none", style: "{stroke(muted)}", "stroke-width": "1", "stroke-dasharray": "4 3", "vector-effect": "non-scaling-stroke" }
-                        }
-                        for ms in by_pair.values().filter(|ms| ms.len() > 1) {
-                            path {
-                                d: (ms.iter().enumerate()).map(|(k, m)| format!("{}{:.2} {:.2}", if k == 0 { "M" } else { "L" }, px(m.x.0), py(m.y))).collect::<String>(),
-                                fill: "none", style: "{stroke(Ramp::Gray.at::<40>())}", "stroke-width": "1", "vector-effect": "non-scaling-stroke"
-                            }
-                        }
-                        for m in marks {
-                            path { d: "M{px(m.x.1):.2} {py(m.y):.2} L{px(m.x.2):.2} {py(m.y):.2}", fill: "none", style: "{stroke(colour(m.class))}", "stroke-width": "2", "vector-effect": "non-scaling-stroke" }
-                        }
-                    }
-                    for r in &ratios {
-                        if let (_, Some((x, y))) = curve(*r) {
-                            // Above its end, or below it where the line leaves through the top.
-                            span { style: "position: absolute; left: {x:.2}%; top: {y:.2}%; transform: translate(-100%, {ratio_dy(y)}); font-size: 0.625rem; color: {muted}; white-space: nowrap; pointer-events: none",
-                                "{tick(*r)}"
-                            }
-                        }
-                    }
-                    for m in marks.iter().filter(|m| m.label.is_some()) {
-                        // Past the free end of its range bar: the right one, or the left where the
-                        // right runs to the panel's edge.
-                        span { style: "position: absolute; top: {py(m.y):.2}%; {label_at(px(m.x.1), px(m.x.2))}; font-size: 0.625rem; white-space: nowrap; pointer-events: none",
-                            "{m.label.clone().unwrap_or_default()}"
-                        }
-                    }
-                    for m in marks {
-                        cds-tooltip { "align": "top", style: "position: absolute; left: {px(m.x.0):.2}%; top: {py(m.y):.2}%; transform: translate(-50%, -50%); display: flex",
-                            div { tabindex: "0", style: "width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; {dot(m.class)}" }
-                            cds-tooltip-content { style: "text-align: left",
-                                TipHeading { heading: m.name.clone() }
-                                for line in &m.tip { div { "{line}" } }
-                            }
-                        }
-                    }
-                }
-                div {}
-                div { style: "position: relative; font-size: 0.625rem; color: {muted}",
-                    for t in &xticks {
-                        span { style: "position: absolute; left: {px(*t):.2}%; top: 0.125rem; transform: translateX(-50%)", "{t * 100.0:.0}%" }
-                    }
-                }
-                div {}
-                div { style: "font-size: 0.625rem; color: {muted}; margin-top: 0.25rem; display: flex; justify-content: space-between",
-                    span { "{axes.y} (log) up" }
-                    span { "{axes.x} across" }
-                }
-            }
-        }
-    };
-    rsx! {
-        Stack { gap: 3,
-            div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; font-size: 0.75rem",
-                for (class, name) in &legend {
-                    span { style: "display: inline-flex; align-items: center; gap: 0.375rem",
-                        span { style: "width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; {dot(class)}" }
-                        "{name}"
-                    }
-                }
-                span { style: "display: inline-flex; align-items: center; gap: 0.375rem",
-                    span { style: "width: 18px; border-top: 1px dashed {muted}" }
-                    "{axes.ratio}"
-                }
-            }
-            div { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); gap: 1.5rem",
-                for (heading, marks) in panels {
-                    {panel(heading, marks)}
-                }
-            }
-        }
-    }
-}
-
 /// One side of a comparison chart: the name of its line, and of its fill
 /// where it is the faster of the two.
 #[derive(Clone, Copy)]
@@ -1556,30 +1340,8 @@ pub fn highlight<'s>(steps: impl Iterator<Item = (Better, &'s mut Step)>) {
 mod tests {
     use super::{
         Axis, AxisDomain, Better, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Ramp, Side, Step,
-        TableAxes, log_domain, one_two_five, ratio_step, spark_points, tick,
+        TableAxes, ratio_step, spark_points,
     };
-
-    /// A log axis's steps are 1, 2 and 5 times its powers of ten, from its low end to its high;
-    /// a value prints whole from 10, else to a digit or two.
-    #[test]
-    fn a_log_axis_steps_one_two_five() {
-        assert_eq!(one_two_five(20.0, 200.0), vec![20.0, 50.0, 100.0, 200.0]);
-        assert_eq!(one_two_five(3.0, 30.0), vec![5.0, 10.0, 20.0]);
-        assert_eq!(one_two_five(0.2, 1.0), vec![0.2, 0.5, 1.0]);
-        assert_eq!(
-            [tick(200.0), tick(2.0), tick(2.5), tick(0.5)],
-            ["200", "2", "2.5", "0.5"]
-        );
-        // A log axis's ends are the steps either side of its values, a value on a step too: two
-        // ends, never one.
-        assert_eq!(log_domain(24.0, 41.0), (20.0, 50.0));
-        assert_eq!(
-            log_domain(50.0, 50.0),
-            (20.0, 100.0),
-            "one value, on a step"
-        );
-        assert_eq!(log_domain(20.0, 200.0), (10.0, 500.0));
-    }
 
     const SCRATCHY: Side = Side {
         line: "scratchy",
