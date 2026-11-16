@@ -657,6 +657,19 @@ pub struct TaskCell {
     /// "2", "3", "4"), each over its tasks sent. None in runs from before it was recorded.
     #[serde(default)]
     pub accuracy_by_group: Option<BTreeMap<String, Option<f64>>>,
+    /// Each request's task, in the order sent, its group (MuSiQue's hop count), and whether it was
+    /// right (None where it was not scored): so a cell can be cut to the tasks another run asked
+    /// ([`TaskCell::head`]). None in runs from before they were recorded.
+    #[serde(default)]
+    pub task_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub task_groups: Option<Vec<Option<u32>>>,
+    #[serde(default)]
+    pub task_right: Option<Vec<Option<bool>>>,
+    /// Which share of MuSiQue's dev set the cell drew its tasks from (`bench serve --task-share`,
+    /// "2/3"), the head of it it asked: None in runs from before, whose cells drew theirs apart.
+    #[serde(default)]
+    pub task_share: Option<String>,
     #[serde(default)]
     pub tpots_ms: Option<Vec<Option<f64>>>,
     /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
@@ -712,6 +725,76 @@ pub struct Energy {
 }
 
 impl TaskCell {
+    /// This cell cut to its first `n` requests: the tasks a cell of fewer asked from the same
+    /// share of the dev set (`--task-share`), which are the head of this one's. Its per-request
+    /// numbers, medians and accuracy are over those alone. What the cell kept only as a whole stays
+    /// the whole cell's: its energy, answer and cached tokens a request, output throughput and
+    /// drafts; its counts of answers cut off or opened as reasoning, in proportion. None where it
+    /// kept no tasks, or fewer than `n`.
+    pub fn head(&self, n: usize) -> Option<TaskCell> {
+        let whole = self
+            .task_ids
+            .as_ref()
+            .map(Vec::len)
+            .filter(|&w| w >= n && n > 0)?;
+        fn cut<T: Clone>(v: &Option<Vec<T>>, n: usize) -> Option<Vec<T>> {
+            v.as_ref().map(|v| v[..n.min(v.len())].to_vec())
+        }
+        let median = |v: &Option<Vec<Option<f64>>>| {
+            (v.as_ref()).and_then(|v| super::numbers::median(v.iter().flatten().copied().collect()))
+        };
+        let (ttfts, e2els, tpots) = (
+            cut(&self.ttfts_ms, n),
+            cut(&self.e2els_ms, n),
+            cut(&self.tpots_ms, n),
+        );
+        let (right, groups) = (cut(&self.task_right, n), cut(&self.task_groups, n));
+        let completed = (e2els.as_ref().or(ttfts.as_ref())).map(|v| v.iter().flatten().count());
+        // Over the tasks scored, a failed or cut-off one counted wrong, as bench serve scores.
+        let share = |rs: &mut dyn Iterator<Item = bool>| {
+            let (k, of) = rs.fold((0usize, 0usize), |(k, of), r| (k + usize::from(r), of + 1));
+            (of > 0).then(|| k as f64 / of as f64)
+        };
+        let accuracy = right
+            .as_ref()
+            .and_then(|r| share(&mut r.iter().flatten().copied()));
+        let accuracy_by_group = right.as_ref().zip(groups.as_ref()).map(|(r, g)| {
+            let mut by: BTreeMap<String, Vec<bool>> = BTreeMap::new();
+            for (r, g) in r.iter().zip(g) {
+                if let (Some(r), Some(g)) = (r, g) {
+                    by.entry(g.to_string()).or_default().push(*r);
+                }
+            }
+            (by.into_iter())
+                .map(|(g, rs)| (g, share(&mut rs.into_iter())))
+                .collect()
+        });
+        let part =
+            |k: Option<u32>| k.map(|k| (f64::from(k) * n as f64 / whole as f64).round() as u32);
+        Some(TaskCell {
+            num_tasks: Some(n as u32),
+            completed: completed.map(|c| c as u32),
+            failed: completed.map(|c| (n - c) as u32),
+            median_ttft_ms: median(&ttfts),
+            median_e2el_ms: median(&e2els),
+            median_tpot_ms: median(&tpots),
+            accuracy: accuracy.or(self.accuracy.filter(|_| right.is_none())),
+            accuracy_by_group: accuracy_by_group.or_else(|| self.accuracy_by_group.clone()),
+            capped_answers: part(self.capped_answers),
+            thinking_answers: part(self.thinking_answers),
+            total_output_tokens: (self.total_output_tokens)
+                .map(|t| (t as f64 * n as f64 / whole as f64).round() as u64),
+            ttfts_ms: ttfts,
+            e2els_ms: e2els,
+            tpots_ms: tpots,
+            prompt_tokens: cut(&self.prompt_tokens, n),
+            task_ids: cut(&self.task_ids, n),
+            task_groups: groups,
+            task_right: right,
+            ..self.clone()
+        })
+    }
+
     /// Answer tokens a task took, on average: as recorded, or from the cell's total where only
     /// that is (a ShareGPT single-turn cell, timed on the completions path).
     pub fn answer_tokens(&self) -> Option<f64> {

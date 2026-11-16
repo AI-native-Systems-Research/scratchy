@@ -391,6 +391,16 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub timed_answers: bool,
 
+    /// Dataset workloads: draw this run's tasks from share I of K (`I/K`, I from 1). The tasks
+    /// that fit are split into K disjoint shares, the same split for the same `--seed`, each
+    /// keeping the dataset's mix of groups (MuSiQue's hops), in a fixed order whose every head
+    /// keeps it too: `--num-prompts` takes the head, so a cell of fewer tasks asks the first of a
+    /// larger one's. The Metal matrix gives each of a model's MuSiQue cells its own share: no
+    /// server meets a prompt an earlier cell sent, a full run grades the whole dev set once
+    /// across them, and a quick run's cells are the heads of a full run's.
+    #[arg(long)]
+    pub task_share: Option<TaskShare>,
+
     /// `sharegpt`: the most tokens a request asks for. A request asks for its conversation's
     /// recorded reply length, which runs to 800 tokens and more; this caps it, keeping the
     /// shorter ones as they are. None by default: the recorded lengths, as vLLM's suite sends.
@@ -601,6 +611,51 @@ pub enum RagSource {
     Musique,
     /// HotpotQA, distractor setting (needs the `datasets` feature).
     Hotpotqa,
+}
+
+/// Which of a dataset's disjoint shares a run draws its tasks from (`--task-share I/K`): share
+/// `index` (from 0) of `of`. Parsing is the only way to make one, so the index is always below
+/// the count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskShare {
+    index: u32,
+    of: std::num::NonZeroU32,
+}
+
+impl TaskShare {
+    /// The share, from 0.
+    pub(crate) fn index(self) -> u32 {
+        self.index
+    }
+
+    /// How many shares the tasks are split into.
+    pub(crate) fn of(self) -> std::num::NonZeroU32 {
+        self.of
+    }
+}
+
+impl std::str::FromStr for TaskShare {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("--task-share takes I/K, I from 1 to K, not {s}");
+        let (i, k) = s.split_once('/').ok_or_else(bad)?;
+        let i: u32 = i.trim().parse().map_err(|_| bad())?;
+        let of = k
+            .trim()
+            .parse::<std::num::NonZeroU32>()
+            .map_err(|_| bad())?;
+        if i == 0 || i > of.get() {
+            return Err(bad());
+        }
+        Ok(Self { index: i - 1, of })
+    }
+}
+
+impl std::fmt::Display for TaskShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.index + 1, self.of)
+    }
 }
 
 /// Arguments for `scr bench startup`.
@@ -1689,5 +1744,16 @@ mod tests {
         );
         assert!(parse("[false]").is_err());
         assert!(parse("enable_thinking=false").is_err());
+    }
+
+    /// `--task-share` takes I of K, I from 1 to K, and prints back as it was given.
+    #[test]
+    fn a_task_share_is_one_of_its_count() {
+        let share: TaskShare = "2/3".parse().unwrap();
+        assert_eq!((share.index(), share.of().get()), (1, 3));
+        assert_eq!(share.to_string(), "2/3");
+        for bad in ["0/3", "4/3", "1/0", "3", "a/3", "1/b", ""] {
+            assert!(bad.parse::<TaskShare>().is_err(), "{bad}");
+        }
     }
 }

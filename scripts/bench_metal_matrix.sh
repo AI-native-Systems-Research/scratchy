@@ -304,29 +304,30 @@ SCALING=1
 # The default sweep is real dataset tasks (the tasks axis); --random runs the random-token grid.
 SCALE_AXES="tasks"
 # The dataset workloads: MuSiQue alone (rag), on a quick run and a full run alike, at every
-# --scale-grid-conc users count; a full run adds its accuracy cell (below). The others are run
-# only by name: --workloads sharegpt,sharegpt-multi-turn for chat and conversations,
+# --scale-grid-conc users count. The others are run only by name: --workloads sharegpt,sharegpt-multi-turn for chat and conversations,
 # shared-prefix,shared-prefix-control for prefix reuse, longbench for long documents (its
 # shortest prompts run to 32k tokens, past the grid's 8k, so with --scale-grid-input ...,32768),
 # and --workloads-scratchy rag-spans for scratchy's own passage reuse.
 WORKLOADS="rag"
 WORKLOADS_SCRATCHY=""
-# One more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count, drawn
-# from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve stratifies
-# by hops), as every RAG cell's are. Its timing is not compared. A quick run's is 100 tasks, about
-# 6 to 10 minutes a model, within about 10 points either way at 60% right: enough to see scratchy
-# lose accuracy. A full run's, on a Mac of LARGE_GB or more, is the whole dev set, every one of
-# its 2,417 questions, about 2.5 to 3 hours an engine a model; on a smaller Mac, 400 of them,
-# about 25 to 40 minutes, within about 5 points. --accuracy-tasks N asks for N instead, 0 for
-# none; all asks for the whole set. Set once the Mac's memory is read (below).
+# Every MuSiQue cell is timed and graded alike, at every users count: its answers end on their
+# own, and each is scored. Each cell draws from its own share of MuSiQue's dev set (bench serve
+# --task-share i/k, one share a cell, disjoint, each in the dev set's mix of 2-, 3- and 4-hop
+# questions), so no server meets a prompt an earlier cell sent and no question is graded twice.
+# A share's tasks come in a fixed order whose every head keeps that mix, and a cell asks the head:
+# a quick run's cells are the first tasks of a full run's, so a quick run can borrow a full run's
+# rival on the same tasks. ACCURACY_TASKS is each cell's count: a quick run's 100, within about
+# 10 points either way at 60% right. A full run's, on a Mac of LARGE_GB or more, is each cell's
+# whole share: the dev set's 2,417 questions over the users counts, about 805 a cell at 1, 2 and
+# 4 users, within about 3.5 points. On the M5 Max the whole set at 4 users took 18 to 63 minutes
+# an engine a model (73f62d8c); the 1-user share, one request at a time, takes longer than its
+# third of that. On a smaller Mac, 200 a cell, within about 7 points: about the tasks its full
+# run sent before. --accuracy-tasks N asks for N a cell instead; all for each cell's whole share.
+# A cell sends at least TASK_MIN_PROMPTS. Set once the Mac's memory is read (below).
 ACCURACY_TASKS=""
 ACCURACY_ALL=2417
-ACCURACY_SMALL=400
+ACCURACY_SMALL=200
 ACCURACY_QUICK=100
-# Its limit: 18 s a task, at least 2400 s, so a slow model is not cut off (gpt-oss-20b took about
-# 6 s a task at 4 users on the M3 Pro, its answers reasoning to their cap). Still a limit, for a
-# hung server. --accuracy-timeout-s S sets it.
-ACCURACY_TIMEOUT_S=0
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 # 48: the summary map splits a cell's requests into four prompt-length buckets at about
@@ -416,7 +417,6 @@ while [[ $# -gt 0 ]]; do
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
         --accuracy-tasks)    ACCURACY_TASKS="$2"; shift 2 ;;
-        --accuracy-timeout-s) ACCURACY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
@@ -460,7 +460,7 @@ while [[ $# -gt 0 ]]; do
 done
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-# The accuracy cell's size: as asked, else on --full the whole dev set on a large Mac and 400
+# A MuSiQue cell's tasks: as asked, else on --full each cell's whole share on a large Mac and 200
 # on a smaller one, else a quick run's 100.
 if [[ "${ACCURACY_TASKS}" == all ]]; then
     ACCURACY_TASKS="${ACCURACY_ALL}"
@@ -471,8 +471,6 @@ elif [[ -z "${ACCURACY_TASKS}" ]]; then
     fi
 fi
 [[ "${ACCURACY_TASKS}" =~ ^[0-9]+$ ]] || { echo "--accuracy-tasks takes a count or all, not ${ACCURACY_TASKS}" >&2; exit 2; }
-[[ "${ACCURACY_TIMEOUT_S}" =~ ^[0-9]+$ ]] || { echo "--accuracy-timeout-s takes seconds, not ${ACCURACY_TIMEOUT_S}" >&2; exit 2; }
-(( ACCURACY_TIMEOUT_S )) || ACCURACY_TIMEOUT_S=$(( ACCURACY_TASKS * 18 > 2400 ? ACCURACY_TASKS * 18 : 2400 ))
 MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
 if [[ -z "${SCALE_GRID_INPUT}" ]]; then
     if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="${SCALE_GRID_INPUT_LARGE}"; else SCALE_GRID_INPUT="${SCALE_GRID_INPUT_SMALL}"; fi
@@ -831,10 +829,12 @@ json.dump({
                  "grid_dataset": e["GRID_DATASET"],
                  "grid_load": float(e["GRID_LOAD"]) if e["OPEN_LOOP"] == "1" else None,
                  "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
-                 # How a RAG cell's tasks were drawn: from all of MuSiQue's dev set, stratified by
-                 # hops. Earlier runs drew from its first 200, all 2-hop, so their accuracy is of
-                 # easier questions and their tasks are not these.
-                 "task_sample": "musique-dev-by-hops",
+                 # How a RAG cell's tasks were drawn: the head of its own share of MuSiQue's dev
+                 # set (--task-share), the shares disjoint and each in the dev set's mix of hops.
+                 # Runs before drew each cell's apart from all of it, by hops
+                 # ("musique-dev-by-hops"), and before those from its first 200, all 2-hop: their
+                 # tasks are not these.
+                 "task_sample": "musique-dev-shares",
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
@@ -1352,10 +1352,26 @@ j = json.load(open(sys.argv[1]))
 base = j["completed"] / j["duration"] if j.get("completed") and j.get("duration") else 0
 print(f"{base * float(sys.argv[2]):.4f}" if base > 0 else "")' "$1" "${GRID_LOAD}" 2>/dev/null
 }
+# A MuSiQue cell's share of the dev set, "i/k" for bench serve --task-share: the i-th of the
+# run's k MuSiQue cells, in the order they run: the users counts, fewest first, or with
+# --open-loop the base cell and then each rate step.
+task_share() { # load
+    local -a loads; local i
+    if (( OPEN_LOOP )); then
+        local -a steps; IFS=',' read -r -a steps <<<"${TASK_RATE_STEPS}"
+        loads=(base); for i in "${!steps[@]}"; do loads+=("rate:$(( i + 1 ))"); done
+    else
+        IFS=',' read -r -a loads <<<"${GRID_CONC_LIST}"
+    fi
+    for i in "${!loads[@]}"; do
+        [[ "${loads[$i]}" == "$1" ]] && { echo "$(( i + 1 ))/${#loads[@]}"; return; }
+    done
+    echo "no MuSiQue share for load $1 among ${loads[*]}" >&2
+    return 1
+}
 # A task cell's offered load, for "<prefix>.tasks-<workload>@<key>.json": "base", 1 user closed
 # loop (the base rate, scratchy's only); "rate:<i>", the i-th of TASK_RATE_STEPS, open loop at
-# that fraction of the base rate; or a users count, closed loop (every cell without --open-loop,
-# and the --full accuracy cell).
+# that fraction of the base rate; or a users count, closed loop (every cell without --open-loop).
 run_task_cell() { # prefix workload load
     local load="$3" key conc rate="" timed=1 base_json
     case "${load}" in
@@ -1382,28 +1398,34 @@ run_task_cell() { # prefix workload load
             return 0
         fi
     fi
-    local out_json="$1.tasks-$2@${key}.json" seed rc=0 w="$2"
+    local out_json="$1.tasks-$2@${key}.json" seed rc=0 w="$2" share=""
     local n=$(( conc * SCALE_ROUNDS > TASK_MIN_PROMPTS ? conc * SCALE_ROUNDS : TASK_MIN_PROMPTS ))
     local -a extra=() chat=() pace=()
-    # Seeded by model, workload and load: the same tasks on every engine at each load.
+    # Seeded by model, workload and load: the same tasks on every engine at each load. MuSiQue's
+    # by model alone, every load the same split of the dev set, each load its own share of it.
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:tasks:$2:${key}" | cksum | cut -d' ' -f1)
+    if [[ "${w}" == rag ]]; then
+        seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:tasks:$2" | cksum | cut -d' ' -f1)
+        share=$(task_share "${load}")
+    fi
     [[ -n "${rate}" ]] && pace=(--request-rate "${rate}")
     # A timed cell forces each answer to its task's length, the same on every engine. MuSiQue's
-    # cells answer on their own, at every users count. A real answer is about 6-12 tokens, so
-    # forced to 64 most of it was text past where the model stopped, which a drafting engine
-    # guesses far worse than the answer (23% accepted against 76%), and its TPOT timed that
-    # (#1208). And answers all one length end the requests that decoded together on one step, so a
-    # closed loop's users came back together and stayed in rounds: at 4 users a request's TTFT
-    # was its place in its round, about 400, 800, 800 and 1200 ms on llama-3.2-1b (#994). Every
-    # engine runs the same model at temperature 0, so their answers run about one length.
+    # cells answer on their own, at every users count, and are graded: an engine's answer is its
+    # own length, and whether it was right is its accuracy. Forced to 64, a real answer of about
+    # 6-12 tokens was mostly text past where the model stopped, which a drafting engine guesses
+    # far worse than the answer (23% accepted against 76%), and its TPOT timed that (#1208). And
+    # answers all one length end the requests that decoded together on one step, so a closed
+    # loop's users came back together and stayed in rounds: at 4 users a request's TTFT was its
+    # place in its round, about 400, 800, 800 and 1200 ms on llama-3.2-1b (#994).
     [[ "${w}" == rag* ]] && timed=0
     (( timed )) && pace+=(--timed-answers)
     case "${w}" in
         sharegpt)              extra=(--dataset-name sharegpt --dataset-path "${SHAREGPT_PATH}" --sharegpt-max-output-len 256) ;;
         sharegpt-multi-turn)   extra=(--dataset-name sharegpt-multi-turn --dataset-path "${SHAREGPT_PATH}")
                                n=$(( n / 4 > 2 ? n / 4 : 2 )) ;;   # conversations, of 4 turns each
-        rag|rag-spans)         extra=(--dataset-name "${w}" --rag-source musique) ;;
-        rag-accuracy)          extra=(--dataset-name rag --rag-source musique); n="${ACCURACY_TASKS}"; pace=() ;;
+        rag)                   extra=(--dataset-name rag --rag-source musique ${share:+--task-share "${share}"})
+                               n=$(( n > ACCURACY_TASKS ? n : ACCURACY_TASKS )) ;;
+        rag-spans)             extra=(--dataset-name rag-spans --rag-source musique) ;;
         longbench)             extra=(--dataset-name longbench --output-len 256) ;;
         shared-prefix)         extra=(--dataset-name shared-prefix) ;;
         shared-prefix-control) extra=(--dataset-name shared-prefix --no-reuse) ;;
@@ -1418,9 +1440,14 @@ run_task_cell() { # prefix workload load
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
     # The cell's limit: the flat one, plus an open-loop cell's arrival schedule; and at least
     # TASK_S_PER_REQUEST a request, so a cell of TASK_MIN_PROMPTS on a slow model is not cut off.
-    local limit=$(( CELL_TIMEOUT_S + $(schedule_s "${n}" "${rate}") )) therm_before therm_after
-    (( n * TASK_S_PER_REQUEST > limit )) && limit=$(( n * TASK_S_PER_REQUEST ))
-    if [[ "${w}" == rag-accuracy ]]; then limit="${ACCURACY_TIMEOUT_S}"; fi
+    # A MuSiQue cell sends no more than its share holds: the dev set over the run's MuSiQue cells.
+    local sent="${n}"
+    if [[ -n "${share}" ]]; then
+        local most=$(( ACCURACY_ALL / ${share#*/} + 1 ))
+        (( sent > most )) && sent="${most}"
+    fi
+    local limit=$(( CELL_TIMEOUT_S + $(schedule_s "${sent}" "${rate}") )) therm_before therm_after
+    (( sent * TASK_S_PER_REQUEST > limit )) && limit=$(( sent * TASK_S_PER_REQUEST ))
     therm_before="$(therm_now)"
     { perl -e 'alarm shift; exec @ARGV' "${limit}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
@@ -1501,8 +1528,6 @@ run_scale_cells() { # prefix restart-function full-length [axes]
             # hand before a larger users count can run a server out of memory.
             for c in "${cs[@]}"; do for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "${c}"; done; done
         fi
-        # The accuracy cell, at the largest users count: the fewest seconds for its tasks.
-        if (( ACCURACY_TASKS > 0 )); then run_task_cell "${prefix}" rag-accuracy "${cs[${#cs[@]}-1]}"; fi
     fi
     if [[ "${axes}" == *",conc,"* ]]; then
         IFS=',' read -r -a xs <<<"${CONC_LIST}"
@@ -2109,7 +2134,7 @@ TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "request_rate", "timed_
                     "accuracy", "empty_answers", "thinking_answers", "capped_answers",
                     # Task by task, where the dataset names its tasks: so engines can be compared
                     # on the same tasks, and accuracy read by MuSiQue's hops.
-                    "task_ids", "task_groups", "task_right", "accuracy_by_group"]
+                    "task_ids", "task_groups", "task_right", "accuracy_by_group", "task_share"]
 TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+|base)\.json$")
 def tasks(engine):
     cells = []
@@ -2120,11 +2145,10 @@ def tasks(engine):
         workload, key = m.groups()
         # A cell's load: "base", the 1-user closed-loop cell the rates are fractions of; with
         # --open-loop, a rate step (1, 2, ...) of TASK_RATE_STEPS; or a users count, stacked (every
-        # cell without --open-loop, and rag-accuracy). conc is the step (0 for base) or the users
-        # count, so a cell is keyed by workload and load as before.
+        # cell without --open-loop). conc is the step (0 for base) or the users count, so a cell is
+        # keyed by workload and load as before.
         step = 0 if key == "base" else int(key)
-        kind = ("base" if key == "base" else
-                "rate" if env["OPEN_LOOP"] == "1" and workload != "rag-accuracy" else "users")
+        kind = "base" if key == "base" else "rate" if env["OPEN_LOOP"] == "1" else "users"
         cell = {"workload": workload, "conc": step, "load": kind,
                 **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}}
         if (e := energy([j])) is not None:

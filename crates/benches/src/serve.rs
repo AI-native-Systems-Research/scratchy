@@ -1727,10 +1727,20 @@ fn run_tasks(
             .collect(),
     };
     // Stratified by group where every task has one (MuSiQue's hops), so a sample of any size
-    // keeps the dataset's mix.
-    let units = crate::workloads::stratified(pool, args.num_prompts, args.seed, |u| {
+    // keeps the dataset's mix. With --task-share, the head of that share, in its fixed order:
+    // a cell of fewer tasks asks the first of a larger one's. The warmups are drawn before the
+    // split, so no share's tasks are any cell's warmups.
+    let group = |u: &Vec<crate::workloads::Task>| -> Option<u32> {
         u.first().and_then(|t| t.label.as_ref()).map(|l| l.group)
-    });
+    };
+    let units = match args.task_share {
+        Some(share) => {
+            let mut units = crate::workloads::share(pool, share, args.seed, group);
+            units.truncate(args.num_prompts);
+            units
+        }
+        None => crate::workloads::stratified(pool, args.num_prompts, args.seed, group),
+    };
     let tasks: Vec<crate::workloads::Task> = units.iter().flatten().map(Clone::clone).collect();
     eprintln!(
         "{dataset}: {} units, {} requests (seed {}), {} warmups",
@@ -1828,6 +1838,8 @@ fn run_tasks(
         .filter_map(|p| p.trim().parse().ok())
         .collect();
     let mut json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
+    // Which share of the tasks the sample was drawn from (--task-share), as given; None for all.
+    json["task_share"] = serde_json::json!(args.task_share.map(|s| s.to_string()));
     add_task_percentiles(&mut json, &results, &tasks, &count, &pcts);
     add_task_requests(&mut json, &results, args.request_rate, &count);
     json["timed_answers"] = serde_json::json!(args.timed_answers);
