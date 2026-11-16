@@ -350,9 +350,10 @@ pub struct SnapshotFill {
 /// keeps none of them: LRU evicts each one just before it is needed again.
 ///
 /// The worker writes every spill first: before this step's memory ops release a unit and before
-/// anything this step rewrites a slot. It reads every fill after the memory ops map, before the
-/// forward; no request restores a fill in the step that reads it. The scheduler never names a disk
-/// slot in a spill that a fill reads in the same step, so this order is the one it decided in.
+/// anything this step rewrites a slot. It reads every fill after the memory ops map, and has it in
+/// its slot before the step's output comes back; no request restores a fill in the step that reads
+/// it, so that step's forward runs while the fill is read. The scheduler never names a disk slot in
+/// a spill that a fill reads in the same step, so this order is the one it decided in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotDiskOps {
     /// Device slots written out to disk slots: snapshots leaving device memory.
