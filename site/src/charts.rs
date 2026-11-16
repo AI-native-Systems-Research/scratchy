@@ -1055,6 +1055,15 @@ fn one_two_five(lo: f64, hi: f64) -> Vec<f64> {
     steps
 }
 
+/// A log axis's extent around values from `lo` to `hi`: the 1-2-5 step below the lowest and the
+/// one above the highest, a step's room either side however the values fall, a value on a step
+/// too: so its two ends are never one.
+fn log_domain(lo: f64, hi: f64) -> (f64, f64) {
+    let below = one_two_five(lo / 10.0, lo).into_iter().rfind(|&v| v < lo);
+    let above = one_two_five(hi, hi * 10.0).into_iter().find(|&v| v > hi);
+    (below.unwrap_or(lo / 2.0), above.unwrap_or(hi * 2.0))
+}
+
 /// A number as an axis or a line prints it: whole above 10, else to its first significant digit
 /// or two.
 fn tick(v: f64) -> String {
@@ -1100,14 +1109,7 @@ pub fn range_scatter(panels: &[ScatterPanel], axes: &ScatterAxes) -> Element {
         let x1 = ((hi * 10.0).ceil() / 10.0).clamp(x0 + 0.1, 1.0);
         let (ylo, yhi) =
             (marks.iter()).fold((f64::MAX, 0.0f64), |(lo, hi), m| (lo.min(m.y), hi.max(m.y)));
-        let y0 = one_two_five(ylo / 10.0, ylo)
-            .last()
-            .copied()
-            .unwrap_or(ylo / 2.0);
-        let y1 = one_two_five(yhi, yhi * 10.0)
-            .first()
-            .copied()
-            .unwrap_or(yhi * 2.0);
+        let (y0, y1) = log_domain(ylo, yhi);
         let px = move |x: f64| (x - x0) / (x1 - x0) * 100.0;
         let py = move |y: f64| (1.0 - (y.ln() - y0.ln()) / (y1.ln() - y0.ln())) * 100.0;
         let yticks = one_two_five(y0, y1);
@@ -1554,7 +1556,7 @@ pub fn highlight<'s>(steps: impl Iterator<Item = (Better, &'s mut Step)>) {
 mod tests {
     use super::{
         Axis, AxisDomain, Better, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Ramp, Side, Step,
-        TableAxes, one_two_five, ratio_step, spark_points, tick,
+        TableAxes, log_domain, one_two_five, ratio_step, spark_points, tick,
     };
 
     /// A log axis's steps are 1, 2 and 5 times its powers of ten, from its low end to its high;
@@ -1568,6 +1570,15 @@ mod tests {
             [tick(200.0), tick(2.0), tick(2.5), tick(0.5)],
             ["200", "2", "2.5", "0.5"]
         );
+        // A log axis's ends are the steps either side of its values, a value on a step too: two
+        // ends, never one.
+        assert_eq!(log_domain(24.0, 41.0), (20.0, 50.0));
+        assert_eq!(
+            log_domain(50.0, 50.0),
+            (20.0, 100.0),
+            "one value, on a step"
+        );
+        assert_eq!(log_domain(20.0, 200.0), (10.0, 500.0));
     }
 
     const SCRATCHY: Side = Side {
