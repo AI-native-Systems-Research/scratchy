@@ -41,7 +41,8 @@ to the zone when it makes the zone's claim, wherever it lives.
   the samplers. Floating-point agreement with a reference is an empirical claim about hardware.
   - Today: `crates/targets/metal/tests/` and the metal crate's own kernel unit tests;
     the `tools/vision_parity/` oracles;
-    `backends/spyre/crates/spyre/tests/element_torchspyre_parity.rs`.
+    `backends/spyre/crates/spyre/tests/element_torchspyre_parity.rs`;
+    the `nvcc` tests of `backends/cuda/crates/cuda/tests/` (an H100's, never CI's).
 - **The wire surface.** What clients we don't control send and expect back: chat templates,
   tool and reasoning parsers, SSE streaming, the OpenAI- and Anthropic-compatible request and
   response shapes, their error codes. Compatibility with the world is an empirical claim, and

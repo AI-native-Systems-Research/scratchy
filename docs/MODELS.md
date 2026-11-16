@@ -412,6 +412,11 @@ configs and presets described above actually forward-expand — see
 including fast-iteration scoping and why they're two separate crate
 aliases.
 
+A target compiles the same scope with its own emitter, and may lower less of
+it: the CUDA workspace (`backends/cuda`) builds only the arches its models
+crate's `build.rs` lists (`CUDA_CAPABLE`), each under
+`fp8-dynamic-per-channel` only, and refuses any other scope at build time.
+
 ## What NOT to do
 
 - **Don't** hand-edit `<size>.json` — keep it verbatim with upstream.
