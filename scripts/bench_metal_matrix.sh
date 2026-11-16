@@ -109,8 +109,9 @@
 # fails the run (exit 1).
 # --resume, with the same --out-dir and flags as a run that died (a full disk, a
 # crash, a kill), keeps every scaling cell that run finished cleanly and measures
-# only the rest; the build, parity gate and startup ladder run again (minutes).
-# Without it a rerun measures, and overwrites, every cell. The JSON records it. --resume refuses a
+# only the rest; the build, parity gate and startup ladder run again (minutes). It
+# appends to the earlier run's power log, so a kept cell keeps its energy, and the
+# whole-run energy counts both runs. Without it a rerun measures, and overwrites, every cell. The JSON records it. --resume refuses a
 # directory whose cells were loaded the other way (stacked against --open-loop): the two name their
 # cells alike.
 # --open-loop times the cells open loop, on a Poisson schedule at fixed rates, instead of stacked
@@ -956,8 +957,13 @@ else
     cargo build --release -p scratchy-power-sampler >"${RAW}/power-build.log" 2>&1 \
         || die "scratchy-power-sampler build failed: see ${RAW}/power-build.log"
 fi
+# No sleep while the run lives: an idle Mac sleeps with the GPU busy once its display is off, which
+# stops the servers and the sampler alike, and a cell the log misses seconds of has no energy.
+caffeinate -dims -w $$ &
+# --resume appends: the cells it keeps have their energy in the log the earlier run wrote.
+(( RESUME )) || : >"${POWER_LOG}"
 "${ROOT}/target/release/scratchy-power-sampler" --interval-ms 1000 \
-    >"${POWER_LOG}" 2>"${RAW}/power-sampler.log" &
+    >>"${POWER_LOG}" 2>"${RAW}/power-sampler.log" &
 POWER_PID=$!
 sleep 1
 kill -0 "${POWER_PID}" 2>/dev/null \
