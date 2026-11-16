@@ -1,6 +1,7 @@
 # Building scratchy
 
-How to build the scratchy CLI — `scr` on metal, `spyre` on IBM Spyre, each its target's binary
+How to build the scratchy CLI — `scr` on metal, `spyre` on IBM Spyre, `cuda` on an NVIDIA H100,
+each its target's binary
 over the common CLI core (`scratchy-cli`) — and the
 `-Fmodel/`/`-Fquant/` feature landscape that scopes which models and
 quantization variants actually compile in. For adding a *new* model
@@ -13,7 +14,14 @@ exists, not adding to it.
 ```bash
 cargo build -p scratchy-target-metal-cli --release --features model/llama-3.2-3b      # scr
 cargo build -p scratchy-target-spyre-cli --release --features spyre-emu,model/granite-3.1-2b-instruct  # spyre
+(cd backends/cuda && cargo build --release --features nvcc,model/qwen3.8-27b-text-only,quant/fp8-dynamic-per-channel)  # cuda
 ```
+
+`cuda` builds from its own workspace, `backends/cuda`, and FP8 models only:
+`quant/fp8-dynamic-per-channel` with `model/qwen3.8-27b-text-only`,
+`model/qwen3.6-35b-a3b` or `model/gemma-4-26b-a4b-it`. Its `nvcc` feature needs
+CUDA 12.8+ on `PATH`; without it the binary builds anywhere and refuses to start
+a worker. See [`backends/cuda/README.md`](../backends/cuda/README.md).
 
 Each binary links its one target. Add
 `serve` for the HTTP server
