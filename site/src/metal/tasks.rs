@@ -5,7 +5,9 @@ use dioxus::prelude::*;
 
 use crate::DASH;
 use crate::carbon::{Fold, Stack, Table, TableCell, TableRow};
-use crate::charts::{RangeGroup, RangeMark, range_dots};
+use crate::charts::{
+    RangeGroup, RangeMark, ScatterAxes, ScatterMark, ScatterPanel, range_dots, range_scatter,
+};
 
 use super::data::{Model, RequestTiming, TaskCell};
 use super::datasets;
@@ -485,6 +487,95 @@ fn short_reason(c: &TaskCell) -> String {
         format!("reasoning {}", of(c.thinking_answers))
     } else {
         right(c)
+    }
+}
+
+/// What a right answer cost: a panel a model, a dot each Mac, engine and users count whose scored
+/// cell kept its energy, at its accuracy across (its 95% range the bar) and its joules a request
+/// up, on a log scale; scratchy's and its rival's on one Mac and load joined, and named once. The
+/// dashed lines are joules a right answer, a request's joules over its accuracy: down and to the
+/// right is better. Nothing where no scored cell kept its energy.
+pub fn joules_accuracy(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
+    let mut panels: Vec<ScatterPanel> = Vec::new();
+    for &(chip, m) in pairs {
+        let mut engines = vec![Engine::Scratchy];
+        engines.extend(rival_of(m, dataset));
+        let several = (engines.iter())
+            .flat_map(|&e| accuracy_cells(e.tasks(m), dataset))
+            .map(|c| c.conc)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1;
+        let mac = chip.trim_start_matches("Apple ");
+        for (&e, class) in engines.iter().zip(["s1", "s2"]) {
+            for c in accuracy_cells(e.tasks(m), dataset) {
+                let (Some(a), Some(j)) = (accuracy(c), per_request(c)) else {
+                    continue;
+                };
+                let r = range(c).unwrap_or(0.0) / 100.0;
+                let users = format!("{} user{}", c.conc, if c.conc == 1 { "" } else { "s" });
+                let mut tip = vec![
+                    format!("{} on {chip}, {users}", m.stem),
+                    format!("accuracy {}", scored(c)),
+                    format!("{} J a request", joules(Some(j))),
+                ];
+                tip.extend(per_right(c).map(|r| format!("{} J a right answer", joules(Some(r)))));
+                tip.extend(
+                    (c.borrowed_from.as_ref())
+                        .map(|w| format!("from the run of {}", w.month_day())),
+                );
+                let mark = ScatterMark {
+                    class,
+                    name: e.label().to_string(),
+                    x: (a, (a - r).max(0.0), (a + r).min(1.0)),
+                    y: j,
+                    pair: format!("{chip} {}", c.conc),
+                    label: None,
+                    tip,
+                };
+                let marks = match panels.iter_mut().position(|(stem, _)| stem == &m.stem) {
+                    Some(i) => &mut panels[i].1,
+                    None => {
+                        panels.push((m.stem.clone(), Vec::new()));
+                        &mut panels.last_mut().expect("just pushed").1
+                    }
+                };
+                // Named once a Mac and load: on scratchy's dot, or its rival's where scratchy's
+                // cell showed no accuracy.
+                if !marks.iter().any(|o| o.pair == mark.pair) {
+                    let label = match several {
+                        true => format!("{mac}, {}u", c.conc),
+                        false => mac.to_string(),
+                    };
+                    marks.push(ScatterMark {
+                        label: Some(label),
+                        ..mark
+                    });
+                } else {
+                    marks.push(mark);
+                }
+            }
+        }
+    }
+    if panels.is_empty() {
+        return rsx! {};
+    }
+    let axes = ScatterAxes {
+        x: "accuracy",
+        y: "joules a request",
+        ratio: "joules a right answer",
+    };
+    rsx! {
+        Stack { gap: 3,
+            p { style: "contain: inline-size",
+                "What a right answer cost. Each dot is an engine's accuracy, across, with its 95% \
+                 range the bar, and the energy it spent a request, up, on a log scale: scratchy's \
+                 and the engine it is set against joined, on one Mac and load. The dashed lines are \
+                 joules a right answer, a request's joules over its accuracy: down and to the right \
+                 is better. Hover a dot for its numbers; the accuracy table has every one."
+            }
+            {range_scatter(&panels, &axes)}
+        }
     }
 }
 

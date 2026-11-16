@@ -4436,6 +4436,67 @@ mod tests {
         assert!(html.contains("Apple M3 Pro, 4 users<"));
     }
 
+    /// What a right answer cost: a panel a model, a dot an engine and users count whose scored cell
+    /// kept its energy, its numbers in its tooltip, each Mac and load named once; a cell with no
+    /// energy has no dot, and a dataset with none has no plot.
+    #[test]
+    fn joules_against_accuracy_is_a_dot_an_engine_and_load() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        for (cells, j, a) in [
+            (m.tasks.as_mut(), 50.0, 0.4),
+            (m.tasks_omlx.as_mut(), 80.0, 0.3),
+        ] {
+            for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                c.timed_answers = false;
+                c.thinking_answers = Some(0);
+                c.task_share = Some("1/3".into());
+                c.accuracy = Some(a);
+                c.num_tasks = Some(100);
+                c.energy = (c.conc != 2).then(|| super::data::Energy {
+                    soc_j: j * 100.0,
+                    window_s: 60.0,
+                    j_per_request: Some(j),
+                    j_per_output_token: None,
+                    j_per_right_answer: Some(j / a),
+                });
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("What a right answer cost"));
+        assert!(html.contains("50.0 J a request") && html.contains("80.0 J a request"));
+        assert!(
+            html.contains("125 J a right answer"),
+            "scratchy's 50 J over 40%"
+        );
+        assert!(
+            html.contains(">M3 Pro, 1u<") && html.contains(">M3 Pro, 4u<"),
+            "named a load"
+        );
+        assert!(
+            !html.contains(">M3 Pro, 2u<"),
+            "2 users kept no energy: no dot"
+        );
+        assert_eq!(
+            html.matches(">M3 Pro, 4u<").count(),
+            1,
+            "once a Mac and load"
+        );
+        // No energy anywhere: no plot.
+        let m = &mut runs[0].models[0];
+        for c in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            c.energy = None;
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(!html.contains("What a right answer cost"));
+    }
+
     /// A MuSiQue timeline does not join runs that drew its tasks differently: a change of questions
     /// is not a regression. The ShareGPT line's tasks did not change, so it joins them.
     #[test]

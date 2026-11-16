@@ -322,6 +322,7 @@ fn dataset_summary(
         .collect();
     rsx! {
         Stack { gap: 4,
+            {tasks::joules_accuracy(dataset, &scored_pairs)}
             p { style: "contain: inline-size",
                 "Per machine, its rows: prefill (P) and decode (D) with 1 user, then end-to-end time \
                  with each users count above it (2u, 4u). A column per model, under its family; the \
