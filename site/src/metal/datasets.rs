@@ -330,8 +330,9 @@ fn dataset_summary(
                  requests against the rival's, on 2u and 4u the joules its requests took over how many \
                  were right against the rival's. Blue better, red worse, grey within noise. A striped \
                  square has no ratio: one engine did not run it, most of its requests failed, its \
-                 answers were forced to a length, so not scored, or one side had no energy reading \
-                 or no right answer there. Hover or focus a square for its ratio, the engine, and a \
+                 answers were forced to a length, so not scored, one side's were mostly cut off or \
+                 in reasoning, as the accuracy table says, or one side had no energy reading or no \
+                 right answer there. Hover or focus a square for its ratio, the engine, and a \
                  borrowed rival's run."
             }
             {summary_map(dataset, id, ran, machines, &summary_columns)}
@@ -1003,15 +1004,15 @@ fn summary_map(
     };
     let bs = of(dataset).map_or(buckets::WHOLE, |d| d.buckets);
     // A square's ratio, how many times better scratchy is, or why it has none.
-    let ratio = |p: Option<&Pair>, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
+    let ratio = |p: Option<&Pair>, row: &Row, b: usize| -> Result<(f64, String), String> {
         let p = p.ok_or("not run")?;
         let rival = p.rival.ok_or("scratchy alone so far")?;
         let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
         let (Some(ours), Some(theirs)) = (ours, theirs) else {
-            return Err("not run at this load");
+            return Err("not run at this load".into());
         };
         if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
-            return Err("most requests failed");
+            return Err("most requests failed".into());
         }
         let (a, t) = match row.measure {
             Measure::Timing(timing) => (
@@ -1020,10 +1021,17 @@ fn summary_map(
             ),
             Measure::JoulesPerRight => {
                 if ours.timed_answers || theirs.timed_answers {
-                    return Err("answers forced to a length, so not scored");
+                    return Err("answers forced to a length, so not scored".into());
+                }
+                // A cell the accuracy table does not score, its answers mostly cut off or in
+                // reasoning, has no joules a correct answer either: the side's reason, as there.
+                for (side, c) in [("scratchy", ours), (rival.label(), theirs)] {
+                    if tasks::accuracy(c).is_none() {
+                        return Err(format!("{side}: {}", tasks::no_accuracy(c)));
+                    }
                 }
                 if ours.energy.is_none() || theirs.energy.is_none() {
-                    return Err("no energy on one side");
+                    return Err("no energy on one side".into());
                 }
                 match (ours.task_joules.as_ref(), theirs.task_joules.as_ref()) {
                     (Some(_), Some(_)) => (
@@ -1107,7 +1115,7 @@ fn summary_map(
                     squares.insert(
                         (m, r, k, b),
                         MapSquare {
-                            ratio: got.map_err(str::to_string),
+                            ratio: got,
                             tip: tip.into_iter().flatten().collect(),
                         },
                     );

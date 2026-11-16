@@ -98,13 +98,13 @@ fn mostly_thought(c: &TaskCell) -> bool {
 
 /// Accuracy, where it is like for like: none for a cell most of whose answers opened as
 /// reasoning, ran to their cap (which read as wrong without being answers), or failed.
-fn accuracy(c: &TaskCell) -> Option<f64> {
+pub(super) fn accuracy(c: &TaskCell) -> Option<f64> {
     c.accuracy.filter(|_| !mostly_thought(c) && usable(c))
 }
 
 /// Why a cell shows no accuracy, in its cell: "not scored" for a timed cell, its answers forced
 /// to one length; else what held it back, with how many.
-fn no_accuracy(c: &TaskCell) -> String {
+pub(super) fn no_accuracy(c: &TaskCell) -> String {
     let done = c.completed.unwrap_or(0) as usize;
     let of = |k: Option<u32>| {
         format!(
