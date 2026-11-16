@@ -323,14 +323,14 @@ fn dataset_summary(
     rsx! {
         Stack { gap: 4,
             p { style: "contain: inline-size",
-                "Per machine, its rows: prefill (P) and decode (D) with 1 user, then end-to-end time \
-                 with each users count above it (2u, 4u). A column per model, under its family; the \
-                 same tasks to every engine. Colour is how many times faster scratchy is than the \
-                 engine it is set against, its median over the cell's requests against the rival's: \
-                 blue faster, red slower, grey within noise. A striped square has no ratio: one engine \
-                 did not run it, most of its requests failed, or, end to end, one engine's \
-                 answers were forced to a length and the other's not, or forced and of different \
-                 lengths. Hover or focus a square for its \
+                "Per machine, its rows: prefill (P) and decode (D) with 1 user, then joules per \
+                 correct answer with each users count above it (2u, 4u). A column per model, under \
+                 its family; the same tasks to every engine. Colour is how many times better scratchy \
+                 is than the engine it is set against: on P and D its median time over the cell's \
+                 requests against the rival's, on 2u and 4u the joules its requests took over how many \
+                 were right against the rival's. Blue better, red worse, grey within noise. A striped \
+                 square has no ratio: one engine did not run it, most of its requests failed, or its \
+                 answers were forced to a length, so not scored. Hover or focus a square for its \
                  ratio, the engine, and a borrowed rival's run."
             }
             {summary_map(dataset, id, ran, machines, &summary_columns)}
@@ -972,8 +972,8 @@ fn summary_map(
                  prompt count; none of the runs shown did. The detail below has each pair's numbers." }
         };
     }
-    // Each machine's rows: P and D at 1 user, then end-to-end time at each users count above it
-    // that any pair of the machine ran.
+    // Each machine's rows: P and D at 1 user, then joules a correct answer at each users count
+    // above it that any pair of the machine ran.
     let rows_of = |chip: &str| -> Vec<Row> {
         let mut users: Vec<u32> = (grid.columns.iter())
             .filter_map(|&col| pair(chip, col))
@@ -983,24 +983,25 @@ fn summary_map(
         users.dedup();
         let mut rows = Vec::new();
         if users.contains(&1) {
-            rows.push(Row { label: "P".into(), name: "Prefill", users: 1, timing: RequestTiming::Ttft,
+            rows.push(Row { label: "P".into(), name: "Prefill", users: 1, measure: Measure::Timing(RequestTiming::Ttft),
                 about: "Time to first token with 1 user: how long the prompt takes before the answer starts." });
-            rows.push(Row { label: "D".into(), name: "Decode", users: 1, timing: RequestTiming::Tpot,
+            rows.push(Row { label: "D".into(), name: "Decode", users: 1, measure: Measure::Timing(RequestTiming::Tpot),
                 about: "Time per output token with 1 user: how fast the answer streams once it has started." });
         }
         for &u in users.iter().filter(|&&u| u > 1) {
             rows.push(Row {
                 label: format!("{u}u"),
-                name: "End-to-end Latency",
+                name: "Joules per Correct Answer",
                 users: u,
-                timing: RequestTiming::E2el,
-                about: "From sending a request to its last token, with that many users at once.",
+                measure: Measure::JoulesPerRight,
+                about: "The energy a right answer took with that many users at once: the joules the \
+                    requests took over how many of them were right. Fewer is better.",
             });
         }
         rows
     };
     let bs = of(dataset).map_or(buckets::WHOLE, |d| d.buckets);
-    // A square's ratio, how many times faster scratchy is, or why it has none.
+    // A square's ratio, how many times better scratchy is, or why it has none.
     let ratio = |p: Option<&Pair>, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
         let p = p.ok_or("not run")?;
         let rival = p.rival.ok_or("scratchy alone so far")?;
@@ -1011,16 +1012,29 @@ fn summary_map(
         if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
             return Err("most requests failed");
         }
-        // An end-to-end time is the whole answer's: it compares where the answers do, as the
-        // detail table's total does.
-        if row.timing == RequestTiming::E2el
-            && let Some(why) = tasks::unlike_answers(ours, theirs)
-        {
-            return Err(why);
-        }
-        let a = buckets::median_in(ours, bs, row.timing, b);
-        let t = buckets::median_in(theirs, bs, row.timing, b);
-        let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
+        let (a, t) = match row.measure {
+            Measure::Timing(timing) => (
+                buckets::median_in(ours, bs, timing, b),
+                buckets::median_in(theirs, bs, timing, b),
+            ),
+            Measure::JoulesPerRight => {
+                if ours.timed_answers || theirs.timed_answers {
+                    return Err("answers forced to a length, so not scored");
+                }
+                match (ours.task_joules.as_ref(), theirs.task_joules.as_ref()) {
+                    (Some(_), Some(_)) => (
+                        buckets::joules_per_right_in(ours, bs, b),
+                        buckets::joules_per_right_in(theirs, bs, b),
+                    ),
+                    // A run that kept no joules a request: each cell's whole, every bucket alike.
+                    _ => (tasks::per_right(ours), tasks::per_right(theirs)),
+                }
+            }
+        };
+        let r = tasks::times(a, t, true).ok_or(match row.measure {
+            Measure::Timing(_) => "no timing on one side",
+            Measure::JoulesPerRight => "no right answer, or no energy, on one side",
+        })?;
         let from = (theirs.borrowed_from.as_ref())
             .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
         Ok((r, format!("{}{from}", rival.label())))
@@ -1033,14 +1047,42 @@ fn summary_map(
             for (k, &column) in grid.columns.iter().enumerate() {
                 let p = pair(chip, column);
                 for (b, &(bucket, _)) in bs.iter().enumerate() {
-                    // How many requests each side's median is over: a cell sends few, so a square
-                    // of one or two can turn on a single answer, and says so.
+                    // How many requests each side's median is over, or right answers its joules a
+                    // correct answer: a cell sends few, so a square of one or two can turn on a
+                    // single answer, and says so. A run with no joules a request reads each
+                    // cell's whole, and says that.
                     let over = p.as_ref().and_then(|p| {
-                        let n = |c: Option<&&TaskCell>| {
-                            c.map_or(0, |c| buckets::in_bucket(c, bs, row.timing, b).len())
-                        };
-                        let (a, t) = (n(p.ours.get(&row.users)), n(p.theirs.get(&row.users)));
-                        (a + t > 0).then(|| format!("over {a} and {t} requests"))
+                        let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
+                        match row.measure {
+                            Measure::Timing(timing) => {
+                                let n = |c: Option<&&TaskCell>| {
+                                    c.map_or(0, |c| buckets::in_bucket(c, bs, timing, b).len())
+                                };
+                                let (a, t) = (n(ours), n(theirs));
+                                (a + t > 0).then(|| format!("over {a} and {t} requests"))
+                            }
+                            Measure::JoulesPerRight => {
+                                let kept = |c: Option<&&TaskCell>| {
+                                    c.is_some_and(|c| c.task_joules.is_some())
+                                };
+                                match kept(ours) && kept(theirs) {
+                                    true => {
+                                        let n = |c: Option<&&TaskCell>| {
+                                            c.map_or(0, |c| buckets::rights_in(c, bs, b))
+                                        };
+                                        Some(format!(
+                                            "over {} and {} right answers",
+                                            n(ours),
+                                            n(theirs)
+                                        ))
+                                    }
+                                    false => (ours.is_some() && theirs.is_some()).then(|| {
+                                        "each cell's whole: its run kept no joules a request"
+                                            .to_string()
+                                    }),
+                                }
+                            }
+                        }
                     });
                     let stem = p.as_ref().map_or("", |p| p.stem);
                     // scratchy's guesses kept over the whole cell: its helper's, not a bucket's.
@@ -1108,13 +1150,22 @@ struct Pair<'a> {
 }
 
 /// One row of the summary map: its label (P, D, 2u), its measure's name and what it measures,
-/// the users count it is read at, and the request timing it compares.
+/// the users count it is read at, and what it compares.
 struct Row {
     label: String,
     name: &'static str,
     users: u32,
-    timing: RequestTiming,
+    measure: Measure,
     about: &'static str,
+}
+
+/// What a summary map row compares, scratchy against its rival: a request timing's median over a
+/// bucket's requests (P and D), or joules a correct answer, the joules a bucket's requests took
+/// over how many were right (2u, 4u). Fewer is better for both.
+#[derive(Clone, Copy, PartialEq)]
+enum Measure {
+    Timing(RequestTiming),
+    JoulesPerRight,
 }
 
 /// The engines a pair of `dataset` is drawn for, scratchy then its rival, and every users count

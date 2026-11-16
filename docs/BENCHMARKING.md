@@ -479,6 +479,15 @@ Engines' answers do run different lengths on the same model, by 10 to 60% in the
 (granite-4.2-3b at 1 user: 122 tokens against oMLX's 97). That is the engines', and their
 accuracy says what it bought.
 
+**Joules per correct answer:** each request's joules is its share of the power log while it ran
+(`scripts/cell_energy.py` `per_request`): every one-second sample's joules within the cell are
+split among the requests in flight during it, by how long each was in flight in it, so a cell's
+requests sum to its joules. In a prompt-length bucket, joules per correct answer is the joules its
+requests took, a wrong or failed one's too, over how many were right. The page's summary map
+compares scratchy's against its rival's at 2 and 4 users, where end-to-end time was before. A run
+from before per-request joules shows each cell's whole joules per right answer in every bucket,
+and a cell whose answers were forced was not scored, so has none.
+
 **Each MuSiQue cell its own share of the dev set:** `bench serve --task-share i/k` splits the dev
 set's questions that fit into k disjoint shares, one a cell, each in the dev set's mix of 2-, 3-
 and 4-hop questions, by a seed of the model alone. No server meets a prompt an earlier cell sent,

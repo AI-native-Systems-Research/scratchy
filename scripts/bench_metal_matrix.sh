@@ -2153,6 +2153,10 @@ def tasks(engine):
                 **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}}
         if (e := energy([j])) is not None:
             cell["energy"] = e
+            # Each request's share of those joules, in the order sent: the summary map's joules
+            # a correct answer by prompt length.
+            if (joules := cell_energy.per_request(j, power_rows)) is not None:
+                cell["task_joules"] = joules
         cells.append(cell)
     return cells or None
 def spec_decode():

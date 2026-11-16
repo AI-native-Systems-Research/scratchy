@@ -82,6 +82,39 @@ def per(cell, e):
     return out
 
 
+def per_request(cell, rows):
+    """Each request's joules, in the order sent (`task_joules`): each power sample's joules inside
+    the cell's window shared among the requests in flight over its interval, by the time each was
+    in flight in it, so the requests' joules sum to the cell's. A request runs from the cell's
+    started_unix_s plus its start_times entry, for its e2els_ms. None for a request that failed;
+    None for a cell that kept no request times, or none of whose requests the log covers."""
+    start, end = cell.get("started_unix_s"), cell.get("ended_unix_s")
+    starts, e2els = cell.get("start_times"), cell.get("e2els_ms")
+    if start is None or end is None or not starts or not e2els or len(starts) != len(e2els):
+        return None
+    spans = [(start + s, start + s + d / 1000.0) if s is not None and d is not None else None
+             for s, d in zip(starts, e2els)]
+    joules = [0.0 if span else None for span in spans]
+    met = False
+    for t, dt, c, g, a in rows:
+        if dt <= 0:
+            continue
+        lo, hi = max(t - dt, start), min(t, end)
+        if hi <= lo:
+            continue
+        flight = [(k, min(hi, b) - max(lo, a0)) for k, span in enumerate(spans) if span
+                  for a0, b in [span]]
+        flight = [(k, f) for k, f in flight if f > 0]
+        busy = sum(f for _, f in flight)
+        if busy <= 0:
+            continue
+        inside = (c + g + a) * (hi - lo) / dt
+        for k, f in flight:
+            joules[k] += inside * f / busy
+            met = True
+    return [round(j, 3) if j is not None else None for j in joules] if met else None
+
+
 def fold(cell_json, power_csv):
     """Fold a cell's energy into its JSON, where it says when its requests ran and the log
     covers it; else leave it as it is."""
@@ -90,10 +123,14 @@ def fold(cell_json, power_csv):
     start, end = cell.get("started_unix_s"), cell.get("ended_unix_s")
     if start is None or end is None:
         return
-    e = window(read(power_csv), float(start), float(end))
+    log = read(power_csv)
+    e = window(log, float(start), float(end))
     if e is None:
         return
     cell["energy"] = per(cell, e)
+    joules = per_request(cell, log)
+    if joules is not None:
+        cell["task_joules"] = joules
     with open(cell_json, "w") as f:
         json.dump(cell, f, indent=2)
 
