@@ -19,7 +19,7 @@ use scratchy_subtile::handoff::{
     ExpansionId, LoweredDecode, SlotMap, SourceBinding, TileId, WeightKind, WeightSlot,
 };
 use scratchy_subtile::kv_codec::CodecGuard;
-use scratchy_subtile::lower::{GemmWeight, InputRef};
+use scratchy_subtile::lower::{ExpertWeight, GemmWeight, InputRef};
 use scratchy_subtile::subtile_ir::{
     AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
     RopeFormTag, RowScale, SubOp, SubtileIR, SubtileId,
@@ -118,6 +118,9 @@ pub enum Refused {
     UndeclaredSharedExpert {
         base: String,
     },
+    /// A dense (bf16) expert bank: metal's expert kernels are affine-only. The front end never
+    /// hands metal one (its call sites pass `DenseExperts::Refuse`); refused should one arrive.
+    DenseExperts,
     /// Every step of the construct may drop its commands or not run, so its fence can land on
     /// none: no step of it runs always, and no two run under complementary guards.
     GroupNeverRuns(ExpansionId),
@@ -820,10 +823,13 @@ impl Recording<'_> {
                 SubOp::ExpertMatmul {
                     proj,
                     n,
-                    quant: q,
+                    weight,
                     bundle: b,
                     ..
                 } => {
+                    let ExpertWeight::Affine(q) = weight else {
+                        return Err(self.no(j, Refused::DenseExperts));
+                    };
                     let width = Some(self.expert_matmul(j)?.step.width.bits());
                     match proj {
                         ExpertProj::Gate => gate = width,
@@ -1008,12 +1014,15 @@ impl Recording<'_> {
     fn expert_matmul(&self, j: usize) -> Result<ExpertRecord, StepRefusal> {
         let SubOp::ExpertMatmul {
             proj,
-            quant,
+            weight,
             bundle,
             ..
         } = *self.op(j)
         else {
             return Err(self.no(j, Refused::FusionShape));
+        };
+        let ExpertWeight::Affine(quant) = weight else {
+            return Err(self.no(j, Refused::DenseExperts));
         };
         let ((rows, reads, norm), e) = (self.moe_rows(j, 0)?, self.source_arg(j, 2)?);
         let (group_size, op_bits) = self.affine(j, quant.group().get(), quant.bits().get())?;

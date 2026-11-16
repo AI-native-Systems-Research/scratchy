@@ -28,6 +28,7 @@ use scratchy_core_common::EngineCoreRequest;
 pub use scratchy_core_common::SamplingParams;
 use scratchy_serving_engine::core_client::{EngineCoreClient, InprocClient};
 use scratchy_serving_engine::engine_core::StepOutcome;
+use scratchy_serving_engine::worker_factory::WorkerFactory;
 
 use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
@@ -366,6 +367,9 @@ pub struct LLM {
     scores_prompts: bool,
     /// Set by [`Interrupter::interrupt`]; the running generation reads it between steps.
     interrupt: Arc<AtomicBool>,
+    /// The factory this binary serves through, whose sampling limit every request is checked
+    /// against before it is added ([`WorkerFactory::check_sampling`]).
+    backend: Option<&'static dyn WorkerFactory>,
 }
 
 /// Stops an [`LLM`]'s generation from another thread: the one running, or — when none is — the
@@ -449,6 +453,7 @@ impl LLM {
             generation_defaults: stack.generation_defaults,
             scores_prompts: stack.scores_prompts,
             interrupt: Arc::default(),
+            backend: scratchy_serving_engine::worker_factory::linked_factory().ok(),
         })
     }
 
@@ -766,6 +771,13 @@ impl LLM {
             "prompt_logprobs is not supported by this backend: it scores only the rows it samples, \
              not every prompt token"
         );
+        // And against what the backend can serve ([`WorkerFactory::check_sampling`]), before any
+        // request is added.
+        if let Some(backend) = self.backend {
+            backend
+                .check_sampling(&params)
+                .map_err(anyhow::Error::msg)?;
+        }
         Ok(params)
     }
 
@@ -1637,6 +1649,8 @@ mod tests {
             },
             scores_prompts: false,
             interrupt: Arc::default(),
+            // No backend's sampling check: the scripted executor takes any sampling.
+            backend: None,
         }
     }
 

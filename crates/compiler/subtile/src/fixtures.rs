@@ -798,6 +798,23 @@ pub fn front_end_lowered(input: LoweringInput) -> LoweredDecode {
     .expect("a fixture of weight sources names no embed row")
 }
 
+/// `l` with its bindings edited by `edit` and its roles re-derived from them
+/// ([`LoweredDecode::new`]): how a fixture rebinds a source, since the bindings are private so
+/// that no edit can leave the roles behind.
+pub fn rebind(l: &mut LoweredDecode, edit: impl FnOnce(&mut Vec<SourceBinding>)) {
+    let mut bindings = l.bindings().to_vec();
+    edit(&mut bindings);
+    *l = LoweredDecode::new(
+        l.input.clone(),
+        bindings,
+        l.op_tiles.clone(),
+        l.norm_gain_add_tiles.clone(),
+        l.op_expansion.clone(),
+        l.unnamed_reads.clone(),
+    )
+    .expect("a rebound fixture names one embed row at most");
+}
+
 /// Per-buffer byte sizes (bf16 = 2 bytes / element) for a
 /// [`LoweringInput`], in `BufId` order: sources first, then per-op
 /// output staging buffers. Mirrors the shape inference in
