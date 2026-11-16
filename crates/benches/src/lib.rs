@@ -36,7 +36,7 @@ pub use args::{
     BenchCommand, BenchCommands, BenchHotpotqaArgs, BenchLatencyArgs, BenchLongbenchArgs,
     BenchMsmarcoArgs, BenchMultihopArgs, BenchMusiqueArgs, BenchNiahArgs, BenchRagcsvArgs,
     BenchRulerArgs, BenchServeArgs, BenchSpansArgs, BenchStartupArgs, BenchThroughputArgs,
-    RagSource, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
+    RagSource, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs, TaskShare,
 };
 
 /// UTC `YYYYMMDD<sep>HHMMSS` tag for auto-generated result filenames.

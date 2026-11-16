@@ -355,6 +355,65 @@ pub(crate) fn sample<T>(mut all: Vec<T>, n: usize, seed: u64) -> Vec<T> {
     all
 }
 
+/// Share `share` of `all` split into its disjoint shares, the same split for the same seed and
+/// the same `all`. Each group (MuSiQue's hops; units with none, one group of their own) is
+/// shuffled by a seed of its own and dealt a unit a share in turn, the deal carrying on from one
+/// group to the next: every share keeps the whole's mix of groups, within one unit a group, and
+/// the shares' sizes are within one of each other. Together they are `all`, each unit once.
+///
+/// The share comes in a fixed order whose every head keeps its mix: each next unit from the group
+/// furthest behind its part of the share. So a cell that asks for fewer of the share's units asks
+/// the first of a larger cell's, the same ones: a quick run's MuSiQue cell is the head of a full
+/// run's.
+pub(crate) fn share<T>(
+    all: Vec<T>,
+    share: crate::TaskShare,
+    seed: u64,
+    group: impl Fn(&T) -> Option<u32>,
+) -> Vec<T> {
+    let mut by: std::collections::BTreeMap<Option<u32>, Vec<T>> = std::collections::BTreeMap::new();
+    for t in all {
+        by.entry(group(&t)).or_default().push(t);
+    }
+    let of = share.of().get() as usize;
+    let mine = share.index() as usize;
+    let mut dealt = 0usize;
+    let mut groups: Vec<std::collections::VecDeque<T>> = Vec::new();
+    for (g, ts) in by {
+        let shuffled = sample(ts, usize::MAX, seed ^ (u64::from(g.unwrap_or(0)) << 32));
+        let mut kept = std::collections::VecDeque::new();
+        for t in shuffled {
+            if dealt % of == mine {
+                kept.push_back(t);
+            }
+            dealt += 1;
+        }
+        groups.push(kept);
+    }
+    // Each next unit from the group furthest behind (t + 1) x its part of the share; ties to the
+    // first group.
+    let sizes: Vec<usize> = groups.iter().map(std::collections::VecDeque::len).collect();
+    let total: usize = sizes.iter().sum();
+    let mut taken = vec![0usize; groups.len()];
+    let mut ordered = Vec::with_capacity(total);
+    for t in 1..=total {
+        let behind = |g: usize| (t * sizes[g]) as i128 - (taken[g] * total) as i128;
+        let next = (0..groups.len()).filter(|&g| taken[g] < sizes[g]).fold(
+            None,
+            |best: Option<usize>, g| match best {
+                Some(b) if behind(b) >= behind(g) => Some(b),
+                _ => Some(g),
+            },
+        );
+        let Some(g) = next else { break };
+        if let Some(u) = groups[g].pop_front() {
+            ordered.push(u);
+        }
+        taken[g] += 1;
+    }
+    ordered
+}
+
 /// `n` units, seeded, each `group`'s share of them its share of `all`, by largest remainder (ties
 /// to the smaller group key), then shuffled together: a dataset ordered by group (MuSiQue's file
 /// is, by hops) keeps its mix however few are asked. Where any unit has no group, [`sample`].
@@ -650,6 +709,71 @@ mod tests {
         assert_eq!(tasks[1].max_tokens, 200);
         assert_eq!(tasks[3].max_tokens, CHAT_MAX_TOKENS, "bounded");
         assert!(!tasks[0].score.scored());
+    }
+
+    /// A task share is one of K disjoint parts of the whole, together the whole, each keeping the
+    /// whole's mix of groups and within one task of the others' size; the same for the same seed.
+    #[test]
+    fn task_shares_split_the_whole_keeping_its_mix() {
+        // 61 of group 2, 30 of 3, 10 of 4, and 2 with no group.
+        let all: Vec<(Option<u32>, usize)> = (0..103)
+            .map(|i| {
+                let g = match i {
+                    0..61 => Some(2),
+                    61..91 => Some(3),
+                    91..101 => Some(4),
+                    _ => None,
+                };
+                (g, i)
+            })
+            .collect();
+        let of = |i: u32| -> Vec<(Option<u32>, usize)> {
+            let s: crate::TaskShare = format!("{i}/3").parse().unwrap();
+            share(all.clone(), s, 7, |&(g, _)| g)
+        };
+        let shares = [of(1), of(2), of(3)];
+        let mut every: Vec<usize> = shares.iter().flatten().map(|&(_, i)| i).collect();
+        every.sort_unstable();
+        assert_eq!(every, (0..103).collect::<Vec<_>>(), "each task once");
+        let sizes: Vec<usize> = shares.iter().map(Vec::len).collect();
+        assert!(
+            sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1,
+            "{sizes:?}"
+        );
+        for g in [Some(2), Some(3), Some(4)] {
+            let counts: Vec<usize> = (shares.iter())
+                .map(|s| s.iter().filter(|&&(h, _)| h == g).count())
+                .collect();
+            let whole = all.iter().filter(|&&(h, _)| h == g).count();
+            for c in &counts {
+                assert!(
+                    c * 3 + 3 > whole && *c * 3 < whole + 3,
+                    "{g:?}: {counts:?} of {whole}"
+                );
+            }
+        }
+        // Every head of a share keeps its mix, within one task a group: a cell of fewer tasks is
+        // the head of a larger one's, the same mix.
+        for s in &shares {
+            for m in 1..=s.len() {
+                for g in [Some(2), Some(3), Some(4), None] {
+                    let in_head = s[..m].iter().filter(|&&(h, _)| h == g).count() as f64;
+                    let in_share = s.iter().filter(|&&(h, _)| h == g).count() as f64;
+                    let due = m as f64 * in_share / s.len() as f64;
+                    assert!(
+                        (in_head - due).abs() < 1.0 + 1e-9,
+                        "{g:?} at {m}: {in_head} vs {due}"
+                    );
+                }
+            }
+        }
+        assert_eq!(of(2), of(2), "seeded");
+        let other: crate::TaskShare = "2/3".parse().unwrap();
+        assert_ne!(
+            of(2),
+            share(all.clone(), other, 8, |&(g, _)| g),
+            "by its seed"
+        );
     }
 
     /// A stratified sample keeps each group's share of the whole, by largest remainder, and is the
