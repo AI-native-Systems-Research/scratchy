@@ -82,11 +82,6 @@ use flex_rs::util::Status;
 /// `flex_rs::scheduler` module doc).
 pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
     card: Arc<flex_rs::card::Card>,
-    /// ⭐ THIS CARD'S INDEX IN SENLIB'S ENUMERATION, from the [`WorldCard`] the runtime opened —
-    /// the index senlib's own cross-port P2P door ([`flex_rs::card::Card::p2p_create_mapping`])
-    /// resolves peers by. The card OPENS by PCI address, never by index (an index can drift);
-    /// this field only NAMES the card to doors that ask for senlib's enumeration.
-    index: u32,
     /// ⭐ THE CPUS THIS CARD'S HOST THREADS RUN ON — its NUMA node's, read from sysfs at open
     /// (`flex_rs::numa`). Its response worker, its rank's submit thread and its bring-up thread
     /// each pin themselves to it first.
@@ -103,7 +98,6 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardRuntime")
             .field("pci", &self.card.pci())
-            .field("index", &self.index)
             .field("cpus", &self.cpus)
             .field("memory", &self.memory)
             .finish_non_exhaustive()
@@ -172,7 +166,6 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
         Ok(Self {
             card,
-            index,
             cpus,
             memory,
             rt,
@@ -1814,7 +1807,7 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
         // another PCIe root is unreachable until its cross-port mapping exists.
         for peer in me.peers() {
             c.card
-                .p2p_route_peer(cards.get(peer).index)
+                .p2p_route_peer(cards.get(peer).card())
                 .map_err(|why| AttachRefusal::P2pMap {
                     card: c.card.pci().to_string(),
                     peer: cards.get(peer).card.pci().to_string(),
