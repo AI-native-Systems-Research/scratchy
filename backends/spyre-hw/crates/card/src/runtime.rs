@@ -1692,7 +1692,11 @@ pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
     /// ([`flex_rs::card::Card::p2p_route_peer`]). Without it that peer's region-2 address has
     /// no route from this card, so the world cannot run: this is the load-time refusal of a
     /// cross-root link that did not attach (#1192).
-    P2pMap { card: String, peer: String, why: String },
+    P2pMap {
+        card: String,
+        peer: String,
+        why: String,
+    },
     /// A base-address-table entry could not be installed.
     Bat { tid: u8, why: String },
     /// A landing slot's xseg word did not compose, or its `XSEG` entry could not be programmed.
