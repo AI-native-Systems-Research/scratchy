@@ -590,6 +590,10 @@ jobs:
         run: cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
       - name: ThunderKittens source check
         run: cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens
+      # The worker links the models crate, so its tests name a model, through the CLI's aliases.
+      - name: Worker and CLI tests
+        run: cargo test -p scratchy-target-cuda-worker -p scratchy-target-cuda-cli
+          --features model/qwen3.8-27b-text-only,quant/fp8-dynamic-per-channel
       - name: Tapes (Qwen3.8-27B)
         run: cargo test -p scratchy-target-cuda-models
           --features scratchy-models/qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel

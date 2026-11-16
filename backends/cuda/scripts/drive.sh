@@ -26,7 +26,6 @@ SCR=$(abs "$SCR"); [ "$PIN" = - ] || PIN=$(abs "$PIN")
 [ -z "$BASELINE_COHERENCE" ] || BASELINE_COHERENCE=$(abs "$BASELINE_COHERENCE")
 cd "$WORKDIR" || exit 1
 mkdir -p logs/$POD
-trap 'k delete pod $POD --ignore-not-found' EXIT
 render=logs/$POD/pod.yml
 sed "s|\${POD}|$POD|; s|\${NAMESPACE}|$NAMESPACE|; s|\${IMAGE}|$IMAGE|; s|\${NODE_SELECTOR_KEY}|$NODE_SELECTOR_KEY|; s|\${NODE_SELECTOR_VALUE}|$NODE_SELECTOR_VALUE|; s|\${TOLERATION_KEY}|$TOLERATION_KEY|; s|\${TOLERATION_VALUE}|$TOLERATION_VALUE|; s|\${HF_SECRET}|$HF_SECRET|" \
   "$SD/pod-template.yml" > $render || exit 1
@@ -36,7 +35,9 @@ for v in REPO_URL SHA BASE SHA_A SHA_B MODEL FETCH_REFS; do
   [ -n "${!v}" ] && printf 'export %s=%q\n' "$v" "${!v}"
 done > $env_sh
 alive(){ for i in 1 2 3 4 5; do k get pod $POD >/dev/null 2>&1 && return 0; /bin/sleep 60; done; return 1; }
-! k get pod $POD >/dev/null 2>&1 || { echo "NOT RUN: $POD already exists"; trap - EXIT; exit 1; }
+! k get pod $POD >/dev/null 2>&1 || { echo "NOT RUN: $POD already exists"; exit 1; }
+# From here the pod is this run's: delete it on every exit.
+trap 'k delete pod $POD --ignore-not-found' EXIT
 k apply -f $render && k wait --for=condition=Ready pod/$POD --timeout=900s || exit 1
 k exec $POD -- mkdir -p /work
 [ "$PIN" != - ] && k cp "$PIN" $POD:/work/pin.txt

@@ -91,9 +91,9 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
   name `quant/fp8-dynamic-per-channel` with one of `model/qwen3.8-27b-text-only`,
   `model/qwen3.6-35b-a3b` or `model/gemma-4-26b-a4b-it`; any other scope panics at
   build time. Its `nvcc` feature compiles the kernels for `sm_90a` and links them:
-  it needs CUDA 12.8+ `nvcc` on `PATH`, and its tests an H100. CI never builds it,
-  so the H100 run (`backends/cuda/scripts`) is its only gate. Without `nvcc` the
-  workspace builds anywhere. See [`backends/cuda/README.md`](backends/cuda/README.md).
+  it needs CUDA 12.8+ `nvcc` on `PATH`, and its tests an H100. CI never builds
+  that feature, so the H100 run (`backends/cuda/scripts`) is its only gate.
+  Without `nvcc` the workspace builds anywhere. See [`backends/cuda/README.md`](backends/cuda/README.md).
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature — a plain `chat`-only build never
   compiles image/png/zune-jpeg/etc., and a scope naming a vision arch needs it.
