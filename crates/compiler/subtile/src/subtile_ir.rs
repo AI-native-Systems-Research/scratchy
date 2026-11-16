@@ -2108,12 +2108,12 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
             SubOp::MatmulTile { .. } => break,
             // ⭐ A SHARDED LM HEAD'S GATHER ENDS THE CHAIN. Below it the projection is one RANK'S
             // block of the vocabulary — `vocab / W` wide, not the vocabulary — so it is not widened:
-            // the draw reads the GATHERED row, whose pad lanes the widening above reserves, and the
+            // the draw reads the GATHERED rows, whose pad lanes the widening above reserves, and the
             // gather's block copies address a column block the same way at any total width
             // (stick-major places a column by its stick and row alone).
             SubOp::AllGather { .. } => {
                 if matches!(suffix, SampleRows::Folded { .. }) {
-                    fold_gathered_tail(graph, t);
+                    fold_gathered_tail(graph, t, rows);
                 }
                 break;
             }
@@ -2177,18 +2177,20 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     }
 }
 
-/// ⛔ A FOLDED TAIL THAT GATHERS IS ONE ROW, DECLARED. A prefill rung's projection computes only the
-/// last prompt row — the emitter's fold writes it at row 0 — and the draw reads row 0, so the
-/// all-gather must move that row and no other. Narrowing only the gather's REGION is not enough:
-/// activations are stick-major, so row 0 of a `[mq, n]` tensor is one stick in every stick column,
-/// not a contiguous run, and a collective's send moves whole stick columns of its operand AS
-/// DECLARED (`collective::Fragment`: `sticks × rows` contiguous) — a one-row fragment of an
-/// `mq`-row tensor sends the wrong bytes. So every tensor of the folded tail — the projection's
-/// output, each epilogue's, the gather's in and out — is declared ONE row, and every region on
-/// them is that row: the gather's operand is then a whole one-row tensor, contiguous, and the fold
-/// writes its m=1 product into exactly it. (A tail with no gather — every one-rank graph — keeps
-/// its declared rows: its row 0 is read locally, never sent.)
-fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId) {
+/// ⛔ A FOLDED TAIL THAT GATHERS IS THE FOLD'S OWN ROWS, DECLARED. A prefill rung's projection
+/// computes only its answer rows — the fold's `m=S` matmul over the requests' last prompt rows
+/// writes rows `0..S` (S = 1 on a solo rung, its one last prompt row; S = the request count on a
+/// packed rung, each window's last row) — and the draw reads exactly those rows, so the
+/// all-gather must move those rows and no other. Narrowing only the gather's REGION is not
+/// enough: activations are stick-major, so row r of a `[mq, n]` tensor is one stick in every
+/// stick column, not a contiguous run, and a collective's send moves whole stick columns of its
+/// operand AS DECLARED (`collective::Fragment`: `sticks × rows` contiguous) — an S-row fragment
+/// of an `mq`-row tensor sends the wrong bytes. So every tensor of the folded tail — the
+/// projection's output, each epilogue's, the gather's in and out — is declared S rows, and every
+/// region on them is those rows: the gather's operand is then a whole S-row tensor, contiguous,
+/// and the fold writes its m=S product into exactly it. (A tail with no gather — every one-rank
+/// graph — keeps its declared rows: its rows are read locally, never sent.)
+fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId, rows: u32) {
     let mut tail = vec![gathered];
     let mut t = graph
         .nodes
@@ -2217,9 +2219,9 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
         }
     }
     for &t in &tail {
-        graph.tensors[t.index()].rows = 1;
+        graph.tensors[t.index()].rows = rows;
     }
-    let one_row = Range::new(0, 1);
+    let folded_rows = Range::new(0, rows);
     for node in &mut graph.nodes {
         for r in node
             .inputs
@@ -2227,7 +2229,7 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
             .chain(std::iter::once(&mut node.output))
         {
             if tail.contains(&r.tensor) {
-                r.region.rows = one_row;
+                r.region.rows = folded_rows;
             }
         }
     }
@@ -5976,12 +5978,15 @@ mod tests {
     // (`W[0][j] = j`).
     const FIXTURE_VOCAB: u32 = 2048;
 
-    /// ⭐ A FOLDED TAIL GATHERS ONE ROW, OF A ONE-ROW TENSOR. A sharded prompt chunk's projection
-    /// computes only its last row (at row 0, the fold's), and the draw reads row 0 — so the
-    /// all-gather in its tail moves that one row, never the chunk's `mq` rows; and since a send
-    /// moves whole stick columns of its operand as declared, the operand is DECLARED one row (one
-    /// row of a taller stick-major tensor is not contiguous). A decode rung's every row is a
-    /// request's, and its gather keeps them all. Shown on a 4-row rung both ways.
+    /// ⭐ A FOLDED TAIL GATHERS THE FOLD'S OWN ROWS — ONE ON A SOLO RUNG. A sharded prompt
+    /// chunk's projection computes only its answer row (at row 0, the fold's), and the draw
+    /// reads row 0 — so the all-gather in its tail moves that one row, never the chunk's `mq`
+    /// rows; and since a send moves whole stick columns of its operand as declared, the
+    /// operand is DECLARED one row (one row of a taller stick-major tensor is not
+    /// contiguous). A decode rung's every row is a request's, and its gather keeps them all.
+    /// Shown on a 4-row rung both ways. The S > 1 case is
+    /// [`a_folded_packed_tail_gathers_its_own_rows`] below — the one-row law stated here is
+    /// the solo instance (S = 1) of the general one, never a second law.
     #[test]
     fn a_folded_tail_gathers_its_one_row() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
@@ -6040,6 +6045,87 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(rows_of_gather(SampleRows::All), (4, 4, 4));
+    }
+
+    /// ⭐ A FOLDED PACKED TAIL GATHERS ITS OWN S ROWS, NOT ONE. A packed rung's fold writes
+    /// one answer row per request — S rows, the `m=S` tail matmul over the requests' last
+    /// prompt rows — and the sharded tail's all-gather must move exactly those S rows: the
+    /// tail's tensors are DECLARED S rows (the same contiguity law the solo case states —
+    /// a send moves whole stick columns of its operand as declared, so the operand is the
+    /// whole S-row tensor the fold writes, never S rows of a taller one). Found on the card
+    /// (2026-11-16, PR #1255 review finding 2): the tail was declared ONE row whatever S,
+    /// so every SHARDED packed rung's mint refused at validate — `Sample { rows: S }` reading
+    /// `rows..S` of a `[1, vocab]` tensor — and the bake dropped all 12 pairs SILENTLY (the
+    /// emitter's validate early-return, and no whole-ship guard over the sharded world's
+    /// table): a tp/2 build served a solo-only prefix ladder and its waves fell to
+    /// serialized solo chunks, byte-identical to main. Shown on a 12-row rung (w=4, s=3):
+    /// the declarations, the gather's operand, and the projection's output are the fold's
+    /// own 3 rows, and the minted graph validates.
+    #[test]
+    fn a_folded_packed_tail_gathers_its_own_rows() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let input = crate::lower::LoweringInput {
+            exported: None,
+            sources: vec![
+                SourceShape { rows: 12, cols: 64 },
+                SourceShape {
+                    rows: 64,
+                    cols: 2048,
+                },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 2048,
+                        weight: crate::lower::GemmWeight::Dense,
+                    },
+                    m: 12,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: SubOp::AllGather { cols: 4096 },
+                    m: 12,
+                    inputs: vec![InputRef::Op(0)],
+                },
+            ],
+            result: 1,
+        };
+        let mut g = lower_region(&input, nz(64));
+        mint_sample(&mut g, SampleRows::Folded { requests: nz(3) });
+        ValidatedGraph::new(&g).expect("the minted packed graph validates");
+        let gather = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::AllGather { .. }))
+            .expect("the tail's gather");
+        let projection = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::MatmulTile { .. }))
+            .expect("the projection");
+        // (gather in region rows, gather in TENSOR rows, projection out tensor rows) — the
+        // fold's own S=3 all the way down.
+        assert_eq!(
+            (
+                gather.inputs[0].region.rows.len,
+                g.shape(gather.inputs[0].tensor).rows,
+                g.shape(projection.output.tensor).rows,
+            ),
+            (3, 3, 3)
+        );
+        // And the draw reads exactly those rows of the gathered result.
+        let sample = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::Sample { .. }))
+            .expect("the minted sample");
+        assert_eq!(
+            (
+                sample.inputs[0].region.rows.len,
+                g.shape(sample.inputs[0].tensor).rows
+            ),
+            (3, 3)
+        );
     }
 
     fn chained_head_fixture(width: u32, hidden: u32) -> crate::lower::LoweringInput {
