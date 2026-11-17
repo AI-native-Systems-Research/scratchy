@@ -398,7 +398,7 @@ fn field_name<S: AsRef<str>>(path: &[S]) -> String {
 fn is_scalar(e: &Expr) -> bool {
     matches!(
         e,
-        Expr::ScalarLit(_) | Expr::SqrtBound(_) | Expr::ConfigScalar { .. }
+        Expr::ScalarLit(_) | Expr::SqrtBound { .. } | Expr::ConfigScalar { .. }
     )
 }
 
@@ -758,7 +758,7 @@ impl Cx<'_, '_> {
                     self.expr(rhs, nest)?
                 ),
             },
-            Expr::ScalarLit(_) | Expr::SqrtBound(_) | Expr::ConfigScalar { .. } => {
+            Expr::ScalarLit(_) | Expr::SqrtBound { .. } | Expr::ConfigScalar { .. } => {
                 "Scalar".to_string()
             }
         })

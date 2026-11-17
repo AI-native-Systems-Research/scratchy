@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 @forward
 def gemma4():
-    hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size)
+    hidden_states = embed(input_ids, embed_tokens) * sqrt_bf16(hidden_size)
     for layer in range(num_hidden_layers):
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer])
 

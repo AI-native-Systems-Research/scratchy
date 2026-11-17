@@ -233,18 +233,23 @@ impl<'a> CfgBuilder<'a> {
     }
 
     /// Recursively fold compile-time scalar expressions using the
-    /// per-model bounds. Currently: `SqrtBound(name)` →
-    /// `ScalarLit((bounds[name] as f64).sqrt())`. Any other
-    /// expression descends into its children.
+    /// per-model bounds. Currently: `SqrtBound { name, bf16 }` →
+    /// `ScalarLit((bounds[name] as f64).sqrt())`, bf16-rounded when
+    /// `bf16`. Any other expression descends into its children.
     fn fold_scalars(&self, expr: &Expr) -> Result<Expr, CfgError> {
         match expr {
-            Expr::SqrtBound(ident) => {
+            Expr::SqrtBound { name: ident, bf16 } => {
                 let name = ident.to_string();
                 let v = self.bounds.get(&name).copied().ok_or_else(|| {
                     let available: Vec<String> = self.bounds.keys().cloned().collect();
                     CfgError::UnknownBound { name, available }
                 })?;
-                Ok(Expr::ScalarLit((v as f64).sqrt()))
+                let root = (v as f64).sqrt();
+                Ok(Expr::ScalarLit(if *bf16 {
+                    round_to_bf16(root)
+                } else {
+                    root
+                }))
             }
             Expr::ConfigScalar { name: ident, recip } => {
                 let name = ident.to_string();
@@ -449,6 +454,14 @@ impl<'a> CfgBuilder<'a> {
     }
 }
 
+/// `v` rounded to the nearest bf16 (ties to even), as `torch.tensor(v,
+/// dtype=torch.bfloat16)` does. Only used on finite positive constants.
+fn round_to_bf16(v: f64) -> f64 {
+    let bits = (v as f32).to_bits();
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) & 0xFFFF_0000;
+    f32::from_bits(rounded) as f64
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -535,6 +548,61 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn round_to_bf16_matches_torch() {
+        // bf16(sqrt(hidden_size)) for the Gemma hiddens of #1282.
+        for (hidden, want) in [
+            (2304u32, 48.0),
+            (3584, 59.75),
+            (4608, 68.0),
+            (1152, 34.0),
+            (2560, 50.5),
+            (3840, 62.0),
+            (5376, 73.5),
+            (2816, 53.0),
+        ] {
+            assert_eq!(
+                round_to_bf16(f64::from(hidden).sqrt()),
+                want,
+                "hidden {hidden}"
+            );
+        }
+        // Exact ties round to even mantissa: 1 + 2^-8 → 1.0, 1 + 3·2^-8 → 1 + 2^-6.
+        assert_eq!(round_to_bf16(1.0 + 2f64.powi(-8)), 1.0);
+        assert_eq!(
+            round_to_bf16(1.0 + 3.0 * 2f64.powi(-8)),
+            1.0 + 2f64.powi(-6)
+        );
+    }
+
+    #[test]
+    fn sqrt_bf16_folds_rounded_and_sqrt_does_not() {
+        let fold = |src: &str| {
+            let cfg = build_cfg(&classify_src(src), &llama_3_2_1b_params()).expect("build cfg");
+            match &cfg.block(cfg.entry).instrs[..] {
+                [
+                    Instr::Assign {
+                        value: Expr::Mul { rhs, .. },
+                        ..
+                    },
+                ] => match **rhs {
+                    Expr::ScalarLit(v) => v,
+                    ref other => panic!("rhs not folded: {other:?}"),
+                },
+                other => panic!("unexpected instrs: {other:?}"),
+            }
+        };
+        // llama-3.2-1b: hidden_size 2048, sqrt = 45.2548…, bf16 = 45.25.
+        assert_eq!(
+            fold("x = embed(input_ids, embed_tokens) * sqrt_bf16(hidden_size);"),
+            45.25
+        );
+        assert_eq!(
+            fold("x = embed(input_ids, embed_tokens) * sqrt(hidden_size);"),
+            2048f64.sqrt()
+        );
     }
 
     #[test]

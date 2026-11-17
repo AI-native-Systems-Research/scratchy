@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # on the flat 8 -> 64 default ladder.
 @forward(workloads=[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096])
 def gemma4_moe():
-    hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size)
+    hidden_states = embed(input_ids, embed_tokens) * sqrt_bf16(hidden_size)
     for layer in range(num_hidden_layers):
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer])
 

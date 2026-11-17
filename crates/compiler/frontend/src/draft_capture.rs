@@ -159,6 +159,7 @@ fn reads(e: &Expr, names: &mut BTreeSet<String>) {
             reads(rhs, names);
         }
         Expr::Reshape { source, .. } => reads(source, names),
-        Expr::Path(_) | Expr::ScalarLit(_) | Expr::SqrtBound(_) | Expr::ConfigScalar { .. } => {}
+        Expr::Path(_) | Expr::ScalarLit(_) | Expr::SqrtBound { .. } | Expr::ConfigScalar { .. } => {
+        }
     }
 }

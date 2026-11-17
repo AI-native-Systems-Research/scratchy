@@ -8,14 +8,13 @@ import torch.nn.functional as F
 
 @forward
 def gemma2():
-    # Gemma scales embeddings by sqrt(hidden_size) — matches vllm
-    # Python `hidden_states *= self.normalizer` (layernorm.py line
-    # 304) and hand-written `kernels::scale_inplace(hidden_states,
-    # embed_scale, ..)` in scratchy-serving-cuda's `Gemma2ForCausalLM::forward`.
-    # The `sqrt(hidden_size)` folds to a compile-time f64 per-model
-    # at CFG build; the `* scalar` triggers the ScalarMulImpl which
-    # emits `scale_inplace` on the embed output.
-    hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size)
+    # Gemma scales embeddings by sqrt(hidden_size), rounded to bf16 —
+    # vllm's `self.normalizer` and HF's `embed_scale` are bf16 tensors
+    # (48.0 is exact here; sqrt(3584) = 59.87 is 59.75 in bf16, #1282).
+    # `sqrt_bf16(hidden_size)` folds to that compile-time constant
+    # per-model at CFG build; the `* scalar` triggers the ScalarMulImpl
+    # which emits `scale_inplace` on the embed output.
+    hidden_states = embed(input_ids, embed_tokens) * sqrt_bf16(hidden_size)
     for layer in range(num_hidden_layers):
         # Pre-attention norm. Gemma's `(1+w)` convention rides as
         # a scalar addition on the weight ref — the solver's
