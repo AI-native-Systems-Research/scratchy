@@ -7759,9 +7759,18 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
     if e.time <= 1 {
         return false;
     }
-    // ldsIdx of every OUTPUT (write) tensor: the computeOp_ outputLabeledDs names
-    // are `Tensor{i}-idx{i}`, so the output ldsIdx set is derivable, but the simpler
-    // robust signal is the LabeledDs dsType_ == "OUTPUT". Collect those ldsIdx.
+    // ldsIdx of every WRITE tensor — the operands the device writes, which is the BINDING's own
+    // `is_input` fact, never the LabeledDs `dsType_`. The pointwise family labels EVERY operand
+    // `Role::Output` (the bmm-bias DDL convention: a READ operand shares the OUTPUT dsType
+    // bucket, `is_input=true` marking it read-only — `AnyTensorArg::set_is_input`'s own law, the
+    // same rule `emit_sdsc`'s collision guard states as "non-input OUTPUT-role args"), so
+    // `dsType_ == "OUTPUT"` counts a broadcast READ operand as a per-trip write: the seat hash's
+    // `[rows, 1]` Col words sit at ONE constant stick address across every trip BY DESIGN
+    // (`rewrite_op_for_time_tile`'s collapsed-along-the-tiled-dim exemption, pinned by
+    // `time_tiled_broadcast_operand_is_address_stable`), and a dsType-keyed write set false-fired
+    // GUARD #14 on exactly that designed case (gemma-4 12b fp8 decode, `muli32toi32_o2435`).
+    // `!is_input` names exactly the tensors written; a missing binding stays in the write set
+    // (fail-closed).
     //
     // A K-SPLIT (reduction/`in`-dim) matmul legitimately has MULTIPLE cores accumulate a partial
     // product into the SAME shared output address WITHIN one trip (dxp PSUM-accumulates them) —
@@ -7783,14 +7792,13 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
             std::collections::BTreeSet::new();
         for dsc_map in &trip.dscs_ {
             for dsc in dsc_map.values() {
-                let out_lds: std::collections::BTreeSet<u32> = dsc
-                    .labeledDs_
-                    .iter()
-                    .filter(|l| l.dsType_ == "OUTPUT")
-                    .map(|l| l.ldsIdx_)
-                    .collect();
                 for node in &dsc.scheduleTree_ {
-                    if node.component_ != "hbm" || !out_lds.contains(&node.ldsIdx_) {
+                    if node.component_ != "hbm"
+                        || e
+                            .arg_bindings
+                            .get(node.ldsIdx_ as usize)
+                            .is_some_and(|b| b.is_input)
+                    {
                         continue;
                     }
                     for v in node.startAddressCoreCorelet_.data_.values() {

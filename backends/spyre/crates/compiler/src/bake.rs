@@ -574,7 +574,16 @@ fn emit_superdsc_wiring(
                 .find(|a| pk.contains_key(a));
             let v_pool = node.args.iter().map(|a| *a as u32).find(|a| pv.contains(a));
             if let (Some(ks), Some(vs)) = (k_pool, v_pool) {
-                layers.push((pk[&ks], ks, vs));
+                // ⭐ THE PACKED PREFILL'S WINDOW COPIES state the SAME wiring once per window
+                // (`attn_s{id}_w{r}`, one node a request window, each binding the layer's own
+                // pools beside its own window tables) — a copy RESTATES a layer's wiring, never
+                // binds it a second time, so the triple is collected once. A node claiming a
+                // layer a DIFFERENT pool names is the real "bound twice" defect the lock below
+                // exists to catch, and an exact-duplicate filter leaves it caught.
+                let entry = (pk[&ks], ks, vs);
+                if !layers.contains(&entry) {
+                    layers.push(entry);
+                }
             }
         }
         layers.sort_by_key(|x| x.0);

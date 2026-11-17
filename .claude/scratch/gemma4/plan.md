@@ -1,115 +1,46 @@
-# gemma-4 on spyre — campaign plan (worktree spyre-moe, 2026-11-17)
+# gemma-4 campaign — plan & state (worktree spyre-moe)
 
-Mission order: **gemma-4 12B dense first, then gemma-4 26B MoE**, through the compiler
-stack (triton→ttir→ktir→superdsc, spliced into the full-forward ladder). No model/kernel
-hacks in the ladder — the ladder lowers ops. Pod: `nickm-54f8b56448-f67zh`, warm slot
-`/work/scratchy` (fire tree), `oc rsync --delete` only, never cold, never a new worktree.
+Mission (user order 2026-11-17): gemma-4 12B dense end-to-end, then gemma-4 26B MoE —
+through the compiler stack, no ladder hacks. Charter in this worktree's CLAUDE.md
+(commit 8c7989e87a).
 
-## Ground truth (measured, 2026-11-17)
+## Part 1 — 12b dense
 
-`cargo build -p scratchy-target-spyre-models --features spyre-lower,
-scratchy-models/gemma-4-12b-it,scratchy-quantizations/fp8-dynamic-per-channel`
-in `backends/spyre` (log `/work/g4d-bake-1.log`): the whole dense ladder lowers —
-1181 tiles, 48 AttnDecode, full superdsc mint — and fails at ONE wall:
+- [x] census the hybrid's attention classes (40 sliding W=1024/nkvh=8/hd=256 + 8 global
+      nkvh=1/hd=512; 48 layers, 1181 tiles, KV pool 390×128)
+- [x] `PagedStep.window` field + mint + codegen (`f9c9dc93ae`)
+- [x] windowed staging law — anchor/first_active, re-anchored mask stack, page-table skip,
+      span admission, per-sequence batch anchoring (`484b7e7f1d`)
+- [x] windowed walk stops at the reference's active-block bound (`441f584b68`)
+- [x] un-refuse the splice (window rides the mask stack) + ONE paged step PER ATTENTION
+      CLASS: `Wiring::paged: &'static [PagedStep]`, class-sorted, class 0 keeps the
+      sentinels; `splice::paged_window_of_class` is the ONE window-family statement;
+      scalar-operand census (`ArgSpec::Scalar` is an operand) — commit `8615433d5c`
+- [x] local proof: 12b bake green (both classes, 48 launches, wiring lock 48/48),
+      spyre-emu numeric gate PASSED, all local suites green
+- [x] pod gates (f67zh, /work/scratchy): lib tests RC=0, clippy RC=0
+- [ ] pod bake (g4d-bake.sh, fp8-dynamic-per-channel) — in flight after rsync
+- [ ] card tier: first spyre-hw build in /work/scratchy/backends/spyre-hw
+      (worker card/forward.rs per-class fan-out compiled only there); card gate
+- [ ] card proof: `spyre chat` on the card, coherent reply
 
-```
-wiring not lowerable — AttnDecode t1142: triton splice: a 1024-position sliding window —
-spyre-inference's paged attention kernels attend every position up to the query's own,
-and have no window
-```
+## Part 2 — 26b MoE (after dense is proven on the card)
 
-Checkpoint on the pod (HF_HOME=/work/huggingface): `RedHatAI/gemma-4-12B-it-FP8-Dynamic`
-(preset `fp8-dynamic-per-channel`).
+- port `moe.py` statement-for-statement from
+  `~/git/spyre-inference/spyre_inference/moe.py` (gemma-4 recipe); replace the tree's
+  untrusted `moe.py`, never patch around it
+- the tape states the MoE as ONE node; the splice binds it (operands, constexprs,
+  gathered-vs-persistent by token count) as `lower_attn` does — nothing past the splice
+  knows it is MoE
+- missing ops (top-k = K rounds of plain ops; gather/scatter/reduce/compare/batched
+  contraction) are GENERAL lowerings with their own fixtures
+- proof on gemma-4-26b: bake → card chat, A/B vs main
 
-## Part 1 — dense: the window law
+## Dev-loop law
 
-ONE fact: `AttnMask::SlidingWindow { window }` (already minted by the bridge,
-`kv_codec.rs`) states the query's reach — a query at absolute position `p` attends keys
-in `[p − W + 1, p]`. The reference (`spyre_attn.py`, `_build_active_tiles_with_skip` /
-`_build_single_tile` / `_max_active_blocks`) states the whole law; our kernels already
-take additive mask stacks, so **the kernels change nothing** — the window rides the mask
-stack and the staging. Every reader of "causal to the sequence end" reads the window at
-its one source:
-
-1. **The mint** — `paged_step_of_ir` (lower_subtile_tape_to_ktir.rs:1589):
-   `PagedStep.window: Option<NonZeroU32>` from the node's mask, inside the existing
-   all-attentions-agree check. Per-class bodies mean only same-mask nodes share a step.
-2. **The walk** — `walk_pages` (splice): a windowed op's swept extent is its SPAN, not
-   the context: `span = W + mq − 1` positions; `walk = min(ceil(span/slots) + 1, pages,
-   active_cap-resolved)` (the reference's `_max_active_blocks`, its `+1` the boundary
-   block). `walk_buckets` for a windowed body top out at the span bound.
-3. **The rungs** — the runtime's one selection line (`rung_for(valid_len)`,
-   `SweptCols::covers`) is UNCHANGED: a windowed ladder's top rung (span bound) is the
-   fallback that serves any length — the window law is what makes a span-bounded sweep
-   serve any position. `prove_ladder_walks` proves span coverage; `check`'s reach law
-   becomes the span law (`span(rows) ≤ walk·slots`, not `rows.end() ≤ walk·slots`).
-4. **The mask law** — `mask_stack_of` (paged_step.rs): re-anchored frame — walk trip `i`
-   covers absolute positions `(first_active + i)·slots + c`; row `r` attends iff
-   `pos(r) − W + 1 ≤ kv ≤ pos(r)` (pos(r) already absolute via `StepRows`). Interior
-   blocks come out zero by the law itself (the reference's zero-tile cache is invisible
-   in the bytes).
-5. **The page table** — windowed row `i` stages `blocks[first_active + i]`, zero past
-   the request's blocks (null page + MASKED, the existing law). `first_active =
-   max(0, rows.start − W + 1) / slots` — the EARLIEST query's window (prefill-correct),
-   derived once, shared by every reader (mask + table + check).
-6. **The batch law** — `batch_sources`: per sequence `first_active_s` from its own
-   position; `mask_by_chunk` carries `window_start_s ≤ slot_pos ≤ pos_s`; chunk pages
-   stage each sequence's active blocks. Chunking covers the max span.
-7. **The splice** — un-refuse `SlidingWindow`; thread the window to the mint. Kernel
-   compile gets `NUM_BLOCKS` = the span-bounded walk (same `walk_pages` call). Operands
-   unchanged.
-
-Every line passes the charter test: would it exist for a non-gemma op that states the
-same mask? Yes — the law is over `AttnMask::SlidingWindow`, its window, and the shapes.
-
-### Proof ladder (each its own commit, each gated by the warm bake)
-a. Field + mint + agreement check (no behavior; bake still fails at the same wall). —
-   LANDED `f9c9dc93ae`
-b/c. Staging law: anchor (`first_active`), re-anchored mask stack, page-table skip,
-   span admission in `check`, per-sequence batch anchoring + fixtures. — LANDED
-   `484b7e7f1d` (tests RC=0, clippy RC=0, bake fails at exactly the same t1142 wall)
-d/e. Walk law: `window_walk_blocks` (the reference's `_max_active_blocks`, the block an
-   input — the step's own `page_slots` at the runtime, the scheduler's reference page at
-   the splice) caps `walk_pages`, the splice's arms, the mint, and `on_body`/
-   `on_body_packed`. **The ladder needs NO selection change**: a windowed span never
-   exceeds its own causal span at the same context (`span ≤ end ≤ sweep`), so a rung
-   selected by context length always serves the windowed class — the windowed body walks
-   its bound *inside* whatever rung it rides, and the ceiling walk at the bake stays the
-   CAUSAL reach (`None` — a hybrid's global class needs the pool covered whole). The
-   fold's trip count is a bake fact (`Walk::trips`), so a 17-block windowed walk
-   relaunches 17 times, never per resident page.
-f. Un-refuse the splice → the 12b bake goes GREEN (emu numeric gate included).
-g. Pod: `spyre` CLI build (spyre-hw, spyre-emu) → `spyre chat` on the card, coherent
-   reply, greedy parity vs the reference path. A/B vs main is N/A (main refuses) — the
-   reference semantics gate (emu) + card chat is the proof.
-
-## Part 2 — MoE: the moe.py port (after dense is proven)
-
-State on main: the DSL states the MoE as ONE node (`gemma_moe(router_in, expert_in,
-router, experts)` — gemma4-moe.py:72); the splice refuses every per-op MoE SubOp by law
-(splice lib.rs:347-368); `kernels/moe.py` (239 ln) + `moe_prefill.py` exist with numeric
-test scaffolding but are UNTRUSTED — the reference is
-`~/git/spyre-inference/spyre_inference/moe.py` (958 ln, gemma-4 recipe,
-`apply_monolithic`).
-
-1. Port `moe.py` statement-for-statement from the reference (boundary: `x` and
-   `router_logits` in; the router projection stays the plain matmul it is), as the
-   head-major attention kernels port theirs. Replace, never patch.
-2. The splice binds the one MoE node to it — operands, constexprs,
-   gathered-vs-persistent by token count — exactly as `lower_attn` binds the attention
-   node and as the reference's `apply_monolithic` dispatches.
-3. A `Program` label routes to the generic walk (`lower_function`), as `PagedAttn` does.
-   Nothing past the splice knows it is MoE.
-4. Missing ops the port needs (gather, reduce, compare, batched contraction) are general
-   lowerings of those ops, reached by any kernel, each with its own fixture.
-5. Proof: parity-tiny bake → emu gate → card chat on `google/gemma-4-26B-A4B-it`
-   (bf16, cached on the pod's home cache) / fp8 presets per the sweep law.
-
-## Laws this plan obeys (charter, CLAUDE.md, memory)
-- The ladder lowers OPS: every window reader is stated over `AttnMask` + shapes, never
-  over gemma/layer kinds/head counts/model names.
-- No runtime refusals over bake-known facts; no fallbacks; no `#[allow]`; no weakened
-  tests. A named refusal only where a combination genuinely has no lowering yet.
-- One fact, one source: `first_active` and the span are derived once and shared.
-- Land one PR at a time; every commit gates on the warm pod bake + touched-crate lib
-  tests; card proof before shipping.
+pod `nickm-54f8b56448-f67zh`, warm tree `/work/scratchy`;
+`oc -n a1-vllm-spyre rsync --delete --exclude='target' --exclude='.git'
+--exclude='bench_results' --exclude='.claude' <worktree>/ <pod>:/work/scratchy`;
+touch the changed files after rsync (stale-warm-target trap); gate scripts
+`/work/g4d-{test,clippy,bake}.sh`; never background a pod build without an RC marker;
+senlib-rs trouble → senlib-rs-auditor.
