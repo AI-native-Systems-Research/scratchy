@@ -19,9 +19,11 @@ gh -R AI-native-Systems-Research/scratchy pr view <N> --json headRefOid,title,bo
 git fetch upstream pull/<N>/head:refs/remotes/pr/<N>
 git fetch upstream main
 git diff --stat=200 upstream/main...refs/remotes/pr/<N> -- . ':!**/third_party/**' ':!**/thunderkittens/**'
-mkdir -p /tmp/purity-<N>/src && git archive refs/remotes/pr/<N> <dirs…> | tar -x -C /tmp/purity-<N>/src
+mkdir -p .claude/scratch/purity-<N>/src && printf '*\n' > .claude/scratch/purity-<N>/.gitignore
+git archive refs/remotes/pr/<N> <dirs…> | tar -x -C .claude/scratch/purity-<N>/src
 ```
 
+- Scratch lives in the worktree, in a directory its own `.gitignore` (`*`) hides. Never `/tmp`: macOS culls it.
 - Every `file:line` is at the pinned `headRefOid`; say so in the report's first line.
 - Skip vendored trees. Do read hand-written kernel sources (`.cu`, `.metal`, `.cuh`).
 - Run git from the worktree with plain, separate commands (no `cd` into other paths).
@@ -39,6 +41,7 @@ mkdir -p /tmp/purity-<N>/src && git archive refs/remotes/pr/<N> <dirs…> | tar 
   - `crates/compiler/ir/src/model_facts.rs`: `HeadDim(NonZeroU32)`, `Class<Kv, Hd, Rot, Page>` with laws as trait bounds, `Gdn`, `RopePairing`.
 
   A PR below main's bar is a finding even if it's internally consistent.
+- **Main's known debt is not precedent.** Where main itself breaks a rule (the rule says so, as P9 does), a PR that copies or extends that code is a finding. Don't cite it as the bar, and don't flag main's existing code in a PR's audit.
 
 ## 1. The rules
 
@@ -153,7 +156,8 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - No new env-var behavior toggles.
 
 ### P9. The device is a type of its constants
-- The target is the chip's facts as const generics (`AppleGpu<GEN, ULTRA>`), and every setting is a formula of them. There's one tape per variant, and the device picks its own at load.
+- **The ruled design (2026-10-09):** the target is the chip's facts as const generics, `AppleGpu<const GEN: u32, const ULTRA: bool>` (the two facts `MTLDevice.architecture.name` carries). Every setting is a formula of them, read in the lowering as `T::…` with `T: MetalTarget`. There's one tape per variant, and the device picks its own at load.
+- **Main doesn't have it yet; this is known P9 debt.** Main's Metal device is `MetalTargetProfile`, a runtime struct of `f64` facts (`crates/targets/metal/src/tape/targets.rs:27`), picked by `profile_for(class: GenClass)` (`crates/targets/metal/compiler/src/static_tape.rs:1261`; `GenClass` at `crates/targets/metal/src/tape/lowered.rs:3155`). That is the class enum this rule forbids. A PR that adds a profile field, a `GenClass` arm or a copy of the pattern for another target is a finding. A PR that moves it toward `AppleGpu<GEN, ULTRA>` is the fix.
 - No hard-coded device numbers in Rust or kernel source (`H100_SXM_SMS = 132`, `TARGET_CTAS = 264`), no per-chip hand tables, and no class enums or bands.
 
 ### P10. One source of truth
@@ -162,7 +166,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - An invented schema in a data file (magic keys, `kind` strings, a second copy of the loader's naming) is a smell to reject.
 
 ### P11. Lock hygiene (report only when it hides one of the above)
-- No `#[allow]` at a site (a reasoned allow goes in `[lints]`).
+- No `#[allow]` anywhere: not at a site, and not in a `[lints]` table. Find the design the lint doesn't flag. (Main's `[lints]` tables only declare check-cfg.)
 - No escape-hatch constructors (`from_untyped`, `conflated_with_*`, a `pub` raw constructor on a checked type).
 - No weakened tests or ratchets ("did the number get smaller?").
 - No `/tmp/…` plan references in code.
@@ -195,9 +199,9 @@ Anything else, including a second checkpoint check outside that one door, is a v
 
 - **P1:** the player picks kernels at play time: `gemv_splits` in 9 places, plus `norm_row_takes`, `attn_decode_split` and `gdn_scan_is_recurrent` in `runtime/worker.rs`. `CudaTape::validate()` runs at expansion (`compiler/src/emit.rs:1085`) and again in `CudaWorker::build` (`worker.rs:840`).
 - **P2:** every `.cu` is compiled once, the same for any model. The kernels are already templates, but their instantiations are hand-picked, with eight attention files for head dims 256 and 512. `H100_SXM_SMS = 132` is copied into 3 files.
-- **P3:** the GEMM tile rule is stated or checked in 5 places: Rust `GEMM_BF16_TILE`, the `.cu` `M_TILE`/`N_TILE`/`K_TILE`, `gemm_kernel` and `gemm_shape` at expansion, and the launcher's runtime `ERR_SHAPE`. Pool presence is two paired `Option`s, re-checked by `WorkerError::*PoolMissing/Unused` and 6 `.expect("`new` made a pool …")`.
+- **P3:** the GEMM tile rule is stated or checked in 5 places: Rust `GEMM_BF16_TILE`, the `.cu` `M_TILE`/`N_TILE`/`K_TILE`, `gemm_kernel` and `gemm_shape` at expansion, and the launcher's runtime `ERR_SHAPE`. Pool presence is two paired `Option`s, re-checked by `WorkerError::*PoolMissing/Unused` and 7 `.expect("`new` made a pool …")`.
 - **P4:**
-  - 98 runtime shape-refusal returns across 44 `.cu` launchers;
+  - 99 runtime shape-refusal sites across all 44 `.cu` launchers: 98 `return SCRATCHY_CUDA_ERR_SHAPE` plus one in a ternary (`gemm_fp8.cu:859`). Grep for both forms;
   - `KernelError` (21 variants), `WorkerError` (14), `ForwardError` (28), `PlanError` (16);
   - greedy-only sampling refused per request through a new stringly `WorkerFactory::check_sampling -> Result<(), String>` seam in shared serving;
   - `DeviceError::NotH100`.
