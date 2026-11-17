@@ -986,7 +986,7 @@ fn send_prefix_and_fill<'a, 'ctx>(
     shadow: &'a [u8],
     staged: usize,
     addr: &DevAddr,
-    mapper: &std::sync::Arc<PfIommuMapper<'_>>,
+    mapper: &std::sync::Arc<PfIommuMapper<'ctx>>,
     alive: &mut Vec<H2dPin<'a, 'ctx>>,
     what: &str,
 ) -> Result<()> {
@@ -1034,7 +1034,7 @@ fn send_premapped<'a, 'ctx>(
     stream: &'a Stream<'ctx>,
     src: &'a [u8],
     addr: &DevAddr,
-    mapper: &std::sync::Arc<PfIommuMapper<'_>>,
+    mapper: &std::sync::Arc<PfIommuMapper<'ctx>>,
     alive: &mut Vec<H2dPin<'a, 'ctx>>,
     what: &str,
 ) -> Result<()> {
@@ -3126,7 +3126,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // it pinned, and its own Drop synchronizes before unpinning — so the guards are
         // safe to drop on ANY exit from here on, not just the sync below.
         let mapper = PfIommuMapper::new(self.card.card());
-        let mut pinned: Vec<H2dPin<'_>> = Vec::new();
+        let mut pinned: Vec<H2dPin<'_, '_>> = Vec::new();
         for i in 0..NUM_SEGMENTS {
             // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
@@ -3270,7 +3270,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         Ok(())
     }
 
-    fn stream_ref(&self) -> Result<&Stream> {
+    fn stream_ref(&self) -> Result<&Stream<'a>> {
         self.stream
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))

@@ -414,8 +414,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         // wave the ladder laws order. The per-card alloc order (anchor → owner → rungs) is PER
         // CARD and each rank's thread keeps its own card's order; cross-card order was never
         // constrained — device memory is per card.
-        let ranks: PerRank<T, Executor<'c, T>> =
-            each_rank_parallel(weights, |r, card_weights| -> Result<Executor<'c, T>> {
+        let ranks: PerRank<T, Executor<'a, 'c, T>> =
+            each_rank_parallel(weights, |r, card_weights| -> Result<Executor<'a, 'c, T>> {
                 let card = cards.get(r);
                 // This rank's build thread runs on its card's NUMA node before it touches the card
                 // (its doorbell and its host writes stay on the card's socket) — the same law as

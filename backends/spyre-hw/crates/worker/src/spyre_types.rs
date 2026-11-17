@@ -10,8 +10,6 @@
 
 use std::path::PathBuf;
 
-#[cfg(feature = "spyre-hw")]
-use crate::card::types::World;
 use scratchy_core_model::weight::HfModelConfig;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
 // runner; the bundle type + session type are cfg-selected, everything else
@@ -202,9 +200,10 @@ pub(crate) struct Loaded {
     /// dedicated thread. Lives HERE so it spans exactly the model's life: dropping `Loaded`
     /// (the worker dropped, however it happened) stops every card through the vendor's
     /// bounded-drain door and then releases the hosting thread, so the completion threads join
-    /// rather than die with the process.
+    /// rather than die with the process. Held, never read — its [`Drop`] is the whole point
+    /// (the same role as `_progress` above on [`SpyreWorker`](crate::spyre_worker::SpyreWorker)).
     #[cfg(feature = "spyre-hw")]
-    pub(crate) serve_span: scratchy_target_spyre_card::runtime::ServeSpan<World>,
+    pub(crate) _serve_span: scratchy_target_spyre_card::runtime::ServeSpan<World>,
 }
 
 /// Per-request generation state the worker keeps beside `InputBatch`.

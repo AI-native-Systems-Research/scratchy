@@ -65,17 +65,17 @@ fn flat_va(segment: u64, offset_bytes: u64) -> u64 {
 
 /// One card's side of the run: its runtime (borrowed from `main`, which owns every card), one
 /// stream, and its N-slot buffer.
-struct Side<'c> {
-    card: &'c CardRuntime<'_>,
-    stream: Arc<RuntimeStream>,
+struct Side<'a, 'c> {
+    card: &'c CardRuntime<'a>,
+    stream: Arc<RuntimeStream<'a>>,
     buf: Arc<CompositeAddress>,
     /// The buffer's (segment, byte offset) on this card — what a peer's send lands against.
     segment: u64,
     offset_bytes: u64,
 }
 
-impl<'c> Side<'c> {
-    fn new(card: &'c CardRuntime<'_>, n: usize) -> Result<Self> {
+impl<'a, 'c> Side<'a, 'c> {
+    fn new(card: &'c CardRuntime<'a>, n: usize) -> Result<Self> {
         let rt = card.context().clone();
         let allocator = rt.get_allocator().map_err(|e| anyhow!("allocator: {e}"))?;
         let buf = Arc::new(
@@ -225,7 +225,7 @@ fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
             .card()
             .check_and_clear_rdma_status()
             .map_err(|e| anyhow!("{e}"))?;
-        ensure!(st == 0, "card {me}: rdma_status {st} before linking");
+        ensure!(!st, "card {me}: rdma_status latched before linking");
         for (peer, &addr) in bar2.iter().enumerate() {
             if peer != me {
                 c.card()
@@ -237,7 +237,7 @@ fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
     println!("linked: {} base-address-table entries", n * (n - 1));
 
     // ── Buffers: own pattern in own slot, zeros elsewhere. ──
-    let sides: Vec<Side<'_>> = cards
+    let sides: Vec<Side<'_, '_>> = cards
         .iter()
         .enumerate()
         .map(|(i, c)| Side::new(c, n).with_context(|| format!("card {i}")))
@@ -364,8 +364,8 @@ fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
             .card()
             .check_and_clear_rdma_status()
             .map_err(|e| anyhow!("{e}"))?;
-        if st != 0 {
-            println!("card {j}: rdma_status {st} after the exchange");
+        if st {
+            println!("card {j}: rdma_status latched after the exchange");
             bad += 1;
         }
     }
@@ -374,7 +374,7 @@ fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
     }
     println!(
         "ALL-GATHER PASS (N={n}): every card holds all {n} cards' slots byte-exact; wdone 0, XSEG \
-         unchanged, rdma_status 0 on every card"
+         unchanged, rdma_status clean on every card"
     );
     Ok(())
 }

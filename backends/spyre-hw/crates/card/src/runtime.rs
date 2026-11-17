@@ -652,10 +652,7 @@ impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
     pub fn build_on_serve_span(
         world: WorldCards<T>,
         cards: &'static PerRank<T, flex_rs::card::Card>,
-    ) -> (
-        ServeSpan<T>,
-        Result<PerRank<T, CardRuntime<'static, T>>, String>,
-    ) {
+    ) -> SpanBuild<T> {
         let (built_tx, built_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let host = std::thread::Builder::new()
@@ -713,6 +710,13 @@ fn open_card(index: u32, pci: &str) -> Result<flex_rs::card::Card, BringUpError>
     tracing::info!("[spyre-card] card {index} ({pci}): opened on {cpus}");
     flex_rs::card::Card::open(pci).map_err(BringUpError::Open)
 }
+
+/// The pair [`WorldCards::build_on_serve_span`] returns: the span hosting every card's
+/// completion threads, and the world's runtimes (or the first rank's build failure, named).
+pub type SpanBuild<T> = (
+    ServeSpan<T>,
+    Result<PerRank<T, CardRuntime<'static, T>>, String>,
+);
 
 /// ⭐ THE WORKER'S SERVE SPAN — the one `thread::scope` that hosts every card's completion
 /// threads. A worker driven by the shared engine (`Box<dyn Worker>`, held for the process) has
@@ -1226,7 +1230,7 @@ impl<'a> Stream<'a> {
     /// does not own an iova for every byte of the shadow.
     pub fn pin_h2d<'p>(
         &'p self,
-        mapper: &PfIommuMapper<'_>,
+        mapper: &std::sync::Arc<PfIommuMapper<'a>>,
         src: &'p [u8],
     ) -> Result<H2dPin<'p, 'a>, HwError> {
         let mapping = mapper
@@ -1535,7 +1539,7 @@ impl<'a> Stream<'a> {
     }
 }
 
-impl Drop for Stream {
+impl Drop for Stream<'_> {
     fn drop(&mut self) {
         // `destroy_stream` teardown-drains (`drain_for_teardown`: set
         // shutdown, wait for in-flight unconditionally — including on a
@@ -1571,7 +1575,7 @@ impl Drop for Stream {
 pub struct H2dPin<'a, 'ctx> {
     src: &'a [u8],
     stream: &'a Stream<'ctx>,
-    mapping: IommuMapping,
+    mapping: IommuMapping<'ctx>,
 }
 
 impl H2dPin<'_, '_> {

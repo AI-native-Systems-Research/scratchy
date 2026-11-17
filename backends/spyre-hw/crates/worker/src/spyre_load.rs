@@ -1389,10 +1389,10 @@ impl SpyreWorker {
             };
         // The serve span hosting every card's completion threads — built with the runtimes
         // (below), adopted by the leaked runtimes, and carried in `Loaded` so it is released
-        // exactly when the model is.
+        // exactly when the model is. NO initializer: the hw session block below is the only
+        // path to `Loaded`, so definite assignment itself proves the span is always built.
         #[cfg(feature = "spyre-hw")]
-        let mut serve_span_v: Option<scratchy_target_spyre_card::runtime::ServeSpan<World>> =
-            None;
+        let serve_span_v: Option<scratchy_target_spyre_card::runtime::ServeSpan<World>>;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -3188,7 +3188,7 @@ impl SpyreWorker {
             #[cfg(feature = "spyre-hw")]
             world_cpus: world_cpus_v,
             #[cfg(feature = "spyre-hw")]
-            serve_span: serve_span_v.expect("the hw load path sets the serve span with the runtimes"),
+            _serve_span: serve_span_v.expect("the hw load path sets the serve span with the runtimes"),
         })
     }
 }
