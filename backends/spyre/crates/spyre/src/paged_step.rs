@@ -708,7 +708,9 @@ pub fn card_step_sources(
     let mut masks = Vec::with_capacity(cap);
     let mut int32 = Vec::with_capacity(cap * 2 + 1);
     for r in 0..cap {
-        let tid = |table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r as u32, table);
+        let tid = |table: u32| {
+            scratchy_triton_splice::paged_window_of_class(step.class as usize, r as u32, table)
+        };
         // THE PAGE INDEX TABLE — request `r`'s page ids one block per trip; an empty window's
         // rows stay zero.
         let mut table = vec![0u8; walk * trip];
@@ -954,8 +956,10 @@ mod tests {
             walk: 4,
             paged_rows: PagedRows::Sequence,
             extent: pair(3, 1),
-            // The fixture's op is causal — its mask states no window.
+            // The fixture's op is causal — its mask states no window — and it is the tape's
+            // only class, so its tids are the sentinels.
             window: None,
+            class: 0,
         }
     }
 

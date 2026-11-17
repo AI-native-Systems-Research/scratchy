@@ -221,34 +221,44 @@ pub(crate) fn forward_chunk(
     };
     let vocab = sh.vocab;
 
-    // ⭐ THE PAGED STEP — the page table, the mask stack and the write rows, staged from the
-    // request's blocks by `scratchy_target_spyre::paged_step` (the law the bake's numeric gate stages
-    // by too), then one fused forward through the resident session. The pools themselves are not
-    // staged: every layer's write scatters this step's K/V into them and its walk gathers from them,
-    // on the device, step after step.
+    // ⭐ THE PAGED STEPS — the page table, the mask stack and the write rows of EVERY attention
+    // class, staged from the request's blocks by `scratchy_target_spyre::paged_step` (the law the
+    // bake's numeric gate stages by too), then one fused forward through the resident session. The
+    // pools themselves are not staged: every layer's write scatters this step's K/V into them and
+    // its walk gathers from them, on the device, step after step. The SHARED tids (the query row
+    // index, the int32 zero stick) stage identical bytes for every class — one staging serves all,
+    // so a tid already staged is not staged again.
     {
-        let step = b
-            .paged
-            .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
+        if b.paged.is_empty() {
+            return Err(werr("this bundle states no paged step — its attention has no pools"));
+        }
         let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
             werr(format!(
                 "request {id}: a decode step of zero rows — no token to run"
             ))
         })?;
-        let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
-            .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
+        let mut int32: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = Vec::new();
+        for step in &b.paged {
+            let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
+                .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
+            for (tid, bytes, shape) in srcs.int32 {
+                if !int32.iter().any(|(t, ..)| *t == tid as usize) {
+                    int32.push((
+                        tid as usize,
+                        bytes,
+                        scratchy_tensors::DType::I32,
+                        shape,
+                    ));
+                }
+            }
+            let (mask_tid, mask, mask_shape) = srcs.mask;
+            if !dynamic.iter().any(|(t, ..)| *t == u64::from(mask_tid)) {
+                dynamic.push((u64::from(mask_tid), mask, mask_shape));
+            }
+        }
         session
-            .set_typed_sources(
-                srcs.int32
-                    .into_iter()
-                    .map(|(tid, bytes, shape)| {
-                        (tid as usize, bytes, scratchy_tensors::DType::I32, shape)
-                    })
-                    .collect(),
-            )
+            .set_typed_sources(int32)
             .map_err(|e| werr(format!("paged step: {e}")))?;
-        let (mask_tid, mask, mask_shape) = srcs.mask;
-        dynamic.push((u64::from(mask_tid), mask, mask_shape));
         // ⭐ ASK FOR THE ROWS THIS FORWARD WROTE, NOT THE WHOLE RESIDENT TENSOR. Decode and prefill
         // share one session, so every tensor is resident at the WIDEST program's row count: a
         // one-row decode step had its outputs decoded at the prefill's `m`. The result is the one

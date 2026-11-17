@@ -105,14 +105,15 @@ pub struct ForwardInputs<'a> {
     /// Stage the embedding and rotary tables stick-scattered. UNCONDITIONAL for the device, but
     /// [`stick_scatter`] is the identity at one row, so decode may pass either.
     pub stick_major: bool,
-    /// ⭐ THE PAGED STEP'S TABLES ON THE CARD — [`crate::paged_step::card_step_sources`] /
-    /// [`crate::paged_step::card_batch_sources`] of the request's KV blocks at the body that runs.
-    /// `Some` exactly when the bundle states a paged step ([`ForwardShape::paged`]).
+    /// ⭐ THE PAGED STEPS' TABLES ON THE CARD — [`crate::paged_step::card_step_sources`] /
+    /// [`crate::paged_step::card_batch_sources`] of the request's KV blocks at the body that runs,
+    /// one set per attention class, class-sorted as [`ForwardShape::paged`]. `Some` exactly when
+    /// the bundle states a paged step.
     ///
     /// ⛔ NOT DERIVABLE HERE. Which physical page holds a request's block is the scheduler's grant,
     /// and it CHURNS as requests are admitted, evicted and share a cached prefix — an input, read by
     /// the caller from the live block table, never recomputed from `positions`.
-    pub paged: Option<&'a crate::paged_step::CardSources>,
+    pub paged: Option<&'a [crate::paged_step::CardSources]>,
 }
 
 /// Run one host kernel and return the values it fills its operand with.
@@ -139,22 +140,29 @@ pub fn kernel_values(
     // named here rather than filled in.
     if let ForwardKernel::Paged = step.kernel {
         let tid = step.tensor.tid();
-        let card = inp.paged.ok_or_else(|| {
+        let cards = inp.paged.ok_or_else(|| {
             format!(
                 "paged step t{tid} on a forward with no KV blocks: an unstaged page table reads as \
                  ZERO, and page 0 is a REAL page — every block would read page 0's keys"
             )
         })?;
-        if let Some((_, mask)) = card.masks.iter().find(|(m, _)| *m == tid) {
+        // ⭐ THE CLASS'S OWN SET — a hybrid model's classes each stage their own tables, and the
+        // tid names which class's set this step reads.
+        if let Some((_, mask)) = cards
+            .iter()
+            .flat_map(|c| c.masks.iter())
+            .find(|(m, _)| *m == tid)
+        {
             return Ok(Staged::F32(std::borrow::Cow::Owned(mask.clone())));
         }
-        return card
-            .words(tid)
+        return cards
+            .iter()
+            .find_map(|c| c.words(tid))
             .map(|w| Staged::I32(w.to_vec()))
             .ok_or_else(|| {
                 format!(
-                    "paged step t{tid}: the step staged no such table — the forward's step and the \
-                     bundle's are not one step"
+                    "paged step t{tid}: no class's step staged such a table — the forward's step \
+                     and the bundle's are not one step"
                 )
             });
     }
@@ -386,11 +394,11 @@ pub struct ForwardShape {
     /// duplicated a `&'static` slice the macro put in the binary, once per forward, per token.
     pub cos_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
     pub sin_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
-    /// ⭐ THE BUNDLE'S PAGED STEP — its tables' tids. `Some` exactly when the bundle's attention reads
-    /// a paged step, so the tape carries a step per table iff the bundle placed it. A projection of the
-    /// wiring's own field, never a caller's opinion: a walk with no staged table gathers through zeros,
-    /// i.e. page 0.
-    pub paged: Option<crate::wiring::PagedStep>,
+    /// ⭐ THE BUNDLE'S PAGED STEPS — every attention class's tables' tids, one step per class
+    /// (a hybrid model's sliding and global layers carry different tables), `[]` when the bundle's
+    /// attention reads no paged step. A projection of the wiring's own field, never a caller's
+    /// opinion: a walk with no staged table gathers through zeros, i.e. page 0.
+    pub paged: Vec<crate::wiring::PagedStep>,
     pub n_consts: usize,
     /// ⭐⭐⭐ THE FORWARD'S OWN PHASE — which head the tape opens with, carried
     /// BY TYPE ([`ForwardPhase`]). DECODE opens with the chained head's two
@@ -455,10 +463,11 @@ impl ForwardShape {
                 tensor: PlaceId::Act(t),
             });
         }
-        // ⭐ THE PAGED STEP'S TABLES — a step each, the ones its card placements stage every step.
-        // See [`ForwardShape::paged`] for why the condition is the wiring and not a caller's opinion,
-        // and [`kernel_values`] for why a forward with no KV blocks is a refusal rather than a buffer.
-        if let Some(p) = self.paged {
+        // ⭐ THE PAGED STEPS' TABLES — a step each, the ones their card placements stage every
+        // step, one set per attention class. See [`ForwardShape::paged`] for why the condition is
+        // the wiring and not a caller's opinion, and [`kernel_values`] for why a forward with no
+        // KV blocks is a refusal rather than a buffer.
+        for p in &self.paged {
             for (tid, seat, _) in p.card_placements() {
                 if seat == crate::wiring::CardSeat::Step {
                     v.push(ForwardStep {
@@ -601,8 +610,10 @@ mod tests {
                 ::core::panic!("the fixture's three rows by one request name a rung")
             }
         },
-        // The fixture's op is causal — its mask states no window.
+        // The fixture's op is causal — its mask states no window — and it is the tape's only
+        // class, so its tids are the sentinels.
         window: None,
+        class: 0,
     };
 
     fn shape() -> ForwardShape {
@@ -611,14 +622,15 @@ mod tests {
             embed_src: 0,
             cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
             sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
-            paged: Some(STEP),
+            paged: vec![STEP],
             n_consts: 3,
             phase: ForwardPhase::Prefill,
         }
     }
 
-    /// Everything a forward of `shape()` reads, with the step's tables `card`.
-    fn inputs(card: Option<&crate::paged_step::CardSources>) -> ForwardInputs<'_> {
+    /// Everything a forward of `shape()` reads, with the step's tables `card` (one set per
+    /// class; the fixture's tape has one).
+    fn inputs(card: Option<&[crate::paged_step::CardSources]>) -> ForwardInputs<'_> {
         ForwardInputs {
             hidden: 64,
             embed_tokens: &[],
@@ -654,15 +666,16 @@ mod tests {
             }],
         )
         .expect("staged");
-        let inp = inputs(Some(&card));
+        let cards = [card];
+        let inp = inputs(Some(&cards));
         for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {
             match staged(ForwardKernel::Paged, t, &inp).expect("a table") {
-                Staged::I32(w) => assert_eq!(Some(w.as_slice()), card.words(t), "t{t}"),
+                Staged::I32(w) => assert_eq!(Some(w.as_slice()), cards[0].words(t), "t{t}"),
                 _ => panic!("t{t}: an index table staged as anything but int32 words"),
             }
         }
         match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
-            Staged::F32(v) => assert_eq!(&v[..], &card.masks[0].1[..]),
+            Staged::F32(v) => assert_eq!(&v[..], &cards[0].masks[0].1[..]),
             _ => panic!("a mask stack is a value tensor"),
         }
         // The pool's statics are staged at load, so the tape has no step for them.
@@ -688,10 +701,10 @@ mod tests {
     #[test]
     fn a_decode_batch_stages_its_own_tables() {
         let batch = ForwardShape {
-            paged: Some(crate::wiring::PagedStep {
+            paged: vec![crate::wiring::PagedStep {
                 paged_rows: crate::paged_step::PagedRows::Batch,
                 ..STEP
-            }),
+            }],
             ..shape()
         };
         let tids: Vec<PlaceId> = batch
@@ -759,7 +772,7 @@ mod tests {
     #[test]
     fn a_bake_fact_removes_the_step_rather_than_branching() {
         let mut sh = shape();
-        sh.paged = None;
+        sh.paged = Vec::new();
         let kinds: Vec<ForwardKernel> = sh.steps().iter().map(|x| x.kernel).collect();
         assert!(!kinds.contains(&ForwardKernel::Paged));
         assert_eq!(kinds.last(), Some(&ForwardKernel::Decode));

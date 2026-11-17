@@ -1935,6 +1935,127 @@ impl PagedStepTids {
         chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
         int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
     };
+
+    /// The step's tables at attention class `class` ([`attn_step_classes`]'s order). Class 0 IS
+    /// [`Self::RESERVED`] — a uniform model (one geometry) has exactly one class, so its ops name
+    /// the same tids as before and its bundle is byte-identical. Classes past the first take the
+    /// class region's class-dependent slots, [`PAGED_STEP_CLASS_STRIDE`] a class: the seven step
+    /// tables (query rows and the int32 zero stick are shared), then the per-window tables
+    /// [`paged_window_of_class`] reads.
+    pub fn of_class(class: usize) -> PagedStepTids {
+        if class == 0 {
+            return Self::RESERVED;
+        }
+        // The seven class-dependent tables, in PagedStepTids field order; class 1 takes the
+        // region's BASE slot (class 0 lives on the sentinels, so no slot is wasted).
+        let slot = |table: usize| {
+            ktir_superdsc::reserved_tids::paged_step_class_tid(
+                (class as u32 - 1)
+                    * ktir_superdsc::reserved_tids::PAGED_STEP_CLASS_STRIDE
+                    + table as u32,
+            )
+        };
+        PagedStepTids {
+            mask: slot(0),
+            page_table: slot(1),
+            write_rows: slot(2),
+            kv_row_pool: slot(3),
+            rep_rows: slot(4),
+            chunk_pages: slot(5),
+            chunk_masks: slot(6),
+            query_rows: Self::RESERVED.query_rows,
+            int32_zero: Self::RESERVED.int32_zero,
+        }
+    }
+}
+
+/// ⭐ A WINDOW'S TABLE AT AN ATTENTION CLASS — the class-aware statement of the packed prefill's
+/// window family. [`reserved_tids::paged_window_tid`] names window `r`'s three per-request tables
+/// (0 the query row index, 1 the page index table, 2 the mask stack) with window 0 IS the
+/// `paged_step` sentinels; THIS is the same family per class: the query row index is the graph's
+/// own rows — one table a window, EVERY class's — while the page table and mask stack are the
+/// class's own (a window changes which blocks the table names and what the mask tiles hold, and a
+/// hybrid model's classes carry different windows), window 0 being the class's own step tables
+/// ([`PagedStepTids::of_class`]; class 0's are the sentinels, so a uniform model binds the tids it
+/// has always bound, byte for byte) and the windows past the first the class region's slots
+/// ([`reserved_tids::paged_step_class_window_tid`]).
+///
+/// ONE source: the splice's operand binding and the wiring's mask-family check both read this
+/// function, so a class's bound masks cannot be one family at the kernel and another at the staged
+/// tables.
+pub fn paged_window_of_class(class: usize, window: u32, table: u32) -> u32 {
+    if class == 0 {
+        return ktir_superdsc::reserved_tids::paged_window_tid(window, table);
+    }
+    match table {
+        // The query row index gathers the graph's own rows — class-independent.
+        0 => ktir_superdsc::reserved_tids::paged_window_tid(window, 0),
+        1 | 2 => {
+            if window == 0 {
+                let tids = PagedStepTids::of_class(class);
+                if table == 1 { tids.page_table } else { tids.mask }
+            } else {
+                ktir_superdsc::reserved_tids::paged_step_class_window_tid(
+                    class as u32,
+                    window,
+                    table,
+                )
+            }
+        }
+        _ => unreachable!("a window owns three tables (paged_window_tid's own assert)"),
+    }
+}
+
+/// ⭐ THE ATTENTION STEP CLASSES — the tape's DISTINCT paged-step geometries, one per
+/// `(window, nkvh)` pair an `AttnDecode` states (window `0` = causal, no window), sorted
+/// DESCENDING so class 0 is the widest-windowed. A hybrid-attention model (gemma-4: sliding
+/// `W=1024, nkvh=8` layers and global full-attention `nkvh=1` layers) carries two; a uniform
+/// model carries one, and its class 0 keeps [`PagedStepTids::RESERVED`]'s tids so its bundle is
+/// byte-identical to the pre-class layout — the same law as
+/// `reserved_tids::rope_p_class_hds`.
+///
+/// This is the reference's own fact stated as a list: spyre-inference builds ONE
+/// `SpyreAttentionMetadataBuilder` per kv-cache group (`spyre_attn.py` 316-345, from the group's
+/// spec including its `sliding_window`), so each geometry gets its own metadata tables. ONE
+/// source: the splice's tid binding and the wiring mint both read this list, so a class index
+/// cannot mean one geometry at the kernel and another at the staged tables.
+pub fn attn_step_classes<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode {
+                mask, attention, ..
+            } => Some((
+                mask.window().map(|w| w.get()).unwrap_or(0),
+                attention.class(mask.class()).kv_heads().get(),
+            )),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable_by(|a, b| b.cmp(a));
+    out.dedup();
+    out
+}
+
+/// The class of one attention's step in [`attn_step_classes`]'s order.
+pub fn attn_step_class_of<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    window: Option<std::num::NonZeroU32>,
+    nkvh: u32,
+) -> Result<usize, String> {
+    let key = (window.map(|w| w.get()).unwrap_or(0), nkvh);
+    attn_step_classes(ir)
+        .iter()
+        .position(|k| *k == key)
+        .ok_or_else(|| {
+            format!(
+                "triton splice: an AttnDecode of window {key:?} is not among the graph's \
+                 attention step classes"
+            )
+        })
 }
 
 /// THE ATTENTION FAMILY's prefill kernel — `page_attn_head_major_prefill.py`, spyre-inference's
@@ -2231,15 +2352,12 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),
         );
     };
-    // Their paged kernels attend causally; a sliding window (gemma's local layers) is not theirs.
-    if let scratchy_subtile::subtile_ir::AttnMask::SlidingWindow { window } = mask {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: a {window}-position sliding window — spyre-inference's \
-             paged attention kernels attend every position up to the query's own, and have no \
-             window",
-            node.output.tensor.index()
-        ));
-    }
+    // The window rides the MASK STACK, never the kernels: every paged kernel takes its keys'
+    // liveness from the additive mask the step stages, and a windowed step stages exactly the
+    // reference's windowed tiles (a key live for the query at `pos` iff `pos − window + 1 ≤
+    // kv ≤ pos`) over the walk the window bounds. The op's own window reaches here at ONE
+    // source — `mask.window()`, the walk's bound below and the wiring's staged tiles above —
+    // and nothing else about a windowed op differs from a causal one.
     if node.inputs.len() < 5 {
         return Err(format!(
             "triton splice: AttnDecode t{} expects 5 inputs [q, k cache, v cache, new k, new v], \
@@ -2319,7 +2437,14 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         let w = query_rows.per_request().get();
         walk_pages(view.get(), w, w, active_cap, window)
     };
-    let tids = PagedStepTids::RESERVED;
+    // ⭐ THE NODE'S OWN CLASS'S TABLES — a hybrid's geometries each carry their own, and this
+    // node's `(window, nkvh)` names its class in the one list the mint also reads.
+    // ⭐ THE STEP'S CLASS — its tables bind this class's tids, so a hybrid model's two attention
+    // geometries each read their own staged page table, mask stack and write rows. The class is
+    // hoisted because the window family below is class-aware too: a window's page table and mask
+    // stack are the class's own ([`paged_window_of_class`]).
+    let class = attn_step_class_of(ir, window, nkvh)?;
+    let tids = PagedStepTids::of_class(class);
     // ⭐ THE POOLS' FORMAT IS THE TAPE'S — the writer this attention's cache names
     // ([`attn_pool_format`]), never a build selection.
     let format = attn_pool_format(ir, node)?;
@@ -2424,8 +2549,10 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let KtirNode { func, program, .. } = positional;
     let mut out = Vec::with_capacity(windows as usize);
     for r in 0..windows {
-        let window =
-            |table: u32| BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, table));
+        // ⭐ THE WINDOW FAMILY AT THE OP'S OWN CLASS — the query row index is the graph's own rows
+        // (shared), the page table and mask stack are the class's own ([`paged_window_of_class`],
+        // the one law the wiring's mask-family check also reads).
+        let window = |table: u32| BufferId::new(paged_window_of_class(class, r, table));
         let mut bindings = vec![
             t(&node.inputs[0]),
             window(0),
@@ -2761,12 +2888,63 @@ pub fn lower_kv_write<
     )?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // ⭐ THE WRITE ROWS' CLASS — a hybrid model's attention geometries each carry their own
+    // write-row table (the kv-head count sizes a row's index), and the attention a writer serves
+    // names it: `KvCacheProducer::SameForwardRopeAppend { producer_node_idx }` points back at
+    // THIS node, so the writer's class is its reader's. A writer no attention names has no step
+    // to stage its rows — refused rather than guessed.
+    let idx = ir
+        .nodes
+        .iter()
+        .position(|n| n.id == node.id)
+        .ok_or_else(|| {
+            format!(
+                "triton splice: RopeAppend {} is not among the graph's nodes",
+                node.id.index()
+            )
+        })? as u32;
+    let (window, reader_nkvh) = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode {
+                mask,
+                attention,
+                producer:
+                    scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend {
+                        producer_node_idx,
+                        ..
+                    },
+                ..
+            } if *producer_node_idx == idx => {
+                Some((mask.window(), attention.class(mask.class()).kv_heads().get()))
+            }
+            _ => None,
+        })
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "triton splice: RopeAppend t{} writes a cache no attention in this graph reads — \
+                 its write rows belong to no paged step",
+                node.output.tensor.index()
+            )
+        })?;
+    if reader_nkvh != nkvh {
+        return Err(format!(
+            "triton splice: RopeAppend t{} writes {} kv head(s) for an attention of {} — the \
+             writer and its reader disagree about the cache's geometry",
+            node.output.tensor.index(),
+            nkvh,
+            reader_nkvh
+        ));
+    }
+    let class = attn_step_class_of(ir, window, nkvh)?;
     let bindings = vec![
         t(key),
         t(value),
         t(k_pool),
         t(v_pool),
-        BufferId::new(PagedStepTids::RESERVED.write_rows),
+        BufferId::new(PagedStepTids::of_class(class).write_rows),
     ];
     let name = format!("kvwrite_s{}", node.id.index());
     let k = rebind(positional, name.clone(), bindings, None)?;
@@ -4395,10 +4573,13 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
         };
         match arg {
             ArgSpec::Ptr(t) => dfs.push(df_of_stated_type(&p.name, t)?),
-            // A scalar parameter is not an operand buffer; the zip with the
-            // binding law below refuses any kernel whose parameters are not
-            // exactly its operands.
-            ArgSpec::Scalar(_) => {}
+            // ⭐ A RUNTIME SCALAR IS STILL AN OPERAND — the rung-3 scalar shape
+            // (`scalarwmul.py`'s `w`): the node binds a `[1]`-element staged buffer
+            // and the launch reads its single value into the scalar, so the census
+            // carries that binding at the scalar's own stated dtype. A kernel whose
+            // scalar has no matching binding is still refused by the zip's count
+            // below.
+            ArgSpec::Scalar(t) => dfs.push(df_of_stated_type(&p.name, t)?),
             ArgSpec::Constexpr => unreachable!("is_constexpr filtered the parameter above"),
         }
     }
