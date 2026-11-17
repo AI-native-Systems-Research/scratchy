@@ -33,15 +33,6 @@ pub(crate) fn forward_chunk(
 ) -> ExecutorResult<ChunkOut> {
     let _ = prefill_meta; // the batched-prefill session pair is a sendnn-only shape
     let n = toks.len();
-    // KTIR caps a forward at the baked m_cap. The sendnn paged prefill runs the
-    // WHOLE prompt in one forward (s0 = padded bucket up to capacity), so its only
-    // cap is the prefix capacity, checked below.
-    {
-        let mcap = b.m_cap;
-        if n == 0 || n > mcap {
-            return Err(werr(format!("forward_chunk: n={n} not in 1..={mcap}")));
-        }
-    }
     if start + n > b.capacity {
         return Err(werr(format!(
             "positions {start}..{} exceed the bundle's KV capacity {} — the model's own context",
@@ -71,6 +62,16 @@ pub(crate) fn forward_chunk(
     // n <= m_cap real rows; the remaining pad rows REPLICATE the last real token (see the staging
     // loop below — the lm-head tail reads the last BAKED row, which must carry the last real token).
     let rows = b.m_cap;
+    // ⭐ THE STEP'S ROWS, MINTED ONCE — the law every staging below reads ([`StepRows::live`]
+    // for a pad row's token and rotary, [`StepRows::pos`] for its position, both delegating to
+    // `ChunkRows::row_logical_pos` — the ONE statement of the pad law). `real ≤ m_cap` is the
+    // type's fact, so the mint refuses what the old bound check refused at this door: a chunk
+    // of zero rows, or one wider than the rung the bundle baked. (The sendnn paged prefill
+    // runs the WHOLE prompt in one forward, so its only other cap is the prefix capacity,
+    // checked below.)
+    let law = scratchy_target_spyre::paged_step::StepRows::new(rows, start, n).ok_or_else(|| {
+        werr(format!("forward_chunk: n={n} not in 1..={rows}"))
+    })?;
 
     // Build this pass's DYNAMIC sources (the static weights stay resident in the
     // session — no per-forward weight marshal). Embedding gather + per-position
@@ -104,16 +105,16 @@ pub(crate) fn forward_chunk(
     let mut cos_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(rows); classes.len()];
     let mut sin_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(rows); classes.len()];
     for i in 0..rows {
-        // A pad row's TOKEN and ROTARY POSITION are the last real token's —
-        // `min(i, n-1)` over tokens, `start + min(i, n-1)` over positions.
-        let r = i.min(n - 1);
+        // A pad row's TOKEN and ROTARY POSITION are the last real token's — the step's own law
+        // (`law.live` / `law.pos`, minted above), never re-derived here.
+        let r = law.live(i);
         let t = toks[r];
         if t >= sh.vocab {
             return Err(werr(format!("token {t} >= vocab {}", sh.vocab)));
         }
         emb[i * h..(i + 1) * h].copy_from_slice(&sh.embed_tokens[t * h..(t + 1) * h]);
         for (ci, &k) in classes.iter().enumerate() {
-            let (c, s) = scratchy_target_spyre::manifest::rope_cos_sin_kind((start + r) as u32, k);
+            let (c, s) = scratchy_target_spyre::manifest::rope_cos_sin_kind(law.pos(i) as u32, k);
             cos_tab[ci].push(c);
             sin_tab[ci].push(s);
         }
@@ -232,11 +233,7 @@ pub(crate) fn forward_chunk(
         if b.paged.is_empty() {
             return Err(werr("this bundle states no paged step — its attention has no pools"));
         }
-        let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
-            werr(format!(
-                "request {id}: a decode step of zero rows — no token to run"
-            ))
-        })?;
+        let rows = law;
         let mut int32: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = Vec::new();
         for step in &b.paged {
             let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
@@ -275,9 +272,9 @@ pub(crate) fn forward_chunk(
         // ⭐ THE MINTED DRAW'S SEAT, STAGED FRESH EVERY STEP. The bake mints the token draw into
         // this rung (`Wiring::sample_seat`), and its five operands go stale the moment a step
         // completes — the step word IS the step's freshness, a held one is a held token. One law
-        // per seat row, by the card's own prompt law: row `r` runs this request's draw at
-        // `start + min(r, n - 1)`, a pad row clamped to the last real position (at decode `n = 1`
-        // and the one row sits at `start`). The words are `seat_words`' — the one statement of the
+        // per seat row, by the card's own prompt law: row `r` runs this request's draw at the
+        // step's own law position (`law.pos(r)` — a pad row clamped to the last real position;
+        // at decode `n = 1` and the one row sits at `start`). The words are `seat_words`' — the one statement of the
         // law both tiers lay out — packed `[rows, 1]` at the views' own dtypes (i32 words, f32
         // inv_t), the memref-faithful layout the bake's numeric gate stages them in; the f16
         // channel `run_step` takes would encode them into half the bytes their views span.
@@ -288,7 +285,7 @@ pub(crate) fn forward_chunk(
                 .map(|r| {
                     seat_words(&RowLaw {
                         draw: draw.as_ref(),
-                        step: (start + r.min(n - 1)) as u32,
+                        step: law.pos(r) as u32,
                     })
                 })
                 .collect();

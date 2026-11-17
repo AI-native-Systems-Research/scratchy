@@ -112,9 +112,9 @@ impl LaunchRows<'_> {
     /// request's real rows (the count its concatenated host seeds carry).
     fn live(&self) -> usize {
         match self {
-            LaunchRows::Sequence { rows, .. } => rows.real.get(),
+            LaunchRows::Sequence { rows, .. } => rows.real(),
             LaunchRows::Batch { seqs } => seqs.len(),
-            LaunchRows::Packed { steps, .. } => steps.iter().map(|s| s.rows.real.get()).sum(),
+            LaunchRows::Packed { steps, .. } => steps.iter().map(|s| s.rows.real()).sum(),
         }
     }
 
@@ -140,7 +140,7 @@ impl LaunchRows<'_> {
     /// 0's last real row, so the seed law's `t[live_of(r)]` always names a real token.
     fn live_of(&self, r: usize) -> usize {
         match self {
-            LaunchRows::Sequence { rows, .. } => r.min(rows.real.get() - 1),
+            LaunchRows::Sequence { rows, .. } => rows.live(r),
             LaunchRows::Batch { seqs } => {
                 if r < seqs.len() {
                     r
@@ -153,11 +153,11 @@ impl LaunchRows<'_> {
                 let mut base = 0;
                 for (i, req) in steps.iter().enumerate() {
                     if i == q {
-                        return base + (r % width).min(req.rows.real.get() - 1);
+                        return base + req.rows.live(r % width);
                     }
-                    base += req.rows.real.get();
+                    base += req.rows.real();
                 }
-                steps[0].rows.real.get() - 1
+                steps[0].rows.last_live()
             }
         }
     }
@@ -1492,9 +1492,10 @@ pub(crate) fn superdsc_forward_chunk(
         let out = run_card_launch(
             LaunchRows::Sequence {
                 blocks: &blocks,
-                rows: StepRows::new(pos, real).ok_or_else(|| {
+                rows: StepRows::new(width, pos, real).ok_or_else(|| {
                     werr(
-                        "superdsc prefill: a chunk of zero real rows — the chunker staged no chunk"
+                        "superdsc prefill: a chunk of zero real rows — or one wider than the rung \
+                         — the chunker staged no chunk"
                             .to_string(),
                     )
                 })?,
@@ -1582,8 +1583,8 @@ pub(crate) fn superdsc_forward_packed(
         .map(|t| {
             Ok(scratchy_target_spyre::paged_step::RequestStep {
                 blocks: &t.blocks,
-                rows: StepRows::new(t.start, t.toks.len()).ok_or_else(|| {
-                    werr("a wave tail of zero real rows — the gatherer staged no tail".to_string())
+                rows: StepRows::new(w, t.start, t.toks.len()).ok_or_else(|| {
+                    werr("a wave tail of zero real rows — or one wider than its window — the gatherer staged no tail".to_string())
                 })?,
             })
         })
@@ -1753,7 +1754,7 @@ mod pad_clamp_tests {
         // this pin checks is the same mint every launch reads.
         let rows_in = LaunchRows::Sequence {
             blocks: &[],
-            rows: scratchy_target_spyre::paged_step::StepRows::new(10, 4)
+            rows: scratchy_target_spyre::paged_step::StepRows::new(4, 10, 4)
                 .expect("the four-real-row rung the pad clamp pins stages"),
         };
         let binds = sample_binds(

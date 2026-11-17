@@ -111,28 +111,61 @@ pub fn prove_ladder_walks(
     Ok(())
 }
 
-/// The rows of one forward: `real` tokens at positions `start..start + real`, in a bundle
-/// [`PagedStep::rows`] wide. A row past the real ones repeats the last real token
-/// ([`ktir_superdsc::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
-/// mask and its KV write are the last real token's.
+/// ⭐ THE POOL ONE DEVICE REGION HOLDS, in token slots. Every layer's K and V pools are one segment,
+/// one allocation of at most [`scratchy_spyre_bundle::MAX_SEGMENT_BYTES`], at `kv_slot_bytes` a slot
+/// (every layer's K and V row of one token). So the pool is the model's own context,
+/// `context_slots`, where that fits, and otherwise the most whole pages that do — vLLM's `num_blocks`
+/// bounded by memory, with `--max-model-len` checked against the pool it got
+/// ([`PagedStep::capacity`]). granite-3.1-8b's 131072 slots at 163840 B are 20 GiB; its pool is
+/// 104832 positions, 819 pages. `None` when not one page fits.
+pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::NonZeroU32> {
+    let fit = scratchy_spyre_bundle::MAX_SEGMENT_BYTES / kv_slot_bytes.max(1);
+    let fit_pages =
+        u32::try_from(fit / u64::from(SchedulerBlockTokens::REFERENCE.get())).unwrap_or(u32::MAX);
+    let slots = context_slots.min(fit_pages.saturating_mul(SchedulerBlockTokens::REFERENCE.get()));
+    std::num::NonZeroU32::new(slots)
+}
+
+/// The rows of one forward: `real` tokens at positions `start..start + real`, in a chunk
+/// [`width`](Self::width) wide — the rung's own row count, which `real` never exceeds: the mint
+/// refuses it. A row past the real ones repeats the last real token ([`Self::live`]'s law), so
+/// its forward, its mask and its KV write are the last real token's.
 ///
-/// ⭐ `real` IS A COUNT, ONE OR MORE — a step of zero real rows is no step, and every reader that
-/// clamped it (`pos`'s own `.max(1)`, the worker's `live_of`) was defending against a value that
-/// names a broken staging, not tolerating a real one. The mint refuses it, so the count the type
-/// carries is the count the staging meant.
+/// ⭐ THE MINT REFUSES A BROKEN STAGING — a chunk of zero rows, a step of zero real rows, or
+/// `real` rows in a narrower chunk. Each names a staging the runtime could only mis-stage, which
+/// the caller names at its own door; the count the type carries is the count the staging meant,
+/// and the width it carries is the width it is staged against — the fact `check` used to
+/// validate at every call, now a fact of the type stated once at the mint.
+///
+/// ⭐ THE PAD LAW IS THE TYPE'S, ONCE. [`Self::live`] delegates to
+/// [`ktir_superdsc::sdsc_abstract::ChunkRows::row_logical_pos`] — the ONE statement of the
+/// chunk's pad-row map (Kani-pinned `prefill_pad_row_holds_last_real_token`) — and every front
+/// (the card worker, the emu forward, the bake's gate) reads it here. A front that hand-rolls
+/// `min(r, real − 1)` or a copy-from-last-row rewrite is re-deriving a law the type already
+/// carries: that is a defect, not a staging.
 #[derive(Clone, Copy, Debug)]
 pub struct StepRows {
-    pub start: usize,
-    pub real: std::num::NonZeroUsize,
+    start: usize,
+    chunk: ktir_superdsc::sdsc_abstract::ChunkRows,
+    real: std::num::NonZeroUsize,
 }
 
 impl StepRows {
-    /// Declare `real` rows from `start`. `None` for zero real rows — a staging that asks for a
-    /// step of nothing, which the caller names at its own door.
-    pub fn new(start: usize, real: usize) -> Option<StepRows> {
+    /// Declare `real` rows of a chunk `width` wide from `start`. `None` for a staging the type
+    /// refuses: a chunk of zero rows, a step of zero real rows, or `real` rows in a narrower
+    /// chunk — each a broken staging the caller names at its own door.
+    pub fn new(width: usize, start: usize, real: usize) -> Option<StepRows> {
+        let chunk = ktir_superdsc::sdsc_abstract::ChunkRows::chunk(
+            u32::try_from(width).ok().and_then(std::num::NonZeroU32::new)?,
+        );
+        let real = std::num::NonZeroUsize::new(real)?;
+        if real.get() > chunk.count().get() as usize {
+            return None;
+        }
         Some(StepRows {
             start,
-            real: std::num::NonZeroUsize::new(real)?,
+            chunk,
+            real,
         })
     }
 
@@ -141,13 +174,42 @@ impl StepRows {
     pub const fn one_at(start: usize) -> StepRows {
         StepRows {
             start,
+            chunk: ktir_superdsc::sdsc_abstract::ChunkRows::chunk(std::num::NonZeroU32::MIN),
             real: std::num::NonZeroUsize::MIN,
         }
     }
 
+    /// ⭐ THE PAD LAW — the live row row `r` reads its token, its rope and its write from:
+    /// [`ChunkRows::row_logical_pos`]'s, the one statement, never re-derived. A row past the
+    /// real ones carries the last real row's values.
+    pub fn live(&self, r: usize) -> usize {
+        self.chunk.row_logical_pos(r, self.real.get())
+    }
+
+    /// The last real row — [`Self::live`]'s bound, the row every pad row reads.
+    pub fn last_live(&self) -> usize {
+        self.real.get() - 1
+    }
+
     /// The sequence position row `r` carries.
     pub fn pos(&self, r: usize) -> usize {
-        self.start + r.min(self.real.get() - 1)
+        self.start + self.live(r)
+    }
+
+    /// The chunk's width — the rung's row count the rows are staged against.
+    pub fn width(&self) -> usize {
+        self.chunk.count().get() as usize
+    }
+
+    /// The real-row count — a count for arithmetic only (totals, seed widths), never a law to
+    /// re-derive from: the law is [`Self::live`].
+    pub fn real(&self) -> usize {
+        self.real.get()
+    }
+
+    /// The step's first position.
+    pub fn start(&self) -> usize {
+        self.start
     }
 
     /// One past the last position this step reaches — the KV length after its write.
@@ -167,23 +229,11 @@ impl std::fmt::Display for PagedStepError {
 }
 
 /// The blocks a step reads and writes must exist: every position below `rows.end()` has a block,
-/// and every block is a page of the pool. `bound` is the row count the rows are checked against —
-/// the graph's rows for one sequence's whole forward, the extent's per-request width for one
-/// request of a packed rung's (the two are the same number at one request).
-fn check(
-    step: &PagedStep,
-    bound: usize,
-    blocks: &[u32],
-    rows: &StepRows,
-) -> Result<(), PagedStepError> {
+/// and every block is a page of the pool. The rows' own width — that they are no wider than the
+/// window they are staged against — is a fact of [`StepRows`]'s mint, not a check here.
+fn check(step: &PagedStep, blocks: &[u32], rows: &StepRows) -> Result<(), PagedStepError> {
     let slots = step.page_slots as usize;
     let need = rows.end().div_ceil(slots);
-    if rows.real.get() > bound {
-        return Err(PagedStepError(format!(
-            "a step of {} real row(s) in a {bound}-row window",
-            rows.real
-        )));
-    }
     if blocks.len() < need {
         return Err(PagedStepError(format!(
             "positions up to {} need {need} block(s) of {slots} slots; the request holds {}",
@@ -256,7 +306,7 @@ pub fn page_table(
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
-    check(step, step.rows as usize, blocks, rows)?;
+    check(step, blocks, rows)?;
     let anchor = first_active(step, rows);
     let mut t = vec![0i32; step.walk as usize * INT32_ELEMS_PER_STICK];
     for (i, &page) in blocks
@@ -309,7 +359,7 @@ pub fn write_rows(
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
-    check(step, step.rows as usize, blocks, rows)?;
+    check(step, blocks, rows)?;
     let (slots, nkvh, q) = (
         step.page_slots as usize,
         step.nkvh as usize,
@@ -689,7 +739,7 @@ pub fn card_step_sources(
         )));
     }
     for (r, req) in reqs.iter().enumerate() {
-        check(step, w, req.blocks, &req.rows)
+        check(step, req.blocks, &req.rows)
             .map_err(|e| PagedStepError(format!("request {r}: {}", e.0)))?;
     }
     let (walk, slots, nkvh) = (
@@ -908,10 +958,6 @@ pub fn pool_of_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn nz(n: usize) -> std::num::NonZeroUsize {
-        std::num::NonZeroUsize::new(n).unwrap()
-    }
 
     fn nz32(n: u32) -> std::num::NonZeroU32 {
         std::num::NonZeroU32::new(n).unwrap()
@@ -1209,10 +1255,7 @@ mod tests {
         let got = request_sources(
             &decode,
             &blocks,
-            &StepRows {
-                start: 5,
-                real: nz(1),
-            },
+            &StepRows::new(1, 5, 1).unwrap(),
         )
         .unwrap();
         let want = batch_sources(
@@ -1229,10 +1272,7 @@ mod tests {
         assert!(tids.contains(&decode.rep_rows) && tids.contains(&decode.chunk_pages));
         assert!(!tids.contains(&decode.page_table) && !tids.contains(&decode.kv_row_pool));
         let prompt = step();
-        let rows = StepRows {
-            start: 5,
-            real: nz(2),
-        };
+        let rows = StepRows::new(3, 5, 2).unwrap();
         assert_eq!(
             request_sources(&prompt, &blocks, &rows).unwrap().int32,
             step_sources(&prompt, &blocks, &rows).unwrap().int32
@@ -1252,10 +1292,7 @@ mod tests {
     #[test]
     fn the_tables_follow_spyre_inference_s_laws() {
         let s = step();
-        let rows = StepRows {
-            start: 5,
-            real: nz(2),
-        };
+        let rows = StepRows::new(3, 5, 2).unwrap();
         let blocks = [2u32, 0];
         let pt = page_table(&s, &blocks, &rows).unwrap();
         assert_eq!(
@@ -1307,7 +1344,7 @@ mod tests {
             window: Some(nz32(6)),
             ..step()
         };
-        let rows = StepRows::new(9, 3).unwrap();
+        let rows = StepRows::new(3, 9, 3).unwrap();
         let blocks = [0u32, 1, 2, 3];
         assert_eq!(first_active(&s, &rows), 1, "the earliest query reaches from 4");
         assert_eq!(s.span(&rows), 8, "end 12 less the anchor's 4 positions");
@@ -1336,7 +1373,7 @@ mod tests {
     /// the anchored table and the windowed stack are the causal ones, byte for byte.
     #[test]
     fn a_window_past_the_sequence_s_start_is_the_causal_stack() {
-        let rows = StepRows::new(3, 2).unwrap();
+        let rows = StepRows::new(3, 3, 2).unwrap();
         let blocks = [2u32, 0];
         let w = PagedStep {
             window: Some(nz32(10)),
@@ -1366,7 +1403,7 @@ mod tests {
         let blocks = [1u32, 2, 3, 4, 5];
         // End 17 (3 rows from 14): the causal step is past the reach and refuses; the W-6 step's
         // span is 17 − 8 = 9 and runs.
-        let rows = StepRows::new(14, 3).unwrap();
+        let rows = StepRows::new(3, 14, 3).unwrap();
         let causal = PagedStep { pages: 8, ..step() };
         assert!(step_sources(&causal, &blocks, &rows).is_err());
         assert!(step_sources(&base, &blocks, &rows).is_ok());
@@ -1482,10 +1519,7 @@ mod tests {
         let chunk = step();
         let staged = tids(
             &chunk,
-            StepRows {
-                start: 5,
-                real: nz(2),
-            },
+            StepRows::new(3, 5, 2).unwrap(),
         );
         assert!(!staged.contains(&chunk.kv_row_pool) && !staged.contains(&chunk.int32_zero));
         let decode = PagedStep {
@@ -1496,10 +1530,7 @@ mod tests {
         let srcs = step_sources(
             &decode,
             &blocks,
-            &StepRows {
-                start: 5,
-                real: nz(1),
-            },
+            &StepRows::new(1, 5, 1).unwrap(),
         )
         .unwrap();
         assert!(srcs.int32.iter().any(|(t, ..)| *t == decode.kv_row_pool));
@@ -1524,10 +1555,7 @@ mod tests {
     #[test]
     fn the_card_holds_the_page_table_one_block_per_trip() {
         let s = step();
-        let rows = StepRows {
-            start: 5,
-            real: nz(2),
-        };
+        let rows = StepRows::new(3, 5, 2).unwrap();
         let blocks = [2u32, 3];
         let card = card_step_sources(
             &s,
@@ -1571,10 +1599,7 @@ mod tests {
             page_slots: 128,
             ..step()
         };
-        let rows = StepRows {
-            start: 5,
-            real: nz(2),
-        };
+        let rows = StepRows::new(3, 5, 2).unwrap();
         let blocks = [2u32, 3];
         let logical = mask_stack(&s, &rows);
         let card = card_step_sources(
@@ -1745,10 +1770,7 @@ mod tests {
                 let body = full
                     .on_body(rows, PagedRows::Sequence, walk * full.page_slots)
                     .unwrap();
-                let st = StepRows {
-                    start: 0,
-                    real: nz(real),
-                };
+                let st = StepRows::new(rows as usize, 0, real).unwrap();
                 let blocks = [3u32, 2, 1, 0];
                 let card = card_step_sources(
                     &body,
@@ -1847,14 +1869,8 @@ mod tests {
         let wtid = |r: u32, table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r, table);
         let a = [2u32, 3];
         let b = [1u32, 0, 3];
-        let ra = StepRows {
-            start: 5,
-            real: nz(2),
-        };
-        let rb = StepRows {
-            start: 1,
-            real: nz(3),
-        };
+        let ra = StepRows::new(3, 5, 2).unwrap();
+        let rb = StepRows::new(3, 1, 3).unwrap();
         let card = card_step_sources(
             &s,
             &[
@@ -1964,10 +1980,7 @@ mod tests {
         let trip = s.card_walk_step() as usize;
         let wtid = |r: u32, table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r, table);
         let a = [2u32, 3];
-        let ra = StepRows {
-            start: 5,
-            real: nz(2),
-        };
+        let ra = StepRows::new(3, 5, 2).unwrap();
         let card = card_step_sources(
             &s,
             &[RequestStep {
@@ -2042,19 +2055,11 @@ mod tests {
             .collect();
         assert!(card_step_sources(&s, &three).is_err());
         assert!(card_step_sources(&s, &[]).is_err());
-        // A request wider than the per-request window refuses by name.
+        // A request wider than the per-request window DOES NOT EXIST — the mint refuses it, so
+        // no staging can name one (the runtime check `check` used to make, now the type's fact).
         assert!(
-            card_step_sources(
-                &one,
-                &[RequestStep {
-                    blocks: &[0, 1, 2, 3],
-                    rows: StepRows {
-                        start: 0,
-                        real: nz(4),
-                    },
-                }]
-            )
-            .is_err()
+            StepRows::new(one.extent.per_request().get() as usize, 0, 4).is_none(),
+            "a step wider than its chunk does not exist"
         );
     }
 
@@ -2237,27 +2242,9 @@ mod tests {
     fn a_step_past_the_request_s_blocks_is_refused() {
         let s = step();
         assert!(
-            page_table(
-                &s,
-                &[2],
-                &StepRows {
-                    start: 3,
-                    real: nz(2)
-                }
-            )
-            .is_err()
+            page_table(&s, &[2], &StepRows::new(3, 3, 2).unwrap()).is_err()
         );
-        assert!(
-            write_rows(
-                &s,
-                &[2, 9],
-                &StepRows {
-                    start: 0,
-                    real: nz(1)
-                }
-            )
-            .is_err()
-        );
+        assert!(write_rows(&s, &[2, 9], &StepRows::new(3, 0, 1).unwrap()).is_err());
     }
 
     /// A bundle whose attention walks two of the pool's four blocks serves a chunk over a cached
@@ -2268,20 +2255,9 @@ mod tests {
         assert_eq!(s.reach(), 8);
         let blocks = [3u32, 1, 0];
         assert!(
-            page_table(
-                &s,
-                &blocks,
-                &StepRows {
-                    start: 5,
-                    real: nz(3)
-                }
-            )
-            .is_ok()
+            page_table(&s, &blocks, &StepRows::new(3, 5, 3).unwrap()).is_ok()
         );
-        let past = StepRows {
-            start: 6,
-            real: nz(3),
-        };
+        let past = StepRows::new(3, 6, 3).unwrap();
         assert!(page_table(&s, &blocks, &past).is_err());
         assert!(write_rows(&s, &blocks, &past).is_err());
     }

@@ -4219,6 +4219,12 @@ pub(crate) fn dump_wavefront_mega(
                                                         mq,
                                                         rotary_cos,
                                                         rotary_sin,
+                                                        // The bake's own probe stages the
+                                                        // rung's full rows; the gate's pad
+                                                        // probe restates the same rung at
+                                                        // `mq − 1` itself
+                                                        // (`numeric_gate`).
+                                                        pad: None,
                                                     }
                                                 },
                                             );

@@ -19,6 +19,18 @@
   arm per target plus one registry row.
 - **No instruction selection** — the tape comes straight from the fused
   forward.
+- **One law, one type — NEVER stated twice, NEVER re-derived at runtime.**
+  (user order 2026-11-17, violation = nuke the worktree.) Every invariant
+  is stated ONCE, as a type's constructor or method, and every front that
+  needs it (card worker, emu forward, the bake's gate, the kernels'
+  staging) CONSUMES that type. A law re-derived in a second front — or
+  re-derived at runtime from facts the types already carry — is a defect
+  even if the copies agree today. When a defect shows up, the fix is the
+  missing type constraint; never another check, probe, or restated law.
+  Worked example: the paged step's pad law (a pad row repeats the last
+  real row — its position, token, rope rows, KV write) is `StepRows`'s
+  alone; any front hand-rolling `min(r, real−1)` or a copy-from-last-row
+  rewrite is violating this law.
 - No new env-var behavior toggles; no `#[allow]`; no weakening tests
   ([`docs/TESTING.md`](docs/TESTING.md) says which tests stay tests, and what weakening one means).
 

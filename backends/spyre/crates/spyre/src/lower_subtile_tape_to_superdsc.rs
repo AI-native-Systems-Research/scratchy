@@ -3039,6 +3039,12 @@ fn stage_synth_weights<F: RopeForm>(
 struct EmuReadback<'a> {
     own: &'a std::collections::HashMap<u64, Vec<f32>>,
     peer: Option<GatePeer<'a>>,
+    /// ⭐ THE REAL-ROW COUNT THIS RUN WAS STAGED AT — `None` for the rung's full rows. The
+    /// walk's local verdicts compare only the rows the runtime reads of a padded run (the
+    /// first `real` rows of a per-token region, the fold's answer row at `real − 1`): the
+    /// pad rows past `real` are the golden's unclamped view of states the runtime never
+    /// reads, and grading them would refuse a correct run.
+    real: Option<u32>,
 }
 
 /// Whether `op` reads across ranks — the nodes a rank's reference evaluates against its peer.
@@ -3613,7 +3619,11 @@ fn teacher_forced_walk<F: RopeForm>(
     weights: &StagedWeightView<'_>,
     covering: Option<&std::collections::HashSet<u64>>,
 ) -> (Vec<Vec<f32>>, Vec<TeacherForcedRow>) {
-    let EmuReadback { own: emu, peer } = run;
+    let EmuReadback {
+        own: emu,
+        peer,
+        real,
+    } = run;
     let nsrc = ir.num_sources as usize;
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
@@ -3828,8 +3838,23 @@ fn teacher_forced_walk<F: RopeForm>(
                     && e_region.len() >= rcols
                 {
                     let e_row = &e_region[..rcols];
-                    let tf_row = &tf_out[tf_out.len() - rcols..];
-                    let g_row = &g_region[g_region.len() - rcols..];
+                    // ⭐ THE PAD LAW'S ANSWER ROW — at a padded staging the fold's product is
+                    // the LAST REAL row's (`real − 1`), the row the worker reads the answer
+                    // from; the golden's own last row is a pad row it never reads. A folded
+                    // tid's walk product may itself be ONE row (the fold's own product, not
+                    // `[mq, cols]`), so the walk's row clamps to its own product's last row —
+                    // at a full probe both clamps are the last row, the law unchanged.
+                    let want = real.map(|rz| (rz as usize).saturating_sub(1));
+                    let tf_rows = tf_out.len() / rcols;
+                    let tf_at = want
+                        .unwrap_or(tf_rows.saturating_sub(1))
+                        .min(tf_rows.saturating_sub(1));
+                    let tf_row = &tf_out[tf_at * rcols..(tf_at + 1) * rcols];
+                    let g_rows = g_region.len().checked_div(rcols).unwrap_or(0);
+                    let g_at = want
+                        .unwrap_or(g_rows.saturating_sub(1))
+                        .min(g_rows.saturating_sub(1));
+                    let g_row = &g_region[g_at * rcols..(g_at + 1) * rcols];
                     rows.push(TeacherForcedRow {
                         tid,
                         node: ni,
@@ -3850,13 +3875,38 @@ fn teacher_forced_walk<F: RopeForm>(
                         shape,
                     );
                 } else {
+                    // ⭐ THE PAD LAW'S LOCAL ROWS — a padded run grades only the rows the
+                    // runtime reads: the first `real` rows of this op's region (the pad rows
+                    // past `real` are the golden's unclamped view of states the runtime never
+                    // reads). The teacher's pin below still scatters the WHOLE region — the
+                    // walk's downstream rows keep the emulator's own values, pads included.
+                    let mask = real
+                        .map(|rz| {
+                            let cols = node.output.region.cols.len as usize;
+                            let rows = node.output.region.rows;
+                            let live = (rz as usize).saturating_sub(rows.start as usize);
+                            if cols > 0 {
+                                (live.min(rows.len as usize)) * cols
+                            } else {
+                                0
+                            }
+                        })
+                        .filter(|m| *m > 0);
+                    let (e_j, tf_j, g_j) = match mask {
+                        Some(m) => (
+                            &e_region[..m.min(e_region.len())],
+                            &tf_out[..m.min(tf_out.len())],
+                            &g_region[..m.min(g_region.len())],
+                        ),
+                        None => (&e_region[..], &tf_out[..], &g_region[..]),
+                    };
                     rows.push(TeacherForcedRow {
                         tid,
                         node: ni,
                         op: node.op.name(),
                         fp8: tainted.contains(&(tid as u32)),
-                        local: rel_l1(&e_region, &tf_out),
-                        inherited: rel_l1(&tf_out, &g_region),
+                        local: rel_l1(e_j, tf_j),
+                        inherited: rel_l1(tf_j, g_j),
                     });
                     // The teacher's pin: downstream nodes see the EMULATOR's
                     // value, not the golden's product.
@@ -4110,13 +4160,16 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
     // per [`rope_table_periods`] — not as flat noise.
     let rope_table_half = rope_table_periods(ir);
+    // ⭐ THE PROBE'S REAL-ROW COUNT — [`PrefillGate::pad`]: the staging fact this probe's tables
+    // follow, `None` for the rung's full rows.
+    let pad = prefill.and_then(|p| p.pad);
     // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
     // this product feeds the emulator's probe binds below AND the golden's
     // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
     // on one side only. Decode stages nothing here and keeps the period-half
     // synth below — its tables are one row, where the periodic pattern and
     // the run-time staging agree by construction.
-    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
+    let mut staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
         Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
         None => Default::default(),
     };
@@ -4181,7 +4234,15 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .flatten()
         .collect();
     let step_rows = match (prefill, paged.first()) {
-        (Some(pg), _) => crate::paged_step::StepRows::new(0, pg.mq as usize).expect(
+        (Some(pg), _) => crate::paged_step::StepRows::new(
+            // The rung's own row count ([`PrefillGate::mq`]) is the chunk's width — the bound
+            // `check` used to validate at every call, now the mint's fact: `real ≤ width` is
+            // carried by the type, and a step wider than its rung does not exist to stage.
+            pg.mq as usize,
+            0,
+            pad.map(|real| real as usize).unwrap_or(pg.mq as usize),
+        )
+        .expect(
             "the prefill wiring's rung holds no query rows — the bake cannot stage its step",
         ),
         (None, Some(p)) => {
@@ -4214,6 +4275,26 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             }
         })
         .unwrap_or_default();
+    // ⭐ THE PAD LAW'S ROPE ROWS — a row past the real ones rotates at the LAST REAL ROW's
+    // position ([`crate::paged_step::StepRows::live`], the one law every front reads — the
+    // worker's `positions` staging and the emu's alike — never re-derived here), never at the
+    // phantom position its graph row names. The full-rows table already holds position
+    // `real − 1`'s row at row `real − 1`, so the clamp is a rewrite of rows `real..` from the
+    // row the law names.
+    if let Some(real) = pad {
+        for (tid, buf) in staged_rope.iter_mut() {
+            let cols = ir.tensors[*tid as usize].cols as usize;
+            if cols == 0 || buf.len() % cols != 0 {
+                continue;
+            }
+            for r in real as usize..(buf.len() / cols) {
+                let (dst, src) = (r * cols, step_rows.live(r) * cols);
+                if dst + cols <= buf.len() && src + cols <= buf.len() {
+                    buf.copy_within(src..src + cols, dst);
+                }
+            }
+        }
+    }
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
         // The covering slice: a source only the dropped launches read is not
@@ -4231,7 +4312,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
         // session's own allocation holds them at zero.
         let n = if pool_tids.contains(&tid) {
-            step_rows.start * t.cols as usize
+            step_rows.start() * t.cols as usize
         } else {
             (t.rows as usize) * (t.cols as usize)
         };
@@ -4248,14 +4329,34 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         };
         match pool_class.get(&tid) {
             Some((p, hd)) => {
-                let pool = crate::paged_step::pool_of_rows(p, *hd, &blocks, &vals, step_rows.start)
+                let pool = crate::paged_step::pool_of_rows(p, *hd, &blocks, &vals, step_rows.start())
                     .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
                 if !pool.is_empty() {
                     let rows = pool.len() / t.cols as usize;
                     sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
                 }
             }
-            None => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
+            None => {
+                // ⭐ THE PAD LAW'S INPUT ROWS — a row past the real ones carries the LAST REAL
+                // ROW's values (the worker's own pad law, [`crate::paged_step::StepRows::live`]
+                // — the ONE statement, never re-derived: a pad row repeats the live token, so
+                // its projections, rotation and KV write are the last real row's). The rope
+                // tables are clamped above at their own statement; every other source repeats
+                // here, so a pad row's product is the last real row's on BOTH legs.
+                let mut vals = vals;
+                if let Some(real) = pad {
+                    let cols = t.cols as usize;
+                    if cols > 0 && (t.rows as usize) > real as usize {
+                        for r in real as usize..(t.rows as usize) {
+                            let (dst, src) = (r * cols, step_rows.live(r) * cols);
+                            if dst + cols <= vals.len() && src + cols <= vals.len() {
+                                vals.copy_within(src..src + cols, dst);
+                            }
+                        }
+                    }
+                }
+                sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize]));
+            }
         }
     }
     // The compile-time scalars, at their reserved tids — the reader-side law
@@ -4360,9 +4461,19 @@ pub const GATE_DECODE_CONTEXT: u32 = 10
     + scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get() / 2;
 
 #[cfg(feature = "spyre-emu")]
+#[derive(Clone)]
 pub struct PrefillGate {
     /// The bundle's query-row count — the rung it was baked at.
     pub mq: u32,
+    /// ⭐ THE REAL-ROW COUNT THIS PROBE STAGES — `None` for the rung's full rows. The runtime
+    /// stages a prompt chunk at `real ≤ mq` rows and every table the step reads follows the pad
+    /// law ([`crate::paged_step::StepRows::live`]: a row past the real ones repeats the last real
+    /// token's position, mask and KV write); a probe at `None` alone gates only the `real == mq`
+    /// corner that law degenerates at. The bake's own probe states `None`; the gate's pad probe
+    /// ([`numeric_gate`]) restates the same rung at `Some(mq − 1)` — the widest pad the rung
+    /// admits — so the duplicate-index KV write and the clamped mask the card actually runs are
+    /// states under test.
+    pub pad: Option<u32>,
     /// `(tid, kind)` for every cos source the tape declares, then every sin
     /// source — the wiring's own rotary-class law (a hybrid arch's sliding and
     /// global classes carry different tables), so the gate stages exactly the
@@ -4774,8 +4885,10 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .map_err(|e| format!("gate run: {e}"))?;
     // ── Compare at the floor, against the in-memory reference ──
     // `mut` in the judge: the teacher-forced walk borrows the golden's staged sources through it
-    // (pointer-swapped per node, restored before return).
-    let eval_bufs =
+    // (pointer-swapped per node, restored before return). The golden's rows below `real` are
+    // clamp-invariant (a row's own position is its index while it is real), so ONE golden
+    // serves both the full-rows probe and the pad probe below.
+    let mut eval_bufs =
         eval_golden_buffers(ir, &staged_rope, &view, covering, None, &|tid| tid as usize);
     let GateWorst {
         local_clean: worst_local_clean,
@@ -4796,8 +4909,9 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             fp,
             cap,
             peer: None,
+            real: None,
         },
-        eval_bufs,
+        &mut eval_bufs,
     )?;
     let mut scope = String::new();
     if let Some(p) = prefill {
@@ -4826,6 +4940,93 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             f64::NAN
         }
     );
+    // ⭐⭐ THE PAD PROBE — the rung's OTHER runtime corner. The full-rows probe above stages
+    // `real == mq`, the one geometry the pad law degenerates at; the runtime stages a first
+    // prompt chunk at `real < mq` whenever the prompt is shorter than its rung, and there the
+    // duplicate-index KV write (a pad row's cache row IS the last real row's), the clamped
+    // mask stack and the clamped rope rows are the states the card runs. This probe stages
+    // the rung at `real = mq − 1` — the WIDEST pad the rung admits, the geometry that
+    // exercises every pad law at once — in a FRESH session (the pools must start empty, as
+    // the runtime's do), judged on the first `real` rows and the fold's answer row at
+    // `real − 1` ([`GateRun::real`]). One golden serves both probes: the golden's rows
+    // below `real` are clamp-invariant, and the pad rows past it are exactly the rows this
+    // compare refuses to read. Measured need: the card's first gemma-4 decode ran every
+    // full-rows probe green while a padded chunk's first token came back garbage — the pad
+    // law was the one runtime state no rung of the gate had ever staged.
+    if let Some(pg) = prefill
+        && pg.mq > 1
+    {
+        let real = pg.mq - 1;
+        // The SAME rung's gate, restated at the pad law — one staging fact changed
+        // ([`PrefillGate::pad`]), every table the probe reads following it.
+        let pad_gate = PrefillGate {
+            pad: Some(real),
+            ..pg.clone()
+        };
+        let GateProbe {
+            emu_weights,
+            view_bytes: _,
+            gemm: _,
+            scale_rows: _,
+            load_consts: _,
+            staged_rope: _,
+            sources: pad_sources,
+        } = stage_gate_probe::<T, F>(
+            ir,
+            weight_ids,
+            covering,
+            Some(&pad_gate),
+            rung,
+            &|tid| tid as usize,
+            None,
+        )?;
+        let emu_weights = emu_weights
+            .into_iter()
+            .map(|(id, b, dt, s)| (id, crate::allocator::HostBytes::Owned(b), dt, s))
+            .collect::<Vec<_>>();
+        let mut session =
+            crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
+                .map_err(|e| format!("gate session (pad real={real}): {e}"))?;
+        let out = session
+            .run_step(0, pad_sources, &compare)
+            .map_err(|e| format!("gate run (pad real={real}): {e}"))?;
+        let GateWorst {
+            local_clean,
+            local_fp8,
+            total_clean,
+            total_fp8,
+        } = judge_gate_run(
+            GateRun {
+                ir,
+                prefill,
+                compare: &compare,
+                out: &out,
+                tainted: &tainted,
+                golden_op: &golden_op,
+                golden_ins: &golden_ins,
+                view: &view,
+                covering,
+                fp,
+                cap,
+                peer: None,
+                real: Some(real),
+            },
+            &mut eval_bufs,
+        )?;
+        let (lx_peak, lx_cap) = (session.lx_peak_used(), session.lx_capacity());
+        eprintln!(
+            "[spyre-superdsc] NUMERIC GATE PASS {fp} [pad real={real}]: {} tensors at the floor \
+             (worst local clean {local_clean:.4}, worst local fp8-chained {local_fp8:.4}; worst \
+             total clean {total_clean:.4}, worst total fp8-chained {total_fp8:.4}; LX peak \
+             {lx_peak} of {lx_cap} bytes, {:.1}% of capacity)",
+            compare.len(),
+            if lx_cap > 0 {
+                lx_peak as f64 * 100.0 / lx_cap as f64
+            } else {
+                f64::NAN
+            }
+        );
+    }
     Ok(())
 }
 
@@ -4845,6 +5046,13 @@ struct GateRun<'a, F: RopeForm> {
     fp: &'a str,
     cap: u32,
     peer: Option<GatePeer<'a>>,
+    /// ⭐ THE REAL-ROW COUNT THIS RUN WAS STAGED AT — `None` for the rung's full rows. A run
+    /// staged at `Some(real)` (the pad law, [`stage_gate_probe`]'s `pad`) compares only what the
+    /// runtime reads at that staging: the first `real` rows of every per-token tensor, and the
+    /// lm-head tail fold's answer row at `real − 1` (the last REAL row — the row the worker
+    /// reads the answer from), never the pad rows past it, whose golden has no clamp and whose
+    /// values the runtime never reads.
+    real: Option<u32>,
 }
 
 /// A passing run's worst errors: each compared tensor's producing op's own execution (`local`) and
@@ -4863,7 +5071,7 @@ struct GateWorst {
 #[cfg(feature = "spyre-emu")]
 fn judge_gate_run<F: RopeForm>(
     run: GateRun<'_, F>,
-    mut eval_bufs: Vec<Vec<f32>>,
+    eval_bufs: &mut [Vec<f32>],
 ) -> Result<GateWorst, String> {
     let GateRun {
         ir,
@@ -4878,6 +5086,7 @@ fn judge_gate_run<F: RopeForm>(
         fp,
         cap,
         peer,
+        real,
     } = run;
     // ── Compare at the floor, against the in-memory reference ──
     const CLEAN_TOL: f32 = 5e-3;
@@ -5030,9 +5239,29 @@ fn judge_gate_run<F: RopeForm>(
             && !e.is_empty()
             && g_full.len().is_multiple_of(mq_rows)
             && g_full.len() / mq_rows <= e.len();
+        // ⭐ THE PAD LAW'S COMPARE SET — a run staged at `real` rows is judged on what the
+        // runtime reads of it: the first `real` rows of a per-token tensor (`[mq, cols]` — the
+        // pad rows past `real` are the golden's unclamped view, values the runtime never
+        // reads), and the tail fold's answer row at `real − 1` — the LAST REAL row, the one
+        // the worker reads the answer from — never the golden's last row, which at a padded
+        // staging is a pad row.
+        let real_rows = real.map(|rz| rz as usize);
         let (g, e): (&[f32], &[f32]) = if tail_fold {
             let cols = g_full.len() / mq_rows;
-            (&g_full[g_full.len() - cols..], &e[..cols])
+            let answer = real_rows.unwrap_or(mq_rows).saturating_sub(1);
+            (
+                &g_full[answer * cols..(answer + 1) * cols],
+                &e[..cols.min(e.len())],
+            )
+        } else if let (Some(rz), true) = (
+            real_rows,
+            mq_rows > 1 && ir.tensors[tid as usize].rows as usize == mq_rows,
+        ) {
+            let cols = g_full.len() / mq_rows;
+            (
+                &g_full[..(rz * cols).min(g_full.len())],
+                &e[..(rz * cols).min(e.len())],
+            )
         } else {
             (g_full, e)
         };
@@ -5093,8 +5322,8 @@ fn judge_gate_run<F: RopeForm>(
     //    judgment.
     let (walk_tf, split) = teacher_forced_walk(
         ir,
-        &mut eval_bufs,
-        EmuReadback { own: out, peer },
+        eval_bufs,
+        EmuReadback { own: out, peer, real },
         tainted,
         &folded,
         view,
@@ -5165,10 +5394,11 @@ fn judge_gate_run<F: RopeForm>(
                 .collect();
             let (tf, _rows) = teacher_forced_walk(
                 ir,
-                &mut eval_bufs,
+                eval_bufs,
                 EmuReadback {
                     own: &overlay,
                     peer,
+                    real,
                 },
                 tainted,
                 &folded,
@@ -5226,7 +5456,7 @@ fn judge_gate_run<F: RopeForm>(
             restarts: &restarts,
         };
         let dump_note =
-            match write_refusal_dump(fp, cap, &failures, &verdicts, &eval_bufs, out, &evidence) {
+            match write_refusal_dump(fp, cap, &failures, &verdicts, eval_bufs, out, &evidence) {
                 Ok(dir) => format!(" — full dump: {}", dir.display()),
                 Err(e) => format!(" — dump failed: {e}"),
             };
@@ -5671,8 +5901,9 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                         rank: me.get(),
                         ranks: &rank_bufs,
                     }),
+                    real: None,
                 },
-                golden[r].clone(),
+                &mut golden[r],
             )
             .map_err(|e| format!("rank {r}: {e}"))?,
         );

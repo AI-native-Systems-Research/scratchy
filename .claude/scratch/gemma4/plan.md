@@ -72,6 +72,47 @@ through the compiler stack, no ladder hacks. Charter in this worktree's CLAUDE.m
       8 good) — prefill-rung lever suspected. NEXT: the eval_node KV-codec reference
       arms (the gate's own named missing rung) → gate the divergence at bake → fix the
       lowering; emu chat still grinding (/work/g4d-emuchat.log) as oracle
+- [x] **THE PAD PROBE — the gate's missing runtime corner** (landed, VERDICT: PASS).
+      Found the gate's blind spot by reading the staging: `numeric_gate`'s prefill arm
+      stages `StepRows::new(0, mq)` — ALWAYS full rows — while the runtime stages
+      `real < mq` (pad law: `StepRows::pos` clamps positions, `live_of` repeats the last
+      live token, write_rows DUPLICATES the last real row's cache index, mask rows clamp,
+      rope rows stage at clamped positions — all verified correct in the worker). ARM:
+      `PrefillGate::pad` — `numeric_gate` re-runs every prefill rung's probe at
+      `real = mq − 1` (widest pad) in a fresh session, staged by the same
+      `request_sources`/clamp laws, judged masked to rows `< real` + the lm-head fold's
+      answer row at `real − 1`; `EmuReadback::real` masks the teacher-forced walk's local
+      rows the same way. One golden serves both probes (rows `< real` are
+      clamp-invariant). 12b fp8 emu bake (gtv97): both probes PASS — `[pad real=18]`
+      worst local fp8-chained 0.0005, identical to the full probe. **The pad corner is
+      clean; by elimination the defect is the KV-codec family (KvEncode/KvStage/
+      RopeAppend) — exactly the gate's SKIP list, i.e. the one op family the gate has
+      never checked.** TRAP learned: the gate's verdict lives in cargo's CAPTURED
+      build-script stderr (`target/release/build/scratchy-target-spyre-models-*/stderr`),
+      never the nohup log — read that file, not the log. Emu oracle (finished):
+      `1 2 3 4 4 o o o …` — clean ~5 tokens then collapse; the emu forward has NO
+      DECODE_READBACK lines (card path only) and RUST_LOG needs UNDERSCORES
+      (`scratchy_target_spyre_worker`) — dashes silently log nothing
+- [x] **THE PAD LAW IS A TYPE** (user order 2026-11-17, now law in CLAUDE.md — "one law, one
+      type, never stated twice, never re-derived at runtime"; violation = nuke the worktree).
+      The pad law was hand-derived in FOUR places: card `live_of` (`r.min(real−1)`, two arms),
+      emu `min(i, n−1)` (two sites), the gate's two copy-from-last-row rewrites, and
+      `StepRows::pos`'s own inline clamp. Now: `StepRows::live` is the ONE statement,
+      delegating to `ChunkRows::row_logical_pos` (the Kani-pinned single source of truth in
+      ktir-superdsc, the lowest crate); `pos` composes it; fields are private
+      (`real()`/`start()`/`width()`/`last_live()` accessors). The type carries the chunk
+      WIDTH and the mint refuses `real > width` — so `check()`'s runtime bound refusal and
+      the emu forward's `n in 1..=m_cap` check are DELETED (runtime errors → the type's
+      facts). Local: spyre crate 163+integration all green, clippy clean, compiler crate
+      green. Pod re-verification (test/clippy/worker emu leg + the pad bake re-run) next —
+      staged bytes must be identical (the mint widths are exactly the old check bounds).
+- [ ] **KV-codec reference arms in `eval_node`** (the gate's own named missing rung, now
+      the front): the SKIP list skips KvEncode/KvStage/RopeAppend — write the reference
+      arms so the gate checks the decode-write codec against a golden, one op at a time.
+      NOTE: when the defect is found, the FIX is a type constraint (the standing order),
+      never another check.
+      Split experiment running alongside: bf16 emu chat vs the fp8 oracle (codec vs
+      geometry) if a bf16 checkpoint is on the pod
 
 ## Part 2 — 26b MoE (after dense is proven on the card)
 
