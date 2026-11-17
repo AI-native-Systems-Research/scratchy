@@ -950,6 +950,25 @@ fn emit_superdsc_wiring(
                     quote! { ::scratchy_target_spyre::paged_step::PagedRows::Sequence }
                 }
             };
+            // ⭐ THE OP'S OWN WINDOW, re-minted by the ONE constructor the type has —
+            // `NonZeroU32::new` is const, and a `None` here names a bake bug (the mint
+            // refuses a zero window), so it is a const panic in the static, never a
+            // runtime fact.
+            let window = match p.window {
+                Some(w) => {
+                    let w = u32l(w.get());
+                    quote! {
+                        match ::core::num::NonZeroU32::new(#w) {
+                            ::core::option::Option::Some(v) => ::core::option::Option::Some(v),
+                            ::core::option::Option::None => ::core::panic!(
+                                "the wiring's sliding window is zero — a bake bug this static \
+                                 cannot carry"
+                            ),
+                        }
+                    }
+                }
+                None => quote! { ::core::option::Option::None },
+            };
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
@@ -958,6 +977,7 @@ fn emit_superdsc_wiring(
                     head_size: #head_size, walk: #walk,
                     paged_rows: #paged_rows,
                     extent: #extent,
+                    window: #window,
                 })
             }
         }

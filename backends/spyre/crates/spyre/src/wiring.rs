@@ -695,6 +695,15 @@ pub struct PagedStep {
     /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
     /// disagree with.
     pub extent: QueryExtent,
+    /// ⭐ THE OP'S OWN SLIDING WINDOW — [`scratchy_subtile::subtile_ir::AttnMask::SlidingWindow`]'s
+    /// `window`, `None` for a causal op. The step's one statement of its queries' reach: a query
+    /// at absolute position `p` attends keys `[p − window + 1, p]`, so every reader that bounds
+    /// or masks the walk by "every position up to the query's own" reads this instead — the
+    /// walk's span ([`crate::paged_step`]'s laws), the mask stack's window cutoff, the page
+    /// table's first active block. Minted from the op's mask at the one mint
+    /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`], inside its agreement check), a
+    /// model constant the op itself states — never a fact of which model is baking.
+    pub window: Option<std::num::NonZeroU32>,
 }
 
 /// ⭐ THE ROW POOL'S PAGE — the bytes one page of `kv_row_pool` holds on the card: the run of

@@ -734,6 +734,8 @@ mod tests {
                 ::core::panic!("the fixture's three rows by one request name a rung")
             }
         },
+        // The fixture's op is causal — its mask states no window.
+        window: None,
     };
 
     fn shape() -> ForwardShape {

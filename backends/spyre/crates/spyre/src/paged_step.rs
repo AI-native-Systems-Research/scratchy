@@ -978,6 +978,8 @@ mod tests {
             walk: 4,
             paged_rows: PagedRows::Sequence,
             extent: pair(3, 1),
+            // The fixture's op is causal — its mask states no window.
+            window: None,
         }
     }
 
