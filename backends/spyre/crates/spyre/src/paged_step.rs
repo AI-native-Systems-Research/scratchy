@@ -39,6 +39,7 @@ use crate::wiring::PagedStep;
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
 pub use scratchy_triton_splice::{
     BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages,
+    window_walk_blocks,
 };
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
@@ -1371,6 +1372,43 @@ mod tests {
             ..base
         };
         assert!(step_sources(&narrow, &blocks, &rows).is_err());
+    }
+
+    /// ⭐ A WINDOWED BODY WALKS ITS OWN BOUND, NOT THE RUNG'S SWEEP — `on_body` names the same walk
+    /// its body baked, however wide the ladder swept to reach the context: the whole pool's sweep
+    /// caps at the window's bound, a rung narrower than the bound keeps its own sweep, and a
+    /// causal body walks everything it sweeps. The bound reads the launch's own per-request
+    /// width — one row for a decode or batch launch, the chunk's width packed — and the step's
+    /// OWN page size, the units its walk is counted in.
+    #[test]
+    fn a_windowed_body_walks_its_bound_not_the_rung_s_sweep() {
+        // An 8-page pool of 4-slot pages, W 6: the bound is ceil(6/4) + 1 = 3 blocks at one
+        // query row, the same 3 at a batch (one row per request), and ceil((6 + 3 - 1)/4) + 1 = 3
+        // at a 3-row packed chunk.
+        let windowed = PagedStep {
+            pages: 8,
+            window: Some(nz32(6)),
+            ..step()
+        };
+        let causal = PagedStep { pages: 8, ..step() };
+        // The whole pool swept (32 slots): the causal body walks all 8 blocks, the windowed
+        // body its 3.
+        assert_eq!(causal.on_body(1, PagedRows::Sequence, 32).unwrap().walk, 8);
+        assert_eq!(
+            windowed.on_body(1, PagedRows::Sequence, 32).unwrap().walk,
+            3
+        );
+        // A batch launch: one row per request, so the bound is the same 3 blocks.
+        assert_eq!(windowed.on_body(4, PagedRows::Batch, 32).unwrap().walk, 3);
+        // A rung narrower than the bound keeps its own sweep: one block swept, one walked.
+        assert_eq!(windowed.on_body(1, PagedRows::Sequence, 4).unwrap().walk, 1);
+        // A packed chunk of 3 rows: the wider query pushes the earliest window start back, so
+        // the bound is ceil((6 + 3 - 1)/4) + 1 = 3 blocks.
+        let packed = PagedStep {
+            extent: pair(3, 2),
+            ..windowed
+        };
+        assert_eq!(packed.on_body_packed(32).unwrap().walk, 3);
     }
 
     /// ⭐ A WINDOWED DECODE BATCH ANCHORS EACH SEQUENCE AT ITS OWN REACH — every sequence's chunk

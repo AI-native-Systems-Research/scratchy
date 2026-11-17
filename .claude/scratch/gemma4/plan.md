@@ -63,11 +63,21 @@ Every line passes the charter test: would it exist for a non-gemma op that state
 same mask? Yes — the law is over `AttnMask::SlidingWindow`, its window, and the shapes.
 
 ### Proof ladder (each its own commit, each gated by the warm bake)
-a. Field + mint + agreement check (no behavior; bake still fails at the same wall).
-b. Mask law + fixtures (pure function, unit-tested against the reference's tiles).
-c. Walk law + page-table/check/reach laws + fixtures.
-d. Ladder/rung/proof laws.
-e. Batch law + fixtures.
+a. Field + mint + agreement check (no behavior; bake still fails at the same wall). —
+   LANDED `f9c9dc93ae`
+b/c. Staging law: anchor (`first_active`), re-anchored mask stack, page-table skip,
+   span admission in `check`, per-sequence batch anchoring + fixtures. — LANDED
+   `484b7e7f1d` (tests RC=0, clippy RC=0, bake fails at exactly the same t1142 wall)
+d/e. Walk law: `window_walk_blocks` (the reference's `_max_active_blocks`, the block an
+   input — the step's own `page_slots` at the runtime, the scheduler's reference page at
+   the splice) caps `walk_pages`, the splice's arms, the mint, and `on_body`/
+   `on_body_packed`. **The ladder needs NO selection change**: a windowed span never
+   exceeds its own causal span at the same context (`span ≤ end ≤ sweep`), so a rung
+   selected by context length always serves the windowed class — the windowed body walks
+   its bound *inside* whatever rung it rides, and the ceiling walk at the bake stays the
+   CAUSAL reach (`None` — a hybrid's global class needs the pool covered whole). The
+   fold's trip count is a bake fact (`Walk::trips`), so a 17-block windowed walk
+   relaunches 17 times, never per resident page.
 f. Un-refuse the splice → the 12b bake goes GREEN (emu numeric gate included).
 g. Pod: `spyre` CLI build (spyre-hw, spyre-emu) → `spyre chat` on the card, coherent
    reply, greedy parity vs the reference path. A/B vs main is N/A (main refuses) — the

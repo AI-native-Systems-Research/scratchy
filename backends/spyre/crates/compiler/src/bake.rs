@@ -3363,7 +3363,12 @@ pub(crate) fn dump_wavefront_mega(
                 // reach its context.
                 let context_pages = ContextPages::of_slots(prefix_len).get();
                 let ceiling_walk = scratchy_target_spyre::paged_step::walk_pages(
-                    prefix_len.get(), prefill_mq.unwrap_or(decode_rows), active_cap);
+                    context_pages,
+                    prefill_mq.unwrap_or(decode_rows),
+                    prefill_mq.unwrap_or(1),
+                    active_cap,
+                    None,
+                );
                 let walked = superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
                     &tape_rolled,
                     &krg,
