@@ -364,7 +364,7 @@ impl Wiring {
         rows: StagedRows,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(self.baked_row_capacity(), rows, self.paged, n_consts)
+        self.forward_shape_within(self.baked_row_capacity(), rows, self.paged.to_vec(), n_consts)
     }
 
     /// [`Self::forward_shape`] with the capacity and the paged step supplied by the CALLER rather
@@ -389,8 +389,9 @@ impl Wiring {
         cap: RowCapacity,
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
-        // The step of the body that runs — this wiring's own for its own bundle.
-        paged: Option<PagedStep>,
+        // The steps of the body that runs — this wiring's own for its own bundle, one per
+        // attention class, already adjusted to the body (`PagedStep::on_body`).
+        paged: Vec<PagedStep>,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -704,6 +705,13 @@ pub struct PagedStep {
     /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`], inside its agreement check), a
     /// model constant the op itself states — never a fact of which model is baking.
     pub window: Option<std::num::NonZeroU32>,
+    /// ⭐ THE STEP'S CLASS — its index among the graph's distinct attention step geometries (the
+    /// `(window, nkvh)` pairs, widest-windowed first;
+    /// `scratchy_triton_splice::attn_step_classes`). Class 0 is the only class a uniform model
+    /// has; the tids above are that class's. A hybrid model's classes each get their own step,
+    /// their own tables through `PagedStepTids::of_class`, and their own packed-prefill window
+    /// family through `scratchy_triton_splice::paged_window_of_class`.
+    pub class: u32,
 }
 
 /// ⭐ THE ROW POOL'S PAGE — the bytes one page of `kv_row_pool` holds on the card: the run of
@@ -875,17 +883,18 @@ impl PagedStep {
                 ]);
             }
             None => {
-                // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID — window `r`'s three tables (page
-                // table, mask stack, query rows) at
-                // [`ktir_superdsc::reserved_tids::paged_window_tid`] `r`, each its own region
-                // sized the ONE-REQUEST size (the step's walk), the windows
-                // packed in window order after the write rows. Window 0's tids ARE the step's
-                // own sentinels, so at one request the rows are exactly today's — same tids,
-                // same sizes, same order, byte for byte.
+                // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID OF THE STEP'S OWN CLASS — window
+                // `r`'s three tables (page table, mask stack, query rows) at
+                // `scratchy_triton_splice::paged_window_of_class` (class 0's family being the
+                // `paged_window_tid` sentinels' own), each its own region sized the ONE-REQUEST
+                // size (the pool's whole walk, as ever), the windows packed in window order
+                // after the write rows. Window 0's tids ARE the class's own step tables, so at
+                // one class and one request the rows are exactly today's — same tids, same
+                // sizes, same order, byte for byte.
                 let w = u64::from(self.extent.per_request().get());
                 let windows = u64::from(self.extent.requests().get());
                 let window_tid = |r: u64, table: u32| {
-                    ktir_superdsc::reserved_tids::paged_window_tid(r as u32, table)
+                    scratchy_triton_splice::paged_window_of_class(self.class as usize, r as u32, table)
                 };
                 for r in 0..windows {
                     v.extend([
@@ -1034,8 +1043,11 @@ pub struct Wiring {
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
     pub attn_mask: Option<u32>,
-    /// The paged step's sources and pool — see [`PagedStep`]. `None` for a graph with no attention.
-    pub paged: Option<PagedStep>,
+    /// The paged steps' sources and pools, one per attention class, class-sorted (widest window
+    /// first; see [`PagedStep`]) — a hybrid-attention model's geometries each carry their own
+    /// tables, the reference's one `SpyreAttentionMetadataBuilder` per kv-cache group. A uniform
+    /// model carries exactly one, at class 0's sentinel tids. EMPTY for a graph with no attention.
+    pub paged: &'static [PagedStep],
     /// Baked `valid_len - 1`; a worker overrides per generated token.
     pub decode_position: u32,
     /// `[rows, cols]` per tensor id.
@@ -2418,10 +2430,11 @@ impl Wiring {
         r as usize * c as usize
     }
 
-    /// The KV capacity the bundle was baked at — its pools' token slots.
+    /// The KV capacity the bundle was baked at — its pools' token slots. The classes share one
+    /// pool (refused at the mint), so the first step's capacity is every class's.
     #[inline]
     pub fn capacity(&self) -> Option<usize> {
-        self.paged.map(PagedStep::capacity)
+        self.paged.first().map(|p| p.capacity())
     }
 }
 
@@ -3080,7 +3093,7 @@ mod constant_tape_tests {
             result_dtype: scratchy_tensors::DType::F16,
             num_sources: 0,
             attn_mask: None,
-            paged: None,
+            paged: &[],
             decode_position: 0,
             tensor_shapes: &[],
             embed_src: 0,

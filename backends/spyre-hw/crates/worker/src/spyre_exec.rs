@@ -140,17 +140,21 @@ impl Worker for SpyreWorker {
 
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has —
     /// every page but the null page a padded row writes (`paged_step::page_of_block`). The pool is the
-    /// bake's: every bundle places it, at the decode wiring's `PagedStep::pages`.
+    /// bake's: every bundle places it, at the decode wiring's `PagedStep::pages` (the classes share
+    /// one pool, refused at the mint, so the first step's count is every class's).
     fn kv_cache_num_blocks_override(&self) -> Option<usize> {
         self.model
             .as_ref()
             .and_then(|m| m.decode.first())
             .and_then(|b| {
                 #[cfg(feature = "spyre-hw")]
-                let paged = b.wiring.paged;
+                {
+                    b.wiring.paged.first()
+                }
                 #[cfg(not(feature = "spyre-hw"))]
-                let paged = b.paged;
-                paged
+                {
+                    b.paged.first()
+                }
             })
             .map(|p| p.host_blocks() as usize)
     }

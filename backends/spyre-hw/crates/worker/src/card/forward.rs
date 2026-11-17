@@ -589,55 +589,71 @@ pub(crate) fn run_card_launch<E: LaunchEnd>(
             ))
         })?
         .get();
-    let paged = b
+    // ⭐ EVERY CLASS'S STEP, at the body that runs — a hybrid model's attention geometries each
+    // carry their own tables, staged side by side. The extent law is the launch's own kind: a
+    // sequence launch re-derives its pair from its rows, a decode batch from its count, and a
+    // WAVE keeps the packed rung's wiring's own pair (`on_body_packed`): the bake minted
+    // `(w, s)` for that rung, and the wave IS that pair, so there is nothing to re-derive.
+    if b.wiring.paged.is_empty() {
+        return Err(werr(
+            "this bundle states no paged step — its attention has no pools",
+        ));
+    }
+    let steps: Vec<scratchy_target_spyre::wiring::PagedStep> = b
         .wiring
         .paged
-        .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
-    // ⭐ THE EXTENT LAW IS THE LAUNCH'S OWN KIND — a sequence launch re-derives its pair from
-    // its rows, a decode batch from its count, and a WAVE keeps the packed rung's wiring's
-    // own pair (`on_body_packed`): the bake minted `(w, s)` for that rung, and the wave IS
-    // that pair, so there is nothing to re-derive.
-    let step = match &rows_in {
-        LaunchRows::Sequence { .. } => paged.on_body(
-            width.get(),
-            scratchy_target_spyre::paged_step::PagedRows::Sequence,
-            swept,
-        ),
-        LaunchRows::Batch { .. } => paged.on_body(
-            width.get(),
-            scratchy_target_spyre::paged_step::PagedRows::Batch,
-            swept,
-        ),
-        LaunchRows::Packed { .. } => paged.on_body_packed(swept),
-    }
-    .ok_or_else(|| {
-        werr(format!(
-            "card launch: the body sweeps {swept} slot(s), which is no walk of this bundle's pool"
-        ))
-    })?;
-    let card = match &rows_in {
-        LaunchRows::Sequence { blocks, rows } => {
-            // One request's list: a sequence launch is one request today — the packing that
-            // widens this list is the concurrent-prefill rung's own step, not this front's.
-            scratchy_target_spyre::paged_step::card_step_sources(
-                &step,
-                &[scratchy_target_spyre::paged_step::RequestStep {
-                    blocks,
-                    rows: *rows,
-                }],
-            )
-        }
-        LaunchRows::Batch { seqs } => {
-            scratchy_target_spyre::paged_step::card_batch_sources(&step, seqs)
-        }
-        // ⭐ THE WAVE'S OWN STEPS, one window per request — `card_step_sources` stages each
-        // request's three tables at its window's own tids and the empty slots past the live
-        // ones as no request's.
-        LaunchRows::Packed { steps, .. } => {
-            scratchy_target_spyre::paged_step::card_step_sources(&step, steps)
-        }
-    }
-    .map_err(|e| werr(format!("card launch at {seq_pos}: paged step: {e}")))?;
+        .iter()
+        .map(|&s| {
+            match &rows_in {
+                LaunchRows::Sequence { .. } => s.on_body(
+                    width.get(),
+                    scratchy_target_spyre::paged_step::PagedRows::Sequence,
+                    swept,
+                ),
+                LaunchRows::Batch { .. } => s.on_body(
+                    width.get(),
+                    scratchy_target_spyre::paged_step::PagedRows::Batch,
+                    swept,
+                ),
+                LaunchRows::Packed { .. } => s.on_body_packed(swept),
+            }
+            .ok_or_else(|| {
+                werr(format!(
+                    "card launch: the body sweeps {swept} slot(s), which is no walk of this \
+                     bundle's pool"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let card: Vec<scratchy_target_spyre::paged_step::CardSources> = steps
+        .iter()
+        .map(|step| {
+            match &rows_in {
+                LaunchRows::Sequence { blocks, rows } => {
+                    // One request's list: a sequence launch is one request today — the packing
+                    // that widens this list is the concurrent-prefill rung's own step, not this
+                    // front's.
+                    scratchy_target_spyre::paged_step::card_step_sources(
+                        step,
+                        &[scratchy_target_spyre::paged_step::RequestStep {
+                            blocks,
+                            rows: *rows,
+                        }],
+                    )
+                }
+                LaunchRows::Batch { seqs } => {
+                    scratchy_target_spyre::paged_step::card_batch_sources(step, seqs)
+                }
+                // ⭐ THE WAVE'S OWN STEPS, one window per request — `card_step_sources` stages
+                // each request's three tables at its window's own tids and the empty slots
+                // past the live ones as no request's.
+                LaunchRows::Packed { steps, .. } => {
+                    scratchy_target_spyre::paged_step::card_step_sources(step, steps)
+                }
+            }
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| werr(format!("card launch at {seq_pos}: paged step: {e}")))?;
     // ⭐ ONE TOKEN PER BOUND ROW — a pad row takes its live row's (`LaunchRows::live_of`). An
     // `OnCard` launch binds none: its seeds are the card's own ChainStage writes, which only a
     // decode-phase bundle's tape reads.
@@ -692,7 +708,7 @@ pub(crate) fn run_card_launch<E: LaunchEnd>(
     let shape = b.wiring.forward_shape_within(
         scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(width),
         launch_rows,
-        Some(step),
+        steps,
         consts.len(),
     );
     let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
@@ -709,7 +725,7 @@ pub(crate) fn run_card_launch<E: LaunchEnd>(
         positions: &positions,
         consts: &consts,
         stick_major: true,
-        paged: Some(&card),
+        paged: Some(card.as_slice()),
     };
     let fsteps = shape.steps();
     let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
@@ -2055,7 +2071,7 @@ mod pad_clamp_tests {
             embed_src: 1,
             cos_srcs: &[],
             sin_srcs: &[],
-            paged: None,
+            paged: Vec::new(),
             n_consts: 0,
             phase: scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain },
         };

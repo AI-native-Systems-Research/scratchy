@@ -354,6 +354,7 @@ mod tests {
             head_size: 64,
             walk: pages,
             window: None,
+            class: 0,
             paged_rows: crate::paged_step::PagedRows::Sequence,
             extent: pair(rows, 1),
         }
