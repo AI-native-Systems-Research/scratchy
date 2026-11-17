@@ -1,6 +1,6 @@
 ---
 name: scratchy-purity-audit
-description: Audit a scratchy PR, branch or diff for Rust/compiler purity — everything is a constant; constants reach kernels as kernel compile-time constants; each invariant expressed once, as a type every code path shares (never re-stated as a runtime check along another path); no runtime refusals, ever; newtypes and non-cosmetic const generics; a derived compiler ladder with no per-model hacks; target surface = opcode lowering only; the device is a type of its constants. Use when asked to audit, review or judge whether code "obeys the scratchy architecture", is "good scratchy", "pure", "locked down", or "high quality Rust".
+description: Audit a scratchy PR, branch or diff for Rust/compiler purity — everything is a constant; constants reach kernels as kernel compile-time constants; each invariant expressed once, as a type every code path shares (never re-stated as a runtime check along another path); no runtime refusals, ever; newtypes and non-cosmetic const generics; a derived compiler ladder with no per-model hacks; target surface = opcode lowering only; the device is a type of its constants; one source of truth; lock and comment hygiene; proper in-tree tests, never standing in for a type. Use when asked to audit, review or judge whether code "obeys the scratchy architecture", is "good scratchy", "pure", "locked down", or "high quality Rust".
 ---
 
 # scratchy purity audit
@@ -110,6 +110,7 @@ Forbidden:
 **Method:** trace at least one invariant end to end and count every place it is described (Rust const, kernel constant, expansion check, validate, runtime launcher check, `expect`, test copy). Each path that re-states it counts once. The count is the finding. The fix gets it to one type, minted once.
 
 - **Tells:** `rg -n 'expect\("|unreachable!|debug_assert|already (checked|refuses)|validate\(\)|the launcher.s rule|mirrors' <dirs>`
+- **Fix shape for "every member must be handled"** (each buffer made resident, each field bound): destructure the struct with no `..` rest pattern, so a new field fails the build until it is handled. Never a per-site check that the list is complete.
 
 ### P4. No runtime refusals. Ever.
 A runtime refusal is a deliberate runtime rejection of a model, shape, dtype, device, config, request parameter or capability:
@@ -156,12 +157,18 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - Shape constraints are **rustc type constraints**: shapes as const-generic or marker parameters on typed steps, with producer out == consumer in as the same type. `const _: () = assert!(..)` over emitted values is not the goal.
 - Every lockdown is two-sided: hardware bounds the tile, and **the tape's own extent pins the product**. Watch for "did the legal set get bigger or the emitted extent smaller" (type weakened, or a degenerate program that satisfies an honest type).
 - **A PR that demotes a const generic or newtype to a value is changes-requested; that is the verdict, not a finding.** This includes routing around a typed fact by adding a parallel raw-value copy, for example a second facts struct of `u32`s beside `model_facts::Class<…>`, or a second `RopePairing`.
+- **A law names its numbers.** A build-time failure states the declared value, the input it came from, and which side broke ("192× the declared 64, from `n`"), never just "invalid".
+- **A per-model generic design shows its cost.**
+  - It measures cold build time and peak RSS against main, each in a fresh target dir, attributed with `--timings`, before it lands.
+  - A compile-time regression is never answered by lowering opt-level or disabling an optimization.
+  - The end state is ONE representation shared by every target and the runtime; a design that adds another copy of the facts is not progress.
 
 ### P7. A real compiler ladder: derived, never declared per model
 - No model, arch or stem names in logic: `match arch`, `.contains(&arch)`, `&[&str]` arch or preset allowlists, `RouteProgram::Qwen*`, `GEMMA_PROGRAM` template flags. Name the math ("top-k, scale, softmax"), never the model.
 - A fact that follows from configs the compiler loads is derived in ONE shared place: no new `overrides.json` hand entries, no arch branches, no model-wide "has X anywhere" proxies.
 - A kernel family covers the general shape space through instantiation, with a rung for off-tile shapes. If coverage is exactly the shapes of the checkpoints in hand, that is the finding: head dims {256, 512}, expert counts {128, 256}, "a tiny parity config's GEMMs sit off the tiles".
 - A rule chosen by name when the shape already decides it (picking a tile by arch name rather than by `n`) is a finding.
+- A checked-in model `config.json` is the verbatim checkpoint config: never edited. A sizing or capacity bug is never fixed by bumping a per-model constant until one test passes. That's reward hacking: the fix derives the value once, from the deployment or the config, for every model.
 - **Tells:**
   - doc comments justifying a rule with a model ("Gemma's", "the 27B's");
   - tables of per-model shapes in comments;
@@ -178,17 +185,38 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - **The ruled design (2026-10-09):** the target is the chip's facts as const generics, `AppleGpu<const GEN: u32, const ULTRA: bool>` (the two facts `MTLDevice.architecture.name` carries). Every setting is a formula of them, read in the lowering as `T::…` with `T: MetalTarget`. There's one tape per variant, and the device picks its own at load.
 - **Main doesn't have it yet; this is known P9 debt.** Main's Metal device is `MetalTargetProfile`, a runtime struct of `f64` facts (`crates/targets/metal/src/tape/targets.rs:27`), picked by `profile_for(class: GenClass)` (`crates/targets/metal/compiler/src/static_tape.rs:1261`; `GenClass` at `crates/targets/metal/src/tape/lowered.rs:3155`). That is the class enum this rule forbids. A PR that adds a profile field, a `GenClass` arm or a copy of the pattern for another target is a finding. A PR that moves it toward `AppleGpu<GEN, ULTRA>` is the fix.
 - No hard-coded device numbers in Rust or kernel source (`H100_SXM_SMS = 132`, `TARGET_CTAS = 264`), no per-chip hand tables, and no class enums or bands.
+- **Metal is MTL4 only.** Not a single line of Metal 3, not even in a test, an experiment or a microbench: no `MTLCommandQueue`/`MTLCommandBuffer`/`MTLComputeCommandEncoder` path, `computeCommandEncoderWithDispatchType` or `memoryBarrierWithScope`.
 
 ### P10. One source of truth
 - The same edit needed in two callers means the duplication is the bug: consolidate the routine, don't share a helper between the copies.
 - A test that checks a copy against a copy can't catch drift; that counts even under `cfg(test)`.
 - An invented schema in a data file (magic keys, `kind` strings, a second copy of the loader's naming) is a smell to reject.
 
-### P11. Lock hygiene (report only when it hides one of the above)
+### P11. Lock and comment hygiene
+Report these as one grouped line after the rules above.
 - No `#[allow]` anywhere: not at a site, and not in a `[lints]` table. Find the design the lint doesn't flag. (Main's `[lints]` tables only declare check-cfg.)
 - No escape-hatch constructors (`from_untyped`, `conflated_with_*`, a `pub` raw constructor on a checked type).
 - No weakened tests or ratchets ("did the number get smaller?").
-- No `/tmp/…` plan references in code.
+- Comments describe the code as it is, in the present tense:
+  - no tombstones ("X used to be here", "these checks are gone");
+  - no refactor narration ("now lives here", "moved from X");
+  - no `/tmp/…` plan references.
+
+  That applies to `Cargo.toml` comments too.
+
+### P12. Proper tests: in-tree Rust, never standing in for a type
+- A test is never written where a type could carry the fact (the ranking at the top of §1).
+- Type proofs are `compile_fail` doctests that name their error code. Only nightly rustdoc checks the code (stable ignores it), so they're proved by the nightly run.
+- No out-of-tree gate pipelines (Python or shell comparers, tape dumpers, ad-hoc gate scripts): "we are a rust project; we need proper tests".
+  - A PR's evidence is CI, the nightly doctests, `scr chat` and a quiet perf A/B.
+  - "Identical output" means an `OUT_DIR` diff of the emitted code against main.
+- Not proper tests:
+  - a test pinning a fake layer's error strings;
+  - a test restating a helper;
+  - a test running a mint on null or fake tensors;
+  - a test checking a copy against a copy (P10).
+- A golden is a hash (one line per model), never a dump. It is blessed by regeneration, never hand-edited.
+- A test that "X changes the answer" first shows that not-X doesn't.
 
 ## 2. The report
 
