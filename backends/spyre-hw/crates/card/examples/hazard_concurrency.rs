@@ -51,7 +51,7 @@ use anyhow::anyhow;
 use scratchy_target_spyre_card::runtime::{CardRuntime as AnyCard, DevAddr, HwError, Stream};
 
 /// A one-card probe: the card's runtime is a world of one's.
-type CardRuntime = AnyCard<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
+type CardRuntime<'a> = AnyCard<'a, scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
 
 /// 512 MiB — see the module doc: the park B pays is bounded by the DmaBufPool's
 /// in-flight cap and varies run to run with the staging-vs-drain race, so the size
@@ -85,7 +85,7 @@ fn pattern_word(i: usize, xor: u64) -> u64 {
 /// One round: stage `old`, launch A's write of `new`, then race B's read on its own
 /// thread. Returns (B's launch duration — the park, when tracked, B's readback).
 fn run_round(
-    card: &CardRuntime,
+    card: &CardRuntime<'_>,
     track_hazards: bool,
     addr: &DevAddr,
 ) -> anyhow::Result<(Duration, Duration, Vec<u8>)> {
@@ -154,20 +154,39 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let card = scratchy_target_spyre_card::runtime::WorldCards::<
+    // ⭐ THE SERVE SPAN OF A ONE-SHOT PROBE IS THE PROBE ITSELF: the scope wraps every round,
+    // so the card's completion thread lives exactly as long as the probe and joins at the
+    // scope's close — plain locals, nothing leaked. The card is opened outside the scope (the
+    // runtime built over it borrows it for longer than the scope's threads live), the rounds
+    // run inside it.
+    let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
+        .map_err(|e| anyhow!("Spyre card table: {e}"))?;
+    let world = scratchy_target_spyre_card::runtime::WorldCards::<
         scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
-    >::open_all()
-    .map_err(|e| anyhow!("{e}"))?
-    .into_first();
+    >::claim(&table)
+    .map_err(|e| anyhow!("{e}"))?;
+    let cards = scratchy_target_spyre_card::runtime::WorldCards::join_opens(world.open_cards())
+        .map_err(|e| anyhow!("{e}"))?;
+    std::thread::scope(|scope| {
+        let card = world
+            .build_all(&cards, scope)
+            .map_err(|e| anyhow!("{e}"))?
+            .into_first();
+        rounds(&card)
+    })
+}
+
+/// The probe's body over its card — both rounds and the park report.
+fn rounds(card: &CardRuntime<'_>) -> anyhow::Result<()> {
     let addr = DevAddr::alloc(
-        &card,
+        card,
         flex_rs::address::ByteSize(SIZE_BYTES as u64),
         flex_rs::memory_region::MemoryType::Tensor,
     )
     .map_err(|e| anyhow!("alloc: {e}"))?;
 
     // ── Round 1: tracked OP_ORDERING streams — the RAW edge must order them. ──
-    let (b_launch_tracked, _t_a, readback) = run_round(&card, true, &addr)?;
+    let (b_launch_tracked, _t_a, readback) = run_round(card, true, &addr)?;
     let mismatches: usize = words(&readback)
         .enumerate()
         .map(|(i, got)| usize::from(got != pattern_word(i, NEW_XOR)))
@@ -184,7 +203,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // ── Round 2 (control): untracked — same shapes, no edge, no park. ──
-    let (b_launch_untracked, _t_a, readback) = run_round(&card, false, &addr)?;
+    let (b_launch_untracked, _t_a, readback) = run_round(card, false, &addr)?;
     // No assertion on WHAT the racing read saw — untracked means unordered, and a torn
     // read is a possible (not promised) outcome. Report it honestly.
     let matched_new = words(&readback)

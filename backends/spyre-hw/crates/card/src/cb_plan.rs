@@ -371,7 +371,7 @@ impl WalkCanvas {
         seg: &[Option<DevAddr>; NUM_SEGMENTS],
         banks: &[Option<DevAddr>],
         where_: &LaunchWhere,
-        stream: &Stream,
+        stream: &Stream<'_>,
     ) -> Result<Self> {
         let (items, barrier) = walk_items(ops, seg, banks, where_)?;
         Ok(Self {

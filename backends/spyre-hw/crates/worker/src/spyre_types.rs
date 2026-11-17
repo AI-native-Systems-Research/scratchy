@@ -10,6 +10,8 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "spyre-hw")]
+use crate::card::types::World;
 use scratchy_core_model::weight::HfModelConfig;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
 // runner; the bundle type + session type are cfg-selected, everything else
@@ -196,6 +198,13 @@ pub(crate) struct Loaded {
     /// the node every card sits on, or rank 0's when they span nodes.
     #[cfg(feature = "spyre-hw")]
     pub(crate) world_cpus: scratchy_target_spyre_card::runtime::WorldCpus,
+    /// ⭐ THE SERVE SPAN — the scope hosting every card's completion threads, on its own
+    /// dedicated thread. Lives HERE so it spans exactly the model's life: dropping `Loaded`
+    /// (the worker dropped, however it happened) stops every card through the vendor's
+    /// bounded-drain door and then releases the hosting thread, so the completion threads join
+    /// rather than die with the process.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) serve_span: scratchy_target_spyre_card::runtime::ServeSpan<World>,
 }
 
 /// Per-request generation state the worker keeps beside `InputBatch`.

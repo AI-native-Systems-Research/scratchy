@@ -860,21 +860,18 @@ impl SpyreWorker {
         // distinct by construction (`WorldCards::claim`). Rank r opens `cards.get(r)` by its PCIe
         // address — no index arithmetic, and nothing in the environment chooses the set.
         #[cfg(feature = "spyre-hw")]
-        let card_open = {
+        let (world, card_open) = {
             let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
                 .map_err(|e| werr(format!("Spyre card table: {e}")))?;
             let world = scratchy_target_spyre_card::runtime::WorldCards::<World>::claim(&table)
                 .map_err(|e| werr(e.to_string()))?;
             info!("[spyre-worker] this world's cards: {}", world.describe());
-            let world = std::sync::Arc::new(world);
-            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::from_fn(|r| {
-                let world = std::sync::Arc::clone(&world);
-                std::thread::spawn(move || {
-                    scratchy_target_spyre_card::runtime::CardRuntime::<World>::open(
-                        world.per_rank().get(r),
-                    )
-                })
-            })
+            // PHASE 1: the cards themselves, each opened on its own background thread NOW so
+            // the ~5.7 s bring-ups overlap the host-side weight load below; joined where the
+            // first runtime needs them (the join block). `world` stays in hand — phase 2 builds
+            // the runtimes from its claimed facts.
+            let open = world.open_cards();
+            (world, open)
         };
 
         let model_dir = resolve_model_path(
@@ -1390,6 +1387,12 @@ impl SpyreWorker {
                     wiring,
                 }
             };
+        // The serve span hosting every card's completion threads — built with the runtimes
+        // (below), adopted by the leaked runtimes, and carried in `Loaded` so it is released
+        // exactly when the model is.
+        #[cfg(feature = "spyre-hw")]
+        let mut serve_span_v: Option<scratchy_target_spyre_card::runtime::ServeSpan<World>> =
+            None;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1533,17 +1536,34 @@ impl SpyreWorker {
                 // that cannot report one does not open — so the KV pool below is sized from the real
                 // card, with no default to fall back to.
                 //
-                // ⭐ OPENED ONCE, FOR THE PROCESS, AND BORROWED BY EVERY SESSION. The sessions land in
-                // `Loaded`, which the worker holds for the life of the process (a `Box<dyn Worker>`,
-                // so `'static`), and each borrows its card: `&'static` is the borrow that outlives
-                // them, given to the cards ONCE here — the same as the bundles this load leaks — so
-                // the compiler, not a refcount, checks that no session outlives its card.
-                let opened: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
-                    h.join()
-                        .map_err(|_| werr(format!("card {}'s bring-up thread panicked", r.get())))?
-                        .map_err(|e| werr(format!("open Spyre card {}: {e}", r.get())))
-                })?;
-                let cards: &'static Cards = Box::leak(Box::new(opened));
+                // ⭐ OPENED ONCE, FOR THE PROCESS. The sessions land in `Loaded`, which the worker
+                // holds for the life of the process (a `Box<dyn Worker>`, so `'static`), and each
+                // borrows its card's RUNTIME, which borrows the card: `&'static` is the borrow
+                // that outlives them all, given ONCE here to the cards and below to the runtimes
+                // — the same as the bundles this load leaks — so the compiler, not a refcount,
+                // checks that no session outlives its runtime and no runtime its card.
+                let opened: OpenedCards =
+                    scratchy_target_spyre_card::runtime::WorldCards::join_opens(card_open)
+                        .map_err(werr)?;
+                let opened_cards: &'static OpenedCards = Box::leak(Box::new(opened));
+                // ⭐ PHASE 2 ON THE SERVE SPAN — the runtimes, built per rank on scoped threads
+                // pinned to their card's node, `create_scheduler` parking each card's completion
+                // threads on the span's scope. The span is hosted by its own thread (the
+                // worker's serve span has no frame of its own — the engine calls in from its
+                // threads); the runtimes borrow only the leaked cards, never the scope, so they
+                // are leaked in turn and every session below borrows them at `&'static`.
+                // Dropping `Loaded` drops the span: every card is stopped through the vendor's
+                // bounded-drain door and the completion threads join, never die with the
+                // process.
+                let (mut serve_span, built) =
+                    scratchy_target_spyre_card::runtime::WorldCards::build_on_serve_span(
+                        world,
+                        opened_cards,
+                    );
+                let runtimes: Cards = built.map_err(werr)?;
+                let cards: &'static Cards = Box::leak(Box::new(runtimes));
+                serve_span.adopt(cards);
+                serve_span_v = Some(serve_span);
                 // ⭐ THIS THREAD BUILDS EVERY SESSION, so it runs where the world's shared work
                 // runs before the first one is built: each session's host copies and the
                 // activation shadows faulted in below are allocated and first touched there.
@@ -3167,6 +3187,8 @@ impl SpyreWorker {
             served_context: served_context_v,
             #[cfg(feature = "spyre-hw")]
             world_cpus: world_cpus_v,
+            #[cfg(feature = "spyre-hw")]
+            serve_span: serve_span_v.expect("the hw load path sets the serve span with the runtimes"),
         })
     }
 }

@@ -6,8 +6,8 @@
 //! everywhere else; it then F-sends slot `i` to every peer, landing in that peer's slot `i`. When
 //! the run ends, every card's buffer must hold every card's pattern, byte for byte.
 //!
-//! The mechanism, all of it the production path (`CardRuntime::open`, the flex scheduler's
-//! `launch_p2p_rdma_send` / `launch_p2p_rdma_wait`):
+//! The mechanism, all of it the production path (`WorldCards::open_cards` / `build_all`, the
+//! flex scheduler's `launch_p2p_rdma_send` / `launch_p2p_rdma_wait`):
 //! - **link**: on every card, base-address-table entry `tid = peer` holds the peer's region-2 PCI
 //!   address (`SenPci::pciaddr_for_region(peer, 2)`, the vendor's `initialize_p2p_address_table`);
 //! - **landing**: on receiver `j`, `XSEG[sid = i]` points at `j`'s slot `i` — the sender's index is
@@ -46,7 +46,7 @@ use scratchy_target_spyre_card::runtime::{CardTable, WorldCards};
 
 /// A raw flex-level probe: the cards are driven below the world-typed p2p link, so they are opened
 /// as one card's runtime each.
-type CardRuntime = AnyCard<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
+type CardRuntime<'a> = AnyCard<'a, TpWorld<1>>;
 
 /// One slot: one card's message.
 const SLOT_BYTES: u64 = 64 * 1024;
@@ -66,7 +66,7 @@ fn flat_va(segment: u64, offset_bytes: u64) -> u64 {
 /// One card's side of the run: its runtime (borrowed from `main`, which owns every card), one
 /// stream, and its N-slot buffer.
 struct Side<'c> {
-    card: &'c CardRuntime,
+    card: &'c CardRuntime<'_>,
     stream: Arc<RuntimeStream>,
     buf: Arc<CompositeAddress>,
     /// The buffer's (segment, byte offset) on this card — what a peer's send lands against.
@@ -75,7 +75,7 @@ struct Side<'c> {
 }
 
 impl<'c> Side<'c> {
-    fn new(card: &'c CardRuntime, n: usize) -> Result<Self> {
+    fn new(card: &'c CardRuntime<'_>, n: usize) -> Result<Self> {
         let rt = card.context().clone();
         let allocator = rt.get_allocator().map_err(|e| anyhow!("allocator: {e}"))?;
         let buf = Arc::new(
@@ -169,40 +169,52 @@ fn main() -> Result<()> {
         n >= 2 && n <= have,
         "N={n}: needs 2..={have} cards (senlib enumerates {have})"
     );
+    let pcis: Vec<String> = table.cards()[..n]
+        .iter()
+        .map(|c| c.pci().to_string())
+        .collect();
     let own: Vec<CardTable> = table.cards()[..n]
         .iter()
         .map(|c| CardTable::of([(c.index(), c.pci().to_string())]))
         .collect();
 
-    // ── Open every card, in parallel: each bring-up is ~5.7 s. ──
+    // ── Phase 1: open every card, in parallel — each bring-up is ~5.7 s, and every open runs
+    //    on its own thread (`open_cards` spawns, `join_opens` joins only after every open is
+    //    already in flight). ──
     let t = Instant::now();
-    let cards: Vec<CardRuntime> = own
+    let worlds: Vec<WorldCards<TpWorld<1>>> = own
         .into_iter()
-        .map(|one| {
-            std::thread::spawn(move || {
-                let world = WorldCards::<TpWorld<1>>::claim(&one).map_err(|e| anyhow!("{e}"))?;
-                CardRuntime::open(world.per_rank().first()).map_err(|e| anyhow!("{e}"))
-            })
-        })
-        .collect::<Vec<_>>()
+        .map(|one| WorldCards::claim(&one).map_err(|e| anyhow!("{e}")))
+        .collect::<Result<_>>()?;
+    let opens: Vec<_> = worlds.iter().map(|w| w.open_cards()).collect();
+    let opened: Vec<_> = opens
         .into_iter()
-        .enumerate()
-        .map(|(i, h)| {
-            h.join()
-                .map_err(|_| anyhow!("card {i}: bring-up thread panicked"))?
-                .map_err(|e| anyhow!("card {i}: {e}"))
-        })
+        .map(|o| WorldCards::join_opens(o).map_err(|e| anyhow!("{e}")))
         .collect::<Result<_>>()?;
     println!(
         "opened {n} cards in one process in {:.2}s: {}",
         t.elapsed().as_secs_f64(),
-        cards
-            .iter()
-            .map(|c| c.card().pci().to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
+        pcis.join(" ")
     );
 
+    // ── Phase 2 + the exchange: ONE scope hosts every card's completion threads for exactly
+    //    the probe's span — the runtimes are plain locals borrowing `opened`, built inside it,
+    //    used inside it, and their completion threads join at its close. Nothing is leaked. ──
+    std::thread::scope(|scope| {
+        let cards: Vec<CardRuntime<'_>> = worlds
+            .iter()
+            .zip(opened.iter())
+            .map(|(w, o)| w.build_all(o, scope).map_err(|e| anyhow!("{e}")))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|r| r.into_first())
+            .collect();
+        exchange(&cards, n)
+    })
+}
+
+/// The exchange over the opened runtimes: link, buffers, landing, sends, waits, judgment.
+fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
     // ── Link: every card's BAT entry for every peer. ──
     let bar2: Vec<u64> = cards
         .iter()

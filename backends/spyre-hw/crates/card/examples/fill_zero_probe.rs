@@ -30,7 +30,10 @@ use anyhow::{Context, Result, anyhow};
 
 use flex_rs::address::ByteSize;
 use flex_rs::memory_region::MemoryType;
-use scratchy_target_spyre_card::runtime::{DevAddr, Stream};
+use scratchy_target_spyre_card::runtime::{CardRuntime as AnyCard, DevAddr, Stream};
+
+/// A one-card probe: the card's runtime is a world of one's.
+type CardRuntime<'a> = AnyCard<'a, ktir_superdsc::collective::TpWorld<1>>;
 
 /// The window step of `zero_seg`'s walk, mirrored here so the probe exercises
 /// the same single-chunk shapes the loader submits.
@@ -55,14 +58,32 @@ fn pattern_bytes(len: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let card = scratchy_target_spyre_card::runtime::WorldCards::<
+    // ⭐ THE PROBE'S SERVE SPAN IS THE PROBE ITSELF: the card is opened outside the
+    // scope (the runtime built over it borrows it for longer than the scope's threads
+    // live), the probe runs inside it, and the card's completion thread joins at the
+    // scope's close — plain locals, nothing leaked.
+    let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
+        .map_err(|e| anyhow!("Spyre card table: {e}"))?;
+    let world = scratchy_target_spyre_card::runtime::WorldCards::<
         ktir_superdsc::collective::TpWorld<1>,
-    >::open_all()
-    .map_err(anyhow::Error::msg)?
-    .into_first();
-    let stream = Stream::create(&card).context("stream create")?;
+    >::claim(&table)
+    .map_err(|e| anyhow!("{e}"))?;
+    let cards = scratchy_target_spyre_card::runtime::WorldCards::join_opens(world.open_cards())
+        .map_err(|e| anyhow!("{e}"))?;
+    std::thread::scope(|scope| {
+        let card = world
+            .build_all(&cards, scope)
+            .map_err(|e| anyhow!("{e}"))?
+            .into_first();
+        probe_body(&card)
+    })
+}
+
+/// The probe's body over its card — poison, fill, verify.
+fn probe_body(card: &CardRuntime<'_>) -> Result<()> {
+    let stream = Stream::create(card).context("stream create")?;
     let total = WINDOW + TAIL;
-    let dev = DevAddr::alloc(&card, ByteSize(total), MemoryType::Tensor)
+    let dev = DevAddr::alloc(card, ByteSize(total), MemoryType::Tensor)
         .context("device buffer alloc")?;
 
     // --- 1. not-X: the region really holds non-zero bytes before the fill ---
