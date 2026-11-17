@@ -15,11 +15,12 @@ audited SHA, never an unread grep hit.
 ## 0. Pin what you audit
 
 ```bash
-gh -R AI-native-Systems-Research/scratchy pr view <N> --json headRefOid,title,body,additions,changedFiles
+head=$(gh -R AI-native-Systems-Research/scratchy pr view <N> --json headRefOid --jq .headRefOid)
 up=$(git remote -v | awk '/AI-native-Systems-Research\/scratchy(\.git)? \(fetch\)/ {print $1; exit}')
-git fetch "$up" pull/<N>/head:refs/remotes/pr/<N>
+git fetch "$up" "+pull/<N>/head:refs/remotes/pr/<N>"   # `+`: a force-pushed head replaces the old ref
 git fetch "$up" main
-sha=$(git rev-parse refs/remotes/pr/<N>)   # must equal headRefOid above
+sha=$(git rev-parse refs/remotes/pr/<N>)
+[ "$sha" = "$head" ] || echo "STOP: fetched $sha, the PR head is $head"
 git diff --stat=200 "$up/main...$sha" -- . ':!**/third_party/**' ':!**/thunderkittens/**'
 s=.claude/scratch/purity-<N>-${sha:0:8}
 rm -rf "$s/src" && mkdir -p "$s/src" && printf '*\n' > "$s/.gitignore"
@@ -27,6 +28,7 @@ git archive -o "$s/src.tar" "$sha" <dirs…>
 tar -xf "$s/src.tar" -C "$s/src"
 ```
 
+- If it prints `STOP`, audit nothing: the fetched ref isn't the PR's head. Fetch again until `sha` equals `headRefOid`.
 - `$up` is whichever remote fetches `AI-native-Systems-Research/scratchy` (`upstream` in some clones, `origin` in others).
 - Scratch lives in the worktree, in a directory its own `.gitignore` (`*`) hides. Never `/tmp`: macOS culls it.
 - The scratch path carries the head SHA, and `src` is emptied before extraction. A re-audit after a force-push never cites a file the new head deleted, and two audits never share a tree.
@@ -129,10 +131,12 @@ These are **not** refusals under this rule, and they are the only ones:
 
 Anything else, including a second checkpoint check outside that one door, is a violation. When unsure, it is a violation.
 
-- **Count them, classified.** For each error enum in the runtime crates (`rg -n 'pub enum \w*(Error|Refusal)'`), read every variant's doc and sort it into exactly one class:
+- **Count them, classified.** Find every error enum in the runtime crates (`rg -n '^pub enum \w*(Error|Refusal)\b' <runtime crates>/src`). That includes the ones raised at load, such as a tape validator or a checkpoint loader, not just the launch and forward enums. Read every variant's doc and sort it into exactly one class:
   - **refusal**: a deliberate rejection of a shape, model, config, request parameter, capability or invariant. Only these count against P4.
   - **operational**: a true runtime failure that is not a decision (`Cuda(cudaError_t)`, a caught host exception, no device present, I/O). Exempt (exception 3). List these separately so the count reproduces, but never add them to the P4 count.
-  - **wrapper**: carries another enum's error (`Launch { error: KernelError }`). Count it under the inner enum, never twice.
+  - **wrapper**: any variant whose payload is another error enum (`Launch { error: KernelError }`, `Tape { error: TapeError }`, `Prepare { error: KernelError }`). Count it under the inner enum, never twice.
+
+  A loader's checkpoint-header checks are exception 2 only if that one function mints a typed weight that everything downstream takes. If anything downstream re-checks the weight (its bytes, its shape, its presence), there is no door: the header checks count as refusals, and so does the re-check.
 
   Report `<enum>: N refusals (+ M operational, W wrappers)` per enum, with the total of refusals.
 - **Also count:** shape-refusal sites in kernel sources (every form: `return ERR_SHAPE` and ternaries), `Result<(), String>` capability hooks, and refusal seams added to shared serving code.
@@ -217,14 +221,17 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - **P3:** the GEMM tile rule is stated or checked in 5 places: Rust `GEMM_BF16_TILE`, the `.cu` `M_TILE`/`N_TILE`/`K_TILE`, `gemm_kernel` and `gemm_shape` at expansion, and the launcher's runtime `ERR_SHAPE`. Pool presence is two paired `Option`s, re-checked by `WorkerError::*PoolMissing/Unused` and 7 `.expect("`new` made a pool …")`.
 - **P4:**
   - 99 runtime shape-refusal sites across all 44 `.cu` launchers: 98 `return SCRATCHY_CUDA_ERR_SHAPE` plus one in a ternary (`gemm_fp8.cu:859`). Grep for both forms;
-  - **74 refusal variants** across the five runtime enums, classified:
+  - **126 refusal variants** across the eight runtime error enums in `backends/cuda/crates/{cuda,worker}/src`, classified:
     - `KernelError`: 19 refusals (+ 2 operational: `HostException`, `Cuda`);
-    - `WorkerError`: 12 refusals (+ 1 operational: `Cuda`; 1 wrapper: `Launch`);
+    - `WorkerError`: 11 refusals (+ 1 operational: `Cuda`; 2 wrappers: `Tape`, `Launch`);
     - `ForwardError`: 26 refusals (+ 1 operational: `Cuda`; 1 wrapper: `Launch`);
     - `PlanError`: 16 refusals;
-    - `DeviceError`: 1 refusal, `NotH100` (+ 3 operational: `Cuda`, `NoDevice`, `Prepare`).
+    - `DeviceError`: 1 refusal, `NotH100` (+ 2 operational: `Cuda`, `NoDevice`; 1 wrapper: `Prepare`);
+    - `TapeError` (`tape.rs:583`, raised at load by `validate()` at `worker.rs:840`): 45 refusals (+ 1 wrapper: `QuantChain`);
+    - `QuantChainError` (`step.rs:439`): 2 refusals;
+    - `LoadError` (`weights.rs:331`): 6 refusals: `TableLength`, `Missing`, `PerExpertTensors`, `Dtype`, `Shape` and `Bytes` (+ 2 operational: `NoCheckpoint`, `Upload`). The header checks are not the #1094 door, because the loader mints no type and `WorkerError::{MissingWeight,WeightTooSmall}` re-checks the bytes.
 
-    The raw totals (21 + 14 + 28 + 16 + 4 = 83) = 74 refusals + 7 operational + 2 wrappers;
+    The raw totals (21 + 14 + 28 + 16 + 4 + 46 + 2 + 8 = 139) = 126 refusals + 8 operational + 5 wrappers;
   - greedy-only sampling refused per request through a new stringly `WorkerFactory::check_sampling -> Result<(), String>` seam in shared serving.
 - **P5–P7:** bare-`u32` step fields; a parallel raw `TargetModelFacts` beside the typed `model_facts::Class`; `CUDA_CAPABLE`, `CUDA_PRESETS` and `CUDA_GEMM_COL64_ARCHS` string allowlists; `RouteProgram::{QwenSoftmax, GemmaScaledSoftmax}`.
 - **P8:** CUDA-private post-lowering passes (`gemv_tc`, `quantize_fp8_inputs`, `fp8_moe_prefill`, `fold_norm_quants`).
