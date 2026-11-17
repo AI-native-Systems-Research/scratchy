@@ -2755,6 +2755,7 @@ dependencies = [
  "scratchy-target-cuda-compiler",
  "scratchy-tensors",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
