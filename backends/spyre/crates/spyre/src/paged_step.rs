@@ -18,8 +18,7 @@
 //!   `first_active = earliest_window_start // block_size`), so its trips read the window's blocks
 //!   however long the context;
 //! * the KV WRITE INDEX — `kv_write_index`: one `[rows]` index per kv head, one after another, head
-//!   `h` of the token at `block · page_slots + offset` at row
-//!   `(block · nkvh + h) · page_slots + offset`;
+//!   `h` of the token at [`PagedStep::cache_row`] — the folded-cache row law's one statement;
 //! * the QUERY ROW INDEX `[rows]` int32 — `_build_query_row_tables`: the sequence's rows of the
 //!   query. A forward here is one sequence whose padded rows already repeat its last real row (the
 //!   worker's pad law), so its rows are `0..rows` in order;
@@ -353,24 +352,18 @@ fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
 }
 
 /// The KV write index: one `[rows]` index per kv head, one after another — head `h` of row `r`'s
-/// token at cache row `(page · nkvh + h) · page_slots + slot`, at the row's position.
+/// token at [`PagedStep::cache_row`], at the row's position.
 pub fn write_rows(
     step: &PagedStep,
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
     check(step, blocks, rows)?;
-    let (slots, nkvh, q) = (
-        step.page_slots as usize,
-        step.nkvh as usize,
-        step.rows as usize,
-    );
+    let (nkvh, q) = (step.nkvh as usize, step.rows as usize);
     let mut w = Vec::with_capacity(nkvh * q);
     for h in 0..nkvh {
         for r in 0..q {
-            let pos = rows.pos(r);
-            let page = blocks[pos / slots] as usize;
-            w.push(((page * nkvh + h) * slots + pos % slots) as i32);
+            w.push(step.cache_row(blocks, rows.pos(r), h) as i32);
         }
     }
     Ok(w)
@@ -607,11 +600,11 @@ pub fn batch_sources(
     let mut write = Vec::with_capacity(nkvh * b);
     for h in 0..nkvh {
         for r in 0..b {
-            let (page, slot) = match seqs.get(r) {
-                Some(q) => (q.blocks[q.pos / slots] as usize, q.pos % slots),
-                None => (NULL_SLOT / slots, NULL_SLOT % slots),
+            let row = match seqs.get(r) {
+                Some(q) => step.cache_row(q.blocks, q.pos, h),
+                None => step.null_cache_row(h),
             };
-            write.push(((page * nkvh + h) * slots + slot) as i32);
+            write.push(row as i32);
         }
     }
     let e = j * b;
@@ -800,15 +793,10 @@ pub fn card_step_sources(
             match reqs.get(r) {
                 Some(req) => {
                     for j in 0..w {
-                        let pos = req.rows.pos(j);
-                        let page = req.blocks[pos / slots] as usize;
-                        write.push(((page * nkvh + h) * slots + pos % slots) as i32);
+                        write.push(step.cache_row(req.blocks, req.rows.pos(j), h) as i32);
                     }
                 }
-                None => {
-                    let null = ((NULL_SLOT / slots) * nkvh + h) * slots + NULL_SLOT % slots;
-                    write.extend(std::iter::repeat_n(null as i32, w));
-                }
+                None => write.extend(std::iter::repeat_n(step.null_cache_row(h) as i32, w)),
             }
         }
     }
@@ -903,8 +891,7 @@ pub fn card_statics(step: &PagedStep) -> Result<Vec<(u32, Vec<u8>)>, PagedStepEr
 }
 
 /// A pool holding token-major cache rows: row `t` of `cache` (`[·, nkvh · hd]`) laid into its page —
-/// head `h` at pool row `(blocks[t / page_slots] · nkvh + h) · page_slots + t % page_slots` — for
-/// every `t < valid`; every other row zero. Returned as the pool's PREFIX through the last page a
+/// head `h` at pool row [`PagedStep::cache_row`] — for every `t < valid`; every other row zero. Returned as the pool's PREFIX through the last page a
 /// row lands on (empty when `valid` is 0): a pool is the model's whole context, and the rows past
 /// that page are the zeroed allocation the session already holds. The bake's numeric gate stages its
 /// reference's cached keys this way, so the paged walk reads the very rows the reference attends.
@@ -945,9 +932,8 @@ pub fn pool_of_rows(
         .unwrap_or(0);
     let mut pool = vec![0f32; pages * slots * width];
     for t in 0..valid {
-        let page = blocks[t / slots] as usize;
         for h in 0..nkvh {
-            let dst = ((page * nkvh + h) * slots + t % slots) * hd;
+            let dst = step.cache_row(blocks, t, h) * hd;
             let src = t * width + h * hd;
             pool[dst..dst + hd].copy_from_slice(&cache[src..src + hd]);
         }

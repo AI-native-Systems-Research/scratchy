@@ -814,6 +814,31 @@ impl PagedStep {
         self.rows == 1 && self.batch().is_none()
     }
 
+    /// ⭐ THE FOLDED-CACHE ROW — the ONE statement of the paged KV cache's layout law: kv head `h`
+    /// of the token at position `pos`, paged by `blocks`, lives at pool row
+    /// `(page · nkvh + h) · page_slots + slot` with `page = blocks[pos / page_slots]` the
+    /// token's block's page and `slot = pos % page_slots` its offset in it — the head-major page
+    /// layout the head-major kernels address (`page_attn_head_major_*.py`,
+    /// `batched_decode_head_major.py`, spyre-inference's `kv_write_index`). Every stager — the
+    /// write index ([`crate::paged_step::write_rows`]), the decode batch
+    /// ([`crate::paged_step::batch_sources`]), the card's packed windows
+    /// ([`crate::paged_step::card_step_sources`]), the pool stimulus
+    /// ([`crate::paged_step::pool_of_rows`]) — CONSUMES this law; none re-derives it.
+    pub fn cache_row(self, blocks: &[u32], pos: usize, h: usize) -> usize {
+        let slots = self.page_slots as usize;
+        (blocks[pos / slots] as usize * self.nkvh as usize + h) * slots + pos % slots
+    }
+
+    /// ⭐ THE NULL CACHE ROW — where a row with no request's KV write lands: [`NULL_SLOT`]'s own,
+    /// the null page's reserved slot, so nothing an empty slot writes reaches a request's cache
+    /// (the empty-slot law, `crate::paged_step`'s [`NULL_SLOT`]). The null spelling every stager
+    /// of sparse slots consumes; `cache_row` at the null page's own slot.
+    pub const fn null_cache_row(self, h: usize) -> usize {
+        let slots = self.page_slots as usize;
+        ((crate::paged_step::NULL_SLOT / slots) * self.nkvh as usize + h) * slots
+            + crate::paged_step::NULL_SLOT % slots
+    }
+
     /// ⭐ THE WALK'S STEP ON THE CARD — the bytes one trip moves the mask tile, and so the pitch the
     /// card holds the trip's page ids at: the relaunch shifts every step source in the activation
     /// segment by that one step (`loop_fold`'s pitched index table). The stack is stick-major
