@@ -9,8 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpSpec, Role, Scale, StickExtent,
-    TensorArg, WorkPlan,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, KernelSlab, OpFunc, OpSpec, Role, Scale,
+    StickExtent, TensorArg, WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -418,9 +418,17 @@ where
     // ── WHO STAGES THE OPERANDS THROUGH LX ──
     // An UNBATCHED dense matmul is handed to dxp WHOLE — torch-spyre's form: ONE descriptor over
     // the cost model's split, HBM operands, no frontend LX-fit time trips; dxp stages the slab
-    // through the fifth of LX it keeps for itself. A shape whose descriptor dxp refuses (the EAR
-    // overflow at the mutable-address split) is refused by the bake, loudly — there is no
-    // frontend tiling to fall back to.
+    // through the fifth of LX it keeps for itself — UP TO the measured EAR envelope
+    // ([`WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT`]). Past it dxp refuses the whole descriptor (the EAR
+    // overflow at the mutable-address split — measured at 176.2 MB/core on the gemma-4 31b, and
+    // again at 503 MB/core on the 12b's m=7 decode rung after #714 deleted this law), so the op
+    // takes the SAME frontend `out` time trips the batched arm takes: the known-good staging,
+    // card-proven on the 31b. The whole-dxp CANDIDATE division runs first, by reference, because
+    // the envelope is a fact about the division it would route: the per-core KERNEL slab
+    // ([`KernelSlab::of_plan`]), read off the plan before the staging is chosen. The trips arm
+    // re-derives the same division from the same splitter inside the tiler (`run_tiler` divides
+    // before it tiles), so this up-front divide emits no byte either arm would not have emitted
+    // on its own — no emitted byte changes inside the envelope.
     // A `y`-BATCHED matmul keeps the frontend's LX-fit time trips: its kernel is per batch and
     // its forms are the card-proven ones (the rope-rotate and attention score doors route here).
     let (plan, time_tile) = if batch > 1 {
@@ -429,10 +437,15 @@ where
             .map_err(|e| e.0)?;
         (tiled.plan, tiled.time_tile)
     } else {
-        (
-            WorkPlan::divide(&tile_op.dims, crate::device_gen::whole(), &splitter)?,
-            None,
-        )
+        let whole = WorkPlan::divide(&tile_op.dims, crate::device_gen::whole(), &splitter)?;
+        if KernelSlab::of_plan(&whole, operand_df).bytes() > WHOLE_DXP_EAR_KERNEL_SLAB_LIMIT {
+            let tiled = tile_op
+                .tile(crate::device_gen::whole(), splitter, OutAxis::NAME)
+                .map_err(|e| e.0)?;
+            (tiled.plan, tiled.time_tile)
+        } else {
+            (whole, None)
+        }
     };
 
     // The CANONICAL matmul dim set is EXACTLY {mb(M), in(K), out(N), x(batch)} — NO
