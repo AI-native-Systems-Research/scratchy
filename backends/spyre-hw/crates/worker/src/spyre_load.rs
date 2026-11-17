@@ -1459,12 +1459,16 @@ impl SpyreWorker {
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
-                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its own region of
-                // the KV segment, at the decode wiring's own page count (the model's context). Nothing
-                // here sizes it: the OWNER session allocates the regions once, and every other session
-                // aliases them.
-                let step = wirings.decode.paged.ok_or_else(|| {
-                    werr("the decode bundle states no paged step — its attention reads no KV pool")
+                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its
+                // own region of the KV segment, placed at the decode wiring's own page count
+                // (the model's context, or as much of it as one device region holds:
+                // `paged_step::pool_slots`). Nothing here sizes it: the OWNER session
+                // allocates the regions once, and every other session aliases them.
+                // The classes share one pool (the mint refuses otherwise), so the FIRST
+                // step's pool facts — pages, page_slots, capacity — are every class's.
+                let step = wirings.decode.paged.first().ok_or_else(|| {
+                    werr("this bundle states no paged step — its attention has no pools")
+                })?;
                 })?;
                 let num_blocks = step.pages as usize;
                 let pool_need_bytes = code.layout.kv_pool_bytes();
@@ -2497,7 +2501,7 @@ impl SpyreWorker {
                 // device half (the prepare wave below) waits for.
                 // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
                 // decode kernel's walk reads; every other session's kernels read none.
-                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
+                let pool_statics = scratchy_target_spyre::paged_step::card_statics(step)
                     .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
                     cards,
