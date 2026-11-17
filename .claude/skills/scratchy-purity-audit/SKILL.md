@@ -1,6 +1,6 @@
 ---
 name: scratchy-purity-audit
-description: Audit a scratchy PR, branch or diff for Rust/compiler purity — everything is a constant; constants reach kernels as kernel compile-time constants; each invariant derived once into a type; no runtime checks and no runtime refusals, ever; newtypes and non-cosmetic const generics; a derived compiler ladder with no per-model hacks; target surface = opcode lowering only; the device is a type of its constants. Use when asked to audit, review or judge whether code "obeys the scratchy architecture", is "good scratchy", "pure", "locked down", or "high quality Rust".
+description: Audit a scratchy PR, branch or diff for Rust/compiler purity — everything is a constant; constants reach kernels as kernel compile-time constants; each invariant expressed once, as a type every code path shares (never re-stated as a runtime check along another path); no runtime refusals, ever; newtypes and non-cosmetic const generics; a derived compiler ladder with no per-model hacks; target surface = opcode lowering only; the device is a type of its constants. Use when asked to audit, review or judge whether code "obeys the scratchy architecture", is "good scratchy", "pure", "locked down", or "high quality Rust".
 ---
 
 # scratchy purity audit
@@ -16,14 +16,20 @@ audited SHA, never an unread grep hit.
 
 ```bash
 gh -R AI-native-Systems-Research/scratchy pr view <N> --json headRefOid,title,body,additions,changedFiles
-git fetch upstream pull/<N>/head:refs/remotes/pr/<N>
-git fetch upstream main
-git diff --stat=200 upstream/main...refs/remotes/pr/<N> -- . ':!**/third_party/**' ':!**/thunderkittens/**'
-mkdir -p .claude/scratch/purity-<N>/src && printf '*\n' > .claude/scratch/purity-<N>/.gitignore
-git archive refs/remotes/pr/<N> <dirs…> | tar -x -C .claude/scratch/purity-<N>/src
+up=$(git remote -v | awk '/AI-native-Systems-Research\/scratchy(\.git)? \(fetch\)/ {print $1; exit}')
+git fetch "$up" pull/<N>/head:refs/remotes/pr/<N>
+git fetch "$up" main
+sha=$(git rev-parse refs/remotes/pr/<N>)   # must equal headRefOid above
+git diff --stat=200 "$up/main...$sha" -- . ':!**/third_party/**' ':!**/thunderkittens/**'
+s=.claude/scratch/purity-<N>-${sha:0:8}
+rm -rf "$s/src" && mkdir -p "$s/src" && printf '*\n' > "$s/.gitignore"
+git archive -o "$s/src.tar" "$sha" <dirs…>
+tar -xf "$s/src.tar" -C "$s/src"
 ```
 
+- `$up` is whichever remote fetches `AI-native-Systems-Research/scratchy` (`upstream` in some clones, `origin` in others).
 - Scratch lives in the worktree, in a directory its own `.gitignore` (`*`) hides. Never `/tmp`: macOS culls it.
+- The scratch path carries the head SHA, and `src` is emptied before extraction. A re-audit after a force-push never cites a file the new head deleted, and two audits never share a tree.
 - Every `file:line` is at the pinned `headRefOid`; say so in the report's first line.
 - Skip vendored trees. Do read hand-written kernel sources (`.cu`, `.metal`, `.cuh`).
 - Run git from the worktree with plain, separate commands (no `cd` into other paths).
@@ -81,8 +87,15 @@ The one sanctioned exception is a staging LUT that an A/B showed faster, and onl
   - `switch (experts)` / `if (head_dim == …)` in launchers.
 - **Fix:** a generated instantiation unit, with each step naming its typed instantiation. Shape rules become `static_assert`s.
 
-### P3. An invariant is derived ONCE, into a type
-If fn A and fn B both need invariant I, a type T carries I. T is minted by one constructor (one law), and both take T. Forbidden:
+### P3. An invariant is expressed ONCE, as a type every code path shares
+**The same invariant is never described more than once, along any number of code paths.** It is expressed once, as a type, and every path that relies on it takes that type. If fn A and fn B both need invariant I, then:
+- a type T carries I;
+- T is minted by one constructor (one law), in one place;
+- A and B both take T, and neither re-states I.
+
+A runtime `if` check is the commonest second description: the code path re-states, as a check, an invariant some other path already established. **No runtime `if` checks enforcing invariants.** A second description in any other form (a duplicated predicate, a mirrored constant, a re-validation, an assertion) is the same violation.
+
+Forbidden:
 - the same predicate evaluated in two layers (lowering and player, Rust and kernel, expansion and load);
 - a Rust mirror of a kernel rule ("the launcher's rule", "mirrors `split_chunks`");
 - re-validation of something already validated;
@@ -92,7 +105,7 @@ If fn A and fn B both need invariant I, a type T carries I. T is minted by one c
 - a struct shared by several variants whose meaning differs per variant (a "with m = 1" doc comment);
 - a field "`None` on every other step".
 
-**Method:** trace at least one invariant end to end and count every place it is stated or checked (Rust const, kernel constant, expansion check, validate, runtime launcher check, test copy). The count is the finding. The fix gets it to one.
+**Method:** trace at least one invariant end to end and count every place it is described (Rust const, kernel constant, expansion check, validate, runtime launcher check, `expect`, test copy). Each path that re-states it counts once. The count is the finding. The fix gets it to one type, minted once.
 
 - **Tells:** `rg -n 'expect\("|unreachable!|debug_assert|already (checked|refuses)|validate\(\)|the launcher.s rule|mirrors' <dirs>`
 
@@ -116,11 +129,13 @@ These are **not** refusals under this rule, and they are the only ones:
 
 Anything else, including a second checkpoint check outside that one door, is a violation. When unsure, it is a violation.
 
-- **Count them:**
-  - error-enum variants in runtime crates (`rg -n 'pub enum \w*(Error|Refusal)'` then count variants);
-  - shape-refusal returns in kernel sources;
-  - `Result<(), String>` capability hooks;
-  - refusal seams added to shared serving code.
+- **Count them, classified.** For each error enum in the runtime crates (`rg -n 'pub enum \w*(Error|Refusal)'`), read every variant's doc and sort it into exactly one class:
+  - **refusal**: a deliberate rejection of a shape, model, config, request parameter, capability or invariant. Only these count against P4.
+  - **operational**: a true runtime failure that is not a decision (`Cuda(cudaError_t)`, a caught host exception, no device present, I/O). Exempt (exception 3). List these separately so the count reproduces, but never add them to the P4 count.
+  - **wrapper**: carries another enum's error (`Launch { error: KernelError }`). Count it under the inner enum, never twice.
+
+  Report `<enum>: N refusals (+ M operational, W wrappers)` per enum, with the total of refusals.
+- **Also count:** shape-refusal sites in kernel sources (every form: `return ERR_SHAPE` and ternaries), `Result<(), String>` capability hooks, and refusal seams added to shared serving code.
 - Report counts plus the worst examples, not a list of all of them.
 
 ### P5. Newtypes for every quantity; no raw scalars; no strings
@@ -202,8 +217,14 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - **P3:** the GEMM tile rule is stated or checked in 5 places: Rust `GEMM_BF16_TILE`, the `.cu` `M_TILE`/`N_TILE`/`K_TILE`, `gemm_kernel` and `gemm_shape` at expansion, and the launcher's runtime `ERR_SHAPE`. Pool presence is two paired `Option`s, re-checked by `WorkerError::*PoolMissing/Unused` and 7 `.expect("`new` made a pool …")`.
 - **P4:**
   - 99 runtime shape-refusal sites across all 44 `.cu` launchers: 98 `return SCRATCHY_CUDA_ERR_SHAPE` plus one in a ternary (`gemm_fp8.cu:859`). Grep for both forms;
-  - `KernelError` (21 variants), `WorkerError` (14), `ForwardError` (28), `PlanError` (16);
-  - greedy-only sampling refused per request through a new stringly `WorkerFactory::check_sampling -> Result<(), String>` seam in shared serving;
-  - `DeviceError::NotH100`.
+  - **74 refusal variants** across the five runtime enums, classified:
+    - `KernelError`: 19 refusals (+ 2 operational: `HostException`, `Cuda`);
+    - `WorkerError`: 12 refusals (+ 1 operational: `Cuda`; 1 wrapper: `Launch`);
+    - `ForwardError`: 26 refusals (+ 1 operational: `Cuda`; 1 wrapper: `Launch`);
+    - `PlanError`: 16 refusals;
+    - `DeviceError`: 1 refusal, `NotH100` (+ 3 operational: `Cuda`, `NoDevice`, `Prepare`).
+
+    The raw totals (21 + 14 + 28 + 16 + 4 = 83) = 74 refusals + 7 operational + 2 wrappers;
+  - greedy-only sampling refused per request through a new stringly `WorkerFactory::check_sampling -> Result<(), String>` seam in shared serving.
 - **P5–P7:** bare-`u32` step fields; a parallel raw `TargetModelFacts` beside the typed `model_facts::Class`; `CUDA_CAPABLE`, `CUDA_PRESETS` and `CUDA_GEMM_COL64_ARCHS` string allowlists; `RouteProgram::{QwenSoftmax, GemmaScaledSoftmax}`.
 - **P8:** CUDA-private post-lowering passes (`gemv_tc`, `quantize_fp8_inputs`, `fp8_moe_prefill`, `fold_norm_quants`).
