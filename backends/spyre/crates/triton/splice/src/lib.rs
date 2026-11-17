@@ -2056,6 +2056,23 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// ⭐ THE WINDOW'S WALK BOUND — the reference's `_max_active_blocks` (`spyre_attn.py`): the widest
+/// span ONE request's queries can sweep. A query at the walk's end reaches back `window` positions,
+/// and a wide query pushes its earliest window start back `per_request − 1` more, so the span is
+/// `window + per_request − 1` positions; the block straddling the window's start adds one more,
+/// and the pool caps all of it — `min(pages, ceil((window + per_request − 1) / block) + 1)`, the
+/// `block` the READER'S OWN pages are sized by (the scheduler's reference page at the splice, the
+/// step's own `page_slots` at the wiring — the mint states they are the same number). The ONE
+/// bound every reader of a windowed walk caps by, never restated.
+pub fn window_walk_blocks(
+    pages: u32,
+    window: std::num::NonZeroU32,
+    per_request: u32,
+    block: u32,
+) -> u32 {
+    ((window.get() + per_request - 1).div_ceil(block) + 1).min(pages)
+}
+
 /// ⭐ A DECODE BATCH'S CHUNK FITS ITS POOL — it gathers fewer pages than the pool holds: a gather of
 /// the whole pool faults the card (torch-spyre#4033), and this port has no per-sequence loop to
 /// serve that step. The ONE statement the splice checks at the pool it lowers over and the bake's
@@ -2065,24 +2082,46 @@ pub fn chunk_fits_pool(chunking: &BatchChunking, pool_pages: u32) -> bool {
 }
 
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
-/// swept extent in pages. Every page of the context at `ActiveCap::FULL` (a decode step's keys can sit
-/// anywhere below it); the pool may hold more pages than the context, and the walk never reaches past
-/// the context. At `ActiveCap::NONE` (a prompt chunk baked with no resident
-/// prefix) the pages its own `mq` rows fill.
+/// swept extent in pages. Every page of the CONTEXT at `ActiveCap::FULL` (a decode step's keys can sit
+/// anywhere below it); the pool may hold fewer pages than the context (the bake's budget law,
+/// [`crate::pool_pages`]), and no request is scheduled past the pool, so the walk over the context
+/// is the walk over what any request can hold. At `ActiveCap::NONE` (a prompt chunk baked with no
+/// resident prefix) the pages its own `mq` rows fill — `mq` the ARM's own fill (the graph's rows
+/// for a decode batch, one request's width for a prefill chunk), `per_request` one request's query
+/// width.
+///
+/// A windowed op caps the walk at its own [`window_walk_blocks`]: whatever the rung sweeps, no
+/// request can touch past its window's span, so the walk stops at the bound. The bound never
+/// widens a walk — `min`, never `max` — so a chunk narrower than the window keeps its own pages.
 ///
 /// Blocks past a sequence's length carry a fully-masked tile, so a walk wider than the context costs
 /// time, never correctness; a walk NARROWER than the context drops keys. So the walk is also the reach
-/// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
+/// of the rung: a step whose span fits `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(context: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
-    let swept = active_cap.resolve(context, ktir_superdsc::sdsc_abstract::POOL_STICK);
+pub fn walk_pages(
+    context_pages: u32,
+    mq: u32,
+    per_request: u32,
+    active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    window: Option<std::num::NonZeroU32>,
+) -> u32 {
+    let swept = active_cap.resolve(
+        context_pages * SchedulerBlockTokens::REFERENCE.get(),
+        ktir_superdsc::sdsc_abstract::POOL_STICK,
+    );
     let walked = if swept == 0 { mq } else { swept };
-    walked
-        .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(std::num::NonZeroU32::new(context).map_or(0, |c| ContextPages::of_slots(c).get()))
+    let mut blocks = walked.div_ceil(SchedulerBlockTokens::REFERENCE.get());
+    if let Some(w) = window {
+        blocks = blocks.min(window_walk_blocks(
+            context_pages,
+            w,
+            per_request,
+            SchedulerBlockTokens::REFERENCE.get(),
+        ));
+    }
+    blocks.min(context_pages)
 }
-
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
 /// kv buckets are the powers of two from one block up to `max_model_len`, plus `max_model_len`
 /// itself, and the kernel is specialized on `num_blocks = ceil(kv / block)` of each. Over a pool of
@@ -2098,6 +2137,42 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     }
     buckets.push(pages);
     buckets
+}
+
+#[cfg(test)]
+mod window_walk_law {
+    use super::*;
+    use ktir_superdsc::ktir_node::ActiveCap;
+
+    fn nz(n: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(n).expect("nonzero")
+    }
+
+    /// The reference's `_max_active_blocks`: `ceil((W + w − 1)/B) + 1`, the straddling block's
+    /// +1 included. Gemma-4's 1024-position window over 64-slot pages walks 17 blocks at one
+    /// query row; a 64-row prefill chunk's wider reach pushes the earliest window start back and
+    /// the bound to 18; the pool caps a bound past it.
+    #[test]
+    fn the_bound_is_the_reference_s_max_active_blocks() {
+        assert_eq!(window_walk_blocks(780, nz(1024), 1, 64), 17);
+        assert_eq!(window_walk_blocks(780, nz(1024), 64, 64), 18);
+        assert_eq!(window_walk_blocks(4, nz(1024), 1, 64), 4);
+    }
+
+    /// A windowed body never walks the rung's whole sweep: the pool's 780 pages at FULL cap to
+    /// the 17-block bound, and a windowless op keeps every page — the cap only ever narrows.
+    #[test]
+    fn a_windowed_walk_caps_the_sweep_at_its_bound() {
+        assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, Some(nz(1024))), 17);
+        assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, None), 780);
+    }
+
+    /// The cap never widens a walk: a chunk narrower than its window keeps its own pages — a
+    /// prefix-free chunk's 64 rows fill one page, below the 17-block bound.
+    #[test]
+    fn a_chunk_narrower_than_its_window_keeps_its_own_pages() {
+        assert_eq!(walk_pages(780, 64, 64, ActiveCap::NONE, Some(nz(1024))), 1);
+    }
 }
 
 /// The KV cache's allocation in a one-kernel bundle — see
@@ -2229,11 +2304,20 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // number, which is why one `mq` served until S > 1; a packed rung's walk must cover one
     // request's `width` rows of its own record, not `width · S` rows of both records fused. The
     // decode kernel (one query row) and the batched kernel (the request axis carried inside one
-    // launch) keep the graph's row count, exactly as before.
+    // launch) keep the graph's row count, exactly as before. The window's span bound always reads
+    // ONE request's width — a batch's sequences sweep their own windows, never each other's.
+    let window = mask.window();
     let blocks = if batch || decode {
-        walk_pages(*valid_len, mq, active_cap)
+        walk_pages(
+            view.get(),
+            mq,
+            query_rows.per_request().get(),
+            active_cap,
+            window,
+        )
     } else {
-        walk_pages(*valid_len, query_rows.per_request().get(), active_cap)
+        let w = query_rows.per_request().get();
+        walk_pages(view.get(), w, w, active_cap, window)
     };
     let tids = PagedStepTids::RESERVED;
     // ⭐ THE POOLS' FORMAT IS THE TAPE'S — the writer this attention's cache names
@@ -4974,7 +5058,9 @@ mod production_ktir_dump {
             blocks: WalkBlocks::new(nz(walk_pages(
                 4 * SchedulerBlockTokens::REFERENCE.get(),
                 64,
+                64,
                 ktir_superdsc::ktir_node::ActiveCap::NONE,
+                None,
             ))),
             scale,
         })

@@ -929,6 +929,12 @@ impl PagedStep {
     /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
     /// `None` when `swept` is no walk of this pool.
     ///
+    /// ⭐ A WINDOWED BODY WALKS ITS OWN BOUND, not the rung's sweep: whatever the ladder swept to
+    /// reach the context (the causal class's need), the windowed body baked
+    /// [`window_walk_blocks`][crate::paged_step::window_walk_blocks] at, and the step the worker
+    /// stages must name the same walk its body walks — the same bound, the same one function, never
+    /// restated. The cap never widens: a rung narrower than the bound keeps its own sweep.
+    ///
     /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
     /// against the wiring's stated pair. The wiring states ONE representative of a tape the
     /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
@@ -943,7 +949,7 @@ impl PagedStep {
         paged_rows: crate::paged_step::PagedRows,
         swept: u32,
     ) -> Option<PagedStep> {
-        let walk = swept / self.page_slots;
+        let mut walk = swept / self.page_slots;
         let extent = match paged_rows {
             crate::paged_step::PagedRows::Sequence => {
                 QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
@@ -952,6 +958,14 @@ impl PagedStep {
                 QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
             }
         };
+        if let Some(w) = self.window {
+            walk = walk.min(crate::paged_step::window_walk_blocks(
+                self.pages,
+                w,
+                extent.per_request().get(),
+                self.page_slots,
+            ));
+        }
         (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
             .then_some(PagedStep {
                 rows,
@@ -971,7 +985,15 @@ impl PagedStep {
     /// there is no pair to re-derive from the launch's rows. Only the walk is the launch's to
     /// derive, from the sweep of the body the session selected — exactly `on_body`'s own law.
     pub fn on_body_packed(self, swept: u32) -> Option<PagedStep> {
-        let walk = swept / self.page_slots;
+        let mut walk = swept / self.page_slots;
+        if let Some(w) = self.window {
+            walk = walk.min(crate::paged_step::window_walk_blocks(
+                self.pages,
+                w,
+                self.extent.per_request().get(),
+                self.page_slots,
+            ));
+        }
         (self.extent.requests().get() > 1
             && walk > 0
             && swept.is_multiple_of(self.page_slots)
