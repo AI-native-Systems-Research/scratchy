@@ -853,25 +853,50 @@ impl SpyreWorker {
     /// Resolve the bundle + load all static weights + derive dims + wiring.
     pub(crate) fn load_inner(&self) -> ExecutorResult<Loaded> {
         // ⭐ THIS WORKER'S CARDS — one per rank of the world this build serves (`World`, one card
-        // without a `tp/N`), from `local_rank` up — each opened on its own background thread NOW,
-        // so their ~5.7 s bring-ups overlap each other and the host-side weight load below. Joined
-        // where the first session needs them; every session of this worker spans all of them.
+        // without a `tp/N`), from `local_rank` up — the WHOLE bring-up (each card's open AND its
+        // runtime's build) runs on a background thread spawned NOW, so it overlaps the host-side
+        // weight load below; the runtimes arrive BUILT at the join, where the first session
+        // needs them. Every session of this worker spans all of them.
         // ⭐ THE WORLD'S CARDS, CLAIMED ONCE: the first `World::RANKS` cards senlib enumerates,
         // distinct by construction (`WorldCards::claim`). Rank r opens `cards.get(r)` by its PCIe
         // address — no index arithmetic, and nothing in the environment chooses the set.
         #[cfg(feature = "spyre-hw")]
-        let (world, card_open) = {
+        let bring_up = {
             let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
                 .map_err(|e| werr(format!("Spyre card table: {e}")))?;
             let world = scratchy_target_spyre_card::runtime::WorldCards::<World>::claim(&table)
                 .map_err(|e| werr(e.to_string()))?;
             info!("[spyre-worker] this world's cards: {}", world.describe());
-            // PHASE 1: the cards themselves, each opened on its own background thread NOW so
-            // the ~5.7 s bring-ups overlap the host-side weight load below; joined where the
-            // first runtime needs them (the join block). `world` stays in hand — phase 2 builds
-            // the runtimes from its claimed facts.
-            let open = world.open_cards();
-            (world, open)
+            // ⭐ THE WHOLE BRING-UP ON ONE THREAD — open each card on its own per-rank thread,
+            // join them, leak the opened cards for the process, and build every runtime on the
+            // serve span, all inside this thread. Spawned NOW so the cards' ~5.7 s opens AND
+            // the runtime builds overlap the host-side weight load below (the bring-up is
+            // device work and allocator init; the weight load is host work — neither waits for
+            // the other). The join block below receives the span and the BUILT runtimes, or
+            // the first refusal, named.
+            std::thread::Builder::new()
+                .name("card-bring-up".to_string())
+                .spawn(
+                    move || -> Result<
+                        scratchy_target_spyre_card::runtime::SpanBuild<World>,
+                        String,
+                    > {
+                        let open = world.open_cards();
+                        let opened =
+                            scratchy_target_spyre_card::runtime::WorldCards::join_opens(open)?;
+                        // ⭐ OPENED ONCE, FOR THE PROCESS — the leak's law is stated in full at
+                        // the join block below, where the runtimes are leaked to match.
+                        let opened_cards: &'static OpenedCards = Box::leak(Box::new(opened));
+                        Ok(
+                            scratchy_target_spyre_card::runtime::WorldCards::build_on_serve_span(
+                                world,
+                                opened_cards,
+                            ),
+                        )
+                    },
+                )
+                .expect("spawn the card bring-up thread — a refusal here is boot-time resource \
+                         exhaustion, not a load error to route around")
         };
 
         let model_dir = resolve_model_path(
@@ -1532,21 +1557,24 @@ impl SpyreWorker {
                     (Some(tp), None) => Some(tp),
                     (None, _) => None,
                 };
-                // ⭐ THE CARD, JOINED. Its capacity was read from the card when it opened — a card
-                // that cannot report one does not open — so the KV pool below is sized from the real
-                // card, with no default to fall back to.
+                // ⭐ THE BRING-UP, JOINED — the runtimes arrive BUILT. The background thread
+                // spawned at the top of the load opened every card, leaked them, and built
+                // every runtime on the serve span while THIS thread loaded weights from disk:
+                // the whole device bring-up overlapped the whole host load, so the join costs
+                // whatever of the two finished later, never their sum. Each card's capacity
+                // was read from the card when it opened — a card that cannot report one does
+                // not open — so the KV pool below is sized from the real card, with no
+                // default to fall back to.
                 //
                 // ⭐ OPENED ONCE, FOR THE PROCESS. The sessions land in `Loaded`, which the worker
                 // holds for the life of the process (a `Box<dyn Worker>`, so `'static`), and each
                 // borrows its card's RUNTIME, which borrows the card: `&'static` is the borrow
-                // that outlives them all, given ONCE here to the cards and below to the runtimes
-                // — the same as the bundles this load leaks — so the compiler, not a refcount,
-                // checks that no session outlives its runtime and no runtime its card.
-                let opened: OpenedCards =
-                    scratchy_target_spyre_card::runtime::WorldCards::join_opens(card_open)
-                        .map_err(werr)?;
-                let opened_cards: &'static OpenedCards = Box::leak(Box::new(opened));
-                // ⭐ PHASE 2 ON THE SERVE SPAN — the runtimes, built per rank on scoped threads
+                // that outlives them all, given ONCE on the bring-up thread to the cards and
+                // here to the runtimes — the same as the bundles this load leaks — so the
+                // compiler, not a refcount, checks that no session outlives its runtime and
+                // no runtime its card.
+                //
+                // ⭐ THE RUNTIMES ON THE SERVE SPAN — built per rank on scoped threads
                 // pinned to their card's node, `create_scheduler` parking each card's completion
                 // threads on the span's scope. The span is hosted by its own thread (the
                 // worker's serve span has no frame of its own — the engine calls in from its
@@ -1555,11 +1583,10 @@ impl SpyreWorker {
                 // Dropping `Loaded` drops the span: every card is stopped through the vendor's
                 // bounded-drain door and the completion threads join, never die with the
                 // process.
-                let (mut serve_span, built) =
-                    scratchy_target_spyre_card::runtime::WorldCards::build_on_serve_span(
-                        world,
-                        opened_cards,
-                    );
+                let (mut serve_span, built) = bring_up
+                    .join()
+                    .map_err(|_| werr("the card bring-up thread panicked"))?
+                    .map_err(werr)?;
                 let runtimes: Cards = built.map_err(werr)?;
                 let cards: &'static Cards = Box::leak(Box::new(runtimes));
                 serve_span.adopt(cards);
