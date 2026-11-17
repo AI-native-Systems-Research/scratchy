@@ -47,8 +47,12 @@ struct SpyreCli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    // ⭐ BOXED — the shared command enum is ≥360 B and `BundleCommand` is ~72 B, so
+    // carrying it inline made every `Command` value pay the larger size (clippy
+    // large_enum_variant). `Box<T>` is an `Args` in clap 4, so the flatten is
+    // unchanged; the box is opened once, at the variant's single reader below.
     #[command(flatten)]
-    Shared(scratchy_cli::args::Commands),
+    Shared(Box<scratchy_cli::args::Commands>),
     /// Run a Spyre bundle this binary did not bake — a `dxp_standalone` output
     /// directory plus the producer's launch map. Every other launch path here needs
     /// the bundle baked into the binary at build time, which leaves an externally
@@ -63,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cli = SpyreCli::parse();
     let r = match cli.command {
-        Command::Shared(command) => scratchy_cli::run::<SpyreCli>(command).await,
+        Command::Shared(command) => scratchy_cli::run::<SpyreCli>(*command).await,
         #[cfg(feature = "spyre-hw")]
         Command::Bundle(command) => bundle::run(command),
     };
