@@ -30,7 +30,7 @@ use crate::charts::{
     ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
     LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, ScaleFit, SparkAxes, SparkPoint, Step,
     TableAxes, chart, colour, grouped_bars, log2_ratio, mini_heatmap, ratio_labels, ratio_scale,
-    ratio_step, sparkline,
+    sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use crate::{Site, slug, thousands};
@@ -2462,10 +2462,11 @@ pub(super) fn over_time_charts(
     charts
 }
 
-/// How many of the overview's heat map squares have their factor written in
-/// them: at most one per colour step, spread over the steps the squares use.
-/// A heat map left without one then gets one of its own.
-pub(super) const HEAT_LABELS: usize = 12;
+/// How many of a summary map's squares have their factor written in them, per machine and
+/// model — one model on one Mac, the map's own block: its slowest and fastest always in, the
+/// interesting colour steps between as far as the count goes. A whole-map budget left most
+/// blocks unlabelled, their fastest squares reading as if they had lost their ink.
+pub(super) const BLOCK_LABELS: usize = 4;
 
 /// One overview heat map's ratios, at its run's [`glance_answer`]: the rival, and each square's
 /// (users, prompt, how many times faster scratchy is, and scratchy's guesses kept).
@@ -2820,30 +2821,18 @@ pub(super) fn grid_glance(id: &str, machines: &BTreeMap<&str, MachineRuns>) -> E
         legend,
     };
     let ratios = map.ratios();
-    // Each colour step's square furthest from ×1, HEAT_LABELS of them ([`ratio_labels`]).
-    let mut highlights: BTreeSet<MapAt> = ratio_labels(&ratios, HEAT_LABELS);
-    // Then each heat map still without a label gets one: its square furthest
-    // from ×1 in a colour step not yet labelled, or, every step it has taken,
-    // its square furthest from ×1.
-    let mut taken: BTreeSet<usize> = highlights.iter().map(|at| ratio_step(ratios[at])).collect();
-    for &key in grids.keys() {
-        let heat_map = &heat_map;
-        let mine = || (ratios.iter()).filter(move |(at, _)| heat_map[*at] == key);
-        if mine().any(|(at, _)| highlights.contains(at)) {
-            continue;
-        }
-        let pick = mine().max_by(|&(_, &a), &(_, &b)| {
-            let fresh = |r: f64| !taken.contains(&ratio_step(r));
-            fresh(a)
-                .cmp(&fresh(b))
-                .then(a.log2().abs().total_cmp(&b.log2().abs()))
-        });
-        if let Some((&at, &r)) = pick {
-            highlights.insert(at);
-            taken.insert(ratio_step(r));
-        }
+    // The squares to write their factor in, per machine and model — the map's blocks, one model
+    // on one Mac: each block's slowest and fastest always in, the interesting colour steps
+    // between ([`ratio_labels`], [`BLOCK_LABELS`]), so a block's extremes always read.
+    let mut blocks: BTreeMap<(&str, &str), BTreeMap<MapAt, f64>> = BTreeMap::new();
+    for (&at, &r) in &ratios {
+        let &(chip, stem, _) = &heat_map[&at];
+        blocks.entry((chip, stem)).or_default().insert(at, r);
     }
-    map.labelled = highlights;
+    map.labelled = blocks
+        .values()
+        .flat_map(|block| ratio_labels(block, BLOCK_LABELS))
+        .collect();
     let one_map = map.render(&format!("{id}-summary-scale"));
     rsx! {
             div { style: "width: fit-content; max-width: 100%",
