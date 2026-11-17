@@ -236,7 +236,7 @@ pub(crate) fn forward_chunk(
         let rows = law;
         let mut int32: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = Vec::new();
         for step in &b.paged {
-            let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
+            let srcs = scratchy_target_spyre::paged_step::request_sources(step, &blocks, &rows)
                 .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
             for (tid, bytes, shape) in srcs.int32 {
                 if !int32.iter().any(|(t, ..)| *t == tid as usize) {
