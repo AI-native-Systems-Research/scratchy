@@ -763,12 +763,24 @@ impl PagedStep {
         }
     }
 
-    /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers. A step whose positions end at
-    /// or below this can run on the bundle from ANY start: the mask stack decides which walked keys each
-    /// row attends, so a prompt chunk over a cached prefix is this bundle's to run whenever the prefix
-    /// and the chunk both sit inside the walk. A step that ends past it would lose keys.
+    /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers, in the walk's own frame:
+    /// the walk's blocks from its anchor. A step runs on the bundle when its
+    /// [`span`](Self::span) fits this — the whole step for a causal op (so a step whose positions
+    /// end at or below this runs from ANY start: the mask stack decides which walked keys each row
+    /// attends), the window's span for a windowed one, whatever the step's absolute position. A
+    /// step whose span exceeds it would lose keys.
     pub const fn reach(self) -> usize {
         self.walk as usize * self.page_slots as usize
+    }
+
+    /// ⭐ THE STEP'S SPAN — the positions its queries' windows sweep, in the walk's own frame:
+    /// from the earliest query's reach ([`crate::paged_step::first_active`]'s block) to the step's
+    /// last position. The whole step (`rows.end()`) for a causal op; the window's span for a
+    /// windowed one. The reach question's one answer — the number [`crate::paged_step`]'s check
+    /// admits against [`Self::reach`], never re-derived: a causal step's span is its end, so the
+    /// law it has always been is this law at `window: None`.
+    pub fn span(self, rows: &crate::paged_step::StepRows) -> usize {
+        rows.end() - crate::paged_step::first_active(&self, rows) * self.page_slots as usize
     }
 
     /// A decode batch's chunking of this bundle's walk (`batched_decode_chunking`), derived from the

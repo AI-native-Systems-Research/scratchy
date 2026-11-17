@@ -6,12 +6,17 @@
 //! spyre-inference 297fc48):
 //!
 //! * the PAGE INDEX TABLE `[walk, INT32_ELEMS_PER_STICK]` int32 — `page_index_tables_cpu`:
-//!   `table[:, 0] = block_table[s, :walk]`, the rest of each row zero. Blocks past the request's own
-//!   are the block table's own zero padding; their tiles are fully masked;
+//!   `table[:, 0] = block_table[s, anchor..anchor + walk]` (the walk's own blocks — see the anchor
+//!   law below), the rest of each row zero. Blocks past the request's own are the block table's own
+//!   zero padding; their tiles are fully masked;
 //! * the MASK STACK `[walk, rows, page_slots]` — `attention_mask_stacks`: 0 where a query row may
-//!   attend the key, `finfo(f16).min` where it may not — past the sequence (`kv_pos < seq_len`) and,
-//!   for a prompt chunk, past the row's causal limit `context_len + q_pos`, a padded row clamped to
-//!   the last real one;
+//!   attend the key, `finfo(f16).min` where it may not — past the sequence (`kv_pos < seq_len`),
+//!   past the row's causal limit `context_len + q_pos`, and, where the op's mask states one, before
+//!   the row's window opens (`kv_pos >= pos - window + 1`, `_build_single_tile`'s per-query
+//!   `window_start`), a padded row clamped to the last real one. A windowed walk ANCHORS at the
+//!   earliest query's reach ([`first_active`] — the reference's active-block staging,
+//!   `first_active = earliest_window_start // block_size`), so its trips read the window's blocks
+//!   however long the context;
 //! * the KV WRITE INDEX — `kv_write_index`: one `[rows]` index per kv head, one after another, head
 //!   `h` of the token at `block · page_slots + offset` at row
 //!   `(block · nkvh + h) · page_slots + offset`;
@@ -192,15 +197,18 @@ fn check(
             step.pages
         )));
     }
-    // The attention reads only the blocks its walk covers, so a step that ends past the bundle's
-    // reach would attend without its last keys.
-    if rows.end() > step.reach() {
+    // The attention reads only the blocks its walk covers, so a step whose span exceeds the
+    // walk's reach would attend without its keys. A causal step's span is its whole end — the
+    // law it has always been; a windowed step's is its window's sweep, whatever its position.
+    let span = step.span(rows);
+    if span > step.reach() {
         return Err(PagedStepError(format!(
-            "positions up to {} are past this bundle's reach — its attention walks {} block(s), \
-             {} positions",
+            "positions up to {} sweep a {}-position span — past this bundle's {}-position reach \
+             (its attention walks {} block(s))",
             rows.end(),
-            step.walk,
-            step.reach()
+            span,
+            step.reach(),
+            step.walk
         )));
     }
     if let Some(&p) = blocks.iter().find(|&&p| p >= step.pages) {
@@ -217,27 +225,63 @@ pub const INT32_ELEMS_PER_STICK: usize =
     <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
 
-/// The page index table: `[walk, INT32_ELEMS_PER_STICK]` int32, row `i` holding block `i`'s page at
-/// column 0 — `table[:, 0] = block_table[s, :walk]`, the block table's own zeros past the request's
-/// blocks.
+/// ⭐ THE QUERY'S REACH — the earliest position the query at `pos` attends: every position for a
+/// causal op; the last `window` positions (its own included) for one whose mask states a window.
+/// The reference's per-query `window_start` (`(abs_q_pos - W + 1).clamp(min=0)`), the one law the
+/// mask stack's cutoffs and the walk's anchor both read — never re-derived.
+fn window_start(step: &PagedStep, pos: usize) -> usize {
+    reach_start(step.window, pos)
+}
+
+/// [`window_start`]'s law over the window alone — what a [`CausalStack`] carries of its step.
+fn reach_start(window: Option<std::num::NonZeroU32>, pos: usize) -> usize {
+    match window {
+        None => 0,
+        Some(w) => pos.saturating_sub(w.get() as usize - 1),
+    }
+}
+
+/// ⭐ THE WALK'S ANCHOR — the block the walk's trip 0 reads: the block holding the step's
+/// EARLIEST query's reach ([`window_start`] at `rows.start` — the earliest query's, never the
+/// latest's, so a prompt chunk's early queries keep their in-window blocks; the reference's
+/// `first_active`). Block 0 for a causal op, and for a window whose reach opens before the
+/// sequence does. THE ONE DERIVATION of the anchor: the mask stack's frame, the page table's
+/// rows and the walk check read this, never a second copy of the arithmetic.
+pub fn first_active(step: &PagedStep, rows: &StepRows) -> usize {
+    window_start(step, rows.start) / step.page_slots as usize
+}
+
+/// The page index table: `[walk, INT32_ELEMS_PER_STICK]` int32, row `i` holding the walk's block
+/// `i`'s page at column 0 — `table[:, 0] = block_table[s, anchor..anchor + walk]`, the block
+/// table's own zeros past the request's blocks. A causal walk anchors at block 0, so its rows
+/// are the blocks from 0 as they always were.
 pub fn page_table(
     step: &PagedStep,
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
     check(step, step.rows as usize, blocks, rows)?;
+    let anchor = first_active(step, rows);
     let mut t = vec![0i32; step.walk as usize * INT32_ELEMS_PER_STICK];
-    for (i, &page) in blocks.iter().take(step.walk as usize).enumerate() {
+    for (i, &page) in blocks
+        .iter()
+        .skip(anchor)
+        .take(step.walk as usize)
+        .enumerate()
+    {
         t[i * INT32_ELEMS_PER_STICK] = page as i32;
     }
     Ok(t)
 }
 
-/// The mask stack: `[walk, q, page_slots]`, tile `i` column `c` keyed by position
-/// `i · page_slots + c` — 0 at or before query row `m`'s position, [`MASKED`] after it. `q` is
-/// the row count one request's stack serves — the graph's rows for one sequence's whole forward
-/// ([`step_sources`]'s spelling), the extent's per-request width for one request of a packed
-/// rung's ([`card_step_sources`]'s); the two are the same number at one request.
+/// The mask stack: `[walk, q, page_slots]`, tile `i` column `c` keyed by the ABSOLUTE position
+/// `(anchor + i) · page_slots + c` of the block walk trip `i` reads — 0 where the query row's
+/// reach holds it (at or before the row's position, at or after [`window_start`] at it),
+/// [`MASKED`] everywhere else. `q` is the row count one request's stack serves — the graph's
+/// rows for one sequence's whole forward ([`step_sources`]'s spelling), the extent's per-request
+/// width for one request of a packed rung's ([`card_step_sources`]'s); the two are the same
+/// number at one request. A causal step anchors at block 0 and reaches from position 0, so its
+/// bytes are the law it has always staged.
 pub fn mask_stack(step: &PagedStep, rows: &StepRows) -> Vec<f32> {
     mask_stack_of(step, step.rows as usize, rows)
 }
@@ -247,19 +291,23 @@ fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
 }
 
 /// ⭐ ONE REQUEST'S CAUSAL MASK STACK, AS ITS LAW — `[walk, q, page_slots]` (`q` the rows one
-/// request's stack serves), line `i · q + r` row `r`'s tile `i`, column `c` keyed by position
-/// `i · page_slots + c`: 0 where row `r` may attend it (`i · page_slots + c ≤ pos(r)`), [`MASKED`]
-/// after; an EMPTY window (`rows: None`, a packed rung's slot no request rides) attends nothing.
+/// request's stack serves), line `i · q + r` row `r`'s tile `i`, column `c` keyed by the ABSOLUTE
+/// position `kv = (anchor + i) · page_slots + c` of the block trip `i` reads ([`first_active`]):
+/// 0 where row `r` may attend it (`window_start(pos(r)) ≤ kv ≤ pos(r)`), [`MASKED`] elsewhere; an
+/// EMPTY window (`rows: None`, a packed rung's slot no request rides) attends nothing. A causal
+/// step anchors at block 0 and reaches from position 0, so each line is the prefix it always was.
 ///
-/// Stated as each line's ATTENDED PREFIX ([`Self::attended`]) — the one law the gate's f32 stack
+/// Stated as each line's ATTENDED RUN ([`Self::attended`]) — the one law the gate's f32 stack
 /// ([`mask_stack`], [`Self::values`]) and the card's SEN169 table
 /// ([`crate::forward_tape::CardTable`]) both read, so the card fills a prompt chunk's millions of
-/// mask values as two runs a line and no f32 stack is built for it.
+/// mask values as at most three runs a line and no f32 stack is built for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CausalStack {
     walk: usize,
     q: usize,
     slots: usize,
+    window: Option<std::num::NonZeroU32>,
+    anchor: usize,
     rows: Option<StepRows>,
 }
 
@@ -270,6 +318,8 @@ impl CausalStack {
             walk: step.walk as usize,
             q,
             slots: step.page_slots as usize,
+            window: step.window,
+            anchor: rows.as_ref().map_or(0, |rows| first_active(step, rows)),
             rows,
         }
     }
@@ -278,25 +328,29 @@ impl CausalStack {
         self.walk * self.q
     }
 
-    /// How many of line `line`'s leading columns its row attends — every column `c` with
-    /// `i · page_slots + c ≤ pos(r)`, which is a prefix of the line.
-    fn attended(&self, line: usize) -> usize {
+    /// The columns of line `line` its row attends — every column `c` whose absolute position
+    /// `kv = (anchor + i) · page_slots + c` is inside the row's reach, `[window_start, pos]`,
+    /// which is one run of the line.
+    fn attended(&self, line: usize) -> std::ops::Range<usize> {
         let Some(rows) = self.rows else {
-            return 0;
+            return 0..0;
         };
         let (i, r) = (line / self.q, line % self.q);
-        (rows.pos(r) + 1)
-            .saturating_sub(i * self.slots)
-            .min(self.slots)
+        let pos = rows.pos(r);
+        let base = (self.anchor + i) * self.slots;
+        let hi = (pos + 1).saturating_sub(base).min(self.slots);
+        let lo = reach_start(self.window, pos).saturating_sub(base).min(hi);
+        lo..hi
     }
 
     /// The stack's values, row-major `[walk · q, page_slots]` — the gate's and the host's form.
     pub fn values(&self) -> Vec<f32> {
         let mut m = Vec::with_capacity(self.lines() * self.slots);
         for line in 0..self.lines() {
-            let n = self.attended(line);
-            m.extend(std::iter::repeat_n(0.0, n));
-            m.extend(std::iter::repeat_n(MASKED, self.slots - n));
+            let run = self.attended(line);
+            m.extend(std::iter::repeat_n(MASKED, run.start));
+            m.extend(std::iter::repeat_n(0.0, run.len()));
+            m.extend(std::iter::repeat_n(MASKED, self.slots - run.end));
         }
         m
     }
@@ -308,9 +362,10 @@ impl crate::forward_tape::CardTable for CausalStack {
     }
     fn sen_row(&self, line: usize, row: &mut [crate::sen_convert::SenF16]) {
         use crate::sen_convert::f32_to_sen;
-        let n = self.attended(line);
-        row[..n].fill(f32_to_sen(0.0));
-        row[n..].fill(f32_to_sen(MASKED));
+        let run = self.attended(line);
+        row[..run.start].fill(f32_to_sen(MASKED));
+        row[run.clone()].fill(f32_to_sen(0.0));
+        row[run.end..].fill(f32_to_sen(MASKED));
     }
 }
 
@@ -457,10 +512,12 @@ pub struct BatchSeq<'a> {
 ///   `x · P + a` — at `P = 1` theirs as they are; at `P = nkvh` (a chunk under Triton's gather
 ///   floor in pages) folded by kv head, the per-sequence decode kernel's `kv_row_pool` form, which
 ///   their batched builder never stages ([`BatchChunking`]);
-/// * the mask is 0 where a sequence's key is at or before its position and `finfo(f16).min` past
-///   it, `-inf` on the block slots past its blocks, and a padded sequence's block 0 `finfo.min` (so
-///   its softmax stays finite); one row per (block slot, sequence), which every kv head reads
-///   through the kernel's broadcast, as their builder's `expand` over the kv axis does.
+/// * the mask is 0 where a sequence's key is inside its one query's reach — at or before its
+///   position, at or after its window opens — and `finfo(f16).min` past it, on the block slots
+///   past its touched blocks, and a padded sequence's block 0 `finfo.min` (so its softmax stays
+///   finite); one row per (block slot, sequence), which every kv head reads through the kernel's
+///   broadcast, as their builder's `expand` over the kv axis does. A windowed sequence's chunk
+///   pages stage ITS OWN blocks from its own anchor, so a batch's sequences anchor independently.
 ///
 /// A padded row's KV write lands on [`NULL_SLOT`], as spyre-inference's padded tokens' do: its
 /// attention reads page 0 under the padded sequence's mask and answers nothing anyone reads, so what
@@ -490,10 +547,17 @@ pub fn batch_sources(
     let padded = c * j;
     for (s, q) in seqs.iter().enumerate() {
         let need = (q.pos + 1).div_ceil(slots);
-        if need > step.walk as usize || q.blocks.len() < need {
+        // ⭐ THE SEQUENCE'S OWN SPAN, in blocks — from the block its one query's reach opens at
+        // ([`window_start`]'s, the walk's anchor law) to its position: every block it holds for
+        // a causal sequence (the count it has always checked), the window's sweep for a windowed
+        // one, whatever the position.
+        let lo = window_start(step, q.pos);
+        let anchor = lo / slots;
+        let touched = q.pos / slots - anchor + 1;
+        if touched > step.walk as usize || q.blocks.len() < need {
             return Err(PagedStepError(format!(
-                "sequence {s} at position {} needs {need} block(s); it holds {} and the bundle \
-                 walks {}",
+                "sequence {s} at position {} touches {touched} block(s) from its anchor \
+                 {anchor}; it holds {} and the bundle walks {}",
                 q.pos,
                 q.blocks.len(),
                 step.walk
@@ -523,11 +587,17 @@ pub fn batch_sources(
     // mask_bs_bb `[B, C·J, slots]`.
     let mut mask_bs = vec![f32::NEG_INFINITY; b * padded * slots];
     for (s, q) in seqs.iter().enumerate() {
-        let need = (q.pos + 1).div_ceil(slots);
-        for i in 0..need {
-            pages[i * b + s] = q.blocks[i] as i32;
+        // The sequence's walk anchors at its own query's reach — block 0 for a causal sequence —
+        // and stages the blocks it touches from there; the block slots past them stay the null
+        // page under fully-masked rows, the padding law they have always been.
+        let lo = window_start(step, q.pos);
+        let anchor = lo / slots;
+        let touched = q.pos / slots - anchor + 1;
+        for i in 0..touched {
+            pages[i * b + s] = q.blocks[anchor + i] as i32;
             for col in 0..slots {
-                mask_bs[(s * padded + i) * slots + col] = if i * slots + col <= q.pos {
+                let kv = (anchor + i) * slots + col;
+                mask_bs[(s * padded + i) * slots + col] = if kv <= q.pos && kv >= lo {
                     0.0
                 } else {
                     MASKED
@@ -746,7 +816,16 @@ pub fn card_step_sources(
         // rows stay zero.
         let mut table = vec![0u8; walk * trip];
         if let Some(req) = reqs.get(r) {
-            for (i, &page) in req.blocks.iter().take(walk).enumerate() {
+            // The window's table stages the walk's own blocks — from the window's anchor
+            // ([`first_active`]), whose trips the mask stack below cuts at each row's reach.
+            let anchor = first_active(step, &req.rows);
+            for (i, &page) in req
+                .blocks
+                .iter()
+                .skip(anchor)
+                .take(walk)
+                .enumerate()
+            {
                 let at = i * trip;
                 table[at..at + 4].copy_from_slice(&(page as i32).to_le_bytes());
             }
@@ -937,6 +1016,10 @@ mod tests {
 
     fn nz(n: usize) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(n).unwrap()
+    }
+
+    fn nz32(n: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(n).unwrap()
     }
 
     /// The extent pair a fixture's rows state — the mint's own spelling, `fn` so `expect` reads.
@@ -1314,6 +1397,141 @@ mod tests {
         assert_eq!(kv_row_pool(&s), (0..8).collect::<Vec<i32>>());
     }
 
+    /// ⭐ A WINDOWED STEP STAGES THE REFERENCE'S ACTIVE WINDOW — the walk anchors at the block
+    /// the earliest query's reach opens at (the reference's `first_active`), the page table names
+    /// the anchored blocks, and the mask stack cuts every row at its own `pos − window + 1` —
+    /// `_build_single_tile`'s per-query `window_start` over `_build_active_tiles_with_skip`'s
+    /// active blocks. Here: W 6 over 4-slot pages, 3 rows at positions 9, 10, 11, so the earliest
+    /// query (position 9) reaches from 4 — block 1 — and every trip's tile is keyed by the
+    /// ABSOLUTE positions of the blocks the anchored table names.
+    #[test]
+    fn a_windowed_step_stages_the_reference_s_active_window() {
+        let s = PagedStep {
+            window: Some(nz32(6)),
+            ..step()
+        };
+        let rows = StepRows::new(9, 3).unwrap();
+        let blocks = [0u32, 1, 2, 3];
+        assert_eq!(first_active(&s, &rows), 1, "the earliest query reaches from 4");
+        assert_eq!(s.span(&rows), 8, "end 12 less the anchor's 4 positions");
+        // The table names the walk's own blocks — 1, 2, 3 — then the block table's zero past
+        // the request's four.
+        let pt = page_table(&s, &blocks, &rows).unwrap();
+        let col0: Vec<i32> = pt.iter().step_by(INT32_ELEMS_PER_STICK).copied().collect();
+        assert_eq!(col0, vec![1, 2, 3, 0]);
+        // The stack: trip i covers the absolute positions (1 + i)·4 + c. Row 0 (position 9)
+        // attends [4, 9], row 1 (position 10) [5, 10], row 2 (position 11) [6, 11].
+        let m = mask_stack(&s, &rows);
+        assert_eq!(&m[0..4], &[0.0; 4], "trip 0 row 0: positions 4..=7");
+        assert_eq!(&m[4..8], &[MASKED, 0.0, 0.0, 0.0], "trip 0 row 1: from 5");
+        assert_eq!(&m[8..12], &[MASKED, MASKED, 0.0, 0.0], "trip 0 row 2: from 6");
+        assert_eq!(&m[12..16], &[0.0, 0.0, MASKED, MASKED], "trip 1 row 0: to 9");
+        assert_eq!(&m[16..20], &[0.0, 0.0, 0.0, MASKED], "trip 1 row 1: to 10");
+        assert_eq!(&m[20..24], &[0.0; 4], "trip 1 row 2: to 11");
+        assert!(
+            m[24..].iter().all(|&v| v == MASKED),
+            "trips past the window are fully masked"
+        );
+    }
+
+    /// A WINDOW THAT COVERS THE SEQUENCE IS CAUSAL — the earliest query's reach opens at or
+    /// before position 0, so the anchor is block 0 and every row's reach is the whole sequence:
+    /// the anchored table and the windowed stack are the causal ones, byte for byte.
+    #[test]
+    fn a_window_past_the_sequence_s_start_is_the_causal_stack() {
+        let rows = StepRows::new(3, 2).unwrap();
+        let blocks = [2u32, 0];
+        let w = PagedStep {
+            window: Some(nz32(10)),
+            ..step()
+        };
+        assert_eq!(first_active(&w, &rows), 0);
+        assert_eq!(w.span(&rows), rows.end());
+        assert_eq!(
+            page_table(&w, &blocks, &rows).unwrap(),
+            page_table(&step(), &blocks, &rows).unwrap()
+        );
+        assert_eq!(mask_stack(&w, &rows), mask_stack(&step(), &rows));
+    }
+
+    /// ⭐ A WINDOWED STEP'S ADMISSION IS ITS SPAN, NOT ITS END — a step whose end is far past a
+    /// causal bundle's reach runs on it when its window's span fits, because the walk anchors at
+    /// the earliest query's reach however long the context is. The causal refusal (`end` past the
+    /// reach) is the same law at `window: None`.
+    #[test]
+    fn a_windowed_step_runs_on_a_rung_by_its_span_not_its_end() {
+        // An 8-page pool of 4-slot pages, a 4-block walk (16 positions of reach).
+        let base = PagedStep {
+            pages: 8,
+            window: Some(nz32(6)),
+            ..step()
+        };
+        let blocks = [1u32, 2, 3, 4, 5];
+        // End 17 (3 rows from 14): the causal step is past the reach and refuses; the W-6 step's
+        // span is 17 − 8 = 9 and runs.
+        let rows = StepRows::new(14, 3).unwrap();
+        let causal = PagedStep { pages: 8, ..step() };
+        assert!(step_sources(&causal, &blocks, &rows).is_err());
+        assert!(step_sources(&base, &blocks, &rows).is_ok());
+        // The same windowed step on a 2-block walk (8 positions) refuses: its span does not fit.
+        let narrow = PagedStep {
+            walk: 2,
+            ..base
+        };
+        assert!(step_sources(&narrow, &blocks, &rows).is_err());
+    }
+
+    /// ⭐ A WINDOWED DECODE BATCH ANCHORS EACH SEQUENCE AT ITS OWN REACH — every sequence's chunk
+    /// pages and mask rows are keyed by its own window's blocks, so one sequence's long context
+    /// never widens another's staging; a sequence whose span is past the walk refuses.
+    #[test]
+    fn a_windowed_decode_batch_anchors_each_sequence_at_its_own_reach() {
+        // `batch()`: a 16-page pool of 4-slot pages, a 2-block walk, J 2 · C 1 at B 4.
+        let s = PagedStep {
+            window: Some(nz32(6)),
+            ..batch()
+        };
+        let a = [1u32, 2, 3];
+        let b = [4u32];
+        // Position 9 touches 2 blocks from anchor 1 (it held 3 under the causal law, past this
+        // walk); position 2 touches its one block from anchor 0.
+        let seqs = [
+            BatchSeq { blocks: &a, pos: 9 },
+            BatchSeq { blocks: &b, pos: 2 },
+        ];
+        let src = batch_sources(&s, &seqs).unwrap();
+        let words = |t: u32| -> Vec<i32> {
+            ints(
+                &src.int32
+                    .iter()
+                    .find(|(tid, ..)| *tid == t)
+                    .expect("staged")
+                    .1,
+            )
+        };
+        // Block slot i, sequence s: A's are its blocks 1 and 2 (anchored at 1), B's its block 0
+        // then the null page past its one touched block.
+        assert_eq!(
+            words(s.chunk_pages),
+            vec![2, 4, 0, 0, 3, 0, 0, 0],
+            "each sequence's own anchored blocks down the block-slot axis"
+        );
+        let (mask, shape) = (&src.mask.1, &src.mask.2);
+        assert_eq!(shape, &vec![8usize, 4]);
+        let tile = |i: usize, s: usize| -> &[f32] {
+            &mask[(i * 4 + s) * 4..(i * 4 + s + 1) * 4]
+        };
+        // A (position 9, reach [4, 9]): slot 0 covers 4..=7 whole, slot 1 (8..=11) to 9.
+        assert_eq!(tile(0, 0), &[0.0; 4]);
+        assert_eq!(tile(1, 0), &[0.0, 0.0, MASKED, MASKED]);
+        // B (position 2, reach [0, 2]): slot 0 to position 2; slot 1 untouched — the stack's own
+        // initial -inf, the padding value a block slot past every touched one carries.
+        assert_eq!(tile(0, 1), &[0.0, 0.0, 0.0, MASKED]);
+        assert_eq!(tile(1, 1), &[f32::NEG_INFINITY; 4]);
+        // A sequence whose span is past the walk refuses: position 12 touches 3 blocks.
+        assert!(batch_sources(&s, &[BatchSeq { blocks: &a, pos: 12 }]).is_err());
+    }
+
     /// spyre-inference's dispatch: the decode kernel, at one query row, is the one that reads
     /// `kv_row_pool`, so a decode step stages it and a prompt chunk does not.
     #[test]
@@ -1536,9 +1754,15 @@ mod tests {
                 start: 5,
                 real: nz(2),
             };
+            // A windowed stack's lines are one run inside the line, masked on both sides.
+            let w = PagedStep {
+                window: Some(nz32(3)),
+                ..s
+            };
             for m in [
                 CardMask::Causal(CausalStack::of(&s, s.rows as usize, Some(rows))),
                 CardMask::Causal(CausalStack::of(&s, s.rows as usize, None)),
+                CardMask::Causal(CausalStack::of(&w, w.rows as usize, Some(rows))),
             ] {
                 let (got, want) = bytes_of(&m);
                 assert_eq!(got, want, "{slots} slots: {m:?}");
