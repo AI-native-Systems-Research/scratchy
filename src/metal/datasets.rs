@@ -16,8 +16,8 @@ use super::buckets::{self, Buckets};
 use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
 use super::{
-    ECDF_COLUMN, Entry, HEAT_LABELS, MachineRuns, Series, Sweep, bar_chart, ecdf_chart, engine_key,
-    grid_glance, grid_maps, helper, helper_info, in_order, kept, lineup, marks_key,
+    BLOCK_LABELS, ECDF_COLUMN, Entry, MachineRuns, Series, Sweep, bar_chart, ecdf_chart,
+    engine_key, grid_glance, grid_maps, helper, helper_info, in_order, kept, lineup, marks_key,
     over_time_charts, parity, parity_info, previous_run, request_plots, runs_table, served_as,
     slug, sweep_part, tasks, users_at,
 };
@@ -1162,9 +1162,17 @@ fn summary_map(
         labelled: BTreeSet::new(),
         legend: None,
     };
-    // The squares to write their factor in, as the random-token map does: each colour step's
-    // square furthest from ×1, so its shades read apart.
-    map.labelled = ratio_labels(&map.ratios(), HEAT_LABELS);
+    // The squares to write their factor in, per machine and model — the map's blocks, one model
+    // on one Mac: each block's slowest and fastest always in, the interesting colour steps
+    // between ([`ratio_labels`], [`BLOCK_LABELS`]), so a block's extremes always read.
+    let mut blocks: BTreeMap<(usize, usize), BTreeMap<MapAt, f64>> = BTreeMap::new();
+    for (&at, &r) in &map.ratios() {
+        blocks.entry((at.0, at.2)).or_default().insert(at, r);
+    }
+    map.labelled = blocks
+        .values()
+        .flat_map(|block| ratio_labels(block, BLOCK_LABELS))
+        .collect();
     map.render(&format!("{id}-summary-scale"))
 }
 
