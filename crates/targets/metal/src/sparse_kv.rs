@@ -354,6 +354,13 @@ impl SparseStores {
         (*self.stores[i].0).clone()
     }
 
+    /// Block `block` in every store, in store order: `(buffer, offset, bytes)`.
+    pub fn block_regions(&self, block: usize) -> Vec<(crate::argmax::Buffer, usize, usize)> {
+        (self.stores.iter())
+            .map(|(buffer, bytes, _)| ((**buffer).clone(), block * bytes, *bytes))
+            .collect()
+    }
+
     /// The blocks mapped so far, as each step publishes them.
     pub fn mapped(&self) -> Arc<AtomicUsize> {
         self.mapped.clone()

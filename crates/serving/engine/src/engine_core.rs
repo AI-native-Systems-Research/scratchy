@@ -31,7 +31,7 @@ use scratchy_core_config::SchedulerConfig;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 use scratchy_serving_scheduler::scheduler::{PauseState, Scheduler, SchedulerInterface};
 use scratchy_serving_transport::messages::PauseMode;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{EngineError, EngineResult};
 use crate::executor::{Executor, ModelRunnerOutput};
@@ -551,7 +551,10 @@ impl EngineCore {
         // ⛔ NOTHING SCHEDULED AND NOTHING RETIRED, with requests still outstanding. Naming it
         // `Stalled` rather than handing back an empty map is what forces every caller to say what
         // it does about that — see [`StepOutcome`].
-        if !model_executed && scheduler_output.finished_req_ids.is_empty() {
+        if !model_executed
+            && scheduler_output.finished_req_ids.is_empty()
+            && scheduler_output.recurrent_state.is_empty()
+        {
             return Ok(StepOutcome::Stalled);
         }
 
@@ -628,7 +631,12 @@ impl EngineCore {
         // Still return the output if there are finished request IDs to clean up,
         // even when no tokens are scheduled. The executor needs to see these IDs
         // to release per-request resources (KV cache buffers, token buffers, etc.).
-        if sched.total_num_scheduled_tokens == 0 && sched.finished_req_ids.is_empty() {
+        // Likewise memory or snapshots it moves: the scheduler counts them moved — a snapshot
+        // read back from disk for a request that was not admitted after all is a hit for the next.
+        if sched.total_num_scheduled_tokens == 0
+            && sched.finished_req_ids.is_empty()
+            && sched.recurrent_state.is_empty()
+        {
             return None;
         }
         Some(sched)
@@ -882,6 +890,16 @@ impl EngineCore {
         };
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
+        // ⛔ BUT A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK HOLDS NOTHING. No request ran on
+        // it — the one it was read for waits for this step — so it is forgotten before the commit,
+        // and that request resumes cold: a disk error costs it a prefill, not its answer.
+        if !model_output.failed_fills.is_empty() {
+            warn!(
+                slots = ?model_output.failed_fills,
+                "recurrent-state snapshots not read back from disk: their requests resume cold"
+            );
+            (self.scheduler).forget_failed_fills(scheduler_output, &model_output.failed_fills);
+        }
         // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
         // BLOCKS REGISTERED WHILE IT WAS SCHEDULED HOLD THEIRS — committed here and not when they
         // were scheduled, because a step that fails never gets here.
@@ -1681,6 +1699,7 @@ mod tests {
                 kv_extent: std::collections::HashMap::new(),
                 kv_pool_reach: None,
                 kv_backed: None,
+                failed_fills: Vec::new(),
             };
 
             let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -1835,6 +1854,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         // Set up engine.
@@ -2291,6 +2311,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2353,6 +2374,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2403,6 +2425,7 @@ mod tests {
             kv_extent: std::collections::HashMap::new(),
             kv_pool_reach: None,
             kv_backed: None,
+            failed_fills: Vec::new(),
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -2771,6 +2794,7 @@ mod tests {
                 slot_bytes: 0,
                 unit_slots: std::num::NonZeroUsize::MIN,
                 max_slots: 4,
+                disk_slots: 0,
             })
         }
     }
@@ -2809,6 +2833,130 @@ mod tests {
                 .any(|op| op.req_id == "r3" && op.position == 592),
             "{:?}",
             resumed.recurrent_state
+        );
+    }
+
+    /// What a [`FailingFillsExecutor`] saw: the fills it failed, and each request's first chunk.
+    #[derive(Default)]
+    struct Seen {
+        failed: usize,
+        first_chunk: HashMap<String, usize>,
+    }
+
+    /// A [`NoopExecutor`] whose worker keeps one snapshot slot and two disk slots, and fails to
+    /// read back every snapshot from disk.
+    struct FailingFillsExecutor(NoopExecutor, std::sync::Arc<std::sync::Mutex<Seen>>);
+
+    impl Executor for FailingFillsExecutor {
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.0.set_stop_token_ids(stop_token_ids)
+        }
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            let mut out = self.0.execute_model(scheduler_output)?;
+            let fills = &scheduler_output.recurrent_state.disk.fills;
+            out.failed_fills = fills.iter().map(|f| f.slot).collect();
+            let mut seen = self.1.lock().unwrap();
+            seen.failed += fills.len();
+            for (req_id, &n) in &scheduler_output.num_scheduled_tokens {
+                seen.first_chunk.entry(req_id.clone()).or_insert(n);
+            }
+            Ok(out)
+        }
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
+            self.0.initialize_cache(gpu, cpu)
+        }
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            self.0.determine_available_memory()
+        }
+        fn shutdown(&mut self) {
+            self.0.shutdown()
+        }
+        fn is_sleeping(&self) -> bool {
+            self.0.is_sleeping()
+        }
+        fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
+            Some(scratchy_serving_scheduler::scheduler::SnapshotBudget {
+                kv_block_bytes: 1,
+                kv_granule_blocks: std::num::NonZeroUsize::MIN,
+                slot_bytes: 0,
+                unit_slots: std::num::NonZeroUsize::MIN,
+                max_slots: 1,
+                disk_slots: 2,
+            })
+        }
+    }
+
+    /// ⛔ A SNAPSHOT THE WORKER COULD NOT READ BACK FROM DISK COSTS ITS REQUEST A COLD PREFILL, AND
+    /// NOTHING ELSE: that request answers in full, as with no disk tier, and so does the one
+    /// decoding beside it.
+    #[test]
+    fn a_failed_fill_costs_its_request_a_cold_prefill_not_its_answer() {
+        let mut config = make_test_config();
+        config.enable_prefix_caching = true;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
+        let mut engine = EngineCore::new(
+            config,
+            Box::new(FailingFillsExecutor(NoopExecutor::new(1024), seen.clone())),
+        );
+        let prompt = |id: &str, seed: u32| {
+            let mut r = make_request(id, 600);
+            r.prompt_token_ids = (0..600).map(|t| seed * 10_000 + t).collect();
+            r.all_token_ids = r.prompt_token_ids.clone();
+            r
+        };
+        let running = |engine: &EngineCore, id: &str| {
+            (engine.scheduler.get_request(id)).is_some_and(|r| !r.status.is_finished())
+        };
+        // What each request's client receives: its tokens and how it finished.
+        let mut received: HashMap<String, (usize, Option<FinishReason>)> = HashMap::new();
+        let mut step = |engine: &mut EngineCore| {
+            let StepOutcome::Progressed { outputs, .. } = engine.step().unwrap() else {
+                panic!("a step that does nothing");
+            };
+            for o in outputs.into_values().flat_map(|o| o.outputs) {
+                let r = received.entry(o.request_id).or_default();
+                r.0 += o.new_token_ids.len();
+                r.1 = r.1.or(o.finish_reason);
+            }
+        };
+        // `a` saves its prompt's end and finishes.
+        engine.add_request(prompt("a", 1));
+        while running(&engine, "a") {
+            step(&mut engine);
+        }
+        // `b`'s save takes the one slot: `a`'s snapshot goes to disk.
+        engine.add_request(prompt("b", 2));
+        step(&mut engine);
+        assert!(running(&engine, "b"), "decoding");
+
+        // `a`'s prompt again, while `b` decodes: a step reads its snapshot back, and that fails.
+        engine.add_request(prompt("a2", 1));
+        while running(&engine, "a2") || running(&engine, "b") {
+            step(&mut engine);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.failed, 1);
+        assert_eq!(
+            seen.first_chunk["a2"], 600,
+            "a2 prefilled cold, all of its prompt"
+        );
+        assert_eq!(
+            received["a2"],
+            (16, Some(FinishReason::Length)),
+            "a2's client gets its whole answer"
+        );
+        assert_eq!(received["b"], (16, Some(FinishReason::Length)));
+
+        engine.add_request(prompt("a3", 1));
+        let next = engine.scheduler.schedule();
+        assert!(next.recurrent_state.disk.fills.is_empty());
+        assert_eq!(
+            next.recurrent_state.restores.first().map(|op| op.position),
+            Some(592),
+            "a2's own save serves the prefix again"
         );
     }
 

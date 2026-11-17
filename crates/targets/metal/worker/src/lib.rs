@@ -8,3 +8,4 @@
 pub mod gpu_worker;
 pub mod gpu_worker_base;
 pub mod metal_info;
+mod snapshot_disk;
