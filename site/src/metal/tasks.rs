@@ -96,10 +96,25 @@ fn mostly_thought(c: &TaskCell) -> bool {
         .is_some_and(|n| n > 0 && 2 * c.thinking_answers.unwrap_or(0) > n)
 }
 
+/// Whether a cell's accuracy shows, at its side of a comparison against `other`: not mostly
+/// failed, and neither mostly capped nor mostly thought unless the other side's answers did the
+/// same. A budget every side ran out of, or reasoning every side opened, is the model's under
+/// this workload, not one side's misconfiguration, so the two accuracies compare like for like;
+/// with no other side, a cell's cut-off answers are its own doing and stay held back.
+fn shows_accuracy(c: &TaskCell, other: Option<&TaskCell>) -> bool {
+    if mostly_failed(c) {
+        return false;
+    }
+    let shared = |cond: fn(&TaskCell) -> bool| other.is_some_and(|o| cond(c) && cond(o));
+    (!mostly_capped(c) || shared(mostly_capped)) && (!mostly_thought(c) || shared(mostly_thought))
+}
+
 /// Accuracy, where it is like for like: none for a cell most of whose answers opened as
-/// reasoning, ran to their cap (which read as wrong without being answers), or failed.
-pub(super) fn accuracy(c: &TaskCell) -> Option<f64> {
-    c.accuracy.filter(|_| !mostly_thought(c) && usable(c))
+/// reasoning, ran to their cap (which read as wrong without being answers), or failed —
+/// unless the other side's did the same, every engine asked alike ([`shows_accuracy`]). `other`
+/// is the cell it is set against on the same tasks.
+pub(super) fn accuracy(c: &TaskCell, other: Option<&TaskCell>) -> Option<f64> {
+    c.accuracy.filter(|_| shows_accuracy(c, other))
 }
 
 /// Why a cell shows no accuracy, in its cell: "not scored" for a timed cell, its answers forced
@@ -260,8 +275,8 @@ fn per_token(c: &TaskCell) -> Option<f64> {
 }
 
 /// A cell's joules a right answer, where it shows its accuracy and kept its energy.
-pub(super) fn per_right(c: &TaskCell) -> Option<f64> {
-    accuracy(c).filter(|&a| a > 0.0)?;
+pub(super) fn per_right(c: &TaskCell, other: Option<&TaskCell>) -> Option<f64> {
+    accuracy(c, other).filter(|&a| a > 0.0)?;
     c.energy.as_ref().and_then(|e| e.j_per_right_answer)
 }
 
@@ -301,7 +316,7 @@ fn pct(v: Option<f64>) -> String {
 /// A cell's accuracy as the table shows it: with its task count, and marked `~` where too few
 /// tasks make it indicative ([`FIRM_ACCURACY_TASKS`]); for a cell most of whose requests failed,
 /// how many answered instead.
-fn right(c: &TaskCell) -> String {
+fn right(c: &TaskCell, other: Option<&TaskCell>) -> String {
     if mostly_failed(c) {
         let done = c.completed.unwrap_or(0) as usize;
         let sent = done + c.failed.unwrap_or(0) as usize;
@@ -311,7 +326,7 @@ fn right(c: &TaskCell) -> String {
             crate::thousands(sent)
         );
     }
-    let Some(a) = accuracy(c) else {
+    let Some(a) = accuracy(c, other) else {
         return no_accuracy(c);
     };
     let whole = match c.num_tasks {
@@ -366,18 +381,21 @@ fn no_ratio(theirs: &TaskCell) -> Option<String> {
 
 /// An accuracy's 95% range, in points: the binomial interval over its tasks,
 /// ±1.96·√(p(1−p)/n), to one decimal. None where it shows no accuracy or kept no task count.
-fn range(c: &TaskCell) -> Option<f64> {
-    let (p, n) = (accuracy(c)?, f64::from(c.num_tasks.filter(|&n| n > 0)?));
+fn range(c: &TaskCell, other: Option<&TaskCell>) -> Option<f64> {
+    let (p, n) = (
+        accuracy(c, other)?,
+        f64::from(c.num_tasks.filter(|&n| n > 0)?),
+    );
     Some((1960.0 * (p * (1.0 - p) / n).sqrt()).round() / 10.0)
 }
 
 /// A cell's accuracy with its range, "25% ±4.2", as the accuracy table shows it; or why it has
 /// none, or how many requests answered where most failed ([`right`]).
-fn scored(c: &TaskCell) -> String {
-    match (accuracy(c), range(c)) {
+fn scored(c: &TaskCell, other: Option<&TaskCell>) -> String {
+    match (accuracy(c, other), range(c, other)) {
         (Some(a), Some(r)) => format!("{} ±{r:.1}", pct(Some(a))),
         (Some(a), None) => format!("~{}", pct(Some(a))),
-        _ => right(c),
+        _ => right(c, other),
     }
 }
 
@@ -386,15 +404,27 @@ fn scored(c: &TaskCell) -> String {
 /// one says why. `pairs` is each machine and its models as the section reads them. Nothing where
 /// none of them was scored.
 pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
-    let rows: Vec<(String, &str, &TaskCell)> = (pairs.iter())
+    // A row a cell: the model and Mac it ran on, the engine, the cell, and the other side's cell
+    // it is set against on the same tasks — the pair its accuracy's gates read.
+    let rows: Vec<(String, &str, &TaskCell, Option<&TaskCell>)> = (pairs.iter())
         .flat_map(|&(chip, m)| {
             let mut engines = vec![Engine::Scratchy];
             engines.extend(rival_of(m, dataset));
-            engines.into_iter().flat_map(move |e| {
-                accuracy_cells(e.tasks(m), dataset)
-                    .into_iter()
-                    .map(move |c| (format!("{} on {chip}", m.stem), e.label(), c))
-            })
+            let cells: Vec<(Engine, Vec<&TaskCell>)> = engines
+                .iter()
+                .map(|&e| (e, accuracy_cells(e.tasks(m), dataset)))
+                .collect();
+            let mut rows = Vec::new();
+            for (e, cs) in &cells {
+                for c in cs.iter().copied() {
+                    let other = cells
+                        .iter()
+                        .find(|(o, _)| *o != *e)
+                        .and_then(|(_, cs)| cs.iter().copied().find(|x| x.conc == c.conc));
+                    rows.push((format!("{} on {chip}", m.stem), e.label(), c, other));
+                }
+            }
+            rows
         })
         .collect();
     if rows.is_empty() {
@@ -415,7 +445,8 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
             "accuracy",
             "The share of tasks answered right, a failed or cut-off answer counted \
             wrong, ± its 95% range over the tasks. Not shown where most answers were cut off at the length limit, \
-            opened in reasoning, or failed: the cell says which.",
+            opened in reasoning, or failed — unless every engine's did the same, the model under \
+            this workload: the cell says which.",
         ),
         (
             "by hops",
@@ -439,21 +470,24 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
             p { style: "font-size: 0.875rem",
                 "Each dot is an engine's accuracy on the same tasks, its bar the 95% range. Where two \
                  engines' bars overlap they are within noise of each other; where they do not, the gap \
-                 is real. Hover a dot for its numbers; the table view has every one."
+                 is real. An accuracy over answers mostly cut off at the length limit, or mostly in \
+                 reasoning, shows only where every engine's answers were the same: the model under \
+                 this workload, not one side's doing. Hover a dot for its numbers; the table view has \
+                 every one."
             }
             {range_dots(&groups)}
             Fold { title: "Table view",
             Table { headers, abouts,
-                for (model, engine, c) in rows {
+                for (model, engine, c, other) in rows {
                     TableRow {
                         TableCell { "{model}" }
                         TableCell { "{engine}" }
                         TableCell { "{load_label(c)}" }
                         TableCell { {c.num_tasks.map_or("—".to_string(), |n| crate::thousands(n as usize))} }
-                        TableCell { "{scored(c)}" }
-                        TableCell { "{by_hops(c).filter(|_| accuracy(c).is_some()).unwrap_or_default()}" }
+                        TableCell { "{scored(c, other)}" }
+                        TableCell { "{by_hops(c).filter(|_| accuracy(c, other).is_some()).unwrap_or_default()}" }
                         TableCell { {c.capped_answers.map_or("—".to_string(), |k| crate::thousands(k as usize))} }
-                        TableCell { "{joules(per_right(c))}" }
+                        TableCell { "{joules(per_right(c, other))}" }
                     }
                 }
             }
@@ -464,7 +498,7 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
 
 /// Why a cell has no accuracy, short enough for its line on the plot: "331 of 400 cut off",
 /// "268 of 2,415 answered"; the table view words it in full ([`right`]).
-fn short_reason(c: &TaskCell) -> String {
+fn short_reason(c: &TaskCell, other: Option<&TaskCell>) -> String {
     let done = c.completed.unwrap_or(0) as usize;
     let of = |k: Option<u32>| {
         format!(
@@ -485,7 +519,7 @@ fn short_reason(c: &TaskCell) -> String {
     } else if mostly_thought(c) {
         format!("reasoning {}", of(c.thinking_answers))
     } else {
-        right(c)
+        right(c, other)
     }
 }
 
@@ -508,16 +542,45 @@ fn accuracy_dots(dataset: &str, pairs: &[(&str, &Model)]) -> Vec<RangeGroup> {
                 .filter_map(|(&e, class)| {
                     let c =
                         (accuracy_cells(e.tasks(m), dataset).into_iter()).find(|c| c.conc == u)?;
-                    let at = match (accuracy(c), range(c)) {
+                    // The other engine's cell at this users count: the pair its accuracy's
+                    // gates read. None where scratchy ran alone.
+                    let other = engines.iter().filter(|&&o| o != e).find_map(|&o| {
+                        (accuracy_cells(o.tasks(m), dataset).into_iter()).find(|x| x.conc == u)
+                    });
+                    let at = match (accuracy(c, other), range(c, other)) {
                         (Some(a), Some(r)) => Ok((a, a - r / 100.0, a + r / 100.0)),
                         (Some(a), None) => Ok((a, a, a)),
-                        _ => Err(short_reason(c)),
+                        _ => Err(short_reason(c, other)),
                     };
                     let mut tip = vec![
                         format!("{} on {chip}", m.stem),
-                        format!("accuracy {}", scored(c)),
+                        format!("accuracy {}", scored(c, other)),
                     ];
-                    tip.extend(by_hops(c).filter(|_| accuracy(c).is_some()));
+                    tip.extend(by_hops(c).filter(|_| accuracy(c, other).is_some()));
+                    // An accuracy shown over answers the other side's matched — mostly cut off
+                    // at the length limit, or mostly in reasoning — says so in its tip.
+                    if accuracy(c, other).is_some() {
+                        let done = c.completed.unwrap_or(0) as usize;
+                        let of = |k: u32| {
+                            format!(
+                                "{} of {}",
+                                crate::thousands(k as usize),
+                                crate::thousands(done)
+                            )
+                        };
+                        if mostly_capped(c) {
+                            tip.push(format!(
+                                "answers cut off at the length limit: {}",
+                                of(c.capped_answers.unwrap_or(0))
+                            ));
+                        }
+                        if mostly_thought(c) {
+                            tip.push(format!(
+                                "opened in reasoning: {}",
+                                of(c.thinking_answers.unwrap_or(0))
+                            ));
+                        }
+                    }
                     if let Some(n) = c.num_tasks {
                         tip.push(format!("over {} tasks", crate::thousands(n as usize)));
                     }
@@ -699,11 +762,11 @@ mod tests {
             "thinking_answers": 0, "capped_answers": 0, "num_tasks": 8,
         }))
         .unwrap();
-        assert_eq!(right(&c), "~38% of 8");
+        assert_eq!(right(&c, None), "~38% of 8");
         c.num_tasks = Some(100);
-        assert_eq!(right(&c), "38% of 100");
+        assert_eq!(right(&c, None), "38% of 100");
         c.num_tasks = None;
-        assert_eq!(right(&c), "~38%", "a run from before the count");
+        assert_eq!(right(&c, None), "~38%", "a run from before the count");
     }
 
     /// A dataset cell's energy, where its run kept it: joules a request, an output token and, on
@@ -725,7 +788,7 @@ mod tests {
         let ours = cell(100.0, 40.0, Some(0.5));
         assert_eq!(joules(per_request(&ours)), "40.0");
         assert_eq!(joules(per_token(&ours)), "0.40");
-        assert_eq!(joules(per_right(&ours)), "80.0");
+        assert_eq!(joules(per_right(&ours, None)), "80.0");
         // A third less energy a request than the rival's: x1.50.
         assert_eq!(
             energy_times(&ours, &cell(100.0, 60.0, Some(0.5))),
@@ -746,8 +809,8 @@ mod tests {
             Some(1.5)
         );
         // Not scored, or none right: no figure a right answer.
-        assert_eq!(joules(per_right(&cell(100.0, 40.0, None))), "—");
-        assert_eq!(joules(per_right(&cell(100.0, 40.0, Some(0.0)))), "—");
+        assert_eq!(joules(per_right(&cell(100.0, 40.0, None), None)), "—");
+        assert_eq!(joules(per_right(&cell(100.0, 40.0, Some(0.0)), None)), "—");
         // A run from before cells kept energy.
         let old: TaskCell = serde_json::from_value(serde_json::json!({
             "workload": "rag", "conc": 1, "completed": 8,
@@ -773,10 +836,10 @@ mod tests {
         };
         let broken = cell(268, 2147);
         let whole = cell(2415, 0);
-        assert_eq!(right(&broken), "268 of 2,415 answered");
+        assert_eq!(right(&broken, None), "268 of 2,415 answered");
         assert_eq!(joules(per_request(&broken)), "—");
         assert_eq!(joules(per_token(&broken)), "—");
-        assert_eq!(joules(per_right(&broken)), "—");
+        assert_eq!(joules(per_right(&broken, None)), "—");
         for (a, b) in [(&broken, &whole), (&whole, &broken)] {
             assert_eq!(ttft_times(a, b), None);
             assert_eq!(total_times(a, b), None);
@@ -784,7 +847,7 @@ mod tests {
         }
         // A few failures leave the rest standing.
         let few = cell(2400, 15);
-        assert_eq!(right(&few), "6% of 2415");
+        assert_eq!(right(&few, None), "6% of 2415");
         assert_eq!(ttft_times(&few, &whole), Some(1.0));
     }
 
@@ -798,9 +861,12 @@ mod tests {
             "accuracy_by_group": {"4": 0.38, "2": 0.52, "3": 0.43},
         }))
         .unwrap();
-        assert_eq!(right(&c), "47% of 400 (2-hop 52%, 3-hop 43%, 4-hop 38%)");
+        assert_eq!(
+            right(&c, None),
+            "47% of 400 (2-hop 52%, 3-hop 43%, 4-hop 38%)"
+        );
         c.accuracy_by_group = None;
-        assert_eq!(right(&c), "47% of 400");
+        assert_eq!(right(&c, None), "47% of 400");
     }
 
     /// Answers forced to one length set their whole time against the rival's only where both ran
@@ -937,11 +1003,11 @@ mod tests {
             .unwrap()
         };
         // 1.96 * sqrt(0.25 * 0.75 / 400) = 4.2 points; over 2,415 tasks, 1.7.
-        assert_eq!(range(&cell(0.25, 400)), Some(4.2));
-        assert_eq!(range(&cell(0.25, 2415)), Some(1.7));
-        assert_eq!(scored(&cell(0.25, 400)), "25% ±4.2");
+        assert_eq!(range(&cell(0.25, 400), None), Some(4.2));
+        assert_eq!(range(&cell(0.25, 2415), None), Some(1.7));
+        assert_eq!(scored(&cell(0.25, 400), None), "25% ±4.2");
         // One decimal always: 1.96 * sqrt(0.5 * 0.5 / 2401) = 2.0 points.
-        assert_eq!(scored(&cell(0.5, 2401)), "50% ±2.0");
+        assert_eq!(scored(&cell(0.5, 2401), None), "50% ±2.0");
     }
 
     /// A held-back accuracy says why in its cell, and one reasoning answer among many does not
@@ -956,12 +1022,15 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            right(&cell(331, 0)),
+            right(&cell(331, 0), None),
             "cut off: 331 of 400 answers hit the length limit"
         );
-        assert_eq!(right(&cell(0, 378)), "answered in reasoning: 378 of 400");
         assert_eq!(
-            right(&cell(0, 1)),
+            right(&cell(0, 378), None),
+            "answered in reasoning: 378 of 400"
+        );
+        assert_eq!(
+            right(&cell(0, 1), None),
             "47% of 400",
             "one reasoning answer in 400"
         );
@@ -969,7 +1038,49 @@ mod tests {
             "workload": "rag", "conc": 1, "completed": 8,
         }))
         .unwrap();
-        assert_eq!(right(&timed), "not scored");
+        assert_eq!(right(&timed, None), "not scored");
+    }
+
+    /// A cell mostly capped or mostly thinking shows its accuracy where the other side's answers
+    /// did the same: the budget, or the reasoning, is the model's under this workload, not one
+    /// side's misconfiguration, and the two accuracies compare like for like. Alone, or against
+    /// answers that ended on their own, it stays held back; mostly failed never shows.
+    #[test]
+    fn a_sharedly_capped_or_thinking_cell_shows_its_accuracy() {
+        let cell = |capped: u32, thinking: u32| -> TaskCell {
+            serde_json::from_value(serde_json::json!({
+                "workload": "rag", "conc": 4, "completed": 805, "num_tasks": 805,
+                "accuracy": 0.08, "capped_answers": capped, "thinking_answers": thinking,
+            }))
+            .unwrap()
+        };
+        let cut = cell(673, 789);
+        let also_cut = cell(755, 803);
+        let plain = cell(0, 0);
+        // Alone: held back, and says why.
+        assert_eq!(
+            right(&cut, None),
+            "cut off: 673 of 805 answers hit the length limit"
+        );
+        assert_eq!(
+            right(&cell(0, 789), None),
+            "answered in reasoning: 789 of 805"
+        );
+        // One side mostly capped or thinking, the other's answers their own: still held back.
+        assert_eq!(accuracy(&cut, Some(&plain)), None, "one side cut off");
+        assert_eq!(
+            accuracy(&cell(0, 789), Some(&plain)),
+            None,
+            "one side thinking"
+        );
+        // Both sides: the accuracies compare, the caveat riding in the tip.
+        assert_eq!(accuracy(&cut, Some(&also_cut)), Some(0.08));
+        assert_eq!(scored(&cut, Some(&also_cut)), "8% ±1.9");
+        // Mostly failed is never shared.
+        let mut broken = cell(0, 0);
+        broken.completed = Some(80);
+        broken.failed = Some(725);
+        assert_eq!(accuracy(&broken, Some(&broken)), None);
     }
 
     #[test]
@@ -1026,14 +1137,18 @@ mod tests {
             energy: None,
             spec_decode: None,
         };
-        assert_eq!(accuracy(&cell(0)), Some(0.5));
-        assert_eq!(accuracy(&cell(4)), None);
+        assert_eq!(accuracy(&cell(0), None), Some(0.5));
+        assert_eq!(accuracy(&cell(4), None), None);
         let mut capped = cell(0);
         capped.capped_answers = Some(4);
-        assert_eq!(accuracy(&capped), None, "every answer ran to its cap");
+        assert_eq!(accuracy(&capped, None), None, "every answer ran to its cap");
         capped.capped_answers = Some(3);
-        assert_eq!(accuracy(&capped), None, "most ran to their cap");
+        assert_eq!(accuracy(&capped, None), None, "most ran to their cap");
         capped.capped_answers = Some(2);
-        assert_eq!(accuracy(&capped), Some(0.5), "half ended on their own");
+        assert_eq!(
+            accuracy(&capped, None),
+            Some(0.5),
+            "half ended on their own"
+        );
     }
 }
