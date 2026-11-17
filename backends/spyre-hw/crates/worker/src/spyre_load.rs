@@ -2864,15 +2864,13 @@ impl SpyreWorker {
                 // ── PREFIX-CAPABLE PREFILL LADDER ── the adoption. The fan-out was spawned with
                 // the prefill ladder's, before the owner (host halves only); its prepare ran in
                 // the wave above. The adoption runs one thread per session, reading the owner
-                // only; refusals and "ready" logs land in ladder order on this thread.
-                let prefix_adopted: Vec<(
-                    u32,
-                    u32,
-                    &'static str,
-                    &'static scratchy_target_spyre::wiring::Wiring,
-                    Result<SuperDscSession, String>,
-                )> = std::thread::scope(|scope| {
-                    let handles: Vec<_> = prefix_jobs
+                // only; refusals and "ready" logs land in ladder order on this thread. Each
+                // thread hands back the rung's OWN JOB beside its session — the job already
+                // states the rung's identity (width, sequence count, bundle, wiring cell), so
+                // the adoption never re-states those facts as a second tuple.
+                let prefix_adopted: Vec<(PrefixRungJob, Result<SuperDscSession, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = prefix_jobs
                             .into_iter()
                             .zip(prefix_prepared)
                             .map(|(job, built)| {
@@ -2880,14 +2878,9 @@ impl SpyreWorker {
                                 let spill = &spill_images;
                                 let pmq = job.pmq;
                                 let seqs = job.seqs;
-                                let fp: &'static str = &job.rcode.fp;
-                                let wiring = job.wiring;
                                 scope.spawn(move || {
                                     (
-                                        pmq,
-                                        seqs,
-                                        fp,
-                                        wiring,
+                                        job,
                                         built.map_err(|(_, m)| m).and_then(|mut ps| {
                                             adopt_from_owner(&mut ps, ss, spill)
                                                 .map_err(|e| {
@@ -2902,29 +2895,29 @@ impl SpyreWorker {
                                 })
                             })
                             .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| match h.join() {
-                            Ok(r) => r,
-                            Err(p) => std::panic::resume_unwind(p),
-                        })
-                        .collect()
-                });
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
+                    });
                 let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
-                for (pmq, seqs, fp, wiring, adopted) in prefix_adopted {
+                for (job, adopted) in prefix_adopted {
                     let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
                     // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its consts
                     // staged — the wave front's launch reads it, never a representative's.
-                    let meta = mk_meta(wiring_to_parsed(wiring)?, 0, wiring);
+                    let meta = mk_meta(wiring_to_parsed(job.wiring)?, 0, job.wiring);
                     info!(
                         "[spyre-worker] sendnn: prefix-capable prefill session ready (w={}, s={}, \
                          bundle {}) — a start>0 chunk runs on the smallest solo rung that holds \
                          it, a wave of tails on the smallest packed product that holds them",
-                        pmq, seqs, fp
+                        job.pmq, job.seqs, job.rcode.fp
                     );
                     prefix_built.push(PrefixRungBuilt {
-                        width: pmq as usize,
-                        seqs: seqs as usize,
+                        width: job.pmq as usize,
+                        seqs: job.seqs as usize,
                         meta,
                         sess: ps,
                     });
