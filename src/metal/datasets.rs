@@ -331,9 +331,9 @@ fn dataset_summary(
                  were right against the rival's. Blue better, red worse, grey within noise. A striped \
                  square has no ratio: one engine did not run it, most of its requests failed, its \
                  answers were forced to a length, so not scored, one side's were mostly cut off or \
-                 in reasoning, as the accuracy table says, or one side had no energy reading or no \
-                 right answer there. Hover or focus a square for its ratio, the engine, and a \
-                 borrowed rival's run."
+                 in reasoning where the other's were not, as the accuracy table says, or one side \
+                 had no energy reading or no right answer there. Hover or focus a square for its \
+                 ratio, the engine, and a borrowed rival's run."
             }
             {summary_map(dataset, id, ran, machines, &summary_columns)}
             {tasks::accuracy_table(dataset, &scored_pairs)}
@@ -839,15 +839,22 @@ impl SummaryMap<'_> {
                     Some((lo, hi)) => Some((f64::min(lo, v), f64::max(hi, v))),
                 })
         };
-        // Over the map's first and last two columns the tooltip reaches inward, not off its edge.
-        let align = |k: usize, c: usize| match (k, c) {
-            (0, c) if c < 2 => "top-left",
-            (k, c) if k + 1 == groups && c + 2 >= n => "top-right",
-            _ => "top",
+        // A tooltip's vertical reach: downward over the map's first two rows, whose tips would
+        // reach past the grid's top into the wrapper that clips it, upward everywhere else.
+        let row_reach =
+            |row: usize, edge: &str| format!("{}{edge}", if row < 2 { "bottom" } else { "top" });
+        // Over the map's first and last two columns the tooltip reaches inward, not off its edge;
+        // over its first two rows it reaches downward, not past the grid's top into the scroll
+        // wrapper around it, whose `overflow-x: auto` clips above and below the grid too (Carbon's
+        // tooltip opens beside its trigger, in place, not at the page's root).
+        let align = |row: usize, k: usize, c: usize| match (k, c) {
+            (0, c) if c < 2 => row_reach(row, "-left"),
+            (k, c) if k + 1 == groups && c + 2 >= n => row_reach(row, "-right"),
+            _ => row_reach(row, ""),
         };
         // Each square with Carbon's tooltip: the square is its trigger, focusable so a keyboard
         // opens it too; the tooltip gives the ratio (or why there is none), then its lines.
-        let square = |at: MapAt, sq: &MapSquare, place: String| -> Element {
+        let square = |at: MapAt, sq: &MapSquare, row: usize, place: String| -> Element {
             let (fill, label, verdict) = match &sq.ratio {
                 Ok((r, vs)) => {
                     let step = ratio_step(*r);
@@ -866,7 +873,7 @@ impl SummaryMap<'_> {
             rsx! {
                 // The grid's own cell, and a flex box: Carbon puts the trigger in an inline box in its
                 // shadow DOM, whose line would add room for text under every square.
-                cds-tooltip { "align": align(at.2, at.3), style: "{place}; display: flex",
+                cds-tooltip { "align": align(row, at.2, at.3), style: "{place}; display: flex",
                     // Its own width: Carbon wraps the trigger in an inline box, so an empty square would
                     // shrink to nothing.
                     div { tabindex: "0", style: "width: {SQUARE}; height: {SQUARE}; {fill}; display: flex; align-items: center; justify-content: center; font-size: 0.625rem; font-weight: 600",
@@ -903,7 +910,7 @@ impl SummaryMap<'_> {
                             Definition { alignment: Alignment::BottomLeft, heading: row.name.clone(), definition: row.about.clone(), strong { "{row.label}" } }
                         }
                         for (&at, sq) in self.squares.range((m, r, 0, 0)..=(m, r, usize::MAX, usize::MAX)) {
-                            {square(at, sq, format!("grid-row: {}; grid-column: {}", i + 4, col(at.2, at.3)))}
+                            {square(at, sq, i, format!("grid-row: {}; grid-column: {}", i + 4, col(at.2, at.3)))}
                         }
                         if let Some((lo, hi)) = range(m, r) {
                             div { style: "grid-row: {i + 4}; grid-column: {col(groups, 0) + 1}; font-size: 0.75rem; white-space: nowrap; padding-left: 1.5rem",
@@ -1024,9 +1031,13 @@ fn summary_map(
                     return Err("answers forced to a length, so not scored".into());
                 }
                 // A cell the accuracy table does not score, its answers mostly cut off or in
-                // reasoning, has no joules a correct answer either: the side's reason, as there.
-                for (side, c) in [("scratchy", ours), (rival.label(), theirs)] {
-                    if tasks::accuracy(c).is_none() {
+                // reasoning without the other side's matching, has no joules a correct answer
+                // either: the side's reason, as there.
+                for (side, c, other) in [
+                    ("scratchy", *ours, Some(*theirs)),
+                    (rival.label(), *theirs, Some(*ours)),
+                ] {
+                    if tasks::accuracy(c, other).is_none() {
                         return Err(format!("{side}: {}", tasks::no_accuracy(c)));
                     }
                 }
@@ -1039,7 +1050,10 @@ fn summary_map(
                         buckets::joules_per_right_in(theirs, bs, b),
                     ),
                     // A run that kept no joules a request: each cell's whole, every bucket alike.
-                    _ => (tasks::per_right(ours), tasks::per_right(theirs)),
+                    _ => (
+                        tasks::per_right(ours, Some(theirs)),
+                        tasks::per_right(theirs, Some(ours)),
+                    ),
                 }
             }
         };
