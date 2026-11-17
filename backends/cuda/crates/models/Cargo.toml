@@ -40,6 +40,8 @@ scratchy-target-cuda-compiler = { path = "../compiler", features = ["test-suppor
 half = { workspace = true }
 # The FP8 tape tests read `tests/fixtures/fp8_headers_*.json`.
 serde_json = { workspace = true }
+# tests/tape_dump.rs: one sha256 per dumped file, per model and over every model.
+sha2 = "0.11"
 
 # The three FP8 checkpoints' emitted CUDA tapes under `fp8-dynamic-per-channel` (FP8 S2): the fp8
 # steps per bucket, the quant writes and the quant scratch's liveness, the weight table, and
