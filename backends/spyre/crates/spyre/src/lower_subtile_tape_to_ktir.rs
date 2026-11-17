@@ -1693,6 +1693,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             walk,
             paged_rows,
             extent: query_rows,
+            window: mask.window(),
         };
         match out {
             Some(prev) if prev != step => {
