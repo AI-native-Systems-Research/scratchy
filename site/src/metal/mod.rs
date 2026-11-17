@@ -2748,7 +2748,14 @@ pub(super) fn grid_glance(id: &str, machines: &BTreeMap<&str, MachineRuns>) -> E
                                 .map(|k| format!("helper kept {k} guessed tokens")),
                         ];
                         let tip = tip.into_iter().flatten().collect();
-                        squares.insert((m, r, k, p), MapSquare { ratio, tip });
+                        squares.insert(
+                            (m, r, k, p),
+                            MapSquare {
+                                ratio,
+                                within_noise: false,
+                                tip,
+                            },
+                        );
                         heat_map.insert((m, r, k, p), (chip, stem, gm.name));
                     }
                 }

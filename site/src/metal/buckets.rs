@@ -91,6 +91,22 @@ pub fn rights_in(c: &TaskCell, buckets: Buckets, at: usize) -> usize {
         .count()
 }
 
+/// A cell's scored requests in bucket `at` of `buckets`, and how many of them were right: the
+/// binomial sample a [`joules_per_right_in`] there divides over, whose swing is the noise in the
+/// ratio of two of them. None where the cell kept no prompt counts or scores, or none there was
+/// scored.
+pub fn rights_and_tasks_in(c: &TaskCell, buckets: Buckets, at: usize) -> Option<(u32, usize)> {
+    let (prompts, right) = (c.prompt_tokens.as_deref()?, c.task_right.as_deref()?);
+    let (mut rights, mut scored) = (0u32, 0usize);
+    for (p, r) in prompts.iter().zip(right) {
+        if p.is_some_and(|p| bucket(buckets, p) == at) && r.is_some() {
+            scored += 1;
+            rights += u32::from(*r == Some(true));
+        }
+    }
+    (scored > 0).then_some((rights, scored))
+}
+
 fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
     match timing {
         RequestTiming::Ttft => c.ttfts_ms.as_deref(),
@@ -181,6 +197,26 @@ mod tests {
             "none that long"
         );
         assert!(bucketed(&c));
+    }
+
+    /// A bucket's rights over its scored requests: the sample a joules-a-right-answer there
+    /// divides over. A request with no score is no trial; a bucket none was scored in has none.
+    #[test]
+    fn a_buckets_rights_and_scored_requests_are_its_scored_sample() {
+        let c: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag", "conc": 2,
+            "prompt_tokens": [2000, 2000, 2000, 2400, null, 3000],
+            "task_right": [true, false, null, true, true, false],
+        }))
+        .unwrap();
+        assert_eq!(rights_and_tasks_in(&c, MUSIQUE, 0), Some((1, 2)));
+        assert_eq!(rights_and_tasks_in(&c, MUSIQUE, 1), Some((1, 1)));
+        assert_eq!(
+            rights_and_tasks_in(&c, MUSIQUE, 2),
+            None,
+            "no request there"
+        );
+        assert_eq!(rights_and_tasks_in(&c, MUSIQUE, 3), Some((0, 1)));
     }
 
     /// A cell from before cells kept prompt counts has no bucket of anything.

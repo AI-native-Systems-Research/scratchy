@@ -328,7 +328,9 @@ fn dataset_summary(
                  its family; the same tasks to every engine. Colour is how many times better scratchy \
                  is than the engine it is set against: on P and D its median time over the cell's \
                  requests against the rival's, on 2u and 4u the joules its requests took over how many \
-                 were right against the rival's. Blue better, red worse, grey within noise. A striped \
+                 were right against the rival's. Blue better, red worse, grey within noise: a \
+                 ratio within the grey band, or — on the joules rows — one whose sides' right \
+                 answers are too small a sample of their accuracies to tell apart. A striped \
                  square has no ratio: one engine did not run it, most of its requests failed, its \
                  answers were forced to a length, so not scored, one side's were mostly cut off or \
                  in reasoning where the other's were not, as the accuracy table says, or one side \
@@ -778,7 +780,22 @@ pub(super) type MapAt = (usize, usize, usize, usize);
 /// against ("oMLX (from Oct 27)"), or why it has no ratio; then its tooltip's lines.
 pub(super) struct MapSquare {
     pub ratio: Result<(f64, String), String>,
+    /// A ratio measured but within the accuracy noise of its two sides — a joules row's accuracies
+    /// too small a sample to tell apart: drawn grey, as a ratio within the grey band is, its
+    /// number still written in it.
+    pub within_noise: bool,
     pub tip: Vec<String>,
+}
+
+/// Whether a ratio of two joules-a-right-answers is within the accuracy noise of its sides: each
+/// side's accuracy is a binomial sample, and its swings — (1−p)/(p·n) each, the squared relative
+/// standard error of the accuracy the joules are divided by — move the ratio by more than the
+/// grey band (±4%) was sized for. 1.96 of the two combined, around ×1, is the same 95% range the
+/// accuracy table prints; within it the ratio is measured but no verdict. `r` is the rival's
+/// joules a right answer over scratchy's.
+fn within_accuracy_noise(r: f64, ours: (f64, usize), theirs: (f64, usize)) -> bool {
+    let var = |(p, n): (f64, usize)| (1.0 - p) / (p * n as f64);
+    r.ln().abs() <= 1.96 * (var(ours) + var(theirs)).sqrt()
 }
 
 /// One row of a summary map: its label (P, D, 2u), its measure's name, and what it measures.
@@ -857,7 +874,13 @@ impl SummaryMap<'_> {
         let square = |at: MapAt, sq: &MapSquare, row: usize, place: String| -> Element {
             let (fill, label, verdict) = match &sq.ratio {
                 Ok((r, vs)) => {
-                    let step = ratio_step(*r);
+                    // A ratio within its sides' accuracy noise is drawn grey, as one within the
+                    // grey band is: measured, but no verdict — its number still written in it.
+                    let step = if sq.within_noise {
+                        ratio_step(1.0)
+                    } else {
+                        ratio_step(*r)
+                    };
                     (
                         format!(
                             "background: {}; color: {}",
@@ -1112,6 +1135,40 @@ fn summary_map(
                         }
                     });
                     let stem = p.as_ref().map_or("", |p| p.stem);
+                    // A joules-a-right-answer ratio within the accuracy noise of its two sides
+                    // ([`within_accuracy_noise`]) is measured but no verdict: drawn grey, as a
+                    // ratio within the grey band is. The noise is at the ratio's own granularity
+                    // — per bucket where both sides kept joules a request, else each cell's whole,
+                    // the accuracy and task count the accuracy table prints.
+                    let within_noise = match (
+                        p.as_ref(),
+                        got.as_ref().ok(),
+                        matches!(row.measure, Measure::JoulesPerRight),
+                    ) {
+                        (Some(p), Some(&(r, _)), true) => {
+                            let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
+                            let bucketed = ours.is_some_and(|c| c.task_joules.is_some())
+                                && theirs.is_some_and(|c| c.task_joules.is_some());
+                            let side = |c: &TaskCell, other: &TaskCell| -> Option<(f64, usize)> {
+                                if bucketed {
+                                    buckets::rights_and_tasks_in(c, bs, b).map(
+                                        |(rights, scored)| (rights as f64 / scored as f64, scored),
+                                    )
+                                } else {
+                                    Some((
+                                        tasks::accuracy(c, Some(other))?,
+                                        c.num_tasks.filter(|&n| n > 0)? as usize,
+                                    ))
+                                }
+                            };
+                            ours.and_then(|c| side(c, theirs?))
+                                .zip(theirs.and_then(|c| side(c, ours?)))
+                                .is_some_and(|(ours, theirs)| {
+                                    within_accuracy_noise(r, ours, theirs)
+                                })
+                        }
+                        _ => false,
+                    };
                     // scratchy's guesses kept over the whole cell: its helper's, not a bucket's.
                     let helped = (p.as_ref())
                         .and_then(|p| kept(p.ours.get(&row.users)?.spec_decode.as_ref()))
@@ -1124,12 +1181,18 @@ fn summary_map(
                             users_at(row.users)
                         )),
                         over,
+                        within_noise.then(|| {
+                            "within the two sides' accuracy noise: too few right answers there to \
+                             tell apart"
+                                .to_string()
+                        }),
                         helped,
                     ];
                     squares.insert(
                         (m, r, k, b),
                         MapSquare {
                             ratio: got,
+                            within_noise,
                             tip: tip.into_iter().flatten().collect(),
                         },
                     );
@@ -1414,4 +1477,31 @@ fn pair_js(id: &str, which: &str) -> String {
     .then(function () {{ fromHash(); window.addEventListener('hashchange', fromHash); }});\
 }})();"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::within_accuracy_noise;
+
+    /// A joules-a-right-answer ratio is grey within its sides' accuracy noise: the M3 Pro's
+    /// granite 4u square — ×0.92 over 44 and 48 right answers of 200 each, four answers of
+    /// noise where the grey band is ±4% — is grey; the M5 Max's dense 4u — ×1.52 over 207 and
+    /// 197 of 805 — is a real win and stays coloured. A small sample greys even a ×0.9, but a
+    /// wide enough gap on one still colours.
+    #[test]
+    fn a_joules_per_right_ratio_is_grey_within_its_sides_accuracy_noise() {
+        let side = |rights: usize, n: usize| (rights as f64 / n as f64, n);
+        assert!(within_accuracy_noise(
+            421.29 / 460.32,
+            side(44, 200),
+            side(48, 200)
+        ));
+        assert!(!within_accuracy_noise(
+            158.29 / 104.21,
+            side(207, 805),
+            side(197, 805)
+        ));
+        assert!(within_accuracy_noise(0.9, side(1, 10), side(2, 10)));
+        assert!(!within_accuracy_noise(4.0, side(8, 10), side(2, 10)));
+    }
 }
