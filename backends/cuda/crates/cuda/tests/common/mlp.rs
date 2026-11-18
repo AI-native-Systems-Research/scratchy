@@ -17,7 +17,7 @@ use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GateUpActBf16, GateUpKernel, GatedOp, GemmBf16, RmsNormBf16,
+    AddBf16, CudaStep, GateUpActBf16, GateUpKernel, GatedOp, GemmBf16, NormKernel, RmsNormBf16,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx,
@@ -118,6 +118,7 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
         cols: H,
         eps_bits: EPS.to_bits(),
         convention: GainConvention::OnePlusScale,
+        kernel: NormKernel::of(rows, H),
     })
 }
 

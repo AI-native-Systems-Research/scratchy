@@ -35,8 +35,9 @@ use scratchy_target_cuda::op_abi::{
 };
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
-    ExpertActQuantFp8, ExpertGateUpGemmFp8, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertProjection,
-    GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp, MoeWeight, QuantChainError,
+    ExpertActQuantFp8, ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8,
+    ExpertGemmBf16, ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel,
+    GateUpTcFp8, GatedOp, GdnPrefillBf16, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError,
     QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, gdn_scratch, gemv_tc_takes, norm_row_takes,
     quant_chain,
 };
@@ -1552,7 +1553,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let bundles: BTreeMap<u32, u64> = (steps.iter())
         .flat_map(|s| s.parts().into_iter().flatten())
         .filter_map(|s| match s {
-            CudaStep::GatedDeltaNet(g) | CudaStep::GdnDecode(g) => {
+            CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, .. }) | CudaStep::GdnDecode(g) => {
                 Some((g.bundle.0, g.bundle_layout()?.bytes))
             }
             // An fp8 weight's buffer is its e4m3 bytes and f32 scales (`step::fp8_weight`).
@@ -1607,16 +1608,18 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     // lowered with the first's geometry.
     let gdn = arena.gdn.and_then(|r| {
         steps.iter().find_map(|s| match s {
-            CudaStep::GatedDeltaNet(g) | CudaStep::GdnDecode(g) => Some(CanonicalGdn {
-                layers: gdn_layers.clone(),
-                num_k_heads: g.num_k_heads,
-                num_v_heads: g.num_v_heads,
-                head_k: g.head_k,
-                head_v: g.head_v,
-                conv_kernel: g.conv_kernel,
-                sequence: r.sequence,
-                scratch: r.scratch,
-            }),
+            CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, .. }) | CudaStep::GdnDecode(g) => {
+                Some(CanonicalGdn {
+                    layers: gdn_layers.clone(),
+                    num_k_heads: g.num_k_heads,
+                    num_v_heads: g.num_v_heads,
+                    head_k: g.head_k,
+                    head_v: g.head_v,
+                    conv_kernel: g.conv_kernel,
+                    sequence: r.sequence,
+                    scratch: r.scratch,
+                })
+            }
             _ => None,
         })
     });
@@ -1697,10 +1700,12 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
 fn gemv_tc(s: CudaStep) -> CudaStep {
     let fp8 = |w: MoeWeight| matches!(w, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
     match s {
-        CudaStep::GemvFp8(g) if g.m == 1 && gemv_tc_takes([g.n, 0, 0], g.k, 1) => {
+        CudaStep::GemvFp8(GemvBf16 { gemm: g, .. })
+            if g.m == 1 && gemv_tc_takes([g.n, 0, 0], g.k, 1) =>
+        {
             CudaStep::GemvTcFp8(g)
         }
-        CudaStep::GemvGroupFp8(g) => {
+        CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {
             let third = g.third.map_or(0, |t| t.n);
             match g.m == 1 && gemv_tc_takes([g.first.n, g.second.n, third], g.k, 1) {
                 true => CudaStep::GemvGroupTcFp8(g),
@@ -1708,7 +1713,7 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
             }
         }
         CudaStep::GateUpAct(fold)
-            if fold.kernel == GateUpKernel::GemvFp8
+            if matches!(fold.kernel, GateUpKernel::GemvFp8(_))
                 && fold.gate.m == 1
                 && fold.gate.n <= ACT_QUANT_MAX_COLS
                 && gemv_tc_takes([fold.gate.n, fold.up.n, 0], fold.gate.k, 1) =>
@@ -1718,14 +1723,16 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
                 q_act: fold.out,
             })
         }
-        CudaStep::ExpertGemv(g) if g.m == 1 && fp8(g.weight) => {
+        CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) if g.m == 1 && fp8(g.weight) => {
             let (n, k) = g.n_k();
             match gemv_tc_takes([n, 0, 0], k, g.top_k) {
                 true => CudaStep::ExpertGemvTcFp8(g),
                 false => s,
             }
         }
-        CudaStep::ExpertGateUpAct(fold) if fold.gate.m == 1 && fp8(fold.gate.weight) => {
+        CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold, .. })
+            if fold.gate.m == 1 && fp8(fold.gate.weight) =>
+        {
             let (n, k) = fold.gate.n_k();
             match n <= ACT_QUANT_MAX_COLS && gemv_tc_takes([n, n, 0], k, fold.gate.top_k) {
                 true => CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {

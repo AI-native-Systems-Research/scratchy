@@ -22,7 +22,7 @@ use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, Instr};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, colour_tape};
 use scratchy_subtile::tape_folding::FusedShape;
 use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_rule};
-use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
+use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16, GemvBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
@@ -485,7 +485,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     let c = lower_canonical(&gemm_m1(1024, 1024), FACTS, AT).expect("the one-row GEMM lowers");
     assert_eq!(
         c.steps,
-        [CudaStep::Gemv(GemmBf16 {
+        [CudaStep::Gemv(GemvBf16::of(GemmBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(c.colour_offsets[1]),
@@ -493,7 +493,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
             n: 1024,
             k: 1024,
             residual: None,
-        })]
+        }))]
     );
     assert_eq!(
         c.weight_bytes,
@@ -510,10 +510,13 @@ fn a_decode_gemm_lowers_to_the_gemv() {
         .expect("gemm_m1_only lowers");
     assert!(matches!(
         c.steps.as_slice(),
-        [CudaStep::Gemv(GemmBf16 {
-            m: 1,
-            n: 2048,
-            k: 2048,
+        [CudaStep::Gemv(GemvBf16 {
+            gemm: GemmBf16 {
+                m: 1,
+                n: 2048,
+                k: 2048,
+                ..
+            },
             ..
         })]
     ));

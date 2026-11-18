@@ -44,8 +44,8 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_cuda::step::{
     AddBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GateApplyBf16,
-    GateSplitBf16, GemmBf16, GemmGroupBf16, GroupMember, RmsNormBf16, RopeAppendBf16, RopeBf16,
-    RopePairing,
+    GateSplitBf16, GemmBf16, GemmGroupBf16, GroupMember, NormKernel, RmsNormBf16, RopeAppendBf16,
+    RopeBf16, RopePairing,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvClass, KvTape, RotaryTable, TapeInput,
@@ -248,6 +248,7 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
         cols,
         eps_bits: EPS.to_bits(),
         convention: GainConvention::OnePlusScale,
+        kernel: NormKernel::of(rows, cols),
     })
 }
 

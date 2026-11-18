@@ -33,7 +33,7 @@ pub enum CudaStep {
     /// The bf16 GEMV, a one-row GEMM, lowered from `SubOp::MatmulTile` of a one-row bucket whose
     /// `n` the narrow GEMM does not take (`kernels/gemv_bf16.cu`): the operands of [`Self::Gemm`]
     /// with `m = 1`, another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
-    Gemv(GemmBf16),
+    Gemv(GemvBf16),
     /// The bf16 RMSNorm, lowered from `SubOp::RmsNorm` (`kernels/rms_norm_bf16.cu`).
     RmsNorm(RmsNormBf16),
     /// The bf16 elementwise add, lowered from `Elementwise(Add)` (`kernels/add_bf16.cu`).
@@ -58,12 +58,12 @@ pub enum CudaStep {
     /// One query row's grouped-query attention over the paged KV cache, lowered from
     /// `SubOp::AttnDecode` when the bucket has one row (`kernels/attn_decode_fp8kv.cu`): the
     /// operands of [`Self::AttnPrefill`] with `rows = 1`, another kernel.
-    AttnDecode(AttnPrefillBf16),
+    AttnDecode(AttnDecodeBf16),
     /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
     /// `kernels/gdn_gating.cu`, `kernels/gdn_chunk_scan.cu` (FP8 S8 F6a: the scan 64 tokens at a
     /// time) then `kernels/gdn_rms_norm_gated.cu`.
-    GatedDeltaNet(GatedDeltaNetBf16),
+    GatedDeltaNet(GdnPrefillBf16),
     /// A MoE block's router, `[m, experts]` logits into the MoE scratch, lowered from
     /// `SubOp::RouterLogits`: the tiled GEMM or the GEMV (`kernels/gemm_bf16.cu`,
     /// `kernels/gemv_bf16.cu`, chosen at expansion) over the router at byte 0 of the bundle.
@@ -96,7 +96,7 @@ pub enum CudaStep {
     ExpertGemm(ExpertGemmBf16),
     /// One projection of every pair, each from its own token row, lowered from
     /// `SubOp::ExpertMatmul` of a gathered bucket (`kernels/expert_gemv_bf16.cu`).
-    ExpertGemv(ExpertGemvBf16),
+    ExpertGemv(ExpertGemvSplitBf16),
     /// Each token's pair rows summed by its routing weights, lowered from `SubOp::ExpertCombine`
     /// (`kernels/moe_combine_bf16.cu`).
     ExpertCombine(ExpertCombineBf16),
@@ -149,7 +149,7 @@ pub enum CudaStep {
     /// `scratchy_cuda_gemv_group_bf16_abt`). Each member takes its own K split
     /// ([`gemv_splits`]), its partials at its own place in the GEMV scratch, so its output is the
     /// bits of its own [`Self::Gemv`].
-    GemvGroup(GemmGroupBf16),
+    GemvGroup(GemvGroupBf16),
     /// `sum = a + b`, then `y = rmsnorm(sum)`, in one launch, lowered from the `AddRmsNorm` fold
     /// of an `Elementwise(Add)` into the `RmsNorm` reading it (#1049, Qwen's residual add and the
     /// next norm; `kernels/rms_norm_bf16.cu`, `scratchy_cuda_add_rms_norm_bf16`). Both outputs
@@ -169,7 +169,7 @@ pub enum CudaStep {
     /// The routed experts' gate and up GEMVs and their activation in one launch, lowered from the
     /// `ExpertActivation` fold of a one-row bucket (#1049, `kernels/gemv_bf16.cu`'s expert gate/up
     /// GEMV): the bits of the two [`Self::ExpertGemv`]s then the activation's step.
-    ExpertGateUpAct(ExpertGateUpActBf16),
+    ExpertGateUpAct(ExpertGateUpGemvBf16),
     /// A one-row bucket's [`Self::GatedDeltaNet`] in one launch (#1049,
     /// `kernels/gdn_decode.cu`): its operands, its conv, gating, scan and gated norm as the four
     /// kernels compute them at one token, so its output, conv ring and state are their bits. The
@@ -190,14 +190,14 @@ pub enum CudaStep {
     GemmNarrowFp8(GemmBf16),
     /// [`Self::Gemv`] over an fp8 weight: `a` is the bf16 row, which the GEMV quantizes in its
     /// prologue (`kernels/gemv_fp8.cu`).
-    GemvFp8(GemmBf16),
+    GemvFp8(GemvBf16),
     /// [`Self::GemmGroup`] over fp8 weights, as [`Self::GemmFp8`] each.
     GemmGroupFp8(GemmGroupBf16),
     /// [`Self::GemmNarrowGroup`] over fp8 weights (the 27B's `in_proj_a` + `in_proj_b`), as
     /// [`Self::GemmFp8`] each.
     GemmNarrowGroupFp8(GemmGroupBf16),
     /// [`Self::GemvGroup`] over fp8 weights, as [`Self::GemvFp8`] each.
-    GemvGroupFp8(GemmGroupBf16),
+    GemvGroupFp8(GemvGroupBf16),
     /// [`Self::GemvFp8`] on the tensor cores (FP8 S8 T2, `kernels/gemv_fp8_tc.cu`'s B8), the
     /// shapes [`gemv_tc_takes`] takes: `a` is the quant scratch, the one e4m3 row the step before
     /// wrote and its scale after it, as [`Self::GemmFp8`]'s; `c = bf16((a·Bᵀ) · w_scale · a_scale)`
@@ -503,6 +503,44 @@ pub const fn gdn_scan_is_recurrent(rows: u32) -> bool {
     rows == 1
 }
 
+/// Which scan a [`CudaStep::GatedDeltaNet`] plays, chosen when the step is emitted
+/// ([`gdn_scan_is_recurrent`] of its rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum GdnScan {
+    /// The recurrent scan (`kernels/gdn_scan.cu`).
+    Recurrent,
+    /// The chunked scan (`kernels/gdn_chunk_scan.cu`).
+    Chunked,
+}
+
+impl GdnScan {
+    /// The scan of a step of `rows` rows.
+    pub const fn of(rows: u32) -> Self {
+        if gdn_scan_is_recurrent(rows) {
+            Self::Recurrent
+        } else {
+            Self::Chunked
+        }
+    }
+}
+
+/// A Gated-DeltaNet bucket's step ([`CudaStep::GatedDeltaNet`]): its layer, and its scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GdnPrefillBf16 {
+    pub gdn: GatedDeltaNetBf16,
+    pub scan: GdnScan,
+}
+
+impl GdnPrefillBf16 {
+    /// `gdn` at its rows' scan.
+    pub const fn of(gdn: GatedDeltaNetBf16) -> Self {
+        Self {
+            gdn,
+            scan: GdnScan::of(gdn.rows),
+        }
+    }
+}
+
 /// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`, FP8 S8
 /// D1): one CTA per value head, a key head's `nv / nk` CTAs one cluster, at most the portable
 /// cluster size; qwen3.5's are 1 (0.8B), 2 (9B, 35B) and 3 (27B).
@@ -552,13 +590,15 @@ pub struct GateUpActBf16 {
 pub enum GateUpKernel {
     Gemm,
     GemmCol64,
-    Gemv,
+    /// The GEMV, each projection at this K split.
+    Gemv(GemvSplit),
     /// The fp8 kernels (FP8 S2): each projection [`CudaStep::GemmFp8`], [`CudaStep::GemmCol64Fp8`]
     /// or [`CudaStep::GemvFp8`] on its own, each scaled by its own `w_scale` before the
     /// activation, rounded once.
     GemmFp8,
     GemmCol64Fp8,
-    GemvFp8,
+    /// The fp8 GEMV, each projection at this K split.
+    GemvFp8(GemvSplit),
 }
 
 impl GateUpKernel {
@@ -567,10 +607,18 @@ impl GateUpKernel {
         match self {
             Self::Gemm => CudaStep::Gemm(g),
             Self::GemmCol64 => CudaStep::GemmCol64(g),
-            Self::Gemv => CudaStep::Gemv(g),
+            Self::Gemv(split) => CudaStep::Gemv(GemvBf16 { gemm: g, split }),
             Self::GemmFp8 => CudaStep::GemmFp8(g),
             Self::GemmCol64Fp8 => CudaStep::GemmCol64Fp8(g),
-            Self::GemvFp8 => CudaStep::GemvFp8(g),
+            Self::GemvFp8(split) => CudaStep::GemvFp8(GemvBf16 { gemm: g, split }),
+        }
+    }
+
+    /// Whether it is a GEMV, and its split.
+    pub const fn gemv_split(self) -> Option<GemvSplit> {
+        match self {
+            Self::Gemv(split) | Self::GemvFp8(split) => Some(split),
+            Self::Gemm | Self::GemmCol64 | Self::GemmFp8 | Self::GemmCol64Fp8 => None,
         }
     }
 }
@@ -590,11 +638,10 @@ impl GateUpActBf16 {
     /// The bytes of GEMV scratch the fused GEMV writes: the gate's partials, then the up's, each
     /// at its own split ([`gemv_scratch_bytes`]); 0 for the GEMMs. `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        let (GateUpKernel::Gemv | GateUpKernel::GemvFp8) = self.kernel else {
+        let Some(split) = self.kernel.gemv_split() else {
             return Some(0);
         };
-        let (n, k) = (self.gate.n, self.gate.k);
-        let Some(one) = gemv_scratch_bytes(n, 1, gemv_splits(n, k, 1)) else {
+        let Some(one) = gemv_scratch_bytes(self.gate.n, 1, split.splits) else {
             return None;
         };
         one.checked_mul(2)
@@ -623,14 +670,33 @@ impl ExpertGateUpActBf16 {
             cols: self.gate.inter,
         }
     }
+}
+
+/// The routed experts' gate and up GEMVs in one launch ([`CudaStep::ExpertGateUpAct`]): the fold,
+/// and the K split each projection takes, chosen when the step is emitted ([`GemvSplit::of`] of
+/// the gate's shape at `m · top_k` pairs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGateUpGemvBf16 {
+    pub fold: ExpertGateUpActBf16,
+    pub split: GemvSplit,
+}
+
+impl ExpertGateUpGemvBf16 {
+    /// `fold` at the split its gate's shape takes.
+    pub const fn of(fold: ExpertGateUpActBf16) -> Self {
+        Self {
+            fold,
+            split: ExpertGemvSplitBf16::split_of(&fold.gate),
+        }
+    }
 
     /// The GEMV scratch the fused launch writes: the gate's partials, then the up's.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        let (n, k) = self.gate.n_k();
-        let Some(pairs) = self.gate.m.checked_mul(self.gate.top_k) else {
+        let (n, _) = self.fold.gate.n_k();
+        let Some(pairs) = self.fold.gate.m.checked_mul(self.fold.gate.top_k) else {
             return None;
         };
-        let Some(one) = gemv_scratch_bytes(n, pairs, gemv_splits(n, k, pairs)) else {
+        let Some(one) = gemv_scratch_bytes(n, pairs, self.split.splits) else {
             return None;
         };
         one.checked_mul(2)
@@ -682,28 +748,28 @@ pub enum GroupKind {
 }
 
 impl GroupKind {
-    /// A member as the step it is on its own.
+    /// A member as the step it is on its own (a GEMV at its shape's split, [`GemvBf16::of`]).
     pub const fn step(self, g: GemmBf16) -> CudaStep {
         match self {
             Self::Gemm => CudaStep::Gemm(g),
             Self::GemmNarrow => CudaStep::GemmNarrow(g),
-            Self::Gemv => CudaStep::Gemv(g),
+            Self::Gemv => CudaStep::Gemv(GemvBf16::of(g)),
             Self::GemmFp8 => CudaStep::GemmFp8(g),
             Self::GemmNarrowFp8 => CudaStep::GemmNarrowFp8(g),
-            Self::GemvFp8 => CudaStep::GemvFp8(g),
+            Self::GemvFp8 => CudaStep::GemvFp8(GemvBf16::of(g)),
             Self::GemvTcFp8 => CudaStep::GemvTcFp8(g),
         }
     }
 
-    /// The grouped step of `g`.
+    /// The grouped step of `g` (a GEMV group at each member's split, [`GemvGroupBf16::of`]).
     pub const fn grouped(self, g: GemmGroupBf16) -> CudaStep {
         match self {
             Self::Gemm => CudaStep::GemmGroup(g),
             Self::GemmNarrow => CudaStep::GemmNarrowGroup(g),
-            Self::Gemv => CudaStep::GemvGroup(g),
+            Self::Gemv => CudaStep::GemvGroup(GemvGroupBf16::of(g)),
             Self::GemmFp8 => CudaStep::GemmGroupFp8(g),
             Self::GemmNarrowFp8 => CudaStep::GemmNarrowGroupFp8(g),
-            Self::GemvFp8 => CudaStep::GemvGroupFp8(g),
+            Self::GemvFp8 => CudaStep::GemvGroupFp8(GemvGroupBf16::of(g)),
             Self::GemvTcFp8 => CudaStep::GemvGroupTcFp8(g),
         }
     }
@@ -747,28 +813,6 @@ impl GemmGroupBf16 {
             k: self.k,
             residual: None,
         }
-    }
-
-    /// The GEMV scratch bytes of the members before `upto` (`upto` 3: all of them), each at its
-    /// own split ([`gemv_scratch_bytes`]): member `i`'s partials start at the bytes before it.
-    /// `None` on overflow.
-    pub const fn gemv_scratch_before(&self, upto: usize) -> Option<u64> {
-        let members = self.members();
-        let mut total = 0u64;
-        let mut i = 0;
-        while i < upto && i < 3 {
-            if let Some(g) = members[i] {
-                let Some(bytes) = gemv_scratch_bytes(g.n, 1, gemv_splits(g.n, self.k, 1)) else {
-                    return None;
-                };
-                let Some(sum) = total.checked_add(bytes) else {
-                    return None;
-                };
-                total = sum;
-            }
-            i += 1;
-        }
-        Some(total)
     }
 }
 
@@ -1007,6 +1051,93 @@ pub const fn gemv_split_chunks(chunks: u32, splits: u32) -> u32 {
     }
 }
 
+/// A decode GEMV's K split, written into its step when the step is emitted ([`gemv_splits`] of the
+/// step's shape and pairs). The player launches it as stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvSplit {
+    pub splits: u32,
+}
+
+impl GemvSplit {
+    /// The split of an `n` × `k` GEMV over `pairs` slices ([`gemv_splits`]).
+    pub const fn of(n: u32, k: u32, pairs: u32) -> Self {
+        Self {
+            splits: gemv_splits(n, k, pairs),
+        }
+    }
+}
+
+/// A dense decode GEMV ([`CudaStep::Gemv`], [`CudaStep::GemvFp8`]): the GEMM it computes, at
+/// its K split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvBf16 {
+    pub gemm: GemmBf16,
+    pub split: GemvSplit,
+}
+
+impl GemvBf16 {
+    /// `gemm` at its shape's split, one pair.
+    pub const fn of(gemm: GemmBf16) -> Self {
+        Self {
+            gemm,
+            split: GemvSplit::of(gemm.n, gemm.k, 1),
+        }
+    }
+}
+
+/// A grouped decode GEMV ([`CudaStep::GemvGroup`], [`CudaStep::GemvGroupFp8`]): the group, and
+/// each member's K split, as [`GemmGroupBf16`]'s members (`third` exactly when it has one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvGroupBf16 {
+    pub group: GemmGroupBf16,
+    pub first: GemvSplit,
+    pub second: GemvSplit,
+    pub third: Option<GemvSplit>,
+}
+
+impl GemvGroupBf16 {
+    /// `group` at each member's split, one pair.
+    pub const fn of(group: GemmGroupBf16) -> Self {
+        let k = group.k;
+        Self {
+            group,
+            first: GemvSplit::of(group.first.n, k, 1),
+            second: GemvSplit::of(group.second.n, k, 1),
+            third: match group.third {
+                Some(m) => Some(GemvSplit::of(m.n, k, 1)),
+                None => None,
+            },
+        }
+    }
+
+    /// Each member's split, in [`GemmGroupBf16::members`]' order.
+    pub const fn splits(&self) -> [Option<GemvSplit>; 3] {
+        [Some(self.first), Some(self.second), self.third]
+    }
+
+    /// The GEMV scratch bytes of the members before `upto` (`upto` 3: all of them), each at its
+    /// stored split ([`gemv_scratch_bytes`]): member `i`'s partials start at the bytes before it.
+    /// `None` on overflow.
+    pub const fn gemv_scratch_before(&self, upto: usize) -> Option<u64> {
+        let (members, splits) = (self.group.members(), self.splits());
+        let mut total = 0u64;
+        let mut i = 0;
+        while i < upto && i < 3 {
+            if let (Some(g), Some(split)) = (members[i], splits[i]) {
+                let Some(bytes) = gemv_scratch_bytes(g.n, 1, split.splits) else {
+                    return None;
+                };
+                let Some(sum) = total.checked_add(bytes) else {
+                    return None;
+                };
+                total = sum;
+            }
+            i += 1;
+        }
+        Some(total)
+    }
+}
+
 /// The f32 scratch bytes a decode GEMV at `splits` writes: `splits · pairs · n_pad` f32, `n_pad`
 /// `n` rounded up to [`GEMV_BLOCK_ROWS`]; 0 at one split (each CTA stores its rows directly).
 /// `None` on overflow.
@@ -1044,6 +1175,28 @@ pub struct RmsNormBf16 {
     pub eps_bits: u32,
     #[serde(serialize_with = "serialize_gain_convention")]
     pub convention: GainConvention,
+    /// The kernel the player launches: chosen when the step is emitted ([`NormKernel::of`]).
+    pub kernel: NormKernel,
+}
+
+/// Which kernel a norm, add-norm or norm-add plays (FP8 S8 N3), chosen when the step is emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum NormKernel {
+    /// The one-row norm (`kernels/rms_norm_quant_row.cu`).
+    Row,
+    /// The row kernels (`kernels/rms_norm_bf16.cu`).
+    Tiled,
+}
+
+impl NormKernel {
+    /// The kernel of a `rows` × `cols` norm ([`norm_row_takes`]).
+    pub const fn of(rows: u32, cols: u32) -> Self {
+        if norm_row_takes(rows, cols) {
+            Self::Row
+        } else {
+            Self::Tiled
+        }
+    }
 }
 
 /// [`GainConvention`] as the unit variant it is: `scratchy_subtile` has no serde, so the static
@@ -1235,11 +1388,45 @@ const _: () = assert!(
 /// `(splits, min_tiles)` of the decode attention at `head_dim` ([`ATTN_DECODE_SPLITS`]); `None`
 /// at a head dim with no decode kernel.
 pub const fn attn_decode_split(head_dim: u32) -> Option<(u32, u32)> {
+    match attn_decode_split_at(head_dim) {
+        Some(s) => Some((s.splits, s.min_tiles)),
+        None => None,
+    }
+}
+
+/// The decode attention's split over keys, written into its step when the step is emitted
+/// ([`ATTN_DECODE_SPLITS`] at its head dim): up to `splits` CTAs a kv head, each at least
+/// `min_tiles` tiles of 64 keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AttnDecodeSplit {
+    pub splits: u32,
+    pub min_tiles: u32,
+}
+
+/// A decode bucket's attention ([`CudaStep::AttnDecode`]): the attention, and its split over keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AttnDecodeBf16 {
+    pub attn: AttnPrefillBf16,
+    pub split: AttnDecodeSplit,
+}
+
+impl AttnDecodeBf16 {
+    /// `attn` at its head dim's split; `None` at a head dim with no decode kernel.
+    pub const fn of(attn: AttnPrefillBf16) -> Option<Self> {
+        match attn_decode_split_at(attn.head_dim) {
+            Some(split) => Some(Self { attn, split }),
+            None => None,
+        }
+    }
+}
+
+/// [`attn_decode_split`] as the stored value.
+const fn attn_decode_split_at(head_dim: u32) -> Option<AttnDecodeSplit> {
     let mut i = 0;
     while i < ATTN_DECODE_SPLITS.len() {
         let (hd, splits, min_tiles) = ATTN_DECODE_SPLITS[i];
         if hd == head_dim {
-            return Some((splits, min_tiles));
+            return Some(AttnDecodeSplit { splits, min_tiles });
         }
         i += 1;
     }
@@ -1254,6 +1441,16 @@ pub const fn attn_decode_scratch_bytes(kv_heads: u32, head_dim: u32) -> Option<(
     let Some((splits, _)) = attn_decode_split(head_dim) else {
         return None;
     };
+    attn_decode_split_scratch_bytes(splits, kv_heads, head_dim)
+}
+
+/// [`attn_decode_scratch_bytes`] at `splits`: what a decode step at its stored split
+/// ([`AttnDecodeSplit`]) writes. `None` on overflow.
+pub const fn attn_decode_split_scratch_bytes(
+    splits: u32,
+    kv_heads: u32,
+    head_dim: u32,
+) -> Option<(u64, u64)> {
     let heads = splits as u64 * kv_heads as u64 * ATTN_DECODE_BF16_MAX_GROUP as u64;
     let Some(rows) = heads.checked_mul(head_dim as u64 * 4) else {
         return None;
@@ -1613,7 +1810,8 @@ impl GatedDeltaNetBf16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum MatmulKernel {
     Tiled,
-    Gemv,
+    /// The GEMV, at its K split.
+    Gemv(GemvSplit),
     /// The 64-column GEMM ([`GEMM_COL64_TILE`]): Gemma's 128-expert router at m ≥ 2
     /// (`scratchy_cuda_gemm_col64_bf16_abt`, #924).
     Col64,
@@ -1874,6 +2072,30 @@ pub struct ExpertGemvBf16 {
     pub inter: u32,
 }
 
+/// The routed experts' decode GEMV ([`CudaStep::ExpertGemv`]): the projection, at its K split over
+/// `m · top_k` pairs, chosen when the step is emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGemvSplitBf16 {
+    pub gemv: ExpertGemvBf16,
+    pub split: GemvSplit,
+}
+
+impl ExpertGemvSplitBf16 {
+    /// `gemv` at its shape's split.
+    pub const fn of(gemv: ExpertGemvBf16) -> Self {
+        Self {
+            gemv,
+            split: Self::split_of(&gemv),
+        }
+    }
+
+    /// The split of `g`'s shape at its `m · top_k` pairs ([`GemvSplit::of`]).
+    pub const fn split_of(g: &ExpertGemvBf16) -> GemvSplit {
+        let (n, k) = g.n_k();
+        GemvSplit::of(n, k, g.m.saturating_mul(g.top_k))
+    }
+}
+
 impl ExpertGemvBf16 {
     /// `(n, k)` of the projection.
     pub const fn n_k(&self) -> (u32, u32) {
@@ -2080,21 +2302,20 @@ impl CudaStep {
     /// named, so a new step states whether it is one.
     pub const fn gemv_split(&self) -> Option<(u32, u32, u32)> {
         match *self {
-            Self::Gemv(GemmBf16 { n, k, .. }) | Self::GemvFp8(GemmBf16 { n, k, .. }) => {
-                Some((n, 1, gemv_splits(n, k, 1)))
+            Self::Gemv(GemvBf16 { gemm, split }) | Self::GemvFp8(GemvBf16 { gemm, split }) => {
+                Some((gemm.n, 1, split.splits))
             }
             Self::RouterLogits(RouterLogitsBf16 {
                 experts,
-                hidden,
-                kernel: MatmulKernel::Gemv,
+                kernel: MatmulKernel::Gemv(split),
                 ..
-            }) => Some((experts, 1, gemv_splits(experts, hidden, 1))),
-            Self::ExpertGemv(g) => {
-                let (n, k) = g.n_k();
+            }) => Some((experts, 1, split.splits)),
+            Self::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, split }) => {
+                let (n, _) = g.n_k();
                 let Some(pairs) = g.m.checked_mul(g.top_k) else {
                     return None;
                 };
-                Some((n, pairs, gemv_splits(n, k, pairs)))
+                Some((n, pairs, split.splits))
             }
             Self::RouterLogits(_)
             | Self::Embed(_)
@@ -2161,10 +2382,10 @@ impl CudaStep {
         match *self {
             Self::Gemm(g) => Some((GroupKind::Gemm, g)),
             Self::GemmNarrow(g) => Some((GroupKind::GemmNarrow, g)),
-            Self::Gemv(g) => Some((GroupKind::Gemv, g)),
+            Self::Gemv(GemvBf16 { gemm: g, .. }) => Some((GroupKind::Gemv, g)),
             Self::GemmFp8(g) => Some((GroupKind::GemmFp8, g)),
             Self::GemmNarrowFp8(g) => Some((GroupKind::GemmNarrowFp8, g)),
-            Self::GemvFp8(g) => Some((GroupKind::GemvFp8, g)),
+            Self::GemvFp8(GemvBf16 { gemm: g, .. }) => Some((GroupKind::GemvFp8, g)),
             Self::QuantRowsFp8(_)
             | Self::GemmCol64Fp8(_)
             | Self::GemmGroupFp8(_)
@@ -2223,10 +2444,10 @@ impl CudaStep {
         match *self {
             Self::GemmGroup(g) => Some((GroupKind::Gemm, g)),
             Self::GemmNarrowGroup(g) => Some((GroupKind::GemmNarrow, g)),
-            Self::GemvGroup(g) => Some((GroupKind::Gemv, g)),
+            Self::GemvGroup(GemvGroupBf16 { group: g, .. }) => Some((GroupKind::Gemv, g)),
             Self::GemmGroupFp8(g) => Some((GroupKind::GemmFp8, g)),
             Self::GemmNarrowGroupFp8(g) => Some((GroupKind::GemmNarrowFp8, g)),
-            Self::GemvGroupFp8(g) => Some((GroupKind::GemvFp8, g)),
+            Self::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => Some((GroupKind::GemvFp8, g)),
             Self::GemvGroupTcFp8(g) => Some((GroupKind::GemvTcFp8, g)),
             Self::GemvTcFp8(_)
             | Self::GateUpTcFp8(_)
@@ -2395,10 +2616,16 @@ impl CudaStep {
                 Some(Self::ExpertActQuant(t.act)),
             ];
         }
-        if let Self::ExpertGateUpAct(g) = self {
+        if let Self::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, split }) = self {
             return [
-                Some(Self::ExpertGemv(g.gate)),
-                Some(Self::ExpertGemv(g.up)),
+                Some(Self::ExpertGemv(ExpertGemvSplitBf16 {
+                    gemv: g.gate,
+                    split: *split,
+                })),
+                Some(Self::ExpertGemv(ExpertGemvSplitBf16 {
+                    gemv: g.up,
+                    split: *split,
+                })),
                 Some(g.act.step(g.activation())),
             ];
         }
@@ -2447,11 +2674,10 @@ impl CudaStep {
     /// ([`attn_decode_scratch_bytes`], written by its split launch and read by its merge, the
     /// same step's second launch); `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        if let Self::AttnDecode(a) = self {
-            return match attn_decode_scratch_bytes(a.kv_heads, a.head_dim) {
+        if let Self::AttnDecode(AttnDecodeBf16 { attn: a, split }) = self {
+            return match attn_decode_split_scratch_bytes(split.splits, a.kv_heads, a.head_dim) {
                 Some((_, all)) => Some(all),
-                // No decode kernel at that head dim: `validate` refuses the step itself.
-                None => Some(0),
+                None => None,
             };
         }
         if let Self::GemvGroup(g) | Self::GemvGroupFp8(g) = self {
@@ -2481,14 +2707,16 @@ impl CudaStep {
     /// `validate` checks every member's through [`Self::parts`].
     pub const fn extents(&self) -> Option<StepExtents> {
         match *self {
-            Self::GemmGroup(g) | Self::GemmNarrowGroup(g) | Self::GemvGroup(g) => {
+            Self::GemmGroup(g)
+            | Self::GemmNarrowGroup(g)
+            | Self::GemvGroup(GemvGroupBf16 { group: g, .. }) => {
                 Self::Gemm(g.member(g.first)).extents()
             }
             // Its parts' ([`Self::parts`]), each checked as the step it is; here the gate's.
             Self::ExpertGateUpGemmFp8(t) => Self::ExpertGemm(t.gate).extents(),
             Self::GemmGroupFp8(g)
             | Self::GemmNarrowGroupFp8(g)
-            | Self::GemvGroupFp8(g)
+            | Self::GemvGroupFp8(GemvGroupBf16 { group: g, .. })
             | Self::GemvGroupTcFp8(g) => match self.group() {
                 Some((kind, _)) => kind.step(g.member(g.first)).extents(),
                 None => None,
@@ -2536,14 +2764,18 @@ impl CudaStep {
                 k,
                 residual,
             })
-            | Self::GemvFp8(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
+            | Self::GemvFp8(GemvBf16 {
+                gemm:
+                    GemmBf16 {
+                        a,
+                        b,
+                        c,
+                        m,
+                        n,
+                        k,
+                        residual,
+                    },
+                ..
             })
             | Self::GemvTcFp8(GemmBf16 {
                 a,
@@ -2637,14 +2869,18 @@ impl CudaStep {
                 k,
                 residual,
             })
-            | Self::Gemv(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
+            | Self::Gemv(GemvBf16 {
+                gemm:
+                    GemmBf16 {
+                        a,
+                        b,
+                        c,
+                        m,
+                        n,
+                        k,
+                        residual,
+                    },
+                ..
             }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
                     (bf16_bytes(m, k), bf16_bytes(n, k), bf16_bytes(m, n))
@@ -2769,9 +3005,10 @@ impl CudaStep {
             }
             // The quantized rows (the token row, or the pairs' own), as `ExpertGemv`'s otherwise.
             Self::ExpertGemvTcFp8(g) => {
-                let (Some(e), Some((_, rows, k))) =
-                    (Self::ExpertGemv(g).extents(), self.quantized_input())
-                else {
+                let (Some(e), Some((_, rows, k))) = (
+                    Self::ExpertGemv(ExpertGemvSplitBf16::of(g)).extents(),
+                    self.quantized_input(),
+                ) else {
                     return None;
                 };
                 let Some(ab) = (QuantRowsFp8 {
@@ -2790,8 +3027,12 @@ impl CudaStep {
                 })
             }
             // The token rows and the picks; the activation rows.
-            Self::ExpertGateUpAct(g) => {
-                let Some(e) = Self::ExpertGemv(g.gate).extents() else {
+            Self::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, split }) => {
+                let Some(e) = Self::ExpertGemv(ExpertGemvSplitBf16 {
+                    gemv: g.gate,
+                    split,
+                })
+                .extents() else {
                     return None;
                 };
                 Some(StepExtents {
@@ -2983,15 +3224,19 @@ impl CudaStep {
                 head_dim,
                 ..
             })
-            | Self::AttnDecode(AttnPrefillBf16 {
-                q,
-                block_table,
-                sequence,
-                out,
-                layer,
-                rows,
-                q_heads,
-                head_dim,
+            | Self::AttnDecode(AttnDecodeBf16 {
+                attn:
+                    AttnPrefillBf16 {
+                        q,
+                        block_table,
+                        sequence,
+                        out,
+                        layer,
+                        rows,
+                        q_heads,
+                        head_dim,
+                        ..
+                    },
                 ..
             }) => {
                 let Some(cols) = q_heads.checked_mul(head_dim) else {
@@ -3017,7 +3262,7 @@ impl CudaStep {
             }
             // The GDN step's reads and its output; no scratch (`kernels/gdn_decode.cu`).
             Self::GdnDecode(g) => {
-                let Some(e) = Self::GatedDeltaNet(g).extents() else {
+                let Some(e) = Self::GatedDeltaNet(GdnPrefillBf16::of(g)).extents() else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3025,21 +3270,23 @@ impl CudaStep {
                     ..e
                 })
             }
-            Self::GatedDeltaNet(
-                g @ GatedDeltaNetBf16 {
-                    qkv,
-                    z,
-                    a,
-                    b,
-                    bundle,
-                    out,
-                    scratch,
-                    layer,
-                    rows,
-                    num_v_heads,
-                    ..
-                },
-            ) => {
+            Self::GatedDeltaNet(GdnPrefillBf16 {
+                gdn:
+                    g @ GatedDeltaNetBf16 {
+                        qkv,
+                        z,
+                        a,
+                        b,
+                        bundle,
+                        out,
+                        scratch,
+                        layer,
+                        rows,
+                        num_v_heads,
+                        ..
+                    },
+                ..
+            }) => {
                 let (Some(conv_dim), Some(value_dim)) = (g.conv_dim(), g.value_dim()) else {
                     return None;
                 };
@@ -3260,7 +3507,7 @@ impl CudaStep {
                     in_place: false,
                 })
             }
-            Self::ExpertGemv(g) => {
+            Self::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => {
                 let Some(pairs) = g.m.checked_mul(g.top_k) else {
                     return None;
                 };
@@ -3535,11 +3782,17 @@ impl CudaStep {
             Self::Gemm(GemmBf16 { b, .. })
             | Self::GemmCol64(GemmBf16 { b, .. })
             | Self::GemmNarrow(GemmBf16 { b, .. })
-            | Self::Gemv(GemmBf16 { b, .. })
+            | Self::Gemv(GemvBf16 {
+                gemm: GemmBf16 { b, .. },
+                ..
+            })
             | Self::GemmFp8(GemmBf16 { b, .. })
             | Self::GemmCol64Fp8(GemmBf16 { b, .. })
             | Self::GemmNarrowFp8(GemmBf16 { b, .. })
-            | Self::GemvFp8(GemmBf16 { b, .. })
+            | Self::GemvFp8(GemvBf16 {
+                gemm: GemmBf16 { b, .. },
+                ..
+            })
             | Self::GemvTcFp8(GemmBf16 { b, .. }) => Some(b),
             Self::RmsNorm(RmsNormBf16 { gain, .. })
             | Self::RouterNorm(RmsNormBf16 { gain, .. })
@@ -3565,7 +3818,10 @@ impl CudaStep {
             }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
             Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
-            Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. })
+            Self::GatedDeltaNet(GdnPrefillBf16 {
+                gdn: GatedDeltaNetBf16 { bundle, .. },
+                ..
+            })
             | Self::GdnDecode(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
@@ -3573,10 +3829,17 @@ impl CudaStep {
                 gate: ExpertGemmBf16 { bundle, .. },
                 ..
             })
-            | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. })
+            | Self::ExpertGemv(ExpertGemvSplitBf16 {
+                gemv: ExpertGemvBf16 { bundle, .. },
+                ..
+            })
             | Self::ExpertGemvTcFp8(ExpertGemvBf16 { bundle, .. })
-            | Self::ExpertGateUpAct(ExpertGateUpActBf16 {
-                gate: ExpertGemvBf16 { bundle, .. },
+            | Self::ExpertGateUpAct(ExpertGateUpGemvBf16 {
+                fold:
+                    ExpertGateUpActBf16 {
+                        gate: ExpertGemvBf16 { bundle, .. },
+                        ..
+                    },
                 ..
             })
             | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
@@ -3603,10 +3866,16 @@ impl CudaStep {
             // A grouped GEMM's first member's; [`Self::weights_mut`] gives every member's.
             Self::GemmGroup(GemmGroupBf16 { first, .. })
             | Self::GemmNarrowGroup(GemmGroupBf16 { first, .. })
-            | Self::GemvGroup(GemmGroupBf16 { first, .. })
+            | Self::GemvGroup(GemvGroupBf16 {
+                group: GemmGroupBf16 { first, .. },
+                ..
+            })
             | Self::GemmGroupFp8(GemmGroupBf16 { first, .. })
             | Self::GemmNarrowGroupFp8(GemmGroupBf16 { first, .. })
-            | Self::GemvGroupFp8(GemmGroupBf16 { first, .. })
+            | Self::GemvGroupFp8(GemvGroupBf16 {
+                group: GemmGroupBf16 { first, .. },
+                ..
+            })
             | Self::GemvGroupTcFp8(GemmGroupBf16 { first, .. }) => Some(&mut first.b),
             Self::Add(_)
             | Self::SiluMul(_)
@@ -3636,10 +3905,10 @@ impl CudaStep {
         match self {
             Self::GemmGroup(g)
             | Self::GemmNarrowGroup(g)
-            | Self::GemvGroup(g)
+            | Self::GemvGroup(GemvGroupBf16 { group: g, .. })
             | Self::GemmGroupFp8(g)
             | Self::GemmNarrowGroupFp8(g)
-            | Self::GemvGroupFp8(g)
+            | Self::GemvGroupFp8(GemvGroupBf16 { group: g, .. })
             | Self::GemvGroupTcFp8(g) => {
                 let GemmGroupBf16 {
                     first,
@@ -3659,7 +3928,10 @@ impl CudaStep {
             Self::ExpertGateUpGemmFp8(ExpertGateUpGemmFp8 { gate, up, .. }) => {
                 vec![&mut gate.bundle, &mut up.bundle]
             }
-            Self::ExpertGateUpAct(ExpertGateUpActBf16 { gate, up, .. })
+            Self::ExpertGateUpAct(ExpertGateUpGemvBf16 {
+                fold: ExpertGateUpActBf16 { gate, up, .. },
+                ..
+            })
             | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
                 fold: ExpertGateUpActBf16 { gate, up, .. },
                 ..

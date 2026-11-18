@@ -14,12 +14,12 @@ use serde::Serialize;
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
     ARGMAX_CHUNK, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AddRmsNormBf16, AddRmsNormQuantFp8,
-    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
-    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GatherLastRowBf16,
-    GemmBf16, MoeRouteBf16, MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8,
-    RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch,
-    quant_chain, sort_index_regions,
+    AttnDecodeBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16,
+    ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16,
+    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
+    GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemvBf16, MoeRouteBf16,
+    MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16, RopeBf16,
+    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -1681,7 +1681,7 @@ impl CudaTape {
                 window,
                 ..
             })
-            | CudaStep::AttnDecode(AttnPrefillBf16 {
+            | CudaStep::AttnDecode(AttnDecodeBf16 { attn: AttnPrefillBf16 {
                 block_table,
                 sequence,
                 layer,
@@ -1689,7 +1689,7 @@ impl CudaTape {
                 head_dim,
                 window,
                 ..
-            }) => {
+            }, .. }) => {
                 self.one_row(step, s)?;
                 let kv = self.kv;
                 let table = ArenaSpan {
@@ -1709,8 +1709,7 @@ impl CudaTape {
             }
             // The one-launch decode (#1049) is the GDN step's geometry and sequence, and reads
             // or writes no scratch, so its scratch offset is the tape's (it names one).
-            CudaStep::GatedDeltaNet(
-                g @ GatedDeltaNetBf16 {
+            CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g @ GatedDeltaNetBf16 {
                     sequence,
                     scratch,
                     num_k_heads,
@@ -1719,8 +1718,7 @@ impl CudaTape {
                     head_v,
                     conv_kernel,
                     ..
-                },
-            )
+                }, .. })
             | CudaStep::GdnDecode(
                 g @ GatedDeltaNetBf16 {
                     sequence,
@@ -2288,19 +2286,21 @@ impl CudaTape {
                 want(input.0, a, input.1)?;
                 want(output.0, c, output.1)
             }
-            CudaStep::ExpertGemv(
-                g @ ExpertGemvBf16 {
-                    a,
-                    topk_idx,
-                    c,
-                    m,
-                    top_k,
-                    experts,
-                    hidden,
-                    inter,
-                    ..
-                },
-            ) => {
+            CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+                gemv:
+                    g @ ExpertGemvBf16 {
+                        a,
+                        topk_idx,
+                        c,
+                        m,
+                        top_k,
+                        experts,
+                        hidden,
+                        inter,
+                        ..
+                    },
+                ..
+            }) => {
                 if moe.sort.is_some()
                     || (m, top_k) != (self.bucket_m, moe.top_k)
                     || !same(experts, hidden, inter)
@@ -2400,10 +2400,19 @@ impl CudaTape {
     /// passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rows = match *s {
-            CudaStep::Gemv(GemmBf16 { m, .. })
-            | CudaStep::GemvFp8(GemmBf16 { m, .. })
+            CudaStep::Gemv(GemvBf16 {
+                gemm: GemmBf16 { m, .. },
+                ..
+            })
+            | CudaStep::GemvFp8(GemvBf16 {
+                gemm: GemmBf16 { m, .. },
+                ..
+            })
             | CudaStep::GemvTcFp8(GemmBf16 { m, .. }) => m,
-            CudaStep::AttnDecode(AttnPrefillBf16 { rows, .. }) => rows,
+            CudaStep::AttnDecode(AttnDecodeBf16 {
+                attn: AttnPrefillBf16 { rows, .. },
+                ..
+            }) => rows,
             CudaStep::RmsNormQuantFp8(RmsNormQuantFp8 { norm, .. })
             | CudaStep::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
                 fold: AddRmsNormBf16 { norm, .. },
@@ -2457,8 +2466,8 @@ mod tests {
     use super::*;
     use crate::step::{
         AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
-        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RopePairing,
-        RouteProgram, WeightRead,
+        GemmBf16, KvUse, MoeRouteBf16, NormKernel, RmsNormBf16, RopeAppendBf16, RopeBf16,
+        RopePairing, RouteProgram, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -2490,6 +2499,7 @@ mod tests {
             cols: 1024,
             eps_bits: 1e-6f32.to_bits(),
             convention: GainConvention::OnePlusScale,
+            kernel: NormKernel::of(256, 1024),
         }),
     ];
 
@@ -3469,7 +3479,7 @@ mod tests {
     }
 
     fn good_gdn_step() -> CudaStep {
-        CudaStep::GatedDeltaNet(gdn_step(0, GDN_SEQ, GDN_SCRATCH))
+        CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(0, GDN_SEQ, GDN_SCRATCH)))
     }
 
     /// The GDN tape of `gdn` and `steps`.
@@ -3591,7 +3601,7 @@ mod tests {
     /// A GDN step at a layer index past the tape's layers, and one on a tape with none.
     #[test]
     fn gdn_layer() {
-        let step = CudaStep::GatedDeltaNet(gdn_step(1, GDN_SEQ, GDN_SCRATCH));
+        let step = CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(1, GDN_SEQ, GDN_SCRATCH)));
         assert_eq!(
             gdn_tape(Some(GDN), &[step]).validate(),
             Err(TapeError::GdnLayer {
@@ -3605,7 +3615,8 @@ mod tests {
     /// A GDN step whose sequence or scratch is not the tape's, and one on a tape with no GDN.
     #[test]
     fn gdn_region_mismatch() {
-        let step = CudaStep::GatedDeltaNet(gdn_step(0, GDN_SEQ - 256, GDN_SCRATCH));
+        let step =
+            CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(0, GDN_SEQ - 256, GDN_SCRATCH)));
         let t = CudaTape {
             arena: ArenaLayout {
                 colour_bytes: &[36864, 4096, 128, 128, 4096, 0],
@@ -3668,10 +3679,10 @@ mod tests {
             Err(TapeError::GdnStepGeometry { step: 0 })
         );
         // The step claims a 3-tap conv over the tape's 4: another ring stride than the pool's.
-        let step = CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
+        let step = CudaStep::GatedDeltaNet(GdnPrefillBf16::of(GatedDeltaNetBf16 {
             conv_kernel: 3,
             ..gdn_step(0, GDN_SEQ, GDN_SCRATCH)
-        });
+        }));
         assert_eq!(
             gdn_tape(Some(GDN), &[step]).validate(),
             Err(TapeError::GdnStepGeometry { step: 0 })
@@ -4105,7 +4116,7 @@ mod tests {
         input: TapeInput::Hidden(span(0, 1024)),
         result: span(1024, 2048),
         weight_bytes: &[0, 1048576],
-        steps: &[CudaStep::Gemv(GemmBf16 {
+        steps: &[CudaStep::Gemv(GemvBf16::of(GemmBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(1024),
@@ -4113,7 +4124,7 @@ mod tests {
             n: 1024,
             k: 512,
             residual: None,
-        })],
+        }))],
         rotary: None,
         kv: None,
         gdn: None,
@@ -4139,15 +4150,17 @@ mod tests {
             input: TapeInput::Hidden(span(0, 4096)),
             result: span(0, 2),
             weight_bytes: &[64],
-            steps: &[CudaStep::Gemv(GemmBf16 {
-                a: ArenaOffset(0),
-                b: WeightIx(0),
-                c: ArenaOffset(1024),
-                m: 1,
-                n: 8,
-                k: 4,
-                residual: None,
-            })],
+            steps: &const {
+                [CudaStep::Gemv(GemvBf16::of(GemmBf16 {
+                    a: ArenaOffset(0),
+                    b: WeightIx(0),
+                    c: ArenaOffset(1024),
+                    m: 1,
+                    n: 8,
+                    k: 4,
+                    residual: None,
+                }))]
+            },
             rotary: None,
             kv: None,
             gdn: None,
@@ -4165,7 +4178,7 @@ mod tests {
     fn a_gemv_is_one_row_of_a_one_row_bucket() {
         assert_eq!(ONE_ROW.validate(), Ok(()));
         let two = CudaTape {
-            steps: Box::leak(Box::new([CudaStep::Gemv(GemmBf16 {
+            steps: Box::leak(Box::new([CudaStep::Gemv(GemvBf16::of(GemmBf16 {
                 a: ArenaOffset(0),
                 b: WeightIx(1),
                 c: ArenaOffset(1024),
@@ -4173,7 +4186,7 @@ mod tests {
                 n: 512,
                 k: 256,
                 residual: None,
-            })])),
+            }))])),
             ..ONE_ROW
         };
         assert_eq!(
@@ -4195,7 +4208,10 @@ mod tests {
     #[test]
     fn a_decode_attention_is_one_row_of_a_one_row_bucket() {
         let decode = |rows, kv_heads| match attn(KV_TABLE, KV_SEQ, kv_heads) {
-            CudaStep::AttnPrefill(a) => CudaStep::AttnDecode(AttnPrefillBf16 { rows, ..a }),
+            CudaStep::AttnPrefill(a) => CudaStep::AttnDecode(
+                AttnDecodeBf16::of(AttnPrefillBf16 { rows, ..a })
+                    .expect("a head dim with a decode kernel"),
+            ),
             _ => unreachable!("an attention"),
         };
         // `kv_tape` is a 256-row bucket: a one-row decode in it is refused for the bucket, a
@@ -4659,6 +4675,7 @@ mod tests {
                 cols: 64,
                 eps_bits: 1e-6f32.to_bits(),
                 convention: GainConvention::Scale,
+                kernel: NormKernel::of(1, 64),
             })
         };
         let tape = |moe, steps: &[CudaStep]| CudaTape {
