@@ -213,65 +213,164 @@ pub(crate) struct PoolCensus {
 }
 
 /// One world's census — the FULL [`BakedCensus`](ktir_superdsc::pool_law::BakedCensus) terms as
-/// the bake resolved them: the rung lists as fingerprints (the decode owner, the anchor, the
-/// family past it), the page stride the KTIR lowering itself derived, the utilization the bake
-/// funded at, the mandatory-residency terms, and the shared-scratch arena owners. Rendered into
-/// the bundle (`SengraphBundle` / `TpForward`) as the census the load READS — the load
-/// re-derives none of it — and returned to the caller for the law's re-bake descent, which reads
-/// the same terms through [`Residency::mandatory_bytes`].
+/// the bake resolved them: the rung lists as bundle identities (the decode owner, the anchor
+/// with its width label, the family past it with each rung's kind and width), the page stride
+/// the KTIR lowering itself derived, the utilization the bake funded at, the
+/// mandatory-residency terms, and the shared-scratch arena owners. Rendered into the bundle
+/// (`SengraphBundle` / `TpForward`) as the census the load READS — the load re-derives none of
+/// it — and returned to the caller for the law's re-bake descent, which reads the same terms
+/// through [`Residency::mandatory_bytes`].
 #[derive(Clone)]
 pub(crate) struct WorldPoolCensus {
     pub(crate) decode_fp: String,
-    pub(crate) anchor_fp: Option<String>,
-    pub(crate) family_fps: Vec<String>,
+    /// The anchor — its bundle fingerprint AND its width label, as the one pair the load
+    /// reads ([`AnchorEntry`]): the label never re-derived at load from a manifest join.
+    pub(crate) anchor: Option<AnchorEntry>,
+    /// The prefill family past the anchor — plain ladder rungs and prefix rungs, each with
+    /// the width facts ([`FamilyEntry`]) its construction needs. The load walks THIS list
+    /// alone; the manifest's rung lists remain what it was minted FROM.
+    pub(crate) family: Vec<FamilyEntry>,
     pub(crate) page_stride: u64,
     pub(crate) residency: ktir_superdsc::pool_law::Residency,
     pub(crate) arena_owners: [Option<String>; ktir_superdsc::pool_law::SHARED_SCRATCH_SEGS.len()],
 }
 
-/// One world's census, as the bundle carries it — a `BakedCensus` token the load reads. The
-/// fingerprints ride the SAME sentinel form the manifest's rung lists use
-/// (`SUPERDSC_BUNDLE:{fp}`), so the load's membership checks compare like with like.
-fn baked_census_lit(w: &WorldPoolCensus) -> proc_macro2::TokenStream {
-    let sentinel = |fp: &str| proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-    let decode_fp = sentinel(&w.decode_fp);
-    let anchor_fp = match &w.anchor_fp {
-        Some(fp) => {
-            let fp = sentinel(fp);
-            quote! { ::core::option::Option::Some(#fp) }
+/// The census's batched-prefill anchor, as the bake resolved it: the bundle fingerprint and
+/// its width label — the narrowest multi-token prefill rung's `m`, or the single prefill
+/// bundle's own width when the ladder baked no rung list.
+#[derive(Clone)]
+pub(crate) struct AnchorEntry {
+    pub(crate) m: u32,
+    pub(crate) fp: String,
+}
+
+/// One member of the census's prefill family: the rung's kind, its width facts and its
+/// bundle fingerprint — everything the load needs to build it without joining the manifest's
+/// separate lists.
+#[derive(Clone)]
+pub(crate) enum FamilyEntry {
+    /// A prefix-free prefill ladder rung at whole-token width `m`.
+    Ladder { m: u32, fp: String },
+    /// A prefix-capable rung: `m` rows per window, `seqs` packed windows.
+    Prefix { m: u32, seqs: u32, fp: String },
+}
+
+impl FamilyEntry {
+    /// The rung's bundle fingerprint.
+    pub(crate) fn fp(&self) -> &str {
+        match self {
+            FamilyEntry::Ladder { fp, .. } | FamilyEntry::Prefix { fp, .. } => fp,
+        }
+    }
+}
+
+/// One registered bundle's STATIC NAME — `BUNDLE_<tag>_<FP-SAFE>`, the name
+/// [`superdsc_bundle_tokens`] gives the bundle's `static` and the census literal references.
+/// The tag names the WORLD the bundle belongs to (`TP1` for the one-rank world, `TP<N>` for
+/// the build's sharded one), so the two worlds' bundles never collide on a name; the
+/// fingerprint is sanitized to identifier-safe uppercase. ONE renderer for both ends — the
+/// static's declaration and the census's reference — so they cannot spell one bundle
+/// differently.
+///
+/// The tag itself is the world's OWN rank count ([`world_static_tag`]) — never a bare string.
+fn bundle_static_ident(tag: &str, fp: &str) -> proc_macro2::Ident {
+    let safe: String = fp
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    proc_macro2::Ident::new(
+        &format!("BUNDLE_{tag}_{safe}"),
+        proc_macro2::Span::call_site(),
+    )
+}
+
+/// The world's static-name tag — `TP<W::RANKS>`. ONE spelling, shared by the statics'
+/// declaration ([`bundle_items`], derived from the bundles' own world) and every census
+/// literal that names that world's statics, so a world's tag is its own rank count and
+/// nothing else: `TP1` is the one-rank world's, `TP<N>` the build's sharded one.
+fn world_static_tag<W: scratchy_target_spyre::bundle_code::collective::World>() -> String {
+    format!("TP{}", W::RANKS)
+}
+
+/// One world's census, as the bundle carries it — a `BakedCensus` token the load reads. Every
+/// bundle the census names is referenced AS THE NAMED STATIC the same expansion declared
+/// ([`bundle_static_ident`]), so a census entry pointing at a bundle this binary does not
+/// carry is a RUSTC ERROR at the model crate's build, never a load-time refusal over an
+/// inventory desync.
+fn baked_census_lit(w: &WorldPoolCensus, tag: &str) -> proc_macro2::TokenStream {
+    let bundle = |fp: &str| {
+        let name = bundle_static_ident(tag, fp);
+        quote! { &#name }
+    };
+    let decode = bundle(&w.decode_fp);
+    let anchor = match &w.anchor {
+        Some(a) => {
+            let m = proc_macro2::Literal::u32_unsuffixed(a.m);
+            let id = bundle(&a.fp);
+            quote! {
+                ::core::option::Option::Some(
+                    ::scratchy_target_spyre::pool_law::AnchorRung { m: #m, id: #id }
+                )
+            }
         }
         None => quote! { ::core::option::Option::None },
     };
-    let family_fps = w.family_fps.iter().map(|fp| sentinel(fp));
+    let family = w.family.iter().map(|e| match e {
+        FamilyEntry::Ladder { m, fp } => {
+            let m = proc_macro2::Literal::u32_unsuffixed(*m);
+            let id = bundle(fp);
+            quote! {
+                ::scratchy_target_spyre::pool_law::FamilyRung::Ladder { m: #m, id: #id }
+            }
+        }
+        FamilyEntry::Prefix { m, seqs, fp } => {
+            let m = proc_macro2::Literal::u32_unsuffixed(*m);
+            let seqs = proc_macro2::Literal::u32_unsuffixed(*seqs);
+            let id = bundle(fp);
+            quote! {
+                ::scratchy_target_spyre::pool_law::FamilyRung::Prefix {
+                    m: #m,
+                    seqs: #seqs,
+                    id: #id,
+                }
+            }
+        }
+    });
     let stride = proc_macro2::Literal::u64_unsuffixed(w.page_stride);
     let res = &w.residency;
     let (dnk, tc, alb, asp, lrb) = (
-        proc_macro2::Literal::u64_unsuffixed(res.decode_non_kv_bytes.0),
-        proc_macro2::Literal::u64_unsuffixed(res.tail_charge.0),
-        proc_macro2::Literal::u64_unsuffixed(res.anchor_live_bytes.0),
-        proc_macro2::Literal::u64_unsuffixed(res.anchor_spare_bytes.0),
-        proc_macro2::Literal::u64_unsuffixed(res.ladder_rung_bytes.0),
+        proc_macro2::Literal::u64_unsuffixed(res.decode_non_kv_bytes.get()),
+        proc_macro2::Literal::u64_unsuffixed(res.tail_charge.get()),
+        proc_macro2::Literal::u64_unsuffixed(res.anchor_live_bytes.get()),
+        proc_macro2::Literal::u64_unsuffixed(res.anchor_spare_bytes.get()),
+        proc_macro2::Literal::u64_unsuffixed(res.ladder_rung_bytes.get()),
     );
     let arena_owners = w.arena_owners.iter().map(|owner| match owner {
         Some(fp) => {
-            let fp = sentinel(fp);
-            quote! { ::core::option::Option::Some(#fp) }
+            let id = bundle(fp);
+            quote! { ::core::option::Option::Some(#id) }
         }
         None => quote! { ::core::option::Option::None },
     });
     quote! {
         ::scratchy_target_spyre::pool_law::BakedCensus {
-            decode_fp: #decode_fp,
-            anchor_fp: #anchor_fp,
-            family_fps: &[#(#family_fps),*],
-            page_stride: ::scratchy_target_spyre::pool_law::PageStride(#stride),
+            decode: #decode,
+            anchor: #anchor,
+            family: &[#(#family),*],
+            page_stride: ::scratchy_target_spyre::pool_law::PageStride::baked(#stride),
             utilization: ::scratchy_target_spyre::pool_law::GpuMemoryUtilization::DEFAULT,
             residency: ::scratchy_target_spyre::pool_law::Residency {
-                decode_non_kv_bytes: ::scratchy_target_spyre::pool_law::Bytes(#dnk),
-                tail_charge: ::scratchy_target_spyre::pool_law::Bytes(#tc),
-                anchor_live_bytes: ::scratchy_target_spyre::pool_law::Bytes(#alb),
-                anchor_spare_bytes: ::scratchy_target_spyre::pool_law::Bytes(#asp),
-                ladder_rung_bytes: ::scratchy_target_spyre::pool_law::Bytes(#lrb),
+                decode_non_kv_bytes: ::scratchy_target_spyre::pool_law::Bytes::new(#dnk),
+                tail_charge: ::scratchy_target_spyre::pool_law::Bytes::new(#tc),
+                anchor_live_bytes: ::scratchy_target_spyre::pool_law::Bytes::new(#alb),
+                anchor_spare_bytes: ::scratchy_target_spyre::pool_law::Bytes::new(#asp),
+                ladder_rung_bytes: ::scratchy_target_spyre::pool_law::Bytes::new(#lrb),
             },
             arena_owners: [#(#arena_owners),*],
         }
@@ -1396,8 +1495,11 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     out
 }
 
-/// Render one world's drained bundles as `inventory` registrations — each `BundleCode::<'static, W>`
-/// (`world` is `W`'s path), registered type-erased so a lookup of world `W` finds it by downcast.
+/// Render one world's drained bundles as NAMED STATICS plus their `inventory` registrations —
+/// each `BundleCode::<'static, W>` (`world` is `W`'s path) declared as a `static` the census
+/// literal can reference BY TYPE-CHECKED IDENTITY, and registered type-erased so a lookup of
+/// world `W` finds it by downcast. The statics' name-tag is the world's OWN rank count
+/// ([`world_static_tag`]), derived here from the bundles' world — never passed in.
 fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     bundles: &[scratchy_target_spyre::bundle_code::BundleCode<'static, T>],
     world: &proc_macro2::TokenStream,
@@ -1407,8 +1509,10 @@ fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     out: &mut proc_macro2::TokenStream,
     (n_groups, n_bytes): (&mut usize, &mut usize),
 ) {
+    let tag = world_static_tag::<T>();
     for b in bundles {
         let fp = proc_macro2::Literal::string(&b.fp);
+        let name = bundle_static_ident(&tag, &b.fp);
         let layout = layout_tokens(&b.layout, places_interner);
         let groups = b
             .groups
@@ -1427,15 +1531,23 @@ fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
             }
             None => quote! { ::core::option::Option::None },
         };
+        // ⭐ A NAMED STATIC, NOT AN INLINE VALUE. The bundle is declared once, by name, and
+        // both of its readers — the registry submit below and the census literal this same
+        // expansion emits — reference THAT name. A census entry naming a bundle the bake did
+        // not emit is then a rustc error ("cannot find value"), never a load-time refusal.
         out.extend(quote! {
+            /// One baked SuperDSC bundle, declared by name so the bake's census can
+            /// reference it as a type-checked identity. Emitted by `#[forward]`.
+            pub static #name: ::scratchy_target_spyre::bundle_code::BundleCode<'static, #world> =
+                ::scratchy_target_spyre::bundle_code::BundleCode {
+                    fp: ::std::borrow::Cow::Borrowed(#fp),
+                    layout: #layout,
+                    groups: ::std::borrow::Cow::Borrowed(&[#(#groups),*]),
+                    reroll: #reroll,
+                };
             ::scratchy_target_spyre::bundle_code::inventory::submit! {
                 ::scratchy_target_spyre::bundle_code::RegisteredBundle {
-                    code: &::scratchy_target_spyre::bundle_code::BundleCode::<'static, #world> {
-                        fp: ::std::borrow::Cow::Borrowed(#fp),
-                        layout: #layout,
-                        groups: ::std::borrow::Cow::Borrowed(&[#(#groups),*]),
-                        reroll: #reroll,
-                    },
+                    code: &#name,
                 }
             }
         });
@@ -6150,12 +6262,14 @@ pub(crate) fn dump_wavefront_mega(
             /// to the decode bundle), the family (the other multi-token prefill rungs plus every
             /// multi-width prefix rung), the decode batch rungs past one, and the borrower count
             /// from the lists' own lengths. Every term the load's census used to re-derive is
-            /// resolved HERE and carried; the page stride is the ledger's own copy of the KTIR
-            /// lowering's derivation, never re-divided.
+            /// resolved HERE and carried — the anchor's WIDTH LABEL rides its entry (the pair
+            /// law), each family entry carries its kind and width facts — and the page stride is
+            /// the ledger's own copy of the KTIR lowering's derivation, never re-divided.
             fn census_world(
                 stem: &str,
                 label: &str,
                 world: &WorldBake<'_>,
+                prefill_m: u32,
             ) -> Option<WorldPoolCensus> {
                 let decode_fp = world.fp.borrow().clone()?;
                 let layouts = world.rung_layouts.borrow();
@@ -6195,29 +6309,55 @@ pub(crate) fn dump_wavefront_mega(
                     .filter(|(rm, _)| *rm > 1)
                     .min_by_key(|(rm, _)| *rm)
                     .map(|(rm, _)| *rm);
-                let anchor = match (&top_prefill, anchor_rung_m) {
-                    (Some(_), Some(rm)) => Some(find(
-                        prefill_rungs
+                // The anchor as ONE PAIR — its bundle AND its width label. The rung case reads
+                // the rung's own `rm`; the single-bundle case (a ladder with no multi-token
+                // rung) reads `prefill_m`, the width the prefill slot was lowered at — the same
+                // number the load used to re-derive from the prefill wiring's embed shape.
+                let anchor: Option<(AnchorEntry, ktir_superdsc::pool_law::RungFacts)> =
+                    match (&top_prefill, anchor_rung_m) {
+                        (Some(_), Some(rm)) => {
+                            let fp = prefill_rungs
                             .iter()
                             .find(|(m, _)| *m == rm)
-                            .map(|(_, fp)| fp.as_str())
+                            .map(|(_, fp)| fp.clone())
                             .unwrap_or_else(|| {
                                 panic!(
                                     "[spyre-superdsc] {stem} ({label}): rung m={rm} vanished from \
                                      its own list"
                                 )
-                            }),
-                    )),
-                    (Some(pfp), None) => Some(find(pfp)),
-                    (None, _) => None,
-                };
-                // The family past the anchor: `(fp, facts)` pairs, because the census carries the
-                // fps (the load marks borrowers by them) AND charges the facts.
-                let mut family: Vec<(String, ktir_superdsc::pool_law::RungFacts)> = prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
-                    .map(|(_, fp)| (fp.clone(), find(fp).facts))
-                    .collect();
+                            });
+                            let entry = find(&fp);
+                            Some((AnchorEntry { m: rm, fp }, entry.facts))
+                        }
+                        (Some(pfp), None) => {
+                            let entry = find(pfp);
+                            Some((
+                                AnchorEntry {
+                                    m: prefill_m,
+                                    fp: pfp.clone(),
+                                },
+                                entry.facts,
+                            ))
+                        }
+                        (None, _) => None,
+                    };
+                // The family past the anchor: `(entry, facts)` pairs, because the census
+                // carries each rung's kind and width facts (the load builds from them, never
+                // by joining the manifest's lists) AND charges the facts.
+                let mut family: Vec<(FamilyEntry, ktir_superdsc::pool_law::RungFacts)> =
+                    prefill_rungs
+                        .iter()
+                        .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
+                        .map(|(rm, fp)| {
+                            (
+                                FamilyEntry::Ladder {
+                                    m: *rm,
+                                    fp: fp.clone(),
+                                },
+                                find(fp).facts,
+                            )
+                        })
+                        .collect();
                 family.extend(
                     world
                         .prefill_prefix_rungs
@@ -6227,7 +6367,16 @@ pub(crate) fn dump_wavefront_mega(
                         // activations are its product's (s windows of width rows), charged
                         // exactly as the solo rung's are.
                         .filter(|(w, _, _)| *w > 1)
-                        .map(|(_, _, fp)| (fp.clone(), find(fp).facts)),
+                        .map(|(w, s, fp)| {
+                            (
+                                FamilyEntry::Prefix {
+                                    m: *w,
+                                    seqs: *s,
+                                    fp: fp.clone(),
+                                },
+                                find(fp).facts,
+                            )
+                        }),
                 );
                 let decode_rungs: Vec<ktir_superdsc::pool_law::RungFacts> = world
                     .decode_rungs
@@ -6245,33 +6394,34 @@ pub(crate) fn dump_wavefront_mega(
                 let res = ktir_superdsc::pool_law::mandatory_residency(
                     &ktir_superdsc::pool_law::CensusInputs {
                         decode: &decode.facts,
-                        anchor: anchor.as_ref().map(|a| &a.facts),
+                        anchor: anchor.as_ref().map(|(_, f)| f),
                         family: &family_facts,
                         decode_rungs: &decode_rung_refs,
                         borrowers,
                     },
                 );
-                // The shared-scratch arenas' owners, as the family's own fingerprints — the load
-                // marks a rung a borrower by comparing against these, never by position.
+                // The shared-scratch arenas' owners, as the family's own entries — the load
+                // marks a rung a borrower by comparing ids against these, never by position.
                 let arenas = ktir_superdsc::pool_law::scratch_arena_owners(&family_facts);
-                let arena_owners = arenas.map(|a| a.map(|arena| family[arena.owner].0.clone()));
+                let arena_owners =
+                    arenas.map(|a| a.map(|arena| family[arena.owner()].0.fp().to_owned()));
                 Some(WorldPoolCensus {
                     decode_fp,
-                    anchor_fp: anchor.as_ref().map(|a| a.fp.clone()),
-                    family_fps: family.into_iter().map(|(fp, _)| fp).collect(),
+                    anchor: anchor.map(|(entry, _)| entry),
+                    family: family.into_iter().map(|(e, _)| e).collect(),
                     page_stride: decode.page_stride,
                     residency: res,
                     arena_owners,
                 })
             }
             let mut worlds: Vec<WorldPoolCensus> = Vec::new();
-            let one_rank_census = census_world(stem, "one-rank world", &one_rank);
+            let one_rank_census = census_world(stem, "one-rank world", &one_rank, prefill_m);
             if let Some(w) = &one_rank_census {
                 worlds.push(w.clone());
             }
             let sharded_census = tp_sources
                 .is_some()
-                .then(|| census_world(stem, "sharded world", &sharded_world))
+                .then(|| census_world(stem, "sharded world", &sharded_world, prefill_m))
                 .flatten();
             if let Some(w) = &sharded_census {
                 worlds.push(w.clone());
@@ -6384,10 +6534,15 @@ pub(crate) fn dump_wavefront_mega(
                         }
                     });
                     // The sharded world's census, as the bundle carries it — the load reads it
-                    // and re-derives nothing.
+                    // and re-derives nothing. Its ids name the SHARDED world's named statics
+                    // (the build world's own tag), which only a sharded build drains — the same
+                    // gate that minted this census (`tp_sources` is `None` on a build of one
+                    // rank).
+                    let tp_build_tag =
+                        world_static_tag::<scratchy_target_spyre::bundle_code::collective::Build>();
                     let tp_pool_census = match &sharded_census {
                         Some(w) => {
-                            let lit = baked_census_lit(w);
+                            let lit = baked_census_lit(w, &tp_build_tag);
                             quote! { ::core::option::Option::Some(&#lit) }
                         }
                         None => quote! { ::core::option::Option::None },
@@ -6433,13 +6588,29 @@ pub(crate) fn dump_wavefront_mega(
             });
         }
         // The one-rank world's census, as the bundle carries it — the load reads it and
-        // re-derives nothing.
-        let pool_census_token = match &one_rank_census {
-            Some(w) => {
-                let lit = baked_census_lit(w);
+        // re-derives nothing. ⛔ CARRIED ONLY WHEN THE BINARY'S OWN `Build` IS THE ONE-RANK
+        // WORLD: `SengraphBundle.pool_census` is typed over `Build` (the load's one world), and
+        // this census names the one-rank world's `TP1` statics — the same type exactly when
+        // the build names no `tp/<N>`. On a sharded build the load never reads this const's
+        // census (its `World::SHARDED` match hands it the `TpForward`'s own census, whose ids
+        // name the sharded world's statics), so it ships `None` rather than a census whose
+        // ids a `Build` load could never resolve. The DESCENT still reads the one-rank
+        // census's terms either way (`PoolCensus::worlds` carries them for the law).
+        let pool_census_token = match (
+            &one_rank_census,
+            <scratchy_target_spyre::bundle_code::collective::Build
+                as scratchy_target_spyre::bundle_code::collective::World>::SHARDED,
+        ) {
+            (Some(w), false) => {
+                // The one-rank world's own tag — `TpWorld<1>`'s rank count, the same tag
+                // `bundle_items` derived the one-rank statics' names from.
+                let lit = baked_census_lit(
+                    w,
+                    &world_static_tag::<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>(),
+                );
                 quote! { ::core::option::Option::Some(&#lit) }
             }
-            None => quote! { ::core::option::Option::None },
+            _ => quote! { ::core::option::Option::None },
         };
         ktir_bundle_out.extend(quote! {
             /// Embedded sendnn LAYER-GROUP bundle — baked by `#[forward]` under

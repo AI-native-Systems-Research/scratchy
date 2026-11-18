@@ -437,6 +437,23 @@ fn apply_weight_scale_folds(
 #[cfg(feature = "spyre-hw")]
 type WorldForward = scratchy_target_spyre::wiring::TpForward<World>;
 
+/// The baked census, as this binary's world carries it — its ids are the bake's NAMED STATICS
+/// of this world's bundles (`&'static BundleCode<'static, World>`), referenced by the census
+/// literal the same expansion emitted, so a census entry naming a bundle this binary does not
+/// carry was a RUSTC ERROR at the model crate's build. The load never resolves a census id by
+/// fingerprint: fingerprint lookup stays at the REGISTRY boundary, where a manifest sentinel
+/// names a world's bundle.
+#[cfg(feature = "spyre-hw")]
+type Census = scratchy_target_spyre::pool_law::BakedCensus<
+    &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+>;
+
+/// A census family rung over this binary's bundle ids — `Census`'s own family element.
+#[cfg(feature = "spyre-hw")]
+type FamilyRung = scratchy_target_spyre::pool_law::FamilyRung<
+    &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+>;
+
 /// ⭐ EVERY BOUND WEIGHT'S BYTES, SHARED FROM THE ALLOCATOR'S STORE — one pass on the owning
 /// thread, before the scatter cut's threads read the views: a VIEW of the weight's mmap
 /// (free), a copy of the one non-mmap source. The share, never a take, is the law the
@@ -1513,17 +1530,16 @@ impl SpyreWorker {
                 // the bake itself used. A bundle with no census is a cardless bake (`spyre-lower`
                 // off): the law's funded budget is a card fact, and this binary cannot serve on
                 // a card.
-                let census: &'static scratchy_target_spyre::pool_law::BakedCensus =
-                    bundle.pool_census.ok_or_else(|| {
-                        werr(
-                            "this model's bundle carries no baked census — it was baked without \
+                let census: &'static Census = bundle.pool_census.ok_or_else(|| {
+                    werr(
+                        "this model's bundle carries no baked census — it was baked without \
                              the card lowering (spyre-lower), so its KV pool was never sized by \
                              the capacity law; a spyre card run needs a card bake",
-                        )
-                    })?;
+                    )
+                })?;
                 // The pool's page stride, as the bake's KTIR lowering derived it and the census
                 // carries it — the ONE statement, never re-divided at either end.
-                let pool_stride_bytes = census.page_stride.0;
+                let pool_stride_bytes = census.page_stride.get();
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
                 // model's own limit, up to the pool.
@@ -1558,25 +1574,13 @@ impl SpyreWorker {
                 // that measured faster — and the widest rung is then just another borrowing rung
                 // built after decode, like all the others.
                 // ⛔ THE ANCHOR'S BUNDLE AND ITS WIDTH LABEL COME FROM THE SAME ENTRY, AS ONE PAIR —
-                // the census names the anchor by fingerprint, the width label below is read back
-                // off the entry the SAME fingerprint keys, and a census fingerprint that names no
-                // compiled bundle is an INVENTORY DESYNC that REFUSES, never a fallback to any
-                // other rung as the anchor.
-                let prefill_code = census
-                    .anchor_fp
-                    .map(|sent| {
-                        sent.strip_prefix(SUPERDSC_SENTINEL)
-                            .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .ok_or_else(|| {
-                                werr(format!(
-                                    "the census's anchor bundle ({sent}) names no bundle compiled \
-                                     into this binary — an inventory desync between the bake and \
-                                     the binary, refusing rather than running any other rung as \
-                                     the anchor"
-                                ))
-                            })
-                    })
-                    .transpose()?;
+                // the census carries the anchor as ONE typed entry (`AnchorRung`): the bake's
+                // named static for its bundle and the width label that entry was selected with.
+                // The load resolves NOTHING here — the id IS the static the same expansion
+                // emitted, so a census naming a bundle this binary does not carry was a rustc
+                // error at the model crate's build, and there is no fallback to any other rung
+                // as the anchor.
+                let anchor = census.anchor;
                 // ⭐ THE BRING-UP, JOINED — the runtimes arrive BUILT. The background thread
                 // spawned at the top of the load opened every card, leaked them, and built
                 // every runtime on the serve span while THIS thread loaded weights from disk:
@@ -1671,24 +1675,23 @@ impl SpyreWorker {
                     funded,
                     census.residency.mandatory_bytes(),
                     census.page_stride,
-                    scratchy_target_spyre::pool_law::Pages(step.pages),
+                    scratchy_target_spyre::pool_law::Pages::new(step.pages),
                 ) {
                     return Err(werr(format!(
                         "the Spyre card's {} MB of tensor memory at the utilization {:.2} the bake \
                          funded at holds {} MB, but this model's mandatory residency is {} MB \
                          beside the bake's {} MB KV pool ({} page(s) of {} B). Use a smaller model.",
                         card_bytes.tensor_capacity() / (1024 * 1024),
-                        census.utilization.0,
-                        funded.0 / (1024 * 1024),
-                        census.residency.mandatory_bytes().0 / (1024 * 1024),
+                        census.utilization.get(),
+                        funded.get() / (1024 * 1024),
+                        census.residency.mandatory_bytes().get() / (1024 * 1024),
                         pool_need_bytes / (1024 * 1024),
                         step.pages,
                         pool_stride_bytes,
                     )));
                 }
-                // NO BANK-CAP RE-CHECK HERE: each pool bank is one allocation, and the bake's
-                // banking pass proved every bank allocable at cargo-build — its own law, stated
-                // once. The card-side restatement of it was a second statement of a baked fact.
+                // Each pool bank is one allocation, proven allocable at cargo-build by the
+                // bake's banking pass — its own law, stated once (`bank_kv_segment`).
                 // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own
                 // bytes by its own page — the two counts are then one count.
                 kv_budget_bytes_v = Some(pool_need_bytes);
@@ -1757,16 +1760,17 @@ impl SpyreWorker {
                 //    runs batched through it, then its seg2 KV is copied to the decode session. If the
                 //    prefill slot's fp == the decode fp (the prefill reroll did NOT bake → C4 fell
                 //    back), prefill=None ⇒ the worker uses the sequential mq=1 path. ──
-                // `prefill_code` (the anchor bundle, by the census's fingerprint) and the KV
-                // pool's own demand were all derived UP AT THE CENSUS — the budget reads them,
-                // so they exist before this point. The session build below is their first
-                // consumer.
-                let (mut prefill_ss, prefill_m) = match prefill_code {
-                    Some(pcode) => {
+                // `anchor` (the census's own typed entry — bundle and width as one pair) and
+                // the KV pool's own demand were all derived UP AT THE CENSUS — the budget
+                // reads them, so they exist before this point. The session build below is
+                // their first consumer.
+                let (mut prefill_ss, prefill_m) = match anchor {
+                    Some(anchor_rung) => {
                         // The baked prefill m (query rows). run_step MUST use exactly this m.
                         //
-                        // ⭐⭐⭐⭐⭐ FROM THE MANIFEST'S OWN RUNG ENTRY, NOT from the embed
-                        // activation's placement bytes. The old derivation was
+                        // ⭐⭐⭐⭐⭐ THE ANCHOR'S BUNDLE AND ITS WIDTH LABEL COME FROM THE SAME
+                        // CENSUS ENTRY, AS ONE PAIR — never from the embed activation's
+                        // placement bytes. The old derivation was
                         // `place_of_tid(embed).size / (hidden·2)`, and BOTH of its halves were
                         // wrong on their own:
                         //
@@ -1791,29 +1795,13 @@ impl SpyreWorker {
                         // "28", sorted above the 11/15/… rungs, and an 8-token prompt — the
                         // fixture's own request — selected it by `prefill_rung_for`'s
                         // smallest-m≥real rule, then ran its attention ops past placements sized
-                        // for 7 rows. The manifest's `prefill_rungs` rows already state each
-                        // bundle's width at the bake (the same list this anchor was selected
-                        // FROM), so the label is read back off the entry the anchor came from —
-                        // no second derivation to disagree with the first.
+                        // for 7 rows. The bake now stamps the width INTO the census's anchor
+                        // entry beside the bundle it selected — the entry the anchor came from,
+                        // no second derivation to disagree with the first, and no manifest join
+                        // for the load to mis-key.
+                        let pcode = anchor_rung.id;
+                        let prefill_m = anchor_rung.m as usize;
                         let pl = &pcode.layout;
-                        // The anchor's width label, keyed by the SAME fingerprint that resolved
-                        // the bundle above (the pair law): either the manifest rung entry the
-                        // census's anchor names (its own `rm`) or — when the anchor is the
-                        // single prefill bundle and the ladder baked no rung list — the prefill
-                        // wiring's own `m_cap`, the shape the embed activation was staged at,
-                        // from the wiring and not from the placement bytes.
-                        let prefill_m = g0
-                            .prefill_rungs
-                            .iter()
-                            .find(|(_, sent)| Some(*sent) == census.anchor_fp)
-                            .map_or_else(
-                                || {
-                                    wirings.prefill.as_ref().map_or(0, |p| {
-                                        p.tensor_shapes[p.embed_src as usize].0 as usize
-                                    })
-                                },
-                                |(rm, _)| *rm as usize,
-                            );
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
                         wirings
@@ -1896,33 +1884,22 @@ impl SpyreWorker {
                 // one thread per session reading the owner — each alias is the placement-equality
                 // proof plus the borrower's own descriptor rebuild and bank alias, never a
                 // pointer swap. See the ADOPTION wave below.
+                // The family the census named — the CENSUS is the one list, and its
+                // entries are typed references to the same bake's named statics, so the
+                // load resolves NOTHING: every rung past the anchor, by bundle reference
+                // and never by position or label. The anchor was built as the session
+                // above, and the `w ≤ 1` entries never entered the census's family.
                 let ladder: Vec<(
                     usize,
-                    &'static str,
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                )> = g0
-                    .prefill_rungs
+                )> = census
+                    .family
                     .iter()
-                    // The family the census named — every rung past the anchor, by
-                    // FINGERPRINT and never by position or label: the anchor is the rung the
-                    // census's own `anchor_fp` names (built as the session above), the `w ≤ 1`
-                    // entries name sessions already built, and a rung the census never charged
-                    // is not this binary's to build. The census is the ONE list.
-                    .filter(|(_, sentinel)| census.family_fps.contains(sentinel))
-                    .map(|(rung_m, sentinel)| {
-                        let rcode = sentinel
-                            .strip_prefix(SUPERDSC_SENTINEL)
-                            .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .ok_or_else(|| {
-                                werr(format!(
-                                    "the census's family rung ({sentinel}) names no bundle \
-                                     compiled into this binary — an inventory desync between the \
-                                     bake and the binary; every rung the bake shipped must load"
-                                ))
-                            })?;
-                        Ok((*rung_m as usize, *sentinel, rcode))
+                    .filter_map(|rung| match rung {
+                        FamilyRung::Ladder { m, id } => Some((*m as usize, *id)),
+                        FamilyRung::Prefix { .. } => None,
                     })
-                    .collect::<ExecutorResult<_>>()?;
+                    .collect();
                 // ⛔ THE LADDER'S HOST HALF SPAWNS HERE, BEFORE THE OWNER — ITS DEVICE HALF DOES
                 // NOT. A rung's build is two halves: the HOST half
                 // (`SuperDscSession::build_borrowing_with_consts` — `Executor::load`, the binds,
@@ -1963,7 +1940,6 @@ impl SpyreWorker {
                     let chunks: Vec<
                         Vec<(
                             usize,
-                            &'static str,
                             &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                         )>,
                     > = if chunk == 0 {
@@ -1988,7 +1964,7 @@ impl SpyreWorker {
                                 let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
-                                        .map(|(rm, sent, rcode)| {
+                                        .map(|(rm, rcode)| {
                                             let r = SuperDscSession::build_borrowing_with_consts(
                                                 cards,
                                                 rcode,
@@ -2004,7 +1980,7 @@ impl SpyreWorker {
                                                 &rung_pool,
                                                 &rung_spill,
                                             );
-                                            (rm, sent, r)
+                                            (rm, r)
                                         })
                                         .collect::<Vec<_>>()
                                 })
@@ -2039,15 +2015,11 @@ impl SpyreWorker {
                 // slowest single build). The adoption and every refusal run on THIS thread at
                 // the join below, in ladder order.
                 // A validated, UNBUILT prefix rung: the static bundle the background build
-                // needs, held until the fan-out below. The sentinel refusal stays on THIS
-                // thread — it is a manifest/wiring fact, not a build result.
+                // needs, held until the fan-out below. The wiring lookup stays on THIS
+                // thread — it is a wiring fact, not a build result.
                 struct PrefixRungJob {
                     pmq: u32,
                     seqs: u32,
-                    /// The rung's manifest sentinel — the census's own key. The wave marks this
-                    /// rung a borrower of a shared scratch segment by comparing it against the
-                    /// census's `arena_owners`, never by position.
-                    sent: &'static str,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                     /// ⭐ THE RUNG'S OWN WIRING — a SOLO rung's the prefill graph's, a PACKED
                     /// rung's its OWN pair's cell. The job's consts (the general mint's nine
@@ -2059,22 +2031,15 @@ impl SpyreWorker {
                 }
                 let pool_for_prefix = prefill_pool_statics(wirings)?;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
-                for &(pmq, seqs, psent) in g0.prefill_prefix {
-                    // The census's family is the ONE list: a prefix rung the census charged
-                    // builds, and one it did not (the `w ≤ 1` entries, which name no session)
-                    // does not — never a second filter restating the bake's own.
-                    if !census.family_fps.contains(&psent) {
-                        continue;
-                    }
-                    let pcode2 = psent
-                        .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "prefix-capable prefill (w={pmq}, s={seqs}): sentinel did not \
-                                 resolve — every rung the bake shipped must load"
-                            )
-                        });
+                // The census's family is the ONE list, and its entries are typed references
+                // to the same bake's named statics — the load resolves NOTHING. A prefix
+                // rung the census charged builds; the `w ≤ 1` entries never entered the
+                // census's family, and no sentinel resolution runs to fail.
+                for rung in census.family {
+                    let (pmq, seqs, rcode) = match *rung {
+                        FamilyRung::Prefix { m, seqs, id } => (m, seqs, id),
+                        FamilyRung::Ladder { .. } => continue,
+                    };
                     let wiring = if seqs == 1 {
                         wirings.prefill.as_ref().unwrap_or(&wirings.decode)
                     } else {
@@ -2093,8 +2058,7 @@ impl SpyreWorker {
                     prefix_jobs.push(PrefixRungJob {
                         pmq,
                         seqs,
-                        sent: psent,
-                        rcode: pcode2,
+                        rcode,
                         wiring,
                     });
                 }
@@ -2583,23 +2547,23 @@ impl SpyreWorker {
                         // driver path and paid 3755 ms for ~a tenth of that in device work.
                         let hl: Vec<_> = ladder_built
                             .into_iter()
-                            .map(|(rm, sent, built)| {
+                            .map(|(rm, rcode, built)| {
                                 scope.spawn(move || {
                                     (
                                         rm,
-                                        sent,
+                                        rcode,
                                         built.and_then(|mut rs| {
                                             // A rung is a BORROWER of a shared scratch
                                             // segment when the census's owner for it is a
-                                            // DIFFERENT fingerprint — the census's own list,
-                                            // never a position in this build.
+                                            // DIFFERENT bundle — the census's own typed
+                                            // references, never a position in this build.
                                             for (si, seg) in
                                                 scratchy_target_spyre::pool_law::SHARED_SCRATCH_SEGS
                                                     .iter()
                                                     .enumerate()
                                             {
                                                 if census.arena_owners[si]
-                                                    .is_some_and(|owner| owner != sent)
+                                                    .is_some_and(|owner| owner != rcode)
                                                 {
                                                     rs.mark_borrowed(
                                                         scratchy_target_spyre_card::superdsc_exec::SegIdx::from(*seg),
@@ -2627,7 +2591,7 @@ impl SpyreWorker {
                                                 .enumerate()
                                         {
                                             if census.arena_owners[si]
-                                                .is_some_and(|owner| owner != job.sent)
+                                                .is_some_and(|owner| owner != job.rcode)
                                             {
                                                 ps.mark_borrowed(
                                                     scratchy_target_spyre_card::superdsc_exec::SegIdx::from(*seg),
@@ -2687,56 +2651,60 @@ impl SpyreWorker {
                 // read while every other session is written, one segment at a time
                 // (`split_at_mut` proving the disjointness the compiler cannot see through
                 // the family vec).
-                // One family vec: every rung the census charged, its census fingerprint, and
-                // its built session — the sharing walks it per segment and the adoption wave
-                // below consumes it by value, partitioned back into the ladder and the prefix
-                // rungs.
-                enum FamilyRung {
+                // One family vec: every rung the census charged, the census's own typed
+                // reference to its bundle, and its built session — the sharing walks it per
+                // segment and the adoption wave below consumes it by value, partitioned back
+                // into the ladder and the prefix rungs.
+                enum BuiltRung {
                     Ladder(usize),
                     Prefix(PrefixRungJob),
                 }
-                let mut family: Vec<(FamilyRung, &'static str, Result<SuperDscSession, String>)> =
-                    ladder_prepared
-                        .into_iter()
-                        .map(|(rm, sent, built)| {
-                            (
-                                FamilyRung::Ladder(rm),
-                                sent,
-                                built.map_err(|e| {
-                                    format!(
-                                        "prefill rung m={rm}: create failed: {e} — every rung the \
+                let mut family: Vec<(
+                    BuiltRung,
+                    &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+                    Result<SuperDscSession, String>,
+                )> = ladder_prepared
+                    .into_iter()
+                    .map(|(rm, rcode, built)| {
+                        (
+                            BuiltRung::Ladder(rm),
+                            rcode,
+                            built.map_err(|e| {
+                                format!(
+                                    "prefill rung m={rm}: create failed: {e} — every rung the \
                                      bake shipped must load"
-                                    )
-                                }),
-                            )
-                        })
-                        .chain(
-                            prefix_jobs
-                                .into_iter()
-                                .zip(prefix_prepared)
-                                .map(|(job, built)| {
-                                    let sent = job.sent;
-                                    (FamilyRung::Prefix(job), sent, built.map_err(|(_, m)| m))
-                                }),
+                                )
+                            }),
                         )
-                        .collect();
+                    })
+                    .chain(
+                        prefix_jobs
+                            .into_iter()
+                            .zip(prefix_prepared)
+                            .map(|(job, built)| {
+                                let rcode = job.rcode;
+                                (BuiltRung::Prefix(job), rcode, built.map_err(|(_, m)| m))
+                            }),
+                    )
+                    .collect();
                 for (si, seg) in scratchy_target_spyre::pool_law::SHARED_SCRATCH_SEGS
                     .iter()
                     .enumerate()
                 {
                     // `None` is the census's own law: the family places nothing in the
                     // segment, no arena is charged, and no rung borrows it.
-                    let Some(owner_sent) = census.arena_owners[si] else {
+                    let Some(owner_id) = census.arena_owners[si] else {
                         continue;
                     };
                     let oi = family
                         .iter()
-                        .position(|(_, sent, _)| *sent == owner_sent)
+                        .position(|(_, id, _)| *id == owner_id)
                         .unwrap_or_else(|| {
                             panic!(
-                                "the census names {owner_sent} the owner of the seg{} family \
-                                 arena, but no family rung carries that fingerprint — the census \
-                                 and the manifest have desynced",
+                                "the census names {} the owner of the seg{} family arena, but no \
+                                 family rung carries that bundle — both are fields of the one \
+                                 census, so this is a bake bug",
+                                owner_id.fp,
                                 seg.index()
                             )
                         });
@@ -2746,9 +2714,10 @@ impl SpyreWorker {
                     );
                     let owner = owner_built.as_mut().unwrap_or_else(|e| {
                         panic!(
-                            "the census's arena owner for seg{} ({owner_sent}) failed to build: \
+                            "the census's arena owner for seg{} ({}) failed to build: \
                              {e} — every rung the bake shipped must load",
-                            seg.index()
+                            seg.index(),
+                            owner_id.fp
                         )
                     });
                     for (_, _, built) in lo.iter_mut().chain(borrowers.iter_mut()) {
@@ -2786,11 +2755,11 @@ impl SpyreWorker {
                 // above. The refusals are still reported in family order on this thread:
                 // every thread returns its failure as a value, and the walk below panics on
                 // the first one in rung order, byte-identical to the serial loop it replaces.
-                let family_adopted: Vec<Result<(FamilyRung, SuperDscSession), String>> =
+                let family_adopted: Vec<Result<(BuiltRung, SuperDscSession), String>> =
                     std::thread::scope(|scope| {
                         let handles: Vec<_> = family
                             .into_iter()
-                            .map(|(rung, _sent, built)| {
+                            .map(|(rung, _id, built)| {
                                 let ss = &ss;
                                 let spill = &spill_images;
                                 scope.spawn(move || {
@@ -2818,11 +2787,11 @@ impl SpyreWorker {
                 for adopted in family_adopted {
                     let (rung, sess) = adopted.unwrap_or_else(|m| panic!("{m}"));
                     match rung {
-                        FamilyRung::Ladder(rm) => {
+                        BuiltRung::Ladder(rm) => {
                             _n_ladder += 1;
                             prefill_ladder.push((rm, sess));
                         }
-                        FamilyRung::Prefix(job) => {
+                        BuiltRung::Prefix(job) => {
                             // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its
                             // consts staged — the wave front's launch reads it, never a
                             // representative's.

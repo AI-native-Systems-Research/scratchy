@@ -302,7 +302,20 @@ pub struct SengraphBundle {
     /// card's, through `pool_law::funded_bytes` / `funded_holds`). `None` on a
     /// cardless bake (`spyre-lower` off): the law's funded budget is a card fact,
     /// and a spyre-hw load refuses a bundle with no census by name.
-    pub pool_census: Option<&'static crate::pool_law::BakedCensus>,
+    ///
+    /// ⛔ TYPED OVER THE BINARY'S OWN `Build` WORLD — the load's one world — because a
+    /// census names bundles BY REFERENCE (the bake's named statics), and the two producers
+    /// of this field must agree on one world type: the one-rank `SENGRAPH_BUNDLE` const
+    /// (whose census names the one-rank world's statics, carried exactly when `Build` IS the
+    /// one-rank world) and the sharded path's hand-off of a `TpForward<Build>`'s census (the
+    /// worker's `sharded_bundle`). Not generic over the world: this struct has no world of
+    /// its own to parameterize — `TpForward` is the generic one, and its census field is
+    /// typed over ITS `T`.
+    pub pool_census: Option<
+        &'static crate::pool_law::BakedCensus<
+            &'static crate::bundle_code::BundleCode<'static, crate::bundle_code::collective::Build>,
+        >,
+    >,
 }
 
 /// One zeroed host buffer per tensor. The caller fills the source slots

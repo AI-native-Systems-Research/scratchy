@@ -60,31 +60,97 @@ pub const SEG_KV: usize = crate::placement::SegRole::Kv as usize;
 
 /// A byte quantity of the capacity law — a funded budget, a residency term, a pool. Newtyped
 /// so no bare `u64` can stand in for one of them (or for a page count) at any boundary this
-/// module owns.
+/// module owns. The field is private: a caller states a quantity through [`Self::new`] and
+/// reads it through [`Self::get`], so no arithmetic this module does not own can reach the
+/// number.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Bytes(pub u64);
+pub struct Bytes(u64);
 
-/// A count of whole KV pool pages.
+impl Bytes {
+    /// The quantity, from a site that has just decided it is a byte count of this law.
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// The byte count — for the diagnostics and literals that render it.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A count of whole KV pool pages. Same law as [`Bytes`]: stated through [`Self::new`], read
+/// through [`Self::get`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Pages(pub u32);
+pub struct Pages(u32);
+
+impl Pages {
+    /// The count, from a site that has just decided it is a page count of this law.
+    pub const fn new(pages: u32) -> Self {
+        Self(pages)
+    }
+
+    /// The page count.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// The pool's whole bytes over its own page count. ONE derivation owns this number — the
 /// KTIR lowering's own division of the summed per-launch KV spans by the paged step's page
 /// count (`lower_subtile_tape_to_ktir`), carried by the census and by the bundle's reroll
 /// meta; neither census end ever re-derives it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PageStride(pub u64);
+///
+/// ⛔ NONZERO BY TYPE. The zero this used to carry was a sentinel for "no stride derived" —
+/// a cardless-build fact the census never reads (a census is minted only where the lowering
+/// derived a stride over a placed pool, and the bake refuses one that did not). With the
+/// sentinel excluded by type, [`budget_pages`] divides by the stride as stated: no `.max(1)`
+/// guard re-deriving nonzero-ness the type already proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageStride(core::num::NonZeroU64);
+
+impl PageStride {
+    /// The stride, or `None` for zero — the excluded sentinel.
+    pub const fn new(bytes: u64) -> Option<Self> {
+        match core::num::NonZeroU64::new(bytes) {
+            Some(n) => Some(Self(n)),
+            None => None,
+        }
+    }
+
+    /// The bake's own constructor — for the census literal, where the bake has ALREADY
+    /// refused a decode bundle that derived no stride over its placed pool (`census_world`).
+    /// A zero reaching here is a bake bug, and the build says so.
+    pub const fn baked(bytes: u64) -> Self {
+        match Self::new(bytes) {
+            Some(s) => s,
+            None => panic!(
+                "a pool page stride is nonzero — the KTIR lowering derived it over a placed pool"
+            ),
+        }
+    }
+
+    /// The stride in bytes.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 /// The fraction of the allocatable tensor capacity a bake funds — a BAKE INPUT: the pool is
 /// baked at this fraction, and the load checks the measured card against the same budget
-/// ([`BakedCensus::utilization`] carries the fraction the bake actually used).
+/// ([`BakedCensus::utilization`] carries the fraction the bake actually used). Field private
+/// for the same law as [`Bytes`]: one constructor, one reader, no bare `f64` at the boundary.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GpuMemoryUtilization(pub f64);
+pub struct GpuMemoryUtilization(f64);
 
 impl GpuMemoryUtilization {
     /// The one fraction every bake that names nothing else funds at — the serving config's
     /// own constant, consumed here and never restated.
     pub const DEFAULT: Self = Self(scratchy_core_config::cache::DEFAULT_GPU_MEMORY_UTILIZATION);
+
+    /// The fraction — for the diagnostics that render it.
+    pub const fn get(self) -> f64 {
+        self.0
+    }
 }
 
 /// ⭐ THE PREFILL FAMILY'S SHARED-SCRATCH SEGMENTS — the segments whose scratch ONE family of
@@ -169,7 +235,7 @@ pub const fn tensor_capacity(card_bytes: u64) -> u64 {
 /// the load computes it from the MEASURED card and the utilization the census carries. One
 /// arithmetic.
 pub fn funded_bytes(card_bytes: u64, utilization: GpuMemoryUtilization) -> Bytes {
-    Bytes((tensor_capacity(card_bytes) as f64 * utilization.0) as u64)
+    Bytes::new((tensor_capacity(card_bytes) as f64 * utilization.get()) as u64)
 }
 
 /// One rung's census facts — the projection of the bake's compile-time
@@ -235,13 +301,27 @@ impl RungFacts {
 }
 
 /// One shared-scratch segment's family arena, as the census states it: the family's WIDEST
-/// extent for that segment and the family entry that holds it.
+/// extent for that segment and the family entry that holds it. Fields private for the same
+/// law as [`Bytes`]: minted only by [`scratch_arena_owners`], read through its accessors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Arena {
     /// The widest extent any family rung places in the segment.
-    pub bytes: u64,
+    bytes: u64,
     /// The index of the family entry that holds the widest extent — the arena's owner.
-    pub owner: usize,
+    owner: usize,
+}
+
+impl Arena {
+    /// The arena's extent — the bytes the build allocates for the segment.
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    /// The family entry that holds the widest extent — the arena's owner, as an index into
+    /// the family list [`scratch_arena_owners`] was run over.
+    pub const fn owner(self) -> usize {
+        self.owner
+    }
 }
 
 /// ⭐⭐ THE PREFILL FAMILY'S SHARED-SCRATCH ARENAS — ONE computation, run ONCE at the bake by
@@ -345,11 +425,11 @@ impl Residency {
     /// the decode owner, the spilled-tail copies, the anchor's live segments, and the ladder.
     /// The anchor's SPARE is deliberately absent (luxury, not law).
     pub fn mandatory_bytes(&self) -> Bytes {
-        Bytes(
-            self.decode_non_kv_bytes.0
-                + self.tail_charge.0
-                + self.anchor_live_bytes.0
-                + self.ladder_rung_bytes.0,
+        Bytes::new(
+            self.decode_non_kv_bytes.get()
+                + self.tail_charge.get()
+                + self.anchor_live_bytes.get()
+                + self.ladder_rung_bytes.get(),
         )
     }
 }
@@ -361,17 +441,17 @@ impl Residency {
 pub fn mandatory_residency(c: &CensusInputs<'_>) -> Residency {
     let (anchor_live_bytes, anchor_spare_bytes) = match c.anchor {
         Some(a) => (
-            Bytes(a.non_resident_bytes()),
-            Bytes(a.segment_bytes[SEG_WEIGHT] + a.weight_bank_bytes.iter().sum::<u64>()),
+            Bytes::new(a.non_resident_bytes()),
+            Bytes::new(a.segment_bytes[SEG_WEIGHT] + a.weight_bank_bytes.iter().sum::<u64>()),
         ),
-        None => (Bytes(0), Bytes(0)),
+        None => (Bytes::new(0), Bytes::new(0)),
     };
     Residency {
-        decode_non_kv_bytes: Bytes(c.decode.non_kv_bytes()),
-        tail_charge: Bytes(c.decode.tail_bytes() * c.borrowers),
+        decode_non_kv_bytes: Bytes::new(c.decode.non_kv_bytes()),
+        tail_charge: Bytes::new(c.decode.tail_bytes() * c.borrowers),
         anchor_live_bytes,
         anchor_spare_bytes,
-        ladder_rung_bytes: Bytes(
+        ladder_rung_bytes: Bytes::new(
             family_non_resident_bytes(c.family)
                 + c.decode_rungs
                     .iter()
@@ -384,9 +464,12 @@ pub fn mandatory_residency(c: &CensusInputs<'_>) -> Residency {
 /// ⭐ THE WHOLE PAGES a funded budget holds beyond mandatory residency — the ONE combination
 /// of the law's terms. The bake's descent takes its pool from it (floored at the model's
 /// whole context); the load's funded check compares the baked pool against it over the
-/// MEASURED card. One arithmetic, two readers, stated once here.
+/// MEASURED card. One arithmetic, two readers, stated once here. The stride is nonzero by
+/// type ([`PageStride`]), so the division needs no guard.
 pub fn budget_pages(funded: Bytes, mandatory: Bytes, stride: PageStride) -> Pages {
-    Pages((funded.0.saturating_sub(mandatory.0) / stride.0.max(1)).min(u32::MAX as u64) as u32)
+    Pages::new(
+        (funded.get().saturating_sub(mandatory.get()) / stride.get()).min(u32::MAX as u64) as u32,
+    )
 }
 
 /// Whether a funded budget holds a baked pool beside mandatory residency — the load's check
@@ -421,19 +504,30 @@ pub fn pool_pages(
 /// re-derives nothing on this list; the only terms it combines are the ones the bake cannot
 /// know — the MEASURED card's bytes, through [`funded_bytes`] and [`funded_holds`].
 ///
-/// The census names the family by FINGERPRINT, not by position: the load wave marks a rung a
-/// borrower by comparing its bundle's fp against [`Self::arena_owners`], so no positional
-/// coupling between the bake's list and the load's build order exists to drift.
-pub struct BakedCensus {
-    /// The decode owner's bundle fingerprint — the session every other rung borrows from.
-    pub decode_fp: &'static str,
-    /// The batched-prefill anchor's fingerprint, when the model baked one; the load resolves
-    /// the anchor bundle by it (the anchor selection is stated once, at the bake).
-    pub anchor_fp: Option<&'static str>,
-    /// The prefill family past the anchor — its plain rungs and its prefix rungs — as the
-    /// census resolved it. The load's ladder and prefix walks keep only the rungs on this
-    /// list.
-    pub family_fps: &'static [&'static str],
+/// The census names bundles BY TYPED REFERENCE (`Id`), not by fingerprint string: the bake
+/// emits every registered bundle as a NAMED static and the census literal names those
+/// statics, so a census entry pointing at a bundle this binary does not carry is a RUSTC
+/// ERROR, never a load-time refusal over an inventory desync. This leaf cannot name the
+/// bundle type (both ends of the pipeline sit above it), so the id is the one generic
+/// parameter — `&'static BundleCode<'static, W>` at the spyre end, where the world `W` is
+/// the binary's own. A census and the statics it names are emitted by the SAME expansion,
+/// so they cannot disagree.
+///
+/// The family is named by IDENTITY, not by position: the load wave marks a rung a borrower
+/// by comparing its id against [`Self::arena_owners`], so no positional coupling between the
+/// bake's list and the load's build order exists to drift.
+pub struct BakedCensus<Id: Copy + PartialEq + 'static> {
+    /// The decode owner's bundle — the session every other rung borrows from.
+    pub decode: Id,
+    /// The batched-prefill anchor — the bundle AND its width label as ONE pair (the anchor
+    /// selection is stated once, at the bake: the narrowest multi-token prefill rung, or the
+    /// single prefill bundle when the ladder baked no rung list; `None` when the prefill
+    /// reroll fell back to the decode bundle — C4).
+    pub anchor: Option<AnchorRung<Id>>,
+    /// The prefill family past the anchor — its plain rungs and its prefix rungs — each
+    /// carrying the width facts its construction needs. The load's ladder and prefix walks
+    /// build exactly this list, in its order: the census is the ONE list.
+    pub family: &'static [FamilyRung<Id>],
     /// The pool's page stride — the KTIR lowering's own division, carried; see
     /// [`PageStride`].
     pub page_stride: PageStride,
@@ -443,9 +537,44 @@ pub struct BakedCensus {
     /// Mandatory residency — the law's own terms ([`Residency`]), minted once at the bake.
     pub residency: Residency,
     /// Per shared segment (position ↔ [`SHARED_SCRATCH_SEGS`]), the family entry that owns
-    /// the arena — the census's own `scratch_arena_owners`, rendered as the owner's
-    /// fingerprint. `None` mints no arena and marks no borrower.
-    pub arena_owners: [Option<&'static str>; SHARED_SCRATCH_SEGS.len()],
+    /// the arena — the census's own `scratch_arena_owners`, carried as the owner's id.
+    /// `None` mints no arena and marks no borrower.
+    pub arena_owners: [Option<Id>; SHARED_SCRATCH_SEGS.len()],
+}
+
+/// The batched-prefill anchor, as ONE value: the bundle the census named and the width
+/// label the load reads — a PAIR, so the label cannot be re-derived at load from anything
+/// but the entry it keys (the mismeasured-width bug this pair law exists for).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchorRung<Id: Copy + PartialEq> {
+    /// The anchor's whole-token width — its rung's `m`, or the single prefill bundle's own
+    /// width when the ladder baked no rung list.
+    pub m: u32,
+    /// The anchor bundle.
+    pub id: Id,
+}
+
+/// One member of the census's prefill family — the rung's bundle and the width facts its
+/// construction needs, in ONE entry. The two kinds build differently (a ladder rung is a
+/// plain width; a prefix rung is a `(width, seqs)` pair whose packed form batches `seqs`
+/// windows), so the kind is stated here rather than re-derived at load by joining the
+/// manifest's separate lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilyRung<Id: Copy + PartialEq> {
+    /// A prefix-free prefill ladder rung at whole-token width `m`.
+    Ladder { m: u32, id: Id },
+    /// A prefix-capable rung: `m` rows per window, `seqs` packed windows (`seqs == 1` for a
+    /// solo rung).
+    Prefix { m: u32, seqs: u32, id: Id },
+}
+
+impl<Id: Copy + PartialEq> FamilyRung<Id> {
+    /// The rung's bundle id.
+    pub const fn id(&self) -> Id {
+        match self {
+            FamilyRung::Ladder { id, .. } | FamilyRung::Prefix { id, .. } => *id,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -578,30 +707,33 @@ mod tests {
             borrowers: 5,
         });
         // decode: non-KV segments (10+1000+10+4) + bank 300. tail: 25 × 5.
-        assert_eq!(res.decode_non_kv_bytes, Bytes(10 + 1000 + 10 + 4 + 300));
-        assert_eq!(res.tail_charge, Bytes(125));
+        assert_eq!(
+            res.decode_non_kv_bytes,
+            Bytes::new(10 + 1000 + 10 + 4 + 300)
+        );
+        assert_eq!(res.tail_charge, Bytes::new(125));
         // anchor live: everything but its weight home and twin pool: 50+5+2.
-        assert_eq!(res.anchor_live_bytes, Bytes(57));
+        assert_eq!(res.anchor_live_bytes, Bytes::new(57));
         // The family of one and the decode rung are each charged their whole non-resident
         // sum: [30,0,0,7,0,3,1] → 30+7+0+3+1 = 41.
         assert_eq!(family_non_resident_bytes(&family), 41);
         // decode rung: whole non-resident = 30+7+0+3+1 = 41.
         assert_eq!(decode_rungs[0].non_resident_bytes(), 41);
-        assert_eq!(res.ladder_rung_bytes, Bytes(41 + 41));
+        assert_eq!(res.ladder_rung_bytes, Bytes::new(41 + 41));
         assert_eq!(
             res.mandatory_bytes(),
-            Bytes(
-                res.decode_non_kv_bytes.0
-                    + res.tail_charge.0
-                    + res.anchor_live_bytes.0
-                    + res.ladder_rung_bytes.0
+            Bytes::new(
+                res.decode_non_kv_bytes.get()
+                    + res.tail_charge.get()
+                    + res.anchor_live_bytes.get()
+                    + res.ladder_rung_bytes.get()
             )
         );
         // The spare is carried as the census's own statement of what was NOT charged, never
         // folded into mandatory residency: `mandatory_bytes()` above does not name it.
         assert_eq!(
             res.anchor_spare_bytes,
-            Bytes(800),
+            Bytes::new(800),
             "the spare is the twin weight home — never charged"
         );
     }
@@ -625,36 +757,65 @@ mod tests {
         assert_eq!(tensor_capacity(7 * 1024), 6 * 1024);
     }
 
+    /// ⛔ A STRIDE IS NONZERO OR IT IS NOT A STRIDE — the zero this type once carried was a
+    /// cardless-build sentinel the census never reads (a census is minted only where the KTIR
+    /// lowering derived a stride over a placed pool), and `budget_pages` used to re-derive
+    /// nonzero-ness with a `.max(1)` guard. The type excludes the sentinel, so the guard is
+    /// gone; this pins both ends of that law.
+    #[test]
+    fn a_page_stride_is_nonzero_by_type() {
+        assert!(PageStride::new(0).is_none(), "zero is not a stride");
+        let stride = PageStride::new(20 * 1024 * 1024).expect("a real stride");
+        assert_eq!(stride.get(), 20 * 1024 * 1024);
+        assert_eq!(PageStride::baked(20 * 1024 * 1024), stride);
+        // The excluded sentinel divides nothing: `budget_pages` over a one-page remainder
+        // reads the stride as stated, with no guard to restate nonzero-ness.
+        assert_eq!(
+            budget_pages(Bytes::new(40), Bytes::new(20), stride),
+            Pages::new(0),
+            "a remainder under one stride page is zero pages"
+        );
+    }
+
     /// THE LAW ITSELF: every whole page the funded budget holds beyond mandatory residency,
     /// floored at the model's whole context — and the refusal when the floor does not fund.
     /// The load's funded check is the SAME combination (`budget_pages`), pinned here over a
     /// budget the pool does fit and one it does not.
     #[test]
     fn the_pool_takes_the_remainder_and_refuses_an_unfundable_context() {
-        let stride = PageStride(20 * 1024 * 1024);
+        let stride = PageStride::baked(20 * 1024 * 1024);
         // granite-8b-shaped: funded 88,473 MB − mandatory 15,975 MB = 72,498 MB of remainder.
-        let funded = Bytes(88_473 * 1024 * 1024);
-        let mandatory = Bytes(15_975 * 1024 * 1024);
-        let pages = pool_pages(funded, mandatory, stride, Pages(1296)).expect("the floor funds");
+        let funded = Bytes::new(88_473 * 1024 * 1024);
+        let mandatory = Bytes::new(15_975 * 1024 * 1024);
+        let pages =
+            pool_pages(funded, mandatory, stride, Pages::new(1296)).expect("the floor funds");
         assert_eq!(
             pages,
-            Pages(((funded.0 - mandatory.0) / stride.0) as u32),
+            Pages::new(((funded.get() - mandatory.get()) / stride.get()) as u32),
             "every whole page"
         );
         // The load's check over the SAME budget holds for the baked pool — one combination.
         assert!(funded_holds(funded, mandatory, stride, pages));
         // A card that reports less than the bake funded fails the same check: 4 GiB less is
         // ~200 pages short.
-        let smaller = Bytes(funded.0 - 4 * 1024 * 1024 * 1024);
+        let smaller = Bytes::new(funded.get() - 4 * 1024 * 1024 * 1024);
         assert!(!funded_holds(smaller, mandatory, stride, pages));
         // A context the budget cannot fund is None — the bake's refusal, never a clamp.
-        assert!(pool_pages(funded, mandatory, stride, Pages(100_000)).is_none());
+        assert!(pool_pages(funded, mandatory, stride, Pages::new(100_000)).is_none());
         // The floor is never the cap: a tiny context still takes the whole remainder.
         assert_eq!(
-            pool_pages(funded, mandatory, stride, Pages(1)).expect("funds"),
+            pool_pages(funded, mandatory, stride, Pages::new(1)).expect("funds"),
             pages
         );
         // Mandatory past funded: nothing left, and a one-page context still refuses.
-        assert!(pool_pages(Bytes(mandatory.0 - 1), mandatory, stride, Pages(1)).is_none());
+        assert!(
+            pool_pages(
+                Bytes::new(mandatory.get() - 1),
+                mandatory,
+                stride,
+                Pages::new(1)
+            )
+            .is_none()
+        );
     }
 }

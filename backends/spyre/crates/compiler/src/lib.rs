@@ -275,8 +275,8 @@ impl TargetEmitter for Spyre {
                         let p = pool_law::pool_pages(
                             funded,
                             w.residency.mandatory_bytes(),
-                            pool_law::PageStride(w.page_stride),
-                            pool_law::Pages(census.context_pages),
+                            pool_law::PageStride::baked(w.page_stride),
+                            pool_law::Pages::new(census.context_pages),
                         )
                         .unwrap_or_else(|| {
                             panic!(
@@ -284,10 +284,10 @@ impl TargetEmitter for Spyre {
                                  cannot hold the model's own context ({} pages) beside this \
                                  bake's {} MB of mandatory residency — a bake that cannot fund \
                                  the model's whole context refuses",
-                                funded.0 / (1024 * 1024),
-                                pool_law::GpuMemoryUtilization::DEFAULT.0,
+                                funded.get() / (1024 * 1024),
+                                pool_law::GpuMemoryUtilization::DEFAULT.get(),
                                 census.context_pages,
-                                w.residency.mandatory_bytes().0 / (1024 * 1024),
+                                w.residency.mandatory_bytes().get() / (1024 * 1024),
                             )
                         });
                         pages = Some(pages.map_or(p, |m: pool_law::Pages| m.min(p)));
@@ -306,7 +306,7 @@ impl TargetEmitter for Spyre {
                     // SMALLER, never ships it. (The old `pages <= current` break shipped
                     // exactly that: a pool sized by the previous pass's census beside
                     // this pass's larger mandatory residency.)
-                    if pages.0 == current_pages {
+                    if pages.get() == current_pages {
                         break;
                     }
                     // The cycle of a monotone map: the target is a count this descent has
@@ -316,7 +316,7 @@ impl TargetEmitter for Spyre {
                     // shrunk-from pass funded) or it is the floor, which the law never
                     // undercuts. An under-grant is a smaller pool; an over-grant is the
                     // OOM the load cannot survive.
-                    if visited.contains(&pages.0) {
+                    if visited.contains(&pages.get()) {
                         let settle = visited.iter().copied().min().unwrap();
                         if settle == current_pages {
                             break;
@@ -344,16 +344,16 @@ impl TargetEmitter for Spyre {
                         panic!(
                             "[spyre] {stem}: the pool descent did not converge in 8 passes — \
                              the law still moves past {} page(s)",
-                            pages.0
+                            pages.get()
                         );
                     }
-                    let positions: u32 = (u64::from(pages.0) * u64::from(page_slots))
+                    let positions: u32 = (u64::from(pages.get()) * u64::from(page_slots))
                         .try_into()
                         .unwrap_or_else(|_| {
                             panic!(
                                 "[spyre] {stem}: the law's pool ({} pages × {page_slots} \
                                  slots) exceeds u32 positions",
-                                pages.0
+                                pages.get()
                             )
                         });
                     eprintln!(
@@ -361,23 +361,20 @@ impl TargetEmitter for Spyre {
                          {} page(s) over the {} placed (the model's own context is {}), \
                          mandatory residency {} MB against the {} MB the card funds; \
                          re-baking at {positions} positions",
-                        pages.0,
+                        pages.get(),
                         current_pages,
-                        final_census
-                            .as_ref()
-                            .map(|c| c.context_pages)
-                            .unwrap_or(0),
+                        final_census.as_ref().map(|c| c.context_pages).unwrap_or(0),
                         final_census
                             .as_ref()
                             .map(|c| {
                                 c.worlds
                                     .iter()
-                                    .map(|w| w.residency.mandatory_bytes().0 / (1024 * 1024))
+                                    .map(|w| w.residency.mandatory_bytes().get() / (1024 * 1024))
                                     .min()
                                     .unwrap_or(0)
                             })
                             .unwrap_or(0),
-                        funded.0 / (1024 * 1024),
+                        funded.get() / (1024 * 1024),
                     );
                     capacity = Some(
                         std::num::NonZeroU32::new(positions)
@@ -395,15 +392,15 @@ impl TargetEmitter for Spyre {
                             pool_law::funded_holds(
                                 funded,
                                 w.residency.mandatory_bytes(),
-                                pool_law::PageStride(w.page_stride),
-                                pool_law::Pages(final_pages),
+                                pool_law::PageStride::baked(w.page_stride),
+                                pool_law::Pages::new(final_pages),
                             ),
                             "[spyre] {stem}: the descent shipped a pool its own census does \
                              not fund — {} page(s) placed beside {} MB of mandatory residency \
                              against the {} MB the card funds: a bake bug, not a card fact",
                             final_pages,
-                            w.residency.mandatory_bytes().0 / (1024 * 1024),
-                            funded.0 / (1024 * 1024),
+                            w.residency.mandatory_bytes().get() / (1024 * 1024),
+                            funded.get() / (1024 * 1024),
                         );
                     }
                 }

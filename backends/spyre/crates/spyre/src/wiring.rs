@@ -2012,7 +2012,12 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
     /// ⭐ THE BAKED CENSUS — the capacity law's terms for THIS world, minted ONCE by the bake
     /// from the rung lists above and READ by the load, which re-derives nothing on its face.
     /// `None` on a cardless bake; a spyre-hw load refuses a forward with no census by name.
-    pub pool_census: Option<&'static crate::pool_law::BakedCensus>,
+    /// The census names THIS world's bundles by reference — its ids are the bake's named
+    /// statics of `BundleCode<'static, T>`, so a forward of one world cannot carry another
+    /// world's census any more than it can carry another world's shapes.
+    pub pool_census: Option<
+        &'static crate::pool_law::BakedCensus<&'static crate::bundle_code::BundleCode<'static, T>>,
+    >,
     /// The world every rank of which runs this forward.
     pub world: core::marker::PhantomData<T>,
 }

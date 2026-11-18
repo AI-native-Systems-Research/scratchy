@@ -119,12 +119,10 @@ impl SpyreWorker {
     /// hold — before `load_model` checks it. The concurrency is the decode ladder's to state
     /// (`Worker::max_num_seqs_override`).
     ///
-    /// ⛔ `--gpu-memory-utilization` IS NOT HERE, AND THAT IS THE LAW: the fraction is a BAKE
-    /// INPUT on spyre — the pool is a baked dimension, sized at
-    /// [`pool_law::GpuMemoryUtilization::DEFAULT`](scratchy_target_spyre::pool_law::GpuMemoryUtilization)
-    /// by the bake and checked at load against the fraction the bake actually used (carried in
-    /// the bundle's census), so no run-time flag can move it. The serve flag stays parseable
-    /// (the CLI is backend-neutral); on spyre it names nothing.
+    /// The utilization fraction is a bake input
+    /// ([`pool_law::GpuMemoryUtilization`](scratchy_target_spyre::pool_law::GpuMemoryUtilization)),
+    /// sized at the bake and checked at load against the census's own copy; the serve flag
+    /// names nothing on spyre.
     pub fn declare_workload(&mut self, max_model_len: Option<usize>) {
         self.declared_context = max_model_len;
     }
