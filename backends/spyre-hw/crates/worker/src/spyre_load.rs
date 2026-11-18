@@ -1477,15 +1477,18 @@ impl SpyreWorker {
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
                 // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, placed in the KV segment of
-                // every bundle at the decode wiring's own page count (the model's context, or as much of
-                // it as one device region holds: `paged_step::pool_slots`). Nothing here sizes it: the
-                // OWNER session allocates the segment once, and every other session aliases it.
+                // every bundle at the decode wiring's own page count (the model's context, banked across
+                // as many device regions as it takes). Nothing here sizes it: the OWNER session allocates
+                // the segment and its banks once, and every other session aliases them.
                 let step = wirings.decode.paged.ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
+                // Bank 0 is `segment_bytes[SEG_KV]`; a pool past one region holds the rest in its
+                // extra banks (`kv_bank_bytes`), so the pool is the sum of both.
                 let pool_need_bytes = code.layout.segment_bytes
-                    [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()];
+                    [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()]
+                    + code.layout.kv_bank_bytes.iter().sum::<u64>();
                 let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
@@ -1844,12 +1847,20 @@ impl SpyreWorker {
                         pool_need_bytes / (1024 * 1024),
                     )));
                 }
-                // ⛔ AND THE POOL IS **ONE** ALLOCATION, so it cannot exceed one region however much
-                // tensor capacity is left over.
-                if pool_need_bytes > card_bytes.max_single_allocation() {
+                // ⛔ AND EACH KV BANK IS **ONE** ALLOCATION, so no bank can exceed one region of THIS
+                // card however much tensor capacity is left over.
+                let kv_seg = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
+                let widest_kv_bank = code
+                    .layout
+                    .kv_bank_bytes
+                    .iter()
+                    .copied()
+                    .fold(code.layout.segment_bytes[kv_seg], u64::max);
+                if widest_kv_bank > card_bytes.max_single_allocation() {
                     return Err(werr(format!(
-                        "the bake's {} MB KV pool is past the {} MB one device allocation can be",
-                        pool_need_bytes / (1024 * 1024),
+                        "the bake's widest KV bank ({} MB) is past the {} MB one device allocation \
+                         can be",
+                        widest_kv_bank / (1024 * 1024),
                         card_bytes.max_single_allocation() / (1024 * 1024),
                     )));
                 }

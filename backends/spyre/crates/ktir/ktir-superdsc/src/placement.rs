@@ -227,6 +227,14 @@ pub struct BundleLayout {
     /// `bundle::Placement::bank` and `bank_weight_segment`.
     #[serde(default)]
     pub weight_bank_bytes: Vec<u64>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS: bytes of banks `1..N`, empty when every layer's pools fit
+    /// ONE device region. Same law as [`Self::weight_bank_bytes`]; see `bank_segment`.
+    ///
+    /// Skipped when empty: the layout's serialization is the bundle fingerprint's input
+    /// (`bundle_fp`), so a one-region pool serializes — and fingerprints — exactly as it did
+    /// before KV banks existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kv_bank_bytes: Vec<u64>,
     /// ⭐ THE SEGMENT BUDGET'S VERDICT on the non-per-layer weight tail — see [`WeightTail`].
     #[serde(default)]
     pub weight_tail: WeightTail,

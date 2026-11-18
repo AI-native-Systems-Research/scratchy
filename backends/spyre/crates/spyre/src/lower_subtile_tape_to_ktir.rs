@@ -3241,7 +3241,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         bundle_layout.segment_bytes[seg3] = synth_high;
     }
     // ─────────────────────────────────────────────────────────────────────────────────────────
-    //  ⭐ THE LAUNCH TABLE — one `(w_bank, w_off, kv_off)` per layer, GENERATED from the
+    //  ⭐ THE LAUNCH TABLE — one `(w_bank, w_off, kv_bank, kv_off)` per layer, GENERATED from the
     //  placements and PROVEN against them, so the executor never re-derives an address from a
     //  stride.
     //
@@ -3322,10 +3322,10 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     //    the class to the entry, so which table generated it cannot matter; a class whose tables
     //    DISAGREE is refused here with both readings named.
     let mut launch_w: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
-    let mut launch_kv: Vec<u64> = Vec::with_capacity(total_layers);
+    let mut launch_kv: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
     for &(body, iter) in &launches {
         let mut w_entry: Option<(u8, u64)> = None;
-        let mut kv_entry: Option<u64> = None;
+        let mut kv_entry: Option<(u8, u64)> = None;
         for (t0, tids) in &per_layer {
             if body_of_tid(*t0) != Some(body as usize) {
                 continue;
@@ -3350,13 +3350,30 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                 }
                 w_entry = Some(entry);
             } else if p0.segment == kv_seg {
-                let entry = pj.offset.wrapping_sub(p0.offset);
+                // ⛔ THE SHIFT IS APPLIED TO A REGION BASE, SO IT CANNOT BE NEGATIVE. The runtime
+                // shifts the bank's base by `kv_off` and a `DevAddr` carries no sign; a class
+                // whose bank-1 block seated below its layer-0 offset would wrap to a huge u64 the
+                // base-shift door then silently drops, mis-addressing every layer of the class.
+                // Refused HERE, at bake, with both readings named.
+                let shift = pj.offset as i128 - p0.offset as i128;
+                if shift < 0 {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: body {body}'s layer {iter} needs a NEGATIVE KV shift \
+                         ({shift} B, from t{t0}'s layer-0 offset {} to layer-{} offset {} across \
+                         banks {} → {}): the launch applies the shift to the bank's REGION base, \
+                         which cannot go backwards. The banking pass seats a class's first launch \
+                         of a bank at that bank's 0, so this fires only for a class whose layer-0 \
+                         block does not start its bank — see `bank_segment`'s law 3.",
+                        p0.offset, iter, pj.offset, p0.bank, pj.bank,
+                    )));
+                }
+                let entry = (pj.bank as u8, shift as u64);
                 if let Some(prev) = kv_entry
                     && prev != entry
                 {
                     return Err(SuperDscError(format!(
                         "reroll-superdsc: body {body}'s per-layer KV tensors DISAGREE about layer \
-                         {iter}'s launch shift ({prev} vs {entry} B, generated from t{t0}) — k, v \
+                         {iter}'s launch shift ({prev:?} vs {entry:?}, generated from t{t0}) — k, v \
                          and Kᵀ must advance together or the score reads one layer's keys against \
                          another's values"
                     )));
@@ -3365,7 +3382,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             }
         }
         launch_w.push(w_entry.unwrap_or((0, 0)));
-        launch_kv.push(kv_entry.unwrap_or(0));
+        launch_kv.push(kv_entry.unwrap_or((0, 0)));
     }
     // ── PROVE, EVERY TENSOR, EVERY LAYER. The launch addresses
     //    `(bank: L.w_bank, offset: L.w_off + placement(t₀).offset)` — hold each per-layer weight
@@ -3374,7 +3391,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     //    this holds ALL of them.
     for (li, &(body, iter)) in launches.iter().enumerate() {
         let (wb, wo) = launch_w[li];
-        let ko = launch_kv[li];
+        let (kb, ko) = launch_kv[li];
         for (t0, tids) in &per_layer {
             if body_of_tid(*t0) != Some(body as usize) {
                 continue;
@@ -3405,19 +3422,23 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                         wb = wb,
                     )));
                 }
-            } else if p0.segment == kv_seg && pj.offset != ko.wrapping_add(p0.offset) {
+            } else if p0.segment == kv_seg
+                && (pj.bank as u8 != kb || pj.offset != ko.wrapping_add(p0.offset))
+            {
                 return Err(SuperDscError(format!(
                     "reroll-superdsc: per-layer KV tensor t{tid} (layer {layer} of body {body}) is \
-                     placed at offset {off}, but the launch table addresses it at {want} (shift \
-                     {ko} + layer-0 offset {base}). The score would read one layer's keys against \
-                     another's values.",
+                     placed at bank {bank} offset {off}, but the launch table addresses it at bank \
+                     {kb} offset {want} (shift {ko} + layer-0 offset {base}). The score would read \
+                     one layer's keys against another's values.",
                     tid = tids[iter as usize],
                     layer = launch_layer[li],
+                    bank = pj.bank,
                     off = pj.offset,
                     want = ko.wrapping_add(p0.offset),
                     ko = ko,
                     base = p0.offset,
                     body = body,
+                    kb = kb,
                 )));
             }
         }
@@ -3450,19 +3471,38 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             )));
         }
     }
-    // The PAGE stride: one pool page covers every layer of every class, so the stride is the
-    // extent of the packed per-layer KV — the max end over every class's LAST layer placement
-    // (classes are packed contiguously; per-class strides differ, which is exactly why this is a
-    // max and not a count × stride). 0 when there is no paged KV.
-    let kv_page_stride = per_layer
-        .values()
-        .filter_map(|tids| {
-            let last = tids.last()?;
-            let p = bundle_layout.placements.get(last)?;
-            (p.segment == kv_seg).then(|| p.offset + p.size)
-        })
-        .max()
-        .unwrap_or(0);
+    // The PAGE stride (`Σ_c n_c · kv_stride_c`): the per-layer KV spans SUMMED over every launch
+    // block, one block per (class, iteration). A SUM OF SPANS, never a max END: banking re-bases
+    // offsets per bank, so the last layer of a banked pool sits at a small offset of its OWN bank
+    // and a max-end would silently understate it. For an unbanked pool the blocks are packed
+    // contiguously, so the sum IS the last end — the same number as before banking. 0 when there
+    // is no paged KV.
+    let kv_page_stride = {
+        let mut total = 0u64;
+        for &(body, iter) in &launches {
+            let mut lo = None;
+            let mut hi = None;
+            for (t0, tids) in &per_layer {
+                if body_of_tid(*t0) != Some(body as usize) {
+                    continue;
+                }
+                let Some(p) = bundle_layout.placements.get(&tids[iter as usize]) else {
+                    continue;
+                };
+                if p.segment != kv_seg {
+                    continue;
+                }
+                lo = Some(lo.map_or(p.offset, |l: u64| l.min(p.offset)));
+                hi = Some(hi.map_or(align128(p.offset + p.size), |h: u64| {
+                    h.max(align128(p.offset + p.size))
+                }));
+            }
+            if let (Some(lo), Some(hi)) = (lo, hi) {
+                total += align128(hi.saturating_sub(lo));
+            }
+        }
+        total
+    };
     // ⛔ AND ONE BANK PER LAUNCH GROUP. A launch is handed ONE base per segment, so a program whose
     // weight operands span two banks cannot be expressed AT ALL — there is no offset that reaches
     // both. `group_weight_banks` was accumulated over the ops as they were emitted, so this is the

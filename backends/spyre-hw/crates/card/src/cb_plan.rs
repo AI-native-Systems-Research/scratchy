@@ -27,9 +27,24 @@ use scratchy_target_spyre::bundle_code::collective::{
 };
 use scratchy_target_spyre::fold_plan;
 
-/// The base one segment's tensors resolve against for this launch — the weight
-/// BANK's region for the weight segment (bank 0 IS `seg_addr[WEIGHT]`; bank
-/// `b ≥ 1` is `banks[b - 1]`), the segment's own region otherwise. Shared by
+/// ⭐ THE SESSION'S REGION TABLES, AS ONE TYPE — the positional segments, the weight
+/// segment's extra banks and the KV segment's. The three always travel together (a launch
+/// resolves each segment's base through whichever of them owns it — see
+/// [`segment_base`]), so the BUNDLE is the parameter: three loose slices at every call
+/// site is a `banks`/`kv_banks` swap waiting to compile.
+pub(crate) struct SegTables<'a> {
+    /// The positional segments (`Executor::seg_addr`), bank 0 of both banked segments
+    /// included.
+    pub(crate) seg: &'a [Option<DevAddr>; NUM_SEGMENTS],
+    /// The weight segment's extra banks (`Executor::weight_bank_addr`), bank `b ≥ 1`.
+    pub(crate) banks: &'a [Option<DevAddr>],
+    /// The KV segment's extra banks (`Executor::kv_bank_addr`), bank `b ≥ 1`.
+    pub(crate) kv_banks: &'a [Option<DevAddr>],
+}
+
+/// The base one segment's tensors resolve against for this launch — the weight BANK's region for
+/// the weight segment and the KV BANK's for the KV segment (bank 0 IS `seg_addr[seg]`; bank
+/// `b ≥ 1` is `banks[b - 1]` / `kv_banks[b - 1]`), the segment's own region otherwise. Shared by
 /// the walk and the canvas construction so the bank selection cannot drift
 /// between them. Refusals are the walk's own, verbatim — except that a bank slot which
 /// exists but holds no region yet, which the walk's old code only reached as
@@ -37,11 +52,12 @@ use scratchy_target_spyre::fold_plan;
 /// same unreachable-at-launch corner: prepare refuses a bank with no region
 /// before any launch can name it).
 fn segment_base<'a>(
-    seg: &'a [Option<DevAddr>; NUM_SEGMENTS],
-    banks: &'a [Option<DevAddr>],
+    tables: &SegTables<'a>,
     weight_bank: usize,
+    kv_bank: usize,
     i: usize,
 ) -> Result<&'a DevAddr> {
+    let (seg, banks, kv_banks) = (tables.seg, tables.banks, tables.kv_banks);
     if i == SEG_WEIGHT.get() {
         match weight_bank.checked_sub(1) {
             None => seg[i]
@@ -51,6 +67,18 @@ fn segment_base<'a>(
                 anyhow!(
                     "launch: weight bank {weight_bank} has no region ({} bank(s))",
                     banks.len() + 1
+                )
+            }),
+        }
+    } else if i == SEG_KV.get() {
+        match kv_bank.checked_sub(1) {
+            None => seg[i]
+                .as_ref()
+                .ok_or_else(|| anyhow!("seg{i} has no region")),
+            Some(b) => kv_banks.get(b).and_then(|a| a.as_ref()).ok_or_else(|| {
+                anyhow!(
+                    "launch: KV bank {kv_bank} has no region ({} bank(s))",
+                    kv_banks.len() + 1
                 )
             }),
         }
@@ -104,8 +132,7 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
     oi: usize,
     request: u32,
     rep: i64,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
+    tables: &SegTables<'_>,
     where_: &LaunchWhere,
 ) -> Result<LaunchSite> {
     let op = &ops[oi];
@@ -125,6 +152,10 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
     // handing a different region here is the whole mechanism that lets one segment's
     // worth of addresses span several regions. Bank 0 (`weight_bank` = 0, every unbanked
     // bundle) is `seg_addr[SEG_WEIGHT]`, exactly as before.
+    // ⭐ AND THE SAME MECHANISM IS THE KV SLOT'S: positional slot 2 is "the pools" to the program,
+    // and a pool outgrowing one region is banked the same way — the launch row's `kv_bank` hands a
+    // different region per layer, bank 0 (`kv_bank` = 0, every unbanked bundle) being
+    // `seg_addr[SEG_KV]`, exactly as before.
     // ⭐ AND A COLLECTIVE'S CONSUME TAKES NEITHER: its weight-segment operand is the receive window,
     // one placement in the base region, so `weight_slot` pins it to shift 0 in bank 0 — the one law
     // the walk and the canvas construction both read through this function.
@@ -133,14 +164,9 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
         .kv
         .weight_slot(off[SEG_WEIGHT.get()], where_.weight_bank);
     off[SEG_WEIGHT.get()] = weight_shift;
-    let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
     let mut ta = Vec::with_capacity(NUM_SEGMENTS);
     for (i, &sh) in off.iter().enumerate() {
-        let base = if i == SEG_WEIGHT.get() {
-            wbase
-        } else {
-            segment_base(seg, banks, weight_bank, i)?
-        };
+        let base = segment_base(tables, weight_bank, where_.kv_bank, i)?;
         ta.push(
             if sh > 0
                 && base.is_single_chunk()
@@ -326,8 +352,7 @@ pub(crate) fn base_addr_entry<T: ktir_superdsc::collective::Tp>(to: Rank<T>) -> 
 /// every launch fences.
 pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
     ops: &Ops<T>,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
+    tables: &SegTables<'_>,
     where_: &LaunchWhere,
 ) -> Result<(Vec<BatchedCb>, bool)> {
     let mut items = Vec::new();
@@ -337,7 +362,7 @@ pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
     // request-outer, and every other op launches once.
     let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
     for l in fold_plan::launches(&kvs, where_.requests.count) {
-        let site = launch_site(ops, l.op, l.request, l.rep, seg, banks, where_)?;
+        let site = launch_site(ops, l.op, l.request, l.rep, tables, where_)?;
         barrier = true;
         items.extend(site_cbs(ops[l.op].site_tp(), site.batched_compute())?);
     }
@@ -368,12 +393,11 @@ impl WalkCanvas {
     /// canvas from this door is never empty.
     pub(crate) fn of_walk<T: ktir_superdsc::collective::Tp>(
         ops: &Ops<T>,
-        seg: &[Option<DevAddr>; NUM_SEGMENTS],
-        banks: &[Option<DevAddr>],
+        tables: &SegTables<'_>,
         where_: &LaunchWhere,
         stream: &Stream<'_>,
     ) -> Result<Self> {
-        let (items, barrier) = walk_items(ops, seg, banks, where_)?;
+        let (items, barrier) = walk_items(ops, tables, where_)?;
         Ok(Self {
             cbs: std::sync::Arc::new(stream.render_batch(&items, 1)?),
             barrier,

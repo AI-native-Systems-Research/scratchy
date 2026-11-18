@@ -687,6 +687,8 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No banking: banks exist for a weight segment too big for one device region, and one
         // Triton kernel's parameters are one region each.
         weight_bank_bytes: Vec::new(),
+        // No KV banking either: a Triton kernel places no paged pools.
+        kv_bank_bytes: Vec::new(),
         // No spilled tail, for the same reason: every parameter is its own region.
         weight_tail: WeightTail::InPlace,
         // No matmul KERNEL re-tile descriptors. These are built ONLY from a `DeviceTileLayout`

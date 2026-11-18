@@ -453,6 +453,9 @@ fn run_loaded(
     let layout = scratchy_target_spyre::bundle_code::BundleLayout {
         segment_bytes,
         weight_bank_bytes: std::borrow::Cow::Owned(Vec::new()),
+        // No KV banks: a Triton-lowered bundle places no paged pools, so its KV segment is
+        // empty and fits any one region.
+        kv_bank_bytes: std::borrow::Cow::Owned(Vec::new()),
         // No weight tail to spill: a single-kernel bundle's parameters are one region each.
         weight_tail: scratchy_target_spyre::bundle_code::WeightTail::InPlace,
         places: std::borrow::Cow::Owned(places),
