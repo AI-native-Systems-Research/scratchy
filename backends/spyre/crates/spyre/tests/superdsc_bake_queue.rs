@@ -4,7 +4,7 @@
 //! alone — an inline test would silently never run.
 
 use scratchy_target_spyre::superdsc_bake::{
-    Bake, COMPILE_WIDTH, DxpTool, MAX_STAGED_BYTES, StageRoot, compile_width,
+    Bake, COMPILE_WIDTH, DxpTool, EmitNs, MAX_STAGED_BYTES, StageRoot, compile_width,
 };
 
 /// ⭐ THE DISK BOUND AND THE COMPILE WIDTH ARE SEPARATE NUMBERS.
@@ -81,11 +81,43 @@ fn staging_is_per_process_and_env_overridable() {
         "staging must be per-process: {}",
         s.path().display()
     );
+    let dir = s.group_dir(EmitNs::mint(), "deadbeefdeadbeef", 7);
+    let text = dir.to_string_lossy();
     assert!(
-        s.group_dir("deadbeefdeadbeef", 7)
-            .ends_with("deadbeefdeadbeef/group_7")
+        text.contains("deadbeefdeadbeef") && text.ends_with("group_7"),
+        "the group dir must keep the fp and the group visible: {text}"
     );
     unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_STAGE") };
+}
+
+/// ⛔ NO TWO EMITS SHARE A STAGING DIRECTORY (#1209). Two worlds can emit the same fp — the collector
+/// is per world, and the fp gate only orders them — and a world renders its own concrete addresses,
+/// so neither the memo nor the gate keeps the second pass out of the tree. The per-emit namespace is
+/// the whole fence: minted once per staging pass, never repeated, so every delete on the staging path
+/// (the success read, the cache hit, the pending twin) meets only its own emit's directory.
+#[test]
+fn two_emits_never_share_a_staging_directory() {
+    let s = StageRoot::resolve();
+    let a = EmitNs::mint();
+    let b = EmitNs::mint();
+    assert_ne!(a, b, "the emit ordinal must not repeat");
+    assert_eq!(
+        s.group_dir(a, "deadbeefdeadbeef", 7),
+        s.group_dir(a, "deadbeefdeadbeef", 7),
+        "one emit's groups land under one stable namespace"
+    );
+    assert_ne!(
+        s.group_dir(a, "deadbeefdeadbeef", 7),
+        s.group_dir(b, "deadbeefdeadbeef", 7),
+        "two emits of the SAME fp must not share a group directory"
+    );
+    // The layout still names the bundle and the group: dxp error messages quote the path.
+    let p = s.group_dir(a, "deadbeefdeadbeef", 7);
+    let text = p.to_string_lossy();
+    assert!(
+        text.contains("deadbeefdeadbeef") && text.ends_with("group_7"),
+        "the path must keep the fp and the group visible: {text}"
+    );
 }
 
 /// Absent the override, staging is the temp dir — never the old bundle cache location.

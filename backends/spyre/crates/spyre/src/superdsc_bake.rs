@@ -943,6 +943,31 @@ pub type Bake = BakeQueue;
 #[derive(Clone, Debug)]
 pub struct StageRoot(PathBuf);
 
+/// The staging namespace ONE EMIT owns — the `e<n>` in `<root>/<fp>/e<n>/group_<i>`.
+///
+/// ⛔ NO TWO EMITS SHARE A STAGING DIRECTORY, WHATEVER THEY SHARE (#1209). Two emits can share a
+/// fingerprint: a bundle re-emitted for another world is the same KTIR under a different `Tp`, and
+/// the fp gate serializes them only to order the check-and-insert. The memo is NO protection there —
+/// its key is the [`GroupDigest`] over the rendered json, and a world renders different concrete
+/// addresses for the same KTIR (a sharded forward's layout places its collective windows where an
+/// unsharded one places nothing), so the second world's groups MISS [`BakeQueue::adopt`] and stage
+/// while the first's dxp children are still compiling the very same directories. Whichever side
+/// settles first then deletes the shared dir — the success read ([`read_compiled`]), the cache hit,
+/// or the pending twin in [`BakeQueue::submit`] — under the other's live compiler, and dxp refuses
+/// with `no bundle to compile`. The ordinal is the whole fence: minted once per staging pass, never
+/// repeated in the process, so every delete on the staging path meets a directory its own emit
+/// staged. A same-world double emit of one fp is immune for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EmitNs(u64);
+
+impl EmitNs {
+    /// Mint the next namespace. Monotonic per process; the number names nothing but the pass.
+    pub fn mint() -> EmitNs {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        EmitNs(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 impl StageRoot {
     pub fn resolve() -> StageRoot {
         let base = match std::env::var_os("SCRATCHY_SUPERDSC_STAGE") {
@@ -953,10 +978,15 @@ impl StageRoot {
         StageRoot(base.join(format!("superdsc-stage-{}", std::process::id())))
     }
 
-    /// The staging dir for one group of one bundle — `<root>/<fp>/group_<i>`, so a dxp error message
-    /// names the bundle and group it refused.
-    pub fn group_dir(&self, fp: &str, gi: usize) -> PathBuf {
-        self.0.join(fp).join(format!("group_{gi}"))
+    /// The staging dir for one group of one emit — `<root>/<fp>/e<n>/group_<i>`, so a dxp error
+    /// message still names the bundle and group it refused, and `e<n>` is the emitting pass's own
+    /// [`EmitNs`]: two emits that share an fp never share a directory, so a delete on the staging
+    /// path only ever deletes its own emit's.
+    pub fn group_dir(&self, ns: EmitNs, fp: &str, gi: usize) -> PathBuf {
+        self.0
+            .join(fp)
+            .join(format!("e{}", ns.0))
+            .join(format!("group_{gi}"))
     }
 
     pub fn path(&self) -> &Path {
@@ -970,17 +1000,31 @@ impl StageRoot {
 /// ⛔ AN IDENTITY, NOT A DIRECTORY, because the identity is the return channel: a result is either
 /// filed under the id that was submitted or the build fails naming it. A directory as the channel
 /// cannot report a group nobody looked for.
+///
+/// ⛔⛔ THE EMIT IS PART OF THE IDENTITY (the #1209 identity race). Two worlds emit the SAME fp —
+/// each renders its own concrete addresses, so each compiles its OWN program for the same group —
+/// and an id keyed by fp and group alone filed both under ONE `results` entry, the last writer
+/// winning SILENTLY (the staging-namespace fix had just made both compiles succeed, so the
+/// collision that used to fail loudly as `no bundle to compile` stopped failing at all). Both
+/// worlds' bundles then referenced the one surviving program, and one of them necessarily received
+/// the OTHER world's — the wrong concrete addresses, and the serving world reads zeros where it
+/// staged its logits. [`EmitNs`] in the key mirrors the directory law ([`StageRoot::group_dir`])
+/// one level up: the emit that staged the program is the emit that owns its result. The memo and
+/// the disk cache stay keyed by DIGEST — identical content still compiles once, and a follower
+/// records the shared program under its own emit-unique id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GroupId {
     /// The emitting bundle's content fingerprint.
     pub fp: String,
+    /// The emitting pass — the same staging namespace the program was staged (or adopted) under.
+    pub ns: EmitNs,
     /// Launch order within that bundle.
     pub group: u32,
 }
 
 impl std::fmt::Display for GroupId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/group_{}", self.fp, self.group)
+        write!(f, "{}/e{}/group_{}", self.fp, self.ns.0, self.group)
     }
 }
 
@@ -1531,8 +1575,9 @@ struct Shared {
     compiled: AtomicUsize,
     /// Device-image bytes compiled, for the build log.
     device_bytes: AtomicUsize,
-    /// ⭐ EVERY COMPILED GROUP, BY IDENTITY. The emit's output, in memory, drained by
-    /// [`BakeQueue::finish`].
+    /// ⭐ EVERY COMPILED GROUP, BY IDENTITY — AND THE IDENTITY CARRIES THE EMIT ([`GroupId`]):
+    /// two worlds that emit one fp each compile their own program, and both records must survive.
+    /// The emit's output, in memory, drained by [`BakeQueue::finish`].
     results: Mutex<HashMap<GroupId, Arc<CompiledGroup>>>,
     /// Groups handed over and not yet accounted for — see [`Latch`].
     inflight: Latch,
@@ -1540,7 +1585,9 @@ struct Shared {
 
 impl Shared {
     /// File `id`'s program — the return channel, keyed by identity: the group is either here for
-    /// the emitter to bake, or the build fails naming it.
+    /// the emitter to bake, or the build fails naming it. The id carries the emit, so two worlds
+    /// emitting one fp record under two keys and BOTH records stand — the last writer can win
+    /// nothing that is not its own.
     fn record(&self, id: GroupId, g: Arc<CompiledGroup>) {
         self.compiled.fetch_add(1, Ordering::Relaxed);
         self.device_bytes
@@ -2099,13 +2146,15 @@ mod tests {
         unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) >= 0 }
     }
 
-    /// A staged group of `bytes` whose identity is its submission number.
+    /// A staged group of `bytes` whose identity is its submission number — one fresh emit per
+    /// call, exactly as a staging pass mints one.
     fn staged(n: u32, bytes: usize) -> SealedGroup {
         let files = vec![(format!("g{n}"), String::new())];
         SealedGroup::of_rendered(
             PathBuf::from(format!("group_{n}")),
             GroupId {
                 fp: "f".to_string(),
+                ns: EmitNs::mint(),
                 group: n,
             },
             &crate::lower_subtile_tape_to_superdsc::GroupInput {
@@ -2129,6 +2178,161 @@ mod tests {
         }
         let order: Vec<u32> = (0..4).map(|_| q.pop().expect("queued").id.group).collect();
         assert_eq!(order, [1, 2, 3, 0]);
+    }
+
+    /// A queue with no tool, no workers and no cache — the record/adopt/settle laws exercised
+    /// without dxp. The pool's threads are the only thing [`BakeQueue::start`] adds beyond this,
+    /// and none of these laws is theirs.
+    fn queueless() -> BakeQueue {
+        BakeQueue {
+            stage: StageRoot::resolve(),
+            shared: Arc::new(Shared {
+                budget: StageBudget::new(),
+                memo: Mutex::new(HashMap::new()),
+                memo_hits: AtomicUsize::new(0),
+                cache: None,
+                disk_hits: AtomicUsize::new(0),
+                queue: GroupQueue::default(),
+                reaper: Arc::new(Reaper::default()),
+                compiled: AtomicUsize::new(0),
+                device_bytes: AtomicUsize::new(0),
+                results: Mutex::new(HashMap::new()),
+                inflight: Latch::default(),
+            }),
+            submitted: std::sync::atomic::AtomicU64::new(0),
+            workers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// One world's id for one fp and group — the emit is minted per call, exactly as a staging
+    /// pass mints one.
+    fn world_id(fp: &str, group: u32) -> GroupId {
+        GroupId {
+            fp: fp.to_string(),
+            ns: EmitNs::mint(),
+            group,
+        }
+    }
+
+    /// A program whose identity is its entry point, so a bundle resolving the OTHER world's
+    /// program is a pointer mismatch, not a coincidence.
+    fn program(entry: u64) -> Arc<CompiledGroup> {
+        Arc::new(CompiledGroup {
+            init_binary: vec![entry as u8],
+            job_bin_ptr: entry,
+            correction: Vec::new(),
+        })
+    }
+
+    fn held(q: &BakeQueue) -> Vec<GroupId> {
+        let r = q.shared.results.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<GroupId> = r.keys().cloned().collect();
+        ids.sort_by_key(|i| (i.fp.clone(), i.ns.0, i.group));
+        ids
+    }
+
+    /// ⛔⭐ TWO WORLDS EMIT ONE fp, AND `results` HOLDS BOTH PROGRAMS (#1209's identity race).
+    ///
+    /// Two worlds emit the same fp — a bundle re-emitted for another `Tp` is the same KTIR — and
+    /// each renders its own concrete addresses, so each compiles its OWN program for the same
+    /// group. Keyed by fp and group alone, both records filed under ONE entry: the last writer
+    /// won SILENTLY (the staging-namespace fix had just made both compiles succeed, so the
+    /// collision that used to fail loudly as `no bundle to compile` stopped failing at all), and
+    /// one world's bundle necessarily baked the other's program — the wrong concrete addresses,
+    /// and the serving world read zeros where it staged its logits. The emit in the key is the
+    /// whole fence, mirroring [`StageRoot::group_dir`]'s law one level up.
+    ///
+    /// This is the forward completion order: the first emit's compile lands first. The reversed
+    /// order is `whichever_emit_lands_last_each_resolves_its_own_program`.
+    #[test]
+    fn two_worlds_emitting_one_fp_each_resolve_their_own_program() {
+        let q = queueless();
+        let one = world_id("f", 3);
+        let two = world_id("f", 3);
+        assert_ne!(one, two, "two emits must not share an identity");
+        let a = program(0xAA);
+        let b = program(0xBB);
+        q.shared.record(one.clone(), Arc::clone(&a));
+        q.shared.record(two.clone(), Arc::clone(&b));
+        assert_eq!(held(&q).len(), 2, "both worlds' records must stand");
+        assert!(
+            Arc::ptr_eq(&q.compiled_group(&one).expect("one's program"), &a),
+            "the first emit must resolve ITS program"
+        );
+        assert!(
+            Arc::ptr_eq(&q.compiled_group(&two).expect("two's program"), &b),
+            "the second emit must resolve ITS program"
+        );
+    }
+
+    /// ⛔⭐ THE NEAR MISS: a same-world double emit still dedups — ONE program, and BOTH
+    /// references valid.
+    ///
+    /// The emit in the key must not cost the memo: identical content still compiles once, and a
+    /// follower records the shared program under its own emit-unique id — through
+    /// [`BakeQueue::adopt`] when the compile has landed, and as a `Pending` follower (settled by
+    /// [`Shared::settle`]) when it has not. Both legs here; one program (`Arc::ptr_eq`) and two
+    /// standing references in each.
+    #[test]
+    fn a_same_world_double_emit_dedups_and_keeps_both_references() {
+        let q = queueless();
+        let key = GroupDigest::of(&[("g0".to_string(), String::new())]);
+        let first = world_id("f", 0);
+        let twin = world_id("f", 0);
+        let g = program(0xC0);
+        // The twin attaches while the first's compile is still pending: one enter for the first's
+        // submit, one for the twin's adopt — exactly the accounting `settle` leaves for.
+        q.shared.inflight.enter();
+        q.shared.inflight.enter();
+        q.shared
+            .memo
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, MemoState::Pending(vec![twin.clone()]));
+        q.shared.settle(key, first.clone(), Ok(Arc::clone(&g)));
+        assert_eq!(held(&q).len(), 2, "one program, two references");
+        assert!(Arc::ptr_eq(
+            &q.compiled_group(&first).expect("first's reference"),
+            &g
+        ));
+        assert!(Arc::ptr_eq(
+            &q.compiled_group(&twin).expect("twin's reference"),
+            &g
+        ));
+        // A later same-world emit adopts the settled program under its own id too.
+        let later = world_id("f", 0);
+        assert!(q.adopt(&later, key), "a settled key must be adoptable");
+        assert!(Arc::ptr_eq(
+            &q.compiled_group(&later).expect("later's reference"),
+            &g
+        ));
+        assert_eq!(held(&q).len(), 3, "every reference stands, one program");
+    }
+
+    /// ⛔⭐ THE REVERSED COMPLETION ORDER: the second emit's compile lands FIRST, and the
+    /// assertion of `two_worlds_emitting_one_fp_each_resolve_their_own_program` must hold either
+    /// way — the two records are independent keys, so no completion order can make one overwrite
+    /// the other. (The defect was order-DEPENDENT: record order was compile-completion order,
+    /// stable on one pod, which is what made the regression deterministic.)
+    #[test]
+    fn whichever_emit_lands_last_each_resolves_its_own_program() {
+        let q = queueless();
+        let one = world_id("f", 3);
+        let two = world_id("f", 3);
+        let a = program(0xAA);
+        let b = program(0xBB);
+        // The second emit's compile forced first.
+        q.shared.record(two.clone(), Arc::clone(&b));
+        q.shared.record(one.clone(), Arc::clone(&a));
+        assert_eq!(held(&q).len(), 2, "both worlds' records must stand");
+        assert!(
+            Arc::ptr_eq(&q.compiled_group(&one).expect("one's program"), &a),
+            "the first emit must resolve ITS program regardless of landing order"
+        );
+        assert!(
+            Arc::ptr_eq(&q.compiled_group(&two).expect("two's program"), &b),
+            "the second emit must resolve ITS program regardless of landing order"
+        );
     }
 
     /// A child that outlives the test if the reap is missing, so a leak is visible rather than racing
