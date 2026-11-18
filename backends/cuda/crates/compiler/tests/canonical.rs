@@ -1263,6 +1263,28 @@ fn a_model_with_no_vocab_is_refused() {
     assert!(matches!(e, ModelRefusal::NoVocab));
 }
 
+/// A model whose config declares no `rope_theta` and whose tape builds a rotary table is refused
+/// by name at that bucket, before any tape is kept: two roped heads of 256 over the fixture's 512
+/// columns.
+#[test]
+fn a_model_with_no_rope_theta_is_refused() {
+    let mut input = tied_model(&[128], "lm_head", 256);
+    input.facts = ModelFacts::new(FactsParts {
+        attention: Some(scratchy_subtile::fixtures::attention_at(
+            2,
+            1,
+            256,
+            1.0 / 16.0,
+        )),
+        ..input.facts.parts()
+    });
+    input.buckets[0].lowered = rope_only(128, 512, 256);
+    assert_eq!(input.rope_theta, None);
+    let e = lower_model(&input).expect_err("refused");
+    assert!(e.to_string().contains("rope_theta"), "{e}");
+    assert!(matches!(e, ModelRefusal::NoRopeTheta { m: 128 }), "{e:?}");
+}
+
 /// A weight the handoff names no checkpoint prefix for, and a table with no prefix.
 #[test]
 fn a_weight_with_no_prefix_is_refused() {
