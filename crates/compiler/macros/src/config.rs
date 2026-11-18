@@ -152,8 +152,8 @@ impl LayerCount {
 }
 
 /// The attention head dim a config states, or the one the loader derives where it states none
-/// (`hidden_size / num_attention_heads`, MLA's `qk_nope + qk_rope`: [`derive_implicit_bounds`],
-/// the one derivation). Never zero.
+/// (`hidden_size / num_attention_heads`, or a decoder state's row ahead of that fallback:
+/// [`derive_implicit_bounds`], the one derivation). Never zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadDim(std::num::NonZeroU32);
 
@@ -4384,11 +4384,14 @@ mod tests {
             }
         }
         let dir = repo_model_archs("llama");
-        let spec = load_arch_json(&dir).expect("arch.json");
+        let mut spec = load_arch_json(&dir).expect("arch.json");
+        // The flag is the arch's default, not the config's: a config integer reaches the bounds
+        // before derivation whatever table the loader reads, an arch default only through the
+        // gate-flag loop over the table it is handed.
+        spec.bound_defaults.push(("probe_gate".to_string(), 1));
         let path = dir.join("llama-3.2-1b.json");
-        let mut json: serde_json::Value =
+        let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-        json["probe_gate"] = serde_json::json!(1);
         let dims = DimTable::assemble(&[&GatedProbe]).expect("the probe assembles");
         let mp =
             model_params_from_json(&json, "s", &path, Vec::new(), &spec, &dims).expect("parse");

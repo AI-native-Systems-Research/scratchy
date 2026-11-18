@@ -398,7 +398,17 @@ carrier calls). The touch points: the decoder state crate
 `crates/models/typed/src/decoder_states.rs`, the one list of decoder states a build
 compiles; and the `-p scratchy-state-decoder-mla` lines of the test and clippy steps, the nightly
 compile_fail doctest step, and that step's coverage comment in
-`.github/workflows/rust.yml`.
+`.github/workflows/rust.yml`. Removing a decoder state also removes each arch that
+uses it: for MLA, GLM-4.7-Flash's carrier (`crates/models/arch/dsl/glm4-moe-lite.py`),
+its configs dir (`crates/models/arch/configs/glm4-moe-lite/`, whose `weights.json`
+reads MLA's derived dims), and its stem and arch features in
+`crates/models/arch/Cargo.toml`. It also removes the tests that
+load its arch's configs by its dims: for MLA, `crates/models/typed/tests/glm4_moe_lite.rs`
+and the GLM-4.7-Flash and stated-head-dim tests at the end of
+`crates/compiler/macros/src/config.rs`'s tests, and the checkpoint header fixtures those
+loads are checked against (`crates/compiler/macros/tests/weight_headers/glm-4.7-flash.json`
+and `crates/compiler/macros/tests/bundle_headers/glm-4.7-flash-4bit.json`). MLA's dim rules are also restated in
+Python in `crates/targets/metal/models/tests/golden_gen_carrier.py`, whose MLA lines go too.
 
 The decoder state crate states each op once, through `scratchy_decoder_state::state_op!`:
 the op's typed signature (the `fn` a carrier's call is type-checked
@@ -420,7 +430,28 @@ another crate; the crate reaches its own module by
 that the module does not declare does not build. Its op and input names must not
 collide with a core op, an op a compiler pass synthesizes, a parser special
 form, a core extern or another decoder state's names: the build fails naming both
-claimants. The Metal bake fails with `StateUnlowered` until the decoder state has
+claimants.
+
+A decoder state declares its own derived dims, the config bounds its weights' shapes
+read that no config states (MLA's projection widths and per-head width): each is a
+`const` `DerivedDim` in its crate, listed after the inputs as `dims = [...]` in
+`decoder_state!`, in the order they derive. The build assembles them once, after the
+core rows (`DERIVED_DIMS` in `crates/compiler/frontend/src/dim.rs`), into the one table the
+config loader derives every config by and the typed carriers spell as types; the table
+is the build's, so a row derives for any config that carries its inputs. A dim named
+like a core row, another decoder state's, or one the same decoder state already lists
+fails the build naming both claimants. A row reads only a row derived before it (one at
+an earlier stage, or above it at its own), and only a core row or its own decoder
+state's, with one exception below; any other read fails the build. A row at
+`DeriveStage::BeforeFallbacks` derives ahead of the generic fallbacks, so it wins over
+them (a config stating the name still wins over it), and may only name one a fallback
+gives: `head_dim` or `num_key_value_heads` (`FALLBACK_DIMS`). The exception: a row at
+any later stage, a core row or any decoder state's, may read such a row, whichever
+decoder state's it is. Deleting that decoder state leaves the fallback's value in its
+place where the config gives the fallback's inputs (`head_dim` needs `hidden_size` to
+divide by `num_attention_heads`); otherwise the config is refused, as GLM-4.7-Flash is
+without MLA. The typed carriers spell a row ahead of the fallbacks as a plain bound,
+not as its rule. The Metal bake fails with `StateUnlowered` until the decoder state has
 a Metal lowering, so the arch's stems stay out of `all` until then.
 
 ### 5. Commit a correctness golden
