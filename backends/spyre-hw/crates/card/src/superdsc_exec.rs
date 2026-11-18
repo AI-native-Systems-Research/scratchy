@@ -34,7 +34,7 @@ use crate::runtime::{
 };
 use scratchy_target_spyre::allocator::HostBytes;
 use scratchy_target_spyre::bundle_code::{
-    self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols,
+    self as bundle, KernelWeight, KvBank, NUM_SEGMENTS, Placement, SweptCols,
 };
 use scratchy_target_spyre::fold_plan::{self, OpKv};
 use scratchy_target_spyre::sen_convert;
@@ -414,6 +414,9 @@ pub(crate) struct LaunchWhere {
     pub(crate) byte_off: [u64; NUM_SEGMENTS],
     /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
     pub(crate) weight_bank: usize,
+    /// ⭐ Which KV region backs the positional pool slot — the launch row's own layer region,
+    /// [`KvBank::BASE`] for the prefix, the suffix and every unrolled bundle.
+    pub(crate) kv_bank: KvBank,
     /// ⭐ HOW MANY REQUESTS THIS LAUNCH SERVES, and the pitch their tables sit at — the request half
     /// of `fold_plan`'s relaunch law (a walking bundle's span repeats once per request, its tables
     /// `request · pitch` into the activation segment). ONE request at no pitch is every launch
@@ -1152,17 +1155,17 @@ enum SourceFiller {
 /// The re-rolled layer loop: ONE BODY PER ATTENTION CLASS, each re-launched for its own layers
 /// with the weight and KV segment bases shifted per layer, between a prefix (embed) and a suffix
 /// (lm_head). ⭐ THE LAUNCH TABLE IS DECLARED DATA — one row per layer, in true layer order, each
-/// naming its body and its segment shifts. There is no per-layer arithmetic left here: no
-/// `v·weight_stride`, no `v / layers_per_bank`, no `v·kv_stride`. A class-split model's classes
-/// have DIFFERENT per-layer strides and different layer counts, which is exactly why the shifts
-/// are a table the bake proved against the placements rather than formulae the runtime re-derives.
+/// naming its body, its weight shift and its KV region. There is no per-layer arithmetic left here:
+/// no `v·weight_stride`, no `v / layers_per_bank`. A class-split model's classes have DIFFERENT
+/// per-layer strides and different layer counts, which is exactly why the shifts are a table the
+/// bake proved against the placements rather than formulae the runtime re-derives.
 struct Rolled {
     /// How many attention classes there are (one body each). 1 for every single-class model.
     n_bodies: usize,
-    /// ⭐ ONE ROW PER LAYER, IN TRUE LAYER ORDER — which body runs it and the segment shifts the
-    /// launch applies. `(body, w_bank, w_off, kv_off)`: the launch binds bank `w_bank` into
-    /// positional slot 1, shifts seg1's base by `w_off` and seg2's by `kv_off`.
-    launches: Vec<(usize, u8, u64, u64)>,
+    /// ⭐ ONE ROW PER LAYER, IN TRUE LAYER ORDER — the baked launch table itself: the launch binds
+    /// weight bank `w_bank` into positional slot 1 shifted by `w_off`, and the layer's own KV
+    /// region `kv_bank` into slot 2.
+    launches: Vec<bundle::LayerLaunch>,
     /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
     /// proved each group's weights live in ONE bank, because a launch has one base per segment.
     prefix_weight_bank: usize,
@@ -1254,6 +1257,14 @@ pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     /// shadow over it. Mirrors [`Self::seg_aliased`], which cannot cover banks because it is indexed
     /// by segment.
     weight_bank_aliased: Vec<bool>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS' REGIONS — one per layer past bank 0, index `b - 1`
+    /// ([`KvBank::extra`]); bank 0 IS `seg_addr[SEG_KV]`. Filled once: by [`Self::prepare`] for the
+    /// pool's owner, by [`Self::alias_seg_from`] with the owner's own regions for a borrower (a
+    /// session borrows the whole pool or none of it — `seg_borrowed[SEG_KV]`). The pools hold no
+    /// host bytes, so a bank is a region to zero-fill or alias, never to stage.
+    kv_bank_addr: Vec<DevAddr>,
+    /// The bundle's KV bank extents ([`bundle::BundleLayout::kv_bank_bytes`]).
+    kv_bank_bytes: &'static [u64],
     /// One slot's host side (see [`HostShadow`]): a real staging/mirror buffer, or the typed
     /// statement that the slot is device-only. Sized by [`Executor::stage_weights`] from the
     /// bundle's own role statement (see [`Executor::host_owned_seg`]).
@@ -1699,6 +1710,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 .collect(),
             weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
+            kv_bank_addr: Vec::new(),
+            kv_bank_bytes: &code.layout.kv_bank_bytes,
             seg_host: [const { HostShadow::Host(HostBuf::empty()) }; NUM_SEGMENTS],
             read_ring: Vec::new(),
             read_ring_free: Vec::new(),
@@ -1818,11 +1831,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         }
         self.rolled = Some(Rolled {
             n_bodies: m.bodies.len(),
-            launches: m
-                .launches
-                .iter()
-                .map(|l| (l.body as usize, l.w_bank, l.w_off, l.kv_off))
-                .collect(),
+            launches: m.launches.to_vec(),
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
         });
@@ -1830,14 +1839,13 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         self.suffix_ops = self.sibling_ops("rolled suffix", &m.suffix)?;
         debug!(
             "[sdsc-superdsc] load: RE-ROLLED — {} body class(es) + prefix({}) + suffix({}); {} \
-             launch(es), page_stride={} B",
+             launch(es)",
             m.bodies.len(),
             m.prefix.as_str(),
             m.suffix.as_str(),
             m.launches.len(),
-            m.kv_page_stride
         );
-        // The launch table verbatim — body/iter/w_bank/w_off/kv_off per layer, in true order. This
+        // The launch table verbatim — body/iter/w_bank/w_off/kv_bank per layer, in true order. This
         // is the arithmetic the card run's launch loop applies, so a card fault at a known device
         // address is traced to its producing launch by reading this against the region bases the
         // prepare-time seg-alloc debug prints.
@@ -3068,6 +3076,21 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 })?,
             );
         }
+        // ⭐ AND ONE REGION PER LAYER PAST BANK 0 — each layer's KV pools are their own allocation
+        // (`place_kv_pools`). A borrowing session takes the owner's regions at
+        // [`Self::alias_seg_from`] and allocates none.
+        if !self.seg_borrowed[SEG_KV.get()] {
+            self.kv_bank_addr = self
+                .kv_bank_bytes
+                .iter()
+                .enumerate()
+                .map(|(b, &bytes)| {
+                    DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                        anyhow!("prepare: KV bank {} alloc of {bytes} B failed: {e}", b + 1)
+                    })
+                })
+                .collect::<Result<_>>()?;
+        }
         lap("seg-alloc", &mut t0);
         // ⭐ THE REGION BASES, ONCE PER SESSION. A card HMI fault names a device address; these
         // lines are what turns that address into "which segment/bank, which offset" — chunk0's
@@ -3093,6 +3116,14 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 "[sdsc-superdsc] seg-alloc bank{}: bytes={} chunk0={:?} (padded total {})",
                 b + 1,
                 self.weight_bank_bytes[b],
+                a.chunk0(),
+                a.total_size().as_u64()
+            );
+        }
+        for (b, (a, bytes)) in self.kv_bank_addr.iter().zip(self.kv_bank_bytes).enumerate() {
+            debug!(
+                "[sdsc-superdsc] seg-alloc kv-bank{}: bytes={bytes} chunk0={:?} (padded total {})",
+                b + 1,
                 a.chunk0(),
                 a.total_size().as_u64()
             );
@@ -3197,6 +3228,19 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     &mapper,
                     &mut pinned,
                     &format!("prepare: weight bank {}", b + 1),
+                )?;
+            }
+        }
+        // ⭐ AND EVERY LAYER'S KV REGION IS BORN ZEROS, like seg2 itself, by the device's own fill.
+        // A borrowed pool is the owner's, already filled and holding live KV; a reserve-only
+        // session is about to be aliased — the same pass the segment loop gives seg2.
+        if !self.seg_borrowed[SEG_KV.get()] && !reserve_only {
+            let stream = self.stream_ref()?;
+            for (b, addr) in self.kv_bank_addr.iter().enumerate() {
+                fill_zero_walk(
+                    stream,
+                    addr,
+                    &format!("prepare: KV bank {} zero fill", b + 1),
                 )?;
             }
         }
@@ -3594,6 +3638,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
         // bundle, which is what makes banking invisible to every model whose weights fit one region.
         weight_bank: usize,
+        // ⭐ WHICH KV REGION backs positional slot 2 — the launch row's own layer region.
+        kv_bank: KvBank,
     ) -> Result<()> {
         let d = Diag::get();
         // The list is taken out so `&self` stays free for the stream and the fold state; every op
@@ -3606,6 +3652,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             LaunchWhere {
                 byte_off,
                 weight_bank,
+                kv_bank,
                 // One request — the count a packed prefill launch states is a later law's; every
                 // launch today serves one, and the span law is inert at one.
                 requests: fold_plan::Requests::default(),
@@ -3682,8 +3729,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     oi,
                     request,
                     rep,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
+                    &cb_plan::SegTables {
+                        seg: &self.seg_addr,
+                        banks: &self.weight_bank_addr,
+                        kv_banks: &self.kv_bank_addr,
+                    },
                     &where_,
                 )?;
                 // The walk's own locals, re-bound from the site: `ta` as the borrows the submit
@@ -5331,12 +5381,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // region by construction (`bank_weight_segment` refuses to bank without layer classes),
             // so bank 0 is the only bank there is.
             let ls = self.list_sel_for(sel, 0);
-            return self.launch_ops(ls, zero, 0);
+            return self.launch_ops(ls, zero, 0, KvBank::BASE);
         };
         let pre_bank = rolled.prefix_weight_bank;
         let suf_bank = rolled.suffix_weight_bank;
 
-        self.launch_ops(ListSel::Prefix, zero, pre_bank)?;
+        self.launch_ops(ListSel::Prefix, zero, pre_bank, KvBank::BASE)?;
 
         // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
         // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
@@ -5344,7 +5394,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // differ, and the resident KV is shared.
         let sel = self.step_body(seq_pos)?.sel;
         // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
-        // order, each naming its body's CLASS and the segment shifts the launch applies — no
+        // order, each naming its body's CLASS, its weight shift and its own KV region — no
         // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
         // against the placements that were baked (see the launch-table guard in
         // `lower_subtile_tape_to_ktir`), so this loop cannot disagree with the layout: it reads
@@ -5354,7 +5404,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // (sorted by absolute layer id), which a single-class roll degenerates to
         // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
         // COPIED OUT before the loop: each launch takes `&mut self`, so the table cannot be
-        // borrowed out of `self.rolled` across them. It is one small tuple per layer — the copy
+        // borrowed out of `self.rolled` across them. It is one small row per layer — the copy
         // is the table's bytes, not a graph.
         let launches: Vec<_> = self
             .rolled
@@ -5362,12 +5412,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             .expect("checked above")
             .launches
             .clone();
-        for (body, wbank, woff, kvoff) in launches {
+        for l in launches {
             let mut off = [0u64; NUM_SEGMENTS];
-            off[SEG_WEIGHT.get()] = woff;
-            off[SEG_KV.get()] = kvoff;
-            let ls = self.list_sel_for(sel, body);
-            self.launch_ops(ls, off, wbank as usize)?;
+            off[SEG_WEIGHT.get()] = l.w_off;
+            let ls = self.list_sel_for(sel, l.body as usize);
+            self.launch_ops(ls, off, l.w_bank as usize, l.kv_bank)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
@@ -5380,7 +5429,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
         // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
         match suffix {
-            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank),
+            SuffixLaunch::Launched => {
+                self.launch_ops(ListSel::Suffix, zero, suf_bank, KvBank::BASE)
+            }
             SuffixLaunch::Skipped => Ok(()),
         }
     }
@@ -5476,18 +5527,19 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: r.prefix_weight_bank,
+                        kv_bank: KvBank::BASE,
                         requests: fold_plan::Requests::default(),
                     },
                 ));
-                for (class, wbank, woff, kvoff) in r.launches.clone() {
+                for l in r.launches.clone() {
                     let mut off = [0u64; NUM_SEGMENTS];
-                    off[SEG_WEIGHT.get()] = woff;
-                    off[SEG_KV.get()] = kvoff;
+                    off[SEG_WEIGHT.get()] = l.w_off;
                     specs.push((
-                        self.list_sel_for(sel, class),
+                        self.list_sel_for(sel, l.body as usize),
                         LaunchWhere {
                             byte_off: off,
-                            weight_bank: wbank as usize,
+                            weight_bank: l.w_bank as usize,
+                            kv_bank: l.kv_bank,
                             requests: fold_plan::Requests::default(),
                         },
                     ));
@@ -5497,6 +5549,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: r.suffix_weight_bank,
+                        kv_bank: KvBank::BASE,
                         requests: fold_plan::Requests::default(),
                     },
                 ));
@@ -5508,6 +5561,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: 0,
+                        kv_bank: KvBank::BASE,
                         requests: fold_plan::Requests::default(),
                     },
                 ));
@@ -5522,8 +5576,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             }
             row_canvases.push(cb_plan::WalkCanvas::of_walk(
                 ops,
-                &self.seg_addr,
-                &self.weight_bank_addr,
+                &cb_plan::SegTables {
+                    seg: &self.seg_addr,
+                    banks: &self.weight_bank_addr,
+                    kv_banks: &self.kv_bank_addr,
+                },
                 &where_,
                 stream,
             )?);
@@ -5563,7 +5620,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
             None => (ListSel::Body(0), 0),
         };
-        self.launch_ops(sel, zero, bank)?;
+        self.launch_ops(sel, zero, bank, KvBank::BASE)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
@@ -6298,6 +6355,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
                 self.weight_bank_aliased[b] = true;
             }
+        }
+        // ⭐⭐ AND EVERY LAYER'S KV REGION — they ARE the KV segment. The placement-equality check
+        // above compared every pool's (bank, offset, size), and every bundle of the model places
+        // its pools through the one `place_kv_pools`, so the owner's regions are this bundle's.
+        if i == SEG_KV.get() {
+            self.kv_bank_addr = owner.kv_bank_addr.clone();
         }
         Ok(())
     }

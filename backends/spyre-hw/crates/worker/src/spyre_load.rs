@@ -1476,16 +1476,15 @@ impl SpyreWorker {
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
-                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, placed in the KV segment of
-                // every bundle at the decode wiring's own page count (the model's context, or as much of
-                // it as one device region holds: `paged_step::pool_slots`). Nothing here sizes it: the
-                // OWNER session allocates the segment once, and every other session aliases it.
+                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its own region of
+                // the KV segment, at the decode wiring's own page count (the model's context). Nothing
+                // here sizes it: the OWNER session allocates the regions once, and every other session
+                // aliases them.
                 let step = wirings.decode.paged.ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
-                let pool_need_bytes = code.layout.segment_bytes
-                    [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()];
+                let pool_need_bytes = code.layout.kv_pool_bytes();
                 let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
@@ -1842,15 +1841,6 @@ impl SpyreWorker {
                         funded / (1024 * 1024),
                         non_kv_bytes / (1024 * 1024),
                         pool_need_bytes / (1024 * 1024),
-                    )));
-                }
-                // ⛔ AND THE POOL IS **ONE** ALLOCATION, so it cannot exceed one region however much
-                // tensor capacity is left over.
-                if pool_need_bytes > card_bytes.max_single_allocation() {
-                    return Err(werr(format!(
-                        "the bake's {} MB KV pool is past the {} MB one device allocation can be",
-                        pool_need_bytes / (1024 * 1024),
-                        card_bytes.max_single_allocation() / (1024 * 1024),
                     )));
                 }
                 // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own

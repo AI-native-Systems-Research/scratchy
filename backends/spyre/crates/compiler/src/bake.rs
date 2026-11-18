@@ -1683,6 +1683,7 @@ fn layout_tokens(
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout {
         segment_bytes,
         weight_bank_bytes,
+        kv_bank_bytes,
         weight_tail,
         places,
         kernel_weights,
@@ -1699,6 +1700,9 @@ fn layout_tokens(
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let wbanks = weight_bank_bytes
+        .iter()
+        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+    let kvbanks = kv_bank_bytes
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places_interner.ident(places);
@@ -1758,6 +1762,7 @@ fn layout_tokens(
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
             weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
+            kv_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#kvbanks),*]),
             weight_tail: #tail,
             places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
@@ -2066,7 +2071,6 @@ fn reroll_tokens(
         rungs,
         fallback_rung,
         launches,
-        kv_page_stride,
         prefix_weight_bank,
         suffix_weight_bank,
     } = m;
@@ -2103,29 +2107,26 @@ fn reroll_tokens(
             iter,
             w_bank,
             w_off,
-            kv_off,
+            kv_bank,
         } = l;
-        let (b, it, wb) = (
+        let (b, it, wb, kb) = (
             proc_macro2::Literal::u8_unsuffixed(*body),
             proc_macro2::Literal::u32_unsuffixed(*iter),
             proc_macro2::Literal::u8_unsuffixed(*w_bank),
+            proc_macro2::Literal::u32_unsuffixed(kv_bank.get()),
         );
-        let (wo, ko) = (
-            proc_macro2::Literal::u64_unsuffixed(*w_off),
-            proc_macro2::Literal::u64_unsuffixed(*kv_off),
-        );
+        let wo = proc_macro2::Literal::u64_unsuffixed(*w_off);
         quote! {
             ::scratchy_target_spyre::bundle_code::LayerLaunch {
                 body: #b,
                 iter: #it,
                 w_bank: #wb,
                 w_off: #wo,
-                kv_off: #ko,
+                kv_bank: ::scratchy_target_spyre::bundle_code::KvBank::of_placement(#kb),
             }
         }
     });
-    let (kps, pwb, swb) = (
-        proc_macro2::Literal::u64_unsuffixed(*kv_page_stride),
+    let (pwb, swb) = (
         proc_macro2::Literal::u32_unsuffixed(*prefix_weight_bank),
         proc_macro2::Literal::u32_unsuffixed(*suffix_weight_bank),
     );
@@ -2138,7 +2139,6 @@ fn reroll_tokens(
             rungs: ::std::borrow::Cow::Borrowed(&[#(#rungs),*]),
             fallback_rung: #fallback_rung,
             launches: ::std::borrow::Cow::Borrowed(&[#(#launches),*]),
-            kv_page_stride: #kps,
             prefix_weight_bank: #pwb,
             suffix_weight_bank: #swb,
         }
@@ -2547,8 +2547,8 @@ pub(crate) fn dump_wavefront_mega(
     // resident cache is a baked dimension (the GPU target takes `decode_position` as a
     // runtime arg over a host-allocated cache instead): every layer's K and V pools hold the
     // model's `max_position_embeddings` token slots — vLLM's own default `max_model_len` — in whole
-    // scheduler pages, as much of it as one device region holds (below). Nothing else caps it and
-    // nothing in the environment moves it: the page walk reads
+    // scheduler pages, each layer's pools their own device region (`place_kv_pools`). Nothing else
+    // caps it and nothing in the environment moves it: the page walk reads
     // only the pages a step's context reaches (its walk rungs, spyre-inference's `num_blocks`
     // buckets), so the pool's size is memory the steps touch, never time.
     // Resident prefix-cache capacity as `NonZeroU32` end-to-end: the 0-row case
@@ -2588,48 +2588,7 @@ pub(crate) fn dump_wavefront_mega(
             primary_m,
         )
     };
-    let mut first = lower_at(prefix_len);
-    // ⭐ AND THE POOL IS WHAT ONE DEVICE REGION HOLDS OF IT (`paged_step::pool_slots`): the KV
-    // segment is one allocation, so a model whose every-layer K and V of its whole context outgrow
-    // one region (granite-3.1-8b: 20 GiB) gets the whole pages that fit, and serves a context up to
-    // them. The bytes a slot costs are the lowered tape's own prefix K and V sources.
-    let prefix_len = {
-        let kv_slot_bytes: Option<u64> = first.as_ref().ok().map(|l| {
-            l.bindings()
-                .iter()
-                .zip(&l.input.sources)
-                .filter(|(b, _)| {
-                    matches!(
-                        b,
-                        scratchy_forward_compiler_macro::to_wavefront::SourceBinding::PrefixK { .. }
-                            | scratchy_forward_compiler_macro::to_wavefront::SourceBinding::PrefixV { .. }
-                    )
-                })
-                .map(|(_, s)| u64::from(s.cols) * 2)
-                .sum()
-        });
-        match kv_slot_bytes {
-            Some(bytes) => {
-                let pool = scratchy_target_spyre::paged_step::pool_slots(prefix_len.get(), bytes)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "[spyre] {stem}: one position's K and V across every layer ({bytes} B) \
-                             leave not one {page_slots}-slot page inside a device region"
-                        )
-                    });
-                if pool < prefix_len {
-                    eprintln!(
-                        "[spyre] {stem}: the KV pool holds {pool} of the model's {prefix_len} \
-                         positions — {bytes} B a position across every layer, one device region \
-                         in all"
-                    );
-                    first = lower_at(pool);
-                }
-                pool
-            }
-            None => prefix_len,
-        }
-    };
+    let first = lower_at(prefix_len);
     let lowered = match first {
         // A quant weight scheme the wavefront/superdsc lowering does not emit (int4/ggml, or fp8 until
         // wired) genuinely has NO superdsc bundle — skip THIS preset (return no bundle). This
@@ -3895,23 +3854,24 @@ pub(crate) fn dump_wavefront_mega(
                                                 if card {
                                                     // ⭐ ZIPPED FROM THE WALK'S OWN TABLES —
                                                     // `launches` (the true layer order), `launch_w`
-                                                    // and `launch_kv` (the per-launch segment
-                                                    // shifts, read off the placements and PROVEN
-                                                    // against them in the walk) — so the table the
-                                                    // runtime plays cannot disagree with the
-                                                    // addresses the bake placed.
+                                                    // (the weight shifts, read off the placements
+                                                    // and PROVEN against them in the walk) and
+                                                    // `launch_kv` (each layer's KV region, the
+                                                    // layout's own) — so the table the runtime
+                                                    // plays cannot disagree with the addresses the
+                                                    // bake placed.
                                                     rolled
                                                         .launches
                                                         .iter()
                                                         .zip(&rolled.launch_w)
                                                         .zip(&rolled.launch_kv)
-                                                        .map(|((&(b, it), &(wb, wo)), &ko)| {
+                                                        .map(|((&(b, it), &(wb, wo)), &kb)| {
                                                             superdsc::bundle::LayerLaunch {
                                                                 body: b,
                                                                 iter: it,
                                                                 w_bank: wb,
                                                                 w_off: wo,
-                                                                kv_off: ko,
+                                                                kv_bank: kb,
                                                             }
                                                         })
                                                         .collect()
@@ -3921,7 +3881,7 @@ pub(crate) fn dump_wavefront_mega(
                                                         iter: 0,
                                                         w_bank: 0,
                                                         w_off: 0,
-                                                        kv_off: 0,
+                                                        kv_bank: superdsc::bundle::KvBank::BASE,
                                                     }]
                                                 };
                                             let meta = superdsc::bundle::RerollMeta {
@@ -3955,15 +3915,6 @@ pub(crate) fn dump_wavefront_mega(
                                                 rungs: std::borrow::Cow::Owned(decode_rungs),
                                                 fallback_rung,
                                                 launches: std::borrow::Cow::Owned(baked_launches),
-                                                kv_page_stride: if card {
-                                                    // One pool page = EVERY layer of EVERY
-                                                    // class — the walk's own max-end over the
-                                                    // per-class last-layer KV placements (0
-                                                    // when the bundle has no paged KV).
-                                                    rolled.kv_page_stride
-                                                } else {
-                                                    0
-                                                },
                                                 prefix_weight_bank: if card {
                                                     rolled.prefix_weight_bank
                                                 } else {
@@ -4225,10 +4176,9 @@ pub(crate) fn dump_wavefront_mega(
                                             }
                                             eprintln!(
                                                 "[spyre-superdsc] {base}: 3 bundles baked — prefix {pfp} / body {bfp} + {} class(es), {} launch(es) \
-                                                 / suffix {sfp}; page_stride={} B (dxp: SMALL bundles → seconds)",
+                                                 / suffix {sfp} (dxp: SMALL bundles → seconds)",
                                                 rolled.bodies.len(),
                                                 rolled.launches.len(),
-                                                rolled.kv_page_stride,
                                             );
                                             // Stamp the DECODE body_fp or the PREFILL body_fp by phase
                                             // (the prefill reroll must NOT clobber the decode fp).

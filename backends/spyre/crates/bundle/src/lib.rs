@@ -158,7 +158,7 @@ pub use ktir_superdsc::ktir_node::{Elementwise, Program};
 pub use ktir_superdsc::place::{OpLocalKind, OpLocalRole, PlaceId, SynthId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
-pub use ktir_superdsc::placement::WeightTail;
+pub use ktir_superdsc::placement::{KvBank, WeightTail};
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +249,12 @@ pub struct BundleLayout<'a> {
     /// coordinate rather than another segment (there is no free segment slot: 0/3 are
     /// intermediates+activations, 2 is KV, 4 logits, 5+6 intermediate COLORS).
     pub weight_bank_bytes: Cow<'a, [u64]>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS, in bank order — bytes of banks `1..N`, one per (class,
+    /// iteration) launch block past the first ([`KvBank`]), so bank `b`'s extent is
+    /// `kv_bank_bytes[b - 1]` and bank 0's is `segment_bytes[SEG_KV]`. Each layer's pools are
+    /// their own device allocation, so the pool holds the model's whole context however its total
+    /// compares to a region. Empty for a bundle that places no per-layer pools.
+    pub kv_bank_bytes: Cow<'a, [u64]>,
     /// ⭐ WHERE THE NON-PER-LAYER WEIGHT TAIL LIVES — the bake's verdict, not the runtime's inference.
     /// [`WeightTail::Spilled`] is the work list every borrowing session's tail copy reads; see
     /// [`WeightTail`] for why this is a field.
@@ -346,6 +352,13 @@ impl<'a> BundleLayout<'a> {
             None => self.segment_bytes.get(weight_seg).copied(),
             Some(i) => self.weight_bank_bytes.get(i).copied(),
         }
+    }
+
+    /// ⭐ THE KV POOL'S BYTES: bank 0 ([`Self::segment_bytes`] at `SegRole::Kv`) plus every extra
+    /// bank ([`Self::kv_bank_bytes`]).
+    pub fn kv_pool_bytes(&self) -> u64 {
+        self.segment_bytes[ktir_superdsc::placement::SegRole::Kv.segment()]
+            + self.kv_bank_bytes.iter().sum::<u64>()
     }
 
     /// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this SHIPPED layout's packed size for
@@ -737,12 +750,11 @@ pub struct LadderRung<'a> {
 /// entry per layer, in the order the layers actually execute, each naming its body (an index into
 /// [`RerollMeta::bodies`]) and its class-relative iteration.
 ///
-/// ⛔ THE OFFSETS ARE THE PLACEMENTS', DISTILLED. `w_off`/`w_bank`/`kv_off` are the per-segment shifts
-/// the launch applies: `(w_bank, w_off + placement(t₀).offset)` must equal `placement(t_v)` for every
-/// per-layer weight `t` of the body's class — a relation the lowering PROVES at cargo-build for every
-/// tensor and every layer, so the runtime never re-derives an address from a stride. This is what
-/// makes a per-class stride, a class-major KV base and a weight BANK all the same thing at launch
-/// time: three columns of one table instead of three formulae that could disagree with the layout.
+/// ⛔ THE OFFSETS ARE THE PLACEMENTS', DISTILLED. `w_bank`/`w_off` are the weight segment's shift:
+/// `(w_bank, w_off + placement(t₀).offset)` must equal `placement(t_v)` for every per-layer weight
+/// `t` of the body's class — a relation the lowering PROVES at cargo-build for every tensor and every
+/// layer, so the runtime never re-derives an address from a stride. `kv_bank` is the KV segment's:
+/// the layer's own pool region, whose pools sit at the body's own baked offsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayerLaunch {
     /// Which body (index into [`RerollMeta::bodies`]) runs this layer.
@@ -753,8 +765,9 @@ pub struct LayerLaunch {
     pub w_bank: u8,
     /// The weight-segment offset shift (from the body's baked layer-0 offsets).
     pub w_off: u64,
-    /// The KV-segment offset shift.
-    pub kv_off: u64,
+    /// The KV region this layer's pools live in — the layout's own
+    /// (`placement::BundleLayout::kv_block_banks`).
+    pub kv_bank: KvBank,
 }
 
 /// The re-rolled layer loop: ONE BODY PER ATTENTION CLASS, each re-launched for its own layers with
@@ -785,11 +798,6 @@ pub struct RerollMeta<'a> {
     /// One entry per layer, IN TRUE LAYER ORDER — see [`LayerLaunch`]. The executor runs exactly
     /// this sequence; there is no per-layer arithmetic left at runtime.
     pub launches: Cow<'a, [LayerLaunch]>,
-    /// ⭐ THE WHOLE PAGE, STATED ONCE — bytes of one pool page = every layer of every class
-    /// (`Σ_c n_c · kv_stride_c`). It used to be derived at runtime as `iters × kv_stride`, which is
-    /// only the same thing when every layer has the same KV geometry; gemma-4's two classes do not
-    /// (sliding 8×256 vs global 1×512), so the number is baked where the packing that decided it is.
-    pub kv_page_stride: u64,
     /// The weight bank the PREFIX program's weight operands live in, and the SUFFIX's.
     ///
     /// ⛔ A LAUNCH HAS ONE BASE PER SEGMENT, so each group's weights must be in ONE bank — proven at
@@ -1075,7 +1083,6 @@ mod tests {
             rungs: Cow::Owned(rungs),
             fallback_rung,
             launches: Cow::Owned(Vec::new()),
-            kv_page_stride: 0,
             prefix_weight_bank: 0,
             suffix_weight_bank: 0,
         };
@@ -1130,9 +1137,8 @@ mod tests {
                 iter: 0,
                 w_bank: 0,
                 w_off: 0,
-                kv_off: 0,
+                kv_bank: KvBank::BASE,
             }]),
-            kv_page_stride: 786432,
             // Every layer in one bank — the unbanked case, where every launch binds bank 0.
             prefix_weight_bank: 0,
             suffix_weight_bank: 0,
