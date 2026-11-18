@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Test-only: a program through the typed-Rust emit pass and rustc, as the build script and this
-//! crate's compile take every carrier, and then run. So a test's own DSL body gets its shapes from
+//! Test-only: a program through the typed-Rust emit pass and rustc, as `scratchy-models-typed`'s
+//! build script and compile take every carrier, and then run. So a test's own DSL body gets its shapes from
 //! rustc's type checker, as the bake's carriers do, and a program whose shapes are wrong is
 //! refused with rustc's own message.
 //!
-//! The program compiles as a binary of its own: the signature module (`typed_shapes.rs`, its
-//! `include!` of the build script's output replaced by this program's emitted module), the dim
-//! vocabulary (`dim.rs`) and the two ids the trace keys by. Running it prints the trace.
+//! The program compiles as a binary of its own: the typed program's module (`scratchy-models-typed`'s
+//! `lib.rs`, its `include!` of the build script's output replaced by this program's emitted
+//! module), the dim vocabulary (`dim.rs`) and the two ids the trace keys by. Running it prints the trace.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -130,17 +130,40 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
-/// The binary's source: the signatures with `emitted` in place of the build script's output, the
-/// dim vocabulary, the ids, and a `main` printing the trace.
+/// The binary's source: the typed program's module with the signature crate's source and `emitted`
+/// in place of its import of the signatures and the build script's output, the dim vocabulary, the
+/// ids, and a `main` printing the trace.
 fn standalone(emitted: &str) -> String {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"));
     let read = |p: &str| std::fs::read_to_string(src.join(p)).expect(p);
     let include = "include!(concat!(env!(\"OUT_DIR\"), \"/typed_carriers.rs\"));";
-    let signatures = read("src/typed_shapes.rs");
+    let signatures = read("../../models/typed/src/lib.rs");
     assert!(
         signatures.contains(include),
-        "typed_shapes.rs includes the build script's output"
+        "scratchy-models-typed includes the build script's output"
     );
+    // The build's decoder state list and the typing over it are the crate's, not its typed program's: a
+    // body names no decoder state.
+    let decoder_states = "mod decoder_states;\npub use decoder_states::decoder_states;\n";
+    let typing = "mod typing;\npub use typing::typing;\n";
+    assert!(
+        signatures.contains(decoder_states) && signatures.contains(typing),
+        "scratchy-models-typed declares its decoder state list and typing apart"
+    );
+    // The signature crate's source, in place of its import, with the front end at the paths the
+    // standalone program defines it at.
+    let bounds_include = "include!(concat!(env!(\"OUT_DIR\"), \"/signature_bounds.rs\"));";
+    let shapes = read("../typed-shapes/src/lib.rs");
+    assert!(
+        shapes.contains(bounds_include),
+        "scratchy-typed-shapes includes the build script's signature bounds"
+    );
+    let vocabulary = shapes
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split yields one part")
+        .replace(bounds_include, &typed_emit::emit_signature_markers())
+        .replace("scratchy_forward_compiler_frontend::", "crate::");
     format!(
         "mod dim {{\n{dim}\n}}\n\
          mod classified {{\n\
@@ -152,7 +175,12 @@ fn standalone(emitted: &str) -> String {
          mod typed_shapes {{\n{signatures}\n}}\n\
          {MAIN}",
         dim = read("../frontend/src/dim.rs"),
-        signatures = signatures.replace(include, emitted),
+        signatures = signatures
+            .replace("use scratchy_typed_shapes::*;", &vocabulary)
+            .replace("scratchy_typed_shapes::trace(", "trace(")
+            .replace(include, emitted)
+            .replace(decoder_states, "")
+            .replace(typing, ""),
     )
 }
 

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use crate::draft_capture::DRAFT_CAPTURE_LAYERS;
 use crate::hf_config::{extract_bounds, normalize_hf_config};
 use crate::quantization::QuantizationConfig;
+use scratchy_forward_compiler_frontend::state::DimTable;
 
 /// One model's parameters, loaded from one `config.json`.
 #[derive(Clone, Debug)]
@@ -151,8 +152,8 @@ impl LayerCount {
 }
 
 /// The attention head dim a config states, or the one the loader derives where it states none
-/// (`hidden_size / num_attention_heads`, MLA's `qk_nope + qk_rope`: [`derive_implicit_bounds`],
-/// the one derivation). Never zero.
+/// (`hidden_size / num_attention_heads`, or a decoder state's row ahead of that fallback:
+/// [`derive_implicit_bounds`], the one derivation). Never zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadDim(std::num::NonZeroU32);
 
@@ -515,13 +516,17 @@ impl std::error::Error for ConfigError {}
 ///
 /// Results are sorted alphabetically by file stem for build
 /// determinism; synthesized variants appear after their base.
+///
+/// `dims`: the derived dims each config derives by, the ones its carrier's program was classified
+/// under (`Program::dims`: the core rows, then each decoder state's).
 pub fn load_dir(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    dims: &DimTable,
     scope: &Scope,
     target: &dyn crate::target::TargetEmitter,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Decoder, spec, scope, target)
+    load_dir_mode(dir, ConfigMode::Decoder, spec, dims, scope, target)
 }
 
 /// [`load_dir`] for a `#[vision_forward]` crate's configs/ dir.
@@ -532,10 +537,11 @@ pub fn load_dir(
 pub fn load_dir_vision(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    dims: &DimTable,
     scope: &Scope,
     target: &dyn crate::target::TargetEmitter,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Vision, spec, scope, target)
+    load_dir_mode(dir, ConfigMode::Vision, spec, dims, scope, target)
 }
 
 /// Process-wide count of models actually forward-expanded (dense bases +
@@ -793,6 +799,7 @@ fn load_dir_mode(
     dir: &Path,
     mode: ConfigMode,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    dims: &DimTable,
     scope: &Scope,
     target: &dyn crate::target::TargetEmitter,
 ) -> Result<Vec<ModelParams>, ConfigError> {
@@ -1017,7 +1024,7 @@ fn load_dir_mode(
         // from it.
         if !arch_has_active_quant {
             tracing::info!("[COMPILING] base {}", stem);
-            let model = model_params_from_json_mode(&json, &stem, p, tracked, mode, spec)?;
+            let model = model_params_from_json_mode(&json, &stem, p, tracked, mode, spec, dims)?;
             out.push(model);
             total_models_emitted_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1116,6 +1123,7 @@ fn load_dir_mode(
                     extra_tracked,
                     mode,
                     spec,
+                    dims,
                 )?;
                 out.push(variant);
                 total_models_emitted_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1194,11 +1202,21 @@ pub(crate) fn carries_head(
     crate::hf_config::carries_head(&head.params, &head.config_aliases, json)
 }
 
+/// The derived dims of the decoder states every build compiles (`scratchy_models_typed::typing()`),
+/// assembled with the core ones: what this crate's tests read a config by, one file at a time, so
+/// it derives as the build does. A caller elsewhere states its own (`Typing::dims`).
+#[cfg(test)]
+pub(crate) fn build_dims() -> DimTable {
+    (scratchy_models_typed::typing().dims())
+        .unwrap_or_else(|e| panic!("the build's decoder states assemble: {e}"))
+}
+
 /// Load a single config.json as a dense-base ModelParams.
 ///
-/// Test-only: the macro reads configs through the directory walk, not one file at a time.
+/// Test-only: the macro reads configs through the directory walk, not one file at a time. `dims`
+/// are the derived dims it derives by, the caller's build's (`Typing::dims`).
 #[cfg(any(test, feature = "test-support"))]
-pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
+pub fn load_file(path: &Path, dims: &DimTable) -> Result<ModelParams, ConfigError> {
     let (_, json) = read_json_file(path)?;
     let stem = stem_of(path)?;
     // The arch's declarations are part of what a config means (its RoPE base where the config
@@ -1206,7 +1224,7 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     let dir = path
         .parent()
         .ok_or_else(|| ConfigError::NotADirectory(path.to_path_buf()))?;
-    model_params_from_json(&json, &stem, path, Vec::new(), &load_arch_json(dir)?)
+    model_params_from_json(&json, &stem, path, Vec::new(), &load_arch_json(dir)?, dims)
 }
 
 /// Deep-merge `<stem>.overrides.json` onto `json` when the file exists, pushing
@@ -1266,11 +1284,12 @@ fn merge_variant_config(
 /// a real build compiles. Both matter: a hand-rolled sequence previously skipped
 /// the base's `<stem>.overrides.json`, and a `DeclaredArchSpec::default()` drops
 /// arch-level facts like `decoder_safetensors_prefix`, either of which leaves a
-/// test asserting against something the build never produces.
+/// test asserting against something the build never produces. `dims` as [`load_file`]'s.
 #[cfg(any(test, feature = "test-support"))]
 pub fn load_file_with_preset(
     config_path: &Path,
     preset_path: &Path,
+    dims: &DimTable,
 ) -> Result<ModelParams, ConfigError> {
     let base_stem = stem_of(config_path)?;
     let preset_stem = stem_of(preset_path)?;
@@ -1286,7 +1305,7 @@ pub fn load_file_with_preset(
     let merged = merge_variant_config(dir, &base_json, &variant_stem, &preset_json, &mut tracked)?;
 
     let spec = load_arch_json(dir)?;
-    model_params_from_json(&merged, &variant_stem, config_path, tracked, &spec)
+    model_params_from_json(&merged, &variant_stem, config_path, tracked, &spec, dims)
 }
 
 /// One dense base as the macro's directory walk loads it: its `<stem>.overrides.json` and its
@@ -1344,7 +1363,15 @@ fn load_file_declared_mode(
     let mut tracked: Vec<PathBuf> = Vec::new();
     apply_overrides_file(dir, &stem, &mut json, &mut tracked)?;
     let spec = load_arch_json(dir)?;
-    model_params_from_json_mode(&json, &stem, config_path, tracked, mode, &spec)
+    model_params_from_json_mode(
+        &json,
+        &stem,
+        config_path,
+        tracked,
+        mode,
+        &spec,
+        &build_dims(),
+    )
 }
 
 /// Load one in-checkpoint head base — its TARGET's config through the head arch's own spec
@@ -1367,7 +1394,14 @@ pub fn load_head_file(
     let mut tracked: Vec<PathBuf> = Vec::new();
     apply_overrides_file(head_arch_dir, &stem, &mut json, &mut tracked)?;
     let spec = load_arch_json(head_arch_dir)?;
-    model_params_from_json(&json, &stem, target_config_path, tracked, &spec)
+    model_params_from_json(
+        &json,
+        &stem,
+        target_config_path,
+        tracked,
+        &spec,
+        &build_dims(),
+    )
 }
 
 /// Read + parse a JSON file, returning the raw string (for
@@ -1614,14 +1648,25 @@ fn model_params_from_json_mode(
     extra_tracked_paths: Vec<PathBuf>,
     mode: ConfigMode,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    dims: &DimTable,
 ) -> Result<ModelParams, ConfigError> {
     match mode {
-        ConfigMode::Decoder => {
-            model_params_from_json(json, source_stem, source_path, extra_tracked_paths, spec)
-        }
-        ConfigMode::Vision => {
-            vision_params_from_json(json, source_stem, source_path, extra_tracked_paths, spec)
-        }
+        ConfigMode::Decoder => model_params_from_json(
+            json,
+            source_stem,
+            source_path,
+            extra_tracked_paths,
+            spec,
+            dims,
+        ),
+        ConfigMode::Vision => vision_params_from_json(
+            json,
+            source_stem,
+            source_path,
+            extra_tracked_paths,
+            spec,
+            dims,
+        ),
     }
 }
 
@@ -1859,6 +1904,7 @@ fn model_params_from_json(
     source_path: &Path,
     extra_tracked_paths: Vec<PathBuf>,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    dims: &DimTable,
 ) -> Result<ModelParams, ConfigError> {
     let json = &normalize_hf_config(json, &spec.config_aliases);
     let name = parse_name(source_stem, source_path)?;
@@ -1875,20 +1921,18 @@ fn model_params_from_json(
             limit: limit.clone(),
         });
     }
-    // A gated derived dim's flag, by the one rule the macros crate's build script reads it with
-    // (`hf_config::flag_value`: the config's, else the arch's default, else 0), so the width this
-    // model derives and the width its carrier's typed program states agree.
-    for flag in crate::dim::DERIVED_DIMS
-        .iter()
-        .filter_map(|d| d.rule.gate_flag())
-    {
+    // A gated derived dim's flag (any row of the assembled table, a decoder state's too), by the
+    // one rule the macros crate's build script reads it with (`hf_config::flag_value`: the
+    // config's, else the arch's default, else 0), so the width this model derives and the width
+    // its carrier's typed program states agree.
+    for flag in dims.rows().filter_map(|d| d.rule.gate_flag()) {
         let v =
             crate::hf_config::flag_value(json, &spec.config_aliases, &spec.bound_defaults, flag);
         if v != 0 {
             bounds.insert(flag.to_string(), v);
         }
     }
-    let mut derived = derive_implicit_bounds(&mut bounds);
+    let mut derived = derive_implicit_bounds(&mut bounds, dims);
     // Arch-declared bound defaults (zero-centered norms, sliding
     // cadence, router renorm, …): explicit config values always win.
     for (k, v) in &spec.bound_defaults {
@@ -1952,7 +1996,7 @@ fn model_params_from_json(
     let arch = resolve_arch_spec(spec, json, source_stem);
     let expert_activation = ExpertActivation::of(json);
 
-    derived.extend(apply_generic_bound_defaults(&mut bounds));
+    derived.extend(apply_generic_bound_defaults(&mut bounds, dims));
     let text = TextGeometry::of(&bounds, &scalars, source_path)?;
 
     Ok(ModelParams {
@@ -2004,6 +2048,7 @@ fn vision_params_from_json(
     source_path: &Path,
     extra_tracked_paths: Vec<PathBuf>,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    dims: &DimTable,
 ) -> Result<ModelParams, ConfigError> {
     let name = parse_name(source_stem, source_path)?;
     let architectures = parse_architectures(json);
@@ -2087,7 +2132,7 @@ fn vision_params_from_json(
     }
 
     let expert_activation = ExpertActivation::of(json);
-    derived.extend(apply_generic_bound_defaults(&mut bounds));
+    derived.extend(apply_generic_bound_defaults(&mut bounds, dims));
     // The decoder this tower feeds, as the wrapper's `text_config` states it — read through the
     // decoder path's own harvest (normalize, bounds, derivations, the arch's defaults), so the two
     // loaders state one geometry for one config.
@@ -2100,7 +2145,7 @@ fn vision_params_from_json(
                 reason,
             }
         })?;
-        derive_implicit_bounds(&mut text_bounds);
+        derive_implicit_bounds(&mut text_bounds, dims);
         let mut text_scalars = extract_scalars(&text_json);
         for (k, v) in &spec.scalar_defaults {
             text_scalars.entry(k.clone()).or_insert(*v);
@@ -2879,28 +2924,24 @@ pub(crate) fn derive_layer_sets(
         .collect())
 }
 
-/// Returns each bound it derived, as the dim it derived it from.
-fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) -> BTreeMap<String, crate::dim::Dim> {
+/// Returns each bound it derived, as the dim it derived it from. `dims` are the build's assembled
+/// derived dims, whose `BeforeFallbacks` rows derive here ahead of the `head_dim` /
+/// `num_key_value_heads` fallbacks, and whose `Implicit` rows after them.
+fn derive_implicit_bounds(
+    bounds: &mut BTreeMap<String, u64>,
+    dims: &DimTable,
+) -> BTreeMap<String, crate::dim::Dim> {
     use crate::dim::Dim;
     let mut derived = BTreeMap::new();
     let bound = |name: &str| Dim::Bound(name.to_string());
-    // MLA (DeepSeek family) head_dim — MUST run before the generic
-    // hidden/heads rule: MLA's per-head Q/K width is
-    // `qk_nope_head_dim + qk_rope_head_dim` (V2-Lite: 128+64=192),
-    // NOT hidden/heads (2048/16=128). The verbatim HF configs carry
-    // the two summands but no `head_dim`.
-    if !bounds.contains_key("head_dim")
-        && let (Some(&nope), Some(&rope)) = (
-            bounds.get("qk_nope_head_dim"),
-            bounds.get("qk_rope_head_dim"),
-        )
-    {
-        bounds.insert("head_dim".to_string(), nope + rope);
-        derived.insert(
-            "head_dim".to_string(),
-            crate::dim::canonical_add(vec![bound("qk_nope_head_dim"), bound("qk_rope_head_dim")]),
-        );
-    }
+    // A row before the fallbacks (a decoder state's own per-head width) wins over them; explicit
+    // values win over both.
+    crate::dim::derive_dims(
+        dims.rows(),
+        bounds,
+        crate::dim::DeriveStage::BeforeFallbacks,
+        &mut derived,
+    );
     if !bounds.contains_key("head_dim")
         && let (Some(&hidden), Some(&heads)) =
             (bounds.get("hidden_size"), bounds.get("num_attention_heads"))
@@ -2949,7 +2990,12 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) -> BTreeMap<String
     // Geometry dims referenced by weights.json shape exprs — pure
     // arithmetic over checkpoint fields, derived here so the configs/
     // files stay verbatim HF copies. Explicit values always win.
-    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::Implicit, &mut derived);
+    crate::dim::derive_dims(
+        dims.rows(),
+        bounds,
+        crate::dim::DeriveStage::Implicit,
+        &mut derived,
+    );
     derived
 }
 
@@ -2959,9 +3005,11 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) -> BTreeMap<String
 /// here — they are `bound_defaults` / `tie_default` declarations on
 /// the owning crate's `#[forward]` attribute (see [`crate::arch_spec`]).
 ///
-/// Returns each bound it derived, as the dim it derived it from.
+/// Returns each bound it derived, as the dim it derived it from. `dims` are the build's assembled
+/// derived dims, whose `AfterDefaults` rows derive here.
 fn apply_generic_bound_defaults(
     bounds: &mut BTreeMap<String, u64>,
+    dims: &DimTable,
 ) -> BTreeMap<String, crate::dim::Dim> {
     use crate::dim::Dim;
     let mut derived = BTreeMap::new();
@@ -3002,7 +3050,12 @@ fn apply_generic_bound_defaults(
     // defaults above so uniform-geometry arches (where those fall back
     // to `head_dim` / `num_key_value_heads`) resolve these identically
     // to `attn_q_dim` / `kv_dim`. Explicit config values always win.
-    crate::dim::derive_dims(bounds, crate::dim::DeriveStage::AfterDefaults, &mut derived);
+    crate::dim::derive_dims(
+        dims.rows(),
+        bounds,
+        crate::dim::DeriveStage::AfterDefaults,
+        &mut derived,
+    );
     derived
 }
 
@@ -3109,6 +3162,7 @@ mod tests {
         let dense = load_dir(
             dir,
             &spec,
+            &build_dims(),
             &Scope::all().with_quants(Vec::<String>::new()),
             &Shared,
         )
@@ -3123,7 +3177,7 @@ mod tests {
         files.sort();
         assert_eq!(bases, files, "every config loads as one dense variant");
 
-        let quantized = load_dir(dir, &spec, &Scope::all(), &Shared)
+        let quantized = load_dir(dir, &spec, &build_dims(), &Scope::all(), &Shared)
             .unwrap_or_else(|e| panic!("load {} with every preset: {e}", dir.display()));
         let mut got: Vec<&str> = quantized.iter().map(|c| c.source_stem.as_str()).collect();
         got.sort();
@@ -3208,6 +3262,7 @@ mod tests {
         let configs = load_dir_vision(
             &dir,
             &load_arch_json(&dir).expect("qwen2-vl arch.json"),
+            &build_dims(),
             &Scope::all(),
             &Shared,
         )
@@ -3336,8 +3391,14 @@ mod tests {
     #[test]
     fn bounds_are_sorted_by_stem_for_determinism() {
         let dir = repo_model_archs("llama");
-        let configs =
-            load_dir(&dir, &load_arch_json(&dir).unwrap(), &Scope::all(), &Shared).unwrap();
+        let configs = load_dir(
+            &dir,
+            &load_arch_json(&dir).unwrap(),
+            &build_dims(),
+            &Scope::all(),
+            &Shared,
+        )
+        .unwrap();
         let stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
         let mut sorted = stems.clone();
         sorted.sort();
@@ -3361,8 +3422,8 @@ mod tests {
         bounds.insert("global_head_dim".into(), 512);
         bounds.insert("num_global_key_value_heads".into(), 1);
 
-        derive_implicit_bounds(&mut bounds);
-        apply_generic_bound_defaults(&mut bounds);
+        derive_implicit_bounds(&mut bounds, &build_dims());
+        apply_generic_bound_defaults(&mut bounds, &build_dims());
 
         // Sliding-class dims (already derived pre-change) — sanity.
         assert_eq!(bounds.get("attn_q_dim"), Some(&4096)); // 16 * 256
@@ -3386,8 +3447,8 @@ mod tests {
         bounds.insert("global_head_dim".into(), 512);
         bounds.insert("num_global_key_value_heads".into(), 4);
 
-        derive_implicit_bounds(&mut bounds);
-        apply_generic_bound_defaults(&mut bounds);
+        derive_implicit_bounds(&mut bounds, &build_dims());
+        apply_generic_bound_defaults(&mut bounds, &build_dims());
 
         assert_eq!(bounds.get("q_global_dim"), Some(&16384)); // 32 * 512
         assert_eq!(bounds.get("k_global_dim"), Some(&2048)); // 4 * 512
@@ -3405,8 +3466,8 @@ mod tests {
         bounds.insert("num_key_value_heads".into(), 8);
         bounds.insert("head_dim".into(), 64);
 
-        derive_implicit_bounds(&mut bounds);
-        apply_generic_bound_defaults(&mut bounds);
+        derive_implicit_bounds(&mut bounds, &build_dims());
+        apply_generic_bound_defaults(&mut bounds, &build_dims());
 
         assert_eq!(bounds.get("q_global_dim"), bounds.get("attn_q_dim"));
         assert_eq!(bounds.get("k_global_dim"), bounds.get("kv_dim"));
@@ -3500,7 +3561,7 @@ mod tests {
             if let Some(limit) = limit {
                 json["time_step_limit"] = limit;
             }
-            model_params_from_json(&json, stem, &path, Vec::new(), &spec)
+            model_params_from_json(&json, stem, &path, Vec::new(), &spec, &build_dims())
         };
         assert!(parse(None).is_ok());
         assert!(parse(Some(serde_json::json!([0.0, null]))).is_ok());
@@ -3542,7 +3603,8 @@ mod tests {
             let path = dir.join(format!("{stem}.json"));
             let json: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec, &build_dims())
+                .expect("parse");
             let set = |name: &str| mp.layer_sets.get(name).expect(name).members().to_vec();
             let (mamba, attention, moe, mlp) = (
                 set("mamba_layers"),
@@ -3582,7 +3644,8 @@ mod tests {
         let path = dir.join("nemotron-3-super-120b-a12b.json");
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-        let mp = model_params_from_json(&json, "s", &path, Vec::new(), &spec).expect("parse");
+        let mp = model_params_from_json(&json, "s", &path, Vec::new(), &spec, &build_dims())
+            .expect("parse");
         assert_eq!(mp.bounds["mamba_conv_dim"], 10240);
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
     }
@@ -3667,8 +3730,15 @@ mod tests {
         json[DRAFT_CAPTURE_LAYERS] = serde_json::json!([1, 10, 19, 28, 37]);
         let parse = |arch: &str| {
             let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
-            model_params_from_json(&json, "qwen3.6-35b-a3b", &target_path, Vec::new(), &spec)
-                .expect("parse")
+            model_params_from_json(
+                &json,
+                "qwen3.6-35b-a3b",
+                &target_path,
+                Vec::new(),
+                &spec,
+                &build_dims(),
+            )
+            .expect("parse")
         };
         let target = parse("qwen3-5-moe");
         assert_eq!(target.bounds["num_hidden_layers"], 40);
@@ -3695,8 +3765,15 @@ mod tests {
         let (_, json) = read_json_file(&target_path).expect("json");
         let parse = |arch: &str| {
             let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
-            model_params_from_json(&json, "qwen3.5-0.8b", &target_path, Vec::new(), &spec)
-                .expect("parse")
+            model_params_from_json(
+                &json,
+                "qwen3.5-0.8b",
+                &target_path,
+                Vec::new(),
+                &spec,
+                &build_dims(),
+            )
+            .expect("parse")
         };
         assert!(parse("qwen3-5").tie_word_embeddings);
         assert!(!parse("qwen3-5-dense-mtp").tie_word_embeddings);
@@ -3762,7 +3839,8 @@ mod tests {
             let path = dir.join(format!("{base}.json"));
             let (_, mut json) = read_json_file(&path).expect("json");
             apply_overrides_file(&dir, base, &mut json, &mut Vec::new()).expect("overrides");
-            model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse")
+            model_params_from_json(&json, stem, &path, Vec::new(), &spec, &build_dims())
+                .expect("parse")
         };
         let g32 = format!("{google}-mlx-affine-b4-g32");
         let g64 = format!("{google}-mlx-affine-b4-g64");
@@ -3817,7 +3895,7 @@ mod tests {
             // so under a backend that can't lower it the refusal is the outcome.
             let Some(mp) = assert_load_or_refuse_by_name(
                 stem,
-                model_params_from_json(&json, stem, &path, Vec::new(), &spec),
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec, &build_dims()),
             ) else {
                 continue;
             };
@@ -3871,7 +3949,7 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
             let mp = assert_load_or_refuse_by_name(
                 stem,
-                model_params_from_json(&json, stem, &path, Vec::new(), &spec),
+                model_params_from_json(&json, stem, &path, Vec::new(), &spec, &build_dims()),
             )?;
             Some(RecurrentDims::of(&mp).expect("a recurrent mixer"))
         };
@@ -4077,6 +4155,7 @@ mod tests {
                 &path,
                 Vec::new(),
                 &spec,
+                &build_dims(),
             )
             .unwrap_or_else(|e| panic!("{stem} config parses: {e:?}")),
         )
@@ -4147,6 +4226,7 @@ mod tests {
         let result = load_dir(
             Path::new("/nonexistent/path/to/configs"),
             &Default::default(),
+            &build_dims(),
             &Scope::all(),
             &Shared,
         );
@@ -4171,7 +4251,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let cfg = load_file(&tmp.join("m.json")).unwrap();
+        let cfg = load_file(&tmp.join("m.json"), &build_dims()).unwrap();
 
         // Integers go to bounds AND to scalars (as f64). Floats go to
         // scalars only. This double-entry for integers is required so
@@ -4199,6 +4279,7 @@ mod tests {
         let configs = load_dir(
             &dir,
             &load_arch_json(&dir).expect("llama arch.json"),
+            &build_dims(),
             &Scope::all(),
             &Shared,
         )
@@ -4230,7 +4311,14 @@ mod tests {
         .unwrap();
         fs::write(tmp.join("README.txt"), "ignore me").unwrap();
 
-        let configs = load_dir(&tmp, &Default::default(), &Scope::all(), &Shared).unwrap();
+        let configs = load_dir(
+            &tmp,
+            &Default::default(),
+            &build_dims(),
+            &Scope::all(),
+            &Shared,
+        )
+        .unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].source_stem, "model");
 
@@ -4258,5 +4346,183 @@ mod tests {
             ExpertActivation::Unrealized("gelu_pytorch_tanh".to_string())
         );
         assert_eq!(expert_body(&gelu), Err("gelu_pytorch_tanh"));
+    }
+
+    /// A decoder state's gated derived dim derives as a core one does: the loader reads its flag
+    /// from the config and derives its arm, because both read the table the loader is handed.
+    #[test]
+    fn a_decoder_states_gated_dim_derives_by_its_flag() {
+        use crate::dim::{DeriveStage, DerivedDim, DerivedRule};
+        use scratchy_forward_compiler_frontend::state::{
+            SignaturePath, StateInputDecl, StateName, StateOpDecl, StateVocabulary,
+        };
+        static GATED_DIMS: [DerivedDim; 1] = [DerivedDim {
+            name: "probe_gated_width",
+            stage: DeriveStage::Implicit,
+            rule: DerivedRule::Gated {
+                flag: "probe_gate",
+                on: &DerivedRule::Mul(&[DerivedRule::Lit(2), DerivedRule::Bound("hidden_size")]),
+                off: &DerivedRule::Bound("hidden_size"),
+            },
+        }];
+        struct GatedProbe;
+        impl StateVocabulary for GatedProbe {
+            fn name(&self) -> StateName {
+                StateName::new("gated_probe")
+            }
+            fn ops(&self) -> &'static [StateOpDecl] {
+                &[]
+            }
+            fn inputs(&self) -> &'static [StateInputDecl] {
+                &[]
+            }
+            fn signatures(&self) -> SignaturePath {
+                SignaturePath::new("::gated_probe::ops")
+            }
+            fn derived_dims(&self) -> &'static [DerivedDim] {
+                &GATED_DIMS
+            }
+        }
+        let dir = repo_model_archs("llama");
+        let mut spec = load_arch_json(&dir).expect("arch.json");
+        // The flag is the arch's default, not the config's: a config integer reaches the bounds
+        // before derivation whatever table the loader reads, an arch default only through the
+        // gate-flag loop over the table it is handed.
+        spec.bound_defaults.push(("probe_gate".to_string(), 1));
+        let path = dir.join("llama-3.2-1b.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        let dims = DimTable::assemble(&[&GatedProbe]).expect("the probe assembles");
+        let mp =
+            model_params_from_json(&json, "s", &path, Vec::new(), &spec, &dims).expect("parse");
+        let hidden = mp.bounds["hidden_size"];
+        assert_eq!(mp.bounds.get("probe_gate"), Some(&1));
+        assert_eq!(mp.bounds.get("probe_gated_width"), Some(&(2 * hidden)));
+        let core = model_params_from_json(&json, "s", &path, Vec::new(), &spec, &build_dims())
+            .expect("parse");
+        assert_eq!(core.bounds.get("probe_gated_width"), None);
+    }
+
+    /// GLM-4.7-Flash's config, loaded by `dims`.
+    fn glm_4_7_flash(dims: &DimTable) -> ModelParams {
+        load_file(
+            &repo_model_archs("glm4-moe-lite").join("glm-4.7-flash.json"),
+            dims,
+        )
+        .expect("GLM-4.7-Flash's config loads")
+    }
+
+    /// With the build's decoder states, GLM-4.7-Flash's per-head query/key width is MLA's: the
+    /// no-rope part and the rope part (192 + 64), not hidden over heads.
+    #[test]
+    fn glm_head_dim_is_the_mla_sum() {
+        use crate::dim::{Dim, canonical_add};
+        let dims = build_dims();
+        let row = dims.find("head_dim").expect("MLA derives the head dim");
+        assert_eq!(row.stage, crate::dim::DeriveStage::BeforeFallbacks);
+        let mp = glm_4_7_flash(&dims);
+        assert_eq!(mp.bounds.get("head_dim"), Some(&256));
+        assert_eq!(
+            mp.derived.get("head_dim"),
+            Some(&canonical_add(vec![
+                Dim::Bound("qk_nope_head_dim".to_string()),
+                Dim::Bound("qk_rope_head_dim".to_string()),
+            ]))
+        );
+        // The widths that read it, and MLA's own projection widths.
+        let pinned = [
+            ("attn_q_dim", 20 * 256),
+            ("kv_dim", 20 * 256),
+            ("q_proj_out", 20 * (192 + 64)),
+            ("kv_lora_out", 20 * (192 + 256)),
+            ("attn_out", 20 * 256),
+            ("kv_a_proj_out", 512 + 64),
+        ];
+        for (name, width) in pinned {
+            assert_eq!(mp.bounds.get(name), Some(&width), "`{name}`");
+        }
+    }
+
+    /// Without MLA's rows (the core table alone), the head dim is the generic fallback's, which
+    /// derives nothing here: 2048 hidden over 20 heads is no whole width, so the config is refused
+    /// for want of a head dim rather than read at MLA's.
+    #[test]
+    fn glm_head_dim_without_its_state_falls_back() {
+        let path = repo_model_archs("glm4-moe-lite").join("glm-4.7-flash.json");
+        let Err(err) = load_file(&path, &DimTable::default()) else {
+            panic!("GLM-4.7-Flash derived a head dim with no decoder state's rows");
+        };
+        let ConfigError::Geometry { reason, .. } = &err else {
+            panic!("expected a Geometry error, got {err:?}");
+        };
+        assert!(
+            reason.contains("head_dim") && reason.contains("hidden_size / num_attention_heads"),
+            "{reason}"
+        );
+    }
+
+    /// A config stating `head_dim` keeps it with MLA's row present, and its summands derive
+    /// nothing over it.
+    #[test]
+    fn a_stated_head_dim_wins() {
+        let mut bounds: BTreeMap<String, u64> = [
+            ("hidden_size", 2048),
+            ("num_attention_heads", 16),
+            ("head_dim", 128),
+            ("qk_nope_head_dim", 192),
+            ("qk_rope_head_dim", 64),
+        ]
+        .map(|(k, v)| (k.to_string(), v))
+        .into();
+        let dims = build_dims();
+        assert!(dims.find("head_dim").is_some(), "MLA's row is in the table");
+        let derived = derive_implicit_bounds(&mut bounds, &dims);
+        assert_eq!(bounds.get("head_dim"), Some(&128));
+        assert_eq!(derived.get("head_dim"), None);
+        assert_eq!(bounds.get("attn_q_dim"), Some(&(16 * 128)));
+    }
+
+    /// A dense model with no `qk_*` bounds derives its head dim and KV width as hidden over heads,
+    /// exactly as before MLA's row joined the table.
+    #[test]
+    fn a_dense_model_derives_as_before() {
+        use crate::dim::Dim;
+        let bound = |n: &str| Dim::Bound(n.to_string());
+        let path = repo_model_archs("llama").join("smollm2-360m.json");
+        let mp = load_file(&path, &build_dims()).expect("smollm2-360m loads");
+        let core = load_file(&path, &DimTable::default()).expect("smollm2-360m loads");
+        assert_eq!(mp.bounds, core.bounds);
+        assert_eq!(mp.derived, core.derived);
+        assert_eq!(mp.bounds.get("head_dim"), Some(&64)); // 960 / 15
+        assert_eq!(
+            mp.derived.get("head_dim"),
+            Some(&Dim::Div(
+                Box::new(bound("hidden_size")),
+                Box::new(bound("num_attention_heads"))
+            ))
+        );
+        assert_eq!(mp.bounds.get("num_key_value_heads"), Some(&5));
+        assert_eq!(mp.bounds.get("attn_q_dim"), Some(&960));
+        assert_eq!(mp.bounds.get("kv_dim"), Some(&320));
+    }
+
+    /// The code fallbacks derive exactly the names a decoder state may derive ahead of them
+    /// (`FALLBACK_DIMS`): with the core table alone and a config stating neither, every bound
+    /// `derive_implicit_bounds` derives outside the table's rows is one of those names, and each
+    /// of them is derived.
+    #[test]
+    fn the_code_fallbacks_derive_the_fallback_names() {
+        let dims = DimTable::default();
+        let mut bounds: BTreeMap<String, u64> = [("hidden_size", 960), ("num_attention_heads", 15)]
+            .map(|(k, v)| (k.to_string(), v))
+            .into();
+        let derived = derive_implicit_bounds(&mut bounds, &dims);
+        let by_fallback: Vec<&str> = (derived.keys())
+            .map(String::as_str)
+            .filter(|name| dims.find(name).is_none())
+            .collect();
+        let mut expected = crate::dim::FALLBACK_DIMS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(by_fallback, expected);
     }
 }

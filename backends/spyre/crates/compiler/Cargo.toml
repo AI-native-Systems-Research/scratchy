@@ -59,3 +59,5 @@ zstd = { version = "0.14", default-features = false, features = ["zdict_builder"
 # The pipeline's real-config fixtures, for the bake's tests on checked-in models.
 [dev-dependencies]
 scratchy-forward-compiler-macro = { path = "../../../../crates/compiler/macros", features = ["test-support"] }
+# The decoder states the build compiles, whose derived dims the fixtures load each config by.
+scratchy-models-typed = { path = "../../../../crates/models/typed" }

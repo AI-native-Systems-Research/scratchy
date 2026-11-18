@@ -234,7 +234,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::AttnDecode { .. }
             | O::Sample { .. }
             | O::EmbedRowGather { .. }
-            | O::ChainStage { .. } => None,
+            | O::ChainStage { .. }
+            // A decoder state's facts state no additive offset, so no KV writer reads through one.
+            | O::State(_) => None,
         }
     }
 }

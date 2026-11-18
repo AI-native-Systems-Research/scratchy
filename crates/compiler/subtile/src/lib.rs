@@ -26,6 +26,8 @@ pub mod lower;
 /// compiled: the value side of the geometry is the facts' own [`Attention`], threaded from the
 /// bake, whatever the target (scratchy_ir::model_facts::Attention).
 pub mod model_geometry;
+/// A state op: the one opaque op variant, whose facts are its decoder state's own.
+pub mod state_op;
 pub mod subtile_ir;
 // ⛔ UNGATED, AND THAT IS THE POINT. The re-roll machinery (`reroll_subtile_tape` /
 // `lower_dag_to_tape` / the `OpenLoop`/`CloseLoop` tape) is THE shared artifact: the

@@ -81,6 +81,7 @@ fn main() {
         },
         dump_dir: None,
         inspect: &metal_tape_models,
+        typing: scratchy_models_typed::typing(),
     });
     write_metal_bake(&out_dir);
     write_metal_models(&out_dir, &built.inspected);

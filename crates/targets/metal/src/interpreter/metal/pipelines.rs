@@ -941,12 +941,6 @@ mod tests {
             0.125,
             scratchy_ir::model_facts::ActDtype::Bf16,
         );
-        const KV_LORA_RANK: usize = 0;
-        const QK_NOPE_HEAD_DIM: usize = 0;
-        const QK_ROPE_HEAD_DIM: usize = 0;
-        const V_HEAD_DIM: usize = 0;
-        const QK_HEAD_DIM: usize = 0;
-        const MLA_ATTN_SCALE: f32 = 0.0;
     }
     impl scratchy_ir::WeightAccessors for TinyLlamaProbe {}
 
@@ -965,12 +959,6 @@ mod tests {
             0.088388347,
             scratchy_ir::model_facts::ActDtype::Bf16,
         );
-        const KV_LORA_RANK: usize = 0;
-        const QK_NOPE_HEAD_DIM: usize = 0;
-        const QK_ROPE_HEAD_DIM: usize = 0;
-        const V_HEAD_DIM: usize = 0;
-        const QK_HEAD_DIM: usize = 0;
-        const MLA_ATTN_SCALE: f32 = 0.0;
     }
     impl scratchy_ir::WeightAccessors for Llama32Probe {}
 
@@ -992,12 +980,6 @@ mod tests {
             0.125,
             scratchy_ir::model_facts::ActDtype::Bf16,
         );
-        const KV_LORA_RANK: usize = 0;
-        const QK_NOPE_HEAD_DIM: usize = 0;
-        const QK_ROPE_HEAD_DIM: usize = 0;
-        const V_HEAD_DIM: usize = 0;
-        const QK_HEAD_DIM: usize = 0;
-        const MLA_ATTN_SCALE: f32 = 0.0;
         const ACT_DTYPE: crate::interpreter::metal::MetalDtype =
             crate::interpreter::metal::MetalDtype::Bf16;
     }

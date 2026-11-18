@@ -573,8 +573,6 @@ pub enum Instruction {
     /// `kv_offsets`: the additive offset the K and V it writes carry — see
     /// [`KvOffsets`].
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool, bool, KvOffsets),
-    MlaSplit(u32, u32, u32),
-    MlaAttention(u32, u32, u32, u32, u32),
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). Args:
     /// `(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer)`. Reads the
     /// `linear_attn[layer]` weight bundle (`GatedDeltaNetLayer`) via
@@ -934,7 +932,7 @@ pub const fn unpack_moe_expert_bits(packed: u32) -> (u32, u32, u32) {
 pub trait CanonicalParams: WeightAccessors {
     /// ⭐ THE CANONICAL'S FACTS, typed ([`model_facts::ModelFacts`]): the one source every numeric
     /// const below that has a fact is derived from ([`model_facts::raw`]). The generated impl states
-    /// only this and the consts no fact covers (the MLA dims and the target/build knobs).
+    /// only this and the consts no fact covers (the target/build knobs).
     const FACTS: model_facts::ModelFacts;
     const HEAD_DIM: u32 = model_facts::raw::head_dim(Self::FACTS);
     const NUM_Q_HEADS: u32 = model_facts::raw::num_q_heads(Self::FACTS);
@@ -945,15 +943,7 @@ pub trait CanonicalParams: WeightAccessors {
     const ATTN_SCALE: f32 = model_facts::raw::attn_scale(Self::FACTS);
     const ATTN_SOFTCAP: f32 = model_facts::raw::attn_softcap(Self::FACTS);
     const SLIDING_WINDOW: i32 = model_facts::raw::sliding_window(Self::FACTS);
-    const KV_LORA_RANK: usize;
-    const QK_NOPE_HEAD_DIM: usize;
-    const QK_ROPE_HEAD_DIM: usize;
-    const V_HEAD_DIM: usize;
     const FINAL_LOGIT_SOFTCAPPING: f32 = model_facts::raw::final_logit_softcapping(Self::FACTS);
-    /// `qk_nope_head_dim + qk_rope_head_dim` (MlaAttention).
-    const QK_HEAD_DIM: usize;
-    /// MlaAttention scale: `1/sqrt(qk_head_dim)` w/ YaRN correction.
-    const MLA_ATTN_SCALE: f32;
     /// MRoPE (Qwen2-VL / Qwen2.5-VL) section split `[T, H, W]` (rotary
     /// pairs assigned to time / height / width axes; sum equals
     /// `head_dim/2`). `None` for every text-only arch — the rope kernel

@@ -658,11 +658,19 @@ jobs:
       # lib, under the target of every shared default (`target::Shared`). Its loader tests name the
       # build scope they load under (`config::Scope`), so none selects zero configs and passes
       # having checked nothing. Then its test targets at -D warnings, which no other step lints.
+      # Then the typed carriers and the op signatures they are checked against, which no other step
+      # runs: that every carrier has a typed program, the product-order pins, the decoder state crates' own
+      # tests. Then the frontend's state table, typed-Rust emit pass and carrier facts (whose flag
+      # scan must see a decoder state's gated dim), filtered to those three suites, which the typed
+      # crates are built on. Then those crates' test targets at -D warnings.
       - name: Forward-compiler macro tests
         working-directory: .
         run: |
           cargo test -p scratchy-forward-compiler-macro --lib
           cargo clippy -p scratchy-forward-compiler-macro --tests -- -D warnings
+          cargo test -p scratchy-typed-shapes -p scratchy-models-typed -p scratchy-decoder-state -p scratchy-state-decoder-mla
+          cargo test -p scratchy-forward-compiler-frontend --lib -- state:: typed_emit:: carrier_facts::
+          cargo clippy -p scratchy-typed-shapes -p scratchy-models-typed -p scratchy-decoder-state -p scratchy-state-decoder-mla --tests -- -D warnings
       # Spyre's bake (the per-model emission the pipeline calls through `TargetEmitter`), and its
       # pinned derivations on the checked-in configs.
       - name: Spyre compiler tests
@@ -723,6 +731,9 @@ jobs:
   # (`git grep -l 'compile_fail,E' -- crates backends`):
   #   scratchy-tensors       src/typed.rs
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
+  #   scratchy-subtile       src/state_op.rs
+  #   scratchy-decoder-state  src/lib.rs  (state_op! and decoder_state!: a malformed op or list)
+  #   scratchy-state-decoder-mla  src/ops.rs  (MlaCache: a cache of another rope width)
   #   scratchy-target-spyre-card  src/runtime.rs
   # ktir-core's former E0080 wrong-copy fixture is deleted: it asserted a
   # `31` it declared inside itself, which proves only that `assert!` fails
@@ -750,7 +761,7 @@ jobs:
             backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Doctests (compile_fail error codes)
-        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal
+        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal -p scratchy-subtile -p scratchy-decoder-state -p scratchy-state-decoder-mla
       - name: Doctests (compile_fail error codes, spyre workspace)
         working-directory: backends/spyre
         run: cargo +nightly test --doc -p ktir-core

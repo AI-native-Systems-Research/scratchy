@@ -442,6 +442,7 @@ mod tests {
             prelude: Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         }
     }
 

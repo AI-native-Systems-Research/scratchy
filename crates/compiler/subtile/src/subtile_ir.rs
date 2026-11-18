@@ -1071,6 +1071,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 g.head_dim().get().hash(h);
                 a.scale().get().to_bits().hash(h);
             }
+            // The op's identity and its output widths are class: two state ops, or one at two
+            // widths, are different programs.
+            SubOp::State(op) => (op.id(), op.out_cols()).hash(h),
         }
     }
 }
@@ -1709,6 +1712,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         table_rows: u32,
         k: u32,
     },
+    /// A decoder state's op: ONE opaque variant for every decoder state, carrying its decoder state's
+    /// facts ([`crate::state_op::StateOpFacts`]) and this instance's output widths. Every
+    /// registry column reads the op's own facts; a target lowers it through the decoder state's own
+    /// facet, and refuses it by name until it has one.
+    State(crate::state_op::StateSubOp),
 }
 
 /// The token draw's padded row: the vocab rounded up to a power-of-two whole
@@ -3987,6 +3995,12 @@ pub fn eval_node<F: RopeForm>(
             "SubOp::DraftSelect has no host reference: its anchors, sampling policies and uniforms \
              are runtime inputs, and its proposals land in the drafter's runtime outputs"
         ),
+        SubOp::State(op) => panic!(
+            "decoder state {} op {} has no host reference: its semantics are its decoder state's own, and the \
+             shared reference knows only the op's facts",
+            op.id().state(),
+            op.id().name()
+        ),
         // The capture's copy lands outside the graph; the forward reads `x` unchanged.
         SubOp::CaptureHidden { .. } => gather(&node.inputs[0], graph, bufs).0,
         SubOp::DraftConv { stage } => {
@@ -4691,6 +4705,8 @@ pub fn lower_region(
             SubOp::SampleRowsGather => SubOp::SampleRowsGather,
             SubOp::SampleRowsScatter => SubOp::SampleRowsScatter,
             SubOp::AllRowsMatmul => SubOp::AllRowsMatmul,
+            // No witness to bind: the op's facts and widths are the whole op.
+            SubOp::State(op) => SubOp::State(op),
         };
 
         if let SubOp::MatmulTile { n, weight } = subop {

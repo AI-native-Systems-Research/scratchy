@@ -32,6 +32,7 @@ arch-gemma3 = []
 arch-gemma4 = []
 arch-gemma4-moe = []
 arch-glm4-moe = []
+arch-glm4-moe-lite = []
 arch-gpt-oss = []
 arch-granite = []
 arch-llama = []
@@ -155,6 +156,9 @@ all-arches = [
 # glm4-moe (1 configs)
 "glm-4.5-air" = ["arch-glm4-moe"]
 "glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
+
+# glm4-moe-lite (1 configs)
+"glm-4.7-flash" = ["arch-glm4-moe-lite"]
 
 # gpt-oss (4 configs)
 "gpt-oss-120b" = ["arch-gpt-oss"]
@@ -358,6 +362,9 @@ all-arches = [
     "glm-4.5-air",
     "glm-4.5-air-parity-tiny",
 ]
+"glm4-moe-lite" = [
+    "glm-4.7-flash",
+]
 "gpt-oss" = [
     "gpt-oss-120b",
     "gpt-oss-120b-3bit",
@@ -526,7 +533,8 @@ all-arches = [
     "qwen3-moe-1-layer",
 ]
 # `all` — every checked-in config, every arch (CI's full-scope build);
-# reached as `model/all` from scratchy-cli.
+# reached as `model/all` from scratchy-cli. GLM-4.7-Flash (`glm-4.7-flash`, and
+# `arch-glm4-moe-lite` in `all-arches`) joins it once its Metal lowering lands.
 all = [
     "c4ai-command-r-v01",
     "c4ai-command-r-v01-parity-tiny",

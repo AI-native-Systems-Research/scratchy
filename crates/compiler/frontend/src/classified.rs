@@ -148,6 +148,9 @@ pub enum ExternKind {
     /// multi-token-prediction head fuses with the next token's embedding. Written by the host
     /// from the target's forward; materialized into a tile by `rows_lowering::materialize_rows`.
     TargetHidden,
+    /// A layered state input a decoder state declares (`crate::state`), read as
+    /// `name[layer]`. The decoder state's own crate names it; nothing shared does.
+    State(crate::state::StateInput),
 }
 
 /// Which DSL prelude (extern + op name set) is in scope when a
@@ -184,6 +187,11 @@ impl ExternKind {
             .find(|k| k.prelude() == prelude && k.name() == name)
     }
 
+    /// Whether some prelude's core extern is read by `name`: a name no decoder state may declare.
+    pub fn is_core_name(name: &str) -> bool {
+        Self::ALL.into_iter().any(|k| k.name() == name)
+    }
+
     /// Every extern.
     const ALL: [Self; 21] = [
         Self::InputIds,
@@ -210,7 +218,7 @@ impl ExternKind {
     ];
 
     /// The prelude whose bodies may read this extern.
-    fn prelude(self) -> Prelude {
+    pub(crate) fn prelude(self) -> Prelude {
         match self {
             Self::InputIds
             | Self::Positions
@@ -218,7 +226,9 @@ impl ExternKind {
             | Self::RotaryLocal
             | Self::BlockTable
             | Self::KvCache
-            | Self::TargetHidden => Prelude::Decoder,
+            | Self::TargetHidden
+            // A decoder state is a decoder's: it rides the decoder's layer loop.
+            | Self::State(_) => Prelude::Decoder,
             Self::Pixels
             | Self::CuSeqlens
             | Self::Cos
@@ -260,6 +270,7 @@ impl ExternKind {
             Self::ReverseIndices => "reverse_indices",
             Self::PositionIds => "position_ids",
             Self::PosEmbeds => "pos_embeds",
+            Self::State(input) => input.name().get(),
         }
     }
 
@@ -277,7 +288,8 @@ impl ExternKind {
 /// The fixed enum of DSL op kinds. One variant per op, no
 /// tile-kind sub-variants. Extending the DSL with a new op means
 /// adding one variant here, one shape signature in Phase 4, and
-/// one kernel implementation — nothing else.
+/// one kernel implementation — nothing else. A decoder state's
+/// ops add no variant: they ride the one [`Self::State`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OpKind {
     Embed,
@@ -506,19 +518,6 @@ pub enum OpKind {
     /// Qwen2.5-VL vision towers; expected reuse by future ViT-RoPE
     /// architectures.
     VisionRope,
-    /// MLA kv_a split: decomposes `[T, kv_lora_rank + qk_rope_head_dim]`
-    /// into `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`.
-    /// DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`. Tuple-returning;
-    /// the 2-target binding is handled in `Stmt::AssignTuple`. Used
-    /// exclusively by DeepSeek V2/V3.
-    MlaSplit,
-    /// MLA full attention: applies interleaved RoPE to q_pe / k_pe, writes
-    /// compressed KV to paged cache, assembles full K and V from cached
-    /// kv_b + k_pe, runs flash attention, then slices the output to
-    /// `v_head_dim`. Consumes `q, kv_b, k_pe` plus externs
-    /// `(positions, rotary, kv_cache[layer], block_table)`. Output:
-    /// `[T, num_attention_heads * v_head_dim]`. Used by DeepSeek V2/V3.
-    MlaAttention,
     /// MoE block — gate routing + top-K fused GEMM for routed experts
     /// plus an optional shared expert. The DSL form is the same across
     /// every MoE arch: `moe_out = moe_block(x, moe[layer])`. Mirrors
@@ -583,7 +582,8 @@ pub enum OpKind {
     /// `q_proj` output `[T, num_heads*2*head_dim]` (viewed `[T, nh, 2, hd]`)
     /// into `query` (`[:,:,0,:]`) and `gate` (`[:,:,1,:]`), each
     /// `[T, num_heads*head_dim]`. Tuple-returning (`(q, gate) = gate_split(qg)`);
-    /// the 2-target binding is handled in `Stmt::AssignTuple` like `MlaSplit`.
+    /// a tuple assignment binds its two outputs, as it binds a [`Self::State`] op's declared
+    /// `OutputCount`.
     /// Used only by Qwen3.5 full-attention layers (`attn_output_gate=True`).
     GateSplit,
     /// Qwen3.5 attention output gate application: `out = attn * sigmoid(gate)`.
@@ -660,6 +660,10 @@ pub enum OpKind {
     /// reuses `kernels::embedding_gather_masked` (the same kernel
     /// `Instruction::Embed` calls) reading `ctx.fwd.position_ids`.
     PosEmbed,
+    /// An op a decoder state declares (`crate::state`): its name, arity and output count
+    /// are the decoder state's declaration, resolved after the core names [`Self::from_name`] knows.
+    /// A tuple assignment binds exactly its declared outputs.
+    State(crate::state::StateOp),
 }
 
 impl OpKind {
@@ -714,8 +718,6 @@ impl OpKind {
             // `Reshape` is the DSL's `reshape(x, [..])` expression
             // (`ast::Expr::Reshape`), never a call by name: not listed
             // in `from_name`.
-            "mla_split" => Some(Self::MlaSplit),
-            "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
             "gemma_moe" => Some(Self::GemmaMoe),
             "gptoss_moe" => Some(Self::GptOssMoe),
@@ -731,6 +733,26 @@ impl OpKind {
             "pos_embed" => Some(Self::PosEmbed),
             _ => None,
         }
+    }
+
+    /// The ops no DSL body calls by name ([`Self::from_name`] omits them): the compiler's passes
+    /// insert them, and their [`Self::as_str`] names are the compiler's.
+    pub const SYNTHESIZED: [Self; 6] = [
+        Self::Mul,
+        Self::Reshape,
+        Self::AllReduce,
+        Self::AllGather,
+        Self::MmEmbedSplice,
+        Self::LoadRows(scratchy_tensors::compiler_ids::RowsExtern::Pixels),
+    ];
+
+    /// Whether `name` is the core vocabulary's: an op a body calls ([`Self::from_name`]), an op a
+    /// pass inserts ([`Self::SYNTHESIZED`]), or a call-shaped form that is no op
+    /// ([`crate::ast::SpecialForm`]). No decoder state may declare an op by one.
+    pub fn is_core_name(name: &str) -> bool {
+        Self::from_name(name).is_some()
+            || Self::SYNTHESIZED.iter().any(|k| k.as_str() == name)
+            || crate::ast::SpecialForm::from_name(name).is_some()
     }
 
     pub fn as_str(self) -> &'static str {
@@ -772,8 +794,6 @@ impl OpKind {
             Self::BiasAdd => "bias_add",
             Self::Mul => "mul",
             Self::Reshape => "reshape",
-            Self::MlaSplit => "mla_split",
-            Self::MlaAttention => "mla_attention",
             Self::Moe => "moe_block",
             Self::GemmaMoe => "gemma_moe",
             Self::GptOssMoe => "gptoss_moe",
@@ -800,6 +820,7 @@ impl OpKind {
             Self::AvgPool2d => "avg_pool_2d",
             Self::StripCls => "strip_cls",
             Self::PosEmbed => "pos_embed",
+            Self::State(op) => op.name().get(),
         }
     }
 }
@@ -840,6 +861,10 @@ pub struct Program {
     /// `ModelParams::weight_leaf_renames`). Applied by
     /// `codegen::safetensors_prefix` after segment translation.
     pub weight_leaf_renames: Vec<(String, String)>,
+    /// The derived dims of the vocabulary this program was classified under: the core rows, then
+    /// each decoder state's. What the config loader derives a model of this program's carrier by,
+    /// and what the typed-Rust emit pass types its derived dims as.
+    pub dims: crate::state::DimTable,
 }
 
 impl Program {
@@ -1160,6 +1185,7 @@ mod tests {
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
+            dims: Default::default(),
         }
     }
 

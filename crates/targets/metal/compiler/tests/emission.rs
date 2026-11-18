@@ -34,6 +34,7 @@ fn python_costume_emits_the_qwen3_tape() {
         None,
         &Scope::stems(&[("qwen3", "qwen3-0.6b")]),
         &Metal { turboquant: false },
+        &scratchy_models_typed::typing(),
     )
     .expect("python-costume pipeline");
 
@@ -65,6 +66,9 @@ fn python_costume_emits_the_qwen3_tape() {
 #[test]
 fn metal_lowers_the_mlx_affine_and_nvfp4_presets_only() {
     let metal = Metal { turboquant: false };
+    let dims = scratchy_models_typed::typing()
+        .dims()
+        .expect("the build's decoder states assemble");
     for (arch, presets) in [
         (
             "llama",
@@ -80,11 +84,12 @@ fn metal_lowers_the_mlx_affine_and_nvfp4_presets_only() {
         let dense = load_dir(
             &dir,
             &spec,
+            &dims,
             &Scope::all().with_quants(Vec::<String>::new()),
             &metal,
         )
         .unwrap_or_else(|e| panic!("load {arch} dense: {e}"));
-        let quantized = load_dir(&dir, &spec, &Scope::all(), &metal)
+        let quantized = load_dir(&dir, &spec, &dims, &Scope::all(), &metal)
             .unwrap_or_else(|e| panic!("load {arch} with every preset: {e}"));
         let mut want: Vec<String> = (dense.iter())
             .flat_map(|b| {
