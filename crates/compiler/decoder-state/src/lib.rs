@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A decoder state as the compiler takes it: one handle ([`DecoderState`]) holding everything the
 //! decoder state contributes from its own crate, and the typing ([`Typing`]) the build that compiles the
-//! models hands the forward compiler, which lists those handles.
+//! models hands the forward compiler, which lists those handles. A decoder state crate states each op
+//! once, through [`state_op!`], and lists its ops and inputs once, through [`decoder_state!`].
 
 use scratchy_forward_compiler_frontend::state::{OpName, StateVocabulary};
 use scratchy_subtile::state_op::StateOpFacts;
@@ -63,4 +64,378 @@ pub fn vocabularies(decoder_states: &[DecoderState]) -> impl Iterator<Item = &dy
     decoder_states
         .iter()
         .map(|state| state.vocabulary() as &dyn StateVocabulary)
+}
+
+/// The items [`state_op!`] and [`decoder_state!`] expand to, named from the decoder state crate without its
+/// depending on the front end or the subtile IR.
+#[doc(hidden)]
+pub mod __private {
+    pub use scratchy_forward_compiler_frontend::state::{
+        Arity, InputName, OpName, SignaturePath, StateInputDecl, StateName, StateOpDecl, StateOpId,
+        StateVocabulary,
+    };
+    pub use scratchy_subtile::state_op::{StateOpFacts, StateOutputs, StateRows};
+    pub use scratchy_subtile::tensor_parallel::TpRule;
+}
+
+/// The number of token trees it is given, as a `u8`: an op's arity, counted from its parameter
+/// names. More than `u8::MAX` fails const evaluation.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __state_count {
+    () => {
+        0u8
+    };
+    ($one:tt) => {
+        1u8
+    };
+    ($head:tt $($tail:tt)+) => {
+        1u8 + $crate::__state_count!($($tail)+)
+    };
+}
+
+/// One state op, stated once: its typed signature, which a carrier's call is type-checked
+/// against, then its row law and its sharding rule. Beside the `fn` it expands to a module of the
+/// same name (the two live in different namespaces) holding:
+///
+/// - `DECL`, the op's DSL declaration: its name, its arity counted from the parameters and its
+///   output count counted from the return type (a 2- or 3-tuple returns two or three values,
+///   anything else one);
+/// - `facts(state)`, the op's subtile facts under the decoder state [`decoder_state!`] names, which reads the
+///   same counts, so the declaration and the facts cannot disagree.
+///
+/// `rows` is a [`StateRows`](scratchy_subtile::state_op::StateRows) variant and `tp` a
+/// [`TpRule`](scratchy_subtile::tensor_parallel::TpRule) variant.
+///
+/// ```
+/// pub mod ops {
+///     scratchy_decoder_state::state_op! {
+///         /// Two operands in, two values out.
+///         pub fn probe_split(a: u32, b: u32) -> (u32, u32) {
+///             (a, b)
+///         }
+///         rows = In0, tp = Whole;
+///     }
+/// }
+/// assert_eq!(ops::probe_split::DECL.arity.get(), 2);
+/// assert_eq!(ops::probe_split::DECL.outputs.get().get(), 2);
+/// ```
+///
+/// An op without its row law does not build:
+///
+/// ```compile_fail
+/// scratchy_decoder_state::state_op! {
+///     pub fn probe(a: u32) -> u32 {
+///         a
+///     }
+///     tp = Whole;
+/// }
+/// ```
+///
+/// Nor does an op returning more values than a state op may declare:
+///
+/// ```compile_fail
+/// scratchy_decoder_state::state_op! {
+///     pub fn probe(a: u32) -> (u32, u32, u32, u32) {
+///         (a, a, a, a)
+///     }
+///     rows = In0, tp = Whole;
+/// }
+/// ```
+///
+/// Nor one returning no value:
+///
+/// ```compile_fail
+/// scratchy_decoder_state::state_op! {
+///     pub fn probe(_a: u32) -> () {}
+///     rows = In0, tp = Whole;
+/// }
+/// ```
+///
+/// Nor an op with no operands whose rows are operand 0's:
+///
+/// ```compile_fail,E0080
+/// scratchy_decoder_state::state_op! {
+///     pub fn probe() -> u32 {
+///         0
+///     }
+///     rows = In0, tp = Whole;
+/// }
+/// fn main() {}
+/// ```
+///
+/// Nor one stating the rule only the sharding pass inserts:
+///
+/// ```compile_fail,E0080
+/// scratchy_decoder_state::state_op! {
+///     pub fn probe(a: u32) -> u32 {
+///         a
+///     }
+///     rows = In0, tp = Collective;
+/// }
+/// fn main() {}
+/// ```
+#[macro_export]
+macro_rules! state_op {
+    (@op $outputs:ident [$(#[$meta:meta])*] $vis:vis $name:ident [$($g:ident),*]
+        [$($p:ident : $pt:ty),*] [$ret:ty] $body:block $rows:ident $tp:ident) => {
+        $(#[$meta])*
+        $vis fn $name<$($g),*>($($p: $pt),*) -> $ret $body
+
+        #[doc = ::core::concat!(
+            "The declaration and subtile facts of the state op `",
+            ::core::stringify!($name),
+            "`, counted from its signature."
+        )]
+        $vis mod $name {
+            const ARITY: $crate::__private::Arity =
+                $crate::__private::Arity::new($crate::__state_count!($($p)*));
+            const OUTPUTS: $crate::__private::StateOutputs =
+                $crate::__private::StateOutputs::$outputs;
+            const ROWS: $crate::__private::StateRows = $crate::__private::StateRows::$rows;
+            const TP: $crate::__private::TpRule = $crate::__private::TpRule::$tp;
+
+            const _: () = ::core::assert!(
+                !(ARITY.get() == 0
+                    && ::core::matches!(ROWS, $crate::__private::StateRows::In0)),
+                ::core::concat!(
+                    "state op `",
+                    ::core::stringify!($name),
+                    "` takes no operand, so its rows cannot be operand 0's"
+                )
+            );
+            const _: () = ::core::assert!(
+                !::core::matches!(TP, $crate::__private::TpRule::Collective),
+                ::core::concat!(
+                    "state op `",
+                    ::core::stringify!($name),
+                    "` states `Collective`, which only the sharding pass inserts"
+                )
+            );
+
+            /// The op as the decoder state's DSL vocabulary declares it.
+            pub const DECL: $crate::__private::StateOpDecl = $crate::__private::StateOpDecl {
+                name: $crate::__private::OpName::new(::core::stringify!($name)),
+                arity: ARITY,
+                outputs: OUTPUTS.count(),
+            };
+
+            /// The op's subtile facts, as the decoder state named `state` declares it.
+            pub const fn facts(
+                state: $crate::__private::StateName,
+            ) -> $crate::__private::StateOpFacts {
+                $crate::__private::StateOpFacts::new(
+                    $crate::__private::StateOpId::new(state, DECL.name),
+                    ARITY,
+                    OUTPUTS,
+                    ROWS,
+                    TP,
+                )
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident $(<$($g:ident),* $(,)?>)? ($($p:ident : $pt:ty),* $(,)?)
+            -> () $body:block
+        rows = $rows:ident, tp = $tp:ident $(,)?;
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "state op `",
+            ::core::stringify!($name),
+            "` returns no value: a state op returns one, two or three"
+        ));
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident $(<$($g:ident),* $(,)?>)? ($($p:ident : $pt:ty),* $(,)?)
+            -> ($r0:ty, $r1:ty $(,)?) $body:block
+        rows = $rows:ident, tp = $tp:ident $(,)?;
+    ) => {
+        $crate::state_op!(@op Two [$(#[$meta])*] $vis $name [$($($g),*)?] [$($p: $pt),*]
+            [($r0, $r1)] $body $rows $tp);
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident $(<$($g:ident),* $(,)?>)? ($($p:ident : $pt:ty),* $(,)?)
+            -> ($r0:ty, $r1:ty, $r2:ty $(,)?) $body:block
+        rows = $rows:ident, tp = $tp:ident $(,)?;
+    ) => {
+        $crate::state_op!(@op Three [$(#[$meta])*] $vis $name [$($($g),*)?] [$($p: $pt),*]
+            [($r0, $r1, $r2)] $body $rows $tp);
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident $(<$($g:ident),* $(,)?>)? ($($p:ident : $pt:ty),* $(,)?)
+            -> ($r0:ty, $r1:ty, $r2:ty, $($more:ty),+ $(,)?) $body:block
+        rows = $rows:ident, tp = $tp:ident $(,)?;
+    ) => {
+        ::core::compile_error!(::core::concat!(
+            "state op `",
+            ::core::stringify!($name),
+            "` returns more than three values: a state op returns one, two or three"
+        ));
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident $(<$($g:ident),* $(,)?>)? ($($p:ident : $pt:ty),* $(,)?)
+            -> $ret:ty $body:block
+        rows = $rows:ident, tp = $tp:ident $(,)?;
+    ) => {
+        $crate::state_op!(@op One [$(#[$meta])*] $vis $name [$($($g),*)?] [$($p: $pt),*]
+            [$ret] $body $rows $tp);
+    };
+}
+
+/// One decoder state, listed once: its name, the absolute path of the module holding its ops'
+/// signatures and its inputs' constructors (`::<crate>::<module>`, as the typed carriers call it
+/// from another crate), each op [`state_op!`] declared there and each input's constructor.
+/// Expands to a `static` [`DecoderState`] whose vocabulary declares those ops and inputs and whose
+/// `subtile` maps each op's name to its facts. A decoder state crate reaches its own signatures through
+/// the absolute path by naming itself: `extern crate self as <crate>;`.
+///
+/// ```
+/// extern crate self as probe;
+///
+/// pub mod ops {
+///     scratchy_decoder_state::state_op! {
+///         /// One operand in, one value out.
+///         pub fn probe_scale(a: u32) -> u32 {
+///             a
+///         }
+///         rows = In0, tp = Whole;
+///     }
+///
+///     /// The probe's layered state input.
+///     pub fn probe_state() -> u32 {
+///         0
+///     }
+/// }
+///
+/// scratchy_decoder_state::decoder_state! {
+///     /// The probe decoder state.
+///     pub static PROBE: name = probe, signatures = ::probe::ops,
+///         ops = [probe_scale], inputs = [probe_state];
+/// }
+///
+/// fn main() {
+///     assert_eq!(PROBE.vocabulary().ops().len(), 1);
+///     assert_eq!(PROBE.vocabulary().inputs().len(), 1);
+///     assert!(PROBE.subtile()(ops::probe_scale::DECL.name).is_some());
+/// }
+/// ```
+///
+/// A decoder state listing an op no [`state_op!`] declared does not build:
+///
+/// ```compile_fail,E0433
+/// extern crate self as probe;
+///
+/// pub mod ops {}
+///
+/// scratchy_decoder_state::decoder_state! {
+///     pub static PROBE: name = probe, signatures = ::probe::ops, ops = [nope], inputs = [];
+/// }
+/// fn main() {}
+/// ```
+///
+/// Nor one listing a plain `fn` as an op:
+///
+/// ```compile_fail,E0433
+/// extern crate self as probe;
+///
+/// pub mod ops {
+///     pub fn plain(a: u32) -> u32 {
+///         a
+///     }
+/// }
+///
+/// scratchy_decoder_state::decoder_state! {
+///     pub static PROBE: name = probe, signatures = ::probe::ops, ops = [plain], inputs = [];
+/// }
+/// fn main() {}
+/// ```
+///
+/// Nor one listing an input with no constructor:
+///
+/// ```compile_fail,E0425
+/// extern crate self as probe;
+///
+/// pub mod ops {
+///     scratchy_decoder_state::state_op! {
+///         pub fn probe_scale(a: u32) -> u32 {
+///             a
+///         }
+///         rows = In0, tp = Whole;
+///     }
+/// }
+///
+/// scratchy_decoder_state::decoder_state! {
+///     pub static PROBE: name = probe, signatures = ::probe::ops,
+///         ops = [probe_scale], inputs = [nope];
+/// }
+/// fn main() {}
+/// ```
+#[macro_export]
+macro_rules! decoder_state {
+    (
+        $(#[$meta:meta])*
+        $vis:vis static $state_static:ident: name = $state:ident,
+            signatures = $(:: $seg:ident)+,
+            ops = [$($op:ident),+ $(,)?],
+            inputs = [$($input:ident),* $(,)?] $(,)?;
+    ) => {
+        $(#[$meta])*
+        $vis static $state_static: $crate::DecoderState = {
+            use $(:: $seg)+ as signatures;
+
+            const NAME: $crate::__private::StateName =
+                $crate::__private::StateName::new(::core::stringify!($state));
+
+            struct Vocabulary;
+
+            impl $crate::__private::StateVocabulary for Vocabulary {
+                fn name(&self) -> $crate::__private::StateName {
+                    NAME
+                }
+
+                fn ops(&self) -> &'static [$crate::__private::StateOpDecl] {
+                    const OPS: &[$crate::__private::StateOpDecl] =
+                        &[$(signatures::$op::DECL),+];
+                    OPS
+                }
+
+                fn inputs(&self) -> &'static [$crate::__private::StateInputDecl] {
+                    // Each input names its constructor, which a carrier calls.
+                    $(let _: fn() -> _ = signatures::$input;)*
+                    const INPUTS: &[$crate::__private::StateInputDecl] = &[$(
+                        $crate::__private::StateInputDecl {
+                            name: $crate::__private::InputName::new(::core::stringify!($input)),
+                        }
+                    ),*];
+                    INPUTS
+                }
+
+                fn signatures(&self) -> $crate::__private::SignaturePath {
+                    $crate::__private::SignaturePath::new(::core::concat!(
+                        $("::", ::core::stringify!($seg)),+
+                    ))
+                }
+            }
+
+            fn subtile(
+                op: $crate::__private::OpName,
+            ) -> ::core::option::Option<&'static $crate::__private::StateOpFacts> {
+                $(
+                    if op == signatures::$op::DECL.name {
+                        static FACTS: $crate::__private::StateOpFacts =
+                            signatures::$op::facts(NAME);
+                        return ::core::option::Option::Some(&FACTS);
+                    }
+                )+
+                ::core::option::Option::None
+            }
+
+            $crate::DecoderState::new(&Vocabulary, subtile)
+        };
+    };
 }

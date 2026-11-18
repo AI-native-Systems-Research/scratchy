@@ -391,8 +391,10 @@ An arch whose attention the core ops cannot state needs a **decoder state**: its
 own ops and layered state inputs, declared from its own crate (see
 `crates/state/decoder/mla`, multi-head latent attention, which GLM-4.7-Flash's
 carrier calls). The touch points: the decoder state crate
-`crates/state/decoder/<name>` (a `StateVocabulary` impl and a module of the ops'
-typed signatures and the inputs' constructors); its line in the root
+`crates/state/decoder/<name>` (a module of the ops' typed signatures, each stated
+once through `scratchy_decoder_state::state_op!` with its row law and sharding
+rule, and the inputs' constructors, listed once through
+`scratchy_decoder_state::decoder_state!`); its line in the root
 `Cargo.toml`'s `members` and its `[workspace.dependencies]` row;
 `scratchy-models-typed`'s dependency and build-dependency rows on it
 (`crates/models/typed/Cargo.toml`); and its entry in

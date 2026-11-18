@@ -1769,7 +1769,7 @@ dependencies = [
 name = "scratchy-state-decoder-mla"
 version = "0.1.0"
 dependencies = [
- "scratchy-forward-compiler-frontend",
+ "scratchy-decoder-state",
  "scratchy-typed-shapes",
 ]
 

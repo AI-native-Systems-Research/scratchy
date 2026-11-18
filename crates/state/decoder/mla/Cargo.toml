@@ -9,7 +9,13 @@ publish = false
 # Multi-head latent attention as a decoder state: the DSL ops and state input it adds to the core
 # vocabulary, and their typed signatures, which every carrier naming them is type-checked against.
 [dependencies]
-# The vocabulary trait and its op and input declarations.
-scratchy-forward-compiler-frontend = { path = "../../../compiler/frontend" }
+# The macros each op and the decoder state are stated through, and the decoder state handle they expand to.
+scratchy-decoder-state = { workspace = true }
 # The activation, weight and input types the signatures are written over.
 scratchy-typed-shapes = { workspace = true }
+
+[dev-dependencies]
+# The canonical dim order the signatures' products and sums are pinned against.
+scratchy-forward-compiler-frontend = { path = "../../../compiler/frontend" }
+# The row law and sharding rule the restated ops' facts are pinned against.
+scratchy-subtile = { path = "../../../compiler/subtile" }
