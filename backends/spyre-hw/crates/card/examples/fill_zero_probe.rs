@@ -83,8 +83,8 @@ fn main() -> Result<()> {
 fn probe_body(card: &CardRuntime<'_>) -> Result<()> {
     let stream = Stream::create(card).context("stream create")?;
     let total = WINDOW + TAIL;
-    let dev = DevAddr::alloc(card, ByteSize(total), MemoryType::Tensor)
-        .context("device buffer alloc")?;
+    let dev =
+        DevAddr::alloc(card, ByteSize(total), MemoryType::Tensor).context("device buffer alloc")?;
 
     // --- 1. not-X: the region really holds non-zero bytes before the fill ---
     let poison = pattern_bytes(total as usize);

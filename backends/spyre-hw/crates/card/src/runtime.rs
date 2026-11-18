@@ -672,12 +672,14 @@ impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
                     let _ = release_rx.recv();
                 })
             })
-            .expect("spawn the serve-span hosting thread — a refusal here is boot-time resource \
-                     exhaustion, not a load error to route around");
-        let built = built_rx
-            .recv()
-            .expect("the serve-span host returns the build result before it parks, or dies with \
-                     the worker — neither leaves the channel silently empty");
+            .expect(
+                "spawn the serve-span hosting thread — a refusal here is boot-time resource \
+                     exhaustion, not a load error to route around",
+            );
+        let built = built_rx.recv().expect(
+            "the serve-span host returns the build result before it parks, or dies with \
+                     the worker — neither leaves the channel silently empty",
+        );
         (
             ServeSpan {
                 release: Some(release_tx),

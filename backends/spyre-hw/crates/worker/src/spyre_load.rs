@@ -3208,7 +3208,8 @@ impl SpyreWorker {
             #[cfg(feature = "spyre-hw")]
             world_cpus: world_cpus_v,
             #[cfg(feature = "spyre-hw")]
-            _serve_span: serve_span_v.expect("the hw load path sets the serve span with the runtimes"),
+            _serve_span: serve_span_v
+                .expect("the hw load path sets the serve span with the runtimes"),
         })
     }
 }

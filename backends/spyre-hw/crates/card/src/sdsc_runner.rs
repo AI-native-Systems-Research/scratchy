@@ -566,7 +566,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
 
     /// Apply `f` on EVERY card, rank order, stopping at the first refusal (named by its rank in a
     /// sharded world).
-    fn each<R>(&mut self, mut f: impl FnMut(&mut Executor<'a, 'c, T>) -> Result<R>) -> Result<Vec<R>> {
+    fn each<R>(
+        &mut self,
+        mut f: impl FnMut(&mut Executor<'a, 'c, T>) -> Result<R>,
+    ) -> Result<Vec<R>> {
         use ktir_superdsc::collective::World;
         self.ranks
             .iter_mut()

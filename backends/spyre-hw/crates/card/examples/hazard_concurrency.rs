@@ -125,18 +125,19 @@ fn run_round(
 
     // B races on a scoped thread — its stream borrows the card, so it cannot
     // leave this function's lifetime the way a 'static spawn demands.
-    let (b_launch, readback) = std::thread::scope(|s| -> Result<(Duration, Vec<u8>), anyhow::Error> {
-        let addr = addr.clone();
-        let mut readback = std::mem::take(&mut readback);
-        let reader = s.spawn(move || -> Result<(Duration, Vec<u8>), HwError> {
-            let t_b = Instant::now();
-            b.d2h(&mut readback, &addr)?;
-            let launch = t_b.elapsed();
-            b.synchronize()?;
-            Ok((launch, readback))
-        });
-        Ok(reader.join().map_err(|_| anyhow!("reader panicked"))??)
-    })?;
+    let (b_launch, readback) =
+        std::thread::scope(|s| -> Result<(Duration, Vec<u8>), anyhow::Error> {
+            let addr = addr.clone();
+            let mut readback = std::mem::take(&mut readback);
+            let reader = s.spawn(move || -> Result<(Duration, Vec<u8>), HwError> {
+                let t_b = Instant::now();
+                b.d2h(&mut readback, &addr)?;
+                let launch = t_b.elapsed();
+                b.synchronize()?;
+                Ok((launch, readback))
+            });
+            Ok(reader.join().map_err(|_| anyhow!("reader panicked"))??)
+        })?;
     a.synchronize().map_err(|e| anyhow!("A sync: {e}"))?;
     let t_a = t_write.elapsed();
     println!(
