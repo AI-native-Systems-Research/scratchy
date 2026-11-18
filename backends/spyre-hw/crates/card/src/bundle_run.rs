@@ -853,10 +853,21 @@ fn run_loaded(
     // here does not map an unmapped segment, it DESTROYS the staged bytes. Measured the moment a
     // gamma was first placed in `SegRole::Weight`: `zeroed seg1`, and the card then multiplied by a
     // gamma of exactly 0 (output all zeros, ramp probe resolving every element to index -1).
+    // ⭐ THE SET IS THE SEGMENTS THE LAUNCHER ITSELF STAGES AS WEIGHTS — `is_weight`'s own
+    // partition, three calls above — not only the `role == "Weight"` placements. A reserved
+    // device constant (the ramps, the fp8 clamp bounds, the scalarmul scales: every tid at or
+    // above `RESERVED_TID_FLOOR`) places as `SegRole::Activation` — the layout's own law for a
+    // reserved const — yet the launcher binds it BEFORE prepare and `stage_weights` H2Ds it
+    // into that segment, so the principle above ("a segment holding a weight, which staging
+    // already wrote") covers it exactly. Filtering on the role alone zeroed the activation
+    // segment AFTER staging had written the reserved consts into it — destroying them while
+    // the launch reported success, the same all-wrong-output shape the gamma story records.
+    // One derivation, already in hand: `is_weight` is the split the weight loop itself uses,
+    // so the two cannot disagree about which tensors are weights.
     let weight_segs: std::collections::BTreeSet<_> = pf
         .places
         .iter()
-        .filter(|p| p.role == "Weight")
+        .filter(|p| p.role == "Weight" || is_weight(p.tid))
         .map(|p| p.segment)
         .collect();
     // ⭐ AND THE SEGMENTS ONLY A SYNTHETIC NAMES. A lowering bump-allocates its intermediates into
