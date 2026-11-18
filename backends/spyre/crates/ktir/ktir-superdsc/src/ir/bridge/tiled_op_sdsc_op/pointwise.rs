@@ -1022,101 +1022,163 @@ pub fn assemble_index_select<L: LandingOp, T: crate::collective::Tp>(
         .map_err(|e| format!("assemble_index_select {op_name}: {e}"))
 }
 
-/// What a [`expand_blocks_opspec`] copies: `batch` stick-major `[rows, cols]` blocks, each `group`
+/// What [`assemble_expand_blocks`] copies: `batch` stick-major `[rows, cols]` blocks, each `group`
 /// times.
+///
+/// ⭐ SEALED: fields are private and [`ExpandedBlocks::of`] is the SOLE constructor — the
+/// expansion's geometry is a TYPED FACT, verified against the source it reads, never divided
+/// out of row counts at a call site. A source whose own frame disagrees with the stated
+/// blocks (the W²-producing mis-statement measured at rung 29: a 4-D input stated over a
+/// 3-D-geometry source) is REFUSED AT BAKE, not mis-copied. The group repetition is the
+/// OUTPUT's addressing — the input side never carries an axis the source does not have.
 #[derive(Clone, Copy, Debug)]
 pub struct ExpandedBlocks {
-    pub batch: u32,
-    pub group: u32,
-    pub rows: u32,
-    pub cols: u32,
+    batch: u32,
+    group: u32,
+    rows: u32,
+    cols: u32,
 }
 
-/// ⭐ torch-spyre's KERNEL EXPANSION — `batch` stick-major `[rows, cols]` blocks copied `group` times
-/// each, into `batch · group` blocks one after another: block `i·group + j` is block `i`. The
-/// reference's compiled prompt trip contracts each query head against a kernel block of its own, so
-/// it lays Kᵀ and V once per query head of a group (its `ReStickifyOpHBM` and its V relayout, the
-/// group dim broadcast on the read side), and every core of its row-split contraction then reads
-/// one kernel at one start.
-///
-/// An `identity` over `N_ {mb: batch, x: group, y: rows, out: cols}`, one block a core: the source
-/// read with `x` broadcast, both sides stated to dxp innermost-first as stick-major blocks
-/// (`['y','out','x','mb']`).
-pub fn expand_blocks_opspec(
-    src: &str,
-    dst: &str,
-    ExpandedBlocks {
-        batch,
-        group,
-        rows,
-        cols,
-    }: ExpandedBlocks,
-) -> Result<OpSpec, String> {
-    let df = Df::Fp16;
-    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
-    if batch == 0 || group < 2 || rows == 0 {
-        return Err(format!(
-            "expand_blocks_opspec('{src}' -> '{dst}'): {batch} block(s) of {rows} rows, {group} \
-             times each — an expansion copies whole blocks at least twice"
-        ));
+impl ExpandedBlocks {
+    /// The ONE constructor. `src_rows`/`src_cols` are the source region's own frame: the
+    /// source MUST be exactly `batch` stick-major `[rows, cols]` blocks (`src_rows ==
+    /// batch·rows`, `src_cols == cols`). Everything else — a stale frame, a rows/heads
+    /// units swap, a source one group short — is a bake-time refusal.
+    pub fn of(
+        batch: u32,
+        group: u32,
+        rows: u32,
+        cols: u32,
+        src_rows: u32,
+        src_cols: u32,
+    ) -> Result<Self, String> {
+        if batch == 0 || group < 2 || rows == 0 {
+            return Err(format!(
+                "{batch} block(s) of {rows} rows, {group} times each — an expansion copies \
+                 whole blocks at least twice"
+            ));
+        }
+        if src_rows != batch * rows || src_cols != cols {
+            return Err(format!(
+                "an expansion of {batch} block(s) of {rows} rows over a source \
+                 `[{src_rows}, {src_cols}]`: the source is not those blocks — the typed \
+                 geometry and the source's own frame disagree"
+            ));
+        }
+        Ok(Self {
+            batch,
+            group,
+            rows,
+            cols,
+        })
     }
-    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
-        name,
-        size,
-        is_reduction: false,
-        is_stick,
-        df,
-    };
-    let dims = [
-        dim("mb", batch, false),
-        dim("x", group, false),
-        dim("y", rows, false),
-        dim("out", cols, true),
-    ];
-    let (mb_cores, x_cores) = {
-        let mb = crate::work::core_split(batch, crate::device_gen::BUILD_CORES);
-        (
-            mb,
-            crate::work::core_split(group, crate::device_gen::BUILD_CORES / mb),
-        )
-    };
-    let plan =
-        crate::superdsc_opspec::WorkPlan::divide(&dims, crate::device_gen::whole(), |_, _| {
-            std::collections::BTreeMap::from([("mb", mb_cores), ("x", x_cores)])
-        })?;
-    let layout = ["mb", "x", "y", "out"];
-    let arg = |is_input: bool, name: &str, scale: [Scale; 4]| -> Result<_, String> {
-        Ok(AnyTensorArg::R4(
-            TensorArg::<4>::new(
-                is_input,
-                name.to_string(),
-                Role::Output,
-                scale,
-                plan.iter_syms(layout),
-                layout,
-                "out",
-                Allocation::Hbm,
-            )
-            .map_err(|e| e.0)?
-            .with_device_order(["y", "out", "x", "mb"])
-            .map_err(|e| e.0)?,
-        ))
-    };
-    let input = arg(
-        true,
-        src,
-        [
-            Scale::Active,
-            Scale::RedNonStick,
-            Scale::Active,
-            Scale::Active,
-        ],
-    )?;
-    let output = arg(false, dst, [Scale::Active; 4])?;
-    OpSpec::new(OpFunc::Identity, plan, vec![input], output).map_err(|e| e.0)
 }
 
-/// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
+/// The expansion copy's source-side form — THE TYPE'S OWN DISPATCH over the source's declared
+/// arrangement (the arrangement authority's record, [`BundleLayout::arrangement_of`]), never a
+/// second arrangement predicate stated at the copy. A flat-addressed record lays each block's
+/// bytes contiguously; a stick-blocked record of the blocks' own frame lays each block one stick
+/// column at a time, at the addresses [`StickLayout::dev_off`] itself computes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExpandSrcForm {
+    /// Each block one contiguous run of `rows·cols/lanes` sticks — a flat-addressed
+    /// arrangement IS the whole-tensor element sequence, so block `b` is elements
+    /// `[b·block, (b+1)·block)` of it.
+    Contiguous,
+    /// Each block `cols/lanes` runs of one stick a row, per stick column — the bytes the
+    /// record's own `dev_off` places. The record travels WITH the dispatch: the copy reads
+    /// its addresses from it, never re-derives a stride.
+    PerStickColumn {
+        record: crate::sdsc_abstract::StickLayout,
+    },
+}
+
+impl ExpandedBlocks {
+    /// ⭐ THE COPY'S FORM, DISPATCHED BY THE ARRANGEMENT AUTHORITY'S OWN RECORD — one law, one
+    /// statement: the producer declared the source's layout to
+    /// [`BundleLayout::declare_arrangement`], and this READS that record
+    /// ([`BundleLayout::arrangement_of`]) to pick the copy's form. A flat-addressed record
+    /// takes the contiguous form (its element sequence IS the blocks, whatever frame the
+    /// record states them in); a stick-blocked record of the blocks' own `[batch·rows, cols]`
+    /// frame takes the per-stick-column form. Everything else — a record of the same total
+    /// whose frame the blocks do not occupy, a foreign stick width, a source no op ever
+    /// declared — REFUSES BY NAME: the copy serves the arrangements the device states,
+    /// never an assumption (the pre-restructure identity op served any declared
+    /// arrangement; a copy that serves only the flat one narrows the selector's candidate
+    /// set for no principle, and that narrowing is a defect, not a selection).
+    pub(crate) fn src_form(
+        &self,
+        layout: Option<&BundleLayout>,
+        src: &str,
+    ) -> Result<ExpandSrcForm, String> {
+        let ExpandedBlocks {
+            batch,
+            group: _,
+            rows,
+            cols,
+        } = *self;
+        let Some(l) = layout else {
+            // No authority exists (a unit-test world) — the caller states its own bytes.
+            return Ok(ExpandSrcForm::Contiguous);
+        };
+        let Some(record) = l.arrangement_of(src) else {
+            return Err(format!(
+                "expand_blocks('{src}'): no op has declared the source's arrangement — the \
+                 copy cannot know its bytes. The producer must state the layout it wrote \
+                 (declare_arrangement) before anything copies the tensor."
+            ));
+        };
+        if record.df != Df::Fp16 {
+            return Err(format!(
+                "expand_blocks('{src}'): the source's declared arrangement is {record:?} — a \
+                 stick width the fp16 expansion does not serve"
+            ));
+        }
+        let total = batch * rows * cols;
+        if record.rows as u64 * record.cols as u64 != total as u64 {
+            return Err(format!(
+                "expand_blocks('{src}'): the source's declared arrangement is \
+                 [{}, {}] over an expansion of {batch} block(s) of {rows} rows \
+                 [{total} elements] — a different total is a tensor the blocks are not",
+                record.rows, record.cols
+            ));
+        }
+        if record.flat_addressed() {
+            return Ok(ExpandSrcForm::Contiguous);
+        }
+        if record.rows == (batch * rows) as usize && record.cols == cols as usize {
+            return Ok(ExpandSrcForm::PerStickColumn { record });
+        }
+        Err(format!(
+            "expand_blocks('{src}'): the source's declared arrangement is [{}, {}] — a \
+             frame the expansion's {} block(s) of [{rows}, {cols}] do not occupy, and the \
+             copy serves the arrangements the device states, never an assumption",
+            record.rows, record.cols, batch
+        ))
+    }
+}
+
+/// ⭐ torch-spyre's KERNEL EXPANSION — `batch` stick-major `[rows, cols]` blocks copied `group`
+/// times each, into `batch · group` blocks one after another: block `i·group + j` is block `i`.
+/// The reference's compiled prompt trip contracts each query head against a kernel block of its
+/// own, so it lays Kᵀ and V once per query head of a group (its `ReStickifyOpHBM` and its V
+/// relayout, the group dim broadcast on the read side), and every core of its row-split
+/// contraction then reads one kernel at one start.
+///
+/// The copy's source-side form is [`ExpandedBlocks::src_form`]'s dispatch over the source's
+/// DECLARED arrangement: a flat-addressed record takes `group` contiguous-run copies (one a
+/// group slot, the form the rung-27 golden geometry pins); a stick-blocked record takes a
+/// transposing per-stick scatter — `cols/lanes` runs of one stick a row per stick column, every
+/// address folded through the record's own `dev_off`. The group repetition is the OUTPUT
+/// addressing alone in both forms (run `b` written to block `b·group + g`, so query head
+/// `b·group + g` reads kv head `b`'s kernel); the input side never carries an axis the source
+/// does not have — the broadcast is the output's pitch ([`TensorArg::with_device_extent`]),
+/// never a marker on a phantom source axis (the rung-29 corruption was exactly that marker).
+///
+/// The destination's block frame is the contraction's own kernel view, derived here through the
+/// SAME classifier the contraction's kernel arg goes through (`for_view_df` over
+/// `['x', in, out]`: `Flat [x, in·out]`, row-major blocks with the stick dim innermost) — one
+/// law with the reader, never a stride stated twice.
 pub fn assemble_expand_blocks<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
@@ -1124,11 +1186,117 @@ pub fn assemble_expand_blocks<T: crate::collective::Tp>(
     blocks: ExpandedBlocks,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp<T>, String> {
-    let op = expand_blocks_opspec(src, dst, blocks)?;
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .map_err(|e| format!("assemble_expand_blocks {op_name}: {e}"))
+) -> Result<Vec<EmittedOp<T>>, String> {
+    let ExpandedBlocks {
+        batch,
+        group,
+        rows,
+        cols,
+    } = blocks;
+    let df = Df::Fp16;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    let stick = df.elems_per_stick() as usize;
+    let block_sticks = rows * cols / stick as u32;
+    // ⛔ NO VALIDITY CHECK HERE — the geometry's law lives ONCE, in [`ExpandedBlocks::of`], the
+    // sealed sole constructor. A value of this type has already passed it.
+    let form = blocks.src_form(layout, src)?;
+    // ⭐ THE CONTRACTION'S OWN KERNEL FRAME — `for_view_df` over `['x', in, out]`, the same
+    // classifier [`matmul_opspec_rows_split`]'s kernel arg goes through: `Flat [x, in·out]`,
+    // row-major blocks, the stick dim innermost. Every destination address below folds through
+    // THIS layout's `dev_off`, so the copy's writes and the contraction's reads are one law.
+    let dst_kernel = crate::sdsc_abstract::StickLayout::for_view_df(
+        &[(batch * group) as usize, rows as usize, cols as usize],
+        2,
+        df,
+    );
+    let mut ops = Vec::new();
+    match form {
+        ExpandSrcForm::Contiguous => {
+            let chunks = stick_runs_chunks(batch);
+            ops.reserve(chunks.len() * group as usize);
+            for g in 0..group {
+                for (k, (first, count)) in chunks.iter().copied().enumerate() {
+                    let name = match chunks.len() {
+                        1 => format!("{op_name}g{g}"),
+                        _ => format!("{op_name}g{g}r{k}"),
+                    };
+                    ops.push(
+                        assemble_stick_runs_copy(
+                            &name,
+                            src,
+                            dst,
+                            StickRuns {
+                                runs: count,
+                                run_sticks: block_sticks,
+                                src_pitch: block_sticks,
+                                dst_pitch: group * block_sticks,
+                                src_elems: first * block_sticks * stick as u32,
+                                dst_elems: dst_kernel
+                                    .dev_off((first * group + g) as usize, 0)
+                                    as u32,
+                                df,
+                            },
+                            sym_id_base,
+                            layout,
+                        )
+                        .map_err(|e| format!("assemble_expand_blocks {op_name}: {e}"))?,
+                    );
+                }
+            }
+        }
+        ExpandSrcForm::PerStickColumn { record } => {
+            // ⛔ THE TRANSPOSING PER-STICK SCATTER — every address is the RECORD's own `dev_off`
+            // (source) or the contraction kernel frame's (destination), never a re-derived
+            // stride. Block `b`'s stick column `j` is `rows` sticks at
+            // `record.dev_off(b·rows + r, j·lanes)` — consecutive rows are consecutive sticks;
+            // the destination's block `b·group + g` is row-major, so its column-`j` sticks sit
+            // `cols/lanes` apart. One run a stick, at most one run a core.
+            let columns = cols as usize / stick;
+            let chunks = stick_runs_chunks(rows);
+            ops.reserve(columns * group as usize * batch as usize * chunks.len());
+            for g in 0..group {
+                for j in 0..columns {
+                    for b in 0..batch {
+                        for (k, (first, count)) in chunks.iter().copied().enumerate() {
+                            let name = match chunks.len() {
+                                1 => format!("{op_name}g{g}j{j}b{b}"),
+                                _ => format!("{op_name}g{g}j{j}b{b}r{k}"),
+                            };
+                            ops.push(
+                                assemble_stick_runs_copy(
+                                    &name,
+                                    src,
+                                    dst,
+                                    StickRuns {
+                                        runs: count,
+                                        run_sticks: 1,
+                                        src_pitch: 1,
+                                        dst_pitch: columns as u32,
+                                        src_elems: record
+                                            .dev_off((b * rows + first) as usize, j * stick)
+                                            as u32,
+                                        dst_elems: dst_kernel
+                                            .dev_off(
+                                                (b * group + g) as usize,
+                                                first as usize * cols as usize + j * stick,
+                                            )
+                                            as u32,
+                                        df,
+                                    },
+                                    sym_id_base,
+                                    layout,
+                                )
+                                .map_err(|e| {
+                                    format!("assemble_expand_blocks {op_name}: {e}")
+                                })?,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(ops)
 }
 
 /// ⭐ A STICK PERMUTE'S DIRECTION — between the two card frames of `R` rows of `C` sticks:
@@ -1339,6 +1507,19 @@ pub fn assemble_stick_runs_copy<T: crate::collective::Tp>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .map_err(|e| format!("assemble_stick_runs_copy {op_name}: {e}"))
+}
+
+/// ⭐ AT MOST ONE RUN A CORE — the ONE statement of the [`StickRuns`] chunking law: a copy of
+/// more runs than cores hands a core several, which the card steps by the run's device-extent
+/// pitch — a stride no copy has run with. Past the cores, the runs go out a core's worth an op,
+/// each op's runs one a core: `(first, count)` a chunk. Every emitter of multi-run copies
+/// consumes THIS — a second chunking stated at a call site is the law stated twice.
+pub fn stick_runs_chunks(total: u32) -> Vec<(u32, u32)> {
+    let per_op = crate::device_gen::BUILD_CORES;
+    let chunks = total.div_ceil(per_op);
+    (0..chunks)
+        .map(|k| (k * per_op, per_op.min(total - k * per_op)))
+        .collect()
 }
 
 /// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
@@ -2728,59 +2909,385 @@ mod index_select_tests {
 mod expand_blocks_tests {
     use super::*;
 
-    /// ⭐ granite's Kᵀ for the prompt trip: 8 kv heads' `[64, 128]` blocks, each laid for its 4 query
-    /// heads. Core `kv·4 + g` reads kv head `kv`'s block and writes query head `kv·4 + g`'s.
+    /// ⭐ THE FIRED NEAR-MISS (rung 29, gemma-4 prefill): a stated geometry that disagrees with
+    /// the source's own frame — the W²-producing mis-statement (a source stated at 841 = W²
+    /// rows where `batch·rows` belongs) — REFUSES at the constructor, never reaches a copy.
     #[test]
-    fn each_query_head_gets_its_kv_heads_block() {
-        let op = expand_blocks_opspec(
+    fn a_source_that_is_not_the_stated_blocks_refuses() {
+        let err = ExpandedBlocks::of(8, 2, 29, 256, 841, 256)
+            .expect_err("841 rows is not 8 blocks of 29 rows");
+        assert!(err.contains("disagree"), "the refusal names the disagreement: {err}");
+        let err = ExpandedBlocks::of(8, 2, 29, 256, 232, 2048)
+            .expect_err("the cols disagree with the source frame");
+        assert!(err.contains("disagree"), "the refusal names the disagreement: {err}");
+    }
+
+    /// ⭐ THE RUNG-27 GOLDEN GEOMETRY (gemma-4-12b's good rung — the card verified the attention
+    /// clean there pre-fix, plan §S1: reconstruction rel 0.0017, the V read in span): the
+    /// expansion at EXACTLY that geometry — 4 kv heads of `[27, 128]` blocks laid for their 4
+    /// query heads each (16 query heads, W=27, head dim 128) — pins the byte law the correct
+    /// path served at 27: query head `H = b·4 + g` reads kv head `b = H/4`'s block — run `b` of
+    /// group `g` written at query head `b·4 + g`'s block. The cores sweep the four runs' sticks
+    /// over the source's own contiguous frame; every core's start stays inside it, every block
+    /// base is covered on both sides, and each core's output start is its input start's run at
+    /// the expanded pitch — the identical bytes the card walked at the rung where it was right.
+    #[test]
+    fn rung_27s_golden_geometry_lays_each_query_heads_block_byte_for_byte() {
+        let mut sym = 0i64;
+        let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_w27",
             "Tensor0",
             "Tensor1",
-            ExpandedBlocks {
-                batch: 8,
-                group: 4,
-                rows: 64,
-                cols: 128,
-            },
+            ExpandedBlocks::of(4, 4, 27, 128, 108, 128).expect("the expansion builds"),
+            &mut sym,
+            None,
         )
         .expect("the expansion builds");
-        assert_eq!(op.iter.cores_used().get(), 32, "one block a core");
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let v = serde_json::to_value(
-            crate::emit::emit_sdsc("expand_o1", &op, &folds, None).expect("it emits"),
-        )
-        .expect("json");
-        let tree = v["dscs_"][0]["expand_o1"]["scheduleTree_"]
-            .as_array()
-            .expect("a tree")
-            .clone();
-        let starts = |i: usize| -> Vec<u64> {
-            let data = &tree[i]["startAddressCoreCorelet_"]["data_"];
-            let at = |c: u32| -> u64 {
-                data[format!("[{c}, 0, 0]")]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .expect("a concrete start")
+        assert_eq!(ops.len(), 4, "one copy a group slot");
+        let (block, stick) = (27 * 128 * 2, 64 * 2); // bytes: one block / one stick of fp16
+        for (g, op) in ops.iter().enumerate() {
+            assert_eq!(op.op_name, format!("expand_w27g{g}"), "group {g}'s copy");
+            let v = serde_json::to_value(op.dsc()).expect("the copy serializes");
+            let dsc = &v["dscs_"][0][op.op_name.as_str()];
+            assert!(
+                dsc["N_"].get("x_").is_none(),
+                "the walk is the source's own — no phantom group axis"
+            );
+            let tree = dsc["scheduleTree_"].as_array().expect("a tree").clone();
+            for n in &tree[..2] {
+                assert_eq!(
+                    n["layoutDimOrder_"],
+                    serde_json::json!(["y", "mb", "out"]),
+                    "both sides over the source's own three dims"
+                );
+            }
+            let starts = |i: usize| -> Vec<u64> {
+                let mut starts: Vec<(u64, u64)> = tree[i]["startAddressCoreCorelet_"]["data_"]
+                    .as_object()
+                    .expect("per-core starts")
+                    .iter()
+                    .filter_map(|(k, val)| {
+                        let c = k
+                            .strip_prefix('[')?
+                            .split(',')
+                            .next()?
+                            .parse::<u64>()
+                            .ok()?;
+                        let s = val.as_str()?.parse::<u64>().ok()?;
+                        Some((c, s))
+                    })
+                    .collect();
+                assert!(!starts.is_empty(), "the copy has cores");
+                starts.sort();
+                let base = starts[0].1; // core 0: the first run's first stick
+                starts.into_iter().map(|(_, s)| s - base).collect()
             };
-            (0..32).map(|c| at(c) - at(0)).collect()
+            let (input, output) = (starts(0), starts(1));
+            let g = g as u64;
+            for b in 0..4u64 {
+                assert!(
+                    input.contains(&(b * block)),
+                    "kv head {b}'s block is read from its own first stick"
+                );
+                assert!(
+                    output.contains(&(b * 4 * block)),
+                    "run {b}'s block is written at query head {}'s first stick (group {g}'s \
+                     base is core 0's, the start the relative frame subtracts)",
+                    b * 4 + g
+                );
+            }
+            for (&in_rel, &out_rel) in input.iter().zip(&output) {
+                assert!(
+                    in_rel < 4 * block,
+                    "every core reads inside the source's own 4-block frame (108 rows), where \
+                     the rung-29 mis-statement read past it at W²"
+                );
+                assert_eq!(in_rel % stick, 0, "a core starts on a stick");
+                let (b, within) = (in_rel / block, in_rel % block);
+                assert_eq!(
+                    out_rel,
+                    b * 4 * block + within,
+                    "core holding run {b}'s stick writes it at query head {}'s block",
+                    b * 4 + g
+                );
+            }
+        }
+    }
+
+    /// ⭐ granite's Kᵀ for the prompt trip: 8 kv heads' `[64, 128]` blocks, each laid for its 4
+    /// query heads — one [`StickRuns`] copy a group slot. Group `g`'s copy states the source over
+    /// its TRUE 2-D block frame (no phantom group axis in the walk, no permutation in either
+    /// side's order) and writes run `b` at query head `b·4 + g`'s block: whatever (run, stick) a
+    /// core holds, its output start is its input start's run at the expanded pitch — and every
+    /// input start stays inside the source's own 8-block frame, where the rung-29 mis-statement
+    /// read past it at `W²`.
+    #[test]
+    fn each_query_head_gets_its_kv_heads_block() {
+        let mut sym = 0i64;
+        let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_o1",
+            "Tensor0",
+            "Tensor1",
+            ExpandedBlocks::of(8, 4, 64, 128, 512, 128).expect("the expansion builds"),
+            &mut sym,
+            None,
+        )
+        .expect("the expansion builds");
+        assert_eq!(ops.len(), 4, "one copy a group slot");
+        let (block, stick) = (64 * 128 * 2, 64 * 2); // bytes: one block / one stick of fp16
+        for (g, op) in ops.iter().enumerate() {
+            assert_eq!(op.op_name, format!("expand_o1g{g}"), "group {g}'s copy");
+            let v = serde_json::to_value(op.dsc()).expect("the copy serializes");
+            let dsc = &v["dscs_"][0][op.op_name.as_str()];
+            assert!(
+                dsc["N_"].get("x_").is_none(),
+                "the walk is the source's own — no phantom group axis"
+            );
+            let tree = dsc["scheduleTree_"].as_array().expect("a tree").clone();
+            for n in &tree[..2] {
+                assert_eq!(
+                    n["layoutDimOrder_"],
+                    serde_json::json!(["y", "mb", "out"]),
+                    "both sides over the source's own three dims — no phantom group axis, no \
+                     permutation into a frame the source does not have"
+                );
+            }
+            let starts = |i: usize| -> Vec<u64> {
+                let mut starts: Vec<(u64, u64)> = tree[i]["startAddressCoreCorelet_"]["data_"]
+                    .as_object()
+                    .expect("per-core starts")
+                    .iter()
+                    .filter_map(|(k, val)| {
+                        let c = k
+                            .strip_prefix('[')?
+                            .split(',')
+                            .next()?
+                            .parse::<u64>()
+                            .ok()?;
+                        let s = val.as_str()?.parse::<u64>().ok()?;
+                        Some((c, s))
+                    })
+                    .collect();
+                assert!(!starts.is_empty(), "the copy has cores");
+                starts.sort();
+                let base = starts[0].1; // core 0: the first run's first stick
+                starts.into_iter().map(|(_, s)| s - base).collect()
+            };
+            let (input, output) = (starts(0), starts(1));
+            assert_eq!(input.len(), output.len(), "one plan, both sides");
+            for (&in_rel, &out_rel) in input.iter().zip(&output) {
+                assert!(
+                    in_rel < 8 * block,
+                    "every core reads inside the source's own 8-block frame"
+                );
+                assert_eq!(in_rel % stick, 0, "a core starts on a stick");
+                let (b, within) = (in_rel / block, in_rel % block);
+                assert_eq!(
+                    out_rel,
+                    b * 4 * block + within,
+                    "core holding run {b}'s stick writes it at query head {}'s block",
+                    b * 4 + g as u64
+                );
+            }
+        }
+    }
+
+    /// A layout with the source and destination synth'd, and the source's arrangement DECLARED —
+    /// the world the arrangement authority holds.
+    fn declared(src_rows: u32, src_cols: u32, dst_rows: u32, dst_cols: u32) -> BundleLayout {
+        let l = BundleLayout::default();
+        l.synth(crate::place::SynthId::Act(1), &[src_rows, src_cols]);
+        l.synth(crate::place::SynthId::Act(2), &[dst_rows, dst_cols]);
+        l
+    }
+
+    /// Per-core starts (core order) of an emitted copy, RELATIVE to core 0, with core 0's
+    /// ABSOLUTE start — the segment bases cancel in every cross-op difference of the absolute
+    /// bases and in every within-op relative stride.
+    fn op_starts(
+        op: &super::EmittedOp<crate::collective::TpWorld<1>>,
+    ) -> ((Vec<u64>, u64), (Vec<u64>, u64)) {
+        let v = serde_json::to_value(op.dsc()).expect("the copy serializes");
+        let dsc = &v["dscs_"][0][op.op_name.as_str()];
+        let tree = dsc["scheduleTree_"].as_array().expect("a tree").clone();
+        let starts = |i: usize| -> (Vec<u64>, u64) {
+            let mut starts: Vec<(u64, u64)> = tree[i]["startAddressCoreCorelet_"]["data_"]
+                .as_object()
+                .expect("per-core starts")
+                .iter()
+                .filter_map(|(k, val)| {
+                    let c = k.strip_prefix('[')?.split(',').next()?.parse::<u64>().ok()?;
+                    let s = val.as_str()?.parse::<u64>().ok()?;
+                    Some((c, s))
+                })
+                .collect();
+            assert!(!starts.is_empty(), "the copy has cores");
+            starts.sort();
+            let base = starts[0].1;
+            (
+                starts.iter().map(|(_, s)| s - base).collect(),
+                base,
+            )
         };
-        let block = 64 * 128 * 2;
+        (starts(0), starts(1))
+    }
+
+    /// ⭐ THE STICK-BLOCKED SOURCE — the s146 windowed attention's under the prompt-trip plan
+    /// (the 324 probe refusals the arrangement authority held while the copy served only flat
+    /// sources): the producer declared the source `RowBlocked [512, 128]` — 8 kv heads'
+    /// `[64, 128]` blocks, stick-column-major — and the expansion lays it for 2 query heads a
+    /// group BY THE RECORD'S OWN `dev_off`: block `b`'s stick column `j` is 64 consecutive
+    /// source sticks at `dev_off(b·64 + r, j·64)`, written to the row-major destination block
+    /// `b·2 + g` at `(first + r)·2 + j` sticks in — the transposing per-stick scatter, every
+    /// address the record's own (source) or the contraction kernel frame's (destination,
+    /// `for_view_df` over `['x','in','out']`), never a re-derived stride.
+    #[test]
+    fn a_stick_blocked_source_copies_by_the_arrangements_own_dev_off() {
+        use crate::sdsc_abstract::StickLayout;
+        let l = declared(512, 128, 1024, 128);
+        let (src, dst) = (crate::place::act_name(1), crate::place::act_name(2));
+        let record = StickLayout::row_blocked(512, 128);
+        l.declare_arrangement(&src, record)
+            .expect("the producer's stick-major [512, 128]");
+        // The contraction's own kernel frame — the same classifier its kernel arg goes through.
+        let dst_kernel =
+            StickLayout::for_view_df(&[16, 64, 128], 2, Df::Fp16);
+        let mut sym = 0i64;
+        let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_o2",
+            &src,
+            &dst,
+            ExpandedBlocks::of(8, 2, 64, 128, 512, 128).expect("the expansion builds"),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the stick-blocked source copies");
+        // 2 group slots × 2 stick columns × 8 blocks × 2 row-chunks (64 one-stick runs, 32 a core).
         assert_eq!(
-            starts(0),
-            (0..32u64).map(|c| c / 4 * block).collect::<Vec<_>>(),
-            "kv head c/4's block"
+            ops.len(),
+            64,
+            "the transposing scatter: group × stick column × block × row chunk"
         );
-        assert_eq!(
-            starts(1),
-            (0..32u64).map(|c| c * block).collect::<Vec<_>>(),
-            "query head c's block"
-        );
-        for n in &tree[..2] {
+        let ((_, in0), (_, out0)) = op_starts(&ops[0]);
+        for (idx, op) in ops.iter().enumerate() {
+            let (g, j, b, k) = (idx / 32, (idx % 32) / 16, (idx % 16) / 2, idx % 2);
+            let first = k * 32;
             assert_eq!(
-                n["layoutDimOrder_"],
-                serde_json::json!(["y", "out", "x", "mb"]),
-                "stick-major blocks"
+                op.op_name,
+                format!("expand_o2g{g}j{j}b{b}r{k}"),
+                "the scatter's op names its (group, column, block, chunk)"
+            );
+            let ((input, in_base), (output, out_base)) = op_starts(op);
+            assert_eq!(input.len(), 32, "one one-stick run a core");
+            for r in 0..input.len() {
+                assert_eq!(
+                    input[r],
+                    (r * 128) as u64,
+                    "core {r} reads run {r}'s own stick — one stick a run, consecutive rows \
+                     of the block's stick column"
+                );
+                assert_eq!(
+                    output[r],
+                    (r * 256) as u64,
+                    "core {r} writes run {r} at the destination's column stride (2 sticks)"
+                );
+            }
+            assert_eq!(
+                in_base - in0,
+                (record.dev_off(b * 64 + first, j * 64) * 2) as u64,
+                "block {b}'s stick column {j}, row chunk {k}: the source base IS the \
+                 record's own dev_off"
+            );
+            assert_eq!(
+                out_base - out0,
+                (dst_kernel.dev_off(b * 2 + g, first * 128 + j * 64) * 2) as u64,
+                "query head {}'s block, row chunk {k}, column {j}: the destination base IS \
+                 the contraction kernel frame's own dev_off",
+                b * 2 + g
             );
         }
+    }
+
+    /// ⭐ THE NEAR-MISS THE DISPATCH MUST NOT STEAL: a flat-addressed record at the SAME
+    /// geometry takes the CONTIGUOUS form by the record's own law — a flat-addressed
+    /// arrangement IS the whole-tensor element sequence, whatever frame it states it in (here
+    /// the reshaped `[1, 65536]`) — never a shape test. The group-slot copies, byte-identical
+    /// to the layout-None golden form.
+    #[test]
+    fn a_flat_record_takes_the_contiguous_form_by_the_records_own_law() {
+        use crate::sdsc_abstract::StickLayout;
+        let l = declared(512, 128, 1024, 128);
+        let (src, dst) = (crate::place::act_name(1), crate::place::act_name(2));
+        l.declare_arrangement(&src, StickLayout::flat(1, 512 * 128))
+            .expect("a flat-addressed reshaped record of the same bytes");
+        let mut sym = 0i64;
+        let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_o2",
+            &src,
+            &dst,
+            ExpandedBlocks::of(8, 2, 64, 128, 512, 128).expect("the expansion builds"),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the flat record takes the contiguous form");
+        assert_eq!(ops.len(), 2, "one copy a group slot — the contiguous form");
+        let block = 64 * 128 * 2; // bytes: one block of fp16
+        for (g, op) in ops.iter().enumerate() {
+            assert_eq!(op.op_name, format!("expand_o2g{g}"), "group {g}'s copy");
+            let ((input, _), (output, _)) = op_starts(op);
+            for (&in_rel, &out_rel) in input.iter().zip(&output) {
+                let (b, within) = (in_rel / block, in_rel % block);
+                assert_eq!(
+                    out_rel, b * 2 * block + within,
+                    "run {b}'s stick writes at query head {}'s block — the golden law",
+                    b * 2 + g as u64
+                );
+            }
+        }
+    }
+
+    /// A record the blocks do not occupy, and a source no op ever declared, REFUSE — the copy
+    /// serves the arrangements the device states, never an assumption.
+    #[test]
+    fn a_record_the_blocks_do_not_occupy_refuses() {
+        use crate::sdsc_abstract::StickLayout;
+        let l = declared(512, 128, 1024, 128);
+        let (src, dst) = (crate::place::act_name(1), crate::place::act_name(2));
+        l.declare_arrangement(&src, StickLayout::row_blocked(256, 256))
+            .expect("a same-total record in a frame the blocks do not occupy");
+        let mut sym = 0i64;
+        let err = match assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_o2",
+            &src,
+            &dst,
+            ExpandedBlocks::of(8, 2, 64, 128, 512, 128).expect("the expansion builds"),
+            &mut sym,
+            Some(&l),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a [256, 256] record does not carry [64, 128] blocks"),
+        };
+        assert!(
+            err.contains("do not occupy"),
+            "the refusal names the frame: {err}"
+        );
+        // A source no op ever declared: the copy cannot know its bytes.
+        let l = declared(512, 128, 1024, 128);
+        let err = match assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_o2",
+            &src,
+            &dst,
+            ExpandedBlocks::of(8, 2, 64, 128, 512, 128).expect("the expansion builds"),
+            &mut sym,
+            Some(&l),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("an undeclared source has no bytes to copy"),
+        };
+        assert!(
+            err.contains("cannot know its bytes"),
+            "the refusal names the missing declaration: {err}"
+        );
     }
 }
 

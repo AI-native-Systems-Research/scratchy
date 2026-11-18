@@ -7011,8 +7011,14 @@ pub fn batch_transpose<T: crate::collective::Tp>(
     );
     // ⭐ THE ALL-HEADS FORM, under the plan that divides the walk one batch a core: ONE relayout, core
     // `i` on batch `i` (torch-spyre's decode trip), so each core's block lands where the all-heads
-    // contraction on that core reads its kernel.
-    if layout.is_some_and(|l| l.lx_division.get().is_some_and(|d| d.one_op_over(batch))) {
+    // contraction on that core reads its kernel. The arm is gated on the form's OWN divisibility
+    // law ([`super::restickify_batched_serves`], the same fact the constructor refuses on) — a
+    // batch the form cannot serve (the batch-1 window transposes under the prompt trip's division,
+    // which `one_op_over` alone would claim) falls to the per-batch loop, which at one batch is
+    // the same ONE op the division promises.
+    if super::restickify_batched_serves(batch)
+        && layout.is_some_and(|l| l.lx_division.get().is_some_and(|d| d.one_op_over(batch)))
+    {
         return Ok(vec![
             super::try_assemble_restickify_transpose_batched(
                 &format!("transpose_o{}", out.tid),
@@ -10524,6 +10530,47 @@ mod batch_transpose_tests {
             let offs: Vec<u32> = e.arg_bindings.iter().map(|a| a.offset_elems).collect();
             assert_eq!(offs, [i as u32 * 64 * 128; 2], "{}", e.op_name);
         }
+    }
+
+    /// ⭐ THE FIRED NEAR-MISS (the rung reroute, gemma-4 11-18): a batch-1 rank-3 transpose under
+    /// the prompt trip's division — whose `one_op_over` is blanket `true` — was routed into the
+    /// all-heads restickify, whose own divisibility law refuses a batch of 1, and that refusal
+    /// killed the whole HeadsInner probe at every windowed attention (324 silently dropped
+    /// candidates, every rung rerouted to Flat for the wrong reason). The arm is gated on the
+    /// form's own law now ([`super::restickify_batched_serves`]), so the batch-1 transpose falls
+    /// to the per-batch loop — which at one batch is ONE 2-D restickify, the same one op the
+    /// division promises. Pinned: one op, the single batch's zero offsets, no refusal.
+    #[test]
+    fn a_batch_of_one_under_the_prompt_plan_is_one_restickify_not_a_refusal() {
+        let layout = BundleLayout::default();
+        layout
+            .lx_division
+            .set(Some(crate::placement::WalkDivision::HeadsInner { chunks: 4 }));
+        // Both sides declared to the layout — the 2-D door mints the whole-buffer window.
+        layout.synth(crate::place::SynthId::Act(5), &[64, 128]);
+        layout.synth(crate::place::SynthId::Act(6), &[128, 64]);
+        let mut sym = 0i64;
+        // `[1, 64, 128] → [1, 128, 64]` — a window function's relayout over its block-laid
+        // source, the exact shape the capture shows refusing.
+        let rs = vec![reg(5, 64, 128, false), reg(6, 128, 64, true)];
+        let ops = match batch_transpose::<crate::collective::TpWorld<1>>(
+            "t",
+            1,
+            BatchFrame::Blocks,
+            &rs,
+            &mut sym,
+            Some(&layout),
+        ) {
+            Ok(ops) => ops,
+            Err(e) => panic!("{}", e.message),
+        };
+        assert_eq!(
+            ops.len(),
+            1,
+            "one batch, one 2-D restickify — the one op the division promises"
+        );
+        let offs: Vec<u32> = ops[0].arg_bindings.iter().map(|a| a.offset_elems).collect();
+        assert_eq!(offs, [0, 0], "{}", ops[0].op_name);
     }
 }
 

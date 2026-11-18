@@ -2144,6 +2144,43 @@ fn nz(v: u32) -> std::num::NonZeroU32 {
     std::num::NonZeroU32::new(v).expect("a test extent is positive")
 }
 
+/// ⭐ THE K/V POOLS — one cache in two planes, ONE verified page count. An attention's K and V
+/// caches are the SAME pool read in two planes: the constructor reads both, refuses unless they
+/// are one pool (the same whole number of pages at the same `kv_width`), and the result carries
+/// the count every downstream front needs — the walk's page extent, the append's row count, the
+/// kernel's `NUM_PAGES` — read from the one verified value. A second front re-deriving either
+/// pool's geometry (its own `pool_pages` call, its own equality) is the restatement this type
+/// kills: the equality law lives HERE, once, at the constructor.
+struct KvPools {
+    pages: std::num::NonZeroU32,
+}
+
+impl KvPools {
+    /// The sole constructor — both planes stated, both verified one pool.
+    fn of<F: scratchy_subtile::subtile_ir::RopeForm>(
+        ir: &SubtileIR<F>,
+        k: &scratchy_subtile::subtile_ir::TensorRegion,
+        v: &scratchy_subtile::subtile_ir::TensorRegion,
+        kv_width: u32,
+        at: &str,
+    ) -> Result<Self, String> {
+        let pages = pool_pages(ir, k, kv_width, "K")?;
+        let v_pages = pool_pages(ir, v, kv_width, "V")?;
+        if v_pages != pages {
+            return Err(format!(
+                "triton splice: {at}: the K pool is {pages} page(s) and the V pool {v_pages} — \
+                 they are one pool in two planes and must state the same page count"
+            ));
+        }
+        Ok(Self { pages })
+    }
+
+    /// The verified count — the only way a front reads either pool's pages.
+    fn pages(&self) -> u32 {
+        self.pages.get()
+    }
+}
+
 /// A region that is its whole tensor, `rows × cols` — what a kernel viewing the tensor from corner
 /// `[0, 0]` requires of its operand.
 fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
@@ -2408,15 +2445,18 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         ));
     }
     let kv_width = nkvh * hd.get();
-    let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
-    if pool_pages(ir, &node.inputs[2], kv_width, "V")? != pages {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: the K and V pools differ in pages",
-            node.output.tensor.index()
-        ));
-    }
-    // The kernel's view of the pools is the context's pages ([`ContextPages::of_slots`]); `pages`
-    // stays the pool's own, which the batch's eligibility below compares a chunk's gather against.
+    // The pools meet their law HERE, once: both planes one pool, the verified count threaded
+    // to every front below (the walk, the chunk bound, the kernel's NUM_PAGES).
+    let pools = KvPools::of(
+        ir,
+        &node.inputs[1],
+        &node.inputs[2],
+        kv_width,
+        &format!("AttnDecode t{}", node.output.tensor.index()),
+    )?;
+    // The kernel's view of the pools is the context's pages ([`ContextPages::of_slots`]); the
+    // pool's own count stays what `pools` states, which the batch's eligibility below compares a
+    // chunk's gather against.
     let view = ContextPages::of_slots(positive(*valid_len, "the attention's context")?);
     whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
@@ -2463,14 +2503,15 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
         let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
-        if !chunk_fits_pool(&chunking, pages.get()) {
+        if !chunk_fits_pool(&chunking, pools.pages()) {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
-                 gathers {} page(s) a chunk, and the pool holds {pages} — a gather of the whole \
+                 gathers {} page(s) a chunk, and the pool holds {} — a gather of the whole \
                  pool faults the card, so spyre-inference serves this step with its per-sequence \
                  loop, one launch a sequence, which this port does not have",
                 node.output.tensor.index(),
-                chunking.entries()
+                chunking.entries(),
+                pools.pages()
             ));
         }
         let positional = batched_decode_at(
@@ -7145,16 +7186,19 @@ mod walk_on_the_card {
     /// ⭐⭐ THE PROMPT TRIP IN torch-spyre's FORM — its compiled prefill's: the query rows split across
     /// the cores, each core holding whole query rows of every head (row `p·32 + h`), the scores and
     /// the value product each ONE contraction over every query head against the kv head's block
-    /// expanded once per query head of its group (read by every core at one start, from HBM), the
+    /// expanded once per query head of its group — laid by the expansion's own group-slot copies,
+    /// one copy op per query head of the group into the one kernel scratch (the phantom-axis
+    /// broadcast op that did it in one is deleted: its stick-moving device order was the rung-29
+    /// card corruption) — read by every core at one start, from HBM, the
     /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
     /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
-    /// with the rows: 23 at either head dim, each page gathered in one op (the reference's trip is
+    /// with the rows: 29 at either head dim, each page gathered in one op (the reference's trip is
     /// 21). At 512 rows every value still fits, because a pin is held
     /// for its value's lifetime rather than the walk's (torch-spyre's placement), so values the trip
     /// is done with hand their bytes to the next.
     #[test]
     fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
-        for (mq, hd, trip) in [(128, 64, 23), (512, 64, 23), (128, 128, 23), (512, 128, 23)] {
+        for (mq, hd, trip) in [(128, 64, 29), (512, 64, 29), (128, 128, 29), (512, 128, 29)] {
             let blocks = 4;
             let node = walk_at(mq, blocks, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
@@ -7189,19 +7233,26 @@ mod walk_on_the_card {
                 })
                 .collect();
             let bmms = named("bmm");
+            // The walk's 32 query heads over its 8 kv heads: the group the expansion serves.
+            let group = 32 / 8;
             assert_eq!(
                 (expanded.len(), bmms.len()),
-                (2, 2),
-                "mq={mq} hd={hd}: one expansion and one contraction for the scores and for the \
-                 value product"
+                (2 * group, 2),
+                "mq={mq} hd={hd}: the expansion's group-slot copies — one per query head of the \
+                 group — and one contraction for the scores and for the value product"
             );
-            for (e, kernel) in bmms.iter().zip(&expanded) {
+            for e in bmms.iter() {
                 let [a, k, out] = e.arg_bindings.as_slice() else {
                     panic!("{}: activation, kernel, output", e.op_name);
                 };
+                let slots = expanded
+                    .iter()
+                    .filter(|kernel| k.buffer == **kernel)
+                    .count();
                 assert_eq!(
-                    k.buffer, *kernel,
-                    "mq={mq} hd={hd} {}: the expanded block",
+                    slots, group,
+                    "mq={mq} hd={hd} {}: its kernel scratch laid by one copy per query head of \
+                     its group",
                     e.op_name
                 );
                 assert!(
@@ -7348,17 +7399,24 @@ mod walk_on_the_card {
             })
             .collect();
         let bmms = named("bmm");
+        // The walk's 32 query heads over its 8 kv heads: the group the expansion serves.
+        let group = 32 / 8;
         assert_eq!(
             (expanded.len(), bmms.len()),
-            (2, 2),
-            "the scores and the value product: one expansion and one contraction each"
+            (2 * group, 2),
+            "the scores and the value product: the expansion's group-slot copies — one per \
+             query head of the group — and one contraction each"
         );
-        for (&i, kernel) in bmms.iter().zip(&expanded) {
+        for &i in &bmms {
             let e = &ops[i];
             assert!(e.walk.is_some(), "{}: on the trip", e.op_name);
+            let slots = expanded
+                .iter()
+                .filter(|kernel| e.arg_bindings[1].buffer == **kernel)
+                .count();
             assert_eq!(
-                e.arg_bindings[1].buffer, *kernel,
-                "{}: its kernel is the expanded block",
+                slots, group,
+                "{}: its kernel scratch laid by one copy per query head of its group",
                 e.op_name
             );
         }

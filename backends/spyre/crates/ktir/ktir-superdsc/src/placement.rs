@@ -1500,6 +1500,16 @@ impl BundleLayout {
         }
     }
 
+    /// The arrangement the authority HOLDS for `name` — the record a consumer reads to
+    /// address the tensor as its producer laid it. Reading it here is CONSUMING the one
+    /// statement [`Self::declare_arrangement`] wrote (a second front re-deriving the
+    /// layout from its own view of the shape is the restatement this kills); `None` when
+    /// no op has declared the tensor yet — a consumer that needs the bytes to copy then
+    /// refuses rather than assumes.
+    pub fn arrangement_of(&self, name: &str) -> Option<StickLayout> {
+        self.arrangements.borrow().get(name).copied()
+    }
+
     /// The row-outermost arrangement of `tid` at its placement's present size, at format `df` —
     /// row-major, whole `df` sticks, as many as the placement holds. Refuses an unplaced buffer or a
     /// size that is not whole sticks. The ONE statement of what a row-outermost allocation is.

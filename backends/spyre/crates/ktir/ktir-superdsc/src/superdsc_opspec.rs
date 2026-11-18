@@ -2659,6 +2659,57 @@ impl ArgView<'_> {
     pub fn device_dims_order(&self) -> &[&'static str] {
         self.device_order.map_or(self.layout, |o| o.dims)
     }
+
+    /// ⭐⭐ THE BROADCAST-AXIS/DEVICE-ORDER LAW (the rung-29 class gate), three-way: an INPUT
+    /// axis the source's own frame lacks is a ZERO-STRIDE fact stated once in the typed
+    /// geometry — never a `RedNonStick` marker on a stated axis under an order that re-derives
+    /// the source's frame. dxp derives every dim's stride from `layoutDimOrder_`
+    /// (`dsc/dsc2.cpp:2971-2979`). The ONE proven stated order for a marked input is the
+    /// CANONICAL RANK-3 SWAP — the two row dims swapped, the stick kept at its layout position
+    /// (`SprayOrder::device_layout`, the card-proven prompt-mask-add form). Everything else
+    /// refuses:
+    /// * no stated order at all — the marker over the source's own unpermuted frame (the
+    ///   census sites: the rmsnorm gamma, the merged source's vendor reduced-dim row, the
+    ///   tanhsoftcap cap, the fused-epilogue operand) — PASSES;
+    /// * the canonical swap — PASSES;
+    /// * an order that MOVES the stick dim spells a frame the source's bytes do not have and
+    ///   walks the marked axis at its dense stride: MEASURED at gemma-4 rung 29, the kernel
+    ///   expansion's phantom `x` under `["y","out","x","mb"]` read V at `g·W² + b·W` — every
+    ///   row, every head, card-only — REFUSES;
+    /// * any other row-dim permutation is UNPROVEN, and the compiler's answer to an unmeasured
+    ///   form is refusal, not assumption: every new form enters with a card proof, exactly as
+    ///   the spray row did, and the law gains its row then — never before. REFUSES.
+    ///
+    /// A broadcast that must survive a refused form is stated as explicit strides instead
+    /// ([`crate::ir::bridge::tiled_op_sdsc_op::StickRuns`]).
+    pub fn broadcast_order_law(&self) -> Result<(), SuperDscError> {
+        if self.is_input && self.scale.contains(&Scale::RedNonStick) && self.device_order.is_some()
+        {
+            // The canonical swap: rank 3, the stick last in the layout, the two row dims
+            // swapped under it — `SprayOrder::device_layout`, the one card-proven form.
+            let canonical_swap = self.layout.len() == 3
+                && self.stick_idx == 2
+                && self.device_dims_order()
+                    == [self.layout[1], self.layout[0], self.stick].as_slice();
+            if !canonical_swap {
+                return Err(SuperDscError(format!(
+                    "operand '{}': an input axis the source's own frame lacks (scale \
+                     RedNonStick) stated under device order {:?} over layout {:?} — the ONE \
+                     proven stated order for a marked input is the canonical rank-3 swap (the \
+                     row dims swapped, the stick kept at its layout position, the card-proven \
+                     spray form). A stick-moving order re-derives the source's frame and walks \
+                     the marked axis at its dense stride (MEASURED at gemma-4 rung 29: \
+                     g·W² + b·W, every row, every head); any other row-dim permutation is \
+                     unproven and refuses until it arrives with its own card proof. State the \
+                     broadcast as explicit strides (StickRuns) instead.",
+                    self.name,
+                    self.device_dims_order(),
+                    self.layout
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AnyTensorArg {
@@ -4875,6 +4926,199 @@ mod tests {
         assert!(StickExtent::<Fp16>::new(65).is_err()); // not a multiple of 64
         assert!(StickExtent::<Fp16>::new(0).is_err());
         assert_eq!(StickExtent::<Fp16>::new(384).unwrap().stick_count(), 6);
+    }
+
+    /// ⭐ THE CENSUS ITSELF — the broadcast-axis/device-order law's fixture (the rung-29 class
+    /// gate). The legitimate marker rows pass: the five un-ordered forms (a genuinely collapsed
+    /// dim over the source's own unpermuted frame) AND the spray row — the counterexample that
+    /// REFINED the law, the marker under the canonical respelling (`SprayOrder::device_layout`:
+    /// the row dims swap, the stick keeps its layout position), the card-proven prompt-mask-add
+    /// form. The phantom-axis shape (the kernel expansion's rung-29 input: a marked `x` under
+    /// an order that MOVES the stick dim off its layout position) refuses at the arg AND at
+    /// the emission's one choke point, naming the law.
+    #[test]
+    fn the_census_of_broadcast_markers_holds_the_order_law() {
+        let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        let plan3 = WorkPlan::divide(
+            &[dim("mb", 8, false), dim("out", 64, true), dim("y", 128, false)],
+            crate::device_gen::whole(),
+            crate::work::EwDivision::Law.splitter(),
+        )
+        .expect("a rank-3 plan");
+        let row = |name: &str, scale: [Scale; 3], layout: [&'static str; 3]| {
+            AnyTensorArg::R3(
+                TensorArg::<3>::new(
+                    true,
+                    name.to_string(),
+                    Role::Input,
+                    scale,
+                    plan3.iter_syms(layout),
+                    layout,
+                    "out",
+                    Allocation::Hbm,
+                )
+                .expect("a legitimate broadcast row"),
+            )
+        };
+        // The census's five legitimate un-ordered rows, at their own construction forms. The
+        // marker with NO stated order — dxp derives strides from the unpermuted frame, where
+        // the collapsed dim's read is the vendor's reduced-dim law.
+        let rows = [
+            // The rmsnorm gamma / vocab-wide x·gamma (`EwOperand`'s mb_broadcast arm).
+            row("gamma", [Scale::RedNonStick, Scale::Active, Scale::Active], ["mb", "out", "y"]),
+            // The merged source's vendor reduced-dim row (the spray dim, stride-0 read).
+            row("merged", [Scale::RedNonStick, Scale::Active, Scale::Active], ["mb", "out", "y"]),
+            // `EwOperand`'s y-broadcast arm (the tanhsoftcap cap's form).
+            row("y_bcast", [Scale::Active, Scale::Active, Scale::RedNonStick], ["mb", "out", "y"]),
+            // The sprayed source in the `[mb, y, out]` order.
+            row("sprayed", [Scale::Active, Scale::RedNonStick, Scale::Active], ["mb", "y", "out"]),
+            // The fused-epilogue route: the marker set AFTER construction (`set_scale_for_dim`).
+            {
+                let mut fused = row("fused", [Scale::Active; 3], ["mb", "out", "y"]);
+                fused.set_scale_for_dim("mb", Scale::RedNonStick);
+                fused
+            }
+        ];
+        for leg in &rows {
+            assert!(
+                leg.view().broadcast_order_law().is_ok(),
+                "a collapsed dim over the source's own unpermuted frame is the vendor's law"
+            );
+        }
+        // The spray row — the counterexample that refined the law: the marker under the
+        // CANONICAL respelling of its own layout (the row dims swap, the stick KEEPS its
+        // layout position), `SprayOrder::Outer::device_layout` — the card-proven
+        // prompt-mask-add form (`a_y_major_op_takes_one_spray_per_core`).
+        let spray_layout = ["y", "mb", "out"];
+        let spray = AnyTensorArg::R3(
+            TensorArg::<3>::new(
+                true,
+                "mask".to_string(),
+                Role::Input,
+                [Scale::RedNonStick, Scale::Active, Scale::Active],
+                plan3.iter_syms(spray_layout),
+                spray_layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .expect("the spray row builds")
+            .with_device_order(["mb", "y", "out"])
+            .expect("the canonical respelling is a permutation"),
+        );
+        assert!(
+            spray.view().broadcast_order_law().is_ok(),
+            "the marker under the canonical respelling — the stick keeps its layout position — \
+             is the card-proven spray form"
+        );
+        // The phantom-axis shape — the fired defect's own input (the deleted expansion op's):
+        // a marked `x` the source's frame lacks, PLUS a stated device order.
+        let plan4 = WorkPlan::divide(
+            &[
+                dim("mb", 8, false),
+                dim("x", 4, false),
+                dim("y", 64, false),
+                dim("out", 128, true),
+            ],
+            crate::device_gen::whole(),
+            |_, _| std::collections::BTreeMap::new(),
+        )
+        .expect("a rank-4 plan");
+        let layout4 = ["mb", "x", "y", "out"];
+        let phantom = TensorArg::<4>::new(
+            true,
+            "w".to_string(),
+            Role::Output,
+            [
+                Scale::Active,
+                Scale::RedNonStick,
+                Scale::Active,
+                Scale::Active,
+            ],
+            plan4.iter_syms(layout4),
+            layout4,
+            "out",
+            Allocation::Hbm,
+        )
+        .expect("the arg builds — the gate is at the law, not the constructor")
+        .with_device_order(["y", "out", "x", "mb"])
+        .expect("the order is a permutation — the law refuses the COMBINATION");
+        let phantom = AnyTensorArg::R4(phantom);
+        let err = phantom
+            .view()
+            .broadcast_order_law()
+            .expect_err("the phantom shape refuses");
+        assert!(
+            err.0.contains("rung 29"),
+            "the refusal names the measured kill: {}",
+            err.0
+        );
+        // The UNPROVEN MIDDLE — a row-dim permutation with the stick UNMOVED that is not the
+        // canonical swap (a rank-4 row reversal): the compiler's answer to an unmeasured form
+        // is refusal, not assumption. It refuses until it arrives with its own card proof.
+        let middle_layout = ["mb", "x", "y", "out"];
+        let middle = AnyTensorArg::R4(
+            TensorArg::<4>::new(
+                true,
+                "middle".to_string(),
+                Role::Input,
+                [
+                    Scale::Active,
+                    Scale::RedNonStick,
+                    Scale::Active,
+                    Scale::Active,
+                ],
+                plan4.iter_syms(middle_layout),
+                middle_layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .expect("the middle row builds")
+            .with_device_order(["y", "x", "mb", "out"])
+            .expect("a permutation with the stick unmoved"),
+        );
+        let err = middle
+            .view()
+            .broadcast_order_law()
+            .expect_err("the unproven middle refuses");
+        assert!(
+            err.0.contains("unproven"),
+            "the refusal names the unproven form: {}",
+            err.0
+        );
+        // And at the one choke point: the emission refuses the op that carries it, whatever
+        // route built the arg.
+        let output = TensorArg::<4>::new(
+            false,
+            "expanded".to_string(),
+            Role::Output,
+            [Scale::Active; 4],
+            plan4.iter_syms(layout4),
+            layout4,
+            "out",
+            Allocation::Hbm,
+        )
+        .expect("the output builds");
+        let op = OpSpec::new(
+            OpFunc::Identity,
+            plan4,
+            vec![phantom],
+            AnyTensorArg::R4(output),
+        )
+        .expect("the op builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let err = crate::emit::emit_sdsc("phantom_o1", &op, &folds, None)
+            .expect_err("the emission refuses the phantom shape");
+        assert!(
+            err.0.contains("rung 29"),
+            "the choke point names the measured kill: {}",
+            err.0
+        );
     }
 
     /// ⭐ A MID-STICK RUN START CANNOT BE BUILT — `covering`'s start half IS the check, with the

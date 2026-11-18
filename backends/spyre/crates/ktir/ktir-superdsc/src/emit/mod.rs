@@ -3494,6 +3494,12 @@ pub fn emit_sdsc(
     }
     core_local_reads_agree(op_name, op, &views, layout)?;
     note_lx_touches(op_name, op, &views, layout)?;
+    // ⭐ THE BROADCAST-AXIS/DEVICE-ORDER LAW — consumed for EVERY arg of EVERY op here (the one
+    // choke point: the marker can arrive by the constructor's scale or by `set_scale_for_dim`
+    // after it, so only the emission sees all three facts regardless of construction route).
+    for v in &views {
+        v.broadcast_order_law()?;
+    }
     // fp8 W8A8 matmul: a matmul/batchmatmul with an fp8 (SEN143_FP8) NON-OUTPUT operand. The DDL
     // `batchmatmulfp8` kernel (bmm.ddl:55) + its dataflow constraint require a DISTINCT operand layout
     // vs the fp16 kernel (verified against IBM's l0_tethering/fp8_32core_nonmx fixture): the fp8 WEIGHT
@@ -6857,6 +6863,18 @@ fn restickify_transpose_opspec_2d(
 /// Both sides are blocks one after another (batch `i` at `i·rows·cols`), stated to dxp innermost-first
 /// (`['y','out','mb']` in, `['out','y','mb']` out): the 2-D door's own two views
 /// ([`restickify_kt_opspec_2d`]) with the batch outermost.
+/// ⭐ THE ALL-HEADS RESTICKIFY'S OWN DIVISIBILITY LAW — the sole statement of which batches the
+/// form serves: the form hands the cores an `mb` division of the batch, so a batch that does not
+/// split over cores (fewer than two) has no division to hand and the form does not exist for it.
+/// The constructor REFUSES on this law; the router ([`lower_ktir_to_superdsc::batch_transpose`]'s
+/// all-heads arm) CONSUMES it, so a batch the form cannot serve falls to the per-batch loop — at
+/// one batch that loop is ONE 2-D restickify, the same one-op-over-batches the walk's division
+/// promises — never a routing into a form whose own law excludes it (the batch-1 window
+/// transposes under the prompt trip's division, which the blanket `one_op_over` used to claim).
+pub(crate) fn restickify_batched_serves(batch: u32) -> bool {
+    batch > 1 && crate::work::core_split(batch, crate::device_gen::BUILD_CORES) > 1
+}
+
 pub(crate) fn restickify_transpose_opspec_batched(
     batch: u32,
     (rows, cols): (u32, u32),
@@ -6866,7 +6884,7 @@ pub(crate) fn restickify_transpose_opspec_batched(
     let _cols_ext = StickExtent::<Fp16>::new(cols)?;
     // One batch a core, or past the cores, as many consecutive batches a core as divide evenly.
     let cores = crate::work::core_split(batch, crate::device_gen::BUILD_CORES);
-    if batch <= 1 || cores <= 1 {
+    if !restickify_batched_serves(batch) {
         return Err(format!(
             "restickify transpose '{o_name}': a batch of {batch} divides over no cores of {cores}",
             cores = crate::device_gen::BUILD_CORES
