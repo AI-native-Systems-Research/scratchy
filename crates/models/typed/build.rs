@@ -7,8 +7,14 @@ use scratchy_forward_compiler_frontend::{
     carrier_facts, classify, parse_python, typed_emit, weights_manifest,
 };
 
+// The crate's decoder state list, compiled here from the same file: the carriers are classified with the
+// list the crate exports.
+#[path = "src/decoder_states.rs"]
+mod decoder_states;
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/decoder_states.rs");
     emit_typed_carriers();
 }
 
@@ -84,11 +90,9 @@ fn emit_carrier(
         std::fs::read_to_string(&dsl).map_err(|e| format!("read {}: {e}", dsl.display()))?;
     let carrier =
         parse_python::parse_python_file(&source).map_err(|e| format!("{}: {e}", dsl.display()))?;
-    // The program the bake lowers, by the one construction both use.
-    // The decoder states `scratchy_models_typed::decoder_states()` lists, which a build script cannot read from
-    // its own crate's library: the list is empty until a decoder state crate exists, which then becomes a
-    // build-dependency here too and is passed by the same list.
-    let program = classify::carrier_program(&carrier, &[])
+    // The program the bake lowers, by the one construction both use, under the decoder states the
+    // crate's `decoder_states()` lists.
+    let program = classify::carrier_program(&carrier, decoder_states::decoder_states())
         .map_err(|e| format!("classify {}: {e}", dsl.display()))?;
     let manifest = weights_manifest::load_or_empty(&configs)
         .map_err(|e| format!("{}: {e:?}", configs.display()))?;

@@ -29,6 +29,7 @@ members = [
     "crates/compiler/macros",
     "crates/compiler/frontend",
     "crates/compiler/typed-shapes",
+    "crates/state/decoder/mla",
     "crates/compiler/subtile",
     "crates/targets/metal",
     "crates/targets/metal/cli",
@@ -205,6 +206,8 @@ scratchy-forward-compiler = { path = "crates/compiler" }
 scratchy-typed-shapes = { path = "crates/compiler/typed-shapes" }
 # Every carrier's typed program, which each target's models build hands the forward compiler.
 scratchy-models-typed = { path = "crates/models/typed" }
+# Multi-head latent attention: its DSL ops, state input and typed signatures.
+scratchy-state-decoder-mla = { path = "crates/state/decoder/mla" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
 scratchy-cli = { path = "crates/cli/scr", default-features = false }

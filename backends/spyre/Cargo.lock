@@ -1722,6 +1722,7 @@ name = "scratchy-models-typed"
 version = "0.1.0"
 dependencies = [
  "scratchy-forward-compiler-frontend",
+ "scratchy-state-decoder-mla",
  "scratchy-typed-shapes",
 ]
 
@@ -1751,6 +1752,14 @@ dependencies = [
  "ktir-superdsc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "scratchy-state-decoder-mla"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-typed-shapes",
 ]
 
 [[package]]

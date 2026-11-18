@@ -1,0 +1,15 @@
+[package]
+name = "scratchy-state-decoder-mla"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not published: the root CI step `cargo publish --workspace --dry-run --no-verify` would otherwise package it.
+publish = false
+
+# Multi-head latent attention as a decoder state: the DSL ops and state input it adds to the core
+# vocabulary, and their typed signatures, which every carrier naming them is type-checked against.
+[dependencies]
+# The vocabulary trait and its op and input declarations.
+scratchy-forward-compiler-frontend = { path = "../../../compiler/frontend" }
+# The activation, weight and input types the signatures are written over.
+scratchy-typed-shapes = { workspace = true }

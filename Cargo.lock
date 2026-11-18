@@ -3184,6 +3184,7 @@ name = "scratchy-models-typed"
 version = "0.1.0"
 dependencies = [
  "scratchy-forward-compiler-frontend",
+ "scratchy-state-decoder-mla",
  "scratchy-typed-shapes",
 ]
 
@@ -3323,6 +3324,14 @@ name = "scratchy-spec"
 version = "0.1.0"
 dependencies = [
  "scratchy-models",
+]
+
+[[package]]
+name = "scratchy-state-decoder-mla"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-typed-shapes",
 ]
 
 [[package]]
