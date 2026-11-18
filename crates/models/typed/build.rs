@@ -92,7 +92,9 @@ fn emit_carrier(
         parse_python::parse_python_file(&source).map_err(|e| format!("{}: {e}", dsl.display()))?;
     // The program the bake lowers, by the one construction both use, under the decoder states the
     // crate's `decoder_states()` lists.
-    let program = classify::carrier_program(&carrier, decoder_states::decoder_states())
+    let vocabularies: Vec<_> =
+        scratchy_decoder_state::vocabularies(decoder_states::decoder_states()).collect();
+    let program = classify::carrier_program(&carrier, &vocabularies)
         .map_err(|e| format!("classify {}: {e}", dsl.display()))?;
     let manifest = weights_manifest::load_or_empty(&configs)
         .map_err(|e| format!("{}: {e:?}", configs.display()))?;

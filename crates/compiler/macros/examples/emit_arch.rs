@@ -20,9 +20,7 @@
 //! Writes nothing; redirect stdout to capture. Stderr carries progress.
 
 use scratchy_forward_compiler_macro::target::Shared;
-use scratchy_forward_compiler_macro::{
-    Scope, Typing, compile_carrier, parse_python_file, render_tokens,
-};
+use scratchy_forward_compiler_macro::{Scope, compile_carrier, parse_python_file, render_tokens};
 use std::path::PathBuf;
 
 fn main() {
@@ -92,10 +90,7 @@ fn main() {
         None,
         &scope,
         &Shared,
-        &Typing {
-            traced: scratchy_models_typed::traced,
-            decoder_states: scratchy_models_typed::decoder_states(),
-        },
+        &scratchy_models_typed::typing(),
     )
     .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 

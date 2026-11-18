@@ -508,15 +508,8 @@ impl std::fmt::Display for CarrierError {
 }
 
 /// How the carriers are typed: what the build that compiles the models hands [`compile_carrier`].
-pub struct Typing<'a> {
-    /// The shapes of the carrier whose arch is the argument: its typed program, run (`None` when
-    /// no carrier of that arch is typed). `scratchy_models_typed::traced` for every build.
-    pub traced: fn(&str) -> Option<scratchy_typed_shapes::Shapes>,
-    /// The decoder states whose ops and inputs a carrier may name after the core ones
-    /// (`classify::carrier_program`). `scratchy_models_typed::decoder_states()` for every build: the
-    /// same list the typing classified with.
-    pub decoder_states: &'a [&'a dyn scratchy_forward_compiler_frontend::state::StateVocabulary],
-}
+/// `scratchy_models_typed::typing()` for every build.
+pub use scratchy_decoder_state::Typing;
 
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
@@ -551,7 +544,8 @@ pub fn compile_carrier(
     // The program `scratchy-models-typed`'s build script typed (`classify::carrier_program`, the one
     // construction): a decoder's layer loop captures what a drafter compiled beside it reads
     // (`draft_capture`), the compiler's, whatever the arch's DSL says.
-    let classified = classify::carrier_program(&carrier, typing.decoder_states)
+    let vocabularies: Vec<_> = typing.vocabularies().collect();
+    let classified = classify::carrier_program(&carrier, &vocabularies)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))
         .map_err(CarrierError::Arch)?;
     let PythonCarrier { arch_name, .. } = carrier;

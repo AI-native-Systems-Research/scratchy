@@ -138,9 +138,13 @@ fn fixtures() -> Vec<Checked> {
             let source =
                 std::fs::read_to_string(arch_dir().join(format!("dsl/{carrier}.py"))).unwrap();
             let parsed = crate::parse_python::parse_python_file(&source).unwrap();
-            let mut program =
-                crate::classify::carrier_program(&parsed, scratchy_models_typed::decoder_states())
-                    .unwrap();
+            let mut program = crate::classify::carrier_program(
+                &parsed,
+                &scratchy_models_typed::typing()
+                    .vocabularies()
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
             // As the bake lowers it for this model (`compile_carrier`).
             if !parsed.vision {
                 program.decoder_safetensors_prefix = model.arch.decoder_prefix.clone();
@@ -562,9 +566,13 @@ fn every_weights_json_entry_has_a_checkpoint() {
                 .unwrap();
         let source = std::fs::read_to_string(&dir).unwrap();
         let parsed = crate::parse_python::parse_python_file(&source).unwrap();
-        let program =
-            crate::classify::carrier_program(&parsed, scratchy_models_typed::decoder_states())
-                .unwrap();
+        let program = crate::classify::carrier_program(
+            &parsed,
+            &scratchy_models_typed::typing()
+                .vocabularies()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let concat_parts: Vec<&String> = manifest.packed_concats.values().flatten().collect();
         // Every committed model's reads.
         let mut reached = std::collections::HashSet::new();

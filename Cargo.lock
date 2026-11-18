@@ -3060,6 +3060,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-decoder-state"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-typed-shapes",
+]
+
+[[package]]
 name = "scratchy-e2e"
 version = "0.1.0"
 dependencies = [
@@ -3116,6 +3124,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rayon",
+ "scratchy-decoder-state",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
@@ -3183,6 +3192,7 @@ dependencies = [
 name = "scratchy-models-typed"
 version = "0.1.0"
 dependencies = [
+ "scratchy-decoder-state",
  "scratchy-forward-compiler-frontend",
  "scratchy-state-decoder-mla",
  "scratchy-typed-shapes",

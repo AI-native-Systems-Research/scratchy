@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The shared pipeline driven through metal's emitter, on checked-in models.
 
+use scratchy_forward_compiler_macro::Scope;
 use scratchy_forward_compiler_macro::config::{load_arch_json, load_dir};
-use scratchy_forward_compiler_macro::{Scope, Typing};
 use scratchy_target_metal_compiler::Metal;
 use std::path::PathBuf;
 
@@ -34,10 +34,7 @@ fn python_costume_emits_the_qwen3_tape() {
         None,
         &Scope::stems(&[("qwen3", "qwen3-0.6b")]),
         &Metal { turboquant: false },
-        &Typing {
-            traced: scratchy_models_typed::traced,
-            decoder_states: scratchy_models_typed::decoder_states(),
-        },
+        &scratchy_models_typed::typing(),
     )
     .expect("python-costume pipeline");
 

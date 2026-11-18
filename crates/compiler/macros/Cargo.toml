@@ -47,6 +47,8 @@ scratchy-forward-compiler = { path = ".." }
 scratchy-forward-compiler-frontend = { path = "../frontend" }
 # The typed op signatures: the shapes a carrier's typed program records.
 scratchy-typed-shapes = { workspace = true }
+# How the carriers are typed (`Typing`, re-exported) and the decoder state handles it lists.
+scratchy-decoder-state = { workspace = true }
 
 # The front end's test fixtures, for this crate's tests.
 [dev-dependencies]

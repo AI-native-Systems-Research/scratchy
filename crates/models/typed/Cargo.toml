@@ -12,14 +12,18 @@ publish = false
 [dependencies]
 # The op signatures each emitted carrier is type-checked against.
 scratchy-typed-shapes = { workspace = true }
-# The state vocabulary trait `decoder_states()` lists the build's decoder states under; also the
-# carrier parser, for the test that every carrier is typed.
+# The carrier parser, for the test that every carrier is typed, and the decoder state names the typing
+# test reads.
 scratchy-forward-compiler-frontend = { path = "../../compiler/frontend" }
 # The decoder states `decoder_states()` lists, whose signatures the typed carriers call.
 scratchy-state-decoder-mla = { workspace = true }
+# The decoder state handle `decoder_states()` lists the decoder states as, and the typing `typing()` builds.
+scratchy-decoder-state = { workspace = true }
 
 # The build script runs the front end's typed-Rust emit pass (`build.rs`) over the carriers.
 [build-dependencies]
 scratchy-forward-compiler-frontend = { path = "../../compiler/frontend" }
 # The same decoder states, which the build script classifies the carriers under (`src/decoder_states.rs`).
 scratchy-state-decoder-mla = { workspace = true }
+# The decoder state handle the same list is written as.
+scratchy-decoder-state = { workspace = true }
