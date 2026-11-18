@@ -208,20 +208,27 @@ impl TargetEmitter for Spyre {
     fn bake_model(&self, cx: &BakeCx<'_>) -> TokenStream {
         match cx.decode_bounds {
             Some(decode_bounds) => {
-                // ⭐⭐⭐ THE POOL LAW'S DESCENT. The KV pool is every whole page the funded
-                // budget holds beyond mandatory residency, floored at the model's whole
-                // context — stated ONCE in `pool_law`, read HERE. The pool is a baked
-                // dimension (a KTIR bundle is static-shape), so the law can only be applied
-                // by re-baking: pass 1 lowers at the floor (the model's own context) to
-                // measure the census, then the law's pages become the next pass's capacity,
-                // until the law over a pass's own census holds no page beyond what that pass
-                // already baked. Mandatory residency only grows with capacity (the walk
-                // buckets' mask statics grow with it), so the law's pages only shrink and
-                // the descent converges; a pass bound that runs out is a bake bug, and a
-                // budget that cannot fund the model's whole context is a REFUSAL here, at
-                // the bake — the compile-time check. (The census is the card build's alone:
-                // off-card it comes back `None` and the floor stands, exactly as those
-                // builds have always sized it.)
+                // ⭐⭐⭐ THE POOL LAW'S DESCENT — TO THE FIXED POINT. The KV pool is every
+                // whole page the funded budget holds beyond mandatory residency, floored at
+                // the model's whole context — stated ONCE in `pool_law`, read HERE. The
+                // pool is a baked dimension (a KTIR bundle is static-shape), so the law can
+                // only be applied by re-baking: pass 1 lowers at the floor (the model's own
+                // context) to measure the census, then the law's pages over that pass's own
+                // census become the next pass's capacity. Mandatory residency only GROWS
+                // with capacity (the walk buckets' mask statics grow with it), so the law's
+                // map is monotone decreasing and its fixed point — the largest page count
+                // whose own census funds it — is reached by re-baking in BOTH directions:
+                // grow when the law funds more than placed, shrink when it funds fewer
+                // (an over-grant is a pool its own census does not fund, and it never
+                // ships). A 2-cycle between adjacent counts resolves DOWNWARD (the smaller
+                // count is funded with margin; an under-grant is a smaller pool, an
+                // over-grant is the OOM the load cannot survive). The descent SEALED: the
+                // final pass's placement is asserted funded over that pass's own census, at
+                // the bake — a build failure, never a load refusal. A pass bound that runs
+                // out is a bake bug, and a budget that cannot fund the model's whole
+                // context is a REFUSAL here, at the bake. (The census is the card build's
+                // alone: off-card it comes back `None` and the floor stands, exactly as
+                // those builds have always sized it.)
                 use ktir_core::ddl_binds::{Baked, DeviceGen};
                 use scratchy_target_spyre::pool_law;
                 let stem = cx.model.source_stem.as_str();
@@ -236,6 +243,12 @@ impl TargetEmitter for Spyre {
                     scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                 let mut capacity: Option<std::num::NonZeroU32> = None;
                 let mut out = TokenStream::new();
+                // The page counts this descent has baked at — a repeat target is a cycle of
+                // the monotone law, resolved DOWNWARD below. The final pass's census and
+                // placed pages are carried for the seal after the loop.
+                let mut visited: Vec<u32> = Vec::new();
+                let mut final_census: Option<bake::PoolCensus> = None;
+                let mut final_pages: u32 = 0;
                 for pass in 1..=8u32 {
                     let mut stream = TokenStream::new();
                     let census = bake::dump_wavefront_mega(
@@ -283,13 +296,54 @@ impl TargetEmitter for Spyre {
                     let current_pages = capacity
                         .map(|c| c.get() / page_slots)
                         .unwrap_or(census.context_pages);
-                    if pages.0 <= current_pages {
+                    visited.push(current_pages);
+                    final_census = Some(census);
+                    final_pages = current_pages;
+                    // ⭐ THE FIXED POINT, EXACTLY. The ONLY clean exit is equality: the
+                    // pass's own census funds exactly the pages that pass placed. A law
+                    // that funds FEWER pages than the pass placed is an OVER-GRANT — a
+                    // pool its own census does not fund — and the descent re-bakes
+                    // SMALLER, never ships it. (The old `pages <= current` break shipped
+                    // exactly that: a pool sized by the previous pass's census beside
+                    // this pass's larger mandatory residency.)
+                    if pages.0 == current_pages {
                         break;
+                    }
+                    // The cycle of a monotone map: the target is a count this descent has
+                    // already baked, so equality will not terminate it. Resolve DOWNWARD:
+                    // the SMALLEST count visited is funded by its own census with margin —
+                    // it was entered by SHRINK (the monotone law funds everything the
+                    // shrunk-from pass funded) or it is the floor, which the law never
+                    // undercuts. An under-grant is a smaller pool; an over-grant is the
+                    // OOM the load cannot survive.
+                    if visited.contains(&pages.0) {
+                        let settle = visited.iter().copied().min().unwrap();
+                        if settle == current_pages {
+                            break;
+                        }
+                        let positions: u32 = (u64::from(settle) * u64::from(page_slots))
+                            .try_into()
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "[spyre] {stem}: the law's pool ({settle} pages × \
+                                     {page_slots} slots) exceeds u32 positions"
+                                )
+                            });
+                        eprintln!(
+                            "[spyre] {stem}: the capacity law's descent cycles — settling \
+                             DOWN at {settle} page(s), funded by its own census with margin \
+                             (pass {pass})"
+                        );
+                        capacity = Some(
+                            std::num::NonZeroU32::new(positions)
+                                .expect("the law's pages are nonzero pages of nonzero slots"),
+                        );
+                        continue;
                     }
                     if pass == 8 {
                         panic!(
                             "[spyre] {stem}: the pool descent did not converge in 8 passes — \
-                             the law still grows past {} page(s)",
+                             the law still moves past {} page(s)",
                             pages.0
                         );
                     }
@@ -303,16 +357,25 @@ impl TargetEmitter for Spyre {
                             )
                         });
                     eprintln!(
-                        "[spyre] {stem}: the capacity law grows the KV pool — pass {pass}: {} \
-                         page(s) (the model's own context is {}), mandatory residency {} MB \
-                         against the {} MB the card funds; re-baking at {positions} positions",
+                        "[spyre] {stem}: the capacity law re-sizes the KV pool — pass {pass}: \
+                         {} page(s) over the {} placed (the model's own context is {}), \
+                         mandatory residency {} MB against the {} MB the card funds; \
+                         re-baking at {positions} positions",
                         pages.0,
-                        census.context_pages,
-                        census
-                            .worlds
-                            .iter()
-                            .map(|w| w.residency.mandatory_bytes().0 / (1024 * 1024))
-                            .min()
+                        current_pages,
+                        final_census
+                            .as_ref()
+                            .map(|c| c.context_pages)
+                            .unwrap_or(0),
+                        final_census
+                            .as_ref()
+                            .map(|c| {
+                                c.worlds
+                                    .iter()
+                                    .map(|w| w.residency.mandatory_bytes().0 / (1024 * 1024))
+                                    .min()
+                                    .unwrap_or(0)
+                            })
                             .unwrap_or(0),
                         funded.0 / (1024 * 1024),
                     );
@@ -320,6 +383,29 @@ impl TargetEmitter for Spyre {
                         std::num::NonZeroU32::new(positions)
                             .expect("the law's pages are nonzero pages of nonzero slots"),
                     );
+                }
+                // ⭐⭐ THE SEAL — the bake's own proof over the FINAL census it minted: the
+                // pool the last pass placed is funded by that pass's own terms, through the
+                // same ONE combination the load checks over the measured card. With the
+                // fixed point this holds by construction; the assert turns a descent bug
+                // into a BUILD failure — never a load refusal over a fact the bake knew.
+                if let Some(census) = final_census {
+                    for w in &census.worlds {
+                        assert!(
+                            pool_law::funded_holds(
+                                funded,
+                                w.residency.mandatory_bytes(),
+                                pool_law::PageStride(w.page_stride),
+                                pool_law::Pages(final_pages),
+                            ),
+                            "[spyre] {stem}: the descent shipped a pool its own census does \
+                             not fund — {} page(s) placed beside {} MB of mandatory residency \
+                             against the {} MB the card funds: a bake bug, not a card fact",
+                            final_pages,
+                            w.residency.mandatory_bytes().0 / (1024 * 1024),
+                            funded.0 / (1024 * 1024),
+                        );
+                    }
                 }
                 out
             }
