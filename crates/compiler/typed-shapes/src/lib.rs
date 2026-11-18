@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! SHAPES AS RUST TYPES: the op signatures as generic Rust functions, and every carrier the
-//! typed-Rust emit pass (`typed_emit.rs`, run by the build script) turned into a Rust function over them.
+//! SHAPES AS RUST TYPES: the core op signatures as generic Rust functions, over which the typed-Rust
+//! emit pass (`typed_emit.rs`, run by `scratchy-models-typed`'s build script) writes every carrier.
 //!
 //! A dim is a type: a config bound is a marker named for it (`HeadDim` for `head_dim`), a product
 //! is [`Mul`] in the one canonical order [`canonical_mul`] writes. An activation is [`Act<T, D>`]:

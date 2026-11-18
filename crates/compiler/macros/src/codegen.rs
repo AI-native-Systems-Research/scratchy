@@ -7755,8 +7755,8 @@ pub fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
     })
 }
 
-/// A canonical's facts at `tp_world_size`, from its config, and the six MLA consts no fact covers
-/// yet, as its `CanonicalParams` impl states them.
+/// A canonical's facts at `tp_world_size`, from its config, as its `CanonicalParams` impl states
+/// them.
 pub(crate) fn fill_canonical_params(
     model: &ModelParams,
     tp_world_size: u8,

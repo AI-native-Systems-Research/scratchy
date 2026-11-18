@@ -658,11 +658,18 @@ jobs:
       # lib, under the target of every shared default (`target::Shared`). Its loader tests name the
       # build scope they load under (`config::Scope`), so none selects zero configs and passes
       # having checked nothing. Then its test targets at -D warnings, which no other step lints.
+      # Then the typed carriers and the op signatures they are checked against, which no other step
+      # runs: that every carrier has a typed program, the product-order pins, the decoder state crates' own
+      # tests. Then the frontend's state table and typed-Rust emit pass, filtered to those two
+      # suites, which the typed crates are built on. Then those crates' test targets at -D warnings.
       - name: Forward-compiler macro tests
         working-directory: .
         run: |
           cargo test -p scratchy-forward-compiler-macro --lib
           cargo clippy -p scratchy-forward-compiler-macro --tests -- -D warnings
+          cargo test -p scratchy-typed-shapes -p scratchy-models-typed -p scratchy-state-decoder-mla
+          cargo test -p scratchy-forward-compiler-frontend --lib -- state:: typed_emit::
+          cargo clippy -p scratchy-typed-shapes -p scratchy-models-typed -p scratchy-state-decoder-mla --tests -- -D warnings
       # Spyre's bake (the per-model emission the pipeline calls through `TargetEmitter`), and its
       # pinned derivations on the checked-in configs.
       - name: Spyre compiler tests

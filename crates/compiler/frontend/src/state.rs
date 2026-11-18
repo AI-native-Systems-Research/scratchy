@@ -20,7 +20,8 @@ pub trait StateVocabulary: Sync {
     fn name(&self) -> StateName;
     fn ops(&self) -> &'static [StateOpDecl];
     fn inputs(&self) -> &'static [StateInputDecl];
-    /// The Rust path of the module that holds the signatures and input constructors.
+    /// The absolute Rust path (`::crate::module`) of the module that holds the signatures and input
+    /// constructors: the typed carriers call it from another crate.
     fn signatures(&self) -> SignaturePath;
 }
 

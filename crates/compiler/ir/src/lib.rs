@@ -932,7 +932,7 @@ pub const fn unpack_moe_expert_bits(packed: u32) -> (u32, u32, u32) {
 pub trait CanonicalParams: WeightAccessors {
     /// ⭐ THE CANONICAL'S FACTS, typed ([`model_facts::ModelFacts`]): the one source every numeric
     /// const below that has a fact is derived from ([`model_facts::raw`]). The generated impl states
-    /// only this and the consts no fact covers (the MLA dims and the target/build knobs).
+    /// only this and the consts no fact covers (the target/build knobs).
     const FACTS: model_facts::ModelFacts;
     const HEAD_DIM: u32 = model_facts::raw::head_dim(Self::FACTS);
     const NUM_Q_HEADS: u32 = model_facts::raw::num_q_heads(Self::FACTS);

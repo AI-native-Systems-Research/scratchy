@@ -149,7 +149,7 @@ fn kind_family_color(kind: &str) -> Option<&'static str> {
     let k = kind.trim();
     if k.contains("RmsNorm") || k.contains("LayerNorm") {
         Some("36") // cyan
-    } else if k.contains("Attention") || k.starts_with("Mla") || k == "RopeAppend" {
+    } else if k.contains("Attention") || k == "RopeAppend" {
         Some("35") // magenta
     } else if k == "Gemm"
         || k.starts_with("Cutlass")

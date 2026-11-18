@@ -1,7 +1,8 @@
 # The glm4-moe-lite forward, in torch-idiom Python. Parsed by scratchy
 # (compiler/frontend/src/parse_python.rs), never executed by the
-# compiler. Executed under torch only by the CI oracle, where the SAME
-# text is the reference implementation and the spec at once.
+# compiler. Unlike the other carriers, no CI oracle executes it yet: the
+# torch oracle has no implementation of the MLA decoder state's ops, so this
+# text is the spec but not yet a reference implementation.
 #
 # GLM-4.7-Flash (`glm4_moe_lite`): glm4-moe's MoE half under multi-head
 # latent attention (the `mla` decoder state, crates/state/decoder/mla). The query

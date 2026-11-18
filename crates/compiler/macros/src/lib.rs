@@ -548,9 +548,9 @@ pub fn compile_carrier(
     };
     let name_span = args.span;
     // ── Front end: classify ────────────────────────────────────────
-    // The program the build script typed (`classify::carrier_program`, the one construction): a
-    // decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`), the
-    // compiler's, whatever the arch's DSL says.
+    // The program `scratchy-models-typed`'s build script typed (`classify::carrier_program`, the one
+    // construction): a decoder's layer loop captures what a drafter compiled beside it reads
+    // (`draft_capture`), the compiler's, whatever the arch's DSL says.
     let classified = classify::carrier_program(&carrier, typing.decoder_states)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))
         .map_err(CarrierError::Arch)?;
