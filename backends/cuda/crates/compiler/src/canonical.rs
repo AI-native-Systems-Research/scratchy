@@ -73,20 +73,6 @@ pub struct CudaModelFacts {
     /// the handoff's `attn_classes`. `None` for a uniform model, whose one class is `head_dim`,
     /// `rot_dim` and `rope_theta`, with no window and the half-rotated pairing.
     pub classes: Option<CudaAttnClasses>,
-    /// Which column tiles the model's GEMMs take: the 256-column tile only, or the 64-column tile
-    /// too (`op_abi::CUDA_GEMM_COL64_ARCHS`).
-    pub gemm_col_tile: GemmColTile,
-}
-
-/// Which column tiles a model's GEMMs take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GemmColTile {
-    /// The tiled GEMM's 256 columns only (every Qwen model).
-    Tile256Only,
-    /// Also the 64-column GEMM: an `n` above the narrow GEMM's that is a multiple of 64 and not of
-    /// 256 lowers to `CudaStep::GemmCol64`, and an expert GEMM's `n_tile` is 64 when `n` is not a
-    /// multiple of 256 (Gemma 4).
-    Col64,
 }
 
 /// A two-class model's attention classes. `base` is `head_dim`, `rot_dim` and `rope_theta`'s, and
