@@ -54,6 +54,13 @@ impl DecoderState {
     pub fn subtile(self, op: OpName) -> Option<&'static StateOpFacts> {
         (self.subtile)(op)
     }
+
+    /// Whether `facts` is one of the decoder state's own listed subtile rows: the very static it
+    /// lists under that name, not another row that shares its name.
+    pub fn owns(self, facts: &StateOpFacts) -> bool {
+        self.subtile(facts.id().name())
+            .is_some_and(|listed| std::ptr::eq(listed, facts))
+    }
 }
 
 /// How the carriers are typed: what the build that compiles the models hands the forward compiler.
@@ -229,11 +236,12 @@ macro_rules! state_op {
 /// One or more subtile ops, each stated once as a `static`
 /// [`StateOpFacts`](scratchy_subtile::state_op::StateOpFacts): the op's name, the decoder state
 /// it belongs to (the crate's `const` [`StateName`], which [`decoder_state!`] checks against its
-/// own name), its operand count, its output count, its row law, its sharding rule and the operand
-/// that is its weight (`none`, or the operand's index). A decoder state's lowerings push these
+/// own name), its operand count, its row law, its sharding rule and the operand that is its weight
+/// (`none`, or the operand's index). Every subtile op has one output, so the grammar has no key
+/// for it: a DSL op with several outputs lowers to one subtile op per output. A decoder state's lowerings push these
 /// ops; the DSL op a carrier calls is [`state_op!`]'s, and one DSL op may lower to several.
 ///
-/// `outputs` is a [`StateOutputs`](scratchy_subtile::state_op::StateOutputs) variant, `rows` a
+/// `rows` is a
 /// [`StateRows`](scratchy_subtile::state_op::StateRows) variant and `tp` a
 /// [`TpRule`](scratchy_subtile::tensor_parallel::TpRule) variant.
 ///
@@ -244,10 +252,10 @@ macro_rules! state_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     /// One operand in, one value out.
-///     pub static PROBE_COPY: name = probe_copy, state = STATE, arity = 1, outputs = One,
+///     pub static PROBE_COPY: name = probe_copy, state = STATE, arity = 1,
 ///         rows = In0, tp = Whole, weight = none;
 ///     /// An activation and a weight in, one row per token out.
-///     pub static PROBE_MIX: name = probe_mix, state = STATE, arity = 2, outputs = One,
+///     pub static PROBE_MIX: name = probe_mix, state = STATE, arity = 2,
 ///         rows = M, tp = Whole, weight = 1;
 /// }
 ///
@@ -259,6 +267,20 @@ macro_rules! state_op {
 /// }
 /// ```
 ///
+/// A row stating an output count does not parse: every subtile op has one output.
+///
+/// ```compile_fail
+/// use scratchy_decoder_state::StateName;
+///
+/// pub const STATE: StateName = StateName::new("probe");
+///
+/// scratchy_decoder_state::subtile_op! {
+///     pub static PROBE: name = probe, state = STATE, arity = 1, outputs = Two,
+///         rows = In0, tp = Whole, weight = none;
+/// }
+/// fn main() {}
+/// ```
+///
 /// An op with no operands whose rows are operand 0's does not build:
 ///
 /// ```compile_fail,E0080
@@ -267,7 +289,7 @@ macro_rules! state_op {
 /// pub const STATE: StateName = StateName::new("probe");
 ///
 /// scratchy_decoder_state::subtile_op! {
-///     pub static PROBE: name = probe, state = STATE, arity = 0, outputs = One,
+///     pub static PROBE: name = probe, state = STATE, arity = 0,
 ///         rows = In0, tp = Whole, weight = none;
 /// }
 /// fn main() {}
@@ -281,7 +303,7 @@ macro_rules! state_op {
 /// pub const STATE: StateName = StateName::new("probe");
 ///
 /// scratchy_decoder_state::subtile_op! {
-///     pub static PROBE: name = probe, state = STATE, arity = 1, outputs = One,
+///     pub static PROBE: name = probe, state = STATE, arity = 1,
 ///         rows = In0, tp = Collective, weight = none;
 /// }
 /// fn main() {}
@@ -295,7 +317,7 @@ macro_rules! state_op {
 /// pub const STATE: StateName = StateName::new("probe");
 ///
 /// scratchy_decoder_state::subtile_op! {
-///     pub static PROBE: name = probe, state = STATE, arity = 2, outputs = One,
+///     pub static PROBE: name = probe, state = STATE, arity = 2,
 ///         rows = M, tp = Whole, weight = 2;
 /// }
 /// fn main() {}
@@ -311,7 +333,7 @@ macro_rules! subtile_op {
     ($(
         $(#[$meta:meta])*
         $vis:vis static $facts:ident: name = $name:ident, state = $state:path,
-            arity = $arity:literal, outputs = $outputs:ident, rows = $rows:ident,
+            arity = $arity:literal, rows = $rows:ident,
             tp = $tp:ident, weight = $weight:tt $(,)?;
     )+) => {$(
         $(#[$meta])*
@@ -344,7 +366,7 @@ macro_rules! subtile_op {
                     $crate::__private::OpName::new(::core::stringify!($name)),
                 ),
                 ARITY,
-                $crate::__private::StateOutputs::$outputs,
+                $crate::__private::StateOutputs::One,
                 ROWS,
                 TP,
                 $crate::subtile_op!(@weight $weight),
@@ -397,7 +419,7 @@ macro_rules! subtile_op {
 /// scratchy_decoder_state::subtile_op! {
 ///     /// The one subtile op `probe_scale` lowers to.
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// pub mod lower {
@@ -409,7 +431,7 @@ macro_rules! subtile_op {
 ///     pub fn scale(l: &mut dyn StateLowering) -> Result<(), LowerError> {
 ///         let a = l.input(ArgIndex::new(0))?;
 ///         let cols = l.out_cols(OutIndex::new(0))?;
-///         let scaled = l.push(StateSubOp::new(&crate::PROBE_SCALE_TILE, |_| cols), vec![a]);
+///         let scaled = l.push(StateSubOp::new(&crate::PROBE_SCALE_TILE, |_| cols), vec![a])?;
 ///         l.produce(OutIndex::new(0), scaled);
 ///         Ok(())
 ///     }
@@ -457,7 +479,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// fn unlowered(
@@ -514,7 +536,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// scratchy_decoder_state::decoder_state! {
@@ -545,7 +567,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = OTHER, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// fn unlowered(
@@ -580,7 +602,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// fn unlowered(
@@ -612,7 +634,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// fn unlowered(
@@ -645,7 +667,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// fn unlowered(
@@ -680,7 +702,7 @@ macro_rules! subtile_op {
 ///
 /// scratchy_decoder_state::subtile_op! {
 ///     pub static PROBE_SCALE_TILE: name = probe_scale_tile, state = STATE, arity = 1,
-///         outputs = One, rows = In0, tp = Whole, weight = none;
+///         rows = In0, tp = Whole, weight = none;
 /// }
 ///
 /// fn unlowered(

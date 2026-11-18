@@ -405,7 +405,9 @@ reads MLA's derived dims), and its stem and arch features in
 `crates/models/arch/Cargo.toml`. It also removes the tests that
 load its arch's configs by its dims: for MLA, `crates/models/typed/tests/glm4_moe_lite.rs`
 and the GLM-4.7-Flash and stated-head-dim tests at the end of
-`crates/compiler/macros/src/config.rs`'s tests, and the checkpoint header fixtures those
+`crates/compiler/macros/src/config.rs`'s tests, the `to_wavefront` tests at the end of
+`crates/compiler/macros/src/typed_shapes_tests.rs`, the GLM step-records test in
+`crates/targets/metal/compiler/src/steps_from_tape.rs`'s tests, and the checkpoint header fixtures those
 loads are checked against (`crates/compiler/macros/tests/weight_headers/glm-4.7-flash.json`
 and `crates/compiler/macros/tests/bundle_headers/glm-4.7-flash-4bit.json`). MLA's dim rules are also restated in
 Python in `crates/targets/metal/models/tests/golden_gen_carrier.py`, whose MLA lines go too.
@@ -423,12 +425,22 @@ A DSL op lowers into the subtile IR through the decoder state's own code: a
 `LowerFn` (`scratchy_decoder_state::lower`) that builds through the
 state-neutral `StateLowering` builder, which hands out the op's inputs, output
 widths, config bounds, cos/sin pairs, weights and layers, and takes only the
-decoder state's own subtile ops. One DSL op may lower to several subtile ops,
-and a DSL output that passes a value on points at that value's producer. Each
+decoder state's own listed subtile rows: `push` refuses any other row
+(`LowerError::NotOwnRow`), even one sharing a listed row's name. The decoder state lowers its own ops: the
+bridge (`crates/compiler/macros/src/to_wavefront.rs`) implements `StateLowering`
+over its own helpers and calls the `LowerFn` that `decoder_state!` lists for the
+op (`ops = [<op> => <lowering>]`), and nothing shared names the decoder state's
+ops. One DSL op may lower to several subtile ops, and a DSL output that passes a
+value on points at that value's producer. The subtile ops a lowering pushes are
+single-output, and `subtile_op!` has no output key: `push` hands back the op's
+one output and no consumer reads another slot, so a DSL op with several outputs lowers to one
+subtile op per output, as `mla_split` lowers to `mla_latent` and
+`mla_rope_key`. A weighted subtile op's weight is read under its storage scheme
+by the same mapping a gemm's is, and binds as a linear weight. Each
 subtile op is stated once, through `scratchy_decoder_state::subtile_op!`, as a
 `static` of its facts: its name, the crate's `const` `StateName`, its operand
-count, its output count, its row law, its sharding rule and its weight operand
-(`state = STATE, arity = N, outputs = One | Two | Three, rows = In0 | M,
+count, its row law, its sharding rule and its weight operand
+(`state = STATE, arity = N, rows = In0 | M,
 tp = <TpRule variant>, weight = none | <operand>;`). Rows of operand 0 with no
 operand, `tp = Collective`, or a weight past the operands does not build.
 
@@ -466,8 +478,14 @@ decoder state's it is. Deleting that decoder state leaves the fallback's value i
 place where the config gives the fallback's inputs (`head_dim` needs `hidden_size` to
 divide by `num_attention_heads`); otherwise the config is refused, as GLM-4.7-Flash is
 without MLA. The typed carriers spell a row ahead of the fallbacks as a plain bound,
-not as its rule. The Metal bake fails with `StateUnlowered` until the decoder state has
-a Metal lowering, so the arch's stems stay out of `all` until then.
+not as its rule. On a config whose experts Metal lowers (the one-layer gate config),
+until the decoder state has a Metal lowering, the Metal bake lowers its ops through the
+bridge and every shared pass and then fails at Metal step lowering
+with `Refused::StateUnlowered`, naming the first subtile op, so the arch's stems stay out
+of `all` until then. The bridge's own `StateUnlowered` means only that the bake was
+handed a list of decoder states without the op's. That stop is pinned on GLM-4.7-Flash's
+one dense layer (a test in `crates/targets/metal/compiler/src/steps_from_tape.rs`); its full
+stem also needs its Metal arch module and an expert path Metal has a kernel for, both S3.
 
 ### 5. Commit a correctness golden
 

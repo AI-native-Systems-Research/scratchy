@@ -3106,6 +3106,77 @@ mod tests {
         }
     }
 
+    /// GLM-4.7-Flash at its one dense layer lowers through the bridge and every shared pass metal
+    /// runs, and stops at the step records: its first MLA subtile op, `mla_latent`, has no metal
+    /// lowering.
+    #[test]
+    fn glm_stops_at_the_step_records_on_its_first_state_op() {
+        use scratchy_forward_compiler_macro::fixtures;
+        use scratchy_forward_compiler_macro::to_wavefront::{
+            BridgeModel, PrefixCapacity, lower_decode_to_wavefront,
+        };
+        use scratchy_tensors::compiler_ids::{OpName, StateName, StateOpId};
+        let typing = scratchy_models_typed::typing();
+        let dims = typing.dims().expect("the build's dims");
+        let mut model = fixtures::config_of("glm4-moe-lite", "glm-4.7-flash", &dims);
+        model.bounds.insert("num_hidden_layers".to_string(), 1);
+        let (program, inferred, fuf) = fixtures::carrier_graph_of("glm4-moe-lite", &model, &typing);
+        let facts = fixtures::facts_of(&model, &fuf);
+        let bridge = BridgeModel {
+            params: &model,
+            facts: &facts,
+            decoder_states: typing.decoder_states,
+        };
+        let wp = scratchy_forward_compiler_macro::workload::WorkloadPoint {
+            num_tokens: 1,
+            sk_bucket: 0,
+        };
+        let bounds = scratchy_forward_compiler_macro::codegen::bounds_for_wp(&model, wp, 1);
+        let prefix = PrefixCapacity::new(std::num::NonZeroU32::new(8192).expect("nonzero"));
+        let lowered = lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1)
+            .expect("the bridge lowers GLM's one layer");
+        let weight_paths: Vec<Vec<String>> = (program.weights.ids())
+            .map(|id| program.weights.path(id).to_vec())
+            .collect();
+        let step_facts = crate::canonical::MetalStepFacts {
+            weight_paths: &weight_paths,
+            shared_expert_banks: &Default::default(),
+            embed_base: "embed_tokens",
+            embed_quant: None,
+            mlp: crate::canonical::MlpForm::Packed,
+            moe_expert_bits: None,
+        };
+        let at = crate::canonical::CanonicalAt {
+            stem: "glm-4.7-flash",
+            m: 1,
+            buckets: &[1],
+            rows: scratchy_subtile::sample_rows::ResultRows::Sampled,
+        };
+        let mut sources = crate::canonical::SourceManifest::default();
+        let refusal = match crate::canonical::lower_canonical_classed(
+            &lowered,
+            &step_facts,
+            &facts,
+            at,
+            &mut sources,
+        ) {
+            Err(crate::canonical::CanonicalRefusal::Steps(refusal)) => refusal,
+            Err(other) => panic!("expected the step records to refuse, got {other}"),
+            Ok(_) => panic!("GLM's state ops lowered on metal"),
+        };
+        let StepRefusal {
+            op: Some((_, "mla_latent")),
+            why: Refused::StateUnlowered { op },
+        } = refusal
+        else {
+            panic!("expected StateUnlowered on mla_latent, got {refusal}");
+        };
+        assert_eq!(
+            op,
+            StateOpId::new(StateName::new("mla"), OpName::new("mla_latent"))
+        );
+    }
+
     /// A construct's rows fence as ONE: the first on every member's accesses, the rest always.
     #[test]
     fn a_constructs_rows_fence_as_one() {

@@ -1071,8 +1071,11 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 g.head_dim().get().hash(h);
                 a.scale().get().to_bits().hash(h);
             }
-            // The op's identity, output widths, layer and weight scheme are class: two state ops,
-            // one at two widths, two layers or two schemes, are different programs.
+            // The op's identity, output widths and weight scheme are class. Its layer is per-layer
+            // identity, which the other arms mask, but it is hashed here on purpose: a re-rolled
+            // body rebinds a layered op's layer through `layer_index`, which names no state op
+            // yet, so a state op's layers must not roll onto one body. Hashing the layer keeps
+            // every layer's state ops in their own class until `layer_index` names them.
             SubOp::State(op) => (op.id(), op.out_cols(), op.layer(), op.scheme()).hash(h),
         }
     }

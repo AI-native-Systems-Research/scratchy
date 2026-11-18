@@ -2,12 +2,15 @@
 //! How a decoder state lowers its own DSL ops into the subtile IR: each op's [`LowerFn`] builds
 //! through a [`StateLowering`], a state-neutral builder the bridge implements over its own
 //! helpers. The builder hands out the op's inputs, output widths, config bounds, cos/sin pairs,
-//! weights and layers, and takes only [`StateSubOp`]s, so a decoder state can push its own subtile
-//! ops and nothing else.
+//! weights and layers, and takes only the [`StateSubOp`]s of the decoder state's own listed
+//! subtile rows: a push of any other row is refused ([`LowerError::NotOwnRow`]), so a decoder
+//! state can push its own subtile ops and nothing else.
 
 pub use scratchy_subtile::handoff::UnrollIndex;
 pub use scratchy_subtile::lower::{GemmWeight, InputRef};
 pub use scratchy_subtile::state_op::StateSubOp;
+
+use scratchy_forward_compiler_frontend::state::StateOpId;
 
 /// A DSL argument position of the op being lowered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +53,9 @@ pub struct StateWeight {
 pub enum LowerError {
     /// The op has no argument at `arg`.
     MissingArg { arg: ArgIndex },
+    /// The argument at `arg` is not a value the builder resolves: no op produced it, it is not a
+    /// tile or a weight, or its shape does not close under the model's bounds.
+    Unresolved { arg: ArgIndex },
     /// The argument at `arg` is not a weight.
     NotAWeight { arg: ArgIndex },
     /// The argument at `arg` is not a layered state input.
@@ -62,6 +68,8 @@ pub enum LowerError {
     WidthOverflow { what: &'static str },
     /// The weight's storage has no scheme a state op can read it under.
     Weight { detail: &'static str },
+    /// A push of the subtile op `op` whose facts are not a row the lowering's decoder state lists.
+    NotOwnRow { op: StateOpId },
 }
 
 /// The builder a decoder state's lowering of one DSL op writes through.
@@ -78,8 +86,9 @@ pub trait StateLowering {
     fn weight(&mut self, arg: ArgIndex) -> Result<StateWeight, LowerError>;
     /// The layer DSL argument `arg`, a layered state input, names.
     fn layer(&self, arg: ArgIndex) -> Result<UnrollIndex, LowerError>;
-    /// Appends `op` over `inputs`, returning its output.
-    fn push(&mut self, op: StateSubOp, inputs: Vec<InputRef>) -> InputRef;
+    /// Appends `op` over `inputs`, returning its output; an op whose facts are not one of the
+    /// decoder state's own listed rows is refused.
+    fn push(&mut self, op: StateSubOp, inputs: Vec<InputRef>) -> Result<InputRef, LowerError>;
     /// Records `value` as DSL output `out`.
     fn produce(&mut self, out: OutIndex, value: InputRef);
 }
@@ -98,13 +107,16 @@ mod recorder {
         ArgIndex, InputRef, LowerError, OutIndex, StateLowering, StateSubOp, StateWeight,
         UnrollIndex,
     };
+    use crate::DecoderState;
 
     /// A [`StateLowering`] over given inputs (one per argument), output widths (one per output),
     /// bounds, weights and layers, which records every op pushed, every output produced and
     /// every cos/sin pair asked for. Each cos/sin pair is a fresh pair of external sources past
     /// every source the inputs and weights name; each pushed op's output is
-    /// [`InputRef::Op`] of its push order.
+    /// [`InputRef::Op`] of its push order. A push of a row `state` does not list is refused, as
+    /// the bridge refuses it.
     pub struct Recorder {
+        state: DecoderState,
         inputs: Vec<InputRef>,
         widths: Vec<u32>,
         bounds: BTreeMap<&'static str, u32>,
@@ -124,10 +136,12 @@ mod recorder {
     }
 
     impl Recorder {
-        /// A recorder whose argument `i` is `inputs[i]` and output `o` is `widths[o]` wide.
-        pub fn new(inputs: Vec<InputRef>, widths: Vec<u32>) -> Self {
+        /// A recorder for a lowering of `state`, whose argument `i` is `inputs[i]` and output `o`
+        /// is `widths[o]` wide.
+        pub fn new(state: DecoderState, inputs: Vec<InputRef>, widths: Vec<u32>) -> Self {
             let next_ext = inputs.iter().copied().map(past).max().unwrap_or(0);
             Self {
+                state,
                 inputs,
                 widths,
                 bounds: BTreeMap::new(),
@@ -221,9 +235,12 @@ mod recorder {
                 .ok_or(LowerError::NotLayered { arg })
         }
 
-        fn push(&mut self, op: StateSubOp, inputs: Vec<InputRef>) -> InputRef {
+        fn push(&mut self, op: StateSubOp, inputs: Vec<InputRef>) -> Result<InputRef, LowerError> {
+            if !self.state.owns(op.facts()) {
+                return Err(LowerError::NotOwnRow { op: op.id() });
+            }
             self.pushes.push((op, inputs));
-            InputRef::Op(self.pushes.len() - 1)
+            Ok(InputRef::Op(self.pushes.len() - 1))
         }
 
         fn produce(&mut self, out: OutIndex, value: InputRef) {

@@ -78,25 +78,25 @@ pub const KV_A_PROJ_OUT: DerivedDim = DerivedDim {
 scratchy_decoder_state::subtile_op! {
     /// The latent: the first out-width columns of its operand, the compressed KV of
     /// kv_a_proj_with_mqa's output.
-    pub static MLA_LATENT: name = mla_latent, state = STATE, arity = 1, outputs = One,
+    pub static MLA_LATENT: name = mla_latent, state = STATE, arity = 1,
         rows = In0, tp = Whole, weight = none;
     /// The shared rope key: the last out-width columns of its operand, the rope part of
     /// kv_a_proj_with_mqa's output.
-    pub static MLA_ROPE_KEY: name = mla_rope_key, state = STATE, arity = 1, outputs = One,
+    pub static MLA_ROPE_KEY: name = mla_rope_key, state = STATE, arity = 1,
         rows = In0, tp = Whole, weight = none;
     /// `[q, cos, sin]`: q with each head's rope part roped by the cos/sin pair, which is every
     /// head's rope part wide (heads times the rope width). The output is q's own width.
-    pub static MLA_ROPE_Q: name = mla_rope_q, state = STATE, arity = 3, outputs = One,
+    pub static MLA_ROPE_Q: name = mla_rope_q, state = STATE, arity = 3,
         rows = In0, tp = Whole, weight = none;
     /// `[latent, k_pe, cos, sin]`: k_pe roped by the cos/sin pair, one rope part wide, and written
     /// with the latent as the row `[latent | roped k_pe]` into the cache of the op's layer. Its
     /// output is the roped k_pe.
-    pub static MLA_CACHE_WRITE: name = mla_cache_write, state = STATE, arity = 4, outputs = One,
+    pub static MLA_CACHE_WRITE: name = mla_cache_write, state = STATE, arity = 4,
         rows = In0, tp = Whole, weight = none;
     /// `[q, latent, k_pe, kv_b]`: attention over the cache of the op's layer, with `kv_b`, its
     /// operand 3, decompressing the latent into each head's no-rope key and value. One row per
     /// token, every head's value.
-    pub static MLA_ATTEND: name = mla_attend, state = STATE, arity = 4, outputs = One,
+    pub static MLA_ATTEND: name = mla_attend, state = STATE, arity = 4,
         rows = M, tp = Whole, weight = 3;
 }
 

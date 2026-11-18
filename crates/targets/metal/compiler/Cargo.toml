@@ -30,3 +30,6 @@ serde = { version = "1", features = ["derive"] }
 # The carriers' typed programs, which the emission test hands the pipeline as a build does.
 [dev-dependencies]
 scratchy-models-typed = { workspace = true }
+# The real-config fixtures (`fixtures`): a carrier's fused graph and facts, built as the bake builds
+# them, for the tests that lower a checked-in model through metal's passes.
+scratchy-forward-compiler-macro = { path = "../../../compiler/macros", features = ["test-support"] }

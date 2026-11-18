@@ -70,3 +70,45 @@ pub fn fuf_of_ast(arch: &str, model: &ModelParams, ast: &crate::ast::Ast) -> (Pr
     fuf.annotate_storage_formats(&program, model);
     (program, fuf)
 }
+
+/// The program, trace and fused graph of `model` under its arch's carrier, as the bake builds a
+/// model's: classified under `typing`'s decoder states, traced by `typing`, and through the
+/// bake's per-model passes at one rank.
+pub fn carrier_graph_of(
+    arch: &str,
+    model: &ModelParams,
+    typing: &crate::Typing<'_>,
+) -> (Program, crate::shape::Inferred, Fuf) {
+    let dsl = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models/arch/dsl")
+        .join(format!("{arch}.py"));
+    let source = std::fs::read_to_string(&dsl).expect("the carrier");
+    let carrier = crate::parse_python::parse_python_file(&source).expect("carrier parses");
+    let mut program =
+        crate::classify::carrier_program(&carrier, &typing.vocabularies().collect::<Vec<_>>())
+            .expect("classify");
+    let inferred = (typing.traced)(&carrier.arch_name).expect("a typed carrier");
+    if !carrier.vision {
+        program.decoder_safetensors_prefix = model.arch.decoder_prefix.clone();
+    }
+    program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
+    crate::shape::erase_identity_regroupings(&mut program, &inferred, &model.bounds);
+    let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");
+    let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
+    fuf.annotate_storage_formats(&program, model);
+    crate::rows_lowering::materialize_rows(&mut fuf);
+    (program, inferred, fuf)
+}
+
+/// `model`'s facts over `fuf`, as the bake fills them at one rank, with no lent target and no KV
+/// compression.
+pub fn facts_of(model: &ModelParams, fuf: &Fuf) -> scratchy_ir::model_facts::ModelFacts {
+    crate::codegen::fill_canonical_params(
+        model,
+        1,
+        crate::codegen::fuf_uses_rotary(fuf),
+        &crate::codegen::KvCacheLayers::of(fuf),
+        None,
+        false,
+    )
+}

@@ -418,6 +418,8 @@ mod tests {
         assert_eq!((out.rows.len, out.cols.len), (1, 48));
     }
 
+    /// Two layers' instances of one state op are two ops, and the class key pins that no
+    /// re-roll folds a state op's layers onto one body yet.
     #[test]
     fn two_layers_are_two_ops() {
         let at = |n| StateSubOp::new(&PROBE_A, |_| 64).at_layer(UnrollIndex(n));
@@ -425,6 +427,10 @@ mod tests {
         assert_ne!(l0, l1);
         assert_eq!(l0, at(0));
         assert_eq!(l1.layer(), Some(UnrollIndex(1)));
+        // No re-roll across a state op's layers yet: `layer_index` names no state op, so a
+        // rolled body could not rebind the layer, and the class key keeps the layers apart.
+        let l0_op: SubOp = SubOp::State(l0);
+        assert_eq!(l0_op.layer_index(), None);
         assert_ne!(class_key(&SubOp::State(l0)), class_key(&SubOp::State(l1)));
         assert_ne!(l0, StateSubOp::new(&PROBE_A, |_| 64));
     }

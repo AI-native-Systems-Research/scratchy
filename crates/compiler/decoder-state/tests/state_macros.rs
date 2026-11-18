@@ -34,10 +34,10 @@ pub mod ops {
 
 scratchy_decoder_state::subtile_op! {
     /// The first of `probe_mix`'s two subtile ops: its three operands in, one row per token out.
-    pub static PROBE_MIX_A: name = probe_mix_a, state = STATE, arity = 3, outputs = One,
+    pub static PROBE_MIX_A: name = probe_mix_a, state = STATE, arity = 3,
         rows = M, tp = Whole, weight = none;
     /// The second: `probe_mix_a`'s output and a weight in, one value out.
-    pub static PROBE_MIX_B: name = probe_mix_b, state = STATE, arity = 2, outputs = One,
+    pub static PROBE_MIX_B: name = probe_mix_b, state = STATE, arity = 2,
         rows = In0, tp = Whole, weight = 1;
 }
 
@@ -49,7 +49,7 @@ fn lower_mix(l: &mut dyn StateLowering) -> Result<(), LowerError> {
         l.input(ArgIndex::new(2))?,
     ];
     let cols = l.out_cols(OutIndex::new(0))?;
-    let mixed = l.push(StateSubOp::new(&PROBE_MIX_A, |_| cols), args.to_vec());
+    let mixed = l.push(StateSubOp::new(&PROBE_MIX_A, |_| cols), args.to_vec())?;
     l.produce(OutIndex::new(0), mixed);
     l.produce(OutIndex::new(1), args[0]);
     Ok(())
