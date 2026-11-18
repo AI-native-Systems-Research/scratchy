@@ -206,6 +206,12 @@ fn weight_of(lowered: &LoweredDecode, ext: usize) -> Option<(WeightId, Option<Un
 fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String> {
     use SubOp as L;
     let op = &lowered.input.ops[op_idx].op;
+    let untaught = || {
+        format!(
+            "weight_bindings: op {op:?} binds a weight but this walk has no kind for it — \
+             add its arm rather than defaulting, or the emitted Weights field gets the wrong type"
+        )
+    };
     Ok(match op {
         // ⭐ A LAYERNORM IS A SHAPE, NOT AN OPCODE. The DSL declares a `LayerNorm` field, but by
         // the time it reaches the tape it is a `Mean -> Sub -> RmsNorm -> BiasAdd` chain, and the
@@ -214,12 +220,12 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         // qwen2-vl and locateanything. The centering `Sub` on its input is what distinguishes
         // the two, so the kind is read from the op's NEIGHBOURHOOD, not the op alone.
         L::RmsNorm { .. } if reads_centered(lowered, op_idx) => WeightKind::LayerNorm,
-        L::MatmulTile { weight, .. } => match weight {
-            GemmWeight::Dense => WeightKind::Linear,
-            GemmWeight::Fp8Dynamic => WeightKind::Fp8,
-            // The quantized-linear kinds are named by the PRESET, which the
-            // tape carries on the gemm itself.
-            GemmWeight::Affine { .. } => WeightKind::Linear,
+        L::MatmulTile { weight, .. } => kind_of_scheme(*weight),
+        // A state op's weight is a linear weight read under its scheme. A state op with no scheme
+        // reads no weight, so one bound to a weight is refused as an untaught op is.
+        L::State(state) => match state.scheme() {
+            Some(scheme) => kind_of_scheme(scheme),
+            None => return Err(untaught()),
         },
         L::RmsNorm { .. } | L::RmsNormUnit { .. } => WeightKind::RmsNorm,
         L::EmbeddingGather { .. } => WeightKind::Embedding,
@@ -246,13 +252,19 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         // gains; its convolutions' base kernels and its selector's codebooks bare tensors.
         L::DraftAttention { .. } | L::DraftContextKv { .. } => WeightKind::RmsNorm,
         L::DraftConv { .. } | L::DraftSelect => WeightKind::Tensor,
-        other => {
-            return Err(format!(
-                "weight_bindings: op {other:?} binds a weight but this walk has no kind for it — \
-                 add its arm rather than defaulting, or the emitted Weights field gets the wrong type"
-            ));
-        }
+        _ => return Err(untaught()),
     })
+}
+
+/// The kind of a linear weight read under `scheme`: a gemm's, and a state op's weight's.
+fn kind_of_scheme(scheme: GemmWeight) -> WeightKind {
+    match scheme {
+        GemmWeight::Dense => WeightKind::Linear,
+        GemmWeight::Fp8Dynamic => WeightKind::Fp8,
+        // The quantized-linear kinds are named by the PRESET, which the
+        // tape carries on the gemm itself.
+        GemmWeight::Affine { .. } => WeightKind::Linear,
+    }
 }
 
 /// The struct FIELD type for a weight kind.
@@ -442,6 +454,7 @@ mod tests {
             prelude: Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         }
     }
 
@@ -698,6 +711,52 @@ mod tests {
             .iter()
             .find(|a| a.name == name)
             .map(|a| a.rust_type.to_string().replace(' ', ""))
+    }
+
+    /// A probe state op over `[x, w]` whose operand 1 is its weight.
+    static PROBE_WEIGHTED: scratchy_subtile::state_op::StateOpFacts =
+        scratchy_subtile::state_op::StateOpFacts::new(
+            scratchy_tensors::compiler_ids::StateOpId::new(
+                scratchy_tensors::compiler_ids::StateName::new("probe"),
+                scratchy_tensors::compiler_ids::OpName::new("probe_weighted"),
+            ),
+            scratchy_tensors::compiler_ids::Arity::new(2),
+            scratchy_subtile::state_op::StateOutputs::One,
+            scratchy_subtile::state_op::StateRows::M,
+            scratchy_subtile::tensor_parallel::TpRule::Whole,
+            Some(1),
+        );
+
+    /// A state op's weight is a linear weight read under its scheme: a dense one binds a
+    /// `Linear` field, as a dense gemm's does.
+    #[test]
+    fn a_state_weight_binds_as_a_linear() {
+        use scratchy_subtile::state_op::StateSubOp;
+        let program = program_with(&[&["w"]]);
+        let op = StateSubOp::new(&PROBE_WEIGHTED, |_| 8).weighted(GemmWeight::Dense);
+        let tw = from_tape(
+            &decode(
+                vec![
+                    SourceBinding::EmbeddedHidden,
+                    SourceBinding::Weight { id: 0, index: None },
+                ],
+                vec![OpDesc {
+                    op: SubOp::State(op),
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                }],
+            ),
+            &program,
+            WeightAbi {
+                mlp: MlpPacking::Split,
+                embed: EmbedStorage::Dense,
+            },
+        )
+        .expect("derives");
+        assert_eq!(
+            ty_of(&tw, "w").as_deref(),
+            Some("crate::__gpu::layers::LinearLayer")
+        );
     }
 
     /// ⛔ AN UNTAUGHT WEIGHT-BINDING OP MUST REFUSE, NOT DEFAULT. A silent

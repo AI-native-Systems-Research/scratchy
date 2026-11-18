@@ -16,13 +16,19 @@
 //! touched nine files, and every slot bug of that branch traced to one site disagreeing with
 //! another.
 //!
-//! Row grammar: `Kind [<pattern>] arity = (|n| <bool over n>), cols = <class>;`
+//! Row grammar: `Kind [<pattern>] arity = (|n| <bool over n>), cols = <class>, rows = <class>,
+//! gemm_w = <class>, tp = <class>;`
 //! - `Kind` names the op in [`SubOpKind`] and in [`crate::subtile_ir::SubOp::name`]; for a
 //!   variant with fields it is the variant's own name.
 //! - The pattern is a real match pattern, so an elementwise kind (`Elementwise(EwKind::Silu)`) is
 //!   a row in its own right rather than a special case the consumer has to unpack.
 //! - `arity` is a closure-form predicate over the operand count (the binder is declared IN the
 //!   row so macro hygiene ties it to the body).
+//! - `[state r]`, in the `arity`, `cols`, `rows`, `gemm_w` and `tp` columns of the one `State`
+//!   row: the fact is the state op's own, read off the [`crate::state_op::StateSubOp`] that `r`
+//!   binds (its declared arity, its output 0's width, its row law, its weight operand, its
+//!   sharding rule). Its `arity`
+//!   class also makes the op's `name` its own op name. The row states no fact of any decoder state.
 //! - `cols` is one of (bracketed so it stays one macro token tree):
 //!   - `[in0]` — shape-preserving: output width = `inputs[0]` width;
 //!   - `[in1]` — output width = `inputs[1]` width (GDN's z operand);
@@ -218,6 +224,10 @@ macro_rules! for_each_subop {
             // pick row (the write-through is GPU-only, RopeAppend's law).
             ChainStage [SubOp::ChainStage { .. }] arity = (|n| n == 5), cols = [ustick],
                 rows = [in0], gemm_w = [none], tp = [whole];
+            // Every decoder state's ops: each fact is the op's own (`crate::state_op`), the operand
+            // that is its gemm weight included, when its facts declare one.
+            State [SubOp::State(..)] arity = [state r], cols = [state r], rows = [state r],
+                gemm_w = [state r], tp = [state r];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
@@ -305,6 +315,9 @@ macro_rules! __out_cols_pat {
     ($kind:ident, $pat:pat, [pairs $f:ident $k:ident]) => {
         $crate::subtile_ir::SubOp::$kind { $f, $k, .. }
     };
+    ($kind:ident, $pat:pat, [state $r:ident]) => {
+        $crate::subtile_ir::SubOp::$kind($r)
+    };
     ($kind:ident, $pat:pat, $cols:tt) => {
         $pat
     };
@@ -343,6 +356,9 @@ macro_rules! __out_cols_body {
     ($w:ident, $s:expr, [pairs $f:ident $k:ident]) => {
         *$f * $k.get()
     };
+    ($w:ident, $s:expr, [state $r:ident]) => {
+        $r.out_cols().first()
+    };
 }
 
 // ── Derived: output rows ────────────────────────────────────────────
@@ -350,11 +366,15 @@ macro_rules! __out_cols_body {
 // - `[in0]` — the op preserves its operand 0's row count (the row scale a per-head Reshape
 //   view introduced is carried by the tensors and inherited through operand 0);
 // - `[m]` — the op's output rows are the TOKEN count `m`;
-// - `[scale f]` — Reshape's own `m · mult / div`, the one op the front end states a scale for.
+// - `[scale f]` — Reshape's own `m · mult / div`, the one op the front end states a scale for;
+// - `[state r]` — a state op's own row law (`crate::state_op::StateRows`).
 // A field-reading class binds the row's own field name in the pattern.
 macro_rules! __out_rows_pat {
     ($kind:ident, $pat:pat, [scale $f:ident]) => {
         $crate::subtile_ir::SubOp::$kind { $f, .. }
+    };
+    ($kind:ident, $pat:pat, [state $r:ident]) => {
+        $crate::subtile_ir::SubOp::$kind($r)
     };
     ($kind:ident, $pat:pat, $rows:tt) => {
         $pat
@@ -379,12 +399,56 @@ macro_rules! __out_rows_body {
         );
         (r / d) as u32
     }};
+    ($w:ident, $m:ident, [state $r:ident]) => {
+        $r.out_rows($m, $w)
+    };
+}
+
+// ── Derived: arity and name ─────────────────────────────────────────
+// A closure-form row binds its operand count in its own body; a `[state r]` row asks the op. The
+// same class decides the name: a state op's is its own, every other op's its kind's.
+macro_rules! __arity_pat {
+    ($kind:ident, $pat:pat, [state $r:ident]) => {
+        $crate::subtile_ir::SubOp::$kind($r)
+    };
+    ($kind:ident, $pat:pat, $arity:tt) => {
+        $pat
+    };
+}
+macro_rules! __arity_body {
+    ($n:ident, (|$an:ident| $arity:expr)) => {{
+        let $an = $n;
+        $arity
+    }};
+    ($n:ident, [state $r:ident]) => {
+        $r.arity_ok($n)
+    };
+}
+macro_rules! __name_body {
+    ($kind:ident, [state $r:ident]) => {
+        $r.name()
+    };
+    ($kind:ident, $arity:tt) => {
+        stringify!($kind)
+    };
 }
 
 // ── Derived: the gemm-weight operand ───────────────────────────────
-// One class pair: `[in k]` names operand k as the op's GEMM WEIGHT, `[none]` says it has none.
-// The arm's pattern is the row's own `$pat` — no field of the op keys the fact.
+// Three classes: `[in k]` names operand k as the op's GEMM WEIGHT, `[none]` says it has none, and
+// `[state r]` asks the state op, whose facts name its weight operand or none. The state arm binds
+// `SubOp::State(r)`; every other arm uses the row's own `$pat`, and no field of the op keys the fact.
+macro_rules! __gemm_w_pat {
+    ($kind:ident, $pat:pat, [state $r:ident]) => {
+        $crate::subtile_ir::SubOp::$kind($r)
+    };
+    ($kind:ident, $pat:pat, $gw:tt) => {
+        $pat
+    };
+}
 macro_rules! __gemm_w_body {
+    ([state $r:ident]) => {
+        $r.facts().weight()
+    };
     ([none]) => {
         None
     };
@@ -394,7 +458,16 @@ macro_rules! __gemm_w_body {
 }
 
 // ── Derived: the sharding rule ──────────────────────────────────────
-// One class per row, naming a `TpRule` variant (see `crate::tensor_parallel`).
+// One class per row, naming a `TpRule` variant (see `crate::tensor_parallel`), or `[state r]`,
+// the state op's own rule.
+macro_rules! __tp_pat {
+    ($kind:ident, $pat:pat, [state $r:ident]) => {
+        $crate::subtile_ir::SubOp::$kind($r)
+    };
+    ($kind:ident, $pat:pat, $tp:tt) => {
+        $pat
+    };
+}
 macro_rules! __tp_body {
     ([contract]) => {
         $crate::tensor_parallel::TpRule::Contract
@@ -420,17 +493,20 @@ macro_rules! __tp_body {
     ([whole]) => {
         $crate::tensor_parallel::TpRule::Whole
     };
+    ([state $r:ident]) => {
+        $r.tp_rule()
+    };
 }
 
 macro_rules! __derive_registry {
-    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
+    ($( $kind:ident [$pat:pat] arity = $arity:tt, cols = $cols:tt,
         rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*
-     @expansion $( $ek:ident [$ep:pat] arity = (|$ean:ident| $ea:expr), cols = $ec:tt,
+     @expansion $( $ek:ident [$ep:pat] arity = $ea:tt, cols = $ec:tt,
         rows = $erc:tt, gemm_w = $egw:tt, tp = $etp:tt; )*) => {
         __derive_registry! {
-            $( $kind [$pat] arity = (|$an| $arity), cols = $cols, rows = $rows, gemm_w = $gw,
+            $( $kind [$pat] arity = $arity, cols = $cols, rows = $rows, gemm_w = $gw,
                 tp = $tp; )*
-            $( $ek [$ep] arity = (|$ean| $ea), cols = $ec, rows = $erc, gemm_w = $egw,
+            $( $ek [$ep] arity = $ea, cols = $ec, rows = $erc, gemm_w = $egw,
                 tp = $etp; )*
         }
 
@@ -443,7 +519,7 @@ macro_rules! __derive_registry {
             };
         }
     };
-    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
+    ($( $kind:ident [$pat:pat] arity = $arity:tt, cols = $cols:tt,
         rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*) => {
         /// An op without its fields: how a declared target table names an op. Derived from the
         /// registry, so no table keeps a parallel list.
@@ -468,7 +544,7 @@ macro_rules! __derive_registry {
             pub fn name(&self) -> &'static str {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => stringify!($kind), )*
+                    $( __arity_pat!($kind, $pat, $arity) => __name_body!($kind, $arity), )*
                 }
             }
 
@@ -476,7 +552,7 @@ macro_rules! __derive_registry {
             pub fn arity_ok(&self, n_operands: usize) -> bool {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => { let $an = n_operands; $arity } )*
+                    $( __arity_pat!($kind, $pat, $arity) => __arity_body!(n_operands, $arity), )*
                 }
             }
 
@@ -523,7 +599,7 @@ macro_rules! __derive_registry {
             pub fn gemm_weight_input(&self) -> Option<usize> {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => __gemm_w_body!($gw), )*
+                    $( __gemm_w_pat!($kind, $pat, $gw) => __gemm_w_body!($gw), )*
                 }
             }
 
@@ -534,7 +610,7 @@ macro_rules! __derive_registry {
             pub fn tp_rule(&self) -> $crate::tensor_parallel::TpRule {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => __tp_body!($tp), )*
+                    $( __tp_pat!($kind, $pat, $tp) => __tp_body!($tp), )*
                 }
             }
         }

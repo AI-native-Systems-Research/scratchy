@@ -1071,6 +1071,12 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 g.head_dim().get().hash(h);
                 a.scale().get().to_bits().hash(h);
             }
+            // The op's identity, output widths and weight scheme are class. Its layer is per-layer
+            // identity, which the other arms mask, but it is hashed here on purpose: a re-rolled
+            // body rebinds a layered op's layer through `layer_index`, which names no state op
+            // yet, so a state op's layers must not roll onto one body. Hashing the layer keeps
+            // every layer's state ops in their own class until `layer_index` names them.
+            SubOp::State(op) => (op.id(), op.out_cols(), op.layer(), op.scheme()).hash(h),
         }
     }
 }
@@ -1709,6 +1715,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         table_rows: u32,
         k: u32,
     },
+    /// A decoder state's op: ONE opaque variant for every decoder state, carrying its decoder state's
+    /// facts ([`crate::state_op::StateOpFacts`]) and this instance's output widths. Every
+    /// registry column reads the op's own facts; a target lowers it through the decoder state's own
+    /// facet, and refuses it by name until it has one.
+    State(crate::state_op::StateSubOp),
 }
 
 /// The token draw's padded row: the vocab rounded up to a power-of-two whole
@@ -3987,6 +3998,12 @@ pub fn eval_node<F: RopeForm>(
             "SubOp::DraftSelect has no host reference: its anchors, sampling policies and uniforms \
              are runtime inputs, and its proposals land in the drafter's runtime outputs"
         ),
+        SubOp::State(op) => panic!(
+            "decoder state {} op {} has no host reference: its semantics are its decoder state's own, and the \
+             shared reference knows only the op's facts",
+            op.id().state(),
+            op.id().name()
+        ),
         // The capture's copy lands outside the graph; the forward reads `x` unchanged.
         SubOp::CaptureHidden { .. } => gather(&node.inputs[0], graph, bufs).0,
         SubOp::DraftConv { stage } => {
@@ -4258,6 +4275,17 @@ pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
         // op, no hand-maintained parallel match.
         if !node.op.arity_ok(arity) {
             return Err(format!("node {i} op {:?} bad arity {arity}", node.op));
+        }
+        // A state op's weight scheme and its facts agree on whether it has a weight operand.
+        if let SubOp::State(state) = &node.op
+            && state.scheme().is_some() != state.facts().weight().is_some()
+        {
+            return Err(format!(
+                "node {i} state op {}: scheme {:?} and facts' weight operand {:?} must agree",
+                state.name(),
+                state.scheme(),
+                state.facts().weight()
+            ));
         }
         // Output must target an op-output tensor, in bounds.
         let ot = node.output.tensor;
@@ -4691,6 +4719,8 @@ pub fn lower_region(
             SubOp::SampleRowsGather => SubOp::SampleRowsGather,
             SubOp::SampleRowsScatter => SubOp::SampleRowsScatter,
             SubOp::AllRowsMatmul => SubOp::AllRowsMatmul,
+            // No witness to bind: the op's facts and widths are the whole op.
+            SubOp::State(op) => SubOp::State(op),
         };
 
         if let SubOp::MatmulTile { n, weight } = subop {

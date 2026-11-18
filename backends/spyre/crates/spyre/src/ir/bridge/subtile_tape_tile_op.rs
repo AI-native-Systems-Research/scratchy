@@ -124,6 +124,12 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
             "{} is a collective — a CB sequence, never a standard tile op",
             n.op.name()
         )),
+        // A state op's tile is its decoder state's own.
+        SubOp::State(op) => Err(format!(
+            "decoder state {} op {} has no spyre tile op: its decoder state declares none",
+            op.id().state(),
+            op.id().name()
+        )),
         // The token draw is NOT one standard tile either: its body is whole-row
         // reduces over a PAD_V-wide row plus a [1, 64] pointwise tail — a MIXED-WIDTH
         // body the [mb, out_active, y] declaration cannot state (out_active would have

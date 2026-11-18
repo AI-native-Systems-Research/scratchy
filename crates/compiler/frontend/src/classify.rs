@@ -11,14 +11,170 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use syn::Ident;
 
-use crate::ast::{self, BoundExpr};
+use crate::ast::{self, At, BoundExpr, Site};
 use crate::classified::{
     BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
     WeightTable,
 };
 use crate::dim::{Dim, canonical_mul};
+use crate::state::{
+    Arity, DimName, InputName, OpName, OutputCount, SourceCount, StateName, StateTable,
+    StateVocabulary, Vocabulary,
+};
 
-pub type ClassifyResult<T> = Result<T, syn::Error>;
+pub type ClassifyResult<T> = Result<T, ClassifyError>;
+
+/// Why a carrier does not classify.
+#[derive(Debug)]
+pub enum ClassifyError {
+    /// A DSL shape the classifier rejects (an unknown op, a bad index, a misplaced reshape, …).
+    Dsl(syn::Error),
+    /// An op name with two claims: the core vocabulary or a decoder state first, then `second`.
+    DuplicateOpName {
+        name: OpName,
+        first: Vocabulary,
+        second: StateName,
+    },
+    /// An input name with two claims, as [`Self::DuplicateOpName`].
+    DuplicateInputName {
+        name: InputName,
+        first: Vocabulary,
+        second: StateName,
+    },
+    /// A derived dim's name with two claims, as [`Self::DuplicateOpName`].
+    DuplicateDimName {
+        name: DimName,
+        first: Vocabulary,
+        second: StateName,
+    },
+    /// A derived dim of decoder state `state` ahead of the fallbacks whose name no fallback gives
+    /// (not one of [`crate::dim::FALLBACK_DIMS`]).
+    DimAheadOfNoFallback { name: DimName, state: StateName },
+    /// A derived dim of `owner` reading `reads`, a dim of `reads_owner` it may not read: one the
+    /// table derives after it or above it at its own stage, or another decoder state's that is not
+    /// ahead of the fallbacks.
+    DimReadsUnavailable {
+        name: DimName,
+        owner: Vocabulary,
+        reads: DimName,
+        reads_owner: Vocabulary,
+    },
+    /// A state op called with other than its declared number of arguments.
+    StateOpArity {
+        op: OpName,
+        expected: Arity,
+        got: SourceCount,
+        at: Option<At>,
+    },
+    /// A state op bound to other than its declared number of outputs.
+    StateOpOutputs {
+        op: OpName,
+        expected: OutputCount,
+        got: SourceCount,
+        at: Option<At>,
+    },
+    /// A state input read without its `[layer]`.
+    StateInputUnindexed { input: InputName, at: Option<Site> },
+}
+
+impl From<syn::Error> for ClassifyError {
+    fn from(e: syn::Error) -> Self {
+        Self::Dsl(e)
+    }
+}
+
+/// `"<where>: "`, or nothing for a construct a compiler pass inserted.
+struct Prefix<T>(Option<T>);
+
+impl<T: std::fmt::Display> std::fmt::Display for Prefix<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(at) => write!(f, "{at}: "),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Display for ClassifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dsl(e) => e.fmt(f),
+            Self::DuplicateOpName {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "op `{name}` is claimed twice: by {first} and by decoder state `{second}`"
+            ),
+            Self::DuplicateInputName {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "input `{name}` is claimed twice: by {first} and by decoder state `{second}`"
+            ),
+            Self::DuplicateDimName {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "derived dim `{name}` is claimed twice: by {first} and by decoder state `{second}`"
+            ),
+            Self::DimAheadOfNoFallback { name, state } => write!(
+                f,
+                "derived dim `{name}` of decoder state `{state}` is derived ahead of the fallbacks, \
+                 but no fallback gives `{name}`: only {:?} may be",
+                crate::dim::FALLBACK_DIMS
+            ),
+            Self::DimReadsUnavailable {
+                name,
+                owner,
+                reads,
+                reads_owner,
+            } => write!(
+                f,
+                "derived dim `{name}` of {owner} reads `{reads}` of {reads_owner}: a derived dim \
+                 reads a dim derived before it (at an earlier stage, or above it at its own) that \
+                 is a core dim, its own decoder state's, or one ahead of the fallbacks read from a \
+                 later stage"
+            ),
+            Self::StateOpArity {
+                op,
+                expected,
+                got,
+                at,
+            } => write!(
+                f,
+                "{}state op `{op}` takes {} argument(s), the call passes {}",
+                Prefix(*at),
+                expected.get(),
+                got.get()
+            ),
+            Self::StateOpOutputs {
+                op,
+                expected,
+                got,
+                at,
+            } => write!(
+                f,
+                "{}state op `{op}` produces {} output(s), the assignment binds {}",
+                Prefix(*at),
+                expected.get(),
+                got.get()
+            ),
+            Self::StateInputUnindexed { input, at } => write!(
+                f,
+                "{}state input `{input}` is per layer: read it as `{input}[layer]`",
+                Prefix(*at)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClassifyError {}
 
 /// Convert a parser-produced [`ast::DimSpec`] into a [`Dim`]. `Lit` /
 /// `Bound` map directly; `Mul` flattens into [`Dim::Mul`] via
@@ -41,19 +197,25 @@ fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
 /// `compile_carrier` calls [`classify_with`] with an explicit prelude.
 #[allow(dead_code)]
 pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
-    classify_with(ast, Prelude::Decoder)
+    classify_with(ast, Prelude::Decoder, &StateTable::default())
 }
 
 /// The program a carrier compiles to: a decoder's with the compiler's drafter capture
 /// (`draft_capture`), classified under the carrier's prelude. The ONE construction of it: the build
 /// script types this program and the bake lowers it, and the bake reads each local's shape from the
-/// typed program's trace by its `LocalId`, so both must hold the same program.
-pub fn carrier_program(carrier: &crate::parse_python::PythonCarrier) -> ClassifyResult<Program> {
+/// typed program's trace by its `LocalId`, so both must hold the same program. `decoder_states` are the
+/// decoder states the build compiles, whose ops and inputs a body may name after the core ones.
+pub fn carrier_program(
+    carrier: &crate::parse_python::PythonCarrier,
+    decoder_states: &[&dyn StateVocabulary],
+) -> ClassifyResult<Program> {
+    let decoder_states = StateTable::assemble(decoder_states)?;
     match carrier.vision {
-        true => classify_with(&carrier.ast, Prelude::Vision),
+        true => classify_with(&carrier.ast, Prelude::Vision, &decoder_states),
         false => classify_with(
             &crate::draft_capture::insert(&carrier.ast),
             Prelude::Decoder,
+            &decoder_states,
         ),
     }
 }
@@ -62,11 +224,22 @@ pub fn carrier_program(carrier: &crate::parse_python::PythonCarrier) -> Classify
 /// which extern names are recognized — decoder bodies use
 /// `input_ids`/`positions`/etc., vision bodies use
 /// `pixels`/`cu_seqlens`/etc. — and is otherwise inert: every
-/// downstream pass operates on the same `Program` shape.
-pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program> {
+/// downstream pass operates on the same `Program` shape. A name the
+/// core vocabulary lacks resolves in `decoder_states`.
+pub fn classify_with(
+    ast: &ast::Ast,
+    prelude: Prelude,
+    decoder_states: &StateTable,
+) -> ClassifyResult<Program> {
     let mut cx = Ctx {
+        locals: LocalTable::default(),
+        weights: WeightTable::default(),
+        scope: HashMap::default(),
         prelude,
-        ..Ctx::default()
+        decoder_states,
+        site: None,
+        reshape_targets: HashMap::default(),
+        dim_casts: HashMap::default(),
     };
     let statements = cx.classify_stmts(&ast.statements)?;
     Ok(Program {
@@ -78,11 +251,11 @@ pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program
         prelude,
         decoder_safetensors_prefix: None,
         weight_leaf_renames: Vec::new(),
+        dims: decoder_states.dims().clone(),
     })
 }
 
-#[derive(Default)]
-struct Ctx {
+struct Ctx<'r> {
     locals: LocalTable,
     weights: WeightTable,
     /// Name → most-recent LocalId for that name. Reflects straight-
@@ -90,6 +263,11 @@ struct Ctx {
     /// For-loops push their induction variable and pop it on exit.
     scope: HashMap<String, Vec<LocalId>>,
     prelude: Prelude,
+    /// The decoder states' ops and inputs, resolved after the core names.
+    decoder_states: &'r StateTable,
+    /// Where the expression being classified is: its innermost enclosing call, else its
+    /// statement's line. Diagnostics about a read point here.
+    site: Option<Site>,
     /// DSL-authored reshape targets accumulated during classify; they
     /// flow into `Program::reshape_targets` keyed by the producing
     /// `LocalId`. See [`Ctx::classify_stmt`] for the
@@ -99,7 +277,7 @@ struct Ctx {
     dim_casts: HashMap<LocalId, Dim>,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     fn classify_stmts(&mut self, stmts: &[ast::Stmt]) -> ClassifyResult<Vec<Stmt>> {
         stmts.iter().map(|s| self.classify_stmt(s)).collect()
     }
@@ -111,6 +289,7 @@ impl Ctx {
                 value,
                 line,
             } => {
+                self.site = line.map(Site::Line);
                 // `out = reshape(source, [d0, d1, ...])` is the only
                 // place an `ast::Expr::Reshape` is admitted. We
                 // intercept here (before `classify_expr`) so the
@@ -139,21 +318,23 @@ impl Ctx {
                 }
                 // `x = as_dim(y, <bound>)`: an alias of the local `y`, its width stated as the
                 // bound (`Program::dim_casts`). Admitted only as an assignment's whole RHS.
-                if let ast::Expr::Call { op, args } = value
-                    && op == "as_dim"
+                if let ast::Expr::Call { op, args, .. } = value
+                    && ast::SpecialForm::from_name(&op.to_string()) == Some(ast::SpecialForm::AsDim)
                 {
                     let [source, ast::Expr::Var(bound)] = args.as_slice() else {
                         return Err(syn::Error::new(
                             proc_macro2::Span::call_site(),
                             "`as_dim(x, <bound>)` takes a local and a config bound",
-                        ));
+                        )
+                        .into());
                     };
                     let source = self.classify_expr(source)?;
                     if !matches!(source, Expr::Local(_)) {
                         return Err(syn::Error::new(
                             proc_macro2::Span::call_site(),
                             "`as_dim(x, <bound>)` casts a local",
-                        ));
+                        )
+                        .into());
                     }
                     let id = self.bind(target.clone(), *line);
                     self.dim_casts.insert(id, Dim::Bound(bound.to_string()));
@@ -164,7 +345,7 @@ impl Ctx {
                 }
                 // Classify RHS first so that `x = f(x)` reads the
                 // previous binding of `x`, not the new one.
-                let value = self.classify_expr(value)?;
+                let value = self.classify_value(value, SourceCount::ONE)?;
                 let id = self.bind(target.clone(), *line);
                 Ok(Stmt::Assign { target: id, value })
             }
@@ -173,7 +354,8 @@ impl Ctx {
                 value,
                 line,
             } => {
-                let value = self.classify_expr(value)?;
+                self.site = line.map(Site::Line);
+                let value = self.classify_value(value, SourceCount::of(targets.len()))?;
                 let ids = targets
                     .iter()
                     .map(|t| self.bind(t.clone(), *line))
@@ -314,7 +496,8 @@ impl Ctx {
                      would otherwise see the pre-`if` value when the other arm ran). \
                      Arm-local scratch names (new in one arm, dead after) are allowed.",
                 ),
-            ));
+            )
+            .into());
         }
 
         // Merge over the INTERSECTION — names changed in BOTH arms escape
@@ -423,9 +606,78 @@ impl Ctx {
         }
     }
 
+    /// An assignment's whole right-hand side, which binds `binds` names: a state op there must
+    /// produce exactly that many outputs.
+    fn classify_value(&mut self, expr: &ast::Expr, binds: SourceCount) -> ClassifyResult<Expr> {
+        match expr {
+            ast::Expr::Call { op, args, at } => self.classify_call(op, args, *at, binds),
+            other => self.classify_expr(other),
+        }
+    }
+
+    /// `op(args)`, whose result binds `binds` names: a core op by [`OpKind::from_name`], else a
+    /// state op by its declaration, whose arity and output count it checks.
+    fn classify_call(
+        &mut self,
+        op: &Ident,
+        args: &[ast::Expr],
+        at: Option<At>,
+        binds: SourceCount,
+    ) -> ClassifyResult<Expr> {
+        let name = op.to_string();
+        let kind = match (OpKind::from_name(&name), self.decoder_states.op(&name)) {
+            (Some(kind), _) => kind,
+            (None, Some(state)) => {
+                let got = SourceCount::of(args.len());
+                if !got.admitted_by(state.arity()) {
+                    return Err(ClassifyError::StateOpArity {
+                        op: state.name(),
+                        expected: state.arity(),
+                        got,
+                        at,
+                    });
+                }
+                if !binds.binds(state.outputs()) {
+                    return Err(ClassifyError::StateOpOutputs {
+                        op: state.name(),
+                        expected: state.outputs(),
+                        got: binds,
+                        at,
+                    });
+                }
+                OpKind::State(state)
+            }
+            (None, None) => {
+                return Err(
+                    syn::Error::new(op.span(), format!("{}unknown op `{op}`", Prefix(at))).into(),
+                );
+            }
+        };
+        let outer = self.site;
+        self.site = at.map(Site::Call).or(outer);
+        let args = args
+            .iter()
+            .map(|a| self.classify_expr(a))
+            .collect::<ClassifyResult<Vec<_>>>();
+        self.site = outer;
+        Ok(Expr::Call {
+            op: kind,
+            args: args?,
+        })
+    }
+
     fn classify_expr(&mut self, expr: &ast::Expr) -> ClassifyResult<Expr> {
         match expr {
-            ast::Expr::Var(ident) => self.classify_read(ident, None),
+            ast::Expr::Var(ident) => match self.classify_read(ident, None)? {
+                Expr::Extern {
+                    kind: ExternKind::State(input),
+                    index: None,
+                } => Err(ClassifyError::StateInputUnindexed {
+                    input: input.name(),
+                    at: self.site,
+                }),
+                read => Ok(read),
+            },
 
             ast::Expr::Path(segments) => {
                 // Dotted paths never resolve to locals or externs
@@ -451,15 +703,7 @@ impl Ctx {
                 attach_index(target_expr, index_id)
             }
 
-            ast::Expr::Call { op, args } => {
-                let kind = OpKind::from_name(&op.to_string())
-                    .ok_or_else(|| syn::Error::new(op.span(), format!("unknown op `{op}`")))?;
-                let args = args
-                    .iter()
-                    .map(|a| self.classify_expr(a))
-                    .collect::<ClassifyResult<Vec<_>>>()?;
-                Ok(Expr::Call { op: kind, args })
-            }
+            ast::Expr::Call { op, args, at } => self.classify_call(op, args, *at, SourceCount::ONE),
 
             ast::Expr::Mul { lhs, rhs } => {
                 let lhs = self.classify_expr(lhs)?;
@@ -497,7 +741,8 @@ impl Ctx {
             ast::Expr::Reshape { .. } => Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 "`reshape(source, [..])` may only appear as the top-level RHS of an assignment",
-            )),
+            )
+            .into()),
         }
     }
 
@@ -514,7 +759,8 @@ impl Ctx {
             _ => Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 "indexing target must be a variable or a dotted path",
-            )),
+            )
+            .into()),
         }
     }
 
@@ -531,6 +777,14 @@ impl Ctx {
         }
         if let Some(kind) = ExternKind::from_name_for(&name, self.prelude) {
             return Ok(Expr::Extern { kind, index });
+        }
+        if let Some(input) = self.decoder_states.input(&name)
+            && ExternKind::State(input).prelude() == self.prelude
+        {
+            return Ok(Expr::Extern {
+                kind: ExternKind::State(input),
+                index,
+            });
         }
         // Weight ref by bare ident (e.g. `embed_tokens`, `lm_head`,
         // `norm`). Intern as a single-segment path.
@@ -616,14 +870,16 @@ fn attach_index(expr: Expr, index: LocalId) -> ClassifyResult<Expr> {
         Expr::Local(_) => Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "cannot index a local binding",
-        )),
+        )
+        .into()),
         // Double-indexing or indexing a call/mul shouldn't reach here
         // because the parser's Index wraps one expression and the
         // target path produces at most one index at a time.
         other => Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             format!("cannot index expression: {other:?}"),
-        )),
+        )
+        .into()),
     }
 }
 
@@ -635,17 +891,18 @@ mod tests {
 
     fn classify_src(src: &str) -> Program {
         let ast = parse_body(src).expect("DSL parse");
-        classify_with(&ast, Prelude::Decoder).expect("classification")
+        classify_with(&ast, Prelude::Decoder, &StateTable::default()).expect("classification")
     }
 
-    fn classify_err(src: &str) -> syn::Error {
+    fn classify_err(src: &str) -> ClassifyError {
         let ast = parse_body(src).expect("DSL parse");
-        classify_with(&ast, Prelude::Decoder).expect_err("expected classification error")
+        classify_with(&ast, Prelude::Decoder, &StateTable::default())
+            .expect_err("expected classification error")
     }
 
     fn classify_vision_src(src: &str) -> Program {
         let ast = parse_body(src).expect("DSL parse");
-        classify_with(&ast, Prelude::Vision).expect("classification")
+        classify_with(&ast, Prelude::Vision, &StateTable::default()).expect("classification")
     }
 
     #[test]

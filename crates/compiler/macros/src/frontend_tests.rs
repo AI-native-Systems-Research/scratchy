@@ -25,7 +25,8 @@ mod draft_capture {
     fn llama(captured: &[u64]) -> ModelParams {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../models/arch/configs/llama/llama-3.2-1b.json");
-        let mut params = config::load_file(&path).expect("load config");
+        let mut params =
+            config::load_file(&path, &crate::config::build_dims()).expect("load config");
         let set = LayerSet::of(captured.iter().copied());
         params
             .layer_sets

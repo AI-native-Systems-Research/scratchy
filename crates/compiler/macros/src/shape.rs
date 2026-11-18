@@ -27,6 +27,8 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         ExternKind::RotaryLocal => vec![],
         ExternKind::BlockTable => vec![],
         ExternKind::KvCache => vec![],
+        // A decoder state's layered input: opaque, as the KV cache's is.
+        ExternKind::State(_) => vec![],
         // Vision externs. `Pixels` has the per-row patch shape the
         // encoder's first GEMM reads (`patch_embed_proj`); `Cos`/`Sin`
         // carry the per-row half-

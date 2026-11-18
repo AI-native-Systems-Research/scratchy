@@ -23,12 +23,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use crate::bundles::Bundle;
-use crate::classified::{Expr, LocalId, OpKind, Program, Stmt};
-use crate::dim::{DERIVED_DIMS, DerivedRule, Dim, canonical_add, canonical_mul};
+use crate::classified::{Expr, ExternKind, LocalId, OpKind, Program, Stmt};
+use crate::dim::{DerivedRule, Dim, canonical_add, canonical_mul};
 use crate::hf_config::ParamExpr;
 use crate::weights_manifest::WeightsManifest;
 
-/// The bounds the op signatures in `typed_shapes` name themselves, beside those a `weights.json`
+/// The bounds the op signatures in `scratchy-typed-shapes` name themselves, beside those a `weights.json`
 /// declares. Config vocabulary, shared by every arch.
 pub const SIGNATURE_BOUNDS: [&str; 11] = [
     "backbone_hidden_size",
@@ -225,22 +225,39 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
     ))
 }
 
-/// The marker of every base bound in `bounds` and in [`SIGNATURE_BOUNDS`]: every derived dim is a
-/// type alias in the module of the carrier that names it ([`carrier_aliases`]).
+/// The marker of every base bound in `bounds` that [`SIGNATURE_BOUNDS`] does not already name (the
+/// signatures declare those themselves): every derived dim is a type alias in the module of the
+/// carrier that names it ([`carrier_aliases`]).
 pub fn emit_markers(bounds: &BTreeSet<String>) -> Result<String, String> {
-    let all: BTreeSet<&str> = (bounds.iter().map(String::as_str))
-        .chain(SIGNATURE_BOUNDS)
-        .collect();
-    let rows: String = (all.iter())
+    Ok(marker_rows(
+        bounds
+            .iter()
+            .map(String::as_str)
+            .filter(|b| !SIGNATURE_BOUNDS.contains(b)),
+    ))
+}
+
+/// The marker of every bound in [`SIGNATURE_BOUNDS`], as `scratchy-typed-shapes`' build script
+/// writes them into the crate the signatures name them in: the one place those markers' text is
+/// made.
+pub fn emit_signature_markers() -> String {
+    marker_rows(SIGNATURE_BOUNDS.iter().copied())
+}
+
+/// A `bounds!` invocation declaring the marker of each of `bounds`.
+fn marker_rows<'a>(bounds: impl Iterator<Item = &'a str>) -> String {
+    let rows: String = bounds
         .map(|b| format!("    {} => {b:?},\n", marker(b)))
         .collect();
-    Ok(format!("bounds! {{\n{rows}}}\n"))
+    format!("bounds! {{\n{rows}}}\n")
 }
 
 /// The carrier's derived dims among `named` (and every derived dim their rules read), each a type
 /// alias for its rule (`type KvDim = Mul<HeadDim, NumKeyValueHeads>;`); every base bound they read
-/// goes into `base`. A derived dim is one of [`DERIVED_DIMS`] (a gated one by the carrier's
-/// resolved flag) or one of its arch.json `expr` params.
+/// goes into `base`. A derived dim is a row of the carrier program's assembled table
+/// ([`Program::dims`]: the core rows, then each decoder state's; a gated one by the carrier's
+/// resolved flag; a row before the fallbacks is a base bound) or one of its arch.json `expr`
+/// params.
 fn carrier_aliases(
     c: &Carrier<'_>,
     named: BTreeSet<String>,
@@ -252,7 +269,12 @@ fn carrier_aliases(
         if aliases.contains_key(&name) || base.contains(&name) {
             continue;
         }
-        let dim = if let Some(d) = DERIVED_DIMS.iter().find(|d| d.name == name) {
+        // A row before the fallbacks derives its name only where the config has the row's inputs,
+        // and the fallback or the config gives it elsewhere: the types read that name as the base
+        // bound the loader resolved, never as the one row's rule.
+        let dim = if let Some(d) = (c.program.dims.find(&name))
+            .filter(|d| d.stage != crate::dim::DeriveStage::BeforeFallbacks)
+        {
             Some(rule_dim(c, &name, &d.rule)?)
         } else if let Some(e) = c.facts.exprs.get(&name) {
             Some(expr_dim(c, &name, e)?)
@@ -289,12 +311,12 @@ fn carrier_aliases(
         .collect();
     Ok(format!(
         "{types}\n    /// Each derived dim's type, as the dim it states (for the tests: every one must equal \
-         the\n    /// config loader's value under each config's bounds).\n    #[cfg(test)]\n    \
+         the\n    /// config loader's value under each config's bounds).\n    \
          pub fn derived_dims() -> Vec<(&'static str, Dim)> {{\n        vec![\n{rows}        ]\n    }}\n\n"
     ))
 }
 
-/// A [`DERIVED_DIMS`] rule as a dim, a gated rule's arm chosen by the carrier's resolved flag.
+/// A derived dim's rule as a dim, a gated rule's arm chosen by the carrier's resolved flag.
 fn rule_dim(c: &Carrier<'_>, name: &str, rule: &DerivedRule) -> Result<Dim, String> {
     Ok(match rule {
         DerivedRule::Bound(b) => Dim::Bound(b.to_string()),
@@ -346,7 +368,6 @@ pub fn emit_dispatch(carriers: &[(String, String)]) -> String {
          pub fn typed_program(arch: &str) -> Option<fn(&Trace)> {{\n\
          \x20   match arch {{\n{arms}        _ => None,\n    }}\n}}\n\n\
          /// The derived dims of the carrier whose arch is `arch`, each as its type states it.\n\
-         #[cfg(test)]\n\
          pub fn derived_dims_of(arch: &str) -> Option<Vec<(&'static str, Dim)>> {{\n\
          \x20   match arch {{\n{derived_arms}        _ => None,\n    }}\n}}\n"
     )
@@ -694,6 +715,11 @@ impl Cx<'_, '_> {
     fn value(&self, e: &Expr, nest: &mut Nest) -> Result<String, String> {
         Ok(match e {
             Expr::Local(id) => format!("l{}", id.0),
+            // A decoder state's input is built by its own decoder state's constructor, not read off `Inputs`.
+            Expr::Extern {
+                kind: ExternKind::State(input),
+                ..
+            } => format!("{}::{}()", input.signatures(), input.name()),
             Expr::Extern { kind, .. } => format!("inputs.{}", kind.name()),
             Expr::Weight { id, .. } => {
                 let path = self.c.program.weights.path(*id);
@@ -735,6 +761,16 @@ impl Cx<'_, '_> {
                 let args = (args.iter())
                     .map(|a| self.expr(a, nest))
                     .collect::<Result<Vec<_>, _>>()?;
+                // A state op is a signature of its own decoder state's module; a core op's arity form
+                // is one of the shared `ops`.
+                if let OpKind::State(state) = op {
+                    return Ok(format!(
+                        "{}::{}({})",
+                        state.signatures(),
+                        state.name(),
+                        args.join(", ")
+                    ));
+                }
                 let name = (ARITY_FORMS.iter())
                     .find(|(o, arity, _)| o == op && *arity == args.len())
                     .map_or(op.as_str(), |(_, _, name)| name);
@@ -774,5 +810,53 @@ struct Nest {
 impl Nest {
     fn of(target: LocalId) -> Self {
         Self { target, next: 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classified::Prelude;
+    use crate::classify::classify_with;
+    use crate::parse_python::parse_body;
+    use crate::state::StateTable;
+    use crate::state::probe::Probe;
+
+    #[test]
+    fn a_state_call_names_its_decoder_states_module() {
+        let source = "
+for layer in range(num_hidden_layers):
+    (a, b) = probe_split(input_ids)
+    y = probe_mix(a, probe_state[layer], b)
+";
+        let decoder_states =
+            StateTable::assemble(&[&Probe]).expect("the probe decoder state assembles");
+        let program = classify_with(
+            &parse_body(source).expect("DSL parse"),
+            Prelude::Decoder,
+            &decoder_states,
+        )
+        .expect("classification");
+        let manifest = WeightsManifest::empty();
+        let facts = CarrierFacts::default();
+        let carrier = Carrier {
+            module: "body",
+            arch: "Body",
+            file: "probe.py",
+            source,
+            program: &program,
+            manifest: &manifest,
+            facts: &facts,
+        };
+        let emitted = emit(&carrier, &mut BTreeSet::new()).expect("the carrier emits");
+        assert!(emitted.contains("::probe::ops::probe_mix("), "{emitted}");
+        assert!(emitted.contains("::probe::ops::probe_state()"), "{emitted}");
+        assert!(emitted.contains("::probe::ops::probe_split("), "{emitted}");
+        assert!(
+            !emitted
+                .replace("::probe::ops::probe_", "")
+                .contains("ops::probe_"),
+            "{emitted}"
+        );
     }
 }

@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The MLA ops' typed signatures, each named as a carrier calls it and stated once, and the
+//! constructor of its state input. A product or sum is written in the order `canonical_mul` / `canonical_add` give a `weights.json` dim (a head count
+//! before a per-head sum, the latent before the rope key), which this module's
+//! `mla_products_order` pins.
+
+use std::marker::PhantomData;
+
+use scratchy_typed_shapes::ops::as_dim;
+use scratchy_typed_shapes::{Act, Add, BlockTable, Mul, Rotary, Tokens, W2};
+
+/// One layer's latent cache, holding rows `[latent | roped k_pe]`: `R` is the latent width and `P`
+/// the rope width. The cache is opaque to shapes, so its widths are only these two parameters,
+/// and both ops that take it name them. An emitted carrier's `mla_cache()` is inferred from the op
+/// each call feeds, so that op fixes the widths; a hand-written signature that wires a cache of
+/// other widths does not build. Here a cache at rope width `Rope` is passed with a `k_pe` of that
+/// width:
+///
+/// ```
+/// use scratchy_state_decoder_mla::ops::{MlaCache, mla_attention};
+/// use scratchy_typed_shapes::{Act, Add, BlockTable, Mul, W2};
+///
+/// struct T;
+/// struct H;
+/// struct Nope;
+/// struct Rope;
+/// struct R;
+/// struct V;
+///
+/// fn wired(
+///     q: Act<T, Mul<H, Add<Nope, Rope>>>,
+///     latent: Act<T, R>,
+///     k_pe: Act<T, Rope>,
+///     kv_b: W2<R, Mul<H, Add<Nope, V>>>,
+///     cache: MlaCache<R, Rope>,
+///     block_table: BlockTable,
+/// ) -> Act<T, Mul<H, V>> {
+///     mla_attention(q, latent, k_pe, kv_b, cache, block_table)
+/// }
+/// ```
+///
+/// The same call with a cache built at another rope width, `Other`, is the only change, and is
+/// rejected:
+///
+/// ```compile_fail,E0308
+/// use scratchy_state_decoder_mla::ops::{MlaCache, mla_attention};
+/// use scratchy_typed_shapes::{Act, Add, BlockTable, Mul, W2};
+///
+/// struct T;
+/// struct H;
+/// struct Nope;
+/// struct Rope;
+/// struct Other;
+/// struct R;
+/// struct V;
+///
+/// fn wired(
+///     q: Act<T, Mul<H, Add<Nope, Rope>>>,
+///     latent: Act<T, R>,
+///     k_pe: Act<T, Rope>,
+///     kv_b: W2<R, Mul<H, Add<Nope, V>>>,
+///     cache: MlaCache<R, Other>,
+///     block_table: BlockTable,
+/// ) -> Act<T, Mul<H, V>> {
+///     mla_attention(q, latent, k_pe, kv_b, cache, block_table)
+/// }
+/// ```
+pub struct MlaCache<R, P>(PhantomData<fn() -> (R, P)>);
+
+// By hand: a derive would bound `R` and `P`, which are width markers and need be nothing.
+impl<R, P> Clone for MlaCache<R, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R, P> Copy for MlaCache<R, P> {}
+
+scratchy_decoder_state::state_op! {
+    /// `mla_split(kv_a: [T, R + P]) -> ([T, R], [T, P])`: the compressed KV, then the one rope key
+    /// every head shares. Each row splits into its two parts.
+    pub fn mla_split<T, R, P>(x: Act<T, Add<R, P>>) -> (Act<T, R>, Act<T, P>) {
+        (as_dim(x), as_dim(x))
+    }
+}
+
+scratchy_decoder_state::state_op! {
+    /// `mla_append(q, latent, k_pe, positions, rotary, mla_cache)`: rope (interleaved) on each
+    /// head's rope part of q and on the shared rope key, and the latent row `[latent | roped k_pe]`
+    /// written to the layer's cache. Each row keeps its shape: q comes back roped, the latent passes
+    /// on, k_pe comes back roped.
+    pub fn mla_append<T, Q, L, P>(
+        q: Act<T, Q>,
+        latent: Act<T, L>,
+        k_pe: Act<T, P>,
+        _positions: Tokens<T>,
+        _rotary: Rotary,
+        _cache: MlaCache<L, P>,
+    ) -> (Act<T, Q>, Act<T, L>, Act<T, P>) {
+        (q, latent, k_pe)
+    }
+}
+
+scratchy_decoder_state::state_op! {
+    /// `mla_attention(q, latent, k_pe, kv_b, mla_cache, block_table)`: q is `H` heads of a no-rope
+    /// part `Nope` and a rope part `Rope`; `kv_b` decompresses the `R`-wide latent into each head's
+    /// no-rope key and `V`-wide value; the shared `k_pe` is one rope part wide. The output is every
+    /// head's value, one row per token.
+    pub fn mla_attention<T, H, Nope, Rope, R, V>(
+        q: Act<T, Mul<H, Add<Nope, Rope>>>,
+        _latent: Act<T, R>,
+        _k_pe: Act<T, Rope>,
+        _kv_b: W2<R, Mul<H, Add<Nope, V>>>,
+        _cache: MlaCache<R, Rope>,
+        _block_table: BlockTable,
+    ) -> Act<T, Mul<H, V>> {
+        as_dim(q)
+    }
+}
+
+/// `mla_cache[layer]`: one layer's latent cache, at the latent and rope widths the ops it feeds
+/// take it at.
+pub fn mla_cache<R, P>() -> MlaCache<R, P> {
+    MlaCache(PhantomData)
+}
+
+#[cfg(test)]
+mod tests {
+    use scratchy_forward_compiler_frontend::dim::{Dim, canonical_add, canonical_mul};
+    use scratchy_typed_shapes::{DimType, NumAttentionHeads};
+
+    /// The signatures above write each product and sum in the order `canonical_mul` and
+    /// `canonical_add` give its `weights.json` dims: a head count before a per-head sum, a head
+    /// count before the value width, and the compressed KV before the shared rope key.
+    #[test]
+    fn mla_products_order() {
+        let bound = |name: &str| Dim::Bound(name.to_string());
+        let heads = NumAttentionHeads::dim();
+        let (nope, rope, v) = (
+            bound("qk_nope_head_dim"),
+            bound("qk_rope_head_dim"),
+            bound("v_head_dim"),
+        );
+        let latent = bound("kv_lora_rank");
+        for (first, second) in [(nope.clone(), rope.clone()), (nope.clone(), v.clone())] {
+            let per_head = canonical_add(vec![second.clone(), first.clone()]);
+            assert_eq!(per_head, Dim::Add(vec![first, second]));
+            assert_eq!(
+                canonical_mul(vec![per_head.clone(), heads.clone()]),
+                Dim::Mul(vec![heads.clone(), per_head])
+            );
+        }
+        assert_eq!(
+            canonical_mul(vec![v.clone(), heads.clone()]),
+            Dim::Mul(vec![heads, v])
+        );
+        assert_eq!(
+            canonical_add(vec![rope.clone(), latent.clone()]),
+            Dim::Add(vec![latent, rope])
+        );
+    }
+}

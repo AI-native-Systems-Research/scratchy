@@ -129,5 +129,9 @@ All arches share the one `scratchy-models` crate (`crates/models/arch/`):
    dependency alias; add it to a new bare-`<arch>` list and to `all` too) in
    `crates/models/arch/Cargo.toml`, plus a gated `pub mod <arch>` in
    `crates/models/arch/src/lib.rs`.
+5. An arch whose ops are not core needs a decoder state crate under
+   `crates/state/decoder/<name>`, listed in `crates/models/typed/src/decoder_states.rs`;
+   its stems stay out of `all` until the decoder state has a Metal lowering — see
+   [`MODELS.md`](MODELS.md) for its touch points.
 
 See [`MODELS.md`](MODELS.md) for the full recipe.

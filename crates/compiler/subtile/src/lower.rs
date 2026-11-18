@@ -34,7 +34,7 @@ pub enum InputRef {
 /// weight's `StorageFormat` (the scheme is already known at compile time — no need to launder it through
 /// a runtime bool), and the SDSC emitter matches it EXHAUSTIVELY: adding a scheme is a `cargo build`
 /// error at every lowering site until it is handled (guard-driven), never a silent misread-as-dense.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GemmWeight {
     /// Dense bf16/fp16 weight. Matmul inputs: `[act, weight]` (arity-2). The path every dense model takes.
     Dense,
@@ -71,7 +71,7 @@ impl GemmWeight {
 /// Bits per packed weight element. Minted only for widths a kernel family exists for,
 /// so a checkpoint declaring an unsupported width is refused at lowering rather than
 /// unpacked with the wrong stride.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QuantBits(u32);
 
 impl QuantBits {
@@ -81,7 +81,7 @@ impl QuantBits {
 }
 
 /// Elements of K sharing one scale/bias pair.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupSize(u32);
 
 impl GroupSize {
@@ -101,7 +101,7 @@ impl GroupSize {
 /// output rather than faulting. `bits` is checked here for the same reason: the packing
 /// stride is `32 / bits` elements per word, and a width no kernel exists for would
 /// silently unpack at the wrong stride.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AffineInt4 {
     bits: QuantBits,
     group: GroupSize,
@@ -234,7 +234,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::AttnDecode { .. }
             | O::Sample { .. }
             | O::EmbedRowGather { .. }
-            | O::ChainStage { .. } => None,
+            | O::ChainStage { .. }
+            // A decoder state's facts state no additive offset, so no KV writer reads through one.
+            | O::State(_) => None,
         }
     }
 }

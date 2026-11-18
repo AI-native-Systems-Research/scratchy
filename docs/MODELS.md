@@ -40,8 +40,8 @@ crates/models/arch/
 
 - **`weights.json`** — the exact shape of every weight the DSL reads.
   The typed-Rust emit pass types each weight by it, and rustc checks
-  every use of the weight in the DSL against that type when the compiler
-  builds. Shapes are expressed as products and sums of bound names from
+  every use of the weight in the DSL against that type when
+  `scratchy-models-typed` (`crates/models/typed/`) builds. Shapes are expressed as products and sums of bound names from
   the config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
   are per-head RMS norms of shape `[head_dim]`:
 
@@ -347,7 +347,7 @@ Run the probe binary against any one model size — the shape formulas
 don't change across sizes, so one probe suffices:
 
 ```
-cargo run -p scratchy-forward-compiler --bin probe_weights --features probe -- \
+cargo run -p scratchy-forward-compiler --bin probe-weights --features probe -- \
     --arch <arch> <hf-org>/<size> [<hf-org>/<size> ...]
 ```
 
@@ -386,6 +386,106 @@ etc. Every tensor is a local; weights are referenced by dotted path
 (e.g. `self_attn.q_proj[layer]`). Loop over `num_hidden_layers` using
 a bound name from config.json. See `dsl/llama.py` as the canonical
 reference.
+
+An arch whose attention the core ops cannot state needs a **decoder state**: its
+own ops and layered state inputs, declared from its own crate (see
+`crates/state/decoder/mla`, multi-head latent attention, which GLM-4.7-Flash's
+carrier calls). The touch points: the decoder state crate
+`crates/state/decoder/<name>`; its line in the root
+`Cargo.toml`'s `members` and its `[workspace.dependencies]` row;
+`scratchy-models-typed`'s dependency and build-dependency rows on it
+(`crates/models/typed/Cargo.toml`); and its entry in
+`crates/models/typed/src/decoder_states.rs`, the one list of decoder states a build
+compiles; and the `-p scratchy-state-decoder-mla` lines of the test and clippy steps, the nightly
+compile_fail doctest step, and that step's coverage comment in
+`.github/workflows/rust.yml`. Removing a decoder state also removes each arch that
+uses it: for MLA, GLM-4.7-Flash's carrier (`crates/models/arch/dsl/glm4-moe-lite.py`),
+its configs dir (`crates/models/arch/configs/glm4-moe-lite/`, whose `weights.json`
+reads MLA's derived dims), and its stem and arch features in
+`crates/models/arch/Cargo.toml`. It also removes the tests that
+load its arch's configs by its dims: for MLA, `crates/models/typed/tests/glm4_moe_lite.rs`
+and the GLM-4.7-Flash and stated-head-dim tests at the end of
+`crates/compiler/macros/src/config.rs`'s tests, the `to_wavefront` tests at the end of
+`crates/compiler/macros/src/typed_shapes_tests.rs`, the GLM step-records test in
+`crates/targets/metal/compiler/src/steps_from_tape.rs`'s tests, and the checkpoint header fixtures those
+loads are checked against (`crates/compiler/macros/tests/weight_headers/glm-4.7-flash.json`
+and `crates/compiler/macros/tests/bundle_headers/glm-4.7-flash-4bit.json`). MLA's dim rules are also restated in
+Python in `crates/targets/metal/models/tests/golden_gen_carrier.py`, whose MLA lines go too.
+
+The decoder state crate states each DSL op once, through `scratchy_decoder_state::state_op!`:
+the op's typed signature (the `fn` a carrier's call is type-checked
+against). The macro counts the op's arity from the parameters and its output
+count from the return type, which the DSL declaration reads. Write a
+multi-value return as the tuple itself (`-> (Act<T, R>, Act<T, P>)`): the
+count is read from the syntax, so a type alias for a tuple counts as one
+output. An op returns one, two or three values; returning none or more than
+three does not build.
+
+A DSL op lowers into the subtile IR through the decoder state's own code: a
+`LowerFn` (`scratchy_decoder_state::lower`) that builds through the
+state-neutral `StateLowering` builder, which hands out the op's inputs, output
+widths, config bounds, cos/sin pairs, weights and layers, and takes only the
+decoder state's own listed subtile rows: `push` refuses any other row
+(`LowerError::NotOwnRow`), even one sharing a listed row's name. The decoder state lowers its own ops: the
+bridge (`crates/compiler/macros/src/to_wavefront.rs`) implements `StateLowering`
+over its own helpers and calls the `LowerFn` that `decoder_state!` lists for the
+op (`ops = [<op> => <lowering>]`), and nothing shared names the decoder state's
+ops. One DSL op may lower to several subtile ops, and a DSL output that passes a
+value on points at that value's producer. The subtile ops a lowering pushes are
+single-output, and `subtile_op!` has no output key: `push` hands back the op's
+one output and no consumer reads another slot, so a DSL op with several outputs lowers to one
+subtile op per output, as `mla_split` lowers to `mla_latent` and
+`mla_rope_key`. A weighted subtile op's weight is read under its storage scheme
+by the same mapping a gemm's is, and binds as a linear weight. Each
+subtile op is stated once, through `scratchy_decoder_state::subtile_op!`, as a
+`static` of its facts: its name, the crate's `const` `StateName`, its operand
+count, its row law, its sharding rule and its weight operand
+(`state = STATE, arity = N, rows = In0 | M,
+tp = <TpRule variant>, weight = none | <operand>;`). Rows of operand 0 with no
+operand, `tp = Collective`, or a weight past the operands does not build.
+
+The crate then lists the decoder state once, through
+`scratchy_decoder_state::decoder_state!`, in this order: its name (`name =
+STATE`), the absolute path of the module holding the signatures and the
+inputs' constructors (`signatures = ::<crate>::<module>`, since the typed
+carriers call it from another crate; the crate reaches its own module by
+`extern crate self as <crate>;`), each DSL op with its lowering (`ops = [<op>
+=> <path to LowerFn>, ...]`), its inputs, and its subtile ops (`subtile =
+[<static>, ...]`). It expands to the `static` `DecoderState` that
+`decoder_states.rs` lists. An op or input listed there that the module does
+not declare, a DSL op listed without its lowering, or a listed subtile row
+stated under another decoder state's name does not build. Its op and input names
+must not collide with a core op, an op a compiler pass synthesizes, a parser
+special form, a core extern or another decoder state's names: the build fails
+naming both claimants.
+
+A decoder state declares its own derived dims, the config bounds its weights' shapes
+read that no config states (MLA's projection widths and per-head width): each is a
+`const` `DerivedDim` in its crate, listed after the subtile ops as `dims = [...]` in
+`decoder_state!`, in the order they derive. The build assembles them once, after the
+core rows (`DERIVED_DIMS` in `crates/compiler/frontend/src/dim.rs`), into the one table the
+config loader derives every config by and the typed carriers spell as types; the table
+is the build's, so a row derives for any config that carries its inputs. A dim named
+like a core row, another decoder state's, or one the same decoder state already lists
+fails the build naming both claimants. A row reads only a row derived before it (one at
+an earlier stage, or above it at its own), and only a core row or its own decoder
+state's, with one exception below; any other read fails the build. A row at
+`DeriveStage::BeforeFallbacks` derives ahead of the generic fallbacks, so it wins over
+them (a config stating the name still wins over it), and may only name one a fallback
+gives: `head_dim` or `num_key_value_heads` (`FALLBACK_DIMS`). The exception: a row at
+any later stage, a core row or any decoder state's, may read such a row, whichever
+decoder state's it is. Deleting that decoder state leaves the fallback's value in its
+place where the config gives the fallback's inputs (`head_dim` needs `hidden_size` to
+divide by `num_attention_heads`); otherwise the config is refused, as GLM-4.7-Flash is
+without MLA. The typed carriers spell a row ahead of the fallbacks as a plain bound,
+not as its rule. On a config whose experts Metal lowers (the one-layer gate config),
+until the decoder state has a Metal lowering, the Metal bake lowers its ops through the
+bridge and every shared pass and then fails at Metal step lowering
+with `Refused::StateUnlowered`, naming the first subtile op, so the arch's stems stay out
+of `all` until then. The bridge's own `StateUnlowered` means only that the bake was
+handed a list of decoder states without the op's. That stop is pinned on GLM-4.7-Flash's
+one dense layer (a test in `crates/targets/metal/compiler/src/steps_from_tape.rs`); its full
+stem also needs its Metal arch module and an expert path Metal has a kernel for, both S3.
 
 ### 5. Commit a correctness golden
 

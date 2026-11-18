@@ -26,8 +26,14 @@ fn typed_carrier_unrolls(stem: &str, configs: usize) -> (crate::classified::Prog
     let source = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
     // The program the bake lowers.
-    let program = crate::classify::carrier_program(&carrier).unwrap();
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name)
+    let program = crate::classify::carrier_program(
+        &carrier,
+        &scratchy_models_typed::typing()
+            .vocabularies()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name)
         .unwrap_or_else(|| panic!("{stem} has a typed program"));
     assert!(
         inferred.locals_of(&local_names(&program)),
@@ -74,8 +80,14 @@ fn a_trace_is_of_its_own_program_only() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
-    let lowered = crate::classify::carrier_program(&carrier).unwrap();
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
+    let lowered = crate::classify::carrier_program(
+        &carrier,
+        &scratchy_models_typed::typing()
+            .vocabularies()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     assert!(inferred.locals_of(&local_names(&lowered)));
     let written = crate::classify::classify(&carrier.ast).unwrap();
     assert_ne!(local_names(&written), local_names(&lowered));
@@ -144,7 +156,12 @@ fn the_emit_pass_and_its_signatures_name_no_arch_or_model() {
         names.iter().any(|n| n == "llama"),
         "the scan sees the carriers"
     );
-    for file in ["../../frontend/src/typed_emit.rs", "typed_shapes.rs"] {
+    for file in [
+        "../../frontend/src/typed_emit.rs",
+        "../../typed-shapes/src/lib.rs",
+        "typed_shapes.rs",
+        "../../../models/typed/src/lib.rs",
+    ] {
         let text = std::fs::read_to_string(src.join(file)).expect(file);
         let words: std::collections::HashSet<&str> = text
             .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
@@ -183,10 +200,16 @@ fn gemma4_reshapes_left(config: &str) -> (usize, usize) {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/gemma4.py")).expect("gemma4.py");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let mut program = crate::classify::carrier_program(&carrier).unwrap();
+    let mut program = crate::classify::carrier_program(
+        &carrier,
+        &scratchy_models_typed::typing()
+            .vocabularies()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let configs_dir = arch.join("configs/gemma4");
     let model = crate::config::load_file_declared(&configs_dir.join(config)).unwrap();
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
     let before = reshapes(&program.statements);
     crate::shape::erase_identity_regroupings(&mut program, &inferred, &model.bounds);
     (before, reshapes(&program.statements))
@@ -331,6 +354,8 @@ fn bounds_snapshot() {
 fn a_gated_flag_resolves_as_the_config_loader_derives_it() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let mut checked = 0;
+    // Every gated rule the loader derives by: the core rows and each decoder state's.
+    let dims = crate::config::build_dims();
     for (stem, vision) in carriers(&arch) {
         let arch_json = arch.join("configs").join(&stem).join("arch.json");
         let facts = match arch_json.exists() {
@@ -344,7 +369,7 @@ fn a_gated_flag_resolves_as_the_config_loader_derives_it() {
             let model = model.unwrap_or_else(|e| panic!("{stem}/{cfg}: {e:?}"));
             let raw: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            for d in crate::dim::DERIVED_DIMS.iter() {
+            for d in dims.rows() {
                 let Some(flag) = d.rule.gate_flag() else {
                     continue;
                 };
@@ -396,7 +421,7 @@ fn every_derived_alias_equals_the_config_loaders_value() {
     for (stem, vision) in carriers(&arch) {
         let source = std::fs::read_to_string(arch.join("dsl").join(format!("{stem}.py"))).unwrap();
         let carrier = crate::parse_python::parse_python_file(&source).unwrap();
-        let Some(derived) = crate::typed_shapes::derived_dims_of(&carrier.arch_name) else {
+        let Some(derived) = scratchy_models_typed::derived_dims_of(&carrier.arch_name) else {
             continue;
         };
         for (cfg, _, model) in carrier_models(&arch, &stem, vision) {
@@ -435,7 +460,7 @@ fn the_typed_qwen2_vl_unrolls_on_every_config() {
 fn every_typed_carrier_unrolls_on_every_config() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let carriers = carriers(&arch);
-    assert_eq!(carriers.len(), 30, "the carriers under dsl/");
+    assert_eq!(carriers.len(), 31, "the carriers under dsl/");
     let mut configs = 0;
     let mut failed = Vec::new();
     for (stem, vision) in &carriers {
@@ -460,13 +485,19 @@ fn mtp_head_on_its_target() -> (
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/qwen3-5-mtp.py")).expect("carrier");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let program = crate::classify::carrier_program(
+        &carrier,
+        &scratchy_models_typed::typing()
+            .vocabularies()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let (_, _, model) = carrier_models(&arch, "qwen3-5-mtp", false)
         .into_iter()
         .next()
         .expect("a target config carries the head");
     let model = model.unwrap();
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
     (program, inferred, model)
 }
 
@@ -478,7 +509,6 @@ fn head_facts(
 ) -> scratchy_ir::model_facts::ModelFacts {
     let width = crate::codegen::target_width(program, inferred);
     crate::codegen::fill_canonical_params(model, 1, false, &Default::default(), Some(width), false)
-        .0
 }
 
 /// An in-checkpoint head reads its target's lent lm_head through `as_dim`: its own width stated as
@@ -548,7 +578,13 @@ fn typed_carrier_rebundled(
     let written = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
     let source = edit(&written);
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let program = crate::classify::carrier_program(
+        &carrier,
+        &scratchy_models_typed::typing()
+            .vocabularies()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let configs = arch.join("configs").join(stem);
     let mut manifest = crate::weights_manifest::load_or_empty(&configs).expect("manifest");
     declare(&mut manifest);
@@ -734,7 +770,13 @@ fn derived_bundles(
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join(format!("dsl/{carrier}.py"))).expect("carrier");
     let parsed = crate::parse_python::parse_python_file(&source).expect("parse");
-    let program = crate::classify::carrier_program(&parsed).unwrap();
+    let program = crate::classify::carrier_program(
+        &parsed,
+        &scratchy_models_typed::typing()
+            .vocabularies()
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     crate::bundles::derive(
         &program,
         &crate::bundles::BundleConfig {
@@ -960,4 +1002,205 @@ fn every_bundle_carrier_config_sizes_its_loaders() {
         }
     }
     assert!(checked > 20, "{checked} configs");
+}
+
+/// The bridge on GLM-4.7-Flash's carrier and config: a decoder state's op lowers through the
+/// decoder state that declared it.
+mod to_wavefront {
+    use scratchy_forward_compiler_frontend::state::OpName;
+    use scratchy_subtile::subtile_ir::SubOp;
+    use scratchy_tensors::compiler_ids::UnrollIndex;
+
+    use crate::classified::OpKind;
+    use crate::config::ModelParams;
+    use crate::fuf::{Fuf, FufInput};
+    use crate::quantization::StorageFormat;
+    use crate::shape::Inferred;
+    use crate::to_wavefront::{
+        BridgeError, BridgeModel, PrefixCapacity, gemm_weight_of, lower_decode_to_wavefront,
+    };
+    use scratchy_decoder_state::lower::LowerError;
+
+    /// GLM-4.7-Flash, shrunk to its one dense layer: its config, its trace and its fused graph, as
+    /// the bake builds them.
+    fn glm_one_layer() -> (ModelParams, Inferred, Fuf) {
+        let typing = scratchy_models_typed::typing();
+        let dims = typing.dims().expect("the build's dims");
+        let mut model = crate::fixtures::config_of("glm4-moe-lite", "glm-4.7-flash", &dims);
+        model.bounds.insert("num_hidden_layers".to_string(), 1);
+        let (_, inferred, fuf) =
+            crate::fixtures::carrier_graph_of("glm4-moe-lite", &model, &typing);
+        (model, inferred, fuf)
+    }
+
+    /// `fuf` lowered at one row against `decoder_states`, as the bake lowers its decode bucket.
+    fn lower(
+        model: &ModelParams,
+        inferred: &Inferred,
+        fuf: &Fuf,
+        decoder_states: &[scratchy_decoder_state::DecoderState],
+    ) -> Result<crate::to_wavefront::LoweredDecode, BridgeError> {
+        let facts = crate::fixtures::facts_of(model, fuf);
+        let bridge = BridgeModel {
+            params: model,
+            facts: &facts,
+            decoder_states,
+        };
+        // The bridge finds each of the carrier's state ops' lowering in the build's list.
+        for node in &fuf.nodes {
+            if let OpKind::State(op) = node.op {
+                assert_eq!(
+                    bridge.state_lowering(op).is_some(),
+                    !decoder_states.is_empty(),
+                    "{}",
+                    op.name()
+                );
+            }
+        }
+        let wp = crate::workload::WorkloadPoint {
+            num_tokens: 1,
+            sk_bucket: 0,
+        };
+        let bounds = crate::codegen::bounds_for_wp(model, wp, 1);
+        let prefix = PrefixCapacity::new(std::num::NonZeroU32::new(8192).expect("nonzero"));
+        lower_decode_to_wavefront(fuf, inferred, &bounds, &bridge, prefix, 1)
+    }
+
+    /// The weight of the first node `pick` selects, stored as an affine weight in groups of
+    /// `group_size`.
+    fn store_affine(fuf: &mut Fuf, pick: impl Fn(OpKind) -> bool, group_size: u32) {
+        let node = (fuf.nodes.iter_mut())
+            .find(|n| pick(n.op))
+            .expect("the graph holds the node");
+        let storage = (node.inputs.iter_mut())
+            .find_map(|i| match i {
+                FufInput::Weight { storage, .. } => Some(storage),
+                _ => None,
+            })
+            .expect("the node reads a weight");
+        *storage = StorageFormat::Affine {
+            bits: 4,
+            group_size,
+        };
+    }
+
+    /// GLM's state ops lower through MLA's own lowering: the tape holds MLA's five subtile ops at
+    /// layer 0, the attention's with its weight's scheme, and the graph they lower to validates.
+    #[test]
+    fn a_state_op_lowers_through_its_state() {
+        let (model, inferred, fuf) = glm_one_layer();
+        let states = scratchy_models_typed::decoder_states();
+        let lowered = lower(&model, &inferred, &fuf, states).expect("GLM lowers");
+        let state_ops: Vec<_> = (lowered.input.ops.iter())
+            .filter_map(|od| match od.op {
+                SubOp::State(op) => Some((op.name(), op.layer(), op.scheme())),
+                _ => None,
+            })
+            .collect();
+        let at = |name: &str| {
+            (state_ops.iter())
+                .find(|(n, ..)| *n == name)
+                .unwrap_or_else(|| panic!("the tape holds `{name}`: {state_ops:?}"))
+        };
+        for name in ["mla_latent", "mla_rope_key", "mla_rope_q"] {
+            assert_eq!(at(name).1, None, "{name} reads no layer's cache");
+            assert_eq!(at(name).2, None, "{name} reads no weight");
+        }
+        assert_eq!(at("mla_cache_write").1, Some(UnrollIndex(0)));
+        assert_eq!(at("mla_cache_write").2, None);
+        assert_eq!(at("mla_attend").1, Some(UnrollIndex(0)));
+        assert_eq!(
+            at("mla_attend").2,
+            Some(scratchy_subtile::lower::GemmWeight::Dense)
+        );
+        assert_eq!(state_ops.len(), 5, "{state_ops:?}");
+        let graph =
+            scratchy_subtile::subtile_ir::lower_region(&lowered.input, std::num::NonZeroU32::MAX);
+        scratchy_subtile::subtile_ir::validate(&graph).expect("the graph validates");
+    }
+
+    /// Lowered against a list holding no decoder state (a bake given another list than the
+    /// classification's), the first state op is refused by its name.
+    #[test]
+    fn an_unlistable_state_op_is_refused_by_name() {
+        let (model, inferred, fuf) = glm_one_layer();
+        match lower(&model, &inferred, &fuf, &[]) {
+            Err(BridgeError::StateUnlowered { op }) => {
+                assert_eq!(op.name(), OpName::new("mla_split"));
+            }
+            other => panic!("expected StateUnlowered, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A state op's affine weight whose group does not tile k is refused at the bridge with the
+    /// detail a gemm's gets, from the one scheme mapping both read.
+    #[test]
+    fn an_affine_state_weight_that_does_not_tile_k_is_refused() {
+        // A group of 3072 tiles none of GLM's widths (2048, 768, 5120, 10240).
+        const GROUP: u32 = 3072;
+        let states = scratchy_models_typed::decoder_states();
+        let (model, inferred, mut fuf) = glm_one_layer();
+        store_affine(&mut fuf, |op| op == OpKind::Gemm, GROUP);
+        let gemm = match lower(&model, &inferred, &fuf, states) {
+            Err(BridgeError::UnsupportedWeight { detail, .. }) => detail,
+            other => panic!("expected UnsupportedWeight, got {:?}", other.map(|_| ())),
+        };
+        let (model, inferred, mut fuf) = glm_one_layer();
+        let attention =
+            |op| matches!(op, OpKind::State(s) if s.name() == OpName::new("mla_attention"));
+        store_affine(&mut fuf, attention, GROUP);
+        match lower(&model, &inferred, &fuf, states) {
+            Err(BridgeError::StateLowering {
+                op,
+                error: LowerError::Weight { detail },
+                ..
+            }) => {
+                assert_eq!(op.name(), OpName::new("mla_attention"));
+                assert_eq!(detail, gemm);
+            }
+            other => panic!(
+                "expected a state weight refusal, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        // kv_b is `[k, n]` = `[512, 8960]`: a group of 512 tiles its k and lowers, and a group of
+        // 640 tiles its n (8960 = 14 x 640) but not its k, and is refused.
+        let (model, inferred, mut fuf) = glm_one_layer();
+        store_affine(&mut fuf, attention, 512);
+        lower(&model, &inferred, &fuf, states).expect("a group that tiles kv_b's k lowers");
+        let (model, inferred, mut fuf) = glm_one_layer();
+        store_affine(&mut fuf, attention, 640);
+        match lower(&model, &inferred, &fuf, states) {
+            Err(BridgeError::StateLowering {
+                error: LowerError::Weight { detail },
+                ..
+            }) => assert_eq!(detail, gemm),
+            other => panic!(
+                "expected a state weight refusal, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        // A group of 1024 tiles q's 5120 columns but not kv_b's own 512: the weight's own k is
+        // what its groups must tile.
+        let (model, inferred, mut fuf) = glm_one_layer();
+        store_affine(&mut fuf, attention, 1024);
+        match lower(&model, &inferred, &fuf, states) {
+            Err(BridgeError::StateLowering {
+                error: LowerError::Weight { detail },
+                ..
+            }) => assert_eq!(detail, gemm),
+            other => panic!(
+                "expected a state weight refusal, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let direct = StorageFormat::Affine {
+            bits: 4,
+            group_size: GROUP,
+        };
+        match gemm_weight_of(Some(&direct), 5120, crate::fuf::TileId(0)) {
+            Err(BridgeError::UnsupportedWeight { detail, .. }) => assert_eq!(detail, gemm),
+            other => panic!("expected UnsupportedWeight, got {other:?}"),
+        }
+    }
 }

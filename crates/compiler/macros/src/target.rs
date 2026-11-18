@@ -29,6 +29,8 @@ pub struct BakeCx<'a> {
     /// Where a bake writes its device inputs when the build asked (`superdsc-dump`); `None`
     /// writes nothing.
     pub dump_dir: Option<&'a Path>,
+    /// The decoder states the model's build compiles.
+    pub decoder_states: &'a [scratchy_decoder_state::DecoderState],
 }
 
 /// What a target's loaded-model surface for one arch reads: the arch's compiled models, and its
@@ -57,6 +59,8 @@ pub struct StructCx<'a> {
     pub facts: &'a scratchy_ir::model_facts::ModelFacts,
     pub fuf: &'a Fuf,
     pub inferred: &'a Inferred,
+    /// The decoder states the model's build compiles.
+    pub decoder_states: &'a [scratchy_decoder_state::DecoderState],
     /// The point the struct is derived at — the decode (num_tokens = 1) point, else the first —
     /// as its bounds and its token count. `None` when the model compiles no point.
     pub decode_point: Option<(&'a BTreeMap<String, u64>, u32)>,
@@ -109,6 +113,8 @@ pub struct ModelCx<'a> {
     /// Where a bake writes its device inputs when the build asked (`superdsc-dump`); `None`
     /// writes nothing.
     pub dump_dir: Option<&'a Path>,
+    /// The decoder states the model's build compiles.
+    pub decoder_states: &'a [scratchy_decoder_state::DecoderState],
     /// The model's `CanonicalParams` impl (its `FACTS`), for a target whose emitted code reads it.
     pub canonical_params_impl: &'a TokenStream,
     /// The shared struct emission over an accessor set (`None`: no accessors) and the dims its
@@ -235,6 +241,7 @@ pub trait TargetEmitter: Sync {
                 facts: cx.facts,
                 fuf: cx.fuf,
                 inferred: cx.inferred,
+                decoder_states: cx.decoder_states,
                 decode_point: decode_point.as_ref().map(|(b, m)| (b, *m)),
                 struct_of: &struct_of,
             })
@@ -249,6 +256,7 @@ pub trait TargetEmitter: Sync {
             inferred: cx.inferred,
             decode_bounds: decode_bounds.as_ref(),
             dump_dir: cx.dump_dir,
+            decoder_states: cx.decoder_states,
         });
         ModelEmission { weights, items }
     }

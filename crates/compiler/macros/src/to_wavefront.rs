@@ -25,8 +25,9 @@
 //! the scheduler, not here.
 //!
 //! Scope: the Llama-3.2 decode op set (`Embed`, `RmsNorm`, `Gemm`,
-//! `RopeAppend`, `Attention`, `Silu`, `Mul`, `Add`). Anything else
-//! (MoE, MLA, sliding-window / interleaved rope, vision, TP collectives)
+//! `RopeAppend`, `Attention`, `Silu`, `Mul`, `Add`). A decoder state's
+//! ops lower through the decoder state's own lowering. Anything else
+//! (MoE, sliding-window / interleaved rope, vision, TP collectives)
 //! is surfaced as [`BridgeError::UnsupportedOp`] — never silently
 //! skipped. The drive treats any error as "no wavefront lowering for
 //! this model" and continues; this never gates a normal build.
@@ -35,6 +36,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use scratchy_decoder_state::lower::{
+    ArgIndex, LowerError, OutIndex, StateLowering, StateSubOp, StateWeight,
+};
 use scratchy_ir::model_facts::ModelFacts;
 use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
@@ -104,6 +108,17 @@ pub enum BridgeError {
     NoKernel { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
     UnrealizedExpertActivation { tile: TileId, act: String },
+    /// A state op whose lowering no decoder state in the bridge's list holds: the bake was given
+    /// another list of decoder states than the one the carrier was classified under.
+    StateUnlowered {
+        op: scratchy_forward_compiler_frontend::state::StateOp,
+    },
+    /// A decoder state's lowering of its op `op` at `tile` could not build it.
+    StateLowering {
+        tile: TileId,
+        op: scratchy_forward_compiler_frontend::state::StateOpId,
+        error: LowerError,
+    },
 }
 
 impl BridgeError {
@@ -160,6 +175,18 @@ impl std::fmt::Display for BridgeError {
                 "tile {} moe_block: the config declares expert activation `{act}`, which no \
                  expert body realizes (a gated `silu` bank or an ungated `relu2` one)",
                 tile.0
+            ),
+            Self::StateUnlowered { op } => write!(
+                f,
+                "op {op}: no decoder state in the bridge's list lowers it; the bake was given \
+                 another list than the carrier was classified under"
+            ),
+            Self::StateLowering { tile, op, error } => write!(
+                f,
+                "tile {} op `{}` (decoder state `{}`): its lowering refused: {error:?}",
+                tile.0,
+                op.name(),
+                op.state()
             ),
             Self::UnsupportedWeight { tile, detail } => {
                 write!(
@@ -496,6 +523,106 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// The builder a decoder state's lowering of the op at `tile` writes through: each method is one
+/// of the bridge's own helpers, so a state op's inputs, widths, cos/sin pairs and weights resolve
+/// as a core op's do. `state` is the decoder state whose lowering runs, whose own listed rows are
+/// the only ops it may push; `last` is the last op the lowering pushed.
+struct StateCx<'b, 'a> {
+    bx: &'b mut Builder<'a>,
+    state: scratchy_decoder_state::DecoderState,
+    tile: TileId,
+    node: &'b FufNode,
+    last: Option<usize>,
+}
+
+impl<'b> StateCx<'b, '_> {
+    /// The FUF input at DSL argument `arg`.
+    fn arg(&self, arg: ArgIndex) -> Result<&'b FufInput, LowerError> {
+        let node = self.node;
+        (node.inputs)
+            .get(usize::from(arg.get()))
+            .ok_or(LowerError::MissingArg { arg })
+    }
+}
+
+impl StateLowering for StateCx<'_, '_> {
+    fn input(&mut self, arg: ArgIndex) -> Result<InputRef, LowerError> {
+        let input = self.arg(arg)?;
+        (self.bx)
+            .resolve(self.tile, input)
+            .map_err(|_| LowerError::Unresolved { arg })
+    }
+
+    fn out_cols(&self, out: OutIndex) -> Result<u32, LowerError> {
+        (self.bx)
+            .out_cols(self.tile, usize::from(out.get()), "state op output")
+            .map_err(|_| LowerError::UnresolvedWidth { out })
+    }
+
+    fn bound(&self, name: &'static str) -> Result<u32, LowerError> {
+        let value = (self.bx.bounds.get(name)).ok_or(LowerError::MissingBound { name })?;
+        u32::try_from(*value).map_err(|_| LowerError::WidthOverflow { what: name })
+    }
+
+    fn cos_sin(&mut self, cols: u32) -> (InputRef, InputRef) {
+        let (cos, sin) = self.bx.cos_sin(cols, false);
+        (InputRef::Ext(cos), InputRef::Ext(sin))
+    }
+
+    /// The weight's source, and its scheme mapped as a gemm's is, with k the weight's own input
+    /// width: the leading dim of its rank-2 shape, as a FUF weight is `[k, n]`. A weight of any
+    /// other rank is unresolved.
+    fn weight(&mut self, arg: ArgIndex) -> Result<StateWeight, LowerError> {
+        let FufInput::Weight { id, index, storage } = self.arg(arg)? else {
+            return Err(LowerError::NotAWeight { arg });
+        };
+        let k = (self.bx.inferred.weights.get(id))
+            .and_then(|shape| eval_shape_with(shape, &self.bx.bounds))
+            .and_then(|dims| match dims.as_slice() {
+                [k, _] => u32::try_from(*k).ok(),
+                _ => None,
+            })
+            .ok_or(LowerError::Unresolved { arg })?;
+        let source = (self.bx)
+            .weight_source(self.tile, id.0, *index)
+            .map_err(|_| LowerError::Unresolved { arg })?;
+        let scheme = gemm_weight_of(Some(storage), k, self.tile).map_err(|e| match e {
+            BridgeError::UnsupportedWeight { detail, .. } => LowerError::Weight { detail },
+            _ => LowerError::Unresolved { arg },
+        })?;
+        Ok(StateWeight {
+            source: InputRef::Ext(source),
+            scheme,
+        })
+    }
+
+    fn layer(&self, arg: ArgIndex) -> Result<UnrollIndex, LowerError> {
+        match self.arg(arg)? {
+            FufInput::Extern {
+                index: Some(layer), ..
+            } => Ok(*layer),
+            _ => Err(LowerError::NotLayered { arg }),
+        }
+    }
+
+    fn push(&mut self, op: StateSubOp, inputs: Vec<InputRef>) -> Result<InputRef, LowerError> {
+        if !self.state.owns(op.facts()) {
+            return Err(LowerError::NotOwnRow { op: op.id() });
+        }
+        let idx = self.bx.push_op(SubOp::State(op), inputs);
+        self.last = Some(idx);
+        Ok(InputRef::Op(idx))
+    }
+
+    fn produce(&mut self, out: OutIndex, value: InputRef) {
+        let producer = match value {
+            InputRef::Op(j) => Producer::Op(j),
+            InputRef::Ext(e) => Producer::Ext(e),
+        };
+        self.bx.produced.insert((self.tile.0, out.get()), producer);
+    }
+}
+
 /// The sliding window extent every sliding-attention tile reads — the one
 /// source every target already trusts (`model.bounds["sliding_window"]`).
 /// A sliding tile on a model with no such bound is a config error, named
@@ -531,6 +658,41 @@ fn kv_cache_index(node: &FufNode) -> Option<u64> {
             index,
         } => index.map(|i| i.0),
         _ => None,
+    })
+}
+
+/// The typed scheme a weight stored as `storage` is read under, by a gemm or a state op whose
+/// activation is `k` columns wide. The scheme is known at expansion time (`weight_storage_of`), so
+/// it is mapped to the typed `GemmWeight` rather than laundered through a bool. A scheme the
+/// wavefront lowering does not emit is refused at build rather than mis-lowered as dense fp16.
+pub(crate) fn gemm_weight_of(
+    storage: Option<&StorageFormat>,
+    k: u32,
+    tile: TileId,
+) -> Result<GemmWeight, BridgeError> {
+    Ok(match storage {
+        None | Some(StorageFormat::Dense) => GemmWeight::Dense,
+        // fp8 W8A8: the arity-3 branch in `lower_subtile_tape_to_superdsc` does the per-token
+        // qfp8ch quant + matmulfp8 (fp8×fp8→fp16) + `a_scale·w_scale` dequant. Feed it the
+        // per-channel `weight_scale` as the 3rd input; the worker loads the 1-byte weight + scale.
+        Some(StorageFormat::Fp8 { .. }) => GemmWeight::Fp8Dynamic,
+        // MLX-affine packed weights — the format every 4-bit MLX checkpoint
+        // ships. `k` is the activation's column count, checked here against the
+        // group so a weight whose groups do not tile K cannot be lowered.
+        Some(StorageFormat::Affine { bits, group_size }) => {
+            let affine =
+                AffineInt4::mint(*bits, *group_size, k).ok_or(BridgeError::UnsupportedWeight {
+                    tile,
+                    detail: "affine weight: bits unsupported, or group_size does not tile k",
+                })?;
+            GemmWeight::Affine { affine }
+        }
+        Some(_) => {
+            return Err(BridgeError::UnsupportedWeight {
+                tile,
+                detail: "non-affine int4/ggml weight not yet lowered on the SDSC/wavefront path",
+            });
+        }
     })
 }
 
@@ -578,11 +740,29 @@ impl PrefixCapacity {
     }
 }
 
-/// The one model the bridge lowers: its config params and its typed facts
-/// travel together — they are the same model, and the bake holds both.
+/// The one model the bridge lowers: its config params, its typed facts and its decoder states
+/// travel together — they are the same model, and the bake holds them together.
 pub struct BridgeModel<'a> {
     pub params: &'a ModelParams,
     pub facts: &'a ModelFacts,
+    /// The decoder states the model's build compiles.
+    pub decoder_states: &'a [scratchy_decoder_state::DecoderState],
+}
+
+impl BridgeModel<'_> {
+    /// The decoder state that declared the state op `op`, with its lowering of `op`: `None` when
+    /// no decoder state the build compiles declares it.
+    pub fn state_lowering(
+        &self,
+        op: scratchy_forward_compiler_frontend::state::StateOp,
+    ) -> Option<(
+        scratchy_decoder_state::DecoderState,
+        scratchy_decoder_state::lower::LowerFn,
+    )> {
+        let state =
+            *(self.decoder_states.iter()).find(|state| state.vocabulary().name() == op.state())?;
+        Some((state, state.lowering(op.name())?))
+    }
 }
 
 /// Translate a decode FUF into a wavefront `LoweringInput`.
@@ -601,6 +781,7 @@ pub fn lower_decode_to_wavefront(
 ) -> Result<LoweredDecode, BridgeError> {
     // The config params and the typed facts are ONE model — the bake holds them
     // together, so the bridge takes them together.
+    let bridge = model;
     let (model, facts) = (model.params, model.facts);
     // Unwrap the typed capacity to the raw row count once, at the boundary; the
     // rest of the bridge keeps using a plain `u32`.
@@ -846,39 +1027,7 @@ pub fn lower_decode_to_wavefront(
                 )?;
                 let act = bx.input_at(tile, 0)?;
                 let w = bx.input_at(tile, 1)?;
-                let _ = k; // k is now derived from in0_cols at lower-time
-                // The weight's quantization scheme is KNOWN here at expansion time (`weight_storage_of`);
-                // map it to the typed `GemmWeight` rather than laundering it through a bool. Dense is the
-                // only scheme the SDSC/wavefront lowering emits today; fp8 needs the weight_scale wired as
-                // a 3rd Gemm input + 1-byte staging (the coupled pass), and int4/ggml are unwired — refuse
-                // at BUILD (guard) rather than mis-lower a packed weight as dense fp16.
-                let weight = match crate::weight_vocab::weight_storage_of(node) {
-                    None | Some(crate::quantization::StorageFormat::Dense) => GemmWeight::Dense,
-                    // fp8 W8A8: the arity-3 branch in `lower_subtile_tape_to_superdsc` does the per-token
-                    // qfp8ch quant + matmulfp8 (fp8×fp8→fp16) + `a_scale·w_scale` dequant. Feed it the
-                    // per-channel `weight_scale` as the 3rd input; the worker loads the 1-byte weight + scale.
-                    Some(crate::quantization::StorageFormat::Fp8 { .. }) => GemmWeight::Fp8Dynamic,
-                    // MLX-affine packed weights — the format every 4-bit MLX checkpoint
-                    // ships. `k` is the activation's column count, checked here against the
-                    // group so a weight whose groups do not tile K cannot be lowered.
-                    Some(crate::quantization::StorageFormat::Affine { bits, group_size }) => {
-                        let affine = AffineInt4::mint(*bits, *group_size, k).ok_or(
-                            BridgeError::UnsupportedWeight {
-                                tile,
-                                detail: "affine weight: bits unsupported, or group_size does \
-                                         not tile k",
-                            },
-                        )?;
-                        GemmWeight::Affine { affine }
-                    }
-                    Some(_) => {
-                        return Err(BridgeError::UnsupportedWeight {
-                            tile,
-                            detail: "non-affine int4/ggml weight not yet lowered on the \
-                                     SDSC/wavefront path",
-                        });
-                    }
-                };
+                let weight = gemm_weight_of(crate::weight_vocab::weight_storage_of(node), k, tile)?;
                 // Dense = arity-2 `[act, W]`. fp8 = arity-3 `[act, W_fp8, w_scale]`: the scale sibling
                 // reuses the weight's `(id, index)` (worker resolves `{prefix}.weight_scale`), shape `[1,n]`.
                 let inputs = match weight {
@@ -2018,6 +2167,26 @@ pub fn lower_decode_to_wavefront(
                     bx.produced.insert((tile.0, 0), Producer::Op(idx));
                     result = Some(idx);
                 }
+            }
+            // A decoder state lowers its own op, through the bridge's helpers.
+            OpKind::State(op) => {
+                let (state, lower) = bridge
+                    .state_lowering(op)
+                    .ok_or(BridgeError::StateUnlowered { op })?;
+                let mut cx = StateCx {
+                    bx: &mut bx,
+                    state,
+                    tile,
+                    node,
+                    last: None,
+                };
+                lower(&mut cx).map_err(|error| BridgeError::StateLowering {
+                    tile,
+                    op: op.id(),
+                    error,
+                })?;
+                // A lowering that pushes no op (pure aliases) leaves the previous result.
+                result = cx.last.or(result);
             }
             other => return Err(BridgeError::UnsupportedOp { tile, op: other }),
         }

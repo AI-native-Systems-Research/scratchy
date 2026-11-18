@@ -1,0 +1,29 @@
+[package]
+name = "scratchy-models-typed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not published: the root CI step `cargo publish --workspace --dry-run --no-verify` would otherwise package it.
+publish = false
+
+# Every carrier under `crates/models/arch/dsl/` as typed Rust over the op signatures, compiled: a
+# shape error in a carrier is a type error here. Each target's models build hands `traced` to the
+# forward compiler, which reads no model file of its own.
+[dependencies]
+# The op signatures each emitted carrier is type-checked against.
+scratchy-typed-shapes = { workspace = true }
+# The carrier parser, for the test that every carrier is typed, and the decoder state names the typing
+# test reads.
+scratchy-forward-compiler-frontend = { path = "../../compiler/frontend" }
+# The decoder states `decoder_states()` lists, whose signatures the typed carriers call.
+scratchy-state-decoder-mla = { workspace = true }
+# The decoder state handle `decoder_states()` lists the decoder states as, and the typing `typing()` builds.
+scratchy-decoder-state = { workspace = true }
+
+# The build script runs the front end's typed-Rust emit pass (`build.rs`) over the carriers.
+[build-dependencies]
+scratchy-forward-compiler-frontend = { path = "../../compiler/frontend" }
+# The same decoder states, which the build script classifies the carriers under (`src/decoder_states.rs`).
+scratchy-state-decoder-mla = { workspace = true }
+# The decoder state handle the same list is written as.
+scratchy-decoder-state = { workspace = true }

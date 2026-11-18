@@ -136,6 +136,10 @@ pub enum Refused {
     /// A collective: metal runs one rank, where tensor parallelism weaves none in, so a node
     /// here is a sharded forward handed to the metal tape — a wiring bug, never a missing kernel.
     Collective,
+    /// A state op whose decoder state declares no metal lowering: the op and its decoder state, by id.
+    StateUnlowered {
+        op: scratchy_tensors::compiler_ids::StateOpId,
+    },
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -2642,6 +2646,11 @@ impl Recording<'_> {
             L::AllReduce | L::AllGather { .. } => {
                 return Err(self.no(i, Refused::Collective));
             }
+            // A state op lowers through its decoder state's own metal facet; until its decoder state declares
+            // one, the build stops here naming the op and its decoder state.
+            L::State(op) => {
+                return Err(self.no(i, Refused::StateUnlowered { op: op.id() }));
+            }
         }))
     }
 }
@@ -3097,6 +3106,77 @@ mod tests {
         }
     }
 
+    /// GLM-4.7-Flash at its one dense layer lowers through the bridge and every shared pass metal
+    /// runs, and stops at the step records: its first MLA subtile op, `mla_latent`, has no metal
+    /// lowering.
+    #[test]
+    fn glm_stops_at_the_step_records_on_its_first_state_op() {
+        use scratchy_forward_compiler_macro::fixtures;
+        use scratchy_forward_compiler_macro::to_wavefront::{
+            BridgeModel, PrefixCapacity, lower_decode_to_wavefront,
+        };
+        use scratchy_tensors::compiler_ids::{OpName, StateName, StateOpId};
+        let typing = scratchy_models_typed::typing();
+        let dims = typing.dims().expect("the build's dims");
+        let mut model = fixtures::config_of("glm4-moe-lite", "glm-4.7-flash", &dims);
+        model.bounds.insert("num_hidden_layers".to_string(), 1);
+        let (program, inferred, fuf) = fixtures::carrier_graph_of("glm4-moe-lite", &model, &typing);
+        let facts = fixtures::facts_of(&model, &fuf);
+        let bridge = BridgeModel {
+            params: &model,
+            facts: &facts,
+            decoder_states: typing.decoder_states,
+        };
+        let wp = scratchy_forward_compiler_macro::workload::WorkloadPoint {
+            num_tokens: 1,
+            sk_bucket: 0,
+        };
+        let bounds = scratchy_forward_compiler_macro::codegen::bounds_for_wp(&model, wp, 1);
+        let prefix = PrefixCapacity::new(std::num::NonZeroU32::new(8192).expect("nonzero"));
+        let lowered = lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1)
+            .expect("the bridge lowers GLM's one layer");
+        let weight_paths: Vec<Vec<String>> = (program.weights.ids())
+            .map(|id| program.weights.path(id).to_vec())
+            .collect();
+        let step_facts = crate::canonical::MetalStepFacts {
+            weight_paths: &weight_paths,
+            shared_expert_banks: &Default::default(),
+            embed_base: "embed_tokens",
+            embed_quant: None,
+            mlp: crate::canonical::MlpForm::Packed,
+            moe_expert_bits: None,
+        };
+        let at = crate::canonical::CanonicalAt {
+            stem: "glm-4.7-flash",
+            m: 1,
+            buckets: &[1],
+            rows: scratchy_subtile::sample_rows::ResultRows::Sampled,
+        };
+        let mut sources = crate::canonical::SourceManifest::default();
+        let refusal = match crate::canonical::lower_canonical_classed(
+            &lowered,
+            &step_facts,
+            &facts,
+            at,
+            &mut sources,
+        ) {
+            Err(crate::canonical::CanonicalRefusal::Steps(refusal)) => refusal,
+            Err(other) => panic!("expected the step records to refuse, got {other}"),
+            Ok(_) => panic!("GLM's state ops lowered on metal"),
+        };
+        let StepRefusal {
+            op: Some((_, "mla_latent")),
+            why: Refused::StateUnlowered { op },
+        } = refusal
+        else {
+            panic!("expected StateUnlowered on mla_latent, got {refusal}");
+        };
+        assert_eq!(
+            op,
+            StateOpId::new(StateName::new("mla"), OpName::new("mla_latent"))
+        );
+    }
+
     /// A construct's rows fence as ONE: the first on every member's accesses, the rest always.
     #[test]
     fn a_constructs_rows_fence_as_one() {
@@ -3306,5 +3386,112 @@ mod tests {
             sig(&[1], &[], None), // RAW on slot 1 → Coherent
         ];
         assert_eq!(hazard_fences(rows.iter()), [No, Ordered, Coherent]);
+    }
+
+    /// A state op reaching metal's step records stops the build naming the op and its decoder state:
+    /// the shared passes carry it as far as the records, which have no lowering for it.
+    #[test]
+    fn a_state_op_is_refused_by_name() {
+        use scratchy_subtile::lower::{LoweringInput, OpDesc};
+        use scratchy_subtile::state_op::{StateOpFacts, StateOutputs, StateRows, StateSubOp};
+        use scratchy_subtile::subtile_ir::SourceShape;
+        use scratchy_subtile::tape_colouring::colour_tape;
+        use scratchy_subtile::tape_folding::{ModelFoldFacts, fold_tape};
+        use scratchy_subtile::tensor_parallel::TpRule;
+        use scratchy_target_metal::op_abi::{METAL_COLOUR_FACTS, METAL_FUSIONS};
+        use scratchy_tensors::compiler_ids::{Arity, OpName, StateName, StateOpId};
+
+        static PROBE_A: StateOpFacts = StateOpFacts::new(
+            StateOpId::new(StateName::new("probe_state"), OpName::new("probe_a")),
+            Arity::new(2),
+            StateOutputs::One,
+            StateRows::In0,
+            TpRule::Whole,
+            None,
+        );
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: 64 },
+                SourceShape { rows: 1, cols: 64 },
+            ],
+            ops: vec![OpDesc {
+                op: SubOp::State(StateSubOp::new(&PROBE_A, |_| 64)),
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+            exported: None,
+        };
+        let bindings = vec![
+            SourceBinding::EmbeddedHidden,
+            SourceBinding::Weight { id: 0, index: None },
+        ];
+        let l = LoweredDecode::new(
+            input,
+            bindings,
+            vec![Some((0, 0))],
+            HashMap::new(),
+            vec![None],
+            Vec::new(),
+        )
+        .expect("one embed row");
+        let tp = crate::tape_program::tape_program(&l, "probe", 1);
+        let model = ModelFoldFacts {
+            fold_projections: false,
+            matvec_ends: false,
+            matvec_norms: false,
+            row_programs: false,
+            hidden_out: false,
+        };
+        let folds = fold_tape(&tp.graph, &tp.tape, &l, &METAL_FUSIONS, model).expect("folds");
+        let colouring = colour_tape(
+            &tp.graph,
+            &tp.tape,
+            l.bindings(),
+            &folds.fold_facts(),
+            &METAL_COLOUR_FACTS,
+        )
+        .expect("colours");
+        let steps = UnrolledSteps::read(&l, &tp.unrolled).expect("steps");
+        let colours = OpColours::project(&l, &steps, &colouring).expect("op colours");
+        let banks = std::collections::BTreeSet::new();
+        let facts = MetalStepFacts {
+            weight_paths: &[],
+            shared_expert_banks: &banks,
+            embed_base: "embed_tokens",
+            embed_quant: None,
+            mlp: crate::canonical::MlpForm::Packed,
+            moe_expert_bits: None,
+        };
+        let recording = Recording {
+            l: &l,
+            graph: &tp.graph,
+            steps: &steps,
+            colours: &colours,
+            folds: &folds,
+            facts: &facts,
+            hidden: W(64),
+            intermediate: None,
+            bucket_m: 1,
+            named: Default::default(),
+            read: Default::default(),
+        };
+        let Err(refusal) = recording.kept(0) else {
+            panic!("a state op lowered on metal");
+        };
+        let StepRefusal {
+            op: Some((0, name)),
+            why: Refused::StateUnlowered { op },
+        } = &refusal
+        else {
+            panic!("expected StateUnlowered on op 0, got {refusal}");
+        };
+        assert_eq!(*name, "probe_a");
+        assert_eq!(*op, PROBE_A.id());
+        let msg = refusal.to_string();
+        assert!(
+            msg.contains("probe_a") && msg.contains("probe_state"),
+            "{msg}"
+        );
     }
 }

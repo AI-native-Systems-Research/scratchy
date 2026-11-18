@@ -407,6 +407,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         }
     }
 
@@ -771,6 +772,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         };
         let original_count = fuf.nodes.len();
 
@@ -857,6 +859,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         };
         let original_count = fuf.nodes.len();
         insert_lm_head_allgather(&mut fuf, &program, 1);
@@ -900,6 +903,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         };
         let original_count = fuf.nodes.len();
         insert_lm_head_allgather(&mut fuf, &program, 4);
@@ -971,6 +975,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         };
 
         let original_count = fuf.nodes.len();
@@ -1039,6 +1044,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         };
         let original_count = fuf.nodes.len();
         insert_all_reduces(&mut fuf, &program, 4);
@@ -1119,6 +1125,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         };
 
         let original_count = fuf.nodes.len();

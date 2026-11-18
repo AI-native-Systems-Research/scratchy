@@ -103,8 +103,10 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
 }
 
 /// A derived dim's rule over config bounds: the arithmetic a `weights.json` name like `kv_dim`
-/// stands for. The one table of these, [`DERIVED_DIMS`], is what the config loader derives each
-/// model's value from and what the typed-Rust emit pass spells as a type, so the two cannot drift.
+/// stands for. A build's one table of these, the core rows ([`DERIVED_DIMS`]) then each decoder
+/// state's, assembled once (the front end's `state::DimTable`), is what the config loader derives
+/// each model's value from and what the typed-Rust emit pass spells as a type, so the two cannot
+/// drift.
 #[derive(Clone, Copy, Debug)]
 pub enum DerivedRule {
     /// A config bound.
@@ -147,6 +149,20 @@ impl DerivedRule {
         }
     }
 
+    /// Every bound the rule reads, a gated rule's flag and both arms included, into `out`.
+    pub fn reads(&self, out: &mut Vec<&'static str>) {
+        match self {
+            Self::Bound(name) => out.push(name),
+            Self::Lit(_) => {}
+            Self::Mul(rules) | Self::Add(rules) => rules.iter().for_each(|r| r.reads(out)),
+            Self::Gated { flag, on, off } => {
+                out.push(flag);
+                on.reads(out);
+                off.reads(out);
+            }
+        }
+    }
+
     /// The rule's value under `bounds`, `None` when a bound it reads is absent.
     pub fn eval(&self, bounds: &std::collections::BTreeMap<String, u64>) -> Option<u64> {
         match self {
@@ -167,14 +183,26 @@ impl DerivedRule {
     }
 }
 
-/// When the config loader derives a [`DerivedDim`]: with the implicit bounds, or after the generic
-/// defaults (the global attention class's widths read `global_head_dim` /
-/// `num_global_key_value_heads`, which default then).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// When the config loader derives a [`DerivedDim`]: before the fallbacks (`head_dim` as
+/// `hidden_size / num_attention_heads`, `num_key_value_heads` as `num_attention_heads`), so a row
+/// stated here wins over them; with the implicit bounds; or after the generic defaults (the global
+/// attention class's widths read `global_head_dim` / `num_global_key_value_heads`, which default
+/// then). Declared in the order the loader runs them, so a row may read one of an earlier stage, or
+/// one above it at its own. A row before the fallbacks states a name the fallbacks or the config
+/// otherwise give ([`FALLBACK_DIMS`]), so every later stage may read it, whichever decoder state's it
+/// is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeriveStage {
+    BeforeFallbacks,
     Implicit,
     AfterDefaults,
 }
+
+/// The names the config loader's fallbacks derive where no config states them (`head_dim` as
+/// `hidden_size / num_attention_heads`, `num_key_value_heads` as `num_attention_heads`): the only
+/// names a decoder state may derive at [`DeriveStage::BeforeFallbacks`], since every later stage
+/// reads them whether or not a decoder state derives them first.
+pub const FALLBACK_DIMS: [&str; 2] = ["head_dim", "num_key_value_heads"];
 
 /// A config bound derived from others, where no config states it.
 #[derive(Clone, Copy, Debug)]
@@ -184,8 +212,9 @@ pub struct DerivedDim {
     pub rule: DerivedRule,
 }
 
-/// Every derived dim, in derivation order (a rule may read one derived above it).
-pub const DERIVED_DIMS: [DerivedDim; 11] = [
+/// The core derived dims, every build's, in derivation order (a rule may read one derived above
+/// it). A decoder state's own dims are its crate's, assembled after these.
+pub const DERIVED_DIMS: [DerivedDim; 7] = [
     DerivedDim {
         name: "attn_q_dim",
         stage: DeriveStage::Implicit,
@@ -234,49 +263,6 @@ pub const DERIVED_DIMS: [DerivedDim; 11] = [
             DerivedRule::Bound("gdn_value_dim"),
         ]),
     },
-    // Multi-head latent attention (the DeepSeek family). q_proj's (or q_b_proj's, under Q-LoRA)
-    // output: per head, the no-rope and rope parts of a query.
-    DerivedDim {
-        name: "q_proj_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Mul(&[
-            DerivedRule::Bound("num_attention_heads"),
-            DerivedRule::Add(&[
-                DerivedRule::Bound("qk_nope_head_dim"),
-                DerivedRule::Bound("qk_rope_head_dim"),
-            ]),
-        ]),
-    },
-    // kv_b_proj's decompressed output: per head, a key's no-rope part and a value.
-    DerivedDim {
-        name: "kv_lora_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Mul(&[
-            DerivedRule::Bound("num_attention_heads"),
-            DerivedRule::Add(&[
-                DerivedRule::Bound("qk_nope_head_dim"),
-                DerivedRule::Bound("v_head_dim"),
-            ]),
-        ]),
-    },
-    // o_proj's input: every head's value.
-    DerivedDim {
-        name: "attn_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Mul(&[
-            DerivedRule::Bound("num_attention_heads"),
-            DerivedRule::Bound("v_head_dim"),
-        ]),
-    },
-    // kv_a_proj_with_mqa's output: the compressed KV, then the one shared rope key.
-    DerivedDim {
-        name: "kv_a_proj_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Add(&[
-            DerivedRule::Bound("kv_lora_rank"),
-            DerivedRule::Bound("qk_rope_head_dim"),
-        ]),
-    },
     // The global attention class's projection widths (Gemma 4's dual-class attention):
     // q_proj_global's output, and the one shared global K/V projection's.
     DerivedDim {
@@ -297,70 +283,22 @@ pub const DERIVED_DIMS: [DerivedDim; 11] = [
     },
 ];
 
-/// Derive into `bounds` every [`DERIVED_DIMS`] entry of `stage` that no config states and whose
-/// inputs `bounds` has, each into `derived` as the dim its rule derives it from. Explicit values
-/// always win.
-pub fn derive_dims(
+/// Derive into `bounds` every row of `rows` of `stage` that no config states and whose inputs
+/// `bounds` has, each into `derived` as the dim its rule derives it from. Explicit values always
+/// win. `rows` are a build's assembled derived dims (the front end's `state::DimTable`), in
+/// derivation order.
+pub fn derive_dims<'a>(
+    rows: impl IntoIterator<Item = &'a DerivedDim>,
     bounds: &mut std::collections::BTreeMap<String, u64>,
     stage: DeriveStage,
     derived: &mut std::collections::BTreeMap<String, Dim>,
 ) {
-    for d in DERIVED_DIMS.iter().filter(|d| d.stage == stage) {
+    for d in rows.into_iter().filter(|d| d.stage == stage) {
         if !bounds.contains_key(d.name)
             && let Some(v) = d.rule.eval(bounds)
         {
             derived.insert(d.name.to_string(), d.rule.dim(bounds));
             bounds.insert(d.name.to_string(), v);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every bound a rule reads, nested rules included.
-    fn reads(rule: &DerivedRule, out: &mut Vec<&'static str>) {
-        match rule {
-            DerivedRule::Bound(name) => out.push(name),
-            DerivedRule::Lit(_) => {}
-            DerivedRule::Mul(rules) | DerivedRule::Add(rules) => {
-                rules.iter().for_each(|r| reads(r, out));
-            }
-            DerivedRule::Gated { flag, on, off } => {
-                out.push(flag);
-                reads(on, out);
-                reads(off, out);
-            }
-        }
-    }
-
-    /// The table's order is load-bearing: a rule reading another derived dim finds it derived only
-    /// if that one comes EARLIER, at the same or an earlier stage. So a reordering that would
-    /// silently change a value fails here.
-    #[test]
-    fn a_derived_dim_reads_only_derived_dims_above_it() {
-        let rank = |s: DeriveStage| match s {
-            DeriveStage::Implicit => 0,
-            DeriveStage::AfterDefaults => 1,
-        };
-        for (i, d) in DERIVED_DIMS.iter().enumerate() {
-            let mut names = Vec::new();
-            reads(&d.rule, &mut names);
-            for name in names {
-                if let Some(j) = DERIVED_DIMS.iter().position(|e| e.name == name) {
-                    assert!(
-                        j < i,
-                        "`{}` reads `{name}`, which the table derives after it",
-                        d.name
-                    );
-                    assert!(
-                        rank(DERIVED_DIMS[j].stage) <= rank(d.stage),
-                        "`{}` reads `{name}`, which is derived at a later stage",
-                        d.name
-                    );
-                }
-            }
         }
     }
 }

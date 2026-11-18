@@ -3,7 +3,7 @@
 //! the typed-Rust emit pass reads ([`typed_emit::CarrierFacts`]), for the build script and for a
 //! test that types a program of its own.
 
-use crate::{bundles, classified::Program, dim, hf_config, typed_emit};
+use crate::{bundles, classified::Program, hf_config, typed_emit};
 
 /// What the carrier `stem`'s configs and arch.json say about its derived dims, by the config rules
 /// the config loader uses (`hf_config`): each gated rule's flag over every config of the carrier (a
@@ -67,10 +67,11 @@ pub fn carrier_facts(
         }
     }
     read_files.extend(configs.iter().map(|(p, _)| p.clone()));
+    // Every gated rule of the program's assembled table, a decoder state's as well as a core one.
     // The config loader reads a gated rule's flag on the decoder path only (a vision tower's
     // bounds are its own `vision_*`): a vision carrier resolves none, and naming one is refused.
     let mut gated = std::collections::BTreeMap::new();
-    for flag in (dim::DERIVED_DIMS.iter())
+    for flag in (program.dims.rows())
         .filter_map(|d| d.rule.gate_flag())
         .filter(|_| !vision)
     {
@@ -147,5 +148,73 @@ pub fn carrier_facts(
         gated,
         exprs,
         bundles,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dim::{DeriveStage, DerivedDim, DerivedRule};
+    use crate::state::{
+        DimTable, SignaturePath, StateInputDecl, StateName, StateOpDecl, StateVocabulary,
+    };
+
+    static GATED_DIMS: [DerivedDim; 1] = [DerivedDim {
+        name: "probe_gated_width",
+        stage: DeriveStage::Implicit,
+        rule: DerivedRule::Gated {
+            flag: "probe_gate",
+            on: &DerivedRule::Mul(&[DerivedRule::Lit(2), DerivedRule::Bound("hidden_size")]),
+            off: &DerivedRule::Bound("hidden_size"),
+        },
+    }];
+
+    /// A decoder state whose one derived dim is a gated rule.
+    struct GatedProbe;
+
+    impl StateVocabulary for GatedProbe {
+        fn name(&self) -> StateName {
+            StateName::new("gated_probe")
+        }
+        fn ops(&self) -> &'static [StateOpDecl] {
+            &[]
+        }
+        fn inputs(&self) -> &'static [StateInputDecl] {
+            &[]
+        }
+        fn signatures(&self) -> SignaturePath {
+            SignaturePath::new("::gated_probe::ops")
+        }
+        fn derived_dims(&self) -> &'static [DerivedDim] {
+            &GATED_DIMS
+        }
+    }
+
+    /// A gated rule a decoder state declares has its flag resolved over the carrier's configs, as a
+    /// core one does: the scan reads the program's assembled table, not the core rows alone.
+    #[test]
+    fn a_decoder_states_gated_flag_is_resolved() {
+        let arch_root = std::env::temp_dir().join("scratchy_carrier_facts_state_gate");
+        let configs = arch_root.join("configs").join("probe");
+        std::fs::create_dir_all(&configs).unwrap();
+        std::fs::write(
+            configs.join("probe-1.json"),
+            r#"{"hidden_size": 8, "probe_gate": 1}"#,
+        )
+        .unwrap();
+        let program = Program {
+            dims: DimTable::assemble(&[&GatedProbe]).expect("the probe assembles"),
+            ..Default::default()
+        };
+        let facts = carrier_facts(&arch_root, "probe", false, &program, &mut Vec::new());
+        assert_eq!(facts.gated.get("probe_gate"), Some(&Ok(1)));
+        let core = carrier_facts(
+            &arch_root,
+            "probe",
+            false,
+            &Program::default(),
+            &mut Vec::new(),
+        );
+        assert_eq!(core.gated.get("probe_gate"), None);
     }
 }

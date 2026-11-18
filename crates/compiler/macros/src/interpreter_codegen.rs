@@ -411,20 +411,6 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let g = lit_u32(g);
             quote! { RopeAppendNormed(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
         }
-        I::MlaSplit(a, b, c) => {
-            let a = lit_u32(a);
-            let b = lit_u32(b);
-            let c = lit_u32(c);
-            quote! { MlaSplit(#a, #b, #c) }
-        }
-        I::MlaAttention(a, b, c, d, e) => {
-            let a = lit_u32(a);
-            let b = lit_u32(b);
-            let c = lit_u32(c);
-            let d = lit_u32(d);
-            let e = lit_u32(e);
-            quote! { MlaAttention(#a, #b, #c, #d, #e) }
-        }
         I::GatedDeltaNet(a, b, c, d, e, f) => {
             let a = lit_u32(a);
             let b = lit_u32(b);

@@ -17,5 +17,6 @@ pub mod dim;
 pub mod draft_capture;
 pub mod hf_config;
 pub mod parse_python;
+pub mod state;
 pub mod typed_emit;
 pub mod weights_manifest;
