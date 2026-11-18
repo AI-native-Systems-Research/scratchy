@@ -11,3 +11,7 @@ publish = false
 # carrier's emitted Rust against it.
 [dependencies]
 scratchy-forward-compiler-frontend = { path = "../frontend" }
+
+# The signature markers are generated from the front end's one list of signature bounds.
+[build-dependencies]
+scratchy-forward-compiler-frontend = { path = "../frontend" }

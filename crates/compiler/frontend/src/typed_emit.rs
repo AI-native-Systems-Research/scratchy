@@ -229,11 +229,27 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
 /// signatures declare those themselves): every derived dim is a type alias in the module of the
 /// carrier that names it ([`carrier_aliases`]).
 pub fn emit_markers(bounds: &BTreeSet<String>) -> Result<String, String> {
-    let rows: String = (bounds.iter())
-        .filter(|b| !SIGNATURE_BOUNDS.contains(&b.as_str()))
+    Ok(marker_rows(
+        bounds
+            .iter()
+            .map(String::as_str)
+            .filter(|b| !SIGNATURE_BOUNDS.contains(b)),
+    ))
+}
+
+/// The marker of every bound in [`SIGNATURE_BOUNDS`], as `scratchy-typed-shapes`' build script
+/// writes them into the crate the signatures name them in: the one place those markers' text is
+/// made.
+pub fn emit_signature_markers() -> String {
+    marker_rows(SIGNATURE_BOUNDS.iter().copied())
+}
+
+/// A `bounds!` invocation declaring the marker of each of `bounds`.
+fn marker_rows<'a>(bounds: impl Iterator<Item = &'a str>) -> String {
+    let rows: String = bounds
         .map(|b| format!("    {} => {b:?},\n", marker(b)))
         .collect();
-    Ok(format!("bounds! {{\n{rows}}}\n"))
+    format!("bounds! {{\n{rows}}}\n")
 }
 
 /// The carrier's derived dims among `named` (and every derived dim their rules read), each a type

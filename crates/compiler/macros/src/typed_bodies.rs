@@ -152,10 +152,12 @@ fn standalone(emitted: &str) -> String {
     );
     // The signature crate's source, in place of its import, with the front end at the paths the
     // standalone program defines it at.
+    let bounds_include = "include!(concat!(env!(\"OUT_DIR\"), \"/signature_bounds.rs\"));";
     let vocabulary = read("../typed-shapes/src/lib.rs")
         .split("#[cfg(test)]")
         .next()
         .expect("split yields one part")
+        .replace(bounds_include, &typed_emit::emit_signature_markers())
         .replace("scratchy_forward_compiler_frontend::", "crate::");
     format!(
         "mod dim {{\n{dim}\n}}\n\

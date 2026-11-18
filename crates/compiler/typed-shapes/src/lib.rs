@@ -411,21 +411,9 @@ impl<T, Px, Rh, Bh, Ve> Inputs<T, Px, Rh, Bh, Ve> {
     }
 }
 
-// The bounds the signatures below name (`typed_emit::SIGNATURE_BOUNDS`); a carrier's own are declared
-// beside its emitted functions.
-bounds! {
-    BackboneHiddenSize => "backbone_hidden_size",
-    GlobalHeadDim => "global_head_dim",
-    HeadDim => "head_dim",
-    HiddenSize => "hidden_size",
-    NumAttentionHeads => "num_attention_heads",
-    NumGlobalKeyValueHeads => "num_global_key_value_heads",
-    NumKeyValueHeads => "num_key_value_heads",
-    NumTokens => "num_tokens",
-    VisionEmbedDim => "vision_embed_dim",
-    VisionInFeatures => "vision_in_features",
-    VisionRopeHalfDim => "vision_rope_half_dim",
-}
+// The bounds the signatures below name (`typed_emit::SIGNATURE_BOUNDS`), declared by the build script
+// from that one list; a carrier's own are declared beside its emitted functions.
+include!(concat!(env!("OUT_DIR"), "/signature_bounds.rs"));
 
 /// The op signatures, each named as its `OpKind` is in a carrier.
 pub mod ops {
@@ -1017,7 +1005,6 @@ pub fn trace(forward: fn(&Trace)) -> Shapes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scratchy_forward_compiler_frontend::typed_emit;
 
     /// The generic attention signature matches `Mul<Hd, H>`: a product of a head width and a
     /// head count written in [`canonical_mul`]'s order puts the head width first. Pinned for every
@@ -1035,33 +1022,6 @@ mod tests {
                 canonical_mul(vec![count.clone(), width.clone()]),
                 Dim::Mul(vec![width, count])
             );
-        }
-    }
-
-    /// The markers declared above are exactly the bounds the emit pass leaves to the signatures,
-    /// each named as the emit pass spells its marker.
-    #[test]
-    fn the_declared_markers_are_the_signature_bounds() {
-        let declared = [
-            (<BackboneHiddenSize as Bound>::NAME, "BackboneHiddenSize"),
-            (<GlobalHeadDim as Bound>::NAME, "GlobalHeadDim"),
-            (<HeadDim as Bound>::NAME, "HeadDim"),
-            (<HiddenSize as Bound>::NAME, "HiddenSize"),
-            (<NumAttentionHeads as Bound>::NAME, "NumAttentionHeads"),
-            (
-                <NumGlobalKeyValueHeads as Bound>::NAME,
-                "NumGlobalKeyValueHeads",
-            ),
-            (<NumKeyValueHeads as Bound>::NAME, "NumKeyValueHeads"),
-            (<NumTokens as Bound>::NAME, "NumTokens"),
-            (<VisionEmbedDim as Bound>::NAME, "VisionEmbedDim"),
-            (<VisionInFeatures as Bound>::NAME, "VisionInFeatures"),
-            (<VisionRopeHalfDim as Bound>::NAME, "VisionRopeHalfDim"),
-        ];
-        let names: Vec<&str> = declared.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, typed_emit::SIGNATURE_BOUNDS);
-        for (name, marker) in declared {
-            assert_eq!(typed_emit::marker(name), marker);
         }
     }
 }
