@@ -4279,9 +4279,7 @@ mod tests {
         m: 1,
         experts: 4,
         top_k: 2,
-        renorm: true,
-        expert_scale: None,
-        program: RouteProgram::QwenSoftmax,
+        program: RouteProgram::SoftmaxTopK { renorm: true },
     };
 
     fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {

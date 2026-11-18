@@ -170,16 +170,16 @@ fn pair_rows(r: PairRows) -> Value {
     }
 }
 
-fn route(p: RouteProgram, renorm: bool) -> Value {
+fn route(p: RouteProgram) -> Value {
     match p {
-        RouteProgram::QwenSoftmax => json!({
+        RouteProgram::SoftmaxTopK { renorm } => json!({
             "program": "softmax over every expert, then the top-k picks",
             "renormalise_over_picks": renorm,
         }),
-        RouteProgram::GemmaScaledSoftmax { scale_bits } => json!({
+        RouteProgram::TopKScaledSoftmax { scale_bits, .. } => json!({
             "program": "top-k of the raw logits, each times scale, softmax over the picks, then \
                         times the per-expert scale",
-            "renormalise_over_picks": renorm,
+            "renormalise_over_picks": false,
             "scale": f32_bits(scale_bits),
         }),
     }
@@ -429,9 +429,12 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::MoeRoute(r) => (
             "moe_route_bf16 (the stored program)",
             json!({"logits": off(r.logits), "topk_idx": off(r.topk_idx),
-                   "scores": off(r.scores), "m": r.m, "experts": r.experts, "top_k": r.top_k,
-                   "route": route(r.program, r.renorm),
-                   "expert_scale": r.expert_scale.map_or(Value::Null, wix)}),
+            "scores": off(r.scores), "m": r.m, "experts": r.experts, "top_k": r.top_k,
+            "route": route(r.program),
+            "expert_scale": match r.program {
+                RouteProgram::TopKScaledSoftmax { expert_scale, .. } => wix(expert_scale),
+                RouteProgram::SoftmaxTopK { .. } => Value::Null,
+            }}),
             Value::Null,
         ),
         CudaStep::ExpertSort(e) | CudaStep::ExpertSortFp8(e) => {

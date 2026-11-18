@@ -325,9 +325,9 @@ pub enum ForwardError {
     SpanOutsideArena { span: ArenaSpan, arena_bytes: u64 },
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
-    /// The `step`-th step is `op`, a step no kernel launches: a Qwen routing at another count than
-    /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921). Checked over the whole tape
-    /// before anything is uploaded or enqueued.
+    /// The `step`-th step is `op`, a step no kernel launches: a softmax-top-k routing at another
+    /// count than [`MOE_ROUTE_EXPERTS`], that program's one instance (#921). Checked over the whole
+    /// tape before anything is uploaded or enqueued.
     NotLaunched { step: usize, op: &'static str },
     /// A greedy forward ([`CudaWorker::forward_greedy`]) of a tape with no greedy argmax
     /// ([`CudaTape::greedy`]): not one row, or not a bf16 row of a multiple of `ARGMAX_CHUNK`
@@ -646,13 +646,13 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The name of `s` when no kernel launches it: the Qwen routing at another count than
-/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's Qwen program is instantiated at 256 only (its
-/// launcher refuses any other count), so such a tape is refused before anything is enqueued,
+/// The name of `s` when no kernel launches it: the softmax-top-k routing at another count than
+/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's softmax-top-k program is instantiated at 256 only
+/// (its launcher refuses any other count), so such a tape is refused before anything is enqueued,
 /// rather than at its routing step. `None` for every other step.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
     if let CudaStep::MoeRoute(MoeRouteBf16 {
-        program: RouteProgram::QwenSoftmax,
+        program: RouteProgram::SoftmaxTopK { .. },
         experts,
         ..
     }) = *s
@@ -2024,14 +2024,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         m,
                         experts,
                         top_k,
-                        renorm,
                         program,
-                        expert_scale,
-                    }) => match (program, expert_scale) {
+                    }) => match program {
                         // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
                         // (`m*top_k` each).
-                        (RouteProgram::QwenSoftmax, _) => unsafe {
-                            kernels::moe_route_bf16(
+                        RouteProgram::SoftmaxTopK { renorm } => unsafe {
+                            kernels::moe_route_softmax_topk_bf16(
                                 slot(logits),
                                 (slot(topk_idx), slot(scores)),
                                 (m, experts, top_k),
@@ -2039,13 +2037,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 stream.0,
                             )
                         },
-                        (RouteProgram::GemmaScaledSoftmax { scale_bits }, pes) => {
-                            // A Gemma routing with no per-expert scale is the launcher's refusal (a
-                            // null pointer), before it touches any pointer.
-                            let pes = pes.map_or(std::ptr::null(), |w| weights[w.0 as usize].ptr());
+                        RouteProgram::TopKScaledSoftmax {
+                            scale_bits,
+                            expert_scale,
+                        } => {
+                            let pes = weights[expert_scale.0 as usize].ptr();
                             // SAFETY: as above, and `expert_scale` (`experts`).
                             unsafe {
-                                kernels::gemma_route_bf16(
+                                kernels::moe_route_topk_scaled_softmax_bf16(
                                     (slot(logits), pes),
                                     (slot(topk_idx), slot(scores)),
                                     (m, experts, top_k),

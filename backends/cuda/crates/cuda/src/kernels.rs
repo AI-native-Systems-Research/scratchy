@@ -3645,14 +3645,14 @@ pub unsafe fn gdn_rms_norm_gated(
 /// to `m · top_k` f32, 16-byte aligned and valid for the whole kernel, the outputs overlapping
 /// nothing. `stream` must be a live `cudaStream_t` of the current device, or null for the default
 /// stream.
-pub unsafe fn moe_route_bf16(
+pub unsafe fn moe_route_softmax_topk_bf16(
     logits: *const c_void,
     (topk_idx, scores): (*mut c_void, *mut c_void),
     (m, experts, top_k): (u32, u32, u32),
     renorm: bool,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
-    // SAFETY: as `rms_norm_bf16`'s; the Qwen program reads no per-expert scale.
+    // SAFETY: as `rms_norm_bf16`'s; the softmax-top-k program reads no per-expert scale.
     let code = unsafe {
         scratchy_cuda_moe_route_bf16(
             logits,
@@ -3663,7 +3663,7 @@ pub unsafe fn moe_route_bf16(
             experts,
             top_k,
             u32::from(renorm),
-            ROUTE_QWEN,
+            ROUTE_SOFTMAX_TOPK,
             0.0,
             stream,
         )
@@ -3672,22 +3672,22 @@ pub unsafe fn moe_route_bf16(
         code,
         KernelError::MoeShape {
             kernel: "moe_route_bf16",
-            dims: [m, experts, top_k, ROUTE_QWEN],
+            dims: [m, experts, top_k, ROUTE_SOFTMAX_TOPK],
         },
     )
 }
 
-/// `kernels/moe_route_bf16.cu`'s `program`: the Qwen routing.
-const ROUTE_QWEN: u32 = 0;
-/// `kernels/moe_route_bf16.cu`'s `program`: the Gemma routing.
-const ROUTE_GEMMA: u32 = 1;
+/// `kernels/moe_route_bf16.cu`'s `program` for `step::RouteProgram::SoftmaxTopK`.
+const ROUTE_SOFTMAX_TOPK: u32 = 0;
+/// `kernels/moe_route_bf16.cu`'s `program` for `step::RouteProgram::TopKScaledSoftmax`.
+const ROUTE_TOPK_SCALED_SOFTMAX: u32 = 1;
 
-/// Launch Gemma's MoE routing (`kernels/moe_route_bf16.cu`'s Gemma program): per token row of
-/// `logits` (`[m, experts]` bf16), the `top_k` largest RAW logits picked (equal logits by the
-/// higher expert index, a NaN lowest; always `top_k` distinct indices in `0..experts`), each
-/// scaled by `scale` (`hidden^-0.5`), a softmax over the picks in f32, then each times its
-/// expert's `expert_scale` entry; stored ascending (slot `top_k − 1` the best) as i32 into
-/// `topk_idx` and f32 into `scores` (`[m, top_k]` each). Asynchronous.
+/// Launch the scaled MoE routing (`kernels/moe_route_bf16.cu`'s scaled program, Gemma 4's): per
+/// token row of `logits` (`[m, experts]` bf16), the `top_k` largest RAW logits picked (equal
+/// logits by the higher expert index, a NaN lowest; always `top_k` distinct indices in
+/// `0..experts`), each scaled by `scale` (`hidden^-0.5`), a softmax over the picks in f32, then
+/// each times its expert's `expert_scale` entry; stored ascending (slot `top_k − 1` the best) as
+/// i32 into `topk_idx` and f32 into `scores` (`[m, top_k]` each). Asynchronous.
 ///
 /// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_route_bf16", dims: [m, experts, top_k,
 /// 1] }`, before any pointer is touched, unless `m` is non-zero and at most `i32::MAX`, `experts`
@@ -3700,7 +3700,7 @@ const ROUTE_GEMMA: u32 = 1;
 /// `topk_idx` to `m · top_k` i32 and `scores` to `m · top_k` f32, 16-byte aligned and valid for
 /// the whole kernel, the outputs overlapping nothing. `stream` must be a live `cudaStream_t` of the
 /// current device, or null for the default stream.
-pub unsafe fn gemma_route_bf16(
+pub unsafe fn moe_route_topk_scaled_softmax_bf16(
     (logits, expert_scale): (*const c_void, *const c_void),
     (topk_idx, scores): (*mut c_void, *mut c_void),
     (m, experts, top_k): (u32, u32, u32),
@@ -3718,7 +3718,7 @@ pub unsafe fn gemma_route_bf16(
             experts,
             top_k,
             0,
-            ROUTE_GEMMA,
+            ROUTE_TOPK_SCALED_SOFTMAX,
             scale,
             stream,
         )
@@ -3727,7 +3727,7 @@ pub unsafe fn gemma_route_bf16(
         code,
         KernelError::MoeShape {
             kernel: "moe_route_bf16",
-            dims: [m, experts, top_k, ROUTE_GEMMA],
+            dims: [m, experts, top_k, ROUTE_TOPK_SCALED_SOFTMAX],
         },
     )
 }

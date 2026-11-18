@@ -14,10 +14,10 @@ pub mod common {
 
 use common::numerics::{bf16_inputs, bits, mismatched_bits};
 use half::bf16;
-use scratchy_target_cuda::kernels::gemma_route_bf16;
+use scratchy_target_cuda::kernels::moe_route_topk_scaled_softmax_bf16;
 use scratchy_target_cuda::kernels::{
     KernelError, SortRegions, expert_gemm_bf16, expert_gemv_bf16, gate_scale_bf16, gemm_bf16_abt,
-    gemv_bf16_abt, moe_combine_bf16, moe_route_bf16, moe_sort,
+    gemv_bf16_abt, moe_combine_bf16, moe_route_softmax_topk_bf16, moe_sort,
 };
 use scratchy_target_cuda::kernels::{
     expert_act_quant_fp8, gelu_mul_bf16, moe_sort_fp8, moe_sort_fp8_m64, quant_rows_fp8,
@@ -182,7 +182,7 @@ fn run_route(
     // m·top_k 4-byte values each, both their own allocations; null is the default stream, which
     // the downloads below wait for.
     unsafe {
-        moe_route_bf16(
+        moe_route_softmax_topk_bf16(
             lb.ptr(),
             (idx.ptr(), sc.ptr()),
             (m as u32, EXPERTS as u32, top_k as u32),
@@ -349,7 +349,7 @@ fn moe_route_bf16_takes_ties_by_the_higher_index_and_survives_nan() {
         let out = up_u32(&device, &vec![u32::MAX; 4 * 33]);
         // SAFETY: the launcher refuses these shapes before it touches any pointer.
         let got = unsafe {
-            moe_route_bf16(
+            moe_route_softmax_topk_bf16(
                 lb.ptr(),
                 (out.ptr(), out.ptr()),
                 (m, e, k),
@@ -1059,7 +1059,7 @@ fn the_moe_kernel_times_are_recorded() {
             // SAFETY: as `run_route`'s.
             || {
                 unsafe {
-                    moe_route_bf16(
+                    moe_route_softmax_topk_bf16(
                         logits.ptr(),
                         (idx.ptr(), sc.ptr()),
                         (m as u32, EXPERTS as u32, TOP_K as u32),
@@ -1198,7 +1198,7 @@ fn run_gemma_route(
     // `idx` and `sc` m·TOP_K 4-byte values each, both their own allocations; null is the default
     // stream, which the downloads below wait for.
     unsafe {
-        gemma_route_bf16(
+        moe_route_topk_scaled_softmax_bf16(
             (lb.ptr(), pb.ptr()),
             (idx.ptr(), sc.ptr()),
             (m as u32, GEMMA_EXPERTS as u32, TOP_K as u32),
@@ -1476,7 +1476,7 @@ fn gemma_route_bf16_ties_nan_and_unit_scale() {
         };
         // SAFETY: the launcher refuses these shapes before it touches any pointer.
         let got = unsafe {
-            gemma_route_bf16(
+            moe_route_topk_scaled_softmax_bf16(
                 (lb.ptr(), pes_ptr),
                 (out.ptr(), out.ptr()),
                 (m, e, k),
@@ -1515,7 +1515,7 @@ fn gemma_route_kernel_times_are_recorded() {
             // SAFETY: as `run_gemma_route`'s.
             || {
                 unsafe {
-                    gemma_route_bf16(
+                    moe_route_topk_scaled_softmax_bf16(
                         (logits.ptr(), pes.ptr()),
                         (idx.ptr(), sc.ptr()),
                         (m as u32, GEMMA_EXPERTS as u32, TOP_K as u32),

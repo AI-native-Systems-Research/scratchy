@@ -1746,10 +1746,9 @@ pub struct RouterLogitsBf16 {
     pub kernel: MatmulKernel,
 }
 
-/// The routing of `m` tokens over `experts` (one warp per token row, `experts` = 256): `p =
-/// softmax(logits)` in f32, its `top_k` largest picked (equal probabilities by the higher expert
-/// index; a NaN lowest), stored ascending (slot `top_k − 1` the best) as i32 into `topk_idx`, and
-/// their probabilities, divided by their sum when `renorm`, as f32 into `scores`.
+/// The routing of `m` tokens over `experts` (one warp per token row) by `program`: its `top_k`
+/// picks (equal scores by the higher expert index; a NaN lowest), stored ascending (slot
+/// `top_k − 1` the best) as i32 into `topk_idx`, and their weights as f32 into `scores`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct MoeRouteBf16 {
     pub logits: ArenaOffset,
@@ -1758,23 +1757,23 @@ pub struct MoeRouteBf16 {
     pub m: u32,
     pub experts: u32,
     pub top_k: u32,
-    pub renorm: bool,
     pub program: RouteProgram,
-    /// Gemma's `router.per_expert_scale` (`[experts]` bf16), each pick's weight multiplied by its
-    /// expert's entry last; `None` for Qwen.
-    pub expert_scale: Option<WeightIx>,
 }
 
-/// Which routing a [`MoeRouteBf16`] runs.
+/// Which routing a [`MoeRouteBf16`] runs, each with only its own facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum RouteProgram {
-    /// Qwen: a softmax over every expert, the top-k, renormalised when `renorm`.
-    QwenSoftmax,
-    /// Gemma: the top-k of the raw logits, each scaled by `scale` (`hidden^-0.5`), a softmax over
-    /// the picks, then the per-expert scale (`kernels/moe_route_bf16.cu`'s Gemma program).
-    GemmaScaledSoftmax {
+    /// `p = softmax(logits)` over every expert in f32 (at [`MOE_ROUTE_EXPERTS`]), its `top_k`
+    /// largest picked, their probabilities divided by their sum when `renorm` (qwen3-5-moe).
+    SoftmaxTopK { renorm: bool },
+    /// The `top_k` largest raw logits picked, each times `scale` (`hidden^-0.5`), a softmax over
+    /// the picks, then each times its expert's `expert_scale` entry (Gemma 4;
+    /// `kernels/moe_route_bf16.cu`'s scaled program).
+    TopKScaledSoftmax {
         /// `scale` as its bits (`f32::to_bits`).
         scale_bits: u32,
+        /// `router.per_expert_scale`, `[experts]` bf16.
+        expert_scale: WeightIx,
     },
 }
 
@@ -3210,18 +3209,17 @@ impl CudaStep {
                 m,
                 experts,
                 top_k,
-                expert_scale,
-                ..
+                program,
             }) => {
                 let (Some(lb), Some(pairs)) = (bf16_bytes(m, experts), m.checked_mul(top_k)) else {
                     return None;
                 };
-                let weight = match expert_scale {
-                    Some(ix) => Some(WeightRead {
-                        ix,
+                let weight = match program {
+                    RouteProgram::TopKScaledSoftmax { expert_scale, .. } => Some(WeightRead {
+                        ix: expert_scale,
                         bytes: experts as u64 * CUDA_ACT_BYTES,
                     }),
-                    None => None,
+                    RouteProgram::SoftmaxTopK { .. } => None,
                 };
                 Some(StepExtents {
                     reads: [Some(span(logits, lb)), None, None, None],
@@ -3668,7 +3666,10 @@ impl CudaStep {
                 ..
             }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
-            Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
+            Self::MoeRoute(MoeRouteBf16 { program, .. }) => match program {
+                RouteProgram::TopKScaledSoftmax { expert_scale, .. } => Some(expert_scale),
+                RouteProgram::SoftmaxTopK { .. } => None,
+            },
             Self::GatedDeltaNet(GdnPrefillBf16 {
                 gdn: GatedDeltaNetBf16 { bundle, .. },
                 ..
