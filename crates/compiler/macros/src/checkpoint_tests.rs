@@ -56,7 +56,7 @@ fn read_by(
     std::collections::HashSet<WeightId>,
 ) {
     use crate::classified::OpKind;
-    let inferred = crate::typed_shapes::traced(arch).expect("a typed program");
+    let inferred = scratchy_models_typed::traced(arch).expect("a typed program");
     let mut prog = program.clone();
     crate::shape::erase_identity_regroupings(&mut prog, &inferred, &model.bounds);
     let cfg = crate::cfg::build_cfg(&prog, model).expect("cfg");

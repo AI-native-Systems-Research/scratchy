@@ -21,6 +21,7 @@ members = [
     "crates/compiler/ir",
     "crates/models/arch",
     "crates/models/build",
+    "crates/models/typed",
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",
@@ -202,6 +203,8 @@ scratchy-vision = { path = "crates/models/vision" }
 scratchy-forward-compiler = { path = "crates/compiler" }
 # The typed op signatures (shapes as Rust types) the forward compiler type-checks carriers against.
 scratchy-typed-shapes = { path = "crates/compiler/typed-shapes" }
+# Every carrier's typed program, which each target's models build hands the forward compiler.
+scratchy-models-typed = { path = "crates/models/typed" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
 scratchy-cli = { path = "crates/cli/scr", default-features = false }

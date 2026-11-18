@@ -43,20 +43,16 @@ rayon = { workspace = true }
 # back (the re-export of the proc-macro was dropped to break the cycle).
 scratchy-forward-compiler = { path = ".." }
 # The front end (parser, classifier, dims, config rules, weights manifest, typed-Rust emit pass): its
-# own crate so the build script below and this crate share one compile of it.
+# own crate so `scratchy-models-typed`'s build script and this crate share one compile of it.
 scratchy-forward-compiler-frontend = { path = "../frontend" }
-# The typed op signatures each emitted carrier is type-checked against.
+# The typed op signatures: the shapes a carrier's typed program records.
 scratchy-typed-shapes = { workspace = true }
-
-# The build script runs the front end's typed-Rust emit pass (`build.rs`) over the carriers: the same
-# front-end crate this crate depends on, the same host build of it.
-[build-dependencies]
-scratchy-forward-compiler-frontend = { path = "../frontend" }
-serde_json = { workspace = true }
 
 # The front end's test fixtures, for this crate's tests.
 [dev-dependencies]
 scratchy-forward-compiler-frontend = { path = "../frontend", features = ["test-support"] }
+# The carriers' typed programs, which the tests hand `compile_carrier` as a build does.
+scratchy-models-typed = { workspace = true }
 
 # Emits through `target::Shared`, the test-support target.
 [[example]]

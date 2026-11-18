@@ -1718,6 +1718,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-models-typed"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-typed-shapes",
+]
+
+[[package]]
 name = "scratchy-quantizations"
 version = "0.1.0"
 dependencies = [
@@ -1817,6 +1825,7 @@ dependencies = [
  "scratchy-layers",
  "scratchy-models",
  "scratchy-models-build",
+ "scratchy-models-typed",
  "scratchy-quantizations",
  "scratchy-subtile",
  "scratchy-target-spyre",

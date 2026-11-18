@@ -288,7 +288,7 @@ fn carrier_aliases(
         .collect();
     Ok(format!(
         "{types}\n    /// Each derived dim's type, as the dim it states (for the tests: every one must equal \
-         the\n    /// config loader's value under each config's bounds).\n    #[cfg(test)]\n    \
+         the\n    /// config loader's value under each config's bounds).\n    \
          pub fn derived_dims() -> Vec<(&'static str, Dim)> {{\n        vec![\n{rows}        ]\n    }}\n\n"
     ))
 }
@@ -345,7 +345,6 @@ pub fn emit_dispatch(carriers: &[(String, String)]) -> String {
          pub fn typed_program(arch: &str) -> Option<fn(&Trace)> {{\n\
          \x20   match arch {{\n{arms}        _ => None,\n    }}\n}}\n\n\
          /// The derived dims of the carrier whose arch is `arch`, each as its type states it.\n\
-         #[cfg(test)]\n\
          pub fn derived_dims_of(arch: &str) -> Option<Vec<(&'static str, Dim)>> {{\n\
          \x20   match arch {{\n{derived_arms}        _ => None,\n    }}\n}}\n"
     )

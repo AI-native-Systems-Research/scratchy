@@ -20,7 +20,9 @@
 //! Writes nothing; redirect stdout to capture. Stderr carries progress.
 
 use scratchy_forward_compiler_macro::target::Shared;
-use scratchy_forward_compiler_macro::{Scope, compile_carrier, parse_python_file, render_tokens};
+use scratchy_forward_compiler_macro::{
+    Scope, Typing, compile_carrier, parse_python_file, render_tokens,
+};
 use std::path::PathBuf;
 
 fn main() {
@@ -84,8 +86,17 @@ fn main() {
     let text = std::fs::read_to_string(&dsl_path).expect("read DSL");
     let carrier =
         parse_python_file(&text).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let tokens = compile_carrier(carrier, &configs_dir, None, &scope, &Shared)
-        .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
+    let tokens = compile_carrier(
+        carrier,
+        &configs_dir,
+        None,
+        &scope,
+        &Shared,
+        &Typing {
+            traced: scratchy_models_typed::traced,
+        },
+    )
+    .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 
     let mut rendered = String::with_capacity(1 << 20);
     render_tokens(tokens, &mut rendered);

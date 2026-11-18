@@ -27,7 +27,7 @@ fn typed_carrier_unrolls(stem: &str, configs: usize) -> (crate::classified::Prog
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
     // The program the bake lowers.
     let program = crate::classify::carrier_program(&carrier).unwrap();
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name)
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name)
         .unwrap_or_else(|| panic!("{stem} has a typed program"));
     assert!(
         inferred.locals_of(&local_names(&program)),
@@ -74,7 +74,7 @@ fn a_trace_is_of_its_own_program_only() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
     let lowered = crate::classify::carrier_program(&carrier).unwrap();
     assert!(inferred.locals_of(&local_names(&lowered)));
     let written = crate::classify::classify(&carrier.ast).unwrap();
@@ -148,6 +148,7 @@ fn the_emit_pass_and_its_signatures_name_no_arch_or_model() {
         "../../frontend/src/typed_emit.rs",
         "../../typed-shapes/src/lib.rs",
         "typed_shapes.rs",
+        "../../../models/typed/src/lib.rs",
     ] {
         let text = std::fs::read_to_string(src.join(file)).expect(file);
         let words: std::collections::HashSet<&str> = text
@@ -190,7 +191,7 @@ fn gemma4_reshapes_left(config: &str) -> (usize, usize) {
     let mut program = crate::classify::carrier_program(&carrier).unwrap();
     let configs_dir = arch.join("configs/gemma4");
     let model = crate::config::load_file_declared(&configs_dir.join(config)).unwrap();
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
     let before = reshapes(&program.statements);
     crate::shape::erase_identity_regroupings(&mut program, &inferred, &model.bounds);
     (before, reshapes(&program.statements))
@@ -400,7 +401,7 @@ fn every_derived_alias_equals_the_config_loaders_value() {
     for (stem, vision) in carriers(&arch) {
         let source = std::fs::read_to_string(arch.join("dsl").join(format!("{stem}.py"))).unwrap();
         let carrier = crate::parse_python::parse_python_file(&source).unwrap();
-        let Some(derived) = crate::typed_shapes::derived_dims_of(&carrier.arch_name) else {
+        let Some(derived) = scratchy_models_typed::derived_dims_of(&carrier.arch_name) else {
             continue;
         };
         for (cfg, _, model) in carrier_models(&arch, &stem, vision) {
@@ -470,7 +471,7 @@ fn mtp_head_on_its_target() -> (
         .next()
         .expect("a target config carries the head");
     let model = model.unwrap();
-    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
     (program, inferred, model)
 }
 

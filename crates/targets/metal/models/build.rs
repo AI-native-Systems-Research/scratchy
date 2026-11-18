@@ -4,7 +4,7 @@
 //! every arch: the baked kernels the models name (`metal_bake.rs`), and every model that bakes a
 //! tape (`metal_models.rs`).
 use proc_macro2::{TokenStream, TokenTree};
-use scratchy_models_build::{ModelsBuild, ScopeMetadata, write_if_changed};
+use scratchy_models_build::{ModelsBuild, ScopeMetadata, Typing, write_if_changed};
 use std::path::{Path, PathBuf};
 
 /// The model modules of one arch's emit that carry a metal tape: each top-level
@@ -81,6 +81,9 @@ fn main() {
         },
         dump_dir: None,
         inspect: &metal_tape_models,
+        typing: Typing {
+            traced: scratchy_models_typed::traced,
+        },
     });
     write_metal_bake(&out_dir);
     write_metal_models(&out_dir, &built.inspected);

@@ -3119,6 +3119,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
+ "scratchy-models-typed",
  "scratchy-subtile",
  "scratchy-tensors",
  "scratchy-typed-shapes",
@@ -3176,6 +3177,14 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler-macro",
  "serde_json",
+]
+
+[[package]]
+name = "scratchy-models-typed"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-typed-shapes",
 ]
 
 [[package]]
@@ -3388,6 +3397,7 @@ dependencies = [
  "scratchy-forward-compiler-frontend",
  "scratchy-forward-compiler-macro",
  "scratchy-ir",
+ "scratchy-models-typed",
  "scratchy-subtile",
  "scratchy-target-metal",
  "scratchy-tensors",
@@ -3412,6 +3422,7 @@ dependencies = [
  "scratchy-layers",
  "scratchy-models",
  "scratchy-models-build",
+ "scratchy-models-typed",
  "scratchy-quantizations",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",

@@ -14,6 +14,8 @@
 
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
+/// How the carriers are typed: a field of [`ModelsBuild`], so a target's build states it.
+pub use scratchy_forward_compiler_macro::Typing;
 use scratchy_forward_compiler_macro::target::TargetEmitter;
 use scratchy_forward_compiler_macro::{
     CarrierError, Scope, compile_carrier, parse_python_file, render_tokens,
@@ -104,6 +106,8 @@ pub struct ModelsBuild<'a> {
     /// Read off each arch's emitted tokens (before rendering) — what a target's own build
     /// tables need of them.
     pub inspect: &'a (dyn Fn(&TokenStream) -> Vec<String> + Sync),
+    /// How the carriers are typed (`scratchy-models-typed`'s), handed to the pipeline.
+    pub typing: Typing,
 }
 
 /// What a models build emitted.
@@ -247,13 +251,20 @@ fn emit_arch(
         parse_python_file(&dsl).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
     // The stem arrives as a FIELD of the typed error (compile_carrier is called once per
     // arch, so the per-config stem can only enter there) — printed, never parsed.
-    let tokens = compile_carrier(carrier, configs_dir, build.dump_dir, scope, build.emitter)
-        .unwrap_or_else(|e| match e {
-            CarrierError::Config { stem, source } => {
-                panic!("forward pipeline ({mod_name}/{stem}): {source}")
-            }
-            CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
-        });
+    let tokens = compile_carrier(
+        carrier,
+        configs_dir,
+        build.dump_dir,
+        scope,
+        build.emitter,
+        &build.typing,
+    )
+    .unwrap_or_else(|e| match e {
+        CarrierError::Config { stem, source } => {
+            panic!("forward pipeline ({mod_name}/{stem}): {source}")
+        }
+        CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
+    });
     // Each compiled variant as `cfg(compiled_model = "<arch>::<variant>")`, so code naming one
     // (a test pinning one model) gates on exactly that module existing.
     for variant in compiled_variants(&tokens, mod_name) {
