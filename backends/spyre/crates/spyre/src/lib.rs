@@ -42,6 +42,11 @@ pub mod ir;
 /// configs cannot live in a leaf crate, and it cannot arrive as data either, because the point is that
 /// the values become `const` parameters.
 pub mod ktir_superdsc_door;
+/// ⭐⭐⭐ THE CAPACITY LAW, re-exported so every reader names it through the target crate — the
+/// bake (`scratchy-target-spyre-compiler`), the load census and the load wave (the worker), and
+/// the card crate's carve delegation all hold `::scratchy_target_spyre::pool_law` as the one
+/// path to the pool's size, the census terms, and the prefill family's shared-scratch law.
+pub use ktir_superdsc::pool_law;
 /// SubtileIR → KTIR: the producer half. One KTIR program per node, and no descriptors.
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;

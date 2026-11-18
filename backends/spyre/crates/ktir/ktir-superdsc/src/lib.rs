@@ -83,6 +83,12 @@ pub mod place;
 /// ⛔ A STRUCT, NOT A TRAIT — it is a DEVICE memory plan, not scratchy's; the module header carries
 /// the evidence and what a trait would have cost.
 pub mod placement;
+/// ⭐⭐⭐ THE CAPACITY LAW — the KV pool's size, stated ONCE for both of its readers (the bake's
+/// descent and the load census): every whole page the funded budget holds beyond mandatory
+/// residency, floored at the model's whole context, over the platform table's own memory and
+/// carve. Also the prefill family's shared-scratch law (arenas and charges), moved here from
+/// the worker so the bake and the load read one statement of it.
+pub mod pool_law;
 /// THE RESERVED TID SPACE — the tensor ids no model produces (RoPE `P`, the attention
 /// scale/mask/causal constants, the rmsnorm Newton constants, the fp8 clamp bounds, the head-major
 /// selectors), with the region table and both of its compile-time disjointness proofs. The

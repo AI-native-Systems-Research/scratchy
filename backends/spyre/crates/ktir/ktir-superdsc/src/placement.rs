@@ -129,6 +129,20 @@ pub enum WeightTail {
     Spilled { segment: u32, bytes: u64 },
 }
 
+impl WeightTail {
+    /// THE ONE MATCH ON THE VERDICT — the tail's own byte span, as `(spill segment, bytes)`, for
+    /// every consumer that walks what the bake spilled: the load's copy work list (which needs the
+    /// segment to land it) and the capacity census (which needs the bytes to charge them per
+    /// borrower). A new kind of tail extends this enum and lands here exactly once, never as a
+    /// second match at a consumer.
+    pub fn spilled_span(&self) -> Option<(u32, u64)> {
+        match self {
+            WeightTail::InPlace => None,
+            WeightTail::Spilled { segment, bytes } => Some((*segment, *bytes)),
+        }
+    }
+}
+
 // ⛔⛔⛔ THERE IS NO `MAX_PAGES_PER_REQUEST` AND NO `MAX_FOLD_PASSES`, AND THE GUARD THAT TIED THEM
 // TO THE ROW CONST IS GONE WITH ALL THREE.
 //
@@ -227,6 +241,11 @@ pub struct BundleLayout {
     /// `bundle::Placement::bank` and `bank_weight_segment`.
     #[serde(default)]
     pub weight_bank_bytes: Vec<u64>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS: bytes of banks `1..N`, empty when every layer's pools fit
+    /// ONE device region (every model that worked before KV banking existed). Same law as
+    /// [`Self::weight_bank_bytes`]; see `bank_kv_segment`.
+    #[serde(default)]
+    pub kv_bank_bytes: Vec<u64>,
     /// ⭐ THE SEGMENT BUDGET'S VERDICT on the non-per-layer weight tail — see [`WeightTail`].
     #[serde(default)]
     pub weight_tail: WeightTail,

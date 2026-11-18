@@ -198,6 +198,27 @@ type DecodeRungEntry = (
     Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
 );
 
+/// ⭐⭐⭐ ONE BAKE'S CENSUS, AS THE POOL LAW READS IT — the terms the capacity law needs to size
+/// the KV pool beyond the model's own context: the floor (the context, in whole pages) and each
+/// baked world's mandatory residency with its page stride. Returned by
+/// [`dump_wavefront_mega`] so the caller ([`super::BakeEmitter::bake_model`]'s descent) can
+/// apply `pool_law::pool_pages` and re-bake at the law's own capacity. `None` when no world
+/// baked a decode bundle, or the build does not lower for the card: the law's funded budget is
+/// a card fact (`DeviceGen::MEMORY_BYTES`), and a build without the card keeps the floor.
+pub(crate) struct PoolCensus {
+    /// The law's FLOOR, in whole pages — the model's own context, never its cap.
+    pub(crate) context_pages: u32,
+    /// Every world that baked a decode bundle, one census entry each.
+    pub(crate) worlds: Vec<WorldPoolCensus>,
+}
+
+/// One world's census terms: its decode bundle's page stride, and the mandatory residency the
+/// law charges before the pool takes the remainder of the funded budget.
+pub(crate) struct WorldPoolCensus {
+    pub(crate) page_stride_bytes: u64,
+    pub(crate) mandatory_bytes: u64,
+}
+
 /// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
 /// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
 /// [`TpForward`](scratchy_target_spyre::wiring::TpForward), from that world's committed rung cells.
@@ -1683,6 +1704,7 @@ fn layout_tokens(
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout {
         segment_bytes,
         weight_bank_bytes,
+        kv_bank_bytes,
         weight_tail,
         places,
         kernel_weights,
@@ -1699,6 +1721,9 @@ fn layout_tokens(
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let wbanks = weight_bank_bytes
+        .iter()
+        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+    let kvbanks = kv_bank_bytes
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places_interner.ident(places);
@@ -1758,6 +1783,7 @@ fn layout_tokens(
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
             weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
+            kv_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#kvbanks),*]),
             weight_tail: #tail,
             places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
@@ -2103,12 +2129,14 @@ fn reroll_tokens(
             iter,
             w_bank,
             w_off,
+            kv_bank,
             kv_off,
         } = l;
-        let (b, it, wb) = (
+        let (b, it, wb, kb) = (
             proc_macro2::Literal::u8_unsuffixed(*body),
             proc_macro2::Literal::u32_unsuffixed(*iter),
             proc_macro2::Literal::u8_unsuffixed(*w_bank),
+            proc_macro2::Literal::u8_unsuffixed(*kv_bank),
         );
         let (wo, ko) = (
             proc_macro2::Literal::u64_unsuffixed(*w_off),
@@ -2120,6 +2148,7 @@ fn reroll_tokens(
                 iter: #it,
                 w_bank: #wb,
                 w_off: #wo,
+                kv_bank: #kb,
                 kv_off: #ko,
             }
         }
@@ -2511,13 +2540,19 @@ pub(crate) fn dump_wavefront_mega(
     fuf: &Fuf,
     inferred: &scratchy_forward_compiler_macro::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
+    // ⭐ THE POOL LAW'S CAPACITY, in positions — the KV pool this bake lowers at, as whole
+    // pages. `None` is the model's own context (the FLOOR): the caller's first pass. A `Some`
+    // is the law's grown pool (`pool_law::pool_pages` over the previous pass's census), and
+    // every bundle of the model lowers at it — the pool is a baked dimension, so growth at
+    // load is structurally impossible and this parameter is the only door.
+    pool_capacity: Option<std::num::NonZeroU32>,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
     // (spliced into the per-model module); empty under every other target.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
     // Where the bake writes each bundle's dxp input, when the build asked (`superdsc-dump`): the
     // build script's own output directory, passed down from `compile_carrier`'s caller.
     dump_dir: Option<&std::path::Path>,
-) {
+) -> Option<PoolCensus> {
     use scratchy_forward_compiler_macro::to_wavefront;
     let stem = model.source_stem.as_str();
     let dump = match dump_dir {
@@ -2559,17 +2594,25 @@ pub(crate) fn dump_wavefront_mega(
     //
     // The page is the one the forward's attention walks (`paged_step::SchedulerBlockTokens::REFERENCE.get()`).
     let page_slots = scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
-    let prefix_len: std::num::NonZeroU32 = model
+    // ⭐⭐⭐ THE MODEL'S OWN CONTEXT — THE POOL LAW'S FLOOR, never its cap. The law (user order,
+    // 2026-11-17): the KV pool is every whole page the funded budget holds beyond mandatory
+    // residency, floored at this number; a bake that cannot fund it refuses, and everything
+    // past it that the budget holds is the pool's. The caller's first pass lowers at the floor
+    // (`pool_capacity: None`) to measure the census; a grown pass lowers at the law's own
+    // pages, which is why `prefix_len` is a parameter here and not a fact of the model alone.
+    let model_context: std::num::NonZeroU32 = model
         .bounds
         .get("max_position_embeddings")
         .map(|&v| (v.min(u32::MAX as u64) as u32).next_multiple_of(page_slots))
         .and_then(std::num::NonZeroU32::new)
         .unwrap_or_else(|| {
             panic!(
-                "[spyre] {stem}: the config states no max_position_embeddings — the KV pool is \
-                 the model's own context"
+                "[spyre] {stem}: the config states no max_position_embeddings — the KV pool's \
+                 floor is the model's own context"
             )
         });
+    let context_pages = model_context.get() / page_slots;
+    let prefix_len: std::num::NonZeroU32 = pool_capacity.unwrap_or(model_context);
     // Primary bundle row count: 1 = decode (default), >1 = the mq golden-gate
     // knob. The worker's batched-prefill bundle is emitted separately below
     // (default m = prefix_len; `KTIR_PREFILL_LEN` overrides).
@@ -2588,48 +2631,15 @@ pub(crate) fn dump_wavefront_mega(
             primary_m,
         )
     };
-    let mut first = lower_at(prefix_len);
-    // ⭐ AND THE POOL IS WHAT ONE DEVICE REGION HOLDS OF IT (`paged_step::pool_slots`): the KV
-    // segment is one allocation, so a model whose every-layer K and V of its whole context outgrow
-    // one region (granite-3.1-8b: 20 GiB) gets the whole pages that fit, and serves a context up to
-    // them. The bytes a slot costs are the lowered tape's own prefix K and V sources.
-    let prefix_len = {
-        let kv_slot_bytes: Option<u64> = first.as_ref().ok().map(|l| {
-            l.bindings()
-                .iter()
-                .zip(&l.input.sources)
-                .filter(|(b, _)| {
-                    matches!(
-                        b,
-                        scratchy_forward_compiler_macro::to_wavefront::SourceBinding::PrefixK { .. }
-                            | scratchy_forward_compiler_macro::to_wavefront::SourceBinding::PrefixV { .. }
-                    )
-                })
-                .map(|(_, s)| u64::from(s.cols) * 2)
-                .sum()
-        });
-        match kv_slot_bytes {
-            Some(bytes) => {
-                let pool = scratchy_target_spyre::paged_step::pool_slots(prefix_len.get(), bytes)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "[spyre] {stem}: one position's K and V across every layer ({bytes} B) \
-                             leave not one {page_slots}-slot page inside a device region"
-                        )
-                    });
-                if pool < prefix_len {
-                    eprintln!(
-                        "[spyre] {stem}: the KV pool holds {pool} of the model's {prefix_len} \
-                         positions — {bytes} B a position across every layer, one device region \
-                         in all"
-                    );
-                    first = lower_at(pool);
-                }
-                pool
-            }
-            None => prefix_len,
-        }
-    };
+    let first = lower_at(prefix_len);
+    // ⭐ AND THE POOL IS THE MODEL'S WHOLE CONTEXT, BANKED ACROSS REGIONS
+    // (`lower_subtile_tape_to_superdsc::bank_kv_segment`): a model whose every-layer K and V of
+    // its whole context outgrow one region (granite-3.1-8b: 131072 positions × 163840 B = 20 GiB
+    // against a 16 GiB region) gets its pool SPLIT at layer boundaries into as many regions as it
+    // takes, not shrunk to what one region holds. The old law (`paged_step::pool_slots`) capped
+    // the pool at one region — 104832 of granite-3.1-8b's 131072 positions, 819 of 1024 pages —
+    // which thrashed any working set past it. Every bundle of the model lowers at this same
+    // capacity, so every bundle banks identically and the sessions' seg2 alias checks pass.
     let lowered = match first {
         // A quant weight scheme the wavefront/superdsc lowering does not emit (int4/ggml, or fp8 until
         // wired) genuinely has NO superdsc bundle — skip THIS preset (return no bundle). This
@@ -2655,7 +2665,7 @@ pub(crate) fn dump_wavefront_mega(
                 "[wavefront] {stem}: no superdsc bundle — affine-quantized \
                  weights have no realization on this path; preset skipped"
             );
-            return;
+            return None;
         }
         Ok(l) => bake_tape(stem, l),
         Err(to_wavefront::BridgeError::UnsupportedWeight { detail, .. }) => {
@@ -2663,7 +2673,7 @@ pub(crate) fn dump_wavefront_mega(
                 "[wavefront] {stem}: no superdsc bundle — weight scheme unsupported here \
                  ({detail}); preset skipped"
             );
-            return;
+            return None;
         }
         Err(e) => {
             // If you asked for superdsc and a DENSE model's decode can't be lowered, that is a
@@ -2806,6 +2816,21 @@ pub(crate) fn dump_wavefront_mega(
             std::cell::RefCell::new((None, None));
         let weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>> =
             std::cell::RefCell::new(Vec::new());
+        // ⭐⭐⭐ THE CENSUS LEDGER — one entry per CONCRETE rung bundle this world baked: the
+        // rung's own layout facts (`pool_law::RungFacts`, the same projection the load census
+        // builds from the runtime bundle) plus the emitter's own page stride. The capacity law
+        // reads it after the last bake to state mandatory residency EXACTLY as the load census
+        // will — one law, one census, both ends of the pipeline. Joined by fingerprint against
+        // the rung lists below; a listed fp with no entry is a bake bug this module panics on.
+        #[derive(Clone)]
+        struct RungLayoutEntry {
+            fp: String,
+            facts: ktir_superdsc::pool_law::RungFacts,
+        }
+        let rung_layouts: std::cell::RefCell<Vec<RungLayoutEntry>> =
+            std::cell::RefCell::new(Vec::new());
+        let tp_rung_layouts: std::cell::RefCell<Vec<RungLayoutEntry>> =
+            std::cell::RefCell::new(Vec::new());
         // ⭐ THE STATE ONE TENSOR-PARALLEL WORLD'S BAKES COMMIT INTO. Every cell above is the
         // one-rank world's; a sharded world bakes its own forward (rank-local weights, its own
         // fingerprints, its own wiring) and commits into cells of its own — its weight segment is
@@ -2821,6 +2846,7 @@ pub(crate) fn dump_wavefront_mega(
             wiring: &'w std::cell::RefCell<WiringCells>,
             fold_census: &'w std::cell::RefCell<WeightFoldCensus>,
             weight_seg_ledger: &'w std::cell::RefCell<Vec<(String, u64, Vec<u64>)>>,
+            rung_layouts: &'w std::cell::RefCell<Vec<RungLayoutEntry>>,
         }
         /// One world's wiring cells: the decode and prefill slots (single, last successful bake
         /// wins) and the packed prefix rungs' OWN cells — one `(width, seqs)` pair each, joined
@@ -2840,6 +2866,7 @@ pub(crate) fn dump_wavefront_mega(
             wiring: &wiring_tokens,
             fold_census: &weight_fold_census,
             weight_seg_ledger: &weight_seg_ledger,
+            rung_layouts: &rung_layouts,
         };
         // The sharded world's cells (`TP_WORLD`; see the sharded bake below).
         let tp_fp = std::cell::RefCell::new(None);
@@ -2863,6 +2890,7 @@ pub(crate) fn dump_wavefront_mega(
             wiring: &tp_wiring,
             fold_census: &tp_fold_census,
             weight_seg_ledger: &tp_weight_seg_ledger,
+            rung_layouts: &tp_rung_layouts,
         };
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
         // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
@@ -2916,6 +2944,16 @@ pub(crate) fn dump_wavefront_mega(
                 base: String,
                 bank0: u64,
                 banks: Vec<u64>,
+            },
+            // ⭐⭐ THE CENSUS LEDGER'S ENTRY — one CONCRETE rung bundle's own layout facts,
+            // joined by fingerprint against the rung lists. The capacity law reads the ledger
+            // after the last bake; the load census reads the same facts from the runtime
+            // bundle the fp names, so the two censuses are one census. (The pool's page stride
+            // is not a carried field: it is the LAW's own division of the pool's whole bytes
+            // by the page count the pool was baked at — `pool_law::page_stride_bytes`.)
+            RungLayout {
+                fp: String,
+                facts: ktir_superdsc::pool_law::RungFacts,
             },
             // ⭐ THIS BAKE'S SCALAR REGISTRY, by phase — the registry ledger's entry.
             Registry {
@@ -3905,15 +3943,18 @@ pub(crate) fn dump_wavefront_mega(
                                                         .iter()
                                                         .zip(&rolled.launch_w)
                                                         .zip(&rolled.launch_kv)
-                                                        .map(|((&(b, it), &(wb, wo)), &ko)| {
-                                                            superdsc::bundle::LayerLaunch {
-                                                                body: b,
-                                                                iter: it,
-                                                                w_bank: wb,
-                                                                w_off: wo,
-                                                                kv_off: ko,
-                                                            }
-                                                        })
+                                                        .map(
+                                                            |((&(b, it), &(wb, wo)), &(kb, ko))| {
+                                                                superdsc::bundle::LayerLaunch {
+                                                                    body: b,
+                                                                    iter: it,
+                                                                    w_bank: wb,
+                                                                    w_off: wo,
+                                                                    kv_bank: kb,
+                                                                    kv_off: ko,
+                                                                }
+                                                            },
+                                                        )
                                                         .collect()
                                                 } else {
                                                     vec![superdsc::bundle::LayerLaunch {
@@ -3921,6 +3962,7 @@ pub(crate) fn dump_wavefront_mega(
                                                         iter: 0,
                                                         w_bank: 0,
                                                         w_off: 0,
+                                                        kv_bank: 0,
                                                         kv_off: 0,
                                                     }]
                                                 };
@@ -4230,6 +4272,30 @@ pub(crate) fn dump_wavefront_mega(
                                                 rolled.launches.len(),
                                                 rolled.kv_page_stride,
                                             );
+                                            // ⭐⭐⭐ THE CENSUS LEDGER'S ENTRY for this bundle — its
+                                            // own layout facts, exactly as the load census will
+                                            // read them from the runtime bundle `bfp` names.
+                                            // CONCRETE tapes only (`seq_sym.is_none()`, the same
+                                            // discriminator that gates `DecodeFp`): the symbolic
+                                            // CB tapes are emulator artifacts no session ever
+                                            // loads, and the census charges sessions.
+                                            if seq_sym.is_none() && !bfp.is_empty() {
+                                                fx.push(BakeEffect::RungLayout {
+                                                    fp: bfp.clone(),
+                                                    facts: ktir_superdsc::pool_law::RungFacts {
+                                                        segment_bytes: rolled.layout.segment_bytes,
+                                                        weight_bank_bytes: rolled
+                                                            .layout
+                                                            .weight_bank_bytes
+                                                            .clone(),
+                                                        kv_bank_bytes: rolled
+                                                            .layout
+                                                            .kv_bank_bytes
+                                                            .clone(),
+                                                        weight_tail: rolled.layout.weight_tail,
+                                                    },
+                                                });
+                                            }
                                             // Stamp the DECODE body_fp or the PREFILL body_fp by phase
                                             // (the prefill reroll must NOT clobber the decode fp).
                                             if let Some(mq) = prefill_mq.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
@@ -4572,6 +4638,24 @@ pub(crate) fn dump_wavefront_mega(
                             .weight_seg_ledger
                             .borrow_mut()
                             .push((base, bank0, banks));
+                    }
+                    // ⭐ THE CENSUS LEDGER — joined by fingerprint; a second entry for one
+                    // fingerprint is an inventory desync UNLESS it is the same facts (a rebake
+                    // of the same rung), in which case it is nothing new to charge.
+                    BakeEffect::RungLayout { fp, facts } => {
+                        let mut l = world.rung_layouts.borrow_mut();
+                        match l.iter().find(|e| e.fp == fp) {
+                            Some(prev) => {
+                                if prev.facts != facts {
+                                    panic!(
+                                        "[spyre-superdsc] bundle {fp} baked two different \
+                                         layouts — an inventory desync, refusing rather than \
+                                         charging one of them"
+                                    );
+                                }
+                            }
+                            None => l.push(RungLayoutEntry { fp, facts }),
+                        }
                     }
                     BakeEffect::Registry {
                         prefill,
@@ -6111,6 +6195,144 @@ pub(crate) fn dump_wavefront_mega(
                 };
         });
         // KTIR rides the embedded const + try_load.
+
+        // ⭐⭐⭐ THE CENSUS — the pool law's own terms over THIS bake's rungs, joined by
+        // fingerprint against the same rung lists the load census reads from the manifest.
+        // The law itself is `pool_law`'s; this join is its bake-side reader, and it runs
+        // here, after the last bake of the model, when the ledger is complete. The caller's
+        // descent feeds it to `pool_law::pool_pages` and re-bakes at the law's capacity.
+        //
+        // ⛔ CARD BUILDS ONLY (`spyre-lower`): the law's funded budget is a fact of the
+        // card the platform table states (`DeviceGen::MEMORY_BYTES`); a build without the
+        // card has no device memory to fund a budget from, so its pool stays at the model's
+        // own context — the floor — exactly as every such bake has always sized it. (The
+        // ledger is populated on every build; only the law's reader is the card's.)
+        if !cfg!(feature = "spyre-lower") {
+            return None;
+        }
+        /// One world's census, resolved exactly as the load census resolves it — the anchor
+        /// (narrowest multi-token prefill rung, else the prefill slot's own bundle, none
+        /// when the prefill reroll fell back to the decode bundle), the family (the other
+        /// multi-token prefill rungs plus every multi-width prefix rung), the decode batch
+        /// rungs past one, and the borrower count from the lists' own lengths. The page
+        /// stride is the LAW's own division of the decode bundle's pool bytes by the page
+        /// count this bake lowered at — never a carried field.
+        fn census_world(
+            stem: &str,
+            label: &str,
+            world: &WorldBake<'_>,
+            pages: u32,
+        ) -> Option<WorldPoolCensus> {
+            let decode_fp = world.fp.borrow().clone()?;
+            let layouts = world.rung_layouts.borrow();
+            let find =
+                |fp: &str| -> RungLayoutEntry {
+                    layouts.iter().find(|e| e.fp == fp).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "[spyre-superdsc] {stem} ({label}): bundle {fp} is in the rung lists \
+                         but baked no census entry — the census ledger and the ladder have \
+                         desynced"
+                    )
+                })
+                };
+            let decode = find(&decode_fp);
+            let kv_total = decode.facts.kv_total_bytes();
+            if kv_total == 0 {
+                panic!(
+                    "[spyre-superdsc] {stem} ({label}): the decode bundle places no KV pool — \
+                     the pool law sizes what a decode bundle must place"
+                );
+            }
+            let page_stride_bytes = ktir_superdsc::pool_law::page_stride_bytes(kv_total, pages);
+            let prefill_rungs = world.prefill_rungs.borrow().clone();
+            // The prefill slot's own bundle — `None` when the reroll fell back to the decode
+            // bundle (C4), the same filter the load census applies.
+            let top_prefill = world
+                .prefill_fp
+                .borrow()
+                .clone()
+                .filter(|pfp| *pfp != decode_fp);
+            let anchor_rung_m = prefill_rungs
+                .iter()
+                .filter(|(rm, _)| *rm > 1)
+                .min_by_key(|(rm, _)| *rm)
+                .map(|(rm, _)| *rm);
+            let anchor = match (&top_prefill, anchor_rung_m) {
+                (Some(_), Some(rm)) => Some(find(
+                    prefill_rungs
+                        .iter()
+                        .find(|(m, _)| *m == rm)
+                        .map(|(_, fp)| fp.as_str())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "[spyre-superdsc] {stem} ({label}): rung m={rm} vanished from \
+                                 its own list"
+                            )
+                        }),
+                )),
+                (Some(pfp), None) => Some(find(pfp)),
+                (None, _) => None,
+            };
+            let mut family: Vec<ktir_superdsc::pool_law::RungFacts> = prefill_rungs
+                .iter()
+                .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
+                .map(|(_, fp)| find(fp).facts)
+                .collect();
+            family.extend(
+                world
+                    .prefill_prefix_rungs
+                    .borrow()
+                    .iter()
+                    // Every prefix rung charges — solo AND packed: a packed rung's
+                    // activations are its product's (s windows of width rows), charged
+                    // exactly as the solo rung's are.
+                    .filter(|(w, _, _)| *w > 1)
+                    .map(|(_, _, fp)| find(fp).facts),
+            );
+            let decode_rungs: Vec<ktir_superdsc::pool_law::RungFacts> = world
+                .decode_rungs
+                .borrow()
+                .iter()
+                .filter(|(rn, _, _, _)| *rn > 1)
+                .map(|(_, _, fp, _)| find(fp).facts)
+                .collect();
+            let borrowers = (prefill_rungs.len() + world.decode_rungs.borrow().len() + 1) as u64;
+            let family_refs: Vec<&ktir_superdsc::pool_law::RungFacts> = family.iter().collect();
+            let decode_rung_refs: Vec<&ktir_superdsc::pool_law::RungFacts> =
+                decode_rungs.iter().collect();
+            let res = ktir_superdsc::pool_law::mandatory_residency(
+                &ktir_superdsc::pool_law::CensusInputs {
+                    decode: &decode.facts,
+                    anchor: anchor.as_ref().map(|a| &a.facts),
+                    family: &family_refs,
+                    decode_rungs: &decode_rung_refs,
+                    borrowers,
+                },
+            );
+            Some(WorldPoolCensus {
+                page_stride_bytes,
+                mandatory_bytes: res.mandatory_bytes(),
+            })
+        }
+        // The page count this bake lowered at — the capacity every pool in every bundle of
+        // this model was placed for, in whole pages.
+        let baked_pages = prefix_len.get() / page_slots;
+        let mut worlds: Vec<WorldPoolCensus> = Vec::new();
+        if let Some(w) = census_world(stem, "one-rank world", &one_rank, baked_pages) {
+            worlds.push(w);
+        }
+        if tp_sources.is_some()
+            && let Some(w) = census_world(stem, "sharded world", &sharded_world, baked_pages)
+        {
+            worlds.push(w);
+        }
+        if worlds.is_empty() {
+            return None;
+        }
+        Some(PoolCensus {
+            context_pages,
+            worlds,
+        })
     }
 }
 

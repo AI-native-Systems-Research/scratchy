@@ -376,6 +376,9 @@ pub trait DeviceGen {
     const NUM_SEGMENTS: usize;
     /// The bytes one segment may hold.
     const MAX_SEGMENT_BYTES: u64;
+    /// The device's total memory, in bytes — the capacity law's reported-from number (see the
+    /// gen1 row for the carve that turns it into what an allocation may use).
+    const MEMORY_BYTES: u64;
     /// One flit, in bytes — the unit every CB address and length field
     /// counts in, and (by the device's own stick law) the width of every
     /// format's stick: elems per stick = `FLIT_BYTES / element size`.
@@ -741,6 +744,20 @@ impl DeviceGen for Gen1 {
     /// device's VA segments — senlib-rs states 8 VA segments for snt1p0
     /// (snt1p0.rs:545) and the executor model packs 7.
     const NUM_SEGMENTS: usize = 7;
+
+    /// The card's TOTAL memory, in bytes — the number the capacity law REPORTS from, never the
+    /// number an allocation is sized from ([`Self::NUM_SEGMENTS`] with one region reserved for
+    /// program memory carves what a tensor allocation may use; `pool_law::tensor_capacity` is
+    /// that derivation's one statement). 114,688 MB as the card itself reports it
+    /// (`CardRuntime::open`, dd2, 2026-11-10) = 120,259,084,288 B.
+    ///
+    /// A COMPILE-TIME FACT, BY ORDER (2026-11-17): the KV pool is sized at the bake from the
+    /// funded budget — every whole page the funded tensor capacity holds beyond mandatory
+    /// residency, floored at the model's whole context — and every term of that arithmetic is
+    /// a bake fact. Nothing reads the card at boot to size the pool. A card that reports LESS
+    /// than this is caught by the load census's funded check (a refusal naming the numbers);
+    /// a card that reports more simply leaves the un-taken remainder unspent.
+    const MEMORY_BYTES: u64 = 120_259_084_288;
 
     /// One segment = 16 GiB: senlib-rs `XLAT_LEN_MAX_FLITS: u64 = 1 << 27`
     /// (snt1p0.rs:535 — "a stored length of zero is the field maximum,

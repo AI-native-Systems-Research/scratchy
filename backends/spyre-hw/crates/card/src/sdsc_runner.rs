@@ -21,6 +21,8 @@ use tracing::debug;
 use scratchy_target_spyre::manifest::bytes_to_f32;
 
 use ktir_superdsc::collective::PerRank;
+
+use crate::runtime::DevAddr;
 use scratchy_target_spyre::sen_convert::f32_to_f16_le;
 
 /// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
@@ -1167,6 +1169,38 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         // Rank r aliases the owner's rank r: both sessions are one executor per rank of `T`.
         for (r, e) in self.ranks.iter_mut() {
             e.alias_seg_from(owner.ranks.get(r), s)?;
+        }
+        Ok(())
+    }
+
+    /// Declare, BEFORE prepare, that `seg` will be borrowed — the wave-built rung's route to
+    /// [`Executor::mark_borrowed`] (the constructors take their borrowed list at build; a session
+    /// that only learns its family role after the build marks it here, between build and
+    /// `prepare_in_rank_order`). Rank-wide, like every segment decision.
+    pub fn mark_borrowed(&mut self, seg: i64) -> Result<()> {
+        let s = SegIdx::checked(seg)
+            .ok_or_else(|| anyhow!("mark_borrowed: segment {seg} out of range"))?;
+        for e in self.ranks.values_mut() {
+            e.mark_borrowed(s)?;
+        }
+        Ok(())
+    }
+
+    /// Mint this session's per-rank regions for a shared-scratch segment as ARENA DATA — one
+    /// `DevAddr` per rank, held without the session. See [`Executor::seg_arena`].
+    pub fn seg_arena(&self, seg: i64) -> Result<PerRank<T, DevAddr>> {
+        let s =
+            SegIdx::checked(seg).ok_or_else(|| anyhow!("seg_arena: segment {seg} out of range"))?;
+        PerRank::try_from_fn(|r| self.ranks.get(r).seg_arena(s))
+    }
+
+    /// Point every rank's borrowed `seg` at the family arena — rank r shares rank r's arena, the
+    /// same rank-matching the alias uses. See [`Executor::share_scratch_seg_from`].
+    pub fn share_scratch_seg_from(&mut self, seg: i64, arena: &PerRank<T, DevAddr>) -> Result<()> {
+        let s = SegIdx::checked(seg)
+            .ok_or_else(|| anyhow!("share_scratch_seg: segment {seg} out of range"))?;
+        for (r, e) in self.ranks.iter_mut() {
+            e.share_scratch_seg_from(s, arena.get(r))?;
         }
         Ok(())
     }

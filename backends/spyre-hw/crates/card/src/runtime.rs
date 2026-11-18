@@ -288,6 +288,22 @@ const _: () = assert!(
     scratchy_target_spyre::bundle_code::MAX_SEGMENT_BYTES == flex_rs::allocator::MAX_REGION_BYTES
 );
 
+// ⛔ AND THE CAPACITY LAW'S REGION CARVE IS THE ALLOCATOR'S. The bake sizes the KV pool from
+// `pool_law::tensor_capacity` (a compile-time statement over the platform table), and this crate
+// is the only one that sees both that statement and flex-rs's own carve — so it refuses to
+// compile if they ever diverge: a law that sized the pool against regions the allocator does
+// not carve would fund memory that does not exist.
+const _: () = assert!(
+    scratchy_target_spyre::pool_law::PLATFORM_REGIONS
+        == flex_rs::allocator::DEFAULT_MAX_REGIONS as u64
+        && scratchy_target_spyre::pool_law::PLATFORM_PROGRAM_REGIONS
+            == flex_rs::allocator::DEFAULT_NUM_PROGRAM_REGIONS as u64
+        && <scratchy_target_spyre::ktir::ddl_binds::Baked
+            as scratchy_target_spyre::ktir::ddl_binds::DeviceGen>::NUM_SEGMENTS
+            == flex_rs::allocator::DEFAULT_MAX_REGIONS,
+    "the capacity law's region carve and the allocator's have diverged"
+);
+
 impl CardMemory {
     /// The card's TOTAL capacity in bytes — the number to REPORT, not the number to size an
     /// allocation from. See [`Self::tensor_capacity`] / [`Self::max_single_allocation`], which are
@@ -313,10 +329,12 @@ impl CardMemory {
     /// next allocation reported `total_capacity_bytes=103079215104` — 96 GiB, i.e. 6 of 7 regions.
     /// The pool that budget sizes is one allocation on that same 96 GiB, so the missing 16 GiB was
     /// never the KV cache's to spend.
-    pub const fn tensor_capacity(self) -> u64 {
-        let regions = flex_rs::allocator::DEFAULT_MAX_REGIONS as u64;
-        let program = flex_rs::allocator::DEFAULT_NUM_PROGRAM_REGIONS as u64;
-        self.region_bytes() * (regions - program)
+    /// ⭐ THE DERIVATION IS THE CAPACITY LAW'S OWN — `pool_law::tensor_capacity`, the ONE
+    /// statement the bake's pool descent also reads, pinned to flex-rs's carve by the const
+    /// assert at this module's top. This method names the law, never a second copy of its
+    /// arithmetic.
+    pub fn tensor_capacity(self) -> u64 {
+        scratchy_target_spyre::pool_law::tensor_capacity(self.0)
     }
 
     /// ⛔ THE LARGEST **SINGLE** ALLOCATION THIS CARD CAN SERVE = one region.
@@ -331,15 +349,10 @@ impl CardMemory {
         self.region_bytes()
     }
 
-    /// One region's size, exactly as `pre_allocate_regions` computes it: an equal share of the card,
-    /// capped at the hardware ceiling.
+    /// One region's size, exactly as `pre_allocate_regions` computes it: an equal share of the
+    /// card, capped at the hardware ceiling — the capacity law's own `region_bytes`.
     const fn region_bytes(self) -> u64 {
-        let per = self.0 / flex_rs::allocator::DEFAULT_MAX_REGIONS as u64;
-        if per < flex_rs::allocator::MAX_REGION_BYTES {
-            per
-        } else {
-            flex_rs::allocator::MAX_REGION_BYTES
-        }
+        scratchy_target_spyre::pool_law::region_bytes(self.0)
     }
 }
 

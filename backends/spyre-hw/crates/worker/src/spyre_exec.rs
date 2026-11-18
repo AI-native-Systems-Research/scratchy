@@ -172,6 +172,19 @@ impl Worker for SpyreWorker {
         None
     }
 
+    /// NO BUCKET CAPS A SCHEDULED FORWARD on this device. The prefill ladder's widest rung is
+    /// the widest SINGLE-LAUNCH chunk (512 here), but the executor splits any scheduled token
+    /// count into rung-width launches inside one call — a step may carry four of them. The
+    /// ladder is therefore not a bucket the step budget must fit, and reporting its ceiling
+    /// as one (measured, conc-10300: a 512-token budget paces a ~10k prompt at 21 steps whose
+    /// per-step host work is paid 21 times, putting the unshared prefill at 16.4s — above
+    /// torch's whole median) conflates the launch width with the step budget. `None` is the
+    /// honest answer: the serving layer's own default paces the step, and an explicit
+    /// `--max-num-batched-tokens` needs no clamp the device cannot actually enforce.
+    fn prefill_bucket_max_m(&self) -> Option<u32> {
+        None
+    }
+
     /// Every row writes its key at its own token position, on every tier.
     fn kv_addressing(&self) -> scratchy_core_common::KvAddressing {
         scratchy_core_common::KvAddressing::ByToken
@@ -256,6 +269,13 @@ impl Worker for SpyreWorker {
         // above.
         #[cfg(feature = "spyre-hw")]
         let mut decode_join: Vec<(String, usize)> = Vec::new();
+        // ⭐ A FRESH REQUEST'S NON-FINAL SOLO ROW WAITS FOR THE DECODE SUBMIT. The step's decode
+        // launch goes to the card BEFORE any prompt chunk runs (the decode-first law below), so
+        // its device time overlaps the chunks' staging and execution instead of serializing
+        // behind them; a 1-token admission row is one of the step's solo chunks and runs with
+        // them, after the submit. `(id, start, n)` — everything `run_request_step` takes.
+        #[cfg(feature = "spyre-hw")]
+        let mut pending_solo: Vec<(String, usize, usize)> = Vec::new();
         for nr in &scheduler_output.scheduled_new_reqs {
             let n = scheduler_output
                 .num_scheduled_tokens
@@ -330,10 +350,16 @@ impl Worker for SpyreWorker {
                 decode_join.push((nr.req_id.clone(), start));
                 continue;
             }
-            let req = requests.get_mut(&nr.req_id).expect("just inserted");
-            let s = run_request_step(model, req, &nr.req_id, input_batch, start, n)?;
-            order.push(nr.req_id.clone());
-            sampled.push(s);
+            // The deferred solo row (hw) / the plain inline run (no card).
+            #[cfg(feature = "spyre-hw")]
+            pending_solo.push((nr.req_id.clone(), start, n));
+            #[cfg(not(feature = "spyre-hw"))]
+            {
+                let req = requests.get_mut(&nr.req_id).expect("just inserted");
+                let s = run_request_step(model, req, &nr.req_id, input_batch, start, n)?;
+                order.push(nr.req_id.clone());
+                sampled.push(s);
+            }
         }
 
         // Cached requests = decode (n=1) or a prefill-continuation chunk.
@@ -418,53 +444,7 @@ impl Worker for SpyreWorker {
             });
             waved.insert(id.clone());
         }
-        // ⭐ THE PREFILL WAVE — every gathered tail in as few launches as the packed table
-        // holds (`packed_fill`: the rung seating the most tails at the widest tail's width,
-        // the whole wave when one rung holds it). One weight stream per launch, one readback
-        // of `s` picks — request `r`'s own answer from window `r`. The wave runs WIDEST TAILS
-        // FIRST so each group's rung is chosen by the widest tail it carries and the narrow
-        // leftovers pack on narrower rungs at higher counts. A wave of fewer than two is not
-        // a wave: a lone tail would pay `s − 1` empty windows for nothing, so it and every
-        // tail wider than every window run the solo chunk loop.
-        #[cfg(feature = "spyre-hw")]
-        {
-            wave.sort_by_key(|t| std::cmp::Reverse(t.toks.len()));
-            let mut rest: &[PackedTail] = &wave;
-            while rest.len() >= 2 {
-                let widest = rest[0].toks.len();
-                let SendnnSession::SuperDsc(sb) = &mut model.session;
-                let Some((rung, seats)) = sb.prefill_prefix.packed_fill(widest, rest.len()) else {
-                    break;
-                };
-                let sh = Shared {
-                    embed_tokens: &model.embed_tokens,
-                    hidden: model.hidden,
-                    vocab: model.vocab,
-                };
-                let SendnnSession::SuperDsc(sb) = &mut model.session;
-                let (group, tail) = rest.split_at(seats);
-                let picks =
-                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
-                for (t, pick) in group.iter().zip(picks) {
-                    order.push(t.id.clone());
-                    sampled.push(pick);
-                }
-                rest = tail;
-            }
-            // Fewer than two left, or a tail wider than every window: every remaining tail
-            // runs the solo chunk loop, exactly as before — a selection, never a refusal.
-            for t in rest {
-                let req = requests
-                    .get_mut(&t.id)
-                    .ok_or_else(|| werr(format!("unknown wave req {}", t.id)))?;
-                let s = run_request_step(model, req, &t.id, input_batch, t.start, t.toks.len())?;
-                order.push(t.id.clone());
-                sampled.push(s);
-            }
-            // ⛔ `waved` STAYS SET: every gathered tail ran above — packed or solo — and the
-            // per-request loop below must not run the cached ones a second time.
-        }
-        // ── BATCHED DECODE ────────────────────────────────────────────────────────────────────────
+        // ── BATCHED DECODE, SUBMITTED FIRST ───────────────────────────────────────────────────────
         // Every cached request scheduled for exactly ONE GENERATED token is a decode step, and those
         // are the whole reason the weight set gets streamed over and over: each used to be its own
         // forward. Run them together on the smallest rung that holds them and the weights move once.
@@ -476,11 +456,32 @@ impl Worker for SpyreWorker {
         // (`batched_decode_head_major`); the paged step each stages is built from the requests' own
         // block tables and positions.
         //
-        // A continuation chunk (n > 1) is not a decode step — the wave above took it, or (no rung
-        // holding) the per-request path below did; a DECODE step never takes either — one request
+        // A continuation chunk (n > 1) is not a decode step — the wave below took it, or (no rung
+        // holding) the per-request path did; a DECODE step never takes either — one request
         // is the W=1 OWNER here, and a live count past the widest rung refuses below.
+        //
+        // ⭐ THE DECODE SUBMITS BEFORE ANY PROMPT CHUNK RUNS. The decode rides its OWN session
+        // (its own card stream) while every prompt chunk runs on a prefill session's, so a step
+        // that mixes them wants the decode's launch — its staging, its submit, its device time —
+        // STARTED before the chunks' blocking waits, not serialized after the last chunk's
+        // device time with the card idle through the launch. Submitted here, the decode executes
+        // under the chunks' staging and (when the card runs the two streams together) their
+        // execution; collected after them (below), its read has long since fired and the fence is
+        // free. A pure step — nothing but decodes — submits, defers and drains exactly as before:
+        // nothing runs between this submit and that collect.
         #[cfg(feature = "spyre-hw")]
         let mut batched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // The collect half runs after the chunks; this carries what it needs that the submit
+        // computed — the step's decode rows in slot order, the pure flag, and the cell the
+        // deferred resolver waits on.
+        #[cfg(feature = "spyre-hw")]
+        type DecodeSubmitted = (
+            Vec<(String, usize)>,
+            bool,
+            std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+        );
+        #[cfg(feature = "spyre-hw")]
+        let mut decode_submitted: Option<DecodeSubmitted> = None;
         #[cfg(feature = "spyre-hw")]
         {
             let mut decode_ids: Vec<(String, usize)> = cr
@@ -703,9 +704,11 @@ impl Worker for SpyreWorker {
                     .map(|(slot, (id, start))| (id.clone(), *start, slot))
                     .collect();
                 // A step defers only when it is THE WHOLE STEP — a pure decode, on a driver whose
-                // engine can drain it. A mixed schedule (a prefill chunk ran, or a per-request
-                // forward will run after this) collects in-call through the SAME pop, because its
-                // output has to carry the other rows' tokens with it.
+                // engine can drain it. A mixed schedule (a prompt chunk runs below, after this
+                // submit) collects in-call through the SAME pop, because its output has to carry
+                // the other rows' tokens with it. For a pure step nothing runs between this
+                // submit and the collect below, so the deferral is that collect's first arm and
+                // the pure step's pipeline is exactly what it was.
                 let pure = scheduler_output.scheduled_new_reqs.is_empty()
                     && cr
                         .req_ids
@@ -718,50 +721,81 @@ impl Worker for SpyreWorker {
                     rung: ri,
                     rows: laid,
                 });
-                if pure && self.drain_door.is_some() {
-                    // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a resolver
-                    // that waited first would block the one thread that can fill the cell.
-                    let door = self.drain_door.clone().expect("checked above");
-                    let waiting = cell.clone();
-                    let resolver = move || -> Result<Vec<u32>, String> {
-                        door.knock(waiting.clone()).map_err(|e| e.to_string())?;
-                        waiting.wait().map_err(|e| e.to_string())
-                    };
-                    let req_ids: Vec<String> =
-                        decode_ids.iter().map(|(id, _)| id.clone()).collect();
-                    return Ok(ModelRunnerOutput::deferred(req_ids, Box::new(resolver)));
-                }
-                // NOT DEFERRABLE — drain it right here, through the same pop the knock takes.
-                //
-                // ⛔ IN SUBMISSION ORDER. The step before this one may still be in flight (a stable
-                // seating submits at depth 2), and each drain appends its pick to the request's
-                // history. Draining this step first appended the two picks swapped, so the next
-                // churn re-seeded the request from the OLDER pick and it decoded that token twice
-                // (granite-3.1-2b: "Title: A A …" at a second request's join). The older steps
-                // drain first; this step is the queue's last.
-                while self.in_flight.len() > 1 {
-                    let older = self.in_flight.pop_front().expect("len > 1");
-                    Self::drain_one(older, model, requests, input_batch)?;
-                }
-                let infl = self.in_flight.pop_front().expect("queued just above");
-                let rows = Self::drain_one(infl, model, requests, input_batch)?;
-                // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — live `i` in slot
-                // `i`. The pool bookkeeping (push_generated, set_tokens_in_pool) already ran in the
-                // drain; this loop only carries the step's answer into the output.
-                for (slot, (id, _start)) in decode_ids.iter().enumerate() {
-                    let tok = rows.get(slot).copied().ok_or_else(|| {
-                        werr(format!(
-                            "decode: {} token(s) for {} request(s) — the rung's sampler did not \
-                             pick one per launch slot",
-                            rows.len(),
-                            decode_ids.len()
-                        ))
-                    })?;
-                    order.push(id.clone());
-                    sampled.push(Some(tok));
+                // `batched` fills HERE — at the submit, before any chunk runs — so the leftover
+                // per-request loop below (which runs before the collect) already skips the
+                // decode rows; the collect carries their tokens.
+                for (id, _) in &decode_ids {
                     batched.insert(id.clone());
                 }
+                // Everything the collect needs that this submit computed: the step's decode rows
+                // in slot order, the pure flag, and the cell the deferred resolver waits on.
+                decode_submitted = Some((decode_ids, pure, cell));
             }
+        }
+        // ── THE PREFILL WAVE ────────────────────────────────────────────────────────────────────────
+        // The gathered tails (fresh requests' chunks above, cached continuation chunks after the
+        // grant install), packed where a rung window holds them. Sorted widest-first so the
+        // widest tail names the window every packed group needs.
+        //
+        // ⭐ A TAIL WIDER THAN EVERY WINDOW IS SKIPPED, NOT A STOP. The old loop `break`ed when
+        // the widest remaining tail exceeded every packed window — which suppressed packing for
+        // every NARROWER tail behind it too, exactly what this block exists to do for them. The
+        // too-wide tail runs the solo chunk path and packing retries on the rest.
+        #[cfg(feature = "spyre-hw")]
+        {
+            wave.sort_by_key(|t| std::cmp::Reverse(t.toks.len()));
+            let mut solo: Vec<&PackedTail> = Vec::new();
+            let mut rest: &[PackedTail] = &wave;
+            while rest.len() >= 2 {
+                let widest = rest[0].toks.len();
+                let SendnnSession::SuperDsc(sb) = &mut model.session;
+                let Some((rung, seats)) = sb.prefill_prefix.packed_fill(widest, rest.len()) else {
+                    // The widest tail exceeds every packed window: it runs the solo path, and
+                    // packing retries on the narrower tails behind it.
+                    solo.push(&rest[0]);
+                    rest = &rest[1..];
+                    continue;
+                };
+                let sh = Shared {
+                    embed_tokens: &model.embed_tokens,
+                    hidden: model.hidden,
+                    vocab: model.vocab,
+                };
+                let SendnnSession::SuperDsc(sb) = &mut model.session;
+                let (group, tail) = rest.split_at(seats);
+                let picks =
+                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
+                for (t, pick) in group.iter().zip(picks) {
+                    order.push(t.id.clone());
+                    sampled.push(pick);
+                }
+                rest = tail;
+            }
+            solo.extend(rest.iter());
+            // Fewer than two left, or every remaining tail wider than every window: each runs
+            // the solo chunk loop, exactly as before — a selection, never a refusal.
+            for t in solo {
+                let req = requests
+                    .get_mut(&t.id)
+                    .ok_or_else(|| werr(format!("unknown wave req {}", t.id)))?;
+                let s = run_request_step(model, req, &t.id, input_batch, t.start, t.toks.len())?;
+                order.push(t.id.clone());
+                sampled.push(s);
+            }
+            // ⛔ `waved` STAYS SET: every gathered tail ran above — packed or solo — and the
+            // per-request loop below must not run the cached ones a second time.
+        }
+        // ⭐ THE DEFERRED SOLO ROWS — fresh requests' 1-token non-final admissions — run here,
+        // after the decode submit (they are prompt chunks; the decode-first law above is for
+        // them too) and with the wave's chunks, in arrival order.
+        #[cfg(feature = "spyre-hw")]
+        for (id, start, n) in pending_solo {
+            let req = requests
+                .get_mut(&id)
+                .ok_or_else(|| werr(format!("unknown fresh req {id}")))?;
+            let s = run_request_step(model, req, &id, input_batch, start, n)?;
+            order.push(id.clone());
+            sampled.push(s);
         }
         for (i, req_id) in cr.req_ids.iter().enumerate() {
             #[cfg(feature = "spyre-hw")]
@@ -793,6 +827,56 @@ impl Worker for SpyreWorker {
             let s = run_request_step(model, req, req_id, input_batch, start, n)?;
             order.push(req_id.clone());
             sampled.push(s);
+        }
+        // ── THE DECODE COLLECT ───────────────────────────────────────────────────────────────────────
+        // The step's decode was submitted before the chunks ran; the chunks are done; the launch
+        // has been on the card the whole time. A pure step (the decode was the whole schedule —
+        // nothing ran between its submit and here) defers through the drain door exactly as
+        // before. A mixed step collects in-call, through the same pop the knock takes, so its
+        // output carries the decode tokens with the chunks' rows.
+        #[cfg(feature = "spyre-hw")]
+        if let Some((decode_ids, pure, cell)) = decode_submitted {
+            if pure && self.drain_door.is_some() {
+                // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a resolver
+                // that waited first would block the one thread that can fill the cell.
+                let door = self.drain_door.clone().expect("checked above");
+                let waiting = cell;
+                let resolver = move || -> Result<Vec<u32>, String> {
+                    door.knock(waiting.clone()).map_err(|e| e.to_string())?;
+                    waiting.wait().map_err(|e| e.to_string())
+                };
+                let req_ids: Vec<String> = decode_ids.iter().map(|(id, _)| id.clone()).collect();
+                return Ok(ModelRunnerOutput::deferred(req_ids, Box::new(resolver)));
+            }
+            // NOT DEFERRABLE — drain it right here, through the same pop the knock takes.
+            //
+            // ⛔ IN SUBMISSION ORDER. The step before this one may still be in flight (a stable
+            // seating submits at depth 2), and each drain appends its pick to the request's
+            // history. Draining this step first appended the two picks swapped, so the next
+            // churn re-seeded the request from the OLDER pick and it decoded that token twice
+            // (granite-3.1-2b: "Title: A A …" at a second request's join). The older steps
+            // drain first; this step is the queue's last.
+            while self.in_flight.len() > 1 {
+                let older = self.in_flight.pop_front().expect("len > 1");
+                Self::drain_one(older, model, requests, input_batch)?;
+            }
+            let infl = self.in_flight.pop_front().expect("queued at the submit");
+            let rows = Self::drain_one(infl, model, requests, input_batch)?;
+            // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — live `i` in slot
+            // `i`. The pool bookkeeping (push_generated, set_tokens_in_pool) already ran in the
+            // drain; this loop only carries the step's answer into the output.
+            for (slot, (id, _start)) in decode_ids.iter().enumerate() {
+                let tok = rows.get(slot).copied().ok_or_else(|| {
+                    werr(format!(
+                        "decode: {} token(s) for {} request(s) — the rung's sampler did not \
+                         pick one per launch slot",
+                        rows.len(),
+                        decode_ids.len()
+                    ))
+                })?;
+                order.push(id.clone());
+                sampled.push(Some(tok));
+            }
         }
 
         // One sampled token per request, in processing order; intermediate

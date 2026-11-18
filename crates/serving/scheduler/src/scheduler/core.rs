@@ -3598,6 +3598,26 @@ impl SchedulerInterface for Scheduler {
         // ---------------------------------------------------------------
         // Phase 2: Schedule WAITING requests
         // ---------------------------------------------------------------
+        // ⭐ RIDERS VS PREFILLS, taken BEFORE the loop so requests admitted during this
+        // very pass (not yet running) do not close it on each other. While a running
+        // request is still computing its prompt, a waiting request may join the step
+        // only if its WHOLE prompt remainder fits the step's remaining token budget:
+        // such a rider finishes its prompt in this one step — one chunk beside the
+        // in-flight prefill, a decode's share of the device — and can never split a
+        // prefill across steps. A wider remainder is a prefill that would share every
+        // step with the in-flight one until one of them ends (measured on the card,
+        // conc-10300: leak-window admissions of fresh ~10k prompts ran two prefills
+        // half-rate to a simultaneous finish — a lockstep pair whose finishes then
+        // clumped the next wave's entries into 12s queue waits); it waits until no
+        // prompt is being computed, then takes the full budget at full width. A
+        // deferred candidate does not block the riders behind it: it is held to the
+        // end of this pass and put back at the head, so the queue's order survives
+        // the pass while the riders ride.
+        let prefill_in_flight = self
+            .running
+            .iter()
+            .any(|r| (r.num_computed_tokens as usize) < r.num_prompt_tokens as usize);
+        let mut deferred: Vec<Request> = Vec::new();
         if preempted_reqs.is_empty() && self.pause_state == PauseState::Unpaused {
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.max_num_running_reqs {
@@ -3717,6 +3737,17 @@ impl SchedulerInterface for Scheduler {
                     && num_new_tokens > self.long_prefill_token_threshold
                 {
                     num_new_tokens = self.long_prefill_token_threshold;
+                }
+
+                // ⭐ THE RIDER LAW (see `prefill_in_flight` above), tested on the
+                // number of tokens this step can actually take — threshold-capped,
+                // then budget-capped: if the whole remainder does not fit, the
+                // candidate is a multi-step prefill and defers (never head-blocking
+                // the riders behind it); if it fits, it runs its entire remainder in
+                // this one step.
+                if prefill_in_flight && num_new_tokens.min(token_budget) < num_new_tokens_raw {
+                    deferred.push(request);
+                    continue;
                 }
 
                 // If chunked prefill is disabled, skip if the request
@@ -3841,6 +3872,12 @@ impl SchedulerInterface for Scheduler {
                     }
                 }
             }
+        }
+        // ⭐ THE DEFERRED GO BACK, at the head and in their popped order — the queue's
+        // FCFS order survives the pass that let smaller riders past them. Every exit
+        // from the loop above (budget gone, slots gone, allocation failed) lands here.
+        for request in deferred.into_iter().rev() {
+            self.waiting.prepend_request(request);
         }
 
         // ---------------------------------------------------------------
@@ -7301,6 +7338,150 @@ mod tests {
         );
     }
 
+    /// The conc-10300 card cell, replayed on the tracker alone: 16 distinct
+    /// ~10.3k-token prompts, conc 4, a pool of 1023 blocks of 128 slots, two
+    /// bench reps of the same dataset in the same order, each rep preceded by
+    /// two warmup requests of prompt 0. The working set (16 × 81 prompt
+    /// blocks + decode tails = 1328 blocks) exceeds the pool by ~27 groups,
+    /// and rep 2 re-requests the prompts in the same order rep 1 freed them.
+    ///
+    /// This test pins what the LRU law itself does there — NOT what any
+    /// particular cell wants. Retention is real (freed hash mappings survive
+    /// until their block is popped), but a cyclic re-request over a pool
+    /// smaller than the working set is LRU's worst case: every rep-2
+    /// admission that misses allocates ~83 fresh blocks from the free-queue
+    /// FRONT, which is the next-to-be-re-requested prompt's cache, so the
+    /// eviction pointer runs a few requests ahead of the request pointer and
+    /// the median re-request finds its blocks freshly evicted. The only
+    /// rep-2 hit is prompt 0 via its own re-warmup. That is exactly what the
+    /// card showed (18 s median TTFT, 1 full hit in rep 2), i.e. the card's
+    /// zero-retention-under-pressure is this law, not a defect line. Fixing
+    /// the cell takes capacity (fp8 KV halves the working set below the
+    /// pool), not a scheduler change.
+    #[test]
+    fn test_prefix_cache_cyclic_rerequest_is_lru_worst_case() {
+        const BLOCK: usize = 128;
+        const POOL: usize = 1023;
+        const NUM_PROMPTS: usize = 16;
+        const PROMPT_TOKENS: usize = 10_299;
+        const DECODE_TOKENS: usize = 256;
+        const CONCURRENCY: usize = 4;
+
+        let prompt_of = |k: usize| -> Vec<u32> {
+            (0..PROMPT_TOKENS)
+                .map(|i| (k as u64 * 100_003 + i as u64) as u32)
+                .collect()
+        };
+
+        let mut tracker =
+            SimpleBlockTracker::with_spans_config(POOL, kbt(BLOCK), spans_config_enabled());
+
+        // One request lifetime: admission lookup (returns the hit), prompt
+        // allocation, decode allocation, seal, and — if the concurrency slot
+        // is needed — freeing the OLDEST running request first (the card
+        // admits a new prompt only as an old one finishes).
+        let mut running: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let serve = |tracker: &mut SimpleBlockTracker,
+                     running: &mut std::collections::VecDeque<String>,
+                     id: &str,
+                     prompt: Vec<u32>|
+         -> usize {
+            let mut req = Request::new(
+                id.into(),
+                prompt,
+                SamplingParams {
+                    max_tokens: Some(DECODE_TOKENS as u32),
+                    ..Default::default()
+                },
+                1.0,
+                0,
+                0,
+                None,
+            );
+            let (cached, matched) = tracker.get_computed_blocks(&req);
+            let hit_blocks = matched[0].len();
+            req.num_computed_tokens = cached;
+            let prompt_new = PROMPT_TOKENS.saturating_sub(cached as usize);
+            tracker
+                .allocate_slots(&req, prompt_new, 0, &matched)
+                .expect("pool must fit one request");
+            // Decode: 256 tokens appended past the prompt.
+            req.append_output_token_ids(&(0..DECODE_TOKENS as u32).collect::<Vec<_>>());
+            req.num_computed_tokens = PROMPT_TOKENS as u32;
+            tracker
+                .allocate_slots(&req, DECODE_TOKENS, 0, &[])
+                .expect("decode tail must fit");
+            tracker.seal(&req);
+            if running.len() >= CONCURRENCY {
+                let oldest = running
+                    .pop_front()
+                    .expect("full concurrency implies a runner");
+                tracker.free(&oldest);
+            }
+            running.push_back(id.to_string());
+            hit_blocks
+        };
+
+        // Rep 1: two warmups of prompt 0 (the second shares the first's
+        // in-flight blocks), then the 16 prompts, each admitted as the
+        // oldest of the 4 runners finishes.
+        let warm0 = serve(&mut tracker, &mut running, "w1", prompt_of(0));
+        let warm1 = serve(&mut tracker, &mut running, "w2", prompt_of(0));
+        assert_eq!(warm0, 0, "cold warmup misses");
+        assert_eq!(
+            warm1,
+            PROMPT_TOKENS / BLOCK,
+            "second warmup shares the first's in-flight prompt blocks"
+        );
+        for k in 0..NUM_PROMPTS {
+            let hits = serve(&mut tracker, &mut running, &format!("r1-{k}"), prompt_of(k));
+            let expected = if k == 0 {
+                // Prompt 0's blocks are still cached: rep 1's requests so far
+                // have only drawn virgin blocks from the front of the queue.
+                PROMPT_TOKENS / BLOCK
+            } else {
+                0
+            };
+            assert_eq!(
+                hits, expected,
+                "rep-1 prompt {k}: distinct prompts cannot hit"
+            );
+        }
+        while let Some(id) = running.pop_front() {
+            tracker.free(&id);
+        }
+
+        // Rep 2: same two warmups, then the same 16 prompts in the same
+        // order. The freed-queue holds rep 1's caches in free order — the
+        // SAME order rep 2 re-requests them in.
+        let warm2 = serve(&mut tracker, &mut running, "w3", prompt_of(0));
+        assert_eq!(
+            warm2, 0,
+            "prompt 0's rep-1 blocks were evicted during rep 1's tail: \
+             the pool fits only ~12 of the 16 prompt groups"
+        );
+        let warm3 = serve(&mut tracker, &mut running, "w4", prompt_of(0));
+        assert_eq!(warm3, PROMPT_TOKENS / BLOCK, "warmup 4 shares warmup 3");
+
+        let mut rep2_hits = 0;
+        for k in 0..NUM_PROMPTS {
+            let hits = serve(&mut tracker, &mut running, &format!("r2-{k}"), prompt_of(k));
+            if hits > 0 {
+                rep2_hits += 1;
+            }
+        }
+        // The LRU law's own verdict on a cyclic re-request whose working set
+        // exceeds the pool: the eviction pointer (front of the freed queue =
+        // earliest-freed group = the next re-requested prompt) runs ahead of
+        // the request pointer, so only a prompt whose blocks were re-written
+        // moments before (prompt 0, via rep 2's own warmups) can hit.
+        assert_eq!(
+            rep2_hits, 1,
+            "cyclic re-request over an over-small pool is LRU's worst case: \
+             exactly the prompt re-warmed within the rep hits"
+        );
+    }
+
     #[test]
     fn test_volatile_evicts_before_normal() {
         // Volatile blocks go to the front of the free queue (evicted first).
@@ -7698,9 +7879,15 @@ mod tests {
         let shared = run_317_cell(HybridKvStores::Shared, false, 27_000, CELL_4096_512);
         let apart = run_317_cell(HybridKvStores::GlobalApart, false, 27_000, CELL_4096_512);
         assert_eq!(apart.global_reach, 8 * (4096 + 512usize).div_ceil(32));
+        // `shared.global_reach` tracks how deep the interleave of concurrently
+        // prefilling requests runs; the rider law (a multi-step prefill defers while
+        // another prompt is still computing) admits fewer of them per step, so the
+        // interleave is one prompt shallower than the pre-law 3153 — the property
+        // under test (shared interleaves past the global group's own peak, apart
+        // does not) is unchanged.
         assert_eq!(
             (shared.global_reach, shared.pool_reach, apart.pool_reach),
-            (3153, 4376, 3240)
+            (3135, 4376, 3240)
         );
     }
 

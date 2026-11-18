@@ -249,6 +249,16 @@ pub struct BundleLayout<'a> {
     /// coordinate rather than another segment (there is no free segment slot: 0/3 are
     /// intermediates+activations, 2 is KV, 4 logits, 5+6 intermediate COLORS).
     pub weight_bank_bytes: Cow<'a, [u64]>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS, same law as [`Self::weight_bank_bytes`]: bytes of banks
+    /// `1..N`, so bank `b`'s extent is `kv_bank_bytes[b - 1]` and bank 0's is
+    /// `segment_bytes[SEG_KV]`. EMPTY for every bundle whose pools fit one device region — the
+    /// single-region case every model was before KV banking, byte-identical in layout and in
+    /// every runtime path. The pool outgrows one region exactly when the model's whole context
+    /// of every layer's K and V does (granite-3.1-8b fp16: 131072 positions × 163840 B = 20 GiB);
+    /// the banks then hold it at LAYER boundaries, which is the one boundary a launch can split
+    /// on (a launch has ONE base per segment). See [`Placement::bank`] — a bank is a coordinate,
+    /// not another segment, because segments 5+6 are intermediate COLORS a pool may not share.
+    pub kv_bank_bytes: Cow<'a, [u64]>,
     /// ⭐ WHERE THE NON-PER-LAYER WEIGHT TAIL LIVES — the bake's verdict, not the runtime's inference.
     /// [`WeightTail::Spilled`] is the work list every borrowing session's tail copy reads; see
     /// [`WeightTail`] for why this is a field.
@@ -345,6 +355,22 @@ impl<'a> BundleLayout<'a> {
         match b.checked_sub(1) {
             None => self.segment_bytes.get(weight_seg).copied(),
             Some(i) => self.weight_bank_bytes.get(i).copied(),
+        }
+    }
+
+    /// How many BANKS the KV segment occupies — always ≥ 1, exactly 1 for every bundle whose
+    /// pools fit one device region. Derived from [`Self::kv_bank_bytes`] so the count and the
+    /// extents cannot disagree.
+    pub fn kv_banks(&self) -> usize {
+        1 + self.kv_bank_bytes.len()
+    }
+
+    /// Bank `b`'s extent in bytes: bank 0 is the KV segment's own total, the rest come from
+    /// [`Self::kv_bank_bytes`]. `None` for a bank this bundle does not have.
+    pub fn kv_bank_extent(&self, b: usize, kv_seg: usize) -> Option<u64> {
+        match b.checked_sub(1) {
+            None => self.segment_bytes.get(kv_seg).copied(),
+            Some(i) => self.kv_bank_bytes.get(i).copied(),
         }
     }
 
@@ -737,12 +763,14 @@ pub struct LadderRung<'a> {
 /// entry per layer, in the order the layers actually execute, each naming its body (an index into
 /// [`RerollMeta::bodies`]) and its class-relative iteration.
 ///
-/// ⛔ THE OFFSETS ARE THE PLACEMENTS', DISTILLED. `w_off`/`w_bank`/`kv_off` are the per-segment shifts
-/// the launch applies: `(w_bank, w_off + placement(t₀).offset)` must equal `placement(t_v)` for every
-/// per-layer weight `t` of the body's class — a relation the lowering PROVES at cargo-build for every
-/// tensor and every layer, so the runtime never re-derives an address from a stride. This is what
-/// makes a per-class stride, a class-major KV base and a weight BANK all the same thing at launch
-/// time: three columns of one table instead of three formulae that could disagree with the layout.
+/// ⛔ THE OFFSETS ARE THE PLACEMENTS', DISTILLED. `w_off`/`w_bank`/`kv_off`/`kv_bank` are the
+/// per-segment shifts the launch applies: `(w_bank, w_off + placement(t₀).offset)` must equal
+/// `placement(t_v)` for every per-layer weight `t` of the body's class, and
+/// `(kv_bank, kv_off + placement(t₀).offset)` the same for every per-layer KV tensor — a relation
+/// the lowering PROVES at cargo-build for every tensor and every layer, so the runtime never
+/// re-derives an address from a stride. This is what makes a per-class stride, a class-major KV
+/// base and a weight or KV BANK all the same thing at launch time: columns of one table instead
+/// of formulae that could disagree with the layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayerLaunch {
     /// Which body (index into [`RerollMeta::bodies`]) runs this layer.
@@ -753,7 +781,9 @@ pub struct LayerLaunch {
     pub w_bank: u8,
     /// The weight-segment offset shift (from the body's baked layer-0 offsets).
     pub w_off: u64,
-    /// The KV-segment offset shift.
+    /// The KV-segment bank this layer's pools live in.
+    pub kv_bank: u8,
+    /// The KV-segment offset shift (from the body's baked layer-0 offsets).
     pub kv_off: u64,
 }
 
@@ -1130,6 +1160,7 @@ mod tests {
                 iter: 0,
                 w_bank: 0,
                 w_off: 0,
+                kv_bank: 0,
                 kv_off: 0,
             }]),
             kv_page_stride: 786432,

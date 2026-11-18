@@ -118,9 +118,10 @@ impl SpyreWorker {
             seating: None,
             input_batch: scratchy_serving_engine::input_batch::InputBatch::new(),
             declared_context: None,
-            // Matches the CLI's own `--gpu-memory-utilization` default; `declare_workload` overwrites
-            // it with what the run actually asked for.
-            gpu_memory_utilization: 0.9,
+            // The capacity law's own default — the same fraction the bake sized the pool at, so a
+            // run that names nothing is checked against the budget the pool was baked to fill.
+            // `declare_workload` overwrites it with what the run actually asked for.
+            gpu_memory_utilization: scratchy_target_spyre::pool_law::DEFAULT_GPU_MEMORY_UTILIZATION,
         }
     }
 
