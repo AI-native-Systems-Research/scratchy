@@ -3,7 +3,9 @@
 //! a host-staged row source. Here, beneath every crate that names them (`scratchy-ir`,
 //! `scratchy-subtile`, the macros crate), so the macros crate's build script, which compiles the
 //! crate's front end by path, reaches them without the rest of the compiler. Each crate that used to
-//! define one re-exports it at its old path: one type each.
+//! define one re-exports it at its old path: one type each. A state op's identity and the counts
+//! its declaration states ([`Arity`], [`OutputCount`]) live here too, so the front end that
+//! classifies a call and the subtile op that carries the op's facts read the same types.
 
 /// A weight tensor's identity in the model's weight table. The same id spans every layer;
 /// [`UnrollIndex`] picks which one.
@@ -85,6 +87,37 @@ static_name!(
     /// A decoder state's name, as its diagnostics print it.
     StateName
 );
+
+/// The number of arguments an op takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Arity(u8);
+
+impl Arity {
+    pub const fn new(args: u8) -> Self {
+        Self(args)
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// The number of values an op produces: at least one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OutputCount(std::num::NonZeroU8);
+
+impl OutputCount {
+    /// An op that produces one value.
+    pub const ONE: Self = Self(std::num::NonZeroU8::MIN);
+
+    pub const fn new(outputs: std::num::NonZeroU8) -> Self {
+        Self(outputs)
+    }
+
+    pub const fn get(self) -> std::num::NonZeroU8 {
+        self.0
+    }
+}
 
 /// A state op's identity: its decoder state and its name, the pair that tells it from every other op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

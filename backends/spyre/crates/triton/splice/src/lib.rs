@@ -473,6 +473,11 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             "a DFlash2 drafter's op (or its target's capture): its kernels are Splash's, \
              lowered on the GPU target alone — a spyre drafter needs its kernels first",
         ),
+        // A state op's kernel is its decoder state's own; the caller's message names the op and its
+        // decoder state off the node.
+        SubOp::State(_) => TritonKernelRow::Refused(
+            "a state op: its decoder state declares no Triton kernel, so the splice has none to compile",
+        ),
     }
 }
 

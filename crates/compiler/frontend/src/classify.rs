@@ -584,7 +584,7 @@ impl Ctx<'_> {
             (Some(kind), _) => kind,
             (None, Some(state)) => {
                 let got = SourceCount::of(args.len());
-                if !state.arity().admits(got) {
+                if !got.admitted_by(state.arity()) {
                     return Err(ClassifyError::StateOpArity {
                         op: state.name(),
                         expected: state.arity(),
@@ -592,7 +592,7 @@ impl Ctx<'_> {
                         at,
                     });
                 }
-                if !state.outputs().bound_by(binds) {
+                if !binds.binds(state.outputs()) {
                     return Err(ClassifyError::StateOpOutputs {
                         op: state.name(),
                         expected: state.outputs(),

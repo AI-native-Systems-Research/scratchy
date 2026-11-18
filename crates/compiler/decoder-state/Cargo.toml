@@ -13,3 +13,5 @@ publish = false
 scratchy-forward-compiler-frontend = { path = "../frontend" }
 # The shapes a carrier's typed program records (`Typing::traced`).
 scratchy-typed-shapes = { workspace = true }
+# The facts a decoder state's ops carry into the subtile IR (`DecoderState::subtile`).
+scratchy-subtile = { path = "../subtile" }

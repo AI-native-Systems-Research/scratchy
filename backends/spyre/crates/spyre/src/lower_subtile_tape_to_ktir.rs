@@ -940,6 +940,12 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::KvAppend { .. }
         | SubOp::ExpertAct { .. }
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // A state op's kernel is its decoder state's own.
+        SubOp::State(op) => Unhandled(format!(
+            "decoder state {} op {} has no SuperDSC kernel: its decoder state declares none",
+            op.id().state(),
+            op.id().name()
+        )),
         // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
         // pipeline sends this rank's operand fragment into every peer's window and waits for every
         // peer's before the consume launches (`bundle::collective::cb_pipeline`). What IS a program

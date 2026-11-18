@@ -3,23 +3,38 @@
 //! decoder state contributes from its own crate, and the typing ([`Typing`]) the build that compiles the
 //! models hands the forward compiler, which lists those handles.
 
-use scratchy_forward_compiler_frontend::state::StateVocabulary;
+use scratchy_forward_compiler_frontend::state::{OpName, StateVocabulary};
+use scratchy_subtile::state_op::StateOpFacts;
 use scratchy_typed_shapes::Shapes;
 
-/// One decoder state, as the build lists it: its DSL vocabulary.
+/// One decoder state, as the build lists it: its DSL vocabulary, and the facts its ops carry
+/// into the subtile IR.
 #[derive(Clone, Copy)]
 pub struct DecoderState {
     vocabulary: &'static dyn StateVocabulary,
+    subtile: fn(OpName) -> Option<&'static StateOpFacts>,
 }
 
 impl DecoderState {
-    pub const fn new(vocabulary: &'static dyn StateVocabulary) -> Self {
-        Self { vocabulary }
+    pub const fn new(
+        vocabulary: &'static dyn StateVocabulary,
+        subtile: fn(OpName) -> Option<&'static StateOpFacts>,
+    ) -> Self {
+        Self {
+            vocabulary,
+            subtile,
+        }
     }
 
     /// The ops and state inputs the decoder state adds to the core vocabulary.
     pub const fn vocabulary(self) -> &'static dyn StateVocabulary {
         self.vocabulary
+    }
+
+    /// The subtile facts of the decoder state's op named by its argument, `None` for a name the decoder state
+    /// states no facts for.
+    pub const fn subtile(self) -> fn(OpName) -> Option<&'static StateOpFacts> {
+        self.subtile
     }
 }
 

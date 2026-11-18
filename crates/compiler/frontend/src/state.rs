@@ -10,7 +10,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::num::NonZeroU8;
 
 use crate::classified::{ExternKind, OpKind};
 use crate::classify::ClassifyError;
@@ -25,54 +24,15 @@ pub trait StateVocabulary: Sync {
     fn signatures(&self) -> SignaturePath;
 }
 
-pub use scratchy_tensors::compiler_ids::{InputName, OpName, StateInputId, StateName, StateOpId};
+pub use scratchy_tensors::compiler_ids::{
+    Arity, InputName, OpName, OutputCount, StateInputId, StateName, StateOpId,
+};
 use scratchy_tensors::static_name;
 
 static_name!(
     /// A Rust module path (`crate::module`).
     SignaturePath
 );
-
-/// The number of arguments an op takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Arity(u8);
-
-impl Arity {
-    pub const fn new(args: u8) -> Self {
-        Self(args)
-    }
-
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-
-    /// Whether a call passing `args` arguments matches this arity.
-    pub fn admits(self, args: SourceCount) -> bool {
-        usize::from(self.0) == args.0
-    }
-}
-
-/// The number of values an op produces: at least one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OutputCount(NonZeroU8);
-
-impl OutputCount {
-    /// An op that produces one value.
-    pub const ONE: Self = Self(NonZeroU8::MIN);
-
-    pub const fn new(outputs: NonZeroU8) -> Self {
-        Self(outputs)
-    }
-
-    pub const fn get(self) -> NonZeroU8 {
-        self.0
-    }
-
-    /// Whether an assignment binding `targets` names binds every output.
-    pub fn bound_by(self, targets: SourceCount) -> bool {
-        usize::from(self.0.get()) == targets.0
-    }
-}
 
 /// A count read off a carrier: the arguments a call passes, or the names an assignment binds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -88,6 +48,16 @@ impl SourceCount {
 
     pub fn get(self) -> usize {
         self.0
+    }
+
+    /// Whether a call passing this many arguments matches `arity`.
+    pub fn admitted_by(self, arity: Arity) -> bool {
+        usize::from(arity.get()) == self.0
+    }
+
+    /// Whether an assignment binding this many names binds every one of `outputs`.
+    pub fn binds(self, outputs: OutputCount) -> bool {
+        usize::from(outputs.get().get()) == self.0
     }
 }
 

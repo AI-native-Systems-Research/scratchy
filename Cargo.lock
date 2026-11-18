@@ -3064,6 +3064,7 @@ name = "scratchy-decoder-state"
 version = "0.1.0"
 dependencies = [
  "scratchy-forward-compiler-frontend",
+ "scratchy-subtile",
  "scratchy-typed-shapes",
 ]
 
