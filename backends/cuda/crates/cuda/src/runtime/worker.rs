@@ -38,15 +38,16 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, DecodeSplit, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16,
-    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpGemmFp8,
-    ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
-    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16,
-    GatherLastRowBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16,
-    RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
-    attn_decode_scratch_bytes, attn_decode_split, fp8_moe_layout, fp8_weight,
-    gdn_scan_is_recurrent, gemv_splits, norm_row_takes,
+    ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnDecodeBf16,
+    AttnDecodeSplit, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16,
+    ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16,
+    ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
+    GateSplitBf16, GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16,
+    GdnScan, GemmBf16, GemvBf16, GemvGroupBf16, GemvSplit, GroupMember, LayerScaleBf16,
+    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows,
+    QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_split_scratch_bytes,
+    fp8_moe_layout, fp8_weight,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -1542,14 +1543,18 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = 'launch: {
                 match *s {
-                    CudaStep::GemvFp8(GemmBf16 {
-                        a,
-                        b,
-                        c,
-                        n,
-                        k,
-                        residual,
-                        ..
+                    CudaStep::GemvFp8(GemvBf16 {
+                        gemm:
+                            GemmBf16 {
+                                a,
+                                b,
+                                c,
+                                n,
+                                k,
+                                residual,
+                                ..
+                            },
+                        split,
                     }) => {
                         let b = Self::fp8_weight(weights, b, n, k);
                         // SAFETY: as the `Gemv` arm's, for `a` (`k` bf16, which the kernel quantizes
@@ -1561,13 +1566,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::gemv_fp8_residual(
                                 (slot(a).cast_const(), b, slot(c)),
                                 partials,
-                                (n, k, gemv_splits(n, k, 1)),
+                                (n, k, split.splits),
                                 residual.map_or(std::ptr::null(), |r| slot(r).cast_const()),
                                 stream.0,
                             )
                         }
                     }
-                    CudaStep::GemvGroupFp8(g) => {
+                    CudaStep::GemvGroupFp8(gw @ GemvGroupBf16 { group: g, .. }) => {
                         let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
                             .filter_map(|(i, m)| m.map(|m| (i, m)))
                             .collect();
@@ -1575,13 +1580,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             .iter())
                         .map(|(_, m)| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
                         .collect();
-                        let splits: Vec<u32> = (present.iter())
-                            .map(|(_, m)| gemv_splits(m.n, g.k, 1))
-                            .collect();
+                        let splits = Self::member_splits(&gw, &present);
                         // Member `i`'s partials follow the members' before it, as the bf16 group's.
                         let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
                             .map(|(&(i, _), &sp)| {
-                                (g.gemv_scratch_before(i))
+                                (gw.gemv_scratch_before(i))
                                     .filter(|_| sp > 1 && !partials.is_null())
                                     .map_or(std::ptr::null_mut(), |before| {
                                         partials.cast::<u8>().wrapping_add(before as usize).cast()
@@ -1871,17 +1874,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
                         }
                     }
-                    CudaStep::Gemv(GemmBf16 {
-                        a,
-                        b,
-                        c,
-                        n,
-                        k,
-                        residual,
-                        ..
+                    CudaStep::Gemv(GemvBf16 {
+                        gemm:
+                            GemmBf16 {
+                                a,
+                                b,
+                                c,
+                                n,
+                                k,
+                                residual,
+                                ..
+                            },
+                        split,
                     }) => {
                         let b = weights[b.0 as usize].ptr();
-                        let splits = gemv_splits(n, k, 1);
+                        let splits = split.splits;
                         // SAFETY: as above, for `a` (`k`, its `m` is 1: `validate`), `b` (`n*k`) and
                         // `c` (`n`); the scratch is the tape's GEMV scratch, at least this step's
                         // partials' bytes, which no other step touches (`validate`).
@@ -1935,7 +1942,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GemvGroup(g) => {
+                    CudaStep::GemvGroup(gw @ GemvGroupBf16 { group: g, .. }) => {
                         let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
                             .filter_map(|(i, m)| m.map(|m| (i, m)))
                             .collect();
@@ -1944,14 +1951,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n)
                             })
                             .collect();
-                        let splits: Vec<u32> = (present.iter())
-                            .map(|(_, m)| gemv_splits(m.n, g.k, 1))
-                            .collect();
+                        let splits = Self::member_splits(&gw, &present);
                         // Member `i`'s partials follow the members' before it
-                        // (`GemmGroupBf16::gemv_scratch_before`), null at one split.
+                        // (`GemvGroupBf16::gemv_scratch_before`), null at one split.
                         let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
                             .map(|(&(i, _), &sp)| {
-                                (g.gemv_scratch_before(i))
+                                (gw.gemv_scratch_before(i))
                                     .filter(|_| sp > 1 && !partials.is_null())
                                     .map_or(std::ptr::null_mut(), |before| {
                                         partials.cast::<u8>().wrapping_add(before as usize).cast()
@@ -1998,10 +2003,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     hidden,
                                     stream.0,
                                 ),
-                                MatmulKernel::Gemv => kernels::gemv_split_bf16_abt(
+                                MatmulKernel::Gemv(split) => kernels::gemv_split_bf16_abt(
                                     (slot(x), b, slot(logits)),
                                     partials,
-                                    (experts, hidden, gemv_splits(experts, hidden, 1)),
+                                    (experts, hidden, split.splits),
                                     stream.0,
                                 ),
                                 // Gemma's 128-expert router at m ≥ 2, its own projection.
@@ -2079,8 +2084,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::ExpertGateUpGemmFp8(t) => {
                         Self::expert_gate_up_fp8(&t, slot, weights, stream)
                     }
-                    CudaStep::ExpertGemv(g) => {
-                        Self::expert_gemv(&g, slot, partials, weights, stream)
+                    CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, split }) => {
+                        Self::expert_gemv(&g, split, slot, partials, weights, stream)
                     }
                     CudaStep::GateUpAct(g) => {
                         let (gate, up) = (
@@ -2093,21 +2098,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         // (`GateUpActBf16::gemv_scratch`, which `validate` checked).
                         unsafe {
                             match g.kernel {
-                                GateUpKernel::Gemv => kernels::gate_up_gemv_bf16(
+                                GateUpKernel::Gemv(split) => kernels::gate_up_gemv_bf16(
                                     (slot(a), gate, up),
                                     (slot(g.out), partials),
-                                    (n, k, gemv_splits(n, k, 1)),
+                                    (n, k, split.splits),
                                     act,
                                     stream.0,
                                 ),
-                                GateUpKernel::GemvFp8 => kernels::gate_up_gemv_fp8(
+                                GateUpKernel::GemvFp8(split) => kernels::gate_up_gemv_fp8(
                                     (
                                         slot(a).cast_const(),
                                         Self::fp8_weight(weights, g.gate.b, n, k),
                                         Self::fp8_weight(weights, g.up.b, n, k),
                                     ),
                                     (slot(g.out), partials),
-                                    (n, k, gemv_splits(n, k, 1)),
+                                    (n, k, split.splits),
                                     act,
                                     stream.0,
                                 ),
@@ -2136,8 +2141,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             }
                         }
                     }
-                    CudaStep::ExpertGateUpAct(g) => {
-                        Self::expert_gate_up(&g, slot, partials, weights, stream)
+                    CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, split }) => {
+                        Self::expert_gate_up(&g, split, slot, partials, weights, stream)
                     }
                     CudaStep::ExpertCombine(ExpertCombineBf16 {
                         down,
@@ -2179,16 +2184,16 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GatedDeltaNet(g) => {
+                    CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, scan }) => {
                         let pool = gdn.expect("`new` made a pool for a GDN tape");
-                        Self::gated_delta_net(&g, pool, slot, weights, stream)
+                        Self::gated_delta_net(&g, scan, pool, slot, weights, stream)
                     }
                     CudaStep::GdnDecode(g) => {
                         let pool = gdn.expect("`new` made a pool for a GDN tape");
                         Self::gdn_decode(&g, pool, slot, weights, stream)
                     }
                     CudaStep::RmsNorm(norm) | CudaStep::RouterNorm(norm)
-                        if norm_row_takes(norm.rows, norm.cols) =>
+                        if norm.kernel == NormKernel::Row =>
                     {
                         Self::norm_row(norm, (0, norm.x, None, None), None, slot, weights, stream)
                     }
@@ -2228,7 +2233,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::AddRmsNorm(f) if norm_row_takes(f.norm.rows, f.norm.cols) => {
+                    CudaStep::AddRmsNorm(f) if f.norm.kernel == NormKernel::Row => {
                         let add = (1, f.a, Some(f.b), Some(f.sum));
                         Self::norm_row(f.norm, add, None, slot, weights, stream)
                     }
@@ -2249,7 +2254,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::NormAdd(NormAddBf16 { norm: n, residual })
-                        if norm_row_takes(n.rows, n.cols) =>
+                        if n.kernel == NormKernel::Row =>
                     {
                         Self::norm_row(
                             n,
@@ -2518,31 +2523,33 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::AttnDecode(
-                        attn @ AttnPrefillBf16 {
-                            q,
-                            block_table,
-                            sequence,
-                            out,
-                            layer,
-                            q_heads,
-                            kv_heads,
-                            head_dim,
-                            window,
-                            ..
-                        },
-                    ) => {
+                    CudaStep::AttnDecode(AttnDecodeBf16 {
+                        attn:
+                            attn @ AttnPrefillBf16 {
+                                q,
+                                block_table,
+                                sequence,
+                                out,
+                                layer,
+                                q_heads,
+                                kv_heads,
+                                head_dim,
+                                window,
+                                ..
+                            },
+                        split: stored,
+                    }) => {
                         let pool = kv.expect("`new` made a pool for a KV tape");
                         let l = layer as usize;
                         let layout = pool.layer_layout(l);
-                        // The split over keys (W6b): the head dim's `(splits, min_tiles)`, its
+                        // The split over keys (W6b): the step's `(splits, min_tiles)`, its
                         // partials in the tape's split scratch, rows then maxima and sums.
-                        let (Some((splits, min_tiles)), Some((rows_bytes, _))) = (
-                            attn_decode_split(head_dim),
-                            attn_decode_scratch_bytes(kv_heads, head_dim),
-                        ) else {
-                            // No decode attention kernel at another head dim: refused, nothing
-                            // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                        let AttnDecodeSplit { splits, min_tiles } = stored;
+                        let Some((rows_bytes, _)) =
+                            attn_decode_split_scratch_bytes(splits, kv_heads, head_dim)
+                        else {
+                            // The scratch overflows u64: refused, nothing launched (`validate`
+                            // already refuses it, `CudaStep::gemv_scratch`).
                             let error = KernelError::AttnDecodeShape {
                                 q_heads,
                                 kv_heads,
@@ -2863,8 +2870,16 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         }
     }
 
+    /// The stored K split of each of a GEMV group's present members (`present`, in member order).
+    fn member_splits(g: &GemvGroupBf16, present: &[(usize, GroupMember)]) -> Vec<u32> {
+        (present.iter())
+            .map(|&(i, _)| g.splits()[i].map_or(1, |s| s.splits))
+            .collect()
+    }
+
     fn gated_delta_net(
         g: &GatedDeltaNetBf16,
+        scan: GdnScan,
         pool: &GdnPool,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
         weights: &[DeviceBuffer],
@@ -2924,9 +2939,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             // A prefill bucket's step scans 64 tokens a chunk (FP8 S8 F6a); a one-row bucket's (a
             // decode `GdnDecode` does not take) by the recurrent scan (`gdn_scan_is_recurrent`).
             // The two take the same contract.
-            let scan = match gdn_scan_is_recurrent(g.rows) {
-                true => kernels::gdn_scan,
-                false => kernels::gdn_chunk_scan,
+            let scan = match scan {
+                GdnScan::Recurrent => kernels::gdn_scan,
+                GdnScan::Chunked => kernels::gdn_chunk_scan,
             };
             scan(
                 (conv_out.cast_const(), gate.cast_const(), beta.cast_const()),
@@ -3348,13 +3363,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     /// part of the bundle or bank, its partials in the tape's GEMV scratch `partials`.
     fn expert_gemv(
         g: &ExpertGemvBf16,
+        split: GemvSplit,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
         partials: *mut c_void,
         weights: &[DeviceBuffer],
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        let splits = gemv_splits(n, k, g.m.saturating_mul(g.top_k));
+        let splits = split.splits;
         if matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) {
             let Some((b, expert_rows)) = Self::fp8_expert_slab(
                 weights,
@@ -3411,6 +3427,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     /// and the up's [`Self::expert_slab`]s of one bundle, at the split each would take on its own.
     fn expert_gate_up(
         g: &ExpertGateUpActBf16,
+        split: GemvSplit,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
         partials: *mut c_void,
         weights: &[DeviceBuffer],
@@ -3422,7 +3439,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             kernel: "expert_gate_up_gemv_bf16",
             dims: [pairs, n, k, 0],
         };
-        let splits = gemv_splits(n, k, pairs);
+        let splits = split.splits;
         if matches!(g.gate.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) {
             let slab = |e: &ExpertGemvBf16| {
                 Self::fp8_expert_slab(

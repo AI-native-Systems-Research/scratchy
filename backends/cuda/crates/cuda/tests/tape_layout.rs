@@ -41,7 +41,10 @@ use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
 use scratchy_subtile::subtile_tape::Instr;
-use scratchy_target_cuda::step::{CudaStep, GemmBf16, GemmGroupBf16, RopeAppendBf16};
+use scratchy_target_cuda::step::{
+    AttnDecodeBf16, CudaStep, ExpertGateUpGemvBf16, ExpertGemvSplitBf16, GemmBf16, GemmGroupBf16,
+    GemvBf16, GemvGroupBf16, RopeAppendBf16,
+};
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput, WeightIx,
 };
@@ -172,12 +175,15 @@ fn a_decode_gemm_lowers_to_the_gemv() {
         .expect("a one-row GEMM lowers");
     assert!(matches!(
         c.steps.as_slice(),
-        [CudaStep::Gemv(GemmBf16 {
-            a: ArenaOffset(0),
-            b: WeightIx(1),
-            m: 1,
-            n: 2048,
-            k: 2048,
+        [CudaStep::Gemv(GemvBf16 {
+            gemm: GemmBf16 {
+                a: ArenaOffset(0),
+                b: WeightIx(1),
+                m: 1,
+                n: 2048,
+                k: 2048,
+                ..
+            },
             ..
         })]
     ));
@@ -1451,7 +1457,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     let c = lower_with(&attn_layer(1), QWEN3_5_FACTS).expect("the attention layer lowers at m = 1");
     let attn: Vec<_> = (c.steps.iter())
         .filter_map(|s| match s {
-            CudaStep::AttnDecode(a) => Some(*a),
+            CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => Some(*a),
             CudaStep::AttnPrefill(_) => panic!("a one-row attention on the prefill kernel"),
             _ => None,
         })
@@ -1484,12 +1490,22 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
         ]
     ));
     assert!(
-        matches!(c.steps[1], CudaStep::GemvGroup(GemmGroupBf16 { m: 1, .. })),
+        matches!(
+            c.steps[1],
+            CudaStep::GemvGroup(GemvGroupBf16 {
+                group: GemmGroupBf16 { m: 1, .. },
+                ..
+            })
+        ),
         "step 1: {:?}",
         c.steps[1]
     );
     assert!(
-        matches!(c.steps[8], CudaStep::Gemv(GemmBf16 { m: 1, residual, .. }) if residual.is_some()),
+        matches!(
+            c.steps[8],
+            CudaStep::Gemv(GemvBf16 { gemm: GemmBf16 { m: 1, residual, .. }, .. })
+                if residual.is_some()
+        ),
         "step 8: {:?}",
         c.steps[8]
     );
@@ -2383,12 +2399,12 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     assert_eq!((r.renorm, r.expert_scale), (false, Some(WeightIx(3))));
                 }
                 CudaStep::GeluMul(_) => gelus += 1,
-                CudaStep::ExpertGemv(g) => {
+                CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => {
                     experts += 1;
                     assert_eq!(g.weight, MoeWeight::Own, "m={m}");
                 }
                 // At one row the gate and up GEMVs and the GeGLU are one launch (#1049).
-                CudaStep::ExpertGateUpAct(g) => {
+                CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, .. }) => {
                     gelus += 1;
                     experts += 2;
                     assert_eq!(g.act, scratchy_target_cuda::step::GatedOp::Gelu, "m={m}");
@@ -2627,7 +2643,7 @@ fn a_sliding_layer_lowers_with_its_class() {
             match *step {
                 CudaStep::Rope(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
                 CudaStep::RopeAppend(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
-                CudaStep::AttnPrefill(a) | CudaStep::AttnDecode(a) => {
+                CudaStep::AttnPrefill(a) | CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => {
                     assert_eq!(a.window, Some(1024), "m={m}")
                 }
                 _ => {}

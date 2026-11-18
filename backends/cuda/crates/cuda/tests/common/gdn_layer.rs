@@ -36,8 +36,8 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GatedDeltaNetBf16, GemmBf16, GemmGroupBf16, GroupMember, RmsNormBf16,
-    gdn_bundle,
+    AddBf16, CudaStep, GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemmGroupBf16, GroupMember,
+    NormKernel, RmsNormBf16, gdn_bundle,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
@@ -180,6 +180,7 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
         cols: H,
         eps_bits: EPS.to_bits(),
         convention: GainConvention::OnePlusScale,
+        kernel: NormKernel::of(rows, H),
     })
 }
 
@@ -283,12 +284,12 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
             [(2, 524288, CONV_DIM), (3, 2097152, VALUE_DIM)],
         )),
         CudaStep::GemmNarrowGroup(group(262144, 128, [(4, 2621440, NV), (5, 2625536, NV)])),
-        CudaStep::GatedDeltaNet(gdn_step(
+        CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
             (524288, 2097152, 2621440, 2625536),
             2629632,
             (3416064, 3416320),
             128,
-        )),
+        ))),
         CudaStep::Gemm(gemm(2629632, 7, 262144, (128, H, VALUE_DIM))),
         add(262144, 0, 3153920, 128),
     ],
@@ -327,12 +328,12 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
             [(2, 1048576, CONV_DIM), (3, 4194304, VALUE_DIM)],
         )),
         CudaStep::GemmNarrowGroup(group(524288, 256, [(4, 5242880, NV), (5, 5251072, NV)])),
-        CudaStep::GatedDeltaNet(gdn_step(
+        CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
             (1048576, 4194304, 5242880, 5251072),
             5259264,
             (6832128, 6832384),
             256,
-        )),
+        ))),
         CudaStep::Gemm(gemm(5259264, 7, 524288, (256, H, VALUE_DIM))),
         add(524288, 0, 6307840, 256),
     ],

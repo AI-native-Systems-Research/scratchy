@@ -25,18 +25,19 @@ use scratchy_subtile::tape_folding::{FusedShape, Fusion, StepRole, TapeFolds};
 use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
-    ATTN_WINDOW_MULTIPLE, AddBf16, AddRmsNormBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS,
-    EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
-    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GATHER_LAST_ROW_BF16_COLS,
-    GDN_CONV_KERNEL_RANGE, GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
-    GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N,
-    GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
-    GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp,
-    GatherLastRowBf16, GemmBf16, GemmGroupBf16, GroupKind, GroupMember, HeadNorms, LayerScaleBf16,
-    MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows,
-    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
-    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16,
+    ATTN_WINDOW_MULTIPLE, AddBf16, AddRmsNormBf16, AttnDecodeBf16, AttnPrefillBf16, CudaStep,
+    EMBED_BF16_COLS, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpGemvBf16,
+    ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16,
+    GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
+    GATE_SPLIT_BF16_HEAD_MULTIPLE, GATHER_LAST_ROW_BF16_COLS, GDN_CONV_KERNEL_RANGE,
+    GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
+    GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
+    GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GatherLastRowBf16, GdnPrefillBf16,
+    GemmBf16, GemmGroupBf16, GemvBf16, GemvSplit, GroupKind, GroupMember, HeadNorms,
+    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16,
+    NormKernel, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16,
     SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
@@ -139,7 +140,7 @@ pub fn lower_step(
         // decode kernel takes its geometry; else, and at every prefill bucket, the four.
         L::GatedDeltaNet => gated_delta_net(cx, s).map(|g| match cx.tokens {
             Some(1) if gdn_decode_takes(&g) => CudaStep::GdnDecode(g),
-            Some(_) | None => CudaStep::GatedDeltaNet(g),
+            Some(_) | None => CudaStep::GatedDeltaNet(GdnPrefillBf16::of(g)),
         }),
         L::RouterLogits { experts, router } => {
             router_logits(cx, s, experts.get(), *router, computes).map(CudaStep::RouterLogits)
@@ -514,10 +515,12 @@ fn gate_up_act(
     let kernel = |g: &TapeStep<'_>| match lower_step(cx, g, computes)? {
         Some(CudaStep::Gemm(g)) => Ok((GateUpKernel::Gemm, g)),
         Some(CudaStep::GemmCol64(g)) => Ok((GateUpKernel::GemmCol64, g)),
-        Some(CudaStep::Gemv(g)) => Ok((GateUpKernel::Gemv, g)),
+        Some(CudaStep::Gemv(GemvBf16 { gemm: g, split })) => Ok((GateUpKernel::Gemv(split), g)),
         Some(CudaStep::GemmFp8(g)) => Ok((GateUpKernel::GemmFp8, g)),
         Some(CudaStep::GemmCol64Fp8(g)) => Ok((GateUpKernel::GemmCol64Fp8, g)),
-        Some(CudaStep::GemvFp8(g)) => Ok((GateUpKernel::GemvFp8, g)),
+        Some(CudaStep::GemvFp8(GemvBf16 { gemm: g, split })) => {
+            Ok((GateUpKernel::GemvFp8(split), g))
+        }
         Some(_) | None => Err(refused()),
     };
     let (gk, gate) = kernel(absorbed_step(s, gate, computes)?)?;
@@ -556,7 +559,7 @@ fn expert_gate_up_act(
         Some(_) | None => return Err(refused()),
     };
     let gemv = |g: &TapeStep<'_>| match lower_step(cx, g, computes)? {
-        Some(CudaStep::ExpertGemv(g)) => Ok(g),
+        Some(CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. })) => Ok(g),
         Some(_) | None => Err(refused()),
     };
     let gate = gemv(absorbed_step(s, gate, computes)?)?;
@@ -589,12 +592,14 @@ fn expert_gate_up_act(
     if !projections || pair(&gate) != pair(&up) || (mul.gate, mul.up) != (gate.c, up.c) {
         return Err(refused());
     }
-    Ok(CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
-        gate,
-        up,
-        out: mul.out,
-        act,
-    }))
+    Ok(CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16::of(
+        ExpertGateUpActBf16 {
+            gate,
+            up,
+            out: mul.out,
+            act,
+        },
+    )))
 }
 
 /// The `AddRmsNorm` fold (#1049): the driving `RmsNorm` and the `Add` its shape names, each
@@ -882,6 +887,7 @@ fn rms_norm(
         cols,
         eps_bits: eps.to_bits(),
         convention,
+        kernel: NormKernel::of(rows, cols),
     })
 }
 
@@ -1314,10 +1320,6 @@ fn attention_step(
     let op = node.op.name();
     let rows = cx.graph.shape(node.output.tensor).rows;
     let head_dim = geom.head_dim().get();
-    let kernel: fn(AttnPrefillBf16) -> CudaStep = match rows {
-        1 => CudaStep::AttnDecode,
-        _ => CudaStep::AttnPrefill,
-    };
     let (class, _) = attn_class(cx, mask).ok_or(CanonicalRefusal::SlidingWindow { step, op })?;
     let q = match node.inputs.as_slice() {
         [q, _, _, _, _] => q,
@@ -1417,7 +1419,7 @@ fn attention_step(
         });
     }
     let at = arena(cx)?;
-    Ok(kernel(AttnPrefillBf16 {
+    let attn = AttnPrefillBf16 {
         q: at(qc),
         block_table: regions.block_table.offset,
         sequence: regions.sequence.offset,
@@ -1429,7 +1431,23 @@ fn attention_step(
         head_dim,
         scale_bits: scale.to_bits(),
         window: class.window,
-    }))
+    };
+    match rows {
+        // A decode bucket's attention at its head dim's split over keys (W6b).
+        1 => {
+            AttnDecodeBf16::of(attn)
+                .map(CudaStep::AttnDecode)
+                .ok_or(CanonicalRefusal::AttnShape {
+                    step,
+                    rows,
+                    head_dim,
+                    rule: AttnShapeRule::HeadDim {
+                        want: class.head_dim,
+                    },
+                })
+        }
+        _ => Ok(CudaStep::AttnPrefill(attn)),
+    }
 }
 
 /// The model layer of a `GatedDeltaNet`'s weight bundle (operand 4): a `SourceBinding::Weight`
@@ -1963,7 +1981,8 @@ fn router_logits(
     let col64 =
         cx.facts.gemm_col_tile == GemmColTile::Col64 && !experts.is_multiple_of(GEMM_BF16_TILE.1);
     let kernel = match m {
-        1 => gemv_shape(experts, hidden).map(|()| MatmulKernel::Gemv),
+        1 => gemv_shape(experts, hidden)
+            .map(|()| MatmulKernel::Gemv(GemvSplit::of(experts, hidden, 1))),
         _ if col64 => gemm_col64_shape(m, experts, hidden).map(|()| MatmulKernel::Col64),
         _ => gemm_shape(m, experts, hidden).map(|()| MatmulKernel::Tiled),
     }
@@ -2139,6 +2158,7 @@ fn router_norm(
         cols,
         eps_bits: eps.to_bits(),
         convention: GainConvention::Scale,
+        kernel: NormKernel::of(rows, cols),
     })
 }
 
@@ -2271,20 +2291,22 @@ fn expert_matmul(
             }
             PairRows::Pair => moe.act.offset,
         };
-        return Ok(CudaStep::ExpertGemv(ExpertGemvBf16 {
-            a,
-            rows: reads,
-            bundle,
-            weight: layout,
-            proj: projection,
-            topk_idx: moe.topk_idx.offset,
-            c: out.1.offset,
-            m: cx.tokens.unwrap_or(0),
-            top_k,
-            experts: moe.experts,
-            hidden: moe.hidden,
-            inter: moe.inter,
-        }));
+        return Ok(CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(
+            ExpertGemvBf16 {
+                a,
+                rows: reads,
+                bundle,
+                weight: layout,
+                proj: projection,
+                topk_idx: moe.topk_idx.offset,
+                c: out.1.offset,
+                m: cx.tokens.unwrap_or(0),
+                top_k,
+                experts: moe.experts,
+                hidden: moe.hidden,
+                inter: moe.inter,
+            },
+        )));
     };
     let (_, tn, tk) = GEMM_BF16_TILE;
     // A 64-column-tile model's expert GEMM takes 64-column tiles when `n` is off the 256 one.
@@ -2551,7 +2573,7 @@ fn gemm_kernel(
     }
     if m == 1 {
         gemv_shape(n, k)?;
-        return Ok(CudaStep::Gemv);
+        return Ok(|g| CudaStep::Gemv(GemvBf16::of(g)));
     }
     gemm_shape(m, n, k)?;
     Ok(CudaStep::Gemm)
@@ -2596,7 +2618,7 @@ fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, G
         });
     }
     Ok(match (m, n) {
-        (1, _) => CudaStep::GemvFp8,
+        (1, _) => |g| CudaStep::GemvFp8(GemvBf16::of(g)),
         _ if n.is_multiple_of(GEMM_BF16_TILE.1) => CudaStep::GemmFp8,
         _ if n.is_multiple_of(GEMM_COL64_TILE.1) => CudaStep::GemmCol64Fp8,
         _ if n < GEMM_COL64_TILE.1 && n.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) => {

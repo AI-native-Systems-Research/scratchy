@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
-    CudaStep, ExpertGateUpActBf16, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16,
-    GateUpActBf16, GateUpKernel, GateUpTcFp8, MoeWeight, QuantChainError, QuantRowsFp8,
-    gemv_tc_takes, quant_chain,
+    CudaStep, ExpertGateUpActBf16, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpKernel, GateUpTcFp8, GemvBf16,
+    GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, TapeError, overlap,
@@ -198,18 +198,25 @@ fn every_tape_has_the_fp8_steps() {
                 ..
             }) = *s
             {
-                let want: &[GateUpKernel] = match m {
-                    1 => &[GateUpKernel::GemvFp8],
-                    _ => &[GateUpKernel::GemmFp8, GateUpKernel::GemmCol64Fp8],
+                let want = match m {
+                    1 => matches!(kernel, GateUpKernel::GemvFp8(_)),
+                    _ => matches!(kernel, GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8),
                 };
-                assert!(want.contains(&kernel), "m={m} step {i}: {kernel:?}");
+                assert!(want, "m={m} step {i}: {kernel:?}");
             }
             let expert = match *s {
                 CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
-                | CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
+                | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+                    gemv: ExpertGemvBf16 { weight, .. },
+                    ..
+                })
                 | CudaStep::ExpertGemvTcFp8(ExpertGemvBf16 { weight, .. })
-                | CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
-                    gate: ExpertGemvBf16 { weight, .. },
+                | CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 {
+                    fold:
+                        ExpertGateUpActBf16 {
+                            gate: ExpertGemvBf16 { weight, .. },
+                            ..
+                        },
                     ..
                 })
                 | CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
@@ -357,10 +364,10 @@ fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
     for (i, s) in tape.steps.iter().enumerate() {
         match *s {
             CudaStep::QuantRowsFp8(q) => assert_eq!(q.rows, 1, "m=1 step {i}: one row"),
-            CudaStep::GemvFp8(g) => {
+            CudaStep::GemvFp8(GemvBf16 { gemm: g, .. }) => {
                 assert!(!gemv_tc_takes([g.n, 0, 0], g.k, 1), "m=1 step {i}: {g:?}")
             }
-            CudaStep::GemvGroupFp8(g) => {
+            CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {
                 let ns = [g.first.n, g.second.n, g.third.map_or(0, |t| t.n)];
                 assert!(!gemv_tc_takes(ns, g.k, 1), "m=1 step {i}: {ns:?}");
             }

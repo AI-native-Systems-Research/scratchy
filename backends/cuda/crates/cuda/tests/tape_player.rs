@@ -60,7 +60,9 @@ use scratchy_target_cuda::runtime::{
     KvPoolConfig, KvSequence, WorkerError,
 };
 use scratchy_target_cuda::step::MatmulKernel;
-use scratchy_target_cuda::step::{CudaStep, RopeAppendBf16, gdn_bundle, gdn_scratch};
+use scratchy_target_cuda::step::{
+    AttnDecodeBf16, CudaStep, GemvBf16, RopeAppendBf16, gdn_bundle, gdn_scratch,
+};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError,
     TapeInput, WeightIx,
@@ -2726,7 +2728,7 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
     let one = &buckets[0];
     let (
         CudaStep::RopeAppend(append @ RopeAppendBf16 { q: Some(rope), .. }),
-        CudaStep::AttnDecode(decode),
+        CudaStep::AttnDecode(AttnDecodeBf16 { attn: decode, .. }),
     ) = (one.steps[5], one.steps[6])
     else {
         panic!(
@@ -3223,12 +3225,10 @@ fn gemma_moe_play(
             CudaStep::RouterLogits(r) => Some(r.kernel),
             _ => None,
         });
-        let want_router = if m == 1 {
-            MatmulKernel::Gemv
-        } else {
-            MatmulKernel::Col64
-        };
-        let router_ok = router == Some(want_router);
+        let router_ok = matches!(
+            (router, m == 1),
+            (Some(MatmulKernel::Gemv(_)), true) | (Some(MatmulKernel::Col64), false)
+        );
         let scratch = gemma_moe_scratch(tape);
         let want =
             (GEMMA_MOE_SCRATCH.iter()).find(|&&(wm, _)| wm as usize == m && geometry == REAL);
@@ -3785,7 +3785,10 @@ fn unwindowed(t: &CudaTape) -> CudaTape {
             CudaStep::AttnPrefill(a) => {
                 CudaStep::AttnPrefill(AttnPrefillBf16 { window: None, ..a })
             }
-            CudaStep::AttnDecode(a) => CudaStep::AttnDecode(AttnPrefillBf16 { window: None, ..a }),
+            CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => CudaStep::AttnDecode(
+                AttnDecodeBf16::of(AttnPrefillBf16 { window: None, ..a })
+                    .expect("a head dim with a decode kernel"),
+            ),
             s => s,
         })
         .collect();
@@ -4913,7 +4916,7 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
     static BAD: std::sync::OnceLock<[CudaTape; 1]> = std::sync::OnceLock::new();
     let tapes = BAD.get_or_init(|| {
         let mut t = whole_arena_tape(4096);
-        t.steps = Box::leak(Box::new([CudaStep::Gemv(
+        t.steps = Box::leak(Box::new([CudaStep::Gemv(GemvBf16::of(
             scratchy_target_cuda::step::GemmBf16 {
                 a: ArenaOffset(0),
                 b: WeightIx(0),
@@ -4923,7 +4926,7 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
                 k: 4,
                 residual: None,
             },
-        )]));
+        ))]));
         t.weight_bytes = Box::leak(Box::new([64]));
         [t]
     });

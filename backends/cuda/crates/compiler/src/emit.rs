@@ -49,9 +49,9 @@ use scratchy_subtile::handoff::{
 };
 use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
-    AddRmsNormBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16,
-    GemmBf16, LayerScaleBf16, MoeRouteBf16, MoeWeight, NormAddBf16, RmsNormBf16, RouterLogitsBf16,
-    gdn_conv_dim,
+    AddRmsNormBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16,
+    GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemvBf16, LayerScaleBf16, MoeRouteBf16, MoeWeight,
+    NormAddBf16, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -93,6 +93,16 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "CudaStep",
                 "EmbedBf16",
                 "GemmBf16",
+                "GemvBf16",
+                "GemvGroupBf16",
+                "GemvSplit",
+                "NormKernel",
+                "AttnDecodeBf16",
+                "AttnDecodeSplit",
+                "GdnPrefillBf16",
+                "GdnScan",
+                "ExpertGemvSplitBf16",
+                "ExpertGateUpGemvBf16",
                 "RmsNormBf16",
                 "AddBf16",
                 "SiluMulBf16",
@@ -517,15 +527,17 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         CudaStep::Gemm(GemmBf16 { b, n, k, .. })
         | CudaStep::GemmCol64(GemmBf16 { b, n, k, .. })
         | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. })
-        | CudaStep::Gemv(GemmBf16 { b, n, k, .. }) => {
-            Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
-        }
+        | CudaStep::Gemv(GemvBf16 {
+            gemm: GemmBf16 { b, n, k, .. },
+            ..
+        }) => Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2))),
         CudaStep::GemmFp8(GemmBf16 { b, n, k, .. })
         | CudaStep::GemmCol64Fp8(GemmBf16 { b, n, k, .. })
         | CudaStep::GemmNarrowFp8(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemvFp8(GemmBf16 { b, n, k, .. }) => {
-            Some((b, Role::Fp8([u64::from(n), u64::from(k)])))
-        }
+        | CudaStep::GemvFp8(GemvBf16 {
+            gemm: GemmBf16 { b, n, k, .. },
+            ..
+        }) => Some((b, Role::Fp8([u64::from(n), u64::from(k)]))),
         CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. })
         | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. })
         | CudaStep::AddRmsNorm(AddRmsNormBf16 {
@@ -542,13 +554,17 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             experts,
             ..
         }) => Some((ix, Role::Bf16([u64::from(experts), 0], 1))),
-        CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
-            bundle,
-            num_k_heads,
-            num_v_heads,
-            head_k,
-            head_v,
-            conv_kernel,
+        CudaStep::GatedDeltaNet(GdnPrefillBf16 {
+            gdn:
+                GatedDeltaNetBf16 {
+                    bundle,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k,
+                    head_v,
+                    conv_kernel,
+                    ..
+                },
             ..
         })
         | CudaStep::GdnDecode(GatedDeltaNetBf16 {
@@ -585,12 +601,16 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         })
-        | CudaStep::ExpertGemv(ExpertGemvBf16 {
-            bundle,
-            weight: MoeWeight::Bundle,
-            experts,
-            hidden,
-            inter,
+        | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+            gemv:
+                ExpertGemvBf16 {
+                    bundle,
+                    weight: MoeWeight::Bundle,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
             ..
         }) => Some((bundle, Role::MoeBundle([experts, hidden, inter]))),
         // Gemma's router projection, one bf16 tensor.
@@ -613,12 +633,16 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         })
-        | CudaStep::ExpertGemv(ExpertGemvBf16 {
-            bundle,
-            weight: MoeWeight::Own,
-            experts,
-            hidden,
-            inter,
+        | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+            gemv:
+                ExpertGemvBf16 {
+                    bundle,
+                    weight: MoeWeight::Own,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
             ..
         }) => Some((bundle, Role::ExpertBank([experts, hidden, inter]))),
         CudaStep::RouterLogits(RouterLogitsBf16 {
@@ -637,12 +661,16 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         })
-        | CudaStep::ExpertGemv(ExpertGemvBf16 {
-            bundle,
-            weight: MoeWeight::Fp8Bundle,
-            experts,
-            hidden,
-            inter,
+        | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+            gemv:
+                ExpertGemvBf16 {
+                    bundle,
+                    weight: MoeWeight::Fp8Bundle,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
             ..
         }) => Some((bundle, Role::Fp8MoeBundle([experts, hidden, inter]))),
         // Gemma's router stays its own bf16 projection beside an fp8 bank (the checkpoint's
@@ -665,12 +693,16 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         })
-        | CudaStep::ExpertGemv(ExpertGemvBf16 {
-            bundle,
-            weight: MoeWeight::Fp8Own,
-            experts,
-            hidden,
-            inter,
+        | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+            gemv:
+                ExpertGemvBf16 {
+                    bundle,
+                    weight: MoeWeight::Fp8Own,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
             ..
         }) => Some((bundle, Role::Fp8ExpertBank([experts, hidden, inter]))),
         CudaStep::QuantRowsFp8(_) | CudaStep::ExpertSortFp8(_) | CudaStep::ExpertActQuant(_) => {
@@ -708,10 +740,12 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         // The tensor-core decode GEMVs (FP8 S8 T2) read their weights as their CUDA-core twins
         // do; a tensor-core gate/up's first part is itself, so it names its gate's (its second
         // part, the up's GEMV, the up's).
-        CudaStep::GemvTcFp8(g) => role(&CudaStep::GemvFp8(g)),
-        CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(t.fold.gate)),
-        CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(g)),
-        CudaStep::ExpertGateUpTcFp8(t) => role(&CudaStep::ExpertGemv(t.fold.gate)),
+        CudaStep::GemvTcFp8(g) => role(&CudaStep::GemvFp8(GemvBf16::of(g))),
+        CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(GemvBf16::of(t.fold.gate))),
+        CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(g))),
+        CudaStep::ExpertGateUpTcFp8(t) => {
+            role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(t.fold.gate)))
+        }
         // A norm with its quantization (FP8 S8 N3) reads its norm's gain.
         CudaStep::RmsNormQuantFp8(t) => role(&CudaStep::RmsNorm(t.norm)),
         CudaStep::AddRmsNormQuantFp8(t) => role(&CudaStep::AddRmsNorm(t.fold)),

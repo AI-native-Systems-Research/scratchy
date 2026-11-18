@@ -17,9 +17,11 @@
 //! - float fields decoded (`{"f32": value, "bits": bits}`);
 //! - stored choices (a router's matmul, a gate/up kernel, a routing program, a rope pairing, a gain
 //!   convention) as what they compute;
-//! - the kernel choices the player still makes at run time, as `player` (`gemv_splits`,
-//!   `norm_row_takes`, `attn_decode_split`, `gdn_scan_is_recurrent`, called with the step's
-//!   constants).
+//! - the kernel choices written into each step at emission, as `player`: a GEMV's split, a norm's
+//!   row-or-tiled kernel, the decode attention's split, a GDN scan (at 99c60d50 the player made
+//!   them at run time, by `gemv_splits`, `norm_row_takes`, `attn_decode_split` and
+//!   `gdn_scan_is_recurrent` of the step's constants, under the same keys, so equal dumps prove
+//!   the stored choices equal those functions').
 //!
 //! So a type-only change (a newtype, a split payload, a renamed variant or field) leaves the step
 //! lines equal once this file maps the new types to the same keys, and a change to what runs does
@@ -43,9 +45,9 @@ use std::path::PathBuf;
 use scratchy_target_cuda::registry::{self, CudaModelEntry};
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
-    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16,
-    GemmGroupBf16, MatmulKernel, MoeWeight, PairRows, RmsNormBf16, RopePairing, RouteProgram,
-    SiluMulBf16, attn_decode_split, gdn_scan_is_recurrent, gemv_splits, norm_row_takes,
+    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan, GemmBf16,
+    GemmGroupBf16, GemvSplit, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16,
+    RopePairing, RouteProgram, SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, CudaTape, RotaryTable, WeightIx};
 use serde_json::{Map, Value, json};
@@ -186,7 +188,7 @@ fn route(p: RouteProgram, renorm: bool) -> Value {
 fn matmul(k: MatmulKernel) -> Value {
     match k {
         MatmulKernel::Tiled => json!("gemm_bf16_abt"),
-        MatmulKernel::Gemv => json!("gemv_split_bf16_abt"),
+        MatmulKernel::Gemv(_) => json!("gemv_split_bf16_abt"),
         MatmulKernel::Col64 => json!("gemm_col64_bf16_abt"),
     }
 }
@@ -195,10 +197,12 @@ fn gate_up_kernel(k: GateUpKernel) -> Value {
     match k {
         GateUpKernel::Gemm => json!({"launcher": "gate_up_gemm_bf16", "tile_cols": 128}),
         GateUpKernel::GemmCol64 => json!({"launcher": "gate_up_gemm_bf16", "tile_cols": 64}),
-        GateUpKernel::Gemv => json!({"launcher": "gate_up_gemv_bf16", "tile_cols": Value::Null}),
+        GateUpKernel::Gemv(_) => json!({"launcher": "gate_up_gemv_bf16", "tile_cols": Value::Null}),
         GateUpKernel::GemmFp8 => json!({"launcher": "gate_up_gemm_fp8", "tile_cols": 128}),
         GateUpKernel::GemmCol64Fp8 => json!({"launcher": "gate_up_gemm_fp8", "tile_cols": 64}),
-        GateUpKernel::GemvFp8 => json!({"launcher": "gate_up_gemv_fp8", "tile_cols": Value::Null}),
+        GateUpKernel::GemvFp8(_) => {
+            json!({"launcher": "gate_up_gemv_fp8", "tile_cols": Value::Null})
+        }
     }
 }
 
@@ -269,15 +273,14 @@ fn gdn(g: &GatedDeltaNetBf16) -> Value {
            "head_v": g.head_v, "conv_kernel": g.conv_kernel, "eps": f32_bits(g.eps_bits)})
 }
 
-/// The expert GEMV's K split at its `m · top_k` pairs, as the player computes it.
-fn expert_splits(g: &ExpertGemvBf16) -> Value {
-    let (n, k) = g.n_k();
-    json!({"gemv_splits": gemv_splits(n, k, g.m.saturating_mul(g.top_k))})
+/// A GEMV's stored K split, the player's choice.
+fn splits(s: GemvSplit) -> Value {
+    json!({"gemv_splits": s.splits})
 }
 
-/// The norm's row-or-tiled pick, as the player makes it.
+/// The norm's stored row-or-tiled kernel, the player's choice.
 fn norm_pick(n: &RmsNormBf16) -> Value {
-    json!({"norm_row_takes": norm_row_takes(n.rows, n.cols)})
+    json!({"norm_row_takes": n.kernel == NormKernel::Row})
 }
 
 /// One step: the kernel(s) it launches, its arguments, and the player's run-time choices.
@@ -293,32 +296,32 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::GemmNarrow(g) => ("gemm_narrow_bf16_abt", gemm(g), Value::Null),
         CudaStep::Gemv(g) => (
             "gemv_bf16 (unsplit, split or residual by its arguments)",
-            gemm(g),
-            json!({"gemv_splits": gemv_splits(g.n, g.k, 1)}),
+            gemm(&g.gemm),
+            splits(g.split),
         ),
         CudaStep::GemmCol64(g) => ("gemm_col64_bf16_abt", gemm(g), Value::Null),
         CudaStep::GemmFp8(g) => ("gemm_fp8_abt (128-col tiles)", gemm(g), Value::Null),
         CudaStep::GemmCol64Fp8(g) => ("gemm_fp8_abt (64-col tiles)", gemm(g), Value::Null),
         CudaStep::GemmNarrowFp8(g) => ("gemm_narrow_fp8_abt", gemm(g), Value::Null),
-        CudaStep::GemvFp8(g) => (
-            "gemv_fp8_residual",
-            gemm(g),
-            json!({"gemv_splits": gemv_splits(g.n, g.k, 1)}),
-        ),
+        CudaStep::GemvFp8(g) => ("gemv_fp8_residual", gemm(&g.gemm), splits(g.split)),
         CudaStep::GemvTcFp8(g) => ("gemv_fp8_b8", gemm(g), Value::Null),
         CudaStep::GemmGroup(g) => ("gemm_group_bf16_abt", group(g), Value::Null),
         CudaStep::GemmNarrowGroup(g) => ("gemm_narrow_group_bf16_abt", group(g), Value::Null),
         CudaStep::GemmGroupFp8(g) => ("gemm_group_fp8_abt", group(g), Value::Null),
         CudaStep::GemmNarrowGroupFp8(g) => ("gemm_narrow_group_fp8_abt", group(g), Value::Null),
         CudaStep::GemvGroup(g) | CudaStep::GemvGroupFp8(g) => {
-            let splits: Vec<Value> = (g.members().iter())
-                .map(|m| m.map_or(Value::Null, |m| json!(gemv_splits(m.n, g.k, 1))))
+            let member_splits: Vec<Value> = (g.splits().iter())
+                .map(|m| m.map_or(Value::Null, |m| json!(m.splits)))
                 .collect();
             let kernel = match s {
                 CudaStep::GemvGroup(_) => "gemv_group_bf16_abt",
                 _ => "gemv_group_fp8_abt",
             };
-            (kernel, group(g), json!({"gemv_splits": splits}))
+            (
+                kernel,
+                group(&g.group),
+                json!({"gemv_splits": member_splits}),
+            )
         }
         CudaStep::GemvGroupTcFp8(g) => ("gemv_fp8_b8 (per member)", group(g), Value::Null),
         CudaStep::RmsNorm(n) => (
@@ -404,14 +407,13 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::AttnDecode(a) => (
             "attn_decode_fp8kv_split + attn_decode_merge",
-            attn(a),
-            json!({"attn_decode_split": attn_decode_split(a.head_dim)
-                       .map_or(Value::Null, |(splits, keys)| json!([splits, keys]))}),
+            attn(&a.attn),
+            json!({"attn_decode_split": [a.split.splits, a.split.min_tiles]}),
         ),
         CudaStep::GatedDeltaNet(g) => (
             "gdn_conv1d + gdn_gating + (gdn_scan or gdn_chunk_scan) + gdn_rms_norm_gated",
-            gdn(g),
-            json!({"gdn_scan_is_recurrent": gdn_scan_is_recurrent(g.rows)}),
+            gdn(&g.gdn),
+            json!({"gdn_scan_is_recurrent": g.scan == GdnScan::Recurrent}),
         ),
         CudaStep::GdnDecode(g) => ("gdn_decode", gdn(g), Value::Null),
         CudaStep::RouterLogits(r) => (
@@ -420,9 +422,7 @@ fn step_record(s: &CudaStep) -> Value {
                    "logits": off(r.logits), "m": r.m, "experts": r.experts, "hidden": r.hidden,
                    "inter": r.inter, "matmul": matmul(r.kernel)}),
             match r.kernel {
-                MatmulKernel::Gemv => {
-                    json!({"gemv_splits": gemv_splits(r.experts, r.hidden, 1)})
-                }
+                MatmulKernel::Gemv(split) => splits(split),
                 MatmulKernel::Tiled | MatmulKernel::Col64 => Value::Null,
             },
         ),
@@ -470,15 +470,15 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::ExpertGemv(g) => (
             "expert_gemv (split bf16 or fp8, by its weight)",
-            expert_gemv(g),
-            expert_splits(g),
+            expert_gemv(&g.gemv),
+            splits(g.split),
         ),
         CudaStep::ExpertGemvTcFp8(g) => ("gemv_fp8_b8 (per pair)", expert_gemv(g), Value::Null),
         CudaStep::ExpertGateUpAct(g) => (
             "expert_gate_up_gemv (bf16 or fp8, by its weight)",
-            json!({"gate": expert_gemv(&g.gate), "up": expert_gemv(&g.up), "out": off(g.out),
-                   "act": act(g.act)}),
-            expert_splits(&g.gate),
+            json!({"gate": expert_gemv(&g.fold.gate), "up": expert_gemv(&g.fold.up),
+                   "out": off(g.fold.out), "act": act(g.fold.act)}),
+            splits(g.split),
         ),
         CudaStep::ExpertGateUpTcFp8(t) => (
             "act_quant_fp8 + gemv_fp8_b8 (per pair)",
@@ -527,15 +527,7 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::GateUpAct(g) => (
             "gate_up (the stored kernel)",
             gate_up(g),
-            match g.kernel {
-                GateUpKernel::Gemv | GateUpKernel::GemvFp8 => {
-                    json!({"gemv_splits": gemv_splits(g.gate.n, g.gate.k, 1)})
-                }
-                GateUpKernel::Gemm
-                | GateUpKernel::GemmCol64
-                | GateUpKernel::GemmFp8
-                | GateUpKernel::GemmCol64Fp8 => Value::Null,
-            },
+            g.kernel.gemv_split().map_or(Value::Null, splits),
         ),
         CudaStep::GateUpTcFp8(t) => (
             "act_quant_fp8 + gemv_fp8_b8 (gate and up)",
