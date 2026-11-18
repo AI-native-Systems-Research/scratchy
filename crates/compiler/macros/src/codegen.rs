@@ -7767,7 +7767,7 @@ pub(crate) fn fill_canonical_params(
     target: Option<scratchy_ir::model_facts::TargetWidth>,
     // Whether the target compresses a KV cache the codec takes (`TargetEmitter::compresses_kv`).
     compress_kv: bool,
-) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
+) -> scratchy_ir::model_facts::ModelFacts {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -7787,11 +7787,6 @@ pub(crate) fn fill_canonical_params(
         0
     };
     let q_size = (num_q_heads as usize) * (head_dim as usize);
-    let kv_lora_rank = *model.bounds.get("kv_lora_rank").unwrap_or(&0) as usize;
-    let qk_nope_head_dim = *model.bounds.get("qk_nope_head_dim").unwrap_or(&0) as usize;
-    let qk_rope_head_dim = *model.bounds.get("qk_rope_head_dim").unwrap_or(&0) as usize;
-    let v_head_dim = *model.bounds.get("v_head_dim").unwrap_or(&0) as usize;
-    let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
     let spec_drafts = *model.bounds.get("spec_drafts").unwrap_or(&0) as u32;
     // A DFlash2 drafter's geometry (its arch.json params), and the blocks of the rows a target
@@ -7859,28 +7854,6 @@ pub(crate) fn fill_canonical_params(
         .get("final_logit_softcapping")
         .copied()
         .unwrap_or(0.0) as f32;
-    // MLA scale: 1/sqrt(qk_head_dim) with YaRN mscale_all_dim
-    // correction. Mirrors MlaAttentionImpl's previous bake.
-    let mla_attn_scale: f32 = if qk_head_dim > 0 {
-        let base = 1.0_f32 / (qk_head_dim as f32).sqrt();
-        match &model.rope_scaling {
-            Some(crate::config::RopeScaling::Yarn {
-                factor,
-                mscale_all_dim,
-                ..
-            }) if *mscale_all_dim != 0.0 => {
-                let mm = if *factor <= 1.0 {
-                    1.0_f64
-                } else {
-                    0.1 * mscale_all_dim * factor.ln() + 1.0
-                };
-                base * (mm * mm) as f32
-            }
-            _ => base,
-        }
-    } else {
-        0.0
-    };
 
     // Vision-only bodies (the `#[vision_forward]` crates — qwen2-vl,
     // qwen2.5-vl, qwen3.5-vl, locateanything) carry NO text
@@ -7946,11 +7919,6 @@ pub(crate) fn fill_canonical_params(
         .copied()
         .map(|v| v as usize)
         .unwrap_or(0);
-    let kv_lora_rank_lit = proc_macro2::Literal::usize_unsuffixed(kv_lora_rank);
-    let qk_nope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_nope_head_dim);
-    let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
-    let v_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(v_head_dim);
-    let qk_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_head_dim);
     // Rotary dim for the rope kernel's `ROT_DIM` fn-const. Mirrors
     // the rope-cache builder (codegen.rs ~2758): `partial_rotary_factor
     // * head_dim` for partial-rope arches (Qwen3.5: 0.25*256 = 64), else
@@ -8061,7 +8029,6 @@ pub(crate) fn fill_canonical_params(
             model.source_stem, sliding_per_token, global_per_token,
         );
     };
-    let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
 
     // SCALE_DTYPE override — only matters to a target whose kernels read it.
     // mlx-community 4bit convention (probed across cached HF snapshots):
@@ -8114,7 +8081,7 @@ pub(crate) fn fill_canonical_params(
 
     let num_hidden_layers = model.text.layers.get();
 
-    let facts = {
+    {
         use scratchy_ir::model_facts as mf;
         let positive = |v: u32| (v > 0).then_some(v);
         // A decoder's attention. A vision-only body's text consts above carry its tower's numbers
@@ -8229,25 +8196,11 @@ pub(crate) fn fill_canonical_params(
             capture_slots: positive(draft_capture_slots).map(mf::CaptureSlots::new),
             target,
         })
-    };
-    (
-        facts,
-        quote! {
-            const KV_LORA_RANK: usize = #kv_lora_rank_lit;
-            const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
-            const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
-            const V_HEAD_DIM: usize = #v_head_dim_lit;
-            const QK_HEAD_DIM: usize = #qk_head_dim_lit;
-            const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
-        },
-    )
+    }
 }
 
-/// A canonical's `CanonicalParams` impl: its `facts` serialized as `FACTS`, and `mla_consts`.
-fn emit_canonical_params_impl(
-    facts: scratchy_ir::model_facts::ModelFacts,
-    mla_consts: &TokenStream,
-) -> TokenStream {
+/// A canonical's `CanonicalParams` impl: its `facts` serialized as `FACTS`.
+fn emit_canonical_params_impl(facts: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     let facts_tokens = model_facts_tokens(facts);
     quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
@@ -8257,8 +8210,6 @@ fn emit_canonical_params_impl(
         // backend feature.
         impl ::scratchy_forward_compiler::CanonicalParams for Weights {
             const FACTS: ::scratchy_forward_compiler::model_facts::ModelFacts = #facts_tokens;
-            // The MLA dims: no fact covers them yet (no target path reads them).
-            #mla_consts
         }
     }
 }
@@ -8541,7 +8492,7 @@ pub fn emit_model(
     // consumer reads them: its weight struct, its lowering and the per-canonical
     // `CanonicalParams` impl. Every fact is a field of this one value; nothing downstream
     // re-reads a config or a bound for a fact it states.
-    let (model_facts, mla_consts) = fill_canonical_params(
+    let model_facts = fill_canonical_params(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
@@ -8549,7 +8500,7 @@ pub fn emit_model(
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
         emitter.compresses_kv(),
     );
-    let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
+    let canonical_params_impl = emit_canonical_params_impl(model_facts);
     let crate::target::ModelEmission { weights, items } = emitter.model(&crate::target::ModelCx {
         program,
         model,
@@ -8813,8 +8764,7 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts =
-                fill_canonical_params(&model, 1, false, &every_layer(&model), None, false).0;
+            let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None, false);
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -8921,8 +8871,8 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
-        let ts = emit_canonical_params_impl(facts, &mla).to_string();
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
+        let ts = emit_canonical_params_impl(facts).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
             assert!(
@@ -8937,7 +8887,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -8969,7 +8919,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false);
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -9015,7 +8965,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false);
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,

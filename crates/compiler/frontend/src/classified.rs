@@ -518,19 +518,6 @@ pub enum OpKind {
     /// Qwen2.5-VL vision towers; expected reuse by future ViT-RoPE
     /// architectures.
     VisionRope,
-    /// MLA kv_a split: decomposes `[T, kv_lora_rank + qk_rope_head_dim]`
-    /// into `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`.
-    /// DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`. Tuple-returning;
-    /// a tuple assignment binds its two outputs. Used
-    /// exclusively by DeepSeek V2/V3.
-    MlaSplit,
-    /// MLA full attention: applies interleaved RoPE to q_pe / k_pe, writes
-    /// compressed KV to paged cache, assembles full K and V from cached
-    /// kv_b + k_pe, runs flash attention, then slices the output to
-    /// `v_head_dim`. Consumes `q, kv_b, k_pe` plus externs
-    /// `(positions, rotary, kv_cache[layer], block_table)`. Output:
-    /// `[T, num_attention_heads * v_head_dim]`. Used by DeepSeek V2/V3.
-    MlaAttention,
     /// MoE block — gate routing + top-K fused GEMM for routed experts
     /// plus an optional shared expert. The DSL form is the same across
     /// every MoE arch: `moe_out = moe_block(x, moe[layer])`. Mirrors
@@ -731,8 +718,6 @@ impl OpKind {
             // `Reshape` is the DSL's `reshape(x, [..])` expression
             // (`ast::Expr::Reshape`), never a call by name: not listed
             // in `from_name`.
-            "mla_split" => Some(Self::MlaSplit),
-            "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
             "gemma_moe" => Some(Self::GemmaMoe),
             "gptoss_moe" => Some(Self::GptOssMoe),
@@ -809,8 +794,6 @@ impl OpKind {
             Self::BiasAdd => "bias_add",
             Self::Mul => "mul",
             Self::Reshape => "reshape",
-            Self::MlaSplit => "mla_split",
-            Self::MlaAttention => "mla_attention",
             Self::Moe => "moe_block",
             Self::GemmaMoe => "gemma_moe",
             Self::GptOssMoe => "gptoss_moe",
