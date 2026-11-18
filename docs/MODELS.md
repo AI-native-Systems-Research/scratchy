@@ -40,8 +40,8 @@ crates/models/arch/
 
 - **`weights.json`** — the exact shape of every weight the DSL reads.
   The typed-Rust emit pass types each weight by it, and rustc checks
-  every use of the weight in the DSL against that type when the compiler
-  builds. Shapes are expressed as products and sums of bound names from
+  every use of the weight in the DSL against that type when
+  `scratchy-models-typed` (`crates/models/typed/`) builds. Shapes are expressed as products and sums of bound names from
   the config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
   are per-head RMS norms of shape `[head_dim]`:
 
@@ -347,7 +347,7 @@ Run the probe binary against any one model size — the shape formulas
 don't change across sizes, so one probe suffices:
 
 ```
-cargo run -p scratchy-forward-compiler --bin probe_weights --features probe -- \
+cargo run -p scratchy-forward-compiler --bin probe-weights --features probe -- \
     --arch <arch> <hf-org>/<size> [<hf-org>/<size> ...]
 ```
 
@@ -386,6 +386,42 @@ etc. Every tensor is a local; weights are referenced by dotted path
 (e.g. `self_attn.q_proj[layer]`). Loop over `num_hidden_layers` using
 a bound name from config.json. See `dsl/llama.py` as the canonical
 reference.
+
+An arch whose attention the core ops cannot state needs a **decoder state**: its
+own ops and layered state inputs, declared from its own crate (see
+`crates/state/decoder/mla`, multi-head latent attention, which GLM-4.7-Flash's
+carrier calls). The touch points: the decoder state crate
+`crates/state/decoder/<name>`; its line in the root
+`Cargo.toml`'s `members` and its `[workspace.dependencies]` row;
+`scratchy-models-typed`'s dependency and build-dependency rows on it
+(`crates/models/typed/Cargo.toml`); and its entry in
+`crates/models/typed/src/decoder_states.rs`, the one list of decoder states a build
+compiles; and the `-p scratchy-state-decoder-mla` lines of the test and clippy steps, the nightly
+compile_fail doctest step, and that step's coverage comment in
+`.github/workflows/rust.yml`.
+
+The decoder state crate states each op once, through `scratchy_decoder_state::state_op!`:
+the op's typed signature (the `fn` a carrier's call is type-checked
+against), then its row law and sharding rule
+(`rows = In0 | M, tp = <TpRule variant>;`). The macro counts the op's arity
+from the parameters and its output count from the return type, and both the
+DSL declaration and the subtile facts read those counts, so they cannot
+disagree. Write a multi-value return as the tuple itself
+(`-> (Act<T, R>, Act<T, P>)`): the count is read from the syntax, so a type
+alias for a tuple counts as one output. An op returns one, two or three
+values; returning none or more than three, rows of operand 0 with no
+operand, or `tp = Collective` does not build. The crate then lists the
+decoder state once, through `scratchy_decoder_state::decoder_state!`: its name, the absolute path
+of the module holding the signatures and the inputs' constructors
+(`signatures = ::<crate>::<module>`, since the typed carriers call it from
+another crate; the crate reaches its own module by
+`extern crate self as <crate>;`), its ops and its inputs. It expands to the
+`static` `DecoderState` that `decoder_states.rs` lists, and an op or input listed there
+that the module does not declare does not build. Its op and input names must not
+collide with a core op, an op a compiler pass synthesizes, a parser special
+form, a core extern or another decoder state's names: the build fails naming both
+claimants. The Metal bake fails with `StateUnlowered` until the decoder state has
+a Metal lowering, so the arch's stems stay out of `all` until then.
 
 ### 5. Commit a correctness golden
 

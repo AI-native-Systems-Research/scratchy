@@ -34,6 +34,7 @@ fn python_costume_emits_the_qwen3_tape() {
         None,
         &Scope::stems(&[("qwen3", "qwen3-0.6b")]),
         &Metal { turboquant: false },
+        &scratchy_models_typed::typing(),
     )
     .expect("python-costume pipeline");
 

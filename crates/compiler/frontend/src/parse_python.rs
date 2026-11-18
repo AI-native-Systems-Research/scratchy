@@ -29,7 +29,7 @@
 //! Anything else — classes, comprehensions, walrus, star-args, keyword
 //! args, `while`, `try`, one-line suites, tabs — is a loud error.
 
-use crate::ast::{Ast, BoolExpr, BoundExpr, DimSpec, Expr, InSet, Stmt};
+use crate::ast::{Ast, BoolExpr, BoundExpr, DimSpec, Expr, InSet, SpecialForm, Stmt};
 use proc_macro2::Span;
 use std::fmt;
 
@@ -1372,30 +1372,35 @@ fn lower_call(
         [PyExpr::Name(n, _)] => Ok(ident(n, span)),
         _ => Err(err(at, usage)),
     };
-    match (op.as_str(), args) {
-        ("sqrt", _) => Ok(Expr::SqrtBound(name_arg(
+    match (SpecialForm::from_name(op), args) {
+        (Some(SpecialForm::Sqrt), _) => Ok(Expr::SqrtBound(name_arg(
             "`sqrt(<bound_name>)` takes exactly one bound identifier",
         )?)),
-        ("scalar" | "recip_scalar", _) => Ok(Expr::ConfigScalar {
-            name: name_arg(
-                "`scalar(<name>)` / `recip_scalar(<name>)` takes exactly one config key identifier",
-            )?,
-            recip: op == "recip_scalar",
-        }),
-        ("reshape", [source, shape]) => Ok(Expr::Reshape {
+        (Some(form @ (SpecialForm::Scalar | SpecialForm::RecipScalar)), _) => {
+            Ok(Expr::ConfigScalar {
+                name: name_arg(
+                    "`scalar(<name>)` / `recip_scalar(<name>)` takes exactly one config key \
+                     identifier",
+                )?,
+                recip: form == SpecialForm::RecipScalar,
+            })
+        }
+        (Some(SpecialForm::Reshape), [source, shape]) => Ok(Expr::Reshape {
             source: Box::new(lower_expr(source, span)?),
             target_shape: lower_dims(shape, span)?,
         }),
-        ("reshape", _) => Err(err(
+        (Some(SpecialForm::Reshape), _) => Err(err(
             at,
             "`reshape(source, [dim0, dim1, ...])` takes exactly two arguments",
         )),
-        _ => Ok(Expr::Call {
+        // `as_dim` is a call here; `classify` intercepts it.
+        (Some(SpecialForm::AsDim) | None, _) => Ok(Expr::Call {
             op: ident(op, span),
             args: args
                 .iter()
                 .map(|a| lower_expr(a, span))
                 .collect::<Result<_, _>>()?,
+            at: Some(crate::ast::At::new(at.line, at.col)),
         }),
     }
 }
@@ -1495,7 +1500,7 @@ mod tests {
         match &ast.statements[0] {
             Stmt::Assign {
                 target,
-                value: Expr::Call { op, args },
+                value: Expr::Call { op, args, .. },
                 ..
             } => {
                 assert_eq!(target.to_string(), "x");

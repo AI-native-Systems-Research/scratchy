@@ -1,0 +1,17 @@
+[package]
+name = "scratchy-typed-shapes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not published: the root CI step `cargo publish --workspace --dry-run --no-verify` would otherwise package it.
+publish = false
+
+# The typed op-signature vocabulary: shapes as Rust types (dims, activations, weights, the `ops`
+# signatures) and the `Trace` that records them. The forward compiler's macro crate type-checks each
+# carrier's emitted Rust against it.
+[dependencies]
+scratchy-forward-compiler-frontend = { path = "../frontend" }
+
+# The signature markers are generated from the front end's one list of signature bounds.
+[build-dependencies]
+scratchy-forward-compiler-frontend = { path = "../frontend" }

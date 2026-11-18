@@ -170,6 +170,9 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         // none here): each writes the whole value into a buffer of its own.
         | L::AllReduce
         | L::AllGather { .. } => FRESH,
+        // A state op: its decoder state's Metal facet supplies its rule once it states one. A fresh
+        // buffer is correct for any op; it can only cost a colour.
+        L::State(_) => FRESH,
         // The rest of a MoE block lives in the op scratch (`moe_write`), not the arena.
         L::RouterNorm { .. }
         | L::RouterLogits { .. }

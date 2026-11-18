@@ -8,6 +8,94 @@
 
 use syn::Ident;
 
+/// A place in a carrier file: the line and column (both from 1) a construct starts at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct At {
+    line: u32,
+    col: u32,
+}
+
+impl At {
+    pub(crate) fn new(line: u32, col: u32) -> Self {
+        Self { line, col }
+    }
+
+    pub fn line(self) -> u32 {
+        self.line
+    }
+
+    pub fn col(self) -> u32 {
+        self.col
+    }
+}
+
+impl std::fmt::Display for At {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}:{}", self.line, self.col)
+    }
+}
+
+/// Where a classify diagnostic points: the call it is in, or (for a read outside any call) its
+/// statement's line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Site {
+    Call(At),
+    Line(u32),
+}
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Call(at) => at.fmt(f),
+            Self::Line(line) => write!(f, "line {line}"),
+        }
+    }
+}
+
+/// A call-shaped DSL form that is not an op: the parser lowers the first four to their own
+/// [`Expr`] variants, and `classify` intercepts `as_dim` on an assignment's right-hand side. Its
+/// names are the compiler's, so no decoder state may declare an op by one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialForm {
+    /// `sqrt(<bound>)`, [`Expr::SqrtBound`].
+    Sqrt,
+    /// `scalar(<key>)`, [`Expr::ConfigScalar`].
+    Scalar,
+    /// `recip_scalar(<key>)`, [`Expr::ConfigScalar`] with `recip`.
+    RecipScalar,
+    /// `reshape(source, [dims])`, [`Expr::Reshape`].
+    Reshape,
+    /// `x = as_dim(y, <bound>)`, `classify`'s width cast.
+    AsDim,
+}
+
+impl SpecialForm {
+    /// Every special form.
+    pub const ALL: [Self; 5] = [
+        Self::Sqrt,
+        Self::Scalar,
+        Self::RecipScalar,
+        Self::Reshape,
+        Self::AsDim,
+    ];
+
+    /// The form a call by `name` is, if it is one.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    /// The name a body calls this form by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sqrt => "sqrt",
+            Self::Scalar => "scalar",
+            Self::RecipScalar => "recip_scalar",
+            Self::Reshape => "reshape",
+            Self::AsDim => "as_dim",
+        }
+    }
+}
+
 /// Top-level: the body of the `@forward` carrier `def`.
 #[derive(Clone, Debug)]
 pub struct Ast {
@@ -109,7 +197,13 @@ pub enum Expr {
     /// that restriction happens in a later pass.
     Index { target: Box<Expr>, index: Ident },
     /// A named op call, e.g. `gemm(x, w)`.
-    Call { op: Ident, args: Vec<Expr> },
+    Call {
+        op: Ident,
+        args: Vec<Expr>,
+        /// Where the call is written in its carrier file; `None` for one a compiler pass inserted
+        /// (as [`Stmt::Assign`]'s `line`).
+        at: Option<At>,
+    },
     /// `lhs * rhs` (SwiGLU `gate * up`). Tensor × tensor.
     Mul { lhs: Box<Expr>, rhs: Box<Expr> },
     /// `lhs + rhs`. Admitted when the RHS (or LHS) is a scalar

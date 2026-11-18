@@ -23,5 +23,6 @@ fn main() {
         emitter: &scratchy_target_spyre_compiler::Spyre,
         dump_dir,
         inspect: &|_| Vec::new(),
+        typing: scratchy_models_typed::typing(),
     });
 }

@@ -646,25 +646,6 @@ impl InstructionInfo for Instruction {
                     F::KvOffsets(kv_offsets),
                 ],
             ),
-            Instruction::MlaSplit(in_slot, kv_latent_slot, k_pe_slot) => (
-                "MlaSplit",
-                vec![
-                    F::Slot(in_slot),
-                    F::Slot(kv_latent_slot),
-                    F::Slot(k_pe_slot),
-                ],
-            ),
-            Instruction::MlaAttention(q_slot, kv_b_slot, k_pe_slot, out_slot, layer) => (
-                "MlaAttention",
-                vec![
-                    F::Slot(q_slot),
-                    F::Slot(kv_b_slot),
-                    F::Slot(k_pe_slot),
-                    F::Slot(out_slot),
-                    F::Layer(layer),
-                    F::RopeCosSin,
-                ],
-            ),
             Instruction::GatedDeltaNet(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer) => (
                 "GatedDeltaNet",
                 vec![

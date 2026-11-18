@@ -1250,94 +1250,6 @@ def vision_rope(q, k, cos, sin):
     return rot2d(q), rot2d(k)
 
 
-# ── MLA (cuda mla_attention_eval) ──
-
-
-def mla_split(kv_a):
-    rank = STATE["bounds"]["kv_lora_rank"]
-    return kv_a[:, :rank], kv_a[:, rank:]
-
-
-def mla_attention(q, kv_b, k_pe, positions, rotary, layer_cache, block_table):
-    """cuda eval: extract q_pe (per-head rope tail), interleaved-rope q_pe
-    and k_pe, write K/V to the cache, causal attention with MLA scale,
-    slice output to heads*v_head_dim."""
-    b = STATE["bounds"]
-    heads, nope, rope_d, vhd = b["num_attention_heads"], b["qk_nope_head_dim"], b["qk_rope_head_dim"], b["v_head_dim"]
-    qk_hd = nope + rope_d
-    layer = STATE["layer_of"][id(layer_cache)]
-    kcache, vcache = layer_cache
-    n = q.shape[0]
-
-    # Per-head layout: q [n, heads, nope+rope] — rope tail is the LAST
-    # rope_d of each head.
-    qv = q.view(n, heads, qk_hd)
-    q_pe = qv[:, :, nope:]  # [n, heads, rope_d]
-
-    # Interleaved rope on q_pe / k_pe (pair (2i, 2i+1)).
-    theta = STATE["mla_theta"]
-    pos = torch.as_tensor(positions, dtype=torch.long)
-    half = rope_d // 2
-    inv = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float64) * 2.0 / rope_d))
-    ang = pos.to(torch.float64).unsqueeze(1) * inv.unsqueeze(0)
-    cos, sin = ang.cos().float(), ang.sin().float()  # [n, half]
-
-    def rot_i(t, hdim):
-        tv = t.view(n, -1, hdim)
-        x0 = tv[:, :, 0::2]
-        x1 = tv[:, :, 1::2]
-        out = tv.clone()
-        out[:, :, 0::2] = x0 * cos.unsqueeze(1) - x1 * sin.unsqueeze(1)
-        out[:, :, 1::2] = x1 * cos.unsqueeze(1) + x0 * sin.unsqueeze(1)
-        return out.reshape(n, -1)
-
-    q_pe_r = rot_i(q_pe.reshape(n, heads * rope_d), rope_d)
-    k_pe_r = rot_i(k_pe, rope_d)
-
-    # Assemble K: per head [kv_b_head | k_pe], V: kv_b per head padded…
-    # mla_assemble_k/v: K[t, h] = [kv_b[t, h*(nope+vhd) .. +nope] | k_pe[t]],
-    # V[t, h] = kv_b[t, h*(nope+vhd)+nope .. +vhd]. k_pe is SINGLE-HEAD
-    # ([T, rope_dim], impl_lib MlaAttention doc) — broadcast across heads.
-    kv_bv = kv_b.view(n, heads, nope + vhd)
-    k = torch.cat([kv_bv[:, :, :nope], k_pe_r.view(n, 1, rope_d).expand(n, heads, rope_d)], dim=-1)  # [n, heads, qk_hd]
-    v = kv_bv[:, :, nope:]  # [n, heads, vhd]
-
-    # Write paged cache at this step's slots (cache geometry: kv heads =
-    # q heads for MLA, head_dim = qk_hd for K... K and V widths differ, so
-    # the cache holds [nope+rope | pad] and [vhd] — the eval writes K at
-    # qk_head_dim and V zero-padded to qk_head_dim.
-    q_pe_final = q_pe_r.view(n, heads * rope_d)
-    qv = qv.clone()
-    qv[:, :, nope:] = q_pe_r.view(n, heads, rope_d)
-    q = qv.reshape(n, heads * qk_hd)
-
-    # attention: causal over cache positions, MLA scale, per-head over
-    # qk_hd; output sliced to vhd.
-    scale = STATE["mla_scale"]
-    k_full = torch.zeros(n, heads, qk_hd)
-    k_full[:, :, :] = k
-    v_full = torch.zeros(n, heads, qk_hd)
-    v_full[:, :, :vhd] = v
-    _paged_write(k.reshape(n, heads * qk_hd), v_full.reshape(n, heads * qk_hd), layer, heads, qk_hd)
-    bt = STATE["block_table"]
-    out = torch.empty(n, heads, vhd)
-    for t in range(n):
-        p = STATE["positions"][t]
-        attend = p + 1
-        ks = torch.empty(attend, heads, qk_hd)
-        vs = torch.empty(attend, heads, qk_hd)
-        for j in range(attend):
-            blk, off = j // BLOCK_SIZE, j % BLOCK_SIZE
-            pb = bt[blk]
-            ks[j] = kcache[pb, :, off, :]
-            vs[j] = vcache[pb, :, off, :]
-        for h in range(heads):
-            scores = (ks[:, h, :] @ q.view(n, heads, qk_hd)[t, h]) * scale
-            probs = torch.softmax(scores, dim=0)
-            out[t, h] = (probs @ vs[:, h, :])[:vhd]
-    return out.reshape(n, heads * vhd)
-
-
 # ── GDN (cpu_golden.rs gdn_* pipeline, exact order) ──
 
 
@@ -2818,9 +2730,6 @@ def main():
                 "scale": attn_scale_for(cfg, bounds, head_dim),
                 "window": bounds.get("sliding_window", 0),
             }
-    STATE["mla_theta"] = float(cfg.get("rope_theta", 10000.0))
-    STATE["mla_scale"] = 1.0 / math.sqrt(bounds.get("qk_nope_head_dim", 1) + bounds.get("qk_rope_head_dim", 1)) \
-        if "qk_nope_head_dim" in bounds else 0.0
 
     # inputs — identity layout (the qwen3 gate's convention)
     STATE["input_ids"] = torch.from_numpy(rng.integers(low=1, high=max(2, min(1000, bounds.get("vocab_size", 1000))), size=n).astype(np.int64))
