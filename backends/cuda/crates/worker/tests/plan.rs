@@ -460,27 +460,26 @@ fn a_gdn_start_other_than_fresh_at_zero_is_refused() {
     assert!(gdn_fresh(codes[0], 0).is_err());
 }
 
-/// The factory states the greedy-only limit to the engine, which checks it when a request is
-/// submitted: non-greedy sampling is refused there, before scheduling, with the worker's message.
+/// The factory declares the greedy-only limit to the engine, which reads it when a request is
+/// submitted: non-greedy sampling is refused there, before scheduling.
 #[test]
 fn the_factory_reports_the_greedy_only_limit() {
-    let f = CudaWorkerFactory;
-    assert_eq!(f.check_sampling(&greedy()), Ok(()));
+    use scratchy_serving_engine::worker_factory::Unserved;
+    let served = CudaWorkerFactory.served();
+    assert_eq!(served.refusal(&greedy()), None);
     let hot = SamplingParams {
         temperature: 0.7,
         ..greedy()
     };
-    let msg = f.check_sampling(&hot).unwrap_err();
-    assert_eq!(
-        msg,
-        PlanError::NotGreedy { temperature: 0.7 }.to_string(),
-        "the worker's own message"
-    );
-    assert!(msg.contains("--temperature 0"), "{msg}");
+    let why = served
+        .refusal(&hot)
+        .expect("non-greedy sampling is refused");
+    assert_eq!(why, Unserved::Sampling { temperature: 0.7 });
+    assert!(why.to_string().contains("--temperature 0"), "{why}");
     let found = scratchy_serving_engine::worker_factory::linked_factory()
         .expect("the one registered factory");
     assert_eq!(found.name(), "cuda");
-    assert!(found.check_sampling(&hot).is_err(), "the registered one");
+    assert_eq!(found.served(), served, "the registered one");
 }
 
 /// The factory is in the neutral registry `linked_factory` reads.
