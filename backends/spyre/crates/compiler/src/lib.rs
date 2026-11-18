@@ -230,7 +230,7 @@ impl TargetEmitter for Spyre {
                 // caught at load, by the same law over the measured card.
                 let funded = pool_law::funded_bytes(
                     <Baked as DeviceGen>::MEMORY_BYTES,
-                    pool_law::DEFAULT_GPU_MEMORY_UTILIZATION,
+                    pool_law::GpuMemoryUtilization::DEFAULT,
                 );
                 let page_slots: u32 =
                     scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
@@ -254,14 +254,16 @@ impl TargetEmitter for Spyre {
                         break;
                     };
                     // The law over every baked world — the pool a binary serves is one pool,
-                    // so the smallest world's pages bound it.
-                    let mut pages: Option<u32> = None;
+                    // so the smallest world's pages bound it. The terms are the census's own
+                    // (minted once at the bake): the residency it carried, the stride the
+                    // KTIR lowering derived, the floor in whole pages.
+                    let mut pages: Option<pool_law::Pages> = None;
                     for w in &census.worlds {
                         let p = pool_law::pool_pages(
                             funded,
-                            w.mandatory_bytes,
-                            w.page_stride_bytes,
-                            census.context_pages,
+                            w.residency.mandatory_bytes(),
+                            pool_law::PageStride(w.page_stride),
+                            pool_law::Pages(census.context_pages),
                         )
                         .unwrap_or_else(|| {
                             panic!(
@@ -269,49 +271,50 @@ impl TargetEmitter for Spyre {
                                  cannot hold the model's own context ({} pages) beside this \
                                  bake's {} MB of mandatory residency — a bake that cannot fund \
                                  the model's whole context refuses",
-                                funded / (1024 * 1024),
-                                pool_law::DEFAULT_GPU_MEMORY_UTILIZATION,
+                                funded.0 / (1024 * 1024),
+                                pool_law::GpuMemoryUtilization::DEFAULT.0,
                                 census.context_pages,
-                                w.mandatory_bytes / (1024 * 1024),
+                                w.residency.mandatory_bytes().0 / (1024 * 1024),
                             )
                         });
-                        pages = Some(pages.map_or(p, |m: u32| m.min(p)));
+                        pages = Some(pages.map_or(p, |m: pool_law::Pages| m.min(p)));
                     }
                     let pages = pages.expect("a census always names at least one world");
                     let current_pages = capacity
                         .map(|c| c.get() / page_slots)
                         .unwrap_or(census.context_pages);
-                    if pages <= current_pages {
+                    if pages.0 <= current_pages {
                         break;
                     }
                     if pass == 8 {
                         panic!(
                             "[spyre] {stem}: the pool descent did not converge in 8 passes — \
                              the law still grows past {} page(s)",
-                            pages
+                            pages.0
                         );
                     }
-                    let positions: u32 = (u64::from(pages) * u64::from(page_slots))
+                    let positions: u32 = (u64::from(pages.0) * u64::from(page_slots))
                         .try_into()
                         .unwrap_or_else(|_| {
                             panic!(
-                                "[spyre] {stem}: the law's pool ({pages} pages × {page_slots} \
-                                 slots) exceeds u32 positions"
+                                "[spyre] {stem}: the law's pool ({} pages × {page_slots} \
+                                 slots) exceeds u32 positions",
+                                pages.0
                             )
                         });
                     eprintln!(
                         "[spyre] {stem}: the capacity law grows the KV pool — pass {pass}: {} \
                          page(s) (the model's own context is {}), mandatory residency {} MB \
                          against the {} MB the card funds; re-baking at {positions} positions",
-                        pages,
+                        pages.0,
                         census.context_pages,
                         census
                             .worlds
                             .iter()
-                            .map(|w| w.mandatory_bytes / (1024 * 1024))
+                            .map(|w| w.residency.mandatory_bytes().0 / (1024 * 1024))
                             .min()
                             .unwrap_or(0),
-                        funded / (1024 * 1024),
+                        funded.0 / (1024 * 1024),
                     );
                     capacity = Some(
                         std::num::NonZeroU32::new(positions)

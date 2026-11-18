@@ -212,11 +212,70 @@ pub(crate) struct PoolCensus {
     pub(crate) worlds: Vec<WorldPoolCensus>,
 }
 
-/// One world's census terms: its decode bundle's page stride, and the mandatory residency the
-/// law charges before the pool takes the remainder of the funded budget.
+/// One world's census — the FULL [`BakedCensus`](ktir_superdsc::pool_law::BakedCensus) terms as
+/// the bake resolved them: the rung lists as fingerprints (the decode owner, the anchor, the
+/// family past it), the page stride the KTIR lowering itself derived, the utilization the bake
+/// funded at, the mandatory-residency terms, and the shared-scratch arena owners. Rendered into
+/// the bundle (`SengraphBundle` / `TpForward`) as the census the load READS — the load
+/// re-derives none of it — and returned to the caller for the law's re-bake descent, which reads
+/// the same terms through [`Residency::mandatory_bytes`].
+#[derive(Clone)]
 pub(crate) struct WorldPoolCensus {
-    pub(crate) page_stride_bytes: u64,
-    pub(crate) mandatory_bytes: u64,
+    pub(crate) decode_fp: String,
+    pub(crate) anchor_fp: Option<String>,
+    pub(crate) family_fps: Vec<String>,
+    pub(crate) page_stride: u64,
+    pub(crate) residency: ktir_superdsc::pool_law::Residency,
+    pub(crate) arena_owners: [Option<String>; ktir_superdsc::pool_law::SHARED_SCRATCH_SEGS.len()],
+}
+
+/// One world's census, as the bundle carries it — a `BakedCensus` token the load reads. The
+/// fingerprints ride the SAME sentinel form the manifest's rung lists use
+/// (`SUPERDSC_BUNDLE:{fp}`), so the load's membership checks compare like with like.
+fn baked_census_lit(w: &WorldPoolCensus) -> proc_macro2::TokenStream {
+    let sentinel = |fp: &str| proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
+    let decode_fp = sentinel(&w.decode_fp);
+    let anchor_fp = match &w.anchor_fp {
+        Some(fp) => {
+            let fp = sentinel(fp);
+            quote! { ::core::option::Option::Some(#fp) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    let family_fps = w.family_fps.iter().map(|fp| sentinel(fp));
+    let stride = proc_macro2::Literal::u64_unsuffixed(w.page_stride);
+    let res = &w.residency;
+    let (dnk, tc, alb, asp, lrb) = (
+        proc_macro2::Literal::u64_unsuffixed(res.decode_non_kv_bytes.0),
+        proc_macro2::Literal::u64_unsuffixed(res.tail_charge.0),
+        proc_macro2::Literal::u64_unsuffixed(res.anchor_live_bytes.0),
+        proc_macro2::Literal::u64_unsuffixed(res.anchor_spare_bytes.0),
+        proc_macro2::Literal::u64_unsuffixed(res.ladder_rung_bytes.0),
+    );
+    let arena_owners = w.arena_owners.iter().map(|owner| match owner {
+        Some(fp) => {
+            let fp = sentinel(fp);
+            quote! { ::core::option::Option::Some(#fp) }
+        }
+        None => quote! { ::core::option::Option::None },
+    });
+    quote! {
+        ::scratchy_target_spyre::pool_law::BakedCensus {
+            decode_fp: #decode_fp,
+            anchor_fp: #anchor_fp,
+            family_fps: &[#(#family_fps),*],
+            page_stride: ::scratchy_target_spyre::pool_law::PageStride(#stride),
+            utilization: ::scratchy_target_spyre::pool_law::GpuMemoryUtilization::DEFAULT,
+            residency: ::scratchy_target_spyre::pool_law::Residency {
+                decode_non_kv_bytes: ::scratchy_target_spyre::pool_law::Bytes(#dnk),
+                tail_charge: ::scratchy_target_spyre::pool_law::Bytes(#tc),
+                anchor_live_bytes: ::scratchy_target_spyre::pool_law::Bytes(#alb),
+                anchor_spare_bytes: ::scratchy_target_spyre::pool_law::Bytes(#asp),
+                ladder_rung_bytes: ::scratchy_target_spyre::pool_law::Bytes(#lrb),
+            },
+            arena_owners: [#(#arena_owners),*],
+        }
+    }
 }
 
 /// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
@@ -2826,6 +2885,10 @@ pub(crate) fn dump_wavefront_mega(
         struct RungLayoutEntry {
             fp: String,
             facts: ktir_superdsc::pool_law::RungFacts,
+            /// The rung's pool page stride — the KTIR lowering's OWN derivation (the sum of the
+            /// per-launch KV spans over the pages the pool was baked at), carried so the census
+            /// reads it instead of re-deriving it. THE ONE STATEMENT of the stride.
+            page_stride: u64,
         }
         let rung_layouts: std::cell::RefCell<Vec<RungLayoutEntry>> =
             std::cell::RefCell::new(Vec::new());
@@ -2945,15 +3008,16 @@ pub(crate) fn dump_wavefront_mega(
                 bank0: u64,
                 banks: Vec<u64>,
             },
-            // ⭐⭐ THE CENSUS LEDGER'S ENTRY — one CONCRETE rung bundle's own layout facts,
-            // joined by fingerprint against the rung lists. The capacity law reads the ledger
-            // after the last bake; the load census reads the same facts from the runtime
-            // bundle the fp names, so the two censuses are one census. (The pool's page stride
-            // is not a carried field: it is the LAW's own division of the pool's whole bytes
-            // by the page count the pool was baked at — `pool_law::page_stride_bytes`.)
+            // ⭐⭐ THE CENSUS LEDGER'S ENTRY — one CONCRETE rung bundle's own layout facts and
+            // its pool page stride, joined by fingerprint against the rung lists. The capacity
+            // law reads the ledger after the last bake; the load reads the SAME facts from the
+            // census the ledger minted (carried in the bundle), so the two censuses are one
+            // census. The page stride is the KTIR lowering's own derivation, carried — never
+            // re-divided at either end.
             RungLayout {
                 fp: String,
                 facts: ktir_superdsc::pool_law::RungFacts,
+                page_stride: u64,
             },
             // ⭐ THIS BAKE'S SCALAR REGISTRY, by phase — the registry ledger's entry.
             Registry {
@@ -4294,6 +4358,14 @@ pub(crate) fn dump_wavefront_mega(
                                                             .clone(),
                                                         weight_tail: rolled.layout.weight_tail,
                                                     },
+                                                    // The stride the lowering derived for THIS
+                                                    // rung's pools — 0 off-card, where no pool
+                                                    // is placed and the census never runs.
+                                                    page_stride: if card {
+                                                        rolled.kv_page_stride
+                                                    } else {
+                                                        0
+                                                    },
                                                 });
                                             }
                                             // Stamp the DECODE body_fp or the PREFILL body_fp by phase
@@ -4642,11 +4714,15 @@ pub(crate) fn dump_wavefront_mega(
                     // ⭐ THE CENSUS LEDGER — joined by fingerprint; a second entry for one
                     // fingerprint is an inventory desync UNLESS it is the same facts (a rebake
                     // of the same rung), in which case it is nothing new to charge.
-                    BakeEffect::RungLayout { fp, facts } => {
+                    BakeEffect::RungLayout {
+                        fp,
+                        facts,
+                        page_stride,
+                    } => {
                         let mut l = world.rung_layouts.borrow_mut();
                         match l.iter().find(|e| e.fp == fp) {
                             Some(prev) => {
-                                if prev.facts != facts {
+                                if prev.facts != facts || prev.page_stride != page_stride {
                                     panic!(
                                         "[spyre-superdsc] bundle {fp} baked two different \
                                          layouts — an inventory desync, refusing rather than \
@@ -4654,7 +4730,11 @@ pub(crate) fn dump_wavefront_mega(
                                     );
                                 }
                             }
-                            None => l.push(RungLayoutEntry { fp, facts }),
+                            None => l.push(RungLayoutEntry {
+                                fp,
+                                facts,
+                                page_stride,
+                            }),
                         }
                     }
                     BakeEffect::Registry {
@@ -6046,6 +6126,164 @@ pub(crate) fn dump_wavefront_mega(
                 });
             }
         }
+        // ⭐⭐⭐ THE CENSUS — the pool law's own terms over THIS bake's rungs, minted ONCE here,
+        // after the last bake of the model, when the ledger is complete, from the SAME rung lists
+        // the manifest carries. It is rendered into the bundle (`SengraphBundle` for the one-rank
+        // world, `TpForward` for the sharded one) as the `BakedCensus` the load READS — the load
+        // re-derives nothing the census states — and returned to the caller
+        // ([`super::BakeEmitter::bake_model`]'s descent), which feeds it to
+        // `pool_law::pool_pages` and re-bakes at the law's capacity.
+        //
+        // ⛔ CARD BUILDS ONLY (`spyre-lower`): the law's funded budget is a fact of the card the
+        // platform table states (`DeviceGen::MEMORY_BYTES`); a build without the card has no
+        // device memory to fund a budget from, so its pool stays at the model's own context — the
+        // floor — exactly as every such bake has always sized it, and its bundle carries NO census
+        // (`None`), which the spyre-hw load refuses by name: a card run needs a card bake. (The
+        // ledger is populated on every build; only the law's reader is the card's.)
+        let (census, one_rank_census, sharded_census): (
+            Option<PoolCensus>,
+            Option<WorldPoolCensus>,
+            Option<WorldPoolCensus>,
+        ) = if cfg!(feature = "spyre-lower") {
+            /// One world's census, resolved ONCE — the anchor (narrowest multi-token prefill
+            /// rung, else the prefill slot's own bundle, none when the prefill reroll fell back
+            /// to the decode bundle), the family (the other multi-token prefill rungs plus every
+            /// multi-width prefix rung), the decode batch rungs past one, and the borrower count
+            /// from the lists' own lengths. Every term the load's census used to re-derive is
+            /// resolved HERE and carried; the page stride is the ledger's own copy of the KTIR
+            /// lowering's derivation, never re-divided.
+            fn census_world(
+                stem: &str,
+                label: &str,
+                world: &WorldBake<'_>,
+            ) -> Option<WorldPoolCensus> {
+                let decode_fp = world.fp.borrow().clone()?;
+                let layouts = world.rung_layouts.borrow();
+                let find = |fp: &str| -> RungLayoutEntry {
+                    layouts.iter().find(|e| e.fp == fp).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "[spyre-superdsc] {stem} ({label}): bundle {fp} is in the rung lists \
+                         but baked no census entry — the census ledger and the ladder have \
+                         desynced"
+                    )
+                })
+                };
+                let decode = find(&decode_fp);
+                if decode.facts.kv_total_bytes() == 0 {
+                    panic!(
+                        "[spyre-superdsc] {stem} ({label}): the decode bundle places no KV pool — \
+                         the pool law sizes what a decode bundle must place"
+                    );
+                }
+                if decode.page_stride == 0 {
+                    panic!(
+                        "[spyre-superdsc] {stem} ({label}): the decode bundle's KTIR lowering \
+                         derived no page stride over a placed pool — the census cannot carry a \
+                         stride the lowering never stated"
+                    );
+                }
+                let prefill_rungs = world.prefill_rungs.borrow().clone();
+                // The prefill slot's own bundle — `None` when the reroll fell back to the decode
+                // bundle (C4), the same filter the census has always applied.
+                let top_prefill = world
+                    .prefill_fp
+                    .borrow()
+                    .clone()
+                    .filter(|pfp| *pfp != decode_fp);
+                let anchor_rung_m = prefill_rungs
+                    .iter()
+                    .filter(|(rm, _)| *rm > 1)
+                    .min_by_key(|(rm, _)| *rm)
+                    .map(|(rm, _)| *rm);
+                let anchor = match (&top_prefill, anchor_rung_m) {
+                    (Some(_), Some(rm)) => Some(find(
+                        prefill_rungs
+                            .iter()
+                            .find(|(m, _)| *m == rm)
+                            .map(|(_, fp)| fp.as_str())
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "[spyre-superdsc] {stem} ({label}): rung m={rm} vanished from \
+                                     its own list"
+                                )
+                            }),
+                    )),
+                    (Some(pfp), None) => Some(find(pfp)),
+                    (None, _) => None,
+                };
+                // The family past the anchor: `(fp, facts)` pairs, because the census carries the
+                // fps (the load marks borrowers by them) AND charges the facts.
+                let mut family: Vec<(String, ktir_superdsc::pool_law::RungFacts)> = prefill_rungs
+                    .iter()
+                    .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
+                    .map(|(_, fp)| (fp.clone(), find(fp).facts))
+                    .collect();
+                family.extend(
+                    world
+                        .prefill_prefix_rungs
+                        .borrow()
+                        .iter()
+                        // Every prefix rung charges — solo AND packed: a packed rung's
+                        // activations are its product's (s windows of width rows), charged
+                        // exactly as the solo rung's are.
+                        .filter(|(w, _, _)| *w > 1)
+                        .map(|(_, _, fp)| (fp.clone(), find(fp).facts)),
+                );
+                let decode_rungs: Vec<ktir_superdsc::pool_law::RungFacts> = world
+                    .decode_rungs
+                    .borrow()
+                    .iter()
+                    .filter(|(rn, _, _, _)| *rn > 1)
+                    .map(|(_, _, fp, _)| find(fp).facts)
+                    .collect();
+                let borrowers =
+                    (prefill_rungs.len() + world.decode_rungs.borrow().len() + 1) as u64;
+                let family_facts: Vec<&ktir_superdsc::pool_law::RungFacts> =
+                    family.iter().map(|(_, f)| f).collect();
+                let decode_rung_refs: Vec<&ktir_superdsc::pool_law::RungFacts> =
+                    decode_rungs.iter().collect();
+                let res = ktir_superdsc::pool_law::mandatory_residency(
+                    &ktir_superdsc::pool_law::CensusInputs {
+                        decode: &decode.facts,
+                        anchor: anchor.as_ref().map(|a| &a.facts),
+                        family: &family_facts,
+                        decode_rungs: &decode_rung_refs,
+                        borrowers,
+                    },
+                );
+                // The shared-scratch arenas' owners, as the family's own fingerprints — the load
+                // marks a rung a borrower by comparing against these, never by position.
+                let arenas = ktir_superdsc::pool_law::scratch_arena_owners(&family_facts);
+                let arena_owners = arenas.map(|a| a.map(|arena| family[arena.owner].0.clone()));
+                Some(WorldPoolCensus {
+                    decode_fp,
+                    anchor_fp: anchor.as_ref().map(|a| a.fp.clone()),
+                    family_fps: family.into_iter().map(|(fp, _)| fp).collect(),
+                    page_stride: decode.page_stride,
+                    residency: res,
+                    arena_owners,
+                })
+            }
+            let mut worlds: Vec<WorldPoolCensus> = Vec::new();
+            let one_rank_census = census_world(stem, "one-rank world", &one_rank);
+            if let Some(w) = &one_rank_census {
+                worlds.push(w.clone());
+            }
+            let sharded_census = tp_sources
+                .is_some()
+                .then(|| census_world(stem, "sharded world", &sharded_world))
+                .flatten();
+            if let Some(w) = &sharded_census {
+                worlds.push(w.clone());
+            }
+            let census = (!worlds.is_empty()).then_some(PoolCensus {
+                context_pages,
+                worlds,
+            });
+            (census, one_rank_census, sharded_census)
+        } else {
+            (None, None, None)
+        };
         // ⭐ THE SHARDED WORLDS this model baked — one `TpForward` per world whose bake committed a
         // decode bundle and its wiring.
         {
@@ -6145,6 +6383,15 @@ pub(crate) fn dump_wavefront_mega(
                             }
                         }
                     });
+                    // The sharded world's census, as the bundle carries it — the load reads it
+                    // and re-derives nothing.
+                    let tp_pool_census = match &sharded_census {
+                        Some(w) => {
+                            let lit = baked_census_lit(w);
+                            quote! { ::core::option::Option::Some(&#lit) }
+                        }
+                        None => quote! { ::core::option::Option::None },
+                    };
                     vec![quote! {
                         ::scratchy_target_spyre::wiring::TpForward::<
                             ::scratchy_target_spyre::bundle_code::collective::Build,
@@ -6160,6 +6407,7 @@ pub(crate) fn dump_wavefront_mega(
                                 packed_prefill: &[#(#tp_packed_lits),*],
                             },
                             sources: &[#(#sources),*],
+                            pool_census: #tp_pool_census,
                             world: ::core::marker::PhantomData,
                         }
                     }]
@@ -6184,6 +6432,15 @@ pub(crate) fn dump_wavefront_mega(
                 >] = &[#(#tp_forwards),*];
             });
         }
+        // The one-rank world's census, as the bundle carries it — the load reads it and
+        // re-derives nothing.
+        let pool_census_token = match &one_rank_census {
+            Some(w) => {
+                let lit = baked_census_lit(w);
+                quote! { ::core::option::Option::Some(&#lit) }
+            }
+            None => quote! { ::core::option::Option::None },
+        };
         ktir_bundle_out.extend(quote! {
             /// Embedded sendnn LAYER-GROUP bundle — baked by `#[forward]` under
             /// `-Fspyre`. Reached by the `sendnn`-feature spyre worker, which
@@ -6192,147 +6449,15 @@ pub(crate) fn dump_wavefront_mega(
             pub const SENGRAPH_BUNDLE: ::scratchy_target_spyre::manifest::SengraphBundle =
                 ::scratchy_target_spyre::manifest::SengraphBundle {
                     groups: &[ #(#group_tokens),* ],
+                    pool_census: #pool_census_token,
                 };
         });
         // KTIR rides the embedded const + try_load.
 
-        // ⭐⭐⭐ THE CENSUS — the pool law's own terms over THIS bake's rungs, joined by
-        // fingerprint against the same rung lists the load census reads from the manifest.
-        // The law itself is `pool_law`'s; this join is its bake-side reader, and it runs
-        // here, after the last bake of the model, when the ledger is complete. The caller's
-        // descent feeds it to `pool_law::pool_pages` and re-bakes at the law's capacity.
-        //
-        // ⛔ CARD BUILDS ONLY (`spyre-lower`): the law's funded budget is a fact of the
-        // card the platform table states (`DeviceGen::MEMORY_BYTES`); a build without the
-        // card has no device memory to fund a budget from, so its pool stays at the model's
-        // own context — the floor — exactly as every such bake has always sized it. (The
-        // ledger is populated on every build; only the law's reader is the card's.)
-        if !cfg!(feature = "spyre-lower") {
-            return None;
-        }
-        /// One world's census, resolved exactly as the load census resolves it — the anchor
-        /// (narrowest multi-token prefill rung, else the prefill slot's own bundle, none
-        /// when the prefill reroll fell back to the decode bundle), the family (the other
-        /// multi-token prefill rungs plus every multi-width prefix rung), the decode batch
-        /// rungs past one, and the borrower count from the lists' own lengths. The page
-        /// stride is the LAW's own division of the decode bundle's pool bytes by the page
-        /// count this bake lowered at — never a carried field.
-        fn census_world(
-            stem: &str,
-            label: &str,
-            world: &WorldBake<'_>,
-            pages: u32,
-        ) -> Option<WorldPoolCensus> {
-            let decode_fp = world.fp.borrow().clone()?;
-            let layouts = world.rung_layouts.borrow();
-            let find =
-                |fp: &str| -> RungLayoutEntry {
-                    layouts.iter().find(|e| e.fp == fp).cloned().unwrap_or_else(|| {
-                    panic!(
-                        "[spyre-superdsc] {stem} ({label}): bundle {fp} is in the rung lists \
-                         but baked no census entry — the census ledger and the ladder have \
-                         desynced"
-                    )
-                })
-                };
-            let decode = find(&decode_fp);
-            let kv_total = decode.facts.kv_total_bytes();
-            if kv_total == 0 {
-                panic!(
-                    "[spyre-superdsc] {stem} ({label}): the decode bundle places no KV pool — \
-                     the pool law sizes what a decode bundle must place"
-                );
-            }
-            let page_stride_bytes = ktir_superdsc::pool_law::page_stride_bytes(kv_total, pages);
-            let prefill_rungs = world.prefill_rungs.borrow().clone();
-            // The prefill slot's own bundle — `None` when the reroll fell back to the decode
-            // bundle (C4), the same filter the load census applies.
-            let top_prefill = world
-                .prefill_fp
-                .borrow()
-                .clone()
-                .filter(|pfp| *pfp != decode_fp);
-            let anchor_rung_m = prefill_rungs
-                .iter()
-                .filter(|(rm, _)| *rm > 1)
-                .min_by_key(|(rm, _)| *rm)
-                .map(|(rm, _)| *rm);
-            let anchor = match (&top_prefill, anchor_rung_m) {
-                (Some(_), Some(rm)) => Some(find(
-                    prefill_rungs
-                        .iter()
-                        .find(|(m, _)| *m == rm)
-                        .map(|(_, fp)| fp.as_str())
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "[spyre-superdsc] {stem} ({label}): rung m={rm} vanished from \
-                                 its own list"
-                            )
-                        }),
-                )),
-                (Some(pfp), None) => Some(find(pfp)),
-                (None, _) => None,
-            };
-            let mut family: Vec<ktir_superdsc::pool_law::RungFacts> = prefill_rungs
-                .iter()
-                .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
-                .map(|(_, fp)| find(fp).facts)
-                .collect();
-            family.extend(
-                world
-                    .prefill_prefix_rungs
-                    .borrow()
-                    .iter()
-                    // Every prefix rung charges — solo AND packed: a packed rung's
-                    // activations are its product's (s windows of width rows), charged
-                    // exactly as the solo rung's are.
-                    .filter(|(w, _, _)| *w > 1)
-                    .map(|(_, _, fp)| find(fp).facts),
-            );
-            let decode_rungs: Vec<ktir_superdsc::pool_law::RungFacts> = world
-                .decode_rungs
-                .borrow()
-                .iter()
-                .filter(|(rn, _, _, _)| *rn > 1)
-                .map(|(_, _, fp, _)| find(fp).facts)
-                .collect();
-            let borrowers = (prefill_rungs.len() + world.decode_rungs.borrow().len() + 1) as u64;
-            let family_refs: Vec<&ktir_superdsc::pool_law::RungFacts> = family.iter().collect();
-            let decode_rung_refs: Vec<&ktir_superdsc::pool_law::RungFacts> =
-                decode_rungs.iter().collect();
-            let res = ktir_superdsc::pool_law::mandatory_residency(
-                &ktir_superdsc::pool_law::CensusInputs {
-                    decode: &decode.facts,
-                    anchor: anchor.as_ref().map(|a| &a.facts),
-                    family: &family_refs,
-                    decode_rungs: &decode_rung_refs,
-                    borrowers,
-                },
-            );
-            Some(WorldPoolCensus {
-                page_stride_bytes,
-                mandatory_bytes: res.mandatory_bytes(),
-            })
-        }
-        // The page count this bake lowered at — the capacity every pool in every bundle of
-        // this model was placed for, in whole pages.
-        let baked_pages = prefix_len.get() / page_slots;
-        let mut worlds: Vec<WorldPoolCensus> = Vec::new();
-        if let Some(w) = census_world(stem, "one-rank world", &one_rank, baked_pages) {
-            worlds.push(w);
-        }
-        if tp_sources.is_some()
-            && let Some(w) = census_world(stem, "sharded world", &sharded_world, baked_pages)
-        {
-            worlds.push(w);
-        }
-        if worlds.is_empty() {
-            return None;
-        }
-        Some(PoolCensus {
-            context_pages,
-            worlds,
-        })
+        // ⭐⭐⭐ THE LAW'S DESCENT INPUT — the census computed above, rendered into the bundle
+        // and handed to the caller. `None` on a cardless build (no funded budget exists to size
+        // a pool from) and when no world baked a decode bundle (nothing to census).
+        census
     }
 }
 

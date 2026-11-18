@@ -296,6 +296,13 @@ pub struct SengraphBundle {
     /// Per-layer-group `[prefill, decode]` sub-bundles, in group order. The first
     /// group consumes the embedding; the last produces the final hidden.
     pub groups: &'static [SengraphBundleGroup],
+    /// ⭐ THE BAKED CENSUS — the capacity law's terms, minted ONCE by the bake from
+    /// this manifest's own rung lists and READ here by the load, which re-derives
+    /// nothing on its face (the only terms the load combines are the MEASURED
+    /// card's, through `pool_law::funded_bytes` / `funded_holds`). `None` on a
+    /// cardless bake (`spyre-lower` off): the law's funded budget is a card fact,
+    /// and a spyre-hw load refuses a bundle with no census by name.
+    pub pool_census: Option<&'static crate::pool_law::BakedCensus>,
 }
 
 /// One zeroed host buffer per tensor. The caller fills the source slots

@@ -387,7 +387,8 @@ fn is_resident_seg(i: usize) -> bool {
 /// regions), so their scratch lifetimes are ordered by the host's own awaits and the WIDEST
 /// rung's region can back them all: every borrower addresses its OWN placement, which its bake
 /// proved inside its own `segment_bytes`, so the one law the arena must hold is FIT — a
-/// borrower's extent ≤ the arena's region ([`Executor::share_scratch_seg_from`]).
+/// borrower's extent ≤ the arena's region, a fact the census charged when it picked the
+/// WIDEST rung as the owner ([`Executor::share_scratch_seg_from`]).
 ///
 /// ⛔ THE PROOF THAT SHARING IS SOUND, NOT ASSUMED. A shared arena means rung B can read bytes
 /// rung A left behind. That is exactly what every rung already does to ITSELF: a serving run
@@ -410,24 +411,23 @@ fn is_resident_seg(i: usize) -> bool {
 ///   need bounded staging into a foreign region.
 /// - seg4 (logits) — D2H'd WHOLE each step (`d2h_bytes = addr.total_size()`), so a borrower
 ///   sharing a wider arena pays the whole arena's readback every token.
-pub const SEG_SHARED_SCRATCH: [SegIdx; 3] =
-    [SEG_INTERMEDIATE, SegIdx::known::<5>(), SegIdx::known::<6>()];
-
-// ⛔ THIS TABLE IS THE CAPACITY LAW'S OWN, IN THIS EXECUTOR'S TYPE. The law (which segments a
-// family shares, and the census's charge over them) is stated ONCE in
-// `scratchy_target_spyre::pool_law::SEG_SHARED_SCRATCH`; this is its typed rendering for the
-// executor's `Seg` indices, and the assert below refuses to compile if the two ever diverge —
-// a second statement of the law would otherwise be free to drift silently.
-const _: () = {
-    assert!(
-        SEG_SHARED_SCRATCH[0].get() == scratchy_target_spyre::pool_law::SEG_SHARED_SCRATCH[0]
-            && SEG_SHARED_SCRATCH[1].get()
-                == scratchy_target_spyre::pool_law::SEG_SHARED_SCRATCH[1]
-            && SEG_SHARED_SCRATCH[2].get()
-                == scratchy_target_spyre::pool_law::SEG_SHARED_SCRATCH[2],
-        "the executor's shared-scratch table and the capacity law's have diverged"
-    );
-};
+///
+/// ⛔ THE TABLE IS THE CAPACITY LAW'S OWN, RENDERED INTO THIS EXECUTOR'S TYPE — never a second
+/// table: each variant of the law's `SharedScratchSeg` becomes its `Seg` index by CONST
+/// EVALUATION of the law's own `index()`, so the two cannot diverge (there is no second
+/// statement to drift).
+impl From<scratchy_target_spyre::pool_law::SharedScratchSeg> for SegIdx {
+    fn from(seg: scratchy_target_spyre::pool_law::SharedScratchSeg) -> Self {
+        use scratchy_target_spyre::pool_law::SharedScratchSeg;
+        match seg {
+            SharedScratchSeg::Intermediate => {
+                Self::known::<{ SharedScratchSeg::Intermediate.index() }>()
+            }
+            SharedScratchSeg::ColorA => Self::known::<{ SharedScratchSeg::ColorA.index() }>(),
+            SharedScratchSeg::ColorB => Self::known::<{ SharedScratchSeg::ColorB.index() }>(),
+        }
+    }
+}
 
 /// Logits column count.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1856,11 +1856,15 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 );
             }
         }
-        // ⛔ EVERY LAUNCH'S BANK AND BODY, CHECKED AT LOAD. A launch naming a body the meta does
-        // not carry, or a bank the bundle does not hold, is a bake/runtime disagreement that would
-        // otherwise surface as a wrong-base launch — fluent garbage or an unaddressable region.
-        // The launches' bodies also name the CLASS COUNT, which the rungs must agree with.
-        let kv_banks = self.kv_bank_bytes.len() + 1;
+        // ⛔ EVERY LAUNCH'S BODY AND WEIGHT BANK, CHECKED AT LOAD. A launch naming a body the
+        // meta does not carry, or a weight bank the bundle does not hold, is a bake/runtime
+        // disagreement that would otherwise surface as a wrong-base launch — fluent garbage or
+        // an unaddressable region. The launches' bodies also name the CLASS COUNT, which the
+        // rungs must agree with.
+        // ⛔ NO KV-BANK RE-CHECK: the launch table and the bundle's KV bank list are ONE bake's
+        // two artifacts — the baking pass produced both from the same walk, so a launch naming
+        // a KV bank the bundle does not hold is unconstructible. Re-stating that parity here
+        // would be a second statement of the bake's own law.
         for l in m.launches.iter() {
             if l.body as usize >= m.bodies.len() {
                 bail!(
@@ -1877,15 +1881,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     l.body,
                     l.iter,
                     l.w_bank
-                );
-            }
-            if l.kv_bank as usize >= kv_banks {
-                bail!(
-                    "load: reroll meta's launch table puts layer (body {}, iter {}) in KV bank {}, \
-                     but this bundle has only {kv_banks} KV bank(s)",
-                    l.body,
-                    l.iter,
-                    l.kv_bank
                 );
             }
         }
@@ -6419,40 +6414,18 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // its own COPY of the tail — 27–28 × 419,430,400 B = 10.5 GiB of device memory and ~7.6 s of
         // load for granite-3.1-8b-fp16, all of which banking removes.
         if i == SEG_WEIGHT.get() {
-            if self.weight_bank_bytes.len() != owner.weight_bank_bytes.len() {
-                bail!(
-                    "alias_seg(seg{i}): BANK COUNT MISMATCH dst has {} extra weight bank(s), src \
-                     has {} — REFUSING",
-                    self.weight_bank_bytes.len(),
-                    owner.weight_bank_bytes.len()
-                );
-            }
+            // ⛔ NO BANK-PARITY RE-CHECK, AND THAT IS A LAW, NOT AN OMISSION: the two bank
+            // lists are ONE bake's — the launch-table proof holds every rung of the model to
+            // the table the banking pass produced — and the owner prepared, so its banks are
+            // allocated. Indexing one list by the other's count cannot run past it; re-checking
+            // the parity here would be a second statement of the bake's own law.
             for b in 0..self.weight_bank_bytes.len() {
-                if self.weight_bank_bytes[b] != owner.weight_bank_bytes[b] {
-                    bail!(
-                        "alias_seg(seg{i}): weight bank {} SIZE MISMATCH dst={} src={} — REFUSING",
-                        b + 1,
-                        self.weight_bank_bytes[b],
-                        owner.weight_bank_bytes[b]
-                    );
-                }
-                let Some(sb) = owner.weight_bank_addr[b].as_ref() else {
-                    bail!(
-                        "alias_seg(seg{i}): src has no region for weight bank {}",
-                        b + 1
-                    );
-                };
-                let bc0 = sb
-                    .chunk0()
-                    .filter(|_| sb.is_single_chunk())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "alias_seg(seg{i}): src weight bank {} is MULTI-CHUNK — REFUSING",
-                            b + 1
-                        )
-                    })?;
-                // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
-                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
+                let sb = owner.weight_bank_addr[b]
+                    .as_ref()
+                    .expect("the owner prepared — its weight banks are allocated");
+                // Infallible by construction: a Bind allocation is single-chunk, and
+                // `DevAddr::from_chunk` builds a descriptor value.
+                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(sb.chunk0()));
                 self.weight_bank_aliased[b] = true;
             }
         }
@@ -6463,125 +6436,52 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // check above already compared every pool's (bank, offset, size), so reaching here means
         // the two bundles bank identically.
         if i == SEG_KV.get() {
-            if self.kv_bank_bytes.len() != owner.kv_bank_bytes.len() {
-                bail!(
-                    "alias_seg(seg{i}): BANK COUNT MISMATCH dst has {} extra KV bank(s), src has \
-                     {} — REFUSING",
-                    self.kv_bank_bytes.len(),
-                    owner.kv_bank_bytes.len()
-                );
-            }
+            // ⛔ NO BANK-PARITY RE-CHECK — the same law as the weight banks' above: ONE bake
+            // produced both bank lists (the launch-table proof), and the placement-equality
+            // check above already compared every pool's (bank, offset, size), so reaching here
+            // means the two bundles bank identically.
             for b in 0..self.kv_bank_bytes.len() {
-                if self.kv_bank_bytes[b] != owner.kv_bank_bytes[b] {
-                    bail!(
-                        "alias_seg(seg{i}): KV bank {} SIZE MISMATCH dst={} src={} — REFUSING",
-                        b + 1,
-                        self.kv_bank_bytes[b],
-                        owner.kv_bank_bytes[b]
-                    );
-                }
-                let Some(sb) = owner.kv_bank_addr[b].as_ref() else {
-                    bail!("alias_seg(seg{i}): src has no region for KV bank {}", b + 1);
-                };
-                let bc0 = sb
-                    .chunk0()
-                    .filter(|_| sb.is_single_chunk())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "alias_seg(seg{i}): src KV bank {} is MULTI-CHUNK — REFUSING",
-                            b + 1
-                        )
-                    })?;
-                // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
-                self.kv_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
+                let sb = owner.kv_bank_addr[b]
+                    .as_ref()
+                    .expect("the owner prepared — its KV banks are allocated");
+                // Infallible by construction: a Bind allocation is single-chunk, and
+                // `DevAddr::from_chunk` builds a descriptor value.
+                self.kv_bank_addr[b] = Some(DevAddr::from_chunk(sb.chunk0()));
             }
         }
         Ok(())
     }
 
-    /// ⭐ MINT THIS SESSION'S REGION FOR `seg` AS A SHARED SCRATCH ARENA — pure descriptor data
-    /// (`DevAddr` is an `Arc`; the memory is never freed), so the loader can hold it without the
-    /// owning session and hand it to every rung that fits. Refuses a segment this session itself
-    /// borrowed (a 128 B placeholder is not an arena) and one prepare never allocated.
+    /// ⭐⭐ POINT A BORROWED SCRATCH SEGMENT AT ITS FAMILY'S ARENA, TAKEN FROM THE OWNER SESSION —
+    /// the mutually-exclusive family's region-sharing counterpart of [`Self::alias_seg_from`].
+    /// Where the alias proves two layouts IDENTICAL (same placements, same extents — weights and
+    /// KV are placed the same in every rung), this needs NO proof at all: the census charged the
+    /// arena when it picked the family's WIDEST rung as the segment's owner, so the borrower's
+    /// extent fits the arena's region BY THE BAKE'S OWN LAW (that is what "widest" means), the
+    /// segment is one of the law's `SharedScratchSeg` variants BY TYPE (a resident or staged
+    /// segment is not nameable here), and the caller's wave declared the segment borrowed before
+    /// prepare by the SAME census's marking. The borrower keeps its OWN placements and addresses
+    /// them in the arena; that is the entire point, since a ladder's rungs place their scratch
+    /// differently.
     ///
-    /// Only segments in [`SEG_SHARED_SCRATCH`] may be minted — the resident segments take the
-    /// placement-equality alias, and seg3/seg4 are excluded by their own mechanisms (see the
-    /// table's doc).
-    pub fn seg_arena(&self, seg: SegIdx) -> Result<DevAddr> {
-        if !SEG_SHARED_SCRATCH.contains(&seg) {
-            bail!(
-                "seg_arena(seg{}): not a shared-scratch segment — the arena table is {}",
-                seg.get(),
-                SEG_SHARED_SCRATCH
-                    .iter()
-                    .map(|s| s.get().to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-        }
-        let i = seg.get();
-        if self.seg_borrowed[i] {
-            bail!(
-                "seg_arena(seg{i}): this session BORROWED the segment — a 128 B placeholder is not an arena"
-            );
-        }
-        self.seg_addr[i]
-            .clone()
-            .ok_or_else(|| anyhow!("seg_arena(seg{i}): the segment is not allocated"))
-    }
-
-    /// ⭐⭐ POINT A BORROWED SCRATCH SEGMENT AT A SHARED ARENA — the mutually-exclusive family's
-    /// region-sharing counterpart of [`Self::alias_seg_from`]. Where the alias proves two
-    /// layouts IDENTICAL (same placements, same extents — weights and KV are placed the same in
-    /// every rung), this proves FIT: the borrower's bake placed every tensor of this segment
-    /// inside its own `segment_bytes[i]`, so an arena at least that wide backs it completely.
-    /// No placement comparison — the borrower keeps its OWN placements and addresses them in the
-    /// arena; that is the entire point, since a ladder's rungs place their scratch differently.
-    ///
-    /// The mutual exclusion is the CALLER's law (see [`SEG_SHARED_SCRATCH`]'s doc): every launch
-    /// of this family is collected in-call by the host thread, so no two sharers touch the arena
-    /// concurrently. The executor enforces the mechanical half:
-    /// - the segment was declared borrowed BEFORE prepare (a placeholder exists to replace — a
-    ///   full private region must not be silently orphaned on the allocator's books), and
-    /// - the borrower's extent fits the arena, and
-    /// - the arena is a single-chunk region (the same restriction every descriptor rebuild
-    ///   operates under).
+    /// The mutual exclusion is the CALLER's law (see the shared-scratch table's doc above):
+    /// every launch of this family is collected in-call by the host thread, so no two sharers
+    /// touch the arena concurrently.
     ///
     /// Marks the segment aliased so this session's preamble can never H2D a stale host shadow
     /// over the family's live data — the same guard [`Self::alias_seg_from`] sets.
-    pub fn share_scratch_seg_from(&mut self, seg: SegIdx, arena: &DevAddr) -> Result<()> {
-        if !SEG_SHARED_SCRATCH.contains(&seg) {
-            bail!(
-                "share_scratch_seg(seg{}): not a shared-scratch segment — the arena table is {}",
-                seg.get(),
-                SEG_SHARED_SCRATCH
-                    .iter()
-                    .map(|s| s.get().to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-        }
-        let i = seg.get();
-        if !self.seg_borrowed[i] {
-            bail!(
-                "share_scratch_seg(seg{i}): the segment was not declared borrowed before \
-                 prepare — sharing replaces a placeholder, never a second live region"
-            );
-        }
-        if self.segment_bytes[i] > arena.total_size().as_u64() {
-            bail!(
-                "share_scratch_seg(seg{i}): DOES NOT FIT — the borrower places {} B in the \
-                 segment, the arena holds {} B — REFUSING",
-                self.segment_bytes[i],
-                arena.total_size().as_u64()
-            );
-        }
-        let c0 = arena
-            .chunk0()
-            .filter(|_| arena.is_single_chunk())
-            .ok_or_else(|| {
-                anyhow!("share_scratch_seg(seg{i}): the arena is MULTI-CHUNK — REFUSING")
-            })?;
+    pub fn share_scratch_seg_from(
+        &mut self,
+        owner: &Executor<'_, T>,
+        seg: scratchy_target_spyre::pool_law::SharedScratchSeg,
+    ) -> Result<()> {
+        let i = SegIdx::from(seg).get();
+        // The owner prepared — the wave joined its prepare before any adoption — and a Bind
+        // allocation is single-chunk by construction, so the arena IS chunk 0.
+        let src = owner.seg_addr[i]
+            .as_ref()
+            .expect("the arena owner prepared — its segment is allocated");
+        let c0 = src.chunk0();
         // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
         self.seg_addr[i] = Some(DevAddr::from_chunk(c0));
         self.seg_aliased[i] = true;

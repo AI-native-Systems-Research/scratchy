@@ -60,6 +60,13 @@ ktir-core = { path = "../ktir-core" }
 # the type lives in a dependency-free leaf the shared sharding analysis names too, so both state the
 # same world. No scratchy dependency of its own, so this crate stays a leaf.
 scratchy-tp-world = { path = "../../../../../crates/core/tp-world" }
+# ⭐ THE CAPACITY LAW'S FUNDED FRACTION — the serving config's ONE constant
+# (`DEFAULT_GPU_MEMORY_UTILIZATION`), consumed by `pool_law::GpuMemoryUtilization::DEFAULT` so
+# the bake funds the pool at exactly the fraction the config states and the number is never
+# restated. The config crate is serde types over primitives — no device, no Apple-only edge —
+# so this stays the leaf's heaviest dependency by far, and it is paid for a law that must not
+# drift.
+scratchy-core-config = { path = "../../../../../crates/core/config" }
 
 # ⛔⛔⛔ THE KANI HARNESSES IN `sdsc_abstract.rs` CAME WITH IT, AND THEY NEED THIS DECLARATION.
 # They compile only under the model checker, so `cfg(kani)` is a real name a normal build never

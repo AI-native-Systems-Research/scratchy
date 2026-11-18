@@ -836,10 +836,12 @@ impl Worker for SpyreWorker {
         // output carries the decode tokens with the chunks' rows.
         #[cfg(feature = "spyre-hw")]
         if let Some((decode_ids, pure, cell)) = decode_submitted {
-            if pure && self.drain_door.is_some() {
-                // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a resolver
-                // that waited first would block the one thread that can fill the cell.
-                let door = self.drain_door.clone().expect("checked above");
+            // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a resolver
+            // that waited first would block the one thread that can fill the cell.
+            // (A pure step — the decode was the whole schedule — defers through the drain
+            // door when one exists; the let-chain BINDS it, so no re-look-up can disagree
+            // with the check.)
+            if pure && let Some(door) = self.drain_door.clone() {
                 let waiting = cell;
                 let resolver = move || -> Result<Vec<u32>, String> {
                     door.knock(waiting.clone()).map_err(|e| e.to_string())?;

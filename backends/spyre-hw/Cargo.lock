@@ -1578,6 +1578,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "ktir-core",
+ "scratchy-core-config",
  "scratchy-tp-world",
  "serde",
  "serde_json",

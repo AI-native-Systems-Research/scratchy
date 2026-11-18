@@ -94,12 +94,6 @@ pub struct SpyreWorker {
     /// HOW DEEP ONE REQUEST MAY GO — `--max-model-len`, as the CLI gave it. `None` falls back to the
     /// model's own `max_position_embeddings`. The bake's KV pool must hold it, or the load refuses.
     pub(crate) declared_context: Option<usize>,
-    /// WHAT FRACTION OF THE CARD THIS RUN MAY SPEND — `--gpu-memory-utilization`, as the CLI gave it.
-    ///
-    /// ⛔ SPYRE IGNORED THIS FLAG ENTIRELY, because its KV budget was a constant and a constant has no
-    /// fraction to take. The GPU target sizes from `total_memory * utilization`, so the flag meant
-    /// something on one backend and not the other.
-    pub(crate) gpu_memory_utilization: f64,
 }
 
 impl SpyreWorker {
@@ -118,19 +112,21 @@ impl SpyreWorker {
             seating: None,
             input_batch: scratchy_serving_engine::input_batch::InputBatch::new(),
             declared_context: None,
-            // The capacity law's own default — the same fraction the bake sized the pool at, so a
-            // run that names nothing is checked against the budget the pool was baked to fill.
-            // `declare_workload` overwrites it with what the run actually asked for.
-            gpu_memory_utilization: scratchy_target_spyre::pool_law::DEFAULT_GPU_MEMORY_UTILIZATION,
         }
     }
 
-    /// Tell this worker its declared workload — `--max-model-len`, which the bake's KV pool must hold,
-    /// and `--gpu-memory-utilization`, the card fraction the sessions may spend — before `load_model`
-    /// checks both. The concurrency is the decode ladder's to state (`Worker::max_num_seqs_override`).
-    pub fn declare_workload(&mut self, max_model_len: Option<usize>, gpu_memory_utilization: f64) {
+    /// Tell this worker its declared workload — `--max-model-len`, which the bake's KV pool must
+    /// hold — before `load_model` checks it. The concurrency is the decode ladder's to state
+    /// (`Worker::max_num_seqs_override`).
+    ///
+    /// ⛔ `--gpu-memory-utilization` IS NOT HERE, AND THAT IS THE LAW: the fraction is a BAKE
+    /// INPUT on spyre — the pool is a baked dimension, sized at
+    /// [`pool_law::GpuMemoryUtilization::DEFAULT`](scratchy_target_spyre::pool_law::GpuMemoryUtilization)
+    /// by the bake and checked at load against the fraction the bake actually used (carried in
+    /// the bundle's census), so no run-time flag can move it. The serve flag stays parseable
+    /// (the CLI is backend-neutral); on spyre it names nothing.
+    pub fn declare_workload(&mut self, max_model_len: Option<usize>) {
         self.declared_context = max_model_len;
-        self.gpu_memory_utilization = gpu_memory_utilization;
     }
 
     /// Parsed HF config — available after [`Worker::load_model`]. `create_worker`
@@ -204,9 +200,8 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
             gguf_file: cfg.gguf_file.clone(),
         };
         let mut worker = SpyreWorker::new(worker_config, cfg.model_path.clone());
-        // BEFORE `load_model`, which checks the declared context against the baked pool and the
-        // sessions against the card fraction.
-        worker.declare_workload(cfg.max_model_len, cfg.gpu_memory_utilization);
+        // BEFORE `load_model`, which checks the declared context against the baked pool.
+        worker.declare_workload(cfg.max_model_len);
         worker.init_device().context("spyre init_device")?;
         worker.load_model().context("spyre load_model")?;
         let hf_config = worker

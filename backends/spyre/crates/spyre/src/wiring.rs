@@ -2009,6 +2009,10 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
     pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.
     pub sources: &'static [SourceShard],
+    /// ⭐ THE BAKED CENSUS — the capacity law's terms for THIS world, minted ONCE by the bake
+    /// from the rung lists above and READ by the load, which re-derives nothing on its face.
+    /// `None` on a cardless bake; a spyre-hw load refuses a forward with no census by name.
+    pub pool_census: Option<&'static crate::pool_law::BakedCensus>,
     /// The world every rank of which runs this forward.
     pub world: core::marker::PhantomData<T>,
 }

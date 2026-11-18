@@ -161,8 +161,13 @@ pub struct CacheConfig {
     pub kv_offloading_backend: Cow<'static, str>,
 }
 
+/// The fraction of allocatable device memory a bake funds — the ONE statement of the
+/// number, consumed by both readers: the serde default below, and the spyre capacity
+/// law (`pool_law::GpuMemoryUtilization::DEFAULT`), whose bake sizes the KV pool by it.
+pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.9;
+
 fn default_gpu_memory_utilization() -> f64 {
-    0.9
+    DEFAULT_GPU_MEMORY_UTILIZATION
 }
 
 fn default_swap_space() -> f64 {

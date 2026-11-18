@@ -276,29 +276,12 @@ fn audit_layout_addresses(
     // returns an OOM whose numbers deny each other (`requested_bytes` well under `free_space_bytes`),
     // because the free bytes are in the regions the request cannot reach. Nothing in that message
     // names a segment, a tensor, or a model. All of it is decided here, by constants.
-    // A weight or KV BANK is a device region like any other, so it is bound by the same cap;
-    // checking the banks here is what stops banking from trading one over-size allocation for
-    // another.
-    for (b, &bytes) in weight_bank_bytes.iter().enumerate() {
-        if bytes > bundle::MAX_SEGMENT_BYTES {
-            fail.push(format!(
-                "weight bank {} packs {bytes} B, {} B past the {} B a single device region can hold",
-                b + 1,
-                bytes - bundle::MAX_SEGMENT_BYTES,
-                bundle::MAX_SEGMENT_BYTES,
-            ));
-        }
-    }
-    for (b, &bytes) in kv_bank_bytes.iter().enumerate() {
-        if bytes > bundle::MAX_SEGMENT_BYTES {
-            fail.push(format!(
-                "KV bank {} packs {bytes} B, {} B past the {} B a single device region can hold",
-                b + 1,
-                bytes - bundle::MAX_SEGMENT_BYTES,
-                bundle::MAX_SEGMENT_BYTES,
-            ));
-        }
-    }
+    //
+    // ⛔ NO BANK-CAP RE-CHECK HERE: the bank extents arrive as DATA (the per-placement bound below
+    // consumes them), but whether a BANK itself fits the cap is proven once, by the banking pass's
+    // own construction — greedy packing opens the next bank before the current one can pass the cap,
+    // and a launch block whose span alone passed the cap is refused there. Restating that law here
+    // would be a second statement of it.
     for (seg, &bytes) in segment_bytes.iter().enumerate() {
         if bytes > bundle::MAX_SEGMENT_BYTES {
             let (biggest, share) = places
@@ -753,7 +736,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
-    // see [`bank_weight_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
+    // see [`bank_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
     // different layer counts, and banking needs the class boundaries), from
     // [`per_layer_external_tids`], a pre-pass over the re-rolled tape; EMPTY for an unrolled
     // bundle, which has no layer boundary and therefore cannot bank. A uniform model is one class,
@@ -941,7 +924,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 tid,
                 role,
                 segment: seg,
-                // Bank 0 — every placement is packed into one region here, and `bank_weight_segment`
+                // Bank 0 — every placement is packed into one region here, and `bank_segment`
                 // is the ONE pass that ever moves a weight to another bank.
                 bank: 0,
                 offset: off,
@@ -992,7 +975,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    a re-rolled body reaches layer `v`'s pools at one uniform stride. On a CARD build only: the
     //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and the emulator
     //    never places them. A model whose pools outgrow one device region (`max_position_embeddings`
-    //    pages of every layer) is BANKED across regions below — `bank_kv_segment` — not shrunk: the
+    //    pages of every layer) is BANKED across regions below — `bank_segment` — not shrunk: the
     //    pool is the model's whole context, and the split falls on layer boundaries, the one boundary
     //    a launch can split on (a launch has ONE base per segment).
     let pools = if cfg!(feature = "spyre-lower") {
@@ -1025,7 +1008,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //      address it emits stays unambiguous, because `SEGMENT_OFFSETS[seg] + offset` still resolves
     //      to one region per segment. MEASURED on the card, granite-3.1-8b-instruct at fp16: coherent
     //      prose, TTFT 206.9 ms, ITL 189.2 ms, 5.3 tok/s, 0 WARN/SKIPPED/REFUSED.
-    //    * [`bank_weight_segment`] backs ONE segment number with SEVERAL regions. It is the only lever
+    //    * [`bank_segment`] backs ONE segment number with SEVERAL regions. It is the only lever
     //      on the PER-LAYER block (which the spill cannot touch) and its banks are aliasable where the
     //      spill slot is not — but it makes two regions share a segment number, and with it EVERY
     //      forward faulted `CB tag=ResponseTag(7341) state=Succeeded status=Error locator=0x2`,
@@ -1064,20 +1047,30 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     } else {
         // A bank holds the tail like any other weight, so nothing is spilled.
         (
-            bank_weight_segment(&mut placements, &mut seg_bytes, per_layer_ext)?,
+            bank_segment(
+                BankedRole::Weight,
+                &mut placements,
+                &mut seg_bytes,
+                per_layer_ext,
+            )?,
             WeightTail::InPlace,
         )
     };
     // ── THE KV SEGMENT'S OWN BUDGET ── the pools are packed by now, so this is the point that
     //    knows whether every layer's K and V of the model's WHOLE context fit one device region.
-    //    Where they do not, `bank_kv_segment` backs the ONE segment number with several regions,
-    //    split at (class, iteration) layer boundaries — the same lever `bank_weight_segment`
-    //    is for the per-layer weight block, over a segment whose every tensor is per-layer (the
-    //    reroll's own guard: a body reads only per-layer tensors in the KV segment), so there is
-    //    no tail to spill and banking is the only expressible answer. A no-op — byte-identical
-    //    layout, empty bank list — for every model whose pools fit one region, which is every
-    //    model that worked before this line existed.
-    let kv_bank_bytes = bank_kv_segment(&mut placements, &mut seg_bytes, per_layer_ext)?;
+    //    Where they do not, the ONE banking pass backs the segment number with several regions,
+    //    split at (class, iteration) layer boundaries — the same lever it is for the per-layer
+    //    weight block, over a segment whose every tensor is per-layer (the reroll's own guard:
+    //    a body reads only per-layer tensors in the KV segment), so there is no tail to spill
+    //    and banking is the only expressible answer. A no-op — byte-identical layout, empty bank
+    //    list — for every model whose pools fit one region, which is every model that worked
+    //    before this line existed.
+    let kv_bank_bytes = bank_segment(
+        BankedRole::Kv,
+        &mut placements,
+        &mut seg_bytes,
+        per_layer_ext,
+    )?;
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
     // weight segment's base region (bank 0) directly above the packed weights: `WINDOW_CUTS`
     // adjacent cuts, each one block per sending rank of the forward's world, each block
@@ -1823,7 +1816,7 @@ fn spill_weight_tail(
                  garbage that nothing downstream can detect — so this is a build refusal. The \
                  non-per-layer tail is already spilled; what remains over the cap is the per-layer \
                  block itself, and splitting THAT needs the weight segment to become a bank of \
-                 regions (see `bank_weight_segment`).",
+                 regions (see `bank_segment`).",
                 seg_bytes[w_seg],
                 seg_bytes[w_seg] - bundle::MAX_SEGMENT_BYTES,
                 bundle::MAX_SEGMENT_BYTES,
@@ -2058,55 +2051,119 @@ pub(crate) fn per_layer_external_tids(
     out
 }
 
-/// ⭐⭐⭐ THE WEIGHT SEGMENT AS A **BANK** OF DEVICE REGIONS — what lifts the 16 GiB ceiling on a
-/// model's weights, and the one pass that ever sets [`TensorPlacement::bank`].
+/// ⭐⭐⭐ BANK A SEGMENT ACROSS DEVICE REGIONS — the ONE pass that ever sets
+/// [`TensorPlacement::bank`], parameterized by the segment's [`BankedRole`]. Two roles reach it:
+/// the WEIGHT segment (what lifts the 16 GiB ceiling on a model's weights) and the KV POOL segment
+/// (what holds the model's WHOLE context instead of what one region holds of it).
 ///
 /// A segment is ONE `FlexAllocator` allocation served from ONE region, and a region is
 /// [`bundle::MAX_SEGMENT_BYTES`]; the same 16 GiB is the addressing stride (`SEGMENT_OFFSETS`). That
-/// bounded the WEIGHTS of any model at 16 GiB — fp16 dense topped out near 8B — and no segment slot
-/// is free to take a second one (0 intermediates, 1 weights, 2 KV, 3 activations, 4 logits, 5+6
-/// intermediate COLORS, all occupied; taking a colour is what the `WeightOverflow = 5` attempt got
-/// wrong).
+/// bounded the WEIGHTS of any model at 16 GiB — fp16 dense topped out near 8B — and the POOLS of
+/// any model at one region's worth of context: granite-3.1-8b fp16 carries 131072 positions ×
+/// 163840 B a position across every layer = 20 GiB of pools against the 16 GiB cap, and shrinking
+/// the pool to one region (the old `paged_step::pool_slots` law) held 104832 positions — 819 of
+/// 1024 pages — so a 16-prompt × 10.3k-token working set thrashed rep-2 to 0/80 blocks hit, while
+/// banking holds all 1024 pages (banks 0 and 1 at a 32/8-layer split, 16 GiB + 4 GiB). And no
+/// segment slot is free to take a second allocation (0 intermediates, 1 weights, 2 KV, 3
+/// activations, 4 logits, 5+6 intermediate COLORS, all occupied; taking a colour is what the
+/// `WeightOverflow = 5` attempt got wrong).
 ///
 /// ⭐ BUT 16 GiB IS A LIMIT ON BYTES PER REGION, NOT ON ADDRESSES PER SEGMENT. The rolled body bakes
 /// only LAYER 0's offsets and reaches layer `v` by advancing the base it is handed
 /// (`off[SEG_WEIGHT] = v·weight_stride`), and `tensor_allocs` is positional per launch with no
-/// segment identity in a `DevAddr`. So layer `v` can be handed a DIFFERENT REGION in slot 1 with the
-/// same descriptors — the weight segment becomes N regions, and the ceiling becomes N × 16 GiB.
+/// segment identity in a `DevAddr`. So layer `v` can be handed a DIFFERENT REGION in the same slot
+/// with the same descriptors — the segment becomes N regions, and the ceiling becomes N × 16 GiB.
 ///
-/// ⛔ THREE RULES, EACH ONE A FAILURE MODE THAT IS SILENT IF IT IS NOT CHECKED HERE:
+/// ⛔ THE LAWS, EACH ONE A FAILURE MODE THAT IS SILENT IF IT IS NOT CHECKED HERE:
 ///
 ///  1. **A launch has ONE base per segment**, so a bank boundary may only fall on a LAYER boundary —
 ///     `lpb` whole layers per bank. A launch straddling two banks cannot be expressed at all.
 ///  2. **Every layer must keep the SAME intra-layer offsets**, because ONE baked body serves all of
-///     them. This pass therefore only ever SUBTRACTS a whole number of layer strides from an
-///     existing offset; it never repacks a layer, so `weight_stride` and every relative address
-///     survive untouched.
-///  3. **The non-per-layer weights go in ONE bank together.** The suffix reads the final norm AND
-///     the lm_head; if those two landed in different banks the suffix would be inexpressible. That
-///     is the defect the seg6 tail spill hid: it moved only as many trailing tensors as it took to
-///     fit, which for granite-3.1-8b-fp16 was the embedding alone, leaving the final norm behind.
+///     them. This pass therefore only ever SUBTRACTS a whole launch block's base from an existing
+///     offset; it never repacks a layer, so `weight_stride` and every relative address survive
+///     untouched.
+///  3. **A launch's shift never wraps negative.** The launch table carries `pj.offset − p0.offset`
+///     as a `u64` shift applied to a REGION base; a class whose bank-1 block seated BELOW its
+///     layer-0 offset would need a negative shift, which the runtime would silently drop
+///     (`base.shifted` falls back to the unshifted base). Contiguous launch-order packing seats
+///     every class's FIRST launch of bank `b ≥ 1` at that bank's 0, so the refusal below fires only
+///     for a class whose layer-0 block does not start its bank — the hybrid-class case, refused
+///     HERE at bake rather than mis-addressed on the card.
+///  4. **The weight role's non-per-layer tail goes in ONE bank together.** The suffix reads the
+///     final norm AND the lm_head; if those two landed in different banks the suffix would be
+///     inexpressible. That is the defect the seg6 tail spill hid: it moved only as many trailing
+///     tensors as it took to fit, which for granite-3.1-8b-fp16 was the embedding alone, leaving
+///     the final norm behind. The KV role has NO tail — every tensor in seg2 is one layer's own
+///     pool (the reroll's own guard refuses a body reading anything else in the KV segment), so
+///     the pass instead REFUSES a placement that no launch re-bases.
 ///
-/// A bank is ALIASABLE, which is the second half of the payoff: it holds only weights, placed
-/// identically in every bundle, so `alias_seg_from`'s size + placement equality checks pass and every
-/// borrowing session SHARES the owner's regions. The spill slot could not be aliased (its co-tenant
-/// intermediate colour is m-dependent), so each of granite-3.1-8b-fp16's 27–28 sessions needed its
-/// own 419,430,400 B COPY of the tail — 10.5 GiB of device memory and ~7.6 s of the 25.2 s load.
+/// A bank is ALIASABLE, which is the second half of the payoff: it holds only tensors placed
+/// identically in every bundle of the model (the weights by construction; the pools from the same
+/// sources at the same prefix capacity), so `alias_seg_from`'s size + placement equality checks
+/// pass and every borrowing session SHARES the owner's regions. The spill slot could not be aliased
+/// (its co-tenant intermediate colour is m-dependent), so each of granite-3.1-8b-fp16's 27–28
+/// sessions needed its own 419,430,400 B COPY of the tail — 10.5 GiB of device memory and ~7.6 s of
+/// the 25.2 s load.
 ///
 /// Returns the extents of banks `1..N` (empty ⇒ one bank ⇒ nothing moved, and every model whose
-/// weights already fit is byte-identical, including its `seg_bytes`).
-fn bank_weight_segment(
+/// segment already fits one region is byte-identical, including its `seg_bytes`).
+#[derive(Clone, Copy)]
+enum BankedRole {
+    /// seg1: the per-layer weight block, plus the head/norm/lm_head tail that must stay in ONE
+    /// bank together.
+    Weight,
+    /// seg2: the paged KV pools — every tensor in the segment is one layer's own copy of a pool.
+    Kv,
+}
+
+impl BankedRole {
+    /// The segment this role banks.
+    fn segment(self) -> usize {
+        match self {
+            BankedRole::Weight => SegRole::Weight.segment(),
+            BankedRole::Kv => SegRole::Kv.segment(),
+        }
+    }
+    /// How the role names its segment in refusals ("weight segment" / "KV segment").
+    fn what(self) -> &'static str {
+        match self {
+            BankedRole::Weight => "weight",
+            BankedRole::Kv => "KV",
+        }
+    }
+    /// How the role names ONE bankable tensor ("a per-layer weight" / "a per-layer pool").
+    fn unit(self) -> &'static str {
+        match self {
+            BankedRole::Weight => "weight",
+            BankedRole::Kv => "pool",
+        }
+    }
+    /// Whether a placement is one of this role's bankable tensors.
+    fn owns(self, p: &TensorPlacement) -> bool {
+        match self {
+            BankedRole::Weight => {
+                p.segment == SegRole::Weight.segment() && matches!(p.role, SegRole::Weight)
+            }
+            BankedRole::Kv => p.segment == SegRole::Kv.segment(),
+        }
+    }
+}
+
+fn bank_segment(
+    role: BankedRole,
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
     seg_bytes: &mut [u64; 7],
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
 ) -> Result<Vec<u64>, SuperDscError> {
-    let w_seg = SegRole::Weight.segment();
-    if seg_bytes[w_seg] <= bundle::MAX_SEGMENT_BYTES {
-        return Ok(Vec::new()); // the overwhelming case: one region holds every weight.
+    let seg = role.segment();
+    let what = role.what();
+    let unit = role.unit();
+    if seg_bytes[seg] <= bundle::MAX_SEGMENT_BYTES {
+        return Ok(Vec::new()); // the overwhelming case: one region holds every tensor.
     }
-    // ── The per-layer WEIGHT classes, ONE LIST PER ATTENTION CLASS ──
-    // Only classes whose layer-0 tid is a WEIGHT in this segment: `per_layer_ext` also carries the
-    // KV caches (seg2), which have their own stride and their own segment.
+    // ── The per-layer classes, ONE LIST PER ATTENTION CLASS ── only classes whose layer-0 tid
+    // belongs to THIS role's segment (`per_layer_ext` carries every role's tensors, each with its
+    // own stride and its own segment).
     //
     // ⭐ THE LISTS KEEP THEIR CLASS BOUNDARIES. A hybrid model's classes have different layer
     // counts AND different per-layer strides (gemma-4's sliding and global layers pack different
@@ -2120,11 +2177,8 @@ fn bank_weight_segment(
         .map(|m| {
             m.values()
                 .filter(|tids| {
-                    tids.first().is_some_and(|t0| {
-                        placements.get(t0).is_some_and(|p| {
-                            p.segment == w_seg && matches!(p.role, SegRole::Weight)
-                        })
-                    })
+                    tids.first()
+                        .is_some_and(|t0| placements.get(t0).is_some_and(|p| role.owns(p)))
                 })
                 .cloned()
                 .collect()
@@ -2132,12 +2186,12 @@ fn bank_weight_segment(
         .collect();
     if classes.iter().all(|c| c.is_empty()) {
         return Err(SuperDscError(format!(
-            "seg{w_seg} packs {} B, {} B past the {} B one device region can hold, and the tape has \
-             NO per-layer weight classes — so there is no layer boundary to split the segment on. \
-             Banking a weight segment needs the re-rolled layer loop; an unrolled bundle this large \
-             cannot be addressed.",
-            seg_bytes[w_seg],
-            seg_bytes[w_seg] - bundle::MAX_SEGMENT_BYTES,
+            "seg{seg} packs {} B, {} B past the {} B one device region can hold, and the tape has \
+             NO per-layer {what} classes — so there is no layer boundary to split the segment on. \
+             Banking a {what} segment needs the re-rolled layer loop; an unrolled bundle this \
+             large cannot be addressed.",
+            seg_bytes[seg],
+            seg_bytes[seg] - bundle::MAX_SEGMENT_BYTES,
             bundle::MAX_SEGMENT_BYTES,
         )));
     }
@@ -2145,7 +2199,7 @@ fn bank_weight_segment(
     // class, by the source loop. Banking walks every class's every layer in OFFSET order of that
     // class's layer-0 placements, packs banks greedily to just under the cap, and RE-BASES each
     // (class, iteration) so the launch table's per-launch shifts stay small. One constraint only:
-    // all of a launch's weights land in ONE bank, which greedy whole-launch packing guarantees and
+    // all of a launch's tensors land in ONE bank, which greedy whole-launch packing guarantees and
     // the launch-table proof re-checks.
     // ⭐ SPAN FACTS TAKE THE MAP AS A PARAMETER, not a capture: a capturing closure would hold the
     // immutable borrow across the re-placement's `get_mut`, and pre-copying every launch's span into
@@ -2159,11 +2213,10 @@ fn bank_weight_segment(
     for class in &classes {
         let iters = class.iter().map(|c| c.len()).max().unwrap_or(0);
         if class.iter().any(|c| c.len() != iters) {
-            return Err(SuperDscError(
-                "bank_weight_segment: one class's per-layer weights disagree on that class's \
-                 layer count — the class's own layer boundary is not well defined"
-                    .into(),
-            ));
+            return Err(SuperDscError(format!(
+                "bank_segment: one class's per-layer {unit}s disagree on that class's layer \
+                 count — the class's own layer boundary is not well defined"
+            )));
         }
         for v in 0..iters {
             launches.push(class.iter().map(|c| c[v]).collect());
@@ -2177,7 +2230,9 @@ fn bank_weight_segment(
     // + global block, so the GLOBAL class's inter-iteration stride alternates 473,992,192 /
     // 985,470,976 B), which is FINE: the stride varying across iterations is exactly what the
     // per-launch table absorbs. What is NOT fine — and is refused here — is two tables of one class
-    // disagreeing about iteration i's shift, because no single launch entry could name both.
+    // disagreeing about iteration i's shift, because no single launch entry could name both. (For
+    // the KV role the same law is what keeps k, v and Kᵀ advancing together — one table lagging
+    // another would read one layer's keys against another's values.)
     for class in &classes {
         let Some(first) = class.first() else { continue };
         let shifts: Vec<u64> = first
@@ -2185,40 +2240,39 @@ fn bank_weight_segment(
             .map(|t| off_of(placements, t))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
-                SuperDscError("bank_weight_segment: a per-layer weight has no placement".into())
+                SuperDscError(format!("bank_segment: a per-layer {unit} has no placement"))
             })?;
         // `shifts[i] − shifts[0]` is iteration i's shift as the FIRST table lives it; every other
         // table must move its OWN layer-0 offset by exactly that same shift.
         for c in class {
             let Some(base) = off_of(placements, &c[0]) else {
-                return Err(SuperDscError(
-                    "bank_weight_segment: a per-layer weight has no placement".into(),
-                ));
+                return Err(SuperDscError(format!(
+                    "bank_segment: a per-layer {unit} has no placement"
+                )));
             };
             for (i, t) in c.iter().enumerate() {
                 let Some(o) = off_of(placements, t) else {
-                    return Err(SuperDscError(
-                        "bank_weight_segment: a per-layer weight has no placement".into(),
-                    ));
+                    return Err(SuperDscError(format!(
+                        "bank_segment: a per-layer {unit} has no placement"
+                    )));
                 };
                 let want = shifts[i].wrapping_sub(shifts[0]);
                 let got = o.wrapping_sub(base);
                 if got != want {
                     return Err(SuperDscError(format!(
-                        "bank_weight_segment: two tables of one weight class disagree on layer \
-                         {i}'s shift ({want} vs {got} B). The baked body carries iteration-0 \
-                         addresses and the launch table carries ONE shift per launch, so a class \
-                         whose tables shift differently cannot be addressed by any launch table."
+                        "bank_segment: two tables of one {what} class disagree on layer {i}'s \
+                         shift ({want} vs {got} B). The baked body carries iteration-0 addresses \
+                         and the launch table carries ONE shift per launch, so a class whose \
+                         tables shift differently cannot be addressed by any launch table."
                     )));
                 }
             }
         }
     }
-    // ── Re-place: greedy whole-launch packing into banks, everything else into the tail bank ──
-    // Each launch is a RIGID BLOCK: it keeps its intra-launch relative offsets (the baked body's
-    // addresses are those relatives plus the launch entry's base) and is re-seated at `cur_end` of
-    // the current bank, contiguously with the launches before it — no holes, so a bank's byte total
-    // is just where `cur_end` stops.
+    // ── Re-place: greedy whole-launch packing in TRUE LAYER ORDER, each launch a RIGID BLOCK
+    // re-seated contiguously at `cur_end` of the current bank (no holes; the block keeps its
+    // intra-launch relative offsets, so a bank's byte total is just where `cur_end` stops). One
+    // launch block per (class, iteration).
     let mut bank_bytes: Vec<u64> = vec![0u64];
     let mut cur_bank = 0usize;
     let mut cur_end = 0u64;
@@ -2241,9 +2295,9 @@ fn bank_weight_segment(
         let span = align128(hi.saturating_sub(lo));
         if span > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
-                "bank_weight_segment: ONE layer's weights span {span} B, past the {} B a single \
-                 device region can hold. A bank boundary can only fall on a layer boundary, so \
-                 this model cannot be addressed by advancing a per-layer base — it needs the layer \
+                "bank_segment: ONE layer's {unit}s span {span} B, past the {} B a single device \
+                 region can hold. A bank boundary can only fall on a layer boundary, so this \
+                 model cannot be addressed by advancing a per-layer base — it needs the layer \
                  itself split, which the rolled body cannot express.",
                 bundle::MAX_SEGMENT_BYTES,
             )));
@@ -2262,268 +2316,80 @@ fn bank_weight_segment(
         cur_end += span;
         bank_bytes[cur_bank] = cur_end;
     }
-    // The non-per-layer weights (the head that sorted before layer 0, the final norm, the lm_head /
-    // tied embedding) share ONE bank: the last layer bank if they fit in it, else a bank of their
-    // own. Sharing costs nothing and saves a region; what matters is that they are TOGETHER, so the
-    // suffix — which reads the norm and the lm_head in one launch — needs exactly one base.
+    // ── The role's epilogue over what no launch re-based ──
     let launched: std::collections::BTreeSet<u32> = launches.iter().flatten().copied().collect();
-    let mut tail: Vec<u32> = placements
-        .values()
-        .filter(|p| {
-            p.segment == w_seg && matches!(p.role, SegRole::Weight) && !launched.contains(&p.tid)
-        })
-        .map(|p| p.tid)
-        .collect();
-    tail.sort_by_key(|t| placements[t].offset); // keep the packed order the tape produced
-    let tail_len: u64 = tail
-        .iter()
-        .fold(0u64, |acc, t| align128(acc + placements[t].size));
-    // An empty tail needs no room, so it "fits" the last layer bank trivially — one condition, not
-    // two arms that happen to agree.
-    let tail_bank = if tail.is_empty()
-        || align128(bank_bytes[bank_bytes.len() - 1]) + tail_len <= bundle::MAX_SEGMENT_BYTES
-    {
-        bank_bytes.len() - 1
-    } else {
-        bank_bytes.push(0);
-        bank_bytes.len() - 1
-    };
-    let mut cur = align128(bank_bytes[tail_bank]);
-    for tid in &tail {
-        let p = placements.get_mut(tid).expect("tid came from this map");
-        p.bank = tail_bank as u32;
-        p.offset = cur;
-        cur = align128(cur + p.size);
-        bank_bytes[tail_bank] = cur;
-    }
-    // ── Prove every bank is allocatable BEFORE anything is baked ──
-    for (b, &bytes) in bank_bytes.iter().enumerate() {
-        if bytes > bundle::MAX_SEGMENT_BYTES {
-            return Err(SuperDscError(format!(
-                "bank_weight_segment: weight bank {b} packs {bytes} B, {} B past the {} B one \
-                 device region can hold ({} launch(es), {} bank(s)).",
-                bytes - bundle::MAX_SEGMENT_BYTES,
-                bundle::MAX_SEGMENT_BYTES,
-                launches.len(),
-                bank_bytes.len(),
-            )));
-        }
-    }
-    seg_bytes[w_seg] = bank_bytes[0];
-    Ok(bank_bytes[1..].to_vec())
-}
-
-/// ⭐⭐⭐ BANK THE KV POOL SEGMENT — back ONE segment number (seg2, the pools) with several device
-/// regions, so the pool is the model's WHOLE context instead of what one region holds of it.
-///
-/// This is the same lever [`bank_weight_segment`] is for the per-layer weight block, over a
-/// segment with a simpler shape: EVERY tensor in seg2 is one layer's own copy of a pool (the
-/// reroll's own guard — "a body reads only per-layer tensors in the KV segment" — refuses
-/// anything else), so there is no tail to spill and no suffix to keep together. The unit of
-/// banking is the (class, iteration) launch exactly as for weights, because a launch has ONE base
-/// per segment and the boundary must fall where the base can change.
-///
-/// granite-3.1-8b fp16 is the case that needs it: 131072 positions × 163840 B a position across
-/// every layer = 20 GiB of pools, against a 16 GiB region cap. Shrinking the pool to one region
-/// (the old `paged_step::pool_slots` law) held 104832 positions — 819 of 1024 pages — and a
-/// 16-prompt × 10.3k-token working set (165k positions) thrashed rep-2 to 0/80 blocks hit.
-/// Banking holds all 1024 pages: banks 0 and 1 at a 32/8-layer split (16 GiB + 4 GiB).
-///
-/// Laws, all proven here or by the launch-table proof downstream
-/// (`lower_subtile_tape_to_ktir`), which holds every placement to the table this pass produces:
-///  1. **A bank boundary falls on a (class, iteration) launch.** Greedy whole-launch packing,
-///     `lpb` whole layers per bank. A launch straddling two banks cannot be expressed at all.
-///  2. **Every layer keeps the SAME intra-layer offsets** — one baked body serves all of them —
-///     so this pass only ever SUBTRACTS a whole launch block's base from an existing offset; it
-///     never repacks a layer.
-///  3. **A launch's shift never wraps negative.** The launch table carries
-///     `pj.offset − p0.offset` as a `u64` shift applied to a REGION base; a class whose bank-1
-///     block seated BELOW its layer-0 offset would need a negative shift, which the runtime
-///     would silently drop (`base.shifted` falls back to the unshifted base). Contiguous
-///     launch-order packing seats every class's FIRST launch of bank `b ≥ 1` at that bank's 0,
-///     so the refusal below fires only for a class whose layer-0 block does not start its bank —
-///     the hybrid-class case, refused HERE at bake rather than mis-addressed on the card.
-///
-/// A bank is ALIASABLE like a weight bank: pools are placed identically in every bundle of the
-/// model (the same sources at the same prefix capacity), so `alias_seg_from`'s size + placement
-/// equality checks pass and every borrowing session SHARES the owner's regions.
-///
-/// Returns the extents of banks `1..N` (empty ⇒ one bank ⇒ nothing moved, and every model whose
-/// pools fit one region is byte-identical, including its `seg_bytes`).
-fn bank_kv_segment(
-    placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-    seg_bytes: &mut [u64; 7],
-    per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-) -> Result<Vec<u64>, SuperDscError> {
-    let kv_seg = SegRole::Kv.segment();
-    if seg_bytes[kv_seg] <= bundle::MAX_SEGMENT_BYTES {
-        return Ok(Vec::new()); // the overwhelming case: one region holds every pool.
-    }
-    // ── The per-layer KV classes, ONE LIST PER ATTENTION CLASS ── only classes whose layer-0 tid
-    // is a POOL in this segment (`per_layer_ext` also carries the weights, which have their own
-    // banking). The unit of banking is the (class, iteration) launch, not the bare layer index.
-    let classes: Vec<Vec<Vec<u32>>> = per_layer_ext
-        .iter()
-        .map(|m| {
-            m.values()
-                .filter(|tids| {
-                    tids.first()
-                        .is_some_and(|t0| placements.get(t0).is_some_and(|p| p.segment == kv_seg))
-                })
-                .cloned()
-                .collect()
-        })
-        .collect();
-    if classes.iter().all(|c| c.is_empty()) {
-        return Err(SuperDscError(format!(
-            "seg{kv_seg} packs {} B, {} B past the {} B one device region can hold, and the tape \
-             has NO per-layer KV classes — so there is no layer boundary to split the pool on. \
-             Banking a KV segment needs the re-rolled layer loop; an unrolled bundle this large \
-             cannot be addressed.",
-            seg_bytes[kv_seg],
-            seg_bytes[kv_seg] - bundle::MAX_SEGMENT_BYTES,
-            bundle::MAX_SEGMENT_BYTES,
-        )));
-    }
-    // ⭐ SHIFT AGREEMENT, the same precondition the weight banking proves: within a class,
-    // `placement_i(t) − placement_0(t)` is the SAME number for every table `t` of the class, or
-    // no single launch entry could name the class's iteration `i`. (k, v and Kᵀ must advance
-    // together or the score reads one layer's keys against another's values.)
-    let off_of = |m: &std::collections::BTreeMap<u32, TensorPlacement>, t: &u32| -> Option<u64> {
-        m.get(t).map(|p| p.offset)
-    };
-    for class in &classes {
-        let Some(first) = class.first() else { continue };
-        let shifts: Vec<u64> = first
-            .iter()
-            .map(|t| off_of(placements, t))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                SuperDscError("bank_kv_segment: a per-layer pool has no placement".into())
-            })?;
-        for c in class {
-            let Some(base) = off_of(placements, &c[0]) else {
-                return Err(SuperDscError(
-                    "bank_kv_segment: a per-layer pool has no placement".into(),
-                ));
+    match role {
+        BankedRole::Weight => {
+            // The non-per-layer weights (the head that sorted before layer 0, the final norm, the
+            // lm_head / tied embedding) share ONE bank: the last layer bank if they fit in it, else
+            // a bank of their own. Sharing costs nothing and saves a region; what matters is that
+            // they are TOGETHER, so the suffix — which reads the norm and the lm_head in one
+            // launch — needs exactly one base.
+            let mut tail: Vec<u32> = placements
+                .values()
+                .filter(|p| role.owns(p) && !launched.contains(&p.tid))
+                .map(|p| p.tid)
+                .collect();
+            tail.sort_by_key(|t| placements[t].offset); // keep the packed order the tape produced
+            let tail_len: u64 = tail
+                .iter()
+                .fold(0u64, |acc, t| align128(acc + placements[t].size));
+            // An empty tail needs no room, so it "fits" the last layer bank trivially — one
+            // condition, not two arms that happen to agree.
+            let tail_bank = if tail.is_empty()
+                || align128(bank_bytes[bank_bytes.len() - 1]) + tail_len
+                    <= bundle::MAX_SEGMENT_BYTES
+            {
+                bank_bytes.len() - 1
+            } else {
+                bank_bytes.push(0);
+                bank_bytes.len() - 1
             };
-            for (i, t) in c.iter().enumerate() {
-                let Some(o) = off_of(placements, t) else {
-                    return Err(SuperDscError(
-                        "bank_kv_segment: a per-layer pool has no placement".into(),
-                    ));
-                };
-                if o.wrapping_sub(base) != shifts[i].wrapping_sub(shifts[0]) {
-                    return Err(SuperDscError(format!(
-                        "bank_kv_segment: two tables of one KV class disagree on layer {i}'s \
-                         shift. The baked body carries iteration-0 addresses and the launch table \
-                         carries ONE shift per launch, so a class whose tables shift differently \
-                         cannot be addressed by any launch table."
-                    )));
-                }
+            let mut cur = align128(bank_bytes[tail_bank]);
+            for tid in &tail {
+                let p = placements.get_mut(tid).expect("tid came from this map");
+                p.bank = tail_bank as u32;
+                p.offset = cur;
+                cur = align128(cur + p.size);
+                bank_bytes[tail_bank] = cur;
+            }
+        }
+        BankedRole::Kv => {
+            // ⛔ EVERY PLACEMENT IN THE SEGMENT IS A LAUNCH BLOCK — the reroll's own guard refuses
+            // a body reading anything else in seg2, and the pools are placed from the same
+            // per-layer walk. A tensor left out of every launch would sit at an offset NO re-based
+            // launch addresses, so prove the walk was exhaustive rather than trusting the two
+            // derivations to agree.
+            let strays: Vec<u32> = placements
+                .values()
+                .filter(|p| role.owns(p) && !launched.contains(&p.tid))
+                .map(|p| p.tid)
+                .collect();
+            if !strays.is_empty() {
+                return Err(SuperDscError(format!(
+                    "bank_segment: {} placement(s) in seg{seg} belong to no (class, iteration) \
+                     launch ({:?} first) — a banked pool can only address what a launch re-bases, \
+                     so the banking walk and the per-layer walk disagree",
+                    strays.len(),
+                    strays.iter().take(4).collect::<Vec<_>>(),
+                )));
             }
         }
     }
-    // ── Re-place: greedy whole-launch packing in TRUE LAYER ORDER, each launch a RIGID BLOCK
-    // re-seated contiguously at `cur_end` of the current bank (no holes; the block keeps its
-    // intra-launch relative offsets). One launch block per (class, iteration).
-    let mut launches: Vec<Vec<u32>> = Vec::new();
-    for class in &classes {
-        let iters = class.iter().map(|c| c.len()).max().unwrap_or(0);
-        if class.iter().any(|c| c.len() != iters) {
-            return Err(SuperDscError(
-                "bank_kv_segment: one class's per-layer pools disagree on that class's layer \
-                 count — the class's own layer boundary is not well defined"
-                    .into(),
-            ));
-        }
-        for v in 0..iters {
-            launches.push(class.iter().map(|c| c[v]).collect());
-        }
+    // ⛔ NO BANK-CAP RE-CHECK, AND THAT IS A LAW, NOT AN OMISSION: greedy packing opens the NEXT
+    // bank before the current one can pass the cap, and any single launch block whose span alone
+    // passed the cap was already refused above, so a bank over the cap is unconstructible — a
+    // re-check here would be a second statement of a law the packing already proves.
+    if matches!(role, BankedRole::Kv) {
+        eprintln!(
+            "[superdsc-layout] the KV pool banks across {} region(s) — {} B in bank 0, {:?} B more — \
+             so the pool holds the model's whole context instead of what one region holds of it",
+            bank_bytes.len(),
+            bank_bytes[0],
+            &bank_bytes[1..],
+        );
     }
-    let mut bank_bytes: Vec<u64> = vec![0u64];
-    let mut cur_bank = 0usize;
-    let mut cur_end = 0u64;
-    for launch in &launches {
-        // Read every offset BEFORE any mutation: the reads borrow the map immutably and the
-        // re-placement below needs it mutably.
-        let offs: Vec<(u32, u64, u64)> = launch
-            .iter()
-            .map(|&t| {
-                let p = placements.get(&t).expect("tid came from this map");
-                (t, p.offset, p.size)
-            })
-            .collect();
-        let lo = offs.iter().map(|(_, o, _)| *o).min().unwrap_or(0);
-        let hi = offs
-            .iter()
-            .map(|(_, o, s)| align128(o + s))
-            .max()
-            .unwrap_or(0);
-        let span = align128(hi.saturating_sub(lo));
-        if span > bundle::MAX_SEGMENT_BYTES {
-            return Err(SuperDscError(format!(
-                "bank_kv_segment: ONE layer's pools span {span} B, past the {} B a single device \
-                 region can hold. A bank boundary can only fall on a layer boundary, so this \
-                 model's context cannot be addressed by advancing a per-layer base — the pool \
-                 itself would need a split the rolled body cannot express.",
-                bundle::MAX_SEGMENT_BYTES,
-            )));
-        }
-        if cur_end + span > bundle::MAX_SEGMENT_BYTES {
-            // Open the next bank at 0 — a launch never straddles.
-            bank_bytes.push(0);
-            cur_bank += 1;
-            cur_end = 0;
-        }
-        for (t, o, _sz) in &offs {
-            let p = placements.get_mut(t).expect("tid came from this map");
-            p.bank = cur_bank as u32;
-            p.offset = *o - lo + cur_end;
-        }
-        cur_end += span;
-        bank_bytes[cur_bank] = cur_end;
-    }
-    // ⛔ EVERY PLACEMENT IN THE SEGMENT IS A LAUNCH BLOCK — the reroll's own guard refuses a
-    // body reading anything else in seg2, and the pools are placed from the same per-layer walk.
-    // A tensor left out of every launch would sit at an offset NO re-based launch addresses, so
-    // prove the walk was exhaustive rather than trusting the two derivations to agree.
-    let launched: std::collections::BTreeSet<u32> = launches.iter().flatten().copied().collect();
-    let strays: Vec<u32> = placements
-        .values()
-        .filter(|p| p.segment == kv_seg && !launched.contains(&p.tid))
-        .map(|p| p.tid)
-        .collect();
-    if !strays.is_empty() {
-        return Err(SuperDscError(format!(
-            "bank_kv_segment: {} placement(s) in seg{kv_seg} belong to no (class, iteration) \
-             launch ({:?} first) — a banked pool can only address what a launch re-bases, so the \
-             banking walk and the per-layer walk disagree",
-            strays.len(),
-            strays.iter().take(4).collect::<Vec<_>>(),
-        )));
-    }
-    // ── Prove every bank is allocatable BEFORE anything is baked ──
-    for (b, &bytes) in bank_bytes.iter().enumerate() {
-        if bytes > bundle::MAX_SEGMENT_BYTES {
-            return Err(SuperDscError(format!(
-                "bank_kv_segment: KV bank {b} packs {bytes} B, {} B past the {} B one device \
-                 region can hold ({} launch(es), {} bank(s)).",
-                bytes - bundle::MAX_SEGMENT_BYTES,
-                bundle::MAX_SEGMENT_BYTES,
-                launches.len(),
-                bank_bytes.len(),
-            )));
-        }
-    }
-    eprintln!(
-        "[superdsc-layout] the KV pool banks across {} region(s) — {} B in bank 0, {:?} B more — \
-         so the pool holds the model's whole context instead of what one region holds of it",
-        bank_bytes.len(),
-        bank_bytes[0],
-        &bank_bytes[1..],
-    );
-    seg_bytes[kv_seg] = bank_bytes[0];
+    seg_bytes[seg] = bank_bytes[0];
     Ok(bank_bytes[1..].to_vec())
 }
 
@@ -11033,8 +10899,13 @@ mod kv_banking_tests {
             .values()
             .map(|p| (p.tid, p.offset, p.size))
             .collect();
-        let banks = bank_kv_segment(&mut placements, &mut seg_bytes, &per_layer_ext)
-            .expect("a 20 GiB pool of 2 GiB layers banks");
+        let banks = bank_segment(
+            BankedRole::Kv,
+            &mut placements,
+            &mut seg_bytes,
+            &per_layer_ext,
+        )
+        .expect("a 20 GiB pool of 2 GiB layers banks");
         // 8 layers fit bank 0 exactly (16 GiB); the last 2 open bank 1 (4 GiB).
         assert_eq!(
             banks,
@@ -11080,8 +10951,13 @@ mod kv_banking_tests {
             .values()
             .map(|p| (p.tid, p.bank, p.offset, p.size))
             .collect();
-        let banks = bank_kv_segment(&mut placements, &mut seg_bytes, &per_layer_ext)
-            .expect("a fitting pool is a no-op, not a refusal");
+        let banks = bank_segment(
+            BankedRole::Kv,
+            &mut placements,
+            &mut seg_bytes,
+            &per_layer_ext,
+        )
+        .expect("a fitting pool is a no-op, not a refusal");
         assert!(banks.is_empty(), "one region, one bank, no extras");
         assert_eq!(seg_bytes, seg_before, "seg_bytes untouched");
         let after: Vec<(u32, u32, u64, u64)> = placements
@@ -11092,22 +10968,21 @@ mod kv_banking_tests {
     }
 
     /// ⛔ A POOL WITH NO LAYER CLASSES CANNOT BANK — an unrolled bundle has no boundary a base
-    /// could change on, so the refusal names it instead of mis-addressing a region.
+    /// could change on. The test pins THAT it refuses (a bake-boundary refusal), never the
+    /// refusal's wording: the message is diagnostics, not a law.
     #[test]
     fn a_pool_with_no_layer_classes_refuses() {
         let (mut placements, mut seg_bytes, _) = banked_fixture(10, 1 << 31);
         let empty: Vec<std::collections::BTreeMap<u32, Vec<u32>>> = vec![];
-        let err = bank_kv_segment(&mut placements, &mut seg_bytes, &empty)
-            .expect_err("no layer classes is a refusal");
-        let msg = format!("{err:?}");
         assert!(
-            msg.contains("NO per-layer KV classes"),
-            "the refusal names the missing boundary: {msg}"
+            bank_segment(BankedRole::Kv, &mut placements, &mut seg_bytes, &empty).is_err(),
+            "no layer classes is a refusal"
         );
     }
 
     /// ⛔ A STRAY NON-PER-LAYER TENSOR IN THE SEGMENT REFUSES — the banking walk re-bases only
     /// launch blocks, so a tensor no launch owns would sit at an address nothing addresses.
+    /// Pinned as a refusal, never as wording.
     #[test]
     fn a_stray_tensor_in_the_pool_segment_refuses() {
         let (mut placements, mut seg_bytes, per_layer_ext) = banked_fixture(10, 1 << 31);
@@ -11123,12 +10998,15 @@ mod kv_banking_tests {
                 size: 128,
             },
         );
-        let err = bank_kv_segment(&mut placements, &mut seg_bytes, &per_layer_ext)
-            .expect_err("a stray pool-segment tensor is a refusal");
-        let msg = format!("{err:?}");
         assert!(
-            msg.contains("belong to no (class, iteration) launch"),
-            "the refusal names the stray: {msg}"
+            bank_segment(
+                BankedRole::Kv,
+                &mut placements,
+                &mut seg_bytes,
+                &per_layer_ext
+            )
+            .is_err(),
+            "a stray pool-segment tensor is a refusal"
         );
     }
 }

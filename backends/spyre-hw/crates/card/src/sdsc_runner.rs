@@ -22,7 +22,6 @@ use scratchy_target_spyre::manifest::bytes_to_f32;
 
 use ktir_superdsc::collective::PerRank;
 
-use crate::runtime::DevAddr;
 use scratchy_target_spyre::sen_convert::f32_to_f16_le;
 
 /// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
@@ -239,7 +238,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        borrowed: &[i64],
+        borrowed: &[SegIdx],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_borrowing_with_consts(
@@ -268,7 +267,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        borrowed: &[i64],
+        borrowed: &[SegIdx],
         load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         // ⛔ THE POOL'S OWN TABLES, FOR A SESSION WHOSE ATTENTION READS THEM. They are NOT covered by
         // `borrowed`: the pool statics are placed as an INTERMEDIATE colour segment
@@ -302,7 +301,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        borrowed: &[i64],
+        borrowed: &[SegIdx],
         load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
@@ -321,41 +320,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         )
     }
 
-    /// Allocate every segment at FULL size but populate none — no weights bound, so staging no-ops.
-    ///
-    /// This exists for the batched-prefill session, whose 2.6 GB seg1 reservation is what PLACES the
-    /// decode session's weight region: borrowing (a 128 B placeholder) instead moves decode's weights
-    /// ~2.6 GB earlier in HBM and costs 1.8 tok/s, measured. The placement effect comes from the
-    /// ALLOCATION, not from the bytes — and those bytes are dead, since the session is aliased onto
-    /// decode's copy immediately afterwards. So reserving without populating keeps the placement and
-    /// drops the bind + stage (6.97s of startup for granite-3.1-8b, measured).
-    ///
-    /// `load_consts` — the prefill wiring's own staged-constant list. The general mint puts the
-    /// sampler's nine tables in EVERY prefill rung too, and they sit in the session's own seg3
-    /// (never aliased), so the anchor stages its own copy exactly as a borrowing rung does.
-    pub fn new_reserving(
-        cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
-        code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
-        dims: SessionDims,
-        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
-        // The pool's own tables, for the same reason the borrowing constructor takes them.
-        pool_statics: &[(u32, Vec<u8>)],
-        spilled_tail: &[u32],
-    ) -> Result<Self> {
-        Self::new_inner(
-            cards,
-            code,
-            dims,
-            Staged {
-                weights: None,
-                load_consts,
-                pool_statics,
-            },
-            &[],
-            spilled_tail,
-        )
-    }
-
     /// Every constructor, composed: the HOST half then the DEVICE half. The ladder fan-outs are
     /// the one caller that splits them (see
     /// [`build_borrowing_with_consts`](Self::build_borrowing_with_consts) and
@@ -365,7 +329,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         staged: Staged<'_, T>,
-        borrowed: &[i64],
+        borrowed: &[SegIdx],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         let mut sess = Self::build_inner(cards, code, dims, staged, borrowed, spilled_tail)?;
@@ -384,7 +348,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         staged: Staged<'_, T>,
-        borrowed: &[i64],
+        borrowed: &[SegIdx],
         // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
         // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
         // intermediate color cannot be aliased, so `adopt_from_owner` copies it into this
@@ -449,10 +413,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
                 );
                 // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
                 // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
+                // The list is TYPED (`SegIdx`) end to end: no bare index is re-minted here.
                 for &seg in borrowed {
-                    let s = SegIdx::checked(seg)
-                        .ok_or_else(|| anyhow!("mark_borrowed: segment {seg} out of range"))?;
-                    exec.mark_borrowed(s)?;
+                    exec.mark_borrowed(seg)?;
                 }
 
                 // Bind every weight to its input `t{id}` as device-dtype bytes. Prepare packs them, so they
@@ -1163,12 +1126,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         Ok(())
     }
 
-    pub fn alias_seg_from(&mut self, owner: &SuperDscSession<'a, '_, T>, seg: i64) -> Result<()> {
-        let s =
-            SegIdx::checked(seg).ok_or_else(|| anyhow!("alias_seg: segment {seg} out of range"))?;
+    pub fn alias_seg_from(&mut self, owner: &SuperDscSession<'_, T>, seg: SegIdx) -> Result<()> {
         // Rank r aliases the owner's rank r: both sessions are one executor per rank of `T`.
         for (r, e) in self.ranks.iter_mut() {
-            e.alias_seg_from(owner.ranks.get(r), s)?;
+            e.alias_seg_from(owner.ranks.get(r), seg)?;
         }
         Ok(())
     }
@@ -1177,30 +1138,23 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// [`Executor::mark_borrowed`] (the constructors take their borrowed list at build; a session
     /// that only learns its family role after the build marks it here, between build and
     /// `prepare_in_rank_order`). Rank-wide, like every segment decision.
-    pub fn mark_borrowed(&mut self, seg: i64) -> Result<()> {
-        let s = SegIdx::checked(seg)
-            .ok_or_else(|| anyhow!("mark_borrowed: segment {seg} out of range"))?;
+    pub fn mark_borrowed(&mut self, seg: SegIdx) -> Result<()> {
         for e in self.ranks.values_mut() {
-            e.mark_borrowed(s)?;
+            e.mark_borrowed(seg)?;
         }
         Ok(())
     }
 
-    /// Mint this session's per-rank regions for a shared-scratch segment as ARENA DATA — one
-    /// `DevAddr` per rank, held without the session. See [`Executor::seg_arena`].
-    pub fn seg_arena(&self, seg: i64) -> Result<PerRank<T, DevAddr>> {
-        let s =
-            SegIdx::checked(seg).ok_or_else(|| anyhow!("seg_arena: segment {seg} out of range"))?;
-        PerRank::try_from_fn(|r| self.ranks.get(r).seg_arena(s))
-    }
-
     /// Point every rank's borrowed `seg` at the family arena — rank r shares rank r's arena, the
-    /// same rank-matching the alias uses. See [`Executor::share_scratch_seg_from`].
-    pub fn share_scratch_seg_from(&mut self, seg: i64, arena: &PerRank<T, DevAddr>) -> Result<()> {
-        let s = SegIdx::checked(seg)
-            .ok_or_else(|| anyhow!("share_scratch_seg: segment {seg} out of range"))?;
+    /// same rank-matching the alias uses. The arena's OWNER is the session the census named for
+    /// this segment (its prepare already ran); see [`Executor::share_scratch_seg_from`].
+    pub fn share_scratch_seg_from(
+        &mut self,
+        owner: &SuperDscSession<'_, T>,
+        seg: scratchy_target_spyre::pool_law::SharedScratchSeg,
+    ) -> Result<()> {
         for (r, e) in self.ranks.iter_mut() {
-            e.share_scratch_seg_from(s, arena.get(r))?;
+            e.share_scratch_seg_from(owner.ranks.get(r), seg)?;
         }
         Ok(())
     }

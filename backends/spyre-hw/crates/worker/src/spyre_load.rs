@@ -45,9 +45,20 @@ pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
 /// placeholder/H2D skips read; seg5 is empty for every model whose weights fit one segment, and
 /// aliasing an empty segment is a no-op the size/placement checks accept.
 ///
-/// Card-only, like [`adopt_from_owner`], its only reader.
+/// Card-only, like [`adopt_from_owner`], its only reader. The segments themselves are the
+/// card crate's OWN typed consts (`SEG_WEIGHT`, `SEG_KV`) — the same values
+/// `superdsc_exec::SEG_RESIDENT` holds — so the numbers are stated once, there.
 #[cfg(feature = "spyre-hw")]
-const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident KV")];
+const RESIDENT_SEGS: [(scratchy_target_spyre_card::superdsc_exec::SegIdx, &str); 2] = [
+    (
+        scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT,
+        "resident WEIGHTS",
+    ),
+    (
+        scratchy_target_spyre_card::superdsc_exec::SEG_KV,
+        "resident KV",
+    ),
+];
 
 /// ⭐⭐ THE KV POOL'S TABLES A **PREFILL** SESSION MUST STAGE FOR ITSELF — `kv_row_pool` and the int32
 /// zero beside it, from the PREFILL bundle's own paged step.
@@ -111,7 +122,7 @@ fn adopt_from_owner(
     for (seg, what) in RESIDENT_SEGS {
         borrower
             .alias_seg_from(owner, seg)
-            .map_err(|e| format!("seg{seg} ({what}) alias failed: {e}"))?;
+            .map_err(|e| format!("seg{} ({what}) alias failed: {e}", seg.get()))?;
     }
     for (seg, image) in spill {
         borrower.write_seg_prefix(*seg, image).map_err(|e| {
@@ -150,21 +161,6 @@ fn spilled_weight_spans(
         .spilled_span()
         .map(|(segment, bytes)| vec![(segment as i64, bytes as usize)])
         .unwrap_or_default()
-}
-
-/// ⭐ THE CENSUS'S LAYOUT PROJECTION — one runtime bundle's layout as the capacity law's own
-/// `RungFacts`, the same projection the bake pushes per rung. A projection, not a copy: each
-/// field is read from the layout that already owns it.
-#[cfg(feature = "spyre-hw")]
-fn rung_facts(
-    layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
-) -> scratchy_target_spyre::pool_law::RungFacts {
-    scratchy_target_spyre::pool_law::RungFacts {
-        segment_bytes: layout.segment_bytes,
-        weight_bank_bytes: layout.weight_bank_bytes.iter().copied().collect(),
-        kv_bank_bytes: layout.kv_bank_bytes.iter().copied().collect(),
-        weight_tail: layout.weight_tail,
-    }
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -566,6 +562,8 @@ fn sharded_bundle(
     };
     Ok(Box::leak(Box::new(SengraphBundle {
         groups: Box::leak(Box::new([group])),
+        // The world's OWN census — the sharded world's terms, never the one-rank world's.
+        pool_census: f.pool_census,
     })))
 }
 
@@ -1507,10 +1505,25 @@ impl SpyreWorker {
                 let pool_need_bytes = code.layout.segment_bytes
                     [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()]
                     + code.layout.kv_bank_bytes.iter().sum::<u64>();
-                // The stride is the capacity law's own division — the same one the bake's
-                // census states over the baked layout, never a second arithmetic here.
-                let pool_stride_bytes =
-                    scratchy_target_spyre::pool_law::page_stride_bytes(pool_need_bytes, step.pages);
+                // ⭐⭐⭐ THE BAKED CENSUS — the capacity law's terms, minted ONCE by the bake from
+                // this manifest's own rung lists (the anchor, the family, the decode rungs, the
+                // borrowers, the arena owners) and carried in the bundle. The load READS it and
+                // re-derives NOTHING on its face; the only terms it combines are the MEASURED
+                // card's, through the law's own `funded_bytes` / `funded_holds` over the fraction
+                // the bake itself used. A bundle with no census is a cardless bake (`spyre-lower`
+                // off): the law's funded budget is a card fact, and this binary cannot serve on
+                // a card.
+                let census: &'static scratchy_target_spyre::pool_law::BakedCensus =
+                    bundle.pool_census.ok_or_else(|| {
+                        werr(
+                            "this model's bundle carries no baked census — it was baked without \
+                             the card lowering (spyre-lower), so its KV pool was never sized by \
+                             the capacity law; a spyre card run needs a card bake",
+                        )
+                    })?;
+                // The pool's page stride, as the bake's KTIR lowering derived it and the census
+                // carries it — the ONE statement, never re-divided at either end.
+                let pool_stride_bytes = census.page_stride.0;
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
                 // model's own limit, up to the pool.
@@ -1527,16 +1540,11 @@ impl SpyreWorker {
                     None => max_model_len.min(capacity).max(1),
                 };
                 //
-                // ── THE BATCHED-PREFILL ANCHOR BUNDLE, resolved here because the census below
-                // reads its layout — the anchor session's residency is a budget input now, and
-                // whether it RESERVES or BORROWS is a capacity decision the budget itself makes. ──
-                // Did the prefill reroll bake at all? (fp == the decode fp ⇒ C4 fell back.)
-                let top_prefill = g0
-                    .prefill
-                    .graph_json
-                    .strip_prefix(SUPERDSC_SENTINEL)
-                    .filter(|pfp| *pfp != fp)
-                    .and_then(scratchy_target_spyre::bundle_code::bundle::<World>);
+                // ── THE BATCHED-PREFILL ANCHOR BUNDLE, resolved BY FINGERPRINT from the census —
+                // the anchor SELECTION (which rung is the anchor) is stated once, at the bake
+                // (the narrowest multi-token prefill rung, or the single prefill bundle when the
+                // ladder has no multi-token rung; none at all when the prefill reroll fell back
+                // to the decode bundle — C4); the load resolves only the name it carries. ──
                 // ── PLACEMENT ANCHOR = the NARROWEST rung, not the widest ────────────────────────
                 // This is the one session built BEFORE the decode session, so its footprint is what
                 // positions decode's weight region (see the ownership note below). It used to be the
@@ -1549,38 +1557,26 @@ impl SpyreWorker {
                 // pre-decode footprint at the `mq_pad=64` value for every ceiling — the configuration
                 // that measured faster — and the widest rung is then just another borrowing rung
                 // built after decode, like all the others.
-                // NOT "build decode first": the measurement below says decode's weights landing
-                // EARLIER is the slow case (34.7 vs 36.5 tok/s), and decode-first is the earliest of
-                // all. The fix is to hold the reservation CONSTANT, not to remove it.
                 // ⛔ THE ANCHOR'S BUNDLE AND ITS WIDTH LABEL COME FROM THE SAME ENTRY, AS ONE PAIR —
-                // and a manifest rung whose sentinel names no compiled bundle is an INVENTORY DESYNC
-                // that REFUSES, never a fallback. The old `.or(top_prefill)` silently ran the TOP
-                // prefill bundle under the NARROWEST rung's width label when the narrowest entry
-                // failed to resolve (the mislabel class the anchor-width note below records), and
-                // the ladder then built the widest rung too — the same bundle as two real sessions.
-                // `top_prefill` remains exactly what it was gated to be: the anchor ONLY when the
-                // ladder has no multi-token rung at all, so its width is the prefill wiring's own
-                // `m_cap` in that case and never disagrees with the bundle it runs.
-                let narrowest_rung = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm);
-                let prefill_code = match (top_prefill, narrowest_rung) {
-                    (Some(_tp), Some((rm, sent))) => Some(sent
-                        .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .ok_or_else(|| {
-                            werr(format!(
-                                "the manifest's narrowest prefill rung (m={rm}) names no bundle \
-                                 compiled into this binary — an inventory desync between the bake \
-                                 and the manifest, refusing rather than running the top prefill \
-                                 bundle under the narrow rung's width"
-                            ))
-                        })?),
-                    (Some(tp), None) => Some(tp),
-                    (None, _) => None,
-                };
+                // the census names the anchor by fingerprint, the width label below is read back
+                // off the entry the SAME fingerprint keys, and a census fingerprint that names no
+                // compiled bundle is an INVENTORY DESYNC that REFUSES, never a fallback to any
+                // other rung as the anchor.
+                let prefill_code = census
+                    .anchor_fp
+                    .map(|sent| {
+                        sent.strip_prefix(SUPERDSC_SENTINEL)
+                            .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
+                            .ok_or_else(|| {
+                                werr(format!(
+                                    "the census's anchor bundle ({sent}) names no bundle compiled \
+                                     into this binary — an inventory desync between the bake and \
+                                     the binary, refusing rather than running any other rung as \
+                                     the anchor"
+                                ))
+                            })
+                    })
+                    .transpose()?;
                 // ⭐ THE BRING-UP, JOINED — the runtimes arrive BUILT. The background thread
                 // spawned at the top of the load opened every card, leaked them, and built
                 // every runtime on the serve span while THIS thread loaded weights from disk:
@@ -1588,7 +1584,7 @@ impl SpyreWorker {
                 // whatever of the two finished later, never their sum. Each card's capacity
                 // was read from the card when it opened — a card that cannot report one does
                 // not open — so the KV pool below is sized from the real card, with no
-                // default to fall back to.
+                // default to fall back on.
                 //
                 // ⭐ OPENED ONCE, FOR THE PROCESS. The sessions land in `Loaded`, which the worker
                 // holds for the life of the process (a `Box<dyn Worker>`, so `'static`), and each
@@ -1652,185 +1648,47 @@ impl SpyreWorker {
                     .values()
                     .map(|c| c.memory())
                     .fold(cards.first().memory(), std::cmp::min);
-                // ⭐⭐⭐ THE CENSUS — the capacity law's own computation (`pool_law`), over THIS
-                // build's own bundles: mandatory residency exactly as the bake's pool descent
-                // measured it, from ONE statement of the arithmetic. Every term's law and its
-                // measured evidence are documented at the term's `pool_law` home:
-                //   - WHAT THE BUNDLE ALREADY OWNS — every segment except the KV one, PLUS the
-                //     weight segment's extra banks (`segment_bytes` counts bank 0 only; a banked
-                //     bundle's remaining banks are resident weights too — 419 MB on
-                //     granite-3.1-8b-fp16, half a model for anything that banks to fit — charged
-                //     ONCE, not per session, precisely because a bank IS aliasable).
-                //   - THE SPILLED WEIGHT TAIL, charged ONCE PER SESSION, not once: the spill slot
-                //     cannot be aliased — its co-tenant intermediate colour is m-dependent, so
-                //     every borrowing session takes its own COPY (MEASURED on granite-3.1-8b fp16:
-                //     27 sessions × 419,430,400 B = 10.55 GiB this budget once could not see). The
-                //     session count is an UPPER BOUND from the declared rung lists — over-charging
-                //     shrinks the KV pool, under-charging hands out memory that does not exist.
-                //   - THE BATCHED-PREFILL ANCHOR'S OWN RESIDENCY — the one session the decode
-                //     bundle's `segment_bytes` cannot describe. The anchor is a DIFFERENT bundle
-                //     (the narrowest prefill rung): its intermediate/mask/logits segments are sized
-                //     for m query rows, it holds its own KV pool — an exact twin of the pool this
-                //     budget is sizing — and, when it RESERVES, a full spare copy of the weight
-                //     home. Leaving that uncounted is what put gemma-4-26b under (census 62,601
-                //     MB, allocator holding ~92 GB, dead at `prepare: weight bank 1`,
-                //     2026-10-09). LIVE segments are mandatory; the SPARE is the policy's below.
-                //   - THE LADDER THE SPARE HAS TO SURVIVE: the prefill family's PRIVATE segments
-                //     per rung plus ONE ARENA per shared scratch segment at the family's widest
-                //     extent, and the decode batch rungs whole (they share nothing). MEASURED on
-                //     gemma-4-31b fp8 (2026-10-14): the census said 86,633 MB ≤ the 88,473 MB that
-                //     --gpu-memory-utilization 0.90 funds, so the anchor RESERVED; the ladder's
-                //     rungs then took ~24,500 MB while decode staged, and the run died at
-                //     `prepare: weight bank 1` with 2,196,278,528 B free. Charged, the 31b
-                //     borrows and fits with room to spare. The entries the ladder loops themselves
-                //     SKIP are not charged (`rm`/`rn` ≤ 1 name sessions already built, and the
-                //     narrowest `rm > 1` is the anchor's own bundle, already charged as live) —
-                //     read off the entry list, never a second derivation of `prefill_m`.
-                let decode_facts = rung_facts(&code.layout);
-                let anchor_facts = prefill_code.as_ref().map(|pc| rung_facts(&pc.layout));
-                let anchor_rung_m = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm)
-                    .map(|(rm, _)| *rm);
-                let census_family: Vec<scratchy_target_spyre::pool_law::RungFacts> = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
-                    .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
-                    .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                    .map(|rc| rung_facts(&rc.layout))
-                    .chain(
-                        g0.prefill_prefix
-                            .iter()
-                            // Every prefix rung builds — solo AND packed: a packed rung's
-                            // activations are its product's (s windows of width rows), charged
-                            // exactly as the solo rung's are.
-                            .filter(|rung| rung.0 > 1)
-                            .filter_map(|(_, _, psent)| psent.strip_prefix(SUPERDSC_SENTINEL))
-                            .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|rc| rung_facts(&rc.layout)),
-                    )
-                    .collect();
-                let census_decode_rungs: Vec<scratchy_target_spyre::pool_law::RungFacts> = g0
-                    .decode_rungs
-                    .iter()
-                    .filter(|(rn, _, _, _)| rn.get() > 1)
-                    .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
-                    .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                    .map(|rc| rung_facts(&rc.layout))
-                    .collect();
-                let borrowers = (g0.prefill_rungs.len() + g0.decode_rungs.len() + 1) as u64;
-                let family_refs: Vec<&scratchy_target_spyre::pool_law::RungFacts> =
-                    census_family.iter().collect();
-                let decode_rung_refs: Vec<&scratchy_target_spyre::pool_law::RungFacts> =
-                    census_decode_rungs.iter().collect();
-                let res = scratchy_target_spyre::pool_law::mandatory_residency(
-                    &scratchy_target_spyre::pool_law::CensusInputs {
-                        decode: &decode_facts,
-                        anchor: anchor_facts.as_ref(),
-                        family: &family_refs,
-                        decode_rungs: &decode_rung_refs,
-                        borrowers,
-                    },
-                );
-                let non_kv_bytes = res.decode_non_kv_bytes + res.tail_charge;
-                let anchor_live_bytes = res.anchor_live_bytes;
-                let anchor_spare_bytes = res.anchor_spare_bytes;
-                let ladder_rung_bytes = res.ladder_rung_bytes;
-                // ⛔ THE ALLOCATABLE TENSOR CAPACITY × THE RUN'S OWN FRACTION — the funded budget,
-                // the capacity law's own arithmetic over the MEASURED card (the bake sized the
-                // pool against the same law over the platform table's `MEMORY_BYTES`; a card that
-                // reports less than the table is caught by the funded check below).
+                // ⭐⭐⭐ THE FUNDED CHECK — the capacity law's own combination (`pool_law`), over
+                // the MEASURED card and the census's BAKED terms. The census was minted ONCE at
+                // the bake from this manifest's own rung lists, and every term's law and its
+                // measured evidence are documented at its `pool_law` home — `Residency`'s fields
+                // for what must be resident beside the pool (the decode owner's non-KV segments
+                // and weight banks, the spilled tail's per-session copies, the anchor's live
+                // segments, the ladder's rungs and arenas), `budget_pages` for the ONE
+                // combination of those terms with a funded budget. The load re-derives none of
+                // it: the only terms it combines are the ones the bake cannot know — the
+                // MEASURED card's bytes, at the utilization fraction the bake itself funded at
+                // (carried in the census; the fraction is a bake input, not a runtime flag).
+                // ⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
+                // of its seven equal regions for PROGRAM memory, so a tensor allocation is served
+                // from six. See `CardMemory::tensor_capacity` — the capacity law's own
+                // derivation, inside `funded_bytes`.
                 let funded = scratchy_target_spyre::pool_law::funded_bytes(
                     card_bytes.bytes(),
-                    self.gpu_memory_utilization,
+                    census.utilization,
                 );
-                // ⛔ DEVICE REGIONS ARE NEVER FREED — `DevAddr`'s own doc: "device memory lives until
-                // process exit". The anchor's spare is not a loan the alias later returns:
-                // `alias_seg_from` repoints the borrower's descriptors and the borrower's own regions
-                // stay on the allocator's books forever. So the spare is PLACEMENT LUXURY — its
-                // allocation is what places decode's weight region, worth 1.8 tok/s on
-                // granite-3.1-2b, measured — never a load requirement, and it is taken ONLY when the
-                // card funds it: mandatory residency plus BOTH KV pools (decode's and the anchor's
-                // twin) plus the spare plus the ladder's real rung segments must fit inside what
-                // `--gpu-memory-utilization` allots. A model that fails that check BORROWS exactly
-                // like every ladder rung — 128 B placeholders now, `adopt_from_owner` onto decode's
-                // regions once the owner is built — costing the placement effect, not the run.
-                let anchor_mandatory_bytes = non_kv_bytes + anchor_live_bytes;
-                let anchor_reserves = prefill_code.is_some()
-                    && (anchor_mandatory_bytes
-                        + anchor_spare_bytes
-                        + 2 * pool_need_bytes
-                        + ladder_rung_bytes)
-                        <= funded;
-                let non_kv_bytes = non_kv_bytes
-                    + anchor_live_bytes
-                    + if anchor_reserves {
-                        anchor_spare_bytes + pool_need_bytes
-                    } else {
-                        0
-                    };
-                if prefill_code.is_some() {
-                    tracing::info!(
-                        "superdsc paged: prefill anchor {} — its {} MB spare (a twin of the weight \
-                         home + a second {} MB KV pool) {} inside the {} MB that \
-                         --gpu-memory-utilization {:.2} funds beyond the {} MB of mandatory \
-                         residency plus the {} MB the ladder's rungs allocate",
-                        if anchor_reserves {
-                            "RESERVES"
-                        } else {
-                            "BORROWS"
-                        },
-                        anchor_spare_bytes / (1024 * 1024),
-                        pool_need_bytes / (1024 * 1024),
-                        if anchor_reserves {
-                            "fits"
-                        } else {
-                            "does NOT fit"
-                        },
-                        funded / (1024 * 1024),
-                        self.gpu_memory_utilization,
-                        anchor_mandatory_bytes / (1024 * 1024),
-                        ladder_rung_bytes / (1024 * 1024),
-                    );
-                }
-                // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
-                // of its seven equal regions for PROGRAM memory, so a tensor allocation is served
-                // from six. See `CardMemory::tensor_capacity` — the capacity law's own derivation.
-                if non_kv_bytes + pool_need_bytes > funded {
+                if !scratchy_target_spyre::pool_law::funded_holds(
+                    funded,
+                    census.residency.mandatory_bytes(),
+                    census.page_stride,
+                    scratchy_target_spyre::pool_law::Pages(step.pages),
+                ) {
                     return Err(werr(format!(
-                        "the Spyre card's {} MB of tensor memory × --gpu-memory-utilization {:.2} funds \
-                         {} MB, but this model's sessions reserve {} MB beside the bake's {} MB KV \
-                         pool. Raise --gpu-memory-utilization, or use a smaller model.",
+                        "the Spyre card's {} MB of tensor memory at the utilization {:.2} the bake \
+                         funded at holds {} MB, but this model's mandatory residency is {} MB \
+                         beside the bake's {} MB KV pool ({} page(s) of {} B). Use a smaller model.",
                         card_bytes.tensor_capacity() / (1024 * 1024),
-                        self.gpu_memory_utilization,
-                        funded / (1024 * 1024),
-                        non_kv_bytes / (1024 * 1024),
+                        census.utilization.0,
+                        funded.0 / (1024 * 1024),
+                        census.residency.mandatory_bytes().0 / (1024 * 1024),
                         pool_need_bytes / (1024 * 1024),
+                        step.pages,
+                        pool_stride_bytes,
                     )));
                 }
-                // ⛔ AND EACH POOL BANK IS **ONE** ALLOCATION, so no bank can exceed one region
-                // however much tensor capacity is left over. The bake already proved this at
-                // cargo-build (`audit_layout_addresses`); this is the card's own statement of it,
-                // against the card's own number.
-                for (b, bank_bytes) in std::iter::once(
-                    code.layout.segment_bytes
-                        [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()],
-                )
-                .chain(code.layout.kv_bank_bytes.iter().copied())
-                .enumerate()
-                {
-                    if bank_bytes > card_bytes.max_single_allocation() {
-                        return Err(werr(format!(
-                            "the bake's KV pool bank {b} is {} MB, past the {} MB one device \
-                             allocation can be",
-                            bank_bytes / (1024 * 1024),
-                            card_bytes.max_single_allocation() / (1024 * 1024),
-                        )));
-                    }
-                }
+                // NO BANK-CAP RE-CHECK HERE: each pool bank is one allocation, and the bake's
+                // banking pass proved every bank allocable at cargo-build — its own law, stated
+                // once. The card-side restatement of it was a second statement of a baked fact.
                 // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own
                 // bytes by its own page — the two counts are then one count.
                 kv_budget_bytes_v = Some(pool_need_bytes);
@@ -1899,9 +1757,10 @@ impl SpyreWorker {
                 //    runs batched through it, then its seg2 KV is copied to the decode session. If the
                 //    prefill slot's fp == the decode fp (the prefill reroll did NOT bake → C4 fell
                 //    back), prefill=None ⇒ the worker uses the sequential mq=1 path. ──
-                // `prefill_code` (the anchor bundle), `anchor_reserves` (its capacity policy) and the
-                // KV pool's own demand were all derived UP AT THE CENSUS — the budget reads them, so
-                // they exist before this point. The session build below is their first consumer.
+                // `prefill_code` (the anchor bundle, by the census's fingerprint) and the KV
+                // pool's own demand were all derived UP AT THE CENSUS — the budget reads them,
+                // so they exist before this point. The session build below is their first
+                // consumer.
                 let (mut prefill_ss, prefill_m) = match prefill_code {
                     Some(pcode) => {
                         // The baked prefill m (query rows). run_step MUST use exactly this m.
@@ -1937,17 +1796,16 @@ impl SpyreWorker {
                         // FROM), so the label is read back off the entry the anchor came from —
                         // no second derivation to disagree with the first.
                         let pl = &pcode.layout;
-                        // The anchor is `top_prefill`-gated: either the manifest's NARROWEST rung
-                        // (the normal path — its width is that entry's own `rm`, the same value
-                        // the selection just keyed on) or the top prefill bundle itself (no
-                        // ladder — its width is the prefill wiring's own `m_cap`, the shape the
-                        // embed activation was staged at, from the wiring and not from the
-                        // placement bytes).
+                        // The anchor's width label, keyed by the SAME fingerprint that resolved
+                        // the bundle above (the pair law): either the manifest rung entry the
+                        // census's anchor names (its own `rm`) or — when the anchor is the
+                        // single prefill bundle and the ladder baked no rung list — the prefill
+                        // wiring's own `m_cap`, the shape the embed activation was staged at,
+                        // from the wiring and not from the placement bytes.
                         let prefill_m = g0
                             .prefill_rungs
                             .iter()
-                            .filter(|(rm, _)| *rm > 1)
-                            .min_by_key(|(rm, _)| *rm)
+                            .find(|(_, sent)| Some(*sent) == census.anchor_fp)
                             .map_or_else(
                                 || {
                                     wirings.prefill.as_ref().map_or(0, |p| {
@@ -1964,41 +1822,21 @@ impl SpyreWorker {
                             .unwrap_or(&wirings.decode)
                             .verify_class_placements(pl)
                             .map_err(werr)?;
-                        // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
-                        // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
-                        // reservation is what places decode's own weight region. Making it borrow (a
-                        // 128 B placeholder) moved decode's weights ~2.6 GB earlier in HBM and cost
-                        // ~1.8 tok/s of DECODE throughput, measured: 36.5 tok/s with this session
-                        // owning its weights vs 34.7 with it borrowing. Decode is weight-BANDWIDTH-
-                        // bound (2.43 GB per token at ~84 GB/s), so where that region lands is
-                        // load-bearing. The effect is NON-LINEAR in session count — 1→2 sessions cost
-                        // 1.8 tok/s, 2→7 cost 0.1 — which is the signature of the FIRST allocation
-                        // ahead of decode mattering, not of per-session overhead.
-                        // The ladder rungs below still borrow, so the ladder stays affordable: this
-                        // costs ONE spare weight copy (exactly what the worker held before the ladder
-                        // existed), not one per rung.
-                        // `pdir` is the NARROWEST rung (see the anchor note above), so this
-                        // reservation is the same size at every ladder ceiling.
+                        // ⛔ THE ANCHOR BORROWS, ALWAYS — exactly like every ladder rung: 128 B
+                        // placeholders for the resident segments here, `adopt_from_owner` onto
+                        // decode's regions once the owner is built. The reserve-or-borrow branch
+                        // this replaced was a runtime capacity decision over facts the bake had
+                        // already fixed: the census states the anchor's live segments as
+                        // MANDATORY (`Residency::anchor_live_bytes`) and its spare — a twin of
+                        // SEG_WEIGHT plus a second KV pool — as never charged
+                        // (`anchor_spare_bytes`, placement luxury; see `pool_law::Residency`),
+                        // because the pool's own law takes every page beyond mandatory
+                        // residency, so no funded budget has bytes left to buy the spare with.
+                        // What the reservation bought was PLACEMENT (decode's weights landing
+                        // ~2.6 GB later in HBM, worth 1.8 tok/s on granite-3.1-2b, measured) —
+                        // a real effect the capacity law deliberately does not pay for: a spare
+                        // the budget happens to hold would be a second, unstated law.
                         let _t = std::time::Instant::now();
-                        // RESERVES seg1 at full size without populating it. The comment above is
-                        // still the reason this session must not BORROW: its 2.6 GB reservation places
-                        // decode's weight region, worth 1.8 tok/s. But that is the ALLOCATION talking,
-                        // not the bytes -- this session is aliased onto decode's copy a few lines
-                        // below, so everything staged here was overwritten by a pointer swap. Keeping
-                        // the reservation and dropping the write saves the bind + stage (6.97s
-                        // measured) and the `weights.clone()` of a ~2.6 GB host buffer with it.
-                        //
-                        // ⛔ BUT THE RESERVATION IS LUXURY, AND LUXURY IS BUDGETED (wall 9,
-                        // 2026-10-09). Device regions are NEVER freed, so the anchor's spare — a
-                        // twin of SEG_WEIGHT, every extra bank, and a second KV pool — is permanent
-                        // dead placement, and at gemma-4-26b scale (~26 GB of spare on a 96 GiB
-                        // tensor domain) it starved decode's own banks: `prepare: weight bank 1
-                        // alloc of 17057081344 B failed` with 10.6 GB free. `anchor_reserves`
-                        // (decided at the census, against the card's funded capacity) keeps the
-                        // measured granite behavior exactly where the card pays for it, and takes
-                        // the BORROWING form — identical to every ladder rung: placeholders here,
-                        // `adopt_from_owner` onto decode's regions after the owner is built — when
-                        // it does not. What that costs is the placement effect, never the run.
                         // ⭐ THE PREFILL WIRING'S OWN STAGED CONSTANTS — the general mint puts
                         // the sampler's nine tables in every prefill rung, and they sit in each
                         // session's own seg3 (never aliased), so every prefill session stages
@@ -2011,34 +1849,19 @@ impl SpyreWorker {
                         // The pool's own tables, staged per prefill session — see
                         // [`prefill_pool_statics`] for why they cannot be aliased.
                         let anchor_pool = prefill_pool_statics(wirings)?;
-                        let pss = if anchor_reserves {
-                            SuperDscSession::new_reserving(
-                                cards,
-                                pcode,
-                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
-                                    vocab,
-                                    kv_dim,
-                                    num_blocks,
-                                },
-                                prefill_consts,
-                                &anchor_pool,
-                                &spill_tids,
-                            )
-                        } else {
-                            SuperDscSession::new_borrowing_with_consts(
-                                cards,
-                                pcode,
-                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
-                                    vocab,
-                                    kv_dim,
-                                    num_blocks,
-                                },
-                                &RESIDENT_SEGS.map(|(seg, _)| seg),
-                                prefill_consts,
-                                &anchor_pool,
-                                &spill_tids,
-                            )
-                        }
+                        let pss = SuperDscSession::new_borrowing_with_consts(
+                            cards,
+                            pcode,
+                            scratchy_target_spyre_card::sdsc_runner::SessionDims {
+                                vocab,
+                                kv_dim,
+                                num_blocks,
+                            },
+                            &RESIDENT_SEGS.map(|(seg, _)| seg),
+                            prefill_consts,
+                            &anchor_pool,
+                            &spill_tids,
+                        )
                         .map_err(|e| werr_chain("build SuperDSC PREFILL dxp session", &e))?;
                         info!(
                             "[spyre-worker] sendnn: SUPERDSC PREFILL session ready (bundle {}, \
@@ -2075,21 +1898,31 @@ impl SpyreWorker {
                 // pointer swap. See the ADOPTION wave below.
                 let ladder: Vec<(
                     usize,
+                    &'static str,
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                 )> = g0
                     .prefill_rungs
                     .iter()
-                    .filter_map(|(rung_m, sentinel)| {
-                        let rm = *rung_m as usize;
-                        if rm == prefill_m || rm <= 1 {
-                            return None;
-                        }
-                        sentinel
+                    // The family the census named — every rung past the anchor, by
+                    // FINGERPRINT and never by position or label: the anchor is the rung the
+                    // census's own `anchor_fp` names (built as the session above), the `w ≤ 1`
+                    // entries name sessions already built, and a rung the census never charged
+                    // is not this binary's to build. The census is the ONE list.
+                    .filter(|(_, sentinel)| census.family_fps.contains(sentinel))
+                    .map(|(rung_m, sentinel)| {
+                        let rcode = sentinel
                             .strip_prefix(SUPERDSC_SENTINEL)
                             .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|c| (rm, c))
+                            .ok_or_else(|| {
+                                werr(format!(
+                                    "the census's family rung ({sentinel}) names no bundle \
+                                     compiled into this binary — an inventory desync between the \
+                                     bake and the binary; every rung the bake shipped must load"
+                                ))
+                            })?;
+                        Ok((*rung_m as usize, *sentinel, rcode))
                     })
-                    .collect();
+                    .collect::<ExecutorResult<_>>()?;
                 // ⛔ THE LADDER'S HOST HALF SPAWNS HERE, BEFORE THE OWNER — ITS DEVICE HALF DOES
                 // NOT. A rung's build is two halves: the HOST half
                 // (`SuperDscSession::build_borrowing_with_consts` — `Executor::load`, the binds,
@@ -2130,6 +1963,7 @@ impl SpyreWorker {
                     let chunks: Vec<
                         Vec<(
                             usize,
+                            &'static str,
                             &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                         )>,
                     > = if chunk == 0 {
@@ -2154,7 +1988,7 @@ impl SpyreWorker {
                                 let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
-                                        .map(|(rm, rcode)| {
+                                        .map(|(rm, sent, rcode)| {
                                             let r = SuperDscSession::build_borrowing_with_consts(
                                                 cards,
                                                 rcode,
@@ -2163,12 +1997,14 @@ impl SpyreWorker {
                                                     kv_dim,
                                                     num_blocks,
                                                 },
-                                                &[1, 2],
+                                                // The resident segments, as the card's own
+                                                // typed list states them.
+                                                &scratchy_target_spyre_card::superdsc_exec::SEG_RESIDENT,
                                                 rung_consts,
                                                 &rung_pool,
                                                 &rung_spill,
                                             );
-                                            (rm, r)
+                                            (rm, sent, r)
                                         })
                                         .collect::<Vec<_>>()
                                 })
@@ -2208,6 +2044,10 @@ impl SpyreWorker {
                 struct PrefixRungJob {
                     pmq: u32,
                     seqs: u32,
+                    /// The rung's manifest sentinel — the census's own key. The wave marks this
+                    /// rung a borrower of a shared scratch segment by comparing it against the
+                    /// census's `arena_owners`, never by position.
+                    sent: &'static str,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                     /// ⭐ THE RUNG'S OWN WIRING — a SOLO rung's the prefill graph's, a PACKED
                     /// rung's its OWN pair's cell. The job's consts (the general mint's nine
@@ -2220,7 +2060,10 @@ impl SpyreWorker {
                 let pool_for_prefix = prefill_pool_statics(wirings)?;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
                 for &(pmq, seqs, psent) in g0.prefill_prefix {
-                    if pmq <= 1 || psent.is_empty() {
+                    // The census's family is the ONE list: a prefix rung the census charged
+                    // builds, and one it did not (the `w ≤ 1` entries, which name no session)
+                    // does not — never a second filter restating the bake's own.
+                    if !census.family_fps.contains(&psent) {
                         continue;
                     }
                     let pcode2 = psent
@@ -2250,6 +2093,7 @@ impl SpyreWorker {
                     prefix_jobs.push(PrefixRungJob {
                         pmq,
                         seqs,
+                        sent: psent,
                         rcode: pcode2,
                         wiring,
                     });
@@ -2284,7 +2128,7 @@ impl SpyreWorker {
                                                     kv_dim,
                                                     num_blocks,
                                                 },
-                                                &[1, 2],
+                                                &scratchy_target_spyre_card::superdsc_exec::SEG_RESIDENT,
                                                 job.wiring.load_consts,
                                                 &pool,
                                                 &spill,
@@ -2479,7 +2323,7 @@ impl SpyreWorker {
                                                     kv_dim,
                                                     num_blocks,
                                                 },
-                                                &[1, 2],
+                                                &scratchy_target_spyre_card::superdsc_exec::SEG_RESIDENT,
                                                 job.rung_consts,
                                                 // A decode rung's rows are its requests', so its
                                                 // attention reads its pages through `chunk_page_ids`
@@ -2635,10 +2479,9 @@ impl SpyreWorker {
                 // Ordering: both sessions' `prepare` has already run (decode's LAST), so the region the
                 // borrower adopts holds freshly-written weights. Aliasing does NOT save prefill's initial
                 // H2D — that already happened during its own `prepare` — and it does NOT free anything
-                // either: device regions live until process exit (`DevAddr`'s doc), so when the anchor
-                // RESERVED, its own regions stay on the allocator's books as the dead placement the
-                // census charged; when it BORROWED it only ever held 128 B placeholders, and there was
-                // never a second live copy to avoid.
+                // either: device regions live until process exit (`DevAddr`'s doc). The anchor
+                // BORROWS: it only ever held 128 B placeholders for the resident segments, and
+                // there was never a second live copy to avoid.
                 if let Some(pf) = prefill_ss.as_mut() {
                     adopt_from_owner(pf, &ss, &spill_images).map_err(|e| {
                         werr(format!(
@@ -2712,25 +2555,16 @@ impl SpyreWorker {
                     Err(p) => std::panic::resume_unwind(p),
                 };
                 let _t_joins = _t_wave.elapsed();
-                // ⭐⭐ THE PREFILL FAMILY'S SHARED-SCRATCH OWNERS — the same computation the
-                // census charged (`pool_law::scratch_arena_owners`), over the same rungs the
-                // fan-out built: this `ladder` and these `prefix_jobs`. One owner per shared
-                // segment, the family's WIDEST rung; every OTHER family rung declares that
-                // segment borrowed before its prepare below (a 128 B placeholder, no fill) and
-                // takes the owner's region as its arena in the adoption wave after it. The DECODE
-                // rungs share nothing — the decode launch is submitted-then-deferred and
-                // genuinely overlaps a prefill launch, so its scratch must stay private; the
-                // exclusion proof is `SEG_SHARED_SCRATCH`'s doc in the card crate.
-                let wave_family: Vec<scratchy_target_spyre::pool_law::RungFacts> = ladder
-                    .iter()
-                    .map(|(_, rcode)| rung_facts(&rcode.layout))
-                    .chain(prefix_jobs.iter().map(|job| rung_facts(&job.rcode.layout)))
-                    .collect();
-                let wave_family_refs: Vec<&scratchy_target_spyre::pool_law::RungFacts> =
-                    wave_family.iter().collect();
-                let wave_arena_owners =
-                    scratchy_target_spyre::pool_law::scratch_arena_owners(&wave_family_refs);
-                let ladder_family_len = ladder.len();
+                // ⭐⭐ THE PREFILL FAMILY'S SHARED-SCRATCH OWNERS — the CENSUS's own list
+                // (`arena_owners`, minted once at the bake over this same family): a rung
+                // declares a shared segment BORROWED before its prepare when the census's owner
+                // for it is a DIFFERENT fingerprint, and the arena itself is shared from the
+                // session that fingerprint names, after its prepare. No position in this build
+                // decides anything — the census's fingerprints do, so the bake's family list
+                // and the load's build order cannot drift. The DECODE rungs share nothing —
+                // the decode launch is submitted-then-deferred and genuinely overlaps a
+                // prefill launch, so its scratch must stay private; the exclusion proof is
+                // `SHARED_SCRATCH_SEGS`' doc in `pool_law`.
                 let (ladder_prepared, prefix_prepared, decode_prepared) = std::thread::scope(
                     |scope| {
                         fn joined<R>(hs: Vec<std::thread::ScopedJoinHandle<'_, R>>) -> Vec<R> {
@@ -2749,33 +2583,27 @@ impl SpyreWorker {
                         // driver path and paid 3755 ms for ~a tenth of that in device work.
                         let hl: Vec<_> = ladder_built
                             .into_iter()
-                            .map(|(rm, built)| {
-                                let ladder = &ladder;
-                                let owners = &wave_arena_owners;
+                            .map(|(rm, sent, built)| {
                                 scope.spawn(move || {
                                     (
                                         rm,
+                                        sent,
                                         built.and_then(|mut rs| {
-                                            // The rung's place in the family list the owners
-                                            // were picked over — the fan-out built from that
-                                            // list, so a rung missing from it is a load
-                                            // invariant broken, not a narrower ladder.
-                                            let fi = ladder
-                                                .iter()
-                                                .position(|(m, _)| *m == rm)
-                                                .unwrap_or_else(|| {
-                                                    panic!(
-                                                        "prefill rung m={rm} is not in the ladder \
-                                                         list it was built from"
-                                                    )
-                                                });
+                                            // A rung is a BORROWER of a shared scratch
+                                            // segment when the census's owner for it is a
+                                            // DIFFERENT fingerprint — the census's own list,
+                                            // never a position in this build.
                                             for (si, seg) in
-                                                scratchy_target_spyre_card::superdsc_exec::SEG_SHARED_SCRATCH
+                                                scratchy_target_spyre::pool_law::SHARED_SCRATCH_SEGS
                                                     .iter()
                                                     .enumerate()
                                             {
-                                                if owners[si].1 != fi {
-                                                    rs.mark_borrowed(seg.get() as i64)?;
+                                                if census.arena_owners[si]
+                                                    .is_some_and(|owner| owner != sent)
+                                                {
+                                                    rs.mark_borrowed(
+                                                        scratchy_target_spyre_card::superdsc_exec::SegIdx::from(*seg),
+                                                    )?;
                                                 }
                                             }
                                             rs.prepare_in_rank_order()?;
@@ -2787,21 +2615,24 @@ impl SpyreWorker {
                             .collect();
                         let hp: Vec<_> = prefix_jobs
                             .iter()
-                            .enumerate()
                             .zip(prefix_built_sessions)
-                            .map(|((ji, job), built)| {
-                                let owners = &wave_arena_owners;
-                                let ladder_len = ladder_family_len;
+                            .map(|(job, built)| {
                                 scope.spawn(move || {
                                     built.and_then(|mut ps| {
-                                        let fi = ladder_len + ji;
+                                        // The census's owner fingerprints, as above — a
+                                        // rung borrows what another rung owns.
                                         for (si, seg) in
-                                            scratchy_target_spyre_card::superdsc_exec::SEG_SHARED_SCRATCH
+                                            scratchy_target_spyre::pool_law::SHARED_SCRATCH_SEGS
                                                 .iter()
                                                 .enumerate()
                                         {
-                                            if owners[si].1 != fi {
-                                                ps.mark_borrowed(seg.get() as i64).map_err(|e| {
+                                            if census.arena_owners[si]
+                                                .is_some_and(|owner| owner != job.sent)
+                                            {
+                                                ps.mark_borrowed(
+                                                    scratchy_target_spyre_card::superdsc_exec::SegIdx::from(*seg),
+                                                )
+                                                .map_err(|e| {
                                                     (job.pmq, format!(
                                                         "prefix-capable prefill (w={}, s={}) \
                                                          scratch borrow failed: {e} — every rung \
@@ -2812,12 +2643,12 @@ impl SpyreWorker {
                                             }
                                         }
                                         ps.prepare_in_rank_order().map_err(|e| {
-                                        (job.pmq, format!(
-                                            "prefix-capable prefill (w={}, s={}) session prepare \
-                                             failed: {e} — every rung the bake shipped must load",
-                                            job.pmq, job.seqs
-                                        ))
-                                    })?;
+                                            (job.pmq, format!(
+                                                "prefix-capable prefill (w={}, s={}) session prepare \
+                                                 failed: {e} — every rung the bake shipped must load",
+                                                job.pmq, job.seqs
+                                            ))
+                                        })?;
                                         Ok(ps)
                                     })
                                 })
@@ -2844,64 +2675,102 @@ impl SpyreWorker {
                         (joined(hl), joined(hp), joined(hd))
                     },
                 );
-                // ⭐⭐ CAPTURE THE ARENAS — per-rank region descriptors read from the owner
-                // rungs AFTER their prepare, so the adoption waves below can share them
-                // without holding the owning session (a `DevAddr` is an `Arc` over a region
-                // that is never freed). The owner of each segment prepared it normally — its
-                // region is real and its prepare zero-filled it exactly once for the whole
-                // family. Each arena carries its owner's family index: the adoption waves
-                // share a segment with its BORROWERS only — the owner already points at the
-                // arena, it minted it. A rung that failed to prepare owns nothing its family
-                // can share: panic here with its own error, exactly as the adoption walk
-                // below would.
-                let family_arenas: Vec<(
-                    i64,
-                    usize,
-                    scratchy_target_spyre::bundle_code::collective::PerRank<
-                        World,
-                        scratchy_target_spyre_card::runtime::DevAddr,
-                    >,
-                )> = scratchy_target_spyre_card::superdsc_exec::SEG_SHARED_SCRATCH
+                // ⭐⭐ SHARE THE FAMILY ARENAS — from the OWNER SESSION the census named, per
+                // segment, on THIS thread and before the adoptions: a borrower's spilled
+                // weight tail is handed over by `adopt_from_owner`'s `write_seg_prefix`, which
+                // writes into whatever `seg_addr` points at — pointed at the 128 B placeholder
+                // it would be a refused copy, and pointed at the arena it lands on the tail
+                // the owner already wrote there (the image is one and the same, so the write
+                // is idempotent). The owner of a segment IS that segment's arena — sharing is
+                // for borrowers only. The sharing runs per segment sequentially over the
+                // family because a rung may own one segment and borrow another: the owner is
+                // read while every other session is written, one segment at a time
+                // (`split_at_mut` proving the disjointness the compiler cannot see through
+                // the family vec).
+                // One family vec: every rung the census charged, its census fingerprint, and
+                // its built session — the sharing walks it per segment and the adoption wave
+                // below consumes it by value, partitioned back into the ladder and the prefix
+                // rungs.
+                enum FamilyRung {
+                    Ladder(usize),
+                    Prefix(PrefixRungJob),
+                }
+                let mut family: Vec<(FamilyRung, &'static str, Result<SuperDscSession, String>)> =
+                    ladder_prepared
+                        .into_iter()
+                        .map(|(rm, sent, built)| {
+                            (
+                                FamilyRung::Ladder(rm),
+                                sent,
+                                built.map_err(|e| {
+                                    format!(
+                                        "prefill rung m={rm}: create failed: {e} — every rung the \
+                                     bake shipped must load"
+                                    )
+                                }),
+                            )
+                        })
+                        .chain(
+                            prefix_jobs
+                                .into_iter()
+                                .zip(prefix_prepared)
+                                .map(|(job, built)| {
+                                    let sent = job.sent;
+                                    (FamilyRung::Prefix(job), sent, built.map_err(|(_, m)| m))
+                                }),
+                        )
+                        .collect();
+                for (si, seg) in scratchy_target_spyre::pool_law::SHARED_SCRATCH_SEGS
                     .iter()
                     .enumerate()
-                    .filter(|(si, _)| wave_arena_owners[*si].1 != usize::MAX)
-                    .map(|(si, seg)| {
-                        let oi = wave_arena_owners[si].1;
-                        let owner: &SuperDscSession = if oi < ladder_family_len {
-                            ladder_prepared[oi].1.as_ref().unwrap_or_else(|e| {
-                                panic!(
-                                    "prefill ladder rung #{oi} failed to prepare — the family \
-                                         arena for seg{} cannot be minted from it: {e}",
-                                    seg.get()
-                                )
-                            })
-                        } else {
-                            prefix_prepared[oi - ladder_family_len]
-                                .as_ref()
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "prefix-capable prefill rung #{:?} failed to prepare — \
-                                             the family arena for seg{} cannot be minted from it",
-                                        e,
-                                        seg.get()
-                                    )
-                                })
-                        };
-                        (
-                            seg.get() as i64,
-                            oi,
-                            owner.seg_arena(seg.get() as i64).unwrap_or_else(|e| {
-                                panic!("seg{} family arena mint failed: {e}", seg.get())
-                            }),
+                {
+                    // `None` is the census's own law: the family places nothing in the
+                    // segment, no arena is charged, and no rung borrows it.
+                    let Some(owner_sent) = census.arena_owners[si] else {
+                        continue;
+                    };
+                    let oi = family
+                        .iter()
+                        .position(|(_, sent, _)| *sent == owner_sent)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "the census names {owner_sent} the owner of the seg{} family \
+                                 arena, but no family rung carries that fingerprint — the census \
+                                 and the manifest have desynced",
+                                seg.index()
+                            )
+                        });
+                    let (lo, hi) = family.split_at_mut(oi);
+                    let ((_, _, owner_built), borrowers) = hi.split_first_mut().expect(
+                        "the position came from the family's own iter, so its owner is in it",
+                    );
+                    let owner = owner_built.as_mut().unwrap_or_else(|e| {
+                        panic!(
+                            "the census's arena owner for seg{} ({owner_sent}) failed to build: \
+                             {e} — every rung the bake shipped must load",
+                            seg.index()
                         )
-                    })
-                    .collect();
+                    });
+                    for (_, _, built) in lo.iter_mut().chain(borrowers.iter_mut()) {
+                        // A rung that failed to build owns nothing its family can share; its
+                        // refusal panics in the adoption walk below, in family order.
+                        if let Ok(sess) = built {
+                            sess.share_scratch_seg_from(owner, *seg).map_err(|e| {
+                                werr(format!(
+                                    "seg{} family-arena share failed: {e} — every rung the \
+                                     bake shipped must load",
+                                    seg.index()
+                                ))
+                            })?;
+                        }
+                    }
+                }
                 let _t_all = _t_wave.elapsed();
                 info!(
                     "[spyre-worker] sendnn: ladder device half: {} session(s) prepared in {:.0} ms \
                      (joins: ladder {:.0} / prefix {:.0} / decode {:.0} + prepare scope {:.0} ms — \
                      join time past zero is host halves that outran the owner's window)",
-                    ladder_prepared.len() + prefix_prepared.len() + decode_prepared.len(),
+                    family.len() + decode_prepared.len(),
                     _t_all.as_secs_f64() * 1e3,
                     _t_ladder_join.as_secs_f64() * 1e3,
                     _t_prefix_join.as_secs_f64() * 1e3,
@@ -2913,62 +2782,27 @@ impl SpyreWorker {
                 // the layout spilled a weight tail, that borrower's own device copy — the
                 // owner is only ever READ here — so the rungs adopt in parallel, one thread
                 // per session, the same width the prepare wave above already rode. The
-                // refusals are still reported in ladder order on this thread: every thread
-                // returns its failure as a value, and the walk below panics on the first
-                // one in rung order, byte-identical to the serial loop it replaces.
-                // ⛔ THE FAMILY ARENA IS SHARED FIRST, deliberately: a borrower's spilled
-                // weight tail is handed over by `adopt_from_owner`'s `write_seg_prefix`, which
-                // writes into whatever `seg_addr` points at — pointed at the 128 B placeholder
-                // it would be a refused copy, and pointed at the arena it lands on the tail
-                // the owner already wrote there (the image is one and the same, so the write
-                // is idempotent).
-                let ladder_adopted: Vec<(usize, Result<SuperDscSession, String>)> =
+                // family arenas were already shared, per segment, from their census owners
+                // above. The refusals are still reported in family order on this thread:
+                // every thread returns its failure as a value, and the walk below panics on
+                // the first one in rung order, byte-identical to the serial loop it replaces.
+                let family_adopted: Vec<Result<(FamilyRung, SuperDscSession), String>> =
                     std::thread::scope(|scope| {
-                        let handles: Vec<_> = ladder_prepared
+                        let handles: Vec<_> = family
                             .into_iter()
-                            .enumerate()
-                            .map(|(fi, (rm, built))| {
+                            .map(|(rung, _sent, built)| {
                                 let ss = &ss;
                                 let spill = &spill_images;
-                                let arenas = &family_arenas;
                                 scope.spawn(move || {
-                                    (
-                                        rm,
-                                        built
+                                    built.and_then(|mut sess| {
+                                        adopt_from_owner(&mut sess, ss, spill)
                                             .map_err(|e| {
                                                 format!(
-                                                    "create failed: {e} — every rung the bake \
-                                                     shipped must load"
+                                                    "{e} — every rung the bake shipped must load"
                                                 )
                                             })
-                                            .and_then(|mut rs| {
-                                                // The rung at family index `fi` IS the arena
-                                                // for the segment it owns — sharing is for
-                                                // borrowers only; the owner already points at
-                                                // the region it minted.
-                                                for (seg, owner_fi, arena) in arenas {
-                                                    if *owner_fi == fi {
-                                                        continue;
-                                                    }
-                                                    rs.share_scratch_seg_from(*seg, arena)
-                                                        .map_err(|e| {
-                                                            format!(
-                                                                "seg{seg} family-arena share \
-                                                                 failed: {e} — every rung the bake \
-                                                                 shipped must load"
-                                                            )
-                                                        })?;
-                                                }
-                                                adopt_from_owner(&mut rs, ss, spill)
-                                                    .map_err(|e| {
-                                                        format!(
-                                                            "{e} — every rung the bake \
-                                                             shipped must load"
-                                                        )
-                                                    })
-                                                    .map(|()| rs)
-                                            }),
-                                    )
+                                            .map(|()| (rung, sess))
+                                    })
                                 })
                             })
                             .collect();
@@ -2980,17 +2814,37 @@ impl SpyreWorker {
                             })
                             .collect()
                     });
-                for (rm, adopted) in ladder_adopted {
-                    match adopted {
-                        Ok(rs) => {
+                let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
+                for adopted in family_adopted {
+                    let (rung, sess) = adopted.unwrap_or_else(|m| panic!("{m}"));
+                    match rung {
+                        FamilyRung::Ladder(rm) => {
                             _n_ladder += 1;
-                            prefill_ladder.push((rm, rs));
+                            prefill_ladder.push((rm, sess));
                         }
-                        Err(msg) => panic!("prefill ladder rung m={rm}: {msg}"),
+                        FamilyRung::Prefix(job) => {
+                            // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its
+                            // consts staged — the wave front's launch reads it, never a
+                            // representative's.
+                            let meta = mk_meta(wiring_to_parsed(job.wiring)?, 0, job.wiring);
+                            info!(
+                                "[spyre-worker] sendnn: prefix-capable prefill session ready (w={}, \
+                                 s={}, bundle {}) — a start>0 chunk runs on the smallest solo rung \
+                                 that holds it, a wave of tails on the smallest packed product that \
+                                 holds them",
+                                job.pmq, job.seqs, job.rcode.fp
+                            );
+                            prefix_built.push(PrefixRungBuilt {
+                                width: job.pmq as usize,
+                                seqs: job.seqs as usize,
+                                meta,
+                                sess,
+                            });
+                        }
                     }
                 }
-                // The TOP rung is `prefill_ss` itself — built and aliased above, never on the
-                // background thread, because its allocation is what places decode's weight region.
+                // The TOP rung is `prefill_ss` itself — the anchor session, built and aliased
+                // above on this thread, never on a background one.
                 if let Some(top) = prefill_ss {
                     prefill_ladder.push((prefill_m, top));
                 }
@@ -3008,87 +2862,9 @@ impl SpyreWorker {
                     prefill_ladder.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
                     prefill_ladder.last().map(|(m, _)| *m).unwrap_or(0),
                 );
-                // ── PREFIX-CAPABLE PREFILL LADDER ── the adoption. The fan-out was spawned with
-                // the prefill ladder's, before the owner (host halves only); its prepare ran in
-                // the wave above. The adoption runs one thread per session, reading the owner
-                // only; refusals and "ready" logs land in ladder order on this thread. Each
-                // thread hands back the rung's OWN JOB beside its session — the job already
-                // states the rung's identity (width, sequence count, bundle, wiring cell), so
-                // the adoption never re-states those facts as a second tuple.
-                let prefix_adopted: Vec<(PrefixRungJob, Result<SuperDscSession, String>)> =
-                    std::thread::scope(|scope| {
-                        let handles: Vec<_> = prefix_jobs
-                            .into_iter()
-                            .zip(prefix_prepared)
-                            .enumerate()
-                            .map(|(ji, (job, built))| {
-                                let ss = &ss;
-                                let spill = &spill_images;
-                                let arenas = &family_arenas;
-                                let pmq = job.pmq;
-                                let seqs = job.seqs;
-                                // The prefix rungs' family indices sit past the ladder's —
-                                // the same combined list `scratch_arena_owners` indexed.
-                                let fi = ladder_family_len + ji;
-                                scope.spawn(move || {
-                                    (
-                                        job,
-                                        built.map_err(|(_, m)| m).and_then(|mut ps| {
-                                            // As below: the owner of a segment IS that
-                                            // segment's arena — share with borrowers only.
-                                            for (seg, owner_fi, arena) in arenas {
-                                                if *owner_fi == fi {
-                                                    continue;
-                                                }
-                                                ps.share_scratch_seg_from(*seg, arena)
-                                                    .map_err(|e| {
-                                                        format!(
-                                                            "seg{seg} family-arena share failed: \
-                                                             {e} — every rung the bake shipped \
-                                                             must load"
-                                                        )
-                                                    })?;
-                                            }
-                                            adopt_from_owner(&mut ps, ss, spill)
-                                                .map_err(|e| {
-                                                    format!(
-                                                        "prefix-capable prefill (w={pmq}, s={seqs}): \
-                                                         {e} — every rung the bake shipped must load"
-                                                    )
-                                                })
-                                                .map(|()| ps)
-                                        }),
-                                    )
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| match h.join() {
-                                Ok(r) => r,
-                                Err(p) => std::panic::resume_unwind(p),
-                            })
-                            .collect()
-                    });
-                let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
-                for (job, adopted) in prefix_adopted {
-                    let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
-                    // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its consts
-                    // staged — the wave front's launch reads it, never a representative's.
-                    let meta = mk_meta(wiring_to_parsed(job.wiring)?, 0, job.wiring);
-                    info!(
-                        "[spyre-worker] sendnn: prefix-capable prefill session ready (w={}, s={}, \
-                         bundle {}) — a start>0 chunk runs on the smallest solo rung that holds \
-                         it, a wave of tails on the smallest packed product that holds them",
-                        job.pmq, job.seqs, job.rcode.fp
-                    );
-                    prefix_built.push(PrefixRungBuilt {
-                        width: job.pmq as usize,
-                        seqs: job.seqs as usize,
-                        meta,
-                        sess: ps,
-                    });
-                }
+                // ── PREFIX-CAPABLE PREFILL LADDER ── the adoption ran in the family walk
+                // above (the prefix rungs are family members like the ladder's, marked and
+                // shared by the same census fingerprints); what is left is the ladder itself.
                 let prefill_prefix = PrefixLadder::of_built(prefix_built);
                 if prefill_prefix.is_empty() {
                     warn!(
