@@ -782,7 +782,7 @@ fn rope_bf16_full_256_matches_the_cpu_reference() {
 // ── The proportional rope (Gemma 4's global layers, #923) ──────────
 
 /// Gemma 4's global heads: 128 of each 512-lane head rotated, lane `d < 64` paired with lane
-/// `d + 256` (`RopePairing::HalfHead`), the frequencies over the head dim, at `rope_theta` 1e6.
+/// `d + 256` (`RopePairing::Proportional`), the frequencies over the head dim, at `rope_theta` 1e6.
 const G_HD: u32 = 512;
 const G_ROT: u32 = 128;
 const THETA_GLOBAL: f64 = 1e6;
@@ -816,7 +816,7 @@ fn rope_bf16_proportional_matches_the_cpu_reference() {
                 tb.ptr(),
                 out.ptr(),
                 (rows as u32, cols as u32),
-                (G_HD, G_ROT, RopePairing::HalfHead),
+                (G_HD, G_ROT, RopePairing::Proportional),
                 std::ptr::null_mut(),
             )
         }
@@ -893,9 +893,9 @@ fn rope_bf16_proportional_matches_the_cpu_reference() {
     let input = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload x");
     let table = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload the table");
     for (head_dim, rot_dim, pairing) in [
-        (256u32, 128u32, RopePairing::HalfHead),
-        (G_HD, 64, RopePairing::HalfHead),
-        (G_HD, G_ROT, RopePairing::HalfRotated),
+        (256u32, 128u32, RopePairing::Proportional),
+        (G_HD, 64, RopePairing::Proportional),
+        (G_HD, G_ROT, RopePairing::Standard),
     ] {
         let out = refused_out(&device, len);
         // SAFETY: the launcher refuses these shapes before it touches any pointer.
@@ -980,21 +980,14 @@ fn the_one_row_rope_is_the_16_row_rope_bit_for_bit() {
     let mut pass = true;
     // (what, heads, head_dim, rot_dim, pairing, theta)
     let shapes = [
-        (
-            "27b q+k <64>",
-            28u32,
-            HD,
-            R,
-            RopePairing::HalfRotated,
-            THETA,
-        ),
-        ("35b q+k <64>", 18, HD, R, RopePairing::HalfRotated, THETA),
+        ("27b q+k <64>", 28u32, HD, R, RopePairing::Standard, THETA),
+        ("35b q+k <64>", 18, HD, R, RopePairing::Standard, THETA),
         (
             "gemma q <256>",
             16,
             FULL,
             FULL,
-            RopePairing::HalfRotated,
+            RopePairing::Standard,
             THETA_LOCAL,
         ),
         (
@@ -1002,7 +995,7 @@ fn the_one_row_rope_is_the_16_row_rope_bit_for_bit() {
             8,
             FULL,
             FULL,
-            RopePairing::HalfRotated,
+            RopePairing::Standard,
             THETA_LOCAL,
         ),
         (
@@ -1010,7 +1003,7 @@ fn the_one_row_rope_is_the_16_row_rope_bit_for_bit() {
             16,
             G_HD,
             G_ROT,
-            RopePairing::HalfHead,
+            RopePairing::Proportional,
             THETA_GLOBAL,
         ),
         (
@@ -1018,7 +1011,7 @@ fn the_one_row_rope_is_the_16_row_rope_bit_for_bit() {
             2,
             G_HD,
             G_ROT,
-            RopePairing::HalfHead,
+            RopePairing::Proportional,
             THETA_GLOBAL,
         ),
     ];
@@ -1026,7 +1019,7 @@ fn the_one_row_rope_is_the_16_row_rope_bit_for_bit() {
         let cols = (heads * hd) as usize;
         for pos in [0u32, 1, 191, 8191] {
             let table = match pairing {
-                RopePairing::HalfHead => rotary_rows_with_freq_dim(&[pos], rot, hd, theta),
+                RopePairing::Proportional => rotary_rows_with_freq_dim(&[pos], rot, hd, theta),
                 _ => rotary_rows(&[pos], rot, theta),
             };
             for seed in 0..3u64 {
@@ -1114,21 +1107,14 @@ fn the_one_row_rope_times_are_recorded() {
     use scratchy_target_cuda::step::RopePairing;
     let device = h100();
     let shapes = [
-        (
-            "27b q+k <64>",
-            28u32,
-            HD,
-            R,
-            RopePairing::HalfRotated,
-            THETA,
-        ),
-        ("35b q+k <64>", 18, HD, R, RopePairing::HalfRotated, THETA),
+        ("27b q+k <64>", 28u32, HD, R, RopePairing::Standard, THETA),
+        ("35b q+k <64>", 18, HD, R, RopePairing::Standard, THETA),
         (
             "gemma q <256>",
             16,
             FULL,
             FULL,
-            RopePairing::HalfRotated,
+            RopePairing::Standard,
             THETA_LOCAL,
         ),
         (
@@ -1136,14 +1122,14 @@ fn the_one_row_rope_times_are_recorded() {
             16,
             G_HD,
             G_ROT,
-            RopePairing::HalfHead,
+            RopePairing::Proportional,
             THETA_GLOBAL,
         ),
     ];
     for (what, heads, hd, rot, pairing, theta) in shapes {
         let cols = (heads * hd) as usize;
         let table = match pairing {
-            RopePairing::HalfHead => rotary_rows_with_freq_dim(&[191, 192], rot, hd, theta),
+            RopePairing::Proportional => rotary_rows_with_freq_dim(&[191, 192], rot, hd, theta),
             _ => rotary_rows(&[191, 192], rot, theta),
         };
         let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
@@ -1470,9 +1456,9 @@ fn w4c_chain(
     };
     use scratchy_target_cuda::step::RopePairing;
     let pairing = if half {
-        RopePairing::HalfHead
+        RopePairing::Proportional
     } else {
-        RopePairing::HalfRotated
+        RopePairing::Standard
     };
     let null = std::ptr::null_mut();
     let buf = |n: usize| DeviceBuffer::upload(device, &vec![0u16; n]).expect("buffer");
@@ -1564,9 +1550,9 @@ fn w4c_launch(
     use scratchy_target_cuda::kernels::rope_append_fp8;
     use scratchy_target_cuda::step::RopePairing;
     let pairing = if half {
-        RopePairing::HalfHead
+        RopePairing::Proportional
     } else {
-        RopePairing::HalfRotated
+        RopePairing::Standard
     };
     let gains = norms.then(|| {
         (
@@ -1608,9 +1594,9 @@ fn the_fused_rope_append_time_is_recorded() {
         let buf = |n: usize| DeviceBuffer::upload(&device, &vec![0u16; n]).expect("buffer");
         let (qn, kn, vn, qr, kr) = (buf(c.qc), buf(c.kc), buf(c.kc), buf(c.qc), buf(c.kc));
         let pairing = if half {
-            RopePairing::HalfHead
+            RopePairing::Proportional
         } else {
-            RopePairing::HalfRotated
+            RopePairing::Standard
         };
         let null = std::ptr::null_mut();
         let shape = (qh, kvh, hd, rot, half);
@@ -1764,9 +1750,9 @@ fn r1_launch(
     use scratchy_target_cuda::kernels::rope_append_fp8;
     use scratchy_target_cuda::step::RopePairing;
     let pairing = if half {
-        RopePairing::HalfHead
+        RopePairing::Proportional
     } else {
-        RopePairing::HalfRotated
+        RopePairing::Standard
     };
     let gains = norms.then(|| {
         (

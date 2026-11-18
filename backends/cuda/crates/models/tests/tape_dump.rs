@@ -130,8 +130,8 @@ fn gain(c: GainConvention) -> Value {
 
 fn pairing(p: RopePairing) -> Value {
     match p {
-        RopePairing::HalfRotated => json!("lane i rotates with lane i + rot_dim/2"),
-        RopePairing::HalfHead => json!("lane i rotates with lane i + head_dim/2"),
+        RopePairing::Standard => json!("lane i rotates with lane i + rot_dim/2"),
+        RopePairing::Proportional => json!("lane i rotates with lane i + head_dim/2"),
     }
 }
 

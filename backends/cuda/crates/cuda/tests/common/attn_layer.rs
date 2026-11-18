@@ -272,7 +272,7 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         cols: Q,
         head_dim: HD,
         rot_dim: R,
-        pairing: RopePairing::HalfRotated,
+        pairing: RopePairing::Standard,
     })
 }
 
@@ -294,7 +294,7 @@ const fn rope_append(
         cols: KV,
         head_dim: HD,
         rot_dim: R,
-        pairing: RopePairing::HalfRotated,
+        pairing: RopePairing::Standard,
         q: None,
         norms: None,
     })

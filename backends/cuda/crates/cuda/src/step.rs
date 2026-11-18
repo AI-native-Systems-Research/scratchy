@@ -4,7 +4,7 @@
 
 /// Re-exported so a static tape names it beside the steps that carry it
 /// (`scratchy_target_cuda::step::GainConvention`).
-pub use scratchy_subtile::handoff::RopePairing;
+pub use scratchy_ir::model_facts::RopePairing;
 pub use scratchy_subtile::subtile_ir::GainConvention;
 use serde::Serialize;
 
@@ -906,14 +906,14 @@ pub struct SoftCapBf16 {
     pub cap_bits: u32,
 }
 
-/// [`RopePairing`] as the unit variant it is: `scratchy_subtile` has no serde.
+/// [`RopePairing`] as the unit variant it is: `scratchy_ir` has no serde.
 fn serialize_rope_pairing<S: serde::Serializer>(
     pairing: &RopePairing,
     s: S,
 ) -> Result<S::Ok, S::Error> {
     let (index, variant) = match pairing {
-        RopePairing::HalfRotated => (0, "HalfRotated"),
-        RopePairing::HalfHead => (1, "HalfHead"),
+        RopePairing::Standard => (0, "Standard"),
+        RopePairing::Proportional => (1, "Proportional"),
     };
     s.serialize_unit_variant("RopePairing", index, variant)
 }
@@ -1264,9 +1264,9 @@ pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
 /// Its launcher refuses any other, so the kernel's rule is tighter than the lowering's
 /// [`ROPE_BF16_ROT_MULTIPLE`].
 pub const ROPE_BF16_KERNEL_SHAPES: &[(u32, RopePairing)] = &[
-    (64, RopePairing::HalfRotated),
-    (256, RopePairing::HalfRotated),
-    (128, RopePairing::HalfHead),
+    (64, RopePairing::Standard),
+    (256, RopePairing::Standard),
+    (128, RopePairing::Proportional),
 ];
 /// The one head dim of the rope kernel's half-head instantiation: a whole 512-lane head is one
 /// unit of 8 boxes (`kernels/rope_bf16.cu`).
@@ -1292,7 +1292,7 @@ pub struct RopeBf16 {
     pub cols: u32,
     pub head_dim: u32,
     pub rot_dim: u32,
-    /// Which lane a rotated lane pairs with: `HalfRotated` (the kernel's), or `HalfHead`
+    /// Which lane a rotated lane pairs with: `Standard` (the kernel's), or `Proportional`
     /// (Gemma's proportional rope, #885's 13b-3). `table` is the tape's table of the step's class.
     #[serde(serialize_with = "serialize_rope_pairing")]
     pub pairing: RopePairing,

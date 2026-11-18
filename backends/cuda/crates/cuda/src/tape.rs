@@ -3059,7 +3059,7 @@ mod tests {
             cols: 2048,
             head_dim: 256,
             rot_dim: 64,
-            pairing: RopePairing::HalfRotated,
+            pairing: RopePairing::Standard,
         })
     }
 
@@ -3132,7 +3132,7 @@ mod tests {
             cols: 512,
             head_dim: 256,
             rot_dim: 64,
-            pairing: RopePairing::HalfRotated,
+            pairing: RopePairing::Standard,
             q: None,
             norms: None,
         })

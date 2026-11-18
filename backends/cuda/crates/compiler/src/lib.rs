@@ -67,7 +67,7 @@ impl TargetEmitter for Cuda {
 /// [`emit::emit_model`], refusing by name a model whose facts state no rope: CUDA has no unroped
 /// attention kernel.
 fn emit_handoff(input: &TargetModelInput) -> TokenStream {
-    if input.facts.rope_theta.is_none() {
+    if input.rope_theta.is_none() {
         panic!(
             "[cuda emit] {}: the model states no rope, and CUDA has no unroped attention kernel",
             input.stem

@@ -2035,12 +2035,12 @@ pub unsafe fn rope_bf16(
     )
 }
 
-/// [`rope_bf16`] in either pairing: `HalfRotated` is [`rope_bf16`] itself, the same launch; in
-/// `HalfHead` (Gemma 4's proportional rope) lane `d < rot_dim/2` pairs with lane `d + head_dim/2`,
+/// [`rope_bf16`] in either pairing: `Standard` is [`rope_bf16`] itself, the same launch; in
+/// `Proportional` (Gemma 4's proportional rope) lane `d < rot_dim/2` pairs with lane `d + head_dim/2`,
 /// and every other lane is copied bit for bit. Asynchronous.
 ///
 /// Refused with [`KernelError::RopeShape`] as [`rope_bf16`], except that `(rot_dim, pairing)` must
-/// be an entry of `step::ROPE_BF16_KERNEL_SHAPES`, and a `HalfHead` `head_dim` must be 512
+/// be an entry of `step::ROPE_BF16_KERNEL_SHAPES`, and a `Proportional` `head_dim` must be 512
 /// (`step::ROPE_BF16_HALF_HEAD_DIM`).
 ///
 /// # Safety
@@ -2056,8 +2056,8 @@ pub unsafe fn rope_paired_bf16(
 ) -> Result<(), KernelError> {
     // The launcher's pairing codes, `kernels/rope_bf16.cu`'s `PAIRING_*`.
     let code = match pairing {
-        RopePairing::HalfRotated => 0,
-        RopePairing::HalfHead => 1,
+        RopePairing::Standard => 0,
+        RopePairing::Proportional => 1,
     };
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe {
@@ -5225,8 +5225,8 @@ pub unsafe fn rope_append_fp8(
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     let pairing_code = match pairing {
-        RopePairing::HalfRotated => 0,
-        RopePairing::HalfHead => 1,
+        RopePairing::Standard => 0,
+        RopePairing::Proportional => 1,
     };
     let (q_gain, k_gain, eps) = norms.unwrap_or((std::ptr::null(), std::ptr::null(), 0.0));
     // SAFETY: the caller upholds the contract above; the launcher checks every rule first.

@@ -544,7 +544,18 @@ pub struct TargetModelInput {
     /// A workload point the shared front end refused, with its refusal; a target decides what
     /// that means for it.
     pub unlowered: Vec<(TargetPoint, String)>,
-    pub facts: TargetModelFacts,
+    /// The model's facts (`scratchy_ir::model_facts`), the one statement of its attention classes,
+    /// rope, Gated-DeltaNet geometry, vocab and norm eps that every target's lowering reads.
+    pub facts: scratchy_ir::model_facts::ModelFacts,
+    /// The rope base frequencies, which the facts do not state: `rope_theta` (the global class's,
+    /// every class's on a uniform model) and a hybrid's sliding class's own
+    /// (`rope_local_base_freq`); `None` where the model states none.
+    pub rope_theta: Option<f64>,
+    pub rope_local_theta: Option<f64>,
+    /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp`), ascending: an
+    /// expert bundle whose shared expert the DSL states as ops of its own, which a target's
+    /// expert combine therefore must not add again (the single-owner rule).
+    pub dsl_shared_expert_bases: Vec<String>,
     /// Each model weight a canonical binds (`SourceBinding::Weight { id, index }`), and the
     /// checkpoint prefix it loads from (without the leaf, e.g. `.weight`). A tied `lm_head`'s is
     /// the embedding table's: the checkpoint stores the one tensor once.
@@ -573,68 +584,6 @@ pub struct TargetPoint {
 pub struct TargetBucket {
     pub point: TargetPoint,
     pub lowered: LoweredDecode,
-}
-
-/// The config facts a target reads beside a canonical: the ones an op of the canonical does not
-/// carry. Each is resolved once, by the macro, from the model's config.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TargetModelFacts {
-    /// `head_dim`.
-    pub head_dim: u32,
-    /// The rotated lanes of a head: `partial_rotary_factor · head_dim`, else `head_dim`.
-    pub rot_dim: u32,
-    /// `rope_theta`; `None` when the config declares none.
-    pub rope_theta: Option<f64>,
-    /// `rms_norm_eps` (or the config's equivalent).
-    pub rms_norm_eps: f32,
-    /// `vocab_size`; 0 when the config declares none.
-    pub vocab_size: u32,
-    /// The linear-attention geometry: `Some` exactly when the model has a Gated-DeltaNet layer.
-    pub gdn: Option<TargetGdnFacts>,
-    /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp`), ascending: an
-    /// expert bundle whose shared expert the DSL states as ops of its own, which a target's
-    /// expert combine therefore must not add again (the single-owner rule).
-    pub dsl_shared_expert_bases: Vec<String>,
-    /// The model's attention classes: the base class first (every layer of a uniform model, the
-    /// sliding layers of a hybrid one, read by the `Cos { local: true }` table when there is a
-    /// second class), then the global class when its geometry differs (Gemma 4's full-attention
-    /// layers, read by the `Cos { local: false }` table). A uniform model has exactly one, equal
-    /// to [`Self::head_dim`], [`Self::rot_dim`] and [`Self::rope_theta`]. Which class a layer is
-    /// is its attention ops' own fact: their mask's window and their head dim.
-    pub attn_classes: Vec<TargetAttnClass>,
-}
-
-/// One attention class's geometry: what a layer of it rotates, caches and masks.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TargetAttnClass {
-    pub head_dim: u32,
-    pub kv_heads: u32,
-    /// The rotated lanes of a head.
-    pub rot_dim: u32,
-    /// The class's rope base frequency; `None` when the config declares none.
-    pub rope_theta: Option<f64>,
-    pub pairing: RopePairing,
-    /// The keys a query sees, the last `window` positions; `None` for full causal attention.
-    pub window: Option<std::num::NonZeroU32>,
-}
-
-/// Which lane a rotated lane `i` pairs with: a fact of the model's rope, not of a target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RopePairing {
-    /// Lane `i + rot_dim/2`: half the rotated span (NeoX, and Qwen3.5's partial rope).
-    HalfRotated,
-    /// Lane `i + head_dim/2`: half the head (Gemma 4's proportional rope, which rotates
-    /// `rot_dim` of `head_dim` lanes with the full `head_dim` as its frequencies' denominator).
-    HalfHead,
-}
-
-/// A Gated-DeltaNet model's key-head geometry: `linear_num_key_heads`, `linear_key_head_dim`,
-/// `linear_conv_kernel_dim`. The value heads and their width are the op's operand widths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TargetGdnFacts {
-    pub num_k_heads: u32,
-    pub head_k: u32,
-    pub conv_kernel: u32,
 }
 
 /// One construct's expansion into ops (see [`LoweredDecode::op_expansion`]).

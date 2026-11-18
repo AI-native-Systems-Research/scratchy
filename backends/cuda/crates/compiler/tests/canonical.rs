@@ -11,8 +11,12 @@ use scratchy_subtile::fixtures::{
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
+use scratchy_ir::model_facts::{
+    ActDtype, FactsParts, HiddenSize, KvCodec, ModelFacts, NormWeightOffset, RmsNormEps,
+    ScaleDtype, VocabSize,
+};
 use scratchy_subtile::handoff::{
-    LoweredDecode, SourceBinding, TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
+    LoweredDecode, SourceBinding, TargetBucket, TargetModelInput, TargetPoint,
 };
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{
@@ -1089,16 +1093,28 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
             })
             .collect(),
         unlowered: Vec::new(),
-        facts: TargetModelFacts {
-            head_dim: 0,
-            rot_dim: 0,
-            rope_theta: None,
-            rms_norm_eps: 1e-6,
-            vocab_size: vocab,
+        facts: ModelFacts::new(FactsParts {
+            act_dtype: ActDtype::Bf16,
+            scale_dtype: ScaleDtype::F16,
+            hidden: HiddenSize::new(512),
+            intermediate: None,
+            vocab: (vocab > 0).then(|| VocabSize::new(vocab as usize)),
+            eps: RmsNormEps::new(1e-6),
+            norm_offset: NormWeightOffset::new(0.0),
+            final_softcap: None,
+            kv_codec: KvCodec::Dense,
+            kv_layers: None,
+            attention: None,
+            vision: None,
             gdn: None,
-            dsl_shared_expert_bases: Vec::new(),
-            attn_classes: Vec::new(),
-        },
+            drafter: None,
+            spec_drafts: None,
+            capture_slots: None,
+            target: None,
+        }),
+        rope_theta: None,
+        rope_local_theta: None,
+        dsl_shared_expert_bases: Vec::new(),
         weight_prefixes: vec![
             (1, None, "model.norm".to_string()),
             (2, None, head.to_string()),

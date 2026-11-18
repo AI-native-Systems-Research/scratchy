@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, RopePairing, SourceBinding};
+use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{ExpertWeight, GemmWeightKind};
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertProj;
@@ -38,8 +38,8 @@ use scratchy_target_cuda::step::{
     ExpertActQuantFp8, ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8,
     ExpertGemmBf16, ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel,
     GateUpTcFp8, GatedOp, GdnPrefillBf16, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError,
-    QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, gdn_scratch, gemv_tc_takes, norm_row_takes,
-    quant_chain,
+    QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes,
+    norm_row_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -114,8 +114,8 @@ impl CudaAttnClass {
     /// for the half-rotated pairing, the head dim for the half-head (proportional) one.
     pub const fn freq_dim(&self) -> u32 {
         match self.pairing {
-            RopePairing::HalfRotated => self.rot_dim,
-            RopePairing::HalfHead => self.head_dim,
+            RopePairing::Standard => self.rot_dim,
+            RopePairing::Proportional => self.head_dim,
         }
     }
 }
@@ -135,7 +135,7 @@ impl CudaModelFacts {
                 kv_heads: 0,
                 rot_dim: self.rot_dim,
                 rope_theta: self.rope_theta,
-                pairing: RopePairing::HalfRotated,
+                pairing: RopePairing::Standard,
                 window: None,
             }),
         }
