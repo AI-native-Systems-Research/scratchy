@@ -3331,7 +3331,7 @@ mod tests {
         use scratchy_tensors::compiler_ids::{Arity, OpName, StateName, StateOpId};
 
         static PROBE_A: StateOpFacts = StateOpFacts::new(
-            StateOpId::new(StateName::new("probe"), OpName::new("probe_a")),
+            StateOpId::new(StateName::new("probe_state"), OpName::new("probe_a")),
             Arity::new(2),
             StateOutputs::One,
             StateRows::In0,
@@ -3417,6 +3417,9 @@ mod tests {
         assert_eq!(*name, "probe_a");
         assert_eq!(*op, PROBE_A.id());
         let msg = refusal.to_string();
-        assert!(msg.contains("probe_a") && msg.contains("probe"), "{msg}");
+        assert!(
+            msg.contains("probe_a") && msg.contains("probe_state"),
+            "{msg}"
+        );
     }
 }

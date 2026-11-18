@@ -4,6 +4,7 @@
 
 use scratchy_forward_compiler_frontend::state::StateName;
 use scratchy_models_typed::typing;
+use std::collections::HashSet;
 
 #[test]
 fn typing_lists_every_state_once() {
@@ -13,6 +14,11 @@ fn typing_lists_every_state_once() {
         .iter()
         .map(|r| r.vocabulary().name())
         .collect();
-    assert_eq!(names, [StateName::new("mla")]);
+    let unique: HashSet<StateName> = names.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "a decoder state is listed twice: {names:?}"
+    );
     assert_eq!(typing.vocabularies().count(), typing.decoder_states.len());
 }

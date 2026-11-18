@@ -85,6 +85,9 @@ impl StateOpFacts {
         self.id
     }
 
+    /// The op's operand count. For now a state op's subtile operands are its DSL arguments, one
+    /// source each and in order, and its subtile outputs are its DSL outputs; a decoder state that lowers
+    /// differently will state its subtile operand count separately.
     pub const fn arity(&self) -> Arity {
         self.arity
     }
@@ -232,7 +235,7 @@ mod tests {
     use crate::lower::{InputRef, LoweringInput, OpDesc};
     use crate::subtile_ir::{SourceShape, SubOp, lower_region};
 
-    const PROBE: StateName = StateName::new("probe");
+    const PROBE: StateName = StateName::new("probe_state");
 
     static PROBE_A: StateOpFacts = StateOpFacts::new(
         StateOpId::new(PROBE, OpName::new("probe_a")),

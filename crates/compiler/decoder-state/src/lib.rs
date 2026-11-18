@@ -79,7 +79,8 @@ pub mod __private {
 }
 
 /// The number of token trees it is given, as a `u8`: an op's arity, counted from its parameter
-/// names. More than `u8::MAX` fails const evaluation.
+/// names. The recursion limit (128 by default) stops the expansion well before a count could
+/// pass `u8::MAX`, so an op with that many parameters fails to compile.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __state_count {
@@ -103,6 +104,10 @@ macro_rules! __state_count {
 ///   anything else one);
 /// - `facts(state)`, the op's subtile facts under the decoder state [`decoder_state!`] names, which reads the
 ///   same counts, so the declaration and the facts cannot disagree.
+///
+/// For now an op's subtile operands are its DSL arguments, one source each and in order, and its
+/// subtile outputs are its DSL outputs, so the one arity counted from the parameters serves both;
+/// a decoder state that lowers differently will state its subtile operand count separately.
 ///
 /// `rows` is a [`StateRows`](scratchy_subtile::state_op::StateRows) variant and `tp` a
 /// [`TpRule`](scratchy_subtile::tensor_parallel::TpRule) variant.
