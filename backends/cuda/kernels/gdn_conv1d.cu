@@ -59,14 +59,14 @@ using namespace kittens;
 namespace {
 
 // `step::GDN_CONV_CHANNEL_GROUP`: one warp's channels, a naive `rv_fl<128>`.
-constexpr int GROUP = 128;
+constexpr int GROUP = scratchy::GDN_CONV_CHANNEL_GROUP;
 constexpr int WARPS = 4;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // `step::GDN_CONV_TOKEN_BLOCK`.
-constexpr int TOKEN_BLOCK = 64;
+constexpr int TOKEN_BLOCK = scratchy::GDN_CONV_TOKEN_BLOCK;
 // `step::GDN_CONV_KERNEL_RANGE`.
-constexpr uint32_t KMIN = 2;
-constexpr uint32_t KMAX = 8;
+constexpr uint32_t KMIN = scratchy::GDN_CONV_KERNEL_RANGE[0];
+constexpr uint32_t KMAX = scratchy::GDN_CONV_KERNEL_RANGE[1];
 
 using chan_vec = rv_fl<GROUP>;
 using x_gl = gl<bf16, 1, 1, -1, -1>;

@@ -45,7 +45,7 @@ constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // `step::GDN_GATING_NV_MULTIPLE`: `nv` is a multiple of this, one chunk a naive vector of TK's
 // 16-element tiles.
-constexpr uint32_t NV_MULTIPLE = 16;
+constexpr uint32_t NV_MULTIPLE = scratchy::GDN_GATING_NV_MULTIPLE;
 using chunk_rv = rv_fl<int(NV_MULTIPLE)>;
 
 using in_gl = gl<bf16, 1, 1, -1, -1>;

@@ -16,6 +16,10 @@
 
 use std::num::NonZeroU32;
 
+/// The constants the kernels share ([`crate::kernel_consts`]), under the paths they always had.
+pub use crate::kernel_consts::{
+    CUDA_EXPERT_TILE_ROWS, CUDA_FP8_EXPERT_TILE_ROWS, MOE_EXPERT_COUNTS,
+};
 use scratchy_subtile::handoff::SourceBinding;
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::ops::SubOpKind;
@@ -500,24 +504,10 @@ pub fn cuda_moe_write<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> Option<CudaM
 pub const CUDA_GROUPED_EXPERTS: &[ExpertBundle] =
     &[ExpertBundle::SharedFused, ExpertBundle::SwitchGlu];
 
-/// The expert counts CUDA's MoE steps take: Gemma 4 26B-A4B's 128 and Qwen3.6-35B-A3B's 256.
-/// Every other count is refused at expansion (`MoeShapeRule::Experts`). The 128-expert kernels
-/// are #885's 13b.
-pub const MOE_EXPERT_COUNTS: &[u32] = &[128, 256];
-
 /// The (token, pick) pairs of a bucket from which its tape sorts the pairs by expert and runs the
 /// grouped GEMM; under it each pair's expert GEMV reads the pair's token row directly (gathered).
 /// Metal's value; with CUDA's buckets {1, 512, …} only the one-row bucket gathers.
 pub const CUDA_SORTED_PAIRS: u32 = 64;
-
-/// Each expert's run of sorted pairs is padded to a multiple of this many rows: the grouped GEMM's
-/// row tile (`step::GEMM_BF16_TILE.0`), so every tile belongs to exactly one expert.
-pub const CUDA_EXPERT_TILE_ROWS: u32 = 128;
-
-/// An fp8 bank's row tile (FP8 S8 P3(a)): its sort pads each expert's run to 64 rows and its expert
-/// GEMM takes 64-row tiles (`kernels/gemm_fp8.cu`'s `M_BLOCK` 1), so a half-full 128-row tile costs
-/// half the rows. A bf16 bank keeps [`CUDA_EXPERT_TILE_ROWS`].
-pub const CUDA_FP8_EXPERT_TILE_ROWS: u32 = 64;
 
 /// The row tile of a bank: [`CUDA_FP8_EXPERT_TILE_ROWS`] for an fp8 one, else
 /// [`CUDA_EXPERT_TILE_ROWS`].

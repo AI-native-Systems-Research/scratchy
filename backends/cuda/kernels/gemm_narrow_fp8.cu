@@ -43,13 +43,13 @@ namespace {
 
 // `step::GEMM_NARROW_BF16_MULTIPLE`: `n` is a multiple of it, so C's row stride is a multiple of 16
 // bytes, as its tensor map needs.
-constexpr uint32_t VEC = 8;
+constexpr uint32_t VEC = scratchy::GEMM_NARROW_BF16_MULTIPLE;
 // `step::GEMM_NARROW_BF16_MAX_N`: B's rows, all in one 64-row tile.
-constexpr uint32_t MAX_N = 64;
+constexpr uint32_t MAX_N = scratchy::GEMM_NARROW_BF16_MAX_N;
 // `quant_rows_fp8.cu`'s 16-row tile: `m` is a multiple of it.
 constexpr uint32_t ROW_MULTIPLE = 16;
 // `step::GEMM_FP8_K_MULTIPLE`: one K step.
-constexpr uint32_t K_STEP = 64;
+constexpr uint32_t K_STEP = scratchy::GEMM_FP8_K_MULTIPLE;
 // Rows and columns of a tile, and K per tile.
 constexpr int TILE = 64;
 constexpr int STAGES = 4;

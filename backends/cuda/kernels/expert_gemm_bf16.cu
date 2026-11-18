@@ -55,13 +55,13 @@ namespace {
 
 // One thread block per SM of an H100 SXM, as `gemm_bf16.cu`: each loops over tasks until none are
 // left, so correctness does not depend on this number; only speed does.
-constexpr int H100_SXM_SMS = 132;
+constexpr int H100_SXM_SMS = scratchy::H100_SXM_SMS;
 // `op_abi::MOE_EXPERT_COUNTS`: the depth of B, and `offsets[EXPERTS]` the padded total.
-constexpr int EXPERTS_SMALL = 128;
-constexpr int EXPERTS_LARGE = 256;
+constexpr int EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
+constexpr int EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
 // `step::EXPERT_GEMM_N_TILES`: the column tiles, `N_BLOCK` 64-column blocks each.
-constexpr uint32_t N_TILE_NARROW = 64;
-constexpr uint32_t N_TILE_WIDE = 256;
+constexpr uint32_t N_TILE_NARROW = scratchy::EXPERT_GEMM_N_TILES[0];
+constexpr uint32_t N_TILE_WIDE = scratchy::EXPERT_GEMM_N_TILES[1];
 
 template <int M_BLOCK, int N_BLOCK>
 struct expert_layout {

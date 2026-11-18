@@ -455,7 +455,7 @@ struct tile_pad_at {
         return (n + (ROWS - 1)) / ROWS * ROWS;
     }
 };
-using tile_pad = tile_pad_at<128>;
+using tile_pad = tile_pad_at<scratchy::CUDA_EXPERT_TILE_ROWS>;
 
 // TK-GAP(exclusive_scan_sv) begin
 // An exclusive prefix sum over a shared vector, in place, each element first mapped by `op`:

@@ -35,6 +35,7 @@ use super::{CudaError, check};
 use scratchy_state_decoder_gdn::layout::GdnStateLayout;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 
+use crate::kernel_consts::NO_SLOT;
 use crate::kernels::{self, DecodeSplit, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
@@ -132,10 +133,6 @@ pub enum KvHalf {
     K,
     V,
 }
-
-/// A slot of the slot mapping or the block table that is not one: a padding row, or an unused
-/// block-table entry.
-const NO_SLOT: u32 = u32::MAX;
 
 /// Why a worker could not be built.
 #[derive(Clone, Debug, PartialEq, Eq)]

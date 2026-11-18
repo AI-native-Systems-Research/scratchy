@@ -87,16 +87,16 @@ using namespace kittens;
 namespace {
 
 // `step::GDN_HEAD_K`.
-constexpr int HEAD_K = 128;
+constexpr int HEAD_K = scratchy::GDN_HEAD_K;
 // `step::GDN_HEAD_V_MULTIPLE`: the value rows of one CTA, 16 per warp.
-constexpr int ROWS = 32;
+constexpr int ROWS = scratchy::GDN_HEAD_V_MULTIPLE;
 constexpr int WARP_ROWS = 16;
 constexpr int WARPS = ROWS / WARP_ROWS;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // `step::GDN_HEAD_V_MAX`.
-constexpr uint32_t HEAD_V_MAX = 256;
+constexpr uint32_t HEAD_V_MAX = scratchy::GDN_HEAD_V_MAX;
 // `step::GDN_SCAN_TOKEN_BLOCK`.
-constexpr int TOKENS = 32;
+constexpr int TOKENS = scratchy::GDN_SCAN_TOKEN_BLOCK;
 // The bytes one token stages by bulk copy: q and k of the key head, v of the CTA's rows.
 constexpr uint32_t QK_BYTES = HEAD_K * sizeof(float);
 constexpr uint32_t V_BYTES = ROWS * sizeof(float);

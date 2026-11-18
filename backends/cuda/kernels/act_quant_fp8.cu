@@ -51,7 +51,7 @@ namespace {
 
 // `step::GEMM_FP8_K_MULTIPLE`: `n` is a multiple of it, so every row stride is a multiple of 16
 // bytes, as the tensor maps need.
-constexpr uint32_t COL_MULTIPLE = 64;
+constexpr uint32_t COL_MULTIPLE = scratchy::GEMM_FP8_K_MULTIPLE;
 constexpr int CHUNK = 256;
 constexpr int WARPS = 8;
 constexpr int THREADS = WARPS * kittens::WARP_THREADS;

@@ -33,12 +33,12 @@ namespace {
 
 // The decodes' rows per kv head (`step::ATTN_DECODE_BF16_MAX_GROUP`), K/V rows per tile, and
 // `step::CUDA_MAX_BLOCKS_PER_SEQ`.
-constexpr int MAX_GROUP = 16;
+constexpr int MAX_GROUP = scratchy::ATTN_DECODE_BF16_MAX_GROUP;
 constexpr int KV_HEIGHT = 64;
-constexpr uint32_t BLOCK_SIZE = 64;
-constexpr uint32_t MAX_BLOCKS_PER_SEQ = 128;
+constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
+constexpr uint32_t MAX_BLOCKS_PER_SEQ = scratchy::CUDA_MAX_BLOCKS_PER_SEQ;
 // `step::ATTN_DECODE_MAX_SPLITS`.
-constexpr uint32_t MAX_SPLITS = 64;
+constexpr uint32_t MAX_SPLITS = scratchy::ATTN_DECODE_MAX_SPLITS;
 constexpr int MERGE_WARPS = 4;
 constexpr int MERGE_THREADS = MERGE_WARPS * kittens::WARP_THREADS;
 // log2(e): the decodes' softmax runs in base 2 with the scale folded in.

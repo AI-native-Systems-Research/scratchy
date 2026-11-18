@@ -87,13 +87,14 @@ namespace {
 
 // `step::GEMV_BF16_MULTIPLE`: `k` is a multiple of it, so every row stride is a multiple of 16
 // bytes, as the tensor maps need.
-constexpr uint32_t VEC = 8;
+constexpr uint32_t VEC = scratchy::GEMV_BF16_MULTIPLE;
 // `step::GEMV_CHUNK`, `GEMV_ROWS_PER_WARP`, `GEMV_BLOCK_ROWS`, `GEMV_MAX_SPLITS`.
-constexpr int CHUNK = 256;
+constexpr int CHUNK = scratchy::GEMV_CHUNK;
 constexpr int ROWS_PER_WARP = 4;
 constexpr int WARPS = 8;
 constexpr int BLOCK_ROWS = WARPS * ROWS_PER_WARP;
-constexpr int MAX_SPLITS = 16;
+static_assert(BLOCK_ROWS == scratchy::GEMV_BLOCK_ROWS, "step::GEMV_BLOCK_ROWS");
+constexpr int MAX_SPLITS = scratchy::GEMV_MAX_SPLITS;
 constexpr int STAGES = 4;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // The rows per warp a one-split launch may take instead of `ROWS_PER_WARP` (#1031 rework, the
@@ -101,16 +102,16 @@ constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // two per SM: `rows_per_warp` picks the first whose grid fills its last wave to 85%.
 constexpr int ROW_CHOICES[] = {4, 3, 2};
 static_assert(ROW_CHOICES[0] == ROWS_PER_WARP, "the 4-row instance is the split one");
-constexpr uint64_t TARGET_CTAS = 264;
+constexpr uint64_t TARGET_CTAS = scratchy::GEMV_TARGET_CTAS;
 // The reduce kernel: one lane per output row, 8 warps per CTA.
 constexpr int REDUCE_WARPS = 8;
 constexpr int REDUCE_ROWS = kittens::WARP_THREADS;
 constexpr int REDUCE_THREADS = REDUCE_WARPS * kittens::WARP_THREADS;
 // The expert GEMV's bounds (`op_abi::MOE_EXPERT_COUNTS`, `step::MOE_ROUTE_MAX_TOP_K`), and the
 // grid's z extent, one slice per pair.
-constexpr uint32_t EXPERTS_SMALL = 128;
-constexpr uint32_t EXPERTS_LARGE = 256;
-constexpr uint32_t MAX_TOP_K = 32;
+constexpr uint32_t EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
+constexpr uint32_t EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
+constexpr uint32_t MAX_TOP_K = scratchy::MOE_ROUTE_MAX_TOP_K;
 constexpr uint32_t MAX_GRID_Z = 65535;
 
 using chunk_sv = sv_bf<CHUNK>;

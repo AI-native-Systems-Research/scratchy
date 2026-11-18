@@ -33,6 +33,9 @@ pub mod facade {
             scratchy_layers::weights::GpuWeights<A>;
     }
 }
+/// The constants the kernels share with Rust, one source for both: `build.rs` writes them into the
+/// header every kernel includes.
+pub mod kernel_consts;
 /// The kernels' `extern "C"` launchers, linked from `libscratchy_cuda_kernels.a`.
 #[cfg(feature = "nvcc")]
 pub mod kernels;

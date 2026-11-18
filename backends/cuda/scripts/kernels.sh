@@ -2,7 +2,7 @@
 # The GPU suite at one SHA, in an H100 pod (pod-side; run through drive.sh, README.md):
 #   REPO_URL=… SHA=… [BASE=…] ./drive.sh scratchy-cuda-k kernels.sh -
 # 1. the build with `nvcc`, the ThunderKittens source check, and ptxas over every kernel with
-#    build.rs's flags (0 spills required);
+#    build.rs's flags and its generated constants header (every compile clean, 0 spills required);
 # 2. every CUDA test binary built with `nvcc`, at SHA and, when BASE is set, at BASE, the two logs
 #    compared by ab.py (bit and ratio lines; timings dropped);
 # 3. the three FP8 models' tape tests (no GPU);
@@ -57,16 +57,26 @@ W=$(ws /root/pr); cd $W
 run build cargo build --release -p scratchy-target-cuda --features nvcc || stop "build"
 run tkcheck cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens -- --nocapture
 
-# 1. ptxas -v over every .cu with build.rs's flags: 0 spills required.
-nvccflags="-std=c++20 -O3 --use_fast_math --expt-extended-lambda --expt-relaxed-constexpr -forward-unknown-to-host-compiler -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing -Xcompiler=-fPIC -DNDEBUG -lineinfo -ftemplate-backtrace-limit=0 -DKITTENS_SM90 -gencode arch=compute_90a,code=sm_90a -Xptxas -v"
+# 1. ptxas -v over every .cu with build.rs's flags, in its order, and its `-include` of the
+#    generated constants header (`scratchy_consts.cuh`, which the build above wrote into its
+#    OUT_DIR); `-Xptxas -v` is the one flag added. A SHA from before the header has none and none of
+#    its kernels reads one. Every compile clean and 0 spills required.
+nvccflags="-std=c++20 -O3 --use_fast_math --expt-extended-lambda --expt-relaxed-constexpr -forward-unknown-to-host-compiler -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing -Xcompiler=-fPIC -DNDEBUG -lineinfo -ftemplate-backtrace-limit=0 -DKITTENS_SM90 -gencode arch=compute_90a,code=sm_90a"
 KD=$(kernels_of /root/pr); mkdir -p /tmp/ptx
+# cargo writes build-script output under build/<crate>-<hash>/out (older) or build/<crate>/<hash>/out (newer).
+HDR=$(find $W/target/release/build -path "*scratchy-target-cuda*" -name scratchy_consts.cuh -print 2>/dev/null | xargs -r ls -t 2>/dev/null | head -1)
+[ -z "$HDR" ] && [ -f $W/crates/cuda/src/kernel_consts.rs ] && stop "the build wrote no scratchy_consts.cuh"
+include=${HDR:+-include $HDR}
+echo "PTXAS header=${HDR:-none}" | tee -a /logs/exits.txt
 for f in $KD/*.cu; do
   k=$(basename $f .cu)
-  nvcc $nvccflags -I $KD/thunderkittens/include -I $KD/thunderkittens/prototype -I $KD -c $f -o /tmp/ptx/$k.o >/logs/ptxas-$k.log 2>&1
+  nvcc $nvccflags -I $KD/thunderkittens/include -I $KD/thunderkittens/prototype -I $KD $include -c $f -o /tmp/ptx/$k.o -Xptxas -v >/logs/ptxas-$k.log 2>&1
   echo "EXIT ptxas-$k $?" >> /logs/exits.txt
 done
 cat /logs/ptxas-*.log > /logs/ptxas-all.log
-run spills bash -c 'echo ptxas_nonzero_exit=$(grep "^EXIT ptxas-" /logs/exits.txt | grep -vc " 0$"); grep "stack frame" /logs/ptxas-all.log | grep -v "0 bytes spill stores, 0 bytes spill loads"; [ "$(grep "stack frame" /logs/ptxas-all.log | grep -vc "0 bytes spill stores, 0 bytes spill loads")" = 0 ]'
+# Fails on a compile that failed, on a spill, and on a report with no `stack frame` line at all
+# (ptxas printed nothing, so nothing was checked).
+run spills bash -c 'bad=$(grep "^EXIT ptxas-" /logs/exits.txt | grep -vc " 0$"); frames=$(grep -c "stack frame" /logs/ptxas-all.log); spilled=$(grep "stack frame" /logs/ptxas-all.log | grep -v "0 bytes spill stores, 0 bytes spill loads"); echo "ptxas_nonzero_exit=$bad stack_frames=$frames"; [ -n "$spilled" ] && echo "$spilled"; [ "$bad" = 0 ] && [ "$frames" -gt 0 ] && [ -z "$spilled" ]'
 
 # 2. The GPU suite, at SHA and at BASE.
 run suite-build sh -c "cd $W && cargo test --release -p scratchy-target-cuda --features nvcc --no-run" || stop "suite build"

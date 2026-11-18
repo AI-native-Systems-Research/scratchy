@@ -66,8 +66,8 @@ constexpr int ROWS = 16;
 constexpr int BOX_COLS = 64;
 constexpr int NORM_COLS = 256;
 // `step::CUDA_KV_BLOCK_SIZE`, and a padding row's slot.
-constexpr uint32_t BLOCK_SIZE = 64;
-constexpr uint32_t NO_SLOT = 0xFFFFFFFFu;
+constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
+constexpr uint32_t NO_SLOT = scratchy::NO_SLOT;
 constexpr uint32_t MAX_SLOT_BLOCKS = (NO_SLOT / BLOCK_SIZE) + 1;
 constexpr int HALF_HEAD_DIM = 512;
 

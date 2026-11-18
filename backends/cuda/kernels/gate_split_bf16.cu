@@ -43,7 +43,7 @@ using namespace kittens;
 namespace {
 
 // `step::GATE_SPLIT_BF16_HEAD_DIM`: the one head dim the kernel is instantiated for, one tile wide.
-constexpr int HEAD_DIM = 256;
+constexpr int HEAD_DIM = scratchy::GATE_SPLIT_BF16_HEAD_DIM;
 constexpr int ROWS = 16;
 constexpr int STAGES = 2;
 constexpr int NUM_THREADS = kittens::WARP_THREADS;

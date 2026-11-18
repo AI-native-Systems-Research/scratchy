@@ -34,7 +34,7 @@ namespace {
 
 // `step::GATHER_LAST_ROW_BF16_COLS`: `cols` is a multiple of it, so every row is a whole number
 // of 16-byte units and starts 16-byte aligned, as the bulk copy needs.
-constexpr uint32_t VEC = 8;
+constexpr uint32_t VEC = scratchy::GATHER_LAST_ROW_BF16_COLS;
 // The bf16 elements one bulk copy moves at most: one 8 KiB buffer.
 constexpr int CHUNK = 4096;
 

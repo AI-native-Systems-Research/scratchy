@@ -58,14 +58,14 @@ using namespace kittens;
 namespace {
 
 // `step::ATTN_D512_BF16_HEAD_DIM`, as two halves of the D = 256 kernels' tile width.
-constexpr int HEAD_DIM = 512;
+constexpr int HEAD_DIM = scratchy::ATTN_D512_BF16_HEAD_DIM;
 constexpr int HALF_DIM = 256;
 constexpr int HALVES = HEAD_DIM / HALF_DIM;
 // Query rows of the stacked tile, and K/V rows per tile: the KV block size.
 constexpr int QO_HEIGHT = 64;
 constexpr int KV_HEIGHT = 64;
 // `step::ATTN_DECODE_BF16_MAX_GROUP`: the rows of a consumer warpgroup's warp 0, the ones stored.
-constexpr int MAX_GROUP = 16;
+constexpr int MAX_GROUP = scratchy::ATTN_DECODE_BF16_MAX_GROUP;
 constexpr int CONSUMER_WARPGROUPS = 2;
 static_assert(CONSUMER_WARPGROUPS == HALVES, "one output half per consumer warpgroup");
 constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + 1;
@@ -76,10 +76,10 @@ constexpr int CONSUMER_THREADS = CONSUMER_WARPGROUPS * kittens::WARPGROUP_THREAD
 constexpr int CONSUMERS_BARRIER = 1;
 using consumers = kittens::group<CONSUMER_WARPGROUPS * kittens::WARPGROUP_WARPS>;
 // Token slots per KV block (`step::CUDA_KV_BLOCK_SIZE`): one block is one K (or V) tile.
-constexpr uint32_t BLOCK_SIZE = 64;
+constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
 static_assert(KV_HEIGHT == int(BLOCK_SIZE), "one paged (block, kv head) half is one TMA box");
 // Entries of a sequence's block table (`step::CUDA_MAX_BLOCKS_PER_SEQ`): the columns of its view.
-constexpr uint32_t MAX_BLOCKS_PER_SEQ = 128;
+constexpr uint32_t MAX_BLOCKS_PER_SEQ = scratchy::CUDA_MAX_BLOCKS_PER_SEQ;
 // log2(e): the softmax runs in base 2 with the scale folded in.
 constexpr float LOG2E = 1.44269504089f;
 
