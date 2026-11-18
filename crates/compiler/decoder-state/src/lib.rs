@@ -244,6 +244,7 @@ macro_rules! state_op {
                     OUTPUTS,
                     ROWS,
                     TP,
+                    ::core::option::Option::None,
                 )
             }
         }

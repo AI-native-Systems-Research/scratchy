@@ -24,9 +24,10 @@
 //!   a row in its own right rather than a special case the consumer has to unpack.
 //! - `arity` is a closure-form predicate over the operand count (the binder is declared IN the
 //!   row so macro hygiene ties it to the body).
-//! - `[state r]`, in the `arity`, `cols`, `rows` and `tp` columns of the one `State` row: the
-//!   fact is the state op's own, read off the [`crate::state_op::StateSubOp`] that `r` binds
-//!   (its declared arity, its output 0's width, its row law, its sharding rule). Its `arity`
+//! - `[state r]`, in the `arity`, `cols`, `rows`, `gemm_w` and `tp` columns of the one `State`
+//!   row: the fact is the state op's own, read off the [`crate::state_op::StateSubOp`] that `r`
+//!   binds (its declared arity, its output 0's width, its row law, its weight operand, its
+//!   sharding rule). Its `arity`
 //!   class also makes the op's `name` its own op name. The row states no fact of any decoder state.
 //! - `cols` is one of (bracketed so it stays one macro token tree):
 //!   - `[in0]` — shape-preserving: output width = `inputs[0]` width;
@@ -223,10 +224,10 @@ macro_rules! for_each_subop {
             // pick row (the write-through is GPU-only, RopeAppend's law).
             ChainStage [SubOp::ChainStage { .. }] arity = (|n| n == 5), cols = [ustick],
                 rows = [in0], gemm_w = [none], tp = [whole];
-            // Every decoder state's ops: each fact is the op's own (`crate::state_op`). No state op
-            // reads a gemm weight through the registry.
+            // Every decoder state's ops: each fact is the op's own (`crate::state_op`), the operand
+            // that is its gemm weight included, when its facts declare one.
             State [SubOp::State(..)] arity = [state r], cols = [state r], rows = [state r],
-                gemm_w = [none], tp = [state r];
+                gemm_w = [state r], tp = [state r];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
@@ -433,9 +434,21 @@ macro_rules! __name_body {
 }
 
 // ── Derived: the gemm-weight operand ───────────────────────────────
-// One class pair: `[in k]` names operand k as the op's GEMM WEIGHT, `[none]` says it has none.
-// The arm's pattern is the row's own `$pat` — no field of the op keys the fact.
+// Three classes: `[in k]` names operand k as the op's GEMM WEIGHT, `[none]` says it has none, and
+// `[state r]` asks the state op, whose facts name its weight operand or none. The state arm binds
+// `SubOp::State(r)`; every other arm uses the row's own `$pat`, and no field of the op keys the fact.
+macro_rules! __gemm_w_pat {
+    ($kind:ident, $pat:pat, [state $r:ident]) => {
+        $crate::subtile_ir::SubOp::$kind($r)
+    };
+    ($kind:ident, $pat:pat, $gw:tt) => {
+        $pat
+    };
+}
 macro_rules! __gemm_w_body {
+    ([state $r:ident]) => {
+        $r.facts().weight()
+    };
     ([none]) => {
         None
     };
@@ -586,7 +599,7 @@ macro_rules! __derive_registry {
             pub fn gemm_weight_input(&self) -> Option<usize> {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => __gemm_w_body!($gw), )*
+                    $( __gemm_w_pat!($kind, $pat, $gw) => __gemm_w_body!($gw), )*
                 }
             }
 

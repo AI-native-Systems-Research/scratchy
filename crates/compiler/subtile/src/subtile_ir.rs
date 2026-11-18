@@ -1071,9 +1071,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 g.head_dim().get().hash(h);
                 a.scale().get().to_bits().hash(h);
             }
-            // The op's identity and its output widths are class: two state ops, or one at two
-            // widths, are different programs.
-            SubOp::State(op) => (op.id(), op.out_cols()).hash(h),
+            // The op's identity, output widths, layer and weight scheme are class: two state ops,
+            // one at two widths, two layers or two schemes, are different programs.
+            SubOp::State(op) => (op.id(), op.out_cols(), op.layer(), op.scheme()).hash(h),
         }
     }
 }
@@ -4272,6 +4272,17 @@ pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
         // op, no hand-maintained parallel match.
         if !node.op.arity_ok(arity) {
             return Err(format!("node {i} op {:?} bad arity {arity}", node.op));
+        }
+        // A state op's weight scheme and its facts agree on whether it has a weight operand.
+        if let SubOp::State(state) = &node.op
+            && state.scheme().is_some() != state.facts().weight().is_some()
+        {
+            return Err(format!(
+                "node {i} state op {}: scheme {:?} and facts' weight operand {:?} must agree",
+                state.name(),
+                state.scheme(),
+                state.facts().weight()
+            ));
         }
         // Output must target an op-output tensor, in bounds.
         let ot = node.output.tensor;

@@ -3336,6 +3336,7 @@ mod tests {
             StateOutputs::One,
             StateRows::In0,
             TpRule::Whole,
+            None,
         );
         let input = LoweringInput {
             sources: vec![

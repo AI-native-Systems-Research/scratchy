@@ -11,8 +11,9 @@
 
 use std::num::NonZeroU8;
 
-use scratchy_tensors::compiler_ids::{Arity, OutputCount, StateOpId};
+use scratchy_tensors::compiler_ids::{Arity, OutputCount, StateOpId, UnrollIndex};
 
+use crate::lower::GemmWeight;
 use crate::tensor_parallel::TpRule;
 
 /// How many values a state op produces: one variant per count a state op may declare, so a
@@ -53,7 +54,8 @@ pub enum StateRows {
 }
 
 /// Everything the shared passes know about one state op, declared once in the decoder state's own
-/// crate: its identity, its operand arity, its output count, its row law and its sharding rule.
+/// crate: its identity, its operand arity, its output count, its row law, its sharding rule and
+/// the operand that is its weight, if it has one.
 #[derive(Debug)]
 pub struct StateOpFacts {
     id: StateOpId,
@@ -61,23 +63,50 @@ pub struct StateOpFacts {
     outputs: StateOutputs,
     rows: StateRows,
     tp: TpRule,
+    weight: Option<u8>,
 }
 
 impl StateOpFacts {
-    /// The facts of the op `id`.
+    /// The facts of the op `id`. A `weight` is an index into the op's `arity` operands, so a
+    /// static whose weight lies past its arity does not build. An instance of an op with a
+    /// `weight` must call [`StateSubOp::weighted`]; `validate` refuses a mismatch either way.
+    ///
+    /// ```compile_fail,E0080
+    /// use scratchy_subtile::state_op::{StateOpFacts, StateOutputs, StateRows};
+    /// use scratchy_subtile::tensor_parallel::TpRule;
+    /// use scratchy_tensors::compiler_ids::{Arity, OpName, StateName, StateOpId};
+    ///
+    /// static PAST: StateOpFacts = StateOpFacts::new(
+    ///     StateOpId::new(StateName::new("s"), OpName::new("o")),
+    ///     Arity::new(2),
+    ///     StateOutputs::One,
+    ///     StateRows::M,
+    ///     TpRule::Whole,
+    ///     Some(2),
+    /// );
+    /// let _ = &PAST;
+    /// ```
     pub const fn new(
         id: StateOpId,
         arity: Arity,
         outputs: StateOutputs,
         rows: StateRows,
         tp: TpRule,
+        weight: Option<u8>,
     ) -> Self {
+        if let Some(w) = weight {
+            assert!(
+                w < arity.get(),
+                "a state op's weight operand is within its arity"
+            );
+        }
         Self {
             id,
             arity,
             outputs,
             rows,
             tp,
+            weight,
         }
     }
 
@@ -85,9 +114,7 @@ impl StateOpFacts {
         self.id
     }
 
-    /// The op's operand count. For now a state op's subtile operands are its DSL arguments, one
-    /// source each and in order, and its subtile outputs are its DSL outputs; a decoder state that lowers
-    /// differently will state its subtile operand count separately.
+    /// The op's subtile operand count; [`weight`](Self::weight) indexes these operands.
     pub const fn arity(&self) -> Arity {
         self.arity
     }
@@ -102,6 +129,14 @@ impl StateOpFacts {
 
     pub const fn tp(&self) -> TpRule {
         self.tp
+    }
+
+    /// The operand index of the op's weight: `None` for an op that reads no gemm weight.
+    pub const fn weight(&self) -> Option<usize> {
+        match self.weight {
+            Some(operand) => Some(operand as usize),
+            None => None,
+        }
     }
 
     /// Each output slot the op declares, in order.
@@ -144,13 +179,16 @@ impl OutCols {
     }
 }
 
-/// A state op as one node performs it: its decoder state's facts and this instance's output widths.
+/// A state op as one node performs it: its decoder state's facts, this instance's output widths,
+/// the layer whose ambient state it reads and the storage scheme of its weight operand.
 /// The facts pointer and the id it carries travel together, so one op's facts are never read for
 /// another's.
 #[derive(Clone, Copy, Debug)]
 pub struct StateSubOp {
     facts: &'static StateOpFacts,
     out_cols: OutCols,
+    layer: Option<UnrollIndex>,
+    scheme: Option<GemmWeight>,
 }
 
 impl StateSubOp {
@@ -165,7 +203,37 @@ impl StateSubOp {
         Self {
             facts,
             out_cols: OutCols { first, rest },
+            layer: None,
+            scheme: None,
         }
+    }
+
+    /// This instance, reading the ambient state of `layer`.
+    pub fn at_layer(self, layer: UnrollIndex) -> Self {
+        Self {
+            layer: Some(layer),
+            ..self
+        }
+    }
+
+    /// This instance, with its weight operand stored as `scheme`. An op whose facts declare a
+    /// weight operand must be built with this, and one that declares none must not: `validate`
+    /// refuses a mismatch in either direction, as it does a bad arity.
+    pub fn weighted(self, scheme: GemmWeight) -> Self {
+        Self {
+            scheme: Some(scheme),
+            ..self
+        }
+    }
+
+    /// The layer whose ambient state the op reads, if it reads a layer's.
+    pub fn layer(self) -> Option<UnrollIndex> {
+        self.layer
+    }
+
+    /// The storage scheme of the weight operand, if the instance has one.
+    pub fn scheme(self) -> Option<GemmWeight> {
+        self.scheme
     }
 
     /// The width of output `slot`: `None` for a slot this op does not declare.
@@ -217,10 +285,12 @@ impl StateSubOp {
     }
 }
 
-/// Equal when they are the same op with the same output widths: the id, not the facts' address.
+/// Equal when they are the same op with the same output widths, layer and weight scheme: the id,
+/// not the facts' address.
 impl PartialEq for StateSubOp {
     fn eq(&self, other: &Self) -> bool {
-        (self.facts.id, self.out_cols) == (other.facts.id, other.out_cols)
+        (self.facts.id, self.out_cols, self.layer, self.scheme)
+            == (other.facts.id, other.out_cols, other.layer, other.scheme)
     }
 }
 
@@ -229,11 +299,11 @@ mod tests {
     use std::hash::{DefaultHasher, Hasher};
     use std::num::NonZeroU32;
 
-    use scratchy_tensors::compiler_ids::{OpName, StateName};
+    use scratchy_tensors::compiler_ids::{OpName, StateName, UnrollIndex};
 
     use super::*;
-    use crate::lower::{InputRef, LoweringInput, OpDesc};
-    use crate::subtile_ir::{SourceShape, SubOp, lower_region};
+    use crate::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
+    use crate::subtile_ir::{SourceShape, SubOp, lower_region, validate};
 
     const PROBE: StateName = StateName::new("probe_state");
 
@@ -243,6 +313,7 @@ mod tests {
         StateOutputs::One,
         StateRows::In0,
         TpRule::Whole,
+        None,
     );
 
     static PROBE_B: StateOpFacts = StateOpFacts::new(
@@ -251,6 +322,16 @@ mod tests {
         StateOutputs::Two,
         StateRows::M,
         TpRule::Heads,
+        None,
+    );
+
+    static PROBE_W: StateOpFacts = StateOpFacts::new(
+        StateOpId::new(PROBE, OpName::new("probe_w")),
+        Arity::new(4),
+        StateOutputs::One,
+        StateRows::M,
+        TpRule::Whole,
+        Some(3),
     );
 
     fn op(facts: &'static StateOpFacts, cols: u32) -> SubOp {
@@ -335,5 +416,58 @@ mod tests {
         assert_eq!(graph.nodes[0].inputs.len(), 2);
         let out = graph.nodes[0].output.region;
         assert_eq!((out.rows.len, out.cols.len), (1, 48));
+    }
+
+    #[test]
+    fn two_layers_are_two_ops() {
+        let at = |n| StateSubOp::new(&PROBE_A, |_| 64).at_layer(UnrollIndex(n));
+        let (l0, l1) = (at(0), at(1));
+        assert_ne!(l0, l1);
+        assert_eq!(l0, at(0));
+        assert_eq!(l1.layer(), Some(UnrollIndex(1)));
+        assert_ne!(class_key(&SubOp::State(l0)), class_key(&SubOp::State(l1)));
+        assert_ne!(l0, StateSubOp::new(&PROBE_A, |_| 64));
+    }
+
+    #[test]
+    fn a_weighted_op_names_its_weight_operand() {
+        let w: SubOp = SubOp::State(StateSubOp::new(&PROBE_W, |_| 8).weighted(GemmWeight::Dense));
+        assert_eq!(w.gemm_weight_input(), Some(3));
+        assert_eq!(PROBE_W.weight(), Some(3));
+        assert_eq!(PROBE_A.weight(), None);
+        assert_eq!(op(&PROBE_A, 8).gemm_weight_input(), None);
+        let dense = StateSubOp::new(&PROBE_W, |_| 8).weighted(GemmWeight::Dense);
+        let fp8 = StateSubOp::new(&PROBE_W, |_| 8).weighted(GemmWeight::Fp8Dynamic);
+        assert_ne!(dense, fp8);
+        assert_eq!(fp8.scheme(), Some(GemmWeight::Fp8Dynamic));
+        assert_ne!(
+            class_key(&SubOp::State(dense)),
+            class_key(&SubOp::State(fp8))
+        );
+    }
+
+    #[test]
+    fn validate_refuses_a_scheme_its_facts_do_not_declare() {
+        let run = |facts: &'static StateOpFacts, scheme: Option<GemmWeight>, n: usize| {
+            let base = StateSubOp::new(facts, |_| 16);
+            let state = scheme.map_or(base, |s| base.weighted(s));
+            let input = LoweringInput {
+                sources: vec![SourceShape { rows: 1, cols: 16 }; n],
+                ops: vec![OpDesc {
+                    op: SubOp::State(state),
+                    m: 1,
+                    inputs: (0..n).map(InputRef::Ext).collect(),
+                }],
+                result: 0,
+                exported: None,
+            };
+            validate(&lower_region(&input, NonZeroU32::new(64).unwrap()))
+        };
+        assert!(run(&PROBE_W, Some(GemmWeight::Dense), 4).is_ok());
+        assert!(run(&PROBE_A, None, 2).is_ok());
+        let undeclared = run(&PROBE_A, Some(GemmWeight::Dense), 2).unwrap_err();
+        assert!(undeclared.contains("probe_a"), "{undeclared}");
+        let missing = run(&PROBE_W, None, 4).unwrap_err();
+        assert!(missing.contains("probe_w"), "{missing}");
     }
 }
