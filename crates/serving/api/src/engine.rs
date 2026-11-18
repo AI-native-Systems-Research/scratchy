@@ -2001,6 +2001,59 @@ impl AsyncEngine {
     }
 
     /// The step loop, one step at a time.
+    /// ⭐ THE IDLE-WAKE COALESCING DRAIN.
+    ///
+    /// Waking from idle on the FIRST request of a burst and scheduling
+    /// immediately serializes the burst: a client's concurrent POSTs never
+    /// share one packet, so the siblings land in `request_rx` a couple of
+    /// milliseconds behind the one that broke the idle select!, miss that
+    /// scheduling pass, and wait a whole step behind it. Measured on
+    /// granite-3.1-8b, concurrency 4 over a shared 1024-token prefix: the
+    /// first request's 59-token tail prefill ran SOLO on the (256,1) rung
+    /// while the three siblings (~2 ms behind) serialized a full prefill
+    /// step behind it — ~530 ms of an 885 ms median TTFT, against torch's
+    /// 651 ms for the same cell.
+    ///
+    /// Holding the first schedule after an idle wake open for a bounded
+    /// window lets the burst admit in ONE scheduling pass, and the
+    /// scheduler's existing wave-gather then packs the burst's prefills
+    /// into a single launch — no solo rung, no interleaved decode steps.
+    ///
+    /// The window is a property of the LOOP, never of a request count,
+    /// shape, or client: every idle wake gets the same drain. It stays open
+    /// only while requests keep landing (a quiet spell of
+    /// [`IDLE_COALESCE_QUIET_TICKS`] ticks ends it) and never past
+    /// [`IDLE_COALESCE_MAX`] overall, so a lone request pays at most one
+    /// quiet spell — a few milliseconds — of extra scheduling latency.
+    const IDLE_COALESCE_TICK: Duration = Duration::from_millis(1);
+    const IDLE_COALESCE_QUIET_TICKS: u32 = 5;
+    const IDLE_COALESCE_MAX: Duration = Duration::from_millis(10);
+
+    /// Drain requests that land in [`request_rx`] within the coalescing
+    /// window after an idle wake. Called only from the idle select's
+    /// request arm, i.e. when the loop had NO work at all (no GPU in
+    /// flight, no pending requests) and the first new request just arrived;
+    /// arrivals while the loop is busy are drained at the top of the loop
+    /// with no wait.
+    async fn coalesce_idle_wake(
+        client: &mut (dyn EngineCoreClient + Send),
+        request_rx: &mut mpsc::UnboundedReceiver<EngineCoreRequest>,
+    ) {
+        let wake = Instant::now();
+        let mut quiet_ticks: u32 = 0;
+        while quiet_ticks < Self::IDLE_COALESCE_QUIET_TICKS && wake.elapsed() < Self::IDLE_COALESCE_MAX {
+            tokio::time::sleep(Self::IDLE_COALESCE_TICK).await;
+            let mut landed = false;
+            while let Ok(ec_request) = request_rx.try_recv() {
+                if let Err(e) = client.add_request(ec_request) {
+                    error!("Failed to add request: {}", e);
+                }
+                landed = true;
+            }
+            quiet_ticks = if landed { 0 } else { quiet_ticks + 1 };
+        }
+    }
+
     fn step_loop_sync(args: StepLoopArgs) -> impl Future<Output = ()> + Send + 'static {
         let StepLoopArgs {
             mut client,
@@ -2051,6 +2104,11 @@ impl AsyncEngine {
                             if let Err(e) = client.add_request(ec_request) {
                                 error!("Failed to add request: {}", e);
                             }
+                            // The burst's siblings land milliseconds behind its
+                            // first request: hold the first schedule open for
+                            // the bounded coalescing window so they admit in
+                            // the same pass (see `coalesce_idle_wake`).
+                            Self::coalesce_idle_wake(client.as_mut(), &mut request_rx).await;
                         }
                         Some(embed_req) = embed_rx.recv() => {
                             let result = tokio::task::block_in_place(|| {
@@ -2486,6 +2544,13 @@ impl AsyncEngine {
                                 if let Err(e) = client.add_request(ec_request) {
                                     error!("Failed to add request: {}", e);
                                 }
+                                // The burst's siblings land milliseconds behind
+                                // its first request: hold the first schedule
+                                // open for the bounded coalescing window so
+                                // they admit in the same scheduling pass and
+                                // the wave-gather packs the burst's prefills
+                                // into one launch (see `coalesce_idle_wake`).
+                                Self::coalesce_idle_wake(client.as_mut(), &mut request_rx).await;
                             }
                             Some(embed_req) = embed_rx.recv() => {
                                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -7890,6 +7955,176 @@ mod tests {
             let inner = result.unwrap_or_else(|_| panic!("{attempt} request was never scheduled"));
             inner.expect_err("expected error from failing executor");
         }
+    }
+
+    /// Records the request ids every executed step carried, so a test can
+    /// assert which requests one scheduling pass admitted together.
+    struct StepRecordingExecutor {
+        inner: NoopExecutor,
+        steps: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl Executor for StepRecordingExecutor {
+        fn execute_model(
+            &mut self,
+            scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) -> scratchy_serving_engine::error::EngineResult<ModelRunnerOutput> {
+            self.steps.lock().unwrap().push(
+                scheduler_output
+                    .num_scheduled_tokens
+                    .keys()
+                    .cloned()
+                    .collect(),
+            );
+            self.inner.execute_model(scheduler_output)
+        }
+
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.inner.set_stop_token_ids(stop_token_ids);
+        }
+
+        fn initialize_cache(
+            &mut self,
+            num_gpu_blocks: usize,
+            num_cpu_blocks: usize,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.inner.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+        }
+
+        fn determine_available_memory(
+            &mut self,
+        ) -> scratchy_serving_engine::error::EngineResult<Vec<usize>> {
+            self.inner.determine_available_memory()
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    /// An engine whose executor records each step's request ids, with async
+    /// scheduling on — the server's own step-loop shape.
+    fn make_recording_engine(
+        steps: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) -> Arc<AsyncEngine> {
+        let executor = StepRecordingExecutor {
+            inner: NoopExecutor::new(1024),
+            steps,
+        };
+        let mut config = make_engine_config();
+        config.async_scheduling = true;
+        config.scheduler_config.async_scheduling = Some(true);
+        let client = Box::new(InprocClient::new(config, Box::new(executor)));
+        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+        engine.set_async_scheduling(true);
+        Arc::new(engine)
+    }
+
+    fn make_burst_request(max_tokens: u32) -> protocol::CompletionRequest {
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
+        request.max_tokens = Some(max_tokens);
+        request.stream = true;
+        request
+    }
+
+    /// The idle-wake coalescing drain: requests that land within the window behind the one
+    /// that woke the loop from idle admit in the SAME scheduling pass — the first executed
+    /// step carries the whole burst — so the scheduler's wave-gather packs them into one
+    /// launch instead of serializing the burst's tail a step behind its head.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_the_idle_wake_coalesces_a_burst_into_one_step() {
+        let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = make_recording_engine(Arc::clone(&steps));
+        engine.spawn_step_loop();
+
+        // A served engine's loop is long since parked in its idle select when a
+        // burst arrives; a freshly spawned one may not be: it owes executor
+        // round trips for its last request's overshoot step, and a request
+        // that lands before the park is drained at the loop top without a
+        // wake. Cycle one request through and give the loop a settle far past
+        // those round trips before starting the burst.
+        let (_, _, mut rx0) = engine
+            .completion_stream(make_burst_request(1))
+            .await
+            .unwrap();
+        while rx0.recv().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A burst: the second request lands ~1 ms behind the first, as a client's
+        // concurrent POSTs do (never in one packet).
+        let (first_id, _, mut rx1) = engine
+            .completion_stream(make_burst_request(4))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (second_id, _, mut rx2) = engine
+            .completion_stream(make_burst_request(4))
+            .await
+            .unwrap();
+        while rx1.recv().await.is_some() {}
+        while rx2.recv().await.is_some() {}
+
+        let steps = steps.lock().unwrap();
+        // The burst's first step is the first recorded step carrying either of
+        // its requests; it must carry both.
+        let burst_first = steps
+            .iter()
+            .find(|ids| ids.iter().any(|id| id == &first_id || id == &second_id))
+            .expect("the burst never ran a step");
+        assert_eq!(
+            burst_first.len(),
+            2,
+            "the burst admitted in one scheduling pass, not a step apart: {steps:?}"
+        );
+    }
+
+    /// The drain is bounded: a request landing well after the coalescing window is NOT
+    /// held back into a step that already ran — the first step stays the first request's
+    /// alone, and the late arrival runs in its own step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_request_after_the_coalescing_window_is_not_held_back() {
+        let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = make_recording_engine(Arc::clone(&steps));
+        engine.spawn_step_loop();
+
+        // Settle the loop into its idle park first, as the burst test does.
+        let (_, _, mut rx0) = engine
+            .completion_stream(make_burst_request(1))
+            .await
+            .unwrap();
+        while rx0.recv().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (first_id, _, mut rx1) = engine
+            .completion_stream(make_burst_request(4))
+            .await
+            .unwrap();
+        // Far past the window's bound: the first request's steps have run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (second_id, _, mut rx2) = engine
+            .completion_stream(make_burst_request(4))
+            .await
+            .unwrap();
+        while rx1.recv().await.is_some() {}
+        while rx2.recv().await.is_some() {}
+
+        let steps = steps.lock().unwrap();
+        // The first request's first step is its alone — the late arrival was
+        // not held back into it — and the late arrival ran a step of its own.
+        let first_step = steps
+            .iter()
+            .find(|ids| ids.iter().any(|id| id == &first_id))
+            .expect("the first request never ran a step");
+        assert_eq!(
+            first_step.len(),
+            1,
+            "a request past the window was held back into the first step: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|ids| ids.iter().any(|id| id == &second_id)),
+            "the late arrival never ran a step of its own: {steps:?}"
+        );
     }
 
     #[test]
