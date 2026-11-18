@@ -61,7 +61,7 @@ use crate::tokenizer::Tokenizer;
 use crate::tool_parser::{
     DeltaToolCall, StreamingToolParserState, ToolCallParser, ToolParserDelta,
 };
-use scratchy_serving_engine::worker_factory::WorkerFactory;
+use scratchy_serving_engine::worker_factory::Served;
 
 /// Upper bound on `n` (completions per request), matching the OpenAI API's own limit. Without
 /// this, a client-supplied `n` feeds `Vec::with_capacity(n)`/`Vec::with_capacity(prompts*n)`
@@ -447,9 +447,9 @@ pub struct AsyncEngine {
     mm_processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
-    /// The sampling the backend can serve ([`WorkerFactory::check_sampling`]), checked against
-    /// every request before it is submitted. `None` serves everything.
-    sampling_check: Option<&'static dyn WorkerFactory>,
+    /// The sampling the backend serves (`WorkerFactory::served`), checked against every request
+    /// before it is submitted ([`Served::refusal`]). [`Served::EVERYTHING`] until set.
+    served: Served,
     /// Maximum time the step loop can have pending requests with no output
     /// before aborting them. Configurable for tests (default: 60s).
     no_progress_timeout: Duration,
@@ -491,7 +491,7 @@ impl AsyncEngine {
             #[cfg(feature = "multimodal")]
             mm_processor: None,
             is_pooling: false,
-            sampling_check: None,
+            served: Served::EVERYTHING,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
     }
@@ -690,10 +690,10 @@ impl AsyncEngine {
         self.async_scheduling = enabled;
     }
 
-    /// Check every request's sampling against `backend` before it is submitted: the factory this
-    /// binary serves through ([`WorkerFactory::check_sampling`]).
-    pub fn set_sampling_check(&mut self, backend: &'static dyn WorkerFactory) {
-        self.sampling_check = Some(backend);
+    /// The sampling the backend serves (`WorkerFactory::served`), which every request is checked
+    /// against before it is submitted.
+    pub fn set_served(&mut self, served: Served) {
+        self.served = served;
     }
 
     /// Set the resolved multimodal processor (built from a scratchy
@@ -2627,8 +2627,10 @@ impl AsyncEngine {
         // ⛔ AND SAMPLING THE BACKEND CANNOT SERVE, HERE TOO, for the same reason: refused in the
         // worker it fails a step the scheduler already formed (a 500, and an orphan step behind it);
         // refused here it is one request's 400, and the scheduler never admits it.
-        if let (Some(backend), Some(params)) = (self.sampling_check, &ec_request.sampling_params) {
-            (backend.check_sampling(params)).map_err(crate::error::ServeError::Validation)?;
+        if let Some(why) =
+            (ec_request.sampling_params.as_ref()).and_then(|p| self.served.refusal(p))
+        {
+            return Err(crate::error::ServeError::Validation(why.to_string()));
         }
         #[cfg(feature = "metrics")]
         {
@@ -5764,37 +5766,16 @@ mod tests {
         assert!(response.usage.completion_tokens.unwrap_or(0) > 0);
     }
 
-    /// A backend that serves temperature 0 only, as a factory reports it.
-    struct GreedyOnly;
-
-    impl WorkerFactory for GreedyOnly {
-        fn name(&self) -> &'static str {
-            "greedy-only"
-        }
-
-        fn create(
-            &self,
-            _cfg: scratchy_serving_engine::worker_factory::WorkerCreateConfig,
-            _progress: Option<scratchy_serving_engine::worker_factory::ProgressCallback>,
-        ) -> anyhow::Result<scratchy_serving_engine::worker_factory::WorkerCreationResult> {
-            anyhow::bail!("not built in this test")
-        }
-
-        fn check_sampling(&self, params: &SamplingParams) -> Result<(), String> {
-            if params.temperature == 0.0 {
-                Ok(())
-            } else {
-                Err("this backend samples greedily only: pass \"temperature\": 0".to_string())
-            }
-        }
-    }
-
     /// Sampling the backend cannot serve is a validation error (a 400) when the request is
     /// submitted: the scheduler never sees it, and a request the backend can serve still runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_unservable_sampling_is_refused_before_scheduling() {
         let mut engine = make_test_engine();
-        engine.set_sampling_check(&GreedyOnly);
+        // A backend that serves temperature 0 only, as its factory declares it.
+        engine.set_served(Served {
+            sampling: false,
+            ..Served::EVERYTHING
+        });
         let engine = Arc::new(engine);
         engine.spawn_step_loop();
 

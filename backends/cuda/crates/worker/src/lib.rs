@@ -25,9 +25,9 @@ pub mod plan;
 #[cfg(feature = "nvcc")]
 mod serving;
 
-use scratchy_core_common::{KvBlockTokens, SamplingParams};
+use scratchy_core_common::KvBlockTokens;
 use scratchy_serving_engine::worker_factory::{
-    ProgressCallback, WorkerCreateConfig, WorkerCreationResult, WorkerFactory,
+    ProgressCallback, Served, WorkerCreateConfig, WorkerCreationResult, WorkerFactory,
 };
 use scratchy_target_cuda::step::CUDA_KV_BLOCK_SIZE;
 
@@ -64,10 +64,17 @@ impl WorkerFactory for CudaWorkerFactory {
         KvBlockTokens::new(CUDA_KV_BLOCK_SIZE as usize)
     }
 
-    /// Greedy only ([`plan::check_sampling`]): the engine refuses anything else when the request
-    /// is submitted, so the scheduler never admits it.
-    fn check_sampling(&self, params: &SamplingParams) -> Result<(), String> {
-        plan::check_sampling(Some(params)).map_err(|e| e.to_string())
+    /// Greedy decoding of one completion, with no penalty, logprobs or logit transform (what
+    /// [`plan::check_sampling`] admits): the engine refuses anything else when the request is
+    /// submitted, so the scheduler never admits it.
+    fn served(&self) -> Served {
+        Served {
+            sampling: false,
+            penalties: false,
+            completions: false,
+            logprobs: false,
+            logit_transforms: false,
+        }
     }
 }
 
