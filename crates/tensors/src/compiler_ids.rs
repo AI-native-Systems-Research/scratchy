@@ -39,3 +39,127 @@ impl RowsExtern {
     /// Every source, in the order a forward materializes the ones it reads.
     pub const ALL: [Self; 3] = [Self::Pixels, Self::PosEmbeds, Self::TargetHidden];
 }
+
+/// A `&'static str` newtype minted only by its `const fn new`.
+#[macro_export]
+macro_rules! static_name {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(&'static str);
+
+        impl $name {
+            pub const fn new(name: &'static str) -> Self {
+                Self(name)
+            }
+
+            pub const fn get(self) -> &'static str {
+                self.0
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+
+        /// A table keyed by the name is looked up by the text a body writes.
+        impl ::std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                self.0
+            }
+        }
+    };
+}
+
+static_name!(
+    /// The name a DSL body calls an op by.
+    OpName
+);
+static_name!(
+    /// The name a DSL body reads a decoder state's input by.
+    InputName
+);
+static_name!(
+    /// A decoder state's name, as its diagnostics print it.
+    StateName
+);
+
+/// A state op's identity: its decoder state and its name, the pair that tells it from every other op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StateOpId {
+    state: StateName,
+    op: OpName,
+}
+
+impl StateOpId {
+    pub const fn new(state: StateName, op: OpName) -> Self {
+        Self { state, op }
+    }
+
+    pub const fn state(self) -> StateName {
+        self.state
+    }
+
+    pub const fn name(self) -> OpName {
+        self.op
+    }
+}
+
+/// A state input's identity: its decoder state and its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StateInputId {
+    state: StateName,
+    input: InputName,
+}
+
+impl StateInputId {
+    pub const fn new(state: StateName, input: InputName) -> Self {
+        Self { state, input }
+    }
+
+    pub const fn state(self) -> StateName {
+        self.state
+    }
+
+    pub const fn name(self) -> InputName {
+        self.input
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_state_op_id_is_its_state_and_name() {
+        let id = StateOpId::new(StateName::new("r"), OpName::new("op"));
+        assert_eq!(id, StateOpId::new(StateName::new("r"), OpName::new("op")));
+        assert_ne!(id, StateOpId::new(StateName::new("s"), OpName::new("op")));
+        assert_ne!(
+            id,
+            StateOpId::new(StateName::new("r"), OpName::new("other"))
+        );
+        assert_eq!(id.state(), StateName::new("r"));
+        assert_eq!(id.name(), OpName::new("op"));
+
+        let input = StateInputId::new(StateName::new("r"), InputName::new("state"));
+        assert_ne!(
+            input,
+            StateInputId::new(StateName::new("s"), InputName::new("state"))
+        );
+        assert_eq!(input.name(), InputName::new("state"));
+    }
+
+    #[test]
+    fn a_state_name_is_const_constructible() {
+        const STATE: StateName = StateName::new("r");
+        const OP: OpName = OpName::new("op");
+        const INPUT: InputName = InputName::new("state");
+        const ID: StateOpId = StateOpId::new(STATE, OP);
+        const INPUT_ID: StateInputId = StateInputId::new(STATE, INPUT);
+        assert_eq!((STATE.get(), OP.get(), INPUT.get()), ("r", "op", "state"));
+        assert_eq!((ID.state(), INPUT_ID.name()), (STATE, INPUT));
+    }
+}

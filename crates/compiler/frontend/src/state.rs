@@ -25,50 +25,9 @@ pub trait StateVocabulary: Sync {
     fn signatures(&self) -> SignaturePath;
 }
 
-/// A `&'static str` newtype minted only by its `const fn new`.
-macro_rules! static_name {
-    ($(#[$doc:meta])* $name:ident) => {
-        $(#[$doc])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(&'static str);
+pub use scratchy_tensors::compiler_ids::{InputName, OpName, StateInputId, StateName, StateOpId};
+use scratchy_tensors::static_name;
 
-        impl $name {
-            pub const fn new(name: &'static str) -> Self {
-                Self(name)
-            }
-
-            pub const fn get(self) -> &'static str {
-                self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(self.0)
-            }
-        }
-
-        /// A table keyed by the name is looked up by the text a body writes.
-        impl std::borrow::Borrow<str> for $name {
-            fn borrow(&self) -> &str {
-                self.0
-            }
-        }
-    };
-}
-
-static_name!(
-    /// The name a DSL body calls an op by.
-    OpName
-);
-static_name!(
-    /// The name a DSL body reads a decoder state's input by.
-    InputName
-);
-static_name!(
-    /// A decoder state's name, as its diagnostics print it.
-    StateName
-);
 static_name!(
     /// A Rust module path (`crate::module`).
     SignaturePath
@@ -171,6 +130,11 @@ impl StateOp {
     pub fn outputs(self) -> OutputCount {
         self.0.outputs
     }
+
+    /// The identity the shared passes carry in place of the handle.
+    pub fn id(self) -> StateOpId {
+        StateOpId::new(self.1, self.0.name)
+    }
 }
 
 impl PartialEq for StateOp {
@@ -209,6 +173,11 @@ impl StateInput {
     /// The module of its decoder state that holds its constructor.
     pub fn signatures(self) -> SignaturePath {
         self.2
+    }
+
+    /// The identity the shared passes carry in place of the handle.
+    pub fn id(self) -> StateInputId {
+        StateInputId::new(self.1, self.0.name)
     }
 }
 
@@ -480,6 +449,23 @@ mod tests {
             Prelude::Decoder,
             &StateTable::assemble(decoder_states)?,
         )
+    }
+
+    #[test]
+    fn a_state_ops_id_names_it() {
+        let table = StateTable::assemble(&[&Probe]).expect("probe assembles");
+        let op = table.op("probe_mix").expect("probe declares probe_mix");
+        assert_eq!(
+            op.id(),
+            StateOpId::new(StateName::new("probe"), OpName::new("probe_mix"))
+        );
+        let input = table
+            .input("probe_state")
+            .expect("probe declares its input");
+        assert_eq!(
+            input.id(),
+            StateInputId::new(StateName::new("probe"), InputName::new("probe_state"))
+        );
     }
 
     #[test]
