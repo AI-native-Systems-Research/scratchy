@@ -2270,9 +2270,10 @@ mod window_walk_law {
     }
 
     /// The reference's `_max_active_blocks`: `ceil((W + w − 1)/B) + 1`, the straddling block's
-    /// +1 included. Gemma-4's 1024-position window over 64-slot pages walks 17 blocks at one
-    /// query row; a 64-row prefill chunk's wider reach pushes the earliest window start back and
-    /// the bound to 18; the pool caps a bound past it.
+    /// +1 included. Pinned at B = 64 (half the reference's own 128, the walk's real block — see
+    /// `a_windowed_walk_caps_the_sweep_at_its_bound`): a 1024-position window at one query row
+    /// walks 17 blocks; a 64-row prefill chunk's wider reach pushes the earliest window start
+    /// back and the bound to 18; the pool caps a bound past it.
     #[test]
     fn the_bound_is_the_reference_s_max_active_blocks() {
         assert_eq!(window_walk_blocks(780, nz(1024), 1, 64), 17);
@@ -2280,11 +2281,13 @@ mod window_walk_law {
         assert_eq!(window_walk_blocks(4, nz(1024), 1, 64), 4);
     }
 
-    /// A windowed body never walks the rung's whole sweep: the pool's 780 pages at FULL cap to
-    /// the 17-block bound, and a windowless op keeps every page — the cap only ever narrows.
+    /// A windowed body never walks the rung's whole sweep: the pool's 780 blocks at FULL cap to
+    /// the 9-block bound (the reference's own 128-token block — a 1024-position window at one
+    /// query row: `ceil(1024/128) + 1`), and a windowless op keeps every block — the cap only
+    /// ever narrows.
     #[test]
     fn a_windowed_walk_caps_the_sweep_at_its_bound() {
-        assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, Some(nz(1024))), 17);
+        assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, Some(nz(1024))), 9);
         assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, None), 780);
     }
 
