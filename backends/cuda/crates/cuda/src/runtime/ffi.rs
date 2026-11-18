@@ -18,10 +18,6 @@ pub(crate) type CudaStreamT = *mut c_void;
 pub(crate) const MEMCPY_HOST_TO_DEVICE: i32 = 1;
 /// `cudaMemcpyDeviceToHost`.
 pub(crate) const MEMCPY_DEVICE_TO_HOST: i32 = 2;
-/// `cudaDevAttrComputeCapabilityMajor`.
-pub(crate) const ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
-/// `cudaDevAttrComputeCapabilityMinor`.
-pub(crate) const ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 /// `cudaStreamNonBlocking`: the stream never waits on the legacy default stream.
 pub(crate) const STREAM_NON_BLOCKING: u32 = 0x01;
 /// `cudaStreamCaptureModeThreadLocal`: a capture refuses only this thread's unsafe calls (a
@@ -34,7 +30,6 @@ pub(crate) type CudaGraphExecT = *mut c_void;
 unsafe extern "C" {
     pub(crate) fn cudaGetDeviceCount(count: *mut i32) -> CudaErrorT;
     pub(crate) fn cudaSetDevice(device: i32) -> CudaErrorT;
-    pub(crate) fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> CudaErrorT;
     pub(crate) fn cudaStreamCreateWithFlags(stream: *mut CudaStreamT, flags: u32) -> CudaErrorT;
     pub(crate) fn cudaStreamSynchronize(stream: CudaStreamT) -> CudaErrorT;
     pub(crate) fn cudaStreamDestroy(stream: CudaStreamT) -> CudaErrorT;
