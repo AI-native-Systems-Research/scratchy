@@ -256,7 +256,8 @@ fn marker_rows<'a>(bounds: impl Iterator<Item = &'a str>) -> String {
 /// alias for its rule (`type KvDim = Mul<HeadDim, NumKeyValueHeads>;`); every base bound they read
 /// goes into `base`. A derived dim is a row of the carrier program's assembled table
 /// ([`Program::dims`]: the core rows, then each decoder state's; a gated one by the carrier's
-/// resolved flag) or one of its arch.json `expr` params.
+/// resolved flag; a row before the fallbacks is a base bound) or one of its arch.json `expr`
+/// params.
 fn carrier_aliases(
     c: &Carrier<'_>,
     named: BTreeSet<String>,
@@ -268,7 +269,12 @@ fn carrier_aliases(
         if aliases.contains_key(&name) || base.contains(&name) {
             continue;
         }
-        let dim = if let Some(d) = c.program.dims.find(&name) {
+        // A row before the fallbacks derives its name only where the config has the row's inputs,
+        // and the fallback or the config gives it elsewhere: the types read that name as the base
+        // bound the loader resolved, never as the one row's rule.
+        let dim = if let Some(d) = (c.program.dims.find(&name))
+            .filter(|d| d.stage != crate::dim::DeriveStage::BeforeFallbacks)
+        {
             Some(rule_dim(c, &name, &d.rule)?)
         } else if let Some(e) = c.facts.exprs.get(&name) {
             Some(expr_dim(c, &name, e)?)

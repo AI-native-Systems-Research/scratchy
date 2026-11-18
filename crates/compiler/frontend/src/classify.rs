@@ -47,8 +47,12 @@ pub enum ClassifyError {
         first: Vocabulary,
         second: StateName,
     },
+    /// A derived dim of decoder state `state` ahead of the fallbacks whose name no fallback gives
+    /// (not one of [`crate::dim::FALLBACK_DIMS`]).
+    DimAheadOfNoFallback { name: DimName, state: StateName },
     /// A derived dim of `owner` reading `reads`, a dim of `reads_owner` it may not read: one the
-    /// table derives after it or at a later stage, or another decoder state's.
+    /// table derives after it or above it at its own stage, or another decoder state's that is not
+    /// ahead of the fallbacks.
     DimReadsUnavailable {
         name: DimName,
         owner: Vocabulary,
@@ -119,6 +123,12 @@ impl std::fmt::Display for ClassifyError {
                 f,
                 "derived dim `{name}` is claimed twice: by {first} and by decoder state `{second}`"
             ),
+            Self::DimAheadOfNoFallback { name, state } => write!(
+                f,
+                "derived dim `{name}` of decoder state `{state}` is derived ahead of the fallbacks, \
+                 but no fallback gives `{name}`: only {:?} may be",
+                crate::dim::FALLBACK_DIMS
+            ),
             Self::DimReadsUnavailable {
                 name,
                 owner,
@@ -127,8 +137,9 @@ impl std::fmt::Display for ClassifyError {
             } => write!(
                 f,
                 "derived dim `{name}` of {owner} reads `{reads}` of {reads_owner}: a derived dim \
-                 reads only a core dim or its own decoder state's, derived above it at the same \
-                 or an earlier stage"
+                 reads a dim derived before it (at an earlier stage, or above it at its own) that \
+                 is a core dim, its own decoder state's, or one ahead of the fallbacks read from a \
+                 later stage"
             ),
             Self::StateOpArity {
                 op,

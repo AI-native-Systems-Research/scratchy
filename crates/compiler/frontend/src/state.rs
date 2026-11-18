@@ -14,7 +14,7 @@ use std::fmt;
 
 use crate::classified::{ExternKind, OpKind};
 use crate::classify::ClassifyError;
-use crate::dim::{DERIVED_DIMS, DerivedDim};
+use crate::dim::{DERIVED_DIMS, DeriveStage, DerivedDim, FALLBACK_DIMS};
 
 /// A decoder state's vocabulary, declared in the decoder state's own crate.
 pub trait StateVocabulary: Sync {
@@ -288,9 +288,14 @@ pub struct DimTable {
 impl DimTable {
     /// The table of the core rows and `decoder_states`' rows. A name the core rows or an earlier
     /// row already claim is a `DuplicateDimName` error naming both claimants. A row reading a name
-    /// the table derives may read only a core row or a row of its own decoder state, above it and of
-    /// a stage no later than its own; any other read is a `DimReadsUnavailable` error, since it
-    /// would read a value not yet derived, or one deleting another decoder state takes away.
+    /// the table derives reads a row derived before it: one of an earlier stage, or one above it at
+    /// its own stage. That row is a core row, a row of the reader's own decoder state, or a row of
+    /// a stage before the fallbacks read from a later stage, whose name the fallbacks (or the
+    /// config) give when its decoder state is deleted: a decoder state's row before the fallbacks
+    /// names one of [`FALLBACK_DIMS`], else it is a `DimAheadOfNoFallback` error naming the state
+    /// and the row. Any other read is a `DimReadsUnavailable`
+    /// error, since it would read a value not yet derived, or one deleting another decoder state
+    /// takes away.
     pub fn assemble(decoder_states: &[&dyn StateVocabulary]) -> Result<Self, ClassifyError> {
         let Self { mut rows } = Self::default();
         for state in decoder_states {
@@ -301,6 +306,12 @@ impl DimTable {
                         name: DimName::new(d.name),
                         first,
                         second,
+                    });
+                }
+                if d.stage == DeriveStage::BeforeFallbacks && !FALLBACK_DIMS.contains(&d.name) {
+                    return Err(ClassifyError::DimAheadOfNoFallback {
+                        name: DimName::new(d.name),
+                        state: second,
                     });
                 }
                 rows.push((Vocabulary::State(second), d));
@@ -314,9 +325,13 @@ impl DimTable {
                     continue;
                 };
                 let (reads_owner, e) = rows[j];
-                let readable = j < i
-                    && e.stage <= d.stage
-                    && (reads_owner == Vocabulary::Core || reads_owner == owner);
+                let derived_before = e.stage < d.stage || (e.stage == d.stage && j < i);
+                let overrides_a_fallback =
+                    e.stage == DeriveStage::BeforeFallbacks && d.stage > e.stage;
+                let readable = derived_before
+                    && (reads_owner == Vocabulary::Core
+                        || reads_owner == owner
+                        || overrides_a_fallback);
                 if !readable {
                     return Err(ClassifyError::DimReadsUnavailable {
                         name: DimName::new(d.name),
@@ -953,9 +968,21 @@ mod tests {
     ];
     static READS_LATER_STAGE: [DerivedDim; 1] =
         [row("too_early", DeriveStage::Implicit, "q_global_dim")];
-    static READS_BEFORE_FALLBACKS_CORE: [DerivedDim; 1] =
-        [row("before_core", DeriveStage::BeforeFallbacks, "kv_dim")];
+    static READS_BEFORE_FALLBACKS_CORE: [DerivedDim; 1] = [row(
+        "num_key_value_heads",
+        DeriveStage::BeforeFallbacks,
+        "kv_dim",
+    )];
     static READS_PROBE: [DerivedDim; 1] = [row("borrows", DeriveStage::Implicit, "probe_width")];
+    static OVERRIDES_HEAD_DIM: [DerivedDim; 1] =
+        [row("head_dim", DeriveStage::BeforeFallbacks, "hidden_size")];
+    static READS_OVERRIDE_LATER: [DerivedDim; 1] =
+        [row("reads_override", DeriveStage::Implicit, "head_dim")];
+    static READS_OVERRIDE_BEFORE_FALLBACKS: [DerivedDim; 1] = [row(
+        "num_key_value_heads",
+        DeriveStage::BeforeFallbacks,
+        "head_dim",
+    )];
 
     /// The table's order is load-bearing: a rule reading another derived dim finds it derived only
     /// if that one comes EARLIER, at the same or an earlier stage. So a reordering that would
@@ -981,7 +1008,7 @@ mod tests {
         );
         breaks_order(
             &[&Dims("first", &READS_BEFORE_FALLBACKS_CORE)],
-            "before_core",
+            "num_key_value_heads",
             "kv_dim",
         );
         breaks_order(
@@ -994,5 +1021,77 @@ mod tests {
             "borrows",
             "probe_width",
         );
+    }
+
+    static FRESH_BEFORE_FALLBACKS: [DerivedDim; 1] = [row(
+        "fresh_width",
+        DeriveStage::BeforeFallbacks,
+        "hidden_size",
+    )];
+    static BASE_BEFORE_FALLBACKS: [DerivedDim; 1] = [row(
+        "num_attention_heads",
+        DeriveStage::BeforeFallbacks,
+        "hidden_size",
+    )];
+
+    /// Ahead of the fallbacks a decoder state derives only a name a fallback gives
+    /// ([`FALLBACK_DIMS`]): a fresh name there would be read by later stages as if a fallback gave
+    /// it, and a base bound's name would change every core dim reading it. Either is refused,
+    /// naming the state and the row; at a later stage the same fresh name assembles.
+    #[test]
+    fn a_row_before_the_fallbacks_names_only_a_fallback() {
+        for (rows, name) in [
+            (&FRESH_BEFORE_FALLBACKS, "fresh_width"),
+            (&BASE_BEFORE_FALLBACKS, "num_attention_heads"),
+        ] {
+            let Err(err) = DimTable::assemble(&[&Dims("early", rows)]) else {
+                panic!("`{name}` was derived ahead of the fallbacks, which give no such name");
+            };
+            let ClassifyError::DimAheadOfNoFallback { name: got, state } = &err else {
+                panic!("expected DimAheadOfNoFallback, got {err}");
+            };
+            assert_eq!((got.get(), *state), (name, StateName::new("early")));
+            let msg = err.to_string();
+            assert!(msg.contains(name) && msg.contains("early"), "{msg}");
+        }
+        for name in FALLBACK_DIMS {
+            assert!(DERIVED_DIMS.iter().all(|d| d.name != name), "`{name}`");
+        }
+    }
+
+    /// A decoder state's row before the fallbacks states a name the fallbacks (or the config)
+    /// otherwise give, so any later stage reads it, the core rows below it and another decoder
+    /// state's rows included: deleting the decoder state leaves the fallback's value in its place.
+    /// At its own stage the fallbacks have not run, so there it is the owner's alone, and one name
+    /// at one stage is still claimed once.
+    #[test]
+    fn a_row_before_the_fallbacks_is_read_by_every_later_stage() {
+        let table = DimTable::assemble(&[&Dims("override", &OVERRIDES_HEAD_DIM)])
+            .expect("the core rows read the head dim a row before the fallbacks derives");
+        let row = table
+            .find("head_dim")
+            .expect("the state derives the head dim");
+        assert_eq!(row.stage, DeriveStage::BeforeFallbacks);
+        DimTable::assemble(&[
+            &Dims("override", &OVERRIDES_HEAD_DIM),
+            &Dims("reader", &READS_OVERRIDE_LATER),
+        ])
+        .expect("a later stage reads another decoder state's row before the fallbacks");
+        breaks_order(
+            &[
+                &Dims("override", &OVERRIDES_HEAD_DIM),
+                &Dims("reader", &READS_OVERRIDE_BEFORE_FALLBACKS),
+            ],
+            "num_key_value_heads",
+            "head_dim",
+        );
+        let Err(ClassifyError::DuplicateDimName { first, second, .. }) = DimTable::assemble(&[
+            &Dims("override", &OVERRIDES_HEAD_DIM),
+            &Dims("twin", &OVERRIDES_HEAD_DIM),
+        ]) else {
+            panic!("two decoder states claimed the head dim before the fallbacks");
+        };
+        assert_eq!(first, Vocabulary::State(StateName::new("override")));
+        assert_eq!(second, StateName::new("twin"));
     }
 }

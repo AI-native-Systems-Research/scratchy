@@ -12,6 +12,17 @@ pub mod ops;
 
 use scratchy_decoder_state::{DeriveStage, DerivedDim, DerivedRule};
 
+/// The per-head query/key width: the no-rope part and the rope part. Derived before the fallbacks,
+/// so it wins over hidden over heads; a config stating `head_dim` wins over it.
+pub const HEAD_DIM: DerivedDim = DerivedDim {
+    name: "head_dim",
+    stage: DeriveStage::BeforeFallbacks,
+    rule: DerivedRule::Add(&[
+        DerivedRule::Bound("qk_nope_head_dim"),
+        DerivedRule::Bound("qk_rope_head_dim"),
+    ]),
+};
+
 /// q_proj's (or q_b_proj's, under Q-LoRA) output: per head, the no-rope and rope parts of a query.
 pub const Q_PROJ_OUT: DerivedDim = DerivedDim {
     name: "q_proj_out",
@@ -63,7 +74,7 @@ scratchy_decoder_state::decoder_state! {
     /// state input, and the projection widths the latent attention's weights are read at.
     pub static MLA: name = mla, signatures = ::scratchy_state_decoder_mla::ops,
         ops = [mla_split, mla_append, mla_attention], inputs = [mla_cache],
-        dims = [Q_PROJ_OUT, KV_LORA_OUT, ATTN_OUT, KV_A_PROJ_OUT];
+        dims = [HEAD_DIM, Q_PROJ_OUT, KV_LORA_OUT, ATTN_OUT, KV_A_PROJ_OUT];
 }
 
 #[cfg(test)]
@@ -115,7 +126,13 @@ mod tests {
         let dims: Vec<_> = vocabulary.derived_dims().iter().map(|d| d.name).collect();
         assert_eq!(
             dims,
-            ["q_proj_out", "kv_lora_out", "attn_out", "kv_a_proj_out"]
+            [
+                "head_dim",
+                "q_proj_out",
+                "kv_lora_out",
+                "attn_out",
+                "kv_a_proj_out"
+            ]
         );
     }
 }

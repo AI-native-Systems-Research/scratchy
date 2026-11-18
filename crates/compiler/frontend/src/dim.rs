@@ -187,14 +187,22 @@ impl DerivedRule {
 /// `hidden_size / num_attention_heads`, `num_key_value_heads` as `num_attention_heads`), so a row
 /// stated here wins over them; with the implicit bounds; or after the generic defaults (the global
 /// attention class's widths read `global_head_dim` / `num_global_key_value_heads`, which default
-/// then). Declared in the order the loader runs them, so a row may read one of a stage that
-/// compares no greater than its own.
+/// then). Declared in the order the loader runs them, so a row may read one of an earlier stage, or
+/// one above it at its own. A row before the fallbacks states a name the fallbacks or the config
+/// otherwise give ([`FALLBACK_DIMS`]), so every later stage may read it, whichever decoder state's it
+/// is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeriveStage {
     BeforeFallbacks,
     Implicit,
     AfterDefaults,
 }
+
+/// The names the config loader's fallbacks derive where no config states them (`head_dim` as
+/// `hidden_size / num_attention_heads`, `num_key_value_heads` as `num_attention_heads`): the only
+/// names a decoder state may derive at [`DeriveStage::BeforeFallbacks`], since every later stage
+/// reads them whether or not a decoder state derives them first.
+pub const FALLBACK_DIMS: [&str; 2] = ["head_dim", "num_key_value_heads"];
 
 /// A config bound derived from others, where no config states it.
 #[derive(Clone, Copy, Debug)]

@@ -2925,7 +2925,8 @@ pub(crate) fn derive_layer_sets(
 }
 
 /// Returns each bound it derived, as the dim it derived it from. `dims` are the build's assembled
-/// derived dims, whose `Implicit` rows derive here.
+/// derived dims, whose `BeforeFallbacks` rows derive here ahead of the `head_dim` /
+/// `num_key_value_heads` fallbacks, and whose `Implicit` rows after them.
 fn derive_implicit_bounds(
     bounds: &mut BTreeMap<String, u64>,
     dims: &DimTable,
@@ -2933,23 +2934,14 @@ fn derive_implicit_bounds(
     use crate::dim::Dim;
     let mut derived = BTreeMap::new();
     let bound = |name: &str| Dim::Bound(name.to_string());
-    // MLA (DeepSeek family) head_dim — MUST run before the generic
-    // hidden/heads rule: MLA's per-head Q/K width is
-    // `qk_nope_head_dim + qk_rope_head_dim` (V2-Lite: 128+64=192),
-    // NOT hidden/heads (2048/16=128). The verbatim HF configs carry
-    // the two summands but no `head_dim`.
-    if !bounds.contains_key("head_dim")
-        && let (Some(&nope), Some(&rope)) = (
-            bounds.get("qk_nope_head_dim"),
-            bounds.get("qk_rope_head_dim"),
-        )
-    {
-        bounds.insert("head_dim".to_string(), nope + rope);
-        derived.insert(
-            "head_dim".to_string(),
-            crate::dim::canonical_add(vec![bound("qk_nope_head_dim"), bound("qk_rope_head_dim")]),
-        );
-    }
+    // A row before the fallbacks (a decoder state's own per-head width) wins over them; explicit
+    // values win over both.
+    crate::dim::derive_dims(
+        dims.rows(),
+        bounds,
+        crate::dim::DeriveStage::BeforeFallbacks,
+        &mut derived,
+    );
     if !bounds.contains_key("head_dim")
         && let (Some(&hidden), Some(&heads)) =
             (bounds.get("hidden_size"), bounds.get("num_attention_heads"))
@@ -4406,5 +4398,128 @@ mod tests {
         let core = model_params_from_json(&json, "s", &path, Vec::new(), &spec, &build_dims())
             .expect("parse");
         assert_eq!(core.bounds.get("probe_gated_width"), None);
+    }
+
+    /// GLM-4.7-Flash's config, loaded by `dims`.
+    fn glm_4_7_flash(dims: &DimTable) -> ModelParams {
+        load_file(
+            &repo_model_archs("glm4-moe-lite").join("glm-4.7-flash.json"),
+            dims,
+        )
+        .expect("GLM-4.7-Flash's config loads")
+    }
+
+    /// With the build's decoder states, GLM-4.7-Flash's per-head query/key width is MLA's: the
+    /// no-rope part and the rope part (192 + 64), not hidden over heads.
+    #[test]
+    fn glm_head_dim_is_the_mla_sum() {
+        use crate::dim::{Dim, canonical_add};
+        let dims = build_dims();
+        let row = dims.find("head_dim").expect("MLA derives the head dim");
+        assert_eq!(row.stage, crate::dim::DeriveStage::BeforeFallbacks);
+        let mp = glm_4_7_flash(&dims);
+        assert_eq!(mp.bounds.get("head_dim"), Some(&256));
+        assert_eq!(
+            mp.derived.get("head_dim"),
+            Some(&canonical_add(vec![
+                Dim::Bound("qk_nope_head_dim".to_string()),
+                Dim::Bound("qk_rope_head_dim".to_string()),
+            ]))
+        );
+        // The widths that read it, and MLA's own projection widths.
+        let pinned = [
+            ("attn_q_dim", 20 * 256),
+            ("kv_dim", 20 * 256),
+            ("q_proj_out", 20 * (192 + 64)),
+            ("kv_lora_out", 20 * (192 + 256)),
+            ("attn_out", 20 * 256),
+            ("kv_a_proj_out", 512 + 64),
+        ];
+        for (name, width) in pinned {
+            assert_eq!(mp.bounds.get(name), Some(&width), "`{name}`");
+        }
+    }
+
+    /// Without MLA's rows (the core table alone), the head dim is the generic fallback's, which
+    /// derives nothing here: 2048 hidden over 20 heads is no whole width, so the config is refused
+    /// for want of a head dim rather than read at MLA's.
+    #[test]
+    fn glm_head_dim_without_its_state_falls_back() {
+        let path = repo_model_archs("glm4-moe-lite").join("glm-4.7-flash.json");
+        let Err(err) = load_file(&path, &DimTable::default()) else {
+            panic!("GLM-4.7-Flash derived a head dim with no decoder state's rows");
+        };
+        let ConfigError::Geometry { reason, .. } = &err else {
+            panic!("expected a Geometry error, got {err:?}");
+        };
+        assert!(
+            reason.contains("head_dim") && reason.contains("hidden_size / num_attention_heads"),
+            "{reason}"
+        );
+    }
+
+    /// A config stating `head_dim` keeps it with MLA's row present, and its summands derive
+    /// nothing over it.
+    #[test]
+    fn a_stated_head_dim_wins() {
+        let mut bounds: BTreeMap<String, u64> = [
+            ("hidden_size", 2048),
+            ("num_attention_heads", 16),
+            ("head_dim", 128),
+            ("qk_nope_head_dim", 192),
+            ("qk_rope_head_dim", 64),
+        ]
+        .map(|(k, v)| (k.to_string(), v))
+        .into();
+        let dims = build_dims();
+        assert!(dims.find("head_dim").is_some(), "MLA's row is in the table");
+        let derived = derive_implicit_bounds(&mut bounds, &dims);
+        assert_eq!(bounds.get("head_dim"), Some(&128));
+        assert_eq!(derived.get("head_dim"), None);
+        assert_eq!(bounds.get("attn_q_dim"), Some(&(16 * 128)));
+    }
+
+    /// A dense model with no `qk_*` bounds derives its head dim and KV width as hidden over heads,
+    /// exactly as before MLA's row joined the table.
+    #[test]
+    fn a_dense_model_derives_as_before() {
+        use crate::dim::Dim;
+        let bound = |n: &str| Dim::Bound(n.to_string());
+        let path = repo_model_archs("llama").join("smollm2-360m.json");
+        let mp = load_file(&path, &build_dims()).expect("smollm2-360m loads");
+        let core = load_file(&path, &DimTable::default()).expect("smollm2-360m loads");
+        assert_eq!(mp.bounds, core.bounds);
+        assert_eq!(mp.derived, core.derived);
+        assert_eq!(mp.bounds.get("head_dim"), Some(&64)); // 960 / 15
+        assert_eq!(
+            mp.derived.get("head_dim"),
+            Some(&Dim::Div(
+                Box::new(bound("hidden_size")),
+                Box::new(bound("num_attention_heads"))
+            ))
+        );
+        assert_eq!(mp.bounds.get("num_key_value_heads"), Some(&5));
+        assert_eq!(mp.bounds.get("attn_q_dim"), Some(&960));
+        assert_eq!(mp.bounds.get("kv_dim"), Some(&320));
+    }
+
+    /// The code fallbacks derive exactly the names a decoder state may derive ahead of them
+    /// (`FALLBACK_DIMS`): with the core table alone and a config stating neither, every bound
+    /// `derive_implicit_bounds` derives outside the table's rows is one of those names, and each
+    /// of them is derived.
+    #[test]
+    fn the_code_fallbacks_derive_the_fallback_names() {
+        let dims = DimTable::default();
+        let mut bounds: BTreeMap<String, u64> = [("hidden_size", 960), ("num_attention_heads", 15)]
+            .map(|(k, v)| (k.to_string(), v))
+            .into();
+        let derived = derive_implicit_bounds(&mut bounds, &dims);
+        let by_fallback: Vec<&str> = (derived.keys())
+            .map(String::as_str)
+            .filter(|name| dims.find(name).is_none())
+            .collect();
+        let mut expected = crate::dim::FALLBACK_DIMS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(by_fallback, expected);
     }
 }
