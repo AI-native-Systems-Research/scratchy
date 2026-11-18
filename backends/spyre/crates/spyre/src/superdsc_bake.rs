@@ -2225,11 +2225,7 @@ mod tests {
     }
 
     fn held(q: &BakeQueue) -> Vec<GroupId> {
-        let r = q
-            .shared
-            .results
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let r = q.shared.results.lock().unwrap_or_else(|p| p.into_inner());
         let mut ids: Vec<GroupId> = r.keys().cloned().collect();
         ids.sort_by_key(|i| (i.fp.clone(), i.ns.0, i.group));
         ids
