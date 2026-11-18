@@ -21,10 +21,10 @@ use crate::runtime::{
     BatchedCb, BatchedCompute, ByteSize, DevAddr, RdmaEnd, RdmaSend, Stream, prog_offset_base,
 };
 use crate::superdsc_exec::{LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT};
-use scratchy_target_spyre::bundle_code::NUM_SEGMENTS;
 use scratchy_target_spyre::bundle_code::collective::{
     CbStep, Rank, Sid, TpConsume, TpSend, WINDOW_SEGMENT, group_steps,
 };
+use scratchy_target_spyre::bundle_code::{Bank, NUM_SEGMENTS};
 use scratchy_target_spyre::fold_plan;
 
 /// ⭐ THE SESSION'S REGION TABLES, AS ONE TYPE — the positional segments, the weight
@@ -38,8 +38,8 @@ pub(crate) struct SegTables<'a> {
     pub(crate) seg: &'a [Option<DevAddr>; NUM_SEGMENTS],
     /// The weight segment's extra banks (`Executor::weight_bank_addr`), bank `b ≥ 1`.
     pub(crate) banks: &'a [Option<DevAddr>],
-    /// The KV segment's extra banks (`Executor::kv_bank_addr`), bank `b ≥ 1`.
-    pub(crate) kv_banks: &'a [Option<DevAddr>],
+    /// The KV segment's extra banks (`Executor::kv_bank_addr`), bank `b ≥ 1` at `b - 1`.
+    pub(crate) kv_banks: &'a [DevAddr],
 }
 
 /// The base one segment's tensors resolve against for this launch — the weight BANK's region for
@@ -54,7 +54,7 @@ pub(crate) struct SegTables<'a> {
 fn segment_base<'a>(
     tables: &SegTables<'a>,
     weight_bank: usize,
-    kv_bank: usize,
+    kv_bank: Bank,
     i: usize,
 ) -> Result<&'a DevAddr> {
     let (seg, banks, kv_banks) = (tables.seg, tables.banks, tables.kv_banks);
@@ -71,16 +71,11 @@ fn segment_base<'a>(
             }),
         }
     } else if i == SEG_KV.get() {
-        match kv_bank.checked_sub(1) {
+        match kv_bank.extra() {
             None => seg[i]
                 .as_ref()
                 .ok_or_else(|| anyhow!("seg{i} has no region")),
-            Some(b) => kv_banks.get(b).and_then(|a| a.as_ref()).ok_or_else(|| {
-                anyhow!(
-                    "launch: KV bank {kv_bank} has no region ({} bank(s))",
-                    kv_banks.len() + 1
-                )
-            }),
+            Some(b) => Ok(&kv_banks[b]),
         }
     } else {
         seg[i]
@@ -154,8 +149,7 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
     // bundle) is `seg_addr[SEG_WEIGHT]`, exactly as before.
     // ⭐ AND THE SAME MECHANISM IS THE KV SLOT'S: positional slot 2 is "the pools" to the program,
     // and a pool outgrowing one region is banked the same way — the launch row's `kv_bank` hands a
-    // different region per layer, bank 0 (`kv_bank` = 0, every unbanked bundle) being
-    // `seg_addr[SEG_KV]`, exactly as before.
+    // different region per layer, `Bank::BASE` (every unbanked bundle) being `seg_addr[SEG_KV]`.
     // ⭐ AND A COLLECTIVE'S CONSUME TAKES NEITHER: its weight-segment operand is the receive window,
     // one placement in the base region, so `weight_slot` pins it to shift 0 in bank 0 — the one law
     // the walk and the canvas construction both read through this function.

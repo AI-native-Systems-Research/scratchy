@@ -251,13 +251,12 @@ pub struct BundleLayout<'a> {
     pub weight_bank_bytes: Cow<'a, [u64]>,
     /// ⭐ THE KV SEGMENT'S EXTRA BANKS, same law as [`Self::weight_bank_bytes`]: bytes of banks
     /// `1..N`, so bank `b`'s extent is `kv_bank_bytes[b - 1]` and bank 0's is
-    /// `segment_bytes[SEG_KV]`. EMPTY for every bundle whose pools fit one device region — the
-    /// single-region case every model was before KV banking, byte-identical in layout and in
-    /// every runtime path. The pool outgrows one region exactly when the model's whole context
-    /// of every layer's K and V does (granite-3.1-8b fp16: 131072 positions × 163840 B = 20 GiB);
-    /// the banks then hold it at LAYER boundaries, which is the one boundary a launch can split
-    /// on (a launch has ONE base per segment). See [`Placement::bank`] — a bank is a coordinate,
-    /// not another segment, because segments 5+6 are intermediate COLORS a pool may not share.
+    /// `segment_bytes[SEG_KV]`. EMPTY for every bundle whose pools fit one device region. The pool
+    /// outgrows one region exactly when the model's whole context of every layer's K and V does
+    /// (granite-3.1-8b fp16: 131072 positions × 163840 B = 20 GiB); the banks then hold it at
+    /// LAYER boundaries, which is the one boundary a launch can split on (a launch has ONE base per
+    /// segment). See [`Placement::bank`] — a bank is a coordinate, not another segment, because
+    /// segments 5+6 are intermediate COLORS a pool may not share.
     pub kv_bank_bytes: Cow<'a, [u64]>,
     /// ⭐ WHERE THE NON-PER-LAYER WEIGHT TAIL LIVES — the bake's verdict, not the runtime's inference.
     /// [`WeightTail::Spilled`] is the work list every borrowing session's tail copy reads; see
@@ -358,20 +357,11 @@ impl<'a> BundleLayout<'a> {
         }
     }
 
-    /// How many BANKS the KV segment occupies — always ≥ 1, exactly 1 for every bundle whose
-    /// pools fit one device region. Derived from [`Self::kv_bank_bytes`] so the count and the
-    /// extents cannot disagree.
-    pub fn kv_banks(&self) -> usize {
-        1 + self.kv_bank_bytes.len()
-    }
-
-    /// Bank `b`'s extent in bytes: bank 0 is the KV segment's own total, the rest come from
-    /// [`Self::kv_bank_bytes`]. `None` for a bank this bundle does not have.
-    pub fn kv_bank_extent(&self, b: usize, kv_seg: usize) -> Option<u64> {
-        match b.checked_sub(1) {
-            None => self.segment_bytes.get(kv_seg).copied(),
-            Some(i) => self.kv_bank_bytes.get(i).copied(),
-        }
+    /// ⭐ THE KV POOL'S BYTES, STATED ONCE: bank 0 ([`Self::segment_bytes`] at `SegRole::Kv`)
+    /// plus every extra bank ([`Self::kv_bank_bytes`]).
+    pub fn kv_pool_bytes(&self) -> u64 {
+        self.segment_bytes[ktir_superdsc::placement::SegRole::Kv.segment()]
+            + self.kv_bank_bytes.iter().sum::<u64>()
     }
 
     /// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this SHIPPED layout's packed size for
@@ -756,6 +746,32 @@ pub struct LadderRung<'a> {
     pub bodies_fused: Cow<'a, [SiblingFp<'a>]>,
 }
 
+/// ⭐ ONE REGION OF A BANKED SEGMENT — bank 0 is the segment's own region, bank `b ≥ 1` its
+/// `b`-th extra region ([`BundleLayout::kv_bank_bytes`]`[b - 1]`). The same coordinate a
+/// [`Placement::bank`] states, carried typed into the launch table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Bank(u32);
+
+impl Bank {
+    /// The segment's own region.
+    pub const BASE: Bank = Bank(0);
+
+    /// The bank a placement names.
+    pub const fn of_placement(p: u32) -> Bank {
+        Bank(p)
+    }
+
+    /// The index into the segment's extra-bank list, or `None` for [`Self::BASE`].
+    pub const fn extra(self) -> Option<usize> {
+        (self.0 as usize).checked_sub(1)
+    }
+
+    /// The bank's number, as the bake's token stream spells it.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// ⭐ ONE LAYER LAUNCH, IN TRUE LAYER ORDER — the whole of the executor's per-layer arithmetic.
 ///
 /// A class-split roll runs its bodies OUT of true order (all of class 0's layers, then class 1's), so
@@ -782,7 +798,7 @@ pub struct LayerLaunch {
     /// The weight-segment offset shift (from the body's baked layer-0 offsets).
     pub w_off: u64,
     /// The KV-segment bank this layer's pools live in.
-    pub kv_bank: u8,
+    pub kv_bank: Bank,
     /// The KV-segment offset shift (from the body's baked layer-0 offsets).
     pub kv_off: u64,
 }
@@ -1160,7 +1176,7 @@ mod tests {
                 iter: 0,
                 w_bank: 0,
                 w_off: 0,
-                kv_bank: 0,
+                kv_bank: Bank::BASE,
                 kv_off: 0,
             }]),
             kv_page_stride: 786432,

@@ -2115,7 +2115,7 @@ fn reroll_tokens(
             proc_macro2::Literal::u8_unsuffixed(*body),
             proc_macro2::Literal::u32_unsuffixed(*iter),
             proc_macro2::Literal::u8_unsuffixed(*w_bank),
-            proc_macro2::Literal::u8_unsuffixed(*kv_bank),
+            proc_macro2::Literal::u32_unsuffixed(kv_bank.get()),
         );
         let (wo, ko) = (
             proc_macro2::Literal::u64_unsuffixed(*w_off),
@@ -2127,7 +2127,7 @@ fn reroll_tokens(
                 iter: #it,
                 w_bank: #wb,
                 w_off: #wo,
-                kv_bank: #kb,
+                kv_bank: ::scratchy_target_spyre::bundle_code::Bank::of_placement(#kb),
                 kv_off: #ko,
             }
         }
@@ -3891,7 +3891,7 @@ pub(crate) fn dump_wavefront_mega(
                                                         iter: 0,
                                                         w_bank: 0,
                                                         w_off: 0,
-                                                        kv_bank: 0,
+                                                        kv_bank: superdsc::bundle::Bank::BASE,
                                                         kv_off: 0,
                                                     }]
                                                 };

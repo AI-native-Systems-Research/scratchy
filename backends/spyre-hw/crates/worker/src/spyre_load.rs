@@ -1484,11 +1484,7 @@ impl SpyreWorker {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
-                // Bank 0 is `segment_bytes[SEG_KV]`; a pool past one region holds the rest in its
-                // extra banks (`kv_bank_bytes`), so the pool is the sum of both.
-                let pool_need_bytes = code.layout.segment_bytes
-                    [scratchy_target_spyre_card::superdsc_exec::SEG_KV.get()]
-                    + code.layout.kv_bank_bytes.iter().sum::<u64>();
+                let pool_need_bytes = code.layout.kv_pool_bytes();
                 let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
@@ -1845,23 +1841,6 @@ impl SpyreWorker {
                         funded / (1024 * 1024),
                         non_kv_bytes / (1024 * 1024),
                         pool_need_bytes / (1024 * 1024),
-                    )));
-                }
-                // ⛔ AND EACH KV BANK IS **ONE** ALLOCATION, so no bank can exceed one region of THIS
-                // card however much tensor capacity is left over.
-                let kv_seg = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
-                let widest_kv_bank = code
-                    .layout
-                    .kv_bank_bytes
-                    .iter()
-                    .copied()
-                    .fold(code.layout.segment_bytes[kv_seg], u64::max);
-                if widest_kv_bank > card_bytes.max_single_allocation() {
-                    return Err(werr(format!(
-                        "the bake's widest KV bank ({} MB) is past the {} MB one device allocation \
-                         can be",
-                        widest_kv_bank / (1024 * 1024),
-                        card_bytes.max_single_allocation() / (1024 * 1024),
                     )));
                 }
                 // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own

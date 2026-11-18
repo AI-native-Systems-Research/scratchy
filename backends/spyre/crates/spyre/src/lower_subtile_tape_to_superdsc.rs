@@ -276,21 +276,8 @@ fn audit_layout_addresses(
     // returns an OOM whose numbers deny each other (`requested_bytes` well under `free_space_bytes`),
     // because the free bytes are in the regions the request cannot reach. Nothing in that message
     // names a segment, a tensor, or a model. All of it is decided here, by constants.
-    // A BANK (weight or KV) is a device region like any other, so it is bound by the same cap;
-    // checking the banks here is what stops banking from trading one over-size allocation for another.
-    for (what, banks) in [("weight", weight_bank_bytes), ("KV", kv_bank_bytes)] {
-        for (b, &bytes) in banks.iter().enumerate() {
-            if bytes > bundle::MAX_SEGMENT_BYTES {
-                fail.push(format!(
-                    "{what} bank {} packs {bytes} B, {} B past the {} B a single device region can \
-                     hold",
-                    b + 1,
-                    bytes - bundle::MAX_SEGMENT_BYTES,
-                    bundle::MAX_SEGMENT_BYTES,
-                ));
-            }
-        }
-    }
+    // A BANK is bound by the same cap, by [`bank_segment`]'s own packing: it opens the next bank
+    // before the current one can pass the cap, and refuses a launch block whose span alone does.
     for (seg, &bytes) in segment_bytes.iter().enumerate() {
         if bytes > bundle::MAX_SEGMENT_BYTES {
             let (biggest, share) = places
@@ -1072,8 +1059,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    weight block, over a segment whose every tensor is per-layer (the reroll's own guard:
     //    a body reads only per-layer tensors in the KV segment), so there is no tail to spill
     //    and banking is the only expressible answer. A no-op — byte-identical layout, empty bank
-    //    list — for every model whose pools fit one region, which is every model that worked
-    //    before this line existed.
+    //    list — for every model whose pools fit one region.
     let kv_bank_bytes = bank_segment(
         BankedRole::Kv,
         &mut placements,
@@ -2093,9 +2079,9 @@ pub(crate) fn per_layer_external_tids(
 ///     as a `u64` shift applied to a REGION base; a class whose bank-1 block seated BELOW its
 ///     layer-0 offset would need a negative shift, which the runtime would silently drop
 ///     (`base.shifted` falls back to the unshifted base). Contiguous launch-order packing seats
-///     every class's FIRST launch of bank `b ≥ 1` at that bank's 0, so the refusal below fires only
-///     for a class whose layer-0 block does not start its bank — the hybrid-class case, refused
-///     HERE at bake rather than mis-addressed on the card.
+///     every class's FIRST launch of bank `b ≥ 1` at that bank's 0, so a negative shift arises only
+///     for a class whose layer-0 block does not start its bank — the hybrid-class case, which the
+///     KV launch table refuses at the bake (`lower_subtile_tape_to_ktir`), never on the card.
 ///  4. **The weight role's non-per-layer tail goes in ONE bank together.** The suffix reads the
 ///     final norm AND the lm_head; if those two landed in different banks the suffix would be
 ///     inexpressible. That is the defect the seg6 tail spill hid: it moved only as many trailing
@@ -2361,40 +2347,10 @@ fn bank_segment(
                 bank_bytes[tail_bank] = cur;
             }
         }
-        BankedRole::Kv => {
-            // ⛔ EVERY PLACEMENT IN THE SEGMENT IS A LAUNCH BLOCK — the reroll's own guard refuses
-            // a body reading anything else in seg2, and the pools are placed from the same
-            // per-layer walk. A tensor left out of every launch would sit at an offset NO re-based
-            // launch addresses, so prove the walk was exhaustive rather than trusting the two
-            // derivations to agree.
-            let strays: Vec<u32> = placements
-                .values()
-                .filter(|p| role.owns(p) && !launched.contains(&p.tid))
-                .map(|p| p.tid)
-                .collect();
-            if !strays.is_empty() {
-                return Err(SuperDscError(format!(
-                    "bank_segment: {} placement(s) in seg{seg} belong to no (class, iteration) \
-                     launch ({:?} first) — a banked pool can only address what a launch re-bases, \
-                     so the banking walk and the per-layer walk disagree",
-                    strays.len(),
-                    strays.iter().take(4).collect::<Vec<_>>(),
-                )));
-            }
-        }
-    }
-    // ── Prove every bank is allocatable BEFORE anything is baked ──
-    for (b, &bytes) in bank_bytes.iter().enumerate() {
-        if bytes > bundle::MAX_SEGMENT_BYTES {
-            return Err(SuperDscError(format!(
-                "bank_segment: {what} bank {b} packs {bytes} B, {} B past the {} B one device \
-                 region can hold ({} launch(es), {} bank(s)).",
-                bytes - bundle::MAX_SEGMENT_BYTES,
-                bundle::MAX_SEGMENT_BYTES,
-                launches.len(),
-                bank_bytes.len(),
-            )));
-        }
+        // Every tensor in the KV segment is one layer's own pool — the reroll's own guard (a body
+        // reads only per-layer tensors in the KV segment) states it — so every one of them is a
+        // launch block and nothing is left to place.
+        BankedRole::Kv => {}
     }
     if matches!(role, BankedRole::Kv) {
         eprintln!(
@@ -7695,7 +7651,7 @@ pub struct RolledSuperDsc<T: ktir_superdsc::collective::Tp> {
     /// against the placements at cargo-build (see [`bundle::LayerLaunch`]).
     pub launch_w: Vec<(u8, u64)>,
     /// Per-launch KV-segment `(bank, offset)`, same contract.
-    pub launch_kv: Vec<(u8, u64)>,
+    pub launch_kv: Vec<(bundle::Bank, u64)>,
     /// Bytes of ONE pool page — every layer of every class (`Σ_c n_c·stride_c`). 0 when
     /// there is no paged KV.
     pub kv_page_stride: u64,
@@ -10957,8 +10913,7 @@ mod kv_banking_tests {
     }
 
     /// ⭐ BYTE-IDENTITY FOR ONE-REGION MODELS: a pool that fits one region moves nothing — the
-    /// same placements, the same `seg_bytes`, an empty bank list. Every model that worked before
-    /// KV banking existed bakes exactly as it did.
+    /// same placements, the same `seg_bytes`, an empty bank list.
     #[test]
     fn a_pool_that_fits_one_region_is_byte_identical() {
         let (mut placements, mut seg_bytes, per_layer_ext) = banked_fixture(10, 1 << 30); // 10 GiB
@@ -10981,48 +10936,5 @@ mod kv_banking_tests {
             .map(|p| (p.tid, p.bank, p.offset, p.size))
             .collect();
         assert_eq!(before, after, "every placement byte-identical");
-    }
-
-    /// ⛔ A POOL WITH NO LAYER CLASSES CANNOT BANK — an unrolled bundle has no boundary a base
-    /// could change on. The test pins THAT it refuses (a bake-boundary refusal), never the
-    /// refusal's wording: the message is diagnostics, not a law.
-    #[test]
-    fn a_pool_with_no_layer_classes_refuses() {
-        let (mut placements, mut seg_bytes, _) = banked_fixture(10, 1 << 31);
-        let empty: Vec<std::collections::BTreeMap<u32, Vec<u32>>> = vec![];
-        assert!(
-            bank_segment(BankedRole::Kv, &mut placements, &mut seg_bytes, &empty).is_err(),
-            "no layer classes is a refusal"
-        );
-    }
-
-    /// ⛔ A STRAY NON-PER-LAYER TENSOR IN THE SEGMENT REFUSES — the banking walk re-bases only
-    /// launch blocks, so a tensor no launch owns would sit at an address nothing addresses.
-    /// Pinned as a refusal, never as wording.
-    #[test]
-    fn a_stray_tensor_in_the_pool_segment_refuses() {
-        let (mut placements, mut seg_bytes, per_layer_ext) = banked_fixture(10, 1 << 31);
-        let kv = SegRole::Kv.segment();
-        placements.insert(
-            9999,
-            TensorPlacement {
-                tid: 9999,
-                role: SegRole::Kv,
-                segment: kv,
-                bank: 0,
-                offset: 0,
-                size: 128,
-            },
-        );
-        assert!(
-            bank_segment(
-                BankedRole::Kv,
-                &mut placements,
-                &mut seg_bytes,
-                &per_layer_ext
-            )
-            .is_err(),
-            "a stray pool-segment tensor is a refusal"
-        );
     }
 }

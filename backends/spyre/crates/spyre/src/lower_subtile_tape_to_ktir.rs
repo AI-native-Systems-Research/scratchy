@@ -3322,10 +3322,11 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     //    the class to the entry, so which table generated it cannot matter; a class whose tables
     //    DISAGREE is refused here with both readings named.
     let mut launch_w: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
-    let mut launch_kv: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
+    let mut launch_kv: Vec<(crate::lower_subtile_tape_to_superdsc::bundle::Bank, u64)> =
+        Vec::with_capacity(total_layers);
     for &(body, iter) in &launches {
         let mut w_entry: Option<(u8, u64)> = None;
-        let mut kv_entry: Option<(u8, u64)> = None;
+        let mut kv_entry: Option<(crate::lower_subtile_tape_to_superdsc::bundle::Bank, u64)> = None;
         for (t0, tids) in &per_layer {
             if body_of_tid(*t0) != Some(body as usize) {
                 continue;
@@ -3367,7 +3368,10 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                         p0.offset, iter, pj.offset, p0.bank, pj.bank,
                     )));
                 }
-                let entry = (pj.bank as u8, shift as u64);
+                let entry = (
+                    crate::lower_subtile_tape_to_superdsc::bundle::Bank::of_placement(pj.bank),
+                    shift as u64,
+                );
                 if let Some(prev) = kv_entry
                     && prev != entry
                 {
@@ -3382,7 +3386,9 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             }
         }
         launch_w.push(w_entry.unwrap_or((0, 0)));
-        launch_kv.push(kv_entry.unwrap_or((0, 0)));
+        launch_kv.push(
+            kv_entry.unwrap_or((crate::lower_subtile_tape_to_superdsc::bundle::Bank::BASE, 0)),
+        );
     }
     // ── PROVE, EVERY TENSOR, EVERY LAYER. The launch addresses
     //    `(bank: L.w_bank, offset: L.w_off + placement(t₀).offset)` — hold each per-layer weight
@@ -3423,7 +3429,9 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                     )));
                 }
             } else if p0.segment == kv_seg
-                && (pj.bank as u8 != kb || pj.offset != ko.wrapping_add(p0.offset))
+                && (crate::lower_subtile_tape_to_superdsc::bundle::Bank::of_placement(pj.bank)
+                    != kb
+                    || pj.offset != ko.wrapping_add(p0.offset))
             {
                 return Err(SuperDscError(format!(
                     "reroll-superdsc: per-layer KV tensor t{tid} (layer {layer} of body {body}) is \
@@ -3438,7 +3446,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                     ko = ko,
                     base = p0.offset,
                     body = body,
-                    kb = kb,
+                    kb = kb.get(),
                 )));
             }
         }

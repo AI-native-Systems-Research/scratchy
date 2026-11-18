@@ -34,7 +34,7 @@ use crate::runtime::{
 };
 use scratchy_target_spyre::allocator::HostBytes;
 use scratchy_target_spyre::bundle_code::{
-    self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols,
+    self as bundle, Bank, KernelWeight, NUM_SEGMENTS, Placement, SweptCols,
 };
 use scratchy_target_spyre::fold_plan::{self, OpKv};
 use scratchy_target_spyre::sen_convert;
@@ -416,9 +416,9 @@ pub(crate) struct LaunchWhere {
     pub(crate) weight_bank: usize,
     /// ⭐ Which KV bank backs the positional pool slot — the launch row's own column, exactly the
     /// weight bank's law: a pool outgrown one region is split at LAYER boundaries, and the launch
-    /// of a layer hands that layer's bank's region into positional slot 2. 0 for every unbanked
-    /// bundle, which is what keeps every path below identical to before KV banking existed.
-    pub(crate) kv_bank: usize,
+    /// of a layer hands that layer's bank's region into positional slot 2. [`Bank::BASE`] for
+    /// every unbanked bundle.
+    pub(crate) kv_bank: Bank,
     /// ⭐ HOW MANY REQUESTS THIS LAUNCH SERVES, and the pitch their tables sit at — the request half
     /// of `fold_plan`'s relaunch law (a walking bundle's span repeats once per request, its tables
     /// `request · pitch` into the activation segment). ONE request at no pitch is every launch
@@ -1164,11 +1164,9 @@ enum SourceFiller {
 struct Rolled {
     /// How many attention classes there are (one body each). 1 for every single-class model.
     n_bodies: usize,
-    /// ⭐ ONE ROW PER LAYER, IN TRUE LAYER ORDER — which body runs it and the segment shifts the
-    /// launch applies. `(body, w_bank, w_off, kv_bank, kv_off)`: the launch binds bank `w_bank`
-    /// into positional slot 1, shifts seg1's base by `w_off`, and binds bank `kv_bank` into
-    /// positional slot 2 shifted by `kv_off`.
-    launches: Vec<(usize, u8, u64, u8, u64)>,
+    /// ⭐ ONE ROW PER LAYER, IN TRUE LAYER ORDER — the baked launch table itself: which body runs
+    /// the layer, the weight bank and shift for positional slot 1, the KV bank and shift for slot 2.
+    launches: Vec<bundle::LayerLaunch>,
     /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
     /// proved each group's weights live in ONE bank, because a launch has one base per segment.
     prefix_weight_bank: usize,
@@ -1260,15 +1258,16 @@ pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     /// shadow over it. Mirrors [`Self::seg_aliased`], which cannot cover banks because it is indexed
     /// by segment.
     weight_bank_aliased: Vec<bool>,
-    /// ⭐ THE KV SEGMENT'S EXTRA BANKS — regions and extents for banks `1..N`, index `b - 1`,
-    /// exactly the weight banks' law. Bank 0 IS `seg_addr[SEG_KV]`, so these are EMPTY for every
-    /// bundle whose pools fit one device region and every path below then behaves exactly as it
-    /// did before KV banking existed. No host shadows: the pools are DEVICE-ONLY (seg2 holds no
-    /// host-owned bytes), so a bank is a region to zero-fill at prepare and alias at load, never
-    /// to stage. Whether a KV bank is borrowed rides `seg_borrowed[SEG_KV]`, the segment's own
-    /// flag — a borrowing session borrows the whole pool or none of it.
-    kv_bank_addr: Vec<Option<DevAddr>>,
-    kv_bank_bytes: Vec<u64>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS' REGIONS, index `b - 1` ([`Bank::extra`]); bank 0 IS
+    /// `seg_addr[SEG_KV]`. Filled once: by [`Self::prepare`]'s allocation for the pool's owner,
+    /// or by [`Self::alias_seg_from`] with the owner's own regions for a borrower — whether a
+    /// session borrows rides `seg_borrowed[SEG_KV]`, the segment's own flag, so a session borrows
+    /// the whole pool or none of it. The pools are DEVICE-ONLY (seg2 holds no host-owned bytes),
+    /// so a bank is a region to zero-fill at prepare and alias at load, never to stage. Empty for
+    /// every bundle whose pools fit one device region.
+    kv_bank_addr: Vec<DevAddr>,
+    /// The bundle's own KV bank extents ([`bundle::BundleLayout::kv_bank_bytes`]).
+    kv_bank_bytes: &'static [u64],
     /// One slot's host side (see [`HostShadow`]): a real staging/mirror buffer, or the typed
     /// statement that the slot is device-only. Sized by [`Executor::stage_weights`] from the
     /// bundle's own role statement (see [`Executor::host_owned_seg`]).
@@ -1717,8 +1716,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // ⭐ THE KV BANKS, STRAIGHT FROM THE BAKED LAYOUT — same law as the weight banks':
             // the bundle decided at cargo-build how many regions its pools need; nothing here
             // chooses. Empty (one bank) for every model whose pools fit one region.
-            kv_bank_addr: code.layout.kv_bank_bytes.iter().map(|_| None).collect(),
-            kv_bank_bytes: code.layout.kv_bank_bytes.to_vec(),
+            kv_bank_addr: Vec::new(),
+            kv_bank_bytes: &code.layout.kv_bank_bytes,
             seg_host: [const { HostShadow::Host(HostBuf::empty()) }; NUM_SEGMENTS],
             read_ring: Vec::new(),
             read_ring_free: Vec::new(),
@@ -1838,11 +1837,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         }
         self.rolled = Some(Rolled {
             n_bodies: m.bodies.len(),
-            launches: m
-                .launches
-                .iter()
-                .map(|l| (l.body as usize, l.w_bank, l.w_off, l.kv_bank, l.kv_off))
-                .collect(),
+            launches: m.launches.to_vec(),
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
         });
@@ -2468,11 +2463,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             b if seg == SEG_WEIGHT.get() && (b as usize) <= self.weight_bank_bytes.len() => {
                 Some(NUM_SEGMENTS + b as usize - 1)
             }
-            // The KV banks sit AFTER the weight banks in the flat space, so a weight bank's
-            // staging index is unchanged by the KV banks' existence.
-            b if seg == SEG_KV.get() && (b as usize) <= self.kv_bank_bytes.len() => {
-                Some(NUM_SEGMENTS + self.weight_bank_bytes.len() + b as usize - 1)
-            }
             _ => None,
         }
     }
@@ -2649,13 +2639,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // bundle DECLARES regardless of who stages it.
             let cap = match slot.checked_sub(NUM_SEGMENTS) {
                 None => self.segment_bytes[slot],
-                // The flat bank space is the weight banks first, then the KV banks
-                // ([`Self::slot_of`]); a staged weight can only name a weight bank (the KV
-                // banks hold per-layer pools, never a bound weight), but the slot-to-capacity
-                // read states both so the flat space has ONE law, not one that panics on the
-                // half it was never handed.
-                Some(b) if b < self.weight_bank_bytes.len() => self.weight_bank_bytes[b],
-                Some(b) => self.kv_bank_bytes[b - self.weight_bank_bytes.len()],
+                Some(b) => self.weight_bank_bytes[b],
             };
             if p.offset as usize + src.len() > cap as usize {
                 bail!(
@@ -3101,22 +3085,20 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 })?,
             );
         }
-        // ⭐ AND ONE REGION PER EXTRA KV BANK, same borrowed-placeholder rule — banks ARE the KV
-        // segment, split because a region is capped while the model's whole context of pools is
-        // not. A borrowing session aliases the owner's pool banks (pools are placed identically
-        // in every bundle, which is what `alias_seg_from`'s checks prove), so allocating the full
-        // extent here would reserve gigabytes only to drop them.
-        for b in 0..self.kv_bank_bytes.len() {
-            let bytes = if self.seg_borrowed[SEG_KV.get()] {
-                128
-            } else {
-                self.kv_bank_bytes[b].max(128)
-            };
-            self.kv_bank_addr[b] = Some(
-                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
-                    anyhow!("prepare: KV bank {} alloc of {bytes} B failed: {e}", b + 1)
-                })?,
-            );
+        // ⭐ AND ONE REGION PER EXTRA KV BANK — banks ARE the KV segment, split because a region
+        // is capped while the model's whole context of pools is not. A borrowing session takes the
+        // owner's regions at [`Self::alias_seg_from`] and allocates none.
+        if !self.seg_borrowed[SEG_KV.get()] {
+            self.kv_bank_addr = self
+                .kv_bank_bytes
+                .iter()
+                .enumerate()
+                .map(|(b, &bytes)| {
+                    DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                        anyhow!("prepare: KV bank {} alloc of {bytes} B failed: {e}", b + 1)
+                    })
+                })
+                .collect::<Result<_>>()?;
         }
         lap("seg-alloc", &mut t0);
         // ⭐ THE REGION BASES, ONCE PER SESSION. A card HMI fault names a device address; these
@@ -3147,14 +3129,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 a.total_size().as_u64()
             );
         }
-        for b in 0..self.kv_bank_bytes.len() {
-            let Some(a) = self.kv_bank_addr[b].as_ref() else {
-                continue;
-            };
+        for (b, (a, bytes)) in self.kv_bank_addr.iter().zip(self.kv_bank_bytes).enumerate() {
             debug!(
-                "[sdsc-superdsc] seg-alloc kv-bank{}: bytes={} chunk0={:?} (padded total {})",
+                "[sdsc-superdsc] seg-alloc kv-bank{}: bytes={bytes} chunk0={:?} (padded total {})",
                 b + 1,
-                self.kv_bank_bytes[b],
                 a.chunk0(),
                 a.total_size().as_u64()
             );
@@ -3269,13 +3247,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // does a RESERVE-ONLY session (nothing bound resident, about to be aliased), the same
         // pass the segment loop above gives seg2 itself.
         if !self.seg_borrowed[SEG_KV.get()] && !reserve_only {
-            for b in 0..self.kv_bank_bytes.len() {
-                let (stream, addr) = (
-                    self.stream_ref()?,
-                    self.kv_bank_addr[b]
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("prepare: KV bank {} has no region", b + 1))?,
-                );
+            let stream = self.stream_ref()?;
+            for (b, addr) in self.kv_bank_addr.iter().enumerate() {
                 fill_zero_walk(
                     stream,
                     addr,
@@ -3677,9 +3650,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
         // bundle, which is what makes banking invisible to every model whose weights fit one region.
         weight_bank: usize,
-        // ⭐ WHICH KV BANK backs positional slot 2 — the launch row's own column, 0 for every
-        // bundle whose pools fit one region.
-        kv_bank: usize,
+        // ⭐ WHICH KV BANK backs positional slot 2 — the launch row's own column, [`Bank::BASE`]
+        // for every bundle whose pools fit one region.
+        kv_bank: Bank,
     ) -> Result<()> {
         let d = Diag::get();
         // The list is taken out so `&self` stays free for the stream and the fold state; every op
@@ -5421,12 +5394,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // region by construction (`bank_weight_segment` refuses to bank without layer classes),
             // so bank 0 is the only bank there is.
             let ls = self.list_sel_for(sel, 0);
-            return self.launch_ops(ls, zero, 0, 0);
+            return self.launch_ops(ls, zero, 0, Bank::BASE);
         };
         let pre_bank = rolled.prefix_weight_bank;
         let suf_bank = rolled.suffix_weight_bank;
 
-        self.launch_ops(ListSel::Prefix, zero, pre_bank, 0)?;
+        self.launch_ops(ListSel::Prefix, zero, pre_bank, Bank::BASE)?;
 
         // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
         // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
@@ -5444,7 +5417,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // (sorted by absolute layer id), which a single-class roll degenerates to
         // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
         // COPIED OUT before the loop: each launch takes `&mut self`, so the table cannot be
-        // borrowed out of `self.rolled` across them. It is one small tuple per layer — the copy
+        // borrowed out of `self.rolled` across them. It is one small row per layer — the copy
         // is the table's bytes, not a graph.
         let launches: Vec<_> = self
             .rolled
@@ -5452,12 +5425,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             .expect("checked above")
             .launches
             .clone();
-        for (body, wbank, woff, kvbank, kvoff) in launches {
+        for l in launches {
             let mut off = [0u64; NUM_SEGMENTS];
-            off[SEG_WEIGHT.get()] = woff;
-            off[SEG_KV.get()] = kvoff;
-            let ls = self.list_sel_for(sel, body);
-            self.launch_ops(ls, off, wbank as usize, kvbank as usize)?;
+            off[SEG_WEIGHT.get()] = l.w_off;
+            off[SEG_KV.get()] = l.kv_off;
+            let ls = self.list_sel_for(sel, l.body as usize);
+            self.launch_ops(ls, off, l.w_bank as usize, l.kv_bank)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
@@ -5470,7 +5443,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
         // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
         match suffix {
-            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank, 0),
+            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank, Bank::BASE),
             SuffixLaunch::Skipped => Ok(()),
         }
     }
@@ -5566,20 +5539,20 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: r.prefix_weight_bank,
-                        kv_bank: 0,
+                        kv_bank: Bank::BASE,
                         requests: fold_plan::Requests::default(),
                     },
                 ));
-                for (class, wbank, woff, kvbank, kvoff) in r.launches.clone() {
+                for l in r.launches.clone() {
                     let mut off = [0u64; NUM_SEGMENTS];
-                    off[SEG_WEIGHT.get()] = woff;
-                    off[SEG_KV.get()] = kvoff;
+                    off[SEG_WEIGHT.get()] = l.w_off;
+                    off[SEG_KV.get()] = l.kv_off;
                     specs.push((
-                        self.list_sel_for(sel, class),
+                        self.list_sel_for(sel, l.body as usize),
                         LaunchWhere {
                             byte_off: off,
-                            weight_bank: wbank as usize,
-                            kv_bank: kvbank as usize,
+                            weight_bank: l.w_bank as usize,
+                            kv_bank: l.kv_bank,
                             requests: fold_plan::Requests::default(),
                         },
                     ));
@@ -5589,7 +5562,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: r.suffix_weight_bank,
-                        kv_bank: 0,
+                        kv_bank: Bank::BASE,
                         requests: fold_plan::Requests::default(),
                     },
                 ));
@@ -5601,7 +5574,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: 0,
-                        kv_bank: 0,
+                        kv_bank: Bank::BASE,
                         requests: fold_plan::Requests::default(),
                     },
                 ));
@@ -5660,7 +5633,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
             None => (ListSel::Body(0), 0),
         };
-        self.launch_ops(sel, zero, bank, 0)?;
+        self.launch_ops(sel, zero, bank, Bank::BASE)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
@@ -6398,34 +6371,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             }
         }
         // ⭐⭐ AND THE KV SEGMENT'S EXTRA BANKS — because they ARE the KV segment. Aliasing seg2
-        // while leaving a pool bank pointing at this session's own zero-filled region would give
-        // the borrower a body whose later layers read a ZERO pool: attention scores masked against
-        // nothing, one garbled token per step, no crash. The placement-equality check above already
-        // compared every pool's (bank, offset, size), so the two bundles bank identically; the
-        // bank lists are read under the same law as the weight banks'.
+        // while leaving a pool bank on this session's own region would give the borrower a body
+        // whose later layers read another pool: one garbled token per step, no crash. Every bundle
+        // of the model lowers its pools at the same capacity through the one banking pass, so the
+        // owner's regions are this bundle's banks.
         if i == SEG_KV.get() {
-            if self.kv_bank_bytes != owner.kv_bank_bytes {
-                bail!(
-                    "alias_seg(seg{i}): KV BANKS MISMATCH dst={:?} src={:?} — REFUSING",
-                    self.kv_bank_bytes,
-                    owner.kv_bank_bytes
-                );
-            }
-            for b in 0..self.kv_bank_bytes.len() {
-                let Some(sb) = owner.kv_bank_addr[b].as_ref() else {
-                    bail!("alias_seg(seg{i}): src has no region for KV bank {}", b + 1);
-                };
-                let bc0 = sb
-                    .chunk0()
-                    .filter(|_| sb.is_single_chunk())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "alias_seg(seg{i}): src KV bank {} is MULTI-CHUNK — REFUSING",
-                            b + 1
-                        )
-                    })?;
-                self.kv_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
-            }
+            self.kv_bank_addr = owner.kv_bank_addr.clone();
         }
         Ok(())
     }
