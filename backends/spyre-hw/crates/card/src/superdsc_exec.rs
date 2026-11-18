@@ -130,6 +130,26 @@ fn pages_of(len: usize) -> usize {
     PageExtent::covering(len).bytes()
 }
 
+/// ⭐ A STAGING SLOT'S EXTENT — the logical bytes rounded UP to a whole [`HOST_PAGE`]. THE
+/// ONE LAW BOTH TWINS OF A HOST-OWNED STAGING SLOT ARE BORN AT: the host shadow
+/// ([`HostShadow::staging`]) and the device region (the segment and weight-bank allocs in
+/// `prepare`). [`send_prefix_and_fill`] rounds the staged prefix up to a whole page (the
+/// pre-mapped DMA's sub-address law) and covers it by walking the REGION's own windows, so
+/// a twin born at the raw byte count stops the coverage one page short of the rounded
+/// prefix whenever the staged extent is not page-aligned: gemma-4-12b's 17,035,401,216 B
+/// seg1 — 2 KiB into its last page, staged to the brim — refused first at the shadow
+/// ("cannot cover a … B prefix") and then, the shadow born rounded, at the walk's own
+/// cover-each-chunk-once law (`DevAddr::alloc` rounds to the ALLOCATOR's granularity, which
+/// is coarser than nothing and finer than this law needs). Born at this extent on BOTH
+/// twins the round-up is structural — `round_up(x) ≤ staging_extent(slot) = slot` for every
+/// `x ≤ slot`, where the slot's region is at least the bytes requested of it — and the
+/// bytes the rounding adds are zeros on both sides: the shadow's mapping reads as born
+/// zeros past its logical length, and the region's pad past the program-visible bytes is
+/// nobody's to read.
+fn staging_extent(bytes: u64) -> u64 {
+    pages_of(bytes.max(128) as usize) as u64
+}
+
 /// Why a host shadow buffer could not be made: the kernel's errno, by stage.
 #[derive(Debug)]
 pub(crate) enum HostBufError {
@@ -375,24 +395,17 @@ impl Default for HostShadow {
 }
 
 impl HostShadow {
-    /// ⭐ THE SHADOW A HOST-OWNED SLOT IS BORN WITH — its PAGE-ROUNDED extent. THE LAW THE
-    /// BOOT SEND RESTS ON, stated here and nowhere else: [`send_prefix_and_fill`] rounds
-    /// the staged prefix UP to a whole [`HOST_PAGE`] (the pre-mapped DMA's sub-address
-    /// law), so a shadow whose length is not itself a whole page can sit BELOW that
-    /// round-up — a bake whose segment holds, say, 17,035,401,216 B (a whole 2 KiB page
-    /// count but not a 4 KiB one) staged to the brim made `send` land one page past the
-    /// shadow and refused at boot with "cannot cover a … B prefix". The buffer's MAPPING
-    /// was always [`pages_of`] the logical length (its tail reads as born zeros); this
-    /// constructor states the logical length as the same page-rounded extent, so the
-    /// round-up is structural — `round_up(x) ≤ round_up(shadow) = shadow` for every
-    /// `x ≤ shadow` — and the bytes the rounding adds are born zeros INSIDE the shadow,
-    /// byte-identical on the device to the zero fill they replace. Both birth sites of a
-    /// staging shadow (the segments, the extra weight banks) go through here; the read
-    /// doors' on-demand materializations ([`Executor::shadow_for_read`],
-    /// `read_tensor_raw`) do not boot-send and keep their exact window sizes.
+    /// ⭐ THE SHADOW A HOST-OWNED SLOT IS BORN WITH — the HOST TWIN of
+    /// [`staging_extent`]'s law: the page-rounded extent, whose bytes past the logical
+    /// length read as born zeros (anonymous `mmap` semantics), so the boot send's page
+    /// round-up lands inside it structurally and the pad it adds is byte-identical on the
+    /// device to the zero fill it replaces. Both birth sites of a staging shadow (the
+    /// segments, the extra weight banks) go through here; the read doors' on-demand
+    /// materializations ([`Executor::shadow_for_read`], `read_tensor_raw`) do not
+    /// boot-send and keep their exact window sizes.
     fn staging(bytes: u64) -> Result<Self, HostBufError> {
         Ok(HostShadow::Host(HostBuf::zeroed(
-            pages_of(bytes.max(128) as usize),
+            staging_extent(bytes) as usize,
         )?))
     }
 
@@ -3164,8 +3177,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 scratchy_spyre_bundle::SegmentHold::Allocated
             };
             let bytes = hold.alloc_bytes(self.segment_bytes[i]);
+            // ⭐ THE DEVICE TWIN of `staging_extent`'s law — the segment's region is born
+            // at the same page-rounded extent its host shadow is, so the boot send's
+            // rounded prefix walks inside it (a raw-sized region stops the walk one page
+            // short; `DevAddr::alloc`'s own granularity is not this law).
             self.seg_addr[i] = Some(
-                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
+                DevAddr::alloc(self.card, ByteSize(staging_extent(bytes)), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -3185,8 +3202,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 scratchy_spyre_bundle::SegmentHold::Allocated
             };
             let bytes = hold.alloc_bytes(self.weight_bank_bytes[b]);
+            // ⭐ The weight banks' DEVICE TWIN of the same law — see the segment loop above.
             self.weight_bank_addr[b] = Some(
-                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                DevAddr::alloc(self.card, ByteSize(staging_extent(bytes)), MemoryType::Tensor)
+                    .map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -6806,14 +6825,17 @@ mod tests {
         assert!(e.is_empty());
     }
 
-    /// ⭐ THE STAGING SHADOW'S OWN LAW — the boot send's page round-up is structural against
-    /// it. A bake may declare a segment of any byte size (the gemma-4 12b bf16 build's seg1
-    /// held 17,035,401,216 B — a whole 2 KiB page count, half a 4 KiB one), and its staged
+    /// ⭐ THE STAGING SLOT'S OWN LAW, ON BOTH TWINS — the boot send's page round-up is
+    /// structural against the shadow AND its walk covers it in the region. A bake may
+    /// declare a segment of any byte size (the gemma-4 12b bf16 build's seg1 held
+    /// 17,035,401,216 B — a whole 2 KiB page count, half a 4 KiB one), and its staged
     /// extent may reach the brim; `send_prefix_and_fill` rounds that prefix UP to a whole
-    /// page, which must land inside the shadow. Pinned here without a card: the staging
-    /// shadow's length is the page-rounded extent (born zeros past the declared bytes), and
-    /// for every staged extent up to and including the shadow, the rounded send never
-    /// passes it — the exact arithmetic that refused at boot before the law existed.
+    /// page, which must land inside the shadow (the first refusal: "cannot cover a … B
+    /// prefix") and inside the region the walk covers (the second: the walk's
+    /// cover-each-chunk-once law stopped at the raw extent). Pinned here without a card:
+    /// BOTH twins are born at `staging_extent` — the shadow's length and the region the
+    /// alloc requests are the same page-rounded extent — and for every staged extent up
+    /// to and including the slot, the rounded send never passes either twin.
     #[test]
     fn a_staging_shadow_admits_the_page_rounded_boot_send() {
         // The bake's own number, half a page past the last whole one.
@@ -6823,19 +6845,30 @@ mod tests {
         let shadow = HostShadow::staging(seg as u64).expect("mmap of the shadow");
         let shadow = shadow.host().expect("a staging shadow is host-owned");
         assert_eq!(shadow.len(), pages_of(seg));
+        // The region the alloc requests is the SAME page-rounded extent — the device
+        // twin. (The allocator may hand back more; `total_size` only grows past this,
+        // which only grows the walk's coverage.)
+        let region = staging_extent(seg as u64) as usize;
+        assert_eq!(region, shadow.len(), "the twins are one extent");
         // The send's own arithmetic, restated as the property it must now always have:
         // staged at the brim (and one byte either side of it), the rounded send — the
-        // slice `send_prefix_and_fill` takes — exists in the shadow.
+        // slice `send_prefix_and_fill` takes — exists in the shadow, and the walk that
+        // covers the region reaches past it.
         for staged in [seg - 1, seg, shadow.len()] {
             let send = staged
                 .min(shadow.len())
-                .min(shadow.len() + HOST_PAGE) // a region at least the shadow
+                .min(region)
                 .div_ceil(HOST_PAGE)
                 * HOST_PAGE;
             assert!(
                 shadow.get(..send).is_some(),
                 "a {staged} B staged prefix of a {} B shadow must cover its {send} B page-rounded send",
                 shadow.len()
+            );
+            assert!(
+                region >= send,
+                "the {} B region's window walk must cover the {send} B page-rounded send",
+                region
             );
         }
         // And the pad the rounding adds is born zeros — byte-identical on the device to
