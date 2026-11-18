@@ -18,8 +18,8 @@ use crate::classified::{
 };
 use crate::dim::{Dim, canonical_mul};
 use crate::state::{
-    Arity, InputName, OpName, OutputCount, SourceCount, StateName, StateTable, StateVocabulary,
-    Vocabulary,
+    Arity, DimName, InputName, OpName, OutputCount, SourceCount, StateName, StateTable,
+    StateVocabulary, Vocabulary,
 };
 
 pub type ClassifyResult<T> = Result<T, ClassifyError>;
@@ -40,6 +40,20 @@ pub enum ClassifyError {
         name: InputName,
         first: Vocabulary,
         second: StateName,
+    },
+    /// A derived dim's name with two claims, as [`Self::DuplicateOpName`].
+    DuplicateDimName {
+        name: DimName,
+        first: Vocabulary,
+        second: StateName,
+    },
+    /// A derived dim of `owner` reading `reads`, a dim of `reads_owner` it may not read: one the
+    /// table derives after it or at a later stage, or another decoder state's.
+    DimReadsUnavailable {
+        name: DimName,
+        owner: Vocabulary,
+        reads: DimName,
+        reads_owner: Vocabulary,
     },
     /// A state op called with other than its declared number of arguments.
     StateOpArity {
@@ -96,6 +110,25 @@ impl std::fmt::Display for ClassifyError {
             } => write!(
                 f,
                 "input `{name}` is claimed twice: by {first} and by decoder state `{second}`"
+            ),
+            Self::DuplicateDimName {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "derived dim `{name}` is claimed twice: by {first} and by decoder state `{second}`"
+            ),
+            Self::DimReadsUnavailable {
+                name,
+                owner,
+                reads,
+                reads_owner,
+            } => write!(
+                f,
+                "derived dim `{name}` of {owner} reads `{reads}` of {reads_owner}: a derived dim \
+                 reads only a core dim or its own decoder state's, derived above it at the same \
+                 or an earlier stage"
             ),
             Self::StateOpArity {
                 op,

@@ -4,6 +4,7 @@
 //! models hands the forward compiler, which lists those handles. A decoder state crate states each op
 //! once, through [`state_op!`], and lists its ops and inputs once, through [`decoder_state!`].
 
+pub use scratchy_forward_compiler_frontend::dim::{DeriveStage, DerivedDim, DerivedRule};
 use scratchy_forward_compiler_frontend::state::{OpName, StateVocabulary};
 use scratchy_subtile::state_op::StateOpFacts;
 use scratchy_typed_shapes::Shapes;
@@ -70,6 +71,7 @@ pub fn vocabularies(decoder_states: &[DecoderState]) -> impl Iterator<Item = &dy
 /// depending on the front end or the subtile IR.
 #[doc(hidden)]
 pub mod __private {
+    pub use scratchy_forward_compiler_frontend::dim::DerivedDim;
     pub use scratchy_forward_compiler_frontend::state::{
         Arity, InputName, OpName, SignaturePath, StateInputDecl, StateName, StateOpDecl, StateOpId,
         StateVocabulary,
@@ -296,9 +298,11 @@ macro_rules! state_op {
 /// signatures and its inputs (`::<crate>::<module>`, as the typed carriers call it from another
 /// crate), each op [`state_op!`] declared there and each input, whose name must resolve in that
 /// module (`typed_emit` calls it as a nullary fn, so a non-fn fails in the generated carrier).
-/// Expands to a `static` [`DecoderState`] whose vocabulary declares those ops and inputs and whose
-/// `subtile` maps each op's name to its facts. A decoder state crate reaches its own signatures through
-/// the absolute path by naming itself: `extern crate self as <crate>;`.
+/// Then, optionally, `dims = [...]`: the path of each `const` [`DerivedDim`] the decoder state adds after
+/// the core ones, in the order they derive (omitted, it adds none).
+/// Expands to a `static` [`DecoderState`] whose vocabulary declares those ops, inputs and dims and
+/// whose `subtile` maps each op's name to its facts. A decoder state crate reaches its own signatures
+/// through the absolute path by naming itself: `extern crate self as <crate>;`.
 ///
 /// ```
 /// extern crate self as probe;
@@ -327,8 +331,80 @@ macro_rules! state_op {
 /// fn main() {
 ///     assert_eq!(PROBE.vocabulary().ops().len(), 1);
 ///     assert_eq!(PROBE.vocabulary().inputs().len(), 1);
+///     assert!(PROBE.vocabulary().derived_dims().is_empty());
 ///     assert!(PROBE.subtile()(ops::probe_scale::DECL.name).is_some());
 /// }
+/// ```
+///
+/// A decoder state adding derived dims lists each, after its inputs:
+///
+/// ```
+/// extern crate self as probe;
+///
+/// use scratchy_decoder_state::{DeriveStage, DerivedDim, DerivedRule};
+///
+/// pub mod ops {
+///     scratchy_decoder_state::state_op! {
+///         pub fn probe_scale(a: u32) -> u32 {
+///             a
+///         }
+///         rows = In0, tp = Whole;
+///     }
+///
+///     pub fn probe_state() -> u32 {
+///         0
+///     }
+/// }
+///
+/// /// Each head's probe lanes.
+/// pub const PROBE_WIDTH: DerivedDim = DerivedDim {
+///     name: "probe_width",
+///     stage: DeriveStage::Implicit,
+///     rule: DerivedRule::Mul(&[
+///         DerivedRule::Bound("num_attention_heads"),
+///         DerivedRule::Bound("probe_lanes"),
+///     ]),
+/// };
+///
+/// /// The probe width, twice.
+/// pub const PROBE_PAIR: DerivedDim = DerivedDim {
+///     name: "probe_pair",
+///     stage: DeriveStage::Implicit,
+///     rule: DerivedRule::Mul(&[DerivedRule::Lit(2), DerivedRule::Bound("probe_width")]),
+/// };
+///
+/// scratchy_decoder_state::decoder_state! {
+///     pub static PROBE: name = probe, signatures = ::probe::ops,
+///         ops = [probe_scale], inputs = [probe_state], dims = [PROBE_WIDTH, crate::PROBE_PAIR];
+/// }
+///
+/// fn main() {
+///     let names: Vec<_> = PROBE.vocabulary().derived_dims().iter().map(|d| d.name).collect();
+///     assert_eq!(names, ["probe_width", "probe_pair"]);
+/// }
+/// ```
+///
+/// A dim that is not a [`DerivedDim`] does not build:
+///
+/// ```compile_fail,E0308
+/// extern crate self as probe;
+///
+/// pub mod ops {
+///     scratchy_decoder_state::state_op! {
+///         pub fn probe_scale(a: u32) -> u32 {
+///             a
+///         }
+///         rows = In0, tp = Whole;
+///     }
+/// }
+///
+/// pub const NOT_A_DIM: u32 = 0;
+///
+/// scratchy_decoder_state::decoder_state! {
+///     pub static PROBE: name = probe, signatures = ::probe::ops,
+///         ops = [probe_scale], inputs = [], dims = [NOT_A_DIM];
+/// }
+/// fn main() {}
 /// ```
 ///
 /// A decoder state listing an op no [`state_op!`] declared does not build:
@@ -388,7 +464,8 @@ macro_rules! decoder_state {
         $vis:vis static $state_static:ident: name = $state:ident,
             signatures = $(:: $seg:ident)+,
             ops = [$($op:ident),+ $(,)?],
-            inputs = [$($input:ident),* $(,)?] $(,)?;
+            inputs = [$($input:ident),* $(,)?]
+            $(, dims = [$($dim:path),* $(,)?])? $(,)?;
     ) => {
         $(#[$meta])*
         $vis static $state_static: $crate::DecoderState = {
@@ -426,6 +503,11 @@ macro_rules! decoder_state {
                     $crate::__private::SignaturePath::new(::core::concat!(
                         $("::", ::core::stringify!($seg)),+
                     ))
+                }
+
+                fn derived_dims(&self) -> &'static [$crate::__private::DerivedDim] {
+                    const DIMS: &[$crate::__private::DerivedDim] = &[$($($dim),*)?];
+                    DIMS
                 }
             }
 

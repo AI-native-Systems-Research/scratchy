@@ -6,13 +6,15 @@
 //!
 //! [`StateTable::assemble`] is the one place the decoder states a build passes become a vocabulary: it
 //! rejects a name claimed twice (by the core vocabulary and a decoder state, or by two decoder states), so a
-//! lookup never picks between two claims.
+//! lookup never picks between two claims. The decoder states' derived dims assemble there too, into
+//! one [`DimTable`] with the core ones.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::classified::{ExternKind, OpKind};
 use crate::classify::ClassifyError;
+use crate::dim::{DERIVED_DIMS, DerivedDim};
 
 /// A decoder state's vocabulary, declared in the decoder state's own crate.
 pub trait StateVocabulary: Sync {
@@ -22,6 +24,11 @@ pub trait StateVocabulary: Sync {
     /// The absolute Rust path (`::crate::module`) of the module that holds the signatures and input
     /// constructors: the typed carriers call it from another crate.
     fn signatures(&self) -> SignaturePath;
+    /// The derived dims the decoder state adds after the core ones ([`DERIVED_DIMS`]), in the order
+    /// they derive: a row reads the core rows and the rows above it here.
+    fn derived_dims(&self) -> &'static [DerivedDim] {
+        &[]
+    }
 }
 
 pub use scratchy_tensors::compiler_ids::{
@@ -187,19 +194,24 @@ impl fmt::Display for Vocabulary {
     }
 }
 
-/// The decoder states a build passes, assembled into one vocabulary in which every name has one claim.
+/// The decoder states a build passes, assembled into one vocabulary in which every name has one claim,
+/// and the derived dims they add to the core ones.
 #[derive(Clone, Debug, Default)]
 pub struct StateTable {
     ops: BTreeMap<OpName, StateOp>,
     inputs: BTreeMap<InputName, StateInput>,
+    dims: DimTable,
 }
 
 impl StateTable {
-    /// The vocabulary of `decoder_states`: every op and input they declare, each claimed once. A name the
-    /// core vocabulary already has, or one two decoder states declare, is a `Duplicate*Name` error naming
-    /// both claimants.
+    /// The vocabulary of `decoder_states`: every op, input and derived dim they declare, each claimed
+    /// once. A name the core vocabulary already has, or one two decoder states declare, is a
+    /// `Duplicate*Name` error naming both claimants; the dims assemble as [`DimTable::assemble`].
     pub fn assemble(decoder_states: &[&dyn StateVocabulary]) -> Result<Self, ClassifyError> {
-        let mut table = Self::default();
+        let mut table = Self {
+            dims: DimTable::assemble(decoder_states)?,
+            ..Self::default()
+        };
         for state in decoder_states {
             let second = state.name();
             let signatures = state.signatures();
@@ -253,6 +265,90 @@ impl StateTable {
     pub fn input(&self, name: &str) -> Option<StateInput> {
         self.inputs.get(name).copied()
     }
+
+    /// The derived dims: the core rows, then each decoder state's.
+    pub fn dims(&self) -> &DimTable {
+        &self.dims
+    }
+}
+
+static_name!(
+    /// The name a derived dim is read by: a config bound no config states.
+    DimName
+);
+
+/// Every derived dim a build knows: the core rows ([`DERIVED_DIMS`]), then each decoder state's
+/// rows in the order the build lists the decoder states and each declares its rows. Assembled once,
+/// so every name has one claim and every row reads only rows it may.
+#[derive(Clone, Debug)]
+pub struct DimTable {
+    rows: Vec<(Vocabulary, &'static DerivedDim)>,
+}
+
+impl DimTable {
+    /// The table of the core rows and `decoder_states`' rows. A name the core rows or an earlier
+    /// row already claim is a `DuplicateDimName` error naming both claimants. A row reading a name
+    /// the table derives may read only a core row or a row of its own decoder state, above it and of
+    /// a stage no later than its own; any other read is a `DimReadsUnavailable` error, since it
+    /// would read a value not yet derived, or one deleting another decoder state takes away.
+    pub fn assemble(decoder_states: &[&dyn StateVocabulary]) -> Result<Self, ClassifyError> {
+        let Self { mut rows } = Self::default();
+        for state in decoder_states {
+            let second = state.name();
+            for d in state.derived_dims() {
+                if let Some(&(first, _)) = rows.iter().find(|(_, e)| e.name == d.name) {
+                    return Err(ClassifyError::DuplicateDimName {
+                        name: DimName::new(d.name),
+                        first,
+                        second,
+                    });
+                }
+                rows.push((Vocabulary::State(second), d));
+            }
+        }
+        for (i, &(owner, d)) in rows.iter().enumerate() {
+            let mut reads = Vec::new();
+            d.rule.reads(&mut reads);
+            for name in reads {
+                let Some(j) = rows.iter().position(|(_, e)| e.name == name) else {
+                    continue;
+                };
+                let (reads_owner, e) = rows[j];
+                let readable = j < i
+                    && e.stage <= d.stage
+                    && (reads_owner == Vocabulary::Core || reads_owner == owner);
+                if !readable {
+                    return Err(ClassifyError::DimReadsUnavailable {
+                        name: DimName::new(d.name),
+                        owner,
+                        reads: DimName::new(name),
+                        reads_owner,
+                    });
+                }
+            }
+        }
+        Ok(Self { rows })
+    }
+
+    /// Every row, the core rows first, then each decoder state's in declaration order.
+    pub fn rows(&self) -> impl Iterator<Item = &DerivedDim> {
+        self.rows.iter().map(|&(_, d)| d)
+    }
+
+    /// The row deriving `name`, if the table has one.
+    pub fn find(&self, name: &str) -> Option<&DerivedDim> {
+        self.rows().find(|d| d.name == name)
+    }
+}
+
+/// The core rows alone: the table of a build listing no decoder state.
+impl Default for DimTable {
+    fn default() -> Self {
+        const CORE: &[DerivedDim] = &DERIVED_DIMS;
+        Self {
+            rows: CORE.iter().map(|d| (Vocabulary::Core, d)).collect(),
+        }
+    }
 }
 
 /// The test decoder state, shared with the passes that read a decoder state's handles.
@@ -261,6 +357,7 @@ pub(crate) mod probe {
     use std::num::NonZeroU8;
 
     use super::*;
+    use crate::dim::{DeriveStage, DerivedDim, DerivedRule};
 
     pub(crate) const TWO: NonZeroU8 = NonZeroU8::MIN.saturating_add(1);
 
@@ -279,8 +376,17 @@ pub(crate) mod probe {
     static PROBE_INPUTS: [StateInputDecl; 1] = [StateInputDecl {
         name: InputName::new("probe_state"),
     }];
+    static PROBE_DIMS: [DerivedDim; 1] = [DerivedDim {
+        name: "probe_width",
+        stage: DeriveStage::Implicit,
+        rule: DerivedRule::Add(&[
+            DerivedRule::Bound("hidden_size"),
+            DerivedRule::Bound("num_attention_heads"),
+        ]),
+    }];
 
-    /// The test decoder state: a two-output split, a three-argument mix and one layered state input.
+    /// The test decoder state: a two-output split, a three-argument mix, one layered state input
+    /// and one derived dim.
     pub(crate) struct Probe;
 
     impl StateVocabulary for Probe {
@@ -296,6 +402,9 @@ pub(crate) mod probe {
         fn signatures(&self) -> SignaturePath {
             SignaturePath::new("::probe::ops")
         }
+        fn derived_dims(&self) -> &'static [DerivedDim] {
+            &PROBE_DIMS
+        }
     }
 }
 
@@ -305,6 +414,7 @@ mod tests {
     use super::*;
     use crate::classified::{Expr, ExternKind, OpKind, Prelude, Program, Stmt};
     use crate::classify::{ClassifyError, classify_with};
+    use crate::dim::{DeriveStage, DerivedDim, DerivedRule};
     use crate::parse_python::parse_body;
 
     static SQUATTER_OPS: [StateOpDecl; 1] = [StateOpDecl {
@@ -594,6 +704,23 @@ mod tests {
         assert!(msg.contains("probe") && msg.contains("twin"), "{msg}");
     }
 
+    /// The decoder states' dims assemble where their ops do: a carrier classified under them reads
+    /// one table, and a dim claimed twice fails the same assembly.
+    #[test]
+    fn a_states_dims_assemble_with_its_vocabulary() {
+        let table = StateTable::assemble(&[&Probe]).expect("probe assembles");
+        assert!(table.dims().find("probe_width").is_some());
+        assert!(table.dims().find("kv_dim").is_some());
+        let Err(err) = StateTable::assemble(&[&Dims("dim_squatter", &GDN_CONV_CLAIM)]) else {
+            panic!("a decoder state claimed a core dim's name");
+        };
+        let ClassifyError::DuplicateDimName { first, second, .. } = &err else {
+            panic!("expected DuplicateDimName, got {err}");
+        };
+        assert_eq!(*first, Vocabulary::Core);
+        assert_eq!(*second, StateName::new("dim_squatter"));
+    }
+
     #[test]
     fn a_state_op_checks_its_arity() {
         let err = classify_under("y = probe_mix(x)", &[&Probe]).expect_err("a wrong arity");
@@ -685,5 +812,187 @@ mod tests {
             assert_eq!(OpKind::from_name(op.as_str()), None, "{op:?}");
             assert!(OpKind::is_core_name(op.as_str()), "{op:?}");
         }
+    }
+
+    /// A decoder state that declares only the derived dims `.1`, named `.0`.
+    struct Dims(&'static str, &'static [DerivedDim]);
+
+    impl StateVocabulary for Dims {
+        fn name(&self) -> StateName {
+            StateName::new(self.0)
+        }
+        fn ops(&self) -> &'static [StateOpDecl] {
+            &[]
+        }
+        fn inputs(&self) -> &'static [StateInputDecl] {
+            &[]
+        }
+        fn signatures(&self) -> SignaturePath {
+            SignaturePath::new("::dims::signatures")
+        }
+        fn derived_dims(&self) -> &'static [DerivedDim] {
+            self.1
+        }
+    }
+
+    /// A row named `name` of `stage` reading the bound `reads`.
+    const fn row(name: &'static str, stage: DeriveStage, reads: &'static str) -> DerivedDim {
+        DerivedDim {
+            name,
+            stage,
+            rule: DerivedRule::Bound(reads),
+        }
+    }
+
+    /// Every row's name, in the table's order.
+    fn names(table: &DimTable) -> Vec<&'static str> {
+        table.rows().map(|d| d.name).collect()
+    }
+
+    #[test]
+    fn a_state_dim_joins_the_table_after_the_core_rows() {
+        let table = DimTable::assemble(&[&Probe]).expect("probe assembles");
+        let mut expected: Vec<_> = DERIVED_DIMS.iter().map(|d| d.name).collect();
+        expected.push("probe_width");
+        assert_eq!(names(&table), expected);
+        let probe = table
+            .find("probe_width")
+            .expect("probe declares probe_width");
+        let bounds = [("hidden_size", 8), ("num_attention_heads", 2)]
+            .map(|(k, v)| (k.to_string(), v))
+            .into();
+        assert_eq!(probe.rule.eval(&bounds), Some(10));
+        assert!(table.find("gdn_conv_dim").is_some());
+        assert!(table.find("hidden_size").is_none());
+    }
+
+    static GDN_CONV_CLAIM: [DerivedDim; 1] =
+        [row("gdn_conv_dim", DeriveStage::Implicit, "hidden_size")];
+
+    #[test]
+    fn a_state_cannot_claim_a_core_dim_name() {
+        let Err(err) = DimTable::assemble(&[&Dims("squatter", &GDN_CONV_CLAIM)]) else {
+            panic!("a decoder state claimed a core dim's name");
+        };
+        let ClassifyError::DuplicateDimName {
+            name,
+            first,
+            second,
+        } = &err
+        else {
+            panic!("expected DuplicateDimName, got {err}");
+        };
+        assert_eq!(*name, DimName::new("gdn_conv_dim"));
+        assert_eq!(*first, Vocabulary::Core);
+        assert_eq!(*second, StateName::new("squatter"));
+        let msg = err.to_string();
+        assert!(msg.contains("core") && msg.contains("squatter"), "{msg}");
+    }
+
+    static PROBE_WIDTH_CLAIM: [DerivedDim; 1] =
+        [row("probe_width", DeriveStage::Implicit, "hidden_size")];
+    static SELF_TWICE: [DerivedDim; 2] = [
+        row("twice", DeriveStage::Implicit, "hidden_size"),
+        row("twice", DeriveStage::Implicit, "hidden_size"),
+    ];
+
+    #[test]
+    fn two_states_cannot_share_a_dim() {
+        let Err(err) = DimTable::assemble(&[&Probe, &Dims("twin", &PROBE_WIDTH_CLAIM)]) else {
+            panic!("two decoder states claimed one dim");
+        };
+        let ClassifyError::DuplicateDimName {
+            name,
+            first,
+            second,
+        } = &err
+        else {
+            panic!("expected DuplicateDimName, got {err}");
+        };
+        assert_eq!(*name, DimName::new("probe_width"));
+        assert_eq!(*first, Vocabulary::State(StateName::new("probe")));
+        assert_eq!(*second, StateName::new("twin"));
+        let msg = err.to_string();
+        assert!(msg.contains("probe") && msg.contains("twin"), "{msg}");
+
+        let Err(err) = DimTable::assemble(&[&Dims("stutter", &SELF_TWICE)]) else {
+            panic!("one decoder state claimed one dim twice");
+        };
+        let ClassifyError::DuplicateDimName { first, second, .. } = &err else {
+            panic!("expected DuplicateDimName, got {err}");
+        };
+        assert_eq!(*first, Vocabulary::State(StateName::new("stutter")));
+        assert_eq!(*second, StateName::new("stutter"));
+    }
+
+    /// The order law `name`'s row breaks by reading `reads`, as the error names them.
+    fn breaks_order(states: &[&dyn StateVocabulary], name: &str, reads: &str) {
+        let Err(err) = DimTable::assemble(states) else {
+            panic!("`{name}` reads `{reads}`, which it may not, yet the table assembled");
+        };
+        let ClassifyError::DimReadsUnavailable {
+            name: got_name,
+            reads: got_reads,
+            ..
+        } = &err
+        else {
+            panic!("expected DimReadsUnavailable, got {err}");
+        };
+        assert_eq!((got_name.get(), got_reads.get()), (name, reads), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains(name) && msg.contains(reads), "{msg}");
+    }
+
+    static READS_OWN_EARLIER: [DerivedDim; 2] = [
+        row("own_first", DeriveStage::Implicit, "hidden_size"),
+        row("own_second", DeriveStage::Implicit, "own_first"),
+    ];
+    static READS_OWN_LATER: [DerivedDim; 2] = [
+        row("own_first", DeriveStage::Implicit, "own_second"),
+        row("own_second", DeriveStage::Implicit, "hidden_size"),
+    ];
+    static READS_LATER_STAGE: [DerivedDim; 1] =
+        [row("too_early", DeriveStage::Implicit, "q_global_dim")];
+    static READS_BEFORE_FALLBACKS_CORE: [DerivedDim; 1] =
+        [row("before_core", DeriveStage::BeforeFallbacks, "kv_dim")];
+    static READS_PROBE: [DerivedDim; 1] = [row("borrows", DeriveStage::Implicit, "probe_width")];
+
+    /// The table's order is load-bearing: a rule reading another derived dim finds it derived only
+    /// if that one comes EARLIER, at the same or an earlier stage. So a reordering that would
+    /// silently change a value fails here.
+    #[test]
+    fn a_derived_dim_reads_only_derived_dims_above_it() {
+        DimTable::assemble(&[]).expect("the core rows keep the order law");
+    }
+
+    /// A decoder state's row reads the core rows and its own rows above it, at the same or an earlier
+    /// stage, and nothing else the table derives: not its own later row, not a later stage's row,
+    /// and not another decoder state's, which deleting that decoder state would take away.
+    #[test]
+    fn a_state_row_reads_only_earlier_rows() {
+        let table = DimTable::assemble(&[&Probe, &Dims("own", &READS_OWN_EARLIER)])
+            .expect("a row reading the core inputs and its own earlier row assembles");
+        assert!(table.find("own_second").is_some());
+        breaks_order(&[&Dims("own", &READS_OWN_LATER)], "own_first", "own_second");
+        breaks_order(
+            &[&Dims("early", &READS_LATER_STAGE)],
+            "too_early",
+            "q_global_dim",
+        );
+        breaks_order(
+            &[&Dims("first", &READS_BEFORE_FALLBACKS_CORE)],
+            "before_core",
+            "kv_dim",
+        );
+        breaks_order(
+            &[&Probe, &Dims("borrower", &READS_PROBE)],
+            "borrows",
+            "probe_width",
+        );
+        breaks_order(
+            &[&Dims("borrower", &READS_PROBE), &Probe],
+            "borrows",
+            "probe_width",
+        );
     }
 }

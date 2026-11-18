@@ -147,6 +147,20 @@ impl DerivedRule {
         }
     }
 
+    /// Every bound the rule reads, a gated rule's flag and both arms included, into `out`.
+    pub fn reads(&self, out: &mut Vec<&'static str>) {
+        match self {
+            Self::Bound(name) => out.push(name),
+            Self::Lit(_) => {}
+            Self::Mul(rules) | Self::Add(rules) => rules.iter().for_each(|r| r.reads(out)),
+            Self::Gated { flag, on, off } => {
+                out.push(flag);
+                on.reads(out);
+                off.reads(out);
+            }
+        }
+    }
+
     /// The rule's value under `bounds`, `None` when a bound it reads is absent.
     pub fn eval(&self, bounds: &std::collections::BTreeMap<String, u64>) -> Option<u64> {
         match self {
@@ -167,11 +181,15 @@ impl DerivedRule {
     }
 }
 
-/// When the config loader derives a [`DerivedDim`]: with the implicit bounds, or after the generic
-/// defaults (the global attention class's widths read `global_head_dim` /
-/// `num_global_key_value_heads`, which default then).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// When the config loader derives a [`DerivedDim`]: before the fallbacks (`head_dim` as
+/// `hidden_size / num_attention_heads`, `num_key_value_heads` as `num_attention_heads`), so a row
+/// stated here wins over them; with the implicit bounds; or after the generic defaults (the global
+/// attention class's widths read `global_head_dim` / `num_global_key_value_heads`, which default
+/// then). Declared in the order the loader runs them, so a row may read one of a stage that
+/// compares no greater than its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeriveStage {
+    BeforeFallbacks,
     Implicit,
     AfterDefaults,
 }
@@ -311,56 +329,6 @@ pub fn derive_dims(
         {
             derived.insert(d.name.to_string(), d.rule.dim(bounds));
             bounds.insert(d.name.to_string(), v);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every bound a rule reads, nested rules included.
-    fn reads(rule: &DerivedRule, out: &mut Vec<&'static str>) {
-        match rule {
-            DerivedRule::Bound(name) => out.push(name),
-            DerivedRule::Lit(_) => {}
-            DerivedRule::Mul(rules) | DerivedRule::Add(rules) => {
-                rules.iter().for_each(|r| reads(r, out));
-            }
-            DerivedRule::Gated { flag, on, off } => {
-                out.push(flag);
-                reads(on, out);
-                reads(off, out);
-            }
-        }
-    }
-
-    /// The table's order is load-bearing: a rule reading another derived dim finds it derived only
-    /// if that one comes EARLIER, at the same or an earlier stage. So a reordering that would
-    /// silently change a value fails here.
-    #[test]
-    fn a_derived_dim_reads_only_derived_dims_above_it() {
-        let rank = |s: DeriveStage| match s {
-            DeriveStage::Implicit => 0,
-            DeriveStage::AfterDefaults => 1,
-        };
-        for (i, d) in DERIVED_DIMS.iter().enumerate() {
-            let mut names = Vec::new();
-            reads(&d.rule, &mut names);
-            for name in names {
-                if let Some(j) = DERIVED_DIMS.iter().position(|e| e.name == name) {
-                    assert!(
-                        j < i,
-                        "`{}` reads `{name}`, which the table derives after it",
-                        d.name
-                    );
-                    assert!(
-                        rank(DERIVED_DIMS[j].stage) <= rank(d.stage),
-                        "`{}` reads `{name}`, which is derived at a later stage",
-                        d.name
-                    );
-                }
-            }
         }
     }
 }
