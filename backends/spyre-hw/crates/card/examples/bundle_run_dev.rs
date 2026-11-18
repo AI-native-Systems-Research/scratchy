@@ -8,8 +8,9 @@
 //!   <dir> t0=x.bin t1=w.bin --out t2=o.bin
 //! ```
 //!
-//! The three markers that ride on the input list are the same ones `scr bundle run --input` takes:
-//! `stick:t<id>=<rows>`, `raw:t<id>` and `const:t<id>=<value>`. An embedding gather, for instance:
+//! The four markers that ride on the input list are the same ones `scr bundle run --input` takes:
+//! `stick:t<id>=<rows>`, `raw:t<id>`, `const:t<id>=<value>` and `fp32:t<id>=<path>` (a resident
+//! f32 const, staged verbatim through `bind_const_fp32`). An embedding gather, for instance:
 //!
 //! ```bash
 //! ... <dir> t0=tokens_i32.bin raw:t0 t1=table.bin stick:t1=256 t2=out.bin stick:t2=256 \

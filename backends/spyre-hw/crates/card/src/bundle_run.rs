@@ -232,6 +232,35 @@ fn split_const(s: &str) -> Result<(u32, Vec<u8>)> {
     Ok((tid, h.to_le_bytes().to_vec()))
 }
 
+/// `fp32:t<id>=<path>` — bind a RESIDENT FP32 CONSTANT's bytes from a file, staged VERBATIM.
+///
+/// The door's reserved-constant floor holds f16 magnitudes (an rmsnorm's `1/cols`, a scalar
+/// multiplier) and, since the MoE ids path, F32 STICKS — the reference's `[1, chunks, 1]` chunk
+/// scale and offset, every lane the value. The weight channel every other reserved const takes
+/// re-encodes its bytes through `ieee_to_sen_bytes`, which reads a 4-byte fp32 as TWO fp16
+/// values and rewrites both mantissas — a fluent, valid, arbitrary number per word (the same
+/// mangling [`split_raw`] records for an int32 index). [`crate::superdsc_exec::Executor::
+/// bind_const_fp32`] is the executor's own channel for these: `Df::Fp32` IS IEEE fp32, so the
+/// host's LE bytes are the device's own and nothing may touch them. This is the spelling that
+/// reaches it from a bundle directory.
+///
+/// ⛔ IT IS A BINDING, not a marker: the fp32 channel has no fp16 default to modify, so the
+/// path rides here (`const:`'s own shape — value inline — at file size).
+fn split_fp32(s: &str) -> Result<(u32, String)> {
+    let body = s
+        .strip_prefix("fp32:")
+        .ok_or_else(|| anyhow!("wants `fp32:t<id>=<path>`, got `{s}`"))?;
+    let (tid, path) = body
+        .split_once('=')
+        .ok_or_else(|| anyhow!("wants `fp32:t<id>=<path>`, got `{s}`"))?;
+    let tid = tid
+        .strip_prefix('t')
+        .unwrap_or(tid)
+        .parse::<u32>()
+        .with_context(|| format!("`{s}`: `{tid}` is not a tensor id"))?;
+    Ok((tid, path.to_string()))
+}
+
 /// A bound tensor's BYTES, however the caller spelled them.
 ///
 /// ⭐ ONE LIST, not a file map beside a const map: `is_weight`, the source-id count, the placement
@@ -561,7 +590,12 @@ fn run_loaded(
         .collect::<Result<_>>()?;
     let mut inputs: BTreeMap<u32, Payload> = input
         .iter()
-        .filter(|s| !s.starts_with("stick:") && !s.starts_with("raw:") && !s.starts_with("const:"))
+        .filter(|s| {
+            !s.starts_with("stick:")
+                && !s.starts_with("raw:")
+                && !s.starts_with("const:")
+                && !s.starts_with("fp32:")
+        })
         .map(|s| split_binding(s, "input").map(|(tid, path)| (tid, Payload::File(path))))
         .collect::<Result<_>>()?;
     // `const:t<id>=<value>` — a scalar stated inline instead of in a two-byte file. It joins the SAME
@@ -579,6 +613,26 @@ fn run_loaded(
             );
         }
     }
+    // `fp32:t<id>=<path>` — the resident-f32-const channel (see `split_fp32`): staged through
+    // `bind_const_fp32`, verbatim, never through the fp16 re-encoding every other weight takes.
+    let fp32s: std::collections::BTreeSet<u32> = input
+        .iter()
+        .filter(|s| s.starts_with("fp32:"))
+        .map(|s| split_fp32(s).map(|(tid, path)| (tid, Payload::File(path))))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(tid, payload)| {
+            // The same collision law the `const:` loop states, for the same reason.
+            if let Some(prev) = inputs.insert(tid, payload) {
+                bail!(
+                    "fp32:t{tid}: t{tid} is already bound by `{}` — two statements of one \
+                     tensor's contents, and nothing here can know which the caller meant",
+                    prev.how()
+                );
+            }
+            Ok(tid)
+        })
+        .collect::<Result<_>>()?;
     // `synth:<name>[@rows]=<path>`. The optional `@rows` is the same statement `stick:tN=<rows>`
     // makes for a bound tensor, said for a synthetic — which has no tid to key that map by.
     let synth_out: Vec<(String, Option<u64>, String)> = output
@@ -681,6 +735,34 @@ fn run_loaded(
         }
     }
 
+    // ⛔ THE fp32 CHANNEL IS EXCLUSIVE, for the same reason `raw:` is: the stick-major map and the
+    // SEN conversion both read 2-byte fp16 elements, and a resident f32 const is 4-byte IEEE the
+    // device takes verbatim — any second marker would either permute its half-words or re-encode
+    // them into different, valid, arbitrary numbers.
+    for tid in &fp32s {
+        if raws.contains(tid) {
+            bail!(
+                "fp32:t{tid} and raw:t{tid}: both say to stage t{tid} outside the fp16 re-encoding, \
+                 but they are different channels — `raw:` is the per-step activation path, `fp32:` \
+                 the resident-const one (`bind_const_fp32`). Pick one; the tensor is one thing."
+            );
+        }
+        if sticks.contains_key(tid) {
+            bail!(
+                "fp32:t{tid} and stick:t{tid}: the stick-major map permutes 2-byte fp16 elements, \
+                 and a resident f32 const is 4-byte IEEE staged verbatim. Permuting it would swap \
+                 half-words between f32 entries and yield numbers nobody asked for."
+            );
+        }
+        if let Some(Payload::Inline(_)) = inputs.get(tid) {
+            bail!(
+                "fp32:t{tid} and const:t{tid}: a `const:` value is an fp16 scalar and a resident \
+                 f32 const is 4-byte IEEE — two different encodings of one tensor, and nothing \
+                 here can know which the caller meant"
+            );
+        }
+    }
+
     // ⛔⛔⛔ REFUSED, NOT ASSUMED ROW-MAJOR. A tensor spanning more than one 64-lane stick is
     // addressed STICK-MAJOR by the descriptors (see `dev_order`), and binding or reading it
     // row-major returns a fluent, plausible, WRONG answer — measured 0.0193 within_2pct on
@@ -779,9 +861,30 @@ fn run_loaded(
     let is_weight = |tid: u32| -> bool {
         tid >= RESERVED_TID_FLOOR || pf.places.iter().any(|p| p.tid == tid && p.role == "Weight")
     };
+    // ⭐ THE fp32 CHANNEL BINDS THROUGH THE EXECUTOR'S OWN PARTITION — ONE STATEMENT OF THE LAW.
+    // `bind_const_fp32` IS the statement that this tensor stages once, verbatim, before prepare:
+    // it inserts the id into the executor's `weight_ids` itself (superdsc_exec), and
+    // `stage_weights` copies its bytes VERBATIM (`StageMode::Verbatim`, checked ahead of every
+    // converter), under its own placement/whole-entries/over-bind guards. The runner does NOT
+    // re-derive that partition with `is_weight` here: a reserved f32 stick below
+    // `RESERVED_TID_FLOOR` whose placement's role is `Activation` (the MoE chunk sticks — the
+    // layout's own law for a reserved const, same as the fp16 ramps) is exactly this channel's
+    // customer, and a second weight statement would refuse it while agreeing today and diverging
+    // the day the layout moves a region. Both loops below skip these tids: one binding, one
+    // statement.
+    for tid in &fp32s {
+        let payload = &inputs[tid];
+        exec.bind_const_fp32(
+            ktir_superdsc::place::PlaceId::Act(*tid),
+            payload.bytes(*tid)?,
+        )?;
+    }
     // The producer's reserved device constants AND the layout's weights: staged once, bound before
     // prepare.
-    for (tid, payload) in inputs.iter().filter(|(t, _)| is_weight(**t)) {
+    for (tid, payload) in inputs
+        .iter()
+        .filter(|(t, _)| is_weight(**t) && !fp32s.contains(*t))
+    {
         let bytes = payload.bytes(*tid)?;
         let want = pf
             .places
@@ -863,11 +966,14 @@ fn run_loaded(
     // segment AFTER staging had written the reserved consts into it — destroying them while
     // the launch reported success, the same all-wrong-output shape the gamma story records.
     // One derivation, already in hand: `is_weight` is the split the weight loop itself uses,
-    // so the two cannot disagree about which tensors are weights.
+    // so the two cannot disagree about which tensors are weights. ⭐ AND THE fp32 SET RIDES THE
+    // SAME PRINCIPLE: a `bind_const_fp32` tensor stages in this same pre-prepare phase, so a
+    // segment holding one and nothing the split above names would be zeroed AFTER staging wrote
+    // it — the gamma story's exact shape, at a below-floor id the split does not reach.
     let weight_segs: std::collections::BTreeSet<_> = pf
         .places
         .iter()
-        .filter(|p| p.role == "Weight" || is_weight(p.tid))
+        .filter(|p| p.role == "Weight" || is_weight(p.tid) || fp32s.contains(&p.tid))
         .map(|p| p.segment)
         .collect();
     // ⭐ AND THE SEGMENTS ONLY A SYNTHETIC NAMES. A lowering bump-allocates its intermediates into
@@ -900,7 +1006,10 @@ fn run_loaded(
     // and 4, and left the read-back with no shadow to read. MEASURED, shadows per segment:
     //   after stage_weights   128 128 128 532608 524288 128 128
     //   after prepare (bound first)   0   0 128      0      0   0   0
-    for (tid, payload) in inputs.iter().filter(|(t, _)| !is_weight(**t)) {
+    for (tid, payload) in inputs
+        .iter()
+        .filter(|(t, _)| !is_weight(**t) && !fp32s.contains(*t))
+    {
         let bytes = payload.bytes(*tid)?;
         let want = pf
             .places
