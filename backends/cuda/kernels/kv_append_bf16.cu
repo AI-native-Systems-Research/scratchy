@@ -46,12 +46,12 @@ using namespace kittens;
 namespace {
 
 // `step::KV_APPEND_BF16_HEAD_DIMS`: the head dims the kernel is instantiated for.
-constexpr int HEAD_DIM_SLIDING = 256;
-constexpr int HEAD_DIM_GLOBAL = 512;
+constexpr int HEAD_DIM_SLIDING = scratchy::KV_APPEND_BF16_HEAD_DIMS[0];
+constexpr int HEAD_DIM_GLOBAL = scratchy::KV_APPEND_BF16_HEAD_DIMS[1];
 // Token slots per block, the attention kernel's K/V tile height (`step::CUDA_KV_BLOCK_SIZE`).
-constexpr uint32_t BLOCK_SIZE = 64;
+constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
 // A padding row's slot.
-constexpr uint32_t NO_SLOT = 0xFFFFFFFFu;
+constexpr uint32_t NO_SLOT = scratchy::NO_SLOT;
 // The most blocks a u32 slot can address: a larger `num_blocks` changes no write.
 constexpr uint32_t MAX_SLOT_BLOCKS = (NO_SLOT / BLOCK_SIZE) + 1;
 constexpr int WARPS = 4;

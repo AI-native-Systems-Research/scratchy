@@ -62,15 +62,16 @@ constexpr int NUM_WARPS = NUM_WARPGROUPS * kittens::WARPGROUP_WARPS;
 constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
 // Query rows per CTA (`step::ATTN_PREFILL_BF16_ROWS`).
 constexpr int CTA_ROWS = CONSUMER_WARPGROUPS * QO_HEIGHT;
+static_assert(CTA_ROWS == scratchy::ATTN_PREFILL_BF16_ROWS, "step::ATTN_PREFILL_BF16_ROWS");
 // The named barrier over the two consumer warpgroups (ids 4 and 5 are each warpgroup's own, at
 // the O store; 0 is `__syncthreads`).
 constexpr int CONSUMERS_BARRIER = 1;
 using consumers = kittens::group<CONSUMER_WARPGROUPS * kittens::WARPGROUP_WARPS>;
 // Token slots per KV block (`step::CUDA_KV_BLOCK_SIZE`): one block is one K (or V) tile.
-constexpr uint32_t BLOCK_SIZE = 64;
+constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
 static_assert(KV_HEIGHT == int(BLOCK_SIZE), "one paged (block, kv head) tile is one TMA box");
 // Entries of a sequence's block table (`step::CUDA_MAX_BLOCKS_PER_SEQ`): the columns of its view.
-constexpr uint32_t MAX_BLOCKS_PER_SEQ = 128;
+constexpr uint32_t MAX_BLOCKS_PER_SEQ = scratchy::CUDA_MAX_BLOCKS_PER_SEQ;
 
 using q_tile = st_bf<QO_HEIGHT, HEAD_DIM>;
 // A K or V tile as cached, and as widened for the WGMMAs.

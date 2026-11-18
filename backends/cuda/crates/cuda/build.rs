@@ -18,6 +18,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The constants the kernels share with Rust: `cuda_header` is the header every kernel is
+/// compiled with.
+mod kernel_consts {
+    include!("src/kernel_consts.rs");
+}
+
+/// The generated header's file name in `OUT_DIR`.
+const CONSTS_HEADER: &str = "scratchy_consts.cuh";
+
 /// The one compile target: Hopper with its architecture-specific instructions (WGMMA, TMA,
 /// `setmaxnreg`). No `compute_90a` PTX is embedded, so the driver cannot JIT for another GPU.
 const CUDA_ARCH: &str = "sm_90a";
@@ -30,6 +39,7 @@ const KERNEL_LIB: &str = "scratchy_cuda_kernels";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/kernel_consts.rs");
     println!("cargo:rerun-if-changed=../../kernels");
     println!("cargo:rerun-if-env-changed=PATH");
 
@@ -58,9 +68,13 @@ fn main() {
         .collect();
     sources.sort();
 
+    let header = out_dir.join(CONSTS_HEADER);
+    std::fs::write(&header, kernel_consts::cuda_header())
+        .unwrap_or_else(|e| panic!("write {} failed: {e}", header.display()));
+
     let objects: Vec<PathBuf> = sources
         .iter()
-        .map(|src| compile_kernel(&nvcc, src, &kernel_dir, &out_dir))
+        .map(|src| compile_kernel(&nvcc, src, (&kernel_dir, &header), &out_dir))
         .collect();
 
     // Archive with nvcc itself, so no separate `ar` is needed.
@@ -163,8 +177,14 @@ fn parse_release(text: &str) -> Option<(u32, u32)> {
 
 /// `nvcc -c kernels/<stem>.cu -o $OUT_DIR/<stem>.o` with the flags of ThunderKittens'
 /// `kernels/common.mk` (`ARCH := SM90`, `CONFIG := standalone`), minus its link-only and
-/// verbose-report flags, plus `-fPIC` for a library. nvcc's stderr is inherited.
-fn compile_kernel(nvcc: &Path, src: &Path, kernel_dir: &Path, out_dir: &Path) -> PathBuf {
+/// verbose-report flags, plus `-fPIC` for a library and `-include` of the shared constants'
+/// `header`. nvcc's stderr is inherited.
+fn compile_kernel(
+    nvcc: &Path,
+    src: &Path,
+    (kernel_dir, header): (&Path, &Path),
+    out_dir: &Path,
+) -> PathBuf {
     let stem = src.file_stem().unwrap().to_str().unwrap();
     let obj = out_dir.join(format!("{stem}.o"));
     let tk = kernel_dir.join("thunderkittens");
@@ -187,6 +207,8 @@ fn compile_kernel(nvcc: &Path, src: &Path, kernel_dir: &Path, out_dir: &Path) ->
         .arg(tk.join("prototype"))
         .arg("-I")
         .arg(kernel_dir)
+        .arg("-include")
+        .arg(header)
         .arg("-c")
         .arg(src)
         .arg("-o")

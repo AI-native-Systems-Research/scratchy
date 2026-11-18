@@ -64,18 +64,18 @@ using namespace kittens;
 namespace {
 
 // `step::GDN_HEAD_K` and `step::GDN_CONV_CHANNEL_GROUP`: one warp's channels.
-constexpr int HEAD_K = 128;
-constexpr int GROUP = 128;
+constexpr int HEAD_K = scratchy::GDN_HEAD_K;
+constexpr int GROUP = scratchy::GDN_CONV_CHANNEL_GROUP;
 constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 constexpr int WARP_ROWS = 16;
 // `step::GDN_GATING_NV_MULTIPLE`.
-constexpr int NV_CHUNK = 16;
+constexpr int NV_CHUNK = scratchy::GDN_GATING_NV_MULTIPLE;
 // `step::GDN_DECODE_MAX_HEADS`: the widest cluster (the portable cluster size), a key head's CTAs.
-constexpr uint32_t MAX_CLUSTER_HEADS = 8;
+constexpr uint32_t MAX_CLUSTER_HEADS = scratchy::GDN_DECODE_MAX_HEADS;
 // `step::GDN_CONV_KERNEL_RANGE`.
-constexpr uint32_t KMIN = 2;
-constexpr uint32_t KMAX = 8;
+constexpr uint32_t KMIN = scratchy::GDN_CONV_KERNEL_RANGE[0];
+constexpr uint32_t KMAX = scratchy::GDN_CONV_KERNEL_RANGE[1];
 using chan_vec = rv_fl<GROUP>;
 using chunk_rv = rv_fl<NV_CHUNK>;
 using state_tile = rt_fl<WARP_ROWS, HEAD_K>;

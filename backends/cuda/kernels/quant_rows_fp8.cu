@@ -50,7 +50,7 @@ namespace {
 
 // `step::GEMM_FP8_K_MULTIPLE`: `cols` is a multiple of it, so every row stride (`cols` e4m3 bytes,
 // `2·cols` bf16 bytes) is a multiple of 16, as the tensor maps need, and the GEMM's K steps tile it.
-constexpr uint32_t COL_MULTIPLE = 64;
+constexpr uint32_t COL_MULTIPLE = scratchy::GEMM_FP8_K_MULTIPLE;
 // One tile's rows: `rows` is a multiple of it.
 constexpr int ROWS = 16;
 constexpr int COLS = 256;

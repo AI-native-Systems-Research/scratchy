@@ -81,12 +81,12 @@ using namespace kittens;
 namespace {
 
 // `step::GDN_HEAD_K`, and the key half one 128-byte-swizzled bf16 tile holds.
-constexpr int HEAD_K = 128;
+constexpr int HEAD_K = scratchy::GDN_HEAD_K;
 constexpr int HALF = 64;
 // `step::GDN_HEAD_V_MULTIPLE`: the value rows of one CTA.
-constexpr int ROWS = 32;
+constexpr int ROWS = scratchy::GDN_HEAD_V_MULTIPLE;
 // `step::GDN_HEAD_V_MAX`.
-constexpr uint32_t HEAD_V_MAX = 256;
+constexpr uint32_t HEAD_V_MAX = scratchy::GDN_HEAD_V_MAX;
 // The chunk: WGMMA's M.
 constexpr int CHUNK = 64;
 constexpr int WARPS = 4;

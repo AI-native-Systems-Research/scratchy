@@ -62,9 +62,9 @@ namespace {
 
 // `step::GEMM_NARROW_BF16_MULTIPLE`: `n` and `k` are multiples of it, so every row stride is a
 // multiple of 16 bytes, as the tensor maps need.
-constexpr uint32_t VEC = 8;
+constexpr uint32_t VEC = scratchy::GEMM_NARROW_BF16_MULTIPLE;
 // `step::GEMM_NARROW_BF16_MAX_N`: B's rows, all in one 64-row tile.
-constexpr uint32_t MAX_N = 64;
+constexpr uint32_t MAX_N = scratchy::GEMM_NARROW_BF16_MAX_N;
 // Rows and columns of a tile, and K per tile.
 constexpr int TILE = 64;
 constexpr int STAGES = 4;
@@ -252,7 +252,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_group_bf16_ker(
 constexpr int ONE_WARPS = 8;
 constexpr int ONE_THREADS = ONE_WARPS * kittens::WARP_THREADS;
 // `step::GEMM_NARROW_BF16_ONE_K_MULTIPLE`: one chunk, a naive `rv_fl<256>`.
-constexpr int ONE_CHUNK = 256;
+constexpr int ONE_CHUNK = scratchy::GEMM_NARROW_BF16_ONE_K_MULTIPLE;
 
 using one_vec = rv_fl<ONE_CHUNK>;
 using one_in_gl = gl<bf16, 1, 1, -1, -1>;

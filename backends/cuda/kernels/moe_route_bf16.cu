@@ -59,15 +59,15 @@ using namespace kittens;
 namespace {
 
 // `step::MOE_ROUTE_EXPERTS`: the Qwen program's one count, one naive `rv_fl<256>` per row.
-constexpr int QWEN_EXPERTS = 256;
+constexpr int QWEN_EXPERTS = scratchy::MOE_ROUTE_EXPERTS;
 // `op_abi::MOE_EXPERT_COUNTS`: the Gemma program's counts.
-constexpr int GEMMA_EXPERTS_SMALL = 128;
-constexpr int GEMMA_EXPERTS_LARGE = 256;
+constexpr int GEMMA_EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
+constexpr int GEMMA_EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
 // The launcher's `program`.
 constexpr uint32_t QWEN = 0;
 constexpr uint32_t GEMMA = 1;
 // `step::MOE_ROUTE_MAX_TOP_K`.
-constexpr uint32_t MAX_TOP_K = 32;
+constexpr uint32_t MAX_TOP_K = scratchy::MOE_ROUTE_MAX_TOP_K;
 constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 

@@ -64,7 +64,7 @@ using namespace kittens::prototype::lcf;
 namespace {
 
 // One thread block per SM of an H100 SXM, as `gemm_bf16.cu`: correctness does not depend on it.
-constexpr int H100_SXM_SMS = 132;
+constexpr int H100_SXM_SMS = scratchy::H100_SXM_SMS;
 
 // An e4m3 operand's tile at K step `K_STEP` (64 or 128), and its view.
 template <int K_STEP> using k_tile = st_fp8e4m3<64, K_STEP>;
@@ -663,10 +663,10 @@ using gate_up_silu_fp8_mmt = gate_up_template<scratchy::ops::silu_mul, 2, N_BLOC
 template <int N_BLOCK, int K_STEP>
 using gate_up_gelu_fp8_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, N_BLOCK, 8, K_STEP>;
 // `op_abi::MOE_EXPERT_COUNTS` and `step::EXPERT_GEMM_N_TILES`, as `expert_gemm_bf16.cu`'s three.
-constexpr int EXPERTS_SMALL = 128;
-constexpr int EXPERTS_LARGE = 256;
-constexpr uint32_t N_TILE_NARROW = 64;
-constexpr uint32_t N_TILE_WIDE = 256;
+constexpr int EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
+constexpr int EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
+constexpr uint32_t N_TILE_NARROW = scratchy::EXPERT_GEMM_N_TILES[0];
+constexpr uint32_t N_TILE_WIDE = scratchy::EXPERT_GEMM_N_TILES[1];
 using expert_gemm_fp8_mmt = expert_template<EXPERTS_LARGE, 4>;
 using expert_gemm_e128_fp8_mmt = expert_template<EXPERTS_SMALL, 4>;
 using expert_gemm_e128_col64_fp8_mmt = expert_template<EXPERTS_SMALL, 1>;

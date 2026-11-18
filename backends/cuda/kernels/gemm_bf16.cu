@@ -41,7 +41,7 @@ using namespace kittens::prototype::lcf;
 
 // One thread block per SM of an H100 SXM. Each block loops over output tiles until none are left,
 // so correctness does not depend on this number; only speed does.
-constexpr int H100_SXM_SMS = 132;
+constexpr int H100_SXM_SMS = scratchy::H100_SXM_SMS;
 
 template<int M_BLOCK, int N_BLOCK>
 struct matmul_layout {
@@ -355,16 +355,22 @@ struct gate_up_template {
     };
 };
 
-using gemm_bf16_abt_mmt = matmul_template<2, 4, 8>;
+using gemm_bf16_abt_mmt =
+    matmul_template<scratchy::GEMM_BF16_TILE[0] / 64, scratchy::GEMM_BF16_TILE[1] / 64, 8>;
 using gate_up_silu_mmt = gate_up_template<scratchy::ops::silu_mul, 2, 2, 8>;
 using gate_up_gelu_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, 2, 8>;
 // One 64-column block per accumulator: the 64-column GEMM's (`gemm_col64_bf16_abt_mmt`) shapes,
 // Gemma's 2112-column dense MLP.
 using gate_up_silu_col64_mmt = gate_up_template<scratchy::ops::silu_mul, 2, 1, 8>;
 using gate_up_gelu_col64_mmt = gate_up_template<scratchy::ops::gelu_tanh_mul, 2, 1, 8>;
-using gemm_group_bf16_abt_mmt = group_template<2, 4, 8>;
+using gemm_group_bf16_abt_mmt =
+    group_template<scratchy::GEMM_BF16_TILE[0] / 64, scratchy::GEMM_BF16_TILE[1] / 64, 8>;
 // One 64-column B block: `rt_fl<16, 64>` accumulators, `a[2]` and `b[1]` input tiles, `c[2][1]`.
-using gemm_col64_bf16_abt_mmt = matmul_template<2, 1, 8>;
+using gemm_col64_bf16_abt_mmt =
+    matmul_template<scratchy::GEMM_COL64_TILE[0] / 64, scratchy::GEMM_COL64_TILE[1] / 64, 8>;
+// The templates step K by one 64-wide tile, the launchers' `K_TILE`.
+static_assert(scratchy::GEMM_BF16_TILE[2] == 64 && scratchy::GEMM_COL64_TILE[2] == 64,
+              "step::GEMM_BF16_TILE and GEMM_COL64_TILE");
 
 // The dynamic shared memory every launch asks for, and the attribute `_prepare` raises the
 // kernel's limit to: the whole H100 budget minus the 1024 bytes `lcf` reserves for alignment.

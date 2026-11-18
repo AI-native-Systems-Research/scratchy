@@ -66,18 +66,20 @@ namespace {
 
 // `op_abi::MOE_EXPERT_COUNTS`: the expert counts the sort is instantiated at, one counter per
 // expert.
-constexpr int EXPERTS_SMALL = 128;
-constexpr int EXPERTS_LARGE = 256;
+constexpr int EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
+constexpr int EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
 // `step::MOE_SORT_CHUNK`: pairs per `chunk_hist` row, one warp of (a) each.
-constexpr int CHUNK = 256;
+constexpr int CHUNK = scratchy::MOE_SORT_CHUNK;
 // `step::MOE_ROUTE_MAX_TOP_K`.
-constexpr uint32_t MAX_TOP_K = 32;
+constexpr uint32_t MAX_TOP_K = scratchy::MOE_ROUTE_MAX_TOP_K;
 // `op_abi::CUDA_EXPERT_TILE_ROWS`: the grouped GEMM's row tile, the runs' padding.
-constexpr int TILE_ROWS = 128;
+constexpr int TILE_ROWS = scratchy::CUDA_EXPERT_TILE_ROWS;
+// `op_abi::CUDA_FP8_EXPERT_TILE_ROWS`: an fp8 bank's row tile.
+constexpr int FP8_TILE_ROWS = scratchy::CUDA_FP8_EXPERT_TILE_ROWS;
 static_assert(scratchy::ops::tile_pad::ROWS == TILE_ROWS, "the scan pads to the GEMM's tile");
 // `step::EMBED_BF16_COLS`'s rule: `hidden` a multiple of 8 bf16, so a row is whole 16-byte units
 // and starts 16-byte aligned, as the bulk copy needs.
-constexpr uint32_t VEC = 8;
+constexpr uint32_t VEC = scratchy::EMBED_BF16_COLS;
 // The bf16 elements one bulk copy moves at most: one 4 KiB buffer, qwen3-5-moe's whole row.
 constexpr int ROW_CHUNK = 2048;
 constexpr int WARPS = 8;
@@ -379,11 +381,13 @@ extern "C" int scratchy_cuda_moe_sort_prepare(void) {
         e != cudaSuccess) {
         return static_cast<int>(e);
     }
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_SMALL, 64>);
+    if (const cudaError_t e =
+            cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_SMALL, FP8_TILE_ROWS>);
         e != cudaSuccess) {
         return static_cast<int>(e);
     }
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_LARGE, 64>);
+    if (const cudaError_t e =
+            cudaFuncGetAttributes(&attr, moe_sort_offsets_ker<EXPERTS_LARGE, FP8_TILE_ROWS>);
         e != cudaSuccess) {
         return static_cast<int>(e);
     }
@@ -545,6 +549,7 @@ extern "C" int scratchy_cuda_moe_sort_fp8_m64(const void* xq, const void* x_scal
                                               uint32_t experts, uint32_t top_k, uint32_t hidden,
                                               uint32_t max_tiles,
                                               void* stream /* cudaStream_t; null = default */) {
-    return sort_fp8<64>(xq, x_scale, topk_idx, chunk_hist, counts, offsets, tile_expert, pos, rows,
-                        row_scale, m, experts, top_k, hidden, max_tiles, stream);
+    return sort_fp8<FP8_TILE_ROWS>(xq, x_scale, topk_idx, chunk_hist, counts, offsets, tile_expert,
+                                   pos, rows, row_scale, m, experts, top_k, hidden, max_tiles,
+                                   stream);
 }

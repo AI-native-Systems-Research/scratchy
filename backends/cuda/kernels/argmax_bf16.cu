@@ -33,7 +33,7 @@ using namespace kittens;
 namespace {
 
 // `step::ARGMAX_CHUNK`: the logits one warp reads at a time, and the iota's length.
-constexpr int CHUNK = 256;
+constexpr int CHUNK = scratchy::ARGMAX_CHUNK;
 constexpr int WARPS = 8;
 constexpr int THREADS = WARPS * kittens::WARP_THREADS;
 // The largest row whose ids are exact f32s.

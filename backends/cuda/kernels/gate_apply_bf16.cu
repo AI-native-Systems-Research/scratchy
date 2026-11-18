@@ -43,7 +43,7 @@ namespace {
 
 // `step::GATE_APPLY_BF16_COLS`: `cols` is a multiple of it, so every row stride is a multiple of 16 bytes,
 // as the tiles' tensor maps need.
-constexpr uint32_t VEC = 8;
+constexpr uint32_t VEC = scratchy::GATE_APPLY_BF16_COLS;
 constexpr int ROWS = 16;
 constexpr int COLS = 256;
 constexpr int WARPS = 4;

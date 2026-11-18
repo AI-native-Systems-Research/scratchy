@@ -50,8 +50,8 @@ namespace {
 constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 // `step::GDN_HEAD_V_MULTIPLE` and `step::GDN_HEAD_V_MAX`.
-constexpr uint32_t HEAD_V_MULTIPLE = 32;
-constexpr uint32_t HEAD_V_MAX = 256;
+constexpr uint32_t HEAD_V_MULTIPLE = scratchy::GDN_HEAD_V_MULTIPLE;
+constexpr uint32_t HEAD_V_MAX = scratchy::GDN_HEAD_V_MAX;
 
 // `o`, `z` and `out` viewed `[rows · nv, head_v]`: one `(t, h)` row each.
 using o_gl = gl<float, 1, 1, -1, -1>;

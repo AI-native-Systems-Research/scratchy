@@ -89,7 +89,7 @@ using namespace kittens;
 namespace {
 
 // `step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`: `head_dim` is whole boxes, so every head starts at a box.
-constexpr uint32_t HEAD_MULTIPLE = 64;
+constexpr uint32_t HEAD_MULTIPLE = scratchy::ROPE_BF16_KERNEL_HEAD_MULTIPLE;
 constexpr int ROWS = 16;
 constexpr int BOX_COLS = 64;
 constexpr int NUM_THREADS = kittens::WARP_THREADS;

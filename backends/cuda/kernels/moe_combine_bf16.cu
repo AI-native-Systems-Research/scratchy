@@ -37,9 +37,9 @@ using namespace kittens;
 namespace {
 
 // `step::MOE_COMBINE_BF16_CHUNK`: one naive `rv_fl<256>`; `hidden` is a multiple of it.
-constexpr int CHUNK = 256;
+constexpr int CHUNK = scratchy::MOE_COMBINE_BF16_CHUNK;
 // `step::MOE_ROUTE_MAX_TOP_K`.
-constexpr uint32_t MAX_TOP_K = 32;
+constexpr uint32_t MAX_TOP_K = scratchy::MOE_ROUTE_MAX_TOP_K;
 constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 

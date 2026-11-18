@@ -65,7 +65,7 @@ using namespace kittens;
 namespace {
 
 // `step::ATTN_D512_BF16_HEAD_DIM`, as two halves of the D = 256 kernel's tile width.
-constexpr int HEAD_DIM = 512;
+constexpr int HEAD_DIM = scratchy::ATTN_D512_BF16_HEAD_DIM;
 constexpr int HALF_DIM = 256;
 constexpr int HALVES = HEAD_DIM / HALF_DIM;
 // Query rows per CTA (both consumer warpgroups on the same rows), and K/V rows per tile.
@@ -77,7 +77,7 @@ constexpr int NUM_WARPGROUPS = CONSUMER_WARPGROUPS + 1;
 constexpr int NUM_WARPS = NUM_WARPGROUPS * kittens::WARPGROUP_WARPS;
 constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
 // `step::ATTN_PREFILL_BF16_ROWS`: the step's rows are a multiple, so a CTA pair covers each 128.
-constexpr uint32_t STEP_ROWS = 128;
+constexpr uint32_t STEP_ROWS = scratchy::ATTN_PREFILL_BF16_ROWS;
 static_assert(STEP_ROWS % QO_HEIGHT == 0, "whole CTAs per step tile");
 constexpr int CONSUMER_THREADS = CONSUMER_WARPGROUPS * kittens::WARPGROUP_THREADS;
 // The named barrier over the two consumer warpgroups (ids 4 and 5 are each warpgroup's own, at
@@ -85,10 +85,10 @@ constexpr int CONSUMER_THREADS = CONSUMER_WARPGROUPS * kittens::WARPGROUP_THREAD
 constexpr int CONSUMERS_BARRIER = 1;
 using consumers = kittens::group<CONSUMER_WARPGROUPS * kittens::WARPGROUP_WARPS>;
 // Token slots per KV block (`step::CUDA_KV_BLOCK_SIZE`): one block is one K (or V) tile.
-constexpr uint32_t BLOCK_SIZE = 64;
+constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
 static_assert(KV_HEIGHT == int(BLOCK_SIZE), "one paged (block, kv head) half is one TMA box");
 // Entries of a sequence's block table (`step::CUDA_MAX_BLOCKS_PER_SEQ`): the columns of its view.
-constexpr uint32_t MAX_BLOCKS_PER_SEQ = 128;
+constexpr uint32_t MAX_BLOCKS_PER_SEQ = scratchy::CUDA_MAX_BLOCKS_PER_SEQ;
 
 using half_tile = st_bf<QO_HEIGHT, HALF_DIM>;
 static_assert(KV_HEIGHT == QO_HEIGHT, "Q, K, V and O halves are one tile type");
