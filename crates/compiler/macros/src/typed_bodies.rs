@@ -153,7 +153,12 @@ fn standalone(emitted: &str) -> String {
     // The signature crate's source, in place of its import, with the front end at the paths the
     // standalone program defines it at.
     let bounds_include = "include!(concat!(env!(\"OUT_DIR\"), \"/signature_bounds.rs\"));";
-    let vocabulary = read("../typed-shapes/src/lib.rs")
+    let shapes = read("../typed-shapes/src/lib.rs");
+    assert!(
+        shapes.contains(bounds_include),
+        "scratchy-typed-shapes includes the build script's signature bounds"
+    );
+    let vocabulary = shapes
         .split("#[cfg(test)]")
         .next()
         .expect("split yields one part")

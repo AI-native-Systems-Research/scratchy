@@ -396,7 +396,8 @@ carrier calls). The touch points: the decoder state crate
 `scratchy-models-typed`'s dependency and build-dependency rows on it
 (`crates/models/typed/Cargo.toml`); and its entry in
 `crates/models/typed/src/decoder_states.rs`, the one list of decoder states a build
-compiles; and the `-p scratchy-state-decoder-mla` lines of the test and clippy steps in
+compiles; and the `-p scratchy-state-decoder-mla` lines of the test and clippy steps, the nightly
+compile_fail doctest step, and that step's coverage comment in
 `.github/workflows/rust.yml`.
 
 The decoder state crate states each op once, through `scratchy_decoder_state::state_op!`:

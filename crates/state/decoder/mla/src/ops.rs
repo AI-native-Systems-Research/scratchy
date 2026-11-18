@@ -6,12 +6,77 @@
 //! before a per-head sum, the latent before the rope key), which this module's
 //! `mla_products_order` pins.
 
+use std::marker::PhantomData;
+
 use scratchy_typed_shapes::ops::as_dim;
 use scratchy_typed_shapes::{Act, Add, BlockTable, Mul, Rotary, Tokens, W2};
 
-/// One layer's latent cache: opaque to shapes.
-#[derive(Clone, Copy)]
-pub struct MlaCache;
+/// One layer's latent cache, holding rows `[latent | roped k_pe]`: `R` is the latent width and `P`
+/// the rope width. The cache is opaque to shapes, so its widths are only these two parameters,
+/// and both ops that take it name them. An emitted carrier's `mla_cache()` is inferred from the op
+/// each call feeds, so that op fixes the widths; a hand-written signature that wires a cache of
+/// other widths does not build. Here a cache at rope width `Rope` is passed with a `k_pe` of that
+/// width:
+///
+/// ```
+/// use scratchy_state_decoder_mla::ops::{MlaCache, mla_attention};
+/// use scratchy_typed_shapes::{Act, Add, BlockTable, Mul, W2};
+///
+/// struct T;
+/// struct H;
+/// struct Nope;
+/// struct Rope;
+/// struct R;
+/// struct V;
+///
+/// fn wired(
+///     q: Act<T, Mul<H, Add<Nope, Rope>>>,
+///     latent: Act<T, R>,
+///     k_pe: Act<T, Rope>,
+///     kv_b: W2<R, Mul<H, Add<Nope, V>>>,
+///     cache: MlaCache<R, Rope>,
+///     block_table: BlockTable,
+/// ) -> Act<T, Mul<H, V>> {
+///     mla_attention(q, latent, k_pe, kv_b, cache, block_table)
+/// }
+/// ```
+///
+/// The same call with a cache built at another rope width, `Other`, is the only change, and is
+/// rejected:
+///
+/// ```compile_fail,E0308
+/// use scratchy_state_decoder_mla::ops::{MlaCache, mla_attention};
+/// use scratchy_typed_shapes::{Act, Add, BlockTable, Mul, W2};
+///
+/// struct T;
+/// struct H;
+/// struct Nope;
+/// struct Rope;
+/// struct Other;
+/// struct R;
+/// struct V;
+///
+/// fn wired(
+///     q: Act<T, Mul<H, Add<Nope, Rope>>>,
+///     latent: Act<T, R>,
+///     k_pe: Act<T, Rope>,
+///     kv_b: W2<R, Mul<H, Add<Nope, V>>>,
+///     cache: MlaCache<R, Other>,
+///     block_table: BlockTable,
+/// ) -> Act<T, Mul<H, V>> {
+///     mla_attention(q, latent, k_pe, kv_b, cache, block_table)
+/// }
+/// ```
+pub struct MlaCache<R, P>(PhantomData<fn() -> (R, P)>);
+
+// By hand: a derive would bound `R` and `P`, which are width markers and need be nothing.
+impl<R, P> Clone for MlaCache<R, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R, P> Copy for MlaCache<R, P> {}
 
 scratchy_decoder_state::state_op! {
     /// `mla_split(kv_a: [T, R + P]) -> ([T, R], [T, P])`: the compressed KV, then the one rope key
@@ -34,7 +99,7 @@ scratchy_decoder_state::state_op! {
         k_pe: Act<T, P>,
         _positions: Tokens<T>,
         _rotary: Rotary,
-        _cache: MlaCache,
+        _cache: MlaCache<L, P>,
     ) -> (Act<T, Q>, Act<T, L>, Act<T, P>) {
         (q, latent, k_pe)
     }
@@ -51,7 +116,7 @@ scratchy_decoder_state::state_op! {
         _latent: Act<T, R>,
         _k_pe: Act<T, Rope>,
         _kv_b: W2<R, Mul<H, Add<Nope, V>>>,
-        _cache: MlaCache,
+        _cache: MlaCache<R, Rope>,
         _block_table: BlockTable,
     ) -> Act<T, Mul<H, V>> {
         as_dim(q)
@@ -59,9 +124,10 @@ scratchy_decoder_state::state_op! {
     rows = M, tp = Whole;
 }
 
-/// `mla_cache[layer]`: one layer's latent cache.
-pub fn mla_cache() -> MlaCache {
-    MlaCache
+/// `mla_cache[layer]`: one layer's latent cache, at the latent and rope widths the ops it feeds
+/// take it at.
+pub fn mla_cache<R, P>() -> MlaCache<R, P> {
+    MlaCache(PhantomData)
 }
 
 #[cfg(test)]

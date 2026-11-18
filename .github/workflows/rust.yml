@@ -732,6 +732,7 @@ jobs:
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
   #   scratchy-subtile       src/state_op.rs
   #   scratchy-decoder-state  src/lib.rs  (state_op! and decoder_state!: a malformed op or list)
+  #   scratchy-state-decoder-mla  src/ops.rs  (MlaCache: a cache of another rope width)
   #   scratchy-target-spyre-card  src/runtime.rs
   # ktir-core's former E0080 wrong-copy fixture is deleted: it asserted a
   # `31` it declared inside itself, which proves only that `assert!` fails
@@ -759,7 +760,7 @@ jobs:
             backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Doctests (compile_fail error codes)
-        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal -p scratchy-subtile -p scratchy-decoder-state
+        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal -p scratchy-subtile -p scratchy-decoder-state -p scratchy-state-decoder-mla
       - name: Doctests (compile_fail error codes, spyre workspace)
         working-directory: backends/spyre
         run: cargo +nightly test --doc -p ktir-core

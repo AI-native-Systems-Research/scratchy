@@ -293,8 +293,9 @@ macro_rules! state_op {
 }
 
 /// One decoder state, listed once: its name, the absolute path of the module holding its ops'
-/// signatures and its inputs' constructors (`::<crate>::<module>`, as the typed carriers call it
-/// from another crate), each op [`state_op!`] declared there and each input's constructor.
+/// signatures and its inputs (`::<crate>::<module>`, as the typed carriers call it from another
+/// crate), each op [`state_op!`] declared there and each input, whose name must resolve in that
+/// module (`typed_emit` calls it as a nullary fn, so a non-fn fails in the generated carrier).
 /// Expands to a `static` [`DecoderState`] whose vocabulary declares those ops and inputs and whose
 /// `subtile` maps each op's name to its facts. A decoder state crate reaches its own signatures through
 /// the absolute path by naming itself: `extern crate self as <crate>;`.
@@ -360,9 +361,9 @@ macro_rules! state_op {
 /// fn main() {}
 /// ```
 ///
-/// Nor one listing an input with no constructor:
+/// Nor one listing an input whose name does not resolve in the signatures module:
 ///
-/// ```compile_fail,E0425
+/// ```compile_fail,E0432
 /// extern crate self as probe;
 ///
 /// pub mod ops {
@@ -410,8 +411,9 @@ macro_rules! decoder_state {
                 }
 
                 fn inputs(&self) -> &'static [$crate::__private::StateInputDecl] {
-                    // Each input names its constructor, which a carrier calls.
-                    $(let _: fn() -> _ = signatures::$input;)*
+                    // Each input names its constructor, which a carrier calls. Its type
+                    // parameters are the carrier's to infer, so only that the name resolves is checked.
+                    $(use signatures::$input as _;)*
                     const INPUTS: &[$crate::__private::StateInputDecl] = &[$(
                         $crate::__private::StateInputDecl {
                             name: $crate::__private::InputName::new(::core::stringify!($input)),
