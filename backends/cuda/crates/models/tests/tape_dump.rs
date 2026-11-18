@@ -47,7 +47,7 @@ use scratchy_target_cuda::step::{
     AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
     GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan, GemmBf16,
     GemmGroupBf16, GemvSplit, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16,
-    RopePairing, RouteProgram, SiluMulBf16,
+    RopeLanes, RouteProgram, SiluMulBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, CudaTape, RotaryTable, WeightIx};
 use serde_json::{Map, Value, json};
@@ -128,10 +128,10 @@ fn gain(c: GainConvention) -> Value {
     }
 }
 
-fn pairing(p: RopePairing) -> Value {
+fn pairing(p: RopeLanes) -> Value {
     match p {
-        RopePairing::HalfRotated => json!("lane i rotates with lane i + rot_dim/2"),
-        RopePairing::HalfHead => json!("lane i rotates with lane i + head_dim/2"),
+        RopeLanes::HalfRotated => json!("lane i rotates with lane i + rot_dim/2"),
+        RopeLanes::HalfHead => json!("lane i rotates with lane i + head_dim/2"),
     }
 }
 

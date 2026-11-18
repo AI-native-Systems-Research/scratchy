@@ -27,7 +27,7 @@ use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
     AddBf16, CudaStep, GateApplyBf16, GateSplitBf16, GemmBf16, NormKernel, RmsNormBf16, RopeBf16,
-    RopePairing,
+    RopeLanes,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, RotaryTable, TapeInput, WeightIx,
@@ -177,7 +177,7 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         cols: Q,
         head_dim: HD,
         rot_dim: R,
-        pairing: RopePairing::HalfRotated,
+        pairing: RopeLanes::HalfRotated,
     })
 }
 

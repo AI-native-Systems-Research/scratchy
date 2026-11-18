@@ -289,7 +289,7 @@ int launch_rope(bf16* xp, bf16* tp, bf16* op, uint32_t rows, uint32_t cols, uint
 
 }  // namespace
 
-// The pairings (`step::RopePairing`, in its declaration order): lane d pairs with d + rot_dim/2,
+// The pairings (`step::RopeLanes`, in its declaration order): lane d pairs with d + rot_dim/2,
 // or with d + head_dim/2.
 constexpr uint32_t PAIRING_HALF_ROTATED = 0;
 constexpr uint32_t PAIRING_HALF_HEAD = 1;

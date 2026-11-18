@@ -34,12 +34,13 @@ use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::{AttnScale, HeadDim, KvRope, Rope};
 use scratchy_subtile::fixtures::{fixture_head_geometry, rebind};
-use scratchy_subtile::handoff::{LoweredDecode, RopePairing, SourceBinding};
+use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::RopeClass;
 use scratchy_subtile::subtile_ir::{
     AttnMask, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
+use scratchy_target_cuda::step::RopeLanes;
 use scratchy_target_cuda_compiler::canonical::{CudaAttnClass, CudaAttnClasses, CudaModelFacts};
 
 use super::chains::{GEMMA4_FACTS, with_hidden};
@@ -88,7 +89,7 @@ pub const GEMMA_ATTN_FACTS: CudaModelFacts = CudaModelFacts {
             kv_heads: KV_HEADS,
             rot_dim: R,
             rope_theta: THETA,
-            pairing: RopePairing::HalfRotated,
+            pairing: RopeLanes::HalfRotated,
             window: Some(WINDOW),
         },
         global: CudaAttnClass {
@@ -96,7 +97,7 @@ pub const GEMMA_ATTN_FACTS: CudaModelFacts = CudaModelFacts {
             kv_heads: 2,
             rot_dim: R_GLOBAL,
             rope_theta: THETA_GLOBAL,
-            pairing: RopePairing::HalfHead,
+            pairing: RopeLanes::HalfHead,
             window: None,
         },
     }),

@@ -13,7 +13,7 @@
 use std::ffi::c_void;
 use std::fmt;
 
-use crate::step::RopePairing;
+use crate::step::RopeLanes;
 
 /// `SCRATCHY_CUDA_ERR_SHAPE` in the `.cu` launchers: the shape was refused, nothing launched.
 const ERR_SHAPE: i32 = -1;
@@ -2035,12 +2035,12 @@ pub unsafe fn rope_bf16(
     )
 }
 
-/// [`rope_bf16`] in either pairing: `HalfRotated` is [`rope_bf16`] itself, the same launch; in
-/// `HalfHead` (Gemma 4's proportional rope) lane `d < rot_dim/2` pairs with lane `d + head_dim/2`,
+/// [`rope_bf16`] in either pairing: `Standard` is [`rope_bf16`] itself, the same launch; in
+/// `Proportional` (Gemma 4's proportional rope) lane `d < rot_dim/2` pairs with lane `d + head_dim/2`,
 /// and every other lane is copied bit for bit. Asynchronous.
 ///
 /// Refused with [`KernelError::RopeShape`] as [`rope_bf16`], except that `(rot_dim, pairing)` must
-/// be an entry of `step::ROPE_BF16_KERNEL_SHAPES`, and a `HalfHead` `head_dim` must be 512
+/// be an entry of `step::ROPE_BF16_KERNEL_SHAPES`, and a `Proportional` `head_dim` must be 512
 /// (`step::ROPE_BF16_HALF_HEAD_DIM`).
 ///
 /// # Safety
@@ -2051,13 +2051,13 @@ pub unsafe fn rope_paired_bf16(
     table: *const c_void,
     out: *mut c_void,
     (rows, cols): (u32, u32),
-    (head_dim, rot_dim, pairing): (u32, u32, RopePairing),
+    (head_dim, rot_dim, pairing): (u32, u32, RopeLanes),
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // The launcher's pairing codes, `kernels/rope_bf16.cu`'s `PAIRING_*`.
     let code = match pairing {
-        RopePairing::HalfRotated => 0,
-        RopePairing::HalfHead => 1,
+        RopeLanes::HalfRotated => 0,
+        RopeLanes::HalfHead => 1,
     };
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe {
@@ -5219,14 +5219,14 @@ pub unsafe fn rope_append_fp8(
     ),
     (table, slot_mapping): (*const c_void, *const c_void),
     (k_cache, v_cache): (*mut c_void, *mut c_void),
-    (q_heads, kv_heads, head_dim, rot_dim, pairing): (u32, u32, u32, u32, RopePairing),
+    (q_heads, kv_heads, head_dim, rot_dim, pairing): (u32, u32, u32, u32, RopeLanes),
     (block_size, num_blocks): (u32, u32),
     norms: Option<(*const c_void, *const c_void, f32)>,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     let pairing_code = match pairing {
-        RopePairing::HalfRotated => 0,
-        RopePairing::HalfHead => 1,
+        RopeLanes::HalfRotated => 0,
+        RopeLanes::HalfHead => 1,
     };
     let (q_gain, k_gain, eps) = norms.unwrap_or((std::ptr::null(), std::ptr::null(), 0.0));
     // SAFETY: the caller upholds the contract above; the launcher checks every rule first.

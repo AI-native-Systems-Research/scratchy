@@ -457,7 +457,7 @@ int launch(const ra_args& a, uint32_t q_heads, uint32_t kv_heads, uint32_t num_b
 
 }  // namespace
 
-// The pairings (`step::RopePairing`, in its declaration order), as `rope_bf16.cu`'s.
+// The pairings (`step::RopeLanes`, in its declaration order), as `rope_bf16.cu`'s.
 constexpr uint32_t PAIRING_HALF_ROTATED = 0;
 constexpr uint32_t PAIRING_HALF_HEAD = 1;
 

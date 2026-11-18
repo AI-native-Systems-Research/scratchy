@@ -25,6 +25,8 @@ nvcc = []
 # The SHARED front end and passes. CUDA lowers the same `SubtileTape` metal and spyre lower; the
 # tables here are inputs to `tape_colouring`, `tape_folding` and `sample_rows`.
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
+# The model facts (`scratchy_ir::model_facts`): the rope pairing the steps name.
+scratchy-ir = { path = "../../../../crates/compiler/ir" }
 # The recurrent state's layout the GDN pool is sized from (`layout::GdnStateLayout`). Plain Rust,
 # no backend.
 scratchy-state-decoder-gdn = { path = "../../../../crates/state/decoder/gdn" }
@@ -50,8 +52,6 @@ inventory = { workspace = true }
 # compiler, which depends on this crate: a dev-only cycle Cargo allows. The integration tests link
 # one copy of this library, the one the compiler links too.
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
-# The model facts the attention fixtures build (#1093: the attention ops carry `Attention`).
-scratchy-ir = { path = "../../../../crates/compiler/ir" }
 scratchy-target-cuda-compiler = { path = "../compiler" }
 # `weight_table` writes a tiny synthetic checkpoint with `safetensors::serialize`.
 safetensors = { workspace = true }

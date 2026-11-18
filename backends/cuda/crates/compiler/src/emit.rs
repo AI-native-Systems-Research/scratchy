@@ -43,15 +43,15 @@ use std::collections::{BTreeMap, HashMap};
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
+use scratchy_ir::model_facts::{HeadGeometry, RopePairing};
 use scratchy_subtile::handoff::{
-    BundleTensor, SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint,
-    UnrollIndex,
+    BundleTensor, SourceBinding, TargetModelInput, TargetPoint, UnrollIndex,
 };
 use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16,
     GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemvBf16, LayerScaleBf16, MoeRouteBf16, MoeWeight,
-    NormAddBf16, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
+    NormAddBf16, RmsNormBf16, RopeLanes, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -126,7 +126,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "ExpertCombineBf16",
                 "GateScaleBf16",
                 "GainConvention",
-                "RopePairing",
+                "RopeLanes",
                 "RouteProgram",
                 "ScaleBf16",
                 "RmsNormUnitBf16",
@@ -159,51 +159,77 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
     held_by_reference: &[],
 };
 
-/// The model facts CUDA's lowering reads, from the neutral ones the macro resolved.
+/// The model facts CUDA's lowering reads: the model's own facts (`input.facts`), the rope's base
+/// frequencies the handoff states beside them, and who computes the shared expert.
 ///
 /// A config that declares no `rope_theta` gets a NaN here, never a default: a tape with a rotary
 /// table is then refused ([`ModelRefusal::NoRopeTheta`]), and a tape with none reads no theta. A
-/// model's input is its token ids, embedded from a table of `vocab_size` rows; a config that
-/// declares none gets no embedding table here, and [`lower_model`] refuses it
-/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s. The GEMM
-/// column tile is the 256-column one here; [`lower_model`] sets the arch's ([`gemm_col_tile`]).
-pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
-    CudaModelFacts {
-        shared_expert: shared_expert_owner(f),
-        embed: (f.vocab_size > 0).then_some(CudaEmbedFacts {
-            vocab: f.vocab_size,
+/// model's input is its token ids, embedded from a table of `vocab` rows; a model with no lm_head
+/// rows gets no embedding table here, and [`lower_model`] refuses it ([`ModelRefusal::NoVocab`]).
+/// The shared expert's owner is [`shared_expert_owner`]'s. The GEMM column tile is the 256-column
+/// one here; [`lower_model`] sets the arch's ([`gemm_col_tile`]).
+///
+/// The attention classes are the facts' two ([`Attention::base`], [`Attention::global`]) when their
+/// geometry differs (Gemma 4: sliding 256 × 8 kv, global 512 × 2 kv, proportional rope 128): the
+/// base class rotates by the local base frequency (its sliding layers' table), the global by
+/// `rope_theta` in the rope's own pairing. A uniform model's one class is `head_dim`, `rot_dim`
+/// and `rope_theta`.
+pub fn model_facts(input: &TargetModelInput) -> Result<CudaModelFacts, ModelRefusal> {
+    let f = &input.facts;
+    let attn = f.attention();
+    let base = attn.map(|a| a.base());
+    let geometry = |g: HeadGeometry| (g.head_dim().get(), g.kv_heads().get(), g.rot_dim().get());
+    let (head_dim, _, rot_dim) = base.map_or((0, 0, 0), geometry);
+    let theta = input.rope_theta.unwrap_or(f64::NAN);
+    let classes = attn
+        .filter(|a| geometry(a.global()) != geometry(a.base()))
+        .map(|a| -> Result<_, ModelRefusal> {
+            let class = |g: HeadGeometry, rope_theta: f64, pairing, window| CudaAttnClass {
+                head_dim: g.head_dim().get(),
+                kv_heads: g.kv_heads().get(),
+                rot_dim: g.rot_dim().get(),
+                rope_theta,
+                pairing,
+                window,
+            };
+            let pairing = match a.rope() {
+                None => RopeLanes::HalfRotated,
+                Some(r) => RopeLanes::of(r.pairing()).ok_or(ModelRefusal::RopeLanes {
+                    pairing: r.pairing(),
+                })?,
+            };
+            Ok(CudaAttnClasses {
+                base: class(
+                    a.base(),
+                    input
+                        .rope_local_theta
+                        .or(input.rope_theta)
+                        .unwrap_or(f64::NAN),
+                    RopeLanes::HalfRotated,
+                    a.window().map(|w| w.get()),
+                ),
+                global: class(a.global(), theta, pairing, None),
+            })
+        })
+        .transpose()?;
+    Ok(CudaModelFacts {
+        shared_expert: shared_expert_owner(input),
+        embed: (f.vocab())
+            .and_then(|v| u32::try_from(v.get()).ok())
+            .filter(|&v| v > 0)
+            .map(|vocab| CudaEmbedFacts { vocab }),
+        head_dim,
+        rot_dim,
+        rope_theta: theta,
+        gdn: f.gdn().map(|g| CudaGdnFacts {
+            num_k_heads: g.k_heads().get(),
+            head_k: g.k_dim().get(),
+            conv_kernel: g.conv_kernel().get(),
+            eps: f.eps().get(),
         }),
-        head_dim: f.head_dim,
-        rot_dim: f.rot_dim,
-        rope_theta: f.rope_theta.unwrap_or(f64::NAN),
-        gdn: f.gdn.map(|g| CudaGdnFacts {
-            num_k_heads: g.num_k_heads,
-            head_k: g.head_k,
-            conv_kernel: g.conv_kernel,
-            eps: f.rms_norm_eps,
-        }),
-        classes: match f.attn_classes.as_slice() {
-            [base, global] => Some(CudaAttnClasses {
-                base: attn_class(base),
-                global: attn_class(global),
-            }),
-            _ => None,
-        },
+        classes,
         gemm_col_tile: GemmColTile::Tile256Only,
-    }
-}
-
-/// One of the handoff's attention classes as CUDA's, its theta NaN when the config declares none
-/// (as [`model_facts`]' `rope_theta`).
-fn attn_class(c: &TargetAttnClass) -> CudaAttnClass {
-    CudaAttnClass {
-        head_dim: c.head_dim,
-        kv_heads: c.kv_heads,
-        rot_dim: c.rot_dim,
-        rope_theta: c.rope_theta.unwrap_or(f64::NAN),
-        pairing: c.pairing,
-        window: c.window.map(std::num::NonZeroU32::get),
-    }
+    })
 }
 
 /// Who computes the model's MoE shared expert: the DSL when it declares a `shared_expert` subtree
@@ -211,8 +237,8 @@ fn attn_class(c: &TargetAttnClass) -> CudaAttnClass {
 /// as metal's facts do); otherwise no one CUDA knows of, and a combine of a bundle with one is
 /// refused. CUDA has one MoE bundle per layer, all under one base (`mlp`): the bases are the
 /// DSL's, not per layer.
-pub fn shared_expert_owner(f: &TargetModelFacts) -> SharedExpertOwner {
-    match f.dsl_shared_expert_bases.is_empty() {
+pub fn shared_expert_owner(input: &TargetModelInput) -> SharedExpertOwner {
+    match input.dsl_shared_expert_bases.is_empty() {
         true => SharedExpertOwner::Undeclared,
         false => SharedExpertOwner::Dsl,
     }
@@ -258,6 +284,9 @@ pub enum ModelRefusal {
     BucketRows { m: u32, bucket_m: u32 },
     /// The tape at `m` builds a rotary table, and the config declares no `rope_theta`.
     NoRopeTheta { m: u32 },
+    /// The model's rope pairs its lanes as `pairing`, which no CUDA rope kernel realizes
+    /// ([`RopeLanes::of`]).
+    RopeLanes { pairing: RopePairing },
     /// No bucket lowered: the model would have no tape.
     NothingLowered,
     /// The `static` tape at `m` does not validate.
@@ -328,6 +357,11 @@ impl std::fmt::Display for ModelRefusal {
                 f,
                 "the tape at m={m} builds a rotary table and the config declares no rope_theta"
             ),
+            Self::RopeLanes { pairing } => write!(
+                f,
+                "the model's rope pairs its lanes {pairing:?}; CUDA's rope kernels pair them \
+                 half-rotated or half-head only"
+            ),
             Self::NothingLowered => write!(f, "no bucket lowers to CUDA"),
             Self::Tape { m, error } => write!(f, "the static tape at m={m}: {error}"),
             Self::NoVocab => write!(
@@ -393,12 +427,12 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
             why: why.clone(),
         });
     }
-    if input.facts.vocab_size == 0 {
+    if (input.facts.vocab()).is_none_or(|v| v.get() == 0) {
         return Err(ModelRefusal::NoVocab);
     }
     let facts = CudaModelFacts {
         gemm_col_tile: gemm_col_tile(&input.arch),
-        ..model_facts(&input.facts)
+        ..model_facts(input)?
     };
     let mut by_m: BTreeMap<u32, Vec<(u32, Lowered)>> = BTreeMap::new();
     for b in &input.buckets {

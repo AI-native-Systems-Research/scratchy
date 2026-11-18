@@ -2467,7 +2467,7 @@ mod tests {
     use crate::step::{
         AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
         GemmBf16, KvUse, MoeRouteBf16, NormKernel, RmsNormBf16, RopeAppendBf16, RopeBf16,
-        RopePairing, RouteProgram, WeightRead,
+        RopeLanes, RouteProgram, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -3059,7 +3059,7 @@ mod tests {
             cols: 2048,
             head_dim: 256,
             rot_dim: 64,
-            pairing: RopePairing::HalfRotated,
+            pairing: RopeLanes::HalfRotated,
         })
     }
 
@@ -3132,7 +3132,7 @@ mod tests {
             cols: 512,
             head_dim: 256,
             rot_dim: 64,
-            pairing: RopePairing::HalfRotated,
+            pairing: RopeLanes::HalfRotated,
             q: None,
             norms: None,
         })

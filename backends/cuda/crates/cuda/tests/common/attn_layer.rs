@@ -45,7 +45,7 @@ use scratchy_subtile::subtile_ir::{
 use scratchy_target_cuda::step::{
     AddBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GateApplyBf16,
     GateSplitBf16, GemmBf16, GemmGroupBf16, GroupMember, NormKernel, RmsNormBf16, RopeAppendBf16,
-    RopeBf16, RopePairing,
+    RopeBf16, RopeLanes,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvClass, KvTape, RotaryTable, TapeInput,
@@ -272,7 +272,7 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         cols: Q,
         head_dim: HD,
         rot_dim: R,
-        pairing: RopePairing::HalfRotated,
+        pairing: RopeLanes::HalfRotated,
     })
 }
 
@@ -294,7 +294,7 @@ const fn rope_append(
         cols: KV,
         head_dim: HD,
         rot_dim: R,
-        pairing: RopePairing::HalfRotated,
+        pairing: RopeLanes::HalfRotated,
         q: None,
         norms: None,
     })

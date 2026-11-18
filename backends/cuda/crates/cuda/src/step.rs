@@ -2,9 +2,9 @@
 //! CUDA's step: one or two kernel launches of a lowered tape, the counterpart of metal's
 //! `MetalStep`.
 
+use scratchy_ir::model_facts::RopePairing;
 /// Re-exported so a static tape names it beside the steps that carry it
 /// (`scratchy_target_cuda::step::GainConvention`).
-pub use scratchy_subtile::handoff::RopePairing;
 pub use scratchy_subtile::subtile_ir::GainConvention;
 use serde::Serialize;
 
@@ -906,16 +906,27 @@ pub struct SoftCapBf16 {
     pub cap_bits: u32,
 }
 
-/// [`RopePairing`] as the unit variant it is: `scratchy_subtile` has no serde.
-fn serialize_rope_pairing<S: serde::Serializer>(
-    pairing: &RopePairing,
-    s: S,
-) -> Result<S::Ok, S::Error> {
-    let (index, variant) = match pairing {
-        RopePairing::HalfRotated => (0, "HalfRotated"),
-        RopePairing::HalfHead => (1, "HalfHead"),
-    };
-    s.serialize_unit_variant("RopePairing", index, variant)
+/// Which lane a CUDA rope kernel rotates each rotated lane with: exactly the pairings its
+/// `pairing` code takes (`kernels/rope_bf16.cu`'s `PAIRING_*`), converted from the model facts'
+/// [`RopePairing`] once, in the lowering ([`Self::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum RopeLanes {
+    /// Lane `i` with lane `i + rot_dim/2`: the facts' `Standard` (NeoX).
+    HalfRotated,
+    /// Lane `i` with lane `i + head_dim/2`: the facts' `Proportional` (Gemma 4's global layers).
+    HalfHead,
+}
+
+impl RopeLanes {
+    /// The lanes a CUDA rope kernel pairs for a model's `pairing`, or `None` for a pairing no CUDA
+    /// rope kernel realizes (multi-head latent attention's interleaved one).
+    pub const fn of(pairing: RopePairing) -> Option<Self> {
+        match pairing {
+            RopePairing::Standard => Some(Self::HalfRotated),
+            RopePairing::Proportional => Some(Self::HalfHead),
+            RopePairing::Interleaved => None,
+        }
+    }
 }
 
 /// The embed's `hidden` is a non-zero multiple of this (`kernels/embed_bf16.cu`: one 16-byte
@@ -1263,10 +1274,10 @@ pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
 /// ([`ROPE_BF16_HALF_HEAD_DIM`]), box 0 paired with box 4 (Gemma 4's global layers, proportional).
 /// Its launcher refuses any other, so the kernel's rule is tighter than the lowering's
 /// [`ROPE_BF16_ROT_MULTIPLE`].
-pub const ROPE_BF16_KERNEL_SHAPES: &[(u32, RopePairing)] = &[
-    (64, RopePairing::HalfRotated),
-    (256, RopePairing::HalfRotated),
-    (128, RopePairing::HalfHead),
+pub const ROPE_BF16_KERNEL_SHAPES: &[(u32, RopeLanes)] = &[
+    (64, RopeLanes::HalfRotated),
+    (256, RopeLanes::HalfRotated),
+    (128, RopeLanes::HalfHead),
 ];
 /// The one head dim of the rope kernel's half-head instantiation: a whole 512-lane head is one
 /// unit of 8 boxes (`kernels/rope_bf16.cu`).
@@ -1292,10 +1303,9 @@ pub struct RopeBf16 {
     pub cols: u32,
     pub head_dim: u32,
     pub rot_dim: u32,
-    /// Which lane a rotated lane pairs with: `HalfRotated` (the kernel's), or `HalfHead`
+    /// Which lane a rotated lane pairs with: `Standard` (the kernel's), or `Proportional`
     /// (Gemma's proportional rope, #885's 13b-3). `table` is the tape's table of the step's class.
-    #[serde(serialize_with = "serialize_rope_pairing")]
-    pub pairing: RopePairing,
+    pub pairing: RopeLanes,
 }
 
 /// The gate split's `head_dim` is a non-zero multiple of this (`kernels/gate_split_bf16.cu`: one
@@ -1490,8 +1500,7 @@ pub struct RopeAppendBf16 {
     pub head_dim: u32,
     pub rot_dim: u32,
     /// As [`RopeBf16::pairing`].
-    #[serde(serialize_with = "serialize_rope_pairing")]
-    pub pairing: RopePairing,
+    pub pairing: RopeLanes,
     /// The query rope the step also computes (FP8 S8 W4c, the one-row bucket's `Sibling` fold):
     /// `q.out = rope(q.x)` over `[rows, q.cols]` at this step's table, head dim, rotated width and
     /// pairing. `None`: the query rope is its own [`CudaStep::Rope`].
@@ -3959,4 +3968,23 @@ const fn u32_bytes(n: u32) -> u64 {
 
 const fn span(offset: ArenaOffset, bytes: u64) -> ArenaSpan {
     ArenaSpan { offset, bytes }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RopeLanes;
+    use scratchy_ir::model_facts::RopePairing;
+
+    #[test]
+    fn a_rope_pairs_its_lanes_as_a_cuda_kernel_does_or_has_no_kernel() {
+        assert_eq!(
+            RopeLanes::of(RopePairing::Standard),
+            Some(RopeLanes::HalfRotated)
+        );
+        assert_eq!(
+            RopeLanes::of(RopePairing::Proportional),
+            Some(RopeLanes::HalfHead)
+        );
+        assert_eq!(RopeLanes::of(RopePairing::Interleaved), None);
+    }
 }

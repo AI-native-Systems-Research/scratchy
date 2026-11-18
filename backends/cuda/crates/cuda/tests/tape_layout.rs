@@ -2575,7 +2575,7 @@ fn a_gemma_moe_under_qwen_facts_is_off_the_256_tile() {
 
 // ── Gemma 4's two attention classes ────────────────────────────────
 
-use scratchy_subtile::handoff::RopePairing;
+use scratchy_target_cuda::step::RopeLanes;
 use scratchy_target_cuda_compiler::canonical::{CudaAttnClass, CudaAttnClasses};
 
 /// [`attn_layer`]'s layer as Gemma's base (sliding) class of a two-class model: 2 kv heads of
@@ -2589,7 +2589,7 @@ fn two_class_facts(window: Option<u32>) -> CudaModelFacts {
                 kv_heads: 2,
                 rot_dim: 64,
                 rope_theta: 1e4,
-                pairing: RopePairing::HalfRotated,
+                pairing: RopeLanes::HalfRotated,
                 window,
             },
             global: CudaAttnClass {
@@ -2597,7 +2597,7 @@ fn two_class_facts(window: Option<u32>) -> CudaModelFacts {
                 kv_heads: 1,
                 rot_dim: 128,
                 rope_theta: 1e6,
-                pairing: RopePairing::HalfHead,
+                pairing: RopeLanes::HalfHead,
                 window: None,
             },
         }),
@@ -2710,9 +2710,13 @@ fn gemma_moe_model(
     down_bank: u32,
     down_names: (&str, &str),
 ) -> scratchy_subtile::handoff::TargetModelInput {
-    use common::gemma_moe::{BANK, LAYER, ROUTER};
+    use common::gemma_moe::{BANK, H, LAYER, ROUTER};
+    use scratchy_ir::model_facts::{
+        ActDtype, FactsParts, HiddenSize, KvCodec, ModelFacts, NormWeightOffset, RmsNormEps,
+        ScaleDtype, VocabSize,
+    };
     use scratchy_subtile::handoff::{
-        BundleTensor as T, TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
+        BundleTensor as T, TargetBucket, TargetModelInput, TargetPoint,
     };
     let mut lowered = gemma_moe(512);
     let index = Some(UnrollIndex(LAYER));
@@ -2748,16 +2752,28 @@ fn gemma_moe_model(
             lowered,
         }],
         unlowered: Vec::new(),
-        facts: TargetModelFacts {
-            head_dim: 0,
-            rot_dim: 0,
-            rope_theta: None,
-            rms_norm_eps: 1e-6,
-            vocab_size: 256,
+        facts: ModelFacts::new(FactsParts {
+            act_dtype: ActDtype::Bf16,
+            scale_dtype: ScaleDtype::F16,
+            hidden: HiddenSize::new(H as usize),
+            intermediate: None,
+            vocab: Some(VocabSize::new(256)),
+            eps: RmsNormEps::new(1e-6),
+            norm_offset: NormWeightOffset::new(0.0),
+            final_softcap: None,
+            kv_codec: KvCodec::Dense,
+            kv_layers: None,
+            attention: None,
+            vision: None,
             gdn: None,
-            dsl_shared_expert_bases: Vec::new(),
-            attn_classes: Vec::new(),
-        },
+            drafter: None,
+            spec_drafts: None,
+            capture_slots: None,
+            target: None,
+        }),
+        rope_theta: None,
+        rope_local_theta: None,
+        dsl_shared_expert_bases: Vec::new(),
         weight_prefixes: Vec::new(),
         embed_prefix: Some("m.embed_tokens".to_string()),
         bundle_tensor_names: names,
@@ -2859,7 +2875,7 @@ fn gemma_vnorm_facts() -> CudaModelFacts {
         kv_heads,
         rot_dim: 64,
         rope_theta: 1e4,
-        pairing: RopePairing::HalfRotated,
+        pairing: RopeLanes::HalfRotated,
         window: None,
     };
     CudaModelFacts {
