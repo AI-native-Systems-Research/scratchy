@@ -21,10 +21,8 @@ scratchy-core-model = { workspace = true }
 anyhow = { workspace = true }
 
 [build-dependencies]
-# The shared models build driver, the emitter it runs CUDA's models through, and the scope's
-# feature names the build script narrows it by.
+# The shared models build driver, and the emitter it runs CUDA's models through.
 scratchy-models-build = { path = "../../../../crates/models/build" }
-scratchy-forward-compiler-macro = { path = "../../../../crates/compiler/macros" }
 scratchy-target-cuda-compiler = { path = "../compiler" }
 
 [dev-dependencies]

@@ -413,9 +413,9 @@ including fast-iteration scoping and why they're two separate crate
 aliases.
 
 A target compiles the same scope with its own emitter, and may lower less of
-it: the CUDA workspace (`backends/cuda`) builds only the arches its models
-crate's `build.rs` lists (`CUDA_CAPABLE`), each under
-`fp8-dynamic-per-channel` only, and refuses any other scope at build time.
+it: the CUDA workspace (`backends/cuda`), as spyre, hands every selected arch to
+its emitter, which fails the build at the first op it does not lower, and
+builds each under `fp8-dynamic-per-channel` only.
 
 ## What NOT to do
 

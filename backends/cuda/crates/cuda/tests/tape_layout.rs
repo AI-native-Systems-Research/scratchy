@@ -1843,13 +1843,13 @@ fn a_narrow_gemm_off_the_vector_is_refused() {
         }
     ));
     let e = refused(
-        &with_hidden(chain_input(256, 1024, &[128])),
-        &["n = 128", "multiple of 256"],
+        &with_hidden(chain_input(256, 1024, &[96])),
+        &["n = 96", "multiple of 256"],
     );
     assert!(matches!(
         e,
         CanonicalRefusal::GemmShape {
-            n: 128,
+            n: 96,
             rule: GemmShapeRule::OffTile { dim: "n", .. },
             ..
         }
@@ -2338,21 +2338,10 @@ fn a_gemma_gemm_of_one_row_or_on_the_256_tile_keeps_its_kernel() {
     assert!(matches!(step, CudaStep::Gemm(_)), "{step:?}");
 }
 
-/// The 64-column GEMM is Gemma 4's alone: under Qwen's facts, n = 128 is still refused as off the
-/// 256-column tile, beside the Gemma fixture that lowers it.
+/// The 64-column GEMM is chosen by shape: n = 128 takes it under Qwen's facts too.
 #[test]
-fn the_64_column_gemm_is_off_under_qwen_facts() {
-    let l = with_hidden(chain_input(256, 1024, &[128]));
-    let e = refused_with(&l, QWEN3_5_FACTS, &["n = 128", "multiple of 256"]);
-    assert!(matches!(
-        e,
-        CanonicalRefusal::GemmShape {
-            n: 128,
-            rule: GemmShapeRule::OffTile { dim: "n", .. },
-            ..
-        }
-    ));
-    let step = one_gemm(256, 1024, 128, GEMMA4_FACTS);
+fn the_64_column_gemm_is_chosen_by_shape() {
+    let step = one_gemm(256, 1024, 128, QWEN3_5_FACTS);
     assert!(matches!(step, CudaStep::GemmCol64(_)), "{step:?}");
 }
 
@@ -2550,26 +2539,22 @@ fn a_router_norm_of_another_router_is_refused() {
     );
 }
 
-/// Under Qwen's facts the Gemma block's 128-expert router GEMM is off the 256-column tile, so the
-/// block is refused at its router, before any expert step.
+/// The column tile is the GEMM's shape's, not the model's: under Qwen's facts the Gemma block
+/// lowers, its 128-expert router GEMM taking the 64-column tile.
 #[test]
 fn a_gemma_moe_under_qwen_facts_is_off_the_256_tile() {
-    let e = refused_with(
-        &gemma_moe(512),
-        QWEN3_5_FACTS,
-        &["n = 128", "multiple of 256"],
-    );
-    assert!(
-        matches!(
-            e,
-            CanonicalRefusal::GemmShape {
-                step: 1,
-                n: 128,
-                rule: GemmShapeRule::OffTile { dim: "n", .. },
-                ..
-            }
-        ),
-        "{e:?}"
+    let c = lower_with(&gemma_moe(512), QWEN3_5_FACTS).unwrap_or_else(|e| panic!("{e}"));
+    let routers: Vec<_> = (c.steps.iter())
+        .filter_map(|s| match *s {
+            CudaStep::RouterLogits(r) => Some((r.experts, r.kernel)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        routers,
+        [(128, scratchy_target_cuda::step::MatmulKernel::Col64)],
+        "{:?}",
+        c.steps
     );
 }
 
@@ -2746,7 +2731,6 @@ fn gemma_moe_model(
     }
     TargetModelInput {
         stem: "gemma_moe".to_string(),
-        arch: "gemma4-moe".to_string(),
         buckets: vec![TargetBucket {
             point: TargetPoint { m: 512, sk: 1 },
             lowered,

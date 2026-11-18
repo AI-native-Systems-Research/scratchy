@@ -121,16 +121,8 @@ fn target_model_input(cx: &ModelCx<'_>) -> scratchy_subtile::handoff::TargetMode
             Some((id, index, tensor, format!("{prefix}.{leaf}")))
         })
         .collect();
-    // The arch is the config's directory (`configs/<arch>/<stem>.json`), the name the build
-    // scopes by; `model.arch` is the declared arch spec, not its name.
-    let arch = (model.source_path.parent())
-        .and_then(|dir| dir.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| panic!("[handoff] {stem}: no arch directory"))
-        .to_string();
     TargetModelInput {
         stem: stem.clone(),
-        arch,
         buckets,
         unlowered,
         weight_prefixes,
