@@ -596,6 +596,20 @@ pub struct BridgeModel<'a> {
     pub decoder_states: &'a [scratchy_decoder_state::DecoderState],
 }
 
+impl BridgeModel<'_> {
+    /// The lowering of the state op `op`, from the decoder state that declared it: `None` when no
+    /// decoder state the build compiles declares it.
+    pub fn state_lowering(
+        &self,
+        op: scratchy_forward_compiler_frontend::state::StateOp,
+    ) -> Option<scratchy_decoder_state::lower::LowerFn> {
+        self.decoder_states
+            .iter()
+            .find(|state| state.vocabulary().name() == op.state())
+            .and_then(|state| state.lowering(op.name()))
+    }
+}
+
 /// Translate a decode FUF into a wavefront `LoweringInput`.
 ///
 /// `bounds` is the per-model integer bounds (tp-sharded if tp>1).

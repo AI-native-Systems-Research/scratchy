@@ -410,31 +410,46 @@ loads are checked against (`crates/compiler/macros/tests/weight_headers/glm-4.7-
 and `crates/compiler/macros/tests/bundle_headers/glm-4.7-flash-4bit.json`). MLA's dim rules are also restated in
 Python in `crates/targets/metal/models/tests/golden_gen_carrier.py`, whose MLA lines go too.
 
-The decoder state crate states each op once, through `scratchy_decoder_state::state_op!`:
+The decoder state crate states each DSL op once, through `scratchy_decoder_state::state_op!`:
 the op's typed signature (the `fn` a carrier's call is type-checked
-against), then its row law and sharding rule
-(`rows = In0 | M, tp = <TpRule variant>;`). The macro counts the op's arity
-from the parameters and its output count from the return type, and both the
-DSL declaration and the subtile facts read those counts, so they cannot
-disagree. Write a multi-value return as the tuple itself
-(`-> (Act<T, R>, Act<T, P>)`): the count is read from the syntax, so a type
-alias for a tuple counts as one output. An op returns one, two or three
-values; returning none or more than three, rows of operand 0 with no
-operand, or `tp = Collective` does not build. The crate then lists the
-decoder state once, through `scratchy_decoder_state::decoder_state!`: its name, the absolute path
-of the module holding the signatures and the inputs' constructors
-(`signatures = ::<crate>::<module>`, since the typed carriers call it from
-another crate; the crate reaches its own module by
-`extern crate self as <crate>;`), its ops and its inputs. It expands to the
-`static` `DecoderState` that `decoder_states.rs` lists, and an op or input listed there
-that the module does not declare does not build. Its op and input names must not
-collide with a core op, an op a compiler pass synthesizes, a parser special
-form, a core extern or another decoder state's names: the build fails naming both
-claimants.
+against). The macro counts the op's arity from the parameters and its output
+count from the return type, which the DSL declaration reads. Write a
+multi-value return as the tuple itself (`-> (Act<T, R>, Act<T, P>)`): the
+count is read from the syntax, so a type alias for a tuple counts as one
+output. An op returns one, two or three values; returning none or more than
+three does not build.
+
+A DSL op lowers into the subtile IR through the decoder state's own code: a
+`LowerFn` (`scratchy_decoder_state::lower`) that builds through the
+state-neutral `StateLowering` builder, which hands out the op's inputs, output
+widths, config bounds, cos/sin pairs, weights and layers, and takes only the
+decoder state's own subtile ops. One DSL op may lower to several subtile ops,
+and a DSL output that passes a value on points at that value's producer. Each
+subtile op is stated once, through `scratchy_decoder_state::subtile_op!`, as a
+`static` of its facts: its name, the crate's `const` `StateName`, its operand
+count, its output count, its row law, its sharding rule and its weight operand
+(`state = STATE, arity = N, outputs = One | Two | Three, rows = In0 | M,
+tp = <TpRule variant>, weight = none | <operand>;`). Rows of operand 0 with no
+operand, `tp = Collective`, or a weight past the operands does not build.
+
+The crate then lists the decoder state once, through
+`scratchy_decoder_state::decoder_state!`, in this order: its name (`name =
+STATE`), the absolute path of the module holding the signatures and the
+inputs' constructors (`signatures = ::<crate>::<module>`, since the typed
+carriers call it from another crate; the crate reaches its own module by
+`extern crate self as <crate>;`), each DSL op with its lowering (`ops = [<op>
+=> <path to LowerFn>, ...]`), its inputs, and its subtile ops (`subtile =
+[<static>, ...]`). It expands to the `static` `DecoderState` that
+`decoder_states.rs` lists. An op or input listed there that the module does
+not declare, a DSL op listed without its lowering, or a listed subtile row
+stated under another decoder state's name does not build. Its op and input names
+must not collide with a core op, an op a compiler pass synthesizes, a parser
+special form, a core extern or another decoder state's names: the build fails
+naming both claimants.
 
 A decoder state declares its own derived dims, the config bounds its weights' shapes
 read that no config states (MLA's projection widths and per-head width): each is a
-`const` `DerivedDim` in its crate, listed after the inputs as `dims = [...]` in
+`const` `DerivedDim` in its crate, listed after the subtile ops as `dims = [...]` in
 `decoder_state!`, in the order they derive. The build assembles them once, after the
 core rows (`DERIVED_DIMS` in `crates/compiler/frontend/src/dim.rs`), into the one table the
 config loader derives every config by and the typed carriers spell as types; the table

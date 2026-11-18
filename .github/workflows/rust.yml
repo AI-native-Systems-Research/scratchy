@@ -732,7 +732,7 @@ jobs:
   #   scratchy-tensors       src/typed.rs
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
   #   scratchy-subtile       src/state_op.rs
-  #   scratchy-decoder-state  src/lib.rs  (state_op! and decoder_state!: a malformed op or list)
+  #   scratchy-decoder-state  src/lib.rs  (state_op!, subtile_op! and decoder_state!: a malformed op, row or list)
   #   scratchy-state-decoder-mla  src/ops.rs  (MlaCache: a cache of another rope width)
   #   scratchy-target-spyre-card  src/runtime.rs
   # ktir-core's former E0080 wrong-copy fixture is deleted: it asserted a

@@ -6,12 +6,18 @@ license.workspace = true
 # Not published: the root CI step `cargo publish --workspace --dry-run --no-verify` would otherwise package it.
 publish = false
 
-# What a decoder state hands the compiler, as one handle (`DecoderState`), and how the carriers are typed
+# What a decoder state hands the compiler, as one handle (`DecoderState`) with its ops' lowerings, and how the carriers are typed
 # (`Typing`): the build that compiles the models states both, and the forward compiler reads them.
 [dependencies]
 # The vocabulary trait a decoder state declares its DSL ops and state inputs under.
 scratchy-forward-compiler-frontend = { path = "../frontend" }
 # The shapes a carrier's typed program records (`Typing::traced`).
 scratchy-typed-shapes = { workspace = true }
-# The facts a decoder state's ops carry into the subtile IR (`DecoderState::subtile`).
+# The facts of a decoder state's subtile ops (`DecoderState::subtile`), and the subtile values and ops
+# its lowerings build (`lower`).
 scratchy-subtile = { path = "../subtile" }
+
+[features]
+# `lower::Recorder`: a `StateLowering` over given inputs, widths and bounds that records what a
+# lowering pushes and produces, for a decoder state crate's own tests.
+test-support = []

@@ -88,6 +88,24 @@ static_name!(
     StateName
 );
 
+impl StateName {
+    /// Whether the two names are the same text, compared byte by byte so a `const` can ask.
+    pub const fn same_as(self, other: Self) -> bool {
+        let (a, b) = (self.0.as_bytes(), other.0.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
 /// The number of arguments an op takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Arity(u8);
@@ -194,5 +212,14 @@ mod tests {
         const INPUT_ID: StateInputId = StateInputId::new(STATE, INPUT);
         assert_eq!((STATE.get(), OP.get(), INPUT.get()), ("r", "op", "state"));
         assert_eq!((ID.state(), INPUT_ID.name()), (STATE, INPUT));
+    }
+
+    #[test]
+    fn a_const_compares_state_names_by_text() {
+        const {
+            assert!(StateName::new("mixer").same_as(StateName::new("mixer")));
+            assert!(!StateName::new("mix").same_as(StateName::new("mixer")));
+            assert!(!StateName::new("mixer").same_as(StateName::new("mixed")));
+        }
     }
 }
