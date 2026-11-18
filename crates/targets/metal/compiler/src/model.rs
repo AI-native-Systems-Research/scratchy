@@ -760,6 +760,16 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             m as u32,
         ) {
             Ok(l) => l,
+            // A decoder state whose ops have no Metal lowering yet: the model does not build for Metal,
+            // and the error names the decoder state and the op the bridge met first.
+            Err(scratchy_forward_compiler_macro::to_wavefront::BridgeError::StateUnlowered {
+                op,
+            }) => panic!(
+                "{stem} m={m}: StateUnlowered {{ op: {} }}: decoder state `{}` has no Metal lowering \
+                 of its ops, so no model naming them builds for Metal",
+                op.name(),
+                op.state(),
+            ),
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
             // so the bake bakes NO variants and the pool refuses at load. Anything else has no
             // fallback.

@@ -507,6 +507,17 @@ impl std::fmt::Display for CarrierError {
     }
 }
 
+/// How the carriers are typed: what the build that compiles the models hands [`compile_carrier`].
+pub struct Typing<'a> {
+    /// The shapes of the carrier whose arch is the argument: its typed program, run (`None` when
+    /// no carrier of that arch is typed). `scratchy_models_typed::traced` for every build.
+    pub traced: fn(&str) -> Option<scratchy_typed_shapes::Shapes>,
+    /// The decoder states whose ops and inputs a carrier may name after the core ones
+    /// (`classify::carrier_program`). `scratchy_models_typed::decoder_states()` for every build: the
+    /// same list the typing classified with.
+    pub decoder_states: &'a [&'a dyn scratchy_forward_compiler_frontend::state::StateVocabulary],
+}
+
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
@@ -518,12 +529,16 @@ impl std::fmt::Display for CarrierError {
 ///
 /// `emitter`: the target this build compiles for ([`target::TargetEmitter`]) — what it emits for a
 /// model is its own.
+///
+/// `typing`: how the carriers are typed ([`Typing`]) — the build that compiles the models states
+/// it, so this crate reads no model file to type one.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
     dump_dir: Option<&std::path::Path>,
     scope: &Scope,
     emitter: &dyn target::TargetEmitter,
+    typing: &Typing<'_>,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -533,10 +548,10 @@ pub fn compile_carrier(
     };
     let name_span = args.span;
     // ── Front end: classify ────────────────────────────────────────
-    // The program the build script typed (`classify::carrier_program`, the one construction): a
-    // decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`), the
-    // compiler's, whatever the arch's DSL says.
-    let classified = classify::carrier_program(&carrier)
+    // The program `scratchy-models-typed`'s build script typed (`classify::carrier_program`, the one
+    // construction): a decoder's layer loop captures what a drafter compiled beside it reads
+    // (`draft_capture`), the compiler's, whatever the arch's DSL says.
+    let classified = classify::carrier_program(&carrier, typing.decoder_states)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))
         .map_err(CarrierError::Arch)?;
     let PythonCarrier { arch_name, .. } = carrier;
@@ -688,15 +703,15 @@ pub fn compile_carrier(
     }
 
     // The arch's shapes: its typed program's trace, every local, weight and nested value at the
-    // shape its type states, which rustc checked when this crate compiled (`typed_shapes`). They
+    // shape its type states, which rustc checked when the typing's crate compiled (`Typing`). They
     // are symbolic in the bounds, so one trace serves every model of the arch.
-    let inferred = typed_shapes::traced(&arch_name)
+    let inferred = (typing.traced)(&arch_name)
         .ok_or_else(|| {
             syn::Error::new(
                 args.span,
                 format!(
-                    "[{arch_name}] has no typed program: the build script types every carrier under \
-                     crates/models/arch/dsl/, and this one is not among them"
+                    "[{arch_name}] has no typed program: scratchy-models-typed types every carrier \
+                     under crates/models/arch/dsl/, and this one is not among them"
                 ),
             )
         })

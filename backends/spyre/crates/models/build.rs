@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The selected models, compiled for spyre: the scope `scratchy-models` publishes, through the
 //! shared models build driver with spyre's emitter.
-use scratchy_models_build::{ModelsBuild, ScopeMetadata};
+use scratchy_models_build::{ModelsBuild, ScopeMetadata, Typing};
 use std::path::PathBuf;
 
 fn main() {
@@ -23,5 +23,9 @@ fn main() {
         emitter: &scratchy_target_spyre_compiler::Spyre,
         dump_dir,
         inspect: &|_| Vec::new(),
+        typing: Typing {
+            traced: scratchy_models_typed::traced,
+            decoder_states: scratchy_models_typed::decoder_states(),
+        },
     });
 }

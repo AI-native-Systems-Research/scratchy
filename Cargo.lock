@@ -3119,8 +3119,10 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
+ "scratchy-models-typed",
  "scratchy-subtile",
  "scratchy-tensors",
+ "scratchy-typed-shapes",
  "serde_json",
  "syn 3.0.10",
  "tracing",
@@ -3175,6 +3177,15 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler-macro",
  "serde_json",
+]
+
+[[package]]
+name = "scratchy-models-typed"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-state-decoder-mla",
+ "scratchy-typed-shapes",
 ]
 
 [[package]]
@@ -3316,6 +3327,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-state-decoder-mla"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+ "scratchy-typed-shapes",
+]
+
+[[package]]
 name = "scratchy-subtile"
 version = "0.1.0"
 dependencies = [
@@ -3387,6 +3406,7 @@ dependencies = [
  "scratchy-forward-compiler-frontend",
  "scratchy-forward-compiler-macro",
  "scratchy-ir",
+ "scratchy-models-typed",
  "scratchy-subtile",
  "scratchy-target-metal",
  "scratchy-tensors",
@@ -3411,6 +3431,7 @@ dependencies = [
  "scratchy-layers",
  "scratchy-models",
  "scratchy-models-build",
+ "scratchy-models-typed",
  "scratchy-quantizations",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
@@ -3459,6 +3480,13 @@ dependencies = [
 [[package]]
 name = "scratchy-tp-world"
 version = "0.1.0"
+
+[[package]]
+name = "scratchy-typed-shapes"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+]
 
 [[package]]
 name = "scratchy-vision"

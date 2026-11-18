@@ -40,8 +40,8 @@ crates/models/arch/
 
 - **`weights.json`** — the exact shape of every weight the DSL reads.
   The typed-Rust emit pass types each weight by it, and rustc checks
-  every use of the weight in the DSL against that type when the compiler
-  builds. Shapes are expressed as products and sums of bound names from
+  every use of the weight in the DSL against that type when
+  `scratchy-models-typed` (`crates/models/typed/`) builds. Shapes are expressed as products and sums of bound names from
   the config.json vocabulary. Example for Qwen3, where `q_norm` / `k_norm`
   are per-head RMS norms of shape `[head_dim]`:
 
@@ -347,7 +347,7 @@ Run the probe binary against any one model size — the shape formulas
 don't change across sizes, so one probe suffices:
 
 ```
-cargo run -p scratchy-forward-compiler --bin probe_weights --features probe -- \
+cargo run -p scratchy-forward-compiler --bin probe-weights --features probe -- \
     --arch <arch> <hf-org>/<size> [<hf-org>/<size> ...]
 ```
 
@@ -386,6 +386,23 @@ etc. Every tensor is a local; weights are referenced by dotted path
 (e.g. `self_attn.q_proj[layer]`). Loop over `num_hidden_layers` using
 a bound name from config.json. See `dsl/llama.py` as the canonical
 reference.
+
+An arch whose attention the core ops cannot state needs a **decoder state**: its
+own ops and layered state inputs, declared from its own crate (see
+`crates/state/decoder/mla`, multi-head latent attention, which GLM-4.7-Flash's
+carrier calls). The touch points: the decoder state crate
+`crates/state/decoder/<name>` (a `StateVocabulary` impl and a module of the ops'
+typed signatures and the inputs' constructors); its line in the root
+`Cargo.toml`'s `members` and its `[workspace.dependencies]` row;
+`scratchy-models-typed`'s dependency and build-dependency rows on it
+(`crates/models/typed/Cargo.toml`); and its entry in
+`crates/models/typed/src/decoder_states.rs`, the one list of decoder states a build
+compiles. Its `SignaturePath` is absolute (`::<crate>::<module>`), since the
+typed carriers call it from another crate. Its op and input names must not
+collide with a core op, an op a compiler pass synthesizes, a parser special
+form, a core extern or another decoder state's names: the build fails naming both
+claimants. The Metal bake fails with `StateUnlowered` until the decoder state has
+a Metal lowering, so the arch's stems stay out of `all` until then.
 
 ### 5. Commit a correctness golden
 

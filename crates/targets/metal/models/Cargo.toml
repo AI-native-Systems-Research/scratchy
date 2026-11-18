@@ -38,6 +38,8 @@ anyhow = { workspace = true }
 scratchy-models-build = { path = "../../../models/build" }
 scratchy-forward-compiler-macro = { path = "../../../compiler/macros" }
 scratchy-target-metal-compiler = { path = "../compiler" }
+# The carriers' typed programs, which the build hands the pipeline.
+scratchy-models-typed = { workspace = true }
 # Reading metal's tables off the emitted tokens.
 proc-macro2 = "1"
 

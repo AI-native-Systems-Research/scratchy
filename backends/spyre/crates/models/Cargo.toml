@@ -47,6 +47,8 @@ anyhow = { workspace = true }
 # The shared models build driver, and the emitter it runs spyre's models through.
 scratchy-models-build = { path = "../../../../crates/models/build" }
 scratchy-target-spyre-compiler = { path = "../compiler" }
+# The carriers' typed programs, which the build hands the pipeline.
+scratchy-models-typed = { path = "../../../../crates/models/typed" }
 
 [dev-dependencies]
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }

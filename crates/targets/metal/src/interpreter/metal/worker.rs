@@ -2441,12 +2441,6 @@ mod tests {
             // bf16 dispatch GEMM routing has its own coverage in the e2e tests.
             scratchy_ir::model_facts::ActDtype::F16,
         );
-        const KV_LORA_RANK: usize = 0;
-        const QK_NOPE_HEAD_DIM: usize = 0;
-        const QK_ROPE_HEAD_DIM: usize = 0;
-        const V_HEAD_DIM: usize = 0;
-        const QK_HEAD_DIM: usize = 0;
-        const MLA_ATTN_SCALE: f32 = 0.0;
     }
 
     // `WeightAccessors` is a supertrait of `CanonicalParams` (every method defaults). The
