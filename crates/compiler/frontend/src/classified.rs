@@ -861,6 +861,10 @@ pub struct Program {
     /// `ModelParams::weight_leaf_renames`). Applied by
     /// `codegen::safetensors_prefix` after segment translation.
     pub weight_leaf_renames: Vec<(String, String)>,
+    /// The derived dims of the vocabulary this program was classified under: the core rows, then
+    /// each decoder state's. What the config loader derives a model of this program's carrier by,
+    /// and what the typed-Rust emit pass types its derived dims as.
+    pub dims: crate::state::DimTable,
 }
 
 impl Program {
@@ -1181,6 +1185,7 @@ mod tests {
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
+            dims: Default::default(),
         }
     }
 

@@ -9527,6 +9527,7 @@ mod fingerprint_tests {
         let configs = crate::config::load_dir(
             &dir,
             &Default::default(),
+            &crate::config::build_dims(),
             &crate::config::Scope::all(),
             &crate::target::Shared,
         )
@@ -9580,8 +9581,16 @@ mod fingerprint_tests {
     /// emits fluent-looking token soup.
     #[test]
     fn granite_3_0_and_3_1_are_separated_by_the_rope_theta_gate() {
-        let v30 = config_of("granite", "granite-3.0-2b-instruct");
-        let v31 = config_of("granite", "granite-3.1-2b-instruct");
+        let v30 = config_of(
+            "granite",
+            "granite-3.0-2b-instruct",
+            &crate::config::build_dims(),
+        );
+        let v31 = config_of(
+            "granite",
+            "granite-3.1-2b-instruct",
+            &crate::config::build_dims(),
+        );
 
         // The premise: they really are indistinguishable without theta.
         for key in [
@@ -9670,7 +9679,7 @@ mod fingerprint_tests {
             "premise broken: llama-2-70b now states a rope_theta, so it no longer exercises the \
              arch default — repoint this test at another config that omits it",
         );
-        let model = config_of("llama", "llama-2-70b");
+        let model = config_of("llama", "llama-2-70b", &crate::config::build_dims());
         assert_eq!(model.text.rope_theta.get(), 10_000.0);
         assert_eq!(emitted_rope_theta(&model, "llama"), Some(10_000.0));
     }
@@ -9697,8 +9706,18 @@ mod fingerprint_tests {
     #[test]
     fn the_two_qwen3_5_moe_stems_resolve_different_gate_widths() {
         let (Some(v3_5), Some(v3_6)) = (
-            variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", "mlx-affine-b4-g64-qembed"),
-            variant_of("qwen3-5-moe", "qwen3.6-35b-a3b", "mlx-affine-b4-g64-qembed"),
+            variant_of(
+                "qwen3-5-moe",
+                "qwen3.5-35b-a3b",
+                "mlx-affine-b4-g64-qembed",
+                &crate::config::build_dims(),
+            ),
+            variant_of(
+                "qwen3-5-moe",
+                "qwen3.6-35b-a3b",
+                "mlx-affine-b4-g64-qembed",
+                &crate::config::build_dims(),
+            ),
         ) else {
             return;
         };
@@ -9740,7 +9759,12 @@ mod fingerprint_tests {
     /// disagreeing with the tensor the loader reads.
     #[test]
     fn the_gemma4_moe_router_width_comes_from_the_declared_override() {
-        let Some(v) = variant_of("gemma4-moe", "gemma-4-26b-a4b-it", "mlx-affine-b4-g64") else {
+        let Some(v) = variant_of(
+            "gemma4-moe",
+            "gemma-4-26b-a4b-it",
+            "mlx-affine-b4-g64",
+            &crate::config::build_dims(),
+        ) else {
             return;
         };
         assert_eq!(
@@ -9842,7 +9866,7 @@ mod fingerprint_tests {
                 None,
             ),
         ] {
-            let Some(model) = variant_of(arch, stem, preset) else {
+            let Some(model) = variant_of(arch, stem, preset, &crate::config::build_dims()) else {
                 continue;
             };
             let (_, fuf) = fuf_of(arch, &model);
@@ -9893,7 +9917,7 @@ mod fingerprint_tests {
     fn the_latent_and_plain_nemotron_moe_probe_different_expert_input_widths() {
         let preset = "mlx-affine-b4-g64-qembed";
         let probe = |arch: &str, stem: &str| -> Option<_> {
-            let model = variant_of(arch, stem, preset)?;
+            let model = variant_of(arch, stem, preset, &crate::config::build_dims())?;
             let (program, fuf) = fuf_of(arch, &model);
             let last_moe = *model.layer_sets["moe_layers"].members().last().unwrap();
             let probe = expert_input_probe(&program, &fuf, &model).expect("an ungated bank");
@@ -9942,15 +9966,20 @@ mod fingerprint_tests {
             assert_eq!(sup_real, 1024 * 4 / 32);
         }
         assert!(
-            variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", preset)
-                .map(|model| {
-                    expert_input_probe(
-                        &layout_test_program(&[]),
-                        &Fuf { nodes: Vec::new() },
-                        &model,
-                    )
-                })
-                .is_none_or(|probe| probe.is_none()),
+            variant_of(
+                "qwen3-5-moe",
+                "qwen3.5-35b-a3b",
+                preset,
+                &crate::config::build_dims()
+            )
+            .map(|model| {
+                expert_input_probe(
+                    &layout_test_program(&[]),
+                    &Fuf { nodes: Vec::new() },
+                    &model,
+                )
+            })
+            .is_none_or(|probe| probe.is_none()),
             "a gated bank's leaf names live in the loaders; no probe is claimed for it",
         );
     }
@@ -9966,6 +9995,7 @@ mod fingerprint_tests {
             arch,
             "nemotron-3-super-120b-a12b",
             "mlx-affine-b4-g64-qembed",
+            &crate::config::build_dims(),
         ) else {
             return;
         };
@@ -10010,7 +10040,11 @@ mod fingerprint_tests {
 
         // The dense base rejects an MLX checkpoint by the `.scales` marker, at the FIRST layer
         // that has the leaf.
-        let dense = config_of(arch, "nemotron-3-super-120b-a12b");
+        let dense = config_of(
+            arch,
+            "nemotron-3-super-120b-a12b",
+            &crate::config::build_dims(),
+        );
         let manifest =
             crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
         let ts = emit_fingerprint_check(&dense, &manifest, 1, &[], None).to_string();
@@ -10082,6 +10116,7 @@ mod fingerprint_tests {
             arch,
             "nemotron-3-nano-30b-a3b-parity-tiny",
             "mlx-affine-b4-g64-qembed",
+            &crate::config::build_dims(),
         ) else {
             return;
         };
@@ -10299,7 +10334,7 @@ mod fingerprint_tests {
     /// variant with no affine tensors emits nothing at all.
     #[test]
     fn the_affine_width_gate_is_emitted_from_the_collected_rows() {
-        let model = config_of("llama", "smollm2-135m");
+        let model = config_of("llama", "smollm2-135m", &crate::config::build_dims());
         let manifest =
             crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
 
@@ -10323,7 +10358,7 @@ mod fingerprint_tests {
     /// routinely disagrees with the canonical `config.json`.
     #[test]
     fn the_theta_gate_is_permissive_when_the_caller_supplies_none() {
-        let model = config_of("llama", "smollm2-135m");
+        let model = config_of("llama", "smollm2-135m", &crate::config::build_dims());
         let manifest =
             crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
         let ts = emit_fingerprint_check(&model, &manifest, 1, &[], None).to_string();
@@ -10378,8 +10413,14 @@ mod fingerprint_tests {
                 "gpt-oss",
                 "gpt-oss-120b",
                 "mlx-affine-b2-g64-attn4-router8-qembed",
+                &crate::config::build_dims(),
             ),
-            variant_of("gpt-oss", "gpt-oss-120b", "mlx-affine-b2-g64-qembed"),
+            variant_of(
+                "gpt-oss",
+                "gpt-oss-120b",
+                "mlx-affine-b2-g64-qembed",
+                &crate::config::build_dims(),
+            ),
         ) else {
             return;
         };
@@ -10450,6 +10491,7 @@ mod fingerprint_tests {
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
+            dims: Default::default(),
         }
     }
 

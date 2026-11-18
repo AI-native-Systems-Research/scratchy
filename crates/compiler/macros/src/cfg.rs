@@ -474,7 +474,7 @@ mod tests {
             .join("configs")
             .join("llama")
             .join("llama-3.2-1b.json");
-        config::load_file(&path).expect("load llama-3.2-1b config")
+        config::load_file(&path, &crate::config::build_dims()).expect("load llama-3.2-1b config")
     }
 
     #[test]

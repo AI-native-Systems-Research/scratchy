@@ -4,8 +4,9 @@
 //! models hands the forward compiler, which lists those handles. A decoder state crate states each op
 //! once, through [`state_op!`], and lists its ops and inputs once, through [`decoder_state!`].
 
+use scratchy_forward_compiler_frontend::classify::ClassifyError;
 pub use scratchy_forward_compiler_frontend::dim::{DeriveStage, DerivedDim, DerivedRule};
-use scratchy_forward_compiler_frontend::state::{OpName, StateVocabulary};
+use scratchy_forward_compiler_frontend::state::{DimTable, OpName, StateVocabulary};
 use scratchy_subtile::state_op::StateOpFacts;
 use scratchy_typed_shapes::Shapes;
 
@@ -56,6 +57,12 @@ impl<'a> Typing<'a> {
     /// carrier under.
     pub fn vocabularies(&self) -> impl Iterator<Item = &'a dyn StateVocabulary> {
         vocabularies(self.decoder_states)
+    }
+
+    /// The derived dims a config derives by under this typing: the core rows, then each decoder
+    /// state's, assembled as a carrier classified under [`Typing::vocabularies`] holds them.
+    pub fn dims(&self) -> Result<DimTable, ClassifyError> {
+        DimTable::assemble(&self.vocabularies().collect::<Vec<_>>())
     }
 }
 

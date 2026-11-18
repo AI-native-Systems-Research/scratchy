@@ -6132,6 +6132,10 @@ mod tests {
     /// walk panics the derivation here instead of failing an emu build.
     #[test]
     fn emu_prefill_lx_width_pins_the_gemma4_rungs() {
+        // The derived dims the build derives each config by.
+        let dims = scratchy_models_typed::typing()
+            .dims()
+            .expect("the build's decoder states assemble");
         for (arch, stem, preset, want) in [
             ("gemma4", "gemma-4-12b-it", "fp8-dynamic-per-channel", 19),
             ("gemma4", "gemma-4-31b-it", "fp8-dynamic-per-channel", 11),
@@ -6144,9 +6148,9 @@ mod tests {
             ("llama", "llama-3.2-1b", "", 31),
         ] {
             let model = if preset.is_empty() {
-                config_of(arch, stem)
+                config_of(arch, stem, &dims)
             } else {
-                match variant_of(arch, stem, preset) {
+                match variant_of(arch, stem, preset, &dims) {
                     Some(model) => model,
                     // Load-or-refuse: a mixed-bit variant skips under a
                     // backend that can't lower it.

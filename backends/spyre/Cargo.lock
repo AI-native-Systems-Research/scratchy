@@ -1825,6 +1825,7 @@ dependencies = [
  "scratchy-forward-compiler-frontend",
  "scratchy-forward-compiler-macro",
  "scratchy-ir",
+ "scratchy-models-typed",
  "scratchy-subtile",
  "scratchy-target-spyre",
  "scratchy-tp-world",

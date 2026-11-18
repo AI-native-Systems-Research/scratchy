@@ -354,6 +354,8 @@ fn bounds_snapshot() {
 fn a_gated_flag_resolves_as_the_config_loader_derives_it() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let mut checked = 0;
+    // Every gated rule the loader derives by: the core rows and each decoder state's.
+    let dims = crate::config::build_dims();
     for (stem, vision) in carriers(&arch) {
         let arch_json = arch.join("configs").join(&stem).join("arch.json");
         let facts = match arch_json.exists() {
@@ -367,7 +369,7 @@ fn a_gated_flag_resolves_as_the_config_loader_derives_it() {
             let model = model.unwrap_or_else(|e| panic!("{stem}/{cfg}: {e:?}"));
             let raw: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            for d in crate::dim::DERIVED_DIMS.iter() {
+            for d in dims.rows() {
                 let Some(flag) = d.rule.gate_flag() else {
                     continue;
                 };

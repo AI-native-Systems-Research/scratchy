@@ -36,3 +36,53 @@ fn glm_attention_is_heads_of_values() {
         assert_eq!(w, bound("qk_rope_head_dim"));
     }
 }
+
+/// GLM-4.7-Flash's latent attention widths come from the multi-head latent attention decoder state,
+/// not the core table: its typed carrier states each at the dim it always has, and the core rows
+/// name none of them.
+#[test]
+fn glm_dims_come_from_its_state() {
+    use scratchy_forward_compiler_frontend::dim::{
+        DERIVED_DIMS, Dim, canonical_add, canonical_mul,
+    };
+    let bound = |name: &str| Dim::Bound(name.to_string());
+    let heads = || bound("num_attention_heads");
+    let expected = [
+        (
+            "q_proj_out",
+            canonical_mul(vec![
+                heads(),
+                canonical_add(vec![bound("qk_nope_head_dim"), bound("qk_rope_head_dim")]),
+            ]),
+        ),
+        (
+            "kv_lora_out",
+            canonical_mul(vec![
+                heads(),
+                canonical_add(vec![bound("qk_nope_head_dim"), bound("v_head_dim")]),
+            ]),
+        ),
+        (
+            "attn_out",
+            canonical_mul(vec![heads(), bound("v_head_dim")]),
+        ),
+        (
+            "kv_a_proj_out",
+            canonical_add(vec![bound("kv_lora_rank"), bound("qk_rope_head_dim")]),
+        ),
+    ];
+    let derived = scratchy_models_typed::derived_dims_of("glm4_moe_lite")
+        .expect("GLM-4.7-Flash's typed program");
+    for (name, dim) in &expected {
+        let stated = (derived.iter())
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("GLM-4.7-Flash's typed carrier states no `{name}`"));
+        assert_eq!(&stated.1, dim, "`{name}`");
+    }
+    for (name, _) in &expected {
+        assert!(
+            DERIVED_DIMS.iter().all(|d| d.name != *name),
+            "the core rows state `{name}`, a latent attention width"
+        );
+    }
+}

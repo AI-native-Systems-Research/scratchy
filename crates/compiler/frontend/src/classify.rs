@@ -240,6 +240,7 @@ pub fn classify_with(
         prelude,
         decoder_safetensors_prefix: None,
         weight_leaf_renames: Vec::new(),
+        dims: decoder_states.dims().clone(),
     })
 }
 

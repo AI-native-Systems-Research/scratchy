@@ -579,8 +579,12 @@ pub fn compile_carrier(
         // bound set from the nested `vision_config` block via the
         // declared `Params` schema instead of the decoder's flat
         // top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec, scope, emitter),
-        _ => config::load_dir(models_dir, &spec, scope, emitter),
+        // Each config derives by the derived dims the carrier was classified under: the core
+        // rows, then the build's decoder states'.
+        classified::Prelude::Vision => {
+            config::load_dir_vision(models_dir, &spec, &classified.dims, scope, emitter)
+        }
+        _ => config::load_dir(models_dir, &spec, &classified.dims, scope, emitter),
     }
     .map_err(|e| {
         // A refusal that belongs to ONE config rides the per-stem arm —

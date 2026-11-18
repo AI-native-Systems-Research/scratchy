@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 
 use crate::bundles::Bundle;
 use crate::classified::{Expr, ExternKind, LocalId, OpKind, Program, Stmt};
-use crate::dim::{DERIVED_DIMS, DerivedRule, Dim, canonical_add, canonical_mul};
+use crate::dim::{DerivedRule, Dim, canonical_add, canonical_mul};
 use crate::hf_config::ParamExpr;
 use crate::weights_manifest::WeightsManifest;
 
@@ -254,7 +254,8 @@ fn marker_rows<'a>(bounds: impl Iterator<Item = &'a str>) -> String {
 
 /// The carrier's derived dims among `named` (and every derived dim their rules read), each a type
 /// alias for its rule (`type KvDim = Mul<HeadDim, NumKeyValueHeads>;`); every base bound they read
-/// goes into `base`. A derived dim is one of [`DERIVED_DIMS`] (a gated one by the carrier's
+/// goes into `base`. A derived dim is a row of the carrier program's assembled table
+/// ([`Program::dims`]: the core rows, then each decoder state's; a gated one by the carrier's
 /// resolved flag) or one of its arch.json `expr` params.
 fn carrier_aliases(
     c: &Carrier<'_>,
@@ -267,7 +268,7 @@ fn carrier_aliases(
         if aliases.contains_key(&name) || base.contains(&name) {
             continue;
         }
-        let dim = if let Some(d) = DERIVED_DIMS.iter().find(|d| d.name == name) {
+        let dim = if let Some(d) = c.program.dims.find(&name) {
             Some(rule_dim(c, &name, &d.rule)?)
         } else if let Some(e) = c.facts.exprs.get(&name) {
             Some(expr_dim(c, &name, e)?)
@@ -309,7 +310,7 @@ fn carrier_aliases(
     ))
 }
 
-/// A [`DERIVED_DIMS`] rule as a dim, a gated rule's arm chosen by the carrier's resolved flag.
+/// A derived dim's rule as a dim, a gated rule's arm chosen by the carrier's resolved flag.
 fn rule_dim(c: &Carrier<'_>, name: &str, rule: &DerivedRule) -> Result<Dim, String> {
     Ok(match rule {
         DerivedRule::Bound(b) => Dim::Bound(b.to_string()),

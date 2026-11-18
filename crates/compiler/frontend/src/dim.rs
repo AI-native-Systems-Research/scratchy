@@ -103,8 +103,10 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
 }
 
 /// A derived dim's rule over config bounds: the arithmetic a `weights.json` name like `kv_dim`
-/// stands for. The one table of these, [`DERIVED_DIMS`], is what the config loader derives each
-/// model's value from and what the typed-Rust emit pass spells as a type, so the two cannot drift.
+/// stands for. A build's one table of these, the core rows ([`DERIVED_DIMS`]) then each decoder
+/// state's, assembled once (the front end's `state::DimTable`), is what the config loader derives
+/// each model's value from and what the typed-Rust emit pass spells as a type, so the two cannot
+/// drift.
 #[derive(Clone, Copy, Debug)]
 pub enum DerivedRule {
     /// A config bound.
@@ -202,8 +204,9 @@ pub struct DerivedDim {
     pub rule: DerivedRule,
 }
 
-/// Every derived dim, in derivation order (a rule may read one derived above it).
-pub const DERIVED_DIMS: [DerivedDim; 11] = [
+/// The core derived dims, every build's, in derivation order (a rule may read one derived above
+/// it). A decoder state's own dims are its crate's, assembled after these.
+pub const DERIVED_DIMS: [DerivedDim; 7] = [
     DerivedDim {
         name: "attn_q_dim",
         stage: DeriveStage::Implicit,
@@ -252,49 +255,6 @@ pub const DERIVED_DIMS: [DerivedDim; 11] = [
             DerivedRule::Bound("gdn_value_dim"),
         ]),
     },
-    // Multi-head latent attention (the DeepSeek family). q_proj's (or q_b_proj's, under Q-LoRA)
-    // output: per head, the no-rope and rope parts of a query.
-    DerivedDim {
-        name: "q_proj_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Mul(&[
-            DerivedRule::Bound("num_attention_heads"),
-            DerivedRule::Add(&[
-                DerivedRule::Bound("qk_nope_head_dim"),
-                DerivedRule::Bound("qk_rope_head_dim"),
-            ]),
-        ]),
-    },
-    // kv_b_proj's decompressed output: per head, a key's no-rope part and a value.
-    DerivedDim {
-        name: "kv_lora_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Mul(&[
-            DerivedRule::Bound("num_attention_heads"),
-            DerivedRule::Add(&[
-                DerivedRule::Bound("qk_nope_head_dim"),
-                DerivedRule::Bound("v_head_dim"),
-            ]),
-        ]),
-    },
-    // o_proj's input: every head's value.
-    DerivedDim {
-        name: "attn_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Mul(&[
-            DerivedRule::Bound("num_attention_heads"),
-            DerivedRule::Bound("v_head_dim"),
-        ]),
-    },
-    // kv_a_proj_with_mqa's output: the compressed KV, then the one shared rope key.
-    DerivedDim {
-        name: "kv_a_proj_out",
-        stage: DeriveStage::Implicit,
-        rule: DerivedRule::Add(&[
-            DerivedRule::Bound("kv_lora_rank"),
-            DerivedRule::Bound("qk_rope_head_dim"),
-        ]),
-    },
     // The global attention class's projection widths (Gemma 4's dual-class attention):
     // q_proj_global's output, and the one shared global K/V projection's.
     DerivedDim {
@@ -315,15 +275,17 @@ pub const DERIVED_DIMS: [DerivedDim; 11] = [
     },
 ];
 
-/// Derive into `bounds` every [`DERIVED_DIMS`] entry of `stage` that no config states and whose
-/// inputs `bounds` has, each into `derived` as the dim its rule derives it from. Explicit values
-/// always win.
-pub fn derive_dims(
+/// Derive into `bounds` every row of `rows` of `stage` that no config states and whose inputs
+/// `bounds` has, each into `derived` as the dim its rule derives it from. Explicit values always
+/// win. `rows` are a build's assembled derived dims (the front end's `state::DimTable`), in
+/// derivation order.
+pub fn derive_dims<'a>(
+    rows: impl IntoIterator<Item = &'a DerivedDim>,
     bounds: &mut std::collections::BTreeMap<String, u64>,
     stage: DeriveStage,
     derived: &mut std::collections::BTreeMap<String, Dim>,
 ) {
-    for d in DERIVED_DIMS.iter().filter(|d| d.stage == stage) {
+    for d in rows.into_iter().filter(|d| d.stage == stage) {
         if !bounds.contains_key(d.name)
             && let Some(v) = d.rule.eval(bounds)
         {

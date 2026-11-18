@@ -10,11 +10,60 @@ extern crate self as scratchy_state_decoder_mla;
 
 pub mod ops;
 
+use scratchy_decoder_state::{DeriveStage, DerivedDim, DerivedRule};
+
+/// q_proj's (or q_b_proj's, under Q-LoRA) output: per head, the no-rope and rope parts of a query.
+pub const Q_PROJ_OUT: DerivedDim = DerivedDim {
+    name: "q_proj_out",
+    stage: DeriveStage::Implicit,
+    rule: DerivedRule::Mul(&[
+        DerivedRule::Bound("num_attention_heads"),
+        DerivedRule::Add(&[
+            DerivedRule::Bound("qk_nope_head_dim"),
+            DerivedRule::Bound("qk_rope_head_dim"),
+        ]),
+    ]),
+};
+
+/// kv_b_proj's decompressed output: per head, a key's no-rope part and a value.
+pub const KV_LORA_OUT: DerivedDim = DerivedDim {
+    name: "kv_lora_out",
+    stage: DeriveStage::Implicit,
+    rule: DerivedRule::Mul(&[
+        DerivedRule::Bound("num_attention_heads"),
+        DerivedRule::Add(&[
+            DerivedRule::Bound("qk_nope_head_dim"),
+            DerivedRule::Bound("v_head_dim"),
+        ]),
+    ]),
+};
+
+/// o_proj's input: every head's value.
+pub const ATTN_OUT: DerivedDim = DerivedDim {
+    name: "attn_out",
+    stage: DeriveStage::Implicit,
+    rule: DerivedRule::Mul(&[
+        DerivedRule::Bound("num_attention_heads"),
+        DerivedRule::Bound("v_head_dim"),
+    ]),
+};
+
+/// kv_a_proj_with_mqa's output: the compressed KV, then the one shared rope key.
+pub const KV_A_PROJ_OUT: DerivedDim = DerivedDim {
+    name: "kv_a_proj_out",
+    stage: DeriveStage::Implicit,
+    rule: DerivedRule::Add(&[
+        DerivedRule::Bound("kv_lora_rank"),
+        DerivedRule::Bound("qk_rope_head_dim"),
+    ]),
+};
+
 scratchy_decoder_state::decoder_state! {
-    /// The multi-head latent attention decoder state: its three ops, and one layer's latent cache as its
-    /// state input.
+    /// The multi-head latent attention decoder state: its three ops, one layer's latent cache as its
+    /// state input, and the projection widths the latent attention's weights are read at.
     pub static MLA: name = mla, signatures = ::scratchy_state_decoder_mla::ops,
-        ops = [mla_split, mla_append, mla_attention], inputs = [mla_cache];
+        ops = [mla_split, mla_append, mla_attention], inputs = [mla_cache],
+        dims = [Q_PROJ_OUT, KV_LORA_OUT, ATTN_OUT, KV_A_PROJ_OUT];
 }
 
 #[cfg(test)]
@@ -63,5 +112,10 @@ mod tests {
         };
         assert_eq!(input.name, InputName::new("mla_cache"));
         assert!((MLA.subtile())(OpName::new("mla_cache")).is_none());
+        let dims: Vec<_> = vocabulary.derived_dims().iter().map(|d| d.name).collect();
+        assert_eq!(
+            dims,
+            ["q_proj_out", "kv_lora_out", "attn_out", "kv_a_proj_out"]
+        );
     }
 }
