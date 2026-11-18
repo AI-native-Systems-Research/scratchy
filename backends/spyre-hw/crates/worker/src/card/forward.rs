@@ -1027,13 +1027,20 @@ fn read_sampled_tokens(
     result_id: u32,
     vocab: usize,
 ) -> ExecutorResult<Vec<u32>> {
-    let bytes = session
-        .read_tensor_raw(
+    // The one-shot door's own pair — defer, then decode ON the landed window
+    // through the visitor (no owned copy): the same zero-alloc stick law the
+    // deferred collect obeys, composed inline because this pick runs in-call.
+    let read = session
+        .defer_read_tensor_raw(
             scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
             width.get() * seat.idx_row_words as usize * 4,
         )
         .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
-    decode_idx_stick(&bytes, width.get(), seat.idx_row_words as usize, vocab)
+    session
+        .finish_deferred_read_with(&read, |bytes| {
+            decode_idx_stick(bytes, width.get(), seat.idx_row_words as usize, vocab)
+        })
+        .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?
 }
 
 /// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
@@ -1051,17 +1058,25 @@ pub(crate) fn collect_decode_tokens(
     // not an artifact), the pick is the decode. And this collect is the outstanding
     // count's other half — the submit incremented it, this decrements it, so the
     // depth row counts exactly the submissions still uncollected.
+    // The on-card alloc-census window steps here, before the fence, so the window
+    // spans the whole steady step (instrumentation only; the card crate's `census`).
+    #[cfg(feature = "alloc-census")]
+    scratchy_target_spyre_card::census::collect_step();
     let t_fence = std::time::Instant::now();
-    let bytes = session
-        .finish_deferred_read_raw(&sub.read)
+    // ⭐ ZERO-ALLOC COLLECT: the decode runs ON the ring slot's landed bytes,
+    // through the visitor door — no copy into a fresh Vec, no intermediate
+    // word buffer. The pick is the only thing this step allocates, and it is
+    // the step's own output crossing the engine's API, not a seam buffer.
+    // The two `?`s keep the original's ORDER: a read error returns before the
+    // outstanding decrement (the submission is still uncollected on a dead
+    // read), a decode refusal decrements first — the step was collected; its
+    // pick is refused.
+    let toks = session
+        .finish_deferred_read_with(&sub.read, |bytes| {
+            decode_idx_stick(bytes, sub.rows.get(), sub.idx_row_words as usize, sub.vocab)
+        })
         .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))?;
     let t_pick = std::time::Instant::now();
-    let toks = decode_idx_stick(
-        &bytes,
-        sub.rows.get(),
-        sub.idx_row_words as usize,
-        sub.vocab,
-    );
     OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let toks = toks?;
     scratchy_serving_worker::step_segs::record_collect(

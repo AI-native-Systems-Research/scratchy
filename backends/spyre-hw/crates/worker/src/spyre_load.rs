@@ -853,28 +853,50 @@ impl SpyreWorker {
     /// Resolve the bundle + load all static weights + derive dims + wiring.
     pub(crate) fn load_inner(&self) -> ExecutorResult<Loaded> {
         // ⭐ THIS WORKER'S CARDS — one per rank of the world this build serves (`World`, one card
-        // without a `tp/N`), from `local_rank` up — each opened on its own background thread NOW,
-        // so their ~5.7 s bring-ups overlap each other and the host-side weight load below. Joined
-        // where the first session needs them; every session of this worker spans all of them.
+        // without a `tp/N`), from `local_rank` up — the WHOLE bring-up (each card's open AND its
+        // runtime's build) runs on a background thread spawned NOW, so it overlaps the host-side
+        // weight load below; the runtimes arrive BUILT at the join, where the first session
+        // needs them. Every session of this worker spans all of them.
         // ⭐ THE WORLD'S CARDS, CLAIMED ONCE: the first `World::RANKS` cards senlib enumerates,
         // distinct by construction (`WorldCards::claim`). Rank r opens `cards.get(r)` by its PCIe
         // address — no index arithmetic, and nothing in the environment chooses the set.
         #[cfg(feature = "spyre-hw")]
-        let card_open = {
+        let bring_up = {
             let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
                 .map_err(|e| werr(format!("Spyre card table: {e}")))?;
             let world = scratchy_target_spyre_card::runtime::WorldCards::<World>::claim(&table)
                 .map_err(|e| werr(e.to_string()))?;
             info!("[spyre-worker] this world's cards: {}", world.describe());
-            let world = std::sync::Arc::new(world);
-            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::from_fn(|r| {
-                let world = std::sync::Arc::clone(&world);
-                std::thread::spawn(move || {
-                    scratchy_target_spyre_card::runtime::CardRuntime::<World>::open(
-                        world.per_rank().get(r),
-                    )
-                })
-            })
+            // ⭐ THE WHOLE BRING-UP ON ONE THREAD — open each card on its own per-rank thread,
+            // join them, leak the opened cards for the process, and build every runtime on the
+            // serve span, all inside this thread. Spawned NOW so the cards' ~5.7 s opens AND
+            // the runtime builds overlap the host-side weight load below (the bring-up is
+            // device work and allocator init; the weight load is host work — neither waits for
+            // the other). The join block below receives the span and the BUILT runtimes, or
+            // the first refusal, named.
+            std::thread::Builder::new()
+                .name("card-bring-up".to_string())
+                .spawn(
+                    move || -> Result<
+                        scratchy_target_spyre_card::runtime::SpanBuild<World>,
+                        String,
+                    > {
+                        let open = world.open_cards();
+                        let opened =
+                            scratchy_target_spyre_card::runtime::WorldCards::join_opens(open)?;
+                        // ⭐ OPENED ONCE, FOR THE PROCESS — the leak's law is stated in full at
+                        // the join block below, where the runtimes are leaked to match.
+                        let opened_cards: &'static OpenedCards = Box::leak(Box::new(opened));
+                        Ok(
+                            scratchy_target_spyre_card::runtime::WorldCards::build_on_serve_span(
+                                world,
+                                opened_cards,
+                            ),
+                        )
+                    },
+                )
+                .expect("spawn the card bring-up thread — a refusal here is boot-time resource \
+                         exhaustion, not a load error to route around")
         };
 
         let model_dir = resolve_model_path(
@@ -1390,6 +1412,12 @@ impl SpyreWorker {
                     wiring,
                 }
             };
+        // The serve span hosting every card's completion threads — built with the runtimes
+        // (below), adopted by the leaked runtimes, and carried in `Loaded` so it is released
+        // exactly when the model is. NO initializer: the hw session block below is the only
+        // path to `Loaded`, so definite assignment itself proves the span is always built.
+        #[cfg(feature = "spyre-hw")]
+        let serve_span_v: Option<scratchy_target_spyre_card::runtime::ServeSpan<World>>;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1529,21 +1557,40 @@ impl SpyreWorker {
                     (Some(tp), None) => Some(tp),
                     (None, _) => None,
                 };
-                // ⭐ THE CARD, JOINED. Its capacity was read from the card when it opened — a card
-                // that cannot report one does not open — so the KV pool below is sized from the real
-                // card, with no default to fall back to.
+                // ⭐ THE BRING-UP, JOINED — the runtimes arrive BUILT. The background thread
+                // spawned at the top of the load opened every card, leaked them, and built
+                // every runtime on the serve span while THIS thread loaded weights from disk:
+                // the whole device bring-up overlapped the whole host load, so the join costs
+                // whatever of the two finished later, never their sum. Each card's capacity
+                // was read from the card when it opened — a card that cannot report one does
+                // not open — so the KV pool below is sized from the real card, with no
+                // default to fall back to.
                 //
-                // ⭐ OPENED ONCE, FOR THE PROCESS, AND BORROWED BY EVERY SESSION. The sessions land in
-                // `Loaded`, which the worker holds for the life of the process (a `Box<dyn Worker>`,
-                // so `'static`), and each borrows its card: `&'static` is the borrow that outlives
-                // them, given to the cards ONCE here — the same as the bundles this load leaks — so
-                // the compiler, not a refcount, checks that no session outlives its card.
-                let opened: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
-                    h.join()
-                        .map_err(|_| werr(format!("card {}'s bring-up thread panicked", r.get())))?
-                        .map_err(|e| werr(format!("open Spyre card {}: {e}", r.get())))
-                })?;
-                let cards: &'static Cards = Box::leak(Box::new(opened));
+                // ⭐ OPENED ONCE, FOR THE PROCESS. The sessions land in `Loaded`, which the worker
+                // holds for the life of the process (a `Box<dyn Worker>`, so `'static`), and each
+                // borrows its card's RUNTIME, which borrows the card: `&'static` is the borrow
+                // that outlives them all, given ONCE on the bring-up thread to the cards and
+                // here to the runtimes — the same as the bundles this load leaks — so the
+                // compiler, not a refcount, checks that no session outlives its runtime and
+                // no runtime its card.
+                //
+                // ⭐ THE RUNTIMES ON THE SERVE SPAN — built per rank on scoped threads
+                // pinned to their card's node, `create_scheduler` parking each card's completion
+                // threads on the span's scope. The span is hosted by its own thread (the
+                // worker's serve span has no frame of its own — the engine calls in from its
+                // threads); the runtimes borrow only the leaked cards, never the scope, so they
+                // are leaked in turn and every session below borrows them at `&'static`.
+                // Dropping `Loaded` drops the span: every card is stopped through the vendor's
+                // bounded-drain door and the completion threads join, never die with the
+                // process.
+                let (mut serve_span, built) = bring_up
+                    .join()
+                    .map_err(|_| werr("the card bring-up thread panicked"))?
+                    .map_err(werr)?;
+                let runtimes: Cards = built.map_err(werr)?;
+                let cards: &'static Cards = Box::leak(Box::new(runtimes));
+                serve_span.adopt(cards);
+                serve_span_v = Some(serve_span);
                 // ⭐ THIS THREAD BUILDS EVERY SESSION, so it runs where the world's shared work
                 // runs before the first one is built: each session's host copies and the
                 // activation shadows faulted in below are allocated and first touched there.
@@ -2844,15 +2891,13 @@ impl SpyreWorker {
                 // ── PREFIX-CAPABLE PREFILL LADDER ── the adoption. The fan-out was spawned with
                 // the prefill ladder's, before the owner (host halves only); its prepare ran in
                 // the wave above. The adoption runs one thread per session, reading the owner
-                // only; refusals and "ready" logs land in ladder order on this thread.
-                let prefix_adopted: Vec<(
-                    u32,
-                    u32,
-                    &'static str,
-                    &'static scratchy_target_spyre::wiring::Wiring,
-                    Result<SuperDscSession, String>,
-                )> = std::thread::scope(|scope| {
-                    let handles: Vec<_> = prefix_jobs
+                // only; refusals and "ready" logs land in ladder order on this thread. Each
+                // thread hands back the rung's OWN JOB beside its session — the job already
+                // states the rung's identity (width, sequence count, bundle, wiring cell), so
+                // the adoption never re-states those facts as a second tuple.
+                let prefix_adopted: Vec<(PrefixRungJob, Result<SuperDscSession, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = prefix_jobs
                             .into_iter()
                             .zip(prefix_prepared)
                             .map(|(job, built)| {
@@ -2860,14 +2905,9 @@ impl SpyreWorker {
                                 let spill = &spill_images;
                                 let pmq = job.pmq;
                                 let seqs = job.seqs;
-                                let fp: &'static str = &job.rcode.fp;
-                                let wiring = job.wiring;
                                 scope.spawn(move || {
                                     (
-                                        pmq,
-                                        seqs,
-                                        fp,
-                                        wiring,
+                                        job,
                                         built.map_err(|(_, m)| m).and_then(|mut ps| {
                                             adopt_from_owner(&mut ps, ss, spill)
                                                 .map_err(|e| {
@@ -2882,29 +2922,29 @@ impl SpyreWorker {
                                 })
                             })
                             .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| match h.join() {
-                            Ok(r) => r,
-                            Err(p) => std::panic::resume_unwind(p),
-                        })
-                        .collect()
-                });
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
+                    });
                 let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
-                for (pmq, seqs, fp, wiring, adopted) in prefix_adopted {
+                for (job, adopted) in prefix_adopted {
                     let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
                     // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its consts
                     // staged — the wave front's launch reads it, never a representative's.
-                    let meta = mk_meta(wiring_to_parsed(wiring)?, 0, wiring);
+                    let meta = mk_meta(wiring_to_parsed(job.wiring)?, 0, job.wiring);
                     info!(
                         "[spyre-worker] sendnn: prefix-capable prefill session ready (w={}, s={}, \
                          bundle {}) — a start>0 chunk runs on the smallest solo rung that holds \
                          it, a wave of tails on the smallest packed product that holds them",
-                        pmq, seqs, fp
+                        job.pmq, job.seqs, job.rcode.fp
                     );
                     prefix_built.push(PrefixRungBuilt {
-                        width: pmq as usize,
-                        seqs: seqs as usize,
+                        width: job.pmq as usize,
+                        seqs: job.seqs as usize,
                         meta,
                         sess: ps,
                     });
@@ -3167,6 +3207,9 @@ impl SpyreWorker {
             served_context: served_context_v,
             #[cfg(feature = "spyre-hw")]
             world_cpus: world_cpus_v,
+            #[cfg(feature = "spyre-hw")]
+            _serve_span: serve_span_v
+                .expect("the hw load path sets the serve span with the runtimes"),
         })
     }
 }

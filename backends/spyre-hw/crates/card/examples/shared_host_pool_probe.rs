@@ -41,7 +41,10 @@ use flex_rs::iommu::PfIommuMapper;
 use flex_rs::memory_region::MemoryType;
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{RuntimeStreamMode, RuntimeStreamPriority};
-use scratchy_target_spyre_card::runtime::DevAddr;
+use scratchy_target_spyre_card::runtime::{CardRuntime as AnyCard, DevAddr};
+
+/// A one-card probe: the card's runtime is a world of one's.
+type CardRuntime<'a> = AnyCard<'a, ktir_superdsc::collective::TpWorld<1>>;
 
 /// One page-multiple megabyte per slot: the aligned stride equals the
 /// request, so the capacity arithmetic in the assertions below is exact.
@@ -79,12 +82,30 @@ fn arc_from_dev(dev: &DevAddr) -> Result<Arc<CompositeAddress>> {
 }
 
 fn main() -> Result<()> {
-    // Real bring-up: card open, card-derived topology/allocator, scheduler, `RuntimeContext`.
-    let card = scratchy_target_spyre_card::runtime::WorldCards::<
+    // ⭐ THE PROBE'S SERVE SPAN IS THE PROBE ITSELF: the card is opened outside the
+    // scope (the runtime built over it borrows it for longer than the scope's threads
+    // live), the probe runs inside it, and the card's completion thread joins at the
+    // scope's close — plain locals, nothing leaked.
+    let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
+        .map_err(|e| anyhow!("Spyre card table: {e}"))?;
+    let world = scratchy_target_spyre_card::runtime::WorldCards::<
         ktir_superdsc::collective::TpWorld<1>,
-    >::open_all()
-    .map_err(anyhow::Error::msg)?
-    .into_first();
+    >::claim(&table)
+    .map_err(|e| anyhow!("{e}"))?;
+    let cards = scratchy_target_spyre_card::runtime::WorldCards::join_opens(world.open_cards())
+        .map_err(|e| anyhow!("{e}"))?;
+    std::thread::scope(|scope| {
+        let card = world
+            .build_all(&cards, scope)
+            .map_err(|e| anyhow!("{e}"))?
+            .into_first();
+        probe_body(&card)
+    })
+}
+
+/// The probe's body over its card — real bring-up, pool, data path, teardown.
+fn probe_body(card: &CardRuntime<'_>) -> Result<()> {
+    // Card-derived topology/allocator, scheduler, `RuntimeContext`.
     let rt = card.context().clone();
     let stream_id = rt
         .create_stream(
@@ -101,7 +122,7 @@ fn main() -> Result<()> {
     // runtime's staging mapper, which is what lets a pool outlive
     // `RuntimeContext::reset()` (the mapper-retention law, carried by the
     // `Arc<PfIommuMapper>` inside the mapping).
-    let mapper = PfIommuMapper::new(card.card().clone());
+    let mapper = PfIommuMapper::new(card.card());
     let mut pool =
         SharedHostPool::new(NUM_SLOTS, SLOT_BYTES, &mapper).context("pool construction")?;
 
@@ -140,7 +161,7 @@ fn main() -> Result<()> {
     );
 
     // --- 3. the data path: slot 0 -> device -> slot 1 ---
-    let dev = DevAddr::alloc(&card, ByteSize(SLOT_BYTES as u64), MemoryType::Tensor)
+    let dev = DevAddr::alloc(card, ByteSize(SLOT_BYTES as u64), MemoryType::Tensor)
         .context("device buffer alloc")?;
     let dev_composite = arc_from_dev(&dev)?;
     let pattern = pattern_bytes(SLOT_BYTES);
@@ -160,7 +181,7 @@ fn main() -> Result<()> {
     );
 
     // --- 4. the validation set refuses before any DMA ---
-    let big = DevAddr::alloc(&card, ByteSize((2 * SLOT_BYTES) as u64), MemoryType::Tensor)
+    let big = DevAddr::alloc(card, ByteSize((2 * SLOT_BYTES) as u64), MemoryType::Tensor)
         .context("oversize device buffer alloc")?;
     let big_composite = arc_from_dev(&big)?;
     match pool.enqueue_copy(&stream, 0, Some(big_composite.clone()), true) {

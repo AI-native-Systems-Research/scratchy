@@ -280,7 +280,7 @@ impl Payload {
 /// exact size the arms below do — `place_raw`'s own doc records the activations that bind less than
 /// their placement on purpose (a pmask's one broadcast row, the index table's one pass block).
 fn bind_raw<T: ktir_superdsc::collective::Tp>(
-    exec: &mut crate::superdsc_exec::Executor<T>,
+    exec: &mut crate::superdsc_exec::Executor<'_, '_, T>,
     tid: u32,
     bytes: Vec<u8>,
     how: &str,
@@ -312,6 +312,37 @@ use ktir_superdsc::reserved_tids::RESERVED_TID_FLOOR;
 type Alone = ktir_superdsc::collective::TpWorld<1>;
 
 pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
+    // One kernel on one card: a world of one's card, the first senlib enumerates.
+    //
+    // ⭐ THE SERVE SPAN OF A ONE-SHOT RUN IS THE RUN ITSELF: the scope below wraps every launch
+    // and read-back, so the card's completion thread lives exactly as long as the run and joins
+    // at the scope's close — PLAIN LOCALS (the cards and the runtime over them), nothing
+    // leaked. The cards are opened OUTSIDE the scope because the runtime built over them
+    // borrows them for longer than the scope's threads live (`create_scheduler`'s `'a: 'scope`
+    // law), and the body runs INSIDE it, on the card the runtime drives.
+    let table =
+        crate::runtime::CardTable::enumerate().map_err(|e| anyhow!("Spyre card table: {e}"))?;
+    let world = crate::runtime::WorldCards::<Alone>::claim(&table).map_err(|e| anyhow!("{e}"))?;
+    let cards =
+        crate::runtime::WorldCards::join_opens(world.open_cards()).map_err(|e| anyhow!("{e}"))?;
+    std::thread::scope(|scope| {
+        let card = world
+            .build_all(&cards, scope)
+            .map_err(|e| anyhow!("{e}"))?
+            .into_first();
+        run_loaded(dir, input, output, &card)
+    })
+}
+
+/// The run's body over its card — everything [`run`] does once the card's runtime is built: the
+/// parse of the producer's launch map and the inputs, the executor's load, staging, launches
+/// and read-backs.
+fn run_loaded(
+    dir: &Path,
+    input: &[String],
+    output: &[String],
+    card: &crate::runtime::CardRuntime<'_, Alone>,
+) -> Result<()> {
     // ── The producer's launch map ──
     let pf: PlacementsFile = serde_json::from_str(
         &std::fs::read_to_string(dir.join("placements.json")).with_context(|| {
@@ -692,12 +723,8 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         }
     };
 
-    // One kernel on one card: a world of one's card, the first senlib enumerates.
-    let card = crate::runtime::WorldCards::<Alone>::open_all()
-        .map_err(|e| anyhow!("{e}"))?
-        .into_first();
     let mut exec = crate::superdsc_exec::Executor::load(
-        &card,
+        card,
         code,
         // ⛔ NOT ZERO. These three are a MODEL's geometry, and a single-kernel bundle has none — but a
         // zero pool leaves the runtime configuring a device with no KV region at all, and the launch

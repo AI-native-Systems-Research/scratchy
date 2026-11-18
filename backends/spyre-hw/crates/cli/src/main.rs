@@ -23,6 +23,18 @@ extern crate scratchy_target_spyre_worker as _;
 #[cfg(feature = "tp")]
 extern crate tp as _;
 
+/// ⭐ THE ZERO-ALLOC PROOF INSTRUMENT, registered for the whole binary (`alloc-census`
+/// feature): flex-rs's census allocator over the system allocator, so every heap
+/// allocation the serve makes is countable. The worker's serving loop frames the
+/// window — `SCRATCHY_ALLOC_CENSUS_STEPS=N` collected decode steps, reported on
+/// stderr at the Nth (the card crate's `census` module). The allocator forwards
+/// every call verbatim, so the serve's behavior is identical with it on or off;
+/// an unset env var leaves the counters dark.
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC_CENSUS: flex_rs::alloc_census::CensusAllocator<std::alloc::System> =
+    flex_rs::alloc_census::CensusAllocator::new(std::alloc::System);
+
 use clap::{Parser, Subcommand};
 
 /// scratchy on IBM Spyre.
@@ -35,8 +47,12 @@ struct SpyreCli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    // ⭐ BOXED — the shared command enum is ≥360 B and `BundleCommand` is ~72 B, so
+    // carrying it inline made every `Command` value pay the larger size (clippy
+    // large_enum_variant). `Box<T>` is an `Args` in clap 4, so the flatten is
+    // unchanged; the box is opened once, at the variant's single reader below.
     #[command(flatten)]
-    Shared(scratchy_cli::args::Commands),
+    Shared(Box<scratchy_cli::args::Commands>),
     /// Run a Spyre bundle this binary did not bake — a `dxp_standalone` output
     /// directory plus the producer's launch map. Every other launch path here needs
     /// the bundle baked into the binary at build time, which leaves an externally
@@ -51,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cli = SpyreCli::parse();
     let r = match cli.command {
-        Command::Shared(command) => scratchy_cli::run::<SpyreCli>(command).await,
+        Command::Shared(command) => scratchy_cli::run::<SpyreCli>(*command).await,
         #[cfg(feature = "spyre-hw")]
         Command::Bundle(command) => bundle::run(command),
     };

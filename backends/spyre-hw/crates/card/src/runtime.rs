@@ -44,6 +44,7 @@ use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
     FlexAllocatorInit,
 };
+pub use flex_rs::card::Card;
 pub use flex_rs::card_table::{CardTable, CardTableError, EnumeratedCard};
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
@@ -65,7 +66,7 @@ use flex_rs::scheduler::{
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{
     DeviceId, RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority,
-    SchedulerError, StreamId,
+    SchedulerError, StreamId, UserCallback,
 };
 use flex_rs::topology::populate_domain_topology;
 use flex_rs::util::Status;
@@ -76,25 +77,29 @@ use flex_rs::util::Status;
 /// nickm5 held 8 open and linked at once, 2026-11-06). A one-card process is the same code with
 /// one `CardRuntime`.
 ///
-/// Built by [`CardRuntime::open`]: the card by PCI address (`flex_rs::card::Card::open`),
-/// its capacity read from the card, then a real `RuntimeContext` over a `Pf` backend and a real
-/// `FlexAllocator` whose address resolution is `FlexAllocatorAddressResolver` (production — see the
-/// `flex_rs::scheduler` module doc).
-pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
-    card: Arc<flex_rs::card::Card>,
+/// Built in two phases over a card its owner opened ([`WorldCards::open_cards`] then
+/// [`WorldCards::build_all`]): the card BORROWED for `'a` — never cloned — its capacity read from
+/// the card, then a real `RuntimeContext` over a `Pf` backend and a real `FlexAllocator` whose
+/// address resolution is `FlexAllocatorAddressResolver` (production — see the
+/// `flex_rs::scheduler` module doc). Every flex object the runtime holds (allocator, hardware
+/// submitter, capacity source, IOMMU mapper, scheduler, context) borrows the card with the same
+/// `'a`, so one card has one owner and the compiler — not a refcount — checks that nothing
+/// outlives it.
+pub struct CardRuntime<'a, T: ktir_superdsc::collective::Tp> {
+    card: &'a flex_rs::card::Card,
     /// ⭐ THE CPUS THIS CARD'S HOST THREADS RUN ON — its NUMA node's, read from sysfs at open
     /// (`flex_rs::numa`). Its response worker, its rank's submit thread and its bring-up thread
     /// each pin themselves to it first.
     cpus: CardCpus,
     memory: CardMemory,
-    rt: Arc<RuntimeContext>,
+    rt: Arc<RuntimeContext<'a>>,
     /// This card's p2p link, when it runs one rank of a sharded world — set once, by
     /// [`link_peers`]. A card's `XSEG` entries point at one window's slots, so the card holds at
     /// most one link for its life.
     link: std::sync::OnceLock<PeerLink<T>>,
 }
 
-impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
+impl<'a, T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardRuntime")
             .field("pci", &self.card.pci())
@@ -104,30 +109,36 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
-    /// Open one card of a world's card set ([`WorldCards`]) — BY ITS PCIe ADDRESS, so the card
-    /// opened is the card named — and bring its runtime up (~5.7 s cold).
+impl<'a, T: ktir_superdsc::collective::Tp> CardRuntime<'a, T> {
+    /// Build one card's runtime over a card its owner already opened ([`WorldCards::open_cards`])
+    /// — the card BORROWED for `'a`, its capacity read from the card.
     ///
     /// Single on-card domain (`DomainId(0)`), unconditionally: nothing in this codebase has ever
     /// asked the topology which domain is real, and this module does not invent a multi-domain
     /// topology query that has no call site anywhere else.
     ///
-    /// Returned BY VALUE: the caller is the card's one owner, and every session and executor on it
-    /// borrows it (`&'c CardRuntime<T>`), so the compiler checks that none outlives its card.
-    ///
     /// ⭐ THE CALLING THREAD IS THE CARD'S BRING-UP THREAD: it is pinned to the card's NUMA node
-    /// before anything is opened, so the host buffers bring-up touches first land on that node.
-    /// Open each card on its own thread (as the worker does) and each thread lands on its card's
-    /// node.
-    pub fn open(card: &WorldCard<T>) -> Result<Self, HwError> {
-        Self::build(card.0.index(), card.0.pci()).map_err(|e| HwError::BringUp(Arc::new(e)))
-    }
-
-    fn build(index: u32, pci: &str) -> Result<Self, BringUpError> {
+    /// before anything is built, so the host buffers the allocator's first touch lands on that
+    /// node. [`WorldCards::build_all`] opens each card's build on its own scoped thread, so each
+    /// thread lands on its card's node.
+    ///
+    /// `scope` is the SERVE SPAN's scope: `create_scheduler` parks its completion threads on it,
+    /// so they run until the serve span ends and are joined at its close — the flex-rs law that
+    /// the completion thread rides a caller's scope, never a thread of its own. That is why
+    /// `'a` (the card's lifetime) must outlive `'scope`: the threads the scope joins borrow the
+    /// hardware objects built here.
+    fn build<'scope>(
+        index: u32,
+        pci: &str,
+        card: &'a flex_rs::card::Card,
+        scope: &'scope std::thread::Scope<'scope, '_>,
+    ) -> Result<Self, BringUpError>
+    where
+        'a: 'scope,
+    {
         let cpus = CardCpus::read(pci).map_err(BringUpError::Placement)?;
         cpus.pin_current_thread().map_err(BringUpError::Pin)?;
         tracing::info!("[spyre-card] card {index} ({pci}): host threads on {cpus}");
-        let card = flex_rs::card::Card::open(pci).map_err(BringUpError::Open)?;
         // Real single on-card domain, sized off the card's actual HBM capacity and RCU core count —
         // `flex::populateDomainTopology` (`device_memory_topology.cpp`), ported natively as
         // `topology::populate_domain_topology`. A hardcoded placeholder here once mis-sized the
@@ -137,21 +148,20 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         let topo = populate_domain_topology(memory.0);
 
         let init = FlexAllocatorInit::default();
-        let dma = DeviceMemoryAllocator::new(card.clone(), flex_rs::allocator::DEVICE_ALIGNMENT);
+        let dma = DeviceMemoryAllocator::new(card, flex_rs::allocator::DEVICE_ALIGNMENT);
         let allocator = Arc::new(Mutex::new(
             FlexAllocator::new(init, topo, dma).map_err(BringUpError::AllocatorInit)?,
         ));
 
         let addr_resolver: Arc<dyn DeviceAddressResolver> =
             Arc::new(FlexAllocatorAddressResolver::new(allocator.clone()));
-        let hw: Arc<dyn HardwareSubmit> =
-            Arc::new(SenlibHardwareSubmit::new(card.clone(), cpus.clone()));
-        let capacity: Arc<dyn QueueCapacitySource> =
-            Arc::new(SenlibQueueCapacity::new(card.clone()));
+        let hw: Arc<dyn HardwareSubmit + 'a> =
+            Arc::new(SenlibHardwareSubmit::new(card, cpus.clone()));
+        let capacity: Arc<dyn QueueCapacitySource + 'a> = Arc::new(SenlibQueueCapacity::new(card));
         // `PfIommuMapper::new` derives the page size itself via `sysconf(_SC_PAGESIZE)`, matching
         // the real C++'s `PfIommuMapper::PfIommuMapper`'s `page_size_(common::page_size())`
         // (`pf_iommu_mapper.cpp:41-42`).
-        let iommu_mapper = flex_rs::iommu::PfIommuMapper::new(card.clone());
+        let iommu_mapper = flex_rs::iommu::PfIommuMapper::new(card);
         // `DeviceKind::Pf` is hardcoded, not read from `RuntimeConfig::flex_device()`:
         // `Card::open` (the real senlib bring-up call) only ever opens a PF device
         // (`SenPci::pf(addr)`, in cxx-shim/senlib_ffi.cpp) — there is no VF/MOCK bring-up path
@@ -160,6 +170,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         let scheduler = create_scheduler(
             &DeviceKind::Pf,
             SchedulerBackendConfig::Real(hw, capacity, addr_resolver, iommu_mapper),
+            scope,
         )
         .map_err(BringUpError::Scheduler)?;
 
@@ -173,9 +184,9 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         })
     }
 
-    /// The senlib card this runtime drives.
-    pub fn card(&self) -> &Arc<flex_rs::card::Card> {
-        &self.card
+    /// The senlib card this runtime drives — borrowed for the card's own `'a`, not refcounted.
+    pub fn card(&self) -> &'a flex_rs::card::Card {
+        self.card
     }
 
     /// The CPUs this card's host threads run on — its NUMA node's, read at [`Self::open`]. A
@@ -198,7 +209,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
 
     /// The flex `RuntimeContext` driving this card — for flex-level probes that drive the runtime's
     /// own types directly (`examples/shared_host_pool_probe.rs`).
-    pub fn context(&self) -> &Arc<RuntimeContext> {
+    pub fn context(&self) -> &Arc<RuntimeContext<'a>> {
         &self.rt
     }
 
@@ -213,6 +224,16 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     /// on this card: their streams and allocations answer `NotCreated` from here on.
     pub fn reset(&self) -> Result<(), HwError> {
         self.rt.reset().map_err(HwError::Reset)
+    }
+
+    /// Stop this card's completion thread — the vendor's own teardown door (`Shutdown`), reached
+    /// through the runtime context. Bounded by that door's own law, unchanged: a 5 s drain
+    /// window for what is still pending, then a force flag and a wait for the exit signal.
+    /// After this the card's sessions are dead; [`Self::reset`] is the mid-process probe, this
+    /// is teardown — the serve span calls it on every card before it releases the scope the
+    /// completion threads live on.
+    pub fn shutdown(&self) {
+        self.rt.shutdown();
     }
 }
 
@@ -237,7 +258,7 @@ pub fn prog_offset_base() -> u64 {
 /// `flex_senlib_device_memory_size()` and a `u64` written `8 * 1024 * 1024 * 1024` are the same
 /// type. So they are not the same type any more.
 ///
-/// The private field is the whole guard: [`CardRuntime::open`] is the ONLY constructor in the
+/// The private field is the whole guard: [`CardRuntime::build`] is the ONLY constructor in the
 /// crate, and it can only answer from `DeviceHandle::GetDmpaSize()`. A future literal cannot be
 /// spent where a `CardMemory` is demanded — `8 * 1024 * 1024 * 1024` does not typecheck as one — so
 /// re-introducing a hardcoded KV budget is a BUILD ERROR, not a silently mis-sized pool. That is the
@@ -273,7 +294,7 @@ impl CardMemory {
     /// the two quantities an allocation actually has to fit.
     ///
     /// Deliberately not `From<u64>`/`new`: the value leaves this type freely, but nothing outside
-    /// [`CardRuntime::open`] can put one IN.
+    /// [`CardRuntime::build`] can put one IN.
     pub const fn bytes(self) -> u64 {
         self.0
     }
@@ -551,23 +572,122 @@ impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
         &self.0
     }
 
-    /// Claim the world's cards from this host's table and open every one, each on its own thread
-    /// (their ~5.7 s bring-ups overlap), joined in rank order.
+    /// PHASE 1 of the two-phase bring-up: open the world's cards, each on its own plain thread
+    /// (their ~5.7 s bring-ups overlap). Returns the per-rank open THREADS, unjoined — a caller
+    /// overlaps the opens with its own work (the worker opens the cards while the host loads
+    /// weights) and joins through [`Self::join_opens`], which hands the cards back BY VALUE —
+    /// their owner's to place: the worker leaks them for the process, a function-scoped runner
+    /// keeps them as locals — because phase 2 ([`Self::build_all`]) borrows each card for the
+    /// life of the runtime it builds over it.
+    ///
+    /// ⭐ EACH THREAD PINS ITSELF to its card's NUMA node before opening it, so the host buffers
+    /// `Card::open` touches first land on that node.
+    pub fn open_cards(
+        &self,
+    ) -> PerRank<T, std::thread::JoinHandle<Result<flex_rs::card::Card, BringUpError>>> {
+        PerRank::<T, _>::from_fn(|r| {
+            let claimed = self.0.get(r);
+            let (index, pci) = (claimed.0.index(), claimed.0.pci().to_string());
+            std::thread::spawn(move || open_card(index, &pci))
+        })
+    }
+
+    /// Join phase 1's open threads, in rank order.
     ///
     /// # Errors
-    /// The table, the claim, or the first rank whose card does not open — named.
-    pub fn open_all() -> Result<PerRank<T, CardRuntime<T>>, String> {
-        let table = CardTable::enumerate().map_err(|e| format!("Spyre card table: {e}"))?;
-        let world = std::sync::Arc::new(Self::claim(&table).map_err(|e| e.to_string())?);
-        let open = PerRank::<T, _>::from_fn(|r| {
-            let world = std::sync::Arc::clone(&world);
-            std::thread::spawn(move || CardRuntime::<T>::open(world.per_rank().get(r)))
-        });
+    /// The first rank whose card did not open — named.
+    pub fn join_opens(
+        open: PerRank<T, std::thread::JoinHandle<Result<flex_rs::card::Card, BringUpError>>>,
+    ) -> Result<PerRank<T, flex_rs::card::Card>, String> {
         open.try_map_into(|r, h| {
             h.join()
-                .map_err(|_| format!("card of rank {}: bring-up thread panicked", r.get()))?
+                .map_err(|_| format!("card of rank {}: open thread panicked", r.get()))?
                 .map_err(|e| format!("open the card of rank {}: {e}", r.get()))
         })
+    }
+
+    /// PHASE 2 of the two-phase bring-up: build every card's runtime over the cards phase 1
+    /// opened, each on its own scoped thread (per-rank construction parallelism — those threads
+    /// close when this returns; they are NOT the serve span), joined in rank order.
+    ///
+    /// `scope` is the SERVE SPAN's scope — the one `create_scheduler` parks each card's
+    /// completion threads on (see [`CardRuntime::build`]), so it must outlive every runtime
+    /// built here.
+    ///
+    /// # Errors
+    /// The first rank whose runtime does not build — named.
+    pub fn build_all<'a, 'scope>(
+        &self,
+        cards: &'a PerRank<T, flex_rs::card::Card>,
+        scope: &'scope std::thread::Scope<'scope, '_>,
+    ) -> Result<PerRank<T, CardRuntime<'a, T>>, String>
+    where
+        'a: 'scope,
+    {
+        std::thread::scope(|build| {
+            let handles = PerRank::<T, _>::from_fn(|r| {
+                let card = cards.get(r);
+                let claimed = self.0.get(r);
+                let (index, pci) = (claimed.0.index(), claimed.0.pci().to_string());
+                build.spawn(move || CardRuntime::build(index, &pci, card, scope))
+            });
+            handles.try_map_into(|r, h| {
+                h.join()
+                    .map_err(|_| format!("card of rank {}: build thread panicked", r.get()))?
+                    .map_err(|e| format!("build the card of rank {}: {e}", r.get()))
+            })
+        })
+    }
+
+    /// PHASE 2 FOR THE WORKER: build the world's runtimes on a serve-span scope a dedicated
+    /// thread hosts ([`ServeSpan`] — the worker's serve span has no frame of its own to run a
+    /// scope in). The scope that `create_scheduler` parks every card's completion threads on is
+    /// the one this thread's body IS; the runtimes it returns borrow only the leaked `cards`,
+    /// never the scope, so they may be leaked in turn and outlive the call.
+    ///
+    /// Returns the span — drop it to stop every card and end the span — together with the build
+    /// result. On failure the span is still live and must still be dropped (its [`Drop`] handles
+    /// a failed build: the runtimes died with the error, so there is nothing to stop and nothing
+    /// parked).
+    pub fn build_on_serve_span(
+        world: WorldCards<T>,
+        cards: &'static PerRank<T, flex_rs::card::Card>,
+    ) -> SpanBuild<T> {
+        let (built_tx, built_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let host = std::thread::Builder::new()
+            .name("serve-span".to_string())
+            .spawn(move || {
+                std::thread::scope(|span| {
+                    let built = world.build_all(cards, span);
+                    // The channel-drop law: if the worker died before taking this, the send
+                    // fails and DROPS the runtimes — their completion threads see their
+                    // scheduler references go and exit — and the park below returns at once,
+                    // because the release sender died with the span handle.
+                    let _ = built_tx.send(built);
+                    // Park for the serve span: every completion thread spawned on `span` runs
+                    // until this scope closes, and it closes only when the span handle is
+                    // dropped (or died with the worker, which the channel-drop case above
+                    // already covered).
+                    let _ = release_rx.recv();
+                })
+            })
+            .expect(
+                "spawn the serve-span hosting thread — a refusal here is boot-time resource \
+                     exhaustion, not a load error to route around",
+            );
+        let built = built_rx.recv().expect(
+            "the serve-span host returns the build result before it parks, or dies with \
+                     the worker — neither leaves the channel silently empty",
+        );
+        (
+            ServeSpan {
+                release: Some(release_tx),
+                host: Some(host),
+                runtimes: None,
+            },
+            built,
+        )
     }
 
     /// One line naming every rank's card — the world's card set, for the log.
@@ -579,6 +699,91 @@ impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
             .map(|(r, c)| format!("r{}={}", r.get(), c.pci()))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+/// Open ONE card by its PCIe address — [`WorldCards::open_cards`]'s per-rank thread body. The
+/// CALLING THREAD (phase 1's per-rank thread) pins itself to the card's NUMA node first, so the
+/// host buffers `Card::open` touches first land on that node; the card comes back BY VALUE for
+/// the owner to place, because phase 2 borrows it for the life of the runtime built over it.
+fn open_card(index: u32, pci: &str) -> Result<flex_rs::card::Card, BringUpError> {
+    let cpus = CardCpus::read(pci).map_err(BringUpError::Placement)?;
+    cpus.pin_current_thread().map_err(BringUpError::Pin)?;
+    tracing::info!("[spyre-card] card {index} ({pci}): opened on {cpus}");
+    flex_rs::card::Card::open(pci).map_err(BringUpError::Open)
+}
+
+/// The pair [`WorldCards::build_on_serve_span`] returns: the span hosting every card's
+/// completion threads, and the world's runtimes (or the first rank's build failure, named).
+pub type SpanBuild<T> = (
+    ServeSpan<T>,
+    Result<PerRank<T, CardRuntime<'static, T>>, String>,
+);
+
+/// ⭐ THE WORKER'S SERVE SPAN — the one `thread::scope` that hosts every card's completion
+/// threads. A worker driven by the shared engine (`Box<dyn Worker>`, held for the process) has
+/// no frame of its own to run a scope in: the engine calls in from its own threads. So the serve
+/// span lives HERE, on a dedicated hosting thread whose body IS the scope:
+/// [`WorldCards::build_on_serve_span`] builds the runtimes nested inside it (per-rank
+/// construction threads, each pinned to its card's node), the built runtimes — whose data
+/// borrows only the leaked cards, never the scope — return over a channel, and the thread parks
+/// for the span. Only the completion THREADS live in the scope; that is why the runtimes may
+/// outlive the frame that built them.
+///
+/// Dropping this handle ends the span, in order:
+///
+/// 1. **The join law.** Every card's completion thread is STOPPED first
+///    ([`CardRuntime::shutdown`] — the vendor's bounded-drain door), so the scope's own join
+///    at exit drains threads that are already stopping, never parked ones. Ranks stop in rank
+///    order; each stop is bounded by the door's own 5 s drain + force law.
+/// 2. **The every-path release.** [`Drop`] IS the release — it runs on every path after the
+///    runtimes were built (a failed later load step, a worker dropped without serving, a panic
+///    unwind), not only happy teardown. A span whose build FAILED releases the same way: its
+///    runtimes were already dropped with the error, their completion threads saw their scheduler
+///    references go, and the hosting thread's park returned when this handle's sender dropped.
+/// 3. **The channel-drop law.** If the worker dies before the build result is taken, the
+///    hosting thread's send fails — the send itself DROPS the runtimes, so their completion
+///    threads exit — and the park below it returns immediately (the release sender died with
+///    the handle). No deadlock, no stranded thread.
+pub struct ServeSpan<T: ktir_superdsc::collective::Tp> {
+    /// The hosting thread's release signal — `send(())` ends the park, the scope closes, the
+    /// completion threads join. `None` only inside [`Drop`], which takes it.
+    release: Option<std::sync::mpsc::Sender<()>>,
+    /// The hosting thread — joined in [`Drop`] after the release, so its scope (and the join it
+    /// performs) is finished before the drop returns.
+    host: Option<std::thread::JoinHandle<()>>,
+    /// The LEAKED runtimes whose completion threads this span hosts — adopted once the caller
+    /// has leaked them, shut down in rank order at [`Drop`] before the hosting thread is
+    /// released. `None` when the build failed (nothing was leaked; nothing to stop).
+    runtimes: Option<&'static PerRank<T, CardRuntime<'static, T>>>,
+}
+
+impl<T: ktir_superdsc::collective::Tp> ServeSpan<T> {
+    /// Adopt the leaked runtimes this span hosts — the one mint, called once by the owner that
+    /// leaked them. Their completion threads are stopped at [`Drop`], before the span releases.
+    pub fn adopt(&mut self, runtimes: &'static PerRank<T, CardRuntime<'static, T>>) {
+        self.runtimes = Some(runtimes);
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> Drop for ServeSpan<T> {
+    fn drop(&mut self) {
+        // The join law: stop every card's completion thread BEFORE the hosting thread is
+        // released, so the scope's join drains already-stopping threads.
+        if let Some(runtimes) = self.runtimes.take() {
+            for (_, card) in runtimes.iter() {
+                card.shutdown();
+            }
+        }
+        // The every-path release: this runs however the worker got here. The send errors when
+        // the hosting thread already ended (a failed build — nothing parks), and the join then
+        // returns with it.
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(host) = self.host.take() {
+            let _ = host.join();
+        }
     }
 }
 
@@ -694,18 +899,19 @@ impl ReadSignal {
         }
     }
 
-    /// The closure handed to `launch_d2h` as the op's user callback: set the
-    /// flag and wake the parker. Runs on the scheduler's completion thread,
-    /// touches nothing but this latch, and cannot borrow the transfer's host
-    /// buffer — the buffer outlives the call site by the caller's own laws
-    /// (the ring slot's index, the shadow's seat ownership).
-    fn arm(&self) -> Box<dyn FnOnce() + Send> {
-        let done = self.done.clone();
-        Box::new(move || {
-            let (mtx, cv) = &*done;
-            *mtx.lock().unwrap() = true;
-            cv.notify_all();
-        })
+    /// The latch handed to `launch_d2h`/`launch_h2d` as the op's user callback:
+    /// the signal's own `(flag, condvar)` pair, by `Arc` clone — the LAST
+    /// per-crossing heap allocation on the seam, gone. Firing it (flex-rs's
+    /// `UserCallback::Latch` arm, under the same catch_unwind protection the
+    /// boxed closure got) sets the flag and wakes the parker; it runs on the
+    /// scheduler's completion thread, touches nothing but this latch, and
+    /// cannot borrow the transfer's host buffer — the buffer outlives the call
+    /// site by the caller's own laws (the ring slot's index, the shadow's seat
+    /// ownership). The latch's pair is `ReadSignal`'s own `done` field verbatim
+    /// — the waiter parks on the same pair the callback fires, with no
+    /// intermediary state to agree on.
+    fn arm(&self) -> UserCallback {
+        UserCallback::Latch(self.done.clone())
     }
 
     /// ⭐ #32 (E) — MINT THE PEEK HANDLE: the overlap probe's non-blocking
@@ -754,8 +960,8 @@ impl Default for ReadSignal {
 /// `Send` by construction: the handle is an `Arc` clone of the shared `RuntimeContext` plus a
 /// `StreamId` — both plain shared state. The stream is only ever used from the session's own
 /// thread, but the session moves across worker threads between forwards.
-pub struct Stream {
-    rt: Arc<RuntimeContext>,
+pub struct Stream<'a> {
+    rt: Arc<RuntimeContext<'a>>,
     id: StreamId,
 }
 
@@ -774,15 +980,15 @@ pub struct Stream {
 /// a 6.19 s parallel build — and correctness here is not tradeable: an aborted load is a lost run.
 static STREAM_CREATE: Mutex<()> = Mutex::new(());
 
-impl Stream {
+impl<'a> Stream<'a> {
     /// Create a dedicated stream: `Normal` priority, `STRICT_ORDERING`, untracked — the values
     /// every scratchy session has ever run. Sessions stay UNTRACKED deliberately: their streams
     /// are user-owned and order through their own submissions; the hazard tracker's conservative
     /// Compute address sets would cross-edge concurrent sessions sharing resident weights into
     /// full serialization. Delegates to [`Self::create_with`].
     pub fn create<T: ktir_superdsc::collective::Tp>(
-        card: &CardRuntime<T>,
-    ) -> Result<Stream, HwError> {
+        card: &CardRuntime<'a, T>,
+    ) -> Result<Stream<'a>, HwError> {
         Self::create_with(
             card,
             RuntimeStreamPriority::Normal,
@@ -800,11 +1006,11 @@ impl Stream {
     /// `OP_ORDERING` streams whose cross-stream ordering the tracker carries instead of a
     /// host-side lock; see `examples/hazard_concurrency.rs`, the #546 concurrency leg.
     pub fn create_with<T: ktir_superdsc::collective::Tp>(
-        card: &CardRuntime<T>,
+        card: &CardRuntime<'a, T>,
         priority: RuntimeStreamPriority,
         mode: RuntimeStreamMode,
         track_hazards: bool,
-    ) -> Result<Stream, HwError> {
+    ) -> Result<Stream<'a>, HwError> {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
         let _serialize = STREAM_CREATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -817,7 +1023,7 @@ impl Stream {
 
     /// The live `RuntimeStream` this handle names. `Err(StreamGone)` after the stream was destroyed
     /// or the runtime reset.
-    fn live(&self) -> Result<Arc<RuntimeStream>, HwError> {
+    fn live(&self) -> Result<Arc<RuntimeStream<'a>>, HwError> {
         match self.rt.get_stream(self.id) {
             Ok(Some(s)) => Ok(s),
             _ => Err(HwError::StreamGone),
@@ -1024,11 +1230,11 @@ impl Stream {
     /// is sent ([`PremappedH2dRefusal::ShortPin`]): the shim's mapping carries its first
     /// scatter-gather entry's length, not the size asked for, so a pin the driver split
     /// does not own an iova for every byte of the shadow.
-    pub fn pin_h2d<'a>(
-        &'a self,
-        mapper: &Arc<PfIommuMapper>,
-        src: &'a [u8],
-    ) -> Result<H2dPin<'a>, HwError> {
+    pub fn pin_h2d<'p>(
+        &'p self,
+        mapper: &std::sync::Arc<PfIommuMapper<'a>>,
+        src: &'p [u8],
+    ) -> Result<H2dPin<'p, 'a>, HwError> {
         let mapping = mapper
             .map(src.as_ptr() as usize, src.len(), true)
             .map_err(HwError::IommuPin)?;
@@ -1335,7 +1541,7 @@ impl Stream {
     }
 }
 
-impl Drop for Stream {
+impl Drop for Stream<'_> {
     fn drop(&mut self) {
         // `destroy_stream` teardown-drains (`drain_for_teardown`: set
         // shutdown, wait for in-flight unconditionally — including on a
@@ -1368,13 +1574,13 @@ impl Drop for Stream {
 /// Built by [`Stream::pin_h2d`], which refuses a mapping that does not cover
 /// the whole slice ([`PremappedH2dRefusal::ShortPin`] — the shim's mapping
 /// carries its first scatter-gather entry's length, not the size asked for).
-pub struct H2dPin<'a> {
+pub struct H2dPin<'a, 'ctx> {
     src: &'a [u8],
-    stream: &'a Stream,
-    mapping: IommuMapping,
+    stream: &'a Stream<'ctx>,
+    mapping: IommuMapping<'ctx>,
 }
 
-impl H2dPin<'_> {
+impl H2dPin<'_, '_> {
     /// Send byte range `range` of the pinned shadow into `window` — the same
     /// transfer as [`Stream::h2d`] on the same consumer path the #606 pool
     /// rides: `DmaShaping::iova` tells the backend the caller already pinned
@@ -1426,7 +1632,7 @@ impl H2dPin<'_> {
     }
 }
 
-impl Drop for H2dPin<'_> {
+impl Drop for H2dPin<'_, '_> {
     fn drop(&mut self) {
         // ⭐ THE PIN OUTLIVES ITS DMA, ON EVERY EXIT: synchronize BEFORE the
         // mapping unpins (`IommuMapping`'s own drop), so an in-flight transfer
@@ -1572,7 +1778,7 @@ impl DevAddr {
     /// Allocate `nbytes` of device memory of the given [`MemoryType`]. The region is never freed
     /// (see the struct doc); this handle describes it.
     pub fn alloc<T: ktir_superdsc::collective::Tp>(
-        card: &CardRuntime<T>,
+        card: &CardRuntime<'_, T>,
         nbytes: ByteSize,
         kind: MemoryType,
     ) -> Result<DevAddr, HwError> {
@@ -1786,7 +1992,7 @@ impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
 /// # Errors
 /// [`AttachRefusal`], by name.
 pub fn link_peers<T: ktir_superdsc::collective::Tp>(
-    cards: &PerRank<T, CardRuntime<T>>,
+    cards: &PerRank<T, CardRuntime<'_, T>>,
     window: RecvWindow<T>,
 ) -> Result<(), AttachRefusal<T>> {
     let region2: PerRank<T, u64> =
@@ -1854,7 +2060,7 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
 /// [`AttachRefusal`]: an unlinked card, a slot past the allocation, a second pointing at another
 /// address, or a word that will not compose or program.
 pub fn point_landing_slots<T: ktir_superdsc::collective::Tp>(
-    card: &CardRuntime<T>,
+    card: &CardRuntime<'_, T>,
     window_region: &DevAddr,
 ) -> Result<(), AttachRefusal<T>> {
     let Some(link) = card.link.get() else {
@@ -1938,7 +2144,7 @@ impl std::error::Error for WindowsApart {}
 /// # Errors
 /// [`WindowsApart`], naming every rank's landing.
 pub fn refuse_if_windows_apart<T: ktir_superdsc::collective::Tp>(
-    cards: &PerRank<T, CardRuntime<T>>,
+    cards: &PerRank<T, CardRuntime<'_, T>>,
 ) -> Result<u64, WindowsApart> {
     let landings: Vec<Option<u64>> = cards
         .values()

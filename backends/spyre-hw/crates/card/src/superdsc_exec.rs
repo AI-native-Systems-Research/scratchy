@@ -838,7 +838,7 @@ impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
+impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, '_, T> {
     fn drop(&mut self) {
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
@@ -928,7 +928,7 @@ const H2D_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
 /// not — and each window is the single-chunk shape the fill control block resolves. Every
 /// device-side fill goes through here (`zero_seg`, `prepare`'s segment and bank fills); a
 /// second copy would drift from this one's window shape.
-fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
+fn fill_zero_walk(stream: &Stream<'_>, addr: &DevAddr, what: &str) -> Result<()> {
     for w in addr.windows(FILL_WINDOW) {
         stream.fill_zero(&w).map_err(|e| anyhow!("{what}: {e}"))?;
     }
@@ -941,7 +941,7 @@ fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
 /// start, so the fill cannot zero bytes the prefix send already landed. A fill window never
 /// straddles a chunk (`windows` cuts them chunk-bounded), so the shifted tail is a legal
 /// single-chunk window of the same chunk.
-fn fill_zero_walk_from(stream: &Stream, addr: &DevAddr, skip: usize, what: &str) -> Result<()> {
+fn fill_zero_walk_from(stream: &Stream<'_>, addr: &DevAddr, skip: usize, what: &str) -> Result<()> {
     let mut off = 0usize;
     for w in addr.windows(FILL_WINDOW) {
         let win = w.total_size().as_u64() as usize;
@@ -981,13 +981,13 @@ fn fill_zero_walk_from(stream: &Stream, addr: &DevAddr, skip: usize, what: &str)
 /// the bytes it always did. `staged` is clamped to the shadow and the region first — the
 /// shadow covers its whole segment by `stage_weights`' sizing, and the region is the
 /// allocation of exactly that size, so the clamp is structural, not a check.
-fn send_prefix_and_fill<'a>(
-    stream: &'a Stream,
+fn send_prefix_and_fill<'a, 'ctx>(
+    stream: &'a Stream<'ctx>,
     shadow: &'a [u8],
     staged: usize,
     addr: &DevAddr,
-    mapper: &std::sync::Arc<PfIommuMapper>,
-    alive: &mut Vec<H2dPin<'a>>,
+    mapper: &std::sync::Arc<PfIommuMapper<'ctx>>,
+    alive: &mut Vec<H2dPin<'a, 'ctx>>,
     what: &str,
 ) -> Result<()> {
     let region = addr.total_size().as_u64() as usize;
@@ -1030,12 +1030,12 @@ fn send_prefix_and_fill<'a>(
 /// full window is refused, so the window itself is sized to the part. The walk covers the
 /// region front-to-back, so a prefix send lands the first `src.len()` bytes wherever they
 /// fall.
-fn send_premapped<'a>(
-    stream: &'a Stream,
+fn send_premapped<'a, 'ctx>(
+    stream: &'a Stream<'ctx>,
     src: &'a [u8],
     addr: &DevAddr,
-    mapper: &std::sync::Arc<PfIommuMapper>,
-    alive: &mut Vec<H2dPin<'a>>,
+    mapper: &std::sync::Arc<PfIommuMapper<'ctx>>,
+    alive: &mut Vec<H2dPin<'a, 'ctx>>,
     what: &str,
 ) -> Result<()> {
     let pin = stream
@@ -1179,14 +1179,16 @@ struct Rolled {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One resident SuperDSC session: program + weights + KV resident on-card.
-pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
+pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
     code: &'static bundle::BundleCode<'static, T>,
-    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's. BORROWED:
-    /// the card's owner opened it once for the process, and `'c` is the proof, checked by the
-    /// compiler, that this session cannot outlive it.
-    card: &'c CardRuntime<T>,
+    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's. BORROWED
+    /// TWICE, and both borrows are proofs the compiler checks: the runtime borrows its CARD for
+    /// `'a` (the card's owner opened it once, for the process), and this session borrows the
+    /// RUNTIME for `'c` — so a session cannot outlive its runtime, and a runtime cannot outlive
+    /// its card.
+    card: &'c CardRuntime<'a, T>,
 
     pub vocab: Vocab,
     pub kv_dim: KvDim,
@@ -1235,7 +1237,7 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     // ── Device state ──
     // ⛔ The `DevAddr`s below are leaked at shutdown by `impl Drop for Executor` — see the note on
     // `impl Drop for OpProg` for the abort that forced it.
-    stream: Option<Stream>,
+    stream: Option<Stream<'a>>,
     seg_addr: [Option<DevAddr>; NUM_SEGMENTS],
     /// ⭐ THE WEIGHT SEGMENT'S EXTRA BANKS — regions, host shadows and extents for banks `1..N`,
     /// index `b - 1`. Bank 0 IS `seg_addr[SEG_WEIGHT]` / `seg_host[SEG_WEIGHT]`, so these three are
@@ -1585,7 +1587,7 @@ impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
     }
 }
 
-impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
+impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1596,12 +1598,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     pub fn load(
-        card: &'c CardRuntime<T>,
+        card: &'c CardRuntime<'a, T>,
         code: &'static bundle::BundleCode<'static, T>,
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
-    ) -> Result<Executor<'c, T>> {
+    ) -> Result<Executor<'a, 'c, T>> {
         // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
         // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
         // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
@@ -3123,8 +3125,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // guard the sends below take. Each guard owns its mapping and borrows the shadow
         // it pinned, and its own Drop synchronizes before unpinning — so the guards are
         // safe to drop on ANY exit from here on, not just the sync below.
-        let mapper = PfIommuMapper::new(self.card.card().clone());
-        let mut pinned: Vec<H2dPin<'_>> = Vec::new();
+        let mapper = PfIommuMapper::new(self.card.card());
+        let mut pinned: Vec<H2dPin<'_, '_>> = Vec::new();
         for i in 0..NUM_SEGMENTS {
             // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
@@ -3268,7 +3270,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         Ok(())
     }
 
-    fn stream_ref(&self) -> Result<&Stream> {
+    fn stream_ref(&self) -> Result<&Stream<'a>> {
         self.stream
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))
@@ -5913,14 +5915,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// pipelined loop had just submitted for overlap — so each per-step drain
     /// fenced a full step anyway and the depth-2 queue bought nothing
     /// (measured 2026-10-25: fence mean = one step ≈ 23.8 ms, ≈ serial tok/s).
-    /// The two signals are the read's own D2H (the bytes this call returns)
-    /// and the LAST H2D a submit enqueued — the shadow's quiet point, taken
-    /// here through the SAME door ([`Self::quiet_shadow`]) every writer of the
-    /// shadow passes through, so the drain and any later bind cannot disagree
-    /// about when the shadow went quiet. Both sit adjacent in the queue at
-    /// depth 2 — the DMAs of the next step's preamble, microseconds behind
-    /// this read — so the park costs the read and not the step, and the steps'
-    /// COMPUTE behind them runs through the drain.
+    /// The two signals are the read's own D2H (the bytes this call hands the
+    /// visitor) and the LAST H2D a submit enqueued — the shadow's quiet point,
+    /// taken here through the SAME door ([`Self::quiet_shadow`]) every writer
+    /// of the shadow passes through, so the drain and any later bind cannot
+    /// disagree about when the shadow went quiet. Both sit adjacent in the
+    /// queue at depth 2 — the DMAs of the next step's preamble, microseconds
+    /// behind this read — so the park costs the read and not the step, and the
+    /// steps' COMPUTE behind them runs through the drain.
     ///
     /// The dead arm is the error escape, and it surfaces the SAME error the
     /// whole-stream wait did by the SAME door: a failed op never fires its
@@ -5928,7 +5930,22 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// sticky-shutdown, `make_completion_callback`'s Err arm), so the signal's
     /// timeout tick hands the park back and the synchronize below — which does
     /// not wait a dead stream, it rethrows — carries the root cause out.
-    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+    ///
+    /// ⭐ ZERO-ALLOC: the landed window is handed to `f` BY BORROW, in place —
+    /// the ring slot's own bytes, or the shadow window's — and the slot is
+    /// recycled only after the visitor returns, so the serving path's stick
+    /// read pays no copy and no fresh Vec per step. `f` takes only the bytes
+    /// (no session access, by signature), so it cannot re-enter the executor
+    /// while a slot is held — the no-reentry law carried by the TYPE. The
+    /// visitor's output crosses by value: it may not borrow the window, or the
+    /// slot's recycle would not compile. [`Self::finish_deferred_read_raw`] is
+    /// this door composed with `.to_vec()` — the one-shot owned contract — so
+    /// the doors cannot drift apart.
+    pub fn finish_deferred_read_with<R>(
+        &mut self,
+        read: &DeferredRead,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
         // The read's own landing, scoped so `dead`'s immutable borrow of `self`
         // ends before the quiet point's mutable half begins.
         let landed = {
@@ -5958,24 +5975,26 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if Diag::get().rb_time {
             self.rb_attribute();
         }
-        // May only return the bytes the transfer actually brought back.
+        // May only hand the visitor the bytes the transfer actually brought back.
         let avail = (read.end - read.offset) as usize;
         let n = (read.size as usize).min(read.cap).min(avail);
         if n == 0 {
             if let Some(slot) = read.ring {
                 self.read_ring_free.push(slot);
             }
-            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
+            return Ok(f(&[])); // a wholly-unreadable placement also has no valid base
         }
         match read.ring {
             Some(slot) => {
                 // The slot holds the WINDOW; the placement's bytes start
                 // `offset − win_start` into it (0 on the own-window arm — the
-                // placement IS the window's start).
+                // placement IS the window's start). The visitor runs while the
+                // slot is still held; the free-list push is a different field,
+                // so the borrows are disjoint.
                 let start = (read.offset - read.win_start) as usize;
-                let bytes = self.read_ring[slot][start..][..n].to_vec();
+                let out = f(&self.read_ring[slot][start..][..n]);
                 self.read_ring_free.push(slot);
-                Ok(bytes)
+                Ok(out)
             }
             None => {
                 // The one-shot landing's window — materialized by the enqueue half
@@ -5988,9 +6007,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         read.seg.get()
                     )
                 })?;
-                Ok(host[read.offset as usize..][..n].to_vec())
+                Ok(f(&host[read.offset as usize..][..n]))
             }
         }
+    }
+
+    /// The stick read's finish half COMPOSED WITH A COPY — the one-shot
+    /// contract (owned bytes) over [`Self::finish_deferred_read_with`]: the
+    /// doors that genuinely need the bytes to outlive the slot (inspection,
+    /// debug readback) buy the Vec; the serving path takes the visitor and
+    /// pays nothing.
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        self.finish_deferred_read_with(read, |bytes| bytes.to_vec())
     }
 
     /// The byte size a [`Executor::read_seg`] of `seg` returns: the DEVICE region's
@@ -6162,7 +6190,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
     }
 
-    pub fn alias_seg_from(&mut self, owner: &Executor<'_, T>, seg: SegIdx) -> Result<()> {
+    pub fn alias_seg_from(&mut self, owner: &Executor<'a, '_, T>, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
             bail!("alias_seg(seg{i}): a session has no region for it");

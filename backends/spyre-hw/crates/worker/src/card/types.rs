@@ -5,17 +5,26 @@
 /// none): the same type the bake baked every bundle for, so a session and its bundles agree by type.
 pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
 
-/// A session over the build's world: one executor per rank of [`World`], each BORROWING its card
-/// for `'static` — the loaded model lives for the process, and so do the cards it runs on (the
-/// loader opens them once and hands out `&'static Cards`; see `load_inner`).
+/// A session over the build's world: one executor per rank of [`World`], each BORROWING its
+/// card's runtime for `'static` (and that runtime borrowing its CARD for `'static` — both
+/// process-lifetimes, because the loaded model lives for the process and so do the cards it runs
+/// on; the loader opens the cards once, leaks them, and hands out `&'static Cards`; see
+/// `load_inner`).
 pub(crate) type SuperDscSession =
-    scratchy_target_spyre_card::sdsc_runner::SuperDscSession<'static, World>;
+    scratchy_target_spyre_card::sdsc_runner::SuperDscSession<'static, 'static, World>;
 
-/// The build's cards, one per rank of [`World`] — OWNED here, once, for the process; every session
-/// borrows them.
+/// The world's OPENED CARDS — phase 1's product, leaked once for the process at the load site, so
+/// every runtime phase 2 builds over them borrows a card for `'static`.
+pub(crate) type OpenedCards = scratchy_target_spyre::bundle_code::collective::PerRank<
+    World,
+    scratchy_target_spyre_card::runtime::Card,
+>;
+
+/// The build's card RUNTIMES, one per rank of [`World`] — OWNED here, once, for the process; every
+/// session borrows them, and each of them borrows its opened card.
 pub(crate) type Cards = scratchy_target_spyre::bundle_code::collective::PerRank<
     World,
-    scratchy_target_spyre_card::runtime::CardRuntime<World>,
+    scratchy_target_spyre_card::runtime::CardRuntime<'static, World>,
 >;
 
 /// The BAKED logits tensor of a bundle: `[rows, width]`, STICK-BLOCKED on the vocab axis.

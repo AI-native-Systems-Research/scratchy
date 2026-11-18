@@ -23,6 +23,14 @@ spyre-emu = ["scratchy-target-spyre/spyre-emu", "scratchy-target-spyre-models/sp
 tp-2 = ["spyre-hw", "scratchy-target-spyre-models/tp-2", "scratchy-target-spyre/tp-2", "scratchy-target-spyre-card/tp-2"]
 tp-4 = ["spyre-hw", "scratchy-target-spyre-models/tp-4", "scratchy-target-spyre/tp-4", "scratchy-target-spyre-card/tp-4"]
 tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/tp-8", "scratchy-target-spyre-card/tp-8"]
+# THE ON-CARD ALLOC-CENSUS WINDOW (flex-rs's zero-alloc proof instrument): frames
+# `arm()`..`disarm()` around N collected decode steps in the serving loop, so the
+# steady-state per-step allocation count is measurable on a real serve, not only in
+# flex-rs's lib tests. The `spyre` binary registers the allocator itself (the CLI's
+# feature of the same name); this row turns on the window the drain steps through
+# (the card crate's `census` module). Instrumentation only — no serving behavior
+# changes with it on or off.
+alloc-census = ["spyre-hw", "scratchy-target-spyre-card/alloc-census"]
 
 [dependencies]
 scratchy-target-spyre = { path = "../../../spyre/crates/spyre" }
