@@ -104,6 +104,11 @@ pub enum BridgeError {
     NoKernel { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
     UnrealizedExpertActivation { tile: TileId, act: String },
+    /// A decoder state's op reached the lowering, and the decoder state contributes no lowering of
+    /// its ops to this bridge yet.
+    StateUnlowered {
+        op: scratchy_forward_compiler_frontend::state::StateOp,
+    },
 }
 
 impl BridgeError {
@@ -160,6 +165,10 @@ impl std::fmt::Display for BridgeError {
                 "tile {} moe_block: the config declares expert activation `{act}`, which no \
                  expert body realizes (a gated `silu` bank or an ungated `relu2` one)",
                 tile.0
+            ),
+            Self::StateUnlowered { op } => write!(
+                f,
+                "op {op}: the decoder state contributes no lowering of its ops to this target's bridge"
             ),
             Self::UnsupportedWeight { tile, detail } => {
                 write!(
@@ -2019,6 +2028,7 @@ pub fn lower_decode_to_wavefront(
                     result = Some(idx);
                 }
             }
+            OpKind::State(op) => return Err(BridgeError::StateUnlowered { op }),
             other => return Err(BridgeError::UnsupportedOp { tile, op: other }),
         }
     }

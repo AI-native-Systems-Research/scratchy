@@ -83,6 +83,7 @@ fn main() {
         inspect: &metal_tape_models,
         typing: Typing {
             traced: scratchy_models_typed::traced,
+            decoder_states: scratchy_models_typed::decoder_states(),
         },
     });
     write_metal_bake(&out_dir);

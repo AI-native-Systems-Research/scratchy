@@ -26,7 +26,7 @@ fn typed_carrier_unrolls(stem: &str, configs: usize) -> (crate::classified::Prog
     let source = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
     // The program the bake lowers.
-    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let program = crate::classify::carrier_program(&carrier, &[]).unwrap();
     let inferred = scratchy_models_typed::traced(&carrier.arch_name)
         .unwrap_or_else(|| panic!("{stem} has a typed program"));
     assert!(
@@ -75,7 +75,7 @@ fn a_trace_is_of_its_own_program_only() {
     let source = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
     let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
-    let lowered = crate::classify::carrier_program(&carrier).unwrap();
+    let lowered = crate::classify::carrier_program(&carrier, &[]).unwrap();
     assert!(inferred.locals_of(&local_names(&lowered)));
     let written = crate::classify::classify(&carrier.ast).unwrap();
     assert_ne!(local_names(&written), local_names(&lowered));
@@ -188,7 +188,7 @@ fn gemma4_reshapes_left(config: &str) -> (usize, usize) {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/gemma4.py")).expect("gemma4.py");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let mut program = crate::classify::carrier_program(&carrier).unwrap();
+    let mut program = crate::classify::carrier_program(&carrier, &[]).unwrap();
     let configs_dir = arch.join("configs/gemma4");
     let model = crate::config::load_file_declared(&configs_dir.join(config)).unwrap();
     let inferred = scratchy_models_typed::traced(&carrier.arch_name).expect("typed");
@@ -465,7 +465,7 @@ fn mtp_head_on_its_target() -> (
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join("dsl/qwen3-5-mtp.py")).expect("carrier");
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let program = crate::classify::carrier_program(&carrier, &[]).unwrap();
     let (_, _, model) = carrier_models(&arch, "qwen3-5-mtp", false)
         .into_iter()
         .next()
@@ -553,7 +553,7 @@ fn typed_carrier_rebundled(
     let written = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
     let source = edit(&written);
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
-    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let program = crate::classify::carrier_program(&carrier, &[]).unwrap();
     let configs = arch.join("configs").join(stem);
     let mut manifest = crate::weights_manifest::load_or_empty(&configs).expect("manifest");
     declare(&mut manifest);
@@ -739,7 +739,7 @@ fn derived_bundles(
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let source = std::fs::read_to_string(arch.join(format!("dsl/{carrier}.py"))).expect("carrier");
     let parsed = crate::parse_python::parse_python_file(&source).expect("parse");
-    let program = crate::classify::carrier_program(&parsed).unwrap();
+    let program = crate::classify::carrier_program(&parsed, &[]).unwrap();
     crate::bundles::derive(
         &program,
         &crate::bundles::BundleConfig {

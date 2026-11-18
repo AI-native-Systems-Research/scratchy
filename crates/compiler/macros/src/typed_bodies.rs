@@ -142,6 +142,12 @@ fn standalone(emitted: &str) -> String {
         signatures.contains(include),
         "scratchy-models-typed includes the build script's output"
     );
+    // The build's decoder state list is the crate's, not its typed program's: a body names no decoder state.
+    let decoder_states = "mod decoder_states;\npub use decoder_states::decoder_states;\n";
+    assert!(
+        signatures.contains(decoder_states),
+        "scratchy-models-typed declares its decoder state list apart"
+    );
     // The signature crate's source, in place of its import, with the front end at the paths the
     // standalone program defines it at.
     let vocabulary = read("../typed-shapes/src/lib.rs")
@@ -163,7 +169,8 @@ fn standalone(emitted: &str) -> String {
         signatures = signatures
             .replace("use scratchy_typed_shapes::*;", &vocabulary)
             .replace("scratchy_typed_shapes::trace(", "trace(")
-            .replace(include, emitted),
+            .replace(include, emitted)
+            .replace(decoder_states, ""),
     )
 }
 

@@ -94,6 +94,7 @@ fn main() {
         &Shared,
         &Typing {
             traced: scratchy_models_typed::traced,
+            decoder_states: scratchy_models_typed::decoder_states(),
         },
     )
     .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));

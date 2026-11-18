@@ -25,6 +25,7 @@ fn main() {
         inspect: &|_| Vec::new(),
         typing: Typing {
             traced: scratchy_models_typed::traced,
+            decoder_states: scratchy_models_typed::decoder_states(),
         },
     });
 }

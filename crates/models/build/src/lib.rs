@@ -107,7 +107,7 @@ pub struct ModelsBuild<'a> {
     /// tables need of them.
     pub inspect: &'a (dyn Fn(&TokenStream) -> Vec<String> + Sync),
     /// How the carriers are typed (`scratchy-models-typed`'s), handed to the pipeline.
-    pub typing: Typing,
+    pub typing: Typing<'a>,
 }
 
 /// What a models build emitted.

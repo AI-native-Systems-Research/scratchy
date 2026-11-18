@@ -36,6 +36,7 @@ fn python_costume_emits_the_qwen3_tape() {
         &Metal { turboquant: false },
         &Typing {
             traced: scratchy_models_typed::traced,
+            decoder_states: scratchy_models_typed::decoder_states(),
         },
     )
     .expect("python-costume pipeline");

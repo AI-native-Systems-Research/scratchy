@@ -60,8 +60,7 @@ pub fn fuf_of(arch: &str, model: &ModelParams) -> (Program, Fuf) {
 
 /// The program and fused graph of `model` under `ast`.
 pub fn fuf_of_ast(arch: &str, model: &ModelParams, ast: &crate::ast::Ast) -> (Program, Fuf) {
-    let mut program =
-        crate::classify::classify_with(ast, crate::classified::Prelude::Decoder).expect("classify");
+    let mut program = crate::classify::classify(ast).expect("classify");
     program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
     let inferred = crate::typed_bodies::trace_carrier_program(arch, &program);
     let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");

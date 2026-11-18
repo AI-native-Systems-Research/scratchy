@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use crate::bundles::Bundle;
-use crate::classified::{Expr, LocalId, OpKind, Program, Stmt};
+use crate::classified::{Expr, ExternKind, LocalId, OpKind, Program, Stmt};
 use crate::dim::{DERIVED_DIMS, DerivedRule, Dim, canonical_add, canonical_mul};
 use crate::hf_config::ParamExpr;
 use crate::weights_manifest::WeightsManifest;
@@ -692,6 +692,11 @@ impl Cx<'_, '_> {
     fn value(&self, e: &Expr, nest: &mut Nest) -> Result<String, String> {
         Ok(match e {
             Expr::Local(id) => format!("l{}", id.0),
+            // A decoder state's input is built by its own decoder state's constructor, not read off `Inputs`.
+            Expr::Extern {
+                kind: ExternKind::State(input),
+                ..
+            } => format!("{}::{}()", input.signatures(), input.name()),
             Expr::Extern { kind, .. } => format!("inputs.{}", kind.name()),
             Expr::Weight { id, .. } => {
                 let path = self.c.program.weights.path(*id);
@@ -733,6 +738,16 @@ impl Cx<'_, '_> {
                 let args = (args.iter())
                     .map(|a| self.expr(a, nest))
                     .collect::<Result<Vec<_>, _>>()?;
+                // A state op is a signature of its own decoder state's module; a core op's arity form
+                // is one of the shared `ops`.
+                if let OpKind::State(state) = op {
+                    return Ok(format!(
+                        "{}::{}({})",
+                        state.signatures(),
+                        state.name(),
+                        args.join(", ")
+                    ));
+                }
                 let name = (ARITY_FORMS.iter())
                     .find(|(o, arity, _)| o == op && *arity == args.len())
                     .map_or(op.as_str(), |(_, _, name)| name);
@@ -772,5 +787,53 @@ struct Nest {
 impl Nest {
     fn of(target: LocalId) -> Self {
         Self { target, next: 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classified::Prelude;
+    use crate::classify::classify_with;
+    use crate::parse_python::parse_body;
+    use crate::state::StateTable;
+    use crate::state::probe::Probe;
+
+    #[test]
+    fn a_state_call_names_its_decoder_states_module() {
+        let source = "
+for layer in range(num_hidden_layers):
+    (a, b) = probe_split(input_ids)
+    y = probe_mix(a, probe_state[layer], b)
+";
+        let decoder_states =
+            StateTable::assemble(&[&Probe]).expect("the probe decoder state assembles");
+        let program = classify_with(
+            &parse_body(source).expect("DSL parse"),
+            Prelude::Decoder,
+            &decoder_states,
+        )
+        .expect("classification");
+        let manifest = WeightsManifest::empty();
+        let facts = CarrierFacts::default();
+        let carrier = Carrier {
+            module: "body",
+            arch: "Body",
+            file: "probe.py",
+            source,
+            program: &program,
+            manifest: &manifest,
+            facts: &facts,
+        };
+        let emitted = emit(&carrier, &mut BTreeSet::new()).expect("the carrier emits");
+        assert!(emitted.contains("::probe::ops::probe_mix("), "{emitted}");
+        assert!(emitted.contains("::probe::ops::probe_state()"), "{emitted}");
+        assert!(emitted.contains("::probe::ops::probe_split("), "{emitted}");
+        assert!(
+            !emitted
+                .replace("::probe::ops::probe_", "")
+                .contains("ops::probe_"),
+            "{emitted}"
+        );
     }
 }

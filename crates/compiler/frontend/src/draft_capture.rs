@@ -91,6 +91,7 @@ fn capture(ivar: &Ident, carried: &str) -> Stmt {
             value: Expr::Call {
                 op: ident(CAPTURE_OP),
                 args: vec![carried.clone()],
+                at: None,
             },
             line: None,
         }],

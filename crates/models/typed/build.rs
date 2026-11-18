@@ -85,7 +85,10 @@ fn emit_carrier(
     let carrier =
         parse_python::parse_python_file(&source).map_err(|e| format!("{}: {e}", dsl.display()))?;
     // The program the bake lowers, by the one construction both use.
-    let program = classify::carrier_program(&carrier)
+    // The decoder states `scratchy_models_typed::decoder_states()` lists, which a build script cannot read from
+    // its own crate's library: the list is empty until a decoder state crate exists, which then becomes a
+    // build-dependency here too and is passed by the same list.
+    let program = classify::carrier_program(&carrier, &[])
         .map_err(|e| format!("classify {}: {e}", dsl.display()))?;
     let manifest = weights_manifest::load_or_empty(&configs)
         .map_err(|e| format!("{}: {e:?}", configs.display()))?;

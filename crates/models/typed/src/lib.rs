@@ -6,6 +6,10 @@
 
 use scratchy_typed_shapes::*;
 
+// The decoder states the build compiles (`decoder_states()`): the build's list, not the typed program.
+mod decoder_states;
+pub use decoder_states::decoder_states;
+
 // The emit pass's output: the marker of every bound the carriers' weights name that the signatures
 // do not (`typed_emit::SIGNATURE_BOUNDS`), one module per carrier, `typed_program`, which names each
 // carrier's traced function by its arch, and `derived_dims_of`.
