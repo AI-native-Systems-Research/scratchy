@@ -587,11 +587,13 @@ impl PrefixCapacity {
     }
 }
 
-/// The one model the bridge lowers: its config params and its typed facts
-/// travel together — they are the same model, and the bake holds both.
+/// The one model the bridge lowers: its config params, its typed facts and its decoder states
+/// travel together — they are the same model, and the bake holds them together.
 pub struct BridgeModel<'a> {
     pub params: &'a ModelParams,
     pub facts: &'a ModelFacts,
+    /// The decoder states the model's build compiles.
+    pub decoder_states: &'a [scratchy_decoder_state::DecoderState],
 }
 
 /// Translate a decode FUF into a wavefront `LoweringInput`.

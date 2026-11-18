@@ -8422,6 +8422,8 @@ pub fn emit_model(
     dump_dir: Option<&std::path::Path>,
     // The target this build compiles for: what it bakes per model is its own.
     emitter: &dyn crate::target::TargetEmitter,
+    // The decoder states the build compiles.
+    decoder_states: &[scratchy_decoder_state::DecoderState],
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
@@ -8510,6 +8512,7 @@ pub fn emit_model(
         inferred,
         tp_world_size,
         dump_dir,
+        decoder_states,
         canonical_params_impl: &canonical_params_impl,
         struct_with: &emit_struct,
         dims_of: &model_dims,

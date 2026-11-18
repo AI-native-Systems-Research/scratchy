@@ -2517,6 +2517,8 @@ pub(crate) fn dump_wavefront_mega(
     // Where the bake writes each bundle's dxp input, when the build asked (`superdsc-dump`): the
     // build script's own output directory, passed down from `compile_carrier`'s caller.
     dump_dir: Option<&std::path::Path>,
+    // The decoder states the model's build compiles.
+    decoder_states: &[scratchy_forward_compiler_macro::DecoderState],
 ) {
     use scratchy_forward_compiler_macro::to_wavefront;
     let stem = model.source_stem.as_str();
@@ -2533,6 +2535,7 @@ pub(crate) fn dump_wavefront_mega(
     let bridge = to_wavefront::BridgeModel {
         params: model,
         facts,
+        decoder_states,
     };
     // Structural prefix-KV-cache rows (== modeled valid_len). MUST be >= 1:
     // with 0 the cache Source is [0, kvdim] and the AttnDecode's prefix read

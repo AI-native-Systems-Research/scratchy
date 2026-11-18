@@ -217,6 +217,7 @@ impl TargetEmitter for Spyre {
                 decode_bounds,
                 &mut out,
                 cx.dump_dir,
+                cx.decoder_states,
             ),
             None => eprintln!(
                 "[wavefront] {}: no decode (num_tokens=1) workload point",

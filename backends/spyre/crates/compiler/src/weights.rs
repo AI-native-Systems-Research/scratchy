@@ -28,12 +28,14 @@ pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
         facts,
         fuf,
         inferred,
+        decoder_states,
         decode_point,
         struct_of,
     } = *cx;
     let bridge_model = BridgeModel {
         params: model,
         facts,
+        decoder_states,
     };
     let lowered = decode_point.and_then(|(bounds, num_tokens)| {
         to_wavefront::lower_decode_to_wavefront(

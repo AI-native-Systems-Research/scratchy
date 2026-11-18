@@ -462,6 +462,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     let bridge_model = scratchy_forward_compiler_macro::to_wavefront::BridgeModel {
         params: model,
         facts: &model_facts,
+        decoder_states: cx.decoder_states,
     };
 
     // Group workload points by TAPE fingerprint. Buckets that lower to

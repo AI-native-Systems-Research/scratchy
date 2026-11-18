@@ -509,7 +509,7 @@ impl std::fmt::Display for CarrierError {
 
 /// How the carriers are typed: what the build that compiles the models hands [`compile_carrier`].
 /// `scratchy_models_typed::typing()` for every build.
-pub use scratchy_decoder_state::Typing;
+pub use scratchy_decoder_state::{DecoderState, Typing};
 
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
@@ -1092,6 +1092,7 @@ pub fn compile_carrier(
             canonical_affine_rows,
             dump_dir,
             emitter,
+            typing.decoder_states,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);
