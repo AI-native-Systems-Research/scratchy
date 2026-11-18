@@ -3121,6 +3121,7 @@ dependencies = [
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-tensors",
+ "scratchy-typed-shapes",
  "serde_json",
  "syn 3.0.9",
  "tracing",
@@ -3459,6 +3460,13 @@ dependencies = [
 [[package]]
 name = "scratchy-tp-world"
 version = "0.1.0"
+
+[[package]]
+name = "scratchy-typed-shapes"
+version = "0.1.0"
+dependencies = [
+ "scratchy-forward-compiler-frontend",
+]
 
 [[package]]
 name = "scratchy-vision"

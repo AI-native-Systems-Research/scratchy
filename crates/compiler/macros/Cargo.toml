@@ -45,6 +45,8 @@ scratchy-forward-compiler = { path = ".." }
 # The front end (parser, classifier, dims, config rules, weights manifest, typed-Rust emit pass): its
 # own crate so the build script below and this crate share one compile of it.
 scratchy-forward-compiler-frontend = { path = "../frontend" }
+# The typed op signatures each emitted carrier is type-checked against.
+scratchy-typed-shapes = { workspace = true }
 
 # The build script runs the front end's typed-Rust emit pass (`build.rs`) over the carriers: the same
 # front-end crate this crate depends on, the same host build of it.

@@ -130,8 +130,9 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
-/// The binary's source: the signatures with `emitted` in place of the build script's output, the
-/// dim vocabulary, the ids, and a `main` printing the trace.
+/// The binary's source: the signature module with its crate's source and `emitted` in place of its
+/// re-export and the build script's output, the dim vocabulary, the ids, and a `main` printing the
+/// trace.
 fn standalone(emitted: &str) -> String {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"));
     let read = |p: &str| std::fs::read_to_string(src.join(p)).expect(p);
@@ -141,6 +142,13 @@ fn standalone(emitted: &str) -> String {
         signatures.contains(include),
         "typed_shapes.rs includes the build script's output"
     );
+    // The signature crate's source, in place of its re-export, with the front end at the paths
+    // the standalone program defines it at.
+    let vocabulary = read("../typed-shapes/src/lib.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split yields one part")
+        .replace("scratchy_forward_compiler_frontend::", "crate::");
     format!(
         "mod dim {{\n{dim}\n}}\n\
          mod classified {{\n\
@@ -152,7 +160,10 @@ fn standalone(emitted: &str) -> String {
          mod typed_shapes {{\n{signatures}\n}}\n\
          {MAIN}",
         dim = read("../frontend/src/dim.rs"),
-        signatures = signatures.replace(include, emitted),
+        signatures = signatures
+            .replace("pub use scratchy_typed_shapes::*;", &vocabulary)
+            .replace("scratchy_typed_shapes::trace(", "trace(")
+            .replace(include, emitted),
     )
 }
 

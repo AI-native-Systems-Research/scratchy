@@ -28,7 +28,7 @@ use crate::dim::{DERIVED_DIMS, DerivedRule, Dim, canonical_add, canonical_mul};
 use crate::hf_config::ParamExpr;
 use crate::weights_manifest::WeightsManifest;
 
-/// The bounds the op signatures in `typed_shapes` name themselves, beside those a `weights.json`
+/// The bounds the op signatures in `scratchy-typed-shapes` name themselves, beside those a `weights.json`
 /// declares. Config vocabulary, shared by every arch.
 pub const SIGNATURE_BOUNDS: [&str; 11] = [
     "backbone_hidden_size",
@@ -225,13 +225,12 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
     ))
 }
 
-/// The marker of every base bound in `bounds` and in [`SIGNATURE_BOUNDS`]: every derived dim is a
-/// type alias in the module of the carrier that names it ([`carrier_aliases`]).
+/// The marker of every base bound in `bounds` that [`SIGNATURE_BOUNDS`] does not already name (the
+/// signatures declare those themselves): every derived dim is a type alias in the module of the
+/// carrier that names it ([`carrier_aliases`]).
 pub fn emit_markers(bounds: &BTreeSet<String>) -> Result<String, String> {
-    let all: BTreeSet<&str> = (bounds.iter().map(String::as_str))
-        .chain(SIGNATURE_BOUNDS)
-        .collect();
-    let rows: String = (all.iter())
+    let rows: String = (bounds.iter())
+        .filter(|b| !SIGNATURE_BOUNDS.contains(&b.as_str()))
         .map(|b| format!("    {} => {b:?},\n", marker(b)))
         .collect();
     Ok(format!("bounds! {{\n{rows}}}\n"))

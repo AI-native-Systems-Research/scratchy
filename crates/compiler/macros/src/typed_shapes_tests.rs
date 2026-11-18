@@ -144,7 +144,11 @@ fn the_emit_pass_and_its_signatures_name_no_arch_or_model() {
         names.iter().any(|n| n == "llama"),
         "the scan sees the carriers"
     );
-    for file in ["../../frontend/src/typed_emit.rs", "typed_shapes.rs"] {
+    for file in [
+        "../../frontend/src/typed_emit.rs",
+        "../../typed-shapes/src/lib.rs",
+        "typed_shapes.rs",
+    ] {
         let text = std::fs::read_to_string(src.join(file)).expect(file);
         let words: std::collections::HashSet<&str> = text
             .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))

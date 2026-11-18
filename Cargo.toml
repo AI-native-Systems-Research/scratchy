@@ -27,6 +27,7 @@ members = [
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/frontend",
+    "crates/compiler/typed-shapes",
     "crates/compiler/subtile",
     "crates/targets/metal",
     "crates/targets/metal/cli",
@@ -199,6 +200,8 @@ hf-hub-downloader = { path = "crates/core/hf-hub-downloader" }
 scratchy-quantizations = { path = "crates/models/quantization" }
 scratchy-vision = { path = "crates/models/vision" }
 scratchy-forward-compiler = { path = "crates/compiler" }
+# The typed op signatures (shapes as Rust types) the forward compiler type-checks carriers against.
+scratchy-typed-shapes = { path = "crates/compiler/typed-shapes" }
 scratchy-serving-transport = { path = "crates/serving/transport" }
 scratchy-bench = { path = "crates/benches" }
 scratchy-cli = { path = "crates/cli/scr", default-features = false }
