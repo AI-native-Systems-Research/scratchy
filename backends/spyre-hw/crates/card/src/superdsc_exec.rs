@@ -1153,7 +1153,8 @@ enum SourceFiller {
 }
 
 /// The re-rolled layer loop: ONE BODY PER ATTENTION CLASS, each re-launched for its own layers
-/// with the weight and KV segment bases shifted per layer, between a prefix (embed) and a suffix
+/// with the weight segment's base shifted and the KV slot handed that layer's own region, between
+/// a prefix (embed) and a suffix
 /// (lm_head). ⭐ THE LAUNCH TABLE IS DECLARED DATA — one row per layer, in true layer order, each
 /// naming its body, its weight shift and its KV region. There is no per-layer arithmetic left here:
 /// no `v·weight_stride`, no `v / layers_per_bank`. A class-split model's classes have DIFFERENT
@@ -5735,15 +5736,17 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let seg = SegIdx::checked(p.segment as i64)
             .ok_or_else(|| anyhow!("tensor '{name}' segment {} out of range", p.segment))?;
         // ⛔ A BANKED TENSOR IS NOT IN ITS SEGMENT'S REGION. `d2h_seg_clamped` reads `seg_addr[seg]`,
-        // which for a weight in bank ≥ 1 is a DIFFERENT region — the read would return bank 0's bytes
-        // at this offset and the caller would compare a golden against another tensor entirely. This
-        // is a selftest/debug reader, so refusing is free; making it bank-aware would mean giving
-        // every segment reader the bank coordinate for a path no forward uses.
+        // which for a weight or a layer's pools in bank ≥ 1 is a DIFFERENT region — the read would
+        // return bank 0's bytes at this offset and the caller would compare a golden against another
+        // tensor entirely. This is a selftest/debug reader, so refusing is free; making it
+        // bank-aware would mean giving every segment reader the bank coordinate for a path no
+        // forward uses.
         if p.bank != 0 {
             bail!(
-                "read_tensor('{name}'): it is in weight bank {}, and a segment read addresses only \
-                 bank 0's region — REFUSING rather than returning another bank's bytes",
-                p.bank
+                "read_tensor('{name}'): it is in bank {} of seg{}, and a segment read addresses \
+                 only bank 0's region — REFUSING rather than returning another bank's bytes",
+                p.bank,
+                p.segment
             );
         }
         // ⭐ THE WHOLE SEGMENT, NOT WHAT A DEVICE-ONLY SLOT HAPPENS TO MIRROR: this is the
@@ -5862,9 +5865,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // worse than refusing.
         if p.bank != 0 {
             bail!(
-                "read_tensor_raw('{id}'): it is in weight bank {}, and a segment read addresses \
-                 only bank 0's region — REFUSING rather than returning another bank's bytes",
-                p.bank
+                "read_tensor_raw('{id}'): it is in bank {} of seg{}, and a segment read \
+                 addresses only bank 0's region — REFUSING rather than returning another bank's \
+                 bytes",
+                p.bank,
+                p.segment
             );
         }
         let addr = self.seg_addr[seg.get()]

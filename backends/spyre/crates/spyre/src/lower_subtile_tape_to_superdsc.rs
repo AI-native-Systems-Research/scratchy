@@ -1958,24 +1958,26 @@ mod weight_tail_tests {
 /// ⭐⭐ THE KV POOLS, ONE DEVICE REGION PER LAYER — every (class, iteration) launch block's pools
 /// are their own bank of the KV segment ([`KvBank`]), at the SAME intra-block offsets for every
 /// iteration of the class: each table of the class, in the map's own order, at the running sum of
-/// its layer-0 tensor's aligned size. A layer's launch therefore re-bases the KV slot by handing it
-/// that layer's region alone — the body bakes the class's intra-block offsets once — and the pool
-/// is the model's whole context whatever its total, with no packing against a region size: the
-/// largest allocation is one layer's pools.
+/// the widest of its layers' aligned sizes. A layer's launch therefore re-bases the KV slot by
+/// handing it that layer's region alone — the body bakes the class's intra-block offsets once —
+/// and the pool is the model's whole context whatever its total, with no packing against a region
+/// size: the largest allocation is one layer's pools.
 ///
-/// The blocks are numbered class-major (bank 0 is the first class's first layer). A pool no
-/// per-layer table names goes in bank 0 after that block, where the unshifted prefix and suffix
-/// launches read it. Off the card `pools` is empty and nothing is placed.
+/// The blocks are numbered class-major (bank 0 is the first class's first layer). Every table's
+/// layers are placed through the table's own list, which `per_layer_external_tids` files only at
+/// its loop's layer count. A pool no per-layer table names goes in bank 0 after that block, where
+/// the unshifted prefix and suffix launches read it. Off the card `pools` is empty and nothing is
+/// placed.
 ///
 /// Returns the extra banks' bytes (banks `1..N`; bank 0's are written to `seg_bytes`) and each
-/// launch block's bank, `[class][iteration]`.
+/// pool table's bank per iteration, keyed by the table's layer-0 tid.
 fn place_kv_pools(
     pools: &[u32],
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
     size_of: impl Fn(u32) -> u64,
     seg_bytes: &mut [u64; 7],
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-) -> (Vec<u64>, Vec<Vec<KvBank>>) {
+) -> (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>) {
     let kv_seg = SegRole::Kv.segment();
     let is_pool: std::collections::BTreeSet<u32> = pools.iter().copied().collect();
     let mut place = |tid: u32, bank: KvBank, offset: u64| {
@@ -1992,30 +1994,35 @@ fn place_kv_pools(
         );
     };
     let mut bank_bytes: Vec<u64> = Vec::new();
-    let mut block_banks: Vec<Vec<KvBank>> = Vec::with_capacity(per_layer_ext.len());
+    let mut table_banks: std::collections::BTreeMap<u32, Vec<KvBank>> = Default::default();
     for class in per_layer_ext {
-        let tables: Vec<&Vec<u32>> = class
+        let tables: Vec<(u32, &Vec<u32>)> = class
             .iter()
             .filter(|(t0, _)| is_pool.contains(t0))
-            .map(|(_, tids)| tids)
+            .map(|(&t0, tids)| (t0, tids))
             .collect();
-        let iters = tables.first().map_or(0, |t| t.len());
+        let Some(&(_, first)) = tables.first() else {
+            continue;
+        };
+        // Each table's slot is as wide as its widest layer, so no layer's tensor reaches into
+        // the next table's slot.
         let mut intra: Vec<u64> = Vec::with_capacity(tables.len());
         let mut block = 0u64;
-        for t in &tables {
+        for (_, tids) in &tables {
             intra.push(block);
-            block = align128(block + size_of(t[0]));
+            let widest = tids.iter().map(|&t| size_of(t)).max().unwrap_or(0);
+            block = align128(block + widest);
         }
-        let mut banks: Vec<KvBank> = Vec::with_capacity(iters);
-        for j in 0..iters {
-            let bank = KvBank::of_placement(bank_bytes.len() as u32);
-            for (t, &off) in tables.iter().zip(&intra) {
-                place(t[j], bank, off);
+        let banks: Vec<KvBank> = (0..first.len())
+            .map(|j| KvBank::of_placement((bank_bytes.len() + j) as u32))
+            .collect();
+        bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
+        for ((t0, tids), &off) in tables.iter().zip(&intra) {
+            for (&tid, &bank) in tids.iter().zip(&banks) {
+                place(tid, bank, off);
             }
-            bank_bytes.push(block);
-            banks.push(bank);
+            table_banks.insert(*t0, banks.clone());
         }
-        block_banks.push(banks);
     }
     if bank_bytes.is_empty() {
         bank_bytes.push(0);
@@ -2031,7 +2038,7 @@ fn place_kv_pools(
     }
     bank_bytes[0] = tail;
     seg_bytes[kv_seg] = bank_bytes[0];
-    (bank_bytes.split_off(1), block_banks)
+    (bank_bytes.split_off(1), table_banks)
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -10859,16 +10866,38 @@ mod kv_pool_placement_tests {
             vec![2 * pool; layers as usize - 1],
             "one bank per further layer"
         );
+        let per_layer_banks: Vec<KvBank> = (0..layers).map(KvBank::of_placement).collect();
         assert_eq!(
             banks,
-            vec![(0..layers).map(KvBank::of_placement).collect::<Vec<_>>()],
-            "the launch block of layer v is bank v"
+            [(1000, per_layer_banks.clone()), (2000, per_layer_banks)]
+                .into_iter()
+                .collect(),
+            "both of the class's tables put layer v in bank v"
         );
         for v in 0..layers {
             let (k, val) = (placements[&(1000 + v)], placements[&(2000 + v)]);
             assert_eq!((k.bank, k.offset), (v, 0), "layer {v}'s K");
             assert_eq!((val.bank, val.offset), (v, pool), "layer {v}'s V");
         }
+    }
+
+    /// A table whose later layer is wider than layer 0 gets a slot as wide as that layer, so the
+    /// next table never starts inside it.
+    #[test]
+    fn a_wider_later_layer_widens_its_tables_slot() {
+        let per_layer_ext = one_class(2);
+        let pools = vec![1000, 1001, 2000, 2001];
+        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
+        let size_of = |t: u32| if t == 1001 { 2048 } else { 1024 };
+        place_kv_pools(
+            &pools,
+            &per_layer_ext,
+            size_of,
+            &mut seg_bytes,
+            &mut placements,
+        );
+        assert_eq!(placements[&2000].offset, 2048, "V starts past the widest K");
+        assert_eq!(placements[&2001].offset, 2048);
     }
 
     /// A pool no per-layer table names sits in bank 0, after that bank's block — where the

@@ -263,11 +263,11 @@ pub struct BundleLayout {
     /// and skipped from the serialization then, so those bundles' fingerprints do not carry it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kv_bank_bytes: Vec<u64>,
-    /// ⭐ WHICH KV BANK EACH LAUNCH BLOCK'S POOLS LIVE IN — `[class][iteration]`, the one
-    /// statement both the placements and the launch table read. A class with no per-layer pools
-    /// has an empty list.
+    /// ⭐ WHICH KV BANK EACH PER-LAYER POOL TABLE'S LAYERS LIVE IN — keyed by the table's layer-0
+    /// tid (the key every per-layer table is owned by), one bank per iteration: the one statement
+    /// both the placements and the launch table read. The tables of one class share one list.
     #[serde(skip)]
-    pub kv_block_banks: Vec<Vec<KvBank>>,
+    pub kv_block_banks: std::collections::BTreeMap<u32, Vec<KvBank>>,
     /// ⭐ THE SEGMENT BUDGET'S VERDICT on the non-per-layer weight tail — see [`WeightTail`].
     #[serde(default)]
     pub weight_tail: WeightTail,

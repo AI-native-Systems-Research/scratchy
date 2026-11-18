@@ -3322,20 +3322,50 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     //    cannot matter; a class whose tables DISAGREE is refused here with both readings named.
     //
     //    The KV column is the layout's own: each launch block's pools are their own region
-    //    (`place_kv_pools`), so the launch names that block's bank and shifts nothing.
-    let mut launch_w: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
-    let launch_kv: Vec<crate::lower_subtile_tape_to_superdsc::KvBank> = launches
-        .iter()
-        .map(|&(body, iter)| {
-            bundle_layout
+    //    (`place_kv_pools`), so the launch names that block's bank and shifts nothing. A body's
+    //    banks are read through the tables it OWNS (`body_of_tid`, the weight column's own key),
+    //    never by its position.
+    use crate::lower_subtile_tape_to_superdsc::KvBank;
+    /// What one body's launches hand the KV slot.
+    enum BodyKv<'a> {
+        /// The banks of the per-layer pool tables this body owns, one per iteration.
+        Owns(&'a [KvBank]),
+        /// The body owns no per-layer pool: the only pools it can read sit in bank 0.
+        OwnsNone,
+    }
+    let body_kv: Vec<BodyKv<'_>> = (0..bodies.len())
+        .map(|b| {
+            let mut owned = bundle_layout
                 .kv_block_banks
-                .get(body as usize)
-                .and_then(|banks| banks.get(iter as usize))
-                .copied()
-                // A class that owns no per-layer pools reads bank 0, where its pools are.
-                .unwrap_or(crate::lower_subtile_tape_to_superdsc::KvBank::BASE)
+                .iter()
+                .filter(|(t0, _)| body_of_tid(**t0) == Some(b));
+            let Some((t0, first)) = owned.next() else {
+                return Ok(BodyKv::OwnsNone);
+            };
+            match owned.find(|(_, banks)| *banks != first) {
+                Some((t1, _)) => Err(SuperDscError(format!(
+                    "reroll-superdsc: body {b} owns pool tables t{t0} and t{t1}, which the layout \
+                     placed in different layers' regions — one launch hands the KV slot one \
+                     region, so no launch addresses both"
+                ))),
+                None => Ok(BodyKv::Owns(first)),
+            }
         })
-        .collect();
+        .collect::<Result<_, SuperDscError>>()?;
+    let launch_kv: Vec<KvBank> = launches
+        .iter()
+        .map(|&(body, iter)| match body_kv[body as usize] {
+            BodyKv::Owns(banks) => banks.get(iter as usize).copied().ok_or_else(|| {
+                SuperDscError(format!(
+                    "reroll-superdsc: body {body} launches layer {iter}, but its pool tables \
+                     hold {} layer(s)",
+                    banks.len()
+                ))
+            }),
+            BodyKv::OwnsNone => Ok(KvBank::BASE),
+        })
+        .collect::<Result<_, SuperDscError>>()?;
+    let mut launch_w: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
     for &(body, iter) in &launches {
         let mut w_entry: Option<(u8, u64)> = None;
         for (t0, tids) in &per_layer {
