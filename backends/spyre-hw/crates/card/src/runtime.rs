@@ -1843,6 +1843,20 @@ impl DevAddr {
         })
     }
 
+    /// ⭐ A SINGLE RESERVATION'S CHUNK 0 — the one chunk a `DevAddr::alloc` reservation IS.
+    /// `allocate` serves one contiguous reservation as one chunk; the multi-chunk addresses
+    /// are the INTERLEAVED regions' ([`Self::windows`]' own doc: "one chunk for a Bind
+    /// allocation, one per stripe for an interleaved one"), and no session placement mints
+    /// one — every segment, weight bank and KV bank is its own single reservation. The
+    /// alias/share paths that rebuild a descriptor from another session's placement consume
+    /// this: the law is stated ONCE, here, and a multi-chunk address reaching those sites is
+    /// a construction bug this names, never a card fact. (The typestate that would make a
+    /// multi-chunk address unnameable at those sites is the follow-up form of this law.)
+    pub fn bind_chunk0(&self) -> Chunk0 {
+        self.chunk0()
+            .expect("a DevAddr::alloc reservation is single-chunk — chunk 0 cannot be absent")
+    }
+
     /// The WHOLE region as single-chunk windows of at most `step` bytes, chunk by chunk in the
     /// region's chunk order — one chunk for a Bind allocation, one per stripe for an interleaved one.
     /// Every window lies inside one chunk and together they cover each chunk's bytes exactly once.

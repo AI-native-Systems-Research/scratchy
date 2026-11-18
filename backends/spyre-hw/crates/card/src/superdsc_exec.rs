@@ -6423,9 +6423,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 let sb = owner.weight_bank_addr[b]
                     .as_ref()
                     .expect("the owner prepared — its weight banks are allocated");
-                // Infallible by construction: a Bind allocation is single-chunk, and
-                // `DevAddr::from_chunk` builds a descriptor value.
-                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(sb.chunk0()));
+                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(sb.bind_chunk0()));
                 self.weight_bank_aliased[b] = true;
             }
         }
@@ -6444,9 +6442,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 let sb = owner.kv_bank_addr[b]
                     .as_ref()
                     .expect("the owner prepared — its KV banks are allocated");
-                // Infallible by construction: a Bind allocation is single-chunk, and
-                // `DevAddr::from_chunk` builds a descriptor value.
-                self.kv_bank_addr[b] = Some(DevAddr::from_chunk(sb.chunk0()));
+                self.kv_bank_addr[b] = Some(DevAddr::from_chunk(sb.bind_chunk0()));
             }
         }
         Ok(())
@@ -6476,13 +6472,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         seg: scratchy_target_spyre::pool_law::SharedScratchSeg,
     ) -> Result<()> {
         let i = SegIdx::from(seg).get();
-        // The owner prepared — the wave joined its prepare before any adoption — and a Bind
-        // allocation is single-chunk by construction, so the arena IS chunk 0.
+        // The owner prepared — the wave joined its prepare before any adoption.
         let src = owner.seg_addr[i]
             .as_ref()
             .expect("the arena owner prepared — its segment is allocated");
-        let c0 = src.chunk0();
-        // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
+        let c0 = src.bind_chunk0();
         self.seg_addr[i] = Some(DevAddr::from_chunk(c0));
         self.seg_aliased[i] = true;
         debug!(
