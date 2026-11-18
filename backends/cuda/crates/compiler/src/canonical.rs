@@ -61,7 +61,9 @@ use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_dr
 pub struct CudaModelFacts {
     pub head_dim: u32,
     pub rot_dim: u32,
-    pub rope_theta: f64,
+    /// `None` for a config that declares none: a canonical with a rotary table is then refused
+    /// ([`CanonicalRefusal::NoRopeTheta`]).
+    pub rope_theta: Option<f64>,
     pub gdn: Option<CudaGdnFacts>,
     pub embed: Option<CudaEmbedFacts>,
     /// Who computes the shared expert of the model's MoE bundles: the DSL, as ops of its own, or
@@ -90,7 +92,7 @@ pub struct CudaAttnClass {
     pub head_dim: u32,
     pub kv_heads: u32,
     pub rot_dim: u32,
-    pub rope_theta: f64,
+    pub rope_theta: Option<f64>,
     pub pairing: RopePairing,
     pub window: Option<u32>,
 }
@@ -126,6 +128,24 @@ impl CudaModelFacts {
             }),
         }
     }
+}
+
+/// The rotary table at `span` of class `c`, when the arena placed one; refused when its class has
+/// no `rope_theta`.
+fn rotary_table(
+    span: Option<ArenaSpan>,
+    c: Option<CudaAttnClass>,
+) -> Result<Option<RotaryTable>, CanonicalRefusal> {
+    let Some((span, c)) = span.zip(c) else {
+        return Ok(None);
+    };
+    let theta = c.rope_theta.ok_or(CanonicalRefusal::NoRopeTheta)?;
+    Ok(Some(RotaryTable {
+        span,
+        rot_dim: c.rot_dim,
+        freq_dim: c.freq_dim(),
+        theta_bits: theta.to_bits(),
+    }))
 }
 
 /// Who computes a MoE bundle's shared expert.
@@ -261,6 +281,8 @@ pub struct CanonicalKv {
 #[derive(Debug)]
 pub enum CanonicalRefusal {
     SampleRows(SampleRowsError),
+    /// The canonical builds a rotary table, and the config declares no `rope_theta` for it.
+    NoRopeTheta,
     /// The graph built from the canonical is not a valid DAG.
     Graph(String),
     Fold(FoldError),
@@ -947,6 +969,10 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} (AttnDecode) is rows={rows} head_dim={head_dim}, which the bf16 \
                  attention refuses: {rule}"
+            ),
+            Self::NoRopeTheta => write!(
+                f,
+                "the canonical builds a rotary table and the config declares no rope_theta"
             ),
             Self::AttnSinks { step } => write!(
                 f,
@@ -1640,23 +1666,8 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         result,
         weight_bytes,
         steps,
-        rotary: arena
-            .rotary
-            .zip(plan.facts.table_class(false))
-            .map(|(span, c)| RotaryTable {
-                span,
-                rot_dim: c.rot_dim,
-                freq_dim: c.freq_dim(),
-                theta_bits: c.rope_theta.to_bits(),
-            }),
-        rotary_local: (arena.rotary_local.zip(plan.facts.table_class(true))).map(|(span, c)| {
-            RotaryTable {
-                span,
-                rot_dim: c.rot_dim,
-                freq_dim: c.freq_dim(),
-                theta_bits: c.rope_theta.to_bits(),
-            }
-        }),
+        rotary: rotary_table(arena.rotary, plan.facts.table_class(false))?,
+        rotary_local: rotary_table(arena.rotary_local, plan.facts.table_class(true))?,
         // The arena placed the regions exactly when a `PrefixK` is bound, and `kv_cache` found
         // the pool exactly then.
         kv: kv.zip(arena.kv).map(|(k, r)| CanonicalKv {
