@@ -24,7 +24,7 @@ use scratchy_target_cuda_compiler::canonical::{
 pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     head_dim: 256,
     rot_dim: 64,
-    rope_theta: 1e7,
+    rope_theta: Some(1e7),
     gdn: None,
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,

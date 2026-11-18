@@ -61,7 +61,7 @@ const AT_256: CanonicalAt<'static> = CanonicalAt {
 const FACTS: CudaModelFacts = CudaModelFacts {
     head_dim: 256,
     rot_dim: 64,
-    rope_theta: 1e7,
+    rope_theta: Some(1e7),
     gdn: None,
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
@@ -250,7 +250,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
     let facts = CudaModelFacts {
         head_dim: 64,
         rot_dim: 32,
-        rope_theta: 1e4,
+        rope_theta: Some(1e4),
         gdn: None,
         embed: None,
         shared_expert: SharedExpertOwner::Undeclared,

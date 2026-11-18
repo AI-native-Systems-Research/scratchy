@@ -161,7 +161,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
 /// The model facts CUDA's lowering reads: the model's own facts (`input.facts`), the rope's base
 /// frequencies the handoff states beside them, and who computes the shared expert.
 ///
-/// A config that declares no `rope_theta` gets a NaN here, never a default: a tape with a rotary
+/// A config that declares no `rope_theta` gets `None` here, never a default: a tape with a rotary
 /// table is then refused ([`ModelRefusal::NoRopeTheta`]), and a tape with none reads no theta. A
 /// model's input is its token ids, embedded from a table of `vocab` rows; a model with no lm_head
 /// rows gets no embedding table here, and [`lower_model`] refuses it ([`ModelRefusal::NoVocab`]).
@@ -178,11 +178,10 @@ pub fn model_facts(input: &TargetModelInput) -> Result<CudaModelFacts, ModelRefu
     let base = attn.map(|a| a.base());
     let geometry = |g: HeadGeometry| (g.head_dim().get(), g.kv_heads().get(), g.rot_dim().get());
     let (head_dim, _, rot_dim) = base.map_or((0, 0, 0), geometry);
-    let theta = input.rope_theta.unwrap_or(f64::NAN);
     let classes = attn
         .filter(|a| geometry(a.global()) != geometry(a.base()))
         .map(|a| -> Result<_, ModelRefusal> {
-            let class = |g: HeadGeometry, rope_theta: f64, pairing, window| CudaAttnClass {
+            let class = |g: HeadGeometry, rope_theta, pairing, window| CudaAttnClass {
                 head_dim: g.head_dim().get(),
                 kv_heads: g.kv_heads().get(),
                 rot_dim: g.rot_dim().get(),
@@ -199,14 +198,11 @@ pub fn model_facts(input: &TargetModelInput) -> Result<CudaModelFacts, ModelRefu
             Ok(CudaAttnClasses {
                 base: class(
                     a.base(),
-                    input
-                        .rope_local_theta
-                        .or(input.rope_theta)
-                        .unwrap_or(f64::NAN),
+                    input.rope_local_theta.or(input.rope_theta),
                     RopeLanes::HalfRotated,
                     a.window().map(|w| w.get()),
                 ),
-                global: class(a.global(), theta, pairing, None),
+                global: class(a.global(), input.rope_theta, pairing, None),
             })
         })
         .transpose()?;
@@ -214,11 +210,10 @@ pub fn model_facts(input: &TargetModelInput) -> Result<CudaModelFacts, ModelRefu
         shared_expert: shared_expert_owner(input),
         embed: (f.vocab())
             .and_then(|v| u32::try_from(v.get()).ok())
-            .filter(|&v| v > 0)
             .map(|vocab| CudaEmbedFacts { vocab }),
         head_dim,
         rot_dim,
-        rope_theta: theta,
+        rope_theta: input.rope_theta,
         gdn: f.gdn().map(|g| CudaGdnFacts {
             num_k_heads: g.k_heads().get(),
             head_k: g.k_dim().get(),
@@ -416,7 +411,7 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
             why: why.clone(),
         });
     }
-    if (input.facts.vocab()).is_none_or(|v| v.get() == 0) {
+    if input.facts.vocab().is_none() {
         return Err(ModelRefusal::NoVocab);
     }
     let facts = model_facts(input)?;
@@ -453,6 +448,7 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
                     }
                     Some(_) => {}
                 },
+                Err(CanonicalRefusal::NoRopeTheta) => return Err(ModelRefusal::NoRopeTheta { m }),
                 Err(refusal) if leaves_bucket_out(&refusal) => {
                     left_out.get_or_insert((sk, refusal));
                 }
@@ -478,10 +474,6 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
                         m,
                         bucket_m: tape.bucket_m,
                     });
-                }
-                let tables = tape.rotary.iter().chain(&tape.rotary_local);
-                if tables.into_iter().any(|t| t.theta().is_nan()) {
-                    return Err(ModelRefusal::NoRopeTheta { m });
                 }
                 model.tapes.push(tape);
             }

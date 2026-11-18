@@ -82,13 +82,13 @@ pub const PREFIX_CAPACITY: u32 = 8192;
 pub const GEMMA_ATTN_FACTS: CudaModelFacts = CudaModelFacts {
     head_dim: HD,
     rot_dim: R,
-    rope_theta: THETA,
+    rope_theta: Some(THETA),
     classes: Some(CudaAttnClasses {
         base: CudaAttnClass {
             head_dim: HD,
             kv_heads: KV_HEADS,
             rot_dim: R,
-            rope_theta: THETA,
+            rope_theta: Some(THETA),
             pairing: RopeLanes::HalfRotated,
             window: Some(WINDOW),
         },
@@ -96,7 +96,7 @@ pub const GEMMA_ATTN_FACTS: CudaModelFacts = CudaModelFacts {
             head_dim: 512,
             kv_heads: 2,
             rot_dim: R_GLOBAL,
-            rope_theta: THETA_GLOBAL,
+            rope_theta: Some(THETA_GLOBAL),
             pairing: RopeLanes::HalfHead,
             window: None,
         },
