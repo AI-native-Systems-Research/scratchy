@@ -50,7 +50,7 @@ use scratchy_subtile::handoff::{
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16,
     GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemvBf16, LayerScaleBf16, MoeRouteBf16, MoeWeight,
-    NormAddBf16, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
+    NormAddBf16, RmsNormBf16, RouteProgram, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -556,7 +556,10 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         }) => Some((gain, Role::Bf16([u64::from(cols), 0], 1))),
         CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Param([1, 0], 1))),
         CudaStep::MoeRoute(MoeRouteBf16 {
-            expert_scale: Some(ix),
+            program:
+                RouteProgram::TopKScaledSoftmax {
+                    expert_scale: ix, ..
+                },
             experts,
             ..
         }) => Some((ix, Role::Bf16([u64::from(experts), 0], 1))),

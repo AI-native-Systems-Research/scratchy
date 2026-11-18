@@ -2383,9 +2383,11 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     let scale = (256f32).powf(-0.5).to_bits();
                     assert_eq!(
                         r.program,
-                        RouteProgram::GemmaScaledSoftmax { scale_bits: scale }
+                        RouteProgram::TopKScaledSoftmax {
+                            scale_bits: scale,
+                            expert_scale: WeightIx(3)
+                        }
                     );
-                    assert_eq!((r.renorm, r.expert_scale), (false, Some(WeightIx(3))));
                 }
                 CudaStep::GeluMul(_) => gelus += 1,
                 CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => {

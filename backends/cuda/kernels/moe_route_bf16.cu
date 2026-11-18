@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The qwen3-5-moe router's routing for the H100 (MoE step M1 of #857): per token row `t` of the
-// router logits `[m, 256]` bf16, `p = softmax(logits[t])` in f32, its `top_k` largest picked, and
+// The MoE router's routing for the H100 (MoE step M1 of #857). The softmax-top-k program
+// (`SOFTMAX_TOPK`, `RouteProgram::SoftmaxTopK`, qwen3-5-moe's): per token row `t` of the router
+// logits `[m, 256]` bf16, `p = softmax(logits[t])` in f32, its `top_k` largest picked, and
 // their probabilities (divided by their sum when `renorm`) stored as f32 `scores [m, top_k]`, their
 // expert indices as i32 `topk_idx [m, top_k]`. The picks are stored ascending: slot `top_k − 1` is
 // the best, as Metal writes `inds[K-1-r]` (`metal/shaders/moe_route.h`).
@@ -25,9 +26,9 @@
 //   - Renorm: the picked probabilities, summed in slot order, then each divided (scalar arithmetic
 //     on reduction results). Lane 0 stores both rows through `gl::operator[]`.
 //
-// Gemma 4's program (`GEMMA`, `RouteProgram::GemmaScaledSoftmax`, Metal's `moe_route.h` score program
-// and `moe_per_expert_scale.metal`), at 128 experts (Gemma 4 26B-A4B) or 256, 4 or 8 logits per
-// lane:
+// The scaled program (`TOPK_SCALED_SOFTMAX`, `RouteProgram::TopKScaledSoftmax`, Gemma 4's; Metal's
+// `moe_route.h` score program and `moe_per_expert_scale.metal`), at 128 experts (Gemma 4 26B-A4B)
+// or 256, 4 or 8 logits per lane:
 //   - The picks are the same top-k rounds over `nan_to_neg_inf` of the RAW logits, not a softmax:
 //     the inputs are exact bf16, so nothing is rounded before the picks. Ties by the higher index.
 //   - `s = logits · scale` (`warp::mul`, `scale` = `hidden^-0.5`), every unpicked entry set to −inf
@@ -36,10 +37,10 @@
 //     `exp(−inf)`); `warp::sum` and `warp::div`: the softmax over the picks.
 //   - `s · per_expert_scale` (`warp::load` of the `[experts]` bf16 weight, widened exactly, then
 //     `warp::mul` vector by vector), each pick's score the one element at its index (`apply`, then
-//     `warp::sum`, as the Qwen program's).
+//     `warp::sum`, as the softmax-top-k program's).
 //   - NaN: all-NaN logits pick `top_k` distinct indices (the highest), and every score is NaN.
-// The template is instantiated for the Qwen program at 256 experts (its body unchanged) and for
-// Gemma's at 128 and 256 (`op_abi::MOE_EXPERT_COUNTS`).
+// The template is instantiated for the softmax-top-k program at 256 experts (its body unchanged)
+// and for the scaled one at 128 and 256 (`op_abi::MOE_EXPERT_COUNTS`).
 //
 // No atomics, a fixed order: the same row gives the same bits wherever it sits.
 
@@ -58,14 +59,15 @@ using namespace kittens;
 
 namespace {
 
-// `step::MOE_ROUTE_EXPERTS`: the Qwen program's one count, one naive `rv_fl<256>` per row.
-constexpr int QWEN_EXPERTS = scratchy::MOE_ROUTE_EXPERTS;
-// `op_abi::MOE_EXPERT_COUNTS`: the Gemma program's counts.
-constexpr int GEMMA_EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
-constexpr int GEMMA_EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
-// The launcher's `program`.
-constexpr uint32_t QWEN = 0;
-constexpr uint32_t GEMMA = 1;
+// `step::MOE_ROUTE_EXPERTS`: the softmax-top-k program's one count, one naive `rv_fl<256>` per
+// row.
+constexpr int SOFTMAX_TOPK_EXPERTS = scratchy::MOE_ROUTE_EXPERTS;
+// `op_abi::MOE_EXPERT_COUNTS`: the scaled program's counts.
+constexpr int SCALED_EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
+constexpr int SCALED_EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
+// The launcher's `program` (`kernels.rs`'s `ROUTE_SOFTMAX_TOPK`, `ROUTE_TOPK_SCALED_SOFTMAX`).
+constexpr uint32_t SOFTMAX_TOPK = 0;
+constexpr uint32_t TOPK_SCALED_SOFTMAX = 1;
 // `step::MOE_ROUTE_MAX_TOP_K`.
 constexpr uint32_t MAX_TOP_K = scratchy::MOE_ROUTE_MAX_TOP_K;
 constexpr int WARPS = 8;
@@ -74,9 +76,9 @@ constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 using idx_gl = gl<int, 1, 1, -1, -1>;
 using score_gl = gl<float, 1, 1, -1, -1>;
 
-// The Qwen program's arguments, as before Gemma's program was added.
-struct route_globals {
-    gl<bf16, 1, 1, -1, QWEN_EXPERTS> logits;
+// The softmax-top-k program's arguments.
+struct softmax_topk_globals {
+    gl<bf16, 1, 1, -1, SOFTMAX_TOPK_EXPERTS> logits;
     idx_gl topk_idx;
     score_gl scores;
     int m;
@@ -84,9 +86,9 @@ struct route_globals {
     bool renorm;
 };
 
-// The Gemma program's: no `renorm`, and its scale and per-expert scale.
+// The scaled program's: no `renorm`, and its scale and per-expert scale.
 template <int EXPERTS>
-struct gemma_route_globals {
+struct scaled_route_globals {
     gl<bf16, 1, 1, -1, EXPERTS> logits;
     idx_gl topk_idx;
     score_gl scores;
@@ -98,23 +100,24 @@ struct gemma_route_globals {
     float scale;
 };
 
-template <int EXPERTS, bool GEMMA_PROGRAM>
-using globals_of = std::conditional_t<GEMMA_PROGRAM, gemma_route_globals<EXPERTS>, route_globals>;
+template <int EXPERTS, bool SCALED>
+using globals_of = std::conditional_t<SCALED, scaled_route_globals<EXPERTS>, softmax_topk_globals>;
 
-template <int EXPERTS, bool GEMMA_PROGRAM>
+template <int EXPERTS, bool SCALED>
 __global__ __launch_bounds__(NUM_THREADS) void moe_route_bf16_ker(
-    const __grid_constant__ globals_of<EXPERTS, GEMMA_PROGRAM> g) {
-    static_assert(GEMMA_PROGRAM || EXPERTS == QWEN_EXPERTS, "the Qwen program is at 256 only");
+    const __grid_constant__ globals_of<EXPERTS, SCALED> g) {
+    static_assert(SCALED || EXPERTS == SOFTMAX_TOPK_EXPERTS,
+                  "the softmax-top-k program is at 256 only");
     using expert_vec = rv_fl<EXPERTS>;
     const int t = blockIdx.x * WARPS + kittens::warpid();
     if (t >= g.m) {
         return;
     }
     constexpr float NEG_INF = kittens::base_types::constants<float>::neg_infty();
-    // `p`: Qwen's probabilities, or Gemma's raw logits.
+    // `p`: the softmax-top-k program's probabilities, or the scaled program's raw logits.
     expert_vec p, key, taken, probe;
     warp::load(p, g.logits, {0, 0, t, 0});
-    if constexpr (!GEMMA_PROGRAM) {
+    if constexpr (!SCALED) {
         const float mx = warp::max(p);
         warp::sub(p, p, mx);
         warp::exp(p, p);
@@ -141,13 +144,13 @@ __global__ __launch_bounds__(NUM_THREADS) void moe_route_bf16_ker(
         const int idx = int(warp::max(probe));
         warp::apply(taken, taken, [&](int i, float was) { return i == idx ? 1.0f : was; });
         picked[j] = idx;
-        if constexpr (!GEMMA_PROGRAM) {
+        if constexpr (!SCALED) {
             // The pick's probability: the one element of `p` at `idx`, every other lane's 0.
             warp::apply(probe, p, [&](int i, float x) { return i == idx ? x : 0.0f; });
             prob[j] = warp::sum(probe);
         }
     }
-    if constexpr (GEMMA_PROGRAM) {
+    if constexpr (SCALED) {
         // The scaled logits of the picks, a softmax over them, then the per-expert scale.
         expert_vec s, pes;
         warp::mul(s, p, g.scale);
@@ -178,7 +181,7 @@ __global__ __launch_bounds__(NUM_THREADS) void moe_route_bf16_ker(
 
     float sum = 0.0f;
     bool renorm = false;
-    if constexpr (!GEMMA_PROGRAM) {
+    if constexpr (!SCALED) {
         renorm = g.renorm;
     }
     if (renorm) {
@@ -203,11 +206,11 @@ __global__ __launch_bounds__(NUM_THREADS) void moe_route_bf16_ker(
 }
 
 // Launch the program with its globals `G` over `m` rows.
-template <int EXPERTS, bool GEMMA_PROGRAM>
-int launch(const globals_of<EXPERTS, GEMMA_PROGRAM>& G, uint32_t m, cudaStream_t stream) {
-    void* args[] = {const_cast<globals_of<EXPERTS, GEMMA_PROGRAM>*>(&G)};
+template <int EXPERTS, bool SCALED>
+int launch(const globals_of<EXPERTS, SCALED>& G, uint32_t m, cudaStream_t stream) {
+    void* args[] = {const_cast<globals_of<EXPERTS, SCALED>*>(&G)};
     const dim3 grid((m + uint32_t(WARPS) - 1) / uint32_t(WARPS)), block(NUM_THREADS);
-    return static_cast<int>(cudaLaunchKernel(moe_route_bf16_ker<EXPERTS, GEMMA_PROGRAM>, grid,
+    return static_cast<int>(cudaLaunchKernel(moe_route_bf16_ker<EXPERTS, SCALED>, grid,
                                              block, args, 0, stream));
 }
 
@@ -220,13 +223,13 @@ int launch(const globals_of<EXPERTS, GEMMA_PROGRAM>& G, uint32_t m, cudaStream_t
 // 0 = done; any other value = the cudaError_t of the first query that failed.
 extern "C" int scratchy_cuda_moe_route_bf16_prepare(void) {
     cudaFuncAttributes attr;
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<QWEN_EXPERTS, false>); e != cudaSuccess) {
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<SOFTMAX_TOPK_EXPERTS, false>); e != cudaSuccess) {
         return static_cast<int>(e);
     }
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<GEMMA_EXPERTS_SMALL, true>); e != cudaSuccess) {
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<SCALED_EXPERTS_SMALL, true>); e != cudaSuccess) {
         return static_cast<int>(e);
     }
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<GEMMA_EXPERTS_LARGE, true>); e != cudaSuccess) {
+    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_route_bf16_ker<SCALED_EXPERTS_LARGE, true>); e != cudaSuccess) {
         return static_cast<int>(e);
     }
     return 0;
@@ -238,11 +241,12 @@ extern "C" int scratchy_cuda_moe_route_bf16_prepare(void) {
 // state.
 //
 // `m` must be non-zero and at most INT_MAX, `top_k` in 1..=32 (`step::MOE_ROUTE_MAX_TOP_K`), and
-// `program` 0 (Qwen) with `experts` 256 (`step::MOE_ROUTE_EXPERTS`), or 1 (Gemma) with `experts`
-// 128 or 256 (`op_abi::MOE_EXPERT_COUNTS`) and a non-null `expert_scale`; all are checked before
-// any pointer is touched. `logits` is `[m, experts]` bf16, `expert_scale` (Gemma's; null for Qwen)
-// `[experts]` bf16, `topk_idx` `[m, top_k]` i32 and `scores` `[m, top_k]` f32, the two outputs
-// overlapping nothing. `renorm` is the Qwen program's; `scale` (`hidden^-0.5`) the Gemma program's.
+// `program` 0 (softmax-top-k) with `experts` 256 (`step::MOE_ROUTE_EXPERTS`), or 1 (scaled) with
+// `experts` 128 or 256 (`op_abi::MOE_EXPERT_COUNTS`) and a non-null `expert_scale`; all are checked
+// before any pointer is touched. `logits` is `[m, experts]` bf16, `expert_scale` (the scaled
+// program's; null for the other) `[experts]` bf16, `topk_idx` `[m, top_k]` i32 and `scores`
+// `[m, top_k]` f32, the two outputs overlapping nothing. `renorm` is the softmax-top-k program's;
+// `scale` (`hidden^-0.5`) the scaled program's.
 // No shared memory, so its one-time setup (`_prepare`, in `PREPARE`) only loads it. The launch is
 // asynchronous on `stream`.
 extern "C" int scratchy_cuda_moe_route_bf16(const void* logits, const void* expert_scale,
@@ -250,11 +254,12 @@ extern "C" int scratchy_cuda_moe_route_bf16(const void* logits, const void* expe
                                             uint32_t experts, uint32_t top_k, uint32_t renorm,
                                             uint32_t program, float scale,
                                             void* stream /* cudaStream_t; null = default */) {
-    const bool qwen = program == QWEN && experts == uint32_t(QWEN_EXPERTS);
-    const bool gemma = program == GEMMA && expert_scale != nullptr &&
-                       (experts == uint32_t(GEMMA_EXPERTS_SMALL) ||
-                        experts == uint32_t(GEMMA_EXPERTS_LARGE));
-    if (m == 0 || m > uint32_t(INT_MAX) || !(qwen || gemma) || top_k == 0 || top_k > MAX_TOP_K) {
+    const bool softmax_topk = program == SOFTMAX_TOPK && experts == uint32_t(SOFTMAX_TOPK_EXPERTS);
+    const bool scaled = program == TOPK_SCALED_SOFTMAX && expert_scale != nullptr &&
+                        (experts == uint32_t(SCALED_EXPERTS_SMALL) ||
+                         experts == uint32_t(SCALED_EXPERTS_LARGE));
+    if (m == 0 || m > uint32_t(INT_MAX) || !(softmax_topk || scaled) || top_k == 0 ||
+        top_k > MAX_TOP_K) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -265,21 +270,21 @@ extern "C" int scratchy_cuda_moe_route_bf16(const void* logits, const void* expe
         // No view carries a TMA type, so building them encodes nothing.
         idx_gl ig{static_cast<int*>(topk_idx), nullptr, nullptr, size_t(m), size_t(top_k)};
         score_gl sg{static_cast<float*>(scores), nullptr, nullptr, size_t(m), size_t(top_k)};
-        if (qwen) {
-            route_globals G{{lp, nullptr, nullptr, size_t(m), nullptr}, ig, sg, int(m),
+        if (softmax_topk) {
+            softmax_topk_globals G{{lp, nullptr, nullptr, size_t(m), nullptr}, ig, sg, int(m),
                             int(top_k), renorm != 0};
-            return launch<QWEN_EXPERTS, false>(G, m, s);
+            return launch<SOFTMAX_TOPK_EXPERTS, false>(G, m, s);
         }
-        if (experts == uint32_t(GEMMA_EXPERTS_SMALL)) {
-            gemma_route_globals<GEMMA_EXPERTS_SMALL> G{
+        if (experts == uint32_t(SCALED_EXPERTS_SMALL)) {
+            scaled_route_globals<SCALED_EXPERTS_SMALL> G{
                 {lp, nullptr, nullptr, size_t(m), nullptr}, ig, sg,
                 {ep, nullptr, nullptr, nullptr, nullptr}, int(m), int(top_k), scale};
-            return launch<GEMMA_EXPERTS_SMALL, true>(G, m, s);
+            return launch<SCALED_EXPERTS_SMALL, true>(G, m, s);
         }
-        gemma_route_globals<GEMMA_EXPERTS_LARGE> G{
+        scaled_route_globals<SCALED_EXPERTS_LARGE> G{
             {lp, nullptr, nullptr, size_t(m), nullptr}, ig, sg,
             {ep, nullptr, nullptr, nullptr, nullptr}, int(m), int(top_k), scale};
-        return launch<GEMMA_EXPERTS_LARGE, true>(G, m, s);
+        return launch<SCALED_EXPERTS_LARGE, true>(G, m, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

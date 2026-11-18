@@ -3696,9 +3696,9 @@ fn qwen_route_at_128() -> &'static [CudaTape] {
             .map(|&s| match s {
                 CudaStep::MoeRoute(r) => {
                     CudaStep::MoeRoute(scratchy_target_cuda::step::MoeRouteBf16 {
-                        program: scratchy_target_cuda::step::RouteProgram::QwenSoftmax,
-                        renorm: true,
-                        expert_scale: None,
+                        program: scratchy_target_cuda::step::RouteProgram::SoftmaxTopK {
+                            renorm: true,
+                        },
                         ..r
                     })
                 }
@@ -3728,7 +3728,8 @@ fn a_qwen_routing_at_128_experts_is_refused_before_anything_is_enqueued() {
         matches!(
             tape.steps[route],
             CudaStep::MoeRoute(r) if r.experts == 128
-                && r.program == scratchy_target_cuda::step::RouteProgram::QwenSoftmax
+                && r.program
+                    == scratchy_target_cuda::step::RouteProgram::SoftmaxTopK { renorm: true }
         ),
         "{:?}",
         tape.steps[route]

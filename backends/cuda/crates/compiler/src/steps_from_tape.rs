@@ -2045,14 +2045,15 @@ fn moe_route(
     };
     let at = |slot: SlotId| computes.iter().find(|c| c.writes == slot);
     let of = |slot: SlotId, want: fn(&SubOp) -> bool| at(slot).filter(|c| want(&c.node.op));
-    // The step the logits are read through: the softmax (Qwen), else the argsort (Gemma).
-    let (reader, program, renorm, expert_scale) = match (pre, tail) {
+    // The step the logits are read through: the softmax (Qwen), else the argsort (Gemma); and,
+    // for the scaled program, its scale and the op that reads its per-expert scale.
+    let (reader, renorm, scaled) = match (pre, tail) {
         (Some(pre), [None, renorm, None, None]) => {
             let softmax = of(pre, |op| matches!(op, SubOp::RouteSoftmax)).ok_or_else(routing)?;
             if renorm.is_some_and(|r| of(r, |op| matches!(op, SubOp::RouteRenorm)).is_none()) {
                 return Err(routing());
             }
-            (softmax, RouteProgram::QwenSoftmax, renorm.is_some(), None)
+            (softmax, renorm.is_some(), None)
         }
         (None, [Some(scale), Some(softmax), Some(per_expert), None]) => {
             let scale = at(scale).ok_or_else(routing)?;
@@ -2066,10 +2067,7 @@ fn moe_route(
             .ok_or_else(routing)?;
             finite_scalar(scale, by, true)?;
             let argsort = of(sort, |op| matches!(op, SubOp::RouteArgsort)).ok_or_else(routing)?;
-            let program = RouteProgram::GemmaScaledSoftmax {
-                scale_bits: by.to_bits(),
-            };
-            (argsort, program, false, Some(per_expert))
+            (argsort, false, Some((by.to_bits(), per_expert)))
         }
         _ => return Err(routing()),
     };
@@ -2081,16 +2079,19 @@ fn moe_route(
     };
     let moe = moe_tape(cx, s)?;
     moe_counts(cx, s, &moe, (experts.get(), k.get()))?;
-    let expert_scale = match expert_scale {
-        Some(per_expert) => {
+    let program = match scaled {
+        Some((scale_bits, per_expert)) => {
             let [_, _, w] = per_expert.node.inputs.as_slice() else {
                 return Err(operand(per_expert, 2, OperandRefusal::Missing));
             };
             same_shape(cx, per_expert, 2, w, 1, moe.experts)?;
             let input = per_expert.inputs.iter().nth(2);
-            Some(weight_operand(cx, per_expert, 2, input)?)
+            RouteProgram::TopKScaledSoftmax {
+                scale_bits,
+                expert_scale: weight_operand(cx, per_expert, 2, input)?,
+            }
         }
-        None => None,
+        None => RouteProgram::SoftmaxTopK { renorm },
     };
     Ok(MoeRouteBf16 {
         logits: moe.logits.offset,
@@ -2099,9 +2100,7 @@ fn moe_route(
         m: cx.tokens.unwrap_or(0),
         experts: moe.experts,
         top_k: moe.top_k,
-        renorm,
         program,
-        expert_scale,
     })
 }
 

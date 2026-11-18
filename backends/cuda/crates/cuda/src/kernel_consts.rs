@@ -205,8 +205,8 @@ kernel_consts! {
     /// chunk (`kernels/moe_combine_bf16.cu`). Checked by the launcher only; qwen3-5-moe's `hidden`
     /// is 2048.
     MOE_COMBINE_BF16_CHUNK: u32 = 256;
-    /// The one expert count the routing kernel's Qwen program takes: one warp per token row, 8
-    /// logits per lane (`kernels/moe_route_bf16.cu`). Its Gemma program takes each of
+    /// The one expert count the routing kernel's softmax-top-k program takes: one warp per token
+    /// row, 8 logits per lane (`kernels/moe_route_bf16.cu`). Its scaled program takes each of
     /// `op_abi::MOE_EXPERT_COUNTS`.
     MOE_ROUTE_EXPERTS: u32 = 256;
     /// The routing kernel's largest top-k: one pick per round of its warp reductions
