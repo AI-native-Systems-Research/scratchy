@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Generated code: the emitted modules mirror model stems and fused weight names, and bring the
-// loader traits into scope whether or not a given model reads them.
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(unused_imports)]
-#![allow(non_camel_case_types)]
+// Two lints the emitted code still trips (#1320, pending): weight field names spelled from DSL
+// paths (`{gate}__fused__{up}`, ModernBERT's `Wo`), and the baked `tp_world_size` literal's cast.
 #![allow(non_snake_case)]
-#![allow(clippy::missing_safety_doc)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::unnecessary_cast)]
-#![allow(clippy::too_many_arguments)]
 //! The selected models, compiled for metal: one `pub mod <arch>` per arch the scope selects
 //! (`scratchy-models`' features), each holding its models' baked tapes, pools and weights. The
 //! build script runs every selected arch through the shared pipeline with metal's emitter into

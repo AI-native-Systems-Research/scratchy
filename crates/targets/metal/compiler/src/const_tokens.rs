@@ -9,6 +9,7 @@
 
 use proc_macro2::TokenStream;
 use scratchy_const_tokens::{ModuleRow, ModuleTable};
+use scratchy_forward_compiler_macro::target::Named;
 use serde::ser::Serialize;
 
 pub use scratchy_const_tokens::Error;
@@ -126,9 +127,10 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
     held_by_reference: &["CommandTable"],
 };
 
-/// The `use … as __tl;` lines the emitted metal tape names its types through.
-pub(crate) fn alias_preamble() -> TokenStream {
-    METAL_MODULES.preamble()
+/// The `use … as __tl;` lines the emitted metal tape names its types through: each only where the
+/// block's body (`named`) uses its alias, so no alias goes unused.
+pub(crate) fn alias_preamble(named: &Named) -> TokenStream {
+    METAL_MODULES.preamble_for(|alias| named.has(alias))
 }
 
 /// Emit the const-constructor tokens for a metal tape `value`.

@@ -57,7 +57,14 @@ impl ModuleTable {
     /// `use <path> as <alias>;` for every row, in order: emitted at the top of the block that
     /// holds the values, the only place the aliases are in scope.
     pub fn preamble(&self) -> TokenStream {
-        let uses = self.rows.iter().map(|row| {
+        self.preamble_for(|_| true)
+    }
+
+    /// [`Self::preamble`]'s line of each row whose alias `used` holds, and only those: a block
+    /// whose values name no type of a module brings that module's alias in nowhere, so the
+    /// emitted code has no unused import.
+    pub fn preamble_for(&self, used: impl Fn(&str) -> bool) -> TokenStream {
+        let uses = self.rows.iter().filter(|row| used(row.alias)).map(|row| {
             let path = row
                 .path
                 .split("::")

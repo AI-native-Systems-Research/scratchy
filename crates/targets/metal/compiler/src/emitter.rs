@@ -6,8 +6,81 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_forward_compiler_macro::QuantMethod;
 use scratchy_forward_compiler_macro::target::{
-    DispatchCx, LoadCx, ModelCx, ModelEmission, TargetEmitter,
+    DispatchCx, ExtTrait, LoadCx, ModelCx, ModelEmission, Named, TargetEmitter, ext_trait_imports,
 };
+
+/// The relocated `load*` extension traits a metal loader body calls through path syntax
+/// (`LinearLayer::load_dense_or_ggml(...)`, `RmsNorm::load(...)`, …), each with the calls it
+/// serves. `load_fn` brings into scope only the ones its body calls.
+const LOADER_TRAITS: &[ExtTrait] = &[
+    ExtTrait {
+        path: "crate::__gpu::layers::LinearLayerOps",
+        calls: &[
+            "LinearLayer::load_dense",
+            "LinearLayer::load_raw",
+            "LinearLayer::load_dense_or_ggml",
+            "LinearLayer::load_dense_concat_packed",
+        ],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers::EmbeddingOps",
+        calls: &["Embedding::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers::RmsNormOps",
+        calls: &["RmsNorm::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers::LayerNormOps",
+        calls: &["LayerNorm::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers::GatedDeltaNetOps",
+        calls: &["GatedDeltaNetLayer::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers::MetalAffineEmbedOps",
+        calls: &["AffineQuantEmbedding::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers::MetalLinearLayerOps",
+        calls: &[
+            "LinearLayer::load_affine_quant",
+            "LinearLayer::load_affine_quant_rows_concat",
+            "LinearLayer::load_nvfp4_quant",
+            "LinearLayer::load_nvfp4_quant_concat",
+            "LinearLayer::load_affine_dequant_as_dense",
+            "LinearLayer::load_affine_dequant_concat_as_dense",
+        ],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers_moe::FusedMoEOps",
+        calls: &["FusedMoELayer::load", "FusedMoELayer::load_affine"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers_moe::SharedFusedMoEOps",
+        calls: &[
+            "SharedFusedMoELayer::load",
+            "SharedFusedMoELayer::load_affine",
+        ],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers_moe::DeepSeekV2MoEOps",
+        calls: &["DeepSeekV2MoELayer::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers_moe::Gemma4RouterOps",
+        calls: &["GemmaRouterLayer::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers_moe::SwitchGluExpertsOps",
+        calls: &["SwitchGluExpertsLayer::load"],
+    },
+    ExtTrait {
+        path: "crate::__gpu::layers_moe::GptOssMoEOps",
+        calls: &["GptOssMoELayer::load"],
+    },
+];
 
 /// The metal target's emitter.
 pub struct Metal {
@@ -116,6 +189,28 @@ impl TargetEmitter for Metal {
             rope_context_init,
             ..
         } = cx;
+        // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
+        // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
+        // dtype). `RmsNorm::load`'s `take_as_dtype` then converts the
+        // gain only when a checkpoint ships a different dtype (e.g. a
+        // standard HF bf16 export feeding an `_s_f16_` Llama arm) — the
+        // mlx zero-copy gain path is preserved on the matching case.
+        let body = quote! {
+            gw.set_rmsnorm_scale_dtype(
+                <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
+            );
+            #packed_splits_prelude
+            #(#lets)*
+            Ok(#weights_ctor {
+                #(#field_shorthand,)*
+                #rotary_deferred_init
+                #rope_context_init
+                metal_pool: ::std::sync::OnceLock::new(),
+                metal_guest: ::std::sync::OnceLock::new(),
+            })
+        };
+        // The relocated `load*` extension traits the body's path calls need, and no other.
+        let traits = ext_trait_imports(LOADER_TRAITS, &Named::of(&body));
         quote! {
             /// The `stream` is `()` and unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
@@ -129,38 +224,8 @@ impl TargetEmitter for Metal {
                 max_model_len: usize,
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                // Bring the relocated `load*` extension traits into scope so
-                // the path-syntax `LinearLayer::load_dense_or_ggml(...)`,
-                // `RmsNorm::load(...)`, `Embedding::load(...)`,
-                // `AffineQuantEmbedding::load(...)`, … calls the body
-                // emits below resolve.
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _, MetalAffineEmbedOps as _, MetalLinearLayerOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    FusedMoEOps as _, SharedFusedMoEOps as _, DeepSeekV2MoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                    GptOssMoEOps as _,
-                };
-                // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
-                // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
-                // dtype). `RmsNorm::load`'s `take_as_dtype` then converts the
-                // gain only when a checkpoint ships a different dtype (e.g. a
-                // standard HF bf16 export feeding an `_s_f16_` Llama arm) — the
-                // mlx zero-copy gain path is preserved on the matching case.
-                gw.set_rmsnorm_scale_dtype(
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
-                );
-                #packed_splits_prelude
-                #(#lets)*
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_deferred_init
-                    #rope_context_init
-                    metal_pool: ::std::sync::OnceLock::new(),
-                    metal_guest: ::std::sync::OnceLock::new(),
-                })
+                #traits
+                #body
             }
         }
     }
