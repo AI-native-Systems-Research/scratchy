@@ -3050,7 +3050,7 @@ impl SpyreWorker {
                 return Err(werr(
                     "sendnn: this bundle is not a SuperDSC bundle (no SUPERDSC_BUNDLE: sentinel on \
                      the decode slot). The sengraph offline_decoder runtime has been removed; \
-                     re-bake with SCRATCHY_SENDNN_MODE=superdsc.",
+                     every spyre bake emits the SuperDSC bundle.",
                 ));
             }
         };
