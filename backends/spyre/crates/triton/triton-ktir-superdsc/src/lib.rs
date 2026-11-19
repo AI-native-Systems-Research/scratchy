@@ -1016,9 +1016,8 @@ mod rope_from_the_fixture {
             l.rope_class_hds
         );
         assert!(
-            l.placements
-                .get(&ktir_superdsc::reserved_tids::ROPE_P_TID)
-                .is_none(),
+            !l.placements
+                .contains_key(&ktir_superdsc::reserved_tids::ROPE_P_TID),
             "nothing reads a P at hd 128, so none is placed"
         );
         assert!(
