@@ -250,11 +250,14 @@ Report these as one grouped line after the rules above.
 - Give counts where the rule is about multiplicity (P3 derivations of one invariant, P4 refusal sites).
 - End each failing rule with the fix shape, not a patch.
 - Separate concerns the audit didn't cover (e2e, perf, numerics) get one closing line at most.
-- **Don't post unless asked.** When asked to post:
+- **An audit of a PR is posted on that PR, unasked.** The user asking for the audit didn't write the code. The author, often another agent, acts on PR comments, so a report kept in the chat reaches no one who can fix it. Never stop to ask whether to post. To post:
   1. re-read `headRefOid`; if it moved, re-verify the cited lines first;
-  2. use `gh -R AI-native-Systems-Research/scratchy pr comment <N> --body-file <file>` for "for discussion", or `gh pr review --request-changes` only when asked for a review (on the user's own PR, a comment saying "changes requested");
+  2. use `gh -R AI-native-Systems-Research/scratchy pr comment <N> --body-file <file>`. A failing verdict is headed "changes requested" (GitHub can't request changes on one's own PR, and the user's PRs are often authored by an agent under the user's account);
   3. rewrite "you"/"your" so the text reads as the user's own comment;
-  4. no bare `@name`.
+  4. no bare `@name`;
+  5. give the user one line with the comment's link.
+
+  Audits of a branch or a local diff, which have no PR, are reported in the chat.
 
 ## 3. Worked example: #978 (CUDA on ThunderKittens) at `99c60d50`
 
