@@ -6,7 +6,7 @@
 //! the shared front end lowered at every workload point, and the config facts beside it. The
 //! pipeline does not know which target it called. Everything CUDA decides about a model is here:
 //!
-//! - the model facts ([`model_facts`]): the neutral facts as [`CudaModelFacts`];
+//! - the model facts ([`model_facts`]): the neutral facts, as [`LoweringFacts`];
 //! - the lowering: [`crate::canonical::lower_canonical`] at every point, one tape per `m`, after
 //!   checking that every `sk` of that `m` lowers to the same tape (CUDA's tape reads no `sk`);
 //! - the refusal policy: a bucket whose first GEMM CUDA has no kernel for — an `m` above 1 and
@@ -43,7 +43,6 @@ use std::collections::{BTreeMap, HashMap};
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
-use scratchy_ir::model_facts::{HeadGeometry, RopePairing};
 use scratchy_subtile::handoff::{
     BundleTensor, SourceBinding, TargetModelInput, TargetPoint, UnrollIndex,
 };
@@ -56,9 +55,8 @@ use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeErr
 use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
-    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaAttnClass, CudaAttnClasses,
-    CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmShapeRule, SharedExpertOwner,
-    lower_canonical,
+    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaCanonical, GemmShapeRule,
+    LoweringFacts, SharedExpertOwner, lower_canonical,
 };
 
 /// The modules of the CUDA tape types, and the aliases the emitted tapes name them by: the one
@@ -158,63 +156,21 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
     held_by_reference: &[],
 };
 
-/// The model facts CUDA's lowering reads: the model's own facts (`input.facts`), the rope's base
+/// The facts CUDA's lowering reads: the model's own typed facts (`input.facts`), the rope's base
 /// frequencies the handoff states beside them, and who computes the shared expert.
 ///
 /// A config that declares no `rope_theta` gets `None` here, never a default: a tape with a rotary
 /// table is then refused ([`ModelRefusal::NoRopeTheta`]), and a tape with none reads no theta. A
-/// model's input is its token ids, embedded from a table of `vocab` rows; a model with no lm_head
-/// rows gets no embedding table here, and [`lower_model`] refuses it ([`ModelRefusal::NoVocab`]).
-/// The shared expert's owner is [`shared_expert_owner`]'s.
-///
-/// The attention classes are the facts' two ([`Attention::base`], [`Attention::global`]) when their
-/// geometry differs (Gemma 4: sliding 256 × 8 kv, global 512 × 2 kv, proportional rope 128): the
-/// base class rotates by the local base frequency (its sliding layers' table), the global by
-/// `rope_theta` in the rope's own pairing. A uniform model's one class is `head_dim`, `rot_dim`
-/// and `rope_theta`.
-pub fn model_facts(input: &TargetModelInput) -> CudaModelFacts {
-    let f = &input.facts;
-    let attn = f.attention();
-    let base = attn.map(|a| a.base());
-    let geometry = |g: HeadGeometry| (g.head_dim().get(), g.kv_heads().get(), g.rot_dim().get());
-    let (head_dim, _, rot_dim) = base.map_or((0, 0, 0), geometry);
-    let classes = attn
-        .filter(|a| geometry(a.global()) != geometry(a.base()))
-        .map(|a| {
-            let class = |g: HeadGeometry, rope_theta, pairing, window| CudaAttnClass {
-                head_dim: g.head_dim().get(),
-                kv_heads: g.kv_heads().get(),
-                rot_dim: g.rot_dim().get(),
-                rope_theta,
-                pairing,
-                window,
-            };
-            let pairing = a.rope().map_or(RopePairing::Standard, |r| r.pairing());
-            CudaAttnClasses {
-                base: class(
-                    a.base(),
-                    input.rope_local_theta.or(input.rope_theta),
-                    RopePairing::Standard,
-                    a.window().map(|w| w.get()),
-                ),
-                global: class(a.global(), input.rope_theta, pairing, None),
-            }
-        });
-    CudaModelFacts {
-        shared_expert: shared_expert_owner(input),
-        embed: (f.vocab())
-            .and_then(|v| u32::try_from(v.get()).ok())
-            .map(|vocab| CudaEmbedFacts { vocab }),
-        head_dim,
-        rot_dim,
+/// model's input is its token ids, embedded from a table of the facts' vocabulary
+/// ([`LoweringFacts::embed_vocab`]); a model with none is refused by [`lower_model`]
+/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s. The
+/// attention classes are the facts' own ([`LoweringFacts::table_class`]).
+pub fn model_facts(input: &TargetModelInput) -> LoweringFacts {
+    LoweringFacts {
+        facts: input.facts,
         rope_theta: input.rope_theta,
-        gdn: f.gdn().map(|g| CudaGdnFacts {
-            num_k_heads: g.k_heads().get(),
-            head_k: g.k_dim().get(),
-            conv_kernel: g.conv_kernel().get(),
-            eps: f.eps().get(),
-        }),
-        classes,
+        rope_local_theta: input.rope_local_theta,
+        shared_expert: shared_expert_owner(input),
     }
 }
 

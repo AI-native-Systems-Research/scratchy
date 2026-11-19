@@ -29,8 +29,9 @@ scratchy-target-cuda-compiler = { path = "../compiler" }
 # tests/cuda_tapes_*_fp8.rs: the canonicals the pipeline hands CUDA's emitter
 # (`target_model_inputs`), recaptured to check the emitted tapes against what CUDA's compiler
 # lowers from them, and the cuda target's own test helper (`#[path]`, not a copy: `chains.rs`),
-# which names these crates.
+# which names these crates (`scratchy-ir` for the typed model facts its fixtures lower with).
 scratchy-forward-compiler-macro = { path = "../../../../crates/compiler/macros" }
+scratchy-ir = { path = "../../../../crates/compiler/ir" }
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
 scratchy-target-cuda-compiler = { path = "../compiler", features = ["test-support"] }
 half = { workspace = true }

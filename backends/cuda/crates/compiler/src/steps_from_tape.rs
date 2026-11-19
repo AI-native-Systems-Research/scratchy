@@ -11,7 +11,7 @@
 
 use std::num::NonZeroU32;
 
-use scratchy_ir::model_facts::HeadGeometry;
+use scratchy_ir::model_facts::{AttnClass, HeadGeometry};
 use scratchy_subtile::handoff::{SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{ExpertWeight, GemmWeight};
 use scratchy_subtile::subtile_ir::{
@@ -44,10 +44,10 @@ use scratchy_target_cuda::step::{
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
 use crate::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaAttnClass, CudaModelFacts, EmbedShapeRule,
-    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool,
-    KvRegions, MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
-    SharedExpertOwner, ViewRefusal,
+    ArenaRefusal, AttnShapeRule, CanonicalRefusal, EmbedShapeRule, GateShapeRule, GdnRegions,
+    GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool, KvRegions, LoweringFacts,
+    MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, SharedExpertOwner,
+    ViewRefusal,
 };
 
 /// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
@@ -60,7 +60,7 @@ pub struct StepCx<'a> {
     /// The folds, which a one-row matvec's lowering reads for the residual add it computes
     /// ([`folded_residual`]).
     pub folds: &'a TapeFolds<CudaFusion>,
-    pub facts: CudaModelFacts,
+    pub facts: LoweringFacts,
     /// The bucket's token count (the embedded hidden's rows), when one source is bound to it.
     pub tokens: Option<u32>,
     /// Each colour's byte offset, or why the arena has no layout.
@@ -1005,15 +1005,18 @@ fn view(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<(), CanonicalRefusal> {
 /// `RopeRotate { head_dim }` as the bf16 partial rope: `x` (operand 0) a computed slot or the
 /// embedded hidden; operands 1 and 2 a rotary `cos` and `sin`, which CUDA does not upload as
 /// sources but reads as the tape's rotary table of their class. The rotated width and the pairing
-/// are that class's (`CudaModelFacts::table_class`); the op carries only `head_dim`.
+/// are that class's (`LoweringFacts::table_class`); the op carries only `head_dim`.
 fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
     let [x, ..] = node.inputs.as_slice() else {
         return Err(operand(s, 0, OperandRefusal::Missing));
     };
-    let class = cx.facts.table_class(table_is_local(cx, s));
-    let class = class.expect("the global table's class is every model's");
-    let rot_dim = class.rot_dim;
+    let (class, g) =
+        (cx.facts.table_class(table_is_local(cx, s))).ok_or(CanonicalRefusal::NoAttention {
+            step,
+            op: node.op.name(),
+        })?;
+    let rot_dim = g.rot_dim().get();
     let TensorShape { rows, cols } = cx.graph.shape(node.output.tensor);
     rope_shape(rows, cols, head_dim, rot_dim, cx.tokens).map_err(|rule| {
         CanonicalRefusal::RopeShape {
@@ -1039,7 +1042,7 @@ fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, Ca
         cols,
         head_dim,
         rot_dim,
-        pairing: class.pairing,
+        pairing: cx.facts.pairing(class),
     })
 }
 
@@ -1056,14 +1059,15 @@ fn table_is_local(cx: &StepCx<'_>, s: &TapeStep<'_>) -> bool {
     local && cx.facts.table_class(true).is_some()
 }
 
-/// The attention class whose window is `mask`'s, and whether it reads the local rotary table:
-/// a layer's class is its attention ops' own fact. A uniform model's one class has no window.
-fn attn_class(cx: &StepCx<'_>, mask: AttnMask) -> Option<(CudaAttnClass, bool)> {
+/// The attention class whose window is `mask`'s, its geometry, and whether it reads the local
+/// rotary table: a layer's class is its attention ops' own fact. A uniform model's one class has
+/// no window.
+fn attn_class(cx: &StepCx<'_>, mask: AttnMask) -> Option<(AttnClass, HeadGeometry, bool)> {
     let window = mask.window().map(NonZeroU32::get);
     [true, false]
         .into_iter()
-        .filter_map(|local| cx.facts.table_class(local).map(|c| (c, local)))
-        .find(|(c, _)| c.window == window)
+        .filter_map(|local| (cx.facts.table_class(local)).map(|(c, g)| (c, g, local)))
+        .find(|&(c, _, _)| cx.facts.window(c) == window)
 }
 
 /// Operands 1 and 2 of a rope (`RopeRotate` or `RopeAppend`): the rotary `cos` and `sin` of the
@@ -1202,18 +1206,19 @@ fn rope_append(
     if pairing == RopeFormTag::Interleaved {
         return Err(CanonicalRefusal::RopePairing { step });
     }
-    let (class, local) =
+    let (class, g, local) =
         attn_class(cx, attn).ok_or(CanonicalRefusal::SlidingWindow { step, op })?;
-    window_rule(s, rows_of(cx, s), head_dim, class.window)?;
-    if head_dim != class.head_dim {
+    window_rule(s, rows_of(cx, s), head_dim, cx.facts.window(class))?;
+    let want = g.head_dim().get();
+    if head_dim != want {
         return Err(CanonicalRefusal::KvHeadDim {
             step,
             op,
             head_dim,
-            want: class.head_dim,
+            want,
         });
     }
-    let rot_dim = class.rot_dim;
+    let rot_dim = g.rot_dim().get();
     let (k, v) = match node.inputs.as_slice() {
         [k, _, _, v, _, _] => (k, v),
         _ => return Err(operand(s, 5, OperandRefusal::Missing)),
@@ -1259,7 +1264,7 @@ fn rope_append(
         cols,
         head_dim,
         rot_dim,
-        pairing: class.pairing,
+        pairing: cx.facts.pairing(class),
         q: None,
         norms: None,
     })
@@ -1316,7 +1321,7 @@ fn attention_step(
     let op = node.op.name();
     let rows = cx.graph.shape(node.output.tensor).rows;
     let head_dim = geom.head_dim().get();
-    let (class, _) = attn_class(cx, mask).ok_or(CanonicalRefusal::SlidingWindow { step, op })?;
+    let (class, g, _) = attn_class(cx, mask).ok_or(CanonicalRefusal::SlidingWindow { step, op })?;
     let q = match node.inputs.as_slice() {
         [q, _, _, _, _] => q,
         [_, _, _, _, _, _] => return Err(CanonicalRefusal::AttnSinks { step }),
@@ -1328,7 +1333,7 @@ fn attention_step(
             rows,
             head_dim,
             rule: AttnShapeRule::HeadDim {
-                want: class.head_dim,
+                want: g.head_dim().get(),
             },
         });
     }
@@ -1342,13 +1347,13 @@ fn attention_step(
             },
         });
     }
-    window_rule(s, rows, head_dim, class.window)?;
-    if head_dim != class.head_dim {
+    window_rule(s, rows, head_dim, cx.facts.window(class))?;
+    if head_dim != g.head_dim().get() {
         return Err(CanonicalRefusal::KvHeadDim {
             step,
             op,
             head_dim,
-            want: class.head_dim,
+            want: g.head_dim().get(),
         });
     }
     let q_width = geom.q_width();
@@ -1426,7 +1431,7 @@ fn attention_step(
         kv_heads,
         head_dim,
         scale_bits: scale.to_bits(),
-        window: class.window,
+        window: cx.facts.window(class),
     };
     match rows {
         // A decode bucket's attention at its head dim's split over keys (W6b).
@@ -1438,7 +1443,7 @@ fn attention_step(
                     rows,
                     head_dim,
                     rule: AttnShapeRule::HeadDim {
-                        want: class.head_dim,
+                        want: g.head_dim().get(),
                     },
                 })
         }
@@ -1479,7 +1484,7 @@ fn gdn_decode_takes(g: &GatedDeltaNetBf16) -> bool {
 /// operand 4 is the layer's weight bundle, a `[1, 1]` source bound to a model layer's weight,
 /// which the device holds packed as `gdn_bundle`. The op carries no geometry: the value heads
 /// and their dim are the operands', the key heads, their dim, the conv kernel and `eps` the
-/// model's (`CudaModelFacts::gdn`).
+/// model's (the facts' `Gdn`).
 fn gated_delta_net(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
@@ -1490,7 +1495,11 @@ fn gated_delta_net(
         [_, _, _, _, _, _, ..] => return Err(operand(s, 5, OperandRefusal::Extra)),
         _ => return Err(operand(s, 4, OperandRefusal::Missing)),
     };
-    let facts = cx.facts.gdn.ok_or(CanonicalRefusal::GdnFacts { step })?;
+    let facts = cx
+        .facts
+        .facts
+        .gdn()
+        .ok_or(CanonicalRefusal::GdnFacts { step })?;
     let refuse = |rule| CanonicalRefusal::GdnShape { step, rule };
     let shape = |r: &TensorRegion| cx.graph.shape(r.tensor);
     let TensorShape {
@@ -1498,7 +1507,11 @@ fn gated_delta_net(
         cols: out_cols,
     } = shape(&node.output);
     let (conv_dim, value_dim, nv) = (shape(qkv).cols, shape(z).cols, shape(a).cols);
-    let (nk, head_k, conv_kernel) = (facts.num_k_heads, facts.head_k, facts.conv_kernel);
+    let (nk, head_k, conv_kernel) = (
+        facts.k_heads().get(),
+        facts.k_dim().get(),
+        facts.conv_kernel().get(),
+    );
     if head_k != GDN_HEAD_K {
         return Err(refuse(GdnShapeRule::HeadK { head_k }));
     }
@@ -1566,7 +1579,7 @@ fn gated_delta_net(
         head_k,
         head_v,
         conv_kernel,
-        eps_bits: facts.eps.to_bits(),
+        eps_bits: cx.facts.facts.eps().get().to_bits(),
     })
 }
 
@@ -1579,7 +1592,12 @@ fn gate_split(
     half_cols: u32,
 ) -> Result<GateSplitBf16, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
-    let head_dim = cx.facts.head_dim;
+    let head_dim = (cx.facts.facts.attention())
+        .map(|a| a.base().head_dim().get())
+        .ok_or(CanonicalRefusal::NoAttention {
+            step,
+            op: node.op.name(),
+        })?;
     let [qg] = node.inputs.as_slice() else {
         return Err(operand(s, 0, OperandRefusal::Missing));
     };
@@ -1737,13 +1755,13 @@ fn rms_norm_unit(
 /// 2048 and 1024), so a row matches at most one. `rows · cols` is unchanged, within `unary_row`'s
 /// bound.
 fn per_head_rows(cx: &StepCx<'_>, rows: u32, cols: u32) -> (u32, u32) {
-    let Some(classes) = cx.facts.classes else {
+    let Some(attention) = cx.facts.two_classes() else {
         return (rows, cols);
     };
-    for class in [classes.base, classes.global] {
-        let heads = class.kv_heads;
-        if heads > 1 && class.head_dim.checked_mul(heads) == Some(cols) {
-            return (rows * heads, class.head_dim);
+    for class in [attention.base(), attention.global()] {
+        let (heads, head_dim) = (class.kv_heads().get(), class.head_dim().get());
+        if heads > 1 && head_dim.checked_mul(heads) == Some(cols) {
+            return (rows * heads, head_dim);
         }
     }
     (rows, cols)

@@ -4953,7 +4953,7 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
 /// (`matvec_ends` and `matvec_norms` false: the tape before FP8 S8 W4a).
 fn w4_tapes(
     l: &scratchy_subtile::handoff::LoweredDecode,
-    facts: scratchy_target_cuda_compiler::canonical::CudaModelFacts,
+    facts: scratchy_target_cuda_compiler::canonical::LoweringFacts,
 ) -> [CudaTape; 2] {
     use scratchy_target_cuda_compiler::canonical::{
         cuda_fold_facts, lower_plan, plan_canonical_folding,

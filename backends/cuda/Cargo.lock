@@ -2746,6 +2746,7 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
+ "scratchy-ir",
  "scratchy-layers",
  "scratchy-models",
  "scratchy-models-build",

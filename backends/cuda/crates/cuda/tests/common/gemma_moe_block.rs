@@ -51,7 +51,7 @@ use scratchy_subtile::subtile_ir::{
     EwKind, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts, RouterBundle,
     SharedExpertBound, SourceShape, SubOp, TopK,
 };
-use scratchy_target_cuda_compiler::canonical::CudaModelFacts;
+use scratchy_target_cuda_compiler::canonical::LoweringFacts;
 
 use super::chains::{GEMMA4_FACTS, with_hidden};
 use super::moe_block::Routing;
@@ -70,7 +70,7 @@ pub const BANK: u32 = 21;
 pub const LAYER: u64 = 0;
 
 /// The block lowers with Gemma 4's facts (the 64-column tile).
-pub const GEMMA_MOE_BLOCK_FACTS: CudaModelFacts = GEMMA4_FACTS;
+pub const GEMMA_MOE_BLOCK_FACTS: LoweringFacts = GEMMA4_FACTS;
 
 /// The block's ops at `m` rows, as the table above.
 pub fn gemma_moe_block_input(m: u32) -> LoweringInput {

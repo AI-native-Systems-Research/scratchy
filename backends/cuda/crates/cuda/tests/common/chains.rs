@@ -5,6 +5,11 @@
 //! Every source is declared in the IR as `[K, N]`; the weight's bytes on the device are `[N, K]`.
 //! Source 0 is the activation, rebound to the embedded hidden: colour 0, the forward's input.
 
+use scratchy_ir::model_facts::{
+    ActDtype, Attention, AttnScale, BlockSize, ConvDim, ConvKernel, FactsParts, Gdn, GdnHeadDim,
+    GdnHeads, HeadDim, HeadGeometry, HiddenSize, KvCodec, KvHeads, KvRope, ModelFacts,
+    NormWeightOffset, QueryHeads, RmsNormEps, Rope, RopePairing, RotDim, ScaleDtype,
+};
 use scratchy_subtile::fixtures::{front_end_lowered, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
@@ -14,38 +19,107 @@ use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
 };
 use scratchy_target_cuda_compiler::canonical::{
-    CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
-    SharedExpertOwner, lower_canonical,
+    CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, LoweringFacts, SharedExpertOwner,
+    lower_canonical,
 };
+
+/// The facts of a fixture model: its attention and linear attention, `rms_norm_eps` 1e-6, and no
+/// vocabulary (the fixtures' input is the embedded hidden). The rest (the dtypes, a hidden of
+/// 2048, a dense KV codec) no lowering reads.
+pub const fn fixture_facts(attention: Option<Attention>, gdn: Option<Gdn>) -> ModelFacts {
+    ModelFacts::new(FactsParts {
+        act_dtype: ActDtype::Bf16,
+        scale_dtype: ScaleDtype::F16,
+        hidden: HiddenSize::new(2048),
+        intermediate: None,
+        vocab: None,
+        eps: RmsNormEps::new(1e-6),
+        norm_offset: NormWeightOffset::new(0.0),
+        final_softcap: None,
+        kv_codec: KvCodec::Dense,
+        kv_layers: None,
+        attention,
+        vision: None,
+        gdn,
+        drafter: None,
+        spec_drafts: None,
+        capture_slots: None,
+        target: None,
+    })
+}
+
+/// One attention class: `q_heads` query heads over `kv_heads` kv heads of `head_dim`, `rot_dim` of
+/// each rotated, in 64-token pages.
+pub const fn class(q_heads: u32, kv_heads: u32, head_dim: u32, rot_dim: u32) -> HeadGeometry {
+    HeadGeometry::new(
+        QueryHeads::new(q_heads),
+        KvHeads::new(kv_heads),
+        HeadDim::new(head_dim),
+        RotDim::new(rot_dim),
+        BlockSize::new(64),
+    )
+}
+
+/// A uniform roped attention: qwen3.5-0.8b's 8 query heads over 2 kv heads, at `head_dim` with
+/// `rot_dim` of each head rotated half-rotated, keys rotated at the write.
+pub const fn uniform_attention(head_dim: u32, rot_dim: u32) -> Attention {
+    let g = class(8, 2, head_dim, rot_dim);
+    let rope = Rope::new(RopePairing::Standard, KvRope::AtWrite, None);
+    Attention::new(g, g, AttnScale::new(0.0625), None, None, Some(rope))
+}
+
+/// `facts` lowered at rope base frequency `theta`, with no local one and no DSL shared expert.
+pub const fn lowering(facts: ModelFacts, theta: Option<f64>) -> LoweringFacts {
+    LoweringFacts {
+        facts,
+        rope_theta: theta,
+        rope_local_theta: None,
+        shared_expert: SharedExpertOwner::Undeclared,
+    }
+}
+
+/// `f` with its attention `attention`.
+pub const fn with_attention(f: LoweringFacts, attention: Option<Attention>) -> LoweringFacts {
+    LoweringFacts {
+        facts: ModelFacts::new(FactsParts {
+            attention,
+            ..f.facts.parts()
+        }),
+        ..f
+    }
+}
 
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7, no linear
 /// attention, and no embedding table (the fixtures' input is the embedded hidden). Every fixture
 /// but the GDN layer lowers with them; one with no rope or gate reads none of them.
-pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
-    head_dim: 256,
-    rot_dim: 64,
-    rope_theta: Some(1e7),
-    gdn: None,
-    embed: None,
-    shared_expert: SharedExpertOwner::Undeclared,
-    classes: None,
-};
+pub const QWEN3_5_FACTS: LoweringFacts = lowering(
+    fixture_facts(Some(uniform_attention(256, 64)), None),
+    Some(1e7),
+);
+
+/// A Gated-DeltaNet geometry: `k_heads` key heads of `k_dim`, a `conv_kernel`-tap conv, and
+/// qwen3.5-0.8b's 16 value heads of 128 (which the op's operands state, so no lowering reads them).
+pub const fn gdn_of(k_heads: u32, k_dim: u32, conv_kernel: u32) -> Gdn {
+    Gdn::new(
+        GdnHeads::new(k_heads),
+        GdnHeads::new(16),
+        GdnHeadDim::new(k_dim),
+        GdnHeadDim::new(128),
+        ConvKernel::new(conv_kernel),
+        ConvDim::new(6144),
+    )
+}
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,
 /// `rms_norm_eps` 1e-6. The GDN layer's fixture lowers with them.
-pub const QWEN3_5_GDN_FACTS: CudaModelFacts = CudaModelFacts {
-    gdn: Some(CudaGdnFacts {
-        num_k_heads: 16,
-        head_k: 128,
-        conv_kernel: 4,
-        eps: 1e-6,
-    }),
-    ..QWEN3_5_FACTS
-};
+pub const QWEN3_5_GDN_FACTS: LoweringFacts = lowering(
+    fixture_facts(Some(uniform_attention(256, 64)), Some(gdn_of(16, 128, 4))),
+    Some(1e7),
+);
 
 /// The facts Gemma 4's fixtures lower with: [`QWEN3_5_FACTS`], since a GEMM's column tile is its
 /// shape's, not the model's.
-pub const GEMMA4_FACTS: CudaModelFacts = QWEN3_5_FACTS;
+pub const GEMMA4_FACTS: LoweringFacts = QWEN3_5_FACTS;
 
 /// Panic unless `tape` is, field by field, what CUDA's compiler lowers `l` to.
 ///
@@ -60,7 +134,7 @@ pub fn assert_tape_is_lowered_with(
     name: &str,
     tape: &CudaTape,
     l: &LoweredDecode,
-    facts: CudaModelFacts,
+    facts: LoweringFacts,
 ) {
     let at = CanonicalAt {
         stem: name,
