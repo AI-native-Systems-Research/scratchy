@@ -1738,7 +1738,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         out,
                         rows,
                         cols,
-                        scale_bits,
+                        scale,
                     }) => {
                         // SAFETY: as above, for `x` and `out` (`rows*cols` each).
                         unsafe {
@@ -1746,7 +1746,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(x),
                                 slot(out),
                                 (rows, cols),
-                                f32::from_bits(scale_bits),
+                                scale.get(),
                                 stream.0,
                             )
                         }
@@ -1770,7 +1770,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         out,
                         rows,
                         cols,
-                        cap_bits,
+                        cap,
                     }) => {
                         // SAFETY: as above, for `x` and `out` (`rows*cols` each).
                         unsafe {
@@ -1778,7 +1778,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(x),
                                 slot(out),
                                 (rows, cols),
-                                f32::from_bits(cap_bits),
+                                cap.get(),
                                 stream.0,
                             )
                         }
@@ -1804,7 +1804,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         y,
                         rows,
                         cols,
-                        eps_bits,
+                        eps,
                     }) => {
                         // SAFETY: as above, for `x` and `y` (`rows*cols` each).
                         unsafe {
@@ -1812,7 +1812,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(x),
                                 slot(y),
                                 (rows, cols),
-                                f32::from_bits(eps_bits),
+                                eps.get(),
                                 stream.0,
                             )
                         }
@@ -2040,7 +2040,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         },
                         RouteProgram::TopKScaledSoftmax {
-                            scale_bits,
+                            scale,
                             expert_scale,
                         } => {
                             let pes = weights[expert_scale.0 as usize].ptr();
@@ -2050,7 +2050,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     (slot(logits), pes),
                                     (slot(topk_idx), slot(scores)),
                                     (m, experts, top_k),
-                                    f32::from_bits(scale_bits),
+                                    scale.get(),
                                     stream.0,
                                 )
                             }
@@ -2232,7 +2232,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 gain,
                                 slot(y),
                                 (rows, cols),
-                                norm.eps(),
+                                norm.eps.get(),
                                 convention.offset(),
                                 stream.0,
                             )
@@ -2253,7 +2253,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 gain,
                                 (slot(f.sum), slot(n.y)),
                                 (n.rows, n.cols),
-                                (n.eps(), n.convention.offset()),
+                                (n.eps.get(), n.convention.offset()),
                                 stream.0,
                             )
                         }
@@ -2280,7 +2280,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 gain,
                                 slot(n.y),
                                 (n.rows, n.cols),
-                                (n.eps(), n.convention.offset()),
+                                (n.eps.get(), n.convention.offset()),
                                 stream.0,
                             )
                         }
@@ -2425,7 +2425,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (
                                     weights[n.q_gain.0 as usize].ptr().cast_const(),
                                     weights[n.k_gain.0 as usize].ptr().cast_const(),
-                                    n.eps(),
+                                    n.eps.get(),
                                 )
                             });
                             // SAFETY: as the unfolded launches' below, and `q.x`, `q.out` (`q.cols`
@@ -2528,7 +2528,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(block_table), slot(sequence)),
                                 (rows, q_heads, kv_heads, head_dim),
                                 (layout.block_size, layout.num_blocks),
-                                (attn.scale(), window.unwrap_or(0)),
+                                (attn.scale.get(), window.unwrap_or(0)),
                                 stream.0,
                             )
                         }
@@ -2590,14 +2590,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(block_table), slot(sequence)),
                                 (q_heads, kv_heads, head_dim),
                                 (layout.block_size, layout.num_blocks),
-                                (attn.scale(), window.unwrap_or(0), split),
+                                (attn.scale.get(), window.unwrap_or(0), split),
                                 stream.0,
                             )
                             .and_then(|()| {
                                 kernels::attn_decode_merge(
                                     (slot(sequence), slot(out)),
                                     (q_heads, kv_heads, head_dim),
-                                    (attn.scale(), window.unwrap_or(0)),
+                                    (attn.scale.get(), window.unwrap_or(0)),
                                     split,
                                     stream.0,
                                 )
@@ -2816,7 +2816,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (slot(y), sum),
                 quant,
                 (rows, cols),
-                (form, norm.eps(), convention.offset()),
+                (form, norm.eps.get(), convention.offset()),
                 stream.0,
             )
         }
@@ -2874,7 +2874,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     g.head_v,
                     g.conv_kernel,
                 ),
-                (g.scale(), g.eps()),
+                (g.scale(), g.eps.get()),
                 stream.0,
             )
         }
@@ -2967,7 +2967,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 seq,
                 slot(g.out),
                 (g.rows, g.num_v_heads, g.head_v),
-                g.eps(),
+                g.eps.get(),
                 stream.0,
             )
         }
@@ -3583,7 +3583,7 @@ fn fill_table<'h>(
 ) -> Option<(ArenaSpan, &'h [u16])> {
     table.map(|r| {
         let rows = &mut host[..positions.len() * r.rot_dim as usize];
-        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta(), rows);
+        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta.get(), rows);
         (r.span, &*rows)
     })
 }

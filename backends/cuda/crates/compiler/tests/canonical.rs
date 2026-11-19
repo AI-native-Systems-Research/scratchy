@@ -299,7 +299,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
     assert_eq!(rope.x.0, 0, "x is the embedded hidden, colour 0");
     assert_eq!(rope.table, table.span.offset);
     assert_eq!(table.span.bytes, 64, "one row of 32 bf16");
-    assert_eq!((table.rot_dim, table.theta()), (32, 1e4));
+    assert_eq!((table.rot_dim, table.theta.get()), (32, 1e4));
     assert_eq!(c.total_bytes, table.span.offset.0 + 256);
     assert_eq!(
         c.weight_bytes,

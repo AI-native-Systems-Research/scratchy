@@ -41,6 +41,7 @@ use scratchy_target_cuda::step::{
     RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
     SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
+use scratchy_target_cuda::step::{AttnScale, RmsNormEps, Scale, SoftCap};
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
 use crate::canonical::{
@@ -400,8 +401,8 @@ fn rope_append_folded(
                     && heads(vn.rows, r.cols)
                     && (qn.convention, kn.convention)
                         == (GainConvention::Scale, GainConvention::Scale)
-                    && qn.eps_bits == kn.eps_bits
-                    && qn.eps_bits == vn.eps_bits
+                    && qn.eps == kn.eps
+                    && qn.eps == vn.eps
                     && r.norms.is_none();
                 if !ok {
                     return Err(refused());
@@ -413,7 +414,7 @@ fn rope_append_folded(
                 r.norms = Some(HeadNorms {
                     q_gain: qn.gain,
                     k_gain: kn.gain,
-                    eps_bits: qn.eps_bits,
+                    eps: qn.eps,
                 });
             }
             _ => return Err(refused()),
@@ -881,7 +882,7 @@ fn rms_norm(
         y: at(colour_of(cx, s.writes)),
         rows,
         cols,
-        eps_bits: eps.to_bits(),
+        eps: RmsNormEps::new(eps),
         convention,
         kernel: NormKernel::of(rows, cols),
     })
@@ -1430,7 +1431,7 @@ fn attention_step(
         q_heads,
         kv_heads,
         head_dim,
-        scale_bits: scale.to_bits(),
+        scale: AttnScale::new(scale),
         window: cx.facts.window(class),
     };
     match rows {
@@ -1579,7 +1580,7 @@ fn gated_delta_net(
         head_k,
         head_v,
         conv_kernel,
-        eps_bits: cx.facts.facts.eps().get().to_bits(),
+        eps: RmsNormEps::new(cx.facts.facts.eps().get()),
     })
 }
 
@@ -1717,7 +1718,7 @@ fn scalar_mul(
         out: at(colour_of(cx, s.writes)),
         rows,
         cols,
-        scale_bits: scale.to_bits(),
+        scale: Scale::new(scale),
     })
 }
 
@@ -1745,7 +1746,7 @@ fn rms_norm_unit(
         y: at(colour_of(cx, s.writes)),
         rows,
         cols,
-        eps_bits: eps.to_bits(),
+        eps: RmsNormEps::new(eps),
     })
 }
 
@@ -1811,7 +1812,7 @@ fn soft_cap(
         out: at(colour_of(cx, s.writes)),
         rows,
         cols,
-        cap_bits: cap.to_bits(),
+        cap: SoftCap::new(cap),
     })
 }
 
@@ -2086,7 +2087,7 @@ fn moe_route(
             .ok_or_else(routing)?;
             finite_scalar(scale, by, true)?;
             let argsort = of(sort, |op| matches!(op, SubOp::RouteArgsort)).ok_or_else(routing)?;
-            (argsort, false, Some((by.to_bits(), per_expert)))
+            (argsort, false, Some((Scale::new(by), per_expert)))
         }
         _ => return Err(routing()),
     };
@@ -2099,14 +2100,14 @@ fn moe_route(
     let moe = moe_tape(cx, s)?;
     moe_counts(cx, s, &moe, (experts.get(), k.get()))?;
     let program = match scaled {
-        Some((scale_bits, per_expert)) => {
+        Some((scale, per_expert)) => {
             let [_, _, w] = per_expert.node.inputs.as_slice() else {
                 return Err(operand(per_expert, 2, OperandRefusal::Missing));
             };
             same_shape(cx, per_expert, 2, w, 1, moe.experts)?;
             let input = per_expert.inputs.iter().nth(2);
             RouteProgram::TopKScaledSoftmax {
-                scale_bits,
+                scale,
                 expert_scale: weight_operand(cx, per_expert, 2, input)?,
             }
         }
@@ -2168,7 +2169,7 @@ fn router_norm(
         y: region.offset,
         rows,
         cols,
-        eps_bits: eps.to_bits(),
+        eps: RmsNormEps::new(eps),
         convention: GainConvention::Scale,
         kernel: NormKernel::of(rows, cols),
     })

@@ -178,7 +178,7 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
         y: ArenaOffset(y),
         rows,
         cols: H,
-        eps_bits: EPS.to_bits(),
+        eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, H),
     })
@@ -217,7 +217,7 @@ pub const fn gdn_step(
         head_k: HEAD_K,
         head_v: HEAD_V,
         conv_kernel: CONV_KERNEL,
-        eps_bits: EPS.to_bits(),
+        eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
     }
 }
 

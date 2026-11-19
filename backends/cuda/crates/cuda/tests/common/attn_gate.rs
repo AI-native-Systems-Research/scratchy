@@ -151,7 +151,7 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
         y: ArenaOffset(y),
         rows,
         cols,
-        eps_bits: EPS.to_bits(),
+        eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, cols),
     })
@@ -206,7 +206,7 @@ const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
         span: span(offset, bytes),
         rot_dim: R,
         freq_dim: R,
-        theta_bits: THETA.to_bits(),
+        theta: scratchy_target_cuda::step::RopeTheta::new(THETA),
     })
 }
 

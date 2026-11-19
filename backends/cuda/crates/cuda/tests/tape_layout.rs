@@ -402,7 +402,10 @@ fn the_mlp_numbers() {
         panic!("the MLP's steps are norm, gate/up and silu_mul in one launch (#1049), gemm, add");
     };
     let (gate, up, sm) = (gu.gate, gu.up, gu.activation());
-    assert_eq!((n.eps(), n.convention), (EPS, GainConvention::OnePlusScale));
+    assert_eq!(
+        (n.eps.get(), n.convention),
+        (EPS, GainConvention::OnePlusScale)
+    );
     assert_eq!((gate.a, up.a), (n.y, n.y), "both projections read n");
     assert_eq!((sm.gate, sm.up), (gate.c, up.c), "silu(gate) · up");
     assert_eq!((sm.rows, sm.cols), (256, I));
@@ -664,7 +667,7 @@ fn the_attention_gate_numbers() {
             (rotary.span.offset.0, rotary.span.bytes),
             (colours_end, m * 64 * 2)
         );
-        assert_eq!((rotary.rot_dim, rotary.theta()), (64, 1e7));
+        assert_eq!((rotary.rot_dim, rotary.theta.get()), (64, 1e7));
         assert_eq!(tape.arena.total_bytes, colours_end + m * 128);
         for &o in tape.arena.colour_offsets {
             assert_eq!(o % CUDA_ARENA_ALIGN, 0);
@@ -1105,8 +1108,11 @@ fn the_attention_layer_numbers() {
         ),
         (0, 256, 8, 2, 256)
     );
-    assert_eq!(attn.scale_bits, 0.0625f32.to_bits());
-    assert_eq!(attn.scale(), 0.0625);
+    assert_eq!(
+        attn.scale,
+        scratchy_target_cuda::step::AttnScale::new(0.0625)
+    );
+    assert_eq!(attn.scale.get(), 0.0625);
     assert_eq!((ga.attn, ga.gate), (attn.out, split.gate));
     assert_eq!(ga.out, rope.out, "ga is written over qr's colour");
     assert_eq!((o.a, o.c), (ga.out, n.y), "o is written over n's colour");
@@ -1467,7 +1473,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
             a.kv_heads,
             a.head_dim,
             a.layer,
-            a.scale()
+            a.scale.get()
         ),
         (1, 8, 2, 256, 0, 0.0625)
     );
@@ -2392,7 +2398,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     assert_eq!(
                         r.program,
                         RouteProgram::TopKScaledSoftmax {
-                            scale_bits: scale,
+                            scale: scratchy_target_cuda::step::Scale(scale),
                             expert_scale: WeightIx(3)
                         }
                     );
@@ -2622,7 +2628,7 @@ fn a_sliding_layer_lowers_with_its_class() {
         let c = lower_with(&l, two_class_facts(Some(1024))).unwrap_or_else(|e| panic!("{e}"));
         let local = c.rotary_local.expect("the local table");
         assert!(c.rotary.is_none(), "m={m}: the global table is not bound");
-        assert_eq!((local.rot_dim, local.theta()), (64, 1e4), "m={m}");
+        assert_eq!((local.rot_dim, local.theta.get()), (64, 1e4), "m={m}");
         let kv = c.kv.as_ref().expect("a KV pool");
         assert_eq!(kv.layer_class, [0], "m={m}");
         assert_eq!(kv.classes[0].window, Some(1024), "m={m}");

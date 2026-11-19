@@ -30,6 +30,52 @@ pub use crate::kernel_consts::{
 };
 use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
 
+/// The `f32`s a step carries, each as its exact bits: a step is `Eq` (a tape is compared by value),
+/// so a float field holds its bits and its type reads them back as the float.
+macro_rules! f32_bits_newtype {
+    ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
+        $(#[$m])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name(pub u32);
+        impl $name {
+            /// `v`, held as its bits.
+            pub const fn new(v: f32) -> Self {
+                Self(v.to_bits())
+            }
+            /// The float.
+            pub const fn get(self) -> f32 {
+                f32::from_bits(self.0)
+            }
+        }
+    )*};
+}
+
+f32_bits_newtype! {
+    /// An RMSNorm's `eps`.
+    RmsNormEps,
+    /// The attention softmax's scale (`head_dim^-0.5` for qwen3.5).
+    AttnScale,
+    /// A multiplier: a pointwise scale's, and the scaled routing's `hidden^-0.5`.
+    Scale,
+    /// A tanh soft cap on logits.
+    SoftCap,
+}
+
+/// A rope's base frequency (`rope_theta`), as its exact `f64` bits, so a rotary table is `Eq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RopeTheta(pub u64);
+
+impl RopeTheta {
+    /// `v`, held as its bits.
+    pub const fn new(v: f64) -> Self {
+        Self(v.to_bits())
+    }
+    /// The base frequency.
+    pub const fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
 /// One launch-emitting step of a lowered tape, its operands already resolved: one kernel launch,
 /// or two stream-ordered launches (a `RopeAppend` rotates K, then writes the cache).
 ///
@@ -840,8 +886,7 @@ pub struct ScaleBf16 {
     pub out: ArenaOffset,
     pub rows: u32,
     pub cols: u32,
-    /// `scale` as its bits (`f32::to_bits`), so the step is `Eq`.
-    pub scale_bits: u32,
+    pub scale: Scale,
 }
 
 /// `y[r, c] = x[r, c] / rms(x[r, :])`, `rms(x) = sqrt(mean(x²) + eps)`, bf16 in and out, computed
@@ -852,8 +897,7 @@ pub struct RmsNormUnitBf16 {
     pub y: ArenaOffset,
     pub rows: u32,
     pub cols: u32,
-    /// `eps` as its bits (`f32::to_bits`).
-    pub eps_bits: u32,
+    pub eps: RmsNormEps,
 }
 
 /// `out = x · scale[0]` over `[rows, cols]`, `scale` a `[1]` bf16 weight, computed in f32 and
@@ -875,8 +919,7 @@ pub struct SoftCapBf16 {
     pub out: ArenaOffset,
     pub rows: u32,
     pub cols: u32,
-    /// `cap` as its bits (`f32::to_bits`).
-    pub cap_bits: u32,
+    pub cap: SoftCap,
 }
 
 /// [`RopePairing`] as the unit variant it is: `scratchy_ir` has no serde.
@@ -1102,8 +1145,7 @@ pub struct RmsNormBf16 {
     pub y: ArenaOffset,
     pub rows: u32,
     pub cols: u32,
-    /// `eps` as its bits (`f32::to_bits`), so the step is `Eq`; [`Self::eps`] reads it back.
-    pub eps_bits: u32,
+    pub eps: RmsNormEps,
     #[serde(serialize_with = "serialize_gain_convention")]
     pub convention: GainConvention,
     /// The kernel the player launches: chosen when the step is emitted ([`NormKernel::of`]).
@@ -1141,13 +1183,6 @@ fn serialize_gain_convention<S: serde::Serializer>(
         GainConvention::OnePlusScale => (1, "OnePlusScale"),
     };
     s.serialize_unit_variant("GainConvention", index, variant)
-}
-
-impl RmsNormBf16 {
-    /// The norm's `eps`.
-    pub const fn eps(&self) -> f32 {
-        f32::from_bits(self.eps_bits)
-    }
 }
 
 /// `out = a + b` over `[rows, cols]`, bf16 in and out: one f32 add, one rounding. No broadcast:
@@ -1392,15 +1427,7 @@ pub struct RopeQ {
 pub struct HeadNorms {
     pub q_gain: WeightIx,
     pub k_gain: WeightIx,
-    /// `eps` as its bits (`f32::to_bits`), so the step is `Eq`.
-    pub eps_bits: u32,
-}
-
-impl HeadNorms {
-    /// The norms' `eps`.
-    pub const fn eps(&self) -> f32 {
-        f32::from_bits(self.eps_bits)
-    }
+    pub eps: RmsNormEps,
 }
 
 /// Causal GQA attention of `q [rows, q_heads · head_dim]` over layer `layer`'s paged K/V cache,
@@ -1422,20 +1449,12 @@ pub struct AttnPrefillBf16 {
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
-    /// `scale` as its bits (`f32::to_bits`), so the step is `Eq`; [`Self::scale`] reads it back.
-    /// The kernel folds it into `log2(e)`.
-    pub scale_bits: u32,
+    /// The softmax scale, which the kernel folds into `log2(e)`.
+    pub scale: AttnScale,
     /// The keys a query row sees, its last `window` positions (a non-zero multiple of
     /// [`ATTN_WINDOW_MULTIPLE`]); `None` for full causal attention. The head-dim-256 kernels take
     /// it as a launch argument (0 for `None`); the head-dim-512 kernels are #885's 13b-3.
     pub window: Option<u32>,
-}
-
-impl AttnPrefillBf16 {
-    /// The softmax scale: `head_dim^-0.5` for qwen3.5.
-    pub const fn scale(&self) -> f32 {
-        f32::from_bits(self.scale_bits)
-    }
 }
 
 /// Bytes of one f32: the GDN scratch, bundle and state are f32.
@@ -1611,17 +1630,11 @@ pub struct GatedDeltaNetBf16 {
     pub head_k: u32,
     pub head_v: u32,
     pub conv_kernel: u32,
-    /// The gated norm's `eps` (`rms_norm_eps`) as its bits (`f32::to_bits`), so the step is `Eq`;
-    /// [`Self::eps`] reads it back.
-    pub eps_bits: u32,
+    /// The gated norm's `eps` (`rms_norm_eps`).
+    pub eps: RmsNormEps,
 }
 
 impl GatedDeltaNetBf16 {
-    /// The gated norm's `eps`.
-    pub const fn eps(&self) -> f32 {
-        f32::from_bits(self.eps_bits)
-    }
-
     /// The query scale, `head_k^-½`.
     pub const fn scale(&self) -> f32 {
         gdn_scale(self.head_k)
@@ -1749,8 +1762,7 @@ pub enum RouteProgram {
     /// the picks, then each times its expert's `expert_scale` entry (Gemma 4;
     /// `kernels/moe_route_bf16.cu`'s scaled program).
     TopKScaledSoftmax {
-        /// `scale` as its bits (`f32::to_bits`).
-        scale_bits: u32,
+        scale: Scale,
         /// `router.per_expert_scale`, `[experts]` bf16.
         expert_scale: WeightIx,
     },

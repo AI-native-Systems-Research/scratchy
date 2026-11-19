@@ -246,7 +246,7 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
         y: ArenaOffset(y),
         rows,
         cols,
-        eps_bits: EPS.to_bits(),
+        eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, cols),
     })
@@ -311,7 +311,7 @@ const fn attn(q: u64, block_table: u64, sequence: u64, out: u64, rows: u32) -> C
         q_heads: HEADS,
         kv_heads: KV_HEADS,
         head_dim: HD,
-        scale_bits: SCALE.to_bits(),
+        scale: scratchy_target_cuda::step::AttnScale::new(SCALE),
         window: None,
     })
 }
@@ -341,7 +341,7 @@ const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
         span: span(offset, bytes),
         rot_dim: R,
         freq_dim: R,
-        theta_bits: THETA.to_bits(),
+        theta: scratchy_target_cuda::step::RopeTheta::new(THETA),
     })
 }
 

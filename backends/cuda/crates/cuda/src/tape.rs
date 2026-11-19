@@ -19,7 +19,7 @@ use crate::step::{
     ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
     GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemvBf16,
     MoeRouteBf16, MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
-    RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
+    RopeBf16, RopeTheta, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
     sort_index_regions,
 };
 
@@ -73,15 +73,8 @@ pub struct RotaryTable {
     /// `F`, the frequency exponent's denominator: `rot_dim` for a half-rotated class, the head dim
     /// for a half-head (proportional) one, Gemma 4's global layers' 512. At least `rot_dim`.
     pub freq_dim: u32,
-    /// `rope_theta` as its bits (`f64::to_bits`), so the table is `Eq`; [`Self::theta`] reads it.
-    pub theta_bits: u64,
-}
-
-impl RotaryTable {
     /// The table's `rope_theta`.
-    pub const fn theta(&self) -> f64 {
-        f64::from_bits(self.theta_bits)
-    }
+    pub theta: RopeTheta,
 }
 
 /// The tape's paged KV cache: which layers' K and V it writes or reads, their geometry, and the
@@ -2470,6 +2463,7 @@ mod tests {
         GemmBf16, KvUse, MoeRouteBf16, NormKernel, RmsNormBf16, RopeAppendBf16, RopeBf16,
         RopePairing, RouteProgram, WeightRead,
     };
+    use crate::step::{AttnScale, RmsNormEps, Scale, SoftCap};
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
         ArenaSpan {
@@ -2498,7 +2492,7 @@ mod tests {
             y: ArenaOffset(786432),
             rows: 256,
             cols: 1024,
-            eps_bits: 1e-6f32.to_bits(),
+            eps: RmsNormEps::new(1e-6),
             convention: GainConvention::OnePlusScale,
             kernel: NormKernel::of(256, 1024),
         }),
@@ -2875,7 +2869,7 @@ mod tests {
             out: ArenaOffset(out),
             rows: 256,
             cols: 1024,
-            cap_bits: 30.0f32.to_bits(),
+            cap: SoftCap::new(30.0),
         })
     }
 
@@ -2908,14 +2902,14 @@ mod tests {
             out: ArenaOffset(262144),
             rows: 256,
             cols: 1024,
-            scale_bits: 2.0f32.to_bits(),
+            scale: Scale::new(2.0),
         });
         let unit = CudaStep::RmsNormUnit(crate::step::RmsNormUnitBf16 {
             x: ArenaOffset(262144),
             y: ArenaOffset(262144),
             rows: 256,
             cols: 1024,
-            eps_bits: 1e-6f32.to_bits(),
+            eps: RmsNormEps::new(1e-6),
         });
         let add = CudaStep::Add(AddBf16 {
             a: ArenaOffset(262144),
@@ -2986,7 +2980,7 @@ mod tests {
                 span: span(offset, bytes),
                 rot_dim: 64,
                 freq_dim: 64,
-                theta_bits: 1e7f64.to_bits(),
+                theta: RopeTheta::new(1e7),
             }),
             ..GOOD
         }
@@ -3004,7 +2998,7 @@ mod tests {
     fn a_rotary_table_inside_the_arena_validates() {
         let t = with_rotary(TABLE_AT, TABLE);
         assert_eq!(t.validate(), Ok(()));
-        assert_eq!(t.rotary.map(|r| r.theta()), Some(1e7));
+        assert_eq!(t.rotary.map(|r| r.theta.get()), Some(1e7));
     }
 
     #[test]
@@ -3151,7 +3145,7 @@ mod tests {
             q_heads: 2,
             kv_heads,
             head_dim: 256,
-            scale_bits: 0.0625f32.to_bits(),
+            scale: AttnScale::new(0.0625),
             window: None,
         })
     }
@@ -3185,7 +3179,7 @@ mod tests {
                 span: span(KV_ROTARY, TABLE),
                 rot_dim: 64,
                 freq_dim: 64,
-                theta_bits: 1e7f64.to_bits(),
+                theta: RopeTheta::new(1e7),
             }),
             kv: Some(kv),
             ..GOOD
@@ -3475,7 +3469,7 @@ mod tests {
             head_k: 128,
             head_v: 32,
             conv_kernel: 4,
-            eps_bits: 1e-6f32.to_bits(),
+            eps: RmsNormEps::new(1e-6),
         }
     }
 
@@ -4609,7 +4603,7 @@ mod tests {
             span: span(offset, TABLE),
             rot_dim: 64,
             freq_dim: 64,
-            theta_bits: 1e4f64.to_bits(),
+            theta: RopeTheta::new(1e4),
         };
         let at = TABLE_AT + TABLE;
         let grown = |t: CudaTape| CudaTape {
@@ -4672,7 +4666,7 @@ mod tests {
                 y: ArenaOffset(y),
                 rows: 1,
                 cols: 64,
-                eps_bits: 1e-6f32.to_bits(),
+                eps: RmsNormEps::new(1e-6),
                 convention: GainConvention::Scale,
                 kernel: NormKernel::of(1, 64),
             })

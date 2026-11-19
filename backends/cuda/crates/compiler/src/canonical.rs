@@ -35,6 +35,7 @@ use scratchy_target_cuda::op_abi::{
     CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, MOE_EXPERT_COUNTS, cuda_fusions,
     expert_tile_rows,
 };
+use scratchy_target_cuda::step::RopeTheta;
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
     EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
@@ -166,7 +167,7 @@ fn rotary_table(
         span,
         rot_dim: g.rot_dim().get(),
         freq_dim: facts.freq_dim(class, g),
-        theta_bits: theta.to_bits(),
+        theta: RopeTheta::new(theta),
     }))
 }
 

@@ -424,7 +424,7 @@ fn n_direct(device: &CudaDevice, tape: &CudaTape, x: &[u16], g: &[u16]) -> Vec<u
         panic!("the tape's first step is its norm");
     };
     assert_eq!(
-        (norm.eps(), norm.convention),
+        (norm.eps.get(), norm.convention),
         (EPS, GainConvention::OnePlusScale)
     );
     let (xb, gb) = (
@@ -440,7 +440,7 @@ fn n_direct(device: &CudaDevice, tape: &CudaTape, x: &[u16], g: &[u16]) -> Vec<u
             gb.ptr(),
             out.ptr(),
             (norm.rows, norm.cols),
-            norm.eps(),
+            norm.eps.get(),
             norm.convention.offset(),
             std::ptr::null_mut(),
         )
@@ -698,7 +698,7 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
         let qr = read(&mut worker, colour(tape, 5));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
-        let table_matches = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta());
+        let table_matches = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta.get());
         let refs = rope_reference(&qn, &uploaded, (m, AG_Q), (AG_HD, AG_R), AG_R / 2);
         let cmp = compare_rope(&qr, &qn, &refs, AG_Q);
         let ok = cmp.rotated.pass() && cmp.pass_through_mismatched == 0 && table_matches;
@@ -854,7 +854,7 @@ static BAD_ROTARY: [CudaTape; 1] = [CudaTape {
         },
         rot_dim: 64,
         freq_dim: 64,
-        theta_bits: 0x416312D000000000,
+        theta: scratchy_target_cuda::step::RopeTheta(0x416312D000000000),
     }),
     ..ATTN_GATE_M256
 }];
@@ -1083,7 +1083,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         pass &= check_stage("v = n·Wvᵀ", &v, &n, &w.wv, (m, AL_KV, AL_H));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
-        let table_ok = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta());
+        let table_ok = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta.get());
         let kr = read(&mut worker, colour(tape, 3));
         let refs = rope_reference(&kn, &uploaded, (m, AL_KV), (AL_HD, AL_R), AL_R / 2);
         let cmp = compare_rope(&kr, &kn, &refs, AL_KV);
@@ -1140,7 +1140,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         let CudaStep::AttnPrefill(step) = tape.steps[7] else {
             panic!("step 7 is the attention");
         };
-        pass &= step.scale_bits == 0.0625f32.to_bits();
+        pass &= step.scale == scratchy_target_cuda::step::AttnScale::new(0.0625);
     }
     assert!(pass, "a stage of the attention layer is out of bound");
 }
@@ -2822,7 +2822,7 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
         );
         pass &= ok && below == 0 && appended == 0 && finite;
     }
-    pass &= decode.rows == 1 && decode.scale_bits == 0.0625f32.to_bits();
+    pass &= decode.rows == 1 && decode.scale == scratchy_target_cuda::step::AttnScale::new(0.0625);
     assert!(
         pass,
         "a decode step of the attention layer failed: see the lines above"
@@ -3436,20 +3436,12 @@ fn play_row_step(device: &CudaDevice, s: &CudaStep, arena: &mut [u16], w: &Devic
     // one; `out` is its own allocation; null is the default stream, which the download waits for.
     unsafe {
         match *s {
-            CudaStep::Scale(st) => scale_bf16(
-                xb.ptr(),
-                ob.ptr(),
-                dims,
-                f32::from_bits(st.scale_bits),
-                null,
-            ),
+            CudaStep::Scale(st) => scale_bf16(xb.ptr(), ob.ptr(), dims, st.scale.get(), null),
             CudaStep::RmsNormUnit(st) => {
-                rms_norm_unit_bf16(xb.ptr(), ob.ptr(), dims, f32::from_bits(st.eps_bits), null)
+                rms_norm_unit_bf16(xb.ptr(), ob.ptr(), dims, st.eps.get(), null)
             }
             CudaStep::LayerScale(_) => layer_scale_bf16(xb.ptr(), w.ptr(), ob.ptr(), dims, null),
-            CudaStep::SoftCap(st) => {
-                soft_cap_bf16(xb.ptr(), ob.ptr(), dims, f32::from_bits(st.cap_bits), null)
-            }
+            CudaStep::SoftCap(st) => soft_cap_bf16(xb.ptr(), ob.ptr(), dims, st.cap.get(), null),
             _ => unreachable!("matched above"),
         }
     }

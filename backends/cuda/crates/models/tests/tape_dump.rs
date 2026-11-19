@@ -176,11 +176,11 @@ fn route(p: RouteProgram) -> Value {
             "program": "softmax over every expert, then the top-k picks",
             "renormalise_over_picks": renorm,
         }),
-        RouteProgram::TopKScaledSoftmax { scale_bits, .. } => json!({
+        RouteProgram::TopKScaledSoftmax { scale, .. } => json!({
             "program": "top-k of the raw logits, each times scale, softmax over the picks, then \
                         times the per-expert scale",
             "renormalise_over_picks": false,
-            "scale": f32_bits(scale_bits),
+            "scale": f32_bits(scale.0),
         }),
     }
 }
@@ -227,7 +227,7 @@ fn group(g: &GemmGroupBf16) -> Value {
 
 fn norm(n: &RmsNormBf16) -> Value {
     json!({"x": off(n.x), "gain_w": wix(n.gain), "y": off(n.y), "rows": n.rows, "cols": n.cols,
-           "eps": f32_bits(n.eps_bits), "convention": gain(n.convention)})
+           "eps": f32_bits(n.eps.0), "convention": gain(n.convention)})
 }
 
 fn add_norm(f: &AddRmsNormBf16) -> Value {
@@ -261,7 +261,7 @@ fn expert_gemm(g: &ExpertGemmBf16) -> Value {
 fn attn(a: &AttnPrefillBf16) -> Value {
     json!({"q": off(a.q), "block_table": off(a.block_table), "sequence": off(a.sequence),
            "out": off(a.out), "layer": a.layer, "rows": a.rows, "q_heads": a.q_heads,
-           "kv_heads": a.kv_heads, "head_dim": a.head_dim, "scale": f32_bits(a.scale_bits),
+           "kv_heads": a.kv_heads, "head_dim": a.head_dim, "scale": f32_bits(a.scale.0),
            "window": a.window})
 }
 
@@ -270,7 +270,7 @@ fn gdn(g: &GatedDeltaNetBf16) -> Value {
            "bundle": wix(g.bundle), "out": off(g.out), "scratch": off(g.scratch),
            "sequence": off(g.sequence), "layer": g.layer, "rows": g.rows,
            "num_k_heads": g.num_k_heads, "num_v_heads": g.num_v_heads, "head_k": g.head_k,
-           "head_v": g.head_v, "conv_kernel": g.conv_kernel, "eps": f32_bits(g.eps_bits)})
+           "head_v": g.head_v, "conv_kernel": g.conv_kernel, "eps": f32_bits(g.eps.0)})
 }
 
 /// A GEMV's stored K split, the player's choice.
@@ -357,7 +357,7 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::RmsNormUnit(n) => (
             "rms_norm_unit_bf16",
             json!({"x": off(n.x), "y": off(n.y), "rows": n.rows, "cols": n.cols,
-                   "eps": f32_bits(n.eps_bits)}),
+                   "eps": f32_bits(n.eps.0)}),
             Value::Null,
         ),
         CudaStep::Add(a) => (
@@ -385,7 +385,7 @@ fn step_record(s: &CudaStep) -> Value {
                                                            "cols": q.cols})),
                    "norms": r.norms.map_or(Value::Null, |n| json!({"q_gain": wix(n.q_gain),
                                                                    "k_gain": wix(n.k_gain),
-                                                                   "eps": f32_bits(n.eps_bits)}))}),
+                                                                   "eps": f32_bits(n.eps.0)}))}),
             Value::Null,
         ),
         CudaStep::GateSplit(g) => (
@@ -507,7 +507,7 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::Scale(x) => (
             "scale_bf16",
             json!({"x": off(x.x), "out": off(x.out), "rows": x.rows, "cols": x.cols,
-                   "scale": f32_bits(x.scale_bits)}),
+                   "scale": f32_bits(x.scale.0)}),
             Value::Null,
         ),
         CudaStep::LayerScale(x) => (
@@ -519,7 +519,7 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::SoftCap(x) => (
             "soft_cap_bf16",
             json!({"x": off(x.x), "out": off(x.out), "rows": x.rows, "cols": x.cols,
-                   "cap": f32_bits(x.cap_bits)}),
+                   "cap": f32_bits(x.cap.0)}),
             Value::Null,
         ),
         CudaStep::GatherLastRow(g) => (
@@ -556,7 +556,7 @@ fn tape_header(stem: &str, t: &CudaTape) -> Value {
         r.map_or(Value::Null, |r| {
             json!({"span": {"offset": r.span.offset.0, "bytes": r.span.bytes},
                    "rot_dim": r.rot_dim, "freq_dim": r.freq_dim,
-                   "theta": {"f64": f64::from_bits(r.theta_bits), "bits": r.theta_bits}})
+                   "theta": {"f64": r.theta.get(), "bits": r.theta.0}})
         })
     };
     m.insert("rotary".into(), rotary(t.rotary));
