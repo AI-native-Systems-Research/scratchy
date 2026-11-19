@@ -585,20 +585,6 @@ impl HfModelConfig {
             .or_else(|| self.head_dim())
     }
 
-    /// Whether the model mixes full and sliding-window attention layers
-    /// (gemma4: 5 `full_attention` + 25 `sliding_attention`) — the case the
-    /// hybrid SWA KV allocator targets. Requires both a `sliding_window` and a
-    /// `layer_types` array that contains both kinds; models that are uniformly
-    /// full (Llama) or uniformly sliding stay single-group.
-    pub fn is_swa_hybrid(&self) -> bool {
-        let Some(types) = self.layer_types() else {
-            return false;
-        };
-        let has_full = types.iter().any(|t| t == "full_attention");
-        let has_sliding = types.iter().any(|t| t == "sliding_attention");
-        has_full && has_sliding && self.sliding_window().is_some()
-    }
-
     /// Read an unsigned-int field from the nested `text_config` (composite
     /// HF configs like gemma4 keep the real text-backbone dims there).
     fn text_config_usize(&self, key: &str) -> Option<usize> {

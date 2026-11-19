@@ -1565,10 +1565,11 @@ fn initialize_core(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(SWA_PREFILL_CHUNK_CAP);
-    let max_num_batched_tokens = if hf_config.is_swa_hybrid() {
-        max_num_batched_tokens.min(swa_chunk_cap)
-    } else {
-        max_num_batched_tokens
+    // The pool's sliding groups, not the config: the cap holds wherever the scheduler runs the
+    // hybrid layout (`swa_hybrid_kv`, laid out from the worker's compiled per-layer geometry).
+    let max_num_batched_tokens = match swa_hybrid_kv {
+        Some(_) => max_num_batched_tokens.min(swa_chunk_cap),
+        None => max_num_batched_tokens,
     };
     // The concurrency the scheduler will actually admit under. A backend whose decode-width ladder is
     // BAKED (a fixed rung ladder) cannot grow it to cover `max_num_seqs`, so it
