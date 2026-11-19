@@ -597,9 +597,11 @@ chip="$(sysctl -n machdep.cpu.brand_string)"
 slug="$(echo "${chip}" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9-]//g')"
 : "${OUT_DIR:="${ROOT}/bench_results/metal_matrix"}"
 RAW="${OUT_DIR}/${slug}"
-# Named <machine>-<start time>-<sha8>.json, the name site/src/metal/ requires,
-# so a finished run drops straight into site/data/metal/ and a second run of
-# one commit on one day never overwrites the first. One timestamp feeds
+# Named <machine>-<start time>-<sha8>.json, the name the site's Metal page
+# requires once gzipped (<name>.json.gz in data/metal/ on the site branch;
+# the metal-bench skill gzips it on copy, and this file stays plain JSON for
+# metal_round.py and for reading), and a second run of one commit on one day
+# never overwrites the first. One timestamp feeds
 # both the name and generated_utc, so the two can never disagree.
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 stamp="${STARTED_UTC//:/}"

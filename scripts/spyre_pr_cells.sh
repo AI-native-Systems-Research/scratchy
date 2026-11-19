@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # A perf PR's merge gate, as one script: the standard cell set, main against
 # the PR, on this pod, back to back — writing the progress entry the spyre
-# page charts (site/data/spyre/progress/<pr>.json) directly, so the gate's
-# numbers and the site's data are the same numbers.
+# page charts (data/spyre/progress/<pr>.json.gz on the site branch, here
+# site/data/spyre/progress/ in a checkout with a worktree of that branch at
+# site/) directly, so the gate's numbers and the site's data are the same
+# numbers. The entry lands by its own PR to the site branch.
 #
 # The standard cell set (the sweep grid's own parameters, from the
 # .sweep-legs cells.tsv the 10-19 sweep ran):
@@ -388,7 +390,7 @@ if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
 fi
 
 mkdir -p "$OUT"
-DEST="$OUT/$PR.json"
+DEST="$OUT/$PR.json.gz"
 [ -e "$DEST" ] && { echo "REFUSING: $DEST already exists — never overwrite a landed entry" >&2; exit 65; }
 
 # ---- the pod env (verbatim, from the legs) ------------------------------------
@@ -615,6 +617,7 @@ fi
 python3 - "$PR" "$TITLE" "$HEAD" "$BASE" "$RUNS_JSONL" "$DEST" "$(hostname)" "$RUNS" "$CORES" "$SELECTED" <<'PY'
 import collections
 import datetime
+import gzip
 import json
 import os
 import sys
@@ -723,10 +726,11 @@ entry = {
                 f"cores {cores}"),
     "cells": [cells[k] for k in sorted(cells)],
 }
+# Gzipped, as the site keeps every data file, with no name or time in the
+# header, so the same entry packs to the same bytes.
 tmp = dest + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(entry, f, indent=2)
-    f.write("\n")
+with open(tmp, "wb") as f:
+    f.write(gzip.compress((json.dumps(entry, indent=2) + "\n").encode(), 9, mtime=0))
 os.replace(tmp, dest)
 print(dest)
 PY

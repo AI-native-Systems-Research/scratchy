@@ -6,20 +6,21 @@
 
 Each team member posts a clean quick run of scripts/bench_metal_matrix.sh as a
 comment on the open round issue (the metal-bench skill, step 7). Once every Mac
-in MACHINES has one, .github/workflows/metal-round.yml opens a PR that adds the
-newest run per Mac to site/data/metal, in one commit, and closes the issue; an
-admin merges the PR.
+in MACHINES has one, .github/workflows/metal-round.yml opens a PR to the site
+branch that adds the newest run per Mac, gzipped, to its data/metal, in one
+commit, and closes the issue; an admin merges the PR.
 
   metal_round.py check RUN.json
       Whether the run can go in a round; exits 1 with the reason if not.
   metal_round.py collect --comments C.json --out-dir D [--main-ref REF]
       Read the issue's comments (gh api .../comments, a JSON array), write the
-      newest accepted run per Mac to D under the bench script's file name, and
+      newest accepted run per Mac to D, gzipped, under the site's file name, and
       print a JSON summary: the status comment's body, the rejections to reply
       to, and whether the round is complete.
   metal_round.py commit-input --branch B --head SHA --repo OWNER/NAME --dir D FILE...
-      The GraphQL request that adds the files to site/data/metal on branch B
-      as one commit (createCommitOnBranch, which GitHub signs).
+      The GraphQL request that adds the files to data/metal on branch B, a
+      branch from the site branch, as one commit (createCommitOnBranch, which
+      GitHub signs).
 
 Standard library only.
 """
@@ -55,6 +56,9 @@ FENCE = re.compile(r"```json[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 PACKED = re.compile(r"```json\+gzip\+base64[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S)
 UTC = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 SHA = re.compile(r"[0-9a-f]{40}")
+
+# Where the site branch keeps the runs its Metal page reads.
+SITE_DATA = "data/metal"
 
 
 def scope(run):
@@ -122,6 +126,13 @@ def stamp(run):
     slug = re.sub(r"[^a-z0-9-]", "", run["machine"]["chip"].lower().replace(" ", "-"))
     utc = run["generated_utc"]
     return f"{slug}-{utc[:10]}T{utc[11:19].replace(':', '')}Z-{run['repo']['sha'][:8]}.json"
+
+
+def site_file(run):
+    """The site's name for a run's file, and its bytes: the bench script's JSON, gzipped with no
+    name or time in its header, so the same run packs to the same bytes."""
+    text = json.dumps(run, indent=2) + "\n"
+    return f"{stamp(run)}.gz", gzip.compress(text.encode(), compresslevel=9, mtime=0)
 
 
 def runs_in(body):
@@ -203,7 +214,7 @@ def commit_input(a):
     adds = []
     for name in a.files:
         with open(f"{a.dir}/{name}", "rb") as f:
-            adds.append({"path": f"site/data/metal/{name}",
+            adds.append({"path": f"{SITE_DATA}/{name}",
                          "contents": base64.b64encode(f.read()).decode()})
     return {
         "query": "mutation($input: CreateCommitOnBranchInput!) "
@@ -257,11 +268,9 @@ def main(argv=None):
     files = []
     for chip in MACHINES:
         if chip in newest:
-            run = newest[chip][0]
-            name = stamp(run)
-            with open(f"{a.out_dir}/{name}", "w") as f:
-                json.dump(run, f, indent=2)
-                f.write("\n")
+            name, packed = site_file(newest[chip][0])
+            with open(f"{a.out_dir}/{name}", "wb") as f:
+                f.write(packed)
             files.append(name)
     json.dump({
         "complete": len(newest) == len(MACHINES),

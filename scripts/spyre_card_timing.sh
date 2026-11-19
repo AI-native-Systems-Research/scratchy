@@ -69,8 +69,9 @@
 #   CORES   the cores serve and client are pinned to (default 48-95)
 #
 # Exits non-zero on any refusal; a failed cell fails the whole run. On the
-# pod, run it from a synced checkout that carries site/data/spyre/ (the
-# torch ratios come from the newest sweep file there).
+# pod, run it from a synced checkout with a worktree of the site branch at
+# site/, which carries site/data/spyre/ (the torch ratios come from the
+# newest sweep file there, gzipped JSON).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -175,7 +176,7 @@ PY
 # report. Stdout only.
 emit_report() {  # emit_report <runs.jsonl> <sweep.json> <model-short> <serve-shapes> <cand> <cand-md5> <ref> <ref-md5> <host> <date> <boot-s> <boots> <w1k-s> <m1k-s> <w10k-s> <m10k-s> <bench-s> <c4-10k-s> <c8-10k-s> <total-s>
   python3 - "$@" <<'PY'
-import json, math, sys
+import gzip, json, math, sys
 
 (runs_path, sweep_path, short, shapes, cand, cand_md5, ref, ref_md5, host,
  date_s, boot_s, boots, w1k_s, m1k_s, w10k_s, m10k_s, bench_s, c4_s, c8_s,
@@ -224,7 +225,8 @@ if set(runs) != expected:
     refuse(f"the measured set is {sorted(runs)}, need exactly {sorted(expected)}")
 
 try:
-    with open(sweep_path) as f:
+    # The site keeps its sweeps gzipped; a plain one (the self-test's) reads as is.
+    with (gzip.open if sweep_path.endswith(".gz") else open)(sweep_path, "rt") as f:
         sweep = json.load(f)
 except (OSError, ValueError) as e:
     refuse(f"cannot read the sweep file {sweep_path} ({e})")
@@ -603,9 +605,9 @@ fi
 
 # The torch ratios come from the newest sweep file — refuse without one
 # rather than print a report with holes.
-SWEEP=$(ls -1 "$REPO"/site/data/spyre/*.json 2>/dev/null | sort | tail -1 || true)
+SWEEP=$(ls -1 "$REPO"/site/data/spyre/*.json.gz 2>/dev/null | sort | tail -1 || true)
 [ -n "$SWEEP" ] || {
-  echo "REFUSING: no sweep file in $REPO/site/data/spyre — the torch ratios come from the newest sweep; run from a synced checkout" >&2
+  echo "REFUSING: no sweep file in $REPO/site/data/spyre — the torch ratios come from the newest sweep; run from a synced checkout with the site branch at site/" >&2
   exit 69
 }
 

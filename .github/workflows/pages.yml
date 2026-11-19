@@ -1,18 +1,22 @@
 name: Pages
 
+# Main's runs of the site build (site-build.yml, which states the build once). The site and its data
+# live on the site branch, which runs the same build from its own pages.yml; main runs it when what
+# the site renders from main changes.
 on:
   push:
     branches: [main]
     paths:
-      - 'site/**'
       - 'docs/**'
       - 'CONTRIBUTING.md'
+      - 'crates/models/arch/dsl/**'
       - '.github/workflows/pages.yml'
-  # Every pull request builds the site and checks its links without deploying: the site renders
-  # files from all over the repo (docs/, the DSLs, site data), so any change can break it.
+      - '.github/workflows/site-build.yml'
+  # Every pull request to main builds the site against the site branch's head and checks its links
+  # without deploying: the site renders files from all over main (docs/, the DSLs), so any change
+  # can break it.
   pull_request:
-  # Also started on a metal round's branch by its bot (metal-round.yml), which builds without
-  # deploying: only main deploys.
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -20,54 +24,17 @@ permissions:
   pages: write
   id-token: write
 
-# One deploy at a time; let an in-flight run finish rather than cancelling it. Anything but main
-# (a pull request, or a dispatch on a metal round's branch) only builds, in a group of its own
-# superseded by its next run, so it never queues behind or cancels a deploy.
+# One deploy at a time, shared with the site branch's Pages runs; let an in-flight run finish rather
+# than cancelling it. Anything but main (a pull request, or a dispatch elsewhere) only builds, in a
+# group of its own superseded by its next run, so it never queues behind or cancels a deploy.
 concurrency:
   group: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'pages' || format('pages-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' || github.event_name == 'pull_request' }}
 
 jobs:
-  build:
-    # Forks don't have Pages enabled, so configure-pages would fail there.
-    if: ${{ !github.event.repository.fork }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: site
-
-      # The site crate is its own workspace, so the repo-wide gates in
-      # rust.yml never see it: lint and test it here.
-      - name: Lint and test the site renderer
-        run: |
-          cargo clippy --manifest-path site/Cargo.toml --all-targets -- -D warnings
-          cargo test --manifest-path site/Cargo.toml
-
-      - name: Build site
-        run: cargo run --release --manifest-path site/Cargo.toml
-
-      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: actions/configure-pages@v6
-
-      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: site/_site
-
-  deploy:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+  site:
+    uses: ./.github/workflows/site-build.yml
+    with:
+      main_ref: ${{ github.sha }}
+      site_ref: site
+      deploy: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}

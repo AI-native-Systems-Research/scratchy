@@ -4,11 +4,12 @@ name: Metal round
 # quick run of scripts/bench_metal_matrix.sh (the metal-bench skill, step 7). On every comment
 # this reads them all again, keeps the newest accepted run per Mac, and keeps one status comment
 # up to date. Once every Mac in scripts/metal_round.py's MACHINES is in, it makes a branch from
-# main, commits those runs into site/data/metal there in one commit, opens a PR for an admin to
-# merge, and closes the issue: a closed issue is a finished round.
+# the site branch, commits those runs, gzipped, into data/metal there in one commit, opens a PR to
+# the site branch for an admin to merge, and closes the issue: a closed issue is a finished round.
 #
-# issue_comment runs this file as it is on main, and nothing here runs code from anywhere else.
-# The runs it reads are data, checked by the site build before they are committed.
+# issue_comment runs this file as it is on main, and runs no code but main's and the site
+# branch's renderer. The runs it reads are data, checked by the site build before they are
+# committed.
 on:
   issue_comment:
     types: [created, edited, deleted]
@@ -86,10 +87,18 @@ jobs:
           echo "files=$(jq -c .files summary.json)" >> "$GITHUB_OUTPUT"
 
       # The site build reads every field the page needs, so it is the check that the runs render.
+      # The site lives on the site branch and reads main's docs and DSLs from the folder above it,
+      # so it goes at site/ in this main checkout, as site-build.yml lays it out. Its lint and
+      # tests read only the renderer's own fixtures, which the runs do not touch: rendering is the
+      # check, and the round's PR runs the whole build (pages.yml on the site branch).
+      - if: steps.collect.outputs.commit == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: site
+          path: site
+
       - if: steps.collect.outputs.commit == 'true'
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - if: steps.collect.outputs.commit == 'true'
         uses: Swatinem/rust-cache@v2
@@ -99,16 +108,14 @@ jobs:
       - if: steps.collect.outputs.commit == 'true'
         name: Build the site with the round's runs
         run: |
-          cp round/*.json site/data/metal/
-          cargo clippy --manifest-path site/Cargo.toml --all-targets -- -D warnings
-          cargo test --manifest-path site/Cargo.toml
+          cp round/*.json.gz site/data/metal/
           cargo run --release --manifest-path site/Cargo.toml
 
       - if: steps.collect.outputs.commit == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: round
-          path: round/*.json
+          path: round/*.json.gz
 
   commit:
     needs: collect
@@ -130,18 +137,18 @@ jobs:
           name: round
           path: round
 
-      # A branch from main named for the issue, and the runs on it in one commit made through the
-      # API rather than git push: GitHub signs a commit made this way, and main's rules take
-      # signed commits only.
+      # A branch from the site branch named for the issue, and the runs on it in one commit made
+      # through the API rather than git push: GitHub signs a commit made this way, and the
+      # branch rules take signed commits only.
       - name: Commit the runs to a new branch
         env:
           FILES: ${{ needs.collect.outputs.files }}
         run: |
           branch="metal-round/$ISSUE"
-          main=$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)
-          gh api "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$main" > /dev/null
+          site=$(gh api "repos/$REPO/git/ref/heads/site" --jq .object.sha)
+          gh api "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$site" > /dev/null
           python3 scripts/metal_round.py commit-input --repo "$REPO" --branch "$branch" \
-            --head "$main" --dir round \
+            --head "$site" --dir round \
             --headline "data(site): Metal quick round, #$ISSUE" \
             $(jq -r '.[]' <<<"$FILES") > commit.json
           gh api graphql --input commit.json --jq .data.createCommitOnBranch.commit.url
@@ -149,20 +156,19 @@ jobs:
 
       - name: Open the PR
         run: |
-          pr=$(gh pr create -R "$REPO" --head "$BRANCH" --base main \
+          pr=$(gh pr create -R "$REPO" --head "$BRANCH" --base site \
             --title "data(site): Metal quick round, #$ISSUE" \
-            --body "The newest quick run of each Mac, as collected on #$ISSUE. Rust CI and Pages were started on this branch by the bot. If their checks do not show here, push a signed empty commit to $BRANCH to start them.")
+            --body "The newest quick run of each Mac, gzipped, as collected on #$ISSUE. Pages was started on this branch by the bot. If its check does not show here, push a signed empty commit to $BRANCH to start it.")
           echo "PR=$pr" >> "$GITHUB_ENV"
 
-      # A push made with this token starts no workflows, so start the required checks on the
-      # branch by hand. If they do not count toward the branch rules, a signed empty commit
-      # pushed to the branch starts them the usual way.
+      # A push made with this token starts no workflows, so start the site build on the branch by
+      # hand: the branch is the site branch's, whose pages.yml builds without deploying anywhere
+      # but site. If it does not count toward the branch rules, a signed empty commit pushed to
+      # the branch starts it the usual way.
       - name: Start the checks
-        run: |
-          gh workflow run rust.yml -R "$REPO" --ref "$BRANCH"
-          gh workflow run pages.yml -R "$REPO" --ref "$BRANCH"
+        run: gh workflow run pages.yml -R "$REPO" --ref "$BRANCH"
 
       - name: Close the round
         run: |
           gh issue close "$ISSUE" -R "$REPO" \
-            --comment "All four Macs are in: $PR adds the newest run per Mac to site/data/metal, for an admin to merge. A run posted from here on goes to the next round."
+            --comment "All four Macs are in: $PR adds the newest run per Mac to data/metal on the site branch, for an admin to merge. A run posted from here on goes to the next round."

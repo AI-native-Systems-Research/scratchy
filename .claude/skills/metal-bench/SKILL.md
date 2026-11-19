@@ -1,6 +1,6 @@
 ---
 name: metal-bench
-description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX, mistral.rs and Splash on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
+description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX, mistral.rs and Splash on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON, gzipped, to the site's Metal page (data/metal on the site branch).
 ---
 
 # Metal benchmark run (one Mac → one JSON → the site)
@@ -80,7 +80,7 @@ and go on to step 4. In the closing summary say: the commit benchmarked and
 where it is against upstream `main`, whether the tree was dirty (the JSON
 records it as `repo.dirty`), the models run and skipped, and the run's
 length. A clean quick run goes to the round issue (step 7, quick run), not
-straight into `site/data/metal`: skip steps 5 and 6.
+straight into the site branch's `data/metal`: skip steps 5 and 6.
 
 ## 1. One-time setup (per Mac)
 
@@ -322,8 +322,11 @@ run on the site. The features are on the log's `--- build -F <features>`
 line. `scr` is the metal CLI crate's binary; a commit from before
 `crates/targets/metal/cli` existed builds it from `scratchy-cli` under `metal`.
 
+The runs are on the repo's `site` branch, gzipped; read them from there:
+
 ```bash
-sha=$(ls site/data/metal/*.json | xargs -n1 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["generated_utc"], d["repo"]["sha"])' | sort | tail -1 | cut -d' ' -f2)
+git fetch -q "$up" site
+sha=$(git ls-tree --name-only "$up/site" data/metal/ | grep '\.json\.gz$' | while read -r p; do git show "$up/site:$p" | gunzip | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["generated_utc"], d["repo"]["sha"])'; done | sort | tail -1 | cut -d' ' -f2)
 git worktree add /tmp/scratchy-known-good "$sha"
 (cd /tmp/scratchy-known-good && if [ -d crates/targets/metal/cli ]; then
    cargo build --release -p scratchy-target-metal-cli --features <features>
@@ -453,20 +456,33 @@ Before copying, ask the user to confirm if any of these is true:
 
 Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
+The site and its data live on the repo's `site` branch, not on main. Work in
+a worktree of it at `site/` in this checkout (main's `.gitignore` ignores
+`/site/`, and the site reads main's docs from the folder above it), on a
+branch of its own from upstream `site`:
+
+```bash
+git fetch -q "$up" site
+b="data/$(basename "$f" .json)"
+if [ -d site ]; then git -C site switch -c "$b" "$up/site"; else git worktree add -b "$b" site "$up/site"; fi
+```
+
 The site shows each chip's two newest runs, as current and previous, and
-computes the ▲/▼ change badges from them. Add the new run, keep the run
-before it as the previous one, and move anything older to
-`site/data/metal/history/`, which the page's Over time section reads. Copy
-first, and move only once the copy has worked: `cp -n` refuses to overwrite
-a run that has the same name, and in that case nothing should be moved.
+computes the ▲/▼ change badges from them. Add the new run, gzipped
+(`gzip -9 -n`, so the same run is the same bytes; the site refuses a plain
+`.json` in `data/`), keep the run before it as the previous one, and move
+anything older to `data/metal/history/`, which the page's Over time section
+reads. Copy first, and move only once the copy has worked: a run that has the
+same name is not overwritten, and in that case nothing should be moved.
 
 ```bash
 m=$(basename "$f" | sed -E 's/-[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{6}Z)?-[0-9a-f]{8}\.json$//')   # e.g. apple-m3-pro
-if cp -n "$f" site/data/metal/; then
-  ls site/data/metal/"$m"-*.json | sort | sed '$d' | sed '$d' \
-    | xargs -r -I{} git mv {} site/data/metal/history/   # keep the newest two; the rest to history/
+g="data/metal/$(basename "$f").gz"
+if [ ! -e "site/$g" ] && gzip -9 -n -c "$f" > "site/$g" && git -C site add "$g"; then
+  ls site/data/metal/"$m"-*.json.gz | sort | sed '$d' | sed '$d' | sed 's|^site/||' \
+    | xargs -r -I{} git -C site mv {} data/metal/history/   # keep the newest two; the rest to history/
 else
-  echo "$(basename "$f") is already in site/data/metal; nothing copied or moved"
+  echo "$(basename "$g") is already in the site's data/metal; nothing copied or moved"
 fi
 ```
 
@@ -477,13 +493,13 @@ Don't delete a run: move it. The one exception is a Mac retired from the
 round, whose runs can be removed with `git rm`.
 
 **Done when:** `ls site/data/metal/$m-*` lists at most two files, the
-newest one is `$(basename "$f")`, and `git status --short site/data/metal`
+newest one is `$(basename "$f").gz`, and `git -C site status --short data/metal`
 shows the new run as added and any older one as renamed into `history/`.
 
 ## 6. Preview
 
-The site's dev server keeps serving (and re-rendering on every change) until
-it's stopped, so run it in the background:
+The site's dev server, from the site worktree of step 5, keeps serving (and
+re-rendering on every change) until it's stopped, so run it in the background:
 
 ```bash
 site/open.sh --port 8001    # then open http://localhost:8001/metal.html
@@ -497,8 +513,9 @@ new run's date and commit.
 
 ## 7. Share or commit
 
-**A full run** goes in its own PR. Commit it on a new branch and open a PR
-titled:
+**A full run** goes in its own PR, to the `site` branch. Commit it in the
+site worktree, on step 5's branch, with this subject, push that branch, and
+open the PR with `gh pr create --base site`, titled the same:
 
 ```
 data(site): <machine> Metal run at <short-sha>
@@ -507,8 +524,9 @@ data(site): <machine> Metal run at <short-sha>
 **A quick run** goes to the metal quick round: one open issue, labelled
 `metal-round`, whose comments collect a quick run from each of the four Macs
 (base M5, M3 Pro, M4 Max, M5 Max). Once all four are in, a workflow
-(`.github/workflows/metal-round.yml`) opens a PR adding the newest run per Mac
-to `site/data/metal` and closes the issue; an admin merges the PR. Post only a
+(`.github/workflows/metal-round.yml`) opens a PR to the `site` branch adding
+the newest run per Mac, gzipped, to its `data/metal` and closes the issue; an
+admin merges the PR. Post only a
 run that exited 0; a run that went wrong is not posted. A second run of the
 same Mac before the round closes is posted too: the newest run, by when it
 ran, is the one committed. Only runs from the repo's owners, members and
@@ -532,7 +550,7 @@ n=$(gh issue list -R "$repo" --label metal-round --state open --json number --jq
 if [ -z "$n" ]; then
   n=$(gh issue create -R "$repo" --label metal-round \
     --title "Metal quick round $(date -u +%F)" \
-    --body "Collects one scratchy quick run from each Mac (base M5, M3 Pro, M4 Max, M5 Max) as comments, posted by the metal-bench skill. Once all four are in, the Metal round workflow opens a PR adding the newest run per Mac to site/data/metal, and closes this issue." \
+    --body "Collects one scratchy quick run from each Mac (base M5, M3 Pro, M4 Max, M5 Max) as comments, posted by the metal-bench skill. Once all four are in, the Metal round workflow opens a PR to the site branch adding the newest run per Mac to its data/metal, and closes this issue." \
     | grep -o '[0-9]*$')
 fi
 ```

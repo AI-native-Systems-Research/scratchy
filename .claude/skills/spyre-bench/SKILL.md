@@ -1,12 +1,13 @@
 ---
 name: spyre-bench
-description: Spyre A/B sweeps, triton-scratchy against torch-spyre on a Spyre card. Use to put a sweep's numbers on the site's Spyre page (spyre.html) as site/data/spyre/<date>-<sha8>.json, covering what to measure, every field of the file (including the page's per-sweep text: what moved, open levers, notes, a target), the checks the build runs, the preview and the PR.
+description: Spyre A/B sweeps, triton-scratchy against torch-spyre on a Spyre card. Use to put a sweep's numbers on the site's Spyre page (spyre.html) as data/spyre/<date>-<sha8>.json.gz on the site branch, covering what to measure, every field of the file (including the page's per-sweep text: what moved, open levers, notes, a target), the checks the build runs, the preview and the PR.
 ---
 
 # Spyre A/B sweep (one card → one JSON → the site)
 
-`spyre.html` charts the newest file in `site/data/spyre/` and lists every
-file in its "About these numbers" table. Everything the page says about one
+`spyre.html` charts the newest file in `data/spyre/` on the repo's `site`
+branch (the site and its data live there, not on main) and lists every file
+in its "About these numbers" table. Everything the page says about one
 sweep comes from that sweep's file: the cells, and also the text (what
 moved since the previous sweep, the open levers, the notes under each
 section, the target tile). So a new sweep is **one new file and no code**.
@@ -89,10 +90,32 @@ each side's harness line says how they were taken.
 
 ## 3. Write the file
 
-Start from a copy of the newest file in `site/data/spyre/`, then replace
-**everything** in it, the text included. Name it
-`<date>-<first 8 characters of the commit>.json`, e.g.
-`2026-10-17-b7c4c889.json`.
+The file goes on the `site` branch. Work in a worktree of it at `site/` in
+this checkout (main's `.gitignore` ignores `/site/`, and the site reads
+main's docs from the folder above it), on a branch of its own from upstream
+`site`:
+
+```bash
+git fetch -q "$up" site
+b="data/spyre-<date>-<sha8>"
+if [ -d site ]; then git -C site switch -c "$b" "$up/site"; else git worktree add -b "$b" site "$up/site"; fi
+```
+
+The data files are gzipped JSON. Start from an unpacked copy of the newest
+file in `site/data/spyre/`, then replace **everything** in it, the text
+included. Name it `<date>-<first 8 characters of the commit>.json`, e.g.
+`2026-10-17-b7c4c889.json`, and edit it outside the worktree:
+
+```bash
+gunzip -c "$(ls site/data/spyre/*.json.gz | sort | tail -1)" > /tmp/<date>-<sha8>.json
+```
+
+When it is written, gzip it into the site (`gzip -9 -n`, so the same file is
+the same bytes; the build refuses a plain `.json` in `data/`):
+
+```bash
+gzip -9 -n -c /tmp/<date>-<sha8>.json > site/data/spyre/<date>-<sha8>.json.gz
+```
 
 | field | what it holds |
 |---|---|
@@ -118,8 +141,9 @@ this sweep closed comes out (and probably goes into `moved`). If you don't
 know a field's new text, leave the field out (the page leaves its section
 out) and ask the user. Don't carry the old text over.
 
-**Done when:** the file is named for its `date` and commit, and every number
-in its text fields matches its cells or names where else it comes from.
+**Done when:** `site/data/spyre/<date>-<sha8>.json.gz` is named for its
+`date` and commit, and every number in its text fields matches its cells or
+names where else it comes from.
 
 ## 4. Build
 
@@ -128,7 +152,8 @@ cd site && cargo run
 ```
 
 The build checks every file in `site/data/spyre/` and lists every problem at
-once: a file not named `<date>-<sha8>.json`, a schema other than 1, a missing
+once: a file not named `<date>-<sha8>.json.gz`, a plain `.json` left
+ungzipped, a schema other than 1, a missing
 `triton_scratchy.commit`, a field it doesn't know (a misspelt key fails here
 rather than vanishing from the page), a cell at a bucket `contexts` lacks, a
 value missing or not above 0, a cell written twice, a `target` with no cell
@@ -158,7 +183,9 @@ Check the page against the file:
 
 ## 6. PR
 
-Commit only the new file, on a new branch, and open a PR titled:
+Commit only the new file, in the site worktree on step 3's branch, push
+that branch, and open the PR to the `site` branch (`gh pr create --base
+site`), titled:
 
 ```
 data(site): torch-spyre A/B sweep at <sha8>
