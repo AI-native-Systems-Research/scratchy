@@ -8,7 +8,7 @@
 //! ## The two forms, one cell each
 //! * **halfswap** — the NEW form: `rot` built by TWO signed half-moves over `[mb, out, y]` views
 //!   of the `[mq, total]` RowBlocked plane (each view sweeps `hd/2` columns of every head under a
-//!   declared extent of `hd` — the stick-axis back gap, card-unproven until this run), then the
+//!   declared extent of `hd` — the stick-axis back gap, card-proven by this sweep), then the
 //!   three whole-tensor legs `xc = x·cos`, `rs = rot·sin`, `out = xc + rs` exactly as `rope_at`
 //!   emits them. The pairing and the sign are READ from `rope_p_entry` (the one statement), never
 //!   restated; the gap is derived from the cell's own stated extents by ONE function.
@@ -21,8 +21,10 @@
 //! ONE function derives `gap = declared − whole-stick-rounded swept` (torch-spyre's production
 //! law, `superdsc.py:1630-1633`, ELEMENTS) and splices
 //! `"backGapCore_":{"out":{"-1":"<gap>"}},` immediately before the gapped view's allocate node's
-//! `"coordinates_"`. It asserts the node carried NO `backGapCore_` before (nothing applied twice)
-//! and that the node occurs once. It never enters the ladder; A1's type replaces it wholesale.
+//! `"coordinates_"`. It asserts the node carried NO `backGapCore_` before (nothing applied twice),
+//! that the node occurs once, and that every patch applied exactly once across the render — a
+//! silently-unpatched view is impossible. It never enters the ladder; A1's type replaces it
+//! wholesale.
 //!
 //! ## The bar (checked by the runner, not here)
 //! EXACT against a host model computed FROM THE OP DEFINITION (HF `rotate_half`, never our
@@ -31,10 +33,14 @@
 //! `rot` is read back too (the half-moves' own output), so a wrong half-move is located before
 //! the legs smear it.
 //!
+//! A HALFSWAP CELL THAT CANNOT LOWER IS A FAILURE OF THE NEW FORM — this writer panics naming
+//! every one. A main-form cell that cannot lower is a fact about main; it is printed verbatim
+//! with its shape and refusal, and its directory carries the refusal in `cell.json` for the
+//! report.
+//!
 //! ```bash
 //! ROPE_HALF_SWAP_ROOT=<dir> ROPE_HALF_SWAP_SHA=<sha> \
-//!   cargo test --release -p scratchy-target-spyre \
-//!   --test zz_rope_half_swap_cells -- --ignored --nocapture
+//!   cargo run --release -p scratchy-target-spyre --example rope_half_swap_cells
 //! ```
 //!
 //! Then on a pod:
@@ -117,43 +123,66 @@ struct Cell {
     /// The refusal, verbatim, for a cell the emission will not produce. `None` ⇒ the bundle was
     /// written and the cell is runnable.
     missing: Option<String>,
-    /// The commit this dump ran at — `ROPE_HALF_SWAP_SHA`, required at dump time (a dump refuses
-    /// to run unstamped). Every verdict line carries it, and the runner skips a cell only when
-    /// sha AND group_0 md5 both match a logged verdict.
+    /// The commit this writer ran at — `ROPE_HALF_SWAP_SHA`, required at run time (the writer
+    /// refuses to run unstamped). Every verdict line carries it, and the runner skips a cell
+    /// only when sha AND group_0 md5 both match a logged verdict.
     sha: String,
 }
 
-/// Dump every cell. One directory per cell: `group_0/` ([`superdsc::write_rendered_dxp_input`],
-/// the halfswap cells through the bridge), `placements.json` (the launch map, the
-/// `bake.rs::write_placements` format) and `cell.json`.
-#[test]
-#[ignore]
-fn dump_rope_half_swap_cells() {
+fn main() {
     let Some(root) = std::env::var_os("ROPE_HALF_SWAP_ROOT") else {
         panic!("ROPE_HALF_SWAP_ROOT=<dir> names where the cells are written");
     };
     let sha = std::env::var("ROPE_HALF_SWAP_SHA")
-        .unwrap_or_else(|_| panic!("ROPE_HALF_SWAP_SHA=<sha> stamps the commit the dump runs at — a dump refuses to run unstamped"));
+        .unwrap_or_else(|_| panic!("ROPE_HALF_SWAP_SHA=<sha> stamps the commit the writer runs at — the writer refuses to run unstamped"));
     let root = std::path::Path::new(&root);
     std::fs::create_dir_all(root).unwrap();
     // One gemma-4 layer's ropes, both widths: hd 256 (the sliding layers' Q16 and K8) and
     // hd 512 (the global layers' Q16 and K1), at the rungs' own row counts (19..128 sampled
     // at the corrupt ones — 23, 29, 31 — plus the decode and full-chunk ends).
-    let mut missing = 0usize;
-    let mut emitted = 0usize;
+    let mut cells = Vec::new();
     for form in [Form::HalfSwap, Form::Main] {
         for &(hd, heads) in &[(256u32, 16u32), (256, 8), (512, 16), (512, 1)] {
             for &mq in &[1u32, 23, 29, 31, 128] {
-                let cell = dump_cell(form, Geo { mq, hd, heads }, root, &sha);
-                match cell.missing {
-                    Some(_) => missing += 1,
-                    None => emitted += 1,
-                }
+                cells.push(emit_cell(form, Geo { mq, hd, heads }, root, &sha));
             }
         }
     }
+    // ⛔ A HALFSWAP CELL THAT CANNOT LOWER IS A FAILURE OF THE NEW FORM, not a count.
+    let halfswap_missing: Vec<&Cell> = cells
+        .iter()
+        .filter(|c| c.form == Form::HalfSwap.tag() && c.missing.is_some())
+        .collect();
+    assert!(
+        halfswap_missing.is_empty(),
+        "the new form must lower at every stated shape — {} cell(s) refused: {}",
+        halfswap_missing.len(),
+        halfswap_missing
+            .iter()
+            .map(|c| format!(
+                "mq={} hd={} heads={}: {}",
+                c.mq,
+                c.hd,
+                c.heads,
+                c.missing.as_deref().unwrap_or("")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    // A main-form cell that cannot lower is a fact about main — printed verbatim for the report.
+    for c in cells.iter().filter(|c| c.missing.is_some()) {
+        eprintln!(
+            "MAIN-FORM REFUSAL mq={} hd={} heads={}: {}",
+            c.mq,
+            c.hd,
+            c.heads,
+            c.missing.as_deref().unwrap_or("")
+        );
+    }
+    let written = cells.iter().filter(|c| c.missing.is_none()).count();
     eprintln!(
-        "rope half-swap sweep: {emitted} bundles, {missing} missing-lowering cells"
+        "rope half-swap sweep: {written} bundles written, {} main-form refusal(s)",
+        cells.len() - written
     );
 }
 
@@ -200,14 +229,14 @@ fn build_layout(geo: Geo) -> BundleLayout {
     l
 }
 
-fn dump_cell(form: Form, geo: Geo, root: &std::path::Path, sha: &str) -> Cell {
+fn emit_cell(form: Form, geo: Geo, root: &std::path::Path, sha: &str) -> Cell {
     let dir = root.join(cell_name(form, geo));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let l = build_layout(geo);
 
-    // ⛔ A BUILD-TIME PANIC IN THE EMITTER IS A MISSING LOWERING TOO — recorded verbatim, never
-    // unwound past. The hook is silenced so a panicking cell does not spam the run.
+    // ⛔ A BUILD-TIME PANIC IN THE EMITTER IS A REFUSAL TOO — recorded verbatim, never unwound
+    // past. The hook is silenced so a panicking cell does not spam the run.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -553,7 +582,7 @@ struct GapPatch {
 /// THE STEP-0 BRIDGE: patch `backGapCore_` into the gapped views' allocate nodes of the rendered
 /// dxp input. Both views of each half-move (the read of x and the write of rot) carry it — each
 /// is a half-swept view of a full-head plane. The op names come from the emission itself, never
-/// restated here; the gap is derived once, from the cell's own stated extents.
+/// restated here; the gap is derived once, from the cell's stated extents.
 fn gap_patches(geo: Geo, half_move_ops: &[String]) -> Vec<GapPatch> {
     let gap = stick_axis_gap(geo.hd, geo.hd / 2, Df::Fp16);
     assert!(gap > 0, "hd {}: the stick-axis gap is zero", geo.hd);
@@ -570,27 +599,37 @@ fn gap_patches(geo: Geo, half_move_ops: &[String]) -> Vec<GapPatch> {
 }
 
 /// Apply the patches to every rendered group's files. An empty patch list (the baseline cells)
-/// touches nothing.
+/// touches nothing. EVERY patch must apply exactly once across the render — a count below the
+/// list's length is a bridge that silently patched nothing, and the writer refuses to write it.
 fn patch_back_gaps(rendered: &mut [superdsc::GroupInput], patches: &[GapPatch]) {
+    let mut applied = 0usize;
     for g in rendered {
         for (_file, contents) in &mut g.files {
             for p in patches {
-                patch_one(contents, p);
+                applied += usize::from(patch_one(contents, p));
             }
         }
     }
+    assert_eq!(
+        applied,
+        patches.len(),
+        "the bridge applied {applied} of {} patches — a gapped view went unpatched",
+        patches.len()
+    );
 }
 
 /// Patch ONE rendered file: locate the op's own allocate node for view `view` (the file's
-/// top-level key ends `_{op}`, the node is named `allocate-Tensor{view}_hbm`), assert it carried
-/// NO `backGapCore_` before (nothing applied twice) and occurs exactly once, then splice
-/// `"backGapCore_":{"out":{"-1":"<gap>"}},` immediately before the node's own `"coordinates_"`.
-/// A file that is not this op's, or holds no such node, is left untouched.
-fn patch_one(contents: &mut String, p: &GapPatch) {
+/// top-level key is `{li}_{op}`, so the key ends `_{op}":`; the node is named
+/// `allocate-Tensor{view}_hbm`), assert it carried NO `backGapCore_` before (nothing applied
+/// twice) and occurs exactly once, then splice
+/// `"backGapCore_":{"out":{"-1":"<gap>"}},` immediately before the node's own
+/// `"coordinates_"`. Returns whether this file held the patch's node. A file that is not this
+/// op's, or holds no such node, is left untouched.
+fn patch_one(contents: &mut String, p: &GapPatch) -> bool {
     let node = format!("\"name_\":\"allocate-Tensor{}_hbm\"", p.view);
-    let key = format!("\"_{}\":", p.op);
+    let key = format!("_{}\":", p.op);
     if !contents.contains(&key) || !contents.contains(&node) {
-        return; // not this op's file, or this op has no such view
+        return false; // not this op's file, or this op has no such view
     }
     let count = contents.matches(&node).count();
     assert_eq!(
@@ -610,6 +649,7 @@ fn patch_one(contents: &mut String, p: &GapPatch) {
     let insertion =
         format!("\"backGapCore_\":{{\"out\":{{\"-1\":\"{}\"}}}},", p.gap_elems);
     contents.insert_str(ins_at, &insertion);
+    true
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════

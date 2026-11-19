@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# ⭐ STEP-0 CARD RUNNER for the rope half-swap cells (`zz_rope_half_swap_cells.rs`, this
-# directory) — runs a cell on the card and checks it EXACT against a host model computed FROM
-# THE OP DEFINITION. Test tooling: nothing here ships.
+# ⭐ STEP-0 CARD RUNNER for the rope half-swap cells (written by
+# `../examples/rope_half_swap_cells.rs`) — runs a cell on the card and checks it EXACT against a
+# host model computed FROM THE OP DEFINITION. Test tooling: nothing here ships.
 #
 # usage: rope_half_swap_cells_run.sh <sweep-root> <tree-with-bundle_run_dev> <log> [cell …]
 #   <sweep-root>  the directory of cell dirs (each: group_0/, placements.json, cell.json)
 #   <tree>        a warm pod checkout's backends/spyre-hw, with target/release/examples/bundle_run_dev
-#                 built from the SAME commit the dump test ran at
+#                 built from the SAME commit the example writer ran at
 #   <log>         the verdict log (one line per cell, appended — resumable: a cell whose verdict
 #                 line is already in the log at the same sha AND group_0 md5 is skipped)
 #   [cell …]      zero or more cell DIRS to run (default: every cell dir, sorted)
@@ -62,7 +62,20 @@ fenced() {
 run_cell() {
   local cell=$1 name sha md5 skip; name=$(basename "$cell")
   [ -f "$cell/cell.json" ] || return 0
-  [ -d "$cell/group_0" ] || return 0   # MISSING-LOWERING: nothing to run
+  if [ ! -d "$cell/group_0" ]; then
+    # MISSING-LOWERING: the writer recorded the refusal in cell.json — a fact for the report,
+    # never a silent skip. (A halfswap cell cannot reach here: the writer refuses to write a
+    # sweep whose new-form cell will not lower, so every MISSING line is a fact about main.)
+    python3 - "$cell" >> "$LOG" <<"PY"
+import json, os, sys
+cell = sys.argv[1]
+c = json.load(open(cell + "/cell.json"))
+print("VERDICT %s MISSING form=%s mq=%d hd=%d heads=%d refusal=%s sha=%s md5=(no-bundle)"
+      % (os.path.basename(cell), c["form"], c["mq"], c["hd"], c["heads"],
+         repr(c.get("missing")), c["sha"]))
+PY
+    return
+  fi
   eval "$(python3 - "$cell" "$LOG" <<"PY"
 import hashlib, json, os, sys
 cell, log = sys.argv[1], sys.argv[2]
@@ -235,7 +248,7 @@ fi
 echo "$cell_list" | while read -r c; do run_cell "$c"; done
 
 # ⛔ A VERDICT OVER NOTHING FAILS: no DONE unless every cell run holds a PASS at ITS OWN STAMP.
-pass=0; firstwrong=0; notrun=0; fenced=0; total=0
+pass=0; firstwrong=0; notrun=0; fenced=0; missing=0; total=0
 for c in $cell_list; do
   total=$((total + 1))
   name=$(basename "$c")
@@ -251,11 +264,12 @@ PY
     FIRST-WRONG) firstwrong=$((firstwrong + 1));;
     NOT-RUN) notrun=$((notrun + 1));;
     FENCED) fenced=$((fenced + 1));;
+    MISSING) missing=$((missing + 1));;
   esac
 done
-echo "PASS=$pass FIRST-WRONG=$firstwrong NOT-RUN=$notrun FENCED=$fenced CELLS=$total"
-if [ "$pass" -lt "$total" ]; then
-  echo "ROPE_HALF_SWAP_RUN_INCOMPLETE — every run cell needs a PASS at its own stamp" >&2
+echo "PASS=$pass FIRST-WRONG=$firstwrong NOT-RUN=$notrun FENCED=$fenced MISSING=$missing CELLS=$total"
+if [ $((pass + missing)) -lt "$total" ]; then
+  echo "ROPE_HALF_SWAP_RUN_INCOMPLETE — every cell needs a PASS (or a reported MISSING) at its own stamp" >&2
   exit 1
 fi
 echo ROPE_HALF_SWAP_RUN_DONE
