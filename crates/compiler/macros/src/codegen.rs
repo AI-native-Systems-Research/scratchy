@@ -2706,14 +2706,14 @@ fn emit_fingerprint_check(
                         if shape.last() != Some(&#cols) {
                             return false;
                         }
-                        __EXPERT_INPUT_SEEN = true;
+                        __expert_input_seen = true;
                     }
                 }
             });
             quote! {
-                let mut __EXPERT_INPUT_SEEN = false;
+                let mut __expert_input_seen = false;
                 #(#probes)*
-                if !__EXPERT_INPUT_SEEN {
+                if !__expert_input_seen {
                     return false;
                 }
             }
@@ -10049,7 +10049,7 @@ mod fingerprint_tests {
         );
         assert!(
             squash.contains("\"backbone.layers.87.mixer.experts.0.up_proj.weight\"")
-                && squash.contains("__EXPERT_INPUT_SEEN"),
+                && squash.contains("__expert_input_seen"),
             "the width gate falls through to the per-expert spellings (Nemotron-3 Super's MTP \
              sidecar ships `experts.<e>.up_proj`, no pre-stacked `switch_mlp`): {ts}"
         );

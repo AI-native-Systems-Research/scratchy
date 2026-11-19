@@ -15,6 +15,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
+use scratchy_forward_compiler_macro::target::Named;
 use scratchy_target_metal::tape::ids::{
     BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, SourceIx,
     TqDecodeHeads,
@@ -235,10 +236,19 @@ impl ArenaOperands {
                 })
             })
             .collect::<Result<Vec<_>, BakeDefect>>()?;
+        // The arena alias and the typed operand helpers, each only where an operand uses it.
+        let consts = quote! { #(#consts)* };
+        let named = Named::of(&consts);
+        let arena = named
+            .has("__a")
+            .then(|| quote! { use super::__arena as __a; });
+        let typed = (["hosts", "slot"].into_iter())
+            .filter(|f| named.has(f))
+            .map(|f| quote::format_ident!("{f}"));
         Ok(quote! {
-            use super::__arena as __a;
-            use ::scratchy_target_metal::tape::typed::{hosts, slot};
-            #(#consts)*
+            #arena
+            #(use ::scratchy_target_metal::tape::typed::#typed;)*
+            #consts
         })
     }
 
@@ -358,7 +368,6 @@ impl CommandPool {
             sources: &self.sources,
         };
         let gemms = TypedGemms::of(&parts, typed, named, &reads, weight_markers)?;
-        let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
                 quote::format_ident!("{name}"),
@@ -509,27 +518,31 @@ impl CommandPool {
                 }
             }
         });
+        let body = quote! {
+            #markers
+            #operands
+            #gemm_helpers
+            #command_helper
+            #(#statics)*
+            pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
+                commands: &COMMANDS,
+                symbols: __ti::PartArray(&SYMBOLS),
+                constants: __ti::PartArray(&CONSTANTS),
+                dispatches: __ti::PartArray(&DISPATCHES),
+                bindings: __ti::PartArray(&BINDINGS),
+                gemms: __ti::PartArray(&GEMMS),
+                gemm_entries: __ti::PartArray(&GEMM_ENTRIES),
+                gemm_operands: __ti::PartArray(&GEMM_OPERANDS),
+                gates: __ti::PartArray(&GATES),
+            };
+            pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
+        };
+        let aliases = crate::const_tokens::alias_preamble(&Named::of(&body));
         let tokens = quote! {
             #[cfg(scratchy_target = "metal")]
             mod __tape_cmds {
                 #aliases
-                #markers
-                #operands
-                #gemm_helpers
-                #command_helper
-                #(#statics)*
-                pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
-                    commands: &COMMANDS,
-                    symbols: __ti::PartArray(&SYMBOLS),
-                    constants: __ti::PartArray(&CONSTANTS),
-                    dispatches: __ti::PartArray(&DISPATCHES),
-                    bindings: __ti::PartArray(&BINDINGS),
-                    gemms: __ti::PartArray(&GEMMS),
-                    gemm_entries: __ti::PartArray(&GEMM_ENTRIES),
-                    gemm_operands: __ti::PartArray(&GEMM_OPERANDS),
-                    gates: __ti::PartArray(&GATES),
-                };
-                pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
+                #body
             }
             #[cfg(scratchy_target = "metal")]
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
@@ -1156,10 +1169,11 @@ pub fn bake_module() -> TokenStream {
             };
         });
     }
+    let statics = quote! { #(#statics)* };
+    let aliases = crate::const_tokens::alias_preamble(&Named::of(&statics));
     quote! {
-        use ::scratchy_target_metal::tape::constants as __tc;
-        use ::scratchy_target_metal::tape::lowered as __tl;
-        #(#statics)*
+        #aliases
+        #statics
     }
 }
 
@@ -1562,12 +1576,15 @@ pub fn bake_bucket_tapes(
     // literal below names its type through `__tl`/`__tc`/`__ti` instead of spelling
     // `::scratchy_target_metal::tape::<module>::` on the order of a million times — see
     // `const_tokens::alias_preamble`.
-    let aliases = crate::const_tokens::alias_preamble();
+    let body = quote! {
+        #(#body_statics)*
+        &[ #(#entries)* ]
+    };
+    let aliases = crate::const_tokens::alias_preamble(&Named::of(&body));
     Ok(quote! {
         {
             #aliases
-            #(#body_statics)*
-            &[ #(#entries)* ]
+            #body
         }
     })
 }

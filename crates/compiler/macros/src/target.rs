@@ -129,6 +129,77 @@ impl ModelCx<'_> {
     }
 }
 
+/// What a body of emitted tokens names: every identifier, and every `A::b` path step. Read in
+/// one pass, so an emitter writes a `use` only where the code it guards needs it and the emitted
+/// code has no unused import.
+#[derive(Default)]
+pub struct Named {
+    idents: std::collections::HashSet<String>,
+    steps: std::collections::HashSet<(String, String)>,
+}
+
+impl Named {
+    /// What `body` names.
+    pub fn of(body: &TokenStream) -> Named {
+        let mut named = Named::default();
+        named.read(body.clone());
+        named
+    }
+
+    /// Adds what `body` names.
+    pub fn read(&mut self, body: TokenStream) {
+        use proc_macro2::TokenTree;
+        let tokens: Vec<TokenTree> = body.into_iter().collect();
+        for (i, t) in tokens.iter().enumerate() {
+            match t {
+                TokenTree::Group(g) => self.read(g.stream()),
+                TokenTree::Ident(a) => {
+                    self.idents.insert(a.to_string());
+                    if let [
+                        TokenTree::Punct(c1),
+                        TokenTree::Punct(c2),
+                        TokenTree::Ident(b),
+                        ..,
+                    ] = &tokens[i + 1..]
+                        && c1.as_char() == ':'
+                        && c2.as_char() == ':'
+                    {
+                        self.steps.insert((a.to_string(), b.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether it names `path`: an identifier (`hosts`), or a path step (`LinearLayer::load`).
+    pub fn has(&self, path: &str) -> bool {
+        match path.split_once("::") {
+            Some((a, b)) => self.steps.contains(&(a.to_string(), b.to_string())),
+            None => self.idents.contains(path),
+        }
+    }
+}
+
+/// An extension trait a target's loader brings into scope (`use <path> as _;`), and the calls it
+/// serves: `Type::method` for a path call, or a method name for a method-syntax call. A target
+/// states its traits as a const table of these.
+pub struct ExtTrait {
+    pub path: &'static str,
+    pub calls: &'static [&'static str],
+}
+
+/// `use <path> as _;` for each trait of `traits` one of whose calls `named` holds, and only those.
+pub fn ext_trait_imports(traits: &[ExtTrait], named: &Named) -> TokenStream {
+    let uses = (traits.iter())
+        .filter(|t| t.calls.iter().any(|c| named.has(c)))
+        .map(|t| {
+            let path: syn::Path = syn::parse_str(t.path).expect("an extension trait's path");
+            quote::quote! { use #path as _; }
+        });
+    quote::quote! { #(#uses)* }
+}
+
 /// One canonical model's emission on a target: its weights struct, and the items its module holds
 /// beside it.
 pub struct ModelEmission {
