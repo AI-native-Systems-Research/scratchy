@@ -1218,19 +1218,19 @@ pub fn compile_carrier(
                 }
             }
         };
-        // Per-variant `per_layer_kv_token_elems` arms — Some(vec![..])
-        // for hybrid-attention-geometry arches (Gemma4), None elsewhere.
+        // Per-variant `kv_layer_geometry` arms — Some(vec![..]) for an arch with
+        // sliding-window layers, None elsewhere.
         // Same per-variant dedup mechanics as gdn_runtime_config above.
-        let per_layer_kv_elems_tokens = {
+        let kv_layer_geometry_tokens = {
             let mut per_variant: std::collections::BTreeMap<
                 String,
                 Option<proc_macro2::TokenStream>,
             > = std::collections::BTreeMap::new();
             for sm in &solved {
                 let key = sm.mod_name.clone();
-                per_variant.entry(key).or_insert_with(|| {
-                    codegen::emit_per_layer_kv_token_elems_arm_body(&sm.fuf, sm.model)
-                });
+                per_variant
+                    .entry(key)
+                    .or_insert_with(|| codegen::emit_kv_layer_geometry_arm_body(&sm.fuf, sm.model));
             }
             if per_variant.values().all(|v| v.is_none()) {
                 proc_macro2::TokenStream::new()
@@ -1248,9 +1248,11 @@ pub fn compile_carrier(
                     })
                     .collect();
                 quote! {
-                    fn per_layer_kv_token_elems(
+                    fn kv_layer_geometry(
                         &self,
-                    ) -> ::core::option::Option<::std::vec::Vec<usize>> {
+                    ) -> ::core::option::Option<
+                        ::std::vec::Vec<::scratchy_forward_compiler::LayerKvGeometry>,
+                    > {
                         match self {
                             #(#arms)*
                         }
@@ -1521,7 +1523,7 @@ pub fn compile_carrier(
         };
         let gdn_runtime_config_tokens = quote! {
             #gdn_runtime_config_tokens
-            #per_layer_kv_elems_tokens
+            #kv_layer_geometry_tokens
             #spec_drafts_tokens
             #rope_on_read_tokens
             #head_tokens

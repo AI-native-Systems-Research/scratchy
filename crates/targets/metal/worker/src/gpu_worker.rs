@@ -685,13 +685,13 @@ fn gdn_draft_lanes(
 /// × [`METAL_KV_ELEM_BYTES`].
 fn kv_per_block_bytes(model: &dyn scratchy_target_metal::MetalWeights, block_size: usize) -> usize {
     let elt_bytes = METAL_KV_ELEM_BYTES;
-    // Hybrid-attention-geometry arches (Gemma4) size each layer by its
-    // own kv_heads*head_dim; uniform arches use the single product.
-    // Mis-summing here mis-sizes the scheduler's KV budget.
-    if let Some(per_layer) = model.per_layer_kv_token_elems() {
-        return per_layer
+    // An arch with sliding-window layers sizes each layer by its own KV heads × head_dim
+    // (`kv_layer_geometry`); every other arch uses the single product. Mis-summing here mis-sizes
+    // the scheduler's KV budget.
+    if let Some(layers) = model.kv_layer_geometry() {
+        return layers
             .iter()
-            .map(|e| e.saturating_mul(2).saturating_mul(block_size))
+            .map(|l| (l.num_kv_heads * l.head_size).saturating_mul(2 * block_size))
             .sum::<usize>()
             .saturating_mul(elt_bytes);
     }
@@ -740,34 +740,23 @@ fn kv_pool_tensors(
     }
 }
 
-/// vLLM group-shared hybrid KV layout (gemma4): infer the per-layer sliding
-/// mask from `per_layer_kv_token_elems` (the bigger-page class is the sliding
-/// class) and compute the grouping. This is `Some` only for the
-/// page-differentiated case — the SAME trigger the scheduler's `hybrid_kv` uses
-/// in `init`, so the two never disagree on group count. `None` → one physical
-/// tensor per layer (the uniform pool).
+/// vLLM group-shared hybrid KV layout: the model's sliding-window layers in groups of their own,
+/// computed from its compiled per-layer geometry (`kv_layer_geometry`) — the same geometry the
+/// scheduler's `hybrid_kv` is laid out from (`Worker::kv_layer_geometry`), so the two never
+/// disagree on group count. `None` → one physical tensor per layer (the uniform pool).
 fn hybrid_kv_layout(
     model: &dyn scratchy_target_metal::MetalWeights,
     block_size: scratchy_core_common::KvBlockTokens,
     elem_bytes: usize,
 ) -> Option<scratchy_core_config::HybridKvLayout> {
-    let elems = model.per_layer_kv_token_elems()?;
-    let max_e = *elems.iter().max()?;
-    let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
-        .iter()
-        .map(|&e| scratchy_core_config::LayerKvGeometry {
-            is_sliding: e == max_e,
-            // Page proxy: head_size 1 keeps the per-class page RATIO
-            // (only the ratio drives grouping + block_size scaling).
-            num_kv_heads: e,
-            head_size: 1,
-            head_size_v: None,
-            sliding_window: if e == max_e { Some(1) } else { None },
-        })
-        .collect();
     // `available` is irrelevant here — the pool sizes from the passed
     // `num_gpu_blocks`; callers only read the grouping fields.
-    scratchy_core_config::compute_hybrid_kv_layout(&geom, block_size, usize::MAX / 2, elem_bytes)
+    scratchy_core_config::compute_hybrid_kv_layout(
+        &model.kv_layer_geometry()?,
+        block_size,
+        usize::MAX / 2,
+        elem_bytes,
+    )
 }
 
 /// A uniform model built with TurboQuant: its KV lives in packed codes and the
@@ -6488,6 +6477,10 @@ impl Worker for MetalWorker {
         .then(|| target_block_bytes(model, block))
     }
 
+    fn kv_layer_geometry(&self) -> Option<Vec<scratchy_core_config::LayerKvGeometry>> {
+        self.model.as_deref()?.kv_layer_geometry()
+    }
+
     fn load_model(&mut self) -> ExecutorResult<()> {
         let _t_total = std::time::Instant::now();
         let t_resolve = std::time::Instant::now();
@@ -6962,12 +6955,14 @@ impl Worker for MetalWorker {
         let per_block_elems = (model.num_key_value_heads() as usize)
             * self.config.block_size.get()
             * (model.head_dim() as usize);
-        // Hybrid-attention-geometry arches (Gemma4): per-layer
-        // kv_heads*head_dim from the macro-emitted IR walk; each layer's
-        // buffers and pool chunks size to their own class.
-        let per_layer_block_elems: Option<Vec<usize>> = model
-            .per_layer_kv_token_elems()
-            .map(|v| v.iter().map(|e| e * self.config.block_size.get()).collect());
+        // An arch with sliding-window layers: each layer's KV heads × head_dim from the
+        // macro-emitted IR walk (`kv_layer_geometry`); each layer's buffers and pool chunks size
+        // to their own class.
+        let per_layer_block_elems: Option<Vec<usize>> = model.kv_layer_geometry().map(|v| {
+            v.iter()
+                .map(|l| l.num_kv_heads * l.head_size * self.config.block_size.get())
+                .collect()
+        });
         let elem_bytes = cache_dtype.size_bytes();
         let chunk_bytes_logical = blocks_per_chunk * per_block_elems * elem_bytes;
 
@@ -7487,11 +7482,11 @@ impl Worker for MetalWorker {
         // ONE record of the peak-activation estimate (`metal_peak_activation_estimate`), at the
         // most blocks a sequence can reach: max_model_len, and no more blocks than the pool holds —
         // those the KV budget buys beside every pool's scratch at its smallest rung (a larger
-        // rung's scratch only shrinks it), a block of each pool apiece. A hybrid-geometry pool,
-        // which the engine sizes by its own layout, takes the max_model_len bound.
+        // rung's scratch only shrinks it), a block of each pool apiece. A hybrid pool, which the
+        // engine sizes by its own layout, takes the max_model_len bound.
         let bs = self.config.block_size;
         let reach = match self.model.as_deref() {
-            Some(target) if target.per_layer_kv_token_elems().is_none() => {
+            Some(target) if hybrid_kv_layout(target, bs, METAL_KV_ELEM_BYTES).is_none() => {
                 let draft = self.draft_model.as_deref();
                 let draft_pb = (draft.filter(|_| self.draft_keeps_kv()))
                     .map_or(0, |d| draft_block_bytes(d, bs.get(), self.draft_scratch()));

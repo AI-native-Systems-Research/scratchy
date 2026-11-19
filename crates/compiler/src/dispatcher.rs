@@ -66,15 +66,13 @@ pub trait ScratchyWeights: Send + Sync {
         None
     }
 
-    /// Per-layer `kv_heads * head_dim` for hybrid-attention-geometry
-    /// arches whose sliding and global classes differ in dims
-    /// (Gemma4: sliding 8×256 = 2048 elems/token, global 1×512 =
-    /// 512). Drives per-layer KV pool sizing. The proc-macro emits
-    /// a per-arch override derived from the unrolled IR (which
-    /// layers carry `sliding_attention` vs `attention` tiles) and
-    /// the GLOBAL_* CanonicalParams; the default `None` keeps the
-    /// uniform pool layout (every same-dims arch, incl. Gemma2/3).
-    fn per_layer_kv_token_elems(&self) -> Option<Vec<usize>> {
+    /// Every layer's KV geometry for an arch with sliding-window layers: whether the layer slides
+    /// (and its window), its KV heads and head dim. The proc-macro emits it from the unrolled IR
+    /// (which layers carry sliding attention tiles) and the model's two attention classes. The KV
+    /// pool lays its layers out from it (`compute_hybrid_kv_layout`: the sliding layers in groups
+    /// of their own) and the scheduler allocates by it; the default `None` (no sliding layer)
+    /// keeps the one uniform pool.
+    fn kv_layer_geometry(&self) -> Option<Vec<scratchy_core_config::LayerKvGeometry>> {
         None
     }
 

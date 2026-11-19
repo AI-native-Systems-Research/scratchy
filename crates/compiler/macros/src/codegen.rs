@@ -8375,18 +8375,16 @@ pub fn emit_gdn_runtime_config_arm_body(
     })
 }
 
-/// Emit the body for the per-arch `ScratchyWeights::per_layer_kv_token_elems`
-/// override — `Some(vec![kv_heads_i * head_dim_i; num_layers])` for
-/// hybrid-attention-geometry arches whose sliding and global classes
-/// differ in dims (Gemma4: sliding 8×256, global 1×512).
+/// Emit the body for the per-arch `ScratchyWeights::kv_layer_geometry` override: every layer's
+/// KV geometry for an arch with sliding-window layers, whatever its two classes' dims — a sliding
+/// layer at the base class's KV heads and head dim and the model's `sliding_window`, a full layer
+/// at the global class's (`global_head_dim`, `num_global_key_value_heads`; the base where the
+/// config states none). `None` (trait default: one uniform pool) for an arch with no sliding layer.
 ///
-/// The per-layer class mask is read straight off the unrolled FUF: every
-/// `OpKind::SlidingAttention` tile carries its layer as the KvCache
-/// extern index, so the mask is exactly the per-layer dispatch the
-/// `#[forward]` `if` resolved at unroll time (IR-driven, not re-derived).
-/// Returns `None` (trait default, uniform pool) when the body has no
-/// sliding tiles OR when both classes share the same dims (Gemma2/3).
-pub fn emit_per_layer_kv_token_elems_arm_body(
+/// The per-layer class mask is read straight off the unrolled FUF: every sliding tile
+/// ([`OpKind::slides`]) carries its layer as the KvCache extern index, so the mask is exactly the
+/// per-layer dispatch the `#[forward]` `if` resolved at unroll time (IR-driven, not re-derived).
+pub fn emit_kv_layer_geometry_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
@@ -8394,7 +8392,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
-        if node.op != OpKind::SlidingAttention {
+        if !node.op.slides() {
             continue;
         }
         has_sliding = true;
@@ -8426,22 +8424,33 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
         .get("num_global_key_value_heads")
         .map(|&v| v as usize)
         .unwrap_or(num_kv);
-    if g_hd == head_dim && g_kv == num_kv {
-        // Sliding/global classes share dims (Gemma2/3) — uniform pool.
-        return None;
-    }
-    let elems = sliding
-        .iter()
-        .map(|&is_sliding| {
-            if is_sliding {
-                num_kv * head_dim
-            } else {
-                g_kv * g_hd
+    let window = (model.bounds.get("sliding_window").copied()).unwrap_or_else(|| {
+        panic!(
+            "{}: sliding-attention tiles, but its config states no `sliding_window`",
+            model.source_stem
+        )
+    }) as usize;
+    let layers = sliding.iter().map(|&is_sliding| {
+        let (kv_heads, head_size, sliding_window) = match is_sliding {
+            true => (
+                num_kv,
+                head_dim,
+                quote! { ::core::option::Option::Some(#window) },
+            ),
+            false => (g_kv, g_hd, quote! { ::core::option::Option::None }),
+        };
+        quote! {
+            ::scratchy_forward_compiler::LayerKvGeometry {
+                is_sliding: #is_sliding,
+                num_kv_heads: #kv_heads,
+                head_size: #head_size,
+                head_size_v: ::core::option::Option::None,
+                sliding_window: #sliding_window,
             }
-        })
-        .map(proc_macro2::Literal::usize_unsuffixed);
+        }
+    });
     Some(quote! {
-        ::core::option::Option::Some(::std::vec![ #(#elems),* ])
+        ::core::option::Option::Some(::std::vec![ #(#layers),* ])
     })
 }
 

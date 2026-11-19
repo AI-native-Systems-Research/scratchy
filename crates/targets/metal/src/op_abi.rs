@@ -224,7 +224,7 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
     const TWIN: Guarded<After> = g(After::PackedTwin, CodecDecode);
     KvCodecFacts {
         head_dims: CodecHeadDims::PowerOfTwoAtMost(512),
-        hybrid_class: AttnMask::Causal,
+        coded_class: AttnMask::Causal,
         after_writer: &[g(KvOperand::K, Codec), g(KvOperand::V, Codec)],
         decode: CodecAround {
             before: &[],

@@ -506,6 +506,7 @@ fn init_cache(
         kv_cache_dtype,
         worker.kv_block_bytes(block_size),
         worker.supports_hybrid_swa_kv(),
+        worker.kv_layer_geometry(),
     );
     // Fixed-size resident KV pool cap (a baked PAGED pool): the on-device pool is
     // exactly `nblk` blocks, so the scheduler's block allocator must not exceed it
@@ -1564,10 +1565,11 @@ fn initialize_core(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(SWA_PREFILL_CHUNK_CAP);
-    let max_num_batched_tokens = if hf_config.is_swa_hybrid() {
-        max_num_batched_tokens.min(swa_chunk_cap)
-    } else {
-        max_num_batched_tokens
+    // The pool's sliding groups, not the config: the cap holds wherever the scheduler runs the
+    // hybrid layout (`swa_hybrid_kv`, laid out from the worker's compiled per-layer geometry).
+    let max_num_batched_tokens = match swa_hybrid_kv {
+        Some(_) => max_num_batched_tokens.min(swa_chunk_cap),
+        None => max_num_batched_tokens,
     };
     // The concurrency the scheduler will actually admit under. A backend whose decode-width ladder is
     // BAKED (a fixed rung ladder) cannot grow it to cover `max_num_seqs`, so it
@@ -2133,13 +2135,13 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
 /// here — TurboQuant codes, or a hybrid model's shared page plus its TurboQuant
 /// global store — and the budget buys that many blocks.
 ///
-/// For uniform (non-SWA) models this is [`compute_num_blocks`] with no hybrid
-/// config. For `is_swa_hybrid` models (gemma4) it computes vLLM's
-/// group-shared layout: the shared-pool `num_blocks`
-/// (`available / page_size / group_size`, the SAME total VA as the uniform pool
-/// but holding `group_size`× more blocks since each physical tensor is shared
-/// across groups) and the per-group `(is_sliding, window, block_size)` the
-/// scheduler's hybrid allocator consumes. Returns `(num_blocks, hybrid_kv)`.
+/// For a model without sliding-window layers this is [`compute_num_blocks`] with no hybrid
+/// config. For one with them (`kv_layers`: the worker's compiled per-layer geometry, which its
+/// own pool is laid out from) it computes vLLM's group-shared layout: the shared-pool
+/// `num_blocks` (`available / page_size / group_size`, the SAME total VA as the uniform pool
+/// but holding `group_size`× more blocks since each physical tensor is shared across groups)
+/// and the per-group `(is_sliding, window, block_size)` the scheduler's hybrid allocator
+/// consumes. Returns `(num_blocks, hybrid_kv)`.
 #[allow(clippy::too_many_arguments)]
 fn compute_kv_blocks(
     available_bytes: usize,
@@ -2150,6 +2152,7 @@ fn compute_kv_blocks(
     kv_cache_dtype: &str,
     block_bytes: Option<usize>,
     allow_hybrid: bool,
+    kv_layers: Option<Vec<scratchy_core_config::LayerKvGeometry>>,
 ) -> (usize, Option<HybridKvConfig>) {
     let uniform = match block_bytes {
         Some(bytes) => blocks_within(available_bytes, bytes),
@@ -2168,7 +2171,7 @@ fn compute_kv_blocks(
     if !allow_hybrid {
         return (uniform, None);
     }
-    let Some(geom_tuples) = hf_config.hybrid_layer_geometry() else {
+    let Some(geom) = kv_layers else {
         return (uniform, None);
     };
     let elem_bytes = if kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8" {
@@ -2176,28 +2179,6 @@ fn compute_kv_blocks(
     } else {
         dtype_elem_bytes
     };
-    let geom: Vec<scratchy_core_config::LayerKvGeometry> = geom_tuples
-        .into_iter()
-        .map(|(is_sliding, num_kv_heads, head_size, sliding_window)| {
-            scratchy_core_config::LayerKvGeometry {
-                is_sliding,
-                num_kv_heads,
-                head_size,
-                head_size_v: None,
-                sliding_window,
-            }
-        })
-        .collect();
-    // Only the page-DIFFERENTIATED case (gemma4: sliding 8×256 vs full 2×512)
-    // takes the group-shared layout — that matches the worker's trigger
-    // (`per_layer_kv_token_elems`, emitted only when the classes' dims differ).
-    // Same-dims SWA (gemma2/3) stays on the uniform pool in BOTH the scheduler
-    // and the worker, so they never disagree on group count.
-    let distinct_pages: std::collections::HashSet<usize> =
-        geom.iter().map(|g| g.num_kv_heads * g.head_size).collect();
-    if distinct_pages.len() <= 1 {
-        return (uniform, None);
-    }
     match scratchy_core_config::compute_hybrid_kv_layout(
         &geom,
         block_size,
@@ -2206,9 +2187,8 @@ fn compute_kv_blocks(
     ) {
         Some(layout) => {
             // The WHOLE budget, at what a block really costs. The scheduler admits
-            // requests until blocks run out and recomputes a preempted one from
-            // token 0 (prefix caching is off on this layout), so this pool's size
-            // IS the concurrency the server sustains: a pool of one 32k sequence
+            // requests until blocks run out and recomputes a preempted one, so this
+            // pool's size IS the concurrency the server sustains: a pool of one 32k sequence
             // preempts 12 requests of 640 tokens and never fits 8 of 4.6k. The
             // pool commits lazily and the lowest-free-first allocator keeps live
             // block ids near the working set, so a large pool costs reserved VA;
@@ -2495,16 +2475,54 @@ mod tests {
         let group_size = 5;
         // ~ what a hybrid-SWA TurboQuant worker reports: the shared pages + the TurboQuant global store.
         let block_bytes = page * group_size + 297_472;
+        // The per-layer geometry the worker reports (`kv_layer_geometry`): a sliding layer at the
+        // base class's dims and the window, a full layer at the global class's.
+        let kv_layers = || {
+            let types = config
+                .layer_types()
+                .expect("gemma-4-26b states layer_types");
+            let at = |v: Option<usize>| v.expect("gemma-4-26b states both classes' dims");
+            Some(
+                (types.iter())
+                    .map(|t| {
+                        let sliding = t == "sliding_attention";
+                        scratchy_core_config::LayerKvGeometry {
+                            is_sliding: sliding,
+                            num_kv_heads: at(match sliding {
+                                true => config.num_kv_heads(),
+                                false => config.num_global_kv_heads(),
+                            }),
+                            head_size: at(match sliding {
+                                true => config.head_dim(),
+                                false => config.global_head_dim(),
+                            }),
+                            head_size_v: None,
+                            sliding_window: sliding.then(|| at(config.sliding_window())),
+                        }
+                    })
+                    .collect(),
+            )
+        };
         for budget in [3usize << 30, 22 << 30] {
             let bs = KvBlockTokens::new(16).expect("16 > 0");
-            let (num_blocks, hybrid) =
-                compute_kv_blocks(budget, bs, &config, 2, 0.9, "auto", Some(block_bytes), true);
+            let (num_blocks, hybrid) = compute_kv_blocks(
+                budget,
+                bs,
+                &config,
+                2,
+                0.9,
+                "auto",
+                Some(block_bytes),
+                true,
+                kv_layers(),
+            );
             let (pool, groups) = hybrid.expect("gemma4 takes the hybrid layout");
             assert_eq!(num_blocks, budget / block_bytes, "budget {budget}");
             assert_eq!(pool, num_blocks, "scheduler and worker size one pool");
             assert_eq!(groups.len(), 6, "1 full + 5 sliding groups");
             // No worker cost: the dense shared pages alone.
-            let (dense, _) = compute_kv_blocks(budget, bs, &config, 2, 0.9, "auto", None, true);
+            let (dense, _) =
+                compute_kv_blocks(budget, bs, &config, 2, 0.9, "auto", None, true, kv_layers());
             assert_eq!(dense, budget / (page * group_size), "budget {budget}");
         }
     }

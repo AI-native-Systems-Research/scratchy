@@ -25,6 +25,9 @@ scratchy-tensors = { path = "../tensors" }
 # The cfg-free `Instruction` enum + `WeightAccessors` trait live here so
 # the forward pipeline and every target share one neutral definition.
 scratchy-ir = { path = "ir" }
+# `LayerKvGeometry`: a compiled model states each layer's KV geometry (`kv_layer_geometry`) in the
+# type the KV pool layout and the scheduler take.
+scratchy-core-config = { workspace = true }
 # Backend-neutral weight-store container (`weights::GpuWeights<A>`) named by the
 # cross-arch load registry (`arch_registry`). The registry's generic `try_load`
 # is monomorphized over the concrete `GpuWeights<A>` at the worker call site;

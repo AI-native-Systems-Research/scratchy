@@ -29,7 +29,7 @@ extern crate scratchy_target_metal_models as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use scratchy_core_config::{LayerKvGeometry, compact_kv_layer_to_tensor, compute_hybrid_kv_layout};
+use scratchy_core_config::{compact_kv_layer_to_tensor, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value};
 use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
@@ -289,23 +289,15 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     };
     let elem_bytes = cache_dtype.size_bytes();
     let blocks_per_chunk = BLOCKS_PER_CHUNK as usize;
-    let per_layer_block_elems: Option<Vec<usize>> = model
-        .per_layer_kv_token_elems()
-        .map(|v| v.iter().map(|e| e * BLOCK_SIZE).collect());
+    let kv_layers = model.kv_layer_geometry();
+    let per_layer_block_elems: Option<Vec<usize>> = kv_layers.as_ref().map(|v| {
+        v.iter()
+            .map(|l| l.num_kv_heads * l.head_size * BLOCK_SIZE)
+            .collect()
+    });
     let block_bytes = kv_heads * BLOCK_SIZE * head_dim * elem_bytes;
-    // The page-differentiated (gemma-4) case only — the same trigger the scheduler uses.
-    let hybrid = model.per_layer_kv_token_elems().and_then(|elems| {
-        let max_e = *elems.iter().max()?;
-        let geom: Vec<LayerKvGeometry> = elems
-            .iter()
-            .map(|&e| LayerKvGeometry {
-                is_sliding: e == max_e,
-                num_kv_heads: e,
-                head_size: 1,
-                head_size_v: None,
-                sliding_window: (e == max_e).then_some(1),
-            })
-            .collect();
+    // The worker's layout (`hybrid_kv_layout`): the model's sliding layers in groups of their own.
+    let hybrid = kv_layers.and_then(|geom| {
         compute_hybrid_kv_layout(
             &geom,
             scratchy_core_common::KvBlockTokens::new(BLOCK_SIZE).expect("16 > 0"),
