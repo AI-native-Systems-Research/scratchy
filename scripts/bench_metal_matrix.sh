@@ -134,10 +134,11 @@ MODELS_ALL=(
   "nemotron-3-super-120b-a12b=mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit:mlx-affine-b4-g64-qembed" # 47.5 GB, latent MoE, Mamba-2 hybrid, OptiQ 2-bit
   "qwen3.6-35b-a3b=mlx-community/Qwen3.6-35B-A3B-4bit:mlx-affine-b4-g64-qembed"        # 20.4 GB, MoE, GDN hybrid
   "qwen3.5-122b-a10b=scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp:mlx-affine-b4-g64-qembed" # 48.3 GB, MoE, GDN hybrid, OptiQ 2-bit, MTP head
-  "granite-4.2-3b=ibm-granite/granite-4.2-3b-q4-mlx:mlx-affine-b4-g64-qembed"             # 2.1 GB, dense
+  "qwen2.5-3b=mlx-community/Qwen2.5-3B-Instruct-4bit:mlx-affine-b4-g64-qembed"           # 1.7 GB, dense
   "granite-4.2-8b=ibm-granite/granite-4.2-8b-q4-mlx:mlx-affine-b4-g64-qembed"             # 4.9 GB, dense
   "granite-4.2-30b=ibm-granite/granite-4.2-30b-q4-mlx:mlx-affine-b4-g64-qembed"           # 16.5 GB, dense
   # By name only (--models <stem>): the earlier rounds' models.
+  "granite-4.2-3b=ibm-granite/granite-4.2-3b-q4-mlx:mlx-affine-b4-g64-qembed"             # 2.1 GB, dense
   "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx-affine-b4-g64"         # 15.4 GB, MoE, sliding window
   "qwen3.6-27b=mlx-community/Qwen3.6-27B-4bit:mlx-affine-b4-g64-qembed"                # 16.1 GB, dense, GDN hybrid
   "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx-affine-b4-g64"                 # 18.4 GB, dense, sliding window
@@ -156,7 +157,7 @@ CLASSES=(
   "Sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
   "Mamba-2|nemotron-3-nano-30b-a3b|nemotron-3-super-120b-a12b"
   "Gated DeltaNet|qwen3.6-35b-a3b|qwen3.5-122b-a10b"
-  "Dense|granite-4.2-3b|granite-4.2-30b"
+  "Dense|qwen2.5-3b|granite-4.2-30b"
 )
 MODELS_SMALL="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ s _ <<<"${c}"; echo "${s}"; done | paste -sd, -)"
 MODELS_LARGE="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ _ l <<<"${c}"; echo "${l}"; done | paste -sd, -)"
@@ -366,7 +367,11 @@ SHAREGPT_URL="https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unf
 SHAREGPT_PATH="${HOME}/.cache/scr-bench/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
 # Thinking off for every dataset request, on every engine, so a short answer cap is not spent
 # inside a thought. A span query takes no template kwargs; its answers are counted apart.
-TASK_TEMPLATE_KWARGS='{"enable_thinking":false}'
+# gpt-oss reasons whatever enable_thinking says; its template reads reasoning_effort (default
+# medium), which no other model's template reads. On 16 MuSiQue tasks (base M5, 1 user) medium
+# took 48 s an answer and ran up to 8,192 tokens; low took 5.7 s and at most 1,286, with 6 right
+# against medium's 5, so a 200-task cell takes minutes rather than hours.
+TASK_TEMPLATE_KWARGS='{"enable_thinking":false,"reasoning_effort":"low"}'
 cell_scratchy=""         # set while scratchy's own sweep runs: its workloads too
 SCALE_CONC="1,2,4"
 SCALE_INPUT="128,512,2048,8192"
