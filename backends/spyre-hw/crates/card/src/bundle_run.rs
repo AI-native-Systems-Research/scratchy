@@ -129,6 +129,57 @@ fn restick(bytes: &[u8], rows: usize, cols: usize, to_device: bool) -> Vec<u8> {
     out
 }
 
+/// ⛔⛔⛔ REFUSED, NOT ASSUMED ROW-MAJOR. A tensor spanning more than one 64-lane stick is
+/// addressed STICK-MAJOR by the descriptors (see `dev_order`), and binding or reading it
+/// row-major returns a fluent, plausible, WRONG answer — measured 0.0193 within_2pct on
+/// rmsnorm_granite, with only the `(r, r)` diagonal tiles exact and nothing zeroed to give it
+/// away. So the row count is STATED per tensor (`stick:tN=<rows>`, collected by the staging
+/// path) and a tensor wide enough for the question to matter must state it. `stick:tN=1` is
+/// the identity, and saying it out loud is the point. ONE statement, read by the input binds
+/// and the read-backs alike.
+fn layout_of(
+    sticks: &BTreeMap<u32, u64>,
+    tid: u32,
+    size: u64,
+    what: &str,
+) -> Result<Option<(usize, usize)>> {
+    let elems = size / 2;
+    match sticks.get(&tid) {
+        Some(&rows) => {
+            // `is_multiple_of` rather than `%`, and not only because clippy says so: it is TOTAL
+            // where `%` is not. `stick:t0=0` parses, `rows > elems` does not catch it, and
+            // `elems % 0` is a divide-by-zero PANIC where this refuses by name — `0` is a
+            // multiple of nothing but `0`, so a non-empty placement bails with the message below.
+            if rows > elems || !elems.is_multiple_of(rows) {
+                bail!(
+                    "stick:t{tid}={rows}: the placement holds {elems} fp16 elements, which do \
+                     not divide into {rows} rows"
+                );
+            }
+            let cols = elems / rows;
+            if rows > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as u64) {
+                bail!(
+                    "stick:t{tid}={rows}: {cols} columns is not a whole number of \
+                     {FP16_ELEMS_PER_STICK}-lane sticks, so the stick-major map would leave holes \
+                     it cannot fill"
+                );
+            }
+            Ok((rows > 1).then_some((rows as usize, cols as usize)))
+        }
+        None if elems > FP16_ELEMS_PER_STICK as u64 => bail!(
+            "t{tid} ({what}) spans {elems} fp16 elements — more than one \
+             {FP16_ELEMS_PER_STICK}-lane stick — and no \
+             `stick:t{tid}=<rows>` states the row count the descriptors address it with. The device \
+             layout is stick-major, (c/{FP16_ELEMS_PER_STICK})·rows·{STICK_BYTES} + \
+             r·{STICK_BYTES} + (c%{FP16_ELEMS_PER_STICK})·2, so binding this row-major \
+             would return a wrong answer that looks right: MEASURED 0.0193 within_2pct on \
+             rmsnorm_granite, exactly the (r, r) diagonal tiles correct. Pass `stick:t{tid}=1` if \
+             the tensor really is one row — that map is the identity."
+        ),
+        None => Ok(None),
+    }
+}
+
 /// `stick:t<id>=<rows>` — the ROW COUNT the descriptors address tensor `<id>` with. The column count
 /// follows from the placement (`size/2/rows`), so the caller states the one number it cannot derive.
 fn split_stick(s: &str) -> Result<(u32, u64)> {
@@ -341,21 +392,35 @@ use ktir_superdsc::reserved_tids::RESERVED_TID_FLOOR;
 type Alone = ktir_superdsc::collective::TpWorld<1>;
 
 pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
-    run_with_timing(dir, input, output, 0)
+    with_card(|card| run_loaded(dir, input, output, card))
 }
 
-/// [`run`] with the timing leg armed: after the correctness launch, `timing_runs` more launches
-/// of the SAME bundle, each timed launch-to-completion (`run_prefix_only` is synchronous end to
-/// end — launch, then stream sync), the median printed as a `TIME` line. Every timed iteration
-/// re-runs the launch's own input refill, and the step-0 rope cells stage both forms IDENTICALLY
-/// by construction, so that refill rides both sides of the A/B equally. The clock of record for
-/// the rope half-swap sweep (`tests/rope_half_swap_cells_run.sh --time`).
-pub fn run_with_timing(
-    dir: &Path,
-    input: &[String],
-    output: &[String],
-    timing_runs: u32,
+/// ⭐ THE NOISE-PROTOCOL A/B (harness-only, `bundle_run_dev --abba`): TWO bundles staged in ONE
+/// process over ONE card — `rounds` ABBA blocks (A, B, B, A), each launch timed with NO refill
+/// ([`crate::superdsc_exec::Executor::launch_timed`]: submit → stream sync, the inputs already
+/// resident), one `TIME-SAMPLE side=A|B round=<r> ns=<n>` line per launch. Interleaving in one
+/// process is the point: drift and thermals hit both sides of the pair equally, never one
+/// form's block before the other's. An A/A pair (both dirs copies of one bundle) is the same
+/// entry — its A−B delta IS the noise floor for that shape. Each side is warmed by one full
+/// `run_prefix_only` (which also stages the inputs) before any timed launch. The two sides take
+/// their OWN input lists: the rope cells stage the same placed tensors in every form, but the
+/// forms' op inputs differ (halfswap4 binds the signed sin' table main never reads), and the
+/// timed launches must not depend on the other side's staging.
+pub fn run_abba(
+    dir_a: &Path,
+    dir_b: &Path,
+    input_a: &[String],
+    input_b: &[String],
+    rounds: u32,
 ) -> Result<()> {
+    with_card(|card| abba_loaded(dir_a, dir_b, input_a, input_b, rounds, card))
+}
+
+/// One card, one world of one, opened for whatever body the caller runs over it — the ONE
+/// statement of the serve-span law, shared by the one-shot run and the ABBA pair alike.
+fn with_card<R>(
+    body: impl FnOnce(&crate::runtime::CardRuntime<'_, Alone>) -> Result<R>,
+) -> Result<R> {
     // One kernel on one card: a world of one's card, the first senlib enumerates.
     //
     // ⭐ THE SERVE SPAN OF A ONE-SHOT RUN IS THE RUN ITSELF: the scope below wraps every launch
@@ -374,20 +439,65 @@ pub fn run_with_timing(
             .build_all(&cards, scope)
             .map_err(|e| anyhow!("{e}"))?
             .into_first();
-        run_loaded(dir, input, output, timing_runs, &card)
+        body(&card)
     })
 }
 
-/// The run's body over its card — everything [`run`] does once the card's runtime is built: the
-/// parse of the producer's launch map and the inputs, the executor's load, staging, launches
-/// and read-backs.
-fn run_loaded(
-    dir: &Path,
-    input: &[String],
-    output: &[String],
-    timing_runs: u32,
+/// The ABBA body over its card: stage both bundles (each with its own inputs), warm both, then
+/// interleave the timed launches.
+fn abba_loaded(
+    dir_a: &Path,
+    dir_b: &Path,
+    input_a: &[String],
+    input_b: &[String],
+    rounds: u32,
     card: &crate::runtime::CardRuntime<'_, Alone>,
 ) -> Result<()> {
+    println!(
+        "ABBA a={} b={} rounds={rounds}",
+        dir_a.display(),
+        dir_b.display()
+    );
+    let mut a = load_staged(dir_a, input_a, card)?;
+    let mut b = load_staged(dir_b, input_b, card)?;
+    // The warm-up: one full launch each — this also refills the staged inputs, which every
+    // timed launch below then recomputes over (the rope ops never write their inputs).
+    a.exec.run_prefix_only()?;
+    b.exec.run_prefix_only()?;
+    let mut stdout = std::io::BufWriter::new(std::io::stdout());
+    use std::io::Write;
+    for r in 0..rounds {
+        // ABBA: the block starts and ends on the same side, so a slow drift across the block
+        // cancels to first order in the A−B delta.
+        for side in ["A", "B", "B", "A"] {
+            let ex = if side == "A" { &mut a } else { &mut b };
+            let d = ex.exec.launch_timed()?;
+            writeln!(stdout, "TIME-SAMPLE side={side} round={r} ns={}", d.as_nanos())?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// One bundle staged for launch — the executor over its loaded code, with the launch map and
+/// the input-side markers the read-backs need. Built by [`load_staged`], the ONE statement of
+/// the staging law: the one-shot run and each side of the ABBA pair stage through it alike.
+struct StagedBundle<'a, 'c> {
+    exec: crate::superdsc_exec::Executor<'a, 'c, Alone>,
+    pf: PlacementsFile,
+    sticks: BTreeMap<u32, u64>,
+    out_ids: Vec<u32>,
+}
+
+/// Stage one bundle over its card — everything up to (and including) the input binds: the
+/// producer's launch map, dxp's own artifacts, the executor's load, the weight/const staging,
+/// `prepare`, the segment zeroing, the input binds. Returns the executor ready to launch
+/// (`run_prefix_only` / `launch_timed`) beside the maps the read-backs need.
+fn load_staged(
+    dir: &Path,
+    input: &[String],
+    card: &crate::runtime::CardRuntime<'_, Alone>,
+) -> Result<StagedBundle<'_, '_>> {
     // ── The producer's launch map ──
     let pf: PlacementsFile = serde_json::from_str(
         &std::fs::read_to_string(dir.join("placements.json")).with_context(|| {
@@ -649,72 +759,6 @@ fn run_loaded(
             Ok(tid)
         })
         .collect::<Result<_>>()?;
-    // `synth:<name>[@rows]=<path>`. The optional `@rows` is the same statement `stick:tN=<rows>`
-    // makes for a bound tensor, said for a synthetic — which has no tid to key that map by.
-    let synth_out: Vec<(String, Option<u64>, String)> = output
-        .iter()
-        .filter_map(|o| o.strip_prefix("synth:"))
-        .map(|o| {
-            let (lhs, path) = o.split_once('=').ok_or_else(|| {
-                anyhow!("--output wants `synth:<name>[@rows]=<path>`, got `synth:{o}`")
-            })?;
-            let (name, rows) = match lhs.split_once('@') {
-                Some((n, r)) => (
-                    n.to_string(),
-                    Some(
-                        r.parse::<u64>()
-                            .with_context(|| format!("synth:{lhs}: `{r}` is not a row count"))?,
-                    ),
-                ),
-                None => (lhs.to_string(), None),
-            };
-            Ok((name, rows, path.to_string()))
-        })
-        .collect::<Result<_>>()?;
-    let outputs: BTreeMap<u32, String> = output
-        .iter()
-        .filter(|o| !o.starts_with("synth:") && !o.starts_with("raw:"))
-        .map(|s| split_binding(s, "output"))
-        .collect::<Result<_>>()?;
-    // `raw:t<id>=<path>` on the OUTPUT side — the readback twin of the input `raw:t<id>` marker.
-    // `read_tensor` runs every byte through `sen_to_ieee_bytes`, the SEN169→IEEE fp16 codec, so an
-    // int32 tensor read that way comes back MANGLED — each 4-byte entry decoded as two fp16 values
-    // and re-encoded, a different, valid, arbitrary pair of numbers (the mirror of what the input
-    // marker's own doc records an fp16 pass doing to an index table on the way IN). A kernel whose
-    // output IS an index — the gather class, argmax's token id — therefore has no honest readback
-    // without this spelling: the bytes are taken verbatim out of the placement's segment, no codec,
-    // no stick permutation.
-    let raw_outs: std::collections::BTreeMap<u32, String> = output
-        .iter()
-        .filter(|o| o.starts_with("raw:"))
-        .map(|s| {
-            let body = s.strip_prefix("raw:").expect("filtered on the prefix");
-            split_binding(body, "output")
-        })
-        .collect::<Result<_>>()?;
-
-    // ⛔ THE SAME COLLISION LAW THE BIND SIDE STATES, for the same reason: a tensor both
-    // `--output t7=a.bin` and `--output raw:t7=b.bin` names would write two files from two
-    // different decoders and nothing here could know which the caller meant to compare.
-    for tid in raw_outs.keys() {
-        if outputs.contains_key(tid) {
-            bail!(
-                "raw:t{tid}: t{tid} is also a plain `--output` — two statements of one readback, \
-                 one through the fp16 codec and one verbatim, and nothing here can know which the \
-                 caller meant to compare"
-            );
-        }
-        // The stick-major map is defined over 2-byte fp16 elements (`dev_order`, `restick`). A raw
-        // output is not fp16 — the only one today is an int32 index stick — so permuting it would
-        // shuffle half-words across entry boundaries.
-        if sticks.contains_key(tid) {
-            bail!(
-                "raw:t{tid} and stick:t{tid}: the stick-major map permutes 2-byte fp16 elements, \
-                 and a raw output is not fp16. Applying it to an int32 stick would swap half-words \
-                 between entries and yield numbers nobody asked for."
-            );
-        }
-    }
 
     // ⛔⛔⛔ A `raw:` MARKER THAT NAMES NOTHING IS EXACTLY THE SILENT WRONG ANSWER IT EXISTS TO STOP.
     // `raw:` only changes how a tensor is STAGED, so a typo'd or stale id leaves the buffer on the
@@ -779,49 +823,8 @@ fn run_loaded(
         }
     }
 
-    // ⛔⛔⛔ REFUSED, NOT ASSUMED ROW-MAJOR. A tensor spanning more than one 64-lane stick is
-    // addressed STICK-MAJOR by the descriptors (see `dev_order`), and binding or reading it
-    // row-major returns a fluent, plausible, WRONG answer — measured 0.0193 within_2pct on
-    // rmsnorm_granite, with only the `(r, r)` diagonal tiles exact and nothing zeroed to give it
-    // away. So the row count is STATED per tensor and a tensor wide enough for the question to
-    // matter must state it. `stick:tN=1` is the identity, and saying it out loud is the point.
-    let layout_of = |tid: u32, size: u64, what: &str| -> Result<Option<(usize, usize)>> {
-        let elems = size / 2;
-        match sticks.get(&tid) {
-            Some(&rows) => {
-                // `is_multiple_of` rather than `%`, and not only because clippy says so: it is TOTAL
-                // where `%` is not. `stick:t0=0` parses, `rows > elems` does not catch it, and
-                // `elems % 0` is a divide-by-zero PANIC where this refuses by name — `0` is a
-                // multiple of nothing but `0`, so a non-empty placement bails with the message below.
-                if rows > elems || !elems.is_multiple_of(rows) {
-                    bail!(
-                        "stick:t{tid}={rows}: the placement holds {elems} fp16 elements, which do \
-                         not divide into {rows} rows"
-                    );
-                }
-                let cols = elems / rows;
-                if rows > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as u64) {
-                    bail!(
-                        "stick:t{tid}={rows}: {cols} columns is not a whole number of \
-                         {FP16_ELEMS_PER_STICK}-lane sticks, so the stick-major map would leave holes \
-                         it cannot fill"
-                    );
-                }
-                Ok((rows > 1).then_some((rows as usize, cols as usize)))
-            }
-            None if elems > FP16_ELEMS_PER_STICK as u64 => bail!(
-                "t{tid} ({what}) spans {elems} fp16 elements — more than one \
-                 {FP16_ELEMS_PER_STICK}-lane stick — and no \
-                 `stick:t{tid}=<rows>` states the row count the descriptors address it with. The device \
-                 layout is stick-major, (c/{FP16_ELEMS_PER_STICK})·rows·{STICK_BYTES} + \
-                 r·{STICK_BYTES} + (c%{FP16_ELEMS_PER_STICK})·2, so binding this row-major \
-                 would return a wrong answer that looks right: MEASURED 0.0193 within_2pct on \
-                 rmsnorm_granite, exactly the (r, r) diagonal tiles correct. Pass `stick:t{tid}=1` if \
-                 the tensor really is one row — that map is the identity."
-            ),
-            None => Ok(None),
-        }
-    };
+    // ⛔⛔⛔ REFUSED, NOT ASSUMED ROW-MAJOR — the stick-major row/col map is `layout_of`, stated
+    // once at module level for the input binds and the read-backs alike.
 
     let mut exec = crate::superdsc_exec::Executor::load(
         card,
@@ -932,7 +935,7 @@ fn run_loaded(
                 bytes.len()
             );
         }
-        let bytes = match layout_of(*tid, want, "weight")? {
+        let bytes = match layout_of(&sticks, *tid, want, "weight")? {
             Some((rows, cols)) => restick(&bytes, rows, cols, true),
             None => bytes,
         };
@@ -1046,7 +1049,7 @@ fn run_loaded(
                 bytes.len()
             );
         }
-        let bytes = match layout_of(*tid, want, "input")? {
+        let bytes = match layout_of(&sticks, *tid, want, "input")? {
             Some((rows, cols)) => restick(&bytes, rows, cols, true),
             None => bytes,
         };
@@ -1058,6 +1061,97 @@ fn run_loaded(
     // shadow: without this the output segment's shadow is empty, `d2h_seg_clamped` brings back 0
     // bytes, and `read_tensor` returns an EMPTY buffer from a launch that otherwise reports success.
     // Measured exactly that way before this call existed.
+    Ok(StagedBundle {
+        exec,
+        pf,
+        sticks,
+        out_ids,
+    })
+}
+
+/// The run's body over its card — everything [`run`] does once the card's runtime is built: the
+/// staging ([`load_staged`]), the launch, and the read-backs.
+fn run_loaded(
+    dir: &Path,
+    input: &[String],
+    output: &[String],
+    card: &crate::runtime::CardRuntime<'_, Alone>,
+) -> Result<()> {
+    let StagedBundle {
+        exec,
+        pf,
+        sticks,
+        out_ids,
+    } = load_staged(dir, input, card)?;
+    let mut exec = exec;
+
+    // ── The output side ──
+    // `synth:<name>[@rows]=<path>`. The optional `@rows` is the same statement `stick:tN=<rows>`
+    // makes for a bound tensor, said for a synthetic — which has no tid to key that map by.
+    let synth_out: Vec<(String, Option<u64>, String)> = output
+        .iter()
+        .filter_map(|o| o.strip_prefix("synth:"))
+        .map(|o| {
+            let (lhs, path) = o.split_once('=').ok_or_else(|| {
+                anyhow!("--output wants `synth:<name>[@rows]=<path>`, got `synth:{o}`")
+            })?;
+            let (name, rows) = match lhs.split_once('@') {
+                Some((n, r)) => (
+                    n.to_string(),
+                    Some(
+                        r.parse::<u64>()
+                            .with_context(|| format!("synth:{lhs}: `{r}` is not a row count"))?,
+                    ),
+                ),
+                None => (lhs.to_string(), None),
+            };
+            Ok((name, rows, path.to_string()))
+        })
+        .collect::<Result<_>>()?;
+    let outputs: BTreeMap<u32, String> = output
+        .iter()
+        .filter(|o| !o.starts_with("synth:") && !o.starts_with("raw:"))
+        .map(|s| split_binding(s, "output"))
+        .collect::<Result<_>>()?;
+    // `raw:t<id>=<path>` on the OUTPUT side — the readback twin of the input `raw:t<id>` marker.
+    // `read_tensor` runs every byte through `sen_to_ieee_bytes`, the SEN169→IEEE fp16 codec, so an
+    // int32 tensor read that way comes back MANGLED — each 4-byte entry decoded as two fp16 values
+    // and re-encoded, a different, valid, arbitrary pair of numbers (the mirror of what the input
+    // marker's own doc records an fp16 pass doing to an index table on the way IN). A kernel whose
+    // output IS an index — the gather class, argmax's token id — therefore has no honest readback
+    // without this spelling: the bytes are taken verbatim out of the placement's segment, no codec,
+    // no stick permutation.
+    let raw_outs: std::collections::BTreeMap<u32, String> = output
+        .iter()
+        .filter(|o| o.starts_with("raw:"))
+        .map(|s| {
+            let body = s.strip_prefix("raw:").expect("filtered on the prefix");
+            split_binding(body, "output")
+        })
+        .collect::<Result<_>>()?;
+
+    // ⛔ THE SAME COLLISION LAW THE BIND SIDE STATES, for the same reason: a tensor both
+    // `--output t7=a.bin` and `--output raw:t7=b.bin` names would write two files from two
+    // different decoders and nothing here could know which the caller meant to compare.
+    for tid in raw_outs.keys() {
+        if outputs.contains_key(tid) {
+            bail!(
+                "raw:t{tid}: t{tid} is also a plain `--output` — two statements of one readback, \
+                 one through the fp16 codec and one verbatim, and nothing here can know which the \
+                 caller meant to compare"
+            );
+        }
+        // The stick-major map is defined over 2-byte fp16 elements (`dev_order`, `restick`). A raw
+        // output is not fp16 — the only one today is an int32 index stick — so permuting it would
+        // shuffle half-words across entry boundaries.
+        if sticks.contains_key(tid) {
+            bail!(
+                "raw:t{tid} and stick:t{tid}: the stick-major map permutes 2-byte fp16 elements, \
+                 and a raw output is not fp16. Applying it to an int32 stick would swap half-words \
+                 between entries and yield numbers nobody asked for."
+            );
+        }
+    }
 
     // ⛔ NOT `run_full`: its own doc says "only a ROLLED bundle has those seams, so an unrolled one
     // reports `false`" — and it reports it by returning `Ok(false)` having launched NOTHING, which is
@@ -1065,27 +1159,6 @@ fn run_loaded(
     // `run_prefix_only` takes `ListSel::Body` for an unrolled bundle, which is what a single-kernel
     // bundle IS: one body, no prefix/suffix seams, no per-layer advance.
     exec.run_prefix_only()?;
-
-    // ⭐ THE TIMING LEG (harness-only, armed by `--time <n>`): `timing_runs` more launches of the
-    // same bundle, each timed launch-to-completion. An ODD count keeps the median a real sample.
-    // The read-backs below still read the LAST launch's outputs — every iteration computes the
-    // same values, so the correctness compare is unaffected.
-    if timing_runs > 0 {
-        let mut samples: Vec<u128> = Vec::with_capacity(timing_runs as usize);
-        for _ in 0..timing_runs {
-            let t0 = std::time::Instant::now();
-            exec.run_prefix_only()?;
-            samples.push(t0.elapsed().as_nanos());
-        }
-        samples.sort_unstable();
-        println!(
-            "TIME runs={} median_ns={} min_ns={} max_ns={}",
-            samples.len(),
-            samples[samples.len() / 2],
-            samples.first().copied().unwrap_or(0),
-            samples.last().copied().unwrap_or(0)
-        );
-    }
 
     // ⭐ ALSO READ THE INTERMEDIATES. Which STAGE diverges is not visible in the final tensor, and the
     // producer's `placements.json` now lists every synthetic with its segment and offset — so a
@@ -1164,7 +1237,7 @@ fn run_loaded(
             ktir_superdsc::place::PlaceId::Act(*tid),
             (p.size / 2) as usize,
         )?;
-        let bytes = match layout_of(*tid, p.size, "output")? {
+        let bytes = match layout_of(&sticks, *tid, p.size, "output")? {
             Some((rows, cols)) => restick(&bytes, rows, cols, false),
             None => bytes,
         };

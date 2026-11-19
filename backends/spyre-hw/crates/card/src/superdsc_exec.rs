@@ -5708,6 +5708,29 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
     }
 
+    /// ⭐ ONE TIMED LAUNCH OF THE ALREADY-STAGED BUNDLE, NO REFILL — the rope half-swap A/B's
+    /// noise-protocol clock (harness-only, `bundle_run_dev --abba`). The same selection
+    /// [`Executor::run_prefix_only`] launches, the same stream sync — but NOT
+    /// `refill_activations`: the caller staged the inputs once and the rope ops never write
+    /// their inputs, so every launch recomputes identical outputs over resident bytes and the
+    /// measured span is the launch itself (submit → completion), never the H2D staging.
+    pub fn launch_timed(&mut self) -> Result<std::time::Duration> {
+        if !self.prepared {
+            bail!("launch_timed before prepare");
+        }
+        let zero = [0u64; NUM_SEGMENTS];
+        let (sel, bank) = match self.rolled.as_ref() {
+            Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
+            None => (ListSel::Body(0), 0),
+        };
+        let t0 = std::time::Instant::now();
+        self.launch_ops(sel, zero, bank)?;
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("launch_timed sync: {e}"))?;
+        Ok(t0.elapsed())
+    }
+
     /// The FULL forward for the selftest: prefix → body×iters (per-layer advance + in-place hidden
     /// threading) → suffix, leaving every tid resident. Exercises what prefix-only cannot: the
     /// per-layer weight/KV advance, the body→suffix seam, and the suffix ops (final norm + tiled

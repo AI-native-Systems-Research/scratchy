@@ -5,15 +5,21 @@
 //! Test tooling: nothing here ships, and the only shipped code it calls is the emission the bake
 //! calls.
 //!
-//! ## The two forms, one cell each
-//! * **halfswap** — the NEW form: `rot` built by TWO signed half-moves over `[mb, out, y]` views
+//! ## The three forms, one cell each
+//! * **halfswap** — the 5-op form: `rot` built by TWO signed half-moves over `[mb, out, y]` views
 //!   of the `[mq, total]` RowBlocked plane (each view sweeps `hd/2` columns of every head under a
 //!   declared extent of `hd` — the stick-axis back gap, card-proven by this sweep), then the
 //!   three whole-tensor legs `xc = x·cos`, `rs = rot·sin`, `out = xc + rs` exactly as `rope_at`
 //!   emits them. The pairing and the sign are READ from `rope_p_entry` (the one statement), never
 //!   restated; the gap is derived from the cell's own stated extents by ONE function.
+//! * **halfswap4** — the 4-op form, NO rot tensor: `xc = x·cos` (whole-tensor), then TWO
+//!   half-multiplies writing the two halves of ONE `rs` through the same gapped views —
+//!   `rs_lo = x_hi · sin'_lo`, `rs_hi = x_lo · sin'_hi` — then `out = xc + rs`. `sin'` is the
+//!   SIGNED table (`sign·sin`): its per-column sign is read from `rope_p_entry` by this writer
+//!   (called per column; `±1` is never typed) and carried in `cell.json` for the runner's fill.
+//!   The host reference is unchanged — `out = x·cos + rotate_half(x)·sin` over UNSIGNED sin.
 //! * **main** — `rope_at` verbatim: the `[hd, hd]` P-matmul rotate (slab arm at `mq == 1`,
-//!   per-head arm above) plus the same three legs. The baseline the new form must match.
+//!   per-head arm above) plus the same three legs. The baseline the new forms must match.
 //!
 //! ## The bridge (opus2-sanctioned 2026-11-19, harness-only; it DIES with A1's `BackGap` type)
 //! The emitter states `backGapCore_: None` (`emit/mod.rs`), so the gapped views' `backGapCore_` is
@@ -76,11 +82,13 @@ impl Geo {
     }
 }
 
-/// The two forms the sweep states.
+/// The three forms the sweep states.
 #[derive(Clone, Copy, PartialEq)]
 enum Form {
-    /// The reference's form: two signed half-moves over gapped views + the three legs.
+    /// The 5-op form: two signed half-moves over gapped views + the three legs.
     HalfSwap,
+    /// The 4-op form: two half-multiplies over gapped views into one rs, no rot tensor.
+    HalfSwap4,
     /// `rope_at` verbatim — the P-matmul rotate.
     Main,
 }
@@ -89,19 +97,22 @@ impl Form {
     fn tag(self) -> &'static str {
         match self {
             Form::HalfSwap => "halfswap",
+            Form::HalfSwap4 => "halfswap4",
             Form::Main => "main",
         }
     }
 }
 
-/// The bundle's tensors, one numbering for every cell: x, cos, sin, out are the `[mq, total]`
-/// plane; p is the baseline's `[hd, hd]` rope-p class (placed and staged in BOTH forms, so the
-/// two cells' staging is identical and the runner's fills never branch on the form).
+/// The bundle's tensors, one numbering for every cell: x, cos, sin, sin', out are the
+/// `[mq, total]` plane; p is the baseline's `[hd, hd]` rope-p class. p AND sin' are placed and
+/// staged in EVERY form (sin' is halfswap4's own input; the others never read it), so every
+/// cell's staging is identical and the runner's fills never branch on the form.
 const X_TID: u32 = 301;
 const COS_TID: u32 = 302;
 const SIN_TID: u32 = 303;
 const OUT_TID: u32 = 304;
 const P_TID: u32 = 305;
+const SINS_TID: u32 = 306;
 
 /// The sweep's own manifest row — everything the runner's fills, staging and host model need.
 #[derive(serde::Serialize)]
@@ -116,8 +127,17 @@ struct Cell {
     sin_tid: u32,
     out_tid: u32,
     p_tid: u32,
-    /// The rotate-half synthetic's name (`t{out}_rot`) — the runner reads it back directly.
-    rot_synth: String,
+    sin_tid_signed: u32,
+    /// The per-column sign of the signed sin' table, READ from `rope_p_entry` (one call per
+    /// column; `±1` is never typed). The runner's fill builds `sin' = sign[col % hd]·sin` from
+    /// this array — the writer is the one statement of the sign law.
+    sin_sign: Vec<i64>,
+    /// The probe synthetic's name (`t{out}_rot` or, for halfswap4, `t{out}_rs`) — the runner
+    /// reads it back directly and compares it per `probe_kind`.
+    probe_synth: String,
+    /// What the probe synthetic IS: `rot` (rotate_half(x), the 5-op and main forms) or `rs`
+    /// (rotate_half(x)·sin, halfswap4's own intermediate — it has no rot tensor).
+    probe_kind: String,
     /// The rendered trip count: the launch count the card pays.
     descriptors: u32,
     /// The refusal, verbatim, for a cell the emission will not produce. `None` ⇒ the bundle was
@@ -141,23 +161,23 @@ fn main() {
     // hd 512 (the global layers' Q16 and K1), at the rungs' own row counts (19..128 sampled
     // at the corrupt ones — 23, 29, 31 — plus the decode and full-chunk ends).
     let mut cells = Vec::new();
-    for form in [Form::HalfSwap, Form::Main] {
+    for form in [Form::HalfSwap, Form::HalfSwap4, Form::Main] {
         for &(hd, heads) in &[(256u32, 16u32), (256, 8), (512, 16), (512, 1)] {
             for &mq in &[1u32, 23, 29, 31, 128] {
                 cells.push(emit_cell(form, Geo { mq, hd, heads }, root, &sha));
             }
         }
     }
-    // ⛔ A HALFSWAP CELL THAT CANNOT LOWER IS A FAILURE OF THE NEW FORM, not a count.
-    let halfswap_missing: Vec<&Cell> = cells
+    // ⛔ A NEW-FORM CELL THAT CANNOT LOWER IS A FAILURE OF THAT FORM, not a count.
+    let new_form_missing: Vec<&Cell> = cells
         .iter()
-        .filter(|c| c.form == Form::HalfSwap.tag() && c.missing.is_some())
+        .filter(|c| c.form != Form::Main.tag() && c.missing.is_some())
         .collect();
     assert!(
-        halfswap_missing.is_empty(),
-        "the new form must lower at every stated shape — {} cell(s) refused: {}",
-        halfswap_missing.len(),
-        halfswap_missing
+        new_form_missing.is_empty(),
+        "the new forms must lower at every stated shape — {} cell(s) refused: {}",
+        new_form_missing.len(),
+        new_form_missing
             .iter()
             .map(|c| format!(
                 "mq={} hd={} heads={}: {}",
@@ -198,7 +218,7 @@ fn cell_name(form: Form, geo: Geo) -> String {
     )
 }
 
-/// The launch map: the five parameters in segment 3 (out labeled `Logits` by the writer — the
+/// The launch map: the six parameters in segment 3 (out labeled `Logits` by the writer — the
 /// runner's read-back role), the synthetics declared by whichever form emits.
 fn build_layout(geo: Geo) -> BundleLayout {
     let total = geo.total();
@@ -210,6 +230,7 @@ fn build_layout(geo: Geo) -> BundleLayout {
         (SIN_TID, geo.mq * total),
         (OUT_TID, geo.mq * total),
         (P_TID, geo.hd * geo.hd),
+        (SINS_TID, geo.mq * total),
     ] {
         l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
         l.placements.insert(
@@ -240,10 +261,20 @@ fn emit_cell(form: Form, geo: Geo, root: &std::path::Path, sha: &str) -> Cell {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Each new form states its gapped ops' names and HOW MANY views of each are gapped
+        // (a half-move: read + write; a half-multiply: x, sin' and rs).
         let (ops, patches) = match form {
             Form::HalfSwap => {
                 let (ops, names) = half_swap_ops(geo, &l)?;
-                (ops, gap_patches(geo, &names))
+                let gapped: Vec<(String, usize)> =
+                    names.into_iter().map(|n| (n, 2usize)).collect();
+                (ops, gap_patches(geo, &gapped))
+            }
+            Form::HalfSwap4 => {
+                let (ops, names) = half_swap4_ops(geo, &l)?;
+                let gapped: Vec<(String, usize)> =
+                    names.into_iter().map(|n| (n, 3usize)).collect();
+                (ops, gap_patches(geo, &gapped))
             }
             Form::Main => (main_ops(geo, &l)?, Vec::new()),
         };
@@ -266,6 +297,13 @@ fn emit_cell(form: Form, geo: Geo, root: &std::path::Path, sha: &str) -> Cell {
         Err(payload) => (0, Some(format!("PANIC: {}", panic_message(&payload)))),
     };
 
+    // The runner's probe: rot for every form but halfswap4, whose own intermediate is rs —
+    // it has no rot tensor.
+    let probe_role = match form {
+        Form::HalfSwap4 => SynthRole::Rs,
+        Form::HalfSwap | Form::Main => SynthRole::Rot,
+    };
+
     let cell = Cell {
         form: form.tag().into(),
         mq: geo.mq,
@@ -277,7 +315,10 @@ fn emit_cell(form: Form, geo: Geo, root: &std::path::Path, sha: &str) -> Cell {
         sin_tid: SIN_TID,
         out_tid: OUT_TID,
         p_tid: P_TID,
-        rot_synth: PlaceId::Act(OUT_TID).synth(SynthRole::Rot).to_string(),
+        sin_tid_signed: SINS_TID,
+        sin_sign: sin_signs(geo.hd),
+        probe_synth: PlaceId::Act(OUT_TID).synth(probe_role).to_string(),
+        probe_kind: probe_role.to_string(),
         descriptors,
         missing,
         sha: sha.into(),
@@ -318,6 +359,86 @@ fn half_move_of(hd: u32, o_lo: u32, o_hi: u32) -> (i64, OpFunc) {
     (rel.unwrap(), func.unwrap())
 }
 
+/// The signed sin' table's per-column sign, READ from `rope_p_entry` — one call per column,
+/// `±1` never typed. The ONE statement of the sign law: the runner's fill builds
+/// `sin' = sign[col % hd] · sin` from this array, so the op never carries a sign.
+fn sin_signs(hd: u32) -> Vec<i64> {
+    (0..hd)
+        .map(|o| {
+            let inn = (0..hd)
+                .find(|&i| rope_p_entry(hd as usize, i as usize, o as usize) != 0)
+                .unwrap_or_else(|| panic!("rope_p_entry(hd={hd}) states no source for column {o}"));
+            rope_p_entry(hd as usize, inn as usize, o as usize)
+        })
+        .collect()
+}
+
+/// ONE gapped `[mb, out, y]` view of the `[mq, total]` plane — the card-proven spelling: layout
+/// `["mb","out","y"]`, stick `out`, declared extent `hd`, device-element offset. Stated ONCE;
+/// the half-moves and the half-multiplies consume it alike.
+fn gapped_view(
+    is_input: bool,
+    name: &str,
+    geo: Geo,
+    off: u32,
+    syms: [IterSym; 3],
+) -> Result<AnyTensorArg, String> {
+    Ok(AnyTensorArg::R3(
+        TensorArg::<3>::new(
+            is_input,
+            name.to_string(),
+            Role::Output,
+            [Scale::Active; 3],
+            syms,
+            ["mb", "out", "y"],
+            "out",
+            Allocation::Hbm,
+        )
+        .map_err(|e| e.0)?
+            .with_row_blocked(true)
+            .with_device_extent("out", geo.hd)
+            .map_err(|e| e.0)?
+            .with_offset(off),
+    ))
+}
+
+/// The half-views' shared work plan: `[mb: mq, out: hd/2 (stick), y: heads]`, `y` PINNED
+/// unsplit — the per-core start fold for a gapped stick view folds only the mb and out corners
+/// (`off_view`, `sdsc_abstract.rs`), so a y split's corner would be dropped and every core past
+/// the first would start at head 0's window. Stated ONCE; both new forms consume it.
+fn half_plan(geo: Geo) -> Result<(WorkPlan, [IterSym; 3]), String> {
+    let dims = [
+        ItDim {
+            name: "mb",
+            size: geo.mq,
+            is_reduction: false,
+            is_stick: false,
+            df: Df::Fp16,
+        },
+        ItDim {
+            name: "out",
+            size: geo.hd / 2,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        },
+        ItDim {
+            name: "y",
+            size: geo.heads,
+            is_reduction: false,
+            is_stick: false,
+            df: Df::Fp16,
+        },
+    ];
+    let plan = WorkPlan::divide(&dims, CoreBudget::whole(), |dims, cap| {
+        let mut splits = distribute_cores(dims, cap);
+        splits.remove("y");
+        splits
+    })?;
+    let syms = plan.iter_syms(["mb", "out", "y"]);
+    Ok((plan, syms))
+}
+
 /// ONE half-move: `func` over a `[mb, out, y]` view of the `[mq, total]` RowBlocked plane — the
 /// read at `read_off` device elements, the write at `write_off`. The view's `out` sweeps `hd/2`
 /// (the half) under a declared extent of `hd` (`.with_device_extent`), so the device walk's
@@ -336,31 +457,48 @@ fn half_move(
     sib: &mut i64,
     l: &BundleLayout,
 ) -> Result<EmittedOp<TpWorld<1>>, String> {
-    let hd = geo.hd;
-    let view = |is_input: bool, name: &str, off: u32| -> Result<AnyTensorArg, String> {
-        Ok(AnyTensorArg::R3(
-            TensorArg::<3>::new(
-                is_input,
-                name.to_string(),
-                Role::Output,
-                [Scale::Active; 3],
-                syms,
-                ["mb", "out", "y"],
-                "out",
-                Allocation::Hbm,
-            )
-            .map_err(|e| e.0)?
-                .with_row_blocked(true)
-                .with_device_extent("out", hd)
-                .map_err(|e| e.0)?
-                .with_offset(off),
-        ))
-    };
     let op = OpSpec::new(
         func,
         plan.clone(),
-        vec![view(true, read, read_off)?],
-        view(false, write, write_off)?,
+        vec![gapped_view(true, read, geo, read_off, syms)?],
+        gapped_view(false, write, geo, write_off, syms)?,
+    )
+    .map_err(|e| e.0)?;
+    emit_sdsc_tiled(
+        op_name,
+        &op,
+        &SdscFoldSet::new(op.iter.cores_used()),
+        sib,
+        Some(l),
+    )
+    .map_err(|e| e.0)
+}
+
+/// ONE half-multiply: `rs = x · sin'` over the same gapped views — x read at `x_off`, sin' read
+/// at `sin_off`, rs written at `rs_off` (device-element offsets). `mul` is the card's own
+/// two-input elementwise op (`OpFunc::Multiply`); the SIGN rides the sin' fill, never the op.
+fn half_multiply(
+    op_name: &str,
+    geo: Geo,
+    x: &str,
+    x_off: u32,
+    sins: &str,
+    sin_off: u32,
+    rs: &str,
+    rs_off: u32,
+    plan: &WorkPlan,
+    syms: [IterSym; 3],
+    sib: &mut i64,
+    l: &BundleLayout,
+) -> Result<EmittedOp<TpWorld<1>>, String> {
+    let op = OpSpec::new(
+        OpFunc::Multiply,
+        plan.clone(),
+        vec![
+            gapped_view(true, x, geo, x_off, syms)?,
+            gapped_view(true, sins, geo, sin_off, syms)?,
+        ],
+        gapped_view(false, rs, geo, rs_off, syms)?,
     )
     .map_err(|e| e.0)?;
     emit_sdsc_tiled(
@@ -404,40 +542,9 @@ fn half_swap_ops(
     let mut sib = 0i64;
     let mut ops = Vec::new();
 
-    // The plan is shared by both half-moves (same work, same views' extents); the symbols are
-    // minted once from it. `y` is PINNED unsplit: the per-core start fold for a gapped stick view
-    // folds only the mb and out corners (`off_view`, `sdsc_abstract.rs`), so a y split's corner
-    // would be dropped and every core past the first would start at head 0's window. Whether the
-    // tiler even wants a y split is an open question the card run reports; the harness refuses it.
-    let dims = [
-        ItDim {
-            name: "mb",
-            size: mq,
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "out",
-            size: half,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "y",
-            size: geo.heads,
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, CoreBudget::whole(), |dims, cap| {
-        let mut splits = distribute_cores(dims, cap);
-        splits.remove("y");
-        splits
-    })?;
-    let syms = plan.iter_syms(["mb", "out", "y"]);
+    // The plan is shared by both half-moves (same work, same views' extents); `half_plan`
+    // states it once for both new forms.
+    let (plan, syms) = half_plan(geo)?;
 
     let mut half_move_names = Vec::new();
     for (o_lo, o_hi) in [(0, half), (half, hd)] {
@@ -524,6 +631,111 @@ fn half_swap_ops(
     Ok((ops, half_move_names))
 }
 
+/// The 4-op form's ops: NO rot tensor. `xc = x·cos` (the whole-tensor leg, verbatim from
+/// `rope_at`), then the two half-multiplies writing the two halves of ONE `rs` through the same
+/// gapped views — `rs[o] = x[inn(o)] · sin'[o]`, the sign riding the sin' fill, never the op —
+/// then `out = xc + rs`. Returns the ops and the half-multiplies' own names (the bridge keys on
+/// them; all THREE of each one's views are gapped — x, sin' and rs).
+fn half_swap4_ops(
+    geo: Geo,
+    l: &BundleLayout,
+) -> Result<(Vec<EmittedOp<TpWorld<1>>>, Vec<String>), String> {
+    let (mq, hd, total) = (geo.mq, geo.hd, geo.total());
+    let half = hd / 2;
+    assert!(
+        half % 64 == 0,
+        "hd {hd}: the half {half} is not whole sticks — this sweep states hd 256/512"
+    );
+    // DECLARE BEFORE USE (`rope_at`'s own law): xc and rs at their TRUE full extent, so the
+    // half-multiplies' partial windows price against the whole plane. rot does not exist here.
+    let out_id = PlaceId::Act(OUT_TID);
+    let xc = syn(Some(l), out_id.synth(SynthRole::Xc));
+    let rs = syn(Some(l), out_id.synth(SynthRole::Rs));
+    for r in [SynthRole::Xc, SynthRole::Rs] {
+        l.synth(out_id.synth(r), &[mq, total]);
+    }
+    let (x, cos, sins, out) = (
+        act_name(X_TID),
+        act_name(COS_TID),
+        act_name(SINS_TID),
+        act_name(OUT_TID),
+    );
+    let mut sib = 0i64;
+    let mut ops = Vec::new();
+
+    // `xc = x·cos`, verbatim from `rope_at`'s own emission.
+    let rows_all = RowCount::of_query_rows(QueryRowCount::of_mq(mq));
+    let cols_all = BlockCols::of_feature_cols(total);
+    ops.push(
+        pw2(
+            &format!("rope_xc_o{OUT_TID}"),
+            "multiply",
+            rows_all,
+            cols_all,
+            In::full(&rb(&x, mq, total)),
+            In::full(&rb(&cos, mq, total)),
+            &rb(&xc, mq, total),
+            &mut sib,
+            Some(l),
+        )
+        .map_err(|e| e.0)?,
+    );
+
+    // The two half-multiplies over the output range `[o_lo, o_hi)`. The x read and rs write
+    // windows are the half-move's own (the permutation's shift, never restated); the sin' view
+    // sweeps the SAME output column range rs writes — one law, `half_move_of`'s.
+    let (plan, syms) = half_plan(geo)?;
+    let mut half_multiply_names = Vec::new();
+    for (o_lo, o_hi) in [(0, half), (half, hd)] {
+        // The move's func is not consumed here — the sign rides the sin' fill (`sin_signs`).
+        let (rel, _func) = half_move_of(hd, o_lo, o_hi);
+        let (x_col, rs_col) = if rel > 0 {
+            (rel as u32, 0)
+        } else {
+            (0, (-rel) as u32)
+        };
+        let x_off = rc_of(mq, total, 0, x_col, Df::Fp16).into_raw_elems();
+        let sin_off = rc_of(mq, total, 0, o_lo, Df::Fp16).into_raw_elems();
+        let rs_off = rc_of(mq, total, 0, rs_col, Df::Fp16).into_raw_elems();
+        let op_name = format!(
+            "rope_{}_o{OUT_TID}",
+            if o_lo == 0 { "rslo" } else { "rshi" }
+        );
+        ops.push(half_multiply(
+            &op_name,
+            geo,
+            &x,
+            x_off,
+            &sins,
+            sin_off,
+            &rs,
+            rs_off,
+            &plan,
+            syms,
+            &mut sib,
+            l,
+        )?);
+        half_multiply_names.push(op_name);
+    }
+
+    // `out = xc + rs`, verbatim from `rope_at`'s own emission.
+    ops.push(
+        pw2(
+            &format!("rope_out_o{OUT_TID}"),
+            "add",
+            rows_all,
+            cols_all,
+            In::full(&rb(&xc, mq, total)),
+            In::full(&rb(&rs, mq, total)),
+            &rb(&out, mq, total),
+            &mut sib,
+            Some(l),
+        )
+        .map_err(|e| e.0)?,
+    );
+    Ok((ops, half_multiply_names))
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  The baseline
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -580,16 +792,17 @@ struct GapPatch {
 }
 
 /// THE STEP-0 BRIDGE: patch `backGapCore_` into the gapped views' allocate nodes of the rendered
-/// dxp input. Both views of each half-move (the read of x and the write of rot) carry it — each
-/// is a half-swept view of a full-head plane. The op names come from the emission itself, never
-/// restated here; the gap is derived once, from the cell's stated extents.
-fn gap_patches(geo: Geo, half_move_ops: &[String]) -> Vec<GapPatch> {
+/// dxp input. Every half-swept view of a full-head plane carries it — a half-move's read of x
+/// and write of rot (2 views), a half-multiply's x, sin' and rs (3 views). The op names come
+/// from the emission itself, never restated here; the gap is derived once, from the cell's
+/// stated extents.
+fn gap_patches(geo: Geo, gapped_ops: &[(String, usize)]) -> Vec<GapPatch> {
     let gap = stick_axis_gap(geo.hd, geo.hd / 2, Df::Fp16);
     assert!(gap > 0, "hd {}: the stick-axis gap is zero", geo.hd);
-    half_move_ops
+    gapped_ops
         .iter()
-        .flat_map(|op| {
-            [0usize, 1].map(move |view| GapPatch {
+        .flat_map(|(op, views)| {
+            (0..*views).map(move |view| GapPatch {
                 op: op.clone(),
                 view,
                 gap_elems: gap,
