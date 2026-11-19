@@ -1,8 +1,8 @@
-//! metal.html, from site/data/metal/*.json.
+//! metal.html, from data/metal/*.json.gz.
 //!
-//! Each data file is one run of scripts/bench_metal_matrix.sh, copied in
-//! unedited and named <machine>-<YYYY-MM-DDTHHMMSSZ>-<sha8>.json (older runs:
-//! <machine>-<YYYY-MM-DD>-<sha8>.json). The page reads them at site-build
+//! Each data file is one run of scripts/bench_metal_matrix.sh, gzipped and
+//! otherwise unedited, named <machine>-<YYYY-MM-DDTHHMMSSZ>-<sha8>.json.gz (older
+//! runs: <machine>-<YYYY-MM-DD>-<sha8>.json.gz). The page reads them at site-build
 //! time, so it cannot drift from what the runner measured.
 //!
 //! The page is a section a dataset the runs measured, the random-token grid
@@ -33,7 +33,7 @@ use crate::charts::{
     sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
-use crate::{Site, slug, thousands};
+use crate::{Site, datafile, slug, thousands};
 use data::{At, Cell, Model, RequestTiming, Run, Scenario};
 use datasets::{MapAt, MapRow, MapSquare, SummaryMap};
 use numbers::{
@@ -41,10 +41,10 @@ use numbers::{
     timing,
 };
 
-/// The run files, relative to site/; copied to the same place under _site/,
+/// The run files, relative to the site's root; copied to the same place under _site/,
 /// where each run table links to its own.
 pub const DATA: &str = "data/metal";
-/// The runs a newer one replaced, relative to site/: only Over time reads them.
+/// The runs a newer one replaced, relative to the site's root: only Over time reads them.
 pub const HISTORY: &str = "data/metal/history";
 
 // --------------------------------------------------------------------- load
@@ -58,30 +58,31 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
 /// [`load`], over every run file in `dirs` (relative to the site): the page's own runs, or those
 /// and the ones a newer run replaced ([`HISTORY`]), for Over time.
 fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let (mut files, mut errors) = (Vec::new(), Vec::new());
     for dir in dirs {
         let dir = site.root.join(dir);
         // history/ may not exist yet; the page's own folder must.
-        let Ok(entries) = fs::read_dir(&dir) else {
+        let Ok(listed) = datafile::list(&dir) else {
             if *dir == *site.root.join(DATA) {
                 return Err(format!("{}: not found", dir.display()));
             }
             continue;
         };
-        files.extend(
-            entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "json")),
-        );
+        for f in listed {
+            match f {
+                Ok(f) => files.push(f),
+                Err(e) => errors.push(e),
+            }
+        }
     }
     files.sort();
-    let (mut runs, mut errors) = (Vec::new(), Vec::new());
+    let mut runs = Vec::new();
     for f in files {
         let name = f
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let text = match fs::read_to_string(&f) {
+        let text = match datafile::read_json_gz(&f) {
             Ok(t) => t,
             Err(e) => {
                 errors.push(format!("{name}: {e}"));
@@ -98,10 +99,12 @@ fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
         // The start time keeps two runs of one commit on one day apart; names
         // from before it carry only the date.
         let (machine, sha8) = (slug(run.machine.chip.as_str()), run.repo.sha8());
-        let want = format!("{machine}-{}-{sha8}.json", run.generated_utc.stamp());
-        if name != want && name != format!("{machine}-{}-{sha8}.json", run.generated_utc.date()) {
+        let named = |when: &str| datafile::named(&format!("{machine}-{when}-{sha8}"));
+        let want = named(&run.generated_utc.stamp());
+        if name != want && name != named(run.generated_utc.date()) {
             errors.push(format!(
-                "{name}: name it {want} (<machine>-<start time>-<sha8>.json)"
+                "{name}: name it {want} ({})",
+                datafile::named("<machine>-<start time>-<sha8>")
             ));
         }
         for m in run.models.iter().filter(|m| m.weights().is_none()) {
@@ -410,7 +413,7 @@ pub(super) fn runs_table(runs: &[&Run], about: Element) -> Element {
                                 TableCell { code { "{flags}" } }
                                 TableCell { "{engine_versions(run)}" }
                                 TableCell { "{pinned(run)}" }
-                                TableCell { a { href: "{DATA}/{file}", "json" } }
+                                TableCell { a { href: "{DATA}/{file}", "json.gz" } }
                             }
                         }
                     }
@@ -2890,8 +2893,8 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let body = if machines.is_empty() {
         rsx! {
             p {
-                "No runs published yet. Run " code { "scripts/bench_metal_matrix.sh" } " and copy its JSON into "
-                code { "site/data/metal/" } "."
+                "No runs published yet. Run " code { "scripts/bench_metal_matrix.sh" } " and copy its JSON, gzipped, into "
+                code { "{DATA}/" } " on the site branch."
             }
         }
     } else {
@@ -3494,22 +3497,19 @@ mod tests {
     }
 
     /// A site whose published runs are the named fixtures alone: a fresh folder under the system's
-    /// temp dir, its data/metal holding copies of them, as over_time_takes_every_run_it_is_given
-    /// builds its Site.
-    fn site_with(names: &[&str]) -> crate::Site {
+    /// temp dir named for `tag`, its data/metal holding each fixture gzipped, as a data PR
+    /// publishes it.
+    fn site_with(tag: &str, names: &[&str]) -> crate::Site {
         let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
-        let root = std::env::temp_dir().join(format!(
-            "metal-site-{}-{}",
-            std::process::id(),
-            names.len() + names.iter().map(|n| n.len()).sum::<usize>()
-        ));
+        let root = std::env::temp_dir().join(format!("metal-site-{}-{tag}", std::process::id()));
         let data = root.join(super::DATA);
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(root.join("_site")).unwrap();
         for name in names {
             let file = std::path::Path::new(name).file_name().unwrap();
-            std::fs::copy(fixtures.join(name), data.join(file)).unwrap();
+            let gz = format!("{}.gz", file.to_string_lossy());
+            gzip(&fixtures.join(name), &data.join(gz));
         }
         crate::Site {
             repo: root.clone(),
@@ -3518,12 +3518,67 @@ mod tests {
         }
     }
 
+    /// Writes `from`'s bytes gzipped to `to`.
+    fn gzip(from: &std::path::Path, to: &std::path::Path) {
+        use std::io::Write;
+        let bytes = std::fs::read(from).expect("a fixture");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&bytes).unwrap();
+        std::fs::write(to, gz.finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_gzipped_run_loads() {
+        let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("gzipped", &[name]);
+        let runs = super::load(&site).expect("the gzipped run");
+        assert_eq!(runs.len(), 1);
+        let file = runs[0]
+            .file
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(file, format!("{name}.gz"));
+    }
+
+    #[test]
+    fn a_plain_json_in_data_is_refused() {
+        let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("plain", &[]);
+        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+        std::fs::copy(fixtures.join(name), site.root.join(super::DATA).join(name)).unwrap();
+        let err = super::load(&site).err().expect("a plain JSON is refused");
+        assert!(err.contains(name), "{err}");
+        assert!(err.contains("gzip"), "{err}");
+    }
+
+    #[test]
+    fn a_run_named_without_gz_is_refused() {
+        let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("unnamed", &[]);
+        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+        let stem = name.trim_end_matches(".json");
+        gzip(
+            &fixtures.join(name),
+            &site.root.join(super::DATA).join(format!("{stem}.gz")),
+        );
+        let err = super::load(&site)
+            .err()
+            .expect("a run named .gz is refused");
+        assert!(err.contains(&format!("{stem}.gz")), "{err}");
+        assert!(err.contains(".json.gz"), "{err}");
+    }
+
     #[test]
     fn the_left_nav_lists_the_datasets_and_nothing_else() {
-        let site = site_with(&[
-            REQUESTS_FIXTURE,
-            "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
-        ]);
+        let site = site_with(
+            "nav",
+            &[
+                REQUESTS_FIXTURE,
+                "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
+            ],
+        );
         let assets = crate::chrome::Published {
             styles: String::new(),
             favicon: String::new(),
@@ -4830,13 +4885,16 @@ mod tests {
     /// Over time takes every run of a Mac it is given.
     #[test]
     fn over_time_takes_every_run_it_is_given() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let site = crate::Site {
-            repo: root.join(".."),
-            out: root.join("_site"),
-            root,
-        };
-        let runs = super::load_from(&site, &[FIXTURES]).expect("the fixtures");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut names: Vec<String> = (std::fs::read_dir(root.join(FIXTURES)).expect(FIXTURES))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let site = site_with("over-time", &names);
+        let runs = super::load(&site).expect("the fixtures");
         let machines = super::index(&runs);
         // The M3 Pro fixtures hold two runs of the current round's gpt-oss-20b, a week apart:
         // Over time draws them, not just the newest.

@@ -39,9 +39,10 @@ const RELOAD_JS: &str = "<script>
 </script>
 ";
 
-const TYPES: [(&str, &str); 7] = [
+const TYPES: [(&str, &str); 8] = [
     ("html", "text/html; charset=utf-8"),
     ("css", "text/css; charset=utf-8"),
+    ("gz", "application/gzip"),
     ("js", "text/javascript; charset=utf-8"),
     ("json", "application/json"),
     ("md", "text/markdown; charset=utf-8"),

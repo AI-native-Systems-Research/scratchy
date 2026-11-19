@@ -1,6 +1,6 @@
-//! site/data/spyre/*.json — the A/B sweeps the page charts.
+//! data/spyre/*.json.gz — the A/B sweeps the page charts.
 //!
-//! One file per sweep, named `<date>-<sha8>.json`: the day of the sweep and
+//! One file per sweep, named `<date>-<sha8>.json.gz`: the day of the sweep and
 //! the commit scratchy's side ran. A sweep holds both stacks' measurements:
 //! torch-spyre and triton-scratchy are measured by their own harnesses (the
 //! file says which), so a cell is a bucket, not a matched prompt — compare
@@ -213,8 +213,8 @@ impl Cell {
     }
 }
 
-/// One perf PR's progress entry, `progress/<pr>.json`, shipped in the PR
-/// itself: the cells its merge gate measured, main against the PR, on one
+/// One perf PR's progress entry, `progress/<pr>.json.gz`, landed on the site
+/// branch beside the PR: the cells its merge gate measured, main against the PR, on one
 /// pod, back to back. The sweep files stay the record; a progress entry
 /// layers on top of them, and the page pairs each of its values with the
 /// newest sweep's torch cell — torch-spyre is never re-measured for one.
@@ -225,7 +225,7 @@ impl Cell {
 #[serde(deny_unknown_fields)]
 pub struct Progress {
     pub schema: u32,
-    /// The PR the file is named for: `progress/<pr>.json`.
+    /// The PR the file is named for: `progress/<pr>.json.gz`.
     pub pr: u32,
     /// The PR's title as merged.
     pub title: String,

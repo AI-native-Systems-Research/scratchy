@@ -1,16 +1,22 @@
-//! Renders the GitHub Pages site into site/_site:
+//! Renders the GitHub Pages site into _site/:
 //!
 //!   /                   the landing page
 //!   /architectures.html every model architecture's DSL, diffable
 //!   /book/              docs/*.md + CONTRIBUTING.md, rendered client-side by zero-md
-//!   /metal.html         Metal benchmark runs from site/data/metal/
-//!   /spyre.html         Spyre A/B sweeps from site/data/spyre/
+//!   /metal.html         Metal benchmark runs from data/metal/, gzipped JSON
+//!   /spyre.html         Spyre A/B sweeps from data/spyre/, gzipped JSON
+//!
+//! The site lives on the repo's `site` branch, apart from main, and is built
+//! from a main checkout with this branch checked out at its `site/`: the docs
+//! and DSL files are read from that main checkout, the parent of this crate.
+//! Locally, `git worktree add site origin/site` from a main checkout's root
+//! (main's .gitignore ignores `/site/`).
 //!
 //! Every page is rendered here, at build time, with Dioxus's server-side
 //! renderer: the browser gets HTML, Carbon's web components, and a few lines
 //! of script per page — no wasm.
 //!
-//! Usage, from the repo root:
+//! Usage, from the main checkout's root:
 //!
 //!   cargo run --release --manifest-path site/Cargo.toml            render once
 //!   cargo run --release --manifest-path site/Cargo.toml -- serve   render, serve on
@@ -22,6 +28,7 @@ mod book;
 mod carbon;
 mod charts;
 mod chrome;
+mod datafile;
 mod highlight;
 mod landing;
 mod metal;
@@ -34,18 +41,18 @@ use std::process::ExitCode;
 
 /// Where the site's inputs are and where it is written.
 pub struct Site {
-    /// site/: styles, favicon, content, data.
+    /// This crate's folder, the site branch: styles, favicon, content, data.
     pub root: PathBuf,
-    /// The repo root, for the docs and the DSL files.
+    /// The main checkout this crate sits in, for the docs and the DSL files.
     pub repo: PathBuf,
-    /// site/_site/, rebuilt from empty every run.
+    /// _site/ in this crate's folder, rebuilt from empty every run.
     pub out: PathBuf,
 }
 
 const STYLES: &str = "styles.css";
 const FAVICON: &str = "favicon.png";
 
-/// The static files, under site/; each is published under its content hash.
+/// The static files, in this crate's folder; each is published under its content hash.
 const ASSETS: [&str; 2] = [STYLES, FAVICON];
 
 /// A file's published name: `<stem>.<hash>.<ext>`, the hash (64-bit FNV-1a)

@@ -1,7 +1,7 @@
-//! spyre.html, from site/data/spyre/*.json.
+//! spyre.html, from data/spyre/*.json.gz.
 //!
 //! Each data file is one A/B sweep of the two Spyre stacks — torch-spyre and
-//! triton-scratchy, scratchy's Spyre path — named <date>-<sha8>.json for the
+//! triton-scratchy, scratchy's Spyre path — named <date>-<sha8>.json.gz for the
 //! day of the sweep and the commit scratchy's side ran. The page charts the
 //! latest sweep and lists every one in its about table, the way metal.html
 //! charts every run of its bench script.
@@ -23,15 +23,15 @@ use crate::charts::{
     grouped_bars, highlight, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
-use crate::{DASH, Site, slug, thousands_f};
+use crate::{DASH, Site, datafile, slug, thousands_f};
 use data::{Cell, Dtype, Metric, Notes, Progress, Provenance, Sweep};
 
-/// The sweep files, relative to site/; copied to the same place under
+/// The sweep files, relative to the site's root; copied to the same place under
 /// _site/, where the about table links to each.
 pub const DATA: &str = "data/spyre";
 
-/// The progress files, relative to site/: one per perf PR, shipped in the PR
-/// itself, named for its number. Copied to the same place under _site/. The
+/// The progress files, relative to the site's root: one per perf PR, landed on
+/// the site branch beside it, named for its number. Copied to the same place under _site/. The
 /// directory is absent until the first perf PR lands one; the page then has
 /// no Progress section, which is not an error.
 pub const PROGRESS: &str = "data/spyre/progress";
@@ -57,19 +57,21 @@ const NOISE: f64 = 0.04;
 /// reports all of them rather than the first.
 fn load(site: &Site) -> Result<Vec<(PathBuf, Sweep)>, String> {
     let dir = site.root.join(DATA);
-    let mut files: Vec<_> = fs::read_dir(&dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
-    files.sort();
+    let listed = datafile::list(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (mut sweeps, mut errors) = (Vec::new(), Vec::new());
-    for f in files {
+    for f in listed {
+        let f = match f {
+            Ok(f) => f,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
         let name = f
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let text = match fs::read_to_string(&f) {
+        let text = match datafile::read_json_gz(&f) {
             Ok(t) => t,
             Err(e) => {
                 errors.push(format!("{name}: {e}"));
@@ -83,10 +85,11 @@ fn load(site: &Site) -> Result<Vec<(PathBuf, Sweep)>, String> {
                 continue;
             }
         };
-        let want = format!("{}-{}.json", sweep.date, sweep.triton_scratchy.sha8());
+        let want = datafile::named(&format!("{}-{}", sweep.date, sweep.triton_scratchy.sha8()));
         if name != want {
             errors.push(format!(
-                "{name}: name it {want} (<date>-<scratchy sha8>.json)"
+                "{name}: name it {want} ({})",
+                datafile::named("<date>-<scratchy sha8>")
             ));
         }
         errors.extend(problems(&sweep).into_iter().map(|e| format!("{name}: {e}")));
@@ -159,24 +162,25 @@ fn problems(sweep: &Sweep) -> Vec<String> {
 /// merge date, then PR number: the order their values supersede each other.
 fn load_progress(site: &Site) -> Result<Vec<(PathBuf, Progress)>, String> {
     let dir = site.root.join(PROGRESS);
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        // No directory yet: no perf PR has shipped a progress file, so the
-        // page has no Progress section. Not an error.
-        Err(_) => return Ok(Vec::new()),
+    // No directory yet: no perf PR has shipped a progress file, so the page
+    // has no Progress section. Not an error.
+    let Ok(listed) = datafile::list(&dir) else {
+        return Ok(Vec::new());
     };
-    let mut files: Vec<_> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
-    files.sort();
     let (mut out, mut errors) = (Vec::new(), Vec::new());
-    for f in files {
+    for f in listed {
+        let f = match f {
+            Ok(f) => f,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
         let name = f
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let text = match fs::read_to_string(&f) {
+        let text = match datafile::read_json_gz(&f) {
             Ok(t) => t,
             Err(e) => {
                 errors.push(format!("{name}: {e}"));
@@ -190,7 +194,7 @@ fn load_progress(site: &Site) -> Result<Vec<(PathBuf, Progress)>, String> {
                 continue;
             }
         };
-        let want = format!("{}.json", progress.pr);
+        let want = datafile::named(&progress.pr.to_string());
         if name != want {
             errors.push(format!("{name}: name it {want} (the PR's number)"));
         }
@@ -1726,8 +1730,8 @@ fn about(sweeps: &[(PathBuf, Sweep)]) -> Element {
                     "torch-spyre and triton-scratchy are measured by their own harnesses (each \
                      sweep's are in the table below) at slightly different prompt lengths, so \
                      cells sit in context buckets and the page compares ratios, not absolutes. \
-                     Each sweep's JSON, with both sides' provenance, is linked below. Perf PRs \
-                     also land their gate cells as progress entries, one JSON per PR under \
+                     Each sweep's gzipped JSON, with both sides' provenance, is linked below. Perf PRs \
+                     also land their gate cells as progress entries, one gzipped JSON per PR under \
                      " code { "{PROGRESS}/" } ", which the Progress section pairs with the \
                      newest sweep's torch value."
                 }
@@ -1753,7 +1757,7 @@ fn about(sweeps: &[(PathBuf, Sweep)]) -> Element {
                             }
                             TableCell {
                                 if let Some(n) = file.file_name() {
-                                    a { href: "{DATA}/{n.to_string_lossy()}", "json" }
+                                    a { href: "{DATA}/{n.to_string_lossy()}", "json.gz" }
                                 }
                             }
                         }
@@ -1795,8 +1799,8 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             rsx! {},
             rsx! {
                 p {
-                    "No sweeps published yet. Copy an A/B sweep's JSON into "
-                    code { "site/{DATA}/" } "."
+                    "No sweeps published yet. Copy an A/B sweep's JSON, gzipped, into "
+                    code { "{DATA}/" } " on the site branch."
                 }
             },
         ),
@@ -1915,6 +1919,26 @@ mod tests {
         CellKey, Dtype, Metric, Progress, Sweep, apply_progress, problems, progress_problems,
         progress_rows, progress_timelines, progress_vocabulary,
     };
+
+    /// A plain progress JSON beside the gzipped ones is refused by name: a forgotten gzip.
+    #[test]
+    fn a_plain_progress_json_is_refused() {
+        let root = std::env::temp_dir().join(format!("spyre-site-{}-plain", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let progress = root.join(super::PROGRESS);
+        std::fs::create_dir_all(&progress).unwrap();
+        std::fs::write(progress.join("709.json"), "{}").unwrap();
+        let site = crate::Site {
+            repo: root.clone(),
+            out: root.join("_site"),
+            root,
+        };
+        let err = super::load_progress(&site)
+            .err()
+            .expect("a plain JSON is refused");
+        assert!(err.contains("709.json"), "{err}");
+        assert!(err.contains("gzip"), "{err}");
+    }
 
     /// A sweep of `cells`, with `extra` fields after them.
     fn sweep(cells: &str, extra: &str) -> serde_json::Result<Sweep> {

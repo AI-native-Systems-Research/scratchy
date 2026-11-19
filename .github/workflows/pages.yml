@@ -1,0 +1,35 @@
+name: Pages
+
+# The site branch's own runs of main's site build (site-build.yml on main, which states the build
+# once): it checks out main at the root and this branch at site/, lints, tests and renders.
+on:
+  push:
+    branches: [site]
+  # A pull request to this branch (a data PR, a page change) builds the site and checks its links
+  # without deploying.
+  pull_request:
+    branches: [site]
+  # Also started on a metal round's branch by its bot (metal-round.yml on main), which builds
+  # without deploying: only the site branch and main deploy.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, shared with main's Pages runs; let an in-flight run finish rather than
+# cancelling it. Anything but this branch (a pull request, or a dispatch on a metal round's branch)
+# only builds, in a group of its own superseded by its next run, so it never queues behind or
+# cancels a deploy.
+concurrency:
+  group: ${{ github.ref == 'refs/heads/site' && github.event_name != 'pull_request' && 'pages' || format('pages-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/site' || github.event_name == 'pull_request' }}
+
+jobs:
+  site:
+    uses: AI-native-Systems-Research/scratchy/.github/workflows/site-build.yml@main
+    with:
+      main_ref: main
+      site_ref: ${{ github.sha }}
+      deploy: ${{ github.ref == 'refs/heads/site' && github.event_name != 'pull_request' }}
