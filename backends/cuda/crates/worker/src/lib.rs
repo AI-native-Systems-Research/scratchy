@@ -64,9 +64,10 @@ impl WorkerFactory for CudaWorkerFactory {
         KvBlockTokens::new(CUDA_KV_BLOCK_SIZE as usize)
     }
 
-    /// Greedy decoding of one completion, with no penalty, logprobs or logit transform (what
-    /// [`plan::check_sampling`] admits): the engine refuses anything else when the request is
-    /// submitted, so the scheduler never admits it.
+    /// Greedy decoding of one completion, with no penalty, logprobs or logit transform: what the
+    /// worker's one tape plays (a greedy argmax of the raw logits, one sequence at a time). The
+    /// API refuses anything else at its door ([`Served::refusal`]), so the scheduler never admits
+    /// it.
     fn served(&self) -> Served {
         Served {
             sampling: false,

@@ -9,17 +9,16 @@
 //! when the step reaches the end of the request's history ([`emits_token`]) takes the greedy
 //! token of its last real row ([`greedy_token`]).
 //!
-//! Sampling is greedy only in this build: a request asking for anything a greedy argmax cannot
-//! honour is refused when it is admitted ([`check_sampling`]), with a message naming the fix.
+//! Sampling is greedy only in this build: the API refuses anything else at its door, from the
+//! factory's `served()`, so every request this plans for decodes greedily.
 
 use std::collections::HashMap;
 use std::fmt;
 
-use scratchy_core_common::SamplingParams;
 use scratchy_state_decoder_gdn::pool::{GdnStart, GdnStep};
 use scratchy_target_cuda::tape::KvTape;
 
-/// Why a step could not be planned, or a request is refused. Every message names what to change.
+/// Why a step could not be planned. Every message names what to change.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanError {
     /// More than one request runs tokens this step; the worker runs one.
@@ -38,20 +37,6 @@ pub enum PlanError {
     },
     /// Token `id`'s logit is NaN, so no argmax exists.
     NanLogit { id: usize },
-    /// The request carries no sampling parameters.
-    NoSamplingParams,
-    /// The temperature is not 0.
-    NotGreedy { temperature: f64 },
-    /// A repetition, presence or frequency penalty is set.
-    Penalties,
-    /// More than one completion per request.
-    Completions { n: u32 },
-    /// Per-token logprobs.
-    Logprobs,
-    /// Prompt logprobs.
-    PromptLogprobs,
-    /// A transform that moves the argmax: `field` names it.
-    LogitTransform { field: &'static str },
     /// The GDN slot allocator's step code for a sequence at token `start` is `code`: not a plain
     /// step, or fresh other than exactly at token 0.
     GdnStart { start: u32, code: u32 },
@@ -63,7 +48,6 @@ pub enum PlanError {
 
 impl fmt::Display for PlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const GREEDY: &str = "the CUDA backend samples greedily only in this build";
         match self {
             Self::ManyRequests { req_ids } => write!(
                 f,
@@ -98,38 +82,6 @@ impl fmt::Display for PlanError {
                     "token {id}'s logit is NaN: the forward produced no argmax"
                 )
             }
-            Self::NoSamplingParams => write!(
-                f,
-                "{GREEDY} and the request carries no sampling parameters: pass --temperature 0 \
-                 (or \"temperature\": 0)"
-            ),
-            Self::NotGreedy { temperature } => write!(
-                f,
-                "{GREEDY}: pass --temperature 0 (or \"temperature\": 0); this request asks for \
-                 temperature {temperature}"
-            ),
-            Self::Penalties => write!(
-                f,
-                "{GREEDY}, with no penalty: drop the repetition, presence and frequency penalties \
-                 (\"repetition_penalty\": 1, \"presence_penalty\": 0, \"frequency_penalty\": 0)"
-            ),
-            Self::Completions { n } => write!(
-                f,
-                "{GREEDY}, one completion per request: pass \"n\": 1; this request asks for {n}"
-            ),
-            Self::Logprobs => write!(
-                f,
-                "{GREEDY} and returns no logprobs: drop \"logprobs\" from the request"
-            ),
-            Self::PromptLogprobs => write!(
-                f,
-                "{GREEDY} and returns no prompt logprobs: drop \"prompt_logprobs\" from the \
-                 request"
-            ),
-            Self::LogitTransform { field } => write!(
-                f,
-                "{GREEDY} and applies no {field}: drop \"{field}\" from the request"
-            ),
             Self::GdnStart { start, code } => write!(
                 f,
                 "the GDN step from token {start} is {:?}: a plain step is fresh exactly at token 0",
@@ -150,41 +102,6 @@ impl fmt::Display for PlanError {
 }
 
 impl std::error::Error for PlanError {}
-
-/// Refuse a request whose sampling a greedy argmax of the raw logits does not honour: anything
-/// but temperature 0 with no penalty, one completion, no logprobs, and no transform that moves
-/// the argmax (a logit bias, an allowed-token list, bad words, a grammar). Top-k, top-p and min-p
-/// pass: at temperature 0 they keep the argmax ([`SamplingParams::is_greedy`]).
-pub fn check_sampling(params: Option<&SamplingParams>) -> Result<(), PlanError> {
-    let p = params.ok_or(PlanError::NoSamplingParams)?;
-    if p.reads_history() {
-        return Err(PlanError::Penalties);
-    }
-    if !p.is_greedy() {
-        return Err(PlanError::NotGreedy {
-            temperature: p.temperature,
-        });
-    }
-    if p.n != 1 {
-        return Err(PlanError::Completions { n: p.n });
-    }
-    if p.logprobs.is_some() {
-        return Err(PlanError::Logprobs);
-    }
-    if p.prompt_logprobs.is_some() {
-        return Err(PlanError::PromptLogprobs);
-    }
-    let transforms = [
-        (p.logit_bias.is_some(), "logit_bias"),
-        (p.allowed_token_ids.is_some(), "allowed_token_ids"),
-        (p.bad_words_token_ids.is_some(), "bad_words"),
-        (p.guided_grammar.is_some(), "guided decoding"),
-    ];
-    match transforms.into_iter().find(|&(set, _)| set) {
-        Some((_, field)) => Err(PlanError::LogitTransform { field }),
-        None => Ok(()),
-    }
-}
 
 /// The one request this step runs tokens for and how many, from the scheduler's
 /// `num_scheduled_tokens`: `None` when the step runs none, and a refusal naming them when it runs
