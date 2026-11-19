@@ -5105,6 +5105,20 @@ mod production_ktir_dump {
                     ("HALF", Val::Int(64)),
                     ("Y_TOTAL", Val::Int(8)),
                     ("R_START", Val::Int(0)),
+                    // Which sin table this head width's rotate reads: the door's own derivation
+                    // (`RotateHalf::sin_table`, over `rope_p_entry`), at this entry's HEAD_DIM.
+                    (
+                        "SIN_SIGNED",
+                        Val::Int(i128::from(
+                            ktir_superdsc::sdsc_abstract::RotateHalf::of(
+                                HeadWidth::of_whole_sticks(128),
+                                ktir_superdsc::sdsc_abstract::Lanes::FP16,
+                            )
+                            .expect("a 128-wide head's rotate factors into whole-stick moves")
+                            .sin_table()
+                            .is_signed(),
+                        )),
+                    ),
                 ],
             ),
             vec![1],
