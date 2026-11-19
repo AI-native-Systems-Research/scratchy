@@ -493,11 +493,11 @@ struct StagedBundle<'a, 'c> {
 /// producer's launch map, dxp's own artifacts, the executor's load, the weight/const staging,
 /// `prepare`, the segment zeroing, the input binds. Returns the executor ready to launch
 /// (`run_prefix_only` / `launch_timed`) beside the maps the read-backs need.
-fn load_staged(
+fn load_staged<'a, 'c>(
     dir: &Path,
     input: &[String],
-    card: &crate::runtime::CardRuntime<'_, Alone>,
-) -> Result<StagedBundle<'_, '_>> {
+    card: &'c crate::runtime::CardRuntime<'a, Alone>,
+) -> Result<StagedBundle<'a, 'c>> {
     // ── The producer's launch map ──
     let pf: PlacementsFile = serde_json::from_str(
         &std::fs::read_to_string(dir.join("placements.json")).with_context(|| {
