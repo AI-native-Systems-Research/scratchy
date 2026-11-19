@@ -1571,7 +1571,6 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
                 s_ktir,
                 &mut s_sym,
                 Some(&layout),
-                None,
                 &mut s_fp8,
             )
             .unwrap_or_else(|e| {

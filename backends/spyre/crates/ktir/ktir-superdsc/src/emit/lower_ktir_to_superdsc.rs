@@ -36,8 +36,7 @@
 use super::{
     ConvertBand, ConvertBandSide, EmittedOp, In, assemble_convert, assemble_convert_band,
     assemble_pointwise_broadcast_off, bmm_site, check_pointwise_cols, check_pointwise_cols_df,
-    emit_sdsc_tiled, op_func_from_str, pointwise_broadcast_opspec_df, pointwise_chunk_out_offset,
-    pw1, pw2, rb, rb_df, rbo,
+    emit_sdsc_tiled, op_func_from_str, pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
@@ -60,7 +59,7 @@ use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
     DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
-use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK};
+use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ddl_binds::DeviceOp;
@@ -2079,7 +2078,8 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -
 }
 
 /// [`pointwise_tile_op`] at a stated [`Df`] — the torch-spyre fp32-rmsnorm precedent's own law
-/// ([`pointwise_broadcast_opspec_df`]): the stick basis is the ACTUAL dtype's (fp32 = 32-element
+/// ([`pointwise_broadcast_opspec_df`](crate::emit::pointwise_broadcast_opspec_df)): the stick basis
+/// is the ACTUAL dtype's (fp32 = 32-element
 /// stick), because an fp32 op's `out` dim measured on the fp16 basis would state the wrong
 /// `stickSize_`/`wordLength` for every operand the tile feeds. `Df::Fp16` keeps the proven basis
 /// verbatim (`cols.max(1)` — `cols` is already whole-stick by [`check_pointwise_cols`], and `0`
@@ -2409,7 +2409,8 @@ pub fn elementwise<T: crate::collective::Tp>(
 }
 
 /// [`elementwise`] at a stated [`Df`] — the torch-spyre fp32-rmsnorm precedent's own door
-/// ([`pointwise_broadcast_opspec_df`]): an op whose RESULT is fp32 (the widen island's
+/// ([`pointwise_broadcast_opspec_df`](crate::emit::pointwise_broadcast_opspec_df)): an op whose
+/// RESULT is fp32 (the widen island's
 /// multiply-add) states `df` on every `ItDim`, the `TileOp`, and every `TensorArg`, because the
 /// stick basis and the `dataFormat_`/`wordLength` the descriptor declares are properties of the
 /// ACTUAL dtype — an fp16-annotated descriptor over fp32 buffers mis-stripes every stick.
@@ -7687,6 +7688,7 @@ fn split_regions(
 #[cfg(test)]
 mod elementwise_tests {
     use super::*;
+    use crate::work::EwDivision;
 
     /// One whole-buffer operand: the view IS the window, and the store windows tile it — the shape
     /// `regions()` reports for a parameter whose `construct_access_tile` takes all of its view.
