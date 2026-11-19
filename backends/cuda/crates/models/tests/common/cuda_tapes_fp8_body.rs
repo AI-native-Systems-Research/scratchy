@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
     CudaStep, ExpertGateUpActBf16, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpKernel, GateUpTcFp8,
+    ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpProj,
     MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
@@ -193,17 +193,17 @@ fn every_tape_has_the_fp8_steps() {
         for (i, s) in tape.steps.iter().enumerate() {
             // Every gate/up pair of these checkpoints is quantized; a tensor-core one folds the
             // CUDA-core one-row gate/up's kernel.
-            if let CudaStep::GateUpAct(GateUpActBf16 { kernel, .. })
-            | CudaStep::GateUpTcFp8(GateUpTcFp8 {
-                fold: GateUpActBf16 { kernel, .. },
-                ..
-            }) = *s
-            {
-                let want = match m {
-                    BucketM(1) => matches!(kernel, GateUpKernel::GemvFp8(_)),
-                    _ => matches!(kernel, GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8),
-                };
-                assert!(want, "m={m} step {i}: {kernel:?}");
+            let fp8_kind = match *s {
+                CudaStep::GateUpAct(GateUpActBf16 { proj, .. }) => Some(match m {
+                    BucketM(1) => matches!(proj, GateUpProj::GemvFp8 { .. }),
+                    _ => matches!(proj, GateUpProj::GemmFp8 { .. } | GateUpProj::GemmCol64Fp8 { .. }),
+                }),
+                // The tensor-core gate/up is the one-row fp8 kind by its type.
+                CudaStep::GateUpTcFp8(_) => Some(m == BucketM(1)),
+                _ => None,
+            };
+            if let Some(want) = fp8_kind {
+                assert!(want, "m={m} step {i}: {s:?}");
             }
             let expert = match *s {
                 CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
@@ -372,7 +372,7 @@ fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
                 let ns = [g.first.n.get(), g.second.n.get(), g.third.map_or(0, |t| t.n.get())];
                 assert!(!gemv_tc_takes(ns, g.k.get(), 1), "m=1 step {i}: {ns:?}");
             }
-            CudaStep::GateUpAct(g) => panic!("m=1 step {i}: a CUDA-core gate/up {:?}", g.kernel),
+            CudaStep::GateUpAct(g) => panic!("m=1 step {i}: a CUDA-core gate/up {:?}", g.proj),
             CudaStep::ExpertGateUpAct(_) | CudaStep::ExpertGemv(_) => {
                 panic!("m=1 step {i}: a CUDA-core expert GEMV")
             }

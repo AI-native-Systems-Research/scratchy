@@ -45,8 +45,8 @@ use std::path::PathBuf;
 use scratchy_target_cuda::registry::{self, CudaModelEntry};
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
-    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan, GemvSplit,
-    Matmul, MatmulGroup, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16, RopePairing,
+    GainConvention, GateUpProj, GatedDeltaNetBf16, GatedOp, GdnScan, GemvSplit, Matmul,
+    MatmulGroup, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16, RopePairing,
     RouteProgram, SiluMulBf16, attn_decode_split_scratch_bytes, gdn_bundle, gdn_conv_dim,
     gdn_scratch,
 };
@@ -194,17 +194,24 @@ fn matmul(k: MatmulKernel) -> Value {
     }
 }
 
-fn gate_up_kernel(k: GateUpKernel) -> Value {
-    match k {
-        GateUpKernel::Gemm => json!({"launcher": "gate_up_gemm_bf16", "tile_cols": 128}),
-        GateUpKernel::GemmCol64 => json!({"launcher": "gate_up_gemm_bf16", "tile_cols": 64}),
-        GateUpKernel::Gemv(_) => json!({"launcher": "gate_up_gemv_bf16", "tile_cols": Value::Null}),
-        GateUpKernel::GemmFp8 => json!({"launcher": "gate_up_gemm_fp8", "tile_cols": 128}),
-        GateUpKernel::GemmCol64Fp8 => json!({"launcher": "gate_up_gemm_fp8", "tile_cols": 64}),
-        GateUpKernel::GemvFp8(_) => {
-            json!({"launcher": "gate_up_gemv_fp8", "tile_cols": Value::Null})
+fn gate_up_kernel(p: &GateUpProj) -> Value {
+    match p {
+        GateUpProj::Gemm { .. } => json!({"launcher": "gate_up_gemm_bf16", "tile_cols": 128}),
+        GateUpProj::GemmCol64 { .. } => json!({"launcher": "gate_up_gemm_bf16", "tile_cols": 64}),
+        GateUpProj::Gemv { .. } => {
+            json!({"launcher": "gate_up_gemv_bf16", "tile_cols": Value::Null})
         }
+        GateUpProj::GemmFp8 { .. } => json!({"launcher": "gate_up_gemm_fp8", "tile_cols": 128}),
+        GateUpProj::GemmCol64Fp8 { .. } => {
+            json!({"launcher": "gate_up_gemm_fp8", "tile_cols": 64})
+        }
+        GateUpProj::GemvFp8 { .. } => gate_up_gemv_fp8(),
     }
+}
+
+/// The fp8 one-row gate/up's launcher, the kernel a tensor-core gate/up folds.
+fn gate_up_gemv_fp8() -> Value {
+    json!({"launcher": "gate_up_gemv_fp8", "tile_cols": Value::Null})
 }
 
 // ── the payloads, as values ──
@@ -251,9 +258,10 @@ fn silu_mul(s: &SiluMulBf16) -> Value {
            "cols": s.cols})
 }
 
-fn gate_up(g: &GateUpActBf16) -> Value {
-    json!({"gate": gemm((g.gate.matmul(), None)), "up": gemm((g.up.matmul(), None)), "out": off(g.out),
-           "kernel": gate_up_kernel(g.kernel), "act": act(g.act)})
+/// A gate/up fold: its projections' matmuls, its activation's output and op, and its kernel.
+fn gate_up((gate, up): (Matmul, Matmul), out: ArenaOffset, kernel: Value, op: GatedOp) -> Value {
+    json!({"gate": gemm((gate, None)), "up": gemm((up, None)), "out": off(out),
+           "kernel": kernel, "act": act(op)})
 }
 
 fn expert_gemv(g: &ExpertGemvBf16) -> Value {
@@ -584,12 +592,13 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::GateUpAct(g) => (
             "gate_up (the stored kernel)",
-            gate_up(g),
-            g.kernel.gemv_split().map_or(Value::Null, splits),
+            gate_up(g.proj.matmuls(), g.out, gate_up_kernel(&g.proj), g.act),
+            g.proj.gemv_split().map_or(Value::Null, splits),
         ),
         CudaStep::GateUpTcFp8(t) => (
             "act_quant_fp8 + gemv_fp8_b8 (gate and up)",
-            json!({"fold": gate_up(&t.fold), "q_act": off(t.q_act)}),
+            json!({"fold": gate_up((t.gate.matmul(), t.up.matmul()), t.out, gate_up_gemv_fp8(), t.act),
+                   "q_act": off(t.q_act)}),
             Value::Null,
         ),
         CudaStep::QuantRowsFp8(q) => (

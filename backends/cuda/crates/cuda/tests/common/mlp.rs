@@ -17,7 +17,7 @@ use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GateUpActBf16, GateUpKernel, GatedOp, GemmBf16, NormKernel, RmsNormBf16,
+    AddBf16, CudaStep, GateUpActBf16, GateUpProj, GatedOp, GemmBf16, NormKernel, RmsNormBf16,
 };
 use scratchy_target_cuda::step::{BucketM, Cols, KDim, NDim, Rows};
 use scratchy_target_cuda::tape::{
@@ -126,24 +126,25 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
 /// `out`, as one launch.
 const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaStep {
     CudaStep::GateUpAct(GateUpActBf16 {
-        gate: GemmBf16 {
-            a: ArenaOffset(n),
-            b: WeightIx(2),
-            c: ArenaOffset(gate),
-            m: Rows(rows),
-            n: NDim(I),
-            k: KDim(H),
-        },
-        up: GemmBf16 {
-            a: ArenaOffset(n),
-            b: WeightIx(3),
-            c: ArenaOffset(up),
-            m: Rows(rows),
-            n: NDim(I),
-            k: KDim(H),
+        proj: GateUpProj::Gemm {
+            gate: GemmBf16 {
+                a: ArenaOffset(n),
+                b: WeightIx(2),
+                c: ArenaOffset(gate),
+                m: Rows(rows),
+                n: NDim(I),
+                k: KDim(H),
+            },
+            up: GemmBf16 {
+                a: ArenaOffset(n),
+                b: WeightIx(3),
+                c: ArenaOffset(up),
+                m: Rows(rows),
+                n: NDim(I),
+                k: KDim(H),
+            },
         },
         out: ArenaOffset(out),
-        kernel: GateUpKernel::Gemm,
         act: GatedOp::Silu,
     })
 }

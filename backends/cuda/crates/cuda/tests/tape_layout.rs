@@ -403,7 +403,7 @@ fn the_mlp_numbers() {
     else {
         panic!("the MLP's steps are norm, gate/up and silu_mul in one launch (#1049), gemm, add");
     };
-    let (gate, up, sm) = (gu.gate, gu.up, gu.activation());
+    let (gate, up, sm) = (gu.gate(), gu.up(), gu.activation());
     assert_eq!(
         (n.eps.get(), n.convention),
         (EPS, GainConvention::OnePlusScale)

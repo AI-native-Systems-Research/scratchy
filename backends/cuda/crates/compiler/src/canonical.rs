@@ -44,11 +44,11 @@ use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
     EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
     ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
-    ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp,
-    GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8, GemmGroupFp8, GemmNarrowFp8,
-    GemmNarrowGroupFp8, GemvGroupTcFp8, GemvTcFp8, MoeWeight, QuantChainError, QuantRowsFp8,
-    RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes, norm_row_takes,
-    quant_chain,
+    ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpActBf16, GateUpProj,
+    GateUpTcFp8, GatedOp, GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8, GemmGroupFp8,
+    GemmNarrowFp8, GemmNarrowGroupFp8, GemvGroupTcFp8, GemvTcFp8, MoeWeight, QuantChainError,
+    QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes,
+    norm_row_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -1744,19 +1744,19 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
                 false => s,
             }
         }
-        CudaStep::GateUpAct(fold)
-            if matches!(fold.kernel, GateUpKernel::GemvFp8(_))
-                && fold.gate.m == Rows(1)
-                && fold.gate.n <= NDim(ACT_QUANT_MAX_COLS)
-                && gemv_tc_takes(
-                    [fold.gate.n.get(), fold.up.n.get(), 0],
-                    fold.gate.k.get(),
-                    1,
-                ) =>
+        CudaStep::GateUpAct(GateUpActBf16 {
+            proj: GateUpProj::GemvFp8 { gate, up },
+            out,
+            act,
+        }) if gate.n <= NDim(ACT_QUANT_MAX_COLS)
+            && gemv_tc_takes([gate.n.get(), up.n.get(), 0], gate.k.get(), 1) =>
         {
             CudaStep::GateUpTcFp8(GateUpTcFp8 {
-                fold,
-                q_act: fold.out,
+                gate: GemvTcFp8::of(gate),
+                up: GemvTcFp8::of(up),
+                out,
+                act,
+                q_act: out,
             })
         }
         CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. })
@@ -1863,8 +1863,15 @@ fn quantize_fp8_inputs(
                 CudaStep::GemmGroupFp8(GemmGroupFp8 { a, .. })
                 | CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8 { a, .. })
                 | CudaStep::GemvGroupTcFp8(GemvGroupTcFp8 { a, .. }) => *a = q,
-                CudaStep::GateUpAct(g) => (g.gate.a, g.up.a) = (q, q),
-                CudaStep::GateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
+                CudaStep::GateUpAct(GateUpActBf16 {
+                    proj: GateUpProj::GemmFp8 { gate, up },
+                    ..
+                }) => (gate.a, up.a) = (q, q),
+                CudaStep::GateUpAct(GateUpActBf16 {
+                    proj: GateUpProj::GemmCol64Fp8 { gate, up },
+                    ..
+                }) => (gate.a, up.a) = (q, q),
+                CudaStep::GateUpTcFp8(t) => (t.gate.a, t.up.a) = (q, q),
                 CudaStep::ExpertGemm(g) => g.a = q,
                 // The e4m3 sort reads the token rows' quantization (FP8 S8 P1).
                 CudaStep::ExpertSortFp8(sort) => sort.x = q,

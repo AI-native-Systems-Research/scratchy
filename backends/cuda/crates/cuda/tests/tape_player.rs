@@ -1192,7 +1192,7 @@ fn gate_up_direct(
     let CudaStep::GateUpAct(step) = tape.steps[1] else {
         panic!("step 1 is the gate/up launch");
     };
-    let g = if up { step.up } else { step.gate };
+    let g = if up { step.up() } else { step.gate() };
     let (nb, wb) = (
         DeviceBuffer::upload(device, n).expect("upload n"),
         DeviceBuffer::upload(device, w).expect("upload the weight"),

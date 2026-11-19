@@ -38,7 +38,7 @@ use scratchy_target_cuda::step::{
     GDN_DECODE_HEAD_VS, GDN_DECODE_MAX_HEADS, GDN_GATING_NV_MULTIPLE, GDN_HEAD_K, GDN_HEAD_V_MAX,
     GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE,
     GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE,
-    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16,
+    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpProj, GatedDeltaNetBf16,
     GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmCol64Bf16, GemmCol64Fp8, GemmFp8,
     GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvSplit, GroupKind, GroupMember, HeadNorms,
     LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulGroup, MatmulKernel, MoeRouteBf16,
@@ -520,34 +520,37 @@ fn gate_up_act(
         up: None,
     };
     let mul = gated_mul(cx, s, split, computes)?;
-    let kernel = |g: &TapeStep<'_>| {
-        let lowered = lower_step(cx, g, computes)?.ok_or_else(refused)?;
-        let kernel = match lowered {
-            CudaStep::Gemm(_) => GateUpKernel::Gemm,
-            CudaStep::GemmCol64(_) => GateUpKernel::GemmCol64,
-            CudaStep::Gemv(g) => GateUpKernel::Gemv(g.split),
-            CudaStep::GemmFp8(_) => GateUpKernel::GemmFp8,
-            CudaStep::GemmCol64Fp8(_) => GateUpKernel::GemmCol64Fp8,
-            CudaStep::GemvFp8(g) => GateUpKernel::GemvFp8(g.split),
-            _ => return Err(refused()),
-        };
-        // A projection feeding the activation folds no residual add.
-        let Some((g, None)) = lowered.gemm_view() else {
-            return Err(refused());
-        };
-        Ok((kernel, GemmBf16::of(g)))
+    let lowered = |g: &TapeStep<'_>| lower_step(cx, g, computes)?.ok_or_else(refused);
+    let gate_step = lowered(absorbed_step(s, gate, computes)?)?;
+    let up_step = lowered(absorbed_step(s, up, computes)?)?;
+    // Both projections on one kernel (a GEMV's at one split): the pair as that kernel's payloads.
+    let proj = match (gate_step, up_step) {
+        (CudaStep::Gemm(gate), CudaStep::Gemm(up)) => GateUpProj::Gemm { gate, up },
+        (CudaStep::GemmCol64(gate), CudaStep::GemmCol64(up)) => GateUpProj::GemmCol64 { gate, up },
+        (CudaStep::Gemv(gate), CudaStep::Gemv(up)) if gate.split == up.split => {
+            GateUpProj::Gemv { gate, up }
+        }
+        (CudaStep::GemmFp8(gate), CudaStep::GemmFp8(up)) => GateUpProj::GemmFp8 { gate, up },
+        (CudaStep::GemmCol64Fp8(gate), CudaStep::GemmCol64Fp8(up)) => {
+            GateUpProj::GemmCol64Fp8 { gate, up }
+        }
+        (CudaStep::GemvFp8(gate), CudaStep::GemvFp8(up)) if gate.split == up.split => {
+            GateUpProj::GemvFp8 { gate, up }
+        }
+        _ => return Err(refused()),
     };
-    let (gk, gate) = kernel(absorbed_step(s, gate, computes)?)?;
-    let (uk, up) = kernel(absorbed_step(s, up, computes)?)?;
-    let same = gk == uk && (gate.a, gate.m, gate.n, gate.k) == (up.a, up.m, up.n, up.k);
+    // A projection feeding the activation folds no residual add.
+    let (Some((gate, None)), Some((up, None))) = (gate_step.gemm_view(), up_step.gemm_view())
+    else {
+        return Err(refused());
+    };
+    let same = (gate.a, gate.m, gate.n, gate.k) == (up.a, up.m, up.n, up.k);
     if !same || (mul.gate, mul.up) != (gate.c, up.c) {
         return Err(refused());
     }
     Ok(CudaStep::GateUpAct(GateUpActBf16 {
-        gate,
-        up,
+        proj,
         out: mul.out,
-        kernel: gk,
         act,
     }))
 }

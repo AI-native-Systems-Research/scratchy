@@ -430,12 +430,16 @@ pub const fn norm_row_takes(rows: u32, cols: u32) -> bool {
     rows == 1 && cols.is_multiple_of(NORM_ROW_COLS) && cols <= NORM_ROW_MAX_COLS
 }
 
-/// [`CudaStep::GateUpTcFp8`]: the gate/up fold it computes (its `kernel` the CUDA-core one,
-/// [`GateUpKernel::GemvFp8`], whose bits it does not keep), and where its act + quantize writes the
-/// activation's e4m3 row and scale (the quant scratch's second slot).
+/// [`CudaStep::GateUpTcFp8`]: a one-row gate/up on the tensor cores, `gate` and `up` its
+/// projections as [`GemvTcFp8`]s off the quantized row (`a` the quant scratch's), `out` and `act`
+/// the activation's, and where its act + quantize writes the activation's e4m3 row and scale (the
+/// quant scratch's second slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GateUpTcFp8 {
-    pub fold: GateUpActBf16,
+    pub gate: GemvTcFp8,
+    pub up: GemvTcFp8,
+    pub out: ArenaOffset,
+    pub act: GatedOp,
     pub q_act: ArenaOffset,
 }
 
@@ -450,16 +454,16 @@ impl GateUpTcFp8 {
     /// The act + quantize's write, as the [`QuantRowsFp8`] of `out` it equals.
     pub const fn quant_write(&self) -> QuantRowsFp8 {
         QuantRowsFp8 {
-            x: self.fold.out,
+            x: self.out,
             q: self.q_act,
-            rows: self.fold.gate.m,
-            cols: Cols(self.fold.gate.n.get()),
+            rows: Rows(1),
+            cols: Cols(self.gate.n.get()),
         }
     }
 
     /// The GEMV scratch it writes: the gate's f32 rows, then the up's ([`gemv_tc_f32_bytes`]).
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        gemv_tc_f32_bytes(self.fold.gate.m.get(), self.fold.gate.n.get())
+        gemv_tc_f32_bytes(1, self.gate.n.get())
     }
 }
 
@@ -722,83 +726,130 @@ impl GatedOp {
     }
 }
 
-/// `out [m, n] = act(bf16(a · gateᵀ), bf16(a · upᵀ))`: `gate` and `up` are the GEMMs it folds,
-/// each a [`GemmBf16`] over the same `a`, `m`, `n` and `k` (their `c` the colours today's two
-/// launches write, which this one never writes); `kernel` the step each would be on its own, the
-/// same for both ([`CudaStep::Gemm`], [`CudaStep::GemmCol64`] or [`CudaStep::Gemv`]).
+/// `out [m, n] = act(bf16(a · gateᵀ), bf16(a · upᵀ))`: `proj` the gate and up GEMMs it folds, over
+/// the same `a`, `m`, `n` and `k` (their `c` the colours today's two launches write, which this one
+/// never writes), each the payload of the kernel it is on its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GateUpActBf16 {
-    pub gate: GemmBf16,
-    pub up: GemmBf16,
+    pub proj: GateUpProj,
     pub out: ArenaOffset,
-    pub kernel: GateUpKernel,
     pub act: GatedOp,
 }
 
-/// Which GEMM kernel a gate/up step's projections are on their own.
+/// A gate/up step's gate and up projections, each the payload of the step it is on its own, the
+/// same kernel for both, chosen when the step is emitted. The fp8 kernels (FP8 S2) scale each
+/// projection by its own `w_scale` before the activation, rounded once; a GEMV's projections each
+/// carry their K split, the same for both (one shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum GateUpKernel {
-    Gemm,
-    GemmCol64,
-    /// The GEMV, each projection at this K split.
-    Gemv(GemvSplit),
-    /// The fp8 kernels (FP8 S2): each projection [`CudaStep::GemmFp8`], [`CudaStep::GemmCol64Fp8`]
-    /// or [`CudaStep::GemvFp8`] on its own, each scaled by its own `w_scale` before the
-    /// activation, rounded once.
-    GemmFp8,
-    GemmCol64Fp8,
-    /// The fp8 GEMV, each projection at this K split.
-    GemvFp8(GemvSplit),
+pub enum GateUpProj {
+    Gemm {
+        gate: GemmBf16,
+        up: GemmBf16,
+    },
+    GemmCol64 {
+        gate: GemmCol64Bf16,
+        up: GemmCol64Bf16,
+    },
+    Gemv {
+        gate: GemvBf16,
+        up: GemvBf16,
+    },
+    GemmFp8 {
+        gate: GemmFp8,
+        up: GemmFp8,
+    },
+    GemmCol64Fp8 {
+        gate: GemmCol64Fp8,
+        up: GemmCol64Fp8,
+    },
+    GemvFp8 {
+        gate: GemvFp8,
+        up: GemvFp8,
+    },
 }
 
-impl GateUpKernel {
-    /// The step `g` is on its own.
-    pub const fn step(self, g: GemmBf16) -> CudaStep {
-        let g = g.matmul();
-        match self {
-            Self::Gemm => CudaStep::Gemm(GemmBf16::of(g)),
-            Self::GemmCol64 => CudaStep::GemmCol64(GemmCol64Bf16::of(g)),
-            Self::Gemv(split) => CudaStep::Gemv(GemvBf16 {
-                split,
-                ..GemvBf16::of(g)
-            }),
-            Self::GemmFp8 => CudaStep::GemmFp8(GemmFp8::of(g)),
-            Self::GemmCol64Fp8 => CudaStep::GemmCol64Fp8(GemmCol64Fp8::of(g)),
-            Self::GemvFp8(split) => CudaStep::GemvFp8(GemvFp8 {
-                split,
-                ..GemvFp8::of(g)
-            }),
+impl GateUpProj {
+    /// The gate and the up as the steps they are on their own.
+    pub const fn steps(&self) -> [CudaStep; 2] {
+        match *self {
+            Self::Gemm { gate, up } => [CudaStep::Gemm(gate), CudaStep::Gemm(up)],
+            Self::GemmCol64 { gate, up } => [CudaStep::GemmCol64(gate), CudaStep::GemmCol64(up)],
+            Self::Gemv { gate, up } => [CudaStep::Gemv(gate), CudaStep::Gemv(up)],
+            Self::GemmFp8 { gate, up } => [CudaStep::GemmFp8(gate), CudaStep::GemmFp8(up)],
+            Self::GemmCol64Fp8 { gate, up } => {
+                [CudaStep::GemmCol64Fp8(gate), CudaStep::GemmCol64Fp8(up)]
+            }
+            Self::GemvFp8 { gate, up } => [CudaStep::GemvFp8(gate), CudaStep::GemvFp8(up)],
         }
     }
 
-    /// Whether it is a GEMV, and its split.
-    pub const fn gemv_split(self) -> Option<GemvSplit> {
+    /// The gate's and the up's matmuls.
+    pub const fn matmuls(&self) -> (Matmul, Matmul) {
+        match *self {
+            Self::Gemm { gate, up } => (gate.matmul(), up.matmul()),
+            Self::GemmCol64 { gate, up } => (gate.matmul(), up.matmul()),
+            Self::Gemv { gate, up } => (gate.matmul(), up.matmul()),
+            Self::GemmFp8 { gate, up } => (gate.matmul(), up.matmul()),
+            Self::GemmCol64Fp8 { gate, up } => (gate.matmul(), up.matmul()),
+            Self::GemvFp8 { gate, up } => (gate.matmul(), up.matmul()),
+        }
+    }
+
+    /// The gate's and the up's weights.
+    pub fn weights_mut(&mut self) -> [&mut WeightIx; 2] {
         match self {
-            Self::Gemv(split) | Self::GemvFp8(split) => Some(split),
-            Self::Gemm | Self::GemmCol64 | Self::GemmFp8 | Self::GemmCol64Fp8 => None,
+            Self::Gemm { gate, up } => [&mut gate.b, &mut up.b],
+            Self::GemmCol64 { gate, up } => [&mut gate.b, &mut up.b],
+            Self::Gemv { gate, up } => [&mut gate.b, &mut up.b],
+            Self::GemmFp8 { gate, up } => [&mut gate.b, &mut up.b],
+            Self::GemmCol64Fp8 { gate, up } => [&mut gate.b, &mut up.b],
+            Self::GemvFp8 { gate, up } => [&mut gate.b, &mut up.b],
+        }
+    }
+
+    /// A GEMV's K split (the gate's, the up's the same); `None` for the GEMMs.
+    pub const fn gemv_split(&self) -> Option<GemvSplit> {
+        match *self {
+            Self::Gemv { gate, .. } => Some(gate.split),
+            Self::GemvFp8 { gate, .. } => Some(gate.split),
+            Self::Gemm { .. }
+            | Self::GemmCol64 { .. }
+            | Self::GemmFp8 { .. }
+            | Self::GemmCol64Fp8 { .. } => None,
         }
     }
 }
 
 impl GateUpActBf16 {
+    /// The gate's matmul.
+    pub const fn gate(&self) -> Matmul {
+        self.proj.matmuls().0
+    }
+
+    /// The up's matmul.
+    pub const fn up(&self) -> Matmul {
+        self.proj.matmuls().1
+    }
+
     /// The activation it folds, over the projections' colours.
     pub const fn activation(&self) -> SiluMulBf16 {
+        let (gate, up) = self.proj.matmuls();
         SiluMulBf16 {
-            gate: self.gate.c,
-            up: self.up.c,
+            gate: gate.c,
+            up: up.c,
             out: self.out,
-            rows: self.gate.m,
-            cols: Cols(self.gate.n.get()),
+            rows: gate.m,
+            cols: Cols(gate.n.get()),
         }
     }
 
     /// The bytes of GEMV scratch the fused GEMV writes: the gate's partials, then the up's, each
     /// at its own split ([`gemv_scratch_bytes`]); 0 for the GEMMs. `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        let Some(split) = self.kernel.gemv_split() else {
+        let Some(split) = self.proj.gemv_split() else {
             return Some(0);
         };
-        let Some(one) = gemv_scratch_bytes(self.gate.n.get(), 1, split.splits.get()) else {
+        let Some(one) = gemv_scratch_bytes(self.gate().n.get(), 1, split.splits.get()) else {
             return None;
         };
         one.checked_mul(2)
@@ -2865,12 +2916,13 @@ impl CudaStep {
                     None => return None,
                 }
             }
-            Self::GateUpTcFp8(t) => t.fold.gate.matmul(),
-            Self::GateUpAct(GateUpActBf16 {
-                gate,
-                kernel: GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8,
-                ..
-            }) => gate.matmul(),
+            Self::GateUpTcFp8(t) => t.gate.matmul(),
+            Self::GateUpAct(
+                g @ GateUpActBf16 {
+                    proj: GateUpProj::GemmFp8 { .. } | GateUpProj::GemmCol64Fp8 { .. },
+                    ..
+                },
+            ) => g.gate(),
             _ => return None,
         };
         Some((g.a, g.m.get(), g.k.get()))
@@ -2926,11 +2978,8 @@ impl CudaStep {
         // A gate/up step's GEMMs, each its own kernel step, then the activation over their
         // colours: what the chain it folds computes, each part checked as that step.
         if let Self::GateUpAct(g) = self {
-            return [
-                Some(g.kernel.step(g.gate)),
-                Some(g.kernel.step(g.up)),
-                Some(g.act.step(g.activation())),
-            ];
+            let [gate, up] = g.proj.steps();
+            return [Some(gate), Some(up), Some(g.act.step(g.activation()))];
         }
         // The prefill's fused expert gate + up + act (FP8 S8 P3(b)): the chain it folds.
         if let Self::ExpertGateUpGemmFp8(t) = self {
@@ -2956,13 +3005,7 @@ impl CudaStep {
         // A tensor-core gate/up: itself (the quantized row, the gate's weight, the activation and
         // its quantization), then its up as the GEMV it is on its own (its weight).
         if let Self::GateUpTcFp8(t) = self {
-            return [
-                Some(*self),
-                Some(Self::GemvTcFp8(GemvTcFp8::of(GemvFp8::of(
-                    t.fold.up.matmul(),
-                )))),
-                None,
-            ];
+            return [Some(*self), Some(Self::GemvTcFp8(t.up)), None];
         }
         if let Self::ExpertGateUpTcFp8(t) = self {
             return [Some(*self), Some(Self::ExpertGemvTcFp8(t.fold.up)), None];
@@ -3203,8 +3246,9 @@ impl CudaStep {
             // The projections' input; the activation's output. The weights are each part's
             // (`validate` checks every part's through [`Self::parts`]), the first one here.
             Self::GateUpAct(g) => {
+                let gate = g.gate();
                 // An fp8 pair's are its first projection's on its own: the quantized rows.
-                let (ab, bb) = match g.kernel.step(g.gate) {
+                let (ab, bb) = match g.proj.steps()[0] {
                     s @ (Self::GemmFp8(_) | Self::GemmCol64Fp8(_) | Self::GemvFp8(_)) => {
                         match s.extents() {
                             Some(StepExtents {
@@ -3216,21 +3260,21 @@ impl CudaStep {
                         }
                     }
                     _ => (
-                        bf16_bytes(g.gate.m.get(), g.gate.k.get()),
-                        bf16_bytes(g.gate.n.get(), g.gate.k.get()),
+                        bf16_bytes(gate.m.get(), gate.k.get()),
+                        bf16_bytes(gate.n.get(), gate.k.get()),
                     ),
                 };
                 let (Some(ab), Some(cb), Some(bb)) =
-                    (ab, bf16_bytes(g.gate.m.get(), g.gate.n.get()), bb)
+                    (ab, bf16_bytes(gate.m.get(), gate.n.get()), bb)
                 else {
                     return None;
                 };
                 Some(StepExtents {
-                    reads: [Some(span(g.gate.a, ab)), None, None, None],
+                    reads: [Some(span(gate.a, ab)), None, None, None],
                     writes: span(g.out, cb),
                     second_write: None,
                     weight: Some(WeightRead {
-                        ix: g.gate.b,
+                        ix: gate.b,
                         bytes: bb,
                     }),
                     kv: None,
@@ -3241,14 +3285,13 @@ impl CudaStep {
             // The quantized row and the gate's weight; the activation, then its quantization in
             // the quant scratch's second slot (the up's weight is its part's: `parts`).
             Self::GateUpTcFp8(t) => {
-                let (Some(e), Some(qb)) = (
-                    Self::GemvTcFp8(GemvTcFp8::of(GemvFp8::of(t.fold.gate.matmul()))).extents(),
-                    t.quant_write().bytes(),
-                ) else {
+                let (Some(e), Some(qb)) =
+                    (Self::GemvTcFp8(t.gate).extents(), t.quant_write().bytes())
+                else {
                     return None;
                 };
                 Some(StepExtents {
-                    writes: span(t.fold.out, e.writes.bytes),
+                    writes: span(t.out, e.writes.bytes),
                     second_write: Some(span(t.q_act, qb)),
                     ..e
                 })
@@ -4130,16 +4173,9 @@ impl CudaStep {
                 ..
             }) => Some(bundle),
             // The gate's; [`Self::weights_mut`] gives the up's too.
-            Self::GateUpAct(GateUpActBf16 {
-                gate: GemmBf16 { b, .. },
-                ..
-            })
-            | Self::GateUpTcFp8(GateUpTcFp8 {
-                fold:
-                    GateUpActBf16 {
-                        gate: GemmBf16 { b, .. },
-                        ..
-                    },
+            Self::GateUpAct(GateUpActBf16 { proj, .. }) => Some(proj.weights_mut()[0]),
+            Self::GateUpTcFp8(GateUpTcFp8 {
+                gate: GemvTcFp8 { b, .. },
                 ..
             }) => Some(b),
             // A grouped GEMM's first member's; [`Self::weights_mut`] gives every member's.
@@ -4204,11 +4240,8 @@ impl CudaStep {
             Self::GemmNarrowGroupFp8(g) => member_weights!(g),
             Self::GemvGroupFp8(g) => member_weights!(g),
             Self::GemvGroupTcFp8(g) => member_weights!(g),
-            Self::GateUpAct(GateUpActBf16 { gate, up, .. })
-            | Self::GateUpTcFp8(GateUpTcFp8 {
-                fold: GateUpActBf16 { gate, up, .. },
-                ..
-            }) => vec![&mut gate.b, &mut up.b],
+            Self::GateUpAct(GateUpActBf16 { proj, .. }) => proj.weights_mut().into(),
+            Self::GateUpTcFp8(GateUpTcFp8 { gate, up, .. }) => vec![&mut gate.b, &mut up.b],
             Self::ExpertGateUpGemmFp8(ExpertGateUpGemmFp8 { gate, up, .. }) => {
                 vec![&mut gate.bundle, &mut up.bundle]
             }

@@ -73,15 +73,10 @@ fn every_stored_kernel_choice_is_its_constants_pick() {
                         }
                     }
                     CudaStep::GateUpAct(g) => {
-                        if let Some(stored) = g.kernel.gemv_split() {
-                            assert_eq!(stored, split(g.gate.n.get(), g.gate.k.get(), 1), "{at}");
-                        }
-                    }
-                    CudaStep::GateUpTcFp8(t) => {
-                        if let Some(stored) = t.fold.kernel.gemv_split() {
+                        if let Some(stored) = g.proj.gemv_split() {
                             assert_eq!(
                                 stored,
-                                split(t.fold.gate.n.get(), t.fold.gate.k.get(), 1),
+                                split(g.gate().n.get(), g.gate().k.get(), 1),
                                 "{at}"
                             );
                         }

@@ -189,7 +189,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "AddRmsNormBf16",
                 "NormAddBf16",
                 "GateUpActBf16",
-                "GateUpKernel",
+                "GateUpProj",
                 "GatedOp",
                 "ExpertGateUpActBf16",
                 "QuantRowsFp8",
@@ -767,7 +767,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         // The tensor-core decode GEMVs (FP8 S8 T2) read their weights as their CUDA-core twins
         // do; a tensor-core gate/up's first part is itself, so it names its gate's (its second
         // part, the up's GEMV, the up's).
-        CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(GemvFp8::of(t.fold.gate.matmul()))),
+        CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvTcFp8(t.gate)),
         CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(g))),
         CudaStep::ExpertGateUpTcFp8(t) => {
             role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(t.fold.gate)))

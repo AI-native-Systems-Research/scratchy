@@ -45,7 +45,7 @@ use crate::step::{
     AttnDecodeSplit, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16,
     ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16,
     ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
-    GateSplitBf16, GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16,
+    GateSplitBf16, GateUpProj, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16,
     GdnScan, GemmBf16, GemvBf16, GemvSplit, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
     MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, QuantRowsFp8,
     RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
@@ -53,8 +53,8 @@ use crate::step::{
 };
 use crate::step::{
     AttnWindow, BucketM, Cols, GdnLayout, GemmCol64Bf16, GemmCol64Fp8, GemmFp8, GemmGroupFp8,
-    GemmNarrowBf16, GemmNarrowFp8, GemmNarrowGroupFp8, GemvFp8, GemvTcFp8, HeadDim, MatmulGroup,
-    NumExperts, Rows, Splits, TopK,
+    GemmNarrowBf16, GemmNarrowFp8, GemmNarrowGroupFp8, GemvFp8, GemvTcFp8, HeadDim, Matmul,
+    MatmulGroup, NumExperts, Rows, Splits, TopK,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -2220,53 +2220,52 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         Self::expert_gemv(&g, split, slot, partials, weights, stream)
                     }
                     CudaStep::GateUpAct(g) => {
-                        let (gate, up) = (
-                            weights[g.gate.b.0 as usize].ptr(),
-                            weights[g.up.b.0 as usize].ptr(),
-                        );
-                        let (GemmBf16 { a, m, n, k, .. }, act) = (g.gate, g.act.code());
+                        let (Matmul { a, b, m, n, k, .. }, up_b, act) =
+                            (g.gate(), g.up().b, g.act.code());
+                        let (gate, up) =
+                            (weights[b.0 as usize].ptr(), weights[up_b.0 as usize].ptr());
                         // SAFETY: as above, for `a` (`m*k`), `gate` and `up` (`n*k` each) and `out`
                         // (`m*n`); at one row the scratch holds both projections' partials
                         // (`GateUpActBf16::gemv_scratch`, which `validate` checked).
                         unsafe {
-                            match g.kernel {
-                                GateUpKernel::Gemv(split) => kernels::gate_up_gemv_bf16(
+                            match g.proj {
+                                GateUpProj::Gemv { gate: gv, .. } => kernels::gate_up_gemv_bf16(
                                     (slot(a), gate, up),
                                     (slot(g.out), partials),
-                                    (n.get(), k.get(), split.splits.get()),
+                                    (n.get(), k.get(), gv.split.splits.get()),
                                     act,
                                     stream.0,
                                 ),
-                                GateUpKernel::GemvFp8(split) => kernels::gate_up_gemv_fp8(
+                                GateUpProj::GemvFp8 { gate: gv, .. } => kernels::gate_up_gemv_fp8(
                                     (
                                         slot(a).cast_const(),
-                                        Self::fp8_weight(weights, g.gate.b, n.get(), k.get()),
-                                        Self::fp8_weight(weights, g.up.b, n.get(), k.get()),
+                                        Self::fp8_weight(weights, b, n.get(), k.get()),
+                                        Self::fp8_weight(weights, up_b, n.get(), k.get()),
                                     ),
                                     (slot(g.out), partials),
-                                    (n.get(), k.get(), split.splits.get()),
+                                    (n.get(), k.get(), gv.split.splits.get()),
                                     act,
                                     stream.0,
                                 ),
-                                GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
+                                GateUpProj::GemmFp8 { .. } | GateUpProj::GemmCol64Fp8 { .. } => {
                                     kernels::gate_up_gemm_fp8(
                                         (
                                             Self::fp8_rows(slot, a, m.get(), k.get()),
-                                            Self::fp8_weight(weights, g.gate.b, n.get(), k.get()),
-                                            Self::fp8_weight(weights, g.up.b, n.get(), k.get()),
+                                            Self::fp8_weight(weights, b, n.get(), k.get()),
+                                            Self::fp8_weight(weights, up_b, n.get(), k.get()),
                                         ),
                                         slot(g.out),
                                         (m.get(), n.get(), k.get()),
-                                        (act, g.kernel == GateUpKernel::GemmCol64Fp8),
+                                        (act, matches!(g.proj, GateUpProj::GemmCol64Fp8 { .. })),
                                         stream.0,
                                     )
                                 }
-                                GateUpKernel::Gemm | GateUpKernel::GemmCol64 => {
+                                GateUpProj::Gemm { .. } | GateUpProj::GemmCol64 { .. } => {
                                     kernels::gate_up_gemm_bf16(
                                         (slot(a), gate, up),
                                         slot(g.out),
                                         (m.get(), n.get(), k.get()),
-                                        (act, g.kernel == GateUpKernel::GemmCol64),
+                                        (act, matches!(g.proj, GateUpProj::GemmCol64 { .. })),
                                         stream.0,
                                     )
                                 }
@@ -3380,17 +3379,18 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         weights: &[DeviceBuffer],
         stream: &Stream,
     ) -> Result<(), KernelError> {
-        let GemmBf16 { a, m, n, k, .. } = t.fold.gate;
+        let GemvTcFp8 { a, n, k, .. } = t.gate;
+        let m = Rows(1);
         let up_at = (u64::from(m) * u64::from(n) * 4).next_multiple_of(CUDA_ARENA_ALIGN) as usize;
         let (gate, up) = (partials, partials.wrapping_byte_add(up_at));
         let members = [
             (
-                Self::fp8_weight(weights, t.fold.gate.b, n.get(), k.get()),
+                Self::fp8_weight(weights, t.gate.b, n.get(), k.get()),
                 gate,
                 n.get(),
             ),
             (
-                Self::fp8_weight(weights, t.fold.up.b, n.get(), k.get()),
+                Self::fp8_weight(weights, t.up.b, n.get(), k.get()),
                 up,
                 n.get(),
             ),
@@ -3414,9 +3414,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             )?;
             kernels::act_quant_fp8(
                 (gate.cast_const(), up.cast_const()),
-                (q_act.cast_mut(), s_act.cast_mut(), slot(t.fold.out)),
+                (q_act.cast_mut(), s_act.cast_mut(), slot(t.out)),
                 (m.get(), n.get()),
-                t.fold.act.code(),
+                t.act.code(),
                 stream.0,
             )
         }
