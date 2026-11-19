@@ -109,7 +109,10 @@ name = os.path.basename(cell)
 if os.path.exists(log):
     for line in open(log):
         if line.startswith("VERDICT " + name + " ") and "sha=" + str(c["sha"]) in line and "md5=" + md5 in line:
-            skip = "True"
+            # ONLY a terminal verdict marks the cell done — PASS, FIRST-WRONG or MISSING.
+            # NOT-RUN and FENCED are failures to measure, not measurements: the cell re-runs.
+            if line.split()[2] in ("PASS", "FIRST-WRONG", "MISSING"):
+                skip = "True"
 print("sha=%s" % c["sha"])
 print("md5=%s" % md5)
 print("skip=%s" % skip)
