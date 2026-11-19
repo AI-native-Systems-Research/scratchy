@@ -325,6 +325,7 @@ line. `scr` is the metal CLI crate's binary; a commit from before
 The runs are on the repo's `site` branch, gzipped; read them from there:
 
 ```bash
+up=$(git remote -v | awk '/AI-native-Systems-Research\/scratchy(\.git)? \(fetch\)/ {print $1; exit}')
 git fetch -q "$up" site
 sha=$(git ls-tree --name-only "$up/site" data/metal/ | grep '\.json\.gz$' | while read -r p; do git show "$up/site:$p" | gunzip | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["generated_utc"], d["repo"]["sha"])'; done | sort | tail -1 | cut -d' ' -f2)
 git worktree add /tmp/scratchy-known-good "$sha"
@@ -462,15 +463,25 @@ a worktree of it at `site/` in this checkout (main's `.gitignore` ignores
 branch of its own from upstream `site`:
 
 ```bash
+up=$(git remote -v | awk '/AI-native-Systems-Research\/scratchy(\.git)? \(fetch\)/ {print $1; exit}')
 git fetch -q "$up" site
 b="data/$(basename "$f" .json)"
-if [ -d site ]; then git -C site switch -c "$b" "$up/site"; else git worktree add -b "$b" site "$up/site"; fi
+if [ -e site/.git ]; then git -C site switch -c "$b" "$up/site"
+elif [ -e site ]; then echo "site/ is a plain folder, not a worktree of the site branch; stop" >&2
+else git worktree add -b "$b" site "$up/site"; fi
 ```
+
+A clone from before the site left main can still have a plain `site/`
+folder, holding only the ignored build output (`target/`, `_site/`). If the
+block says `site/ is a plain folder`, stop: show the user `ls -A site`, ask
+them to check that it holds only `target/` and `_site/`, and once they have
+removed it (`rm -rf site`), run the block again.
 
 The site shows each chip's two newest runs, as current and previous, and
 computes the ▲/▼ change badges from them. Add the new run, gzipped
-(`gzip -9 -n`, so the same run is the same bytes; the site refuses a plain
-`.json` in `data/`), keep the run before it as the previous one, and move
+(`gzip -9 -n`: no name or time in the header, so the same gzip makes the
+same bytes from the same run, though another tool may not; the site refuses
+a plain `.json` in `data/`), keep the run before it as the previous one, and move
 anything older to `data/metal/history/`, which the page's Over time section
 reads. Copy first, and move only once the copy has worked: a run that has the
 same name is not overwritten, and in that case nothing should be moved.

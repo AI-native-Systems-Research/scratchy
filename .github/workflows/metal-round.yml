@@ -7,8 +7,10 @@ name: Metal round
 # the site branch, commits those runs, gzipped, into data/metal there in one commit, opens a PR to
 # the site branch for an admin to merge, and closes the issue: a closed issue is a finished round.
 #
-# issue_comment runs this file as it is on main, and runs no code but main's and the site
-# branch's renderer. The runs it reads are data, checked by the site build before they are
+# issue_comment runs this file as it is on main, and runs no code but main's and the renderer on
+# the site branch: it trusts the site branch as it trusts main, both protected, merged only by an
+# admin. Even so the renderer runs with no token: neither checkout keeps its credentials, and its
+# step has GH_TOKEN emptied. The runs it reads are data, checked by the site build before they are
 # committed.
 on:
   issue_comment:
@@ -55,6 +57,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - id: collect
         run: |
@@ -96,6 +99,7 @@ jobs:
         with:
           ref: site
           path: site
+          persist-credentials: false
 
       - if: steps.collect.outputs.commit == 'true'
         uses: dtolnay/rust-toolchain@stable
@@ -107,9 +111,12 @@ jobs:
 
       - if: steps.collect.outputs.commit == 'true'
         name: Build the site with the round's runs
+        # The renderer is the site branch's code: it never sees the job's token.
+        env:
+          GH_TOKEN: ''
         run: |
           cp round/*.json.gz site/data/metal/
-          cargo run --release --manifest-path site/Cargo.toml
+          cargo run --locked --release --manifest-path site/Cargo.toml
 
       - if: steps.collect.outputs.commit == 'true'
         uses: actions/upload-artifact@v7

@@ -4,7 +4,9 @@
 # page charts (data/spyre/progress/<pr>.json.gz on the site branch, here
 # site/data/spyre/progress/ in a checkout with a worktree of that branch at
 # site/) directly, so the gate's numbers and the site's data are the same
-# numbers. The entry lands by its own PR to the site branch.
+# numbers. The entry lands by its own PR to the site branch, with --base
+# site, opened once the perf PR has merged (the spyre-bench skill's progress
+# entry section). Without --out, it refuses unless site/ is a worktree.
 #
 # The standard cell set (the sweep grid's own parameters, from the
 # .sweep-legs cells.tsv the 10-19 sweep ran):
@@ -295,7 +297,15 @@ sha40() { [ ${#1} -eq 40 ] && case "$1" in *[!0-9a-fA-F]*) false ;; *) true ;; e
 sha40 "$HEAD" || { echo "REFUSING: --head is not a full 40-hex commit sha" >&2; exit 64; }
 sha40 "$BASE" || { echo "REFUSING: --base is not a full 40-hex commit sha" >&2; exit 64; }
 case "$RUNS" in ''|*[!0-9]*|0|1) echo "REFUSING: --runs must be at least 2 (the file needs two runs a side)" >&2; exit 64 ;; esac
-OUT="${OUT:-$REPO/site/data/spyre/progress}"
+if [ -z "$OUT" ]; then
+  # The default lands in the site branch's worktree at site/; a plain site/
+  # folder (old build output, from before the site left main) is not one.
+  [ -e "$REPO/site/.git" ] || {
+    echo "REFUSING: $REPO/site is not a worktree of the site branch (git worktree add site <upstream>/site); a plain site/ folder holding only target/ and _site/ can be removed first" >&2
+    exit 69
+  }
+  OUT="$REPO/site/data/spyre/progress"
+fi
 
 # ---- the standard cell set (cells.tsv's own parameters) -----------------------
 M2B=ibm-granite/granite-3.1-2b-instruct
@@ -727,7 +737,8 @@ entry = {
     "cells": [cells[k] for k in sorted(cells)],
 }
 # Gzipped, as the site keeps every data file, with no name or time in the
-# header, so the same entry packs to the same bytes.
+# header, so this script packs the same entry to the same bytes (another
+# gzip tool may make other bytes).
 tmp = dest + ".tmp"
 with open(tmp, "wb") as f:
     f.write(gzip.compress((json.dumps(entry, indent=2) + "\n").encode(), 9, mtime=0))

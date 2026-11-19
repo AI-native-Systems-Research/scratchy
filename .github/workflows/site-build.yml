@@ -4,6 +4,12 @@ name: Site build
 # lives on the site branch; it renders files from main (docs/, CONTRIBUTING.md, the DSLs), which it
 # reads from the folder above its own. So this checks out main at the root and the site branch at
 # site/, then checks formatting, lints, tests and renders the site, and deploys it when asked.
+#
+# The two branches are coupled here. The site branch builds with main's copy of this file
+# (site-build.yml@main), so a change to it that needs a matching change on the site branch (a new
+# input, a new step the renderer depends on) must land on both, main's first. And the metal
+# round's bot dispatches pages.yml by that path on a branch made from site, so main must keep
+# .github/workflows/pages.yml at that path: a dispatch finds a workflow by its file on main.
 on:
   workflow_call:
     inputs:
@@ -44,15 +50,15 @@ jobs:
           workspaces: site
 
       # The site crate is its own workspace, so the repo-wide gates in rust.yml never see it:
-      # format-check, lint and test it here.
+      # format-check, lint and test it here. --locked: the site branch's Cargo.lock is the build's.
       - name: Format, lint and test the site renderer
         run: |
           cargo fmt --manifest-path site/Cargo.toml --all -- --check
-          cargo clippy --manifest-path site/Cargo.toml --all-targets -- -D warnings
-          cargo test --manifest-path site/Cargo.toml
+          cargo clippy --locked --manifest-path site/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path site/Cargo.toml
 
       - name: Build site
-        run: cargo run --release --manifest-path site/Cargo.toml
+        run: cargo run --locked --release --manifest-path site/Cargo.toml
 
       - if: inputs.deploy
         uses: actions/configure-pages@v6
