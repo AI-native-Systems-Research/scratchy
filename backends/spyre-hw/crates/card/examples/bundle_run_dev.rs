@@ -48,7 +48,9 @@ fn main() -> anyhow::Result<()> {
             let Some(n) = rest.next() else {
                 anyhow::bail!("--time wants a run count");
             };
-            timing_runs = n.parse().map_err(|e| anyhow!("--time {n}: {e}"))?;
+            timing_runs = n
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--time {n}: {e}"))?;
             continue;
         }
         if next_is_out {
