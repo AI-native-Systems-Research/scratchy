@@ -438,7 +438,8 @@ extern "C" int scratchy_cuda_attn_decode_d512_fp8kv_split(
     uint32_t min_tiles, void* o_split, void* ml_split,
     void* stream /* cudaStream_t; null = default */) {
     if (decode_refused(q_heads, kv_heads, head_dim, block_size, num_blocks, scale, window) ||
-        splits == 0 || splits > 64 || min_tiles == 0 || min_tiles > uint32_t(MAX_BLOCKS_PER_SEQ) ||
+        splits == 0 || splits > scratchy::ATTN_DECODE_MAX_SPLITS || min_tiles == 0 ||
+        min_tiles > uint32_t(MAX_BLOCKS_PER_SEQ) ||
         (splits > 1 && (o_split == nullptr || ml_split == nullptr))) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }

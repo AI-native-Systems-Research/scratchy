@@ -162,7 +162,9 @@ extern "C" int scratchy_cuda_attn_decode_merge(const void* o_split, const void* 
                                                uint32_t window, uint32_t splits,
                                                uint32_t min_tiles,
                                                void* stream /* cudaStream_t; null = default */) {
-    if ((head_dim != 256 && head_dim != 512) || q_heads == 0 || kv_heads == 0 ||
+    constexpr uint32_t D256 = scratchy::ATTN_DECODE_BF16_HEAD_DIM;
+    constexpr uint32_t D512 = scratchy::ATTN_D512_BF16_HEAD_DIM;
+    if ((head_dim != D256 && head_dim != D512) || q_heads == 0 || kv_heads == 0 ||
         q_heads % kv_heads != 0 || q_heads / kv_heads > uint32_t(MAX_GROUP) ||
         !std::isfinite(scale) || !(scale > 0.0f) || window % BLOCK_SIZE != 0 || splits == 0 ||
         splits > MAX_SPLITS || min_tiles == 0 || min_tiles > MAX_BLOCKS_PER_SEQ ||
@@ -172,11 +174,11 @@ extern "C" int scratchy_cuda_attn_decode_merge(const void* o_split, const void* 
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        if (head_dim == 256) {
-            return launch_merge<256>(o_split, ml_split, sequence, out, q_heads, kv_heads, scale,
+        if (head_dim == D256) {
+            return launch_merge<D256>(o_split, ml_split, sequence, out, q_heads, kv_heads, scale,
                                      window, splits, min_tiles, stream);
         }
-        return launch_merge<512>(o_split, ml_split, sequence, out, q_heads, kv_heads, scale,
+        return launch_merge<D512>(o_split, ml_split, sequence, out, q_heads, kv_heads, scale,
                                  window, splits, min_tiles, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;

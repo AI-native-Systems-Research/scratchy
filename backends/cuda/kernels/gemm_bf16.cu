@@ -579,16 +579,17 @@ extern "C" int scratchy_cuda_gate_up_gemm_bf16(const void* a, const void* gate, 
                                                void* c, uint32_t m, uint32_t n, uint32_t k,
                                                uint32_t act, uint32_t col64,
                                                void* stream /* cudaStream_t; null = default */) {
-    if (act > 1 || col64 > 1) {
+    if (act > scratchy::GATED_ACT_GELU || col64 > 1) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
+    const bool silu = act == scratchy::GATED_ACT_SILU;
     if (col64 == 1) {
-        return act == 0 ? launch_gate_up<gate_up_silu_col64_mmt, gemm_col64_bf16_abt_mmt>(
+        return silu ? launch_gate_up<gate_up_silu_col64_mmt, gemm_col64_bf16_abt_mmt>(
                               a, gate, up, c, m, n, k, stream)
                         : launch_gate_up<gate_up_gelu_col64_mmt, gemm_col64_bf16_abt_mmt>(
                               a, gate, up, c, m, n, k, stream);
     }
-    return act == 0
+    return silu
                ? launch_gate_up<gate_up_silu_mmt, gemm_bf16_abt_mmt>(a, gate, up, c, m, n, k, stream)
                : launch_gate_up<gate_up_gelu_mmt, gemm_bf16_abt_mmt>(a, gate, up, c, m, n, k, stream);
 }

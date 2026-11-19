@@ -13,6 +13,10 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use crate::kernel_consts::{
+    ROPE_PAIRING_HALF_HEAD, ROPE_PAIRING_HALF_ROTATED, ROUTE_SOFTMAX_TOPK,
+    ROUTE_TOPK_SCALED_SOFTMAX,
+};
 use crate::step::RopeLanes;
 
 /// `SCRATCHY_CUDA_ERR_SHAPE` in the `.cu` launchers: the shape was refused, nothing launched.
@@ -2056,8 +2060,8 @@ pub unsafe fn rope_paired_bf16(
 ) -> Result<(), KernelError> {
     // The launcher's pairing codes, `kernels/rope_bf16.cu`'s `PAIRING_*`.
     let code = match pairing {
-        RopeLanes::HalfRotated => 0,
-        RopeLanes::HalfHead => 1,
+        RopeLanes::HalfRotated => ROPE_PAIRING_HALF_ROTATED,
+        RopeLanes::HalfHead => ROPE_PAIRING_HALF_HEAD,
     };
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe {
@@ -3677,11 +3681,6 @@ pub unsafe fn moe_route_softmax_topk_bf16(
     )
 }
 
-/// `kernels/moe_route_bf16.cu`'s `program` for `step::RouteProgram::SoftmaxTopK`.
-const ROUTE_SOFTMAX_TOPK: u32 = 0;
-/// `kernels/moe_route_bf16.cu`'s `program` for `step::RouteProgram::TopKScaledSoftmax`.
-const ROUTE_TOPK_SCALED_SOFTMAX: u32 = 1;
-
 /// Launch the scaled MoE routing (`kernels/moe_route_bf16.cu`'s scaled program, Gemma 4's): per
 /// token row of `logits` (`[m, experts]` bf16), the `top_k` largest RAW logits picked (equal
 /// logits by the higher expert index, a NaN lowest; always `top_k` distinct indices in
@@ -5225,8 +5224,8 @@ pub unsafe fn rope_append_fp8(
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     let pairing_code = match pairing {
-        RopeLanes::HalfRotated => 0,
-        RopeLanes::HalfHead => 1,
+        RopeLanes::HalfRotated => ROPE_PAIRING_HALF_ROTATED,
+        RopeLanes::HalfHead => ROPE_PAIRING_HALF_HEAD,
     };
     let (q_gain, k_gain, eps) = norms.unwrap_or((std::ptr::null(), std::ptr::null(), 0.0));
     // SAFETY: the caller upholds the contract above; the launcher checks every rule first.

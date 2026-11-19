@@ -248,4 +248,52 @@ kernel_consts! {
     /// A slot of the slot mapping or the block table that is not one: a padding row, or an unused
     /// block-table entry.
     NO_SLOT: u32 = u32::MAX;
+    /// The one-row norm's column granule and widest row (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`:
+    /// 16 warps × 2 chunks of 256 columns), which [`norm_row_takes`](crate::step::norm_row_takes)
+    /// picks it by.
+    NORM_ROW_COLS: u32 = 256;
+    NORM_ROW_MAX_COLS: u32 = 8192;
+    /// The one-row norm's forms, its launcher's `form` codes: the norm, the add then the norm (its
+    /// sum written), and the norm then the add.
+    NORM_ROW_FORM_NORM: u32 = 0;
+    NORM_ROW_FORM_ADD_NORM: u32 = 1;
+    NORM_ROW_FORM_NORM_ADD: u32 = 2;
+    /// B8's row tile (`kernels/gemv_fp8_tc.cu`): every `n` and `k` a multiple of it.
+    GEMV_TC_N_MULTIPLE: u32 = 64;
+    /// B8's grid's pairs axis: CUDA's grid-z limit.
+    GEMV_TC_MAX_PAIRS: u32 = 65535;
+    /// The widest row the row kernels hold whole in shared memory, 68 chunks of 256 columns: the
+    /// act + quantize (`kernels/act_quant_fp8.cu`), the fp8 GEMV's shared row (`gemv_fp8.cu`), the
+    /// per-row and one-row quantize (`quant_rows_fp8.cu`) and the bf16 norm's one-row form
+    /// (`rms_norm_bf16.cu`). The 27B's fp8 down projection's `k`, the widest row of the three FP8
+    /// checkpoints.
+    ROW_MAX_COLS: u32 = 17408;
+    /// The act + quantize's column limit, which the fp8 fold checks before it fuses one.
+    ACT_QUANT_MAX_COLS: u32 = ROW_MAX_COLS;
+    /// The one head dim of the rope kernels' half-head instantiation: a whole 512-lane head is one
+    /// unit of 8 boxes (`kernels/rope_bf16.cu`, `kernels/rope_append_bf16.cu`).
+    ROPE_BF16_HALF_HEAD_DIM: u32 = 512;
+    /// The rope launchers' `pairing` codes: the half-rotated pairing (`RopeLanes::HalfRotated`) and
+    /// the half-head one (`RopeLanes::HalfHead`).
+    ROPE_PAIRING_HALF_ROTATED: u32 = 0;
+    ROPE_PAIRING_HALF_HEAD: u32 = 1;
+    /// The one head dim the prefill attention kernels are instantiated for
+    /// (`kernels/attn_prefill_bf16.cu`, `attn_prefill_fp8kv.cu`).
+    ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
+    /// The gated activations' launcher codes (`step::GatedOp::code`): SwiGLU and GeGLU.
+    GATED_ACT_SILU: u32 = 0;
+    GATED_ACT_GELU: u32 = 1;
+    /// `kernels/moe_route_bf16.cu`'s `program` codes, for `step::RouteProgram::SoftmaxTopK` and
+    /// `TopKScaledSoftmax`.
+    ROUTE_SOFTMAX_TOPK: u32 = 0;
+    ROUTE_TOPK_SCALED_SOFTMAX: u32 = 1;
+    /// The value head dims the one-launch GDN decode is instantiated for (`kernels/gdn_decode.cu`).
+    GDN_DECODE_HEAD_VS: &[u32] = &[128, 256];
+    /// The fused fp8 expert gate/up GEMM's rule (`kernels/gemm_fp8.cu`'s
+    /// `scratchy_cuda_expert_gate_up_gemm_fp8`): `k` (the hidden) a multiple of its 128-wide K
+    /// step, `inter` a multiple of 64. The fp8 fold fuses only shapes it takes.
+    EXPERT_GATE_UP_FP8_K_MULTIPLE: u32 = 128;
+    EXPERT_GATE_UP_FP8_INTER_MULTIPLE: u32 = 64;
+    /// The greedy argmax's widest row (`kernels/argmax_bf16.cu`): its ids stay exact f32s.
+    ARGMAX_MAX_VOCAB: u32 = 1 << 24;
 }

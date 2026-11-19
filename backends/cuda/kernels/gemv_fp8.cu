@@ -96,8 +96,9 @@ constexpr int BLOCK_ROWS = WARPS * ROWS_PER_WARP;
 static_assert(BLOCK_ROWS == scratchy::GEMV_BLOCK_ROWS, "step::GEMV_BLOCK_ROWS");
 constexpr int MAX_SPLITS = scratchy::GEMV_MAX_SPLITS;
 constexpr int STAGES = 4;
-// The chunks of the longest row the shared row holds: 17,408 / 256.
-constexpr int ROW_CHUNKS = 68;
+// The chunks of the longest row the shared row holds: `step::ROW_MAX_COLS` / 256.
+constexpr int ROW_CHUNKS = scratchy::ROW_MAX_COLS / CHUNK;
+static_assert(ROW_CHUNKS * CHUNK == int(scratchy::ROW_MAX_COLS), "whole chunks");
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 constexpr int ROW_CHOICES[] = {4, 3, 2};
 static_assert(ROW_CHOICES[0] == ROWS_PER_WARP, "the 4-row instance is the split one");
@@ -838,8 +839,8 @@ int expert(const void* a, const void* b, const void* b_scale, const void* topk_i
 
 // The gate/up GEMV's activation: 0 SwiGLU (`scratchy::ops::silu_mul`), 1 GeGLU
 // (`scratchy::ops::gelu_tanh_mul`), as `step::GatedOp`; any other value is refused.
-constexpr uint32_t ACT_SILU = 0;
-constexpr uint32_t ACT_GELU = 1;
+constexpr uint32_t ACT_SILU = scratchy::GATED_ACT_SILU;
+constexpr uint32_t ACT_GELU = scratchy::GATED_ACT_GELU;
 
 // The gate/up GEMV's launches on `G`'s gate and up views (each a GEMV of the same `n`, `pairs`
 // and split): the fused CTAs, then at `splits > 1` the fused reduce, on `stream`.

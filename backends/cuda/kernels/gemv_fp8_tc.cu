@@ -61,7 +61,7 @@ namespace {
 
 constexpr int NUM_THREADS = 2 * kittens::WARPGROUP_THREADS;
 // `n` and `k` multiples of it: the scales' reads stay inside the arrays.
-constexpr uint32_t N_MULTIPLE = 64;
+constexpr uint32_t N_MULTIPLE = scratchy::GEMV_TC_N_MULTIPLE;
 
 // B8's instance: its K step, ring, row tile and CTAs per SM, and its two boxes.
 struct tc_b8 {
@@ -349,7 +349,7 @@ bool b8_refused(const b8_args& a, bool f32) {
     constexpr uint64_t LIMIT = uint64_t(INT_MAX);
     const bool expert = a.topk_idx != nullptr;
     if (a.count < 1 || a.count > 3 || a.k == 0 || a.k % N_MULTIPLE != 0 || a.pairs == 0 ||
-        a.pairs > 65535 || a.row_div == 0 || a.a_rows == 0 ||
+        a.pairs > scratchy::GEMV_TC_MAX_PAIRS || a.row_div == 0 || a.a_rows == 0 ||
         uint64_t(a.pairs - 1) / a.row_div >= a.a_rows || a.experts == 0 ||
         (!expert && a.experts != 1) || (f32 && a.residual != nullptr) || a.q == nullptr ||
         a.a_scale == nullptr || uint64_t(a.a_rows) * a.k > LIMIT) {

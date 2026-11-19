@@ -30,15 +30,16 @@ use scratchy_target_cuda::step::{
     ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16,
     GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
     GATE_SPLIT_BF16_HEAD_MULTIPLE, GATHER_LAST_ROW_BF16_COLS, GDN_CONV_KERNEL_RANGE,
-    GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
-    GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
-    GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GatherLastRowBf16, GdnPrefillBf16,
-    GemmBf16, GemmGroupBf16, GemvBf16, GemvSplit, GroupKind, GroupMember, HeadNorms,
-    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16,
-    NormKernel, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16,
-    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GDN_DECODE_HEAD_VS, GDN_DECODE_MAX_HEADS, GDN_GATING_NV_MULTIPLE, GDN_HEAD_K, GDN_HEAD_V_MAX,
+    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE,
+    GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE,
+    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16,
+    GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmGroupBf16, GemvBf16, GemvSplit,
+    GroupKind, GroupMember, HeadNorms, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel,
+    MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS,
+    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
+    RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
+    SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -1466,15 +1467,15 @@ pub fn gdn_bundle_layer(bindings: &[SourceBinding], s: &TapeStep<'_>) -> Option<
 }
 
 /// Whether the one-launch GDN decode takes `g`'s geometry (its launcher's rule, beyond the four
-/// launchers'): `head_v` 128 or 256, and one CTA per value head, a key head's `nv / nk` CTAs one
+/// launchers'): `head_v` one of [`GDN_DECODE_HEAD_VS`], and one CTA per value head, a key head's `nv / nk` CTAs one
 /// cluster, at most [`GDN_DECODE_MAX_HEADS`] of them, `nv` whole 16-head gating chunks (FP8 S8 D1:
 /// the 27B's three value heads a key head now take it).
 fn gdn_decode_takes(g: &GatedDeltaNetBf16) -> bool {
     let heads = g.num_v_heads / g.num_k_heads.max(1);
-    (g.head_v == 128 || g.head_v == 256)
+    GDN_DECODE_HEAD_VS.contains(&g.head_v)
         && g.num_v_heads.is_multiple_of(g.num_k_heads.max(1))
         && (1..=GDN_DECODE_MAX_HEADS).contains(&heads)
-        && g.num_v_heads.is_multiple_of(16)
+        && g.num_v_heads.is_multiple_of(GDN_GATING_NV_MULTIPLE)
 }
 
 /// `GatedDeltaNet(qkv, z, a, b, bundle)` as one prefill chunk of the Gated-DeltaNet layer: four

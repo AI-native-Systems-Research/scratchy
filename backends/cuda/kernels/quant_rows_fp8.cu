@@ -388,8 +388,9 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_resident_ker(
 
 constexpr int PER_ROW_WARPS = 8;
 constexpr int PER_ROW_THREADS = PER_ROW_WARPS * kittens::WARP_THREADS;
-// The longest row's chunks (17,408 / 256), and a warp's share of them.
-constexpr int PER_ROW_MAX_CHUNKS = 68;
+// The longest row's chunks (`step::ROW_MAX_COLS` / 256), and a warp's share of them.
+constexpr int PER_ROW_MAX_CHUNKS = scratchy::ROW_MAX_COLS / COLS;
+static_assert(PER_ROW_MAX_CHUNKS * COLS == int(scratchy::ROW_MAX_COLS), "whole chunks");
 constexpr int PER_ROW_WARP_CHUNKS = (PER_ROW_MAX_CHUNKS + PER_ROW_WARPS - 1) / PER_ROW_WARPS;
 
 // Whether the launcher runs the per-row form on a row of `cols` (the comment above).
@@ -602,8 +603,10 @@ namespace {
 
 constexpr int ONE_WARPS = 8;
 constexpr int ONE_THREADS = ONE_WARPS * kittens::WARP_THREADS;
-// The longest row's chunks (17,408 / 256), and a warp's share of them, `⌈68 / 8⌉`.
-constexpr int ONE_ROW_CHUNKS = 68;
+// The longest row's chunks (`step::ROW_MAX_COLS` / 256), and a warp's share of them,
+// `⌈68 / 8⌉`.
+constexpr int ONE_ROW_CHUNKS = scratchy::ROW_MAX_COLS / COLS;
+static_assert(ONE_ROW_CHUNKS * COLS == int(scratchy::ROW_MAX_COLS), "whole chunks");
 constexpr int ONE_CHUNKS = (ONE_ROW_CHUNKS + 8 - 1) / 8;
 
 using chunk_sv = sv_bf<COLS>;
