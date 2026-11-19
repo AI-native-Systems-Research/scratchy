@@ -16,8 +16,13 @@ pub mod steps_from_tape;
 
 use proc_macro2::TokenStream;
 use quote::quote;
+pub use scratchy_forward_compiler_macro::target::Preset;
 use scratchy_forward_compiler_macro::target::{LoadCx, ModelCx, ModelEmission, TargetEmitter};
 use scratchy_subtile::handoff::TargetModelInput;
+
+/// The quant presets CUDA lowers, and the only ones: it serves FP8 models only (#978), so the
+/// one preset its kernels realize. The emitter ([`Cuda`]) and the models build both read it.
+pub const CUDA_PRESETS: &[Preset] = &[Preset::Fp8DynamicPerChannel];
 
 /// The CUDA target's emitter: the shared weights struct, and beside it the model's lowered tapes
 /// ([`emit::emit_model`]). The worker loads the weights itself through each model's
@@ -30,9 +35,9 @@ impl TargetEmitter for Cuda {
         "cuda"
     }
 
-    /// CUDA serves FP8 models only (#978): the one preset its kernels realize.
-    fn lowers_preset(&self, preset: &str) -> bool {
-        preset == "fp8-dynamic-per-channel"
+    /// [`CUDA_PRESETS`].
+    fn presets(&self) -> &'static [Preset] {
+        CUDA_PRESETS
     }
 
     fn load_fn(&self, cx: &LoadCx<'_>) -> TokenStream {
@@ -86,8 +91,8 @@ impl TargetEmitter for Recording {
         Cuda.name()
     }
 
-    fn lowers_preset(&self, preset: &str) -> bool {
-        Cuda.lowers_preset(preset)
+    fn presets(&self) -> &'static [Preset] {
+        Cuda.presets()
     }
 
     fn load_fn(&self, cx: &LoadCx<'_>) -> TokenStream {

@@ -25,16 +25,17 @@ use scratchy_target_cuda::tape::{
     ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, TapeError, overlap,
 };
 use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
+use scratchy_target_cuda_compiler::Preset;
 use scratchy_target_cuda_compiler::emit::lower_model;
 
 /// The quant preset every tape of this binary is lowered under.
-const PRESET: &str = "fp8-dynamic-per-channel";
+const PRESET: Preset = Preset::Fp8DynamicPerChannel;
 /// Every lowered bucket, ascending: decode's one row, then the prefill buckets.
 const TAPE_BUCKETS: [u32; 5] = [1, 512, 1024, 2048, 4096];
 
 /// The stem the seam hands the fp8 variant over under, and the registry holds it by.
 fn variant() -> String {
-    format!("{STEM}-{PRESET}")
+    format!("{STEM}-{}", PRESET.name())
 }
 
 /// The model's canonicals, as `#[forward]` handed them to the seam: selected, as the build script
