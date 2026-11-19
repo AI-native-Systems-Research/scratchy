@@ -134,9 +134,6 @@ pub(crate) enum LogitsWanted {
     PerRequestDeferred,
 }
 
-/// The sendnn run backend selected from the baked bundle shape. DEFAULT-mode
-/// (`SCRATCHY_SENDNN_MODE=default`) bakes ONE group whose `prefill` and `decode`
-/// slots hold the SAME single static-SDPA graph (host-grown KV, no resident paged
 /// The sendnn session type. ONE variant: the dxp-compiled SuperDSC bundle is the only thing that
 /// runs on silicon. The sengraph families (offline_decoder `GroupedSession`, the static-paged and
 /// default-mode single-graph sessions) are GONE — they were the pre-SuperDSC bring-up path and the
@@ -156,8 +153,8 @@ pub(crate) enum SendnnSession {
     /// return the last new position's logits.
     ///
     /// BATCHED PREFILL (prefill-all-but-last): the bundle carries the m=1 `decode` session
-    /// AND an optional m=N `prefill` session (a SEPARATE SuperDscSession baked at
-    /// KTIR_PREFILL_LEN, lm_head skipped). The prompt runs through `prefill` in ONE forward
+    /// AND an optional m=N `prefill` session (a SEPARATE SuperDscSession baked at the
+    /// ladder's top width, lm_head skipped). The prompt runs through `prefill` in ONE forward
     /// (populating its resident seg2 KV on-card); the worker then copies that seg2 KV into
     /// `decode`'s seg2 (`read_seg`/`write_seg`, byte-identical layout) and decodes the last
     /// prompt token via `decode` → first-gen logits. `prefill` is `None` when the prefill

@@ -1152,7 +1152,7 @@ fn emit_superdsc_wiring(
 
 /// The SuperDSC AoT cache root (peer of `sengraphforge_cache_dir`). The
 /// proc-macro DROPS one bundle dir `<fp>/` (sdsc_{i}.json + bundle.mlir) per
-/// runnable graph here when `SCRATCHY_SENDNN_MODE=superdsc`; build.rs will
+/// runnable graph here; build.rs will
 /// `dxp_standalone --bundle -d <fp>` each into a device program. Fixed path so
 /// both sides agree without a build-graph edge — same contract as sengraphforge.
 /// ⭐⭐⭐⭐⭐ TURN THE EMITTED BUNDLES INTO RUST STRUCTS — the whole of getting a SuperDSC bundle into
@@ -2147,22 +2147,10 @@ fn reroll_tokens(
 
 // The emu's ONE width is LX-derived per model (`emu_prefill_lx_width`
 // below): the widest ladder rung whose fp8 gemms' INTRA-NODE tiles fit a
-// core's 2 MiB LX. This constant is now only the COLLISION-FREE CEILING
-// on that derivation — the largest width the emu will ever bake.
-//
-// CRITICAL: a by-value symbolization consumer (every concrete dim ==
-// prefill_m → `s0`) must not see the width equal any structural model dim,
-// else a non-seq dim is wrongly symbolized (the measured refusal was the
-// m=32 == head_dim/2 collision: the RoPE rotate-half StridedSlice output
-// `[rows, heads, 32]` became `[s0, heads, s0]`, which flex rejected at
-// graphOptimizer.cpp:2865). That consumer is HISTORICAL — it lived in the
-// deleted sengraph/offline_decoder path; in this tree `seq_sym`'s value
-// half is constructed and never destructured, so the emu's KTIR tape is
-// fully CONCRETE and PREFILL_LX_SAFE stands as the collision-free ceiling
-// for whichever symbolic consumer returns. 31 is prime + ≤32 (LX-safe) +
-// collides with no common dim (head_dim 64/128, half 32/64, n_heads,
-// hidden, intermediate, block_size 64). `KTIR_PREFILL_LEN` overrides (must
-// also be collision-free). Read by
+// core's 2 MiB LX. This constant is the COLLISION-FREE CEILING on that
+// derivation — the largest width the emu will ever bake. 31 is prime +
+// ≤32 (LX-safe) + collides with no common dim (head_dim 64/128, half
+// 32/64, n_heads, hidden, intermediate, block_size 64). Read by
 // dump_wavefront_mega and its pinned test.
 const PREFILL_LX_SAFE: u32 = 31;
 
@@ -2172,10 +2160,9 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// m=31 → 69 ms ⇒ ~42 ms + ~0.7 ms/row), so one width is wrong both ways — too narrow re-pays
 /// the fixed term on every extra chunk, too wide computes padding rows that carry no tokens.
 ///
-/// `2^k − 1` by construction: a by-value symbolization of the tape width would wrongly
-/// symbolize an equal NON-seq dim (see [`PREFILL_LX_SAFE`]'s note on m=32 == head_dim/2).
-/// These values collide with none of the power-of-two dims (head_dim, block_size, cap,
-/// hidden, intermediate).
+/// The prefill tape is CONCRETE, so a rung may equal a structural model dim (128 is
+/// granite-8b's head_dim). The low rungs are `2^k − 1` and collide with none of the
+/// power-of-two dims (head_dim, block_size, cap, hidden, intermediate).
 ///
 /// The 63-row ceiling is GONE (2026-07-29): the new-token block is now folded as `mq_pad/64`
 /// stick-wide sub-blocks, so a chunk may span more than one stick. 96 is HARDWARE-PROVEN.
@@ -2184,10 +2171,6 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// 3.7 / 2.3 / 1.4 ms per row) — so a prompt one token past the ceiling used to pay a whole
 /// extra chunk. A 65-row prompt split 63+2 and the 2-token tail alone cost 56.8 ms.
 /// 80 sits between 63 and 96 to halve the worst-case padding in that gap.
-///
-/// `2^k − 1` is no longer required: this ladder is the SuperDSC bake's alone, and that prefill
-/// tape is CONCRETE (`seq_sym` is forced to `None` below), so nothing symbolizes it by value.
-/// That is why 128 may equal granite-8b's head_dim here.
 ///
 /// Rungs that fail to lower for a given model FAIL THE BUILD, so this list is a promise:
 /// every admitted rung bakes or nothing does.
@@ -2570,14 +2553,8 @@ pub(crate) fn dump_wavefront_mega(
                  the model's own context"
             )
         });
-    // Primary bundle row count: 1 = decode (default), >1 = the mq golden-gate
-    // knob. The worker's batched-prefill bundle is emitted separately below
-    // (default m = prefix_len; `KTIR_PREFILL_LEN` overrides).
-    let primary_m: u32 = std::env::var("KTIR_M")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&v| v >= 1)
-        .unwrap_or(1);
+    // The primary bundle is the m=1 decode tape; wider row counts are batch-ladder
+    // rungs, baked below.
     let lower_at = |cap: std::num::NonZeroU32| {
         scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
             fuf,
@@ -2585,7 +2562,7 @@ pub(crate) fn dump_wavefront_mega(
             decode_bounds,
             &bridge,
             scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
-            primary_m,
+            1,
         )
     };
     let first = lower_at(prefix_len);
@@ -2648,25 +2625,6 @@ pub(crate) fn dump_wavefront_mega(
         // Opt-in `--device sdsc` (real-silicon) dump: emit the SAME real-model
         // `krg` SubtileIR to a sendnn op-graph JSON the DeepTools `compile_graph`
         // toolchain consumes. Off by default; writes one `<base>.sengraph.json`
-        // ── PAGED revival (opt-in): `SCRATCHY_SENDNN_MODE=paged` emits the vLLM-Spyre
-        //    offline_decoder [prefill,decode] PAGED bundle (PagedAttnStore/Compute,
-        //    resident KV, symbolic s0/s1) — prefill = SDPA+Store, decode = Store+Compute,
-        //    distinct graphs sharing the cache by node name. UNSET (the build default)
-        //    keeps the dd2-PROVEN static-SDPA host-grown-KV single graph so the decode
-        //    sentinel never regresses. PROVEN viable on dd2 SENTIENT 2026-06-23.
-        let sendnn_paged = std::env::var("SCRATCHY_SENDNN_MODE").as_deref() == Ok("paged");
-        // ── SuperDSC PERF path: the `superdsc` CARGO FEATURE (`--features superdsc`,
-        //    NOT an env var) walks the SAME `krg` SubtileIR straight to a TILE-LEVEL,
-        //    WORK-DIVIDED SuperDSC bundle (`lower_graph_to_superdsc`) that OWNS the
-        //    32-core split — the fix for the sengraph path leaving 31 cores idle
-        //    (SENCORES 1→14.4ms vs 32→9.9ms, only 1.45×). Drops the bundle into the
-        //    per-process scratch tree, where the bake queue dxp-compiles it in place. Only the
-        //    runnable m=1 DECODE tape (seq_sym=None, !is_prefill) is walked; the
-        //    symbolic prefill/CB tapes are skipped (emulator-only). An op the emitter
-        //    can't lower yet is a HARD error here (build-time guard), never a silent
-        //    skip. (A Cargo feature, not an env trigger.)
-        // Every spyre build emits the bundle: the lowering has one target, and it is KTIR.
-        let sendnn_superdsc = true;
 
         // Emit ONE KTIR bundle (decode or prefill) from a lowered graph into
         // `dir`. Factored so we drop BOTH a cheap m=1 decode bundle (fast
@@ -2676,8 +2634,7 @@ pub(crate) fn dump_wavefront_mega(
         // (group_idx, input_tensor_id, result_tensor_id, group_graph_json) — the
         // per-layer-group split graphs.
         type GroupGraphs = Vec<(u32, u32, u32, String)>;
-        // SuperDSC bundle fingerprint (set by the m=1 decode walk under
-        // `SCRATCHY_SENDNN_MODE=superdsc`). When present, the SengraphBundle's
+        // SuperDSC bundle fingerprint (set by the m=1 decode walk). When present, the SengraphBundle's
         // (single) group has its prefill+decode `graph_json` STAMPED to
         // `SUPERDSC_BUNDLE:{fp}` so the worker resolves the baked dxp bundle dir
         // (via `scratchy_builder_spyre::baked_superdsc_dir`) instead of compiling a
@@ -2711,8 +2668,8 @@ pub(crate) fn dump_wavefront_mega(
         let weight_fold_census: std::cell::RefCell<WeightFoldCensus> =
             std::cell::RefCell::new(None);
         // SEPARATE fp for the m=N batched-PREFILL reroll bundle ("prefill-all-but-last"). The
-        // prefill `emit_bundle` (is_prefill=true; under superdsc its seq_sym is forced to None so
-        // the tape is CONCRETE at m=prefill_m) bakes its OWN prefix/body/suffix — with the lm_head
+        // prefill `emit_bundle` (is_prefill=true; the tape is CONCRETE at m=prefill_m) bakes
+        // its OWN prefix/body/suffix — with the lm_head
         // SKIPPED (lower_one_node: is_lm_head && m>1) so the vocab-wide lm_head never time-tiles —
         // and stamps HERE, so it does NOT clobber the decode body_fp. Threaded into the
         // SengraphBundle's PREFILL graph slot (C4) so the worker resolves a DISTINCT prefill dxp
@@ -2910,16 +2867,14 @@ pub(crate) fn dump_wavefront_mega(
              // The capacity THIS bundle is baked for. Decode cap buckets vary it;
              // every other call site passes the full `prefix_len`.
              cap: u32,
-             seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
              prefill_seqs: u32,
              // The resident-prefix sweep this bundle is baked for. Decode always FULL.
              // A PREFILL chunk with start==0 has no resident prefix, so it bakes NONE
              // (nb=0) and skips 308 of 710 ops/layer; continuation chunks need FULL.
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-             // The row count THIS bundle is baked at. Not `primary_m`: a batch-ladder
-             // rung is a wider bake of the same tape, and reading the env knob here
-             // would tell every rung it was one row.
+             // The row count THIS bundle is baked at. The m=1 decode passes 1; a
+             // batch-ladder rung is a wider bake of the same tape at its own count.
              decode_rows: u32,
              // The slice law of every source when `lwd` is one rank of a sharded world — the
              // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
@@ -2950,19 +2905,12 @@ pub(crate) fn dump_wavefront_mega(
                 // are the missing source type: the rung walks should hand the closure a
                 // `RungWidth` / `RungCap` directly, follow-up.)
                 //
-                // ⭐ A SYMBOLIC BATCH TAPE states its width through `seq_sym`: the CB decode
-                // emission lowers at `CB_BATCH_TEMPLATE` rows (a batch SYMBOL the DEM
-                // resolves at runtime) while passing `decode_rows = 1` on purpose — its
-                // `DecodeRung` effect and slot discriminators read the CONCRETE rung
-                // count, which the symbolic tape does not have. Each arm says which
-                // source states the width for which kind of tape: a prefill — symbolic
-                // or concrete — takes its width from `prefill_mq` (one request however
-                // many positions), a symbolic decode batch from its symbol's template,
-                // a concrete decode rung from `decode_rows`.
-                let (per_request, requests) = match (prefill_mq, seq_sym) {
-                    (Some(mq), _) => (mq, prefill_seqs),
-                    (None, Some((_, width))) => (1u32, width),
-                    (None, None) => (1u32, decode_rows),
+                // Each arm says which source states the width for which kind of tape: a
+                // prefill takes its width from `prefill_mq` (one request however many
+                // positions), a decode rung from `decode_rows`.
+                let (per_request, requests) = match prefill_mq {
+                    Some(mq) => (mq, prefill_seqs),
+                    None => (1u32, decode_rows),
                 };
                 let query_rows = (|| {
                     ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
@@ -3142,20 +3090,9 @@ pub(crate) fn dump_wavefront_mega(
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
                     return ((String::new(), Vec::new()), fx);
                 }
-                // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
-                // op-graph JSON (the DeepTools toolchain compiles + runs it on the
-                // AIU). Baked into the binary below as `SENGRAPH_BUNDLE`; dumped to
-                // disk too when `SCRATCHY_SENGRAPH_DUMP` is set.
-                // Only symbolic bundles (seq_sym=Some: prefill prompt, CB decode batch)
-                // are real `--target sendnn` decoder graphs. The plain m=1 KTIR decode
-                // (seq_sym=None) is emulator-only — skip its sengraph so it never trips
-                // the decoder-contract guards as build noise.
-                // DEFAULT-MODE single graph: lower the m=1 decode tape to the static-SDPA
-                // host-grown-KV sengraph and bake it as group 0 (the only group). The
-                // offline_decoder layer-group split was removed (it never cleared the
-                // dd2 per-job flit cap); the default-mode graph partitions itself via the
-                // explicit host Reshape/Transpose breaks. `group_graphs[i]` =
-                // (group, input_tensor, result_tensor, json).
+                // No sengraph is lowered: the runnable artifact is the SuperDSC bundle
+                // the reroll below bakes, and `group_graphs` stays empty — the caller
+                // synthesizes a placeholder group to carry the SUPERDSC_BUNDLE sentinel.
                 let group_graphs: Vec<(u32, u32, u32, String)> = Vec::new();
                 // WEIGHT IDS for the fold pass: the sengraph source tensor id `t{i}` is a
                 // model WEIGHT iff `lwd.bindings()[i]` is `SourceBinding::Weight` (the
@@ -3179,20 +3116,15 @@ pub(crate) fn dump_wavefront_mega(
                         })
                         .collect()
                 };
-                // ── SuperDSC PERF emission (opt-in `SCRATCHY_SENDNN_MODE=superdsc`) ──
+                // ── SuperDSC PERF emission ──
                 // Walk the SAME `krg` straight to a work-divided SuperDSC bundle and
-                // write it to the per-process scratch tree, dxp-compiled in place. Only
-                // the runnable m=1 decode tape (seq_sym=None, !is_prefill) — the symbolic
-                // prefill/CB tapes are emulator-only. An unlowered op is a HARD error
-                // (the worklist signal: it names the exact next op to emit), never a
-                // silent skip (which would mean silently-wrong on-card output).
-                // superdsc bakes BOTH the m=1 decode reroll AND the m=N prefill reroll (C1 forces the
-                // prefill's seq_sym to None so it is CONCRETE here). `seq_sym.is_none()` still excludes
-                // the emulator-only symbolic CB-decode tape (Some(("s0",…))). is_prefill selects which fp
-                // to stamp (superdsc_prefill_fp vs superdsc_fp) at the bake site below.
-                // COMPILE-gated on `superdsc`: the sdsc emitter module only exists under that feature, so a
-                // `spyre`-only (ktir) build must not compile this block at all (`sendnn_superdsc` alone is a
-                // runtime bool and would still require the module to resolve).
+                // write it to the per-process scratch tree, dxp-compiled in place. An
+                // unlowered op is a HARD error (the worklist signal: it names the exact
+                // next op to emit), never a silent skip (which would mean
+                // silently-wrong on-card output).
+                // superdsc bakes BOTH the m=1 decode reroll AND the m=N prefill reroll;
+                // is_prefill selects which fp to stamp (superdsc_prefill_fp vs
+                // superdsc_fp) at the bake site below.
                 // ⭐ THE WIRING COMES OFF THE LOWERING THAT EMITS THE PROGRAMS. Its parameter
                 // pairings are the ones the bundle's launches bind, so there is one lowering and
                 // the wiring cannot describe a different program than the one that ships.
@@ -3212,977 +3144,931 @@ pub(crate) fn dump_wavefront_mega(
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
                 };
-                if sendnn_superdsc && seq_sym.is_none() {
-                    use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
-                    // ── GATE-1 de-risk: when `SCRATCHY_SUPERDSC_GATE1=1`, also drop a
-                    //    SINGLE self-contained matmul bundle (no dangling tensor refs)
-                    //    so a pod `sendnn` build's dxp-bake can prove dxp INGESTS
-                    //    scratchy's emitted SuperDSC (encoding + build.rs arm + init.txt
-                    //    end-to-end) BEFORE the full decode bundle is complete. Content-
-                    //    keyed write → idempotent across emit_bundle calls.
-                    if std::env::var("SCRATCHY_SUPERDSC_GATE1").as_deref() == Ok("1") {
-                        // SMALL LX-fitting matmul (64×64×64, batch 1): per-core tile
-                        // (kernel ~8KB) is well under the LX scratchpad, so it compiles
-                        // WITHOUT the frontend coarse-tile (time-tiling) pass — isolating
-                        // "is the typed emitter's format dxp-valid?" from "does it tile
-                        // large tiles?" (the latter = the coarse_tile port, next).
-                        use ktir_superdsc::sdsc_abstract::{
-                            KernelTag, RowBlockedTag, StickLayout, Stk,
-                        };
-                        // Typed matmul operands (compile-time addressing): activation/output RowBlocked, weight Kernel.
-                        let g1_a =
-                            Stk::<RowBlockedTag>::new("g1_a", StickLayout::row_blocked(64, 64))
-                                .unwrap();
-                        let g1_w = Stk::<KernelTag>::kernel(64, 64, "g1_w");
-                        let g1_o =
-                            Stk::<RowBlockedTag>::new("g1_o", StickLayout::row_blocked(64, 64))
-                                .unwrap();
-                        let g1 = superdsc::assemble_matmul(
-                            "gate1_mm", 64, 64, 64, 1, &g1_a, &g1_w, &g1_o, None,
-                        );
-                        // A hand-authored matmul, so there is no attention node for the four
-                        // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match g1.map_err(|e| e.to_string()).and_then(|g1| {
-                            superdsc::emit_bundle::<$W>(
-                                &[g1],
-                                None,
-                                superdsc::FoldGrouping::Split,
-                                None,
-                                dump,
-                            )
-                            .map_err(|e| e.to_string())
-                        }) {
-                            Ok(fp) => eprintln!(
-                                "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
-                                 dxp compiles it inline"
-                            ),
-                            Err(e) => eprintln!("[spyre-superdsc] GATE-1 bundle emit failed: {e}"),
-                        }
-                    }
-                    // RE-ROLL the layer loop (the 40-min-compile fix): instead of lowering
-                    // the 30×-UNROLLED `krg` to one 2047-op bundle (dxp super-linear → 40 min),
-                    // re-roll the tape (mirror the tk_tape path, codegen ~8807) and lower the
-                    // ONE layer BODY (~68 ops) → a SMALL bundle dxp compiles in SECONDS.
-                    // STAGE 1: bake the BODY bundle (proves the fast compile). STAGE 2 adds the
-                    // prefix(embed)/suffix(lm_head) bundles + the executor loop over `iters`
-                    // layers (per_layer weight/KV/hidden ivar threading).
-                    use scratchy_subtile::subtile_ir::ValidatedGraph;
-                    use scratchy_subtile::subtile_tape::{
-                        lower_dag_to_tape, reroll_layer_classes, reroll_subtile_tape,
-                    };
-                    match ValidatedGraph::new(&krg) {
-                        Ok(valid) => {
-                            let tape_unrolled = lower_dag_to_tape(&valid);
-                            // ⭐ THE CLASS-SPLIT ROLL FIRST. A hybrid-attention model (gemma-4:
-                            // alternating sliding/global layers) has TWO distinct layer shapes, and
-                            // the welded roll's smallest repeat unit is the whole 6-layer cell — a
-                            // bake-unit ~6× larger than either class's body. `reroll_layer_classes`
-                            // splits it into one sibling loop per class; `reroll_subtile_tape`
-                            // remains the single-class roll every other model takes, byte-identical.
-                            let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
-                                .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
-                            match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
-                                &tape_rolled,
-                                &krg,
-                                &weight_ids,
-                                active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
-                                // start==0 chunk, FULL for the continuation bundle.
-                                rows_are_requests,
-                                query_rows,
-                            ) {
-                                Ok(rolled) => {
-                                    // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
-                                    // ceiling's packed weight segment, as the runtime's alias
-                                    // guard reads it. One entry per baked bundle; the ledger is
-                                    // judged once, after the last bake.
-                                    {
-                                        let (bank0, banks) =
-                                            superdsc::weight_seg_record(&rolled.layout);
-                                        fx.push(BakeEffect::WeightSeg {
-                                            base: format!("{base} (ceiling)"),
-                                            bank0,
-                                            banks,
-                                        });
-                                    }
-                                    // `iters` counts LOOP ITERATIONS, not layers: a welded body can
-                                    // be a multi-layer cell (tiny26's (S,F) pair, ×3 = all 6
-                                    // layers), and the runtime load line reports this same sum as
-                                    // "launch(es)" — one launch per (body, iteration).
-                                    let launches: u32 = rolled.bodies.iter().map(|b| b.iters).sum();
-                                    eprintln!(
-                                        "[spyre-superdsc] {base}: RE-ROLLED — prefix {} / {} body \
-                                         class(es) ({} ops each, ×{} launch(es) total) / suffix {} ops \
-                                         ({} per-layer tids). Baking the body bundle(s) (STAGE 1).",
-                                        rolled.prefix.len(),
-                                        rolled.bodies.len(),
-                                        rolled.bodies.first().map(|b| b.ops.len()).unwrap_or(0),
-                                        launches,
-                                        rolled.suffix.len(),
-                                        rolled.per_layer.len(),
-                                    );
-                                    // STAGE 2: bake ALL THREE small bundles (prefix=embed,
-                                    // body=ONE layer, suffix=lm_head) + drop `reroll_meta.json`
-                                    // in the body dir (3 fps + iters + per-layer seg strides) so
-                                    // the worker runs prefix → body×iters (seg-base advance by
-                                    // v·stride) → suffix. The sentinel stays `SUPERDSC_BUNDLE:{body_fp}`;
-                                    // the worker detects rolled mode by the presence of reroll_meta.json.
-                                    // ⭐⭐⭐ WHICH OPS THE ONE PATH GETS IS A PROPERTY OF THE DEVICE.
-                                    //
-                                    // ⛔ AND THE UNROLL'S "COSTS ALMOST NOTHING" ARGUMENT IS TRUE FOR
-                                    // THE EMULATOR AND FALSE FOR THE CARD. A KTIR launch binds a
-                                    // TENSOR, and KTIR programs are INTERNED, so `iters` copies of a
-                                    // body really are `iters` arg-lists over one shared program —
-                                    // free. Nothing is interned at DESCRIPTOR level: on `-Fspyre-hw`
-                                    // every unrolled layer's op becomes its own `SdscOp` and its own
-                                    // dxp group compile. MEASURED on granite-3.1-2b: the unrolled form
-                                    // is 690 KTIR programs → 8744 descriptors / 161 groups, where this
-                                    // same site's ROLLED sibling bake (`&b.ops`, the fused twin
-                                    // below) is 137-164 descriptors / 3 groups. That 40x is the whole
-                                    // bake-time story, and it ends in `dxp refused …: LLVM ERROR:
-                                    // pthread_create failed`.
-                                    //
-                                    // ⭐ SO THE CARD BAKES THE ROLLED BODY and its executor loops it —
-                                    // `superdsc_exec::load_rolled` advances the resident segment base
-                                    // by `v·stride` per iteration, which is exactly what
-                                    // `RerollMeta`'s strides are for and why they are real HERE even
-                                    // though a KTIR launch has no segment base of its own: on this
-                                    // path addresses come from `BundleLayout.places`, not from
-                                    // `LaunchProgram::args` (which `ktir_groups_via_superdsc` leaves
-                                    // empty for exactly that reason).
-                                    //
-                                    // ⛔ THIS IS NOT A SECOND PATH. Both devices still go
-                                    // `SubtileIR → KTIR → SuperDSC → this bake`; only the op LIST
-                                    // differs, the same way `ktir_optimizer::matmul_tile` differs by
-                                    // device without forking the lowering. It is the same correction
-                                    // the matmul pre-tiling needed: an emulator-motivated transform
-                                    // applied upstream of both consumers, moved to the consumer that
-                                    // wants it.
-                                    let unrolled = superdsc::unroll_layers::<$W>(&rolled);
-                                    let card = cfg!(feature = "spyre-lower");
-                                    let unrolled_params = rolled.attn_params;
-                                    let pre = if card {
-                                        superdsc::emit_bundle::<$W>(
-                                            &rolled.prefix,
-                                            Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Split,
-                                            rolled.attn_params,
-                                            dump,
-                                        )
-                                    } else {
-                                        Ok(String::new())
-                                    };
-                                    // ⭐ ONE BODY, PLAYED `iters` TIMES. The old ladder baked one
-                                    // bundle per attention class; this ladder's rolled contract is
-                                    // the single `body` (the welded cell for a hybrid — see the roll
-                                    // call above), and every launch row below replays it with the
-                                    // per-layer segment shifts.
-                                    // ⛔ A FAILED BODY IS A BUILD ERROR, NOT A SKIP — EXCEPT
-                                    // ON THE BATCH LADDER, WHERE THE RUNG CONTRACT IS THE SKIP. An
-                                    // empty fp here rides into `RerollMeta::bodies` as a sibling
-                                    // nobody emitted: the worker's body selector finds no bundle and
-                                    // the first signal is a launch-time refusal with none of this
-                                    // context. This is the site the oversized-dxp-group guard
-                                    // (`DxGroupCeiling`) reaches — log-and-skip here is exactly the
-                                    // swallow that would have turned the guard into an eprintln, so
-                                    // an emit failure is FATAL for every rung alike: primary body,
-                                    // decode batch rung, prefill rung.
-                                    // ONE BUNDLE PER CLASS, class 0 first — class 0 is the ANCHOR
-                                    // (`RerollMeta::bodies[0]` names THIS bundle), and every other
-                                    // class becomes a sibling fingerprint. The emulator's single
-                                    // unrolled bundle stays ONE bundle: `unroll_layers` already
-                                    // walks the launch sequence across classes.
-                                    let mut body_fps: Vec<String> = Vec::new();
-                                    for (ci, b) in rolled.bodies.iter().enumerate() {
-                                        let r = superdsc::emit_bundle::<$W>(
-                                            if card { &b.ops } else { &unrolled },
-                                            Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Split,
-                                            if card {
-                                                rolled.attn_params
-                                            } else {
-                                                unrolled_params
-                                            },
-                                            dump,
-                                        );
-                                        match r {
-                                            Ok(fp) => body_fps.push(fp),
-                                            Err(e) => panic!(
-                                                "[spyre-superdsc] {base}: body class {ci} emit \
-                                                 failed at decode_rows={decode_rows} \
-                                                 prefill_mq={prefill_mq:?} — {e}. A rung the bake \
-                                                 was asked for must ship its bundle; a skip here \
-                                                 ships a binary whose batch silently runs elsewhere"
-                                            ),
-                                        }
-                                    }
-                                    let bod: Result<String, std::io::Error> =
-                                        Ok(body_fps.first().cloned().unwrap_or_default());
-                                    // The SAME body, with the per-page fold fused back into the
-                                    // surrounding work instead of standing alone. Splitting the fold
-                                    // costs one extra launch per layer (measured: 5 groups vs the
-                                    // baseline's 4 = 40 more launches per token on a launch-bound path),
-                                    // and that is only worth paying when the fold is actually
-                                    // re-launched. The runtime picks this one whenever the context fits
-                                    // a single page, which is the case that has to stay at the
-                                    // baseline's cost.
-                                    // ⭐ THE TWIN IS A LAUNCH-*GROUPING* VARIANT, SO IT IS THE CARD'S.
-                                    // Off-card `ktir_groups` takes `_fold` and never reads it — one
-                                    // launch group per op, always — so an emulator twin is a
-                                    // byte-identical copy of its split under a different name, and its
-                                    // only reader (`superdsc_exec::select_body_paged`) is
-                                    // `spyre-hw`-gated. Same rule as the prefix/suffix below: bake it
-                                    // where it is read.
-                                    // One fold-fused twin PER CLASS, same order as the bodies. An
-                                    // emit failure is logged and left `none()` — silent at runtime
-                                    // only in the sense the selector documented: it falls through
-                                    // to the split body, one launch per layer dearer.
-                                    // ⛔ AND ONLY WHERE THERE IS A FOLD TO FUSE
-                                    // (`superdsc::has_fused_twin`). A body with none — every paged
-                                    // step's, whose walk is never fused away — has a "twin" that is
-                                    // its split program again under a second name: a second dxp
-                                    // compile and a second copy in the card image, for every rung.
-                                    let bodies_fused: Vec<superdsc::bundle::SiblingFp<'static>> =
+                use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
+                // RE-ROLL the layer loop (the 40-min-compile fix): instead of lowering
+                // the 30×-UNROLLED `krg` to one 2047-op bundle (dxp super-linear → 40 min),
+                // re-roll the tape (mirror the tk_tape path, codegen ~8807) and lower the
+                // ONE layer BODY (~68 ops) → a SMALL bundle dxp compiles in SECONDS.
+                // STAGE 1: bake the BODY bundle (proves the fast compile). STAGE 2 adds the
+                // prefix(embed)/suffix(lm_head) bundles + the executor loop over `iters`
+                // layers (per_layer weight/KV/hidden ivar threading).
+                use scratchy_subtile::subtile_ir::ValidatedGraph;
+                use scratchy_subtile::subtile_tape::{
+                    lower_dag_to_tape, reroll_layer_classes, reroll_subtile_tape,
+                };
+                match ValidatedGraph::new(&krg) {
+                    Ok(valid) => {
+                        let tape_unrolled = lower_dag_to_tape(&valid);
+                        // ⭐ THE CLASS-SPLIT ROLL FIRST. A hybrid-attention model (gemma-4:
+                        // alternating sliding/global layers) has TWO distinct layer shapes, and
+                        // the welded roll's smallest repeat unit is the whole 6-layer cell — a
+                        // bake-unit ~6× larger than either class's body. `reroll_layer_classes`
+                        // splits it into one sibling loop per class; `reroll_subtile_tape`
+                        // remains the single-class roll every other model takes, byte-identical.
+                        let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
+                            .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
+                        match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
+                            &tape_rolled,
+                            &krg,
+                            &weight_ids,
+                            active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
+                            // start==0 chunk, FULL for the continuation bundle.
+                            rows_are_requests,
+                            query_rows,
+                        ) {
+                            Ok(rolled) => {
+                                // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
+                                // ceiling's packed weight segment, as the runtime's alias
+                                // guard reads it. One entry per baked bundle; the ledger is
+                                // judged once, after the last bake.
+                                {
+                                    let (bank0, banks) =
+                                        superdsc::weight_seg_record(&rolled.layout);
+                                    fx.push(BakeEffect::WeightSeg {
+                                        base: format!("{base} (ceiling)"),
+                                        bank0,
+                                        banks,
+                                    });
+                                }
+                                // `iters` counts LOOP ITERATIONS, not layers: a welded body can
+                                // be a multi-layer cell (tiny26's (S,F) pair, ×3 = all 6
+                                // layers), and the runtime load line reports this same sum as
+                                // "launch(es)" — one launch per (body, iteration).
+                                let launches: u32 = rolled.bodies.iter().map(|b| b.iters).sum();
+                                eprintln!(
+                                    "[spyre-superdsc] {base}: RE-ROLLED — prefix {} / {} body \
+                                     class(es) ({} ops each, ×{} launch(es) total) / suffix {} ops \
+                                     ({} per-layer tids). Baking the body bundle(s) (STAGE 1).",
+                                    rolled.prefix.len(),
+                                    rolled.bodies.len(),
+                                    rolled.bodies.first().map(|b| b.ops.len()).unwrap_or(0),
+                                    launches,
+                                    rolled.suffix.len(),
+                                    rolled.per_layer.len(),
+                                );
+                                // STAGE 2: bake ALL THREE small bundles (prefix=embed,
+                                // body=ONE layer, suffix=lm_head) + drop `reroll_meta.json`
+                                // in the body dir (3 fps + iters + per-layer seg strides) so
+                                // the worker runs prefix → body×iters (seg-base advance by
+                                // v·stride) → suffix. The sentinel stays `SUPERDSC_BUNDLE:{body_fp}`;
+                                // the worker detects rolled mode by the presence of reroll_meta.json.
+                                // ⭐⭐⭐ WHICH OPS THE ONE PATH GETS IS A PROPERTY OF THE DEVICE.
+                                //
+                                // ⛔ AND THE UNROLL'S "COSTS ALMOST NOTHING" ARGUMENT IS TRUE FOR
+                                // THE EMULATOR AND FALSE FOR THE CARD. A KTIR launch binds a
+                                // TENSOR, and KTIR programs are INTERNED, so `iters` copies of a
+                                // body really are `iters` arg-lists over one shared program —
+                                // free. Nothing is interned at DESCRIPTOR level: on `-Fspyre-hw`
+                                // every unrolled layer's op becomes its own `SdscOp` and its own
+                                // dxp group compile. MEASURED on granite-3.1-2b: the unrolled form
+                                // is 690 KTIR programs → 8744 descriptors / 161 groups, where this
+                                // same site's ROLLED sibling bake (`&b.ops`, the fused twin
+                                // below) is 137-164 descriptors / 3 groups. That 40x is the whole
+                                // bake-time story, and it ends in `dxp refused …: LLVM ERROR:
+                                // pthread_create failed`.
+                                //
+                                // ⭐ SO THE CARD BAKES THE ROLLED BODY and its executor loops it —
+                                // `superdsc_exec::load_rolled` advances the resident segment base
+                                // by `v·stride` per iteration, which is exactly what
+                                // `RerollMeta`'s strides are for and why they are real HERE even
+                                // though a KTIR launch has no segment base of its own: on this
+                                // path addresses come from `BundleLayout.places`, not from
+                                // `LaunchProgram::args` (which `ktir_groups_via_superdsc` leaves
+                                // empty for exactly that reason).
+                                //
+                                // ⛔ THIS IS NOT A SECOND PATH. Both devices still go
+                                // `SubtileIR → KTIR → SuperDSC → this bake`; only the op LIST
+                                // differs, the same way `ktir_optimizer::matmul_tile` differs by
+                                // device without forking the lowering. It is the same correction
+                                // the matmul pre-tiling needed: an emulator-motivated transform
+                                // applied upstream of both consumers, moved to the consumer that
+                                // wants it.
+                                let unrolled = superdsc::unroll_layers::<$W>(&rolled);
+                                let card = cfg!(feature = "spyre-lower");
+                                let unrolled_params = rolled.attn_params;
+                                let pre = if card {
+                                    superdsc::emit_bundle::<$W>(
+                                        &rolled.prefix,
+                                        Some(&rolled.layout),
+                                        superdsc::FoldGrouping::Split,
+                                        rolled.attn_params,
+                                        dump,
+                                    )
+                                } else {
+                                    Ok(String::new())
+                                };
+                                // ⭐ ONE BODY, PLAYED `iters` TIMES. The old ladder baked one
+                                // bundle per attention class; this ladder's rolled contract is
+                                // the single `body` (the welded cell for a hybrid — see the roll
+                                // call above), and every launch row below replays it with the
+                                // per-layer segment shifts.
+                                // ⛔ A FAILED BODY IS A BUILD ERROR, NOT A SKIP — EXCEPT
+                                // ON THE BATCH LADDER, WHERE THE RUNG CONTRACT IS THE SKIP. An
+                                // empty fp here rides into `RerollMeta::bodies` as a sibling
+                                // nobody emitted: the worker's body selector finds no bundle and
+                                // the first signal is a launch-time refusal with none of this
+                                // context. This is the site the oversized-dxp-group guard
+                                // (`DxGroupCeiling`) reaches — log-and-skip here is exactly the
+                                // swallow that would have turned the guard into an eprintln, so
+                                // an emit failure is FATAL for every rung alike: primary body,
+                                // decode batch rung, prefill rung.
+                                // ONE BUNDLE PER CLASS, class 0 first — class 0 is the ANCHOR
+                                // (`RerollMeta::bodies[0]` names THIS bundle), and every other
+                                // class becomes a sibling fingerprint. The emulator's single
+                                // unrolled bundle stays ONE bundle: `unroll_layers` already
+                                // walks the launch sequence across classes.
+                                let mut body_fps: Vec<String> = Vec::new();
+                                for (ci, b) in rolled.bodies.iter().enumerate() {
+                                    let r = superdsc::emit_bundle::<$W>(
+                                        if card { &b.ops } else { &unrolled },
+                                        Some(&rolled.layout),
+                                        superdsc::FoldGrouping::Split,
                                         if card {
-                                            rolled
-                                                .bodies
-                                                .iter()
-                                                .map(|b| {
-                                                    if !superdsc::has_fused_twin::<$W>(&b.ops) {
-                                                        return superdsc::bundle::SiblingFp::none();
-                                                    }
-                                                    superdsc::emit_bundle::<$W>(
-                                                        &b.ops,
-                                                        Some(&rolled.layout),
-                                                        superdsc::FoldGrouping::Fused,
-                                                        rolled.attn_params,
-                                                        dump,
-                                                    )
-                                                    .map(superdsc::bundle::SiblingFp::from)
-                                                    .unwrap_or_else(|e| {
-                                                        panic!(
-                                                            "[spyre-superdsc] {base}: fold-fused \
-                                                             body twin does not emit: {e}"
-                                                        )
-                                                    })
-                                                })
-                                                .collect()
+                                            rolled.attn_params
                                         } else {
-                                            vec![
-                                                superdsc::bundle::SiblingFp::none();
-                                                rolled.bodies.len()
-                                            ]
-                                        };
-                                    // ⭐ THE SUFFIX IS ITS OWN BUNDLE ON THE CARD. Rolling the body
-                                    // means the lm-head tail can no longer ride inside it: the body is
-                                    // ONE layer now, run `iters` times. The emulator keeps the single
-                                    // unrolled bundle, where the suffix really is part of it.
-                                    let suf = if card {
-                                        superdsc::emit_bundle::<$W>(
-                                            &rolled.suffix,
-                                            Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Split,
-                                            rolled.attn_params,
-                                            dump,
-                                        )
-                                    } else {
-                                        Ok(String::new())
-                                    };
-                                    match (pre, bod, suf) {
-                                        (Ok(pfp), Ok(bfp), Ok(sfp)) => {
-                                            // ── sk_bucket LADDER (decode only) ── The full-cap body just
-                                            // baked (`bfp`) is the CEILING rung. Additionally bake the decode
-                                            // BODY at each INTERIOR rung (active_cap < cap): same prefix/
-                                            // suffix/layout, only the attention sweep extent shrinks, so all
-                                            // rungs ride the SAME resident weights+KV. `decode_rungs` =
-                                            // [(active_cap, body_fp)] ascending, top = (cap, bfp); the worker
-                                            // loads all N bodies into ONE session + picks the smallest rung ≥
-                                            // the live KV length each step. Only the m=1 DECODE reroll ladders
-                                            // (prefill sweeps its whole chunk); a rung that fails to bake is
-                                            // logged + skipped (the runtime falls back to the next rung up).
-                                            let cap = prefix_len.get();
-                                            // ⭐ EACH RUNG NAMES ITS OWN FUSED TWINS, rather than the
-                                            // runtime reconstructing names by appending "f" — a
-                                            // convention whose miss is silently "this rung has no fused
-                                            // twin", and one extra launch per layer.
-                                            let sib = |fp: Option<String>| match fp {
-                                                Some(fp) => superdsc::bundle::SiblingFp::from(fp),
-                                                None => superdsc::bundle::SiblingFp::none(),
-                                            };
-                                            // ⭐ ONE BODY FINGERPRINT per rung — the same list the
-                                            // ceiling rung's are the bodies just baked; the
-                                            // primary fp is the anchor `bfp`.
-                                            let rung_fps = |fps: &[String]| {
-                                                std::borrow::Cow::Owned(
-                                                    fps.iter()
-                                                        .map(|fp| sib(Some(fp.clone())))
-                                                        .collect::<Vec<_>>(),
+                                            unrolled_params
+                                        },
+                                        dump,
+                                    );
+                                    match r {
+                                        Ok(fp) => body_fps.push(fp),
+                                        Err(e) => panic!(
+                                            "[spyre-superdsc] {base}: body class {ci} emit \
+                                             failed at decode_rows={decode_rows} \
+                                             prefill_mq={prefill_mq:?} — {e}. A rung the bake \
+                                             was asked for must ship its bundle; a skip here \
+                                             ships a binary whose batch silently runs elsewhere"
+                                        ),
+                                    }
+                                }
+                                let bod: Result<String, std::io::Error> =
+                                    Ok(body_fps.first().cloned().unwrap_or_default());
+                                // The SAME body, with the per-page fold fused back into the
+                                // surrounding work instead of standing alone. Splitting the fold
+                                // costs one extra launch per layer (measured: 5 groups vs the
+                                // baseline's 4 = 40 more launches per token on a launch-bound path),
+                                // and that is only worth paying when the fold is actually
+                                // re-launched. The runtime picks this one whenever the context fits
+                                // a single page, which is the case that has to stay at the
+                                // baseline's cost.
+                                // ⭐ THE TWIN IS A LAUNCH-*GROUPING* VARIANT, SO IT IS THE CARD'S.
+                                // Off-card `ktir_groups` takes `_fold` and never reads it — one
+                                // launch group per op, always — so an emulator twin is a
+                                // byte-identical copy of its split under a different name, and its
+                                // only reader (`superdsc_exec::select_body_paged`) is
+                                // `spyre-hw`-gated. Same rule as the prefix/suffix below: bake it
+                                // where it is read.
+                                // One fold-fused twin PER CLASS, same order as the bodies. An
+                                // emit failure is logged and left `none()` — silent at runtime
+                                // only in the sense the selector documented: it falls through
+                                // to the split body, one launch per layer dearer.
+                                // ⛔ AND ONLY WHERE THERE IS A FOLD TO FUSE
+                                // (`superdsc::has_fused_twin`). A body with none — every paged
+                                // step's, whose walk is never fused away — has a "twin" that is
+                                // its split program again under a second name: a second dxp
+                                // compile and a second copy in the card image, for every rung.
+                                let bodies_fused: Vec<superdsc::bundle::SiblingFp<'static>> =
+                                    if card {
+                                        rolled
+                                            .bodies
+                                            .iter()
+                                            .map(|b| {
+                                                if !superdsc::has_fused_twin::<$W>(&b.ops) {
+                                                    return superdsc::bundle::SiblingFp::none();
+                                                }
+                                                superdsc::emit_bundle::<$W>(
+                                                    &b.ops,
+                                                    Some(&rolled.layout),
+                                                    superdsc::FoldGrouping::Fused,
+                                                    rolled.attn_params,
+                                                    dump,
                                                 )
-                                            };
-                                            // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
-                                            // `num_blocks` buckets over this bundle's pool
-                                            // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
-                                            // baked walks `ceiling_walk` pages — the whole pool for a
-                                            // decode bake, the chunk's own pages for a prompt chunk
-                                            // baked with no resident prefix — and every other bucket
-                                            // is a rung, so each step walks the fewest pages that
-                                            // reach its context.
-                                            let pool_pages =
-                                                cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
-                                            let ceiling_walk =
-                                                scratchy_target_spyre::paged_step::walk_pages(
-                                                    pool_pages,
-                                                    prefill_mq.unwrap_or(decode_rows),
-                                                    active_cap,
-                                                );
-                                            let mut decode_rungs: Vec<
-                                                superdsc::bundle::LadderRung<'static>,
-                                            > = vec![superdsc::bundle::LadderRung {
-                                                // A chunk body sweeps its whole chunk, so its rung
-                                                // is the chunk's slots PER REQUEST — what
-                                                // `select_body` compares the live context against.
-                                                // A page walk's rung is the slots its walk reaches.
-                                                active_cap: superdsc::bundle::SweptCols::new(
-                                                    ceiling_walk * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get(),
-                                                ),
-                                                bodies: rung_fps(&body_fps),
-                                                bodies_fused: std::borrow::Cow::Owned(
-                                                    bodies_fused.clone(),
-                                                ),
-                                            }];
-                                            // ⛔ WHAT EACH BAKED RUNG SERVES PAST ITS OWN SWEEP, beside
-                                            // `decode_rungs` and pushed exactly where it is — read off
-                                            // the EMITTED bundle's launch groups, the `page_fold` the
-                                            // runtime loads (the program it was emitted from carries no
-                                            // fold flag: the attention expands inside `emit_bundle`).
-                                            // Proven below.
-                                            let folds_of = |fp: &str| {
-                                                superdsc::emitted_bundle_folds::<$W>(fp).unwrap_or_else(|| {
+                                                .map(superdsc::bundle::SiblingFp::from)
+                                                .unwrap_or_else(|e| {
                                                     panic!(
-                                                        "[spyre-superdsc] {base}: ladder body {fp} was named but never emitted"
+                                                        "[spyre-superdsc] {base}: fold-fused \
+                                                         body twin does not emit: {e}"
                                                     )
                                                 })
-                                            };
-                                            let mut rung_reach: Vec<(
-                                                superdsc::bundle::SweptCols,
-                                                scratchy_target_spyre::fold_plan::RungReach,
-                                            )> = vec![(
-                                                decode_rungs[0].active_cap,
-                                                scratchy_target_spyre::fold_plan::RungReach {
-                                                    // EVERY class body: a rung serves any length only
-                                                    // if each of its classes' attentions folds.
-                                                    folds: body_fps.iter().all(|fp| folds_of(fp)),
-                                                    fused_twin: decode_rungs[0]
-                                                        .bodies_fused
-                                                        .iter()
-                                                        .any(|f| !f.is_none()),
-                                                },
-                                            )];
-                                            // The walk rungs: every bucket below a whole-pool walk — a
-                                            // decode body's, and a prefix-capable prompt chunk's on the
-                                            // card, which runs every chunk past a prompt's first — and,
-                                            // off the card, where a prompt chunk past its first page
-                                            // runs on the prefill ladder, every bucket above a
-                                            // prefix-free chunk's own pages.
-                                            let prefix_free_chunk = is_prefill
-                                                && active_cap
-                                                    == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
-                                            let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
-                                                .into_iter()
-                                                .filter(|&b| {
-                                                    if prefix_free_chunk {
-                                                        !card && b > ceiling_walk
-                                                    } else {
-                                                        b < ceiling_walk
-                                                    }
-                                                })
-                                                .map(|b| {
-                                                    let slots = b * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
-                                                    (
-                                                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
-                                                        slots,
-                                                    )
-                                                });
-                                            let ladder: Vec<(
-                                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-                                                u32,
-                                            )> = sweep.collect();
-                                            if !ladder.is_empty() {
-                                                // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
-                                                // its own sweep/chunk, reading nothing another rung
-                                                // writes — so they lower in parallel and are recorded in
-                                                // ladder order (the vectors are sorted below either way).
-                                                // The rung's own layout rides back with its record: the
-                                                // one-layout check reads the ceiling's layout, which
-                                                // holds interior cells and stays on this thread.
-                                                type RungRecord = (
-                                                    superdsc::bundle::LadderRung<'static>,
-                                                    (
-                                                        superdsc::bundle::SweptCols,
-                                                        scratchy_target_spyre::fold_plan::RungReach,
-                                                    ),
-                                                    (
-                                                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-                                                        superdsc::BundleLayout,
-                                                    ),
-                                                );
-                                                let per_rung: Vec<Option<RungRecord>> = {
-                                                    use rayon::prelude::*;
-                                                    ladder
-                                                        .into_par_iter()
-                                                        .map(|(rung, rung_swept)| -> Option<RungRecord> {
-                                                    match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
-                                                        &tape_rolled,
-                                                        &krg,
-                                                        &weight_ids,
-                                                        rung,
-                                                        rows_are_requests,
-                                                        query_rows,
-                                                    ) {
-                                                        // Same device split as the ceiling rung above: the
-                                                        // card bakes the ROLLED body, the emulator the
-                                                        // single unrolled one. Without this each of the
-                                                        // three interior rungs pays the same 40x.
-                                                        Ok(rr) => {
-                                                            let rung_unrolled = if card {
-                                                                Vec::new()
-                                                            } else {
-                                                                superdsc::unroll_layers::<$W>(&rr)
-                                                            };
-                                                            let rung_params = rr.attn_params;
-                                                            // ONE FP per body class; a failed body emit
-                                                            // leaves the rung unbaked — the runtime falls
-                                                            // back to the next rung up.
-                                                            let mut rfps: Vec<String> = Vec::new();
-                                                            let mut rfused: Vec<
-                                                                superdsc::bundle::SiblingFp<
-                                                                    'static,
-                                                                >,
-                                                            > = Vec::new();
-                                                            for (ci, b) in
-                                                                rr.bodies.iter().enumerate()
-                                                            {
-                                                                match superdsc::emit_bundle::<$W>(
-                                                                    if card {
-                                                                        &b.ops
-                                                                    } else {
-                                                                        &rung_unrolled
-                                                                    },
-                                                                    Some(&rr.layout),
-                                                                    superdsc::FoldGrouping::Split,
-                                                                    // THIS rung's own params — `rr` was
-                                                                    // lowered at `rung`, so its swept
-                                                                    // extent is `rung`'s and not the
-                                                                    // ceiling bundle's.
-                                                                    if card {
-                                                                        rr.attn_params
-                                                                    } else {
-                                                                        rung_params
-                                                                    },
-                                                                    dump,
-                                                                ) {
-                                                                    Ok(rfp) => {
-                                                                        rfps.push(rfp);
-                                                                        // The rung's fold-fused
-                                                                        // twin too: the rung bounds
-                                                                        // the sweep, this bounds the
-                                                                        // launch count, and a short
-                                                                        // context needs BOTH. ON THE
-                                                                        // CARD, for the ceiling twin's
-                                                                        // reason above — and here it
-                                                                        // also keeps the twin's NAME
-                                                                        // lawful. `bundle_fp` says a
-                                                                        // twin is `<split fp>f`, so it
-                                                                        // must hash the ops the split
-                                                                        // hashed; off-card the split
-                                                                        // is `&rung_unrolled` while
-                                                                        // this is `&b.ops`, so the
-                                                                        // "twin" was named after a
-                                                                        // bundle nothing else emitted. And
-                                                                        // only where there is a fold to fuse,
-                                                                        // as for the ceiling's.
-                                                                        rfused.push(if card
-                                                                            && superdsc::has_fused_twin::<$W>(&b.ops)
-                                                                        {
-                                                                        superdsc::emit_bundle::<$W>(
-                                                                            &b.ops,
-                                                                            Some(&rr.layout),
-                                                                            superdsc::FoldGrouping::Fused,
-                                                                            rr.attn_params,
-                                                                            dump,
-                                                                        )
-                                                                        .map(
-                                                                            superdsc::bundle::SiblingFp::from,
-                                                                        )
-                                                                        .unwrap_or_else(|e| {
-                                                                            panic!(
-                                                                                "[spyre-superdsc] {base}: rung {} \
-                                                                                 fused twin does not emit: {e}",
-                                                                                rung.get()
-                                                                            )
-                                                                        })
-                                                                    } else {
-                                                                        superdsc::bundle::SiblingFp::none()
-                                                                    });
-                                                                    }
-                                                                    Err(e) => panic!(
-                                                                        "[spyre-superdsc] {base}: ladder rung {} body \
-                                                                         class {ci} does not emit: {e}",
-                                                                        rung.get()
-                                                                    ),
-                                                                }
-                                                            }
-                                                            eprintln!(
-                                                                "[spyre-superdsc] {base}: ladder rung \
-                                                             active_cap={} baked",
-                                                                rung.get()
-                                                            );
-                                                            let rung_folds = rfps
-                                                                .iter()
-                                                                .all(|fp| folds_of(fp));
-                                                            let rec = superdsc::bundle::LadderRung {
-                                                                active_cap: superdsc::bundle::SweptCols::new(rung_swept),
-                                                                bodies: rung_fps(&rfps),
-                                                                bodies_fused: std::borrow::Cow::Owned(rfused),
-                                                            };
-                                                            // Read off the rung record itself: the
-                                                            // record the runtime loads — any class's
-                                                            // twin counts.
-                                                            let fused_twin =
-                                                                rec.bodies_fused.iter().any(|f| !f.is_none());
-                                                            Some((
-                                                                rec,
-                                                                (
-                                                                    superdsc::bundle::SweptCols::new(rung_swept),
-                                                                    scratchy_target_spyre::fold_plan::RungReach {
-                                                                        folds: rung_folds,
-                                                                        fused_twin,
-                                                                    },
-                                                                ),
-                                                                (rung, rr.layout),
-                                                            ))
-                                                        }
-                                                        // ⛔ A RUNG THE LADDER ASKED FOR MUST LOWER (#1023). Dropping it
-                                                        // served its positions on the next rung up with no sign
-                                                        // anywhere (a proc macro's stderr is swallowed on success),
-                                                        // which hid a broken one-chunk lowering for a whole bisect.
-                                                        // A ladder that wants fewer rungs states so where it is built.
-                                                        Err(e) => panic!(
-                                                            "[spyre-superdsc] {base}: ladder rung {} does not lower: {e}",
-                                                            rung.get()
-                                                        ),
-                                                    }
-                                                        })
-                                                        .collect()
-                                                };
-                                                for (rec, reach, (rung, layout)) in
-                                                    per_rung.into_iter().flatten()
-                                                {
-                                                    // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung reading a
-                                                    // staged input from elsewhere is a build failure,
-                                                    // never a wrong constant.
-                                                    if let Err(e) =
-                                                        superdsc::ladder_stages_one_layout(
-                                                            &rolled.layout,
-                                                            &layout,
-                                                        )
-                                                    {
-                                                        panic!(
-                                                            "[spyre-superdsc] {base}: ladder rung active_cap={}: {e}",
-                                                            rung.get()
-                                                        );
-                                                    }
-                                                    // ⭐ THE PARITY LEDGER'S ENTRY FOR THIS RUNG —
-                                                    // one entry per baked bundle, labelled by its
-                                                    // sweep, so a rung that packs its weight segment
-                                                    // apart from the ceiling's is a build error here,
-                                                    // not an `alias_seg` refusal on the card.
-                                                    {
-                                                        let (bank0, banks) =
-                                                            superdsc::weight_seg_record(&layout);
-                                                        fx.push(BakeEffect::WeightSeg {
-                                                            base: format!(
-                                                                "{base} (rung cap {})",
-                                                                rung.get()
-                                                            ),
-                                                            bank0,
-                                                            banks,
-                                                        });
-                                                    }
-                                                    decode_rungs.push(rec);
-                                                    rung_reach.push(reach);
-                                                }
-                                            }
-                                            decode_rungs.sort_by_key(|r| r.active_cap);
-                                            rung_reach.sort_by_key(|(cap, _)| *cap);
-                                            // The rung a context past every sweep runs — the
-                                            // runtime reads the index baked here
-                                            // (`RerollMeta::fallback_rung`).
-                                            let reach: Vec<
-                                                scratchy_target_spyre::fold_plan::RungReach,
-                                            > = rung_reach.iter().map(|(_, r)| *r).collect();
-                                            let fallback_rung =
-                                                scratchy_target_spyre::fold_plan::fallback_rung(
-                                                    &reach,
-                                                )
-                                                    as u32;
-                                            // ⭐ THE LAYER LOOP, ATTACHED TO THE BODY IT DESCRIBES.
-                                            // Every fingerprint in it is a sibling the registry
-                                            // resolves at load, and `RerollMeta::siblings` walks the
-                                            // fields themselves — so there is no second list of
-                                            // "which fields hold a fingerprint" to fall out of step.
-                                            //
-                                            // ⛔⛔⛔ THE CARD PLAYS THE LAUNCH TABLE; THE EMULATOR
-                                            // PLAYS ONE UNROLLED BUNDLE. `bod` above is `&unrolled`
-                                            // when `!card`, so the emulator's single bundle really is
-                                            // the whole program and its launch table is ONE row —
-                                            // which is the truth about that bundle, not a stub (the
-                                            // same fact the old `iters: 1` carried, as the ONE row
-                                            // the old `for v in 0..1` ran). The CARD's bodies are
-                                            // ONE layer each, played `launches.len()` times with the
-                                            // per-segment shifts each row names.
-                                            //
-                                            // MEASURED, granite-3.1-2b, the defect this guards
-                                            // against repeating: the runtime reported `iters=1
-                                            // wstride=0 kvstride=0` where main reported `iters=40
-                                            // wstride=121643008 kvstride=786432`, and the card ran
-                                            // ONE of forty layers per token — 3.1 ms ITL against
-                                            // main's 42 ms — answering with a single repeated token,
-                                            // while the log beside it printed ×40. The launch table
-                                            // is now ONE artifact both the bake and the runtime
-                                            // read, so the two cannot disagree about the count.
-                                            let baked_launches: Vec<superdsc::bundle::LayerLaunch> =
-                                                if card {
-                                                    // ⭐ ZIPPED FROM THE WALK'S OWN TABLES —
-                                                    // `launches` (the true layer order), `launch_w`
-                                                    // (the weight shifts, read off the placements
-                                                    // and PROVEN against them in the walk) and
-                                                    // `launch_kv` (each layer's KV region, the
-                                                    // layout's own) — so the table the runtime
-                                                    // plays cannot disagree with the addresses the
-                                                    // bake placed.
-                                                    rolled
-                                                        .launches
-                                                        .iter()
-                                                        .zip(&rolled.launch_w)
-                                                        .zip(&rolled.launch_kv)
-                                                        .map(|((&(b, it), &(wb, wo)), &kb)| {
-                                                            superdsc::bundle::LayerLaunch {
-                                                                body: b,
-                                                                iter: it,
-                                                                w_bank: wb,
-                                                                w_off: wo,
-                                                                kv_bank: kb,
-                                                            }
-                                                        })
-                                                        .collect()
-                                                } else {
-                                                    vec![superdsc::bundle::LayerLaunch {
-                                                        body: 0,
-                                                        iter: 0,
-                                                        w_bank: 0,
-                                                        w_off: 0,
-                                                        kv_bank: superdsc::bundle::KvBank::BASE,
-                                                    }]
-                                                };
-                                            let meta = superdsc::bundle::RerollMeta {
-                                                prefix: sib(Some(pfp.clone())),
-                                                suffix: sib(Some(sfp.clone())),
-                                                // ⭐ THE ONE BODY = the ANCHOR (`bfp`, the
-                                                // bundle this meta attaches to). The
-                                                // emulator's unrolled bundle has no siblings —
-                                                // one row, one body, run once.
-                                                bodies: std::borrow::Cow::Owned(
-                                                    (if card {
-                                                        body_fps.clone()
-                                                    } else {
-                                                        vec![bfp.clone()]
-                                                    })
-                                                    .iter()
+                                            })
+                                            .collect()
+                                    } else {
+                                        vec![
+                                            superdsc::bundle::SiblingFp::none();
+                                            rolled.bodies.len()
+                                        ]
+                                    };
+                                // ⭐ THE SUFFIX IS ITS OWN BUNDLE ON THE CARD. Rolling the body
+                                // means the lm-head tail can no longer ride inside it: the body is
+                                // ONE layer now, run `iters` times. The emulator keeps the single
+                                // unrolled bundle, where the suffix really is part of it.
+                                let suf = if card {
+                                    superdsc::emit_bundle::<$W>(
+                                        &rolled.suffix,
+                                        Some(&rolled.layout),
+                                        superdsc::FoldGrouping::Split,
+                                        rolled.attn_params,
+                                        dump,
+                                    )
+                                } else {
+                                    Ok(String::new())
+                                };
+                                match (pre, bod, suf) {
+                                    (Ok(pfp), Ok(bfp), Ok(sfp)) => {
+                                        // ── sk_bucket LADDER (decode only) ── The full-cap body just
+                                        // baked (`bfp`) is the CEILING rung. Additionally bake the decode
+                                        // BODY at each INTERIOR rung (active_cap < cap): same prefix/
+                                        // suffix/layout, only the attention sweep extent shrinks, so all
+                                        // rungs ride the SAME resident weights+KV. `decode_rungs` =
+                                        // [(active_cap, body_fp)] ascending, top = (cap, bfp); the worker
+                                        // loads all N bodies into ONE session + picks the smallest rung ≥
+                                        // the live KV length each step. Only the m=1 DECODE reroll ladders
+                                        // (prefill sweeps its whole chunk); a rung that fails to bake is
+                                        // logged + skipped (the runtime falls back to the next rung up).
+                                        let cap = prefix_len.get();
+                                        // ⭐ EACH RUNG NAMES ITS OWN FUSED TWINS, rather than the
+                                        // runtime reconstructing names by appending "f" — a
+                                        // convention whose miss is silently "this rung has no fused
+                                        // twin", and one extra launch per layer.
+                                        let sib = |fp: Option<String>| match fp {
+                                            Some(fp) => superdsc::bundle::SiblingFp::from(fp),
+                                            None => superdsc::bundle::SiblingFp::none(),
+                                        };
+                                        // ⭐ ONE BODY FINGERPRINT per rung — the same list the
+                                        // ceiling rung's are the bodies just baked; the
+                                        // primary fp is the anchor `bfp`.
+                                        let rung_fps = |fps: &[String]| {
+                                            std::borrow::Cow::Owned(
+                                                fps.iter()
                                                     .map(|fp| sib(Some(fp.clone())))
-                                                    .collect(),
-                                                ),
-                                                bodies_fused: std::borrow::Cow::Owned(if card {
-                                                    bodies_fused.clone()
-                                                } else {
-                                                    vec![superdsc::bundle::SiblingFp::none()]
-                                                }),
-                                                // ⛔ `rungs` IS KEYED BY ACTIVE_CAP — the columns one
-                                                // fold pass sweeps — NOT by the batch width. Two other
-                                                // lists of `(u32, fingerprint)` in this file are keyed
-                                                // by `seqs`, and reading the wrong one selects a body
-                                                // baked for a 64-column sweep because four requests are
-                                                // live.
-                                                rungs: std::borrow::Cow::Owned(decode_rungs),
-                                                fallback_rung,
-                                                launches: std::borrow::Cow::Owned(baked_launches),
-                                                prefix_weight_bank: if card {
-                                                    rolled.prefix_weight_bank
-                                                } else {
-                                                    0
-                                                },
-                                                suffix_weight_bank: if card {
-                                                    rolled.suffix_weight_bank
-                                                } else {
-                                                    0
-                                                },
-                                            };
-                                            // ⛔⛔ AND EVERY POSITION THE CARD SERVES ON IT STAGES A WALK
-                                            // — proven over the ladder the executor reads and the
-                                            // selection it runs (`paged_step::prove_ladder_walks`),
-                                            // so a ladder read as no walk fails here, not on a card.
-                                            if card
-                                                && let Some(step) = gk.paged
-                                                && let Err(e) =
-                                                    scratchy_target_spyre::paged_step::prove_ladder_walks(
-                                                        &meta, step,
-                                                    )
-                                            {
-                                                panic!("[spyre-superdsc] {base}: {e}");
-                                            }
-                                            superdsc::attach_reroll::<$W>(&bfp, meta);
-                                            // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
-                                            // SIBLING IT LAUNCHES, not for itself alone: a rung whose
-                                            // scratch outgrows the ceiling's addresses past its segment.
-                                            if let Err(e) = superdsc::cover_ladder_allocation::<$W>(&bfp)
-                                            {
-                                                panic!("[spyre-superdsc] {base}: {e}");
-                                            }
-                                            // The prefill probe's rotary classes, from the SAME
-                                            // bindings the wiring bakes its classes from — one
-                                            // value law (`superdsc_rotary_kind`), two consumers
-                                            // (the wiring's baked tokens, the gate's staged rows).
-                                            // Carries the rung's mq so the gate's PrefillGate and
-                                            // the DBG golden below share one construction.
-                                            // (mq, cos rows, sin rows) — each row list naming
-                                            // (source row, rotary kind).
-                                            type PrefillRotaryClasses = (
-                                                u32,
-                                                Vec<(
-                                                    u32,
-                                                    scratchy_target_spyre::wiring::RotaryKind,
-                                                )>,
-                                                Vec<(
-                                                    u32,
-                                                    scratchy_target_spyre::wiring::RotaryKind,
-                                                )>,
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        };
+                                        // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
+                                        // `num_blocks` buckets over this bundle's pool
+                                        // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
+                                        // baked walks `ceiling_walk` pages — the whole pool for a
+                                        // decode bake, the chunk's own pages for a prompt chunk
+                                        // baked with no resident prefix — and every other bucket
+                                        // is a rung, so each step walks the fewest pages that
+                                        // reach its context.
+                                        let pool_pages =
+                                            cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
+                                        let ceiling_walk =
+                                            scratchy_target_spyre::paged_step::walk_pages(
+                                                pool_pages,
+                                                prefill_mq.unwrap_or(decode_rows),
+                                                active_cap,
                                             );
-                                            let prefill_classes: Option<PrefillRotaryClasses> =
-                                                prefill_mq.map(|mq| {
-                                                let hd = superdsc_model_head_dim(model);
-                                                let theta = model.text.rope_theta.get();
-                                                let mut rotary_cos = Vec::new();
-                                                let mut rotary_sin = Vec::new();
-                                                for (i, b) in lwd.bindings().iter().enumerate() {
-                                                    let (want_cos, local) = match b {
-                                                        scratchy_forward_compiler_macro::to_wavefront::SourceBinding::Cos { local } => {
-                                                            (true, *local)
-                                                        }
-                                                        scratchy_forward_compiler_macro::to_wavefront::SourceBinding::Sin { local } => {
-                                                            (false, *local)
-                                                        }
-                                                        _ => continue,
-                                                    };
-                                                    let kind =
-                                                        superdsc_rotary_kind(model, hd, theta, local);
-                                                    let pair = (i as u32, kind);
-                                                    if want_cos {
-                                                        rotary_cos.push(pair)
-                                                    } else {
-                                                        rotary_sin.push(pair)
-                                                    }
+                                        let mut decode_rungs: Vec<
+                                            superdsc::bundle::LadderRung<'static>,
+                                        > = vec![superdsc::bundle::LadderRung {
+                                            // A chunk body sweeps its whole chunk, so its rung
+                                            // is the chunk's slots PER REQUEST — what
+                                            // `select_body` compares the live context against.
+                                            // A page walk's rung is the slots its walk reaches.
+                                            active_cap: superdsc::bundle::SweptCols::new(
+                                                ceiling_walk * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get(),
+                                            ),
+                                            bodies: rung_fps(&body_fps),
+                                            bodies_fused: std::borrow::Cow::Owned(
+                                                bodies_fused.clone(),
+                                            ),
+                                        }];
+                                        // ⛔ WHAT EACH BAKED RUNG SERVES PAST ITS OWN SWEEP, beside
+                                        // `decode_rungs` and pushed exactly where it is — read off
+                                        // the EMITTED bundle's launch groups, the `page_fold` the
+                                        // runtime loads (the program it was emitted from carries no
+                                        // fold flag: the attention expands inside `emit_bundle`).
+                                        // Proven below.
+                                        let folds_of = |fp: &str| {
+                                            superdsc::emitted_bundle_folds::<$W>(fp).unwrap_or_else(|| {
+                                                panic!(
+                                                    "[spyre-superdsc] {base}: ladder body {fp} was named but never emitted"
+                                                )
+                                            })
+                                        };
+                                        let mut rung_reach: Vec<(
+                                            superdsc::bundle::SweptCols,
+                                            scratchy_target_spyre::fold_plan::RungReach,
+                                        )> = vec![(
+                                            decode_rungs[0].active_cap,
+                                            scratchy_target_spyre::fold_plan::RungReach {
+                                                // EVERY class body: a rung serves any length only
+                                                // if each of its classes' attentions folds.
+                                                folds: body_fps.iter().all(|fp| folds_of(fp)),
+                                                fused_twin: decode_rungs[0]
+                                                    .bodies_fused
+                                                    .iter()
+                                                    .any(|f| !f.is_none()),
+                                            },
+                                        )];
+                                        // The walk rungs: every bucket below a whole-pool walk — a
+                                        // decode body's, and a prefix-capable prompt chunk's on the
+                                        // card, which runs every chunk past a prompt's first — and,
+                                        // off the card, where a prompt chunk past its first page
+                                        // runs on the prefill ladder, every bucket above a
+                                        // prefix-free chunk's own pages.
+                                        let prefix_free_chunk = is_prefill
+                                            && active_cap
+                                                == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
+                                        let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
+                                            .into_iter()
+                                            .filter(|&b| {
+                                                if prefix_free_chunk {
+                                                    !card && b > ceiling_walk
+                                                } else {
+                                                    b < ceiling_walk
                                                 }
-                                                (mq, rotary_cos, rotary_sin)
+                                            })
+                                            .map(|b| {
+                                                let slots = b * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
+                                                (
+                                                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
+                                                    slots,
+                                                )
                                             });
-                                            // ── NUMERIC BISECTION oracle (opt-in SCRATCHY_SUPERDSC_DBG):
-                                            //    eval_dag golden + synthetic source shapes so
-                                            //    SPYRE_SUPERDSC_SELFTEST localizes the first divergent op.
-                                            //    `dbg_golden_dir` is the ONE statement of where it lives,
-                                            //    called by both the writer here and the reader there. ──
-                                            if let Some(dbg) =
-                                                superdsc::bundle::dbg_golden_dir(&bfp)
-                                            {
-                                                // The DBG golden stages the SAME rope rows the
-                                                // gate does (`staged_rope_rows` — one law), so
-                                                // the bisection oracle cannot drift from the
-                                                // gate's own golden. Decode: an empty map, the
-                                                // period-half contract.
-                                                let staged_rope = prefill_classes
-                                                    .as_ref()
-                                                    .map(|(_, cs, sn)| {
-                                                        superdsc::staged_rope_rows(&krg, cs, sn)
-                                                            .unwrap_or_default()
-                                                    })
-                                                    .unwrap_or_default();
-                                                match superdsc::write_eval_golden(
+                                        let ladder: Vec<(
+                                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+                                            u32,
+                                        )> = sweep.collect();
+                                        if !ladder.is_empty() {
+                                            // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
+                                            // its own sweep/chunk, reading nothing another rung
+                                            // writes — so they lower in parallel and are recorded in
+                                            // ladder order (the vectors are sorted below either way).
+                                            // The rung's own layout rides back with its record: the
+                                            // one-layout check reads the ceiling's layout, which
+                                            // holds interior cells and stays on this thread.
+                                            type RungRecord = (
+                                                superdsc::bundle::LadderRung<'static>,
+                                                (
+                                                    superdsc::bundle::SweptCols,
+                                                    scratchy_target_spyre::fold_plan::RungReach,
+                                                ),
+                                                (
+                                                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+                                                    superdsc::BundleLayout,
+                                                ),
+                                            );
+                                            let per_rung: Vec<Option<RungRecord>> = {
+                                                use rayon::prelude::*;
+                                                ladder
+                                                    .into_par_iter()
+                                                    .map(|(rung, rung_swept)| -> Option<RungRecord> {
+                                                match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
+                                                    &tape_rolled,
                                                     &krg,
                                                     &weight_ids,
-                                                    &dbg,
-                                                    &staged_rope,
-                                                ) {
-                                                    Ok(()) => eprintln!(
-                                                        "[spyre-superdsc] {base}: DBG golden written → {}/dbg",
-                                                        dbg.display()
-                                                    ),
-                                                    Err(e) => eprintln!(
-                                                        "[spyre-superdsc] {base}: DBG golden write failed: {e}"
-                                                    ),
-                                                }
-                                            }
-                                            // ⭐⭐⭐ THE NUMERIC GATE — "if there is garbage, it
-                                            //    cannot compile." Every DECODE bundle AND every
-                                            //    PREFIX-FREE PREFILL RUNG (ActiveCap::NONE — the
-                                            //    first-chunk programs) this bake produced runs on
-                                            //    the emulator and is compared against the
-                                            //    reference semantics of the same dsl_math
-                                            //    (`eval_golden_buffers`), the prefill arm staging
-                                            //    the runtime's OWN first-chunk law (the [mq, mq]
-                                            //    clamped triangle, per-position rope rows, the
-                                            //    dead-prefix view); divergence beyond the quant
-                                            //    floor is a PANIC — the build refuses to ship
-                                            //    the bundle. No env var: under `-Fspyre-emu`
-                                            //    the gate IS the bake's contract. A PREFIX-CAPABLE
-                                            //    prefill bundle (ActiveCap::FULL — the
-                                            //    continuation chunks) still skips loudly: its
-                                            //    resident-prefix mask law is the next rung.
-                                            //    ⭐ THE CLASS-COVERING TWIN: the gate judges the
-                                            //    smallest prefix of launches that covers every
-                                            //    body class AND every class transition (floor 2)
-                                            //    — the reroll's classes are the programs, so a
-                                            //    covered prefix exercises every program and every
-                                            //    boundary the bundle ships; the tail is rebound
-                                            //    to the kept prefix's last hidden-out and the
-                                            //    golden/walk/staging all filter on the twin's
-                                            //    bound set. A graph the law cannot truncate
-                                            //    (short bundles, or a transition the prefix
-                                            //    cannot cover) gates its OWN full depth — the
-                                            //    identity rebind is the built-in equivalence
-                                            //    test. ──
-                                            #[cfg(feature = "spyre-emu")]
-                                            {
-                                                let prefill_gate = prefill_classes.map(
-                                                    |(mq, rotary_cos, rotary_sin)| {
-                                                        superdsc::PrefillGate {
-                                                            mq,
-                                                            rotary_cos,
-                                                            rotary_sin,
-                                                        }
-                                                    },
-                                                );
-                                                // The rung under test, one fact — see
-                                                // `superdsc::GateRung`.
-                                                let gate_rung = superdsc::GateRung {
-                                                    fp: &bfp,
-                                                    cap,
-                                                    active_cap,
+                                                    rung,
+                                                    rows_are_requests,
                                                     query_rows,
-                                                    shards,
-                                                };
-                                                // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
-                                                // from its emitted layout, so the twin's minted
-                                                // programs carry the SAME `lx_window_fits` budget
-                                                // the bake proved (auditor ruling 2026-10-27). A
-                                                // missing entry or an unstated window here is a
-                                                // defect the gate names, not a zero it charges.
-                                                let lx_pin_window = superdsc::emitted_lx_pin_window_bytes::<$W>(&bfp).unwrap_or_else(|| {
-                                                    panic!(
-                                                        "[spyre-superdsc] {base}: bundle {bfp} has \
-                                                         no emitted layout stating its LX pin window \
-                                                         — the twin cannot mint programs without the \
-                                                         budget the bake proved"
-                                                    )
-                                                });
-                                                let run_gate =
-                                                    |prefill: Option<&superdsc::PrefillGate>| {
-                                                        // The twin's own groups, fresh from the
-                                                        // truncated unroll — the same interned
-                                                        // programs the bundle's first K launches
-                                                        // bind, so the emulator session runs
-                                                        // exactly the classes under test.
-                                                        let twin = superdsc::covering_twin_groups::<$W>(
-                                                            &rolled,
-                                                            Some(lx_pin_window),
-                                                        )
-                                                        .unwrap_or_else(|e| {
-                                                            panic!(
-                                                                "[spyre-superdsc] {base}: \
-                                                                         covering twin for {bfp} \
-                                                                         failed to lower — {e}"
-                                                            )
-                                                        });
-                                                        match twin {
-                                                            Some((twin_groups, trunc)) => {
-                                                                match superdsc::numeric_gate::<$W, _>(
-                                                                    &twin_groups,
-                                                                    &krg,
-                                                                    &weight_ids,
-                                                                    &gate_rung,
-                                                                    prefill,
-                                                                    Some(&trunc),
-                                                                ) {
-                                                                    Ok(()) => {}
-                                                                    Err(e) => panic!(
-                                                                        "[spyre-superdsc] {base}: \
-                                                                         NUMERIC GATE REFUSED for \
-                                                                         bundle {bfp} — {e}"
-                                                                    ),
-                                                                }
-                                                            }
-                                                            None => {
-                                                                match superdsc::with_emitted_groups::<$W, _>(
-                                                                    &bfp,
-                                                                    |groups| {
-                                                                        superdsc::numeric_gate::<$W, _>(
-                                                                            groups,
-                                                                            &krg,
-                                                                            &weight_ids,
-                                                                            &gate_rung,
-                                                                            prefill,
-                                                                            None,
+                                                ) {
+                                                    // Same device split as the ceiling rung above: the
+                                                    // card bakes the ROLLED body, the emulator the
+                                                    // single unrolled one. Without this each of the
+                                                    // three interior rungs pays the same 40x.
+                                                    Ok(rr) => {
+                                                        let rung_unrolled = if card {
+                                                            Vec::new()
+                                                        } else {
+                                                            superdsc::unroll_layers::<$W>(&rr)
+                                                        };
+                                                        let rung_params = rr.attn_params;
+                                                        // ONE FP per body class; a failed body emit
+                                                        // leaves the rung unbaked — the runtime falls
+                                                        // back to the next rung up.
+                                                        let mut rfps: Vec<String> = Vec::new();
+                                                        let mut rfused: Vec<
+                                                            superdsc::bundle::SiblingFp<
+                                                                'static,
+                                                            >,
+                                                        > = Vec::new();
+                                                        for (ci, b) in
+                                                            rr.bodies.iter().enumerate()
+                                                        {
+                                                            match superdsc::emit_bundle::<$W>(
+                                                                if card {
+                                                                    &b.ops
+                                                                } else {
+                                                                    &rung_unrolled
+                                                                },
+                                                                Some(&rr.layout),
+                                                                superdsc::FoldGrouping::Split,
+                                                                // THIS rung's own params — `rr` was
+                                                                // lowered at `rung`, so its swept
+                                                                // extent is `rung`'s and not the
+                                                                // ceiling bundle's.
+                                                                if card {
+                                                                    rr.attn_params
+                                                                } else {
+                                                                    rung_params
+                                                                },
+                                                                dump,
+                                                            ) {
+                                                                Ok(rfp) => {
+                                                                    rfps.push(rfp);
+                                                                    // The rung's fold-fused
+                                                                    // twin too: the rung bounds
+                                                                    // the sweep, this bounds the
+                                                                    // launch count, and a short
+                                                                    // context needs BOTH. ON THE
+                                                                    // CARD, for the ceiling twin's
+                                                                    // reason above — and here it
+                                                                    // also keeps the twin's NAME
+                                                                    // lawful. `bundle_fp` says a
+                                                                    // twin is `<split fp>f`, so it
+                                                                    // must hash the ops the split
+                                                                    // hashed; off-card the split
+                                                                    // is `&rung_unrolled` while
+                                                                    // this is `&b.ops`, so the
+                                                                    // "twin" was named after a
+                                                                    // bundle nothing else emitted. And
+                                                                    // only where there is a fold to fuse,
+                                                                    // as for the ceiling's.
+                                                                    rfused.push(if card
+                                                                        && superdsc::has_fused_twin::<$W>(&b.ops)
+                                                                    {
+                                                                    superdsc::emit_bundle::<$W>(
+                                                                        &b.ops,
+                                                                        Some(&rr.layout),
+                                                                        superdsc::FoldGrouping::Fused,
+                                                                        rr.attn_params,
+                                                                        dump,
+                                                                    )
+                                                                    .map(
+                                                                        superdsc::bundle::SiblingFp::from,
+                                                                    )
+                                                                    .unwrap_or_else(|e| {
+                                                                        panic!(
+                                                                            "[spyre-superdsc] {base}: rung {} \
+                                                                             fused twin does not emit: {e}",
+                                                                            rung.get()
                                                                         )
-                                                                    },
-                                                                ) {
-                                                                    Some(Ok(())) => {}
-                                                                    Some(Err(e)) => panic!(
-                                                                        "[spyre-superdsc] {base}: \
-                                                                         NUMERIC GATE REFUSED for \
-                                                                         bundle {bfp} — {e}"
-                                                                    ),
-                                                                    None => eprintln!(
-                                                                        "[spyre-superdsc] {base}: NUMERIC \
-                                                                         GATE could not borrow {bfp}'s \
-                                                                         launch groups (not Ready) — \
-                                                                         UNCHECKED"
-                                                                    ),
+                                                                    })
+                                                                } else {
+                                                                    superdsc::bundle::SiblingFp::none()
+                                                                });
                                                                 }
+                                                                Err(e) => panic!(
+                                                                    "[spyre-superdsc] {base}: ladder rung {} body \
+                                                                     class {ci} does not emit: {e}",
+                                                                    rung.get()
+                                                                ),
                                                             }
                                                         }
-                                                    };
-                                                match prefill_mq {
-                                                    None => run_gate(None),
-                                                    Some(_)
-                                                        if active_cap
-                                                            == superdsc::ActiveCap::NONE =>
-                                                    {
-                                                        run_gate(prefill_gate.as_ref())
+                                                        eprintln!(
+                                                            "[spyre-superdsc] {base}: ladder rung \
+                                                         active_cap={} baked",
+                                                            rung.get()
+                                                        );
+                                                        let rung_folds = rfps
+                                                            .iter()
+                                                            .all(|fp| folds_of(fp));
+                                                        let rec = superdsc::bundle::LadderRung {
+                                                            active_cap: superdsc::bundle::SweptCols::new(rung_swept),
+                                                            bodies: rung_fps(&rfps),
+                                                            bodies_fused: std::borrow::Cow::Owned(rfused),
+                                                        };
+                                                        // Read off the rung record itself: the
+                                                        // record the runtime loads — any class's
+                                                        // twin counts.
+                                                        let fused_twin =
+                                                            rec.bodies_fused.iter().any(|f| !f.is_none());
+                                                        Some((
+                                                            rec,
+                                                            (
+                                                                superdsc::bundle::SweptCols::new(rung_swept),
+                                                                scratchy_target_spyre::fold_plan::RungReach {
+                                                                    folds: rung_folds,
+                                                                    fused_twin,
+                                                                },
+                                                            ),
+                                                            (rung, rr.layout),
+                                                        ))
                                                     }
-                                                    Some(mq) => eprintln!(
-                                                        "[spyre-superdsc] {base}: NUMERIC GATE \
-                                                         SKIP prefill bundle {bfp} (mq={mq}, \
-                                                         prefix-capable) — the continuation-chunk \
-                                                         mask law (resident prefix ∘ [mq, mq] \
-                                                         triangle) is the next rung; UNCHECKED"
+                                                    // ⛔ A RUNG THE LADDER ASKED FOR MUST LOWER (#1023). Dropping it
+                                                    // served its positions on the next rung up with no sign
+                                                    // anywhere (a proc macro's stderr is swallowed on success),
+                                                    // which hid a broken one-chunk lowering for a whole bisect.
+                                                    // A ladder that wants fewer rungs states so where it is built.
+                                                    Err(e) => panic!(
+                                                        "[spyre-superdsc] {base}: ladder rung {} does not lower: {e}",
+                                                        rung.get()
                                                     ),
                                                 }
+                                                    })
+                                                    .collect()
+                                            };
+                                            for (rec, reach, (rung, layout)) in
+                                                per_rung.into_iter().flatten()
+                                            {
+                                                // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung reading a
+                                                // staged input from elsewhere is a build failure,
+                                                // never a wrong constant.
+                                                if let Err(e) =
+                                                    superdsc::ladder_stages_one_layout(
+                                                        &rolled.layout,
+                                                        &layout,
+                                                    )
+                                                {
+                                                    panic!(
+                                                        "[spyre-superdsc] {base}: ladder rung active_cap={}: {e}",
+                                                        rung.get()
+                                                    );
+                                                }
+                                                // ⭐ THE PARITY LEDGER'S ENTRY FOR THIS RUNG —
+                                                // one entry per baked bundle, labelled by its
+                                                // sweep, so a rung that packs its weight segment
+                                                // apart from the ceiling's is a build error here,
+                                                // not an `alias_seg` refusal on the card.
+                                                {
+                                                    let (bank0, banks) =
+                                                        superdsc::weight_seg_record(&layout);
+                                                    fx.push(BakeEffect::WeightSeg {
+                                                        base: format!(
+                                                            "{base} (rung cap {})",
+                                                            rung.get()
+                                                        ),
+                                                        bank0,
+                                                        banks,
+                                                    });
+                                                }
+                                                decode_rungs.push(rec);
+                                                rung_reach.push(reach);
                                             }
-                                            eprintln!(
-                                                "[spyre-superdsc] {base}: 3 bundles baked — prefix {pfp} / body {bfp} + {} class(es), {} launch(es) \
-                                                 / suffix {sfp} (dxp: SMALL bundles → seconds)",
-                                                rolled.bodies.len(),
-                                                rolled.launches.len(),
+                                        }
+                                        decode_rungs.sort_by_key(|r| r.active_cap);
+                                        rung_reach.sort_by_key(|(cap, _)| *cap);
+                                        // The rung a context past every sweep runs — the
+                                        // runtime reads the index baked here
+                                        // (`RerollMeta::fallback_rung`).
+                                        let reach: Vec<
+                                            scratchy_target_spyre::fold_plan::RungReach,
+                                        > = rung_reach.iter().map(|(_, r)| *r).collect();
+                                        let fallback_rung =
+                                            scratchy_target_spyre::fold_plan::fallback_rung(
+                                                &reach,
+                                            )
+                                                as u32;
+                                        // ⭐ THE LAYER LOOP, ATTACHED TO THE BODY IT DESCRIBES.
+                                        // Every fingerprint in it is a sibling the registry
+                                        // resolves at load, and `RerollMeta::siblings` walks the
+                                        // fields themselves — so there is no second list of
+                                        // "which fields hold a fingerprint" to fall out of step.
+                                        //
+                                        // ⛔⛔⛔ THE CARD PLAYS THE LAUNCH TABLE; THE EMULATOR
+                                        // PLAYS ONE UNROLLED BUNDLE. `bod` above is `&unrolled`
+                                        // when `!card`, so the emulator's single bundle really is
+                                        // the whole program and its launch table is ONE row —
+                                        // which is the truth about that bundle, not a stub (the
+                                        // same fact the old `iters: 1` carried, as the ONE row
+                                        // the old `for v in 0..1` ran). The CARD's bodies are
+                                        // ONE layer each, played `launches.len()` times with the
+                                        // per-segment shifts each row names.
+                                        //
+                                        // MEASURED, granite-3.1-2b, the defect this guards
+                                        // against repeating: the runtime reported `iters=1
+                                        // wstride=0 kvstride=0` where main reported `iters=40
+                                        // wstride=121643008 kvstride=786432`, and the card ran
+                                        // ONE of forty layers per token — 3.1 ms ITL against
+                                        // main's 42 ms — answering with a single repeated token,
+                                        // while the log beside it printed ×40. The launch table
+                                        // is now ONE artifact both the bake and the runtime
+                                        // read, so the two cannot disagree about the count.
+                                        let baked_launches: Vec<superdsc::bundle::LayerLaunch> =
+                                            if card {
+                                                // ⭐ ZIPPED FROM THE WALK'S OWN TABLES —
+                                                // `launches` (the true layer order), `launch_w`
+                                                // (the weight shifts, read off the placements
+                                                // and PROVEN against them in the walk) and
+                                                // `launch_kv` (each layer's KV region, the
+                                                // layout's own) — so the table the runtime
+                                                // plays cannot disagree with the addresses the
+                                                // bake placed.
+                                                rolled
+                                                    .launches
+                                                    .iter()
+                                                    .zip(&rolled.launch_w)
+                                                    .zip(&rolled.launch_kv)
+                                                    .map(|((&(b, it), &(wb, wo)), &kb)| {
+                                                        superdsc::bundle::LayerLaunch {
+                                                            body: b,
+                                                            iter: it,
+                                                            w_bank: wb,
+                                                            w_off: wo,
+                                                            kv_bank: kb,
+                                                        }
+                                                    })
+                                                    .collect()
+                                            } else {
+                                                vec![superdsc::bundle::LayerLaunch {
+                                                    body: 0,
+                                                    iter: 0,
+                                                    w_bank: 0,
+                                                    w_off: 0,
+                                                    kv_bank: superdsc::bundle::KvBank::BASE,
+                                                }]
+                                            };
+                                        let meta = superdsc::bundle::RerollMeta {
+                                            prefix: sib(Some(pfp.clone())),
+                                            suffix: sib(Some(sfp.clone())),
+                                            // ⭐ THE ONE BODY = the ANCHOR (`bfp`, the
+                                            // bundle this meta attaches to). The
+                                            // emulator's unrolled bundle has no siblings —
+                                            // one row, one body, run once.
+                                            bodies: std::borrow::Cow::Owned(
+                                                (if card {
+                                                    body_fps.clone()
+                                                } else {
+                                                    vec![bfp.clone()]
+                                                })
+                                                .iter()
+                                                .map(|fp| sib(Some(fp.clone())))
+                                                .collect(),
+                                            ),
+                                            bodies_fused: std::borrow::Cow::Owned(if card {
+                                                bodies_fused.clone()
+                                            } else {
+                                                vec![superdsc::bundle::SiblingFp::none()]
+                                            }),
+                                            // ⛔ `rungs` IS KEYED BY ACTIVE_CAP — the columns one
+                                            // fold pass sweeps — NOT by the batch width. Two other
+                                            // lists of `(u32, fingerprint)` in this file are keyed
+                                            // by `seqs`, and reading the wrong one selects a body
+                                            // baked for a 64-column sweep because four requests are
+                                            // live.
+                                            rungs: std::borrow::Cow::Owned(decode_rungs),
+                                            fallback_rung,
+                                            launches: std::borrow::Cow::Owned(baked_launches),
+                                            prefix_weight_bank: if card {
+                                                rolled.prefix_weight_bank
+                                            } else {
+                                                0
+                                            },
+                                            suffix_weight_bank: if card {
+                                                rolled.suffix_weight_bank
+                                            } else {
+                                                0
+                                            },
+                                        };
+                                        // ⛔⛔ AND EVERY POSITION THE CARD SERVES ON IT STAGES A WALK
+                                        // — proven over the ladder the executor reads and the
+                                        // selection it runs (`paged_step::prove_ladder_walks`),
+                                        // so a ladder read as no walk fails here, not on a card.
+                                        if card
+                                            && let Some(step) = gk.paged
+                                            && let Err(e) =
+                                                scratchy_target_spyre::paged_step::prove_ladder_walks(
+                                                    &meta, step,
+                                                )
+                                        {
+                                            panic!("[spyre-superdsc] {base}: {e}");
+                                        }
+                                        superdsc::attach_reroll::<$W>(&bfp, meta);
+                                        // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
+                                        // SIBLING IT LAUNCHES, not for itself alone: a rung whose
+                                        // scratch outgrows the ceiling's addresses past its segment.
+                                        if let Err(e) = superdsc::cover_ladder_allocation::<$W>(&bfp)
+                                        {
+                                            panic!("[spyre-superdsc] {base}: {e}");
+                                        }
+                                        // The prefill probe's rotary classes, from the SAME
+                                        // bindings the wiring bakes its classes from — one
+                                        // value law (`superdsc_rotary_kind`), two consumers
+                                        // (the wiring's baked tokens, the gate's staged rows).
+                                        // Carries the rung's mq so the gate's PrefillGate and
+                                        // the DBG golden below share one construction.
+                                        // (mq, cos rows, sin rows) — each row list naming
+                                        // (source row, rotary kind).
+                                        type PrefillRotaryClasses = (
+                                            u32,
+                                            Vec<(
+                                                u32,
+                                                scratchy_target_spyre::wiring::RotaryKind,
+                                            )>,
+                                            Vec<(
+                                                u32,
+                                                scratchy_target_spyre::wiring::RotaryKind,
+                                            )>,
+                                        );
+                                        let prefill_classes: Option<PrefillRotaryClasses> =
+                                            prefill_mq.map(|mq| {
+                                            let hd = superdsc_model_head_dim(model);
+                                            let theta = model.text.rope_theta.get();
+                                            let mut rotary_cos = Vec::new();
+                                            let mut rotary_sin = Vec::new();
+                                            for (i, b) in lwd.bindings().iter().enumerate() {
+                                                let (want_cos, local) = match b {
+                                                    scratchy_forward_compiler_macro::to_wavefront::SourceBinding::Cos { local } => {
+                                                        (true, *local)
+                                                    }
+                                                    scratchy_forward_compiler_macro::to_wavefront::SourceBinding::Sin { local } => {
+                                                        (false, *local)
+                                                    }
+                                                    _ => continue,
+                                                };
+                                                let kind =
+                                                    superdsc_rotary_kind(model, hd, theta, local);
+                                                let pair = (i as u32, kind);
+                                                if want_cos {
+                                                    rotary_cos.push(pair)
+                                                } else {
+                                                    rotary_sin.push(pair)
+                                                }
+                                            }
+                                            (mq, rotary_cos, rotary_sin)
+                                        });
+                                        // ── NUMERIC BISECTION oracle (opt-in SCRATCHY_SUPERDSC_DBG):
+                                        //    eval_dag golden + synthetic source shapes so
+                                        //    SPYRE_SUPERDSC_SELFTEST localizes the first divergent op.
+                                        //    `dbg_golden_dir` is the ONE statement of where it lives,
+                                        //    called by both the writer here and the reader there. ──
+                                        if let Some(dbg) =
+                                            superdsc::bundle::dbg_golden_dir(&bfp)
+                                        {
+                                            // The DBG golden stages the SAME rope rows the
+                                            // gate does (`staged_rope_rows` — one law), so
+                                            // the bisection oracle cannot drift from the
+                                            // gate's own golden. Decode: an empty map, the
+                                            // period-half contract.
+                                            let staged_rope = prefill_classes
+                                                .as_ref()
+                                                .map(|(_, cs, sn)| {
+                                                    superdsc::staged_rope_rows(&krg, cs, sn)
+                                                        .unwrap_or_default()
+                                                })
+                                                .unwrap_or_default();
+                                            match superdsc::write_eval_golden(
+                                                &krg,
+                                                &weight_ids,
+                                                &dbg,
+                                                &staged_rope,
+                                            ) {
+                                                Ok(()) => eprintln!(
+                                                    "[spyre-superdsc] {base}: DBG golden written → {}/dbg",
+                                                    dbg.display()
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "[spyre-superdsc] {base}: DBG golden write failed: {e}"
+                                                ),
+                                            }
+                                        }
+                                        // ⭐⭐⭐ THE NUMERIC GATE — "if there is garbage, it
+                                        //    cannot compile." Every DECODE bundle AND every
+                                        //    PREFIX-FREE PREFILL RUNG (ActiveCap::NONE — the
+                                        //    first-chunk programs) this bake produced runs on
+                                        //    the emulator and is compared against the
+                                        //    reference semantics of the same dsl_math
+                                        //    (`eval_golden_buffers`), the prefill arm staging
+                                        //    the runtime's OWN first-chunk law (the [mq, mq]
+                                        //    clamped triangle, per-position rope rows, the
+                                        //    dead-prefix view); divergence beyond the quant
+                                        //    floor is a PANIC — the build refuses to ship
+                                        //    the bundle. No env var: under `-Fspyre-emu`
+                                        //    the gate IS the bake's contract. A PREFIX-CAPABLE
+                                        //    prefill bundle (ActiveCap::FULL — the
+                                        //    continuation chunks) still skips loudly: its
+                                        //    resident-prefix mask law is the next rung.
+                                        //    ⭐ THE CLASS-COVERING TWIN: the gate judges the
+                                        //    smallest prefix of launches that covers every
+                                        //    body class AND every class transition (floor 2)
+                                        //    — the reroll's classes are the programs, so a
+                                        //    covered prefix exercises every program and every
+                                        //    boundary the bundle ships; the tail is rebound
+                                        //    to the kept prefix's last hidden-out and the
+                                        //    golden/walk/staging all filter on the twin's
+                                        //    bound set. A graph the law cannot truncate
+                                        //    (short bundles, or a transition the prefix
+                                        //    cannot cover) gates its OWN full depth — the
+                                        //    identity rebind is the built-in equivalence
+                                        //    test. ──
+                                        #[cfg(feature = "spyre-emu")]
+                                        {
+                                            let prefill_gate = prefill_classes.map(
+                                                |(mq, rotary_cos, rotary_sin)| {
+                                                    superdsc::PrefillGate {
+                                                        mq,
+                                                        rotary_cos,
+                                                        rotary_sin,
+                                                    }
+                                                },
                                             );
-                                            // Stamp the DECODE body_fp or the PREFILL body_fp by phase
-                                            // (the prefill reroll must NOT clobber the decode fp).
-                                            if let Some(mq) = prefill_mq.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
+                                            // The rung under test, one fact — see
+                                            // `superdsc::GateRung`.
+                                            let gate_rung = superdsc::GateRung {
+                                                fp: &bfp,
+                                                cap,
+                                                active_cap,
+                                                query_rows,
+                                                shards,
+                                            };
+                                            // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
+                                            // from its emitted layout, so the twin's minted
+                                            // programs carry the SAME `lx_window_fits` budget
+                                            // the bake proved (auditor ruling 2026-10-27). A
+                                            // missing entry or an unstated window here is a
+                                            // defect the gate names, not a zero it charges.
+                                            let lx_pin_window = superdsc::emitted_lx_pin_window_bytes::<$W>(&bfp).unwrap_or_else(|| {
+                                                panic!(
+                                                    "[spyre-superdsc] {base}: bundle {bfp} has \
+                                                     no emitted layout stating its LX pin window \
+                                                     — the twin cannot mint programs without the \
+                                                     budget the bake proved"
+                                                )
+                                            });
+                                            let run_gate =
+                                                |prefill: Option<&superdsc::PrefillGate>| {
+                                                    // The twin's own groups, fresh from the
+                                                    // truncated unroll — the same interned
+                                                    // programs the bundle's first K launches
+                                                    // bind, so the emulator session runs
+                                                    // exactly the classes under test.
+                                                    let twin = superdsc::covering_twin_groups::<$W>(
+                                                        &rolled,
+                                                        Some(lx_pin_window),
+                                                    )
+                                                    .unwrap_or_else(|e| {
+                                                        panic!(
+                                                            "[spyre-superdsc] {base}: \
+                                                                     covering twin for {bfp} \
+                                                                     failed to lower — {e}"
+                                                        )
+                                                    });
+                                                    match twin {
+                                                        Some((twin_groups, trunc)) => {
+                                                            match superdsc::numeric_gate::<$W, _>(
+                                                                &twin_groups,
+                                                                &krg,
+                                                                &weight_ids,
+                                                                &gate_rung,
+                                                                prefill,
+                                                                Some(&trunc),
+                                                            ) {
+                                                                Ok(()) => {}
+                                                                Err(e) => panic!(
+                                                                    "[spyre-superdsc] {base}: \
+                                                                     NUMERIC GATE REFUSED for \
+                                                                     bundle {bfp} — {e}"
+                                                                ),
+                                                            }
+                                                        }
+                                                        None => {
+                                                            match superdsc::with_emitted_groups::<$W, _>(
+                                                                &bfp,
+                                                                |groups| {
+                                                                    superdsc::numeric_gate::<$W, _>(
+                                                                        groups,
+                                                                        &krg,
+                                                                        &weight_ids,
+                                                                        &gate_rung,
+                                                                        prefill,
+                                                                        None,
+                                                                    )
+                                                                },
+                                                            ) {
+                                                                Some(Ok(())) => {}
+                                                                Some(Err(e)) => panic!(
+                                                                    "[spyre-superdsc] {base}: \
+                                                                     NUMERIC GATE REFUSED for \
+                                                                     bundle {bfp} — {e}"
+                                                                ),
+                                                                None => eprintln!(
+                                                                    "[spyre-superdsc] {base}: NUMERIC \
+                                                                     GATE could not borrow {bfp}'s \
+                                                                     launch groups (not Ready) — \
+                                                                     UNCHECKED"
+                                                                ),
+                                                            }
+                                                        }
+                                                    }
+                                                };
+                                            match prefill_mq {
+                                                None => run_gate(None),
+                                                Some(_)
+                                                    if active_cap
+                                                        == superdsc::ActiveCap::NONE =>
+                                                {
+                                                    run_gate(prefill_gate.as_ref())
+                                                }
+                                                Some(mq) => eprintln!(
+                                                    "[spyre-superdsc] {base}: NUMERIC GATE \
+                                                     SKIP prefill bundle {bfp} (mq={mq}, \
+                                                     prefix-capable) — the continuation-chunk \
+                                                     mask law (resident prefix ∘ [mq, mq] \
+                                                     triangle) is the next rung; UNCHECKED"
+                                                ),
+                                            }
+                                        }
+                                        eprintln!(
+                                            "[spyre-superdsc] {base}: 3 bundles baked — prefix {pfp} / body {bfp} + {} class(es), {} launch(es) \
+                                             / suffix {sfp} (dxp: SMALL bundles → seconds)",
+                                            rolled.bodies.len(),
+                                            rolled.launches.len(),
+                                        );
+                                        // Stamp the DECODE body_fp or the PREFILL body_fp by phase
+                                        // (the prefill reroll must NOT clobber the decode fp).
+                                        if let Some(mq) = prefill_mq.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
                                             // A PREFIX-CAPABLE prefill rung: continuation chunks
                                             // (start>0) run on these, since they DO have resident KV to
                                             // attend — each on the smallest rung that holds it. The
@@ -4242,66 +4128,52 @@ pub(crate) fn dump_wavefront_mega(
                                             }
                                             // The one-request bundle stays THE decode bundle for
                                             // every path that predates the ladder.
-                                            //
-                                            // ⛔ AND `decode_rows <= 1` DOES NOT MEAN THE GRAPH IS
-                                            // ONE ROW. The CB emission (`ktir_decode_cb_*`) passes
-                                            // `decode_rows = 1` on purpose — its rows are a batch
-                                            // SYMBOL the DEM resolves at runtime — while the graph
-                                            // it lowered is `CB_BATCH_TEMPLATE` = 96 rows wide. It
-                                            // runs LAST, so it won this slot and every decode token
-                                            // ran a 96-row program: MEASURED as `[96, 49155]` logits
-                                            // and 195,428,640 elements read back per token, for a
-                                            // ~90 K result. Correct (row 0 is the real token) and
-                                            // ~96x the work. `seq_sym.is_none()` is the same
-                                            // discriminator the superdsc block above uses to exclude
-                                            // that symbolic tape.
-                                            if decode_rows <= 1 && seq_sym.is_none() {
+                                            if decode_rows <= 1 {
                                                 fx.push(BakeEffect::DecodeFp(bfp));
                                             }
                                         }
-                                        }
-                                        // HARD BUILD ERROR (guard-every-crash-at-build-time): a failed bundle
-                                        // write here left `superdsc_fp`/`superdsc_prefill_fp` unset, so the
-                                        // placeholder-group synthesis at the decode-bundle call site
-                                        // (`default_decode_groups.is_empty() && superdsc_fp.borrow().is_some()`)
-                                        // never fires — the SengraphBundle ships with ZERO groups, and the
-                                        // FIRST signal is the worker's runtime "bundle has no layer groups
-                                        // (split produced 0)" at pod load, with none of this context. Panicking
-                                        // here instead surfaces the REAL SuperDSC lowering failure at `cargo
-                                        // build` time, where it belongs.
-                                        (pre, bod, suf) => panic!(
-                                            "[spyre-superdsc] {base}: 3-bundle write failed — \
-                                         prefix_err={:?} body_err={:?} suffix_err={:?}",
-                                            pre.err(),
-                                            bod.err(),
-                                            suf.err(),
-                                        ),
                                     }
-                                }
-                                Err(e) => {
-                                    // ⛔ NO RUNG MAY FAIL TO LOWER. The old "rung contract" — a
-                                    // failed rung is skipped and the batch falls to a narrower one —
-                                    // shipped binaries whose batch decode silently ran elsewhere
-                                    // (measured: the sampler's grid defect skipped EVERY decode
-                                    // batch rung and nothing said so). A rung the bake was asked
-                                    // for is a build obligation: failure is a build failure, naming
-                                    // the rung and the error.
-                                    panic!(
-                                        "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
-                                         decode_rows={decode_rows} prefill_mq={prefill_mq:?} — {e}. \
-                                         Every rung the bake was asked for must lower; a skip ships \
-                                         a binary whose batch silently runs elsewhere"
-                                    );
+                                    // HARD BUILD ERROR (guard-every-crash-at-build-time): a failed bundle
+                                    // write here left `superdsc_fp`/`superdsc_prefill_fp` unset, so the
+                                    // placeholder-group synthesis at the decode-bundle call site
+                                    // (`default_decode_groups.is_empty() && superdsc_fp.borrow().is_some()`)
+                                    // never fires — the SengraphBundle ships with ZERO groups, and the
+                                    // FIRST signal is the worker's runtime "bundle has no layer groups
+                                    // (split produced 0)" at pod load, with none of this context. Panicking
+                                    // here instead surfaces the REAL SuperDSC lowering failure at `cargo
+                                    // build` time, where it belongs.
+                                    (pre, bod, suf) => panic!(
+                                        "[spyre-superdsc] {base}: 3-bundle write failed — \
+                                     prefix_err={:?} body_err={:?} suffix_err={:?}",
+                                        pre.err(),
+                                        bod.err(),
+                                        suf.err(),
+                                    ),
                                 }
                             }
+                            Err(e) => {
+                                // ⛔ NO RUNG MAY FAIL TO LOWER. The old "rung contract" — a
+                                // failed rung is skipped and the batch falls to a narrower one —
+                                // shipped binaries whose batch decode silently ran elsewhere
+                                // (measured: the sampler's grid defect skipped EVERY decode
+                                // batch rung and nothing said so). A rung the bake was asked
+                                // for is a build obligation: failure is a build failure, naming
+                                // the rung and the error.
+                                panic!(
+                                    "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
+                                     decode_rows={decode_rows} prefill_mq={prefill_mq:?} — {e}. \
+                                     Every rung the bake was asked for must lower; a skip ships \
+                                     a binary whose batch silently runs elsewhere"
+                                );
+                            }
                         }
-                        Err(e) => {
-                            panic!(
-                                "[spyre-superdsc] {base}: SubtileIR invalid for reroll — {e:?} (previously \
-                             swallowed by an eprintln, leaving superdsc_fp unset and shipping a ZERO-group \
-                             bundle that only crashed at pod load.)"
-                            )
-                        }
+                    }
+                    Err(e) => {
+                        panic!(
+                            "[spyre-superdsc] {base}: SubtileIR invalid for reroll — {e:?} (previously \
+                         swallowed by an eprintln, leaving superdsc_fp unset and shipping a ZERO-group \
+                         bundle that only crashed at pod load.)"
+                        )
                     }
                 }
                 // Sengraph lowering DELETED (dead end — SDSC-native only). The sdsc bundle rides the
@@ -4339,17 +4211,9 @@ pub(crate) fn dump_wavefront_mega(
                     //
                     // ⛔ AND THE DECODE SLOT TAKES THE CONCRETE, SINGLE-REQUEST GRAPH ONLY. There is
                     // one slot but several non-prefill emissions, so a plain `else` is last-write-
-                    // wins — and the last one is `ktir_decode_cb_*`, lowered at `CB_BATCH_TEMPLATE`
-                    // (96). The worker forwards `m_cap` ROWS and reads `m_cap` off this wiring's
-                    // EmbeddedHidden shape (`spyre_load.rs:109`, `spyre_forward.rs:1377`), so that
-                    // stamp made every single-token decode step compute 96 activation rows.
-                    //
-                    // Both guards are the discriminators this file already uses. `seq_sym.is_none()`
-                    // is how the superdsc block at the top of this closure excludes "the emulator-only
-                    // symbolic CB-decode tape (Some(("s0",..)))" — whose rows are a batch SYMBOL the
-                    // DEM resolves at runtime, not a count anything may forward. `decode_rows ==
-                    // primary_m` keeps a wider batch-ladder rung out: a rung is the same tape baked
-                    // at B rows and is addressed by FINGERPRINT, not through this wiring.
+                    // wins. `decode_rows == 1` keeps a wider batch-ladder rung out: a rung is the
+                    // same tape baked at B rows and is addressed by FINGERPRINT, not through this
+                    // wiring.
                     // ⛔ AND A PREFILL WIRING SHIPS ONLY FOR A PREFILL THAT BAKED. The
                     // prefill walk's KTIR emission and wiring stamp survive their own
                     // reroll's failure (a failed reroll panics after the walk has already
@@ -4357,10 +4221,8 @@ pub(crate) fn dump_wavefront_mega(
                     // carries — see the `prefill_fp_stamped` declaration above for the
                     // measured consequence. A rung that did not bake stamps NEITHER
                     // slot: falling through to the decode arm would ship the m=31
-                    // prefill wiring as the DECODE wiring (both its guards hold for the
-                    // prefill rung call — `seq_sym.is_none()` because superdsc keeps
-                    // the prefill tape concrete, `decode_rows == primary_m` because the
-                    // rung passes 1), overwriting the real decode wiring after the fact
+                    // prefill wiring as the DECODE wiring (the prefill rung call passes
+                    // `decode_rows == 1`), overwriting the real decode wiring after the fact
                     // and poisoning every step's staging (MEASURED: V7b tiny8 — the
                     // same ten PROBE11 clobbers, now routed through the decode slot).
                     // Stamped per call, so a failed WIDER rung cannot overwrite a
@@ -4382,7 +4244,7 @@ pub(crate) fn dump_wavefront_mega(
                         } else {
                             prefill_fp_stamped.then_some(WiringSlot::Prefill)
                         }
-                    } else if seq_sym.is_none() && decode_rows == primary_m {
+                    } else if decode_rows == 1 {
                         Some(WiringSlot::Decode)
                     } else {
                         None
@@ -4535,7 +4397,6 @@ pub(crate) fn dump_wavefront_mega(
             |lwd: &BakeTape,
              base: String,
              cap: u32,
-             seq_sym: Option<(&'static str, u32)>,
              prefill_mq: Option<u32>,
              prefill_seqs: u32,
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
@@ -4544,7 +4405,6 @@ pub(crate) fn dump_wavefront_mega(
                     lwd,
                     base,
                     cap,
-                    seq_sym,
                     prefill_mq,
                     prefill_seqs,
                     active_cap,
@@ -4555,22 +4415,18 @@ pub(crate) fn dump_wavefront_mega(
                 r
             };
 
-        // Decode bundle (m = KTIR_M, default 1): the worker's fast per-token path.
-        // The dd2-PROVEN static-SDPA single graph is emitted from THIS m=1 decode
-        // tape (`seq_sym=None`) and baked as the sendnn bundle — ONE graph for both
-        // prefill-chunks and decode (host-grown KV). This is the only sendnn lowering
-        // (the offline_decoder CB-decode / SDPA-prefill bundle path was removed); a
-        // PLAIN `cargo build -Fsendnn` (no env) produces it. This is also the TOP
-        // decode cap bucket (cap == prefix_len); the narrower buckets are baked below.
+        // Decode bundle (m = 1): the worker's fast per-token path, emitted from THIS
+        // m=1 decode tape and baked as the sendnn bundle. This is the only sendnn
+        // lowering. This is also the TOP decode cap bucket (cap == prefix_len); the
+        // narrower buckets are baked below.
         let (_decode_graph_unused, mut default_decode_groups) = emit_bundle(
             &lowered,
             format!("ktir_decode_{stem_id}"),
             prefix_len.get(),
-            None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
             None, // decode path (Store + PagedAttnCompute) -- no prefill width
             1,    // no prefill rung: no packed count to state
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-            primary_m,
+            1,
         );
 
         // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
@@ -4680,10 +4536,9 @@ pub(crate) fn dump_wavefront_mega(
                 format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
                 prefix_len.get(),
                 None,
-                None,
                 1,
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                primary_m,
+                1,
                 Some(&sf.sources),
             );
             commit_bake(&sharded_world, &tp_lwd, fx);
@@ -4711,7 +4566,7 @@ pub(crate) fn dump_wavefront_mega(
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
         // Five more whole-model bakes for nothing.
-        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
+        if cfg!(feature = "spyre-lower") {
             // RUNGS PAST 8. A decode step's cost is dominated by a FIXED penalty for leaving the
             // mq==1 fast path — the body goes 271 ops/layer at one request to 612 at two, then only
             // +16 per further request — plus one launch per request. Measured 36 ms fixed + ~2 ms per
@@ -4748,8 +4603,7 @@ pub(crate) fn dump_wavefront_mega(
                             format!("ktir_decode_{stem_id}"),
                             // `cap`: this bundle is baked for the full prefix.
                             prefix_len.get(),
-                            // `seq_sym` / `prefill_mq`: decode, so neither applies.
-                            None,
+                            // `prefill_mq`: decode, so it does not apply.
                             None,
                             1,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -4783,7 +4637,6 @@ pub(crate) fn dump_wavefront_mega(
                                 &tp_lwd,
                                 format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
                                 prefix_len.get(),
-                                None,
                                 None,
                                 1,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -4829,212 +4682,60 @@ pub(crate) fn dump_wavefront_mega(
             .filter(|&r| rung_admitted(r))
             .max()
             .unwrap_or(SUB_BLOCKED_PREFILL_CEILING);
-        // ⛔ BUILD GUARD (guard-every-crash, on-card PROVEN 2026-06-24/25 dd2): mq is
-        // NOT free-valued — the DEM/DSM partitioner only tiles the static-paged
-        // PagedAttnCompute batch axis (`mq`) cleanly for a SPECIFIC empirically-
-        // verified set. Out-of-set mq crashes on-card during `session_create`
-        // (CompileGraph), BEFORE any Predict, with one of two signatures depending
-        // on the value (sweep at nblk=4, SmolLM2-135M):
-        //   mq ∈ {2,4,8}     → COMPILES + runs + coherent (decode 5.5 / 6.4 / 9.1 ms)
-        //   mq == 96         → COMPILES + runs + coherent (decode 58.7 ms) [baseline]
-        //   mq ∈ {16,32,256} → ABORT `vector::_M_range_check (0 >= 0)` (DEM tiler:
-        //                      empty partition vector indexed at 0)
-        //   mq == 64         → ABORT `DtException: sumVpPair == tensorProp.shape[d]`
-        //                      (dsm/sharedFuncs.cpp:2804 — partition-sum != axis len)
-        //   mq == 1          → already build-refused upstream (unit-axis Reshape vs
-        //                      symbolic-batch collision, graphOptimizer.cpp:5422)
-        // The plain `mq <= 96` ceiling did NOT catch the mid-range {16,32,64} crashes
-        // (all <= 96). This allowlist turns every out-of-set mq into a `cargo build`
-        // error instead of an on-card `session_create threw` at model load. To add a
-        // new mq, PROVE it compiles+runs on dd2 first, then extend MQ_DEM_SAFE.
-        // Real LONGER CONTEXT comes from a LARGE paged CACHE (prefix_len/nblk —
-        // proven to compile at 512/2048) + CHUNKED prefill + 1-token incremental
-        // decode, NOT a larger mq. A SMALLER decode mq (≤8) is the proven roofline
-        // lever: decode COMPUTE scales ~linearly in mq (≈4.1 ms floor + 0.57 ms·mq
-        // at nblk=4), so mq=2 is ~10.7× faster per decode step than mq=96.
-        //
-        // SMALL-MQ DECODE LEVER (PROVEN ~10.7× per-token, on-card 2026-06-25): the
-        // static-paged DECODE graph is emitted at the SMALL `DECODE_MQ` (incremental
-        // decode has 1 new token, so the old mq=96 over-provisions ~48×; decode COMPUTE
-        // scales ~linearly in mq — 286 ms → ~10 ms/token at mq=2). NUMERICS ARE
-        // IDENTICAL — pure right-sizing: the real token is row 0, the rest is pad
-        // (last-real-row replicated, then discarded; the shim returns row n_new-1).
-        //
-        // ONE session drives BOTH prefill chunks and incremental decode through this
-        // ONE graph — the resident KV lives in the session's on-card allocation and
-        // persists across Predicts, and it CANNOT be shared with a second graph/session
-        // (on-card PROVEN 2026-06-25: a separate prefill graph at mq=96 + a host-buffer
-        // KV hand-off to a mq=2 decode session produced GARBLED output — the prefill's
-        // on-card cache writes are NOT mirrored to the host buffer, so the copy is
-        // stale; both mq=96 and mq=2 garbled with the two-session split, while the
-        // single-session incremental path is coherent). So prefill chunks ride the SAME
-        // small mq (a slower one-time TTFT cost; decode is the dominant repeated cost).
-        // `CB_BATCH_TEMPLATE` is kept ONLY for the DEFAULT (non-paged) mode's CB-decode
-        // template and as the MQ_DEM_SAFE upper anchor.
-        const CB_BATCH_TEMPLATE: u32 = 96; // default-mode CB template (not block_size 64)
-        // PAGED prefill+decode mq = the CONTINUOUS-BATCHING batch axis (#45): mq is the
-        // number of decode ROWS one Predict processes, so it is the max number of
-        // concurrent sequences whose next-token is computed per Predict (the CB batch
-        // axis). DECODE_MQ=2 is the chat-optimal single-stream width: on-card @ nblk=32,
-        // mq=2 → ~9.7 ms/Predict ≈ 104 tok/s with byte-identical output (committed
-        // 206ece8d; ∈ MQ_DEM_SAFE). The worker packs B≤mq requests into the mq rows (1
-        // real token each) via predict_perrow with per-row block_table; B>mq sub-batches
-        // (ceil(B/mq) Predicts). NUMERICS identical: each row is its own seq's real token
-        // over its own scheduler blocks; padding rows replicate the last real row and are
-        // discarded. The per-row CB mechanism is on-card-VERIFIED at mq=8 (C=4 → ~99 tok/s,
-        // 4 concurrent prompts each correct incl Jupiter, ZERO cross-contamination).
-        //
-        // mq is FIXED per compiled graph, so a single static mq trades C=1 latency vs
-        // batch throughput: per-Predict cost grows with BOTH mq and nblk (mq=8 @ nblk=32
-        // → ~33 ms ⇒ C=1 only ~30 tok/s; mq=96 @ nblk=32 → ~58.7 ms but 96 rows ⇒ ~1635
-        // tok/s aggregate at full batch ≈ 36% of the ~4500 tok/s weight-bandwidth
-        // roofline). The PATH to that throughput WITHOUT regressing chat is DYNAMIC mq —
-        // bake decode graphs at several mq ∈ MQ_DEM_SAFE and have the worker pick the
-        // smallest that holds the live batch (C=1 → mq=2, large batch → mq=96). Until that
-        // lands, change `DECODE_MQ` below for an 8-way concurrent server.
-        // DEM/DSM-safe mq values, on-card verified (dd2 SENTIENT, nblk=4). MUST stay
-        // sorted; every entry has been observed to CompileGraph + Predict coherently.
-        const MQ_DEM_SAFE: [u32; 4] = [2, 4, 8, 96];
-        // The smallest DEM-safe mq that holds `min_rows` rows: the law DECODE_MQ
-        // FOLLOWS from, and the same answer the dynamic-mq path gives the live
-        // batch (worker picks the smallest safe mq ≥ the live request count).
-        // Reads MQ_DEM_SAFE ascending, so the table's sorted-order law is its
-        // precondition (asserted below).
-        const fn smallest_dem_safe_mq(min_rows: u32) -> u32 {
-            let mut i = 0;
-            while i < MQ_DEM_SAFE.len() {
-                if MQ_DEM_SAFE[i] >= min_rows {
-                    return MQ_DEM_SAFE[i];
-                }
-                i += 1;
-            }
-            panic!("MQ_DEM_SAFE holds no mq >= the minimal decode row count");
-        }
-        // Incremental decode carries ONE new token per sequence, and the device
-        // already build-refuses mq=1 (unit-axis Reshape vs symbolic-batch
-        // collision, graphOptimizer.cpp:5422 — see the guard note above), so the
-        // minimal lawful decode row count is 2: 1 real token + 1 pad.
-        const MINIMAL_DECODE_ROWS: u32 = 2;
-        // PAGED prefill+decode mq = CB batch axis default (chat-optimal; see note).
-        // DERIVED, not picked: the smallest DEM-safe mq ≥ the minimal decode row
-        // count — identical for every model (min{mq ∈ {2,4,8,96} : mq ≥ 2} = 2).
-        const DECODE_MQ: u32 = smallest_dem_safe_mq(MINIMAL_DECODE_ROWS);
-        const fn mq_is_dem_safe(mq: u32) -> bool {
-            // const-fn linear scan (arrays aren't const-iterable on stable).
-            let mut i = 0;
-            while i < MQ_DEM_SAFE.len() {
-                if MQ_DEM_SAFE[i] == mq {
-                    return true;
-                }
-                i += 1;
-            }
-            false
-        }
-        const _: () = assert!(
-            mq_is_dem_safe(CB_BATCH_TEMPLATE),
-            "CB_BATCH_TEMPLATE (PREFILL mq) is not a DEM/DSM-safe static-paged mq. Only {{2,4,8,96}} \
-             are on-card PROVEN (dd2) to CompileGraph + Predict; other values abort \
-             `session_create` BEFORE any Predict with vector::_M_range_check (mq in {{16,32,256}}) \
-             or DtException sumVpPair==shape (mq==64). Pick a value from MQ_DEM_SAFE; to add \
-             one, prove it compiles+runs on dd2 first."
-        );
-        const _: () = assert!(
-            mq_is_dem_safe(DECODE_MQ),
-            "DECODE_MQ (smallest DEM-safe mq ≥ MINIMAL_DECODE_ROWS) is not in MQ_DEM_SAFE — \
-             the derivation and the table have drifted apart."
-        );
-        // smallest_dem_safe_mq reads MQ_DEM_SAFE ascending; pin that ordering.
-        const _: () = assert!(
-            {
-                let mut i = 1;
-                let mut sorted = true;
-                while i < MQ_DEM_SAFE.len() {
-                    if MQ_DEM_SAFE[i - 1] >= MQ_DEM_SAFE[i] {
-                        sorted = false;
-                    }
-                    i += 1;
-                }
-                sorted
-            },
-            "MQ_DEM_SAFE must stay strictly ascending: smallest_dem_safe_mq scans it in order."
-        );
         // Batched-prefill bundle: the worker runs the prompt through it (one m=N
         // forward per chunk), keeping the m=1 decode bundle for the generation
         // loop. Emitted BY DEFAULT so a plain spyre build prefills the prompt;
         // m=1 ⇒ skip (decode already covers single-token steps, e.g. the m=1
         // self-check gate where prefix_len defaults to its tiny value).
         //
-        // PAGED: the prefill graph is emitted but UNUSED at runtime (one session uses
-        // the decode graph for both phases — see DECODE_MQ note). It is still lowered
-        // (to satisfy the bundle's [prefill,decode] pairing + KV-shape-agreement guards)
-        // at the small DECODE_MQ so its kcache_/vcache_ shapes match decode exactly.
-        // DEFAULT (host-grown) prefill uses the LX-derived width
-        // (`emu_prefill_lx_width`, module level). `KTIR_PREFILL_LEN` overrides.
-        let prefill_m: u32 = std::env::var("KTIR_PREFILL_LEN")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(if sendnn_paged {
-                // The prefill graph is emitted-but-UNUSED in the single-graph path (the mq=1
-                // decode graph drives BOTH phases). It must still be emitted at mq>1, else the
-                // `.filter(|&v| v > 1)` below drops it → the bundle ships no prefill graph → the
-                // paged-bundle guard panics (prefill_present=false). kcache_/vcache_ shapes are
-                // mq-INDEPENDENT ([nblk,64,nkv,hd]), so this mq-2 placeholder prefill graph's KV
-                // shapes still match the mq=1 decode exactly (the KV-shape-agreement guard passes).
-                DECODE_MQ.max(2)
-            } else if sendnn_superdsc && cfg!(feature = "spyre-lower") {
-                // SuperDSC bakes the whole WIDTH LADDER and lets the WIDEST rung that actually
-                // lowers become the ceiling (see the rung loop below), so this is just where the
-                // ladder STARTS looking — not a value that has to be right. That is what demotes
-                // `KTIR_PREFILL_LEN` from a required flag to a diagnostic override, and what stops
-                // a model whose FFN blows the LX budget at the top width from failing the BUILD:
-                // it simply gets a shorter ladder. Capped by the widest rung THIS model admits
-                // (`rung_admitted`), and by nothing else.
-                //
-                // ⛔ NOT BY THE RESIDENT CACHE (`prefix_len`, 256 by default). That cap dates from the
-                // unpaged cache, where a chunk's keys had to fit the baked prefix rows. A paged chunk
-                // writes the POOL, one page part per page (`EmittedOp::kv_slot_offset`), so its width is
-                // the pool's law (`PagedKvPool::PREFILL_CHUNK_SLOTS`, asserted equal to the ladder
-                // ceiling above) and not the cache's. MEASURED: with the cap, the 512-row ladder baked
-                // to 256 in silence — `PREFILL ladder = [..., 192, 256]` at load, and every TTFT cell
-                // equal to the 256-row build's.
-                admitted_ceiling
-            } else {
-                // The EMU's ONE width, LX-derived from the model's own fp8
-                // gemms (`emu_prefill_lx_width`, module level): the old
-                // constant `prefix_len.min(PREFILL_LX_SAFE)` refused ~40 s
-                // into gemma-4-12b's first chat — rung 31's fp8 epilogue
-                // needs 2,887,680 B against a 2 MiB core.
-                emu_prefill_lx_width(fuf, model, prefix_len.get())
-            });
+        // SuperDSC bakes the whole WIDTH LADDER and lets the WIDEST rung that
+        // actually lowers become the ceiling (see the rung loop below), so
+        // `prefill_m` is just where the ladder STARTS looking — not a value that
+        // has to be right. That is what stops a model whose FFN blows the LX
+        // budget at the top width from failing the BUILD: it simply gets a
+        // shorter ladder. Capped by the widest rung THIS model admits
+        // (`rung_admitted`), and by nothing else.
+        //
+        // ⛔ NOT BY THE RESIDENT CACHE (`prefix_len`, 256 by default). That cap dates from the
+        // unpaged cache, where a chunk's keys had to fit the baked prefix rows. A paged chunk
+        // writes the POOL, one page part per page (`EmittedOp::kv_slot_offset`), so its width is
+        // the pool's law (`PagedKvPool::PREFILL_CHUNK_SLOTS`, asserted equal to the ladder
+        // ceiling above) and not the cache's. MEASURED: with the cap, the 512-row ladder baked
+        // to 256 in silence — `PREFILL ladder = [..., 192, 256]` at load, and every TTFT cell
+        // equal to the 256-row build's.
+        //
+        // The EMU bakes ONE width instead (no `spyre-lower`): the LX-derived width from
+        // the model's own fp8 gemms (`emu_prefill_lx_width`, module level) — the old
+        // constant `prefix_len.min(PREFILL_LX_SAFE)` refused ~40 s into gemma-4-12b's
+        // first chat (rung 31's fp8 epilogue needs 2,887,680 B against a 2 MiB core).
+        let prefill_m: u32 = if cfg!(feature = "spyre-lower") {
+            admitted_ceiling
+        } else {
+            emu_prefill_lx_width(fuf, model, prefix_len.get())
+        };
         // ── PREFILL WIDTH LADDER: bake EVERY rung up to the ceiling, ascending ──
-        // `prefill` ends up as the WIDEST rung that actually lowered, so a rung the model cannot fit
-        // (the LX budget scales with mq x intermediate) shortens the ladder instead of failing the
-        // build. Ascending order also means the widest bake is LAST, so it is the one that lands in
-        // `superdsc_prefill_fp` (the single-bundle prefill slot) -- the worker treats that as the
-        // ceiling and every narrower rung as a step below it.
-        // Non-superdsc keeps exactly one width and still PANICS if it will not lower: those paths
-        // have no ladder to fall back to, so a missing prefill graph must stay a build failure.
+        // The ladder is what actually lowered, so a rung the model cannot fit (the LX
+        // budget scales with mq x intermediate) shortens the ladder instead of failing
+        // the build. Ascending order also means the widest bake is LAST, so it is the
+        // one that lands in `superdsc_prefill_fp` (the single-bundle prefill slot) --
+        // the worker treats that as the ceiling and every narrower rung as a step below it.
+        // The emu keeps exactly one width and still PANICS if it will not lower: that
+        // path has no ladder to fall back to, so a missing prefill graph must stay a
+        // build failure.
         // ⛔ THE LADDER IS A CARD FEATURE — BAKE ONE WIDTH OTHERWISE. Every rung is a full lowering
         // of the whole model, and the emulator worker can only ever run ONE of them:
         // `KtirBundle::prefill` is a single `Option` (`manifest.rs:167`) and the narrower rungs are
         // reached through `prefill_rungs`, which `spyre_forward.rs` reads under `spyre-hw` alone.
         // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (25 now, to 256) — the generated
         // model source and rustc's single-threaded pass over it both paid for all of them.
-        let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-lower") {
-            let mut v: Vec<u32> = PREFILL_RUNGS
+        let prefill_rung_widths: Vec<u32> = if cfg!(feature = "spyre-lower") {
+            PREFILL_RUNGS
                 .into_iter()
                 .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
-                .collect();
-            // An explicit KTIR_PREFILL_LEN that is not itself a rung still gets baked, as the top.
-            if v.last() != Some(&prefill_m) && prefill_m > 1 {
-                v.push(prefill_m);
-            }
-            v
+                .collect()
         } else {
             Some(prefill_m).filter(|&v| v > 1).into_iter().collect()
         };
-        type PrefillPick = BakeOut;
-        let mut prefill: Option<PrefillPick> = None;
         // ⭐ THE RUNGS ARE BAKED IN PARALLEL AND COMMITTED IN ORDER. Each rung is a whole-model lowering
         // that reads nothing another rung writes — `emit_bundle_deferred` records its effects instead of
         // applying them — so the 25 bakes run side by side and `commit_bake` then applies their effects
@@ -5043,17 +4744,16 @@ pub(crate) fn dump_wavefront_mega(
         //
         // A rung that does not lower PANICS inside its own bake — every entry that reaches
         // the commit below is `Ok`, so the committed ladder is every rung asked for.
-        // A rung's bake in each world: the one-rank lowering, its pick and effects, and — when the
+        // A rung's bake in each world: the one-rank lowering and its effects, and — when the
         // sharded world baked its decode — the rung's sharded lowering and effects.
         type RungBake = (
             BakeTape,
-            PrefillPick,
             Vec<BakeEffect>,
             Option<(BakeTape, Vec<BakeEffect>)>,
         );
-        let per_rung: Vec<Result<RungBake, (u32, String)>> = {
+        let per_rung: Vec<RungBake> = {
             use rayon::prelude::*;
-            prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
+            prefill_rung_widths.par_iter().map(|&pl| -> RungBake {
             let lowered = to_wavefront::lower_decode_to_wavefront(
                 fuf,
                 inferred,
@@ -5089,17 +4789,9 @@ pub(crate) fn dump_wavefront_mega(
                         lwd,
                         base,
                         prefix_len.get(),
-                        // prefill: rewrite the concrete prompt length `pl` → symbol
-                        // s0 (offline_decoder idx-0 graph: prompt sym = Tq = Tkv).
-                        // ── superdsc: keep the prefill tape CONCRETE (m=pl) so the reroll
-                        //    bakes a real m=N dxp bundle (the dxp reroll is NOT symbolic; the
-                        //    worker runs it at the fixed pl). Only the sengraph offline_decoder
-                        //    path uses the s0 symbol. ──
-                        if sendnn_superdsc {
-                            None
-                        } else {
-                            Some(("s0", pl))
-                        },
+                        // The prefill tape stays CONCRETE (m=pl) so the reroll bakes a
+                        // real m=N dxp bundle (the dxp reroll is NOT symbolic; the worker
+                        // runs it at the fixed pl).
                         Some(pl), // prefill path (SDPA + Store), ladder rung m=pl
                         1,        // a ladder rung is one request's chunk
                         // ⛔ ZERO PREFIX BLOCKS, AND THAT IS ONLY RIGHT FOR THE FIRST CHUNK.
@@ -5126,7 +4818,7 @@ pub(crate) fn dump_wavefront_mega(
                     }
                     let bake_rung = bake_rung_with!(emit_bundle_deferred);
                     let bake_rung_sharded = bake_rung_with!(emit_bundle_deferred_sharded);
-                    let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
+                    let (_, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
                     let tp2 = tp_sources.as_deref().map(|decode_cuts| {
@@ -5154,39 +4846,28 @@ pub(crate) fn dump_wavefront_mega(
                         );
                         (tp_lwd, fx)
                     });
-                    Ok((lwd_p, r, fx, tp2))
+                    (lwd_p, fx, tp2)
                 }
-                Err(e) if sendnn_superdsc => {
+                Err(e) => {
                     panic!(
                         "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}. \
                          Every rung the bake was asked for must lower; a skip ships a binary whose \
                          chunks silently run elsewhere"
                     )
                 }
-                Err(e) => panic!("[wavefront] {stem}: prefill (m={pl}) NOT LOWERED — {e}"),
             }
             }).collect()
         };
-        // A rung that fails to lower panics inside the parallel bake above, so every
-        // entry here is `Ok` — the window guard below still runs, over what baked.
-        for rung in per_rung {
-            match rung {
-                Ok((lwd_p, r, fx, tp2)) => {
-                    commit_bake(&one_rank, &lwd_p, fx);
-                    if let Some((tp_lwd, fx)) = tp2 {
-                        commit_bake(&sharded_world, &tp_lwd, fx);
-                    }
-                    prefill = Some(r);
-                }
-                Err((pl, e)) => {
-                    panic!("[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}")
-                }
+        for (lwd_p, fx, tp2) in per_rung {
+            commit_bake(&one_rank, &lwd_p, fx);
+            if let Some((tp_lwd, fx)) = tp2 {
+                commit_bake(&sharded_world, &tp_lwd, fx);
             }
         }
         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
         // the rungs codegen actually baked, never the const ladder. A short ladder runs, correctly and
         // slowly, with nothing anywhere saying so; see `PagedKvPool::prefill_ladder_reaches_the_window`.
-        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
+        if cfg!(feature = "spyre-lower") {
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
@@ -5220,7 +4901,7 @@ pub(crate) fn dump_wavefront_mega(
         // narrowest.
         // ⛔ ONE WIDTH WAS THE MEASURED COST. This baked the widest rung alone, and a 52-row tail ran a
         // full 512-row chunk — granite-3.1-2b at ~2k tokens: 460 ms against 384 ms on the 256-row build.
-        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
+        if cfg!(feature = "spyre-lower") {
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
@@ -5242,7 +4923,6 @@ pub(crate) fn dump_wavefront_mega(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
                             prefix_len.get(),
-                            None,
                             Some(m),
                             1, // a prompt chunk is one request
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -5277,7 +4957,6 @@ pub(crate) fn dump_wavefront_mega(
                                 &tp_lwd,
                                 format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
                                 prefix_len.get(),
-                                None,
                                 Some(m),
                                 1,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -5315,7 +4994,6 @@ pub(crate) fn dump_wavefront_mega(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
                             prefix_len.get(),
-                            None,
                             Some(w),
                             s,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -5351,7 +5029,6 @@ pub(crate) fn dump_wavefront_mega(
                                 &tp_lwd,
                                 format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
                                 prefix_len.get(),
-                                None,
                                 Some(w),
                                 s,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -5512,153 +5189,6 @@ pub(crate) fn dump_wavefront_mega(
             }
         }
 
-        // ── CB decode sengraph (the baked `--target sendnn` decode graph). The
-        //    offline_decoder decode isengraph must carry a BATCH symbol on its K/Q
-        //    data — the DEM reads batchSym from the PagedAttnStore KEY input
-        //    (dem_frontend decoderSymCheck). The KTIR decode is m=1, so build a
-        //    SEPARATE m=DECODE_MQ tape whose ROWS are the batch dim, then
-        //    symbolicize that value → s0 (batch); the tkv symbol (s1) is emitted
-        //    explicitly on block_table dim0. batch=1 at runtime via symVals[s0]=1. ──
-        // The mq allowlist guard (MQ_DEM_SAFE) + CB_BATCH_TEMPLATE (prefill mq) +
-        // DECODE_MQ (decode mq) are defined ABOVE (before the prefill block, so the
-        // paged prefill can use CB_BATCH_TEMPLATE). The DECODE graph is emitted at the
-        // SMALL DECODE_MQ (the proven ~10.7× decode lever); prefill stays at 96.
-        // ⛔ BUILD GUARD (guard-every-crash, option (b) resident KV): the paged path
-        // serves LONGER CONTEXT only if the resident cache (cap = prefix_len, in
-        // 64-token pages) holds strictly MORE than one forward's worth of tokens
-        // (`mq`). A model whose context were <= CB_BATCH_TEMPLATE would overflow the
-        // cache after the first chunk (the shim's slot-bound guard would reject step 2
-        // at RUNTIME) — turn that into a `cargo build` failure here (this proc-macro
-        // body runs at build time). Only gated to the paged mode.
-        if std::env::var("SCRATCHY_SENDNN_MODE").as_deref() == Ok("paged")
-            && prefix_len.get() <= CB_BATCH_TEMPLATE
-        {
-            panic!(
-                "[spyre-sendnn] paged mode: the model's context {prefix_len} <= mq \
-                 (CB_BATCH_TEMPLATE={CB_BATCH_TEMPLATE}). The resident cache must hold MORE than one \
-                 incremental forward's worth of tokens to serve longer context."
-            );
-        }
-        // `_cb_decode_graph` = the whole-graph decode lowering (stays empty under
-        // the flit-cap guard for 30 layers); the runnable artifacts are the
-        // per-group `cb_decode_groups`.
-        // DECODE graph mq: the SMALL DECODE_MQ for paged (the proven ~10.7× decode
-        // lever — incremental decode has 1 real token, so mq=2 right-sizes the per-
-        // token forward); CB_BATCH_TEMPLATE for default mode (which drives one graph
-        // for both phases). NUMERICS identical: row 0 is the real token, the rest pad.
-        let decode_mq = if sendnn_paged {
-            DECODE_MQ
-        } else {
-            CB_BATCH_TEMPLATE
-        };
-        let (_cb_decode_graph, mut cb_decode_groups): (String, GroupGraphs) =
-            match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
-                fuf,
-                inferred,
-                decode_bounds,
-                &bridge,
-                scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
-                decode_mq,
-            ) {
-                Ok(lwd_cb) => {
-                    let lwd_cb = bake_tape(stem, lwd_cb);
-                    let (sg, groups) = emit_bundle(
-                        &lwd_cb,
-                        format!("ktir_decode_cb_{stem_id}"),
-                        prefix_len.get(),
-                        Some(("s0", decode_mq)),
-                        None,
-                        1,
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                        // The CB sengraph's rows are a batch SYMBOL the DEM resolves at runtime, not
-                        // a baked request count.
-                        1,
-                    );
-                    (sg, groups)
-                }
-                Err(e) => {
-                    panic!("[wavefront] {stem}: CB decode (m={decode_mq}) NOT LOWERED — {e}")
-                }
-            };
-
-        // DEFAULT-MODE OVERRIDE: replace the offline_decoder CB-decode groups with
-        // the single static-SDPA default-mode graph (emitted from the m=1 decode
-        // tape above). The bundle bake below stays unchanged structurally — it
-        // bakes one `SengraphBundleGroup` per group; in default mode there is ONE
-        // group whose `prefill` and `decode` slots both hold the SAME single graph
-        // (the worker drives it for both phases; KV is host-grown, not resident, so
-        // there is no prefill↔decode KV-by-name linkage to satisfy). The `>=2`
-        // / KV-shape / count guards below all pass trivially (one group, identical
-        // graphs). The offline_decoder env is NOT required for this graph.
-        // DEFAULT mode: one group, prefill slot == decode slot (host-grown KV, single
-        // static-SDPA graph drives both phases). PAGED mode: KEEP the distinct paged
-        // decode groups the CB-decode `emit_bundle` produced above (Store+Compute over
-        // the resident cache) — do NOT clobber them with the default clone.
-        if !sendnn_paged {
-            cb_decode_groups = default_decode_groups.clone();
-        }
-
-        // ⛔ GUARD (guard-every-crash-at-build-time) for deeprt.cpp:3317
-        // "Insufficient sengraphs passed for decoder compilation, expected >=2":
-        // offline_decoder compiles [prefill, decode] TOGETHER. Emitting a decode
-        // sengraph without a prefill one would make the shim pass a single graph and
-        // crash on-card. Fail the BUILD instead.
-        // With the layer-group split the runnable artifacts are the per-group
-        // graphs; the whole-graph `pg`/`cb_decode_graph` stay empty under the
-        // flit-cap guard. The "both graphs present" check is now per-GROUP: the
-        // prefill + decode group lists must be non-empty.
-        // "prefill present": DEFAULT mode — the single static-SDPA graph fills both
-        // slots (default_decode_groups non-empty). PAGED mode — default_decode_groups is
-        // empty (the m=1 decode emits no paged sengraph); the prefill groups live in the
-        // `prefill` emit_bundle result (the paged SDPA+Store graph). Without this, paged
-        // would see prefill_sg_present=false and CLEAR the paged decode groups below →
-        // "bundle has no layer groups (split produced 0)" at worker load.
-        let prefill_sg_present = if sendnn_paged {
-            prefill.as_ref().is_some_and(|(_, pgs)| !pgs.is_empty())
-        } else {
-            !default_decode_groups.is_empty()
-        };
-        // offline_decoder compiles [prefill, decode] TOGETHER (deeprt.cpp:3317 expects
-        // >=2). If the decode groups exist but prefill ones do NOT, the bundle is
-        // INCOMPLETE — most commonly because the single-symbol SDPA prefill was REFUSED
-        // by the flit-cap guard (its 256-bucket logits output = 2.29 MB > the 1.03 MB
-        // cap; the only fix is a chunked prefill, not yet landed). Rather than fail
-        // `cargo build` (which would block EVERY -Fsendnn build, incl. other models),
-        // mirror the flit-cap guard's LOG-NOT-PANIC pattern: drop the decode groups so
-        // the baked SENGRAPH_BUNDLE is EMPTY, and let the spyre worker's startup guard
-        // (spyre_worker.rs: empty prefill/decode graph_json) reject the model at load
-        // with a clear message — the card never sees a single-graph (>=2 violating) job.
-        if !cb_decode_groups.is_empty() && !prefill_sg_present {
-            eprintln!(
-                "[spyre-sendnn] {stem}: sendnn bundle has decode group graphs but NO prefill ones \
-                 (the SDPA prefill was likely flit-cap-refused; chunked prefill not yet landed) — \
-                 offline_decoder requires BOTH per group (deeprt.cpp:3317 expects >=2). Baking an \
-                 EMPTY SENGRAPH_BUNDLE; the worker startup guard will reject `--device sendnn` for \
-                 this model. (Set KTIR_PREFILL_LEN / land chunked prefill to produce a runnable bundle.)"
-            );
-            cb_decode_groups.clear();
-        }
-
-        // ⛔ PRIORITY-1 BUILD-TIME GUARD (guard-every-crash-at-build-time): the opt-in
-        // paged path was explicitly requested (SCRATCHY_SENDNN_MODE=paged), so an EMPTY
-        // or INCOMPLETE offline_decoder bundle MUST be a `cargo build` error — NOT the
-        // deferred worker-load "bundle has no layer groups (split produced 0)" runtime
-        // failure (the exact error the prefill_sg_present fix addressed). A runnable
-        // paged bundle needs BOTH a prefill (SDPA+PagedAttnStore) and a decode
-        // (PagedAttnCompute) graph per group; emitting neither/one is a lowering/codegen
-        // bug. (The graceful log-not-panic above is DEFAULT-path-only, where the SDPA
-        // prefill may be flit-refused without blocking other models' -Fsendnn builds.)
-        if sendnn_paged && (cb_decode_groups.is_empty() || !prefill_sg_present) {
-            panic!(
-                "[spyre-sendnn] {stem}: SCRATCHY_SENDNN_MODE=paged produced an INCOMPLETE bundle \
-                 (prefill_present={prefill_sg_present}, decode_groups={}) — the paged offline_decoder \
-                 bundle needs BOTH a prefill (SDPA+PagedAttnStore) and a decode (PagedAttnCompute) \
-                 graph per group. Check lower_graph_to_sengraph_paged_prefill/_decode + the \
-                 emit_bundle paged routing; a worker-load failure must never be the first signal.",
-                cb_decode_groups.len()
-            );
-        }
-
         // Bake the bundle into the binary as a const the per-arch
         // `ScratchyWeights::ktir_bundle()` override returns — no runtime disk read.
         // ⭐ A BUNDLE IS NAMED, NOT COPIED. Its programs were submitted to the registry above as
@@ -5694,29 +5224,9 @@ pub(crate) fn dump_wavefront_mega(
         //    independently + threads the hidden state group→group on the host).
         //    Pair the prefill-group and decode-group by group index; carry the
         //    group IO wiring (input/result tensor ids = the residual edge). ──
-        // DEFAULT mode: the "prefill" slot holds the SAME single static-SDPA graph as
-        // the "decode" slot (one graph drives both phases; host-grown KV). PAGED mode:
-        // pair the REAL paged prefill groups (SDPA+Store, distinct from the paged decode)
-        // from the `prefill` emit_bundle so the bundle has genuinely distinct
-        // [prefill,decode] graphs sharing the resident cache by name.
-        let prefill_groups: &GroupGraphs = if sendnn_paged {
-            prefill
-                .as_ref()
-                .map(|(_, pgs)| pgs)
-                .unwrap_or(&default_decode_groups)
-        } else {
-            &default_decode_groups
-        };
-        // Pair groups by index (prefill ⟷ decode). They MUST agree in count (same
-        // model, same group_size) — guard it.
-        if !cb_decode_groups.is_empty() && prefill_groups.len() != cb_decode_groups.len() {
-            panic!(
-                "[spyre-sendnn] {stem}: prefill split into {} groups but decode into {} — \
-                 the layer-group split must produce the same group count for both phases",
-                prefill_groups.len(),
-                cb_decode_groups.len()
-            );
-        }
+        // Both slots of the one placeholder group carry the SUPERDSC_BUNDLE
+        // sentinel, so both lists are `default_decode_groups` and pair by
+        // construction.
         // ⛔ GUARD (guard-every-crash-at-build-time, priority-1, SILENT-FAILURE class):
         // the offline_decoder links prefill↔decode KV by NODE NAME
         // (`_KVCACHE_TENSOR_ADDRESSES`, dem_frontend.cpp:559-628 +
@@ -5759,17 +5269,17 @@ pub(crate) fn dump_wavefront_mega(
         };
 
         let mut group_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
-        for (gi, (g_idx, in_t, res_t, dec_json)) in cb_decode_groups.iter().enumerate() {
+        for (gi, (g_idx, in_t, res_t, dec_json)) in default_decode_groups.iter().enumerate() {
             // Matching prefill group (same index); its graph json + IO wiring.
-            let pre_json = prefill_groups
+            let pre_json = default_decode_groups
                 .get(gi)
                 .map(|(_, _, _, j)| j.as_str())
                 .unwrap_or("");
-            let pre_in = prefill_groups
+            let pre_in = default_decode_groups
                 .get(gi)
                 .map(|(_, i, _, _)| *i)
                 .unwrap_or(*in_t);
-            let pre_res = prefill_groups
+            let pre_res = default_decode_groups
                 .get(gi)
                 .map(|(_, _, r, _)| *r)
                 .unwrap_or(*res_t);
@@ -5820,14 +5330,12 @@ pub(crate) fn dump_wavefront_mega(
             let (pre_fp, dec_fp) = (String::new(), String::new());
             let pre_fp_lit = proc_macro2::Literal::string(&pre_fp);
             let dec_fp_lit = proc_macro2::Literal::string(&dec_fp);
-            // SuperDSC ROUTING (#51 item 3): under `SCRATCHY_SENDNN_MODE=superdsc`
-            // the m=1 decode walk produced a work-divided dxp bundle keyed by
-            // `superdsc_fp`. Stamp BOTH the prefill and decode `graph_json` of the
-            // (single) group to the sentinel `SUPERDSC_BUNDLE:{fp}` so the worker
-            // resolves the baked bundle dir (`baked_superdsc_dir(fp)`) rather than
-            // treating the string as a sengraph JSON. The sengraph `graph_json` is
-            // overridden ONLY in superdsc mode; the default/paged sengraph path is
-            // untouched (superdsc_fp stays None).
+            // SuperDSC ROUTING (#51 item 3): the m=1 decode walk produced a
+            // work-divided dxp bundle keyed by `superdsc_fp`. Stamp BOTH the prefill
+            // and decode `graph_json` of the (single) group to the sentinel
+            // `SUPERDSC_BUNDLE:{fp}` so the worker resolves the baked bundle dir
+            // (`baked_superdsc_dir(fp)`) rather than treating the string as a
+            // sengraph JSON.
             let superdsc_sentinel = superdsc_fp
                 .borrow()
                 .as_ref()
