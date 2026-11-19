@@ -73,6 +73,9 @@ constexpr int WARP_ROWS = 16;
 constexpr int NV_CHUNK = scratchy::GDN_GATING_NV_MULTIPLE;
 // `step::GDN_DECODE_MAX_HEADS`: the widest cluster (the portable cluster size), a key head's CTAs.
 constexpr uint32_t MAX_CLUSTER_HEADS = scratchy::GDN_DECODE_MAX_HEADS;
+// `step::GDN_DECODE_HEAD_VS`: the value head dims the decode is instantiated for.
+constexpr int HEAD_V_NARROW = scratchy::GDN_DECODE_HEAD_VS[0];
+constexpr int HEAD_V_WIDE = scratchy::GDN_DECODE_HEAD_VS[1];
 // `step::GDN_CONV_KERNEL_RANGE`.
 constexpr uint32_t KMIN = scratchy::GDN_CONV_KERNEL_RANGE[0];
 constexpr uint32_t KMAX = scratchy::GDN_CONV_KERNEL_RANGE[1];
@@ -362,10 +365,10 @@ cudaError_t load_width() {
 //
 // 0 = done; any other value = the cudaError_t of the first query that failed.
 extern "C" int scratchy_cuda_gdn_decode_prepare(void) {
-    if (const cudaError_t e = load_width<128>(); e != cudaSuccess) {
+    if (const cudaError_t e = load_width<HEAD_V_NARROW>(); e != cudaSuccess) {
         return static_cast<int>(e);
     }
-    return static_cast<int>(load_width<256>());
+    return static_cast<int>(load_width<HEAD_V_WIDE>());
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -395,7 +398,8 @@ extern "C" int scratchy_cuda_gdn_decode(const void* qkv, const void* a, const vo
                                         uint32_t nk, uint32_t nv, uint32_t head_k,
                                         uint32_t head_v, uint32_t kernel, float scale, float eps,
                                         void* stream /* cudaStream_t; null = default stream */) {
-    if (head_k != uint32_t(HEAD_K) || (head_v != 128 && head_v != 256) || nk == 0 || nv == 0 ||
+    const bool width = head_v == uint32_t(HEAD_V_NARROW) || head_v == uint32_t(HEAD_V_WIDE);
+    if (head_k != uint32_t(HEAD_K) || !width || nk == 0 || nv == 0 ||
         nv % nk != 0 || nv % uint32_t(NV_CHUNK) != 0 || kernel < KMIN || kernel > KMAX ||
         !std::isfinite(scale) || !(scale > 0.0f) || !std::isfinite(eps) || !(eps > 0.0f)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
@@ -432,8 +436,10 @@ extern "C" int scratchy_cuda_gdn_decode(const void* qkv, const void* a, const vo
         decode_globals G{qg, ag, bg, zg, wg, lg, dg, ng, rg, sg, seqg, og,
                          int(nk), int(heads), scale, eps};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
-        return head_v == 128 ? launch_width<128>(G, nk, heads, kernel, s)
-                             : launch_width<256>(G, nk, heads, kernel, s);
+        if (head_v == uint32_t(HEAD_V_NARROW)) {
+            return launch_width<HEAD_V_NARROW>(G, nk, heads, kernel, s);
+        }
+        return launch_width<HEAD_V_WIDE>(G, nk, heads, kernel, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

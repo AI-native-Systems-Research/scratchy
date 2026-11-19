@@ -37,7 +37,8 @@ constexpr int CHUNK = scratchy::ARGMAX_CHUNK;
 constexpr int WARPS = 8;
 constexpr int THREADS = WARPS * kittens::WARP_THREADS;
 // The largest row whose ids are exact f32s.
-constexpr uint32_t MAX_VOCAB = 1u << 24;
+// `step::ARGMAX_MAX_VOCAB`.
+constexpr uint32_t MAX_VOCAB = scratchy::ARGMAX_MAX_VOCAB;
 
 // A chunk, naive: each logit in one lane (8 a lane), widened from bf16 by TK's load.
 using chunk_rv = rv_fl<CHUNK>;

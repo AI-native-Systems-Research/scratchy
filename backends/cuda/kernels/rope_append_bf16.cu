@@ -69,7 +69,12 @@ constexpr int NORM_COLS = 256;
 constexpr uint32_t BLOCK_SIZE = scratchy::CUDA_KV_BLOCK_SIZE;
 constexpr uint32_t NO_SLOT = scratchy::NO_SLOT;
 constexpr uint32_t MAX_SLOT_BLOCKS = (NO_SLOT / BLOCK_SIZE) + 1;
-constexpr int HALF_HEAD_DIM = 512;
+// The half-head instances' head dim (`step::ROPE_BF16_HALF_HEAD_DIM`), and the half-rotated ones'
+// (`step::KV_APPEND_BF16_HEAD_DIMS`' first; the second is the half-head one).
+constexpr int HALF_HEAD_DIM = scratchy::ROPE_BF16_HALF_HEAD_DIM;
+constexpr int HEAD_DIM_SLIDING = scratchy::KV_APPEND_BF16_HEAD_DIMS[0];
+static_assert(HALF_HEAD_DIM == int(scratchy::KV_APPEND_BF16_HEAD_DIMS[1]),
+              "the half-head instance is the KV append's other head dim");
 
 using box = st_bf<ROWS, BOX_COLS, false>;
 using box_gl = gl<bf16, 1, 1, -1, -1, box>;
@@ -395,12 +400,14 @@ constexpr int smem_bytes() {
                norm_tiles<HEAD_DIM, NORMS>() * (2 * sizeof(norm_tile) + sizeof(gain_vec))) +
            1024;
 }
-static_assert(smem_bytes<128, true, 512, false>() + 3 * 512 * 2 <= 48 * 1024 &&
-                  smem_bytes<256, false, 256, true>() + 3 * 256 * 2 <= 48 * 1024,
+static_assert(smem_bytes<128, true, HALF_HEAD_DIM, false>() + 3 * HALF_HEAD_DIM * 2 <= 48 * 1024 &&
+                  smem_bytes<256, false, HEAD_DIM_SLIDING, true>() + 3 * HEAD_DIM_SLIDING * 2 <=
+                      48 * 1024,
               "under the default dynamic shared memory limit, with the static vectors");
 // The normed global instance's two tiles per view take it past 48 KiB: its setup raises the limit.
-constexpr int HALF_NORMED_SMEM = smem_bytes<128, true, 512, true>();
-static_assert(HALF_NORMED_SMEM > 48 * 1024 && HALF_NORMED_SMEM + 3 * 512 * 2 <= 227 * 1024,
+constexpr int HALF_NORMED_SMEM = smem_bytes<128, true, HALF_HEAD_DIM, true>();
+static_assert(HALF_NORMED_SMEM > 48 * 1024 &&
+                  HALF_NORMED_SMEM + 3 * HALF_HEAD_DIM * 2 <= 227 * 1024,
               "past the default limit, under the H100's opt-in one, with the static vectors");
 
 // The launch's operands, as the launcher was given them.
@@ -458,8 +465,8 @@ int launch(const ra_args& a, uint32_t q_heads, uint32_t kv_heads, uint32_t num_b
 }  // namespace
 
 // The pairings (`step::RopePairing`, in its declaration order), as `rope_bf16.cu`'s.
-constexpr uint32_t PAIRING_HALF_ROTATED = 0;
-constexpr uint32_t PAIRING_HALF_HEAD = 1;
+constexpr uint32_t PAIRING_HALF_ROTATED = scratchy::ROPE_PAIRING_HALF_ROTATED;
+constexpr uint32_t PAIRING_HALF_HEAD = scratchy::ROPE_PAIRING_HALF_HEAD;
 
 // The kernel's one-time setup, run once per device by `kernels::prepare_all`: query each
 // instance's attributes, which loads its module, so a graph capture never loads one mid-capture,
@@ -469,12 +476,13 @@ constexpr uint32_t PAIRING_HALF_HEAD = 1;
 extern "C" int scratchy_cuda_rope_append_fp8_prepare(void) {
     cudaFuncAttributes attr;
     for (const cudaError_t e : {
-             cudaFuncGetAttributes(&attr, rope_append_wide_ker<64, false, 256, false>),
-             cudaFuncGetAttributes(&attr, rope_append_wide_ker<256, false, 256, false>),
-             cudaFuncGetAttributes(&attr, rope_append_wide_ker<256, false, 256, true>),
-             cudaFuncGetAttributes(&attr, rope_append_wide_ker<128, true, 512, false>),
-             cudaFuncGetAttributes(&attr, rope_append_wide_ker<128, true, 512, true>),
-             cudaFuncSetAttribute(rope_append_wide_ker<128, true, 512, true>,
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<64, false, HEAD_DIM_SLIDING, false>),
+             cudaFuncGetAttributes(&attr,
+                                   rope_append_wide_ker<256, false, HEAD_DIM_SLIDING, false>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<256, false, HEAD_DIM_SLIDING, true>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<128, true, HALF_HEAD_DIM, false>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<128, true, HALF_HEAD_DIM, true>),
+             cudaFuncSetAttribute(rope_append_wide_ker<128, true, HALF_HEAD_DIM, true>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, HALF_NORMED_SMEM),
          }) {
         if (e != cudaSuccess) {
@@ -507,9 +515,10 @@ static int rope_append(const void* q, void* q_out, const void* k, void* k_out, c
                        uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim, uint32_t rot_dim,
                        uint32_t pairing, uint32_t block_size, uint32_t num_blocks,
                        const void* q_gain, const void* k_gain, float eps, void* stream) {
-    const bool narrow = pairing == PAIRING_HALF_ROTATED && rot_dim == 64 && head_dim == 256;
-    const bool full = pairing == PAIRING_HALF_ROTATED && rot_dim == 256 && head_dim == 256;
-    const bool half = pairing == PAIRING_HALF_HEAD && rot_dim == 128 && head_dim == 512;
+    const uint32_t sliding = uint32_t(HEAD_DIM_SLIDING), whole = uint32_t(HALF_HEAD_DIM);
+    const bool narrow = pairing == PAIRING_HALF_ROTATED && rot_dim == 64 && head_dim == sliding;
+    const bool full = pairing == PAIRING_HALF_ROTATED && rot_dim == 256 && head_dim == sliding;
+    const bool half = pairing == PAIRING_HALF_HEAD && rot_dim == 128 && head_dim == whole;
     const bool norms = q_gain != nullptr;
     if (!(narrow || full || half) || q_heads == 0 || kv_heads == 0 || block_size != BLOCK_SIZE ||
         uint64_t(q_heads + kv_heads) > 65535 ||
@@ -522,14 +531,19 @@ static int rope_append(const void* q, void* q_out, const void* k, void* k_out, c
         const ra_args a{q, q_out, k, k_out, v, table, slot_mapping, k_cache, v_cache, q_gain, k_gain};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
         if (half) {
-            return norms ? launch<128, true, 512, true>(a, q_heads, kv_heads, num_blocks, eps, s)
-                         : launch<128, true, 512, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+            return norms ? launch<128, true, HALF_HEAD_DIM, true>(a, q_heads, kv_heads,
+                                                                  num_blocks, eps, s)
+                         : launch<128, true, HALF_HEAD_DIM, false>(a, q_heads, kv_heads,
+                                                                   num_blocks, eps, s);
         }
         if (narrow) {
-            return launch<64, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+            return launch<64, false, HEAD_DIM_SLIDING, false>(a, q_heads, kv_heads, num_blocks,
+                                                              eps, s);
         }
-        return norms ? launch<256, false, 256, true>(a, q_heads, kv_heads, num_blocks, eps, s)
-                     : launch<256, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+        return norms ? launch<256, false, HEAD_DIM_SLIDING, true>(a, q_heads, kv_heads,
+                                                                  num_blocks, eps, s)
+                     : launch<256, false, HEAD_DIM_SLIDING, false>(a, q_heads, kv_heads,
+                                                                   num_blocks, eps, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

@@ -119,8 +119,9 @@ using gain_vec = sv_bf<COLS>;
 using sums_vec = sv_fl<ROWS>;
 using x_gl = gl<bf16, 1, 1, -1, -1, tile>;
 using g_gl = gl<bf16, 1, 1, 1, -1, gain_vec>;
-// The row form's widest row, in 256-column tiles (17,408 columns).
-constexpr int ROW_TILES = 68;
+// The row form's widest row, in 256-column tiles (`step::ROW_MAX_COLS`).
+constexpr int ROW_TILES = scratchy::ROW_MAX_COLS / COLS;
+static_assert(ROW_TILES * COLS == int(scratchy::ROW_MAX_COLS), "whole tiles");
 using acc_tile = rt_fl<ROWS, COLS>;
 using bf16_tile = rt_bf<ROWS, COLS>;
 using row_values = acc_tile::col_vec;

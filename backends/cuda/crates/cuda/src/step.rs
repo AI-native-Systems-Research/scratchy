@@ -10,17 +10,22 @@ use serde::Serialize;
 
 /// The constants the kernels share ([`crate::kernel_consts`]), under the paths they always had.
 pub use crate::kernel_consts::{
-    ADD_BF16_COLS, ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM,
-    ATTN_DECODE_BF16_MAX_GROUP, ATTN_DECODE_MAX_SPLITS, ATTN_PREFILL_BF16_ROWS, CUDA_KV_BLOCK_SIZE,
-    CUDA_MAX_BLOCKS_PER_SEQ, EMBED_BF16_COLS, EXPERT_GEMM_N_TILES, GATE_APPLY_BF16_COLS,
-    GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM, GATHER_LAST_ROW_BF16_COLS,
-    GDN_CONV_CHANNEL_GROUP, GDN_CONV_KERNEL_RANGE, GDN_CONV_TOKEN_BLOCK, GDN_DECODE_MAX_HEADS,
-    GDN_GATING_NV_MULTIPLE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SCAN_TOKEN_BLOCK,
-    GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N,
-    GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE_K_MULTIPLE, GEMV_BF16_MULTIPLE,
-    GEMV_BLOCK_ROWS, GEMV_CHUNK, GEMV_MAX_SPLITS, GEMV_TARGET_CTAS, H100_SXM_SMS,
-    KV_APPEND_BF16_HEAD_DIMS, MOE_COMBINE_BF16_CHUNK, MOE_ROUTE_EXPERTS, MOE_ROUTE_MAX_TOP_K,
-    MOE_SORT_CHUNK, RMS_NORM_BF16_COLS, ROPE_BF16_KERNEL_HEAD_MULTIPLE, SCALE_BF16_COLS,
+    ACT_QUANT_MAX_COLS, ADD_BF16_COLS, ARGMAX_CHUNK, ARGMAX_MAX_VOCAB, ATTN_D512_BF16_HEAD_DIM,
+    ATTN_DECODE_BF16_HEAD_DIM, ATTN_DECODE_BF16_MAX_GROUP, ATTN_DECODE_MAX_SPLITS,
+    ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS, CUDA_KV_BLOCK_SIZE,
+    CUDA_MAX_BLOCKS_PER_SEQ, EMBED_BF16_COLS, EXPERT_GATE_UP_FP8_INTER_MULTIPLE,
+    EXPERT_GATE_UP_FP8_K_MULTIPLE, EXPERT_GEMM_N_TILES, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
+    GATE_SPLIT_BF16_HEAD_DIM, GATED_ACT_GELU, GATED_ACT_SILU, GATHER_LAST_ROW_BF16_COLS,
+    GDN_CONV_CHANNEL_GROUP, GDN_CONV_KERNEL_RANGE, GDN_CONV_TOKEN_BLOCK, GDN_DECODE_HEAD_VS,
+    GDN_DECODE_MAX_HEADS, GDN_GATING_NV_MULTIPLE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
+    GDN_SCAN_TOKEN_BLOCK, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE,
+    GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE_K_MULTIPLE,
+    GEMV_BF16_MULTIPLE, GEMV_BLOCK_ROWS, GEMV_CHUNK, GEMV_MAX_SPLITS, GEMV_TARGET_CTAS,
+    GEMV_TC_MAX_PAIRS, GEMV_TC_N_MULTIPLE, H100_SXM_SMS, KV_APPEND_BF16_HEAD_DIMS,
+    MOE_COMBINE_BF16_CHUNK, MOE_ROUTE_EXPERTS, MOE_ROUTE_MAX_TOP_K, MOE_SORT_CHUNK, NORM_ROW_COLS,
+    NORM_ROW_FORM_ADD_NORM, NORM_ROW_FORM_NORM, NORM_ROW_FORM_NORM_ADD, NORM_ROW_MAX_COLS,
+    RMS_NORM_BF16_COLS, ROPE_BF16_HALF_HEAD_DIM, ROPE_BF16_KERNEL_HEAD_MULTIPLE,
+    ROPE_PAIRING_HALF_HEAD, ROPE_PAIRING_HALF_ROTATED, ROW_MAX_COLS, SCALE_BF16_COLS,
     SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS,
 };
 use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
@@ -277,11 +282,6 @@ impl AddRmsNormQuantFp8 {
     }
 }
 
-/// The one-row norm's column granule and widest row (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`'s
-/// `CHUNK` and `MAX_COLS`).
-pub const NORM_ROW_COLS: u32 = 256;
-pub const NORM_ROW_MAX_COLS: u32 = 8192;
-
 /// Whether a norm, add-norm or norm-add of `rows` × `cols` plays the one-row norm (FP8 S8 N3):
 /// the decode bucket's one token row, at a width its kernel takes. Every other norm plays the
 /// row kernels (`kernels/rms_norm_bf16.cu`).
@@ -361,13 +361,6 @@ pub const fn gemv_tc_f32_bytes(rows: u32, n: u32) -> Option<u64> {
 /// ([`gemv_tc_takes`]). shortcut: 1, so every shape the kernel takes switches, until T1's
 /// measured table (/tmp/a-tc-plan.md §4) sets it.
 pub const GEMV_TC_MIN_BYTES: u64 = 1;
-/// B8's row tile and the act + quantize's column limit (`kernels/gemv_fp8_tc.cu`,
-/// `kernels/act_quant_fp8.cu`): every `n` and `k` a multiple of the first, an activation at most
-/// the second columns.
-pub const GEMV_TC_N_MULTIPLE: u32 = 64;
-pub const ACT_QUANT_MAX_COLS: u32 = 17408;
-/// B8's grid's pairs axis.
-pub const GEMV_TC_MAX_PAIRS: u32 = 65535;
 
 /// Whether a decode fp8 GEMV of members `ns` (0 for an absent one) over `k`, at `pairs` pairs,
 /// runs on the tensor cores (FP8 S8, /tmp/a-tc-plan.md §1): every member's `n` and `k` a non-zero
@@ -559,11 +552,11 @@ pub enum GatedOp {
 }
 
 impl GatedOp {
-    /// The launchers' code for it (`kernels/gemv_bf16.cu`'s `ACT_SILU`, `ACT_GELU`).
+    /// The launchers' code for it ([`GATED_ACT_SILU`], [`GATED_ACT_GELU`]).
     pub const fn code(self) -> u32 {
         match self {
-            Self::Silu => 0,
-            Self::Gelu => 1,
+            Self::Silu => GATED_ACT_SILU,
+            Self::Gelu => GATED_ACT_GELU,
         }
     }
 
@@ -1198,9 +1191,6 @@ pub const ROPE_BF16_KERNEL_SHAPES: &[(u32, RopePairing)] = &[
     (256, RopePairing::Standard),
     (128, RopePairing::Proportional),
 ];
-/// The one head dim of the rope kernel's half-head instantiation: a whole 512-lane head is one
-/// unit of 8 boxes (`kernels/rope_bf16.cu`).
-pub const ROPE_BF16_HALF_HEAD_DIM: u32 = 512;
 
 /// Partial rotary embedding over `[rows, cols]`, `cols = heads · head_dim`, bf16 in and out.
 ///
@@ -1253,8 +1243,6 @@ pub struct GateApplyBf16 {
     pub cols: u32,
 }
 
-/// The one head dim the attention kernel is instantiated for.
-pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
 // The worker picks the attention kernel by these names: they are exactly the head dims a KV step
 // may take.
 const _: () = assert!(

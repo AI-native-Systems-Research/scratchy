@@ -31,15 +31,16 @@ use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colou
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FOLD_PROJECTIONS, CUDA_FP8_EXPERT_TILE_ROWS,
-    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions, expert_tile_rows,
+    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, MOE_EXPERT_COUNTS, cuda_fusions,
+    expert_tile_rows,
 };
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
-    ExpertActQuantFp8, ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8,
-    ExpertGemmBf16, ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel,
-    GateUpTcFp8, GatedOp, GdnPrefillBf16, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError,
-    QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes,
-    norm_row_takes, quant_chain,
+    EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
+    ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
+    ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp,
+    GdnPrefillBf16, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8, RmsNormBf16,
+    RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes, norm_row_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -1944,9 +1945,9 @@ pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
             && (act.act.gate, act.act.up, act.offsets) == (gate.c, up.c, gate.offsets)
             && capacity == Some(act.act.rows)
             && act.act.cols == gate.inter
-            && gate.hidden.is_multiple_of(128)
-            && gate.inter.is_multiple_of(64)
-            && matches!(gate.experts, 128 | 256)
+            && gate.hidden.is_multiple_of(EXPERT_GATE_UP_FP8_K_MULTIPLE)
+            && gate.inter.is_multiple_of(EXPERT_GATE_UP_FP8_INTER_MULTIPLE)
+            && MOE_EXPERT_COUNTS.contains(&gate.experts)
     };
     let mut out = Vec::with_capacity(steps.len());
     let mut i = 0;

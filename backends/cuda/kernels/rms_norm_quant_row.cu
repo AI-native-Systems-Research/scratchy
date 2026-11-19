@@ -47,17 +47,19 @@ using namespace kittens;
 
 namespace {
 
-constexpr int CHUNK = 256;
+// `step::NORM_ROW_COLS`.
+constexpr int CHUNK = scratchy::NORM_ROW_COLS;
 constexpr int WARPS = 16;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 constexpr int WARP_CHUNKS = 2;
 // The widest row: 16 warps × 2 chunks × 256 columns.
 constexpr uint32_t MAX_COLS = uint32_t(WARPS * WARP_CHUNKS * CHUNK);
+static_assert(MAX_COLS == scratchy::NORM_ROW_MAX_COLS, "step::NORM_ROW_MAX_COLS");
 
-// The forms, the launcher's codes.
-constexpr int NORM = 0;
-constexpr int ADD_NORM = 1;
-constexpr int NORM_ADD = 2;
+// The forms, the launcher's codes (`step::NORM_ROW_FORM_*`).
+constexpr int NORM = scratchy::NORM_ROW_FORM_NORM;
+constexpr int ADD_NORM = scratchy::NORM_ROW_FORM_ADD_NORM;
+constexpr int NORM_ADD = scratchy::NORM_ROW_FORM_NORM_ADD;
 
 using chunk_rv = rv_fl<CHUNK>;
 using chunk_bf = rv_bf<CHUNK>;

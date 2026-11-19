@@ -13,13 +13,14 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    ARGMAX_CHUNK, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AddRmsNormBf16, AddRmsNormQuantFp8,
-    AttnDecodeBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16,
-    ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16,
-    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemvBf16, MoeRouteBf16,
-    MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16, RopeBf16,
-    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain, sort_index_regions,
+    ARGMAX_CHUNK, ARGMAX_MAX_VOCAB, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AddRmsNormBf16,
+    AddRmsNormQuantFp8, AttnDecodeBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16,
+    ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection,
+    ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
+    GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemvBf16,
+    MoeRouteBf16, MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
+    RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
+    sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -466,7 +467,7 @@ impl GreedyArgmax {
             && result.bytes.is_multiple_of(2)
             && width > 0
             && width.is_multiple_of(ARGMAX_CHUNK as u64)
-            && width <= 1 << 24;
+            && width <= ARGMAX_MAX_VOCAB as u64;
         match takes {
             true => Some(Self {
                 width: width as u32,

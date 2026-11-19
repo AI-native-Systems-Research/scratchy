@@ -839,7 +839,8 @@ template <int N_BLOCK, int K_STEP, typename rule>
 int gate_up_at(const void* a, const void* a_scale, const void* gate, const void* gate_scale,
                const void* up, const void* up_scale, void* c, uint32_t m, uint32_t n, uint32_t k,
                uint32_t act, void* stream) {
-    return act == 0 ? launch_gate_up<gate_up_silu_fp8_mmt<N_BLOCK, K_STEP>, rule>(
+    const bool silu = act == scratchy::GATED_ACT_SILU;
+    return silu ? launch_gate_up<gate_up_silu_fp8_mmt<N_BLOCK, K_STEP>, rule>(
                           a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream)
                     : launch_gate_up<gate_up_gelu_fp8_mmt<N_BLOCK, K_STEP>, rule>(
                           a, a_scale, gate, gate_scale, up, up_scale, c, m, n, k, stream);
@@ -1037,7 +1038,7 @@ extern "C" int scratchy_cuda_gate_up_gemm_fp8(const void* a, const void* a_scale
                                               const void* up_scale, void* c, uint32_t m,
                                               uint32_t n, uint32_t k, uint32_t act, uint32_t col64,
                                               void* stream /* cudaStream_t; null = default */) {
-    if (act > 1 || col64 > 1) {
+    if (act > scratchy::GATED_ACT_GELU || col64 > 1) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     const uint32_t k_step = k_step_of(k);
@@ -1090,7 +1091,7 @@ extern "C" int scratchy_cuda_gate_up_gemm_fp8_variant(
     const void* a, const void* a_scale, const void* gate, const void* gate_scale, const void* up,
     const void* up_scale, void* c, uint32_t m, uint32_t n, uint32_t k, uint32_t act,
     uint32_t n_tile, uint32_t k_step, void* stream /* cudaStream_t; null = default */) {
-    if (act > 1 || (n_tile != 128 && n_tile != 64 && n_tile != 192) ||
+    if (act > scratchy::GATED_ACT_GELU || (n_tile != 128 && n_tile != 64 && n_tile != 192) ||
         (k_step != 64 && k_step != 128)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
@@ -1238,8 +1239,9 @@ extern "C" int scratchy_cuda_expert_gate_up_gemm_fp8(
     const uint64_t rows = uint64_t(max_tiles) * 64;
     const uint64_t wide = inter > k ? inter : k;
     if (max_tiles == 0 || (experts != uint32_t(EXPERTS_LARGE) && experts != uint32_t(EXPERTS_SMALL)) ||
-        inter == 0 || inter % 64 != 0 || k == 0 || k % 128 != 0 ||
-        uint64_t(expert_rows) < 2 * uint64_t(inter) || act > 1 ||
+        inter == 0 || inter % scratchy::EXPERT_GATE_UP_FP8_INTER_MULTIPLE != 0 || k == 0 ||
+        k % scratchy::EXPERT_GATE_UP_FP8_K_MULTIPLE != 0 ||
+        uint64_t(expert_rows) < 2 * uint64_t(inter) || act > scratchy::GATED_ACT_GELU ||
         rows * wide > uint64_t(INT_MAX) ||
         uint64_t(experts) * uint64_t(expert_rows) * uint64_t(k) > uint64_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
@@ -1251,11 +1253,12 @@ extern "C" int scratchy_cuda_expert_gate_up_gemm_fp8(
                                                         tile_expert, c, rows, inter, k, max_tiles,
                                                         expert_rows, stream);
         };
+        const bool silu = act == scratchy::GATED_ACT_SILU;
         if (experts == uint32_t(EXPERTS_LARGE)) {
-            return act == 0 ? go(expert_gate_up_silu_fp8_mmt{}) : go(expert_gate_up_gelu_fp8_mmt{});
+            return silu ? go(expert_gate_up_silu_fp8_mmt{}) : go(expert_gate_up_gelu_fp8_mmt{});
         }
-        return act == 0 ? go(expert_gate_up_e128_silu_fp8_mmt{})
-                        : go(expert_gate_up_e128_gelu_fp8_mmt{});
+        return silu ? go(expert_gate_up_e128_silu_fp8_mmt{})
+                    : go(expert_gate_up_e128_gelu_fp8_mmt{});
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

@@ -35,7 +35,9 @@ use super::{CudaError, check};
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 
-use crate::kernel_consts::NO_SLOT;
+use crate::kernel_consts::{
+    NO_SLOT, NORM_ROW_FORM_ADD_NORM, NORM_ROW_FORM_NORM, NORM_ROW_FORM_NORM_ADD,
+};
 use crate::kernels::{self, DecodeSplit, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
@@ -2191,7 +2193,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::RmsNorm(norm) | CudaStep::RouterNorm(norm)
                         if norm.kernel == NormKernel::Row =>
                     {
-                        Self::norm_row(norm, (0, norm.x, None, None), None, slot, weights, stream)
+                        Self::norm_row(
+                            norm,
+                            (NORM_ROW_FORM_NORM, norm.x, None, None),
+                            None,
+                            slot,
+                            weights,
+                            stream,
+                        )
                     }
                     CudaStep::RmsNorm(
                         norm @ RmsNormBf16 {
@@ -2230,7 +2239,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::AddRmsNorm(f) if f.norm.kernel == NormKernel::Row => {
-                        let add = (1, f.a, Some(f.b), Some(f.sum));
+                        let add = (NORM_ROW_FORM_ADD_NORM, f.a, Some(f.b), Some(f.sum));
                         Self::norm_row(f.norm, add, None, slot, weights, stream)
                     }
                     CudaStep::AddRmsNorm(f) => {
@@ -2254,7 +2263,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     {
                         Self::norm_row(
                             n,
-                            (2, n.x, Some(residual), None),
+                            (NORM_ROW_FORM_NORM_ADD, n.x, Some(residual), None),
                             None,
                             slot,
                             weights,
@@ -2280,7 +2289,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         let quant = Some(t.q);
                         Self::norm_row(
                             t.norm,
-                            (0, t.norm.x, None, None),
+                            (NORM_ROW_FORM_NORM, t.norm.x, None, None),
                             quant,
                             slot,
                             weights,
@@ -2288,7 +2297,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         )
                     }
                     CudaStep::AddRmsNormQuantFp8(t) => {
-                        let add = (1, t.fold.a, Some(t.fold.b), Some(t.fold.sum));
+                        let add = (
+                            NORM_ROW_FORM_ADD_NORM,
+                            t.fold.a,
+                            Some(t.fold.b),
+                            Some(t.fold.sum),
+                        );
                         Self::norm_row(t.fold.norm, add, Some(t.q), slot, weights, stream)
                     }
                     CudaStep::Add(AddBf16 {

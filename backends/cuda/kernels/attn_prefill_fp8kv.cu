@@ -51,7 +51,8 @@ using namespace kittens;
 
 namespace {
 
-constexpr int HEAD_DIM = 256;
+// `step::ATTN_PREFILL_BF16_HEAD_DIM`.
+constexpr int HEAD_DIM = scratchy::ATTN_PREFILL_BF16_HEAD_DIM;
 // Query rows per consumer warpgroup, and K/V rows per tile: the KV block size.
 constexpr int QO_HEIGHT = 64;
 constexpr int KV_HEIGHT = 64;

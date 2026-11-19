@@ -705,8 +705,8 @@ int expert(const void* a, const void* b, const void* topk_idx, void* c, void* pa
 
 // The gate/up GEMV's activation (#1049): 0 SwiGLU (`scratchy::ops::silu_mul`), 1 GeGLU
 // (`scratchy::ops::gelu_tanh_mul`), as `step::GatedOp`; any other value is refused.
-constexpr uint32_t ACT_SILU = 0;
-constexpr uint32_t ACT_GELU = 1;
+constexpr uint32_t ACT_SILU = scratchy::GATED_ACT_SILU;
+constexpr uint32_t ACT_GELU = scratchy::GATED_ACT_GELU;
 
 // The gate/up GEMV's launches on `G`'s gate and up views (each a GEMV of the same `n`, `pairs`
 // and split): the fused CTAs, then at `splits > 1` the fused reduce, on `stream`.

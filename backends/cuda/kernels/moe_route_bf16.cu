@@ -66,8 +66,8 @@ constexpr int SOFTMAX_TOPK_EXPERTS = scratchy::MOE_ROUTE_EXPERTS;
 constexpr int SCALED_EXPERTS_SMALL = scratchy::MOE_EXPERT_COUNTS[0];
 constexpr int SCALED_EXPERTS_LARGE = scratchy::MOE_EXPERT_COUNTS[1];
 // The launcher's `program` (`kernels.rs`'s `ROUTE_SOFTMAX_TOPK`, `ROUTE_TOPK_SCALED_SOFTMAX`).
-constexpr uint32_t SOFTMAX_TOPK = 0;
-constexpr uint32_t TOPK_SCALED_SOFTMAX = 1;
+constexpr uint32_t SOFTMAX_TOPK = scratchy::ROUTE_SOFTMAX_TOPK;
+constexpr uint32_t TOPK_SCALED_SOFTMAX = scratchy::ROUTE_TOPK_SCALED_SOFTMAX;
 // `step::MOE_ROUTE_MAX_TOP_K`.
 constexpr uint32_t MAX_TOP_K = scratchy::MOE_ROUTE_MAX_TOP_K;
 constexpr int WARPS = 8;

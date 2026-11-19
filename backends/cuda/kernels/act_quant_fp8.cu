@@ -56,12 +56,13 @@ constexpr int CHUNK = 256;
 constexpr int WARPS = 8;
 constexpr int THREADS = WARPS * kittens::WARP_THREADS;
 static_assert(THREADS == CHUNK, "one element of the owned chunk a thread");
-// The longest row's chunks (17,408 / 256), and a warp's share of them.
-constexpr int ROW_CHUNKS = 68;
+// The longest row's chunks (`step::ACT_QUANT_MAX_COLS` / 256), and a warp's share of them.
+constexpr int ROW_CHUNKS = scratchy::ACT_QUANT_MAX_COLS / CHUNK;
+static_assert(ROW_CHUNKS * CHUNK == int(scratchy::ACT_QUANT_MAX_COLS), "whole chunks");
 constexpr int WARP_CHUNKS = (ROW_CHUNKS + WARPS - 1) / WARPS;
 // `step::GatedOp`'s codes.
-constexpr uint32_t ACT_SILU = 0;
-constexpr uint32_t ACT_GELU = 1;
+constexpr uint32_t ACT_SILU = scratchy::GATED_ACT_SILU;
+constexpr uint32_t ACT_GELU = scratchy::GATED_ACT_GELU;
 
 using chunk_sv = sv_fl<CHUNK>;
 using chunk_rv = rv_fl<CHUNK>;

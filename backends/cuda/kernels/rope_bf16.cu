@@ -101,8 +101,9 @@ using half_rt = rt_fl<ROWS, BOX_COLS / 2>;
 static_assert(half_rt::width == 2 && box_rt::width == 4,
               "each half of a 64-lane rotated width is two 16-column base tiles");
 
-// The half-head instantiation's one head dim: 8 boxes, a whole head per unit.
-constexpr int HALF_HEAD_DIM = 512;
+// The half-head instantiation's one head dim (`step::ROPE_BF16_HALF_HEAD_DIM`): 8 boxes, a whole
+// head per unit.
+constexpr int HALF_HEAD_DIM = scratchy::ROPE_BF16_HALF_HEAD_DIM;
 // One instantiation per rotated width and pairing (`step::ROPE_BF16_KERNEL_SHAPES`): `BOXES` boxes
 // per unit (`ROT` lanes, or a whole head for the half-head pairing), the table's `TABLE_BOXES`,
 // the box offset `PAIR_OFF` of a rotated box's partner, and the ring's `STAGES` units.
@@ -291,8 +292,8 @@ int launch_rope(bf16* xp, bf16* tp, bf16* op, uint32_t rows, uint32_t cols, uint
 
 // The pairings (`step::RopePairing`, in its declaration order): lane d pairs with d + rot_dim/2,
 // or with d + head_dim/2.
-constexpr uint32_t PAIRING_HALF_ROTATED = 0;
-constexpr uint32_t PAIRING_HALF_HEAD = 1;
+constexpr uint32_t PAIRING_HALF_ROTATED = scratchy::ROPE_PAIRING_HALF_ROTATED;
+constexpr uint32_t PAIRING_HALF_HEAD = scratchy::ROPE_PAIRING_HALF_HEAD;
 
 // The kernel's one-time setup, run once per device by `kernels::prepare_all` (`CudaDevice::open`):
 // query its attributes (`cudaFuncGetAttributes`), which loads its module, so a worker's graph
