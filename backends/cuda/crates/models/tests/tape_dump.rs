@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-//! THE CANONICAL TAPE DUMP: every CUDA tape this build compiled, as values, for proving a change
-//! leaves what runs unchanged.
+//! THE CANONICAL TAPE DUMP: every CUDA tape this build compiled, as values, each model's held to
+//! its pinned hash, so a change to what a CUDA tape runs fails here.
 //!
-//! For each registered model (the build's scope: run it once per FP8 model, with the features
+//! For each registered model (the build's scope: CI runs it once per FP8 model, with the features
 //! the `cuda_tapes_*_fp8` suites take) it writes, under `CARGO_TARGET_TMPDIR/tape-dump/<stem>/`:
 //! - `m<bucket>.jsonl`, one tape: its header line (bucket, arena, regions, input, result), then
 //!   one line per step in launch order;
 //! - `weights.jsonl`, the weight table, one line per index;
 //! - `entry.json`, the registry entry.
 //!
-//! It prints a sha256 per file, one per model and one over every model, on `TAPE_DUMP` lines.
+//! It prints a sha256 per file, one per model and one over every model, on `TAPE_DUMP` lines, and
+//! holds each model's (the sha256 of its files' `<name> <sha256>` lines) to its line in
+//! `tape_dump_hashes.txt`, beside this crate's `Cargo.toml`.
 //!
 //! A step's line is the kernel it launches and every argument as a value, under this file's own
 //! keys:
@@ -28,13 +30,22 @@
 //! not. The header lines and the weight table are the tape types' own `Serialize` output, keys
 //! sorted, so they follow those types' names.
 //!
-//! `#[ignore]`d: it is a tool, not a check. No toolchain and no GPU:
+//! The golden is the test's own, as Metal's `tape_hashes`: on a mismatch it writes
+//! `tape_dump_hashes.txt.new` beside it and fails. The `.new` file holds this build's line for
+//! every model in its scope, and the golden's line for every pinned model outside it. A change
+//! that means to move a tape regenerates the golden, so the moved hashes show in its diff. It
+//! needs no toolchain and no GPU. From `backends/cuda`, at every FP8 model's scope at once (each
+//! model's hash is the same alone and beside the others):
 //!
 //! ```text
-//! cargo test -p scratchy-target-cuda-models \
-//!     --features scratchy-models/<stem>,scratchy-quantizations/fp8-dynamic-per-channel \
-//!     --test tape_dump -- --ignored --nocapture
+//! cargo test -p scratchy-target-cuda-models --features scratchy-models/qwen3.8-27b-text-only,\
+//! scratchy-models/qwen3.6-35b-a3b,scratchy-models/gemma-4-26b-a4b-it,\
+//! scratchy-quantizations/fp8-dynamic-per-channel --test tape_dump -- --nocapture
+//! mv crates/models/tape_dump_hashes.txt.new crates/models/tape_dump_hashes.txt
 //! ```
+//!
+//! Nothing edits the golden by hand. A model the build compiles but the golden does not pin fails
+//! the same way a moved one does.
 
 // The models register through `inventory`; nothing here names one, so link the crate.
 extern crate scratchy_target_cuda_models as _;
@@ -595,13 +606,13 @@ fn model_files(e: &CudaModelEntry) -> Vec<(String, String)> {
 }
 
 #[test]
-#[ignore = "a tool: the canonical dump of every CUDA tape this build compiled"]
-fn dump_every_tape() {
+fn every_cuda_tape_is_its_pinned_hash() {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tape-dump");
     let mut entries: Vec<&CudaModelEntry> = registry::entries().collect();
     entries.sort_by_key(|e| e.stem);
     assert!(!entries.is_empty(), "no CUDA model in this build's scope");
     let mut all = String::new();
+    let mut rows: Vec<(&str, String)> = Vec::new();
     for e in entries {
         let dir = root.join(e.stem);
         std::fs::create_dir_all(&dir).expect("the dump directory");
@@ -615,6 +626,35 @@ fn dump_every_tape() {
         let h = sha(model.as_bytes());
         println!("TAPE_DUMP_MODEL {} sha256={h} ({})", e.stem, dir.display());
         let _ = writeln!(all, "{} {h}", e.stem);
+        rows.push((e.stem, h));
     }
     println!("TAPE_DUMP_ALL sha256={}", sha(all.as_bytes()));
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tape_dump_hashes.txt");
+    let golden = std::fs::read_to_string(&path).unwrap_or_default();
+    let pinned: Vec<(&str, &str)> = (golden.lines())
+        .filter_map(|l| l.split_once("  "))
+        .map(|(m, h)| (m, h.trim()))
+        .collect();
+    let pin = |stem: &str| pinned.iter().find(|(m, _)| *m == stem).map(|(_, h)| *h);
+    let moved: Vec<&str> = (rows.iter())
+        .filter(|(stem, hash)| pin(stem) != Some(hash.as_str()))
+        .map(|(stem, _)| *stem)
+        .collect();
+    if !moved.is_empty() {
+        // This build's line for each model it compiles, the golden's for each pinned one it does not.
+        let mut lines: Vec<(&str, &str)> = (pinned.iter())
+            .filter(|(m, _)| !rows.iter().any(|(stem, _)| stem == m))
+            .copied()
+            .chain(rows.iter().map(|(stem, h)| (*stem, h.as_str())))
+            .collect();
+        lines.sort_by_key(|(m, _)| *m);
+        let new: String = lines.iter().map(|(m, h)| format!("{m}  {h}\n")).collect();
+        std::fs::write(path.with_extension("txt.new"), new)
+            .expect("write tape_dump_hashes.txt.new");
+        panic!(
+            "the CUDA tapes of {moved:?} moved; `tape_dump_hashes.txt.new` holds this build's \
+             hashes (the regeneration command is in this file's header)"
+        );
+    }
 }
