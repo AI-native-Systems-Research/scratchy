@@ -574,18 +574,21 @@ jobs:
       - name: Worker and CLI tests
         run: cargo test -p scratchy-target-cuda-worker -p scratchy-target-cuda-cli
           --features model/qwen3.8-27b-text-only,quant/fp8-dynamic-per-channel
+      # `--test tape_dump`: each model's canonical tape dump (every bucket, the weight table, the
+      # registry entry) held to its pinned hash (backends/cuda/crates/models/tape_dump_hashes.txt),
+      # at each FP8 model's scope.
       - name: Tapes (Qwen3.8-27B)
         run: cargo test -p scratchy-target-cuda-models
           --features scratchy-models/qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel
-          --test cuda_tapes_27b_fp8 --test kernel_choices
+          --test cuda_tapes_27b_fp8 --test kernel_choices --test tape_dump
       - name: Tapes (Qwen3.6-35B-A3B)
         run: cargo test -p scratchy-target-cuda-models
           --features scratchy-models/qwen3.6-35b-a3b,scratchy-quantizations/fp8-dynamic-per-channel
-          --test cuda_tapes_35b_fp8 --test kernel_choices
+          --test cuda_tapes_35b_fp8 --test kernel_choices --test tape_dump
       - name: Tapes (Gemma 4 26B-A4B)
         run: cargo test -p scratchy-target-cuda-models
           --features scratchy-models/gemma-4-26b-a4b-it,scratchy-quantizations/fp8-dynamic-per-channel
-          --test cuda_tapes_gemma4_fp8 --test kernel_choices
+          --test cuda_tapes_gemma4_fp8 --test kernel_choices --test tape_dump
 
   # ⭐ THE TRITON SPLICE'S OWN GATE. The splice is now the ONLY producer for the
   # spliced op kinds (unconditional in `lower_one_node`), so every job that builds

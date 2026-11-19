@@ -2523,6 +2523,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-golden-hash"
+version = "0.1.0"
+
+[[package]]
 name = "scratchy-ir"
 version = "0.1.0"
 dependencies = [
@@ -2746,6 +2750,7 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
+ "scratchy-golden-hash",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-models",
