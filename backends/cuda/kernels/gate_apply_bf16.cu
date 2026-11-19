@@ -34,10 +34,9 @@
 
 using namespace kittens;
 
-// The launcher's return codes that are not a `cudaError_t` (which is non-negative).
-// `src/kernels.rs` mirrors them.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -139,7 +138,7 @@ extern "C" int scratchy_cuda_gate_apply_bf16_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
@@ -179,6 +178,6 @@ extern "C" int scratchy_cuda_gate_apply_bf16(const void* attn, const void* gate,
         return static_cast<int>(cudaLaunchKernel(gate_apply_bf16_ker<false>, grid, block, args,
                                                  EW_SMEM_BYTES, s));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

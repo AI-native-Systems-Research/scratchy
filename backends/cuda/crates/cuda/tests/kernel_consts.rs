@@ -26,7 +26,10 @@ fn every_shared_constant_a_kernel_reads_is_in_the_header() {
     let header = cuda_header();
     let defined: BTreeSet<&str> = header
         .lines()
-        .filter_map(|l| l.strip_prefix("inline constexpr uint32_t "))
+        .filter_map(|l| {
+            (l.strip_prefix("inline constexpr uint32_t "))
+                .or_else(|| l.strip_prefix("inline constexpr int32_t "))
+        })
         .map(|l| l.split([' ', '[']).next().unwrap_or(""))
         .collect();
     assert!(

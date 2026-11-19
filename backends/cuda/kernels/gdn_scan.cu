@@ -80,9 +80,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -276,7 +276,7 @@ extern "C" int scratchy_cuda_gdn_scan_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the runtime's last-error
 // state.
 //
@@ -327,13 +327,13 @@ extern "C" int scratchy_cuda_gdn_scan(const void* conv_out, const void* g, const
         return static_cast<int>(cudaLaunchKernel(gdn_scan_ker, grid, block, args, 0,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
 // Test support for `tests/gdn.rs` only (R8): `out = T · u + S` by the scan's rank-1 update, `S`,
 // `T` and `out` `[16, 128]` f32 and `u` `[16]` f32, 16-byte-aligned device pointers, `out`
-// overlapping no input. 0 = launched; SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any
+// overlapping no input. 0 = launched; scratchy::CUDA_ERR_HOST = a C++ exception was caught; any
 // other value = the launch's cudaError_t. Asynchronous on `stream`.
 extern "C" int scratchy_cuda_gdn_rank_one_probe(const void* s, const void* t, const void* u,
                                                 void* out,
@@ -352,6 +352,6 @@ extern "C" int scratchy_cuda_gdn_rank_one_probe(const void* s, const void* t, co
                                                  dim3(kittens::WARP_THREADS), args, 0,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

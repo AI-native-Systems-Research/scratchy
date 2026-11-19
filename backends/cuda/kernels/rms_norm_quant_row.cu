@@ -41,9 +41,9 @@
 
 using namespace kittens;
 
-// The launcher's return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors them.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -223,7 +223,7 @@ extern "C" int scratchy_cuda_rms_norm_quant_row_prepare(void) {
     return 0;
 }
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; scratchy::CUDA_ERR_HOST = a
 // C++ exception was caught; any other value = the launch's cudaError_t.
 //
 // Per row of `x [rows, cols]` bf16: `form` 0 (`y = norm(x)`), 1 (`sum = bf16(x + other)`, `y =
@@ -280,6 +280,6 @@ extern "C" int scratchy_cuda_rms_norm_quant_row(const void* x, const void* other
                 return launch<NORM_ADD, false>(G, rows, st);
         }
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

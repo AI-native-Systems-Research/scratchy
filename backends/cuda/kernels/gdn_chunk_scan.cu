@@ -74,9 +74,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -555,7 +555,7 @@ int launch(const void* conv_out, const void* g, const void* beta, void* ssm_stat
         return static_cast<int>(cudaLaunchKernel(gdn_chunk_scan_ker, grid, block, args,
                                                  SMEM_BYTES, static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -570,7 +570,7 @@ extern "C" int scratchy_cuda_gdn_chunk_scan_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t
 // cudaLaunchKernel returned for THIS launch.
 //
 // `scratchy_cuda_gdn_scan`'s contract exactly (its arguments, its refusals, its buffers), computed

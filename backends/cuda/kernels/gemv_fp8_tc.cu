@@ -53,9 +53,9 @@
 
 using namespace kittens;
 
-// The launcher's return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors them.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -383,7 +383,7 @@ extern "C" int scratchy_cuda_gemv_fp8_tc_prepare(void) {
 }
 
 // B8 (the tapes' tensor-core decode GEMVs). 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused,
-// nothing launched; SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other
+// nothing launched; scratchy::CUDA_ERR_HOST = a C++ exception was caught; any other
 // value = the launch's cudaError_t. One launch, asynchronous on `stream`.
 //
 // `count` (1 to 3) members off the e4m3 activation `q [a_rows, k]` and its per-row `a_scale
@@ -422,7 +422,7 @@ extern "C" int scratchy_cuda_gemv_fp8_b8(
         }
         return expert ? launch_b8<true, false>(a, stream) : launch_b8<false, false>(a, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -461,6 +461,6 @@ extern "C" int scratchy_cuda_gemv_fp8_b8_box_probe(const void* x, uint32_t rows,
         return static_cast<int>(cudaLaunchKernel(gemv_fp8_b8_box_probe_ker, grid, block, args,
                                                  B8_PROBE_SMEM, static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

@@ -26,9 +26,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -120,7 +120,7 @@ __global__ __launch_bounds__(THREADS, 1) void argmax_bf16_ker(const __grid_const
 // a tie; `−1 − i` when the row holds a NaN, `i` the lowest NaN id. `iota` holds the f32s `0 .. 256`.
 //
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched: `vocab` zero, not a multiple of
-// 256 (`step::ARGMAX_CHUNK`) or above 2^24, or a null pointer; SCRATCHY_CUDA_ERR_HOST = a C++
+// 256 (`step::ARGMAX_CHUNK`) or above 2^24, or a null pointer; scratchy::CUDA_ERR_HOST = a C++
 // exception was caught; any other value = the cudaError_t of the launch. Asynchronous on `stream`;
 // every pointer a device pointer to its elements, `out` overlapping no input.
 extern "C" int scratchy_cuda_argmax_bf16(const void* row, uint32_t vocab, const void* iota,
@@ -143,6 +143,6 @@ extern "C" int scratchy_cuda_argmax_bf16(const void* row, uint32_t vocab, const 
         return static_cast<int>(cudaLaunchKernel(argmax_bf16_ker, grid, block, args, 0,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

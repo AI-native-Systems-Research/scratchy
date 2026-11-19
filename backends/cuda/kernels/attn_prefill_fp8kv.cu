@@ -45,9 +45,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -337,7 +337,7 @@ extern "C" int scratchy_cuda_attn_prefill_fp8kv_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
@@ -395,6 +395,6 @@ extern "C" int scratchy_cuda_attn_prefill_fp8kv(const void* q, const void* k_cac
                                                  ATTN_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
