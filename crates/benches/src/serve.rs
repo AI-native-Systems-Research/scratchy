@@ -2453,7 +2453,7 @@ mod tests {
     }
 
     /// --timed-answers forces each request to its task's answer length, the same on every engine:
-    /// a RAG task's 64 tokens rather than its 256-token cap, with ignore_eos; a span query cannot
+    /// a RAG task's 64 tokens rather than its 2048-token cap, with ignore_eos; a span query cannot
     /// take it, so its answer still ends on its own.
     #[test]
     fn a_timed_request_is_forced_to_its_tasks_answer_length() {
