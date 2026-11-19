@@ -752,12 +752,18 @@ mod yarn_tests {
         let half = GPT_OSS_HEAD_DIM / 2;
         let (cos0, sin0) = table[..GPT_OSS_HEAD_DIM].split_at(half);
         assert!(cos0.iter().all(|&c| c == t), "cos at position 0: {cos0:?}");
-        assert!(sin0.iter().all(|&s| s == 0.0), "sin at position 0: {sin0:?}");
+        assert!(
+            sin0.iter().all(|&s| s == 0.0),
+            "sin at position 0: {sin0:?}"
+        );
         // Sample every 97th row (prime stride) rather than all 131072 —
         // the value law is per-entry.
         for pos in (0..GPT_OSS_MAX_POS).step_by(97) {
             for &v in &table[pos * GPT_OSS_HEAD_DIM..(pos + 1) * GPT_OSS_HEAD_DIM] {
-                assert!(v.abs() <= t, "cos/sin exceeds the temperature at pos {pos}: {v}");
+                assert!(
+                    v.abs() <= t,
+                    "cos/sin exceeds the temperature at pos {pos}: {v}"
+                );
             }
         }
     }
