@@ -871,7 +871,10 @@ const WEIGHTS: [(&str, Bytes); 19] = [
     ("ibm-granite/granite-4.2-8b-q4-mlx", Bytes(4_945_853_970)),
     ("ibm-granite/granite-4.2-30b-q4-mlx", Bytes(16_469_111_945)),
     // The dense class's small model from 2026-11-19, from the same API (main).
-    ("mlx-community/Qwen2.5-3B-Instruct-4bit", Bytes(1_736_293_090)),
+    (
+        "mlx-community/Qwen2.5-3B-Instruct-4bit",
+        Bytes(1_736_293_090),
+    ),
 ];
 
 impl Model {
