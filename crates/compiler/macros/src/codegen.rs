@@ -7450,6 +7450,7 @@ fn kv_codec_for(
     head_dim: u32,
     global_head_dim: u32,
     kv_layers: &KvCacheLayers,
+    sliding: scratchy_ir::SlidingKv,
     bits: scratchy_forward_compiler::TqBits,
     compress: bool,
 ) -> scratchy_forward_compiler::KvCodec {
@@ -7467,6 +7468,7 @@ fn kv_codec_for(
         global_head_dim,
         latent: bound("kv_lora_rank") > 0,
         has_kv_cache: kv_layers.any(),
+        sliding,
     };
     match codec_for(geometry, bits) {
         Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
@@ -7766,6 +7768,8 @@ pub(crate) fn fill_canonical_params(
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
+    // Where its sliding-window layers keep their KV ([`SlidingLayers`]).
+    sliding: scratchy_ir::SlidingKv,
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
     target: Option<scratchy_ir::model_facts::TargetWidth>,
@@ -8112,6 +8116,7 @@ pub(crate) fn fill_canonical_params(
         head_dim,
         global_head_dim,
         kv_layers,
+        sliding,
         tq_bits,
         compress_kv,
     );
@@ -8375,26 +8380,16 @@ pub fn emit_gdn_runtime_config_arm_body(
     })
 }
 
-/// Emit the body for the per-arch `ScratchyWeights::per_layer_kv_token_elems`
-/// override — `Some(vec![kv_heads_i * head_dim_i; num_layers])` for
-/// hybrid-attention-geometry arches whose sliding and global classes
-/// differ in dims (Gemma4: sliding 8×256, global 1×512).
-///
-/// The per-layer class mask is read straight off the unrolled FUF: every
-/// `OpKind::SlidingAttention` tile carries its layer as the KvCache
-/// extern index, so the mask is exactly the per-layer dispatch the
-/// `#[forward]` `if` resolved at unroll time (IR-driven, not re-derived).
-/// Returns `None` (trait default, uniform pool) when the body has no
-/// sliding tiles OR when both classes share the same dims (Gemma2/3).
-pub fn emit_per_layer_kv_token_elems_arm_body(
-    fuf: &Fuf,
-    model: &ModelParams,
-) -> Option<proc_macro2::TokenStream> {
+/// The sliding-window layers of the body, `None` when it has none: read straight off the
+/// unrolled FUF — every sliding tile ([`OpKind::slides`]) carries its layer as the KvCache extern
+/// index, so the mask is exactly the per-layer dispatch the `#[forward]` `if` resolved at unroll
+/// time (IR-driven, not re-derived).
+fn sliding_mask(fuf: &Fuf, model: &ModelParams) -> Option<Vec<bool>> {
     let num_hidden_layers = model.text.layers.get();
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
-        if node.op != OpKind::SlidingAttention {
+        if !node.op.slides() {
             continue;
         }
         has_sliding = true;
@@ -8411,9 +8406,11 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
             }
         }
     }
-    if !has_sliding {
-        return None;
-    }
+    has_sliding.then_some(sliding)
+}
+
+/// The `(kv_heads, head_dim)` of the sliding class and of the full (global) class.
+fn class_dims(model: &ModelParams) -> ((usize, usize), (usize, usize)) {
     let head_dim = model.text.head_dim.get() as usize;
     let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as usize;
     let g_hd = model
@@ -8426,10 +8423,51 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
         .get("num_global_key_value_heads")
         .map(|&v| v as usize)
         .unwrap_or(num_kv);
-    if g_hd == head_dim && g_kv == num_kv {
-        // Sliding/global classes share dims (Gemma2/3) — uniform pool.
-        return None;
+    ((num_kv, head_dim), (g_kv, g_hd))
+}
+
+/// The body's sliding-window layers and where they keep their KV: a pool of their own when their
+/// class's dims differ from the full class's (Gemma4: sliding 8×256, global 1×512), the one
+/// uniform pool when the classes share dims (Gemma2/3, gpt-oss). The worker's pool layout
+/// ([`emit_per_layer_kv_token_elems_arm_body`]) and the KV codec ([`kv_codec_for`]) both read it.
+pub(crate) enum SlidingLayers {
+    None,
+    SharedPool,
+    /// Per layer, whether it slides.
+    OwnPool(Vec<bool>),
+}
+
+impl SlidingLayers {
+    pub fn of(fuf: &Fuf, model: &ModelParams) -> Self {
+        let (sliding, full) = class_dims(model);
+        match sliding_mask(fuf, model) {
+            None => Self::None,
+            Some(_) if sliding == full => Self::SharedPool,
+            Some(mask) => Self::OwnPool(mask),
+        }
     }
+
+    pub fn kv(&self) -> scratchy_ir::SlidingKv {
+        match self {
+            Self::None => scratchy_ir::SlidingKv::None,
+            Self::SharedPool => scratchy_ir::SlidingKv::SharedPool,
+            Self::OwnPool(_) => scratchy_ir::SlidingKv::OwnPool,
+        }
+    }
+}
+
+/// Emit the body for the per-arch `ScratchyWeights::per_layer_kv_token_elems`
+/// override — `Some(vec![kv_heads_i * head_dim_i; num_layers])` for an arch whose sliding layers
+/// keep their KV in a pool of their own ([`SlidingLayers::OwnPool`]). Returns `None` (trait
+/// default, uniform pool) for every other arch.
+pub fn emit_per_layer_kv_token_elems_arm_body(
+    fuf: &Fuf,
+    model: &ModelParams,
+) -> Option<proc_macro2::TokenStream> {
+    let SlidingLayers::OwnPool(sliding) = SlidingLayers::of(fuf, model) else {
+        return None;
+    };
+    let ((num_kv, head_dim), (g_kv, g_hd)) = class_dims(model);
     let elems = sliding
         .iter()
         .map(|&is_sliding| {
@@ -8550,6 +8588,7 @@ pub fn emit_model(
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
+        SlidingLayers::of(fuf, model).kv(),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
         emitter.compresses_kv(),
     );
@@ -8817,8 +8856,16 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts =
-                fill_canonical_params(&model, 1, false, &every_layer(&model), None, false).0;
+            let facts = fill_canonical_params(
+                &model,
+                1,
+                false,
+                &every_layer(&model),
+                scratchy_ir::SlidingKv::None,
+                None,
+                false,
+            )
+            .0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -8925,7 +8972,15 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
+        let (facts, mla) = fill_canonical_params(
+            &m,
+            1,
+            false,
+            &every_layer(&m),
+            scratchy_ir::SlidingKv::None,
+            None,
+            false,
+        );
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -8941,7 +8996,16 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(
+            &m,
+            1,
+            false,
+            &every_layer(&m),
+            scratchy_ir::SlidingKv::None,
+            None,
+            false,
+        )
+        .0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -8973,7 +9037,16 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(
+            &m,
+            2,
+            false,
+            &every_layer(&m),
+            scratchy_ir::SlidingKv::None,
+            None,
+            false,
+        )
+        .0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -9019,7 +9092,16 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(
+            &m,
+            8,
+            false,
+            &every_layer(&m),
+            scratchy_ir::SlidingKv::None,
+            None,
+            false,
+        )
+        .0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
@@ -9921,6 +10003,7 @@ mod fingerprint_tests {
                     global_head_dim: model.bounds["head_dim"] as u32,
                     latent: false,
                     has_kv_cache: kv.any(),
+                    sliding: SlidingLayers::of(&fuf, &model).kv(),
                 };
                 assert_eq!(
                     codec_for(geometry, TqBits::new(4)),

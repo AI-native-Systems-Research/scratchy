@@ -319,6 +319,18 @@ pub const MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
 /// hold one element per thread of a head.
 pub const MAX_HEAD_DIM: u32 = 512;
 
+/// Where a model's sliding-window layers keep their KV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlidingKv {
+    /// The model has no sliding-window layers.
+    None,
+    /// In a pool of their own, their class's dims differing from the full-attention layers'
+    /// (Gemma 4): the codec codes the full-attention class alone and they stay dense.
+    OwnPool,
+    /// In one pool with the full-attention layers, every layer at the same dims (gpt-oss).
+    SharedPool,
+}
+
 /// The attention geometry a model's KV codec is decided from.
 #[derive(Clone, Copy, Debug)]
 pub struct KvGeometry {
@@ -331,6 +343,8 @@ pub struct KvGeometry {
     pub latent: bool,
     /// The model has a KV cache at all (encoders and vision towers don't).
     pub has_kv_cache: bool,
+    /// Where its sliding-window layers keep their KV.
+    pub sliding: SlidingKv,
 }
 
 /// Why a model keeps a dense KV cache in a `turboquant` build.
@@ -346,6 +360,10 @@ pub enum DenseReason {
     SmallKv {
         bytes_per_token: usize,
     },
+    /// The codec codes full-attention layers only, and the sliding-window layers share their
+    /// pool ([`SlidingKv::SharedPool`]): coding part of one pool leaves every layer's dense rows
+    /// in it.
+    SlidingSharesPool,
 }
 
 impl std::fmt::Display for DenseReason {
@@ -363,6 +381,10 @@ impl std::fmt::Display for DenseReason {
                 bytes_per_token / 1024,
                 MIN_KV_BYTES_PER_TOKEN / 1024
             ),
+            Self::SlidingSharesPool => f.write_str(
+                "its sliding-window layers share one KV pool with its full-attention layers, and \
+                 TurboQuant codes only full-attention layers",
+            ),
         }
     }
 }
@@ -378,6 +400,7 @@ pub fn codec_for(geometry: KvGeometry, bits: TqBits) -> Result<TqBits, DenseReas
         global_head_dim,
         latent,
         has_kv_cache,
+        sliding,
     } = geometry;
     let supported = |hd: u32| hd.is_power_of_two() && hd <= MAX_HEAD_DIM;
     if !has_kv_cache {
@@ -385,6 +408,9 @@ pub fn codec_for(geometry: KvGeometry, bits: TqBits) -> Result<TqBits, DenseReas
     }
     if latent {
         return Err(DenseReason::LatentKv);
+    }
+    if sliding == SlidingKv::SharedPool {
+        return Err(DenseReason::SlidingSharesPool);
     }
     if let Some(hd) = [head_dim, global_head_dim]
         .into_iter()
@@ -587,7 +613,7 @@ mod tests {
     fn pack_round_trip_exact() {
         for bits in 1..=4u32 {
             let dim = 128;
-            let mut rng = Lcg(7);
+            let rng = Lcg(7);
             let idx: Vec<u8> = (0..dim)
                 .map(|_| (rng.0.wrapping_add(1) % (1 << bits)) as u8)
                 .collect();
@@ -762,5 +788,28 @@ mod tests {
             store.compression_ratio() > 4.0,
             "3-bit compression should be ~4.6x"
         );
+    }
+
+    /// TurboQuant codes full-attention layers only: a model whose sliding-window layers share
+    /// one pool with them stays dense, while one that keeps them in a pool of their own (or has
+    /// none) is coded. gpt-oss-20b's geometry: 24 layers of 8 KV heads × 64.
+    #[test]
+    fn sliding_layers_sharing_the_pool_keep_it_dense() {
+        let geometry = |sliding| KvGeometry {
+            num_layers: 24,
+            num_kv_heads: 8,
+            head_dim: 64,
+            global_head_dim: 64,
+            latent: false,
+            has_kv_cache: true,
+            sliding,
+        };
+        let bits = TqBits::new(4);
+        assert_eq!(
+            codec_for(geometry(SlidingKv::SharedPool), bits),
+            Err(DenseReason::SlidingSharesPool)
+        );
+        assert_eq!(codec_for(geometry(SlidingKv::OwnPool), bits), Ok(bits));
+        assert_eq!(codec_for(geometry(SlidingKv::None), bits), Ok(bits));
     }
 }

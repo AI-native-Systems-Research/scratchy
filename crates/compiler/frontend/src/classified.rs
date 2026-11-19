@@ -663,6 +663,13 @@ pub enum OpKind {
 }
 
 impl OpKind {
+    /// A layer's own sliding-window attention over the cache it appends to:
+    /// [`Self::SlidingAttention`] and [`Self::SinkSlidingAttention`]. A drafter's
+    /// [`Self::SharedSlidingAttention`] reads its target's cache and appends none.
+    pub fn slides(self) -> bool {
+        matches!(self, Self::SlidingAttention | Self::SinkSlidingAttention)
+    }
+
     /// Map a DSL op-call ident to its `OpKind`. Binary operators
     /// (currently just `*`) do not flow through this path.
     pub fn from_name(name: &str) -> Option<Self> {
