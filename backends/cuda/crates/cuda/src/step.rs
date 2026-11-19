@@ -61,6 +61,100 @@ f32_bits_newtype! {
     SoftCap,
 }
 
+/// The dimensions and counts a step or tape carries, each its own type: a GEMM's `n` cannot be
+/// passed where its `k` is meant. `get()` reads the number; `Display` and `Debug` print it as the
+/// bare number, so every message reads as before.
+macro_rules! u32_newtype {
+    ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
+        $(#[$m])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        pub struct $name(pub u32);
+        impl $name {
+            /// The number.
+            pub const fn get(self) -> u32 {
+                self.0
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(&self.0, f)
+            }
+        }
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(&self.0, f)
+            }
+        }
+        impl From<$name> for u32 {
+            fn from(v: $name) -> u32 {
+                v.0
+            }
+        }
+        impl From<$name> for u64 {
+            fn from(v: $name) -> u64 {
+                u64::from(v.0)
+            }
+        }
+    )*};
+}
+
+u32_newtype! {
+    /// The rows a step runs: a GEMM's `m`, a row op's rows, a bucket's tokens or pairs.
+    Rows,
+    /// A row op's columns (a gate split's `half_cols`).
+    Cols,
+    /// A GEMM's output columns, its weight's rows.
+    NDim,
+    /// A GEMM's inner dimension, its input's columns.
+    KDim,
+    /// Per-head feature width.
+    HeadDim,
+    /// The leading lanes of a head that a rope rotates.
+    RotDim,
+    /// A rotary table's frequency denominator: the rotated width, or the head dim (proportional).
+    FreqDim,
+    /// Query heads.
+    NumQHeads,
+    /// Key/value heads.
+    NumKvHeads,
+    /// A model layer id.
+    LayerId,
+    /// The residual stream's width.
+    HiddenSize,
+    /// A feed-forward's (an expert's) inner width.
+    IntermediateSize,
+    /// The token embedding's rows (the lm_head's, the argmax's row width).
+    VocabSize,
+    /// Routed experts of a MoE layer.
+    NumExperts,
+    /// Experts each token routes to.
+    TopK,
+    /// The sorted expert rows' tiles.
+    MaxTiles,
+    /// An expert GEMM's column tile.
+    NTile,
+    /// The rows of one expert tile.
+    TileRows,
+    /// A Gated-DeltaNet layer's key or value heads.
+    GdnHeads,
+    /// A Gated-DeltaNet key or value head's width.
+    GdnHeadDim,
+    /// A Gated-DeltaNet conv's taps.
+    ConvKernel,
+    /// The slices a split-K GEMV or a split decode attention cuts its work into.
+    Splits,
+    /// The fewest key tiles a decode attention split takes.
+    MinTiles,
+    /// The last keys a sliding-window query sees.
+    AttnWindow,
+    /// Token slots per paged-KV block.
+    BlockSize,
+    /// Block-table entries per sequence.
+    MaxBlocksPerSeq,
+    /// A tape's rows: its bucket's.
+    BucketM,
+}
+
 /// A rope's base frequency (`rope_theta`), as its exact `f64` bits, so a rotary table is `Eq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RopeTheta(pub u64);
@@ -358,36 +452,48 @@ impl GateUpTcFp8 {
             x: self.fold.out,
             q: self.q_act,
             rows: self.fold.gate.m,
-            cols: self.fold.gate.n,
+            cols: Cols(self.fold.gate.n.get()),
         }
     }
 
     /// The GEMV scratch it writes: the gate's f32 rows, then the up's ([`gemv_tc_f32_bytes`]).
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        gemv_tc_f32_bytes(self.fold.gate.m, self.fold.gate.n)
+        gemv_tc_f32_bytes(self.fold.gate.m.get(), self.fold.gate.n.get())
     }
 }
 
 impl ExpertGateUpTcFp8 {
     /// As [`GateUpTcFp8::quant_write`], over the pairs' rows.
     pub const fn quant_write(&self) -> Option<QuantRowsFp8> {
-        let Some(rows) = self.fold.gate.m.checked_mul(self.fold.gate.top_k) else {
+        let Some(rows) = self
+            .fold
+            .gate
+            .m
+            .get()
+            .checked_mul(self.fold.gate.top_k.get())
+        else {
             return None;
         };
         Some(QuantRowsFp8 {
             x: self.fold.out,
             q: self.q_act,
-            rows,
-            cols: self.fold.gate.inter,
+            rows: Rows(rows),
+            cols: Cols(self.fold.gate.inter.get()),
         })
     }
 
     /// As [`GateUpTcFp8::gemv_scratch`], over the pairs' rows.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        let Some(rows) = self.fold.gate.m.checked_mul(self.fold.gate.top_k) else {
+        let Some(rows) = self
+            .fold
+            .gate
+            .m
+            .get()
+            .checked_mul(self.fold.gate.top_k.get())
+        else {
             return None;
         };
-        gemv_tc_f32_bytes(rows, self.fold.gate.inter)
+        gemv_tc_f32_bytes(rows, self.fold.gate.inter.get())
     }
 }
 
@@ -459,22 +565,22 @@ pub const fn fp8_weight(n: u32, k: u32) -> Option<Fp8Weight> {
 pub struct QuantRowsFp8 {
     pub x: ArenaOffset,
     pub q: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 impl QuantRowsFp8 {
     /// The scales' byte offset from `q`: the e4m3 rows, rounded up to
     /// [`crate::tape::CUDA_ARENA_ALIGN`].
     pub const fn scale_at(&self) -> Option<u64> {
-        (self.rows as u64 * self.cols as u64)
+        (self.rows.get() as u64 * self.cols.get() as u64)
             .checked_next_multiple_of(crate::tape::CUDA_ARENA_ALIGN)
     }
 
     /// The quant scratch bytes it writes: the rows, then their scales.
     pub const fn bytes(&self) -> Option<u64> {
         match self.scale_at() {
-            Some(at) => at.checked_add(self.rows as u64 * 4),
+            Some(at) => at.checked_add(self.rows.get() as u64 * 4),
             None => None,
         }
     }
@@ -506,7 +612,7 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
         if let Some((x, m, k)) = s.quantized_input() {
             let slot = live.iter_mut().flatten().find(|(_, q, _, _)| q.q == x);
             match slot {
-                Some((_, q, read, _)) if (q.rows, q.cols) == (m, k) => *read = true,
+                Some((_, q, read, _)) if (q.rows, q.cols) == (Rows(m), Cols(k)) => *read = true,
                 _ => return Err(QuantChainError::Unquantized { step }),
             }
         }
@@ -584,7 +690,7 @@ impl GdnPrefillBf16 {
     pub const fn of(gdn: GatedDeltaNetBf16) -> Self {
         Self {
             gdn,
-            scan: GdnScan::of(gdn.rows),
+            scan: GdnScan::of(gdn.rows.get()),
         }
     }
 }
@@ -674,7 +780,7 @@ impl GateUpActBf16 {
             up: self.up.c,
             out: self.out,
             rows: self.gate.m,
-            cols: self.gate.n,
+            cols: Cols(self.gate.n.get()),
         }
     }
 
@@ -684,7 +790,7 @@ impl GateUpActBf16 {
         let Some(split) = self.kernel.gemv_split() else {
             return Some(0);
         };
-        let Some(one) = gemv_scratch_bytes(self.gate.n, 1, split.splits) else {
+        let Some(one) = gemv_scratch_bytes(self.gate.n.get(), 1, split.splits.get()) else {
             return None;
         };
         one.checked_mul(2)
@@ -709,8 +815,8 @@ impl ExpertGateUpActBf16 {
             gate: self.gate.c,
             up: self.up.c,
             out: self.out,
-            rows: self.gate.m * self.gate.top_k,
-            cols: self.gate.inter,
+            rows: Rows(self.gate.m.get() * self.gate.top_k.get()),
+            cols: Cols(self.gate.inter.get()),
         }
     }
 }
@@ -736,10 +842,16 @@ impl ExpertGateUpGemvBf16 {
     /// The GEMV scratch the fused launch writes: the gate's partials, then the up's.
     pub const fn gemv_scratch(&self) -> Option<u64> {
         let (n, _) = self.fold.gate.n_k();
-        let Some(pairs) = self.fold.gate.m.checked_mul(self.fold.gate.top_k) else {
+        let Some(pairs) = self
+            .fold
+            .gate
+            .m
+            .get()
+            .checked_mul(self.fold.gate.top_k.get())
+        else {
             return None;
         };
-        let Some(one) = gemv_scratch_bytes(n, pairs, self.split.splits) else {
+        let Some(one) = gemv_scratch_bytes(n, pairs, self.split.splits.get()) else {
             return None;
         };
         one.checked_mul(2)
@@ -823,7 +935,7 @@ impl GroupKind {
 pub struct GroupMember {
     pub b: WeightIx,
     pub c: ArenaOffset,
-    pub n: u32,
+    pub n: NDim,
 }
 
 /// Up to three GEMMs `C_i[m, n_i] = A[m, k] · B_i[n_i, k]ᵀ` that share `A`, in one launch: the
@@ -832,8 +944,8 @@ pub struct GroupMember {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GemmGroupBf16 {
     pub a: ArenaOffset,
-    pub m: u32,
-    pub k: u32,
+    pub m: Rows,
+    pub k: KDim,
     pub first: GroupMember,
     pub second: GroupMember,
     pub third: Option<GroupMember>,
@@ -875,8 +987,8 @@ pub const ATTN_WINDOW_MULTIPLE: u32 = CUDA_KV_BLOCK_SIZE;
 pub struct GatherLastRowBf16 {
     pub x: ArenaOffset,
     pub sequence: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 /// `out = x · scale` over `[rows, cols]`, bf16 in and out, computed in f32 and rounded once.
@@ -884,8 +996,8 @@ pub struct GatherLastRowBf16 {
 pub struct ScaleBf16 {
     pub x: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
     pub scale: Scale,
 }
 
@@ -895,8 +1007,8 @@ pub struct ScaleBf16 {
 pub struct RmsNormUnitBf16 {
     pub x: ArenaOffset,
     pub y: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
     pub eps: RmsNormEps,
 }
 
@@ -907,8 +1019,8 @@ pub struct LayerScaleBf16 {
     pub x: ArenaOffset,
     pub scale: WeightIx,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 /// `out = cap · tanh(x / cap)` over `[rows, cols]`, bf16 in and out, computed in f32 and rounded
@@ -917,8 +1029,8 @@ pub struct LayerScaleBf16 {
 pub struct SoftCapBf16 {
     pub x: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
     pub cap: SoftCap,
 }
 
@@ -944,9 +1056,9 @@ pub struct EmbedBf16 {
     pub tokens: ArenaOffset,
     pub table: WeightIx,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub hidden: u32,
-    pub vocab: u32,
+    pub rows: Rows,
+    pub hidden: HiddenSize,
+    pub vocab: VocabSize,
 }
 
 /// `C[m, n] = A[m, k] · B[n, k]ᵀ`, bf16 in and out, accumulated in f32.
@@ -959,9 +1071,9 @@ pub struct GemmBf16 {
     pub a: ArenaOffset,
     pub b: WeightIx,
     pub c: ArenaOffset,
-    pub m: u32,
-    pub n: u32,
-    pub k: u32,
+    pub m: Rows,
+    pub n: NDim,
+    pub k: KDim,
     /// The residual a one-row GEMV adds its output to (FP8 S8 W4a, the one-row bucket's
     /// `MatvecEpilogue`): `c = bf16(bf16(a · Bᵀ) + residual)`, `add_bf16.cu`'s add, `residual` a
     /// `[1, n]` arena slot the GEMV reads and `c` the add's own colour. `None` on every other step.
@@ -1033,14 +1145,14 @@ pub const fn gemv_split_chunks(chunks: u32, splits: u32) -> u32 {
 /// step's shape and pairs). The player launches it as stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GemvSplit {
-    pub splits: u32,
+    pub splits: Splits,
 }
 
 impl GemvSplit {
     /// The split of an `n` × `k` GEMV over `pairs` slices ([`gemv_splits`]).
     pub const fn of(n: u32, k: u32, pairs: u32) -> Self {
         Self {
-            splits: gemv_splits(n, k, pairs),
+            splits: Splits(gemv_splits(n, k, pairs)),
         }
     }
 }
@@ -1058,7 +1170,7 @@ impl GemvBf16 {
     pub const fn of(gemm: GemmBf16) -> Self {
         Self {
             gemm,
-            split: GemvSplit::of(gemm.n, gemm.k, 1),
+            split: GemvSplit::of(gemm.n.get(), gemm.k.get(), 1),
         }
     }
 }
@@ -1079,10 +1191,10 @@ impl GemvGroupBf16 {
         let k = group.k;
         Self {
             group,
-            first: GemvSplit::of(group.first.n, k, 1),
-            second: GemvSplit::of(group.second.n, k, 1),
+            first: GemvSplit::of(group.first.n.get(), k.get(), 1),
+            second: GemvSplit::of(group.second.n.get(), k.get(), 1),
             third: match group.third {
-                Some(m) => Some(GemvSplit::of(m.n, k, 1)),
+                Some(m) => Some(GemvSplit::of(m.n.get(), k.get(), 1)),
                 None => None,
             },
         }
@@ -1102,7 +1214,7 @@ impl GemvGroupBf16 {
         let mut i = 0;
         while i < upto && i < 3 {
             if let (Some(g), Some(split)) = (members[i], splits[i]) {
-                let Some(bytes) = gemv_scratch_bytes(g.n, 1, split.splits) else {
+                let Some(bytes) = gemv_scratch_bytes(g.n.get(), 1, split.splits.get()) else {
                     return None;
                 };
                 let Some(sum) = total.checked_add(bytes) else {
@@ -1143,8 +1255,8 @@ pub struct RmsNormBf16 {
     pub x: ArenaOffset,
     pub gain: WeightIx,
     pub y: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
     pub eps: RmsNormEps,
     #[serde(serialize_with = "serialize_gain_convention")]
     pub convention: GainConvention,
@@ -1192,8 +1304,8 @@ pub struct AddBf16 {
     pub a: ArenaOffset,
     pub b: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 /// `out = gate / (1 + e^(−gate)) · up` over `[rows, cols]`, bf16 in and out, computed in f32 and
@@ -1203,8 +1315,8 @@ pub struct SiluMulBf16 {
     pub gate: ArenaOffset,
     pub up: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 /// The rope's `rot_dim` is a non-zero multiple of this, at most `head_dim`: each head's `R/2`
@@ -1239,10 +1351,10 @@ pub struct RopeBf16 {
     pub x: ArenaOffset,
     pub table: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
-    pub head_dim: u32,
-    pub rot_dim: u32,
+    pub rows: Rows,
+    pub cols: Cols,
+    pub head_dim: HeadDim,
+    pub rot_dim: RotDim,
     /// Which lane a rotated lane pairs with: `Standard` (the kernel's), or `Proportional`
     /// (Gemma's proportional rope, #885's 13b-3). `table` is the tape's table of the step's class.
     #[serde(serialize_with = "serialize_rope_pairing")]
@@ -1262,9 +1374,9 @@ pub struct GateSplitBf16 {
     pub qg: ArenaOffset,
     pub q: ArenaOffset,
     pub gate: ArenaOffset,
-    pub rows: u32,
-    pub half_cols: u32,
-    pub head_dim: u32,
+    pub rows: Rows,
+    pub half_cols: Cols,
+    pub head_dim: HeadDim,
 }
 
 /// `out = attn / (1 + e^(−gate))` over `[rows, cols]`, bf16 in and out, computed in f32 and
@@ -1274,8 +1386,8 @@ pub struct GateApplyBf16 {
     pub attn: ArenaOffset,
     pub gate: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 // The worker picks the attention kernel by these names: they are exactly the head dims a KV step
@@ -1304,7 +1416,7 @@ const _: () = assert!(
 /// at a head dim with no decode kernel.
 pub const fn attn_decode_split(head_dim: u32) -> Option<(u32, u32)> {
     match attn_decode_split_at(head_dim) {
-        Some(s) => Some((s.splits, s.min_tiles)),
+        Some(s) => Some((s.splits.get(), s.min_tiles.get())),
         None => None,
     }
 }
@@ -1314,8 +1426,8 @@ pub const fn attn_decode_split(head_dim: u32) -> Option<(u32, u32)> {
 /// `min_tiles` tiles of 64 keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AttnDecodeSplit {
-    pub splits: u32,
-    pub min_tiles: u32,
+    pub splits: Splits,
+    pub min_tiles: MinTiles,
 }
 
 /// A decode bucket's attention ([`CudaStep::AttnDecode`]): the attention, and its split over keys.
@@ -1328,7 +1440,7 @@ pub struct AttnDecodeBf16 {
 impl AttnDecodeBf16 {
     /// `attn` at its head dim's split; `None` at a head dim with no decode kernel.
     pub const fn of(attn: AttnPrefillBf16) -> Option<Self> {
-        match attn_decode_split_at(attn.head_dim) {
+        match attn_decode_split_at(attn.head_dim.get()) {
             Some(split) => Some(Self { attn, split }),
             None => None,
         }
@@ -1341,7 +1453,10 @@ const fn attn_decode_split_at(head_dim: u32) -> Option<AttnDecodeSplit> {
     while i < ATTN_DECODE_SPLITS.len() {
         let (hd, splits, min_tiles) = ATTN_DECODE_SPLITS[i];
         if hd == head_dim {
-            return Some(AttnDecodeSplit { splits, min_tiles });
+            return Some(AttnDecodeSplit {
+                splits: Splits(splits),
+                min_tiles: MinTiles(min_tiles),
+            });
         }
         i += 1;
     }
@@ -1393,11 +1508,11 @@ pub struct RopeAppendBf16 {
     pub table: ArenaOffset,
     pub slot_mapping: ArenaOffset,
     pub k_out: ArenaOffset,
-    pub layer: u32,
-    pub rows: u32,
-    pub cols: u32,
-    pub head_dim: u32,
-    pub rot_dim: u32,
+    pub layer: LayerId,
+    pub rows: Rows,
+    pub cols: Cols,
+    pub head_dim: HeadDim,
+    pub rot_dim: RotDim,
     /// As [`RopeBf16::pairing`].
     #[serde(serialize_with = "serialize_rope_pairing")]
     pub pairing: RopePairing,
@@ -1417,7 +1532,7 @@ pub struct RopeAppendBf16 {
 pub struct RopeQ {
     pub x: ArenaOffset,
     pub out: ArenaOffset,
-    pub cols: u32,
+    pub cols: Cols,
 }
 
 /// The per-head norms a [`RopeAppendBf16`] applies (FP8 S8 W4c, Gemma's): q's and k's RMSNorm
@@ -1444,17 +1559,17 @@ pub struct AttnPrefillBf16 {
     pub block_table: ArenaOffset,
     pub sequence: ArenaOffset,
     pub out: ArenaOffset,
-    pub layer: u32,
-    pub rows: u32,
-    pub q_heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
+    pub layer: LayerId,
+    pub rows: Rows,
+    pub q_heads: NumQHeads,
+    pub kv_heads: NumKvHeads,
+    pub head_dim: HeadDim,
     /// The softmax scale, which the kernel folds into `log2(e)`.
     pub scale: AttnScale,
     /// The keys a query row sees, its last `window` positions (a non-zero multiple of
     /// [`ATTN_WINDOW_MULTIPLE`]); `None` for full causal attention. The head-dim-256 kernels take
     /// it as a launch argument (0 for `None`); the head-dim-512 kernels are #885's 13b-3.
-    pub window: Option<u32>,
+    pub window: Option<AttnWindow>,
 }
 
 /// Bytes of one f32: the GDN scratch, bundle and state are f32.
@@ -1623,13 +1738,13 @@ pub struct GatedDeltaNetBf16 {
     pub out: ArenaOffset,
     pub scratch: ArenaOffset,
     pub sequence: ArenaOffset,
-    pub layer: u32,
-    pub rows: u32,
-    pub num_k_heads: u32,
-    pub num_v_heads: u32,
-    pub head_k: u32,
-    pub head_v: u32,
-    pub conv_kernel: u32,
+    pub layer: LayerId,
+    pub rows: Rows,
+    pub num_k_heads: GdnHeads,
+    pub num_v_heads: GdnHeads,
+    pub head_k: GdnHeadDim,
+    pub head_v: GdnHeadDim,
+    pub conv_kernel: ConvKernel,
     /// The gated norm's `eps` (`rms_norm_eps`).
     pub eps: RmsNormEps,
 }
@@ -1637,17 +1752,22 @@ pub struct GatedDeltaNetBf16 {
 impl GatedDeltaNetBf16 {
     /// The query scale, `head_k^-½`.
     pub const fn scale(&self) -> f32 {
-        gdn_scale(self.head_k)
+        gdn_scale(self.head_k.get())
     }
 
     /// The conv's channels, or `None` on overflow.
     pub const fn conv_dim(&self) -> Option<u32> {
-        gdn_conv_dim(self.num_k_heads, self.head_k, self.num_v_heads, self.head_v)
+        gdn_conv_dim(
+            self.num_k_heads.get(),
+            self.head_k.get(),
+            self.num_v_heads.get(),
+            self.head_v.get(),
+        )
     }
 
     /// The value width, `num_v_heads · head_v`, or `None` on overflow.
     pub const fn value_dim(&self) -> Option<u32> {
-        self.num_v_heads.checked_mul(self.head_v)
+        self.num_v_heads.get().checked_mul(self.head_v.get())
     }
 
     /// The scratch's regions at this step's rows, or `None` on overflow.
@@ -1655,7 +1775,7 @@ impl GatedDeltaNetBf16 {
         let (Some(conv_dim), Some(value_dim)) = (self.conv_dim(), self.value_dim()) else {
             return None;
         };
-        gdn_scratch(self.rows, conv_dim, self.num_v_heads, value_dim)
+        gdn_scratch(self.rows.get(), conv_dim, self.num_v_heads.get(), value_dim)
     }
 
     /// The bundle's regions for this step's geometry, or `None` on overflow.
@@ -1663,7 +1783,12 @@ impl GatedDeltaNetBf16 {
         let Some(conv_dim) = self.conv_dim() else {
             return None;
         };
-        gdn_bundle(conv_dim, self.conv_kernel, self.num_v_heads, self.head_v)
+        gdn_bundle(
+            conv_dim,
+            self.conv_kernel.get(),
+            self.num_v_heads.get(),
+            self.head_v.get(),
+        )
     }
 }
 
@@ -1730,11 +1855,11 @@ pub struct RouterLogitsBf16 {
     pub bundle: WeightIx,
     pub weight: MoeWeight,
     pub logits: ArenaOffset,
-    pub m: u32,
-    pub experts: u32,
-    pub hidden: u32,
+    pub m: Rows,
+    pub experts: NumExperts,
+    pub hidden: HiddenSize,
     /// The bundle's expert width, so every step naming the bundle states its geometry.
-    pub inter: u32,
+    pub inter: IntermediateSize,
     pub kernel: MatmulKernel,
 }
 
@@ -1746,9 +1871,9 @@ pub struct MoeRouteBf16 {
     pub logits: ArenaOffset,
     pub topk_idx: ArenaOffset,
     pub scores: ArenaOffset,
-    pub m: u32,
-    pub experts: u32,
-    pub top_k: u32,
+    pub m: Rows,
+    pub experts: NumExperts,
+    pub top_k: TopK,
     pub program: RouteProgram,
 }
 
@@ -1782,11 +1907,11 @@ pub struct ExpertSortBf16 {
     pub tile_expert: ArenaOffset,
     pub pos: ArenaOffset,
     pub rows: ArenaOffset,
-    pub m: u32,
-    pub experts: u32,
-    pub top_k: u32,
-    pub hidden: u32,
-    pub max_tiles: u32,
+    pub m: Rows,
+    pub experts: NumExperts,
+    pub top_k: TopK,
+    pub hidden: HiddenSize,
+    pub max_tiles: MaxTiles,
 }
 
 /// The act of an fp8 bank's gate and up over its live rows (`offsets[experts]`, the sort's) and the
@@ -1798,7 +1923,7 @@ pub struct ExpertActQuantFp8 {
     pub act: SiluMulBf16,
     pub op: GatedOp,
     pub offsets: ArenaOffset,
-    pub experts: u32,
+    pub experts: NumExperts,
     pub q_act: ArenaOffset,
 }
 
@@ -1877,18 +2002,18 @@ pub struct ExpertGemmBf16 {
     pub offsets: ArenaOffset,
     pub tile_expert: ArenaOffset,
     pub c: ArenaOffset,
-    pub max_tiles: u32,
-    pub experts: u32,
-    pub hidden: u32,
-    pub inter: u32,
+    pub max_tiles: MaxTiles,
+    pub experts: NumExperts,
+    pub hidden: HiddenSize,
+    pub inter: IntermediateSize,
     /// The column tile, one of [`EXPERT_GEMM_N_TILES`]: 256 for every Qwen tape.
-    pub n_tile: u32,
+    pub n_tile: NTile,
 }
 
 impl ExpertGemmBf16 {
     /// `(n, k)` of the projection.
     pub const fn n_k(&self) -> (u32, u32) {
-        self.proj.n_k(self.hidden, self.inter)
+        self.proj.n_k(self.hidden.get(), self.inter.get())
     }
 }
 
@@ -1914,11 +2039,11 @@ pub struct ExpertGemvBf16 {
     pub proj: ExpertProjection,
     pub topk_idx: ArenaOffset,
     pub c: ArenaOffset,
-    pub m: u32,
-    pub top_k: u32,
-    pub experts: u32,
-    pub hidden: u32,
-    pub inter: u32,
+    pub m: Rows,
+    pub top_k: TopK,
+    pub experts: NumExperts,
+    pub hidden: HiddenSize,
+    pub inter: IntermediateSize,
 }
 
 /// The routed experts' decode GEMV ([`CudaStep::ExpertGemv`]): the projection, at its K split over
@@ -1941,14 +2066,14 @@ impl ExpertGemvSplitBf16 {
     /// The split of `g`'s shape at its `m · top_k` pairs ([`GemvSplit::of`]).
     pub const fn split_of(g: &ExpertGemvBf16) -> GemvSplit {
         let (n, k) = g.n_k();
-        GemvSplit::of(n, k, g.m.saturating_mul(g.top_k))
+        GemvSplit::of(n, k, g.m.get().saturating_mul(g.top_k.get()))
     }
 }
 
 impl ExpertGemvBf16 {
     /// `(n, k)` of the projection.
     pub const fn n_k(&self) -> (u32, u32) {
-        self.proj.n_k(self.hidden, self.inter)
+        self.proj.n_k(self.hidden.get(), self.inter.get())
     }
 }
 
@@ -1961,11 +2086,11 @@ pub struct ExpertCombineBf16 {
     pub pos: Option<ArenaOffset>,
     pub scores: ArenaOffset,
     pub out: ArenaOffset,
-    pub m: u32,
-    pub top_k: u32,
-    pub hidden: u32,
+    pub m: Rows,
+    pub top_k: TopK,
+    pub hidden: HiddenSize,
     /// The down region's rows: `R` sorted, `P` gathered.
-    pub down_rows: u32,
+    pub down_rows: Rows,
 }
 
 /// `out = routed + shared · (1 / (1 + e^(−g)))` over `[rows, cols]`, `g` `[rows, 1]` broadcast
@@ -1976,8 +2101,8 @@ pub struct GateScaleBf16 {
     pub shared: ArenaOffset,
     pub g: ArenaOffset,
     pub out: ArenaOffset,
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Rows,
+    pub cols: Cols,
 }
 
 /// A MoE layer's dense bf16 bundle, its three checkpoint tensors back to back: the byte offsets
@@ -2147,19 +2272,19 @@ impl CudaStep {
     pub const fn gemv_split(&self) -> Option<(u32, u32, u32)> {
         match *self {
             Self::Gemv(GemvBf16 { gemm, split }) | Self::GemvFp8(GemvBf16 { gemm, split }) => {
-                Some((gemm.n, 1, split.splits))
+                Some((gemm.n.get(), 1, split.splits.get()))
             }
             Self::RouterLogits(RouterLogitsBf16 {
                 experts,
                 kernel: MatmulKernel::Gemv(split),
                 ..
-            }) => Some((experts, 1, split.splits)),
+            }) => Some((experts.get(), 1, split.splits.get())),
             Self::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, split }) => {
                 let (n, _) = g.n_k();
-                let Some(pairs) = g.m.checked_mul(g.top_k) else {
+                let Some(pairs) = g.m.get().checked_mul(g.top_k.get()) else {
                     return None;
                 };
-                Some((n, pairs, split.splits))
+                Some((n, pairs, split.splits.get()))
             }
             Self::RouterLogits(_)
             | Self::Embed(_)
@@ -2360,7 +2485,7 @@ impl CudaStep {
             return self.fp8_expert_rows();
         }
         if let Self::ExpertSortFp8(s) = *self {
-            return Some((s.x, s.m, s.hidden));
+            return Some((s.x, s.m.get(), s.hidden.get()));
         }
         // The tensor-core decode GEMVs (FP8 S8 T2): the expert form's token row or pairs' rows.
         if let Self::ExpertGemvTcFp8(g)
@@ -2370,8 +2495,8 @@ impl CudaStep {
         }) = *self
         {
             let rows = match g.rows {
-                PairRows::Token => Some(g.m),
-                PairRows::Pair => g.m.checked_mul(g.top_k),
+                PairRows::Token => Some(g.m.get()),
+                PairRows::Pair => g.m.get().checked_mul(g.top_k.get()),
             };
             return match rows {
                 Some(rows) => Some((g.a, rows, g.n_k().1)),
@@ -2394,7 +2519,7 @@ impl CudaStep {
             }) => gate,
             _ => return None,
         };
-        Some((g.a, g.m, g.k))
+        Some((g.a, g.m.get(), g.k.get()))
     }
 
     /// An fp8 bank's grouped expert GEMM's e4m3 rows `(a, rows, k)`: the sorted capacity rows (its
@@ -2411,6 +2536,7 @@ impl CudaStep {
             // An fp8 bank's row tile (FP8 S8 P3(a)).
             let rows = g
                 .max_tiles
+                .get()
                 .checked_mul(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS);
             return match rows {
                 Some(rows) => Some((g.a, rows, g.n_k().1)),
@@ -2519,7 +2645,11 @@ impl CudaStep {
     /// same step's second launch); `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
         if let Self::AttnDecode(AttnDecodeBf16 { attn: a, split }) = self {
-            return match attn_decode_split_scratch_bytes(split.splits, a.kv_heads, a.head_dim) {
+            return match attn_decode_split_scratch_bytes(
+                split.splits.get(),
+                a.kv_heads.get(),
+                a.head_dim.get(),
+            ) {
                 Some((_, all)) => Some(all),
                 None => None,
             };
@@ -2567,7 +2697,8 @@ impl CudaStep {
             },
             // The bf16 rows; the e4m3 rows and their scales, the quant scratch.
             Self::QuantRowsFp8(q) => {
-                let (Some(xb), Some(qb)) = (bf16_bytes(q.rows, q.cols), q.bytes()) else {
+                let (Some(xb), Some(qb)) = (bf16_bytes(q.rows.get(), q.cols.get()), q.bytes())
+                else {
                     return None;
                 };
                 Some(StepExtents {
@@ -2631,16 +2762,20 @@ impl CudaStep {
                 residual,
             }) => {
                 let ab = match self {
-                    Self::GemvFp8(_) => bf16_bytes(m, k),
+                    Self::GemvFp8(_) => bf16_bytes(m.get(), k.get()),
                     _ => QuantRowsFp8 {
                         x: a,
                         q: a,
                         rows: m,
-                        cols: k,
+                        cols: Cols(k.get()),
                     }
                     .bytes(),
                 };
-                let (Some(ab), Some(cb), Some(w)) = (ab, bf16_bytes(m, n), fp8_weight(n, k)) else {
+                let (Some(ab), Some(cb), Some(w)) = (
+                    ab,
+                    bf16_bytes(m.get(), n.get()),
+                    fp8_weight(n.get(), k.get()),
+                ) else {
                     return None;
                 };
                 // FP8 S8 W4a: the residual a one-row GEMV adds, `[1, n]` as its output.
@@ -2669,12 +2804,14 @@ impl CudaStep {
                 hidden,
                 vocab,
             }) => {
-                let (Some(ob), Some(tb)) = (bf16_bytes(rows, hidden), bf16_bytes(vocab, hidden))
-                else {
+                let (Some(ob), Some(tb)) = (
+                    bf16_bytes(rows.get(), hidden.get()),
+                    bf16_bytes(vocab.get(), hidden.get()),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
-                    reads: [Some(span(tokens, u32_bytes(rows))), None, None, None],
+                    reads: [Some(span(tokens, u32_bytes(rows.get()))), None, None, None],
                     writes: span(out, ob),
                     second_write: None,
                     weight: Some(WeightRead {
@@ -2726,9 +2863,11 @@ impl CudaStep {
                     },
                 ..
             }) => {
-                let (Some(ab), Some(bb), Some(cb)) =
-                    (bf16_bytes(m, k), bf16_bytes(n, k), bf16_bytes(m, n))
-                else {
+                let (Some(ab), Some(bb), Some(cb)) = (
+                    bf16_bytes(m.get(), k.get()),
+                    bf16_bytes(n.get(), k.get()),
+                    bf16_bytes(m.get(), n.get()),
+                ) else {
                     return None;
                 };
                 // FP8 S8 W4a: the residual a one-row GEMV adds, `[1, n]` as its output.
@@ -2762,7 +2901,10 @@ impl CudaStep {
                 cols,
                 ..
             }) => {
-                let (Some(xb), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(1, cols)) else {
+                let (Some(xb), Some(gb)) = (
+                    bf16_bytes(rows.get(), cols.get()),
+                    bf16_bytes(1, cols.get()),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -2794,11 +2936,12 @@ impl CudaStep {
                         }
                     }
                     _ => (
-                        bf16_bytes(g.gate.m, g.gate.k),
-                        bf16_bytes(g.gate.n, g.gate.k),
+                        bf16_bytes(g.gate.m.get(), g.gate.k.get()),
+                        bf16_bytes(g.gate.n.get(), g.gate.k.get()),
                     ),
                 };
-                let (Some(ab), Some(cb), Some(bb)) = (ab, bf16_bytes(g.gate.m, g.gate.n), bb)
+                let (Some(ab), Some(cb), Some(bb)) =
+                    (ab, bf16_bytes(g.gate.m.get(), g.gate.n.get()), bb)
                 else {
                     return None;
                 };
@@ -2858,8 +3001,8 @@ impl CudaStep {
                 let Some(ab) = (QuantRowsFp8 {
                     x: g.a,
                     q: g.a,
-                    rows,
-                    cols: k,
+                    rows: Rows(rows),
+                    cols: Cols(k),
                 })
                 .bytes() else {
                     return None;
@@ -2896,7 +3039,10 @@ impl CudaStep {
                     cols,
                     ..
                 } = f.norm;
-                let (Some(xb), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(1, cols)) else {
+                let (Some(xb), Some(gb)) = (
+                    bf16_bytes(rows.get(), cols.get()),
+                    bf16_bytes(1, cols.get()),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -2922,7 +3068,10 @@ impl CudaStep {
                     cols,
                     ..
                 } = norm;
-                let (Some(xb), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(1, cols)) else {
+                let (Some(xb), Some(gb)) = (
+                    bf16_bytes(rows.get(), cols.get()),
+                    bf16_bytes(1, cols.get()),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -2966,7 +3115,7 @@ impl CudaStep {
                 rows,
                 cols,
             }) => {
-                let Some(bytes) = bf16_bytes(rows, cols) else {
+                let Some(bytes) = bf16_bytes(rows.get(), cols.get()) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -2988,8 +3137,10 @@ impl CudaStep {
                 rot_dim,
                 ..
             }) => {
-                let (Some(xb), Some(tb)) = (bf16_bytes(rows, cols), bf16_bytes(rows, rot_dim))
-                else {
+                let (Some(xb), Some(tb)) = (
+                    bf16_bytes(rows.get(), cols.get()),
+                    bf16_bytes(rows.get(), rot_dim.get()),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3010,7 +3161,7 @@ impl CudaStep {
                 half_cols,
                 ..
             }) => {
-                let Some(hb) = bf16_bytes(rows, half_cols) else {
+                let Some(hb) = bf16_bytes(rows.get(), half_cols.get()) else {
                     return None;
                 };
                 let Some(qgb) = hb.checked_mul(2) else {
@@ -3038,8 +3189,10 @@ impl CudaStep {
                 rot_dim,
                 ..
             }) => {
-                let (Some(kb), Some(tb)) = (bf16_bytes(rows, cols), bf16_bytes(rows, rot_dim))
-                else {
+                let (Some(kb), Some(tb)) = (
+                    bf16_bytes(rows.get(), cols.get()),
+                    bf16_bytes(rows.get(), rot_dim.get()),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3047,12 +3200,12 @@ impl CudaStep {
                         Some(span(k, kb)),
                         Some(span(v, kb)),
                         Some(span(table, tb)),
-                        Some(span(slot_mapping, u32_bytes(rows))),
+                        Some(span(slot_mapping, u32_bytes(rows.get()))),
                     ],
                     writes: span(k_out, kb),
                     second_write: None,
                     weight: None,
-                    kv: Some((layer, KvUse::Write)),
+                    kv: Some((layer.get(), KvUse::Write)),
                     gdn: None,
                     in_place: false,
                 })
@@ -3083,10 +3236,10 @@ impl CudaStep {
                     },
                 ..
             }) => {
-                let Some(cols) = q_heads.checked_mul(head_dim) else {
+                let Some(cols) = q_heads.get().checked_mul(head_dim.get()) else {
                     return None;
                 };
-                let Some(qb) = bf16_bytes(rows, cols) else {
+                let Some(qb) = bf16_bytes(rows.get(), cols) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3099,7 +3252,7 @@ impl CudaStep {
                     writes: span(out, qb),
                     second_write: None,
                     weight: None,
-                    kv: Some((layer, KvUse::Read)),
+                    kv: Some((layer.get(), KvUse::Read)),
                     gdn: None,
                     in_place: false,
                 })
@@ -3135,9 +3288,9 @@ impl CudaStep {
                     return None;
                 };
                 let (Some(qb), Some(vb), Some(hb)) = (
-                    bf16_bytes(rows, conv_dim),
-                    bf16_bytes(rows, value_dim),
-                    bf16_bytes(rows, num_v_heads),
+                    bf16_bytes(rows.get(), conv_dim),
+                    bf16_bytes(rows.get(), value_dim),
+                    bf16_bytes(rows.get(), num_v_heads.get()),
                 ) else {
                     return None;
                 };
@@ -3158,7 +3311,7 @@ impl CudaStep {
                         bytes: bu.bytes,
                     }),
                     kv: None,
-                    gdn: Some(layer),
+                    gdn: Some(layer.get()),
                     in_place: false,
                 })
             }
@@ -3174,9 +3327,9 @@ impl CudaStep {
                 ..
             }) => {
                 let (Some(xb), Some(lb), Some(bu)) = (
-                    bf16_bytes(m, hidden),
-                    bf16_bytes(m, experts),
-                    weight.router_bytes(experts, hidden, inter),
+                    bf16_bytes(m.get(), hidden.get()),
+                    bf16_bytes(m.get(), experts.get()),
+                    weight.router_bytes(experts.get(), hidden.get(), inter.get()),
                 ) else {
                     return None;
                 };
@@ -3202,13 +3355,16 @@ impl CudaStep {
                 top_k,
                 program,
             }) => {
-                let (Some(lb), Some(pairs)) = (bf16_bytes(m, experts), m.checked_mul(top_k)) else {
+                let (Some(lb), Some(pairs)) = (
+                    bf16_bytes(m.get(), experts.get()),
+                    m.get().checked_mul(top_k.get()),
+                ) else {
                     return None;
                 };
                 let weight = match program {
                     RouteProgram::TopKScaledSoftmax { expert_scale, .. } => Some(WeightRead {
                         ix: expert_scale,
-                        bytes: experts as u64 * CUDA_ACT_BYTES,
+                        bytes: experts.get() as u64 * CUDA_ACT_BYTES,
                     }),
                     RouteProgram::SoftmaxTopK { .. } => None,
                 };
@@ -3226,7 +3382,7 @@ impl CudaStep {
                 let Some(l) = s.layout() else {
                     return None;
                 };
-                let Some(xb) = bf16_bytes(s.m, s.hidden) else {
+                let Some(xb) = bf16_bytes(s.m.get(), s.hidden.get()) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3254,6 +3410,7 @@ impl CudaStep {
                 };
                 let Some(capacity) = s
                     .max_tiles
+                    .get()
                     .checked_mul(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS)
                 else {
                     return None;
@@ -3262,13 +3419,13 @@ impl CudaStep {
                     x: s.x,
                     q: s.x,
                     rows: s.m,
-                    cols: s.hidden,
+                    cols: Cols(s.hidden.get()),
                 };
                 let rq = QuantRowsFp8 {
                     x: s.rows,
                     q: s.rows,
-                    rows: capacity,
-                    cols: s.hidden,
+                    rows: Rows(capacity),
+                    cols: Cols(s.hidden.get()),
                 };
                 let (Some(xb), Some(rb)) = (xq.bytes(), rq.bytes()) else {
                     return None;
@@ -3290,16 +3447,17 @@ impl CudaStep {
             }
             // The gate and up rows and the sort's offsets; the quant write's span.
             Self::ExpertActQuant(t) => {
-                let (Some(ab), Some(qb)) =
-                    (bf16_bytes(t.act.rows, t.act.cols), t.quant_write().bytes())
-                else {
+                let (Some(ab), Some(qb)) = (
+                    bf16_bytes(t.act.rows.get(), t.act.cols.get()),
+                    t.quant_write().bytes(),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
                     reads: [
                         Some(span(t.act.gate, ab)),
                         Some(span(t.act.up, ab)),
-                        Some(span(t.offsets, u32_bytes(t.experts + 1))),
+                        Some(span(t.offsets, u32_bytes(t.experts.get() + 1))),
                         None,
                     ],
                     writes: span(t.q_act, qb),
@@ -3312,15 +3470,15 @@ impl CudaStep {
             }
             Self::ExpertGemm(g) => {
                 let fp8 = matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
-                let rows = g.max_tiles as u64 * crate::op_abi::expert_tile_rows(fp8) as u64;
+                let rows = g.max_tiles.get() as u64 * crate::op_abi::expert_tile_rows(fp8) as u64;
                 let (n, k) = g.n_k();
                 // An fp8 bank's rows are the quantized ones, e4m3 then their scales.
                 let ab = match self.fp8_expert_rows() {
                     Some((a, rows, cols)) => QuantRowsFp8 {
                         x: a,
                         q: a,
-                        rows,
-                        cols,
+                        rows: Rows(rows),
+                        cols: Cols(cols),
                     }
                     .bytes(),
                     None => (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
@@ -3328,15 +3486,16 @@ impl CudaStep {
                 let (Some(ab), Some(cb), Some(bu)) = (
                     ab,
                     (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
-                    g.weight.experts(g.experts, g.hidden, g.inter),
+                    g.weight
+                        .experts(g.experts.get(), g.hidden.get(), g.inter.get()),
                 ) else {
                     return None;
                 };
                 Some(StepExtents {
                     reads: [
                         Some(span(g.a, ab)),
-                        Some(span(g.offsets, u32_bytes(g.experts + 1))),
-                        Some(span(g.tile_expert, u32_bytes(g.max_tiles))),
+                        Some(span(g.offsets, u32_bytes(g.experts.get() + 1))),
+                        Some(span(g.tile_expert, u32_bytes(g.max_tiles.get()))),
                         None,
                     ],
                     writes: span(g.c, cb),
@@ -3351,18 +3510,19 @@ impl CudaStep {
                 })
             }
             Self::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => {
-                let Some(pairs) = g.m.checked_mul(g.top_k) else {
+                let Some(pairs) = g.m.get().checked_mul(g.top_k.get()) else {
                     return None;
                 };
                 let a_rows = match g.rows {
                     PairRows::Token => g.m,
-                    PairRows::Pair => pairs,
+                    PairRows::Pair => Rows(pairs),
                 };
                 let (n, k) = g.n_k();
                 let (Some(ab), Some(cb), Some(bu)) = (
-                    bf16_bytes(a_rows, k),
+                    bf16_bytes(a_rows.get(), k),
                     bf16_bytes(pairs, n),
-                    g.weight.experts(g.experts, g.hidden, g.inter),
+                    g.weight
+                        .experts(g.experts.get(), g.hidden.get(), g.inter.get()),
                 ) else {
                     return None;
                 };
@@ -3395,9 +3555,9 @@ impl CudaStep {
                 down_rows,
             }) => {
                 let (Some(pairs), Some(db), Some(ob)) = (
-                    m.checked_mul(top_k),
-                    bf16_bytes(down_rows, hidden),
-                    bf16_bytes(m, hidden),
+                    m.get().checked_mul(top_k.get()),
+                    bf16_bytes(down_rows.get(), hidden.get()),
+                    bf16_bytes(m.get(), hidden.get()),
                 ) else {
                     return None;
                 };
@@ -3427,7 +3587,10 @@ impl CudaStep {
                 rows,
                 cols,
             }) => {
-                let (Some(bytes), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(rows, 1)) else {
+                let (Some(bytes), Some(gb)) = (
+                    bf16_bytes(rows.get(), cols.get()),
+                    bf16_bytes(rows.get(), 1),
+                ) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3455,7 +3618,7 @@ impl CudaStep {
                 cols,
                 ..
             }) => {
-                let Some(bytes) = bf16_bytes(rows, cols) else {
+                let Some(bytes) = bf16_bytes(rows.get(), cols.get()) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3476,7 +3639,7 @@ impl CudaStep {
                 rows,
                 cols,
             }) => {
-                let Some(bytes) = bf16_bytes(rows, cols) else {
+                let Some(bytes) = bf16_bytes(rows.get(), cols.get()) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3499,7 +3662,7 @@ impl CudaStep {
             Self::SoftCap(SoftCapBf16 {
                 x, out, rows, cols, ..
             }) => {
-                let Some(bytes) = bf16_bytes(rows, cols) else {
+                let Some(bytes) = bf16_bytes(rows.get(), cols.get()) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3519,7 +3682,7 @@ impl CudaStep {
                 rows,
                 cols,
             }) => {
-                let Some(bytes) = bf16_bytes(rows, cols) else {
+                let Some(bytes) = bf16_bytes(rows.get(), cols.get()) else {
                     return None;
                 };
                 Some(StepExtents {
@@ -3588,16 +3751,16 @@ const fn aligned_after(at: u64, bytes: u64) -> Option<u64> {
 impl ExpertSortBf16 {
     /// The sort's region layout ([`SortLayout`]), or `None` on overflow.
     pub const fn layout(&self) -> Option<SortLayout> {
-        let Some(pairs) = self.m.checked_mul(self.top_k) else {
+        let Some(pairs) = self.m.get().checked_mul(self.top_k.get()) else {
             return None;
         };
         let Some([chunk_hist, counts, offsets, tile_expert, pos, index_bytes]) =
-            sort_index_regions(pairs, self.experts, self.max_tiles)
+            sort_index_regions(pairs, self.experts.get(), self.max_tiles.get())
         else {
             return None;
         };
-        let rows = self.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
-        let Some(rows_bytes) = (rows * self.hidden as u64).checked_mul(CUDA_ACT_BYTES) else {
+        let rows = self.max_tiles.get() as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
+        let Some(rows_bytes) = (rows * self.hidden.get() as u64).checked_mul(CUDA_ACT_BYTES) else {
             return None;
         };
         Some(SortLayout {

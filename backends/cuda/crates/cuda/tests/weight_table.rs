@@ -12,6 +12,7 @@
 //! `router.proj` kept bf16) staged exactly, and a dtype the entry does not take refused naming the
 //! tensor and both dtypes.
 
+use scratchy_target_cuda::step::BucketM;
 use std::path::Path;
 
 use half::bf16;
@@ -141,7 +142,7 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         bytes: 0,
     };
     CudaTape {
-        bucket_m: 1,
+        bucket_m: BucketM(1),
         arena: ArenaLayout {
             colour_bytes: &[],
             colour_offsets: &[],

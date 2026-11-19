@@ -586,7 +586,7 @@ fn model_files(e: &CudaModelEntry) -> Vec<(String, String)> {
         })
         .collect();
     files.push(("weights.jsonl".into(), weights));
-    let buckets: Vec<u32> = e.tapes.iter().map(|t| t.bucket_m).collect();
+    let buckets: Vec<u32> = e.tapes.iter().map(|t| t.bucket_m.get()).collect();
     files.push((
         "entry.json".into(),
         line(&json!({"stem": e.stem, "buckets": buckets, "weights": e.weights.len()})),

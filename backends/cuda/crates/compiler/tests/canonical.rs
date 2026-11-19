@@ -8,6 +8,8 @@ use scratchy_subtile::fixtures::{
     add_only_input, front_end_lowered, gemm_m1_only_input, n_layer_input, one_layer_input, rebind,
     rmsnorm_only_input, rope_rotate_only_input, silu_mul_only_input,
 };
+use scratchy_target_cuda::step::Cols;
+use scratchy_target_cuda::step::{KDim, NDim, Rows};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
@@ -294,12 +296,20 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         .expect("a canonical binding the global cos has a table");
     assert_eq!(
         (rope.rows, rope.cols, rope.head_dim, rope.rot_dim),
-        (1, 2048, 64, 32)
+        (
+            Rows(1),
+            Cols(2048),
+            scratchy_target_cuda::step::HeadDim(64),
+            scratchy_target_cuda::step::RotDim(32)
+        )
     );
     assert_eq!(rope.x.0, 0, "x is the embedded hidden, colour 0");
     assert_eq!(rope.table, table.span.offset);
     assert_eq!(table.span.bytes, 64, "one row of 32 bf16");
-    assert_eq!((table.rot_dim, table.theta.get()), (32, 1e4));
+    assert_eq!(
+        (table.rot_dim, table.theta.get()),
+        (scratchy_target_cuda::step::RotDim(32), 1e4)
+    );
     assert_eq!(c.total_bytes, table.span.offset.0 + 256);
     assert_eq!(
         c.weight_bytes,
@@ -519,9 +529,9 @@ fn a_decode_gemm_lowers_to_the_gemv() {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(c.colour_offsets[1]),
-            m: 1,
-            n: 1024,
-            k: 1024,
+            m: Rows(1),
+            n: NDim(1024),
+            k: KDim(1024),
             residual: None,
         }))]
     );
@@ -542,9 +552,9 @@ fn a_decode_gemm_lowers_to_the_gemv() {
         c.steps.as_slice(),
         [CudaStep::Gemv(GemvBf16 {
             gemm: GemmBf16 {
-                m: 1,
-                n: 2048,
-                k: 2048,
+                m: Rows(1),
+                n: NDim(2048),
+                k: KDim(2048),
                 ..
             },
             ..
@@ -562,9 +572,9 @@ fn a_decode_gemm_of_a_narrow_n_stays_on_the_narrow_gemm() {
         [CudaStep::GemmNarrow(GemmBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
-            m: 1,
-            n: 16,
-            k: 1024,
+            m: Rows(1),
+            n: NDim(16),
+            k: KDim(1024),
             ..
         })]
     ));
@@ -1168,16 +1178,16 @@ fn a_model_with_a_table_embeds_its_token_ids_first() {
             tokens: tokens.offset,
             table: WeightIx(0),
             out: ArenaOffset(0),
-            rows: 128,
-            hidden: 512,
-            vocab: 256,
+            rows: Rows(128),
+            hidden: scratchy_target_cuda::step::HiddenSize(512),
+            vocab: scratchy_target_cuda::step::VocabSize(256),
         })
     );
     assert_eq!(
         c.input,
         TapeInput::TokenIds {
             span: tokens,
-            vocab: 256
+            vocab: scratchy_target_cuda::step::VocabSize(256)
         }
     );
     let colour_0 = ArenaSpan {

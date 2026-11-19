@@ -13,6 +13,8 @@ mod common {
     pub mod mlp;
 }
 
+use scratchy_target_cuda::step::{BlockSize, Cols, LayerId, NTile, NumKvHeads, NumQHeads, RotDim};
+use scratchy_target_cuda::step::{KDim, MaxBlocksPerSeq, NDim, Rows};
 use std::num::NonZeroU32;
 
 use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate, attn_gate_input};
@@ -145,7 +147,10 @@ fn the_two_gemm_numbers() {
     );
     assert_eq!(
         [(s[0].m, s[0].n, s[0].k), (s[1].m, s[1].n, s[1].k)],
-        [(256, 1024, 512), (256, 512, 1024)]
+        [
+            (Rows(256), NDim(1024), KDim(512)),
+            (Rows(256), NDim(512), KDim(1024))
+        ]
     );
 }
 
@@ -156,7 +161,7 @@ fn the_three_gemm_chain_reuses_y1s_colour_for_y3() {
     assert_eq!(s[2].c, s[0].c, "y3 is written over y1's colour");
     assert_eq!(
         (s[2].a.0, s[2].b.0, s[2].c.0, s[2].m, s[2].n, s[2].k),
-        (786432, 3, 262144, 256, 1024, 512)
+        (786432, 3, 262144, Rows(256), NDim(1024), KDim(512))
     );
     assert_eq!(t.arena.colour_bytes, [262144, 524288, 262144]);
     assert_eq!(t.arena.colour_offsets, [0, 262144, 786432]);
@@ -179,9 +184,9 @@ fn a_decode_gemm_lowers_to_the_gemv() {
             gemm: GemmBf16 {
                 a: ArenaOffset(0),
                 b: WeightIx(1),
-                m: 1,
-                n: 2048,
-                k: 2048,
+                m: Rows(1),
+                n: NDim(2048),
+                k: KDim(2048),
                 ..
             },
             ..
@@ -408,7 +413,7 @@ fn the_mlp_numbers() {
     );
     assert_eq!((gate.a, up.a), (n.y, n.y), "both projections read n");
     assert_eq!((sm.gate, sm.up), (gate.c, up.c), "silu(gate) · up");
-    assert_eq!((sm.rows, sm.cols), (256, I));
+    assert_eq!((sm.rows, sm.cols), (Rows(256), Cols(I)));
     assert_eq!(down.a, sm.out);
     assert_eq!(down.c, n.y, "d is written over n's colour");
     assert_eq!((y.a, y.b), (down.c, ArenaOffset(0)), "y = d + x");
@@ -667,7 +672,7 @@ fn the_attention_gate_numbers() {
             (rotary.span.offset.0, rotary.span.bytes),
             (colours_end, m * 64 * 2)
         );
-        assert_eq!((rotary.rot_dim, rotary.theta.get()), (64, 1e7));
+        assert_eq!((rotary.rot_dim, rotary.theta.get()), (RotDim(64), 1e7));
         assert_eq!(tape.arena.total_bytes, colours_end + m * 128);
         for &o in tape.arena.colour_offsets {
             assert_eq!(o % CUDA_ARENA_ALIGN, 0);
@@ -693,7 +698,7 @@ fn the_attention_gate_numbers() {
     assert_eq!((split.q, split.gate), (colour(3), colour(8)));
     assert_eq!(
         (qn.x, qn.rows, qn.cols),
-        (split.q, 2048, 256),
+        (split.q, Rows(2048), Cols(256)),
         "the per-head view of q"
     );
     assert_eq!(rope.x, qn.y, "the flatten-back view of qn");
@@ -1040,9 +1045,13 @@ fn the_attention_layer_numbers() {
         assert_eq!(kv_tape.layers, [LAYER]);
         assert_eq!(
             (kv_tape.kv_heads, kv_tape.head_dim, kv_tape.block_size),
-            (2, 256, 64)
+            (
+                NumKvHeads(2),
+                scratchy_target_cuda::step::HeadDim(256),
+                BlockSize(64)
+            )
         );
-        assert_eq!(kv_tape.max_blocks_per_seq, 128);
+        assert_eq!(kv_tape.max_blocks_per_seq, MaxBlocksPerSeq(128));
         assert_eq!(tape.steps.len(), 11);
     }
     assert_eq!(ATTN_LAYER_M256.arena.total_bytes, 9733888);
@@ -1071,8 +1080,12 @@ fn the_attention_layer_numbers() {
     let table = t.rotary.expect("a rotary table").span.offset;
     assert_eq!(group.a, n.y, "q, k and v project n");
     assert_eq!(split.qg, qg.c);
-    assert_eq!((qn.x, qn.rows), (split.q, 2048), "the per-head view of q");
-    assert_eq!((kn.x, kn.rows), (k.c, 512), "the per-head view of k");
+    assert_eq!(
+        (qn.x, qn.rows),
+        (split.q, Rows(2048)),
+        "the per-head view of q"
+    );
+    assert_eq!((kn.x, kn.rows), (k.c, Rows(512)), "the per-head view of k");
     assert_eq!((rope.x, rope.table), (qn.y, table));
     assert_eq!(
         (append.k, append.v, append.table, append.k_out),
@@ -1087,7 +1100,13 @@ fn the_attention_layer_numbers() {
             append.head_dim,
             append.rot_dim
         ),
-        (0, 256, 512, 256, 64)
+        (
+            LayerId(0),
+            Rows(256),
+            Cols(512),
+            scratchy_target_cuda::step::HeadDim(256),
+            RotDim(64)
+        )
     );
     assert_eq!(
         (attn.q, attn.block_table, attn.sequence, attn.out),
@@ -1106,7 +1125,13 @@ fn the_attention_layer_numbers() {
             attn.kv_heads,
             attn.head_dim
         ),
-        (0, 256, 8, 2, 256)
+        (
+            LayerId(0),
+            Rows(256),
+            NumQHeads(8),
+            NumKvHeads(2),
+            scratchy_target_cuda::step::HeadDim(256)
+        )
     );
     assert_eq!(
         attn.scale,
@@ -1475,7 +1500,14 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
             a.layer,
             a.scale.get()
         ),
-        (1, 8, 2, 256, 0, 0.0625)
+        (
+            Rows(1),
+            NumQHeads(8),
+            NumKvHeads(2),
+            scratchy_target_cuda::step::HeadDim(256),
+            LayerId(0),
+            0.0625
+        )
     );
     assert_eq!(a.block_table, kv.block_table.offset);
     assert_eq!(a.sequence, kv.sequence.offset);
@@ -1493,7 +1525,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
         matches!(
             c.steps[1],
             CudaStep::GemvGroup(GemvGroupBf16 {
-                group: GemmGroupBf16 { m: 1, .. },
+                group: GemmGroupBf16 { m: Rows(1), .. },
                 ..
             })
         ),
@@ -1503,7 +1535,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     assert!(
         matches!(
             c.steps[8],
-            CudaStep::Gemv(GemvBf16 { gemm: GemmBf16 { m: 1, residual, .. }, .. })
+            CudaStep::Gemv(GemvBf16 { gemm: GemmBf16 { m: Rows(1), residual, .. }, .. })
                 if residual.is_some()
         ),
         "step 8: {:?}",
@@ -1516,10 +1548,10 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     };
     let row = |at: ArenaOffset, cols: u32| span(at.0, 2 * u64::from(cols));
     for (what, read, from) in [
-        ("qn", row(rope.x, rope.cols), 5),
-        ("kr", row(append.k_out, append.cols), 5),
-        ("v", row(append.v, append.cols), 5),
-        ("attn", row(a.out, a.q_heads * a.head_dim), 6),
+        ("qn", row(rope.x, rope.cols.get()), 5),
+        ("kr", row(append.k_out, append.cols.get()), 5),
+        ("v", row(append.v, append.cols.get()), 5),
+        ("attn", row(a.out, a.q_heads.get() * a.head_dim.get()), 6),
     ] {
         for (i, s) in c.steps.iter().enumerate().skip(from + 1) {
             let e = s.extents().expect("extents fit");
@@ -1880,9 +1912,9 @@ fn a_narrow_gemm_takes_any_rows() {
     assert!(matches!(
         c.steps.as_slice(),
         [CudaStep::GemmNarrow(GemmBf16 {
-            m: 37,
-            n: 64,
-            k: 8,
+            m: Rows(37),
+            n: NDim(64),
+            k: KDim(8),
             ..
         })]
     ));
@@ -1891,9 +1923,9 @@ fn a_narrow_gemm_takes_any_rows() {
     assert!(matches!(
         c.steps.as_slice(),
         [CudaStep::GemmNarrow(GemmBf16 {
-            m: 1,
-            n: 16,
-            k: 1024,
+            m: Rows(1),
+            n: NDim(16),
+            k: KDim(1024),
             ..
         })]
     ));
@@ -2279,7 +2311,7 @@ fn a_gemma_gemm_off_the_256_tile_lowers_to_the_64_column_gemm() {
         let CudaStep::GemmCol64(g) = step else {
             panic!("n = {n}: expected GemmCol64, got {step:?}");
         };
-        assert_eq!((g.m, g.n, g.k), (256, n, 2816), "n = {n}");
+        assert_eq!((g.m, g.n, g.k), (Rows(256), NDim(n), KDim(2816)), "n = {n}");
     }
 }
 
@@ -2426,7 +2458,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     } else {
                         64
                     };
-                    assert_eq!((g.weight, g.n_tile), (MoeWeight::Own, tile), "m={m}");
+                    assert_eq!((g.weight, g.n_tile), (MoeWeight::Own, NTile(tile)), "m={m}");
                 }
                 CudaStep::SiluMul(_) => panic!("m={m}: a SiLU in a GeGLU block"),
                 _ => {}
@@ -2568,7 +2600,10 @@ fn a_gemma_moe_under_qwen_facts_is_off_the_256_tile() {
         .collect();
     assert_eq!(
         routers,
-        [(128, scratchy_target_cuda::step::MatmulKernel::Col64)],
+        [(
+            scratchy_target_cuda::step::NumExperts(128),
+            scratchy_target_cuda::step::MatmulKernel::Col64
+        )],
         "{:?}",
         c.steps
     );
@@ -2628,16 +2663,28 @@ fn a_sliding_layer_lowers_with_its_class() {
         let c = lower_with(&l, two_class_facts(Some(1024))).unwrap_or_else(|e| panic!("{e}"));
         let local = c.rotary_local.expect("the local table");
         assert!(c.rotary.is_none(), "m={m}: the global table is not bound");
-        assert_eq!((local.rot_dim, local.theta.get()), (64, 1e4), "m={m}");
+        assert_eq!(
+            (local.rot_dim, local.theta.get()),
+            (RotDim(64), 1e4),
+            "m={m}"
+        );
         let kv = c.kv.as_ref().expect("a KV pool");
         assert_eq!(kv.layer_class, [0], "m={m}");
-        assert_eq!(kv.classes[0].window, Some(1024), "m={m}");
+        assert_eq!(
+            kv.classes[0].window,
+            Some(scratchy_target_cuda::step::AttnWindow(1024)),
+            "m={m}"
+        );
         for step in &c.steps {
             match *step {
                 CudaStep::Rope(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
                 CudaStep::RopeAppend(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
                 CudaStep::AttnPrefill(a) | CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => {
-                    assert_eq!(a.window, Some(1024), "m={m}")
+                    assert_eq!(
+                        a.window,
+                        Some(scratchy_target_cuda::step::AttnWindow(1024)),
+                        "m={m}"
+                    )
                 }
                 _ => {}
             }
@@ -2899,7 +2946,7 @@ fn vnorm_shape(l: &LoweredDecode, facts: LoweringFacts) -> (u32, u32) {
     };
     let c = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("the v_norm lowers: {e}"));
     match static_tape(&c).steps {
-        [CudaStep::RmsNormUnit(n)] => (n.rows, n.cols),
+        [CudaStep::RmsNormUnit(n)] => (n.rows.get(), n.cols.get()),
         other => panic!("one RmsNormUnit step: {other:?}"),
     }
 }

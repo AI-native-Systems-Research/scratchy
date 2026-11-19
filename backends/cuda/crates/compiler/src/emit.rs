@@ -38,6 +38,9 @@
 //! both, under the model's stem, in `scratchy_target_cuda::registry`, where the serving worker
 //! finds them without naming the model crate.
 
+use scratchy_target_cuda::step::{
+    BlockSize, BucketM, ConvKernel, GdnHeadDim, GdnHeads, HeadDim, MaxBlocksPerSeq, NumKvHeads,
+};
 use std::collections::{BTreeMap, HashMap};
 
 use proc_macro2::TokenStream;
@@ -130,6 +133,33 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "Scale",
                 "SoftCap",
                 "RopeTheta",
+                "Rows",
+                "Cols",
+                "NDim",
+                "KDim",
+                "HeadDim",
+                "RotDim",
+                "FreqDim",
+                "NumQHeads",
+                "NumKvHeads",
+                "LayerId",
+                "HiddenSize",
+                "IntermediateSize",
+                "VocabSize",
+                "NumExperts",
+                "TopK",
+                "MaxTiles",
+                "NTile",
+                "TileRows",
+                "GdnHeads",
+                "GdnHeadDim",
+                "ConvKernel",
+                "Splits",
+                "MinTiles",
+                "AttnWindow",
+                "BlockSize",
+                "MaxBlocksPerSeq",
+                "BucketM",
                 "ScaleBf16",
                 "RmsNormUnitBf16",
                 "LayerScaleBf16",
@@ -540,11 +570,16 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         }) => {
             // `validate` sized the bundle, so its conv width fits; `u32::MAX` never matches a
             // checkpoint's.
-            let conv_dim =
-                gdn_conv_dim(num_k_heads, head_k, num_v_heads, head_v).unwrap_or(u32::MAX);
+            let conv_dim = gdn_conv_dim(
+                num_k_heads.get(),
+                head_k.get(),
+                num_v_heads.get(),
+                head_v.get(),
+            )
+            .unwrap_or(u32::MAX);
             Some((
                 bundle,
-                Role::Bundle([conv_dim, conv_kernel, num_v_heads, head_v]),
+                Role::Bundle([conv_dim, conv_kernel.get(), num_v_heads.get(), head_v.get()]),
             ))
         }
         CudaStep::RouterLogits(RouterLogitsBf16 {
@@ -574,7 +609,10 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
                     ..
                 },
             ..
-        }) => Some((bundle, Role::MoeBundle([experts, hidden, inter]))),
+        }) => Some((
+            bundle,
+            Role::MoeBundle([experts.get(), hidden.get(), inter.get()]),
+        )),
         // Gemma's router projection, one bf16 tensor.
         CudaStep::RouterLogits(RouterLogitsBf16 {
             bundle,
@@ -606,7 +644,10 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
                     ..
                 },
             ..
-        }) => Some((bundle, Role::ExpertBank([experts, hidden, inter]))),
+        }) => Some((
+            bundle,
+            Role::ExpertBank([experts.get(), hidden.get(), inter.get()]),
+        )),
         CudaStep::RouterLogits(RouterLogitsBf16 {
             bundle,
             weight: MoeWeight::Fp8Bundle,
@@ -634,7 +675,10 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
                     ..
                 },
             ..
-        }) => Some((bundle, Role::Fp8MoeBundle([experts, hidden, inter]))),
+        }) => Some((
+            bundle,
+            Role::Fp8MoeBundle([experts.get(), hidden.get(), inter.get()]),
+        )),
         // Gemma's router stays its own bf16 projection beside an fp8 bank (the checkpoint's
         // `ignore` lists `router.proj`).
         CudaStep::RouterLogits(RouterLogitsBf16 {
@@ -666,7 +710,10 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
                     ..
                 },
             ..
-        }) => Some((bundle, Role::Fp8ExpertBank([experts, hidden, inter]))),
+        }) => Some((
+            bundle,
+            Role::Fp8ExpertBank([experts.get(), hidden.get(), inter.get()]),
+        )),
         CudaStep::QuantRowsFp8(_) | CudaStep::ExpertSortFp8(_) | CudaStep::ExpertActQuant(_) => {
             None
         }
@@ -1004,7 +1051,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         greedy,
     } = c;
     CudaTape {
-        bucket_m: *bucket_m,
+        bucket_m: BucketM(*bucket_m),
         arena: ArenaLayout {
             colour_bytes: baked(colour_bytes),
             colour_offsets: baked(colour_offsets),
@@ -1030,10 +1077,10 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                  layer_class,
              }| KvTape {
                 layers: baked(layers),
-                kv_heads: *kv_heads,
-                head_dim: *head_dim,
-                block_size: *block_size,
-                max_blocks_per_seq: *max_blocks_per_seq,
+                kv_heads: NumKvHeads(*kv_heads),
+                head_dim: HeadDim(*head_dim),
+                block_size: BlockSize(*block_size),
+                max_blocks_per_seq: MaxBlocksPerSeq(*max_blocks_per_seq),
                 block_table: *block_table,
                 slot_mapping: *slot_mapping,
                 sequence: *sequence,
@@ -1053,11 +1100,11 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                  scratch,
              }| GdnTape {
                 layers: baked(layers),
-                num_k_heads: *num_k_heads,
-                num_v_heads: *num_v_heads,
-                head_k: *head_k,
-                head_v: *head_v,
-                conv_kernel: *conv_kernel,
+                num_k_heads: GdnHeads(*num_k_heads),
+                num_v_heads: GdnHeads(*num_v_heads),
+                head_k: GdnHeadDim(*head_k),
+                head_v: GdnHeadDim(*head_v),
+                conv_kernel: ConvKernel(*conv_kernel),
                 sequence: *sequence,
                 scratch: *scratch,
             },

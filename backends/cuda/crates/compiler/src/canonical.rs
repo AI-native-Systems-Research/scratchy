@@ -19,6 +19,10 @@
 //!
 //! [`steps_from_tape`]: crate::steps_from_tape
 
+use scratchy_target_cuda::step::{
+    AttnWindow, Cols, FreqDim, HeadDim, HiddenSize, IntermediateSize, MaxTiles, NDim, NumExperts,
+    NumKvHeads, RotDim, Rows, TileRows, TopK, VocabSize,
+};
 use std::collections::BTreeMap;
 
 use scratchy_ir::model_facts::{Attention, AttnClass, HeadGeometry, ModelFacts};
@@ -165,8 +169,8 @@ fn rotary_table(
     let theta = facts.theta(class).ok_or(CanonicalRefusal::NoRopeTheta)?;
     Ok(Some(RotaryTable {
         span,
-        rot_dim: g.rot_dim().get(),
-        freq_dim: facts.freq_dim(class, g),
+        rot_dim: RotDim(g.rot_dim().get()),
+        freq_dim: FreqDim(facts.freq_dim(class, g)),
         theta: RopeTheta::new(theta),
     }))
 }
@@ -1578,7 +1582,10 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     };
     let result = span(plan.colouring.result());
     let input = match head {
-        Some((_, span, vocab, _)) => TapeInput::TokenIds { span, vocab },
+        Some((_, span, vocab, _)) => TapeInput::TokenIds {
+            span,
+            vocab: VocabSize(vocab),
+        },
         None => TapeInput::Hidden(span(Colour::ZERO)),
     };
     // A GDN or MoE step's bundle is a `[1, 1]` source in the IR; on the device it is the packed
@@ -1645,11 +1652,11 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, .. }) | CudaStep::GdnDecode(g) => {
                 Some(CanonicalGdn {
                     layers: gdn_layers.clone(),
-                    num_k_heads: g.num_k_heads,
-                    num_v_heads: g.num_v_heads,
-                    head_k: g.head_k,
-                    head_v: g.head_v,
-                    conv_kernel: g.conv_kernel,
+                    num_k_heads: g.num_k_heads.get(),
+                    num_v_heads: g.num_v_heads.get(),
+                    head_k: g.head_k.get(),
+                    head_v: g.head_v.get(),
+                    conv_kernel: g.conv_kernel.get(),
                     sequence: r.sequence,
                     scratch: r.scratch,
                 })
@@ -1724,40 +1731,48 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
     let fp8 = |w: MoeWeight| matches!(w, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
     match s {
         CudaStep::GemvFp8(GemvBf16 { gemm: g, .. })
-            if g.m == 1 && gemv_tc_takes([g.n, 0, 0], g.k, 1) =>
+            if g.m == Rows(1) && gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1) =>
         {
             CudaStep::GemvTcFp8(g)
         }
         CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {
-            let third = g.third.map_or(0, |t| t.n);
-            match g.m == 1 && gemv_tc_takes([g.first.n, g.second.n, third], g.k, 1) {
+            let third = g.third.map_or(0, |t| t.n.get());
+            match g.m == Rows(1)
+                && gemv_tc_takes([g.first.n.get(), g.second.n.get(), third], g.k.get(), 1)
+            {
                 true => CudaStep::GemvGroupTcFp8(g),
                 false => s,
             }
         }
         CudaStep::GateUpAct(fold)
             if matches!(fold.kernel, GateUpKernel::GemvFp8(_))
-                && fold.gate.m == 1
-                && fold.gate.n <= ACT_QUANT_MAX_COLS
-                && gemv_tc_takes([fold.gate.n, fold.up.n, 0], fold.gate.k, 1) =>
+                && fold.gate.m == Rows(1)
+                && fold.gate.n <= NDim(ACT_QUANT_MAX_COLS)
+                && gemv_tc_takes(
+                    [fold.gate.n.get(), fold.up.n.get(), 0],
+                    fold.gate.k.get(),
+                    1,
+                ) =>
         {
             CudaStep::GateUpTcFp8(GateUpTcFp8 {
                 fold,
                 q_act: fold.out,
             })
         }
-        CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) if g.m == 1 && fp8(g.weight) => {
+        CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. })
+            if g.m == Rows(1) && fp8(g.weight) =>
+        {
             let (n, k) = g.n_k();
-            match gemv_tc_takes([n, 0, 0], k, g.top_k) {
+            match gemv_tc_takes([n, 0, 0], k, g.top_k.get()) {
                 true => CudaStep::ExpertGemvTcFp8(g),
                 false => s,
             }
         }
         CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold, .. })
-            if fold.gate.m == 1 && fp8(fold.gate.weight) =>
+            if fold.gate.m == Rows(1) && fp8(fold.gate.weight) =>
         {
             let (n, k) = fold.gate.n_k();
-            match n <= ACT_QUANT_MAX_COLS && gemv_tc_takes([n, n, 0], k, fold.gate.top_k) {
+            match n <= ACT_QUANT_MAX_COLS && gemv_tc_takes([n, n, 0], k, fold.gate.top_k.get()) {
                 true => CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
                     fold,
                     q_act: fold.out,
@@ -1797,8 +1812,8 @@ fn quantize_fp8_inputs(
             let q = QuantRowsFp8 {
                 x,
                 q: x,
-                rows,
-                cols,
+                rows: Rows(rows),
+                cols: Cols(cols),
             };
             most[0] = most[0].max(q.bytes().ok_or_else(too_large)?);
         }
@@ -1824,15 +1839,16 @@ fn quantize_fp8_inputs(
             t.q_act = slots[1];
         }
         if let Some((x, rows, cols)) = s.quantized_input() {
-            let held = (live.iter().flatten()).find(|l| (l.x, l.rows, l.cols) == (x, rows, cols));
+            let held = (live.iter().flatten())
+                .find(|l| (l.x, l.rows, l.cols) == (x, Rows(rows), Cols(cols)));
             let q = match held {
                 Some(l) => l.q,
                 None => {
                     let quant = QuantRowsFp8 {
                         x,
                         q: slots[0],
-                        rows,
-                        cols,
+                        rows: Rows(rows),
+                        cols: Cols(cols),
                     };
                     out.push(CudaStep::QuantRowsFp8(quant));
                     live[0] = Some(quant);
@@ -1867,7 +1883,7 @@ fn quantize_fp8_inputs(
             let rows = l.and_then(|q| {
                 Some(ArenaSpan {
                     offset: q.x,
-                    bytes: u64::from(q.rows.checked_mul(q.cols)?) * CUDA_ACT_BYTES,
+                    bytes: u64::from(q.rows.get().checked_mul(q.cols.get())?) * CUDA_ACT_BYTES,
                 })
             });
             if let (Some(rows), Some(writes)) = (rows, &writes)
@@ -1924,9 +1940,9 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
                     _ => None,
                 });
                 let capacity =
-                    down.and_then(|d| d.max_tiles.checked_mul(CUDA_FP8_EXPERT_TILE_ROWS));
+                    down.and_then(|d| d.max_tiles.get().checked_mul(CUDA_FP8_EXPERT_TILE_ROWS));
                 if let (Some(d), Some(rows)) = (down, capacity)
-                    && (act.rows, act.cols) == (rows, d.inter)
+                    && (act.rows, act.cols) == (Rows(rows), Cols(d.inter.get()))
                 {
                     steps[i] = CudaStep::ExpertActQuant(ExpertActQuantFp8 {
                         act,
@@ -1963,16 +1979,22 @@ pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
                 (g.max_tiles, g.experts, g.hidden, g.inter),
             )
         };
-        let capacity = gate.max_tiles.checked_mul(CUDA_FP8_EXPERT_TILE_ROWS);
+        let capacity = gate.max_tiles.get().checked_mul(CUDA_FP8_EXPERT_TILE_ROWS);
         fp8(gate)
             && (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up)
             && shared(gate) == shared(up)
             && (act.act.gate, act.act.up, act.offsets) == (gate.c, up.c, gate.offsets)
-            && capacity == Some(act.act.rows)
-            && act.act.cols == gate.inter
-            && gate.hidden.is_multiple_of(EXPERT_GATE_UP_FP8_K_MULTIPLE)
-            && gate.inter.is_multiple_of(EXPERT_GATE_UP_FP8_INTER_MULTIPLE)
-            && MOE_EXPERT_COUNTS.contains(&gate.experts)
+            && capacity == Some(act.act.rows.get())
+            && act.act.cols == Cols(gate.inter.get())
+            && gate
+                .hidden
+                .get()
+                .is_multiple_of(EXPERT_GATE_UP_FP8_K_MULTIPLE)
+            && gate
+                .inter
+                .get()
+                .is_multiple_of(EXPERT_GATE_UP_FP8_INTER_MULTIPLE)
+            && MOE_EXPERT_COUNTS.contains(&gate.experts.get())
     };
     let mut out = Vec::with_capacity(steps.len());
     let mut i = 0;
@@ -2004,7 +2026,7 @@ pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
 /// fewer. Every other step is as it was; the quant scratch holds what it held, at the same step.
 fn fold_norm_quants(steps: Vec<CudaStep>) -> Vec<CudaStep> {
     let folds = |n: RmsNormBf16, q: QuantRowsFp8| {
-        (q.x, q.rows, q.cols) == (n.y, n.rows, n.cols) && norm_row_takes(n.rows, n.cols)
+        (q.x, q.rows, q.cols) == (n.y, n.rows, n.cols) && norm_row_takes(n.rows.get(), n.cols.get())
     };
     let mut out: Vec<CudaStep> = Vec::with_capacity(steps.len());
     for s in steps {
@@ -2129,8 +2151,8 @@ fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
         kv_heads,
         head_dim,
         classes: vec![KvClass {
-            kv_heads,
-            head_dim,
+            kv_heads: NumKvHeads(kv_heads),
+            head_dim: HeadDim(head_dim),
             window: None,
         }],
     }))
@@ -2194,16 +2216,16 @@ fn kv_cache_of_classes(
     let kv_class = |c: AttnClass| {
         let (head_dim, kv_heads, _) = shape(attention.class(c));
         KvClass {
-            kv_heads,
-            head_dim,
-            window: plan.facts.window(c),
+            kv_heads: NumKvHeads(kv_heads),
+            head_dim: HeadDim(head_dim),
+            window: (plan.facts.window(c)).map(AttnWindow),
         }
     };
     let base = kv_class(AttnClass::Sliding);
     Ok(Some(KvPool {
         layers,
-        kv_heads: base.kv_heads,
-        head_dim: base.head_dim,
+        kv_heads: base.kv_heads.get(),
+        head_dim: base.head_dim.get(),
         classes: vec![base, kv_class(AttnClass::Full)],
         layer_class,
     }))
@@ -2365,12 +2387,12 @@ fn moe_scratch(
         (None, tail)
     };
     Ok(MoeTape {
-        experts: g.experts,
-        top_k: g.top_k,
-        hidden: g.hidden,
-        inter: g.inter,
-        tile_rows,
-        max_tiles: if sorted { tiles } else { 0 },
+        experts: NumExperts(g.experts),
+        top_k: TopK(g.top_k),
+        hidden: HiddenSize(g.hidden),
+        inter: IntermediateSize(g.inter),
+        tile_rows: TileRows(tile_rows),
+        max_tiles: if sorted { MaxTiles(tiles) } else { MaxTiles(0) },
         logits: head[0],
         topk_idx: head[1],
         scores: head[2],

@@ -14,13 +14,15 @@ use serde::Serialize;
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
     ARGMAX_CHUNK, ARGMAX_MAX_VOCAB, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AddRmsNormBf16,
-    AddRmsNormQuantFp8, AttnDecodeBf16, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16,
-    ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection,
-    ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
-    GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemvBf16,
-    MoeRouteBf16, MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
-    RopeBf16, RopeTheta, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
-    sort_index_regions,
+    AddRmsNormQuantFp8, AttnDecodeBf16, AttnPrefillBf16, AttnWindow, BlockSize, BucketM,
+    CUDA_KV_BLOCK_SIZE, Cols, ConvKernel, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, FreqDim,
+    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
+    GatedDeltaNetBf16, GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GemmBf16, GemvBf16,
+    HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, MoeWeight,
+    NumExperts, NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
+    RopeBf16, RopeTheta, RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows, TopK, VocabSize,
+    gdn_conv_dim, gdn_scratch, quant_chain, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -69,10 +71,10 @@ pub struct RotaryTable {
     /// Where the table lives in the arena, after every colour.
     pub span: ArenaSpan,
     /// `R`, the rotated width of each head.
-    pub rot_dim: u32,
+    pub rot_dim: RotDim,
     /// `F`, the frequency exponent's denominator: `rot_dim` for a half-rotated class, the head dim
     /// for a half-head (proportional) one, Gemma 4's global layers' 512. At least `rot_dim`.
-    pub freq_dim: u32,
+    pub freq_dim: FreqDim,
     /// The table's `rope_theta`.
     pub theta: RopeTheta,
 }
@@ -89,12 +91,12 @@ pub struct KvTape {
     /// Model layer ids whose K/V this tape reads or writes, in pool order (ascending); a step's
     /// `layer` is an index into this list.
     pub layers: &'static [u32],
-    pub kv_heads: u32,
-    pub head_dim: u32,
+    pub kv_heads: NumKvHeads,
+    pub head_dim: HeadDim,
     /// Token slots per block: [`CUDA_KV_BLOCK_SIZE`].
-    pub block_size: u32,
+    pub block_size: BlockSize,
     /// Block-table entries per sequence: `crate::step::CUDA_MAX_BLOCKS_PER_SEQ`.
-    pub max_blocks_per_seq: u32,
+    pub max_blocks_per_seq: MaxBlocksPerSeq,
     /// `max_blocks_per_seq` u32, the unused entries `u32::MAX`.
     pub block_table: ArenaSpan,
     /// `bucket_m` u32, a padding row's `u32::MAX`.
@@ -148,9 +150,9 @@ impl KvTape {
             let class = self.classes.get(usize::from(c))?;
             let layout = PagedKvLayout {
                 num_blocks,
-                num_kv_heads: class.kv_heads,
-                block_size: self.block_size,
-                head_dim: class.head_dim,
+                num_kv_heads: class.kv_heads.get(),
+                block_size: self.block_size.get(),
+                head_dim: class.head_dim.get(),
             };
             per_layer.push((layout, usize::try_from(at).ok()?));
             at = at.checked_add(kv_buffer_elems(&layout)?.checked_mul(2)?)?;
@@ -175,9 +177,9 @@ fn kv_buffer_elems(layout: &PagedKvLayout) -> Option<u64> {
 /// and its queries see their last `window` keys (`None`: every key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct KvClass {
-    pub kv_heads: u32,
-    pub head_dim: u32,
-    pub window: Option<u32>,
+    pub kv_heads: NumKvHeads,
+    pub head_dim: HeadDim,
+    pub window: Option<AttnWindow>,
 }
 
 /// Bytes of one u32 entry of a KV region.
@@ -200,11 +202,11 @@ pub struct GdnTape {
     /// Model layer ids whose GDN state this tape reads and writes, in pool order (ascending); a
     /// step's `layer` is an index into this list.
     pub layers: &'static [u32],
-    pub num_k_heads: u32,
-    pub num_v_heads: u32,
-    pub head_k: u32,
-    pub head_v: u32,
-    pub conv_kernel: u32,
+    pub num_k_heads: GdnHeads,
+    pub num_v_heads: GdnHeads,
+    pub head_k: GdnHeadDim,
+    pub head_v: GdnHeadDim,
+    pub conv_kernel: ConvKernel,
     /// `[slot, q_len, start, 0]` u32: exactly 16 bytes at an aligned offset of its own.
     pub sequence: ArenaSpan,
     /// The f32 scratch every GDN step passes its intermediates through:
@@ -215,9 +217,14 @@ pub struct GdnTape {
 impl GdnTape {
     /// The scratch's bytes at `bucket_m` rows of this geometry, or `None` on overflow.
     fn scratch_bytes(&self, bucket_m: u32) -> Option<u64> {
-        let value_dim = self.num_v_heads.checked_mul(self.head_v)?;
-        let conv_dim = gdn_conv_dim(self.num_k_heads, self.head_k, self.num_v_heads, self.head_v)?;
-        gdn_scratch(bucket_m, conv_dim, self.num_v_heads, value_dim).map(|s| s.bytes)
+        let value_dim = self.num_v_heads.get().checked_mul(self.head_v.get())?;
+        let conv_dim = gdn_conv_dim(
+            self.num_k_heads.get(),
+            self.head_k.get(),
+            self.num_v_heads.get(),
+            self.head_v.get(),
+        )?;
+        gdn_scratch(bucket_m, conv_dim, self.num_v_heads.get(), value_dim).map(|s| s.bytes)
     }
 }
 
@@ -233,14 +240,14 @@ impl GdnTape {
 /// [`CUDA_ARENA_ALIGN`], in that order. Nothing in it is cleared between forwards or layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct MoeTape {
-    pub experts: u32,
-    pub top_k: u32,
-    pub hidden: u32,
-    pub inter: u32,
+    pub experts: NumExperts,
+    pub top_k: TopK,
+    pub hidden: HiddenSize,
+    pub inter: IntermediateSize,
     /// [`CUDA_EXPERT_TILE_ROWS`].
-    pub tile_rows: u32,
+    pub tile_rows: TileRows,
     /// The sorted rows' tiles, `⌊(P + 127·n) / 128⌋`; 0 when gathered.
-    pub max_tiles: u32,
+    pub max_tiles: MaxTiles,
     pub logits: ArenaSpan,
     pub topk_idx: ArenaSpan,
     pub scores: ArenaSpan,
@@ -411,8 +418,8 @@ impl MoeTape {
     /// The rows of the expert regions: `R` sorted, `P` gathered.
     pub fn expert_rows(&self, bucket_m: u32) -> u32 {
         match self.sort {
-            Some(_) => self.max_tiles * self.tile_rows,
-            None => bucket_m * self.top_k,
+            Some(_) => self.max_tiles.get() * self.tile_rows.get(),
+            None => bucket_m * self.top_k.get(),
         }
     }
 }
@@ -426,7 +433,7 @@ pub enum TapeInput {
     /// `bucket_m` u32 token ids, one per row, at an aligned region after every other: the tape's
     /// first step is the one [`CudaStep::Embed`], which gathers them from the `vocab`-row table
     /// into colour 0. Every id is below `vocab`; the worker checks that before any copy.
-    TokenIds { span: ArenaSpan, vocab: u32 },
+    TokenIds { span: ArenaSpan, vocab: VocabSize },
 }
 
 impl TapeInput {
@@ -447,7 +454,7 @@ const TOKEN_ID_BYTES: u64 = 4;
 /// expansion by [`GreedyArgmax::of`]; the worker only plays it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GreedyArgmax {
-    pub width: u32,
+    pub width: VocabSize,
 }
 
 impl GreedyArgmax {
@@ -463,7 +470,7 @@ impl GreedyArgmax {
             && width <= ARGMAX_MAX_VOCAB as u64;
         match takes {
             true => Some(Self {
-                width: width as u32,
+                width: VocabSize(width as u32),
             }),
             false => None,
         }
@@ -474,7 +481,7 @@ impl GreedyArgmax {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CudaTape {
     /// The token count `M` the tape is compiled for.
-    pub bucket_m: u32,
+    pub bucket_m: BucketM,
     pub arena: ArenaLayout,
     /// What the forward uploads: the embedded hidden (colour 0), or the token ids its first step
     /// embeds into colour 0.
@@ -1233,17 +1240,20 @@ impl CudaTape {
             // `rot_dim/2` cos and `rot_dim/2` sin.
             let rows_bytes =
                 (u64::from(self.bucket_m) * u64::from(t.rot_dim)).checked_mul(CUDA_ACT_BYTES);
-            if t.rot_dim == 0 || t.rot_dim % 2 != 0 || rows_bytes != Some(t.span.bytes) {
+            if t.rot_dim == RotDim(0)
+                || t.rot_dim.get() % 2 != 0
+                || rows_bytes != Some(t.span.bytes)
+            {
                 return Err(TapeError::RotaryShape {
                     span: t.span,
-                    bucket_m: self.bucket_m,
-                    rot_dim: t.rot_dim,
+                    bucket_m: self.bucket_m.get(),
+                    rot_dim: t.rot_dim.get(),
                 });
             }
-            if t.freq_dim < t.rot_dim {
+            if t.freq_dim < FreqDim(t.rot_dim.get()) {
                 return Err(TapeError::RotaryFreqDim {
-                    rot_dim: t.rot_dim,
-                    freq_dim: t.freq_dim,
+                    rot_dim: t.rot_dim.get(),
+                    freq_dim: t.freq_dim.get(),
                 });
             }
         }
@@ -1263,7 +1273,7 @@ impl CudaTape {
             }
         }
         // Last, so a tape refused for any other fact names that one first.
-        let want = GreedyArgmax::of(self.bucket_m, self.result);
+        let want = GreedyArgmax::of(self.bucket_m.get(), self.result);
         if self.greedy != want {
             return Err(TapeError::Greedy {
                 got: self.greedy,
@@ -1414,12 +1424,12 @@ impl CudaTape {
                 let want = u64::from(self.bucket_m) * TOKEN_ID_BYTES;
                 if !span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN)
                     || span.bytes != want
-                    || vocab == 0
+                    || vocab == VocabSize(0)
                 {
                     return Err(TapeError::TokenIdsShape {
                         span,
-                        bucket_m: self.bucket_m,
-                        vocab,
+                        bucket_m: self.bucket_m.get(),
+                        vocab: vocab.get(),
                     });
                 }
                 if let Some((step, _)) = embeds.clone().find(|&(step, _)| step > 0) {
@@ -1437,7 +1447,7 @@ impl CudaTape {
                     let first = (!self.steps.is_empty()).then_some(0);
                     return Err(TapeError::EmbedMissing { first });
                 };
-                if (tokens, rows, embed_vocab) != (span.offset, self.bucket_m, vocab) {
+                if (tokens, rows, embed_vocab) != (span.offset, Rows(self.bucket_m.get()), vocab) {
                     return Err(TapeError::EmbedInput { step: 0 });
                 }
                 // The embed fills colour 0 and nothing else: its offset, and its bytes exactly.
@@ -1473,11 +1483,17 @@ impl CudaTape {
         for c in kv.classes {
             let window_ok = c
                 .window
-                .is_none_or(|w| w != 0 && w.is_multiple_of(ATTN_WINDOW_MULTIPLE));
-            let head_ok = c.head_dim == kv.head_dim || ATTN_BF16_HEAD_DIMS.contains(&c.head_dim);
+                .is_none_or(|w| w != AttnWindow(0) && w.get().is_multiple_of(ATTN_WINDOW_MULTIPLE));
+            let head_ok =
+                c.head_dim == kv.head_dim || ATTN_BF16_HEAD_DIMS.contains(&c.head_dim.get());
             let row = u64::from(c.kv_heads) * u64::from(c.head_dim);
             let fits = row <= u64::from(kv.kv_heads) * u64::from(kv.head_dim);
-            if c.kv_heads == 0 || c.head_dim == 0 || !head_ok || !window_ok || !fits {
+            if c.kv_heads == NumKvHeads(0)
+                || c.head_dim == HeadDim(0)
+                || !head_ok
+                || !window_ok
+                || !fits
+            {
                 return Err(TapeError::KvClasses);
             }
         }
@@ -1503,8 +1519,11 @@ impl CudaTape {
         let Some(class) = kv.classes.get(c) else {
             return false;
         };
-        step == (class.kv_heads, class.head_dim, class.window)
-            && (c != 0 || (step.0, step.1) == (kv.kv_heads, kv.head_dim))
+        step == (
+            class.kv_heads.get(),
+            class.head_dim.get(),
+            class.window.map(AttnWindow::get),
+        ) && (c != 0 || (step.0, step.1) == (kv.kv_heads.get(), kv.head_dim.get()))
     }
 
     /// The regions the forward fills before the steps run: the rotary table and the KV regions,
@@ -1524,9 +1543,9 @@ impl CudaTape {
             return Ok(regions);
         };
         self.kv_classes(&kv)?;
-        if kv.block_size != CUDA_KV_BLOCK_SIZE {
+        if kv.block_size != BlockSize(CUDA_KV_BLOCK_SIZE) {
             return Err(TapeError::KvBlockSize {
-                block_size: kv.block_size,
+                block_size: kv.block_size.get(),
             });
         }
         for (region, span, want) in [
@@ -1577,27 +1596,33 @@ impl CudaTape {
             ..
         } = gdn;
         let (kmin, kmax) = GDN_CONV_KERNEL_RANGE;
-        let takes = (kmin..=kmax).contains(&conv_kernel)
-            && num_k_heads > 0
-            && num_v_heads > 0
-            && num_v_heads.is_multiple_of(num_k_heads)
-            && head_k == GDN_HEAD_K
-            && head_v > 0
-            && head_v.is_multiple_of(GDN_HEAD_V_MULTIPLE)
-            && head_v <= GDN_HEAD_V_MAX
-            && gdn_conv_dim(num_k_heads, head_k, num_v_heads, head_v).is_some();
+        let takes = (kmin..=kmax).contains(&conv_kernel.get())
+            && num_k_heads > GdnHeads(0)
+            && num_v_heads > GdnHeads(0)
+            && num_v_heads.get().is_multiple_of(num_k_heads.get())
+            && head_k == GdnHeadDim(GDN_HEAD_K)
+            && head_v > GdnHeadDim(0)
+            && head_v.get().is_multiple_of(GDN_HEAD_V_MULTIPLE)
+            && head_v <= GdnHeadDim(GDN_HEAD_V_MAX)
+            && gdn_conv_dim(
+                num_k_heads.get(),
+                head_k.get(),
+                num_v_heads.get(),
+                head_v.get(),
+            )
+            .is_some();
         if !takes {
             return Err(TapeError::GdnGeometry {
-                num_k_heads,
-                num_v_heads,
-                head_k,
-                head_v,
-                conv_kernel,
+                num_k_heads: num_k_heads.get(),
+                num_v_heads: num_v_heads.get(),
+                head_k: head_k.get(),
+                head_v: head_v.get(),
+                conv_kernel: conv_kernel.get(),
             });
         }
         // A scratch whose size overflows is one no span can match: `want` 0 never equals a
         // non-empty scratch's bytes, and an empty scratch is refused as shape below.
-        let scratch_want = gdn.scratch_bytes(self.bucket_m).unwrap_or(0);
+        let scratch_want = gdn.scratch_bytes(self.bucket_m.get()).unwrap_or(0);
         for (region, span, want) in [
             (Region::GdnSequence, gdn.sequence, GDN_SEQUENCE_BYTES),
             (Region::GdnScratch, gdn.scratch, scratch_want),
@@ -1657,10 +1682,10 @@ impl CudaTape {
                     bytes: u64::from(rows) * KV_ENTRY_BYTES,
                 };
                 region(Region::SlotMapping, span, self.kv.map(|k| k.slot_mapping))?;
-                let kv_heads = cols.checked_div(head_dim).unwrap_or(0);
-                let window = self.kv_class(layer).and_then(|c| c.window);
-                match cols.is_multiple_of(head_dim.max(1))
-                    && self.kv_step_fits(layer, (kv_heads, head_dim, window))
+                let kv_heads = cols.get().checked_div(head_dim.get()).unwrap_or(0);
+                let window = self.kv_class(layer.get()).and_then(|c| c.window);
+                match cols.get().is_multiple_of((head_dim.max(HeadDim(1))).get())
+                    && self.kv_step_fits(layer.get(), (kv_heads, head_dim.get(), window.map(AttnWindow::get)))
                 {
                     true => Ok(()),
                     false => Err(TapeError::KvStepGeometry { step }),
@@ -1696,7 +1721,7 @@ impl CudaTape {
                     bytes: 2 * KV_ENTRY_BYTES,
                 };
                 region(Region::Sequence, seq, kv.map(|k| k.sequence))?;
-                match self.kv_step_fits(layer, (kv_heads, head_dim, window)) {
+                match self.kv_step_fits(layer.get(), (kv_heads.get(), head_dim.get(), window.map(AttnWindow::get))) {
                     true => Ok(()),
                     false => Err(TapeError::KvStepGeometry { step }),
                 }
@@ -1771,7 +1796,7 @@ impl CudaTape {
             CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
                 Some(moe)
                     if Some(y) == moe.router_norm.map(|r| r.offset)
-                        && (rows, cols) == (self.bucket_m, moe.hidden) =>
+                        && (rows, cols) == (Rows(self.bucket_m.get()), Cols(moe.hidden.get())) =>
                 {
                     Ok(())
                 }
@@ -1856,10 +1881,21 @@ impl CudaTape {
         let Some(moe) = self.moe else {
             return Ok(None);
         };
-        let sorted = self.bucket_m.checked_mul(moe.top_k) >= Some(crate::op_abi::CUDA_SORTED_PAIRS);
-        let tiles =
-            moe_tiles_at(self.bucket_m, moe.experts, moe.top_k, moe.tile_rows).map(|(_, t, _)| t);
-        let geometry = (moe.experts, moe.top_k, moe.hidden, moe.inter);
+        let sorted = self.bucket_m.get().checked_mul(moe.top_k.get())
+            >= Some(crate::op_abi::CUDA_SORTED_PAIRS);
+        let tiles = moe_tiles_at(
+            self.bucket_m.get(),
+            moe.experts.get(),
+            moe.top_k.get(),
+            moe.tile_rows.get(),
+        )
+        .map(|(_, t, _)| t);
+        let geometry = (
+            moe.experts.get(),
+            moe.top_k.get(),
+            moe.hidden.get(),
+            moe.inter.get(),
+        );
         // The tile rows are the bank's (FP8 S8 P3(a)): an fp8 bank's 64 when a step is one of its
         // expert steps, else 128.
         let fp8 = self.steps.iter().any(|s| match s {
@@ -1867,17 +1903,23 @@ impl CudaTape {
             CudaStep::ExpertGemm(g) => matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own),
             _ => false,
         });
-        if moe.experts == 0
-            || moe.top_k == 0
-            || moe.top_k > moe.experts
-            || moe.tile_rows != crate::op_abi::expert_tile_rows(fp8)
+        if moe.experts == NumExperts(0)
+            || moe.top_k == TopK(0)
+            || moe.top_k > TopK(moe.experts.get())
+            || moe.tile_rows != TileRows(crate::op_abi::expert_tile_rows(fp8))
             || moe.sort.is_some() != sorted
-            || Some(moe.max_tiles) != if sorted { tiles } else { Some(0) }
+            || Some(moe.max_tiles)
+                != if sorted {
+                    tiles.map(MaxTiles)
+                } else {
+                    Some(MaxTiles(0))
+                }
         {
             return Err(TapeError::MoeGeometry);
         }
-        let mut want = moe_region_bytes_at(self.bucket_m, geometry, sorted, moe.tile_rows)
-            .ok_or(TapeError::MoeGeometry)?;
+        let mut want =
+            moe_region_bytes_at(self.bucket_m.get(), geometry, sorted, moe.tile_rows.get())
+                .ok_or(TapeError::MoeGeometry)?;
         if moe.router_norm.is_some() {
             let bytes = u64::from(self.bucket_m) * u64::from(moe.hidden) * CUDA_ACT_BYTES;
             want.push(bytes);
@@ -2134,7 +2176,7 @@ impl CudaTape {
     fn check_moe_step(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let geometry = TapeError::MoeStepGeometry { step };
         let moe = self.moe.ok_or(geometry)?;
-        let rows = moe.expert_rows(self.bucket_m);
+        let rows = moe.expert_rows(self.bucket_m.get());
         let want = |region: Region, at: ArenaOffset, tape: ArenaSpan| {
             if at == tape.offset {
                 Ok(())
@@ -2150,7 +2192,9 @@ impl CudaTape {
                 })
             }
         };
-        let same = |e: u32, h: u32, i: u32| (e, h, i) == (moe.experts, moe.hidden, moe.inter);
+        let same = |e: u32, h: u32, i: u32| {
+            (e, h, i) == (moe.experts.get(), moe.hidden.get(), moe.inter.get())
+        };
         match *s {
             CudaStep::RouterLogits(RouterLogitsBf16 {
                 logits,
@@ -2160,7 +2204,8 @@ impl CudaTape {
                 inter,
                 ..
             }) => {
-                if m != self.bucket_m || !same(experts, hidden, inter) {
+                if m != Rows(self.bucket_m.get()) || !same(experts.get(), hidden.get(), inter.get())
+                {
                     return Err(geometry);
                 }
                 want(Region::MoeLogits, logits, moe.logits)
@@ -2174,7 +2219,7 @@ impl CudaTape {
                 top_k,
                 ..
             }) => {
-                if (m, experts, top_k) != (self.bucket_m, moe.experts, moe.top_k) {
+                if (m, experts, top_k) != (Rows(self.bucket_m.get()), moe.experts, moe.top_k) {
                     return Err(geometry);
                 }
                 want(Region::MoeLogits, logits, moe.logits)?;
@@ -2214,7 +2259,7 @@ impl CudaTape {
                 let sort = moe.sort.ok_or(geometry)?;
                 if (m, experts, top_k, hidden, max_tiles)
                     != (
-                        self.bucket_m,
+                        Rows(self.bucket_m.get()),
                         moe.experts,
                         moe.top_k,
                         moe.hidden,
@@ -2245,7 +2290,7 @@ impl CudaTape {
                 },
             ) => {
                 let sort = moe.sort.ok_or(geometry)?;
-                if max_tiles != moe.max_tiles || !same(experts, hidden, inter) {
+                if max_tiles != moe.max_tiles || !same(experts.get(), hidden.get(), inter.get()) {
                     return Err(geometry);
                 }
                 want(Region::MoeOffsets, offsets, sort.offsets)?;
@@ -2264,7 +2309,7 @@ impl CudaTape {
                 let fp8 = matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
                 // P3(a): an fp8 bank's rows are 64-row tiles, a bf16 bank's 128-row ones.
                 if (g.proj != ExpertProjection::Down && sort_fp8 != Some(fp8))
-                    || moe.tile_rows != crate::op_abi::expert_tile_rows(fp8)
+                    || moe.tile_rows != TileRows(crate::op_abi::expert_tile_rows(fp8))
                 {
                     return Err(geometry);
                 }
@@ -2296,8 +2341,8 @@ impl CudaTape {
                 ..
             }) => {
                 if moe.sort.is_some()
-                    || (m, top_k) != (self.bucket_m, moe.top_k)
-                    || !same(experts, hidden, inter)
+                    || (m, top_k) != (Rows(self.bucket_m.get()), moe.top_k)
+                    || !same(experts.get(), hidden.get(), inter.get())
                 {
                     return Err(geometry);
                 }
@@ -2324,8 +2369,8 @@ impl CudaTape {
                 },
             ) => {
                 if moe.sort.is_some()
-                    || (m, top_k) != (self.bucket_m, moe.top_k)
-                    || !same(experts, hidden, inter)
+                    || (m, top_k) != (Rows(self.bucket_m.get()), moe.top_k)
+                    || !same(experts.get(), hidden.get(), inter.get())
                 {
                     return Err(geometry);
                 }
@@ -2338,8 +2383,8 @@ impl CudaTape {
             CudaStep::ExpertGateUpTcFp8(t) => {
                 let g = t.fold.gate;
                 if moe.sort.is_some()
-                    || (g.m, g.top_k) != (self.bucket_m, moe.top_k)
-                    || !same(g.experts, g.hidden, g.inter)
+                    || (g.m, g.top_k) != (Rows(self.bucket_m.get()), moe.top_k)
+                    || !same(g.experts.get(), g.hidden.get(), g.inter.get())
                 {
                     return Err(geometry);
                 }
@@ -2352,10 +2397,10 @@ impl CudaTape {
             // offsets, over the capacity rows at the bank's intermediate width.
             CudaStep::ExpertActQuant(t) => {
                 let sort = moe.sort.ok_or(geometry)?;
-                let capacity = moe.max_tiles.checked_mul(moe.tile_rows);
+                let capacity = moe.max_tiles.get().checked_mul(moe.tile_rows.get());
                 if t.experts != moe.experts
-                    || moe.tile_rows != crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS
-                    || (Some(t.act.rows), t.act.cols) != (capacity, moe.inter)
+                    || moe.tile_rows != TileRows(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS)
+                    || (Some(t.act.rows), t.act.cols) != (capacity.map(Rows), Cols(moe.inter.get()))
                     || t.act.out != moe.act.offset
                 {
                     return Err(geometry);
@@ -2374,7 +2419,9 @@ impl CudaTape {
                 down_rows,
                 ..
             }) => {
-                if (m, top_k, hidden, down_rows) != (self.bucket_m, moe.top_k, moe.hidden, rows) {
+                if (m, top_k, hidden, down_rows)
+                    != (Rows(self.bucket_m.get()), moe.top_k, moe.hidden, Rows(rows))
+                {
                     return Err(geometry);
                 }
                 want(Region::MoeDown, down, moe.down)?;
@@ -2414,10 +2461,13 @@ impl CudaTape {
             }) => norm.rows,
             _ => return Ok(()),
         };
-        if rows == 1 && self.bucket_m == 1 {
+        if rows == Rows(1) && self.bucket_m == BucketM(1) {
             Ok(())
         } else {
-            Err(TapeError::OneRowStep { step, rows })
+            Err(TapeError::OneRowStep {
+                step,
+                rows: rows.get(),
+            })
         }
     }
 }
@@ -2455,6 +2505,7 @@ pub fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::step::{KDim, LayerId, NDim, NumQHeads};
     use scratchy_subtile::subtile_ir::GainConvention;
 
     use super::*;
@@ -2481,17 +2532,17 @@ mod tests {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(262144),
-            m: 256,
-            n: 1024,
-            k: 512,
+            m: Rows(256),
+            n: NDim(1024),
+            k: KDim(512),
             residual: None,
         }),
         CudaStep::RmsNorm(RmsNormBf16 {
             x: ArenaOffset(262144),
             gain: WeightIx(2),
             y: ArenaOffset(786432),
-            rows: 256,
-            cols: 1024,
+            rows: Rows(256),
+            cols: Cols(1024),
             eps: RmsNormEps::new(1e-6),
             convention: GainConvention::OnePlusScale,
             kernel: NormKernel::of(256, 1024),
@@ -2499,7 +2550,7 @@ mod tests {
     ];
 
     const GOOD: CudaTape = CudaTape {
-        bucket_m: 256,
+        bucket_m: BucketM(256),
         arena: ArenaLayout {
             colour_bytes: &[262144, 524288, 524288],
             colour_offsets: &[0, 262144, 786432],
@@ -2531,9 +2582,9 @@ mod tests {
             a: ArenaOffset(a),
             b: WeightIx(b),
             c: ArenaOffset(c),
-            m,
-            n,
-            k,
+            m: Rows(m),
+            n: NDim(n),
+            k: KDim(k),
             residual: None,
         })
     }
@@ -2553,9 +2604,9 @@ mod tests {
             tokens: ArenaOffset(tokens),
             table: WeightIx(0),
             out: ArenaOffset(0),
-            rows,
-            hidden: 512,
-            vocab,
+            rows: Rows(rows),
+            hidden: HiddenSize(512),
+            vocab: VocabSize(vocab),
         })
     }
 
@@ -2567,7 +2618,7 @@ mod tests {
             },
             input: TapeInput::TokenIds {
                 span: span(TOKENS, 1024),
-                vocab: VOCAB,
+                vocab: VocabSize(VOCAB),
             },
             weight_bytes: &[102400, 1048576, 2048],
             steps: Box::leak(steps.to_vec().into_boxed_slice()),
@@ -2663,7 +2714,7 @@ mod tests {
                 },
                 input: TapeInput::TokenIds {
                     span: input_span,
-                    vocab,
+                    vocab: VocabSize(vocab),
                 },
                 ..embedded(GOOD_STEPS)
             };
@@ -2849,8 +2900,8 @@ mod tests {
             a: ArenaOffset(0),
             b: ArenaOffset(262144),
             out: ArenaOffset(524288),
-            rows: 256,
-            cols: 1024,
+            rows: Rows(256),
+            cols: Cols(1024),
         }));
         assert_eq!(
             t.validate(),
@@ -2867,8 +2918,8 @@ mod tests {
         CudaStep::SoftCap(crate::step::SoftCapBf16 {
             x: ArenaOffset(262144),
             out: ArenaOffset(out),
-            rows: 256,
-            cols: 1024,
+            rows: Rows(256),
+            cols: Cols(1024),
             cap: SoftCap::new(30.0),
         })
     }
@@ -2900,23 +2951,23 @@ mod tests {
         let scale = CudaStep::Scale(crate::step::ScaleBf16 {
             x: ArenaOffset(262144),
             out: ArenaOffset(262144),
-            rows: 256,
-            cols: 1024,
+            rows: Rows(256),
+            cols: Cols(1024),
             scale: Scale::new(2.0),
         });
         let unit = CudaStep::RmsNormUnit(crate::step::RmsNormUnitBf16 {
             x: ArenaOffset(262144),
             y: ArenaOffset(262144),
-            rows: 256,
-            cols: 1024,
+            rows: Rows(256),
+            cols: Cols(1024),
             eps: RmsNormEps::new(1e-6),
         });
         let add = CudaStep::Add(AddBf16 {
             a: ArenaOffset(262144),
             b: ArenaOffset(786432),
             out: ArenaOffset(262144),
-            rows: 256,
-            cols: 1024,
+            rows: Rows(256),
+            cols: Cols(1024),
         });
         for step in [scale, unit, add] {
             assert_eq!(
@@ -2978,8 +3029,8 @@ mod tests {
             },
             rotary: Some(RotaryTable {
                 span: span(offset, bytes),
-                rot_dim: 64,
-                freq_dim: 64,
+                rot_dim: RotDim(64),
+                freq_dim: FreqDim(64),
                 theta: RopeTheta::new(1e7),
             }),
             ..GOOD
@@ -3034,7 +3085,7 @@ mod tests {
         for rot_dim in [0, 63] {
             let mut t = with_rotary(TABLE_AT, TABLE);
             if let Some(r) = t.rotary.as_mut() {
-                r.rot_dim = rot_dim;
+                r.rot_dim = RotDim(rot_dim);
             }
             assert!(
                 matches!(t.validate(), Err(TapeError::RotaryShape { rot_dim: r, .. }) if r == rot_dim),
@@ -3050,10 +3101,10 @@ mod tests {
             x: ArenaOffset(262144),
             table: ArenaOffset(table),
             out: ArenaOffset(786432),
-            rows: 64,
-            cols: 2048,
-            head_dim: 256,
-            rot_dim: 64,
+            rows: Rows(64),
+            cols: Cols(2048),
+            head_dim: HeadDim(256),
+            rot_dim: RotDim(64),
             pairing: RopePairing::Standard,
         })
     }
@@ -3122,11 +3173,11 @@ mod tests {
             table: ArenaOffset(KV_ROTARY),
             slot_mapping: ArenaOffset(slot_mapping),
             k_out: ArenaOffset(786432),
-            layer,
-            rows: 256,
-            cols: 512,
-            head_dim: 256,
-            rot_dim: 64,
+            layer: LayerId(layer),
+            rows: Rows(256),
+            cols: Cols(512),
+            head_dim: HeadDim(256),
+            rot_dim: RotDim(64),
             pairing: RopePairing::Standard,
             q: None,
             norms: None,
@@ -3140,11 +3191,11 @@ mod tests {
             block_table: ArenaOffset(block_table),
             sequence: ArenaOffset(sequence),
             out: ArenaOffset(786432),
-            layer: 0,
-            rows: 256,
-            q_heads: 2,
-            kv_heads,
-            head_dim: 256,
+            layer: LayerId(0),
+            rows: Rows(256),
+            q_heads: NumQHeads(2),
+            kv_heads: NumKvHeads(kv_heads),
+            head_dim: HeadDim(256),
             scale: AttnScale::new(0.0625),
             window: None,
         })
@@ -3152,16 +3203,16 @@ mod tests {
 
     const KV: KvTape = KvTape {
         layers: &[3],
-        kv_heads: 2,
-        head_dim: 256,
-        block_size: CUDA_KV_BLOCK_SIZE,
-        max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+        kv_heads: NumKvHeads(2),
+        head_dim: HeadDim(256),
+        block_size: BlockSize(CUDA_KV_BLOCK_SIZE),
+        max_blocks_per_seq: MaxBlocksPerSeq(CUDA_MAX_BLOCKS_PER_SEQ),
         block_table: span(KV_TABLE, 512),
         slot_mapping: span(KV_SLOTS, 1024),
         sequence: span(KV_SEQ, 8),
         classes: &[KvClass {
-            kv_heads: 2,
-            head_dim: 256,
+            kv_heads: NumKvHeads(2),
+            head_dim: HeadDim(256),
             window: None,
         }],
         layer_class: &[0],
@@ -3177,8 +3228,8 @@ mod tests {
             steps: Box::leak(steps.to_vec().into_boxed_slice()),
             rotary: Some(RotaryTable {
                 span: span(KV_ROTARY, TABLE),
-                rot_dim: 64,
-                freq_dim: 64,
+                rot_dim: RotDim(64),
+                freq_dim: FreqDim(64),
                 theta: RopeTheta::new(1e7),
             }),
             kv: Some(kv),
@@ -3286,7 +3337,7 @@ mod tests {
     #[test]
     fn kv_block_size() {
         let kv = KvTape {
-            block_size: 16,
+            block_size: BlockSize(16),
             ..KV
         };
         assert_eq!(
@@ -3361,7 +3412,10 @@ mod tests {
             kv_tape(KV, &[attn(KV_TABLE, KV_SEQ, 1)]).validate(),
             Err(TapeError::KvStepGeometry { step: 0 })
         );
-        let kv = KvTape { kv_heads: 4, ..KV };
+        let kv = KvTape {
+            kv_heads: NumKvHeads(4),
+            ..KV
+        };
         assert_eq!(
             kv_tape(kv, &[rope_append(0, KV_SLOTS)]).validate(),
             Err(TapeError::KvStepGeometry { step: 0 })
@@ -3396,9 +3450,9 @@ mod tests {
             qg: ArenaOffset(0),
             q: ArenaOffset(262144),
             gate: ArenaOffset(gate),
-            rows: 64,
-            half_cols: 1024,
-            head_dim: 256,
+            rows: Rows(64),
+            half_cols: Cols(1024),
+            head_dim: HeadDim(256),
         })
     }
 
@@ -3443,11 +3497,11 @@ mod tests {
 
     const GDN: GdnTape = GdnTape {
         layers: &[0],
-        num_k_heads: 1,
-        num_v_heads: 1,
-        head_k: 128,
-        head_v: 32,
-        conv_kernel: 4,
+        num_k_heads: GdnHeads(1),
+        num_v_heads: GdnHeads(1),
+        head_k: GdnHeadDim(128),
+        head_v: GdnHeadDim(32),
+        conv_kernel: ConvKernel(4),
         sequence: span(GDN_SEQ, 16),
         scratch: span(GDN_SCRATCH, GDN_SCRATCH_BYTES),
     };
@@ -3462,13 +3516,13 @@ mod tests {
             out: ArenaOffset(41472),
             scratch: ArenaOffset(scratch),
             sequence: ArenaOffset(sequence),
-            layer,
-            rows: 64,
-            num_k_heads: 1,
-            num_v_heads: 1,
-            head_k: 128,
-            head_v: 32,
-            conv_kernel: 4,
+            layer: LayerId(layer),
+            rows: Rows(64),
+            num_k_heads: GdnHeads(1),
+            num_v_heads: GdnHeads(1),
+            head_k: GdnHeadDim(128),
+            head_v: GdnHeadDim(32),
+            conv_kernel: ConvKernel(4),
             eps: RmsNormEps::new(1e-6),
         }
     }
@@ -3480,7 +3534,7 @@ mod tests {
     /// The GDN tape of `gdn` and `steps`.
     fn gdn_tape(gdn: Option<GdnTape>, steps: &[CudaStep]) -> CudaTape {
         CudaTape {
-            bucket_m: 64,
+            bucket_m: BucketM(64),
             arena: ArenaLayout {
                 colour_bytes: &[36864, 4096, 128, 128, 4096],
                 colour_offsets: &[0, 36864, 40960, 41216, 41472],
@@ -3666,7 +3720,7 @@ mod tests {
     #[test]
     fn gdn_step_geometry() {
         let k3 = GdnTape {
-            conv_kernel: 3,
+            conv_kernel: ConvKernel(3),
             ..GDN
         };
         assert_eq!(
@@ -3675,7 +3729,7 @@ mod tests {
         );
         // The step claims a 3-tap conv over the tape's 4: another ring stride than the pool's.
         let step = CudaStep::GatedDeltaNet(GdnPrefillBf16::of(GatedDeltaNetBf16 {
-            conv_kernel: 3,
+            conv_kernel: ConvKernel(3),
             ..gdn_step(0, GDN_SEQ, GDN_SCRATCH)
         }));
         assert_eq!(
@@ -3691,46 +3745,55 @@ mod tests {
     fn gdn_geometry() {
         for gdn in [
             GdnTape {
-                conv_kernel: 0,
+                conv_kernel: ConvKernel(0),
                 ..GDN
             },
             GdnTape {
-                conv_kernel: 1,
+                conv_kernel: ConvKernel(1),
                 ..GDN
             },
             GdnTape {
-                conv_kernel: 9,
+                conv_kernel: ConvKernel(9),
                 ..GDN
             },
             GdnTape {
-                num_k_heads: 0,
+                num_k_heads: GdnHeads(0),
                 ..GDN
             },
             GdnTape {
-                num_v_heads: 0,
+                num_v_heads: GdnHeads(0),
                 ..GDN
             },
             GdnTape {
-                num_k_heads: 2,
-                num_v_heads: 3,
+                num_k_heads: GdnHeads(2),
+                num_v_heads: GdnHeads(3),
                 ..GDN
             },
-            GdnTape { head_k: 64, ..GDN },
-            GdnTape { head_v: 40, ..GDN },
-            GdnTape { head_v: 512, ..GDN },
             GdnTape {
-                num_v_heads: u32::MAX,
+                head_k: GdnHeadDim(64),
+                ..GDN
+            },
+            GdnTape {
+                head_v: GdnHeadDim(40),
+                ..GDN
+            },
+            GdnTape {
+                head_v: GdnHeadDim(512),
+                ..GDN
+            },
+            GdnTape {
+                num_v_heads: GdnHeads(u32::MAX),
                 ..GDN
             },
         ] {
             assert_eq!(
                 gdn_tape(Some(gdn), &[]).validate(),
                 Err(TapeError::GdnGeometry {
-                    num_k_heads: gdn.num_k_heads,
-                    num_v_heads: gdn.num_v_heads,
-                    head_k: gdn.head_k,
-                    head_v: gdn.head_v,
-                    conv_kernel: gdn.conv_kernel,
+                    num_k_heads: gdn.num_k_heads.get(),
+                    num_v_heads: gdn.num_v_heads.get(),
+                    head_k: gdn.head_k.get(),
+                    head_v: gdn.head_v.get(),
+                    conv_kernel: gdn.conv_kernel.get(),
                 }),
                 "{gdn:?}"
             );
@@ -3754,8 +3817,8 @@ mod tests {
             a: ArenaOffset(0),
             b: ArenaOffset(36864),
             out: ArenaOffset(GDN_SCRATCH),
-            rows: 8,
-            cols: 256,
+            rows: Rows(8),
+            cols: Cols(256),
         });
         assert_eq!(
             gdn_tape(Some(GDN), &[over_scratch]).validate(),
@@ -3769,8 +3832,8 @@ mod tests {
             a: ArenaOffset(GDN_SCRATCH),
             b: ArenaOffset(36864),
             out: ArenaOffset(0),
-            rows: 8,
-            cols: 256,
+            rows: Rows(8),
+            cols: Cols(256),
         });
         assert_eq!(
             gdn_tape(Some(GDN), &[reads_scratch]).validate(),
@@ -3836,7 +3899,9 @@ mod tests {
             TapeError::ResultOutside { span: s, total: 8 },
             TapeError::Greedy {
                 got: None,
-                want: Some(GreedyArgmax { width: 1024 }),
+                want: Some(GreedyArgmax {
+                    width: VocabSize(1024),
+                }),
             },
             TapeError::StepOverflow { step: 1 },
             TapeError::StepMisaligned { step: 1, offset: 4 },
@@ -4084,7 +4149,7 @@ mod tests {
             }
         });
         let narrow = CudaStep::Embed(EmbedBf16 {
-            hidden: 256,
+            hidden: HiddenSize(256),
             ..match embed_step(TOKENS, 256, VOCAB) {
                 CudaStep::Embed(e) => e,
                 _ => unreachable!("an embed"),
@@ -4102,7 +4167,7 @@ mod tests {
     /// `x [1, 512] → GEMV (N = 1024) → y [1, 1024]`, the one-row tape: colours 0 `x` at 0 and 1
     /// `y` at 1024 (256-aligned), weight 1 `W [1024, 512]`.
     const ONE_ROW: CudaTape = CudaTape {
-        bucket_m: 1,
+        bucket_m: BucketM(1),
         arena: ArenaLayout {
             colour_bytes: &[1024, 2048],
             colour_offsets: &[0, 1024],
@@ -4115,9 +4180,9 @@ mod tests {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(1024),
-            m: 1,
-            n: 1024,
-            k: 512,
+            m: Rows(1),
+            n: NDim(1024),
+            k: KDim(512),
             residual: None,
         }))],
         rotary: None,
@@ -4126,7 +4191,9 @@ mod tests {
         moe: None,
         rotary_local: None,
         gemv_scratch: None,
-        greedy: Some(GreedyArgmax { width: 1024 }),
+        greedy: Some(GreedyArgmax {
+            width: VocabSize(1024),
+        }),
     };
 
     /// A GEMV whose `k` is off the launcher's 8-wide vector (`k` = 4) validates: `validate` checks
@@ -4136,7 +4203,7 @@ mod tests {
     #[test]
     fn a_gemv_off_the_launchers_vector_passes_validate() {
         let t = CudaTape {
-            bucket_m: 1,
+            bucket_m: BucketM(1),
             arena: ArenaLayout {
                 colour_bytes: &[4096],
                 colour_offsets: &[0],
@@ -4150,9 +4217,9 @@ mod tests {
                     a: ArenaOffset(0),
                     b: WeightIx(0),
                     c: ArenaOffset(1024),
-                    m: 1,
-                    n: 8,
-                    k: 4,
+                    m: Rows(1),
+                    n: NDim(8),
+                    k: KDim(4),
                     residual: None,
                 }))]
             },
@@ -4177,9 +4244,9 @@ mod tests {
                 a: ArenaOffset(0),
                 b: WeightIx(1),
                 c: ArenaOffset(1024),
-                m: 2,
-                n: 512,
-                k: 256,
+                m: Rows(2),
+                n: NDim(512),
+                k: KDim(256),
                 residual: None,
             }))])),
             ..ONE_ROW
@@ -4189,7 +4256,7 @@ mod tests {
             Err(TapeError::OneRowStep { step: 0, rows: 2 })
         );
         let bucket = CudaTape {
-            bucket_m: 2,
+            bucket_m: BucketM(2),
             ..ONE_ROW
         };
         assert_eq!(
@@ -4227,14 +4294,14 @@ mod tests {
             }
         };
         assert_eq!(
-            with_scratch(kv_tape(KV, &[decode(1, 2)])).validate(),
+            with_scratch(kv_tape(KV, &[decode(Rows(1), 2)])).validate(),
             Err(TapeError::OneRowStep { step: 0, rows: 1 })
         );
         assert_eq!(
-            with_scratch(kv_tape(KV, &[decode(256, 2)])).validate(),
+            with_scratch(kv_tape(KV, &[decode(Rows(256), 2)])).validate(),
             Err(TapeError::OneRowStep { step: 0, rows: 256 })
         );
-        let e = decode(1, 2).extents().expect("the decode's extents");
+        let e = decode(Rows(1), 2).extents().expect("the decode's extents");
         assert_eq!(e.kv, Some((0, KvUse::Read)));
         assert_eq!(e.reads[1], Some(span(KV_TABLE, 512)), "the block table");
         assert_eq!(e.reads[2], Some(span(KV_SEQ, 8)), "the sequence");
@@ -4248,12 +4315,12 @@ mod tests {
     /// scores 8 each at 768 and 1024, gate, up and act 128 each at 1280, 1536 and 1792, down 256
     /// at 2048.
     const MOE: MoeTape = MoeTape {
-        experts: 4,
-        top_k: 2,
-        hidden: 64,
-        inter: 32,
-        tile_rows: CUDA_EXPERT_TILE_ROWS,
-        max_tiles: 0,
+        experts: NumExperts(4),
+        top_k: TopK(2),
+        hidden: HiddenSize(64),
+        inter: IntermediateSize(32),
+        tile_rows: TileRows(CUDA_EXPERT_TILE_ROWS),
+        max_tiles: MaxTiles(0),
         logits: span(512, 8),
         topk_idx: span(768, 8),
         scores: span(1024, 8),
@@ -4271,15 +4338,15 @@ mod tests {
         logits: ArenaOffset(512),
         topk_idx: ArenaOffset(768),
         scores: ArenaOffset(1024),
-        m: 1,
-        experts: 4,
-        top_k: 2,
+        m: Rows(1),
+        experts: NumExperts(4),
+        top_k: TopK(2),
         program: RouteProgram::SoftmaxTopK { renorm: true },
     };
 
     fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {
         CudaTape {
-            bucket_m: 1,
+            bucket_m: BucketM(1),
             arena: ArenaLayout {
                 colour_bytes: &[128, 128],
                 colour_offsets: &[0, 256],
@@ -4309,12 +4376,15 @@ mod tests {
     fn moe_geometry() {
         for moe in [
             MoeTape {
-                tile_rows: 64,
+                tile_rows: TileRows(64),
                 ..MOE
             },
-            MoeTape { top_k: 5, ..MOE },
             MoeTape {
-                max_tiles: 1,
+                top_k: TopK(5),
+                ..MOE
+            },
+            MoeTape {
+                max_tiles: MaxTiles(1),
                 ..MOE
             },
         ] {
@@ -4390,7 +4460,7 @@ mod tests {
     #[test]
     fn moe_step_geometry() {
         let other_k = CudaStep::MoeRoute(MoeRouteBf16 {
-            top_k: 3,
+            top_k: TopK(3),
             ..MOE_ROUTE
         });
         assert_eq!(
@@ -4426,8 +4496,8 @@ mod tests {
             a: ArenaOffset(2048),
             b: ArenaOffset(0),
             out: ArenaOffset(256),
-            rows: 1,
-            cols: 64,
+            rows: Rows(1),
+            cols: Cols(64),
         });
         assert_eq!(
             moe_tape(Some(MOE), &[add]).validate(),
@@ -4446,13 +4516,13 @@ mod tests {
         KvTape {
             classes: &[
                 KvClass {
-                    kv_heads: 2,
-                    head_dim: 256,
+                    kv_heads: NumKvHeads(2),
+                    head_dim: HeadDim(256),
                     window: None,
                 },
                 KvClass {
-                    kv_heads: 1,
-                    head_dim: 512,
+                    kv_heads: NumKvHeads(1),
+                    head_dim: HeadDim(512),
                     window: None,
                 },
             ],
@@ -4487,28 +4557,31 @@ mod tests {
             (
                 "head dim 128",
                 KvTape {
-                    classes: one(class(4, 128, None)),
+                    classes: one(class(NumKvHeads(4), HeadDim(128), None)),
                     ..KV
                 },
             ),
             (
                 "a window of 1000",
                 KvTape {
-                    classes: one(class(2, 256, Some(1000))),
+                    classes: one(class(NumKvHeads(2), HeadDim(256), Some(AttnWindow(1000)))),
                     ..KV
                 },
             ),
             (
                 "a window of 0",
                 KvTape {
-                    classes: one(class(2, 256, Some(0))),
+                    classes: one(class(NumKvHeads(2), HeadDim(256), Some(AttnWindow(0)))),
                     ..KV
                 },
             ),
             (
                 "a row wider than the pool's",
                 KvTape {
-                    classes: Box::leak(Box::new([class(2, 256, None), class(2, 512, None)])),
+                    classes: Box::leak(Box::new([
+                        class(NumKvHeads(2), HeadDim(256), None),
+                        class(NumKvHeads(2), HeadDim(512), None),
+                    ])),
                     layer_class: &[0],
                     ..KV
                 },
@@ -4516,7 +4589,7 @@ mod tests {
             (
                 "no heads",
                 KvTape {
-                    classes: one(class(0, 256, None)),
+                    classes: one(class(NumKvHeads(0), HeadDim(256), None)),
                     ..KV
                 },
             ),
@@ -4546,20 +4619,27 @@ mod tests {
             CudaStep::AttnPrefill(a) => CudaStep::AttnPrefill(AttnPrefillBf16 {
                 head_dim,
                 window,
-                q_heads: 2,
+                q_heads: NumQHeads(2),
                 ..a
             }),
             _ => unreachable!(),
         };
         let global = two_classes(&[1]);
         assert_eq!(
-            kv_tape(global, &[append(512, 512), attend(1, 512, None)]).validate(),
+            kv_tape(
+                global,
+                &[
+                    append(Cols(512), HeadDim(512)),
+                    attend(1, HeadDim(512), None)
+                ]
+            )
+            .validate(),
             Ok(())
         );
         for (what, step) in [
-            ("the class-0 append", append(512, 256)),
-            ("the class-0 attention", attend(2, 256, None)),
-            ("a window", attend(1, 512, Some(1024))),
+            ("the class-0 append", append(Cols(512), HeadDim(256))),
+            ("the class-0 attention", attend(2, HeadDim(256), None)),
+            ("a window", attend(1, HeadDim(512), Some(AttnWindow(1024)))),
         ] {
             assert_eq!(
                 kv_tape(global, &[step]).validate(),
@@ -4580,11 +4660,11 @@ mod tests {
                 ..t
             }
         };
-        assert_eq!(with(64).validate(), Ok(()));
-        assert_eq!(with(512).validate(), Ok(()));
+        assert_eq!(with(FreqDim(64)).validate(), Ok(()));
+        assert_eq!(with(FreqDim(512)).validate(), Ok(()));
         for freq_dim in [0, 2, 63] {
             assert_eq!(
-                with(freq_dim).validate(),
+                with(FreqDim(freq_dim)).validate(),
                 Err(TapeError::RotaryFreqDim {
                     rot_dim: 64,
                     freq_dim
@@ -4601,8 +4681,8 @@ mod tests {
     fn the_local_rotary_table() {
         let local = |offset| RotaryTable {
             span: span(offset, TABLE),
-            rot_dim: 64,
-            freq_dim: 64,
+            rot_dim: RotDim(64),
+            freq_dim: FreqDim(64),
             theta: RopeTheta::new(1e4),
         };
         let at = TABLE_AT + TABLE;
@@ -4664,8 +4744,8 @@ mod tests {
                 x: ArenaOffset(0),
                 gain: WeightIx(0),
                 y: ArenaOffset(y),
-                rows: 1,
-                cols: 64,
+                rows: Rows(1),
+                cols: Cols(64),
                 eps: RmsNormEps::new(1e-6),
                 convention: GainConvention::Scale,
                 kernel: NormKernel::of(1, 64),
@@ -4740,8 +4820,8 @@ mod pool_tests {
             layers: Box::leak((0..layer_class.len() as u32).collect::<Vec<_>>().into()),
             kv_heads: classes[0].kv_heads,
             head_dim: classes[0].head_dim,
-            block_size: crate::step::CUDA_KV_BLOCK_SIZE,
-            max_blocks_per_seq: crate::step::CUDA_MAX_BLOCKS_PER_SEQ,
+            block_size: BlockSize(crate::step::CUDA_KV_BLOCK_SIZE),
+            max_blocks_per_seq: MaxBlocksPerSeq(crate::step::CUDA_MAX_BLOCKS_PER_SEQ),
             block_table: NO_SPAN,
             slot_mapping: NO_SPAN,
             sequence: NO_SPAN,
@@ -4758,13 +4838,13 @@ mod pool_tests {
     fn the_per_class_pool_holds_gemmas_30_layers_back_to_back() {
         const CLASSES: [KvClass; 2] = [
             KvClass {
-                kv_heads: 8,
-                head_dim: 256,
-                window: Some(1024),
+                kv_heads: NumKvHeads(8),
+                head_dim: HeadDim(256),
+                window: Some(AttnWindow(1024)),
             },
             KvClass {
-                kv_heads: 2,
-                head_dim: 512,
+                kv_heads: NumKvHeads(2),
+                head_dim: HeadDim(512),
                 window: None,
             },
         ];
@@ -4788,7 +4868,7 @@ mod pool_tests {
                     layout.num_blocks,
                     layout.block_size
                 ),
-                (class.kv_heads, class.head_dim, num_blocks, 64),
+                (class.kv_heads.get(), class.head_dim.get(), num_blocks, 64),
                 "layer {l}"
             );
             assert_eq!(
@@ -4805,8 +4885,8 @@ mod pool_tests {
     #[test]
     fn a_uniform_pool_is_the_pool_before_the_classes() {
         const ONE: [KvClass; 1] = [KvClass {
-            kv_heads: 2,
-            head_dim: 256,
+            kv_heads: NumKvHeads(2),
+            head_dim: HeadDim(256),
             window: None,
         }];
         let kv = kv(&ONE, &[0; 6]);
@@ -4827,14 +4907,14 @@ mod pool_tests {
     #[test]
     fn a_pool_with_a_missing_class_or_too_many_bytes_is_refused() {
         const ONE: [KvClass; 1] = [KvClass {
-            kv_heads: 2,
-            head_dim: 256,
+            kv_heads: NumKvHeads(2),
+            head_dim: HeadDim(256),
             window: None,
         }];
         assert_eq!(kv(&ONE, &[0, 1]).pool_layout(4), None);
         const HUGE: [KvClass; 1] = [KvClass {
-            kv_heads: u32::MAX,
-            head_dim: u32::MAX,
+            kv_heads: NumKvHeads(u32::MAX),
+            head_dim: HeadDim(u32::MAX),
             window: None,
         }];
         assert_eq!(kv(&HUGE, &[0]).pool_layout(u32::MAX), None);
@@ -4851,9 +4931,9 @@ mod pool_and_overlap_tests {
         bytes: 0,
     };
     const SLIDING: KvClass = KvClass {
-        kv_heads: 8,
-        head_dim: 256,
-        window: Some(1024),
+        kv_heads: NumKvHeads(8),
+        head_dim: HeadDim(256),
+        window: Some(AttnWindow(1024)),
     };
 
     fn kv(classes: &'static [KvClass], layer_class: &'static [u8]) -> KvTape {
@@ -4861,8 +4941,8 @@ mod pool_and_overlap_tests {
             layers: Box::leak((0..layer_class.len() as u32).collect::<Vec<_>>().into()),
             kv_heads: classes[0].kv_heads,
             head_dim: classes[0].head_dim,
-            block_size: CUDA_KV_BLOCK_SIZE,
-            max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+            block_size: BlockSize(CUDA_KV_BLOCK_SIZE),
+            max_blocks_per_seq: MaxBlocksPerSeq(CUDA_MAX_BLOCKS_PER_SEQ),
             block_table: NO_SPAN,
             slot_mapping: NO_SPAN,
             sequence: NO_SPAN,
@@ -4891,8 +4971,8 @@ mod pool_and_overlap_tests {
     #[test]
     fn a_tape_of_another_pool_is_not_the_same_pool() {
         const GLOBAL: KvClass = KvClass {
-            kv_heads: 2,
-            head_dim: 512,
+            kv_heads: NumKvHeads(2),
+            head_dim: HeadDim(512),
             window: None,
         };
         let two = kv(&[SLIDING, GLOBAL], &[0, 1]);
@@ -4904,17 +4984,20 @@ mod pool_and_overlap_tests {
         assert!(!two.same_pool(&kv(&[SLIDING], &[0])), "the layer count");
         let one = kv(&[SLIDING], &[0]);
         for other in [
-            KvTape { kv_heads: 4, ..one },
             KvTape {
-                head_dim: 512,
+                kv_heads: NumKvHeads(4),
                 ..one
             },
             KvTape {
-                block_size: 16,
+                head_dim: HeadDim(512),
                 ..one
             },
             KvTape {
-                max_blocks_per_seq: 64,
+                block_size: BlockSize(16),
+                ..one
+            },
+            KvTape {
+                max_blocks_per_seq: MaxBlocksPerSeq(64),
                 ..one
             },
             KvTape {

@@ -19,6 +19,7 @@ use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
     AddBf16, CudaStep, GateUpActBf16, GateUpKernel, GatedOp, GemmBf16, NormKernel, RmsNormBf16,
 };
+use scratchy_target_cuda::step::{BucketM, Cols, KDim, NDim, Rows};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx,
 };
@@ -102,9 +103,9 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: WeightIx(b),
         c: ArenaOffset(c),
-        m,
-        n,
-        k,
+        m: Rows(m),
+        n: NDim(n),
+        k: KDim(k),
         residual: None,
     })
 }
@@ -114,8 +115,8 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
         x: ArenaOffset(x),
         gain: WeightIx(1),
         y: ArenaOffset(y),
-        rows,
-        cols: H,
+        rows: Rows(rows),
+        cols: Cols(H),
         eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, H),
@@ -130,18 +131,18 @@ const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaSte
             a: ArenaOffset(n),
             b: WeightIx(2),
             c: ArenaOffset(gate),
-            m: rows,
-            n: I,
-            k: H,
+            m: Rows(rows),
+            n: NDim(I),
+            k: KDim(H),
             residual: None,
         },
         up: GemmBf16 {
             a: ArenaOffset(n),
             b: WeightIx(3),
             c: ArenaOffset(up),
-            m: rows,
-            n: I,
-            k: H,
+            m: Rows(rows),
+            n: NDim(I),
+            k: KDim(H),
             residual: None,
         },
         out: ArenaOffset(out),
@@ -155,8 +156,8 @@ const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
         out: ArenaOffset(out),
-        rows,
-        cols: H,
+        rows: Rows(rows),
+        cols: Cols(H),
     })
 }
 
@@ -165,7 +166,7 @@ const MLP_WEIGHT_BYTES: &[u64] = &[0, 2048, 7340032, 7340032, 7340032];
 
 /// [`mlp`]`(128)`: every offset of [`MLP_M256`], halved.
 pub static MLP_M128: CudaTape = CudaTape {
-    bucket_m: 128,
+    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[262144, 262144, 917504, 917504, 917504, 917504, 262144],
         colour_offsets: &[0, 262144, 524288, 1441792, 2359296, 3276800, 4194304],
@@ -192,7 +193,7 @@ pub static MLP_M128: CudaTape = CudaTape {
 /// [`mlp`]`(256)`: `x` 0, `n` 524288, `gate` 1048576, `up` 2883584, `s` 4718592 (unused),
 /// `a` 6553600, `y` 8388608; `d` over `n` at 524288.
 pub static MLP_M256: CudaTape = CudaTape {
-    bucket_m: 256,
+    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[524288, 524288, 1835008, 1835008, 1835008, 1835008, 524288],
         colour_offsets: &[0, 524288, 1048576, 2883584, 4718592, 6553600, 8388608],

@@ -14,6 +14,7 @@ use scratchy_subtile::fixtures::{front_end_lowered, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
+use scratchy_target_cuda::step::{BucketM, KDim, NDim, Rows};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
@@ -185,7 +186,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         gemv_scratch: lowered_gemv_scratch,
         greedy: lowered_greedy,
     } = lowered;
-    assert_eq!(bucket_m, *lowered_m, "{name}: bucket_m");
+    assert_eq!(bucket_m, BucketM(*lowered_m), "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
     assert_eq!(colour_offsets, lowered_offsets, "{name}: offsets");
     assert_eq!(total_bytes, *lowered_total, "{name}: total");
@@ -211,10 +212,10 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
              layer_class,
          }| CanonicalKv {
             layers: layers.to_vec(),
-            kv_heads,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
+            kv_heads: kv_heads.get(),
+            head_dim: head_dim.get(),
+            block_size: block_size.get(),
+            max_blocks_per_seq: max_blocks_per_seq.get(),
             block_table,
             slot_mapping,
             sequence,
@@ -235,11 +236,11 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
              scratch,
          }| CanonicalGdn {
             layers: layers.to_vec(),
-            num_k_heads,
-            num_v_heads,
-            head_k,
-            head_v,
-            conv_kernel,
+            num_k_heads: num_k_heads.get(),
+            num_v_heads: num_v_heads.get(),
+            head_k: head_k.get(),
+            head_v: head_v.get(),
+            conv_kernel: conv_kernel.get(),
             sequence,
             scratch,
         },
@@ -303,9 +304,9 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: WeightIx(b),
         c: ArenaOffset(c),
-        m,
-        n,
-        k,
+        m: Rows(m),
+        n: NDim(n),
+        k: KDim(k),
         residual: None,
     })
 }
@@ -319,7 +320,7 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
 
 /// [`two_gemm`]`(128)`: colours x, y1, y2.
 pub static TWO_GEMM_M128: CudaTape = CudaTape {
-    bucket_m: 128,
+    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[131072, 262144, 131072],
         colour_offsets: &[0, 131072, 393216],
@@ -343,7 +344,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
 pub static TWO_GEMM_M256: CudaTape = CudaTape {
-    bucket_m: 256,
+    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[262144, 524288, 262144],
         colour_offsets: &[0, 262144, 786432],
@@ -368,7 +369,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
 /// two-GEMM one. `y3` is the result.
 pub static THREE_GEMM_M256: CudaTape = CudaTape {
-    bucket_m: 256,
+    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[262144, 524288, 262144],
         colour_offsets: &[0, 262144, 786432],

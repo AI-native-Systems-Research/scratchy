@@ -32,6 +32,10 @@
 //! has a colour of its own. After the colours: the rotary table, the block table, the slot mapping
 //! and the sequence.
 
+use scratchy_target_cuda::step::{
+    BlockSize, BucketM, Cols, FreqDim, KDim, LayerId, MaxBlocksPerSeq, NDim, NumKvHeads, NumQHeads,
+    RotDim, Rows,
+};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
@@ -210,9 +214,9 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: WeightIx(b),
         c: ArenaOffset(c),
-        m,
-        n,
-        k,
+        m: Rows(m),
+        n: NDim(n),
+        k: KDim(k),
         residual: None,
     })
 }
@@ -222,7 +226,7 @@ const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
     GroupMember {
         b: WeightIx(b),
         c: ArenaOffset(c),
-        n,
+        n: NDim(n),
     }
 }
 
@@ -231,8 +235,8 @@ const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
 const fn qkv(n: u64, (qg, k, v): (u64, u64, u64), m: u32) -> CudaStep {
     CudaStep::GemmGroup(GemmGroupBf16 {
         a: ArenaOffset(n),
-        m,
-        k: H,
+        m: Rows(m),
+        k: KDim(H),
         first: member((2, qg, 2 * Q)),
         second: member((4, k, KV)),
         third: Some(member((6, v, KV))),
@@ -244,8 +248,8 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
         x: ArenaOffset(x),
         gain: WeightIx(gain),
         y: ArenaOffset(y),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, cols),
@@ -257,9 +261,9 @@ const fn gate_split(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep {
         qg: ArenaOffset(qg),
         q: ArenaOffset(q),
         gate: ArenaOffset(gate),
-        rows,
-        half_cols: Q,
-        head_dim: HD,
+        rows: Rows(rows),
+        half_cols: Cols(Q),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
     })
 }
 
@@ -268,10 +272,10 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         x: ArenaOffset(x),
         table: ArenaOffset(table),
         out: ArenaOffset(out),
-        rows,
-        cols: Q,
-        head_dim: HD,
-        rot_dim: R,
+        rows: Rows(rows),
+        cols: Cols(Q),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
+        rot_dim: RotDim(R),
         pairing: RopePairing::Standard,
     })
 }
@@ -289,11 +293,11 @@ const fn rope_append(
         table: ArenaOffset(table),
         slot_mapping: ArenaOffset(slot_mapping),
         k_out: ArenaOffset(k_out),
-        layer: 0,
-        rows,
-        cols: KV,
-        head_dim: HD,
-        rot_dim: R,
+        layer: LayerId(0),
+        rows: Rows(rows),
+        cols: Cols(KV),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
+        rot_dim: RotDim(R),
         pairing: RopePairing::Standard,
         q: None,
         norms: None,
@@ -306,11 +310,11 @@ const fn attn(q: u64, block_table: u64, sequence: u64, out: u64, rows: u32) -> C
         block_table: ArenaOffset(block_table),
         sequence: ArenaOffset(sequence),
         out: ArenaOffset(out),
-        layer: 0,
-        rows,
-        q_heads: HEADS,
-        kv_heads: KV_HEADS,
-        head_dim: HD,
+        layer: LayerId(0),
+        rows: Rows(rows),
+        q_heads: NumQHeads(HEADS),
+        kv_heads: NumKvHeads(KV_HEADS),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
         scale: scratchy_target_cuda::step::AttnScale::new(SCALE),
         window: None,
     })
@@ -321,8 +325,8 @@ const fn gate_apply(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep {
         attn: ArenaOffset(attn),
         gate: ArenaOffset(gate),
         out: ArenaOffset(out),
-        rows,
-        cols: Q,
+        rows: Rows(rows),
+        cols: Cols(Q),
     })
 }
 
@@ -331,16 +335,16 @@ const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
         out: ArenaOffset(out),
-        rows,
-        cols: H,
+        rows: Rows(rows),
+        cols: Cols(H),
     })
 }
 
 const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
     Some(RotaryTable {
         span: span(offset, bytes),
-        rot_dim: R,
-        freq_dim: R,
+        rot_dim: RotDim(R),
+        freq_dim: FreqDim(R),
         theta: scratchy_target_cuda::step::RopeTheta::new(THETA),
     })
 }
@@ -349,16 +353,16 @@ const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
 const fn kv(table: u64, (slots, slot_bytes): (u64, u64), seq: u64) -> Option<KvTape> {
     Some(KvTape {
         layers: &[LAYER],
-        kv_heads: KV_HEADS,
-        head_dim: HD,
-        block_size: CUDA_KV_BLOCK_SIZE,
-        max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+        kv_heads: NumKvHeads(KV_HEADS),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
+        block_size: BlockSize(CUDA_KV_BLOCK_SIZE),
+        max_blocks_per_seq: MaxBlocksPerSeq(CUDA_MAX_BLOCKS_PER_SEQ),
         block_table: span(table, 512),
         slot_mapping: span(slots, slot_bytes),
         sequence: span(seq, 8),
         classes: &[KvClass {
-            kv_heads: KV_HEADS,
-            head_dim: HD,
+            kv_heads: NumKvHeads(KV_HEADS),
+            head_dim: scratchy_target_cuda::step::HeadDim(HD),
             window: None,
         }],
         layer_class: &[0],
@@ -376,7 +380,7 @@ const ATTN_LAYER_WEIGHT_BYTES: &[u64] = &[
 /// slot) are fixed. Colours end at 4849664; the table at 4849664, the block table at 4866048, the
 /// slot mapping at 4866560, the sequence at 4867072.
 pub static ATTN_LAYER_M128: CudaTape = CudaTape {
-    bucket_m: 128,
+    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[
             262144, 262144, 1048576, 131072, 131072, 524288, 524288, 131072, 524288, 524288,
@@ -419,7 +423,7 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
 /// 9699328, the block table (512) at 9732096, the slot mapping (1024) at 9732608, the sequence (8,
 /// in a 256-byte slot) at 9733632.
 pub static ATTN_LAYER_M256: CudaTape = CudaTape {
-    bucket_m: 256,
+    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[
             524288, 524288, 2097152, 262144, 262144, 1048576, 1048576, 262144, 1048576, 1048576,

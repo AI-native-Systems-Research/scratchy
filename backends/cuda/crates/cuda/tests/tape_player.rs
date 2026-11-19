@@ -63,6 +63,7 @@ use scratchy_target_cuda::step::MatmulKernel;
 use scratchy_target_cuda::step::{
     AttnDecodeBf16, CudaStep, GemvBf16, RopeAppendBf16, gdn_bundle, gdn_scratch,
 };
+use scratchy_target_cuda::step::{BucketM, FreqDim, KDim, NDim, NumExperts, RotDim, Rows};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError,
     TapeInput, WeightIx,
@@ -169,7 +170,7 @@ fn a_two_gemm_chain_matches_the_cpu_reference_in_each_bucket() {
         CudaWorker::new(&device, &TWO_GEMM_BUCKETS, &table, None, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in TWO_GEMM_BUCKETS.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let x = input(m);
         let mut y2 = vec![0u16; m * H];
         worker
@@ -210,7 +211,7 @@ fn the_worker_allocates_once_and_no_forward_allocates() {
     let mut free_after_first = None;
     let mut identical = true;
     for (i, bucket) in [1usize, 0, 1, 0, 1].into_iter().enumerate() {
-        let m = TWO_GEMM_BUCKETS[bucket].bucket_m as usize;
+        let m = (TWO_GEMM_BUCKETS[bucket].bucket_m).get() as usize;
         let mut y2 = vec![0u16; m * H];
         worker
             .forward(
@@ -439,7 +440,7 @@ fn n_direct(device: &CudaDevice, tape: &CudaTape, x: &[u16], g: &[u16]) -> Vec<u
             xb.ptr(),
             gb.ptr(),
             out.ptr(),
-            (norm.rows, norm.cols),
+            (norm.rows.get(), norm.cols.get()),
             norm.eps.get(),
             norm.convention.offset(),
             std::ptr::null_mut(),
@@ -463,7 +464,7 @@ fn the_mlp_block_matches_the_cpu_reference_in_each_bucket() {
     let mut worker = CudaWorker::new(&device, &MLP_BUCKETS, &table, None, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in MLP_BUCKETS.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let x = mlp_input(m);
         let mut y = vec![0u16; m * MLP_H];
         worker
@@ -516,7 +517,7 @@ fn the_mlp_worker_allocates_once_and_no_forward_allocates() {
     let mut free_after_first = None;
     let mut identical = true;
     for (i, bucket) in [1usize, 0, 1, 0, 1].into_iter().enumerate() {
-        let m = MLP_BUCKETS[bucket].bucket_m as usize;
+        let m = (MLP_BUCKETS[bucket].bucket_m).get() as usize;
         let mut y = vec![0u16; m * MLP_H];
         worker
             .forward(
@@ -666,7 +667,7 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
     let mut worker = CudaWorker::new(&device, &ATTN_BUCKETS, &table, None, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in ATTN_BUCKETS.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let x = attn_input(m);
         let positions = attn_positions(m);
         let mut y = vec![0u16; m * AG_H];
@@ -698,7 +699,8 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
         let qr = read(&mut worker, colour(tape, 5));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
-        let table_matches = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta.get());
+        let table_matches =
+            uploaded == rotary_rows(&positions, rotary.rot_dim.get(), rotary.theta.get());
         let refs = rope_reference(&qn, &uploaded, (m, AG_Q), (AG_HD, AG_R), AG_R / 2);
         let cmp = compare_rope(&qr, &qn, &refs, AG_Q);
         let ok = cmp.rotated.pass() && cmp.pass_through_mismatched == 0 && table_matches;
@@ -757,7 +759,7 @@ fn the_attention_gate_worker_allocates_once_and_no_forward_allocates() {
     let mut free_after_first = None;
     let mut identical = true;
     for (i, bucket) in [1usize, 0, 1, 0, 1].into_iter().enumerate() {
-        let m = ATTN_BUCKETS[bucket].bucket_m as usize;
+        let m = (ATTN_BUCKETS[bucket].bucket_m).get() as usize;
         let mut y = vec![0u16; m * AG_H];
         worker
             .forward(
@@ -852,8 +854,8 @@ static BAD_ROTARY: [CudaTape; 1] = [CudaTape {
             offset: ArenaOffset(8912896 + 256),
             bytes: 32768,
         },
-        rot_dim: 64,
-        freq_dim: 64,
+        rot_dim: RotDim(64),
+        freq_dim: FreqDim(64),
         theta: scratchy_target_cuda::step::RopeTheta(0x416312D000000000),
     }),
     ..ATTN_GATE_M256
@@ -1035,7 +1037,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
     let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let mut pass = true;
     for (bucket, tape) in LAYER_BUCKETS.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let block_table = &[11u32, 3, 14, 0][..m / 64];
         let x = layer_input(m, 0x0A1E);
         let positions = seq_positions(m, 0);
@@ -1083,7 +1085,8 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         pass &= check_stage("v = n·Wvᵀ", &v, &n, &w.wv, (m, AL_KV, AL_H));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
-        let table_ok = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta.get());
+        let table_ok =
+            uploaded == rotary_rows(&positions, rotary.rot_dim.get(), rotary.theta.get());
         let kr = read(&mut worker, colour(tape, 3));
         let refs = rope_reference(&kn, &uploaded, (m, AL_KV), (AL_HD, AL_R), AL_R / 2);
         let cmp = compare_rope(&kr, &kn, &refs, AL_KV);
@@ -1157,7 +1160,8 @@ fn k_direct(device: &CudaDevice, tape: &CudaTape, n: &[u16], wk: &[u16]) -> Vec<
         DeviceBuffer::upload(device, n).expect("upload n"),
         DeviceBuffer::upload(device, wk).expect("upload Wk"),
     );
-    let out = DeviceBuffer::upload(device, &vec![0; (g.m * g.n) as usize]).expect("upload k");
+    let out =
+        DeviceBuffer::upload(device, &vec![0; (g.m.get() * g.n.get()) as usize]).expect("upload k");
     // SAFETY: cudaMalloc pointers are 256-byte aligned; `n` holds m·k, `Wk` n·k and `out` m·n
     // elements; `out` is its own allocation; null is the default stream.
     unsafe {
@@ -1165,9 +1169,9 @@ fn k_direct(device: &CudaDevice, tape: &CudaTape, n: &[u16], wk: &[u16]) -> Vec<
             nb.ptr(),
             wb.ptr(),
             out.ptr(),
-            g.m,
-            g.n,
-            g.k,
+            g.m.get(),
+            g.n.get(),
+            g.k.get(),
             std::ptr::null_mut(),
         )
     }
@@ -1192,7 +1196,8 @@ fn gate_up_direct(
         DeviceBuffer::upload(device, n).expect("upload n"),
         DeviceBuffer::upload(device, w).expect("upload the weight"),
     );
-    let out = DeviceBuffer::upload(device, &vec![0; (g.m * g.n) as usize]).expect("upload out");
+    let out = DeviceBuffer::upload(device, &vec![0; (g.m.get() * g.n.get()) as usize])
+        .expect("upload out");
     // SAFETY: cudaMalloc pointers are 256-byte aligned; `n` holds m·k, the weight n·k and `out`
     // m·n elements; `out` is its own allocation; null is the default stream.
     unsafe {
@@ -1200,9 +1205,9 @@ fn gate_up_direct(
             nb.ptr(),
             wb.ptr(),
             out.ptr(),
-            g.m,
-            g.n,
-            g.k,
+            g.m.get(),
+            g.n.get(),
+            g.k.get(),
             std::ptr::null_mut(),
         )
     }
@@ -1238,8 +1243,8 @@ fn qr_direct(device: &CudaDevice, tape: &CudaTape, qn: &[u16], table: &[u16]) ->
             xb.ptr(),
             tb.ptr(),
             out.ptr(),
-            (rows, cols),
-            (head_dim, rot_dim),
+            (rows.get(), cols.get()),
+            (head_dim.get(), rot_dim.get()),
             std::ptr::null_mut(),
         )
     }
@@ -1475,7 +1480,7 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
     let mut free_after_first = None;
     let mut identical = true;
     for (i, bucket) in [1usize, 0, 1, 0, 1].into_iter().enumerate() {
-        let m = LAYER_BUCKETS[bucket].bucket_m as usize;
+        let m = (LAYER_BUCKETS[bucket].bucket_m).get() as usize;
         let seq = KvSequence {
             block_table: tables[bucket],
             prefix_len: 0,
@@ -1923,7 +1928,7 @@ struct Scratch {
 fn read_scratch(worker: &mut CudaWorker<'_>, tape: &CudaTape) -> Scratch {
     let gdn = tape.gdn.expect("a GDN tape");
     let m = tape.bucket_m;
-    let s = gdn_scratch(m, GL_CONV as u32, GL_NV as u32, GL_VALUE as u32).expect("fits");
+    let s = gdn_scratch(m.get(), GL_CONV as u32, GL_NV as u32, GL_VALUE as u32).expect("fits");
     let base = gdn.scratch.offset.0;
     let mut part = |at: u64, elems: usize| {
         let span = ArenaSpan {
@@ -1932,7 +1937,7 @@ fn read_scratch(worker: &mut CudaWorker<'_>, tape: &CudaTape) -> Scratch {
         };
         f32_from_halves(&read(worker, span))
     };
-    let m = m as usize;
+    let m = m.get() as usize;
     Scratch {
         conv_out: part(s.conv_out, m * GL_CONV),
         g: part(s.g, m * GL_NV),
@@ -1985,7 +1990,7 @@ fn check_gdn_forward(
     (q_len, ring): (usize, &[f64]),
     start: &ScanStart<'_>,
 ) -> (bool, ScanReference) {
-    let m = tape.bucket_m as usize;
+    let m = tape.bucket_m.get() as usize;
     let mut pass = true;
     let n = n_direct(device, tape, x, &w.g_in);
     let n_ref = rms_norm_reference(x, &w.g_in, (m, GL_H), f64::from(EPS), 1.0);
@@ -2155,7 +2160,7 @@ fn the_gdn_layer_matches_the_cpu_reference_in_each_bucket() {
         CudaWorker::new(&device, &GDN_BUCKETS, &table, None, GDN_POOL).expect("worker");
     let mut pass = true;
     for (bucket, tape) in GDN_BUCKETS.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let x = gdn_input(m, 0x6D1);
         let seq = GdnSequence {
             slot: 1,
@@ -2381,10 +2386,10 @@ fn the_gdn_layer_worker_allocates_once_and_no_forward_allocates() {
         let m = GDN_BUCKETS[bucket].bucket_m;
         let seq = GdnSequence {
             slot: bucket as u32,
-            q_len: m,
+            q_len: m.get(),
             fresh,
         };
-        let mut y = vec![0u16; m as usize * GL_H];
+        let mut y = vec![0u16; m.get() as usize * GL_H];
         worker
             .forward(
                 bucket,
@@ -2822,7 +2827,8 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
         );
         pass &= ok && below == 0 && appended == 0 && finite;
     }
-    pass &= decode.rows == 1 && decode.scale == scratchy_target_cuda::step::AttnScale::new(0.0625);
+    pass &= decode.rows == Rows(1)
+        && decode.scale == scratchy_target_cuda::step::AttnScale::new(0.0625);
     assert!(
         pass,
         "a decode step of the attention layer failed: see the lines above"
@@ -2933,7 +2939,7 @@ fn moe_block_matches_the_f64_block_in_each_bucket() {
     let mut worker = CudaWorker::new(&device, tapes, &table, None, None).expect("worker");
     let mut pass = true;
     for (b, tape) in tapes.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         for routing in [Routing::Random, Routing::Skewed, Routing::Half] {
             let x = moe_x(routing, m, 0x0E_5EED ^ m as u64);
             let y = moe_forward(&mut worker, b, &x);
@@ -2982,7 +2988,7 @@ fn whole_arena_tape(bytes: u64) -> CudaTape {
         bytes,
     };
     CudaTape {
-        bucket_m: 1,
+        bucket_m: BucketM(1),
         arena: ArenaLayout {
             colour_bytes: Box::leak(Box::new([bytes])),
             colour_offsets: Box::leak(Box::new([0])),
@@ -3041,7 +3047,7 @@ fn moe_block_invariants_hold() {
     let bytes = tapes[fill].arena.total_bytes;
     let mut pass = true;
     for (b, tape) in tapes[..2].iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let x = moe_x(Routing::Random, m, 0x1A_0000 ^ m as u64);
         fill_arena(&mut worker, fill, bytes, 0);
         let after_zero = moe_forward(&mut worker, b, &x);
@@ -3219,7 +3225,7 @@ fn gemma_moe_play(
     let mut worker = CudaWorker::new(device, tapes, table, None, None).expect("worker");
     let mut pass = true;
     for (b, tape) in tapes.iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         // The router's GEMM: the one-row GEMV at m = 1, the 64-column GEMM above.
         let router = (tape.steps.iter()).find_map(|s| match s {
             CudaStep::RouterLogits(r) => Some(r.kernel),
@@ -3332,7 +3338,7 @@ fn gemma_moe_block_invariants() {
     let bytes = tapes[fill].arena.total_bytes;
     let mut pass = true;
     for (b, tape) in tapes[..2].iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let x = gemma_moe_x(&w, Routing::Random, m, 0x6E1A_0000 ^ m as u64);
         fill_arena(&mut worker, fill, bytes, 0);
         let after_zero = moe_forward(&mut worker, b, &x);
@@ -3429,9 +3435,11 @@ fn play_row_step(device: &CudaDevice, s: &CudaStep, arena: &mut [u16], w: &Devic
         CudaStep::SoftCap(st) => (st.x, st.out, st.rows, st.cols),
         ref other => panic!("the Gemma row chain holds only row maps: {other:?}"),
     };
-    let xb = DeviceBuffer::upload(device, &arena[region(x, rows, cols)]).expect("upload x");
-    let ob = DeviceBuffer::upload(device, &vec![0; rows as usize * cols as usize]).expect("out");
-    let (dims, null) = ((rows, cols), std::ptr::null_mut());
+    let xb =
+        DeviceBuffer::upload(device, &arena[region(x, rows.get(), cols.get())]).expect("upload x");
+    let ob = DeviceBuffer::upload(device, &vec![0; rows.get() as usize * cols.get() as usize])
+        .expect("out");
+    let (dims, null) = ((rows.get(), cols.get()), std::ptr::null_mut());
     // SAFETY: cudaMalloc pointers are 256-byte aligned; `x` and `out` hold rows·cols bf16, `w`
     // one; `out` is its own allocation; null is the default stream, which the download waits for.
     unsafe {
@@ -3447,7 +3455,7 @@ fn play_row_step(device: &CudaDevice, s: &CudaStep, arena: &mut [u16], w: &Devic
     }
     .expect("a standalone row launch");
     let got = ob.download().expect("download out");
-    arena[region(out, rows, cols)].copy_from_slice(&got);
+    arena[region(out, rows.get(), cols.get())].copy_from_slice(&got);
 }
 
 /// Gemma's row chain (`ScalarMul(√2816) → RmsNormUnit → ScalarWeightMul(w) → TanhSoftCap(30)`) at
@@ -3469,7 +3477,7 @@ fn gemma_row_chain_plays_each_step_as_its_kernel() {
     let bytes = tapes[fill].arena.total_bytes;
     let mut pass = true;
     for (b, tape) in tapes[..2].iter().enumerate() {
-        let m = tape.bucket_m as usize;
+        let m = tape.bucket_m.get() as usize;
         let kinds: Vec<String> = (tape.steps.iter())
             .map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_owned())
             .collect();
@@ -3719,7 +3727,7 @@ fn a_qwen_routing_at_128_experts_is_refused_before_anything_is_enqueued() {
     assert!(
         matches!(
             tape.steps[route],
-            CudaStep::MoeRoute(r) if r.experts == 128
+            CudaStep::MoeRoute(r) if r.experts == NumExperts(128)
                 && r.program
                     == scratchy_target_cuda::step::RouteProgram::SoftmaxTopK { renorm: true }
         ),
@@ -4027,7 +4035,7 @@ fn ga_forward(
     table: &[u32],
     x: Option<u16>,
 ) -> Vec<u16> {
-    let m = gemma_attn_buckets()[b].bucket_m as usize;
+    let m = (gemma_attn_buckets()[b].bucket_m).get() as usize;
     let mut input = vec![0u16; m * GA_H];
     for i in 0..len {
         let row = match x {
@@ -4452,7 +4460,7 @@ fn gg_forward(
     table: &[u32],
     input: &dyn Fn(usize) -> Vec<u16>,
 ) -> Vec<u16> {
-    let m = tapes[b].bucket_m as usize;
+    let m = (tapes[b].bucket_m).get() as usize;
     let mut x = vec![0u16; m * GA_H];
     for i in 0..len {
         x[i * GA_H..][..GA_H].copy_from_slice(&input(p + i));
@@ -4797,8 +4805,8 @@ fn a_graph_replay_is_the_per_launch_forward_bit_for_bit() {
     let gdn_w = gdn_table(&device, &gdn_weights());
     let moe_w = moe_table(&device, &moe_weights());
     let block_table = [11u32, 3, 14, 0];
-    let m_layer = LAYER_BUCKETS[1].bucket_m as usize;
-    let m_gdn = GDN_BUCKETS[1].bucket_m as usize;
+    let m_layer = (LAYER_BUCKETS[1].bucket_m).get() as usize;
+    let m_gdn = (GDN_BUCKETS[1].bucket_m).get() as usize;
     let moe_tapes = moe_buckets();
     let cases = [
         (
@@ -4855,7 +4863,11 @@ fn a_graph_replay_is_the_per_launch_forward_bit_for_bit() {
                 table: &moe_w,
                 pools: (None, None),
                 bucket: 1,
-                x: moe_x(Routing::Random, moe_tapes[1].bucket_m as usize, 0x1048),
+                x: moe_x(
+                    Routing::Random,
+                    (moe_tapes[1].bucket_m).get() as usize,
+                    0x1048,
+                ),
                 positions: Vec::new(),
                 kv: None,
                 gdn: None,
@@ -4914,9 +4926,9 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
                 a: ArenaOffset(0),
                 b: WeightIx(0),
                 c: ArenaOffset(1024),
-                m: 1,
-                n: 8,
-                k: 4,
+                m: Rows(1),
+                n: NDim(8),
+                k: KDim(4),
                 residual: None,
             },
         ))]));
@@ -5124,8 +5136,8 @@ fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
     let layer_w = layer_table(&device, &layer_weights());
     let gdn_w = gdn_table(&device, &gdn_weights());
     let block_table = [11u32, 3, 14, 0];
-    let m_layer = LAYER_BUCKETS[1].bucket_m as usize;
-    let m_gdn = GDN_BUCKETS[1].bucket_m as usize;
+    let m_layer = (LAYER_BUCKETS[1].bucket_m).get() as usize;
+    let m_gdn = (GDN_BUCKETS[1].bucket_m).get() as usize;
     let cases = [
         (
             "the MLP block, m=256",
@@ -5180,8 +5192,8 @@ fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
         let whole = played(&device, case, false).0;
         let tape = &case.tapes[case.bucket];
         let m = tape.bucket_m;
-        let width = whole.len() / m as usize;
-        for row in [0, m / 2, m - 1] {
+        let width = whole.len() / m.get() as usize;
+        for row in [0, m.get() / 2, m.get() - 1] {
             let got = played_row(&device, case, row);
             let want = &whole[row as usize * width..][..width];
             let bad = mismatched_bits(&got, want);
@@ -5205,7 +5217,7 @@ fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
         &[],
         None,
         None,
-        (tape.bucket_m, &mut y),
+        (tape.bucket_m.get(), &mut y),
     );
     let mut short = vec![0u16; width - 1];
     let size = worker.forward_row(

@@ -9,6 +9,10 @@
 //! (E0004) as it does in the colour rule. Each opcode issue moves exactly one variant out of the
 //! refusing arm into an arm of its own.
 
+use scratchy_target_cuda::step::{
+    AttnWindow, Cols, ConvKernel, GdnHeadDim, GdnHeads, HeadDim, HiddenSize, KDim, LayerId, NDim,
+    NTile, NumExperts, NumKvHeads, NumQHeads, RotDim, Rows, TopK, VocabSize,
+};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::{AttnClass, HeadGeometry};
@@ -281,9 +285,9 @@ pub fn embed(
         tokens,
         table,
         out,
-        rows,
-        hidden,
-        vocab,
+        rows: Rows(rows),
+        hidden: HiddenSize(hidden),
+        vocab: VocabSize(vocab),
     }))
 }
 
@@ -394,11 +398,16 @@ fn rope_append_folded(
                 let Some(rq) = r.q.as_mut() else {
                     return Err(refused());
                 };
-                let heads = |n: u32, cols: u32| n.checked_mul(r.head_dim) == Some(cols);
-                let ok = (qn.cols, kn.cols, vn.cols) == (r.head_dim, r.head_dim, r.head_dim)
-                    && heads(qn.rows, rq.cols)
-                    && heads(kn.rows, r.cols)
-                    && heads(vn.rows, r.cols)
+                let heads = |n: u32, cols: u32| n.checked_mul(r.head_dim.get()) == Some(cols);
+                let ok = (qn.cols, kn.cols, vn.cols)
+                    == (
+                        Cols(r.head_dim.get()),
+                        Cols(r.head_dim.get()),
+                        Cols(r.head_dim.get()),
+                    )
+                    && heads(qn.rows.get(), rq.cols.get())
+                    && heads(kn.rows.get(), r.cols.get())
+                    && heads(vn.rows.get(), r.cols.get())
                     && (qn.convention, kn.convention)
                         == (GainConvention::Scale, GainConvention::Scale)
                     && qn.eps == kn.eps
@@ -714,7 +723,7 @@ fn sibling_matmuls(
     let [(kind, first), rest @ ..] = lowered.as_slice() else {
         return Err(refused());
     };
-    let promote = matvecs && *kind == GroupKind::GemmNarrow && first.m == 1;
+    let promote = matvecs && *kind == GroupKind::GemmNarrow && first.m == Rows(1);
     let as_group = |k: GroupKind| {
         if promote && k == GroupKind::GemmNarrow {
             GroupKind::Gemv
@@ -724,11 +733,11 @@ fn sibling_matmuls(
     };
     if promote {
         for (_, g) in &lowered {
-            gemv_shape(g.n, g.k).map_err(|rule| CanonicalRefusal::GemmShape {
+            gemv_shape(g.n.get(), g.k.get()).map_err(|rule| CanonicalRefusal::GemmShape {
                 step,
-                m: g.m,
-                n: g.n,
-                k: g.k,
+                m: g.m.get(),
+                n: g.n.get(),
+                k: g.k.get(),
                 rule,
             })?;
         }
@@ -825,16 +834,16 @@ fn gemm(
         a: at(a),
         b,
         c: at(colour_of(cx, s.writes)),
-        m,
-        n,
-        k,
+        m: Rows(m),
+        n: NDim(n),
+        k: KDim(k),
         residual: None,
     };
     // FP8 S8 W4a: the residual add it folded writes the add's output (`a` the matvec's, `b` the
     // residual), of the matvec's one row, on the one-row GEMVs only.
     if let Some(add) = folded_residual(cx, s, computes)? {
         let gemv = matches!(kernel(gemm), CudaStep::Gemv(_) | CudaStep::GemvFp8(_));
-        if !gemv || (add.a, add.rows, add.cols) != (gemm.c, 1, n) {
+        if !gemv || (add.a, add.rows, add.cols) != (gemm.c, Rows(1), Cols(n)) {
             return Err(CanonicalRefusal::FusionShape { step });
         }
         gemm.c = add.out;
@@ -880,8 +889,8 @@ fn rms_norm(
         x: at(xc),
         gain,
         y: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         eps: RmsNormEps::new(eps),
         convention,
         kernel: NormKernel::of(rows, cols),
@@ -909,8 +918,8 @@ fn add(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<AddBf16, CanonicalRefusal> {
         a: at(ac),
         b: at(bc),
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
     })
 }
 
@@ -955,8 +964,8 @@ fn gated_mul(
         gate: at(gate),
         up: at(up),
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
     })
 }
 
@@ -1039,10 +1048,10 @@ fn rope(cx: &StepCx<'_>, s: &TapeStep<'_>, head_dim: u32) -> Result<RopeBf16, Ca
         x: at(xc),
         table,
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
-        head_dim,
-        rot_dim,
+        rows: Rows(rows),
+        cols: Cols(cols),
+        head_dim: HeadDim(head_dim),
+        rot_dim: RotDim(rot_dim),
         pairing: cx.facts.pairing(class),
     })
 }
@@ -1245,11 +1254,11 @@ fn rope_append(
     prefix_operands(s, cx, 4, u64::from(layer))?;
     let (pool, regions, index) = kv_pool(cx, layer)?;
     let cache = pool.class_of(index).expect("every pool layer has a class");
-    if cols != cache.kv_heads * cache.head_dim || cache.head_dim != head_dim {
+    if cols != cache.kv_heads.get() * cache.head_dim.get() || cache.head_dim != HeadDim(head_dim) {
         return Err(CanonicalRefusal::KvGeometry {
             step,
             op,
-            kv_heads: cache.kv_heads,
+            kv_heads: cache.kv_heads.get(),
             cols,
         });
     }
@@ -1260,11 +1269,11 @@ fn rope_append(
         table,
         slot_mapping: regions.slot_mapping.offset,
         k_out: at(colour_of(cx, s.writes)),
-        layer: index,
-        rows,
-        cols,
-        head_dim,
-        rot_dim,
+        layer: LayerId(index),
+        rows: Rows(rows),
+        cols: Cols(cols),
+        head_dim: HeadDim(head_dim),
+        rot_dim: RotDim(rot_dim),
         pairing: cx.facts.pairing(class),
         q: None,
         norms: None,
@@ -1400,7 +1409,7 @@ fn attention_step(
     let (pool, regions, index) = kv_pool(cx, layer)?;
     let (q_heads, kv_heads) = (geom.q_heads().get(), geom.kv_heads().get());
     let cache = pool.class_of(index).expect("every pool layer has a class");
-    if kv_heads != cache.kv_heads || head_dim != cache.head_dim {
+    if kv_heads != cache.kv_heads.get() || head_dim != cache.head_dim.get() {
         return Err(CanonicalRefusal::KvGeometry {
             step,
             op,
@@ -1426,13 +1435,13 @@ fn attention_step(
         block_table: regions.block_table.offset,
         sequence: regions.sequence.offset,
         out: at(colour_of(cx, s.writes)),
-        layer: index,
-        rows,
-        q_heads,
-        kv_heads,
-        head_dim,
+        layer: LayerId(index),
+        rows: Rows(rows),
+        q_heads: NumQHeads(q_heads),
+        kv_heads: NumKvHeads(kv_heads),
+        head_dim: HeadDim(head_dim),
         scale: AttnScale::new(scale),
-        window: cx.facts.window(class),
+        window: (cx.facts.window(class)).map(AttnWindow),
     };
     match rows {
         // A decode bucket's attention at its head dim's split over keys (W6b).
@@ -1472,11 +1481,13 @@ pub fn gdn_bundle_layer(bindings: &[SourceBinding], s: &TapeStep<'_>) -> Option<
 /// cluster, at most [`GDN_DECODE_MAX_HEADS`] of them, `nv` whole 16-head gating chunks (FP8 S8 D1:
 /// the 27B's three value heads a key head now take it).
 fn gdn_decode_takes(g: &GatedDeltaNetBf16) -> bool {
-    let heads = g.num_v_heads / g.num_k_heads.max(1);
-    GDN_DECODE_HEAD_VS.contains(&g.head_v)
-        && g.num_v_heads.is_multiple_of(g.num_k_heads.max(1))
+    let heads = g.num_v_heads.get() / g.num_k_heads.get().max(1);
+    GDN_DECODE_HEAD_VS.contains(&g.head_v.get())
+        && g.num_v_heads
+            .get()
+            .is_multiple_of(g.num_k_heads.get().max(1))
         && (1..=GDN_DECODE_MAX_HEADS).contains(&heads)
-        && g.num_v_heads.is_multiple_of(GDN_GATING_NV_MULTIPLE)
+        && g.num_v_heads.get().is_multiple_of(GDN_GATING_NV_MULTIPLE)
 }
 
 /// `GatedDeltaNet(qkv, z, a, b, bundle)` as one prefill chunk of the Gated-DeltaNet layer: four
@@ -1573,13 +1584,13 @@ fn gated_delta_net(
         out: at(colour_of(cx, s.writes)),
         scratch: regions.scratch.offset,
         sequence: regions.sequence.offset,
-        layer: index as u32,
-        rows,
-        num_k_heads: nk,
-        num_v_heads: nv,
-        head_k,
-        head_v,
-        conv_kernel,
+        layer: LayerId(index as u32),
+        rows: Rows(rows),
+        num_k_heads: GdnHeads(nk),
+        num_v_heads: GdnHeads(nv),
+        head_k: GdnHeadDim(head_k),
+        head_v: GdnHeadDim(head_v),
+        conv_kernel: ConvKernel(conv_kernel),
         eps: RmsNormEps::new(cx.facts.facts.eps().get()),
     })
 }
@@ -1620,9 +1631,9 @@ fn gate_split(
         qg: at(qgc),
         q: at(colour_of(cx, s.writes)),
         gate: at(gate),
-        rows,
-        half_cols,
-        head_dim,
+        rows: Rows(rows),
+        half_cols: Cols(half_cols),
+        head_dim: HeadDim(head_dim),
     })
 }
 
@@ -1664,8 +1675,8 @@ fn gate_apply(
         attn: at(ac),
         gate: at(gate),
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
     })
 }
 
@@ -1716,8 +1727,8 @@ fn scalar_mul(
     Ok(ScaleBf16 {
         x: at(xc),
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         scale: Scale::new(scale),
     })
 }
@@ -1744,8 +1755,8 @@ fn rms_norm_unit(
     Ok(RmsNormUnitBf16 {
         x: at(xc),
         y: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         eps: RmsNormEps::new(eps),
     })
 }
@@ -1789,8 +1800,8 @@ fn layer_scale(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<LayerScaleBf16, Cano
         x: at(xc),
         scale,
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
     })
 }
 
@@ -1810,8 +1821,8 @@ fn soft_cap(
     Ok(SoftCapBf16 {
         x: at(xc),
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         cap: SoftCap::new(cap),
     })
 }
@@ -1834,8 +1845,8 @@ fn gather_last_row(
     Ok(GatherLastRowBf16 {
         x: at(xc),
         sequence: kv.sequence.offset,
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
     })
 }
 
@@ -1912,7 +1923,7 @@ fn moe_counts(
     if !MOE_EXPERT_COUNTS.contains(&experts) || top_k == 0 || top_k > MOE_ROUTE_MAX_TOP_K {
         return Err(moe_refusal(s, MoeShapeRule::Experts { experts, top_k }));
     }
-    if (experts, top_k) != (moe.experts, moe.top_k) {
+    if (experts, top_k) != (moe.experts.get(), moe.top_k.get()) {
         return Err(moe_refusal(s, MoeShapeRule::Geometry));
     }
     let rows = cx.graph.shape(s.node.output.tensor).rows;
@@ -1982,10 +1993,10 @@ fn router_logits(
         _ => return Err(operand(s, 1, OperandRefusal::Missing)),
     };
     let moe = moe_tape(cx, s)?;
-    moe_counts(cx, s, &moe, (experts, moe.top_k))?;
+    moe_counts(cx, s, &moe, (experts, moe.top_k.get()))?;
     let TensorShape { rows: m, cols } = cx.graph.shape(node.output.tensor);
     let hidden = cx.graph.shape(x.tensor).cols;
-    if cols != experts || hidden != moe.hidden {
+    if cols != experts || hidden != moe.hidden.get() {
         return Err(moe_refusal(s, MoeShapeRule::Geometry));
     }
     same_shape(cx, s, 0, x, m, hidden)?;
@@ -2029,9 +2040,9 @@ fn router_logits(
         bundle,
         weight,
         logits: moe.logits.offset,
-        m,
-        experts,
-        hidden,
+        m: Rows(m),
+        experts: NumExperts(experts),
+        hidden: HiddenSize(hidden),
         inter: moe.inter,
         kernel,
     })
@@ -2104,7 +2115,7 @@ fn moe_route(
             let [_, _, w] = per_expert.node.inputs.as_slice() else {
                 return Err(operand(per_expert, 2, OperandRefusal::Missing));
             };
-            same_shape(cx, per_expert, 2, w, 1, moe.experts)?;
+            same_shape(cx, per_expert, 2, w, 1, moe.experts.get())?;
             let input = per_expert.inputs.iter().nth(2);
             RouteProgram::TopKScaledSoftmax {
                 scale,
@@ -2117,7 +2128,7 @@ fn moe_route(
         logits: moe.logits.offset,
         topk_idx: moe.topk_idx.offset,
         scores: moe.scores.offset,
-        m: cx.tokens.unwrap_or(0),
+        m: Rows(cx.tokens.unwrap_or(0)),
         experts: moe.experts,
         top_k: moe.top_k,
         program,
@@ -2149,7 +2160,7 @@ fn router_norm(
     if cx.tokens != Some(rows) {
         return Err(moe_refusal(s, MoeShapeRule::Rows));
     }
-    if cols != moe.hidden {
+    if cols != moe.hidden.get() {
         return Err(moe_refusal(s, MoeShapeRule::Geometry));
     }
     row_shape(s, rows, cols, RMS_NORM_BF16_COLS)?;
@@ -2167,8 +2178,8 @@ fn router_norm(
         x: at(xc),
         gain,
         y: region.offset,
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         eps: RmsNormEps::new(eps),
         convention: GainConvention::Scale,
         kernel: NormKernel::of(rows, cols),
@@ -2210,7 +2221,7 @@ fn expert_sort(
         matches!(op, SubOp::RouteTopK { .. })
     })?;
     let m = cx.tokens.unwrap_or(0);
-    same_shape(cx, s, 0, x, m, moe.hidden)?;
+    same_shape(cx, s, 0, x, m, moe.hidden.get())?;
     whole_tensors(cx, s, &[(0, x)])?;
     let xc = activation(cx, s, 0, s.inputs.iter().next())?;
     let Some(sort) = moe.sort else {
@@ -2226,9 +2237,9 @@ fn expert_sort(
         tile_expert: sort.tile_expert.offset,
         pos: sort.pos.offset,
         rows: sort.rows.offset,
-        m,
-        experts,
-        top_k,
+        m: Rows(m),
+        experts: NumExperts(experts),
+        top_k: TopK(top_k),
         hidden: moe.hidden,
         max_tiles: moe.max_tiles,
     }))
@@ -2268,7 +2279,7 @@ fn expert_matmul(
         ExpertProj::Up => (ExpertProjection::Up, PairRows::Token),
         ExpertProj::Down => (ExpertProjection::Down, PairRows::Pair),
     };
-    let (want_n, k) = projection.n_k(moe.hidden, moe.inter);
+    let (want_n, k) = projection.n_k(moe.hidden.get(), moe.inter.get());
     if n != want_n {
         return Err(moe_refusal(s, MoeShapeRule::Geometry));
     }
@@ -2313,8 +2324,8 @@ fn expert_matmul(
                 proj: projection,
                 topk_idx: moe.topk_idx.offset,
                 c: out.1.offset,
-                m: cx.tokens.unwrap_or(0),
-                top_k,
+                m: Rows(cx.tokens.unwrap_or(0)),
+                top_k: TopK(top_k),
                 experts: moe.experts,
                 hidden: moe.hidden,
                 inter: moe.inter,
@@ -2348,7 +2359,7 @@ fn expert_matmul(
         experts: moe.experts,
         hidden: moe.hidden,
         inter: moe.inter,
-        n_tile: tn,
+        n_tile: NTile(tn),
     }))
 }
 
@@ -2372,13 +2383,13 @@ fn expert_gated_act(
     moe_producer(cx, s, 1, computes, proj_is(ExpertProj::Up))?;
     let moe = moe_tape(cx, s)?;
     let rows = moe.expert_rows(cx.tokens.unwrap_or(0));
-    row_shape(s, rows, moe.inter, SILU_MUL_BF16_COLS)?;
+    row_shape(s, rows, moe.inter.get(), SILU_MUL_BF16_COLS)?;
     Ok(kernel(SiluMulBf16 {
         gate: moe.gate.offset,
         up: moe.up.offset,
         out: moe.act.offset,
-        rows,
-        cols: moe.inter,
+        rows: Rows(rows),
+        cols: Cols(moe.inter.get()),
     }))
 }
 
@@ -2430,7 +2441,7 @@ fn expert_combine(
     let moe = moe_tape(cx, s)?;
     let m = cx.tokens.unwrap_or(0);
     let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
-    if (rows, cols) != (m, hidden) || hidden != moe.hidden {
+    if (rows, cols) != (m, hidden) || hidden != moe.hidden.get() {
         return Err(moe_refusal(s, MoeShapeRule::Geometry));
     }
     row_shape(s, rows, cols, ADD_BF16_COLS)?;
@@ -2440,10 +2451,10 @@ fn expert_combine(
         pos: moe.sort.map(|t| t.pos.offset),
         scores: moe.scores.offset,
         out: at(colour_of(cx, s.writes)),
-        m,
+        m: Rows(m),
         top_k: moe.top_k,
-        hidden,
-        down_rows: moe.expert_rows(m),
+        hidden: HiddenSize(hidden),
+        down_rows: Rows(moe.expert_rows(m)),
     })
 }
 
@@ -2470,8 +2481,8 @@ fn gate_scale(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<GateScaleBf16, Canoni
         shared: at(sc),
         g: at(gc),
         out: at(colour_of(cx, s.writes)),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
     })
 }
 

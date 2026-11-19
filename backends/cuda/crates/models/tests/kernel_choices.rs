@@ -14,23 +14,24 @@ use scratchy_target_cuda::step::{
     AttnDecodeSplit, CudaStep, ExpertGemvBf16, GdnScan, GemvSplit, MatmulKernel, NormKernel,
     RmsNormBf16, attn_decode_split, gdn_scan_is_recurrent, gemv_splits, norm_row_takes,
 };
+use scratchy_target_cuda::step::{MinTiles, Splits};
 
 /// The split an `n` × `k` GEMV over `pairs` slices takes.
 fn split(n: u32, k: u32, pairs: u32) -> GemvSplit {
     GemvSplit {
-        splits: gemv_splits(n, k, pairs),
+        splits: Splits(gemv_splits(n, k, pairs)),
     }
 }
 
 /// The split of an expert GEMV at its `m · top_k` pairs.
 fn expert_split(g: &ExpertGemvBf16) -> GemvSplit {
     let (n, k) = g.n_k();
-    split(n, k, g.m.saturating_mul(g.top_k))
+    split(n, k, g.m.get().saturating_mul(g.top_k.get()))
 }
 
 /// The kernel a norm's rows and columns pick.
 fn norm_kernel(n: &RmsNormBf16) -> NormKernel {
-    match norm_row_takes(n.rows, n.cols) {
+    match norm_row_takes(n.rows.get(), n.cols.get()) {
         true => NormKernel::Row,
         false => NormKernel::Tiled,
     }
@@ -47,28 +48,32 @@ fn every_stored_kernel_choice_is_its_constants_pick() {
                 let at = format!("{} m={} step {i}", entry.stem, tape.bucket_m);
                 match s {
                     CudaStep::Gemv(g) | CudaStep::GemvFp8(g) => {
-                        assert_eq!(g.split, split(g.gemm.n, g.gemm.k, 1), "{at}");
+                        assert_eq!(g.split, split(g.gemm.n.get(), g.gemm.k.get(), 1), "{at}");
                     }
                     CudaStep::GemvGroup(g) | CudaStep::GemvGroupFp8(g) => {
                         let members = g.group.members();
                         for (m, stored) in members.iter().zip(g.splits()) {
-                            let want = m.map(|m| split(m.n, g.group.k, 1));
+                            let want = m.map(|m| split(m.n.get(), g.group.k.get(), 1));
                             assert_eq!(stored, want, "{at}");
                         }
                     }
                     CudaStep::RouterLogits(r) => {
                         if let MatmulKernel::Gemv(stored) = r.kernel {
-                            assert_eq!(stored, split(r.experts, r.hidden, 1), "{at}");
+                            assert_eq!(stored, split(r.experts.get(), r.hidden.get(), 1), "{at}");
                         }
                     }
                     CudaStep::GateUpAct(g) => {
                         if let Some(stored) = g.kernel.gemv_split() {
-                            assert_eq!(stored, split(g.gate.n, g.gate.k, 1), "{at}");
+                            assert_eq!(stored, split(g.gate.n.get(), g.gate.k.get(), 1), "{at}");
                         }
                     }
                     CudaStep::GateUpTcFp8(t) => {
                         if let Some(stored) = t.fold.kernel.gemv_split() {
-                            assert_eq!(stored, split(t.fold.gate.n, t.fold.gate.k, 1), "{at}");
+                            assert_eq!(
+                                stored,
+                                split(t.fold.gate.n.get(), t.fold.gate.k.get(), 1),
+                                "{at}"
+                            );
                         }
                     }
                     CudaStep::ExpertGemv(g) => {
@@ -103,12 +108,17 @@ fn every_stored_kernel_choice_is_its_constants_pick() {
                         );
                     }
                     CudaStep::AttnDecode(a) => {
-                        let want = attn_decode_split(a.attn.head_dim)
-                            .map(|(splits, min_tiles)| AttnDecodeSplit { splits, min_tiles });
+                        let want =
+                            attn_decode_split(a.attn.head_dim.get()).map(|(splits, min_tiles)| {
+                                AttnDecodeSplit {
+                                    splits: Splits(splits),
+                                    min_tiles: MinTiles(min_tiles),
+                                }
+                            });
                         assert_eq!(Some(a.split), want, "{at}");
                     }
                     CudaStep::GatedDeltaNet(g) => {
-                        let want = match gdn_scan_is_recurrent(g.gdn.rows) {
+                        let want = match gdn_scan_is_recurrent(g.gdn.rows.get()) {
                             true => GdnScan::Recurrent,
                             false => GdnScan::Chunked,
                         };

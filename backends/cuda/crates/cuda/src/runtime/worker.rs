@@ -52,6 +52,7 @@ use crate::step::{
     RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_split_scratch_bytes,
     fp8_moe_layout, fp8_weight,
 };
+use crate::step::{AttnWindow, BucketM, Cols, HeadDim, NumExperts, Rows, Splits, TopK};
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
     KV_ELEM_BYTES, KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
@@ -658,7 +659,7 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
         experts,
         ..
     }) = *s
-        && experts != MOE_ROUTE_EXPERTS
+        && experts != NumExperts(MOE_ROUTE_EXPERTS)
     {
         return Some("MoeRoute");
     }
@@ -859,9 +860,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (Some(kv), Some(KvPoolConfig { num_blocks })) if num_blocks >= 1 => {
                 let layout = PagedKvLayout {
                     num_blocks,
-                    num_kv_heads: kv.kv_heads,
-                    block_size: kv.block_size,
-                    head_dim: kv.head_dim,
+                    num_kv_heads: kv.kv_heads.get(),
+                    block_size: kv.block_size.get(),
+                    head_dim: kv.head_dim.get(),
                 };
                 let (per_layer, bytes) = kv
                     .pool_layout(num_blocks)
@@ -876,11 +877,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (Some(g), Some(GdnPoolConfig { num_slots })) if num_slots >= 1 => {
                 let layout = GdnStateLayout::new(
                     num_slots,
-                    g.num_k_heads,
-                    g.num_v_heads,
-                    g.head_k,
-                    g.head_v,
-                    g.conv_kernel,
+                    g.num_k_heads.get(),
+                    g.num_v_heads.get(),
+                    g.head_k.get(),
+                    g.head_v.get(),
+                    g.conv_kernel.get(),
                 );
                 let (offsets, bytes) = gdn_pool_layout(&layout, g.layers.len())
                     .ok_or(WorkerError::GdnPoolTooLarge { num_slots })?;
@@ -915,8 +916,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     layout,
                     per_layer,
                     layers: kv.layers.len(),
-                    block_table_host: vec![NO_SLOT; kv.max_blocks_per_seq as usize],
-                    slot_mapping_host: vec![NO_SLOT; slots.max().unwrap_or(0) as usize],
+                    block_table_host: vec![NO_SLOT; kv.max_blocks_per_seq.get() as usize],
+                    slot_mapping_host: vec![
+                        NO_SLOT;
+                        (slots.max().unwrap_or(BucketM(0))).get() as usize
+                    ],
                 })
             }
             None => None,
@@ -1210,9 +1214,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             return Err(ForwardError::InputSize { expected, got });
         }
         if let Some((ids, vocab)) = ids
-            && let Some((row, &id)) = ids.iter().enumerate().find(|&(_, &id)| id >= vocab)
+            && let Some((row, &id)) = ids.iter().enumerate().find(|&(_, &id)| id >= vocab.get())
         {
-            return Err(ForwardError::TokenOutOfVocab { row, id, vocab });
+            return Err(ForwardError::TokenOutOfVocab {
+                row,
+                id,
+                vocab: vocab.get(),
+            });
         }
         match &out {
             Out::Result(result) => {
@@ -1227,7 +1235,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             Out::Token(_) => {
                 if tape.greedy.is_none() {
                     return Err(ForwardError::NoGreedy {
-                        bucket_m: tape.bucket_m,
+                        bucket_m: tape.bucket_m.get(),
                         result_bytes: tape.result.bytes,
                     });
                 }
@@ -1237,7 +1245,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 if u64::from(*row) >= rows || !tape.result.bytes.is_multiple_of(rows) {
                     return Err(ForwardError::ResultRow {
                         row: *row,
-                        bucket_m: tape.bucket_m,
+                        bucket_m: tape.bucket_m.get(),
                         result_bytes: tape.result.bytes,
                     });
                 }
@@ -1250,7 +1258,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 }
             }
         }
-        let expected = tape.rotary.map_or(0, |_| tape.bucket_m as usize);
+        let expected = tape.rotary.map_or(0, |_| tape.bucket_m.get() as usize);
         if positions.len() != expected {
             return Err(ForwardError::Positions {
                 expected,
@@ -1286,10 +1294,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     });
                 }
                 let bucket_m = tape.bucket_m;
-                if seq.q_len == 0 || seq.q_len > bucket_m {
+                if seq.q_len == 0 || seq.q_len > bucket_m.get() {
                     return Err(ForwardError::GdnQueryLength {
                         q_len: seq.q_len,
-                        bucket_m,
+                        bucket_m: bucket_m.get(),
                     });
                 }
                 pool.sequence_host = [seq.slot, seq.q_len, u32::from(seq.fresh), 0];
@@ -1304,7 +1312,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // rope). `validate` refuses a local table without a global one.
         let (global_host, local_host) = self.rotary_host.split_at_mut(
             tape.rotary
-                .map_or(0, |r| positions.len() * r.rot_dim as usize),
+                .map_or(0, |r| positions.len() * r.rot_dim.get() as usize),
         );
         let tables = [
             fill_table(tape.rotary, positions, global_host),
@@ -1314,7 +1322,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (Some((kv_tape, data)), Some(pool)) => Some(KvUpload {
                 tape: *kv_tape,
                 block_table: &pool.block_table_host,
-                slot_mapping: &pool.slot_mapping_host[..tape.bucket_m as usize],
+                slot_mapping: &pool.slot_mapping_host[..tape.bucket_m.get() as usize],
                 sequence: *data,
             }),
             _ => None,
@@ -1504,7 +1512,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // both the worker's own allocations, which outlive every launch on its stream.
         unsafe {
             kernels::argmax_bf16(
-                (Self::slot_of(arena, tape.result.offset).cast_const(), vocab),
+                (
+                    Self::slot_of(arena, tape.result.offset).cast_const(),
+                    vocab.get(),
+                ),
                 g.iota.ptr().cast_const(),
                 g.token.ptr(),
                 stream.0,
@@ -1555,7 +1566,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             },
                         split,
                     }) => {
-                        let b = Self::fp8_weight(weights, b, n, k);
+                        let b = Self::fp8_weight(weights, b, n.get(), k.get());
                         // SAFETY: as the `Gemv` arm's, for `a` (`k` bf16, which the kernel quantizes
                         // in its prologue), the fp8 weight (`n*k` bytes then `n` f32,
                         // `step::fp8_weight`) and `c` (`n`).
@@ -1565,7 +1576,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::gemv_fp8_residual(
                                 (slot(a).cast_const(), b, slot(c)),
                                 partials,
-                                (n, k, split.splits),
+                                (n.get(), k.get(), split.splits.get()),
                                 residual.map_or(std::ptr::null(), |r| slot(r).cast_const()),
                                 stream.0,
                             )
@@ -1577,7 +1588,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             .collect();
                         let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (present
                             .iter())
-                        .map(|(_, m)| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                        .map(|(_, m)| {
+                            (
+                                Self::fp8_weight(weights, m.b, m.n.get(), g.k.get()),
+                                slot(m.c),
+                                m.n.get(),
+                            )
+                        })
                         .collect();
                         let splits = Self::member_splits(&gw, &present);
                         // Member `i`'s partials follow the members' before it, as the bf16 group's.
@@ -1596,29 +1613,29 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(g.a),
                                 &members,
                                 &parts,
-                                (g.k, &splits),
+                                (g.k.get(), &splits),
                                 stream.0,
                             )
                         }
                     }
                     CudaStep::QuantRowsFp8(QuantRowsFp8 { x, q, rows, cols }) => {
-                        let (q, scale) = Self::fp8_rows(slot, q, rows, cols);
+                        let (q, scale) = Self::fp8_rows(slot, q, rows.get(), cols.get());
                         // SAFETY: as above, for `x` (`rows*cols` bf16) and the quant scratch, which
                         // holds `rows*cols` bytes then `rows` f32 at `scale_at` (`validate`). One
                         // row (the tensor-core decode GEMV's input, FP8 S8 T2) is Q1's, the same
                         // bytes and scale.
                         unsafe {
                             match rows {
-                                1 => kernels::quant_row_fp8_one(
+                                Rows(1) => kernels::quant_row_fp8_one(
                                     slot(x).cast_const(),
                                     (q.cast_mut(), scale.cast_mut()),
-                                    cols,
+                                    cols.get(),
                                     stream.0,
                                 ),
                                 _ => kernels::quant_rows_fp8(
                                     slot(x),
                                     (q.cast_mut(), scale.cast_mut()),
-                                    (rows, cols),
+                                    (rows.get(), cols.get()),
                                     stream.0,
                                 ),
                             }
@@ -1634,15 +1651,19 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         residual,
                         ..
                     }) => {
-                        let (q, scale) = Self::fp8_rows(slot, a, 1, k);
+                        let (q, scale) = Self::fp8_rows(slot, a, 1, k.get());
                         let r = residual.map(|r| [slot(r).cast_const()]);
                         // SAFETY: as the `GemvFp8` arm's, for the quantized row (`k` bytes then its
                         // scale, the quant scratch) in place of the bf16 row.
                         unsafe {
                             kernels::gemv_fp8_b8(
                                 (q, scale, 1),
-                                &[(Self::fp8_weight(weights, b, n, k), slot(c), n)],
-                                k,
+                                &[(
+                                    Self::fp8_weight(weights, b, n.get(), k.get()),
+                                    slot(c),
+                                    n.get(),
+                                )],
+                                k.get(),
                                 (1, 1, None),
                                 kernels::B8Store::Bf16 {
                                     residual: r.as_ref().map(|r| &r[..]),
@@ -1652,18 +1673,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::GemvGroupTcFp8(g) => {
-                        let (q, scale) = Self::fp8_rows(slot, g.a, 1, g.k);
+                        let (q, scale) = Self::fp8_rows(slot, g.a, 1, g.k.get());
                         let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (g.members())
                             .iter()
                             .flatten()
-                            .map(|m| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                            .map(|m| {
+                                (
+                                    Self::fp8_weight(weights, m.b, m.n.get(), g.k.get()),
+                                    slot(m.c),
+                                    m.n.get(),
+                                )
+                            })
                             .collect();
                         // SAFETY: as the `GemvTcFp8` arm's, each member's weight an fp8 buffer.
                         unsafe {
                             kernels::gemv_fp8_b8(
                                 (q, scale, 1),
                                 &members,
-                                g.k,
+                                g.k.get(),
                                 (1, 1, None),
                                 kernels::B8Store::Bf16 { residual: None },
                                 stream.0,
@@ -1685,40 +1712,68 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     }) => {
                         let col64 = matches!(s, CudaStep::GemmCol64Fp8(_));
                         let (a, b) = (
-                            Self::fp8_rows(slot, a, m, k),
-                            Self::fp8_weight(weights, b, n, k),
+                            Self::fp8_rows(slot, a, m.get(), k.get()),
+                            Self::fp8_weight(weights, b, n.get(), k.get()),
                         );
                         // SAFETY: as above, for the quantized rows and their scales, the fp8 weight
                         // (`n*k` bytes then `n` f32, `step::fp8_weight`) and `c` (`m*n`).
-                        unsafe { kernels::gemm_fp8_abt(a, b, slot(c), (m, n, k), col64, stream.0) }
+                        unsafe {
+                            kernels::gemm_fp8_abt(
+                                a,
+                                b,
+                                slot(c),
+                                (m.get(), n.get(), k.get()),
+                                col64,
+                                stream.0,
+                            )
+                        }
                     }
                     CudaStep::GemmNarrowFp8(GemmBf16 {
                         a, b, c, m, n, k, ..
                     }) => {
                         let (a, b) = (
-                            Self::fp8_rows(slot, a, m, k),
-                            Self::fp8_weight(weights, b, n, k),
+                            Self::fp8_rows(slot, a, m.get(), k.get()),
+                            Self::fp8_weight(weights, b, n.get(), k.get()),
                         );
                         // SAFETY: as the `GemmFp8` arm's.
-                        unsafe { kernels::gemm_narrow_fp8_abt(a, b, slot(c), (m, n, k), stream.0) }
+                        unsafe {
+                            kernels::gemm_narrow_fp8_abt(
+                                a,
+                                b,
+                                slot(c),
+                                (m.get(), n.get(), k.get()),
+                                stream.0,
+                            )
+                        }
                     }
                     CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => {
                         let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> =
                             (g.members().iter())
                                 .flatten()
-                                .map(|m| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                                .map(|m| {
+                                    (
+                                        Self::fp8_weight(weights, m.b, m.n.get(), g.k.get()),
+                                        slot(m.c),
+                                        m.n.get(),
+                                    )
+                                })
                                 .collect();
-                        let a = Self::fp8_rows(slot, g.a, g.m, g.k);
+                        let a = Self::fp8_rows(slot, g.a, g.m.get(), g.k.get());
                         // SAFETY: as the `GemmFp8` arm's, for every member, whose outputs overlap
                         // neither the input nor each other (`validate`).
                         unsafe {
                             if matches!(s, CudaStep::GemmGroupFp8(_)) {
-                                kernels::gemm_group_fp8_abt(a, &members, (g.m, g.k), stream.0)
+                                kernels::gemm_group_fp8_abt(
+                                    a,
+                                    &members,
+                                    (g.m.get(), g.k.get()),
+                                    stream.0,
+                                )
                             } else {
                                 kernels::gemm_narrow_group_fp8_abt(
                                     a,
                                     &members,
-                                    (g.m, g.k),
+                                    (g.m.get(), g.k.get()),
                                     stream.0,
                                 )
                             }
@@ -1730,7 +1785,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         let b = weights[b.0 as usize].ptr();
                         // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                         unsafe {
-                            kernels::gemm_col64_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                            kernels::gemm_col64_bf16_abt(
+                                slot(a),
+                                b,
+                                slot(c),
+                                (m.get(), n.get(), k.get()),
+                                stream.0,
+                            )
                         }
                     }
                     CudaStep::Scale(ScaleBf16 {
@@ -1745,7 +1806,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::scale_bf16(
                                 slot(x),
                                 slot(out),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 scale.get(),
                                 stream.0,
                             )
@@ -1762,7 +1823,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         // SAFETY: as above, for `x` and `out` (`rows*cols` each) and `scale` (one
                         // bf16).
                         unsafe {
-                            kernels::layer_scale_bf16(slot(x), w, slot(out), (rows, cols), stream.0)
+                            kernels::layer_scale_bf16(
+                                slot(x),
+                                w,
+                                slot(out),
+                                (rows.get(), cols.get()),
+                                stream.0,
+                            )
                         }
                     }
                     CudaStep::SoftCap(SoftCapBf16 {
@@ -1777,7 +1844,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::soft_cap_bf16(
                                 slot(x),
                                 slot(out),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 cap.get(),
                                 stream.0,
                             )
@@ -1794,7 +1861,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::gather_last_row_bf16(
                                 slot(x),
                                 slot(sequence).cast_const(),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 stream.0,
                             )
                         }
@@ -1811,7 +1878,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::rms_norm_unit_bf16(
                                 slot(x),
                                 slot(y),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 eps.get(),
                                 stream.0,
                             )
@@ -1830,7 +1897,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(gate),
                                 slot(up),
                                 slot(out),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 stream.0,
                             )
                         }
@@ -1852,7 +1919,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(tokens),
                                 table,
                                 slot(out),
-                                (rows, hidden, vocab),
+                                (rows.get(), hidden.get(), vocab.get()),
                                 stream.0,
                             )
                         }
@@ -1862,7 +1929,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     }) => {
                         let b = weights[b.0 as usize].ptr();
                         // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
-                        unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
+                        unsafe {
+                            kernels::gemm_bf16_abt(
+                                slot(a),
+                                b,
+                                slot(c),
+                                m.get(),
+                                n.get(),
+                                k.get(),
+                                stream.0,
+                            )
+                        }
                     }
                     CudaStep::GemmNarrow(GemmBf16 {
                         a, b, c, m, n, k, ..
@@ -1870,7 +1947,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         let b = weights[b.0 as usize].ptr();
                         // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                         unsafe {
-                            kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                            kernels::gemm_narrow_bf16_abt(
+                                slot(a),
+                                b,
+                                slot(c),
+                                (m.get(), n.get(), k.get()),
+                                stream.0,
+                            )
                         }
                     }
                     CudaStep::Gemv(GemvBf16 {
@@ -1899,17 +1982,23 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 kernels::gemv_bf16_residual(
                                     (slot(a), b, slot(c)),
                                     partials,
-                                    (n, k, splits),
+                                    (n.get(), k.get(), splits.get()),
                                     slot(r).cast_const(),
                                     stream.0,
                                 )
-                            } else if splits == 1 {
-                                kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0)
+                            } else if splits == Splits(1) {
+                                kernels::gemv_bf16_abt(
+                                    slot(a),
+                                    b,
+                                    slot(c),
+                                    (n.get(), k.get()),
+                                    stream.0,
+                                )
                             } else {
                                 kernels::gemv_split_bf16_abt(
                                     (slot(a), b, slot(c)),
                                     partials,
-                                    (n, k, splits),
+                                    (n.get(), k.get(), splits.get()),
                                     stream.0,
                                 )
                             }
@@ -1918,25 +2007,42 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::GemmGroup(g) => {
                         let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
                             .flatten()
-                            .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                            .map(|m| {
+                                (
+                                    weights[m.b.0 as usize].ptr().cast_const(),
+                                    slot(m.c),
+                                    m.n.get(),
+                                )
+                            })
                             .collect();
                         // SAFETY: as above, for `a` (`m*k`) and each member's `b` (`n*k`) and `c`
                         // (`m*n`), which overlap neither `a` nor each other (`validate`).
                         unsafe {
-                            kernels::gemm_group_bf16_abt(slot(g.a), &members, (g.m, g.k), stream.0)
+                            kernels::gemm_group_bf16_abt(
+                                slot(g.a),
+                                &members,
+                                (g.m.get(), g.k.get()),
+                                stream.0,
+                            )
                         }
                     }
                     CudaStep::GemmNarrowGroup(g) => {
                         let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
                             .flatten()
-                            .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                            .map(|m| {
+                                (
+                                    weights[m.b.0 as usize].ptr().cast_const(),
+                                    slot(m.c),
+                                    m.n.get(),
+                                )
+                            })
                             .collect();
                         // SAFETY: as the `GemmGroup` arm's.
                         unsafe {
                             kernels::gemm_narrow_group_bf16_abt(
                                 slot(g.a),
                                 &members,
-                                (g.m, g.k),
+                                (g.m.get(), g.k.get()),
                                 stream.0,
                             )
                         }
@@ -1947,7 +2053,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             .collect();
                         let members: Vec<(*const c_void, *mut c_void, u32)> = (present.iter())
                             .map(|(_, m)| {
-                                (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n)
+                                (
+                                    weights[m.b.0 as usize].ptr().cast_const(),
+                                    slot(m.c),
+                                    m.n.get(),
+                                )
                             })
                             .collect();
                         let splits = Self::member_splits(&gw, &present);
@@ -1971,7 +2081,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(g.a),
                                 &members,
                                 &parts,
-                                (g.k, &splits),
+                                (g.k.get(), &splits),
                                 stream.0,
                             )
                         }
@@ -1997,15 +2107,15 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     slot(x),
                                     b,
                                     slot(logits),
-                                    m,
-                                    experts,
-                                    hidden,
+                                    m.get(),
+                                    experts.get(),
+                                    hidden.get(),
                                     stream.0,
                                 ),
                                 MatmulKernel::Gemv(split) => kernels::gemv_split_bf16_abt(
                                     (slot(x), b, slot(logits)),
                                     partials,
-                                    (experts, hidden, split.splits),
+                                    (experts.get(), hidden.get(), split.splits.get()),
                                     stream.0,
                                 ),
                                 // Gemma's 128-expert router at m ≥ 2, its own projection.
@@ -2013,7 +2123,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     slot(x),
                                     b,
                                     slot(logits),
-                                    (m, experts, hidden),
+                                    (m.get(), experts.get(), hidden.get()),
                                     stream.0,
                                 ),
                             }
@@ -2034,7 +2144,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::moe_route_softmax_topk_bf16(
                                 slot(logits),
                                 (slot(topk_idx), slot(scores)),
-                                (m, experts, top_k),
+                                (m.get(), experts.get(), top_k.get()),
                                 renorm,
                                 stream.0,
                             )
@@ -2049,7 +2159,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 kernels::moe_route_topk_scaled_softmax_bf16(
                                     (slot(logits), pes),
                                     (slot(topk_idx), slot(scores)),
-                                    (m, experts, top_k),
+                                    (m.get(), experts.get(), top_k.get()),
                                     scale.get(),
                                     stream.0,
                                 )
@@ -2060,7 +2170,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::ExpertSortFp8(sort) => Self::expert_sort_fp8(&sort, slot, stream),
                     // FP8 S8 P1: the act over the live rows, quantized into the quant scratch.
                     CudaStep::ExpertActQuant(t) => {
-                        let (q, scale) = Self::fp8_rows(slot, t.q_act, t.act.rows, t.act.cols);
+                        let (q, scale) =
+                            Self::fp8_rows(slot, t.q_act, t.act.rows.get(), t.act.cols.get());
                         // SAFETY: as above, for `gate` and `up` (`rows*cols` bf16), the offsets
                         // (`experts + 1` u32) and the quant scratch (`rows*cols` bytes then `rows`
                         // f32 at `scale_at`, `validate`).
@@ -2072,7 +2183,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     slot(t.offsets).cast_const(),
                                 ),
                                 (q.cast_mut(), scale.cast_mut()),
-                                (t.act.rows, t.act.cols, t.experts),
+                                (t.act.rows.get(), t.act.cols.get(), t.experts.get()),
                                 t.op.code(),
                                 stream.0,
                             )
@@ -2099,30 +2210,30 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 GateUpKernel::Gemv(split) => kernels::gate_up_gemv_bf16(
                                     (slot(a), gate, up),
                                     (slot(g.out), partials),
-                                    (n, k, split.splits),
+                                    (n.get(), k.get(), split.splits.get()),
                                     act,
                                     stream.0,
                                 ),
                                 GateUpKernel::GemvFp8(split) => kernels::gate_up_gemv_fp8(
                                     (
                                         slot(a).cast_const(),
-                                        Self::fp8_weight(weights, g.gate.b, n, k),
-                                        Self::fp8_weight(weights, g.up.b, n, k),
+                                        Self::fp8_weight(weights, g.gate.b, n.get(), k.get()),
+                                        Self::fp8_weight(weights, g.up.b, n.get(), k.get()),
                                     ),
                                     (slot(g.out), partials),
-                                    (n, k, split.splits),
+                                    (n.get(), k.get(), split.splits.get()),
                                     act,
                                     stream.0,
                                 ),
                                 GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
                                     kernels::gate_up_gemm_fp8(
                                         (
-                                            Self::fp8_rows(slot, a, m, k),
-                                            Self::fp8_weight(weights, g.gate.b, n, k),
-                                            Self::fp8_weight(weights, g.up.b, n, k),
+                                            Self::fp8_rows(slot, a, m.get(), k.get()),
+                                            Self::fp8_weight(weights, g.gate.b, n.get(), k.get()),
+                                            Self::fp8_weight(weights, g.up.b, n.get(), k.get()),
                                         ),
                                         slot(g.out),
-                                        (m, n, k),
+                                        (m.get(), n.get(), k.get()),
                                         (act, g.kernel == GateUpKernel::GemmCol64Fp8),
                                         stream.0,
                                     )
@@ -2131,7 +2242,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     kernels::gate_up_gemm_bf16(
                                         (slot(a), gate, up),
                                         slot(g.out),
-                                        (m, n, k),
+                                        (m.get(), n.get(), k.get()),
                                         (act, g.kernel == GateUpKernel::GemmCol64),
                                         stream.0,
                                     )
@@ -2158,7 +2269,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::moe_combine_bf16(
                                 (slot(down), pos.map(|p| slot(p).cast_const()), slot(scores)),
                                 slot(out),
-                                (m, top_k, hidden, down_rows),
+                                (m.get(), top_k.get(), hidden.get(), down_rows.get()),
                                 stream.0,
                             )
                         }
@@ -2177,7 +2288,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             kernels::gate_scale_bf16(
                                 (slot(routed), slot(shared), slot(g)),
                                 slot(out),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 stream.0,
                             )
                         }
@@ -2231,7 +2342,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(x),
                                 gain,
                                 slot(y),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 norm.eps.get(),
                                 convention.offset(),
                                 stream.0,
@@ -2252,7 +2363,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(f.a), slot(f.b)),
                                 gain,
                                 (slot(f.sum), slot(n.y)),
-                                (n.rows, n.cols),
+                                (n.rows.get(), n.cols.get()),
                                 (n.eps.get(), n.convention.offset()),
                                 stream.0,
                             )
@@ -2279,7 +2390,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(n.x), slot(residual)),
                                 gain,
                                 slot(n.y),
-                                (n.rows, n.cols),
+                                (n.rows.get(), n.cols.get()),
                                 (n.eps.get(), n.convention.offset()),
                                 stream.0,
                             )
@@ -2314,7 +2425,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     }) => {
                         // SAFETY: as above, for `a`, `b` and `out` (`rows*cols` each).
                         unsafe {
-                            kernels::add_bf16(slot(a), slot(b), slot(out), (rows, cols), stream.0)
+                            kernels::add_bf16(
+                                slot(a),
+                                slot(b),
+                                slot(out),
+                                (rows.get(), cols.get()),
+                                stream.0,
+                            )
                         }
                     }
                     CudaStep::SiluMul(SiluMulBf16 {
@@ -2330,7 +2447,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(gate),
                                 slot(up),
                                 slot(out),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 stream.0,
                             )
                         }
@@ -2352,8 +2469,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(x),
                                 slot(table),
                                 slot(out),
-                                (rows, cols),
-                                (head_dim, rot_dim, pairing),
+                                (rows.get(), cols.get()),
+                                (head_dim.get(), rot_dim.get(), pairing),
                                 stream.0,
                             )
                         }
@@ -2374,8 +2491,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(qg),
                                 slot(q),
                                 slot(gate),
-                                (rows, half_cols),
-                                head_dim,
+                                (rows.get(), half_cols.get()),
+                                head_dim.get(),
                                 stream.0,
                             )
                         }
@@ -2393,7 +2510,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(attn),
                                 slot(gate),
                                 slot(out),
-                                (rows, cols),
+                                (rows.get(), cols.get()),
                                 stream.0,
                             )
                         }
@@ -2414,7 +2531,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         norms,
                     }) => {
                         let pool = kv.expect("`new` made a pool for a KV tape");
-                        let l = layer as usize;
+                        let l = layer.get() as usize;
                         // Layer `l`'s class layout: its `kv_heads` and `head_dim` (`validate`
                         // checked the step's are its class's).
                         let layout = pool.layer_layout(l);
@@ -2443,10 +2560,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     (slot(table).cast_const(), slot(slot_mapping).cast_const()),
                                     (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                                     (
-                                        q.cols / head_dim,
+                                        q.cols.get() / head_dim.get(),
                                         layout.num_kv_heads,
                                         layout.head_dim,
-                                        rot_dim,
+                                        rot_dim.get(),
                                         pairing,
                                     ),
                                     (layout.block_size, layout.num_blocks),
@@ -2464,8 +2581,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(k),
                                 slot(table),
                                 slot(k_out),
-                                (rows, cols),
-                                (head_dim, rot_dim, pairing),
+                                (rows.get(), cols.get()),
+                                (head_dim.get(), rot_dim.get(), pairing),
                                 stream.0,
                             )
                             .and_then(|()| {
@@ -2473,7 +2590,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                     (slot(k_out), slot(v)),
                                     slot(slot_mapping),
                                     (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
-                                    (rows, layout.num_kv_heads, layout.head_dim),
+                                    (rows.get(), layout.num_kv_heads, layout.head_dim),
                                     (layout.block_size, layout.num_blocks),
                                     stream.0,
                                 )
@@ -2496,21 +2613,23 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         },
                     ) => {
                         let pool = kv.expect("`new` made a pool for a KV tape");
-                        let l = layer as usize;
+                        let l = layer.get() as usize;
                         let layout = pool.layer_layout(l);
                         // The column-split kernel at head dim 512, the head-dim-256 one otherwise
                         // (whose launcher refuses any other head dim).
                         let launch: PrefillLaunch = match head_dim {
-                            ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_fp8kv,
-                            ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_fp8kv,
+                            HeadDim(ATTN_PREFILL_BF16_HEAD_DIM) => {
+                                kernels::attn_prefill_windowed_fp8kv
+                            }
+                            HeadDim(ATTN_D512_BF16_HEAD_DIM) => kernels::attn_prefill_d512_fp8kv,
                             // No prefill attention kernel at another head dim: refused, nothing
                             // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
                             other => {
                                 let error = KernelError::AttnShape {
-                                    rows,
-                                    q_heads,
-                                    kv_heads,
-                                    head_dim: other,
+                                    rows: rows.get(),
+                                    q_heads: q_heads.get(),
+                                    kv_heads: kv_heads.get(),
+                                    head_dim: other.get(),
                                     block_size: layout.block_size,
                                     num_blocks: layout.num_blocks,
                                 };
@@ -2526,9 +2645,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(q), slot(out)),
                                 (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                                 (slot(block_table), slot(sequence)),
-                                (rows, q_heads, kv_heads, head_dim),
+                                (rows.get(), q_heads.get(), kv_heads.get(), head_dim.get()),
                                 (layout.block_size, layout.num_blocks),
-                                (attn.scale.get(), window.unwrap_or(0)),
+                                (attn.scale.get(), (window.unwrap_or(AttnWindow(0))).get()),
                                 stream.0,
                             )
                         }
@@ -2550,28 +2669,30 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         split: stored,
                     }) => {
                         let pool = kv.expect("`new` made a pool for a KV tape");
-                        let l = layer as usize;
+                        let l = layer.get() as usize;
                         let layout = pool.layer_layout(l);
                         // The split over keys (W6b): the step's `(splits, min_tiles)`, its
                         // partials in the tape's split scratch, rows then maxima and sums.
                         let AttnDecodeSplit { splits, min_tiles } = stored;
-                        let Some((rows_bytes, _)) =
-                            attn_decode_split_scratch_bytes(splits, kv_heads, head_dim)
-                        else {
+                        let Some((rows_bytes, _)) = attn_decode_split_scratch_bytes(
+                            splits.get(),
+                            kv_heads.get(),
+                            head_dim.get(),
+                        ) else {
                             // The scratch overflows u64: refused, nothing launched (`validate`
                             // already refuses it, `CudaStep::gemv_scratch`).
                             let error = KernelError::AttnDecodeShape {
-                                q_heads,
-                                kv_heads,
-                                head_dim,
+                                q_heads: q_heads.get(),
+                                kv_heads: kv_heads.get(),
+                                head_dim: head_dim.get(),
                                 block_size: layout.block_size,
                                 num_blocks: layout.num_blocks,
                             };
                             return Err((step, error));
                         };
                         let split = DecodeSplit {
-                            splits,
-                            min_tiles,
+                            splits: splits.get(),
+                            min_tiles: min_tiles.get(),
                             o_split: partials,
                             ml_split: partials.wrapping_byte_add(rows_bytes as usize),
                         };
@@ -2588,16 +2709,20 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(q), slot(out)),
                                 (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                                 (slot(block_table), slot(sequence)),
-                                (q_heads, kv_heads, head_dim),
+                                (q_heads.get(), kv_heads.get(), head_dim.get()),
                                 (layout.block_size, layout.num_blocks),
-                                (attn.scale.get(), window.unwrap_or(0), split),
+                                (
+                                    attn.scale.get(),
+                                    (window.unwrap_or(AttnWindow(0))).get(),
+                                    split,
+                                ),
                                 stream.0,
                             )
                             .and_then(|()| {
                                 kernels::attn_decode_merge(
                                     (slot(sequence), slot(out)),
-                                    (q_heads, kv_heads, head_dim),
-                                    (attn.scale.get(), window.unwrap_or(0)),
+                                    (q_heads.get(), kv_heads.get(), head_dim.get()),
+                                    (attn.scale.get(), (window.unwrap_or(AttnWindow(0))).get()),
                                     split,
                                     stream.0,
                                 )
@@ -2804,7 +2929,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let other = other.map_or(std::ptr::null(), |o| slot(o).cast_const());
         let sum = sum.map_or(std::ptr::null_mut(), &slot);
         let quant = quant.map(|q| {
-            let (q, scale) = Self::fp8_rows(&slot, q, rows, cols);
+            let (q, scale) = Self::fp8_rows(&slot, q, rows.get(), cols.get());
             (q.cast_mut(), scale.cast_mut())
         });
         // SAFETY: as the row kernels' arms, for `x`, `other`, `y` and `sum` (`rows*cols` each) and
@@ -2815,7 +2940,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (slot(x).cast_const(), other, gain),
                 (slot(y), sum),
                 quant,
-                (rows, cols),
+                (rows.get(), cols.get()),
                 (form, norm.eps.get(), convention.offset()),
                 stream.0,
             )
@@ -2835,10 +2960,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     ) -> Result<(), KernelError> {
         let Some(bundle) = g.bundle_layout() else {
             return Err(KernelError::GdnDecodeShape {
-                nk: g.num_k_heads,
-                nv: g.num_v_heads,
-                head_v: g.head_v,
-                kernel: g.conv_kernel,
+                nk: g.num_k_heads.get(),
+                nv: g.num_v_heads.get(),
+                head_v: g.head_v.get(),
+                kernel: g.conv_kernel.get(),
             });
         };
         let w = weights[g.bundle.0 as usize].ptr();
@@ -2846,7 +2971,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             let off = usize::try_from(off).expect("a bundle offset fits the host's usize");
             w.wrapping_byte_add(off).cast_const()
         };
-        let (conv_state, ssm_state) = pool.layer_ptrs(g.layer as usize);
+        let (conv_state, ssm_state) = pool.layer_ptrs(g.layer.get() as usize);
         let layout = pool.layout;
         let operands = kernels::GdnDecodeOperands {
             qkv: slot(g.qkv).cast_const(),
@@ -2868,11 +2993,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (ssm_state, layout.ssm_elems_per_slot() as u64),
                 slot(g.sequence).cast_const(),
                 (
-                    g.num_k_heads,
-                    g.num_v_heads,
-                    g.head_k,
-                    g.head_v,
-                    g.conv_kernel,
+                    g.num_k_heads.get(),
+                    g.num_v_heads.get(),
+                    g.head_k.get(),
+                    g.head_v.get(),
+                    g.conv_kernel.get(),
                 ),
                 (g.scale(), g.eps.get()),
                 stream.0,
@@ -2883,7 +3008,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     /// The stored K split of each of a GEMV group's present members (`present`, in member order).
     fn member_splits(g: &GemvGroupBf16, present: &[(usize, GroupMember)]) -> Vec<u32> {
         (present.iter())
-            .map(|&(i, _)| g.splits()[i].map_or(1, |s| s.splits))
+            .map(|&(i, _)| g.splits()[i].map_or(1, |s| s.splits.get()))
             .collect()
     }
 
@@ -2902,9 +3027,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (g.conv_dim(), g.scratch_layout(), g.bundle_layout())
         else {
             return Err(KernelError::GdnConvShape {
-                rows: g.rows,
+                rows: g.rows.get(),
                 conv_dim: 0,
-                kernel: g.conv_kernel,
+                kernel: g.conv_kernel.get(),
             });
         };
         let at = |base: ArenaOffset, off: u64| slot(ArenaOffset(base.0 + off));
@@ -2913,7 +3038,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             let off = usize::try_from(off).expect("a bundle offset fits the host's usize");
             w.wrapping_byte_add(off).cast_const()
         };
-        let (conv_state, ssm_state) = pool.layer_ptrs(g.layer as usize);
+        let (conv_state, ssm_state) = pool.layer_ptrs(g.layer.get() as usize);
         let layout = pool.layout;
         let seq = slot(g.sequence).cast_const();
         let (conv_out, gate, beta, o) = (
@@ -2935,7 +3060,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (conv_state, layout.conv_elems_per_slot() as u64),
                 seq,
                 conv_out,
-                (g.rows, conv_dim, g.conv_kernel),
+                (g.rows.get(), conv_dim, g.conv_kernel.get()),
                 stream.0,
             )?;
             kernels::gdn_gating(
@@ -2943,7 +3068,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (wat(bundle.a_log), wat(bundle.dt_bias)),
                 seq,
                 (gate, beta),
-                (g.rows, g.num_v_heads),
+                (g.rows.get(), g.num_v_heads.get()),
                 stream.0,
             )?;
             // A prefill bucket's step scans 64 tokens a chunk (FP8 S8 F6a); a one-row bucket's (a
@@ -2958,15 +3083,15 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (ssm_state, layout.ssm_elems_per_slot() as u64),
                 seq,
                 o,
-                (g.rows, g.num_k_heads, g.num_v_heads),
-                (g.head_k, g.head_v, g.scale()),
+                (g.rows.get(), g.num_k_heads.get(), g.num_v_heads.get()),
+                (g.head_k.get(), g.head_v.get(), g.scale()),
                 stream.0,
             )?;
             kernels::gdn_rms_norm_gated(
                 (o.cast_const(), slot(g.z).cast_const(), wat(bundle.norm)),
                 seq,
                 slot(g.out),
-                (g.rows, g.num_v_heads, g.head_v),
+                (g.rows.get(), g.num_v_heads.get(), g.head_v.get()),
                 g.eps.get(),
                 stream.0,
             )
@@ -2984,7 +3109,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // sort refuses its shape and nothing launches.
         let refused = KernelError::MoeShape {
             kernel: "moe_sort",
-            dims: [s.m, s.top_k, s.hidden, s.max_tiles],
+            dims: [s.m.get(), s.top_k.get(), s.hidden.get(), s.max_tiles.get()],
         };
         if s.layout().is_none() {
             return Err(refused);
@@ -3004,7 +3129,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (slot(s.x).cast_const(), slot(s.topk_idx).cast_const()),
                 regions,
                 slot(s.rows),
-                (s.m, s.experts, s.top_k, s.hidden, s.max_tiles),
+                (
+                    s.m.get(),
+                    s.experts.get(),
+                    s.top_k.get(),
+                    s.hidden.get(),
+                    s.max_tiles.get(),
+                ),
                 stream.0,
             )
         }
@@ -3019,11 +3150,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     ) -> Result<(), KernelError> {
         let refused = KernelError::MoeShape {
             kernel: "moe_sort_fp8",
-            dims: [s.m, s.top_k, s.hidden, s.max_tiles],
+            dims: [s.m.get(), s.top_k.get(), s.hidden.get(), s.max_tiles.get()],
         };
         let (Some(_), Some(capacity)) = (
             s.layout(),
             s.max_tiles
+                .get()
                 .checked_mul(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS),
         ) else {
             return Err(refused);
@@ -3035,8 +3167,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             tile_expert: slot(s.tile_expert),
             pos: slot(s.pos),
         };
-        let (xq, x_scale) = Self::fp8_rows(&slot, s.x, s.m, s.hidden);
-        let (rows, row_scale) = Self::fp8_rows(&slot, s.rows, capacity, s.hidden);
+        let (xq, x_scale) = Self::fp8_rows(&slot, s.x, s.m.get(), s.hidden.get());
+        let (rows, row_scale) = Self::fp8_rows(&slot, s.rows, capacity, s.hidden.get());
         // SAFETY: as `expert_sort`'s, with `x` the quant scratch's `m*hidden` e4m3 bytes and `m`
         // f32 (`validate`), and `rows` the sorted region's `capacity*hidden` bytes and `capacity`
         // f32 (the e4m3 sort's extents, inside the region's bf16 bytes).
@@ -3045,7 +3177,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (xq, x_scale, slot(s.topk_idx).cast_const()),
                 regions,
                 (rows.cast_mut(), row_scale.cast_mut()),
-                (s.m, s.experts, s.top_k, s.hidden, s.max_tiles),
+                (
+                    s.m.get(),
+                    s.experts.get(),
+                    s.top_k.get(),
+                    s.hidden.get(),
+                    s.max_tiles.get(),
+                ),
                 stream.0,
             )
         }
@@ -3112,7 +3250,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let g = t.gate;
         let refused = || KernelError::MoeShape {
             kernel: "expert_gate_up_gemm_fp8",
-            dims: [g.max_tiles, g.inter, g.hidden, 0],
+            dims: [g.max_tiles.get(), g.inter.get(), g.hidden.get(), 0],
         };
         let Some((a, rows, k)) = CudaStep::ExpertGemm(g).fp8_expert_rows() else {
             return Err(refused());
@@ -3121,11 +3259,16 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             weights,
             (g.bundle, g.weight),
             ExpertProjection::Gate,
-            (g.experts, g.hidden, g.inter),
+            (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
             return Err(refused());
         };
-        let (q, scale) = Self::fp8_rows(&slot, t.act.q_act, t.act.act.rows, t.act.act.cols);
+        let (q, scale) = Self::fp8_rows(
+            &slot,
+            t.act.q_act,
+            t.act.act.rows.get(),
+            t.act.act.cols.get(),
+        );
         // SAFETY: as `expert_gemm`'s fp8 arm, for the sorted rows (`rows*k` e4m3 bytes and `rows`
         // f32), the bank (`fp8_moe_layout`'s bytes: its down scales follow the gate/up scales),
         // the index regions and the gate's region (`rows*inter` bf16, the act's), then as the
@@ -3138,14 +3281,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     slot(g.tile_expert).cast_const(),
                 ),
                 slot(g.c),
-                (g.max_tiles, g.inter, k, g.experts, expert_rows),
+                (
+                    g.max_tiles.get(),
+                    g.inter.get(),
+                    k,
+                    g.experts.get(),
+                    expert_rows,
+                ),
                 t.act.op.code(),
                 stream.0,
             )?;
             kernels::expert_quant_fp8(
                 (slot(g.c).cast_const(), slot(t.act.offsets).cast_const()),
                 (q.cast_mut(), scale.cast_mut()),
-                (t.act.act.rows, t.act.act.cols, t.act.experts),
+                (
+                    t.act.act.rows.get(),
+                    t.act.act.cols.get(),
+                    t.act.experts.get(),
+                ),
                 stream.0,
             )
         }
@@ -3166,11 +3319,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 weights,
                 (g.bundle, g.weight),
                 g.proj,
-                (g.experts, g.hidden, g.inter),
+                (g.experts.get(), g.hidden.get(), g.inter.get()),
             ) else {
                 return Err(KernelError::MoeShape {
                     kernel: "expert_gemm_fp8",
-                    dims: [g.max_tiles, n, k, 0],
+                    dims: [g.max_tiles.get(), n, k, 0],
                 });
             };
             // SAFETY: as the bf16 arm's below, with `a` the quant scratch's `rows*k` e4m3 bytes
@@ -3184,8 +3337,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         slot(g.tile_expert).cast_const(),
                     ),
                     slot(g.c),
-                    (g.max_tiles, n, k, g.experts, expert_rows),
-                    g.n_tile,
+                    (g.max_tiles.get(), n, k, g.experts.get(), expert_rows),
+                    g.n_tile.get(),
                     stream.0,
                 )
             };
@@ -3194,11 +3347,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             weights,
             (g.bundle, g.weight),
             g.proj,
-            (g.experts, g.hidden, g.inter),
+            (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
             return Err(KernelError::MoeShape {
                 kernel: "expert_gemm_bf16",
-                dims: [g.max_tiles, n, k, 0],
+                dims: [g.max_tiles.get(), n, k, 0],
             });
         };
         // SAFETY: as `enqueue`'s, for `a` (`max_tiles*128*k`), `offsets` (`experts + 1`),
@@ -3213,8 +3366,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     slot(g.tile_expert).cast_const(),
                 ),
                 slot(g.c),
-                (g.max_tiles, n, k, g.experts, expert_rows),
-                g.n_tile,
+                (g.max_tiles.get(), n, k, g.experts.get(), expert_rows),
+                g.n_tile.get(),
                 stream.0,
             )
         }
@@ -3234,30 +3387,38 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let up_at = (u64::from(m) * u64::from(n) * 4).next_multiple_of(CUDA_ARENA_ALIGN) as usize;
         let (gate, up) = (partials, partials.wrapping_byte_add(up_at));
         let members = [
-            (Self::fp8_weight(weights, t.fold.gate.b, n, k), gate, n),
-            (Self::fp8_weight(weights, t.fold.up.b, n, k), up, n),
+            (
+                Self::fp8_weight(weights, t.fold.gate.b, n.get(), k.get()),
+                gate,
+                n.get(),
+            ),
+            (
+                Self::fp8_weight(weights, t.fold.up.b, n.get(), k.get()),
+                up,
+                n.get(),
+            ),
         ];
-        let (q_act, s_act) = Self::fp8_rows(&slot, t.q_act, m, n);
+        let (q_act, s_act) = Self::fp8_rows(&slot, t.q_act, m.get(), n.get());
         // SAFETY: as the `GateUpAct` arm's: the quantized row (the quant scratch), both weights;
         // the GEMV scratch holds both f32 rows (`validate` checked its bytes); `out` (`m*n` bf16)
         // and the second slot (`m*n` bytes then `m` f32).
         unsafe {
             kernels::gemv_fp8_b8(
                 (
-                    Self::fp8_rows(&slot, a, m, k).0,
-                    Self::fp8_rows(&slot, a, m, k).1,
-                    m,
+                    Self::fp8_rows(&slot, a, m.get(), k.get()).0,
+                    Self::fp8_rows(&slot, a, m.get(), k.get()).1,
+                    m.get(),
                 ),
                 &members,
-                k,
-                (m, 1, None),
+                k.get(),
+                (m.get(), 1, None),
                 kernels::B8Store::F32,
                 stream.0,
             )?;
             kernels::act_quant_fp8(
                 (gate.cast_const(), up.cast_const()),
                 (q_act.cast_mut(), s_act.cast_mut(), slot(t.fold.out)),
-                (m, n),
+                (m.get(), n.get()),
                 t.fold.act.code(),
                 stream.0,
             )
@@ -3275,35 +3436,35 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let (n, k) = g.n_k();
         let refused = KernelError::MoeShape {
             kernel: "gemv_fp8_b8",
-            dims: [g.m, g.top_k, n, k],
+            dims: [g.m.get(), g.top_k.get(), n, k],
         };
         let Some((b, expert_rows)) = Self::fp8_expert_slab(
             weights,
             (g.bundle, g.weight),
             g.proj,
-            (g.experts, g.hidden, g.inter),
+            (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
             return Err(refused);
         };
-        let pairs = g.m.checked_mul(g.top_k).ok_or(refused)?;
+        let pairs = g.m.get().checked_mul(g.top_k.get()).ok_or(refused)?;
         let (a_rows, row_div) = match g.rows {
             PairRows::Token => (g.m, g.top_k),
-            PairRows::Pair => (pairs, 1),
+            PairRows::Pair => (Rows(pairs), TopK(1)),
         };
-        let (q, scale) = Self::fp8_rows(&slot, g.a, a_rows, k);
+        let (q, scale) = Self::fp8_rows(&slot, g.a, a_rows.get(), k);
         let experts = kernels::B8Experts {
             topk_idx: slot(g.topk_idx).cast_const(),
-            experts: g.experts,
+            experts: g.experts.get(),
             expert_rows,
         };
         // SAFETY: as `expert_gemv`'s fp8 launch, with the quantized rows (the quant scratch) in
         // place of the bf16 ones.
         unsafe {
             kernels::gemv_fp8_b8(
-                (q, scale, a_rows),
+                (q, scale, a_rows.get()),
                 &[(b, slot(g.c), n)],
                 k,
-                (pairs, row_div, Some(experts)),
+                (pairs, row_div.get(), Some(experts)),
                 kernels::B8Store::Bf16 { residual: None },
                 stream.0,
             )
@@ -3323,38 +3484,38 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let (n, k) = g.n_k();
         let refused = KernelError::MoeShape {
             kernel: "gemv_fp8_b8",
-            dims: [g.m, g.top_k, n, k],
+            dims: [g.m.get(), g.top_k.get(), n, k],
         };
         let slab = |p: &ExpertGemvBf16| {
             Self::fp8_expert_slab(
                 weights,
                 (p.bundle, p.weight),
                 p.proj,
-                (p.experts, p.hidden, p.inter),
+                (p.experts.get(), p.hidden.get(), p.inter.get()),
             )
         };
         let (Some((gate_w, expert_rows)), Some((up_w, _))) = (slab(&g), slab(&t.fold.up)) else {
             return Err(refused);
         };
-        let pairs = g.m.checked_mul(g.top_k).ok_or(refused)?;
+        let pairs = g.m.get().checked_mul(g.top_k.get()).ok_or(refused)?;
         let up_at =
             (u64::from(pairs) * u64::from(n) * 4).next_multiple_of(CUDA_ARENA_ALIGN) as usize;
         let (gate, up) = (partials, partials.wrapping_byte_add(up_at));
-        let (q, scale) = Self::fp8_rows(&slot, g.a, g.m, k);
+        let (q, scale) = Self::fp8_rows(&slot, g.a, g.m.get(), k);
         let (q_act, s_act) = Self::fp8_rows(&slot, t.q_act, pairs, n);
         let experts = kernels::B8Experts {
             topk_idx: slot(g.topk_idx).cast_const(),
-            experts: g.experts,
+            experts: g.experts.get(),
             expert_rows,
         };
         // SAFETY: as `expert_gemv_tc`'s for the gate and the up (the GEMV scratch holds both f32
         // rows, `validate` checked its bytes), then the act + quantize as `gate_up_tc`'s.
         unsafe {
             kernels::gemv_fp8_b8(
-                (q, scale, g.m),
+                (q, scale, g.m.get()),
                 &[(gate_w, gate, n), (up_w, up, n)],
                 k,
-                (pairs, g.top_k, Some(experts)),
+                (pairs, g.top_k.get(), Some(experts)),
                 kernels::B8Store::F32,
                 stream.0,
             )?;
@@ -3386,11 +3547,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 weights,
                 (g.bundle, g.weight),
                 g.proj,
-                (g.experts, g.hidden, g.inter),
+                (g.experts.get(), g.hidden.get(), g.inter.get()),
             ) else {
                 return Err(KernelError::MoeShape {
                     kernel: "expert_gemv_fp8",
-                    dims: [g.m, g.top_k, n, k],
+                    dims: [g.m.get(), g.top_k.get(), n, k],
                 });
             };
             // SAFETY: as the bf16 launch's below, with the bank `fp8_moe_layout`'s bytes, expert
@@ -3399,9 +3560,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 kernels::expert_gemv_fp8(
                     (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
                     (slot(g.c), partials),
-                    (g.m, g.top_k, n, k),
-                    (g.experts, expert_rows),
-                    (g.rows == PairRows::Pair, splits),
+                    (g.m.get(), g.top_k.get(), n, k),
+                    (g.experts.get(), expert_rows),
+                    (g.rows == PairRows::Pair, splits.get()),
                     stream.0,
                 )
             };
@@ -3410,11 +3571,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             weights,
             (g.bundle, g.weight),
             g.proj,
-            (g.experts, g.hidden, g.inter),
+            (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
             return Err(KernelError::MoeShape {
                 kernel: "expert_gemv_bf16",
-                dims: [g.m, g.top_k, n, k],
+                dims: [g.m.get(), g.top_k.get(), n, k],
             });
         };
         // SAFETY: as `enqueue`'s, for `a` (its `PairRows` rows of `k`), `topk_idx` (`m*top_k`),
@@ -3425,9 +3586,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             kernels::expert_gemv_split_bf16(
                 (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
                 (slot(g.c), partials),
-                (g.m, g.top_k, n, k),
-                (g.experts, expert_rows),
-                (g.rows == PairRows::Pair, splits),
+                (g.m.get(), g.top_k.get(), n, k),
+                (g.experts.get(), expert_rows),
+                (g.rows == PairRows::Pair, splits.get()),
                 stream.0,
             )
         }
@@ -3444,7 +3605,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.gate.n_k();
-        let pairs = g.gate.m.saturating_mul(g.gate.top_k);
+        let pairs = g.gate.m.get().saturating_mul(g.gate.top_k.get());
         let refused = KernelError::GateUpShape {
             kernel: "expert_gate_up_gemv_bf16",
             dims: [pairs, n, k, 0],
@@ -3456,7 +3617,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     weights,
                     (e.bundle, e.weight),
                     e.proj,
-                    (e.experts, e.hidden, e.inter),
+                    (e.experts.get(), e.hidden.get(), e.inter.get()),
                 )
             };
             let (Some((gate, rows)), Some((up, up_rows))) = (slab(&g.gate), slab(&g.up)) else {
@@ -3476,8 +3637,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         slot(g.gate.topk_idx).cast_const(),
                     ),
                     (slot(g.out), partials),
-                    (g.gate.m, g.gate.top_k, n, k),
-                    (g.gate.experts, rows, splits),
+                    (g.gate.m.get(), g.gate.top_k.get(), n, k),
+                    (g.gate.experts.get(), rows, splits.get()),
                     g.act.code(),
                     stream.0,
                 )
@@ -3488,7 +3649,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 weights,
                 (e.bundle, e.weight),
                 e.proj,
-                (e.experts, e.hidden, e.inter),
+                (e.experts.get(), e.hidden.get(), e.inter.get()),
             )
         };
         let (Some((gate, rows)), Some((up, up_rows))) = (slab(&g.gate), slab(&g.up)) else {
@@ -3509,8 +3670,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     slot(g.gate.topk_idx).cast_const(),
                 ),
                 (slot(g.out), partials),
-                (g.gate.m, g.gate.top_k, n, k),
-                (g.gate.experts, rows, splits),
+                (g.gate.m.get(), g.gate.top_k.get(), n, k),
+                (g.gate.experts.get(), rows, splits.get()),
                 g.act.code(),
                 stream.0,
             )
@@ -3535,8 +3696,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let at = QuantRowsFp8 {
             x: q,
             q,
-            rows,
-            cols,
+            rows: Rows(rows),
+            cols: Cols(cols),
         }
         .scale_at()
         .expect("`validate` checked the quant scratch's extent");
@@ -3582,8 +3743,14 @@ fn fill_table<'h>(
     host: &'h mut [u16],
 ) -> Option<(ArenaSpan, &'h [u16])> {
     table.map(|r| {
-        let rows = &mut host[..positions.len() * r.rot_dim as usize];
-        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta.get(), rows);
+        let rows = &mut host[..positions.len() * r.rot_dim.get() as usize];
+        fill_rotary_rows_with_freq_dim(
+            positions,
+            r.rot_dim.get(),
+            r.freq_dim.get(),
+            r.theta.get(),
+            rows,
+        );
         (r.span, &*rows)
     })
 }
@@ -3612,8 +3779,11 @@ fn fill_sequence(
         q_len,
     } = *seq;
     let bucket_m = tape.bucket_m;
-    if q_len == 0 || q_len > bucket_m {
-        return Err(ForwardError::KvQueryLength { q_len, bucket_m });
+    if q_len == 0 || q_len > bucket_m.get() {
+        return Err(ForwardError::KvQueryLength {
+            q_len,
+            bucket_m: bucket_m.get(),
+        });
     }
     let tokens = u64::from(prefix_len) + u64::from(q_len);
     let max = u64::from(kv.max_blocks_per_seq) * u64::from(kv.block_size);
@@ -3621,7 +3791,7 @@ fn fill_sequence(
         return Err(ForwardError::KvTooLong { tokens, max });
     }
     let need = tokens.div_ceil(u64::from(kv.block_size)) as usize;
-    let max_entries = kv.max_blocks_per_seq as usize;
+    let max_entries = kv.max_blocks_per_seq.get() as usize;
     if block_table.len() < need || block_table.len() > max_entries {
         return Err(ForwardError::KvBlockTable {
             got: block_table.len(),
@@ -3632,7 +3802,7 @@ fn fill_sequence(
     let used = &block_table[..need];
     // A slot is a u32 below `u32::MAX` (the padding sentinel), so a block past the last one whose
     // slots fit is outside the pool too. A pool that large cannot be allocated on an H100.
-    let num_blocks = (pool.layout.num_blocks).min(NO_SLOT / kv.block_size);
+    let num_blocks = (pool.layout.num_blocks).min(NO_SLOT / kv.block_size.get());
     for (entry, &block) in used.iter().enumerate() {
         if block >= num_blocks {
             return Err(ForwardError::KvBlockOutsidePool {
@@ -3659,14 +3829,14 @@ fn fill_sequence(
     table.fill(NO_SLOT);
     table[..need].copy_from_slice(used);
     let block_size = kv.block_size;
-    let slots = &mut pool.slot_mapping_host[..bucket_m as usize];
+    let slots = &mut pool.slot_mapping_host[..bucket_m.get() as usize];
     for (row, slot) in slots.iter_mut().enumerate() {
         *slot = if row < q_len as usize {
             // `pos < tokens`, so `pos / block_size < need`; the block is below `NO_SLOT /
             // block_size`, so the slot is below `NO_SLOT`.
             let pos = u64::from(prefix_len) + row as u64;
             let block = used[(pos / u64::from(block_size)) as usize];
-            block * block_size + (pos % u64::from(block_size)) as u32
+            block * block_size.get() + (pos % u64::from(block_size)) as u32
         } else {
             NO_SLOT
         };

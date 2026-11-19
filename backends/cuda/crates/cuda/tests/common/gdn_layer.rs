@@ -39,6 +39,9 @@ use scratchy_target_cuda::step::{
     AddBf16, CudaStep, GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemmGroupBf16, GroupMember,
     NormKernel, RmsNormBf16, gdn_bundle,
 };
+use scratchy_target_cuda::step::{
+    BucketM, Cols, ConvKernel, GdnHeadDim, GdnHeads, KDim, LayerId, NDim, Rows,
+};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
 };
@@ -143,9 +146,9 @@ const fn gemm(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> GemmBf16 {
         a: ArenaOffset(a),
         b: WeightIx(b),
         c: ArenaOffset(c),
-        m,
-        n,
-        k,
+        m: Rows(m),
+        n: NDim(n),
+        k: KDim(k),
         residual: None,
     }
 }
@@ -155,7 +158,7 @@ const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
     GroupMember {
         b: WeightIx(b),
         c: ArenaOffset(c),
-        n,
+        n: NDim(n),
     }
 }
 
@@ -163,8 +166,8 @@ const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
 const fn group(a: u64, m: u32, members: [(u32, u64, u32); 2]) -> GemmGroupBf16 {
     GemmGroupBf16 {
         a: ArenaOffset(a),
-        m,
-        k: H,
+        m: Rows(m),
+        k: KDim(H),
         first: member(members[0]),
         second: member(members[1]),
         third: None,
@@ -176,8 +179,8 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
         x: ArenaOffset(x),
         gain: WeightIx(1),
         y: ArenaOffset(y),
-        rows,
-        cols: H,
+        rows: Rows(rows),
+        cols: Cols(H),
         eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, H),
@@ -189,8 +192,8 @@ const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
         out: ArenaOffset(out),
-        rows,
-        cols: H,
+        rows: Rows(rows),
+        cols: Cols(H),
     })
 }
 
@@ -210,13 +213,13 @@ pub const fn gdn_step(
         out: ArenaOffset(out),
         scratch: ArenaOffset(scratch),
         sequence: ArenaOffset(sequence),
-        layer: 0,
-        rows,
-        num_k_heads: NK,
-        num_v_heads: NV,
-        head_k: HEAD_K,
-        head_v: HEAD_V,
-        conv_kernel: CONV_KERNEL,
+        layer: LayerId(0),
+        rows: Rows(rows),
+        num_k_heads: GdnHeads(NK),
+        num_v_heads: GdnHeads(NV),
+        head_k: GdnHeadDim(HEAD_K),
+        head_v: GdnHeadDim(HEAD_V),
+        conv_kernel: ConvKernel(CONV_KERNEL),
         eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
     }
 }
@@ -225,11 +228,11 @@ pub const fn gdn_step(
 const fn gdn_tape(sequence: u64, (scratch, bytes): (u64, u64)) -> Option<GdnTape> {
     Some(GdnTape {
         layers: &[LAYER],
-        num_k_heads: NK,
-        num_v_heads: NV,
-        head_k: HEAD_K,
-        head_v: HEAD_V,
-        conv_kernel: CONV_KERNEL,
+        num_k_heads: GdnHeads(NK),
+        num_v_heads: GdnHeads(NV),
+        head_k: GdnHeadDim(HEAD_K),
+        head_v: GdnHeadDim(HEAD_V),
+        conv_kernel: ConvKernel(CONV_KERNEL),
         sequence: span(sequence, 16),
         scratch: span(scratch, bytes),
     })
@@ -265,7 +268,7 @@ const GDN_LAYER_WEIGHT_BYTES: &[u64] = &[
 /// 256-byte slot) at 3416064, the scratch (4210688 bytes: `conv_out` 3145728, `g` 8192, `beta`
 /// 8192, `o` 1048576) at 3416320. Arena 7627008.
 pub static GDN_LAYER_M128: CudaTape = CudaTape {
-    bucket_m: 128,
+    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[262144, 262144, 1572864, 524288, 4096, 4096, 524288, 262144],
         colour_offsets: &[
@@ -307,7 +310,7 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
 /// at 6832128. The GDN sequence at 6832128, the scratch (8421376 bytes: 6291456, 16384, 16384,
 /// 2097152) at 6832384. Arena 15253760.
 pub static GDN_LAYER_M256: CudaTape = CudaTape {
-    bucket_m: 256,
+    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[
             524288, 524288, 3145728, 1048576, 8192, 8192, 1048576, 524288,

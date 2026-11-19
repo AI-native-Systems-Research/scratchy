@@ -18,6 +18,7 @@
 //! Colours: 0 `x`, 1 `n` (then `o`), 2 `qg`, 3 `q` (and the view `qh`), 4 `qn` (and the view
 //! `qf`), 5 `qr`, 6 `ga`, 7 `y`, 8 the gate. The rotary table follows the colours.
 
+use scratchy_target_cuda::step::{BucketM, Cols, FreqDim, KDim, NDim, RotDim, Rows};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
@@ -137,9 +138,9 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: WeightIx(b),
         c: ArenaOffset(c),
-        m,
-        n,
-        k,
+        m: Rows(m),
+        n: NDim(n),
+        k: KDim(k),
         residual: None,
     })
 }
@@ -149,8 +150,8 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
         x: ArenaOffset(x),
         gain: WeightIx(gain),
         y: ArenaOffset(y),
-        rows,
-        cols,
+        rows: Rows(rows),
+        cols: Cols(cols),
         eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
         convention: GainConvention::OnePlusScale,
         kernel: NormKernel::of(rows, cols),
@@ -162,9 +163,9 @@ const fn gate_split(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep {
         qg: ArenaOffset(qg),
         q: ArenaOffset(q),
         gate: ArenaOffset(gate),
-        rows,
-        half_cols: Q,
-        head_dim: HD,
+        rows: Rows(rows),
+        half_cols: Cols(Q),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
     })
 }
 
@@ -173,10 +174,10 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
         x: ArenaOffset(x),
         table: ArenaOffset(table),
         out: ArenaOffset(out),
-        rows,
-        cols: Q,
-        head_dim: HD,
-        rot_dim: R,
+        rows: Rows(rows),
+        cols: Cols(Q),
+        head_dim: scratchy_target_cuda::step::HeadDim(HD),
+        rot_dim: RotDim(R),
         pairing: RopePairing::Standard,
     })
 }
@@ -186,8 +187,8 @@ const fn gate_apply(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep {
         attn: ArenaOffset(attn),
         gate: ArenaOffset(gate),
         out: ArenaOffset(out),
-        rows,
-        cols: Q,
+        rows: Rows(rows),
+        cols: Cols(Q),
     })
 }
 
@@ -196,16 +197,16 @@ const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
         out: ArenaOffset(out),
-        rows,
-        cols: H,
+        rows: Rows(rows),
+        cols: Cols(H),
     })
 }
 
 const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
     Some(RotaryTable {
         span: span(offset, bytes),
-        rot_dim: R,
-        freq_dim: R,
+        rot_dim: RotDim(R),
+        freq_dim: FreqDim(R),
         theta: scratchy_target_cuda::step::RopeTheta::new(THETA),
     })
 }
@@ -217,7 +218,7 @@ const ATTN_GATE_WEIGHT_BYTES: &[u64] = &[0, 2048, 8388608, 512, 0, 0, 4194304];
 /// [`attn_gate`]`(128)`: every offset of [`ATTN_GATE_M256`] halved, and the per-head norm's rows
 /// with them.
 pub static ATTN_GATE_M128: CudaTape = CudaTape {
-    bucket_m: 128,
+    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[
             262144, 262144, 1048576, 524288, 524288, 524288, 524288, 262144, 524288,
@@ -252,7 +253,7 @@ pub static ATTN_GATE_M128: CudaTape = CudaTape {
 /// [`attn_gate`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
 /// `qr` 5242880, `ga` 6291456, `y` 7340032, the gate 7864320; the rotary table at 8912896.
 pub static ATTN_GATE_M256: CudaTape = CudaTape {
-    bucket_m: 256,
+    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[
             524288, 524288, 2097152, 1048576, 1048576, 1048576, 1048576, 524288, 1048576,

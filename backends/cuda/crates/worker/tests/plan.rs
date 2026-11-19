@@ -3,6 +3,7 @@
 //! inputs, the one-request rule, the GDN start, the greedy token, and the sampling it refuses;
 //! and the edge prompts planned step by step (one token; one past the largest bucket).
 
+use scratchy_target_cuda::step::{AttnWindow, BlockSize, HeadDim, MaxBlocksPerSeq, NumKvHeads};
 use std::collections::HashMap;
 
 use scratchy_core_common::SamplingParams;
@@ -172,16 +173,16 @@ fn a_kv_block_costs_k_and_v_per_layer() {
     };
     let kv = KvTape {
         layers: &[3, 7, 11, 15, 19, 23],
-        kv_heads: 2,
-        head_dim: 256,
-        block_size: 64,
-        max_blocks_per_seq: 128,
+        kv_heads: NumKvHeads(2),
+        head_dim: HeadDim(256),
+        block_size: BlockSize(64),
+        max_blocks_per_seq: MaxBlocksPerSeq(128),
         block_table: span,
         slot_mapping: span,
         sequence: span,
         classes: &[KvClass {
-            kv_heads: 2,
-            head_dim: 256,
+            kv_heads: NumKvHeads(2),
+            head_dim: HeadDim(256),
             window: None,
         }],
         layer_class: &[0, 0, 0, 0, 0, 0],
@@ -208,22 +209,22 @@ fn a_kv_block_costs_each_layer_at_its_own_class() {
     ];
     let kv = KvTape {
         layers: &LAYERS,
-        kv_heads: 8,
-        head_dim: 256,
-        block_size: 64,
-        max_blocks_per_seq: 128,
+        kv_heads: NumKvHeads(8),
+        head_dim: HeadDim(256),
+        block_size: BlockSize(64),
+        max_blocks_per_seq: MaxBlocksPerSeq(128),
         block_table: span,
         slot_mapping: span,
         sequence: span,
         classes: &[
             KvClass {
-                kv_heads: 8,
-                head_dim: 256,
-                window: Some(1024),
+                kv_heads: NumKvHeads(8),
+                head_dim: HeadDim(256),
+                window: Some(AttnWindow(1024)),
             },
             KvClass {
-                kv_heads: 2,
-                head_dim: 512,
+                kv_heads: NumKvHeads(2),
+                head_dim: HeadDim(512),
                 window: None,
             },
         ],
