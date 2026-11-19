@@ -341,6 +341,21 @@ use ktir_superdsc::reserved_tids::RESERVED_TID_FLOOR;
 type Alone = ktir_superdsc::collective::TpWorld<1>;
 
 pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
+    run_with_timing(dir, input, output, 0)
+}
+
+/// [`run`] with the timing leg armed: after the correctness launch, `timing_runs` more launches
+/// of the SAME bundle, each timed launch-to-completion (`run_prefix_only` is synchronous end to
+/// end — launch, then stream sync), the median printed as a `TIME` line. Every timed iteration
+/// re-runs the launch's own input refill, and the step-0 rope cells stage both forms IDENTICALLY
+/// by construction, so that refill rides both sides of the A/B equally. The clock of record for
+/// the rope half-swap sweep (`tests/rope_half_swap_cells_run.sh --time`).
+pub fn run_with_timing(
+    dir: &Path,
+    input: &[String],
+    output: &[String],
+    timing_runs: u32,
+) -> Result<()> {
     // One kernel on one card: a world of one's card, the first senlib enumerates.
     //
     // ⭐ THE SERVE SPAN OF A ONE-SHOT RUN IS THE RUN ITSELF: the scope below wraps every launch
@@ -359,7 +374,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             .build_all(&cards, scope)
             .map_err(|e| anyhow!("{e}"))?
             .into_first();
-        run_loaded(dir, input, output, &card)
+        run_loaded(dir, input, output, timing_runs, &card)
     })
 }
 
@@ -370,6 +385,7 @@ fn run_loaded(
     dir: &Path,
     input: &[String],
     output: &[String],
+    timing_runs: u32,
     card: &crate::runtime::CardRuntime<'_, Alone>,
 ) -> Result<()> {
     // ── The producer's launch map ──
@@ -1049,6 +1065,27 @@ fn run_loaded(
     // `run_prefix_only` takes `ListSel::Body` for an unrolled bundle, which is what a single-kernel
     // bundle IS: one body, no prefix/suffix seams, no per-layer advance.
     exec.run_prefix_only()?;
+
+    // ⭐ THE TIMING LEG (harness-only, armed by `--time <n>`): `timing_runs` more launches of the
+    // same bundle, each timed launch-to-completion. An ODD count keeps the median a real sample.
+    // The read-backs below still read the LAST launch's outputs — every iteration computes the
+    // same values, so the correctness compare is unaffected.
+    if timing_runs > 0 {
+        let mut samples: Vec<u128> = Vec::with_capacity(timing_runs as usize);
+        for _ in 0..timing_runs {
+            let t0 = std::time::Instant::now();
+            exec.run_prefix_only()?;
+            samples.push(t0.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        println!(
+            "TIME runs={} median_ns={} min_ns={} max_ns={}",
+            samples.len(),
+            samples[samples.len() / 2],
+            samples.first().copied().unwrap_or(0),
+            samples.last().copied().unwrap_or(0)
+        );
+    }
 
     // ⭐ ALSO READ THE INTERMEDIATES. Which STAGE diverges is not visible in the final tensor, and the
     // producer's `placements.json` now lists every synthetic with its segment and offset — so a

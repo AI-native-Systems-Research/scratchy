@@ -31,7 +31,12 @@
 # (`RAS::PCI::BusFence`, `0xa35e`, `PfMSIMonitor`), and the FIRST one stops the sweep with a
 # FENCED verdict and a non-zero exit. A fence here is a result, not a line to log past.
 set -uo pipefail
-[ $# -ge 3 ] || { echo "usage: rope_half_swap_cells_run.sh <sweep-root> <tree-with-bundle_run_dev> <log> [cell …]" >&2; exit 2; }
+# --time (FIRST arg, before the positionals) switches to the timing leg: per cell, 11 timed
+# launches of the SAME bundle (median reported as a TIME line) — the wall-clock A/B the plan's
+# PASS bar needs. Without it, the runner is the correctness sweep.
+MODE=run
+if [ "${1:-}" = "--time" ]; then MODE=time; shift; fi
+[ $# -ge 3 ] || { echo "usage: rope_half_swap_cells_run.sh [--time] <sweep-root> <tree-with-bundle_run_dev> <log> [cell …]" >&2; exit 2; }
 ROOT=$(cd "$1" && pwd) || exit 80
 TREE=$2
 LOG=$3
@@ -40,7 +45,9 @@ shift 3 || true
 # single-quoted body (a splice of only some of them leaves the rest unset inside).
 RUNNER_SHA=$(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/null || echo unknown)
 RUNNER_MD5=$(md5sum < "$0" 2>/dev/null | cut -c1-32 || echo unknown)
-echo "# RUNNER sha=$RUNNER_SHA md5=$RUNNER_MD5 argv=$*" >> "$LOG"
+echo "# RUNNER mode=$MODE sha=$RUNNER_SHA md5=$RUNNER_MD5 argv=$*" >> "$LOG"
+# MODE rides the environment into the flock body (the body is single-quoted).
+export MODE
 exec flock /work/.spyre-bake.lock bash -c '
 set -uo pipefail
 ROOT=$1; TREE=$2; LOG=$3; shift 3
@@ -234,6 +241,99 @@ else:
 PY
 }
 
+# ⭐ THE TIMING LEG (--time): per cell, 11 timed launches of the SAME bundle through
+# bundle_run_dev --time 11 — each timed launch-to-completion (launch + stream sync), median
+# reported. Staging is IDENTICAL to the correctness run (the m fill, cos/sin 1, P always bound —
+# the same markers, the same binding set), so the per-launch input refill rides both forms of the
+# A/B equally. A TIME line is resumable at the same sha+md5 stamp as a verdict.
+time_cell() {
+  local cell=$1 name sha md5 skip
+  name=$(basename "$cell")
+  [ -f "$cell/cell.json" ] || return 0
+  if [ ! -d "$cell/group_0" ]; then
+    echo "TIME $name MISSING no-bundle sha=unknown md5=(no-bundle)" | tee -a "$LOG"
+    return
+  fi
+  eval "$(python3 - "$cell" "$LOG" <<"PY"
+import hashlib, json, os, sys
+cell, log = sys.argv[1], sys.argv[2]
+c = json.load(open(cell + "/cell.json"))
+md5 = c.get("group_0_md5", "")
+skip = "False"
+name = os.path.basename(cell)
+if os.path.exists(log):
+    for line in open(log):
+        if line.startswith("TIME " + name + " ") and "sha=" + str(c["sha"]) in line and "md5=" + md5 in line:
+            skip = "True"
+print("sha=%s" % c["sha"])
+print("md5=%s" % md5)
+print("skip=%s" % skip)
+PY
+)"
+  [ "$skip" = "True" ] && { echo "SKIP-TIME $name (already timed at sha $sha md5 $md5)"; return; }
+
+  # The fills the timed launches bind (the m fill + unit cos/sin + P, as the correctness run binds).
+  python3 - "$cell" <<"PY"
+import json, sys
+import numpy as np
+cell = sys.argv[1]
+c = json.load(open(f"{cell}/cell.json"))
+mq, hd, total = c["mq"], c["hd"], c["total"]
+m = np.arange(mq)[:, None]
+col = np.arange(total)[None, :]
+np.broadcast_to((m % 15) + 1, (mq, total)).astype(np.float16).tofile(f"{cell}/fill-m-x.bin")
+np.ones((mq, total), dtype=np.float16).tofile(f"{cell}/fill-one-cos.bin")
+np.ones((mq, total), dtype=np.float16).tofile(f"{cell}/fill-one-sin.bin")
+half = hd // 2
+inn = np.arange(hd)[:, None]
+o = np.arange(hd)[None, :]
+p = np.where(o < half, np.where(inn == o + half, -1.0, 0.0),
+             np.where(inn == o - half, 1.0, 0.0)).astype(np.float16)
+p.tofile(f"{cell}/p.bin")
+PY
+  [ $? -eq 0 ] || { echo "TIME $name NOT-RUN fill-failed sha=$sha md5=$md5" | tee -a "$LOG"; return; }
+
+  local x cos sin out p rot run rrc sig tline
+  eval "$(python3 - "$cell" <<"PY"
+import json, sys
+c = json.load(open(sys.argv[1] + "/cell.json"))
+print("x=%d cos=%d sin=%d out=%d p=%d rot=%s mq=%d hd=%d" % (
+    c["x_tid"], c["cos_tid"], c["sin_tid"], c["out_tid"], c["p_tid"], c["rot_synth"], c["mq"], c["hd"]))
+PY
+)"
+  # 1 correctness-style launch (warm-up, the values are already verdicted) + 11 timed launches.
+  ./target/release/examples/bundle_run_dev "$cell" \
+    "t$x=$cell/fill-m-x.bin" "stick:t$x=$mq" \
+    "t$cos=$cell/fill-one-cos.bin" "stick:t$cos=$mq" \
+    "t$sin=$cell/fill-one-sin.bin" "stick:t$sin=$mq" \
+    "t$p=$cell/p.bin" "stick:t$p=$hd" \
+    "stick:t$out=$mq" \
+    --time 11 > "$cell/time.log" 2>&1
+  rrc=$?
+  sig=$(fenced "$cell/time.log")
+  if [ -n "$sig" ]; then
+    echo "TIME $name FENCED sha=$sha md5=$md5 sig=[$sig]" | tee -a "$LOG"
+    echo "FENCE-ABORT at $name (timing)" >&2
+    exit 99
+  fi
+  [ $rrc -ne 0 ] && { echo "TIME $name NOT-RUN rc=$rrc sha=$sha md5=$md5" | tee -a "$LOG"; return; }
+  tline=$(grep -m1 "^TIME " "$cell/time.log") || tline=""
+  if [ -z "$tline" ]; then
+    echo "TIME $name NOT-RUN no-TIME-line sha=$sha md5=$md5" | tee -a "$LOG"
+    return
+  fi
+  python3 - "$cell" "$name" "$tline" "$sha" "$md5" >> "$LOG" <<"PY"
+import json, sys
+cell, name, tline, sha, md5 = sys.argv[1:6]
+c = json.load(open(cell + "/cell.json"))
+fields = dict(kv.split("=", 1) for kv in tline.split()[1:])
+print("TIME %s form=%s mq=%d hd=%d heads=%d desc=%d runs=%s median_ns=%s min_ns=%s max_ns=%s sha=%s md5=%s"
+      % (name, c["form"], c["mq"], c["hd"], c["heads"], c["descriptors"],
+         fields.get("runs"), fields.get("median_ns"), fields.get("min_ns"), fields.get("max_ns"),
+         sha, md5))
+PY
+}
+
 # ⛔ THE CELL LIST, BUILT ONCE — explicit cells if given, every cell dir sorted otherwise.
 if [ -n "$CELLS" ]; then
   cell_list="$CELLS"
@@ -245,6 +345,32 @@ else
     exit 1
   fi
 fi
+if [ "$MODE" = time ]; then
+  echo "$cell_list" | while read -r c; do time_cell "$c"; done
+  # The timing gate: every cell needs a TIME line at its own stamp.
+  timed=0; total=0
+  for c in $cell_list; do
+    total=$((total + 1))
+    name=$(basename "$c")
+    eval "$(python3 - "$c" <<"PY"
+import json, sys
+c = json.load(open(sys.argv[1] + "/cell.json"))
+print("stamp=sha=%s md5=%s" % (c["sha"], c.get("group_0_md5", "")))
+PY
+)"
+    if grep "^TIME $name " "$LOG" 2>/dev/null | grep -F "$stamp" | grep -q "median_ns="; then
+      timed=$((timed + 1))
+    fi
+  done
+  echo "TIMED=$timed CELLS=$total"
+  if [ "$timed" -lt "$total" ]; then
+    echo "ROPE_HALF_SWAP_TIME_INCOMPLETE — every cell needs a TIME line at its own stamp" >&2
+    exit 1
+  fi
+  echo ROPE_HALF_SWAP_TIME_DONE
+  exit 0
+fi
+
 echo "$cell_list" | while read -r c; do run_cell "$c"; done
 
 # ⛔ A VERDICT OVER NOTHING FAILS: no DONE unless every cell run holds a PASS at ITS OWN STAMP.
