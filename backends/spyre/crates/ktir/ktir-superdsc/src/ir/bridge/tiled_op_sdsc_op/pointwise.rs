@@ -9,7 +9,7 @@ use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpInfo, OpSpec, Role, Scale,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MbAxis, OpFunc, OpInfo, OpSpec, Role, Scale,
     SdscFoldSet, TensorArg,
 };
 use crate::work::{CoreDivision, EwDivision};
@@ -312,7 +312,7 @@ pub fn gather_copy_opspec(
     // gather's index may carry, whatever the value operands are. The gathered SOURCE takes the
     // chunk base AFTER the df is set (`set_offset_elems` scales by the word length itself).
     for a in op.args_mut().iter_mut() {
-        a.set_df(df);
+        a.set_df(df).map_err(|e| e.0)?;
     }
     if run.src_elems > 0 {
         op.args_mut()[0].set_offset_elems(run.src_elems);
@@ -492,7 +492,7 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
     // PV contracts it (`ChunkScratch::lx_form`). The copy keeps its own one-entry-per-core division; the
     // read law holds the PV to it. No-op for an HBM scratch.
-    crate::emit::apply_lx_residency(&mut op, layout);
+    crate::emit::apply_lx_residency(&mut op, layout)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
@@ -594,7 +594,7 @@ pub fn scatter_copy_opspec(
         OutView::at(0),
     )?;
     for a in op.args_mut().iter_mut() {
-        a.set_df(df);
+        a.set_df(df).map_err(|e| e.0)?;
     }
     if src_elems > 0 {
         op.args_mut()[0].set_offset_elems(src_elems);
@@ -712,7 +712,7 @@ pub fn page_gather_copy_opspec(
         OutView::at(0),
     )?;
     for a in op.args_mut().iter_mut() {
-        a.set_df(df);
+        a.set_df(df).map_err(|e| e.0)?;
     }
     op.attach_gather_index(gather, ins.len() - 1).ok_or_else(|| {
         format!(
@@ -1361,6 +1361,7 @@ pub fn stick_permute_opspec(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32))
             // The stick-major side is iterated by its stick columns (`y` outermost).
             .with_frame(match order {
@@ -1476,6 +1477,7 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_offset(elems)
             // A run's sticks are its innermost dim, in dxp's innermost-first order.
             .with_device_order(crate::emit::SprayOrder::Inner.device_layout())
@@ -1581,7 +1583,7 @@ pub fn pointwise_opspec_from_tile(
         o_name,
         head_major,
         Division {
-            budget: division.budget(tile_op)?,
+            budget: division.budget(tile_op),
             splitter: division.splitter(),
         },
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
@@ -1773,24 +1775,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
     );
-    // ⭐⭐⭐ THE WINDOWED-STICK LAW, MINTED ONCE AT THIS DOOR. An operand whose declared `mb`
-    // device extent exceeds the op's swept rows — a multi-stick row band of a taller parent
-    // ([`crate::addr::RowWindow`], the parent's row count declared at
-    // [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
-    // crosses a column plane; a multi-stick core would have to walk the parent's inter-plane
-    // stride, which nothing states without `backGapCore_`. So the door states the fact ONCE,
-    // from the operand presentation it already holds (the `mk` below is the presentation's other
-    // reader — it declares the same windows' parent rows as device extents), and
-    // [`crate::work::EwDivision::budget`] holds the op's cores to one stick a core. A ONE-STICK
-    // band declares no device extent (it never crosses a plane) and is not windowed; a band whose
-    // parent is exactly the op's rows (the batch-1 case, declared == swept) is not windowed
-    // either. No call site derives this — the callers' `TileOp`s state shape only.
-    let tile_op = tile_op.with_windowed(
-        out_row_window.is_some_and(|w| w.declares_past(rows))
-            || inputs
-                .iter()
-                .any(|i| i.row_window().is_some_and(|w| w.declares_past(rows))),
-    );
     let df = tile_op.df;
     // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
     // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
@@ -1862,11 +1846,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // `EwOperand::row_window` / `out_row_window`) is a stick-major corner TOO, for the same
     // reason at the parent's own height: the band's `[rows, cols]` planes are whole planes of
     // the PARENT at the parent's plane stride, so the stick-major view from the band's corner
-    // reaches the parent's bytes — with the parent's row count declared as the `mb` device
-    // extent (see `mk` below) so the walk strides those planes at the parent's pitch, never at
-    // the band's own fewer rows'. And a multi-stick band must be rank-2 even at `rows == 1`:
-    // a rank-3 flat walk of a window wider than one stick mis-strides the parent's column
-    // planes, which is why `any_row_window` joins the `rows > 1` clause.
+    // reaches the parent's bytes — with the parent's row count stated as the `mb` PITCH (see
+    // `mk` below; the walk's back gap) so the walk strides those planes at the parent's pitch,
+    // never at the band's own fewer rows'. And a multi-stick band must be rank-2 even at
+    // `rows == 1`: a rank-3 flat walk of a window wider than one stick mis-strides the parent's
+    // column planes, which is why `any_row_window` joins the `rows > 1` clause.
     let any_row_window =
         out_row_window.is_some() || inputs.iter().any(|i| i.row_window().is_some());
     let stickmajor = !head_major
@@ -1916,7 +1900,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 (d, _) => d.resolve(stickmajor, core_local),
             };
             tile_op
-                .tile(d.budget(&tile_op)?, d.splitter(), "out")
+                .tile(d.budget(tile_op), d.splitter(), "out")
                 .map_err(|e| e.0)?
         }
         (stated, Some(_)) => {
@@ -1988,11 +1972,16 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // [`EwOperand::scale_sprayed`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     //
-    // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` device extent
-    // (the caller passes it only when the window spans more than one stick — a one-stick window
-    // never crosses a column plane and needs no declaration): the band's bytes are a
-    // stick-major tensor of the parent's, so the walk must stride the parent's column planes
-    // at the parent's `parent_rows·lanes` pitch, never at the band's own fewer rows'.
+    // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` PITCH
+    // ([`TensorArg::with_pitch`]; every row-window operand passes it, whatever its width — a
+    // one-stick band has no second column plane for the gap to move): the band's bytes are a
+    // stick-major tensor of the parent's, so the walk must stride the parent's column planes at
+    // the parent's `parent_rows·lanes` pitch, never at the band's own fewer rows'. ⛔ A PITCH,
+    // NOT A WINDOW: the pinned walk (`maxDimSizes_`) is a size cap dxp never
+    // reads as a stride — MEASURED on the card (microbenchmark, 2026-11-08), a multi-stick band
+    // placed stick `j` at `j·rows·64` through it, and `backGapCore_[mb] = parent − rows` (what a
+    // pitch emits: the gap past the band's WHOLE swept rows) read and wrote it bit-exact. A band
+    // whose parent IS the op's rows states no pitch at all (`Pitch::past` answers `None`).
     let mk = |is_input: bool,
               name: &str,
               scale: [Scale; 3],
@@ -2013,9 +2002,10 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .map_err(|e| e.0)?
             .with_offset(off)
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32));
             let t = match dev_rows {
-                Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                Some(p) => t.with_pitch::<MbAxis>(&plan, p).map_err(|e| e.0)?,
                 None => t,
             };
             Ok(AnyTensorArg::R2(t))
@@ -2037,9 +2027,10 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 .map_err(|e| e.0)?
                 .with_offset(off)
                 .with_df(df)
+                .map_err(|e| e.0)?
                 .with_row_blocked(matches!(df, Df::Fp32));
                 let t = match dev_rows {
-                    Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                    Some(p) => t.with_pitch::<MbAxis>(&plan, p).map_err(|e| e.0)?,
                     None => t,
                 };
                 // A spray's two row dims go to dxp innermost first.
@@ -2062,9 +2053,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 None => inp.scale(),
             },
             inp.col_offset(),
-            inp.row_window()
-                .filter(|w| !w.spans_one_stick())
-                .map(|w| w.parent_rows()),
+            inp.row_window().map(|w| w.parent_rows()),
         )?);
     }
     // The OUTPUT may write to a COLUMN SLICE of its tensor (`out_offset` cols in →
@@ -2077,9 +2066,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         o_name,
         [Scale::Active, Scale::Active, Scale::Active],
         out_offset,
-        out_row_window
-            .filter(|w| !w.spans_one_stick())
-            .map(|w| w.parent_rows()),
+        out_row_window.map(|w| w.parent_rows()),
     )?;
     Ok(OpSpec::new(op, plan, ins, output)
         .map_err(|e| e.0)?
@@ -2390,14 +2377,16 @@ mod stick_runs_tests {
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
         let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
+        use crate::superdsc_opspec::DeviceAxis::{Swept, Window};
         assert_eq!(
             v[0].device_extent,
-            [None, Some(128), None],
-            "the source's pitch"
+            [Swept, Window(128), Swept],
+            "the source's pitch — a window of its allocation, exact at one run a core \
+             (`stick_runs_chunks`)"
         );
         assert_eq!(
             v[1].device_extent,
-            [None, None, None],
+            [Swept, Swept, Swept],
             "the destination is dense"
         );
         assert_eq!(

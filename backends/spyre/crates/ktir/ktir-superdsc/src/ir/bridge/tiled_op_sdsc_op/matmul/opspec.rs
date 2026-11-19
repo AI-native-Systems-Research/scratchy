@@ -136,7 +136,7 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         m.get(),
         n.get(),
         k.get(),
-        batch.get(),
+        MatmulRows::at_depth(batch.get(), phys_mb.map(PhysM::get)),
         a_name,
         w_name,
         o_name,
@@ -144,7 +144,6 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         w_off,
         o_off,
         operand_df,
-        phys_mb.map(PhysM::get),
         form,
         // The strides ride ON the batch axis, so they arrive here already paired with the `y` extent
         // they describe — there is no slot for a caller to fill one without the other.
@@ -228,7 +227,8 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             )
             .map_err(|e| e.0)?
             .with_offset(w_off)
-            .with_df(operand_df);
+            .with_df(operand_df)
+            .map_err(|e| e.0)?;
             *op.args_mut().get_mut(KERNEL_OPERAND).ok_or_else(|| {
                 format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
             })? = AnyTensorArg::R3(kernel);
@@ -297,7 +297,8 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             )
             .map_err(|e| e.0)?
             .with_offset(w_off)
-            .with_df(operand_df);
+            .with_df(operand_df)
+            .map_err(|e| e.0)?;
             *op.args_mut().get_mut(KERNEL_OPERAND).ok_or_else(|| {
                 format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
             })? = AnyTensorArg::R3(kernel);
@@ -313,6 +314,108 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
     Ok(op)
 }
 
+/// ⭐ THE UNBATCHED FORM'S ROW FACTS — the row count of each row-carrying operand's tensor, when an
+/// unbatched op (`batch <= 1`) sweeps only PART of its rows: one value per operand, stated by the
+/// caller that placed them and read, both of them, by the ONE builder that states their `mb`
+/// pitches ([`matmul_opspec_split`]). The activation and the output differ where a row-sliced
+/// contraction reads a batch block standing alone beside a slice of the flat frame
+/// ([`super::assemble::RowsShape`]); the head-pitch doors place both at one depth
+/// ([`PhysRows::shared`]). The batched form has its own fact ([`MatmulRows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysRows {
+    /// The activation's row count.
+    pub activation: u32,
+    /// The output's row count.
+    pub output: u32,
+}
+
+impl PhysRows {
+    /// Both operands at one row count.
+    pub fn shared(rows: u32) -> PhysRows {
+        PhysRows {
+            activation: rows,
+            output: rows,
+        }
+    }
+}
+
+/// THE BATCHED FORM'S ROW FACT — the activation's row count, when a `y`-batched op sweeps only part
+/// of its rows. Its only one: the batched output's pitch rides on the output's own placement
+/// ([`crate::sdsc_abstract::BatchStrides`]), so this type has no output field to leave unread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivationRows(u32);
+
+impl ActivationRows {
+    fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐ A MATMUL'S BATCH WITH ITS FORM'S ROW FACTS — one value, so the form the builder takes and the
+/// row counts handed to it cannot disagree: the unbatched form (`batch <= 1`) carries
+/// [`PhysRows`], the batched form (`batch > 1`) the activation's row count alone, and neither
+/// carries a field the other leaves unread. The `batch <= 1` boundary is stated here, once
+/// ([`Self::at_depth`]); the builder reads the form off this value ([`Self::is_batched`]).
+#[derive(Clone, Copy, Debug)]
+pub struct MatmulRows(MatmulForm);
+
+#[derive(Clone, Copy, Debug)]
+enum MatmulForm {
+    Unbatched {
+        batch: u32,
+        phys: Option<PhysRows>,
+    },
+    Batched {
+        batch: u32,
+        activation: Option<ActivationRows>,
+    },
+}
+
+impl MatmulRows {
+    /// `batch`'s form, every operand's tensor exactly the rows the op sweeps.
+    pub fn whole(batch: u32) -> MatmulRows {
+        MatmulRows::at_depth(batch, None)
+    }
+
+    /// `batch`'s form, its row-carrying operands placed at ONE depth `rows` when the op sweeps part
+    /// of them — the head-pitch doors: the unbatched form states it on both operands, the batched
+    /// form on the activation.
+    pub fn at_depth(batch: u32, rows: Option<u32>) -> MatmulRows {
+        MatmulRows(if batch <= 1 {
+            MatmulForm::Unbatched {
+                batch,
+                phys: rows.map(PhysRows::shared),
+            }
+        } else {
+            MatmulForm::Batched {
+                batch,
+                activation: rows.map(ActivationRows),
+            }
+        })
+    }
+
+    /// The unbatched form (`batch == 1`) over each operand's own row count — the row-sliced
+    /// contraction ([`super::assemble::assemble_matmul_rows`]).
+    pub fn unbatched(phys: PhysRows) -> MatmulRows {
+        MatmulRows(MatmulForm::Unbatched {
+            batch: 1,
+            phys: Some(phys),
+        })
+    }
+
+    /// The batch.
+    pub fn batch(self) -> u32 {
+        match self.0 {
+            MatmulForm::Unbatched { batch, .. } | MatmulForm::Batched { batch, .. } => batch,
+        }
+    }
+
+    /// Whether the op is `y`-batched — read off the form, never re-decided from the batch.
+    pub fn is_batched(self) -> bool {
+        matches!(self.0, MatmulForm::Batched { .. })
+    }
+}
+
 /// [`matmul_opspec_off`] with an INJECTABLE work-division `splitter` — the SEAM the Kani-verified tower
 /// (`scratchy-sdsc`) drives: it passes a `CoreSplit`-derived splitter so the emitted SDSC uses the PROVEN
 /// 32-core partition (disjoint+covering, #50-free by proof), while this fn keeps owning the ABI OpSpec /
@@ -322,7 +425,17 @@ pub fn matmul_opspec_split<DF: DataFormat, S>(
     m: u32,
     n: u32,
     k: u32,
-    batch: u32,
+    // The batch, with its FORM's row facts ([`MatmulRows`]): the unbatched form's per-operand row
+    // counts ([`PhysRows`]), or the batched form's activation row count — each when the op
+    // iterates only PART of its operands' rows, `None` when each tensor has exactly the rows this
+    // op sweeps.
+    //
+    // The y-batched walk under the request-batch form is HEAD-OUTERMOST, so advancing `y` by one
+    // moves one head PLANE and a plane is `mb·in` elements — the head stride comes from the mb
+    // DEVICE extent. A pass that computes one request's row per head therefore needs `mb = 1` for
+    // the work and the activation's row count naming the tensor's own plane depth, or every head
+    // but the first is addressed the wrong distance in.
+    batch_rows: MatmulRows,
     a_name: &str,
     w_name: &str,
     o_name: &str,
@@ -330,15 +443,6 @@ pub fn matmul_opspec_split<DF: DataFormat, S>(
     w_off: u32,
     o_off: u32,
     operand_df: Df,
-    // PHYSICAL `mb` extent when this op iterates only PART of the activation's rows. `None` (every
-    // caller until the row-batched fold) means "the tensor has exactly the rows this op sweeps".
-    //
-    // The y-batched walk under the request-batch form is HEAD-OUTERMOST, so advancing `y` by one
-    // moves one head PLANE and a plane is `mb·in` elements — the head stride comes from the mb
-    // DEVICE extent. A pass that computes one request's row per head therefore needs `mb = 1` for
-    // the work and `phys_mb` naming the tensor's own plane depth, or every head but the first is
-    // addressed the wrong distance in.
-    phys_mb: Option<u32>,
     // WHICH walk pair the batch>1 arm declares — see [`SharedKernelBmmForm`]. The live callers pick
     // the splitter from this same value (`matmul_split_map_for`); the Kani seam injects its own
     // splitter and states the proven form.
@@ -361,6 +465,7 @@ where
     // stick basis is the operand format's (fp8 ⇒ 128) by TYPE, not a hand-picked 64.
     let n_ext = StickExtent::<DF>::new(n)?;
     let k_ext = StickExtent::<DF>::new(k)?;
+    let batch = batch_rows.batch();
     // ⛔⛔⛔ A `y`-BATCHED SHARED-KERNEL MATMUL CONTRACTS ONE STICK, OR IT IS REFUSED. MEASURED on
     // granite-3.1-8b (hd 128): with the score leg `y`-batched over `in = hd = 128`, two sticks, every
     // per-core address was correct and decode was incoherent from the second token
@@ -369,7 +474,7 @@ where
     // contraction is either split by slab (`OneStickContraction::by_slab_split`, one stick per op) or
     // runs unbatched (`y = 1`, the per-head and query-group scores), and anything else is this build
     // failure rather than fluent garbage on card.
-    if batch > 1 && k_ext.stick_count() > 1 {
+    if batch_rows.is_batched() && k_ext.stick_count() > 1 {
         return Err(format!(
             "matmul_opspec_split('{a_name}' x '{w_name}' -> '{o_name}'): a y-batched (batch {batch}) \
              shared-kernel matmul contracts {k} elements, {} sticks. The batched form is card-validated \
@@ -431,7 +536,7 @@ where
     // on its own — no emitted byte changes inside the envelope.
     // A `y`-BATCHED matmul keeps the frontend's LX-fit time trips: its kernel is per batch and
     // its forms are the card-proven ones (the rope-rotate and attention score doors route here).
-    let (plan, time_tile) = if batch > 1 {
+    let (plan, time_tile) = if batch_rows.is_batched() {
         let tiled = tile_op
             .tile(crate::device_gen::whole(), splitter, OutAxis::NAME)
             .map_err(|e| e.0)?;
@@ -480,191 +585,205 @@ where
     // INPUT/OUTPUT rank tracks the op: a PLAIN 2-D matmul (batch==1) is [mb,in]/[mb,out] (opFuncName
     // "matmul", matching torch-spyre's generate_sdsc — the `y` phantom + batchmatmul was THE mq>1
     // prefill collapse). A true batched matmul (batch>1, attention bmm) keeps the `y`(=batch) dim.
-    let args = if batch <= 1 {
-        let input_walk = Walk2::input_rows_by_k();
-        let input = TensorArg::<2>::new(
-            true,
-            a_name.to_string(),
-            Role::Input,
-            [Scale::Active, Scale::Active],
-            plan.iter_syms(input_walk.order()),
-            input_walk.order(),
-            input_walk.stick(),
-            Allocation::Hbm,
-        )
-        .map_err(|e| e.0)?
-        .with_offset(a_off);
-        // ⭐ THE ACTIVATION'S OWN ROW COUNT, WHEN THIS OP SWEEPS A SLICE OF IT — the same law the
-        // output takes below: a stick-blocked view's stick-group stride comes from its `mb` DEVICE
-        // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
-        // the flat frame) is addressed with the TENSOR's rows, not the op's.
-        let input = match phys_mb {
-            Some(phys) if phys > plan.extent(MbAxis::NAME) => input
-                .with_device_extent(MbAxis::NAME, phys)
-                .map_err(|e| e.0)?,
-            _ => input,
-        };
-        let output_walk = Walk2::output_rows_by_n();
-        let output = TensorArg::<2>::new(
-            false,
-            o_name.to_string(),
-            Role::Output,
-            [Scale::Active, Scale::Active],
-            plan.iter_syms(output_walk.order()),
-            output_walk.order(),
-            output_walk.stick(),
-            Allocation::Hbm,
-        )
-        .map_err(|e| e.0)?
-        .with_offset(o_off);
-        // ⭐⭐⭐⭐⭐ THE OUTPUT'S OWN ROW COUNT, WHEN IT IS A SLICE OF A TALLER BUFFER — and this is what
-        // lets ONE op write a head's WHOLE `[mq, hd]` block instead of one op per slab.
-        //
-        // A rank-2 stick-blocked view addresses `(j/stk)*(dims[0]*stk) + i*stk + (j%stk)`, so its
-        // stick-GROUP stride comes from `dims[0]` — the mb DEVICE extent. An op sweeping one head's
-        // `mq` rows out of a `[nqh*mq, hd]` accumulator therefore derives `mq*stk` where the tensor's
-        // group stride is `rows*stk`: correct for the FIRST stick group and `nqh`× too close for every
-        // one after it. That — not the write width — is what forced `for s in 0..nslab`.
-        //
-        // ⛔ AND IT IS INERT AT ONE SLAB, which is why the loop looked like the only option: with a
-        // single stick group `j/stk` is always 0 and the wrong factor multiplies nothing. Every hd=64
-        // bundle emits byte-identically.
-        //
-        // `phys_mb` already carried exactly this statement for the batched input ("this op ITERATES a
-        // window of a LARGER allocation"); it simply was never offered to the output.
-        let output = match phys_mb {
-            Some(phys) => {
-                let swept = plan.extent(MbAxis::NAME);
-                if phys < swept {
-                    return Err(format!(
-                        "matmul_opspec '{o_name}': phys_mb={phys} is SMALLER than the swept mb \
-                         {swept}. device_extent declares a window into a LARGER allocation."
-                    ));
-                }
-                output
-                    .with_device_extent(MbAxis::NAME, phys)
-                    .map_err(|e| e.0)?
-            }
-            None => output,
-        };
-        [
-            AnyTensorArg::R2(input),
-            AnyTensorArg::R2(kernel),
-            AnyTensorArg::R2(output),
-        ]
-    } else {
-        // WHICH rank-3 walk pair — the REGIME's associated order, carried as the regime's own
-        // typed walks all the way into [`batched_walk_args`], so input and output orders arrive
-        // from one type (see `RungRegime`):
-        //
-        //   * BatchInnerMq1Proven — `[mb, y, in]` / `[mb, y, out]`. The order every shipped bundle
-        //     carries; on-hardware-proven for the mq==1 decode g-form, where the unit `mb` makes its
-        //     stride assignment coincide with the head-major layout. At `mb > 1` a PINNED
-        //     (`maxDimSizes_` = actual) walk of this order declares the strides SWAPPED — MEASURED
-        //     at mq=23: `numWkSlicesPerDim_ {mb:23, y:1}`, `maxDimSizes_ [23,4,64]` — mb-stride 256
-        //     / y-stride 64 against the tensor's real 64 / mq·hd.
-        //   * HeadOutermostRequests — `[y, mb, in]` / `[y, mb, out]` (batch OUTERMOST), the
-        //     rows-are-requests decode rungs. Row-major over this order gives `y` one head PLANE
-        //     (`mb·in` — a head-major operand's head stride at ANY `mb`, with `mb` the DEVICE extent
-        //     so a `phys_mb` override sets the true plane) and `mb` one row (`in`, the row pitch) —
-        //     the layout every head-major attention tensor really has: `qs` head h at `h·mb·in`,
-        //     `sc` head h at `h·mb·out`.
-        //
-        // The stick dim stays LAST in both (contiguous), so `stickDimOrder_` is unchanged. The one
-        // order with NO constructor at all is `[mb, in, y]` — `y` innermost strides ONE ELEMENT
-        // inside each stick. MEASURED at batch=4: qs read heads 1 element apart while the proven
-        // per-head ops read them 64 apart (h4 @6797696, h5 @6797824) — a 64x mis-stride, and exactly
-        // the garbage it produced.
-        // ⛔⛔⛔ THE STRIDE THE WALK WILL USE MUST BE THE STRIDE THE OPERANDS HAVE — REFUSED AT BUILD.
-        //
-        // A `y`-batched op writes ONE base offset and strides to the remaining heads. What it strides
-        // by is decided by the regime's declared order (`RungRegime::y_stride_elems`); where the heads
-        // ACTUALLY are is each operand's own placement law. Nothing related the two, so the arm sat
-        // behind a head-dim gate standing in for the relation, and it was WRONG the moment a head
-        // stopped being one stick: with `out = hd` a head-major output derives `mb*hd` against a real
-        // pitch of `mb*stick`, equal only at `hd == stick`. That is not a fault on-card — it reads and
-        // writes inside another head's features and produces fluent, wrong output.
-        //
-        // `MatY::of_gqa_group` cannot be built without both placements, so the required strides are
-        // always present here, and this compares them against what the walk derives. Returning `Err`
-        // inside the `#[forward]` proc macro IS a `cargo build` failure naming the op — the head-dim
-        // gate is replaced by the relation it was approximating.
-        let pitches = batch_strides.map(|w| (w.activation_pitch().get(), w.output_pitch().get()));
-        if let Some(want) = batch_strides {
-            // ⛔⛔⛔ EACH OPERAND'S OWN PITCH. This was ONE `phys_mb.unwrap_or(m)` shared by both
-            // checks, and that single value is why a one-stick contraction looked impossible: the score
-            // leg's token-stream `qs` needs `mq*nslab` when `in` is one stick, while its head-major
-            // `sc` needs `mq` — satisfying either broke the other. The pitches ride on the same
-            // placements as the strides, so neither can be paired with the wrong operand.
-            let a_mb_dev = want.activation_pitch().get().max(phys_mb.unwrap_or(m));
-            let o_mb_dev = want.output_pitch().get().max(1);
-            let check = |regime_stride: u32,
-                         have: crate::addr::AxisStride,
-                         role: &str,
-                         axis: &str,
-                         ext: u32|
-             -> Result<(), String> {
-                if regime_stride == have.elems() {
-                    return Ok(());
-                }
-                Err(format!(
-                    "matmul '{o_name}': the batched {role} walk strides `y` by {regime_stride} elems \
-                     (derived={regime_stride}, {axis}={ext}), but this operand's placement law puts adjacent \
-                     heads {} elems apart. A `y`-batch would step into another head. If the operand is \
-                     head-major its pitch is `mb*stick`, so declare ONE STICK of `{axis}`; if it is a \
-                     token stream its pitch is `mb*hd` and the full width is right. (This is the \
-                     relation the head_dim==64 gate used to stand in for.)",
-                    have.elems(),
-                ))
+    let args = match batch_rows.0 {
+        MatmulForm::Unbatched { phys: phys_mb, .. } => {
+            let input_walk = Walk2::input_rows_by_k();
+            let input = TensorArg::<2>::new(
+                true,
+                a_name.to_string(),
+                Role::Input,
+                [Scale::Active, Scale::Active],
+                plan.iter_syms(input_walk.order()),
+                input_walk.order(),
+                input_walk.stick(),
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(a_off);
+            // ⭐ THE ACTIVATION'S OWN ROW COUNT, WHEN THIS OP SWEEPS A SLICE OF IT — the same law the
+            // output takes below: a slice of a taller activation (a batched contraction's batch rows,
+            // read out of the flat frame) is addressed with the TENSOR's rows, not the op's, and its
+            // walk strides the tensor's stick groups by them. ⛔ A PITCH, NOT A WINDOW
+            // (`TensorArg::with_pitch`): the address readers fold over the tensor's rows, and the walk
+            // carries the back gap `phys − swept` past the op's WHOLE `mb` sweep — the pinned walk is
+            // a size cap the card never strides by (the flat-frame P·V contraction, MEASURED by the
+            // 2026-11-08 microbenchmark: a pinned walk lost the rows past the first stick group, the
+            // gap read them; branch `tp-allreduce` `e55dd14dd8`). `Pitch::past` decides at, past and
+            // short of the sweep, so no hand guard restates it here.
+            let input = match phys_mb {
+                Some(phys) => input
+                    .with_pitch::<MbAxis>(&plan, phys.activation)
+                    .map_err(|e| e.0)?,
+                None => input,
             };
-            match form.regime() {
-                SharedKernelBmmRegime::Proven(r) => {
-                    check(
-                        r.y_stride_elems(a_mb_dev, k),
-                        want.activation(),
-                        "input",
-                        "in",
-                        k,
-                    )?;
-                    check(
-                        r.y_stride_elems(o_mb_dev, n),
-                        want.output(),
-                        "output",
-                        "out",
-                        n,
-                    )?;
-                }
-                SharedKernelBmmRegime::Requests(r) => {
-                    check(
-                        r.y_stride_elems(a_mb_dev, k),
-                        want.activation(),
-                        "input",
-                        "in",
-                        k,
-                    )?;
-                    check(
-                        r.y_stride_elems(o_mb_dev, n),
-                        want.output(),
-                        "output",
-                        "out",
-                        n,
-                    )?;
+            let output_walk = Walk2::output_rows_by_n();
+            let output = TensorArg::<2>::new(
+                false,
+                o_name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active],
+                plan.iter_syms(output_walk.order()),
+                output_walk.order(),
+                output_walk.stick(),
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(o_off);
+            // ⭐⭐⭐⭐⭐ THE OUTPUT'S OWN ROW COUNT, WHEN IT IS A SLICE OF A TALLER BUFFER — and this is what
+            // lets ONE op write a head's WHOLE `[mq, hd]` block instead of one op per slab.
+            //
+            // A rank-2 stick-blocked view addresses `(j/stk)*(dims[0]*stk) + i*stk + (j%stk)`, so its
+            // stick-GROUP stride comes from `dims[0]` — the mb DEVICE extent. An op sweeping one head's
+            // `mq` rows out of a `[nqh*mq, hd]` accumulator therefore derives `mq*stk` where the tensor's
+            // group stride is `rows*stk`: correct for the FIRST stick group and `nqh`× too close for every
+            // one after it. That — not the write width — is what forced `for s in 0..nslab`.
+            //
+            // ⛔ AND IT IS INERT AT ONE SLAB, which is why the loop looked like the only option: with a
+            // single stick group `j/stk` is always 0 and the wrong factor multiplies nothing. Every hd=64
+            // bundle's ADDRESSES are unchanged by it; the wire carries the back gap below, which no
+            // landing crosses at one stick group.
+            //
+            // `phys_mb` already carried exactly this statement for the batched input ("this op ITERATES a
+            // window of a LARGER allocation"); it simply was never offered to the output.
+            //
+            // ⛔ THE SAME LAW AS THE INPUT'S (`TensorArg::with_pitch`), OVER THE OUTPUT'S OWN ROW COUNT:
+            // the output's batch rows sit `phys.output` rows apart, which is the walk's back gap, and
+            // `Pitch::past` refuses a row count shorter than the sweep by name.
+            let output = match phys_mb {
+                Some(phys) => output
+                    .with_pitch::<MbAxis>(&plan, phys.output)
+                    .map_err(|e| e.0)?,
+                None => output,
+            };
+            [
+                AnyTensorArg::R2(input),
+                AnyTensorArg::R2(kernel),
+                AnyTensorArg::R2(output),
+            ]
+        }
+        MatmulForm::Batched {
+            activation: a_phys_mb,
+            ..
+        } => {
+            // WHICH rank-3 walk pair — the REGIME's associated order, carried as the regime's own
+            // typed walks all the way into [`batched_walk_args`], so input and output orders arrive
+            // from one type (see `RungRegime`):
+            //
+            //   * BatchInnerMq1Proven — `[mb, y, in]` / `[mb, y, out]`. The order every shipped bundle
+            //     carries; on-hardware-proven for the mq==1 decode g-form, where the unit `mb` makes its
+            //     stride assignment coincide with the head-major layout. At `mb > 1` a PINNED
+            //     (`maxDimSizes_` = actual) walk of this order declares the strides SWAPPED — MEASURED
+            //     at mq=23: `numWkSlicesPerDim_ {mb:23, y:1}`, `maxDimSizes_ [23,4,64]` — mb-stride 256
+            //     / y-stride 64 against the tensor's real 64 / mq·hd.
+            //   * HeadOutermostRequests — `[y, mb, in]` / `[y, mb, out]` (batch OUTERMOST), the
+            //     rows-are-requests decode rungs. Row-major over this order gives `y` one head PLANE
+            //     (`mb·in` — a head-major operand's head stride at ANY `mb`, with `mb` the DEVICE extent
+            //     so a `phys_mb` override sets the true plane) and `mb` one row (`in`, the row pitch) —
+            //     the layout every head-major attention tensor really has: `qs` head h at `h·mb·in`,
+            //     `sc` head h at `h·mb·out`.
+            //
+            // The stick dim stays LAST in both (contiguous), so `stickDimOrder_` is unchanged. The one
+            // order with NO constructor at all is `[mb, in, y]` — `y` innermost strides ONE ELEMENT
+            // inside each stick. MEASURED at batch=4: qs read heads 1 element apart while the proven
+            // per-head ops read them 64 apart (h4 @6797696, h5 @6797824) — a 64x mis-stride, and exactly
+            // the garbage it produced.
+            // ⛔⛔⛔ THE STRIDE THE WALK WILL USE MUST BE THE STRIDE THE OPERANDS HAVE — REFUSED AT BUILD.
+            //
+            // A `y`-batched op writes ONE base offset and strides to the remaining heads. What it strides
+            // by is decided by the regime's declared order (`RungRegime::y_stride_elems`); where the heads
+            // ACTUALLY are is each operand's own placement law. Nothing related the two, so the arm sat
+            // behind a head-dim gate standing in for the relation, and it was WRONG the moment a head
+            // stopped being one stick: with `out = hd` a head-major output derives `mb*hd` against a real
+            // pitch of `mb*stick`, equal only at `hd == stick`. That is not a fault on-card — it reads and
+            // writes inside another head's features and produces fluent, wrong output.
+            //
+            // `MatY::of_gqa_group` cannot be built without both placements, so the required strides are
+            // always present here, and this compares them against what the walk derives. Returning `Err`
+            // inside the `#[forward]` proc macro IS a `cargo build` failure naming the op — the head-dim
+            // gate is replaced by the relation it was approximating.
+            let pitches =
+                batch_strides.map(|w| (w.activation_pitch().get(), w.output_pitch().get()));
+            if let Some(want) = batch_strides {
+                // ⛔⛔⛔ EACH OPERAND'S OWN PITCH. This was ONE `phys_mb.unwrap_or(m)` shared by both
+                // checks, and that single value is why a one-stick contraction looked impossible: the score
+                // leg's token-stream `qs` needs `mq*nslab` when `in` is one stick, while its head-major
+                // `sc` needs `mq` — satisfying either broke the other. The pitches ride on the same
+                // placements as the strides, so neither can be paired with the wrong operand.
+                let a_mb_dev = want
+                    .activation_pitch()
+                    .get()
+                    .max(a_phys_mb.map_or(m, ActivationRows::get));
+                let o_mb_dev = want.output_pitch().get().max(1);
+                let check = |regime_stride: u32,
+                             have: crate::addr::AxisStride,
+                             role: &str,
+                             axis: &str,
+                             ext: u32|
+                 -> Result<(), String> {
+                    if regime_stride == have.elems() {
+                        return Ok(());
+                    }
+                    Err(format!(
+                        "matmul '{o_name}': the batched {role} walk strides `y` by {regime_stride} elems \
+                         (derived={regime_stride}, {axis}={ext}), but this operand's placement law puts adjacent \
+                         heads {} elems apart. A `y`-batch would step into another head. If the operand is \
+                         head-major its pitch is `mb*stick`, so declare ONE STICK of `{axis}`; if it is a \
+                         token stream its pitch is `mb*hd` and the full width is right. (This is the \
+                         relation the head_dim==64 gate used to stand in for.)",
+                        have.elems(),
+                    ))
+                };
+                match form.regime() {
+                    SharedKernelBmmRegime::Proven(r) => {
+                        check(
+                            r.y_stride_elems(a_mb_dev, k),
+                            want.activation(),
+                            "input",
+                            "in",
+                            k,
+                        )?;
+                        check(
+                            r.y_stride_elems(o_mb_dev, n),
+                            want.output(),
+                            "output",
+                            "out",
+                            n,
+                        )?;
+                    }
+                    SharedKernelBmmRegime::Requests(r) => {
+                        check(
+                            r.y_stride_elems(a_mb_dev, k),
+                            want.activation(),
+                            "input",
+                            "in",
+                            k,
+                        )?;
+                        check(
+                            r.y_stride_elems(o_mb_dev, n),
+                            want.output(),
+                            "output",
+                            "out",
+                            n,
+                        )?;
+                    }
                 }
             }
+            let (input, output) = match form.regime() {
+                SharedKernelBmmRegime::Proven(regime) => batched_walk_args(
+                    regime, &plan, a_name, o_name, a_off, o_off, a_phys_mb, pitches,
+                )?,
+                SharedKernelBmmRegime::Requests(regime) => batched_walk_args(
+                    regime, &plan, a_name, o_name, a_off, o_off, a_phys_mb, pitches,
+                )?,
+            };
+            let args = [
+                AnyTensorArg::R3(input),
+                AnyTensorArg::R2(kernel),
+                AnyTensorArg::R3(output),
+            ];
+            windows_are_not_crossed_inside_a_core(o_name, &plan, &args)?;
+            args
         }
-        let (input, output) = match form.regime() {
-            SharedKernelBmmRegime::Proven(regime) => batched_walk_args(
-                regime, &plan, a_name, o_name, a_off, o_off, phys_mb, pitches,
-            )?,
-            SharedKernelBmmRegime::Requests(regime) => batched_walk_args(
-                regime, &plan, a_name, o_name, a_off, o_off, phys_mb, pitches,
-            )?,
-        };
-        [
-            AnyTensorArg::R3(input),
-            AnyTensorArg::R2(kernel),
-            AnyTensorArg::R3(output),
-        ]
     };
     // The operand RESIDENCY is the same `DF` type decision as the stick basis: stamp every
     // non-output arg (activation + weight) with `DF::DF` so `::<Fp8>` yields 1-byte packed
@@ -675,7 +794,7 @@ where
     let mut args = args;
     for arg in &mut args {
         if !matches!(arg.view().role, Role::Output) {
-            arg.set_df(DF::DF);
+            arg.set_df(DF::DF).map_err(|e| e.0)?;
         }
     }
     let [input, kernel, output]: [AnyTensorArg; 3] = args;
@@ -700,7 +819,7 @@ fn batched_walk_args<R: RungRegime>(
     o_name: &str,
     a_off: u32,
     o_off: u32,
-    phys_mb: Option<u32>,
+    phys_mb: Option<ActivationRows>,
     // ⭐ EACH OPERAND'S OWN DECLARED ROW PITCH, from its own placement law (see `BatchStrides`). The
     // two genuinely differ on the score leg: a token-stream activation stepped one stick at a time
     // needs `mq*nslab` while the head-major output needs `mq`. One shared `phys_mb` could satisfy
@@ -710,7 +829,7 @@ fn batched_walk_args<R: RungRegime>(
     let input = batched_input_arg(a_name, regime.input_walk(), plan)?.with_offset(a_off);
     // A phys SMALLER than the swept extent is a mis-declaration, not a window (same rule the
     // kernel override enforces): the walk would describe less memory than the op reads.
-    let input = match phys_mb {
+    let input = match phys_mb.map(ActivationRows::get) {
         Some(phys) => {
             let swept = plan.extent(MbAxis::NAME);
             if phys < swept {
@@ -742,6 +861,52 @@ fn batched_walk_args<R: RungRegime>(
         _ => output,
     };
     Ok((input, output))
+}
+
+/// ⛔ CENSUS ROW 4 OF THE ROPE PLAN (2026-11-19 § A1), TYPED AT ITS SITE — the one-head-a-core
+/// reliance of a rank-3 batched operand whose `mb` is a WINDOW of a taller allocation
+/// (`phys_mb`, `a_pitch`, `o_pitch` past the swept rows). Each core's start carries its slice of
+/// the allocation (the address readers fold over the window), but inside one core the walk steps
+/// every axis OUTSIDE `mb` by the SWEPT `mb` extent's plane: `maxDimSizes_` is a size cap
+/// (`dsc/dsc2.cpp:2806-2815`) and a window states no back gap. So a window is exact only while no
+/// core holds more than one step of an axis laid out outside it — in the head-outermost walk
+/// (`[y, mb, ·]`) that is one head (`y`) a core; in the batch-inner walk (`[mb, y, ·]`) nothing
+/// lies outside `mb` and nothing is relied on. A plan that hands a core two steps of such an axis
+/// is a build error naming the op, the operand and the axis — never a silently short head step.
+/// (The operand's `mb` as a PITCH, `backGapCore_[mb]`, would lift this; it changes main's
+/// decode-batch bytes and waits for its card A/B.)
+fn windows_are_not_crossed_inside_a_core(
+    o_name: &str,
+    plan: &WorkPlan,
+    args: &[AnyTensorArg],
+) -> Result<(), String> {
+    let swept = plan.extent(MbAxis::NAME);
+    for a in args {
+        let v = a.view();
+        let Some(at) = v.layout.iter().position(|&d| d == MbAxis::NAME) else {
+            continue;
+        };
+        if !matches!(v.device_extent[at], crate::superdsc_opspec::DeviceAxis::Window(p) if p > swept)
+        {
+            continue;
+        }
+        if let Some(&outer) = v.layout[..at]
+            .iter()
+            .find(|&&d| plan.per_core_extent(d) > 1)
+        {
+            return Err(format!(
+                "matmul '{o_name}': operand '{}' states its `mb` as a window of a taller allocation \
+                 and the plan hands one core {} steps of '{outer}', which is laid out outside it — \
+                 inside a core the walk steps '{outer}' by the swept `mb` plane, not the window's \
+                 (`maxDimSizes_` is a size cap and a window states no back gap), so every step past \
+                 a core's first would land short. One '{outer}' step a core, or the operand's `mb` \
+                 as a pitch (`backGapCore_`), card-proven first.",
+                v.name,
+                plan.per_core_extent(outer)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The batched INPUT descriptor write. Its walk slot is `Walk3<_, _, InAxis>` — only a
@@ -825,29 +990,12 @@ pub fn matmul_opspec_batched(
         0,
         0,
         0,
-        None,
     )
 }
 
-/// [`matmul_opspec_batched`] with per-operand ELEMENT start-offsets and an optional KERNEL
-/// physical-extent override — the form the batched DECODE attention needs.
-///
-/// Two things separate a batched attention bmm from the plain batched form:
-///
-/// 1. **Offsets.** Each block of the online-softmax loop reads a 64-slot window of the resident
-///    K/V cache, so the kernel starts at `b · <block stride>`, not 0.
-/// 2. **Swept extent ≠ storage stride.** `matmul_opspec_batched` derives the 3-D kernel's
-///    per-batch (`y`) stride from the ITERATION extents (`in · out`). That is only the true
-///    stride when the op sweeps the tensor's whole physical extent. The decode ladder sweeps
-///    `active_cap ≤ cap` of a `[nkvh, hd, cap]` Kᵀ cache, and the V cache is `nqh`-sized while
-///    only every `gqa`-th head slot is live — in both cases the real `y` stride is LARGER than
-///    `in · out`. `kernel_device_extent = Some((dim, phys))` declares that dim's TRUE physical
-///    extent via [`TensorArg::with_device_extent`] (torch-spyre's `arg.device_size`), so stride
-///    derivation uses `phys` and the sub-rung ladder addresses correctly. Without it a batched
-///    score is right only at the top rung — the "no ladder-safe drop-in exists" obstacle.
-///
-/// `None` reproduces [`matmul_opspec_batched`] exactly (all offsets 0, strides from iteration
-/// extents), so this is a strict superset and existing behaviour is byte-identical.
+/// [`matmul_opspec_batched`] with per-operand ELEMENT start-offsets — each block of the
+/// online-softmax loop reads a 64-slot window of the resident K/V cache, so the kernel starts at
+/// `b · <block stride>`, not 0. At zero offsets it is [`matmul_opspec_batched`] exactly.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_batched_off(
     m: MatM,
@@ -860,7 +1008,6 @@ pub fn matmul_opspec_batched_off(
     a_off: u32,
     w_off: u32,
     o_off: u32,
-    kernel_device_extent: Option<(&'static str, u32)>,
 ) -> Result<OpSpec, String> {
     // ⛔⛔⛔ THIS FORM IS NOT FOR REQUESTS, AND THAT IS A CARD MEASUREMENT. A `RequestAxis` parameter here
     // once carried the three `y` steps a request-batched fold leg would take, checked against the walk
@@ -915,27 +1062,6 @@ pub fn matmul_opspec_batched_off(
     )
     .map_err(|e| e.0)?
     .with_offset(w_off);
-    // The `y`-stride override (see the fn doc): declare the kernel dim whose PHYSICAL extent
-    // exceeds this op's swept extent, so stride derivation uses storage, not iteration.
-    let kernel = match kernel_device_extent {
-        Some((dim, phys)) => {
-            // `with_device_extent` means "this op sweeps a WINDOW of a larger allocation". A phys
-            // SMALLER than the swept extent is not a window, it is a mis-declaration: the walk would
-            // describe less memory than the op reads. Refuse at `cargo build` rather than emit a
-            // descriptor whose declared size and address span disagree (an on-card Compute CB error).
-            let swept = plan.extent(dim);
-            if phys < swept {
-                return Err(format!(
-                    "matmul_opspec_batched_off '{w_name}': kernel device_extent {dim}={phys} is \
-                     SMALLER than the swept extent {swept}. device_extent declares a window into a \
-                     LARGER physical allocation (phys >= iteration); a smaller value cannot be \
-                     expressed this way."
-                ));
-            }
-            kernel.with_device_extent(dim, phys).map_err(|e| e.0)?
-        }
-        None => kernel,
-    };
     let output_walk = Walk3::output_head_outermost();
     let output = TensorArg::<3>::new(
         false,

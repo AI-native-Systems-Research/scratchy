@@ -442,20 +442,17 @@ pub fn col_window_of(rows: u32, full: u32, c: u32, df: Df) -> Result<ColWindow, 
 ///
 /// A row band is not a column window: the parent strides its column planes `parent_rows·lanes`
 /// apart while a window of fewer rows would stride its own `rows·lanes`, so the window's bytes
-/// are a stick-major tensor of the PARENT's, reached by declaring the parent's row count as the
-/// operand's `mb` device extent ([`TensorArg::with_device_extent`]) — the same law the batched
-/// decode's per-request pass uses to iterate one row while the operand's heads stay `mq` rows
-/// apart. A window at most ONE STICK wide never crosses a plane, so its own stick-major layout
-/// coincides with the parent's inside that plane and it needs no declaration — the card-proven
-/// rotate-half form, byte for byte.
+/// are a stick-major tensor of the PARENT's, reached by stating the parent's row count as the
+/// operand's `mb` PITCH ([`TensorArg::with_pitch`] — the walk's back gap `parent_rows − rows`,
+/// card-measured bit-exact 2026-11-08). ONE LAW AT EVERY WIDTH: a window one stick wide has no
+/// second column plane for the gap to move, so it states the same pitch at the same addresses.
 ///
-/// [`TensorArg::with_device_extent`]: crate::superdsc_opspec::TensorArg::with_device_extent
+/// [`TensorArg::with_pitch`]: crate::superdsc_opspec::TensorArg::with_pitch
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RowWindow {
     corner: DevOff,
     parent_rows: u32,
     width: u32,
-    df: Df,
 }
 
 impl RowWindow {
@@ -464,9 +461,9 @@ impl RowWindow {
         self.corner
     }
 
-    /// The parent's own row count — the extent the `mb` device extent declares, so the operand
-    /// strides its column planes at the parent's `parent_rows·lanes`, never at the window's own
-    /// fewer rows' pitch.
+    /// The parent's own row count — the extent the `mb` pitch declares, so the operand strides its
+    /// column planes at the parent's `parent_rows·lanes`, never at the window's own fewer rows'
+    /// pitch.
     pub fn parent_rows(self) -> u32 {
         self.parent_rows
     }
@@ -474,25 +471,6 @@ impl RowWindow {
     /// The window's own width in elements.
     pub fn width(self) -> u32 {
         self.width
-    }
-
-    /// Whether the window fits inside ONE column plane of the parent (`width ≤ lanes`): a
-    /// one-stick window never crosses a plane boundary, so its own stick-major layout is the
-    /// parent's within that plane and it needs no device-extent declaration. A multi-stick
-    /// window MUST be declared at [`Self::parent_rows`] or its second plane mis-strides.
-    pub fn spans_one_stick(self) -> bool {
-        self.width <= self.df.elems_per_stick()
-    }
-
-    /// ⭐ Whether this window DECLARES a device extent past the op's swept rows — the
-    /// windowed-stick law's fact ([`crate::work::EwDivision::budget`]). True only of a
-    /// MULTI-STICK window (a one-stick window declares nothing — it never crosses a plane) of a
-    /// TALLER parent (`parent_rows > rows`; a band whose parent is exactly the op's rows, the
-    /// batch-1 case, declares an extent equal to the sweep). Such an operand is safe only while
-    /// a core holds ONE stick: a multi-stick core would have to walk the parent's inter-plane
-    /// stride, which nothing states without `backGapCore_`.
-    pub fn declares_past(self, rows: u32) -> bool {
-        !self.spans_one_stick() && self.parent_rows > rows
     }
 }
 
@@ -519,7 +497,6 @@ pub fn row_window_of(
         corner: rc_of(parent_rows, full, r, c, df),
         parent_rows,
         width,
-        df,
     })
 }
 

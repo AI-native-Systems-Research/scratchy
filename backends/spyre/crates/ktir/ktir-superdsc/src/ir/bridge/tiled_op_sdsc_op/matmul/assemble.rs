@@ -178,7 +178,7 @@ pub fn assemble_matmul_split<T: crate::collective::Tp>(
         m,
         n,
         k,
-        batch,
+        super::opspec::MatmulRows::whole(batch),
         a_name,
         w_name,
         o_name,
@@ -186,7 +186,6 @@ pub fn assemble_matmul_split<T: crate::collective::Tp>(
         0,
         0,
         <Fp16 as DataFormat>::DF,
-        None,
         // The tower's shapes are not attention decode rows; they keep the proven walk pair.
         SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness()),
         // No head axis to state: the Kani tower's seam drives dense shapes, never a GQA group, so
@@ -337,7 +336,11 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
         .find(|arg| arg.view().name == w_name)
     {
         use super::walk::WalkAxis as _;
-        kernel.set_device_extent(super::walk::InAxis::NAME, w_in_phys);
+        kernel
+            .set_device_extent(super::walk::InAxis::NAME, w_in_phys)
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+            })?;
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -507,8 +510,10 @@ pub struct RowsShape {
 /// descriptor. Its activation and output are rows `[r0, r0 + m)` of `[rows, k]` / `[rows, n]`
 /// stick-major tensors (the flat frame every rank-3 value lives in), and its kernel is a standalone
 /// `[k, n]` block. A row slice of a stick-major tensor is addressed at element base `r0 · stick` with
-/// the TENSOR's row count as the `mb` device extent — its stick-group stride is `rows · stick`, not the
-/// op's `m · stick` (`matmul_opspec_split`'s `phys_mb`, on both the activation and the output).
+/// the TENSOR's row count as the `mb` PITCH — its stick-group stride is `rows · stick`, not the
+/// op's `m · stick`. Each operand's row count reaches the ONE builder that states the pitches
+/// ([`super::opspec::PhysRows`]: the output's `rows`, the activation's `a_rows`), so a batch block
+/// standing on its own (`a_rows == m`) is swept whole by the same law, never re-stated here.
 pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     op_name: &str,
     shape: RowsShape,
@@ -519,11 +524,14 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let form = SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness());
-    let mut op = matmul_opspec_split::<Fp16, _>(
+    let op = matmul_opspec_split::<Fp16, _>(
         shape.m.get(),
         shape.n.get(),
         shape.k.get(),
-        1,
+        super::opspec::MatmulRows::unbatched(super::opspec::PhysRows {
+            activation: shape.a_rows,
+            output: shape.rows,
+        }),
         a.h.name(),
         w.h.name(),
         o.h.name(),
@@ -531,17 +539,11 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
         w.off,
         o.off,
         <Fp16 as DataFormat>::DF,
-        Some(shape.rows),
         form,
         None,
         super::dims::matmul_split_map_for(form),
     )
     .map_err(crate::superdsc_error::SuperDscError)?;
-    // The activation's own stick-group pitch, when it is not the output's: a batch block read on
-    // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
-    if shape.a_rows != shape.rows {
-        op.args_mut()[0].set_device_extent("mb", shape.a_rows);
-    }
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 
@@ -557,7 +559,7 @@ fn assemble_from_opspec<T: crate::collective::Tp>(
     // the core that gathered it. The residency is the tensor's (decided where its name is pinned), so the
     // matmul door consults it by name exactly as the pointwise door does; `emit`'s core-local read law
     // then proves this op hands each core the slice its producer wrote. No-op for every unpinned operand.
-    crate::emit::apply_lx_residency(&mut op, layout);
+    crate::emit::apply_lx_residency(&mut op, layout)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
@@ -964,7 +966,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
 
 /// [`assemble_matmul_off`] for the TRUE PER-BATCH (3-D-kernel) batchmatmul: ONE op covering
 /// `batch` kv-heads instead of `batch · gqa` per-head ops. See [`matmul_opspec_batched_off`] for
-/// the offset / `kernel_device_extent` contract.
+/// the offset contract.
 ///
 /// Same typed-operand discipline as [`assemble_matmul_off`] — activation is `RowBlocked`, the
 /// K/V cache is a `Kernel`, so addressing the cache as a non-Kernel does not type-check.
@@ -979,7 +981,6 @@ pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abst
     a_off: u32,
     w: &Stk<crate::sdsc_abstract::KernelTag>,
     w_off: u32,
-    kernel_device_extent: Option<(&'static str, u32)>,
     o: &Stk<O>,
     o_off: u32,
     sym_id_base: &mut i64,
@@ -987,17 +988,7 @@ pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abst
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let op = super::opspec::matmul_opspec_batched_off(
-        m,
-        n,
-        k,
-        batch,
-        a_name,
-        w_name,
-        o_name,
-        a_off,
-        w_off,
-        o_off,
-        kernel_device_extent,
+        m, n, k, batch, a_name, w_name, o_name, a_off, w_off, o_off,
     )
     .map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_matmul_batched_off {op_name}: {e}"))

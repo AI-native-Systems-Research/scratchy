@@ -9,9 +9,10 @@
 //! A `[1, 2048]` add costs 0.51 µs on 4–8 cores against 0.80 µs on 32; 32 cores start to win at 24–32 KiB
 //! of output (96 KiB moved by a binary op). Gen1's `BYTES_PER_CORE` = 3 KiB is that crossover.
 //!
-//! The WINDOWED law (a windowed operand's per-core stick count is 1) is proven in `work.rs`'s own
-//! unit tests — its mint (`TileOp::with_windowed`) is crate-private, one writer at the broadcast
-//! door.
+//! The law holds of a BANDED operand no less than a whole one: a row band's stride safety is the
+//! door's pitch statement (the back-gap law,
+//! `zz_a_row_band_states_its_parent_pitch_as_a_back_gap`), never the budget's, so nothing about a
+//! band moves this spend.
 
 use ktir_superdsc::device_gen::{DeviceGen, Gen1};
 use ktir_superdsc::ir::island::tile_op::{TileOp, TileOpKind};
@@ -42,7 +43,7 @@ fn op(rows: u32, cols: u32) -> TileOp {
 /// The budget at each measured decode shape, at gen1.
 #[test]
 fn the_budget_at_each_measured_shape() {
-    let at = |rows, cols| EwDivision::Law.budget(&op(rows, cols)).unwrap().get();
+    let at = |rows, cols| EwDivision::Law.budget(&op(rows, cols)).get();
     assert_eq!(
         at(1, 512),
         1,
@@ -70,11 +71,11 @@ fn the_budget_at_each_measured_shape() {
 #[test]
 fn a_stated_division_ignores_the_byte_law() {
     let small = op(1, 2048);
-    assert_eq!(EwDivision::RowsFirst.budget(&small).unwrap().get(), 4);
-    assert_eq!(EwDivision::SticksFirst.budget(&small).unwrap().get(), 4);
-    assert_eq!(EwDivision::Law.budget(&small).unwrap().get(), 4);
+    assert_eq!(EwDivision::RowsFirst.budget(&small).get(), 4);
+    assert_eq!(EwDivision::SticksFirst.budget(&small).get(), 4);
+    assert_eq!(EwDivision::Law.budget(&small).get(), 4);
     assert_eq!(
-        EwDivision::Groups(8).budget(&small).unwrap().get(),
+        EwDivision::Groups(8).budget(&small).get(),
         <Gen1 as DeviceGen>::CORES,
         "one row group a core is a correctness law of the walk's LX plan, not a cost choice"
     );
@@ -97,7 +98,7 @@ fn every_budgeted_plan_is_a_valid_plan() {
                 ),
                 (EwDivision::SticksFirst, distribute_cores_sticks_first),
             ] {
-                let budget = div.budget(&d).unwrap();
+                let budget = div.budget(&d);
                 let plan = WorkPlan::divide(&d.dims, budget, splitter)
                     .unwrap_or_else(|e| panic!("[{rows}, {cols}] {div:?}: {e}"));
                 let whole = WorkPlan::divide(&d.dims, CoreBudget::whole(), splitter).unwrap();
@@ -123,17 +124,12 @@ fn an_op_whose_bytes_fill_the_machine_is_unchanged() {
     for rows in [8u32, 16, 32, 64, 128, 256, 512] {
         for sticks in [32u32, 64, 72, 128, 200] {
             let (cols, d) = (sticks * 64, op(rows, sticks * 64));
-            assert_eq!(
-                EwDivision::Law.budget(&d).unwrap().get(),
-                32,
-                "[{rows}, {cols}]"
-            );
+            assert_eq!(EwDivision::Law.budget(&d).get(), 32, "[{rows}, {cols}]");
             for splitter in [
                 distribute_cores as fn(&[ItDim], u32) -> _,
                 distribute_cores_sticks_first,
             ] {
-                let a = WorkPlan::divide(&d.dims, EwDivision::Law.budget(&d).unwrap(), splitter)
-                    .unwrap();
+                let a = WorkPlan::divide(&d.dims, EwDivision::Law.budget(&d), splitter).unwrap();
                 let b = WorkPlan::divide(&d.dims, CoreBudget::whole(), splitter).unwrap();
                 assert_eq!(a.splits(), b.splits(), "[{rows}, {cols}]");
             }

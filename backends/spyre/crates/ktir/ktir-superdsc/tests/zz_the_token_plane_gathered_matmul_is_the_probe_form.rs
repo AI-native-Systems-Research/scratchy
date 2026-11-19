@@ -83,7 +83,8 @@ fn probe_matmul(gather: Option<GatherIndex>) -> ktir_superdsc::superdsc_opspec::
             ktir_superdsc::superdsc_opspec::Role::Output
                 | ktir_superdsc::superdsc_opspec::Role::Index
         ) {
-            arg.set_df(<Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::DF);
+            arg.set_df(<Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::DF)
+                .expect("an operand with no stick pitch takes its df");
         }
     }
     op
@@ -437,7 +438,8 @@ fn the_plan_under_a_token_plane_gather_splits_mb_only_at_a_multi_stick_out() {
             ktir_superdsc::superdsc_opspec::Role::Output
                 | ktir_superdsc::superdsc_opspec::Role::Index
         ) {
-            arg.set_df(<Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::DF);
+            arg.set_df(<Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::DF)
+                .expect("an operand with no stick pitch takes its df");
         }
     }
     // THE PLAN IS THE PROBE'S LAW: the entry axis at its own core_split, nothing else.

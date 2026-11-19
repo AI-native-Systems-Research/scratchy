@@ -12,8 +12,9 @@
 //! literals — a quantity with no name and no type, and the recorded mq>1 defect class
 //! (attn.rs, "the two are SWAPPED"): `[mb, y, in]` assigns mb the batch BLOCK `y·in`
 //! while the physical head-major operand's row pitch is `in`, numerically equal exactly
-//! at `mb == 1`. This module gives every matmul walk axis a NAME ([`WalkAxis`]) and every
-//! walk a CONSTRUCTOR named for the stride assignment it encodes — and the batch-inner
+//! at `mb == 1`. Every matmul walk axis has a NAME ([`WalkAxis`], stated once in
+//! [`crate::superdsc_opspec`], where an operand's pitch reads it too), and this module gives
+//! every walk a CONSTRUCTOR named for the stride assignment it encodes — and the batch-inner
 //! pair (`[mb, y, ·]`, the assignment that swaps at `mb > 1`) has PRIVATE constructors
 //! whose only door is the proven regime's [`RungRegime`] impl, so a batch-decode rung
 //! cannot be handed the walk that is right only at one row: its own regime's associated
@@ -27,6 +28,7 @@
 use std::marker::PhantomData;
 
 use crate::sdsc_abstract::QueryRowCount;
+pub(crate) use crate::superdsc_opspec::{InAxis, MbAxis, OutAxis, WalkAxis, YAxis};
 
 /// ⭐ WHICH FORM a SHARED-KERNEL batched (`y > 1`, 2-D-kernel) matmul takes: the RUNG REGIME it is
 /// emitted under, carried as a VALUE of that regime's sealed type. Threaded from `assemble_attn`
@@ -296,37 +298,6 @@ impl RungRegime for HeadOutermostRequests {
     fn y_stride_elems(self, mb_dev: u32, stick_extent: u32) -> u32 {
         mb_dev * stick_extent
     }
-}
-
-/// A named matmul walk axis. `NAME` is the ONE spelling of the axis's `ItDim`/layout/split
-/// key — `matmul_dims`, the split maps and every declared walk read it from here, so the
-/// axis vocabulary cannot fork into per-file string literals.
-pub(crate) trait WalkAxis {
-    const NAME: &'static str;
-}
-
-/// M — the row / token / request axis (`mb`). Carried across the PT array rows.
-pub(crate) struct MbAxis;
-impl WalkAxis for MbAxis {
-    const NAME: &'static str = "mb";
-}
-
-/// The batch axis (`y`) — a GQA group's query head, or the request in the request-axis form.
-pub(crate) struct YAxis;
-impl WalkAxis for YAxis {
-    const NAME: &'static str = "y";
-}
-
-/// K — the reduction stick axis (`in`).
-pub(crate) struct InAxis;
-impl WalkAxis for InAxis {
-    const NAME: &'static str = "in";
-}
-
-/// N — the output stick axis (`out`).
-pub(crate) struct OutAxis;
-impl WalkAxis for OutAxis {
-    const NAME: &'static str = "out";
 }
 
 /// A rank-2 declared walk `[A, S]`, sticked on `S` (the last axis, by construction).

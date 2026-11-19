@@ -443,6 +443,14 @@ mod private {
     impl SealedDf for super::SenInt8 {}
     impl SealedDf for super::Fp8 {}
     impl SealedDf for super::SenUint32 {}
+
+    /// Seals [`WalkAxis`](super::WalkAxis) so the axis vocabulary is the four markers defined in
+    /// this module (`MbAxis`, `YAxis`, `InAxis`, `OutAxis`).
+    pub trait SealedAxis {}
+    impl SealedAxis for super::MbAxis {}
+    impl SealedAxis for super::YAxis {}
+    impl SealedAxis for super::InAxis {}
+    impl SealedAxis for super::OutAxis {}
 }
 
 /// **Value-level** mirror of the [`DataFormat`] sealed marker trait — the ONE dtype a dataspace
@@ -910,9 +918,8 @@ impl serde::Serialize for SliceIndex {
 /// ([`Baked`](crate::device_gen::Baked)) cores one op may be divided over. SEALED: the field is
 /// private and the constructors are [`Self::whole`] (public — the budget of every division that
 /// is a correctness law of its own) and [`Self::for_bytes`] (crate-private;
-/// [`crate::work::EwDivision::budget`] is its only caller, where the byte law and the
-/// windowed-stick law are applied), so no caller can hand the splitter a count it computed
-/// itself.
+/// [`crate::work::EwDivision::budget`] is its only caller, where the byte law is applied), so no
+/// caller can hand the splitter a count it computed itself.
 ///
 ///   * [`Self::whole`] — every core the generation has. The budget of every division that is a
 ///     correctness law of its own (a gather's entries, a walk's row groups, a matmul's cost search,
@@ -956,7 +963,7 @@ impl CoreBudget {
 
     /// The cores `bytes` of operand traffic pay for: `ceil(bytes / BYTES_PER_CORE)`, clamped to
     /// `1..=CORES`. SEALED crate-private: [`crate::work::EwDivision::budget`] — where the byte
-    /// law and the windowed-stick law are stated — is its only caller.
+    /// law is stated — is its only caller.
     pub(crate) const fn for_bytes(bytes: u64) -> Self {
         let want = bytes
             .div_ceil(<crate::device_gen::Baked as crate::device_gen::DeviceGen>::BYTES_PER_CORE);
@@ -967,13 +974,6 @@ impl CoreBudget {
         } else {
             want as u32
         };
-        CoreBudget { cores }
-    }
-
-    /// A budget of exactly `cores` cores — the windowed-stick law's count ([`crate::work::
-    /// EwDivision::budget`]), which has already refused everything above the generation's cores
-    /// and floors at one. Crate-private for the same reason [`Self::for_bytes`] is.
-    pub(crate) const fn of_cores(cores: u32) -> Self {
         CoreBudget { cores }
     }
 
@@ -1662,6 +1662,26 @@ impl Allocation {
     }
     pub fn component(self) -> &'static str {
         if self.is_lx() { "lx" } else { "hbm" }
+    }
+
+    /// ⛔ NO LX VIEW CARRIES A PITCH — the residency half of the back-gap law (plan 2026-11-19
+    /// § A1, purity item 3), stated HERE once and read by both writers of the two facts it
+    /// relates: [`TensorArg::with_pitch`] (a pitch on a view whose residency is stated) and
+    /// [`AnyTensorArg::set_allocation`] (a residency on a view whose pitches are stated). So an
+    /// LX view with a pitch is unconstructable through either order, and the walk's reader
+    /// ([`crate::wire::BackGap::of_hbm_view`]) has nothing left to refuse. dxp keys an HBM gap
+    /// by core `-1` and takes an LX gap only uniform across cores (`dsc/dsc2.cpp:3938-3955`); no
+    /// LX gap form is proven on the card, so a view that would need one is a build error naming
+    /// it — never a runtime one.
+    fn carries_pitch_on(self, view: &str, pitched: &[&'static str]) -> Result<(), SuperDscError> {
+        if self.is_lx() && !pitched.is_empty() {
+            return Err(SuperDscError(format!(
+                "tensor '{view}' is LX-resident and states a pitch on {pitched:?} — no LX back-gap \
+                 form is proven on the card (dxp takes an LX gap only uniform across cores, \
+                 dsc2.cpp:3946-3953), so a pitched view lives in HBM"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2415,6 +2435,220 @@ pub struct DeviceOrderView<'a> {
     pub positions: &'a [usize],
 }
 
+/// ⭐ HOW ONE AXIS OF A VIEW SITS IN ITS ALLOCATION — one slot per axis ([`TensorArg`]'s
+/// `device_extent`), so a view cannot state two device mechanisms for one axis.
+///
+/// The op iterates the axis's swept extent in every case; what differs is the allocation around
+/// it:
+///
+/// * [`DeviceAxis::Swept`] — the allocation's extent along the axis IS the swept one.
+/// * [`DeviceAxis::Window`] — the axis is a WINDOW of a larger allocation
+///   ([`TensorArg::with_device_extent`]). The allocation's extent reaches every ADDRESS reader
+///   (the arrangement, the per-core start, the footprint, the time-tile advance) and a row-major
+///   walk's `maxDimSizes_`, which dxp reads as a size CAP (`dsc/dsc2.cpp:2806-2815`) — never a
+///   stride past the swept extent. A window is exact only where no walk landing crosses the swept
+///   extent inside a core; each consumer's reason is censused in the rope plan (2026-11-19 § A1).
+/// * [`DeviceAxis::Pitch`] — the axis is iterated whole and the next outer step lands a
+///   [`Pitch`] on, past a gap the op never touches ([`TensorArg::with_pitch`]): the walk's BACK
+///   GAP (`backGapCore_`, [`crate::wire::BackGap`]), which dxp folds into the axis's outermost
+///   repeat (`dsc/dsc2.cpp:2900-2926`).
+///
+/// A window and a pitch state the same PHYSICAL extent to every address reader
+/// ([`DeviceAxis::declared`]); only the walk tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAxis {
+    /// The allocation's extent along the axis IS the swept extent.
+    Swept,
+    /// A window of an allocation this many elements long along the axis.
+    Window(u32),
+    /// Iterated whole, the next outer step a [`Pitch`] on — the walk's back gap.
+    Pitch(Pitch),
+}
+
+impl DeviceAxis {
+    /// The physical extent an ADDRESS reads — a window's allocation and a pitch's declared extent
+    /// alike; `None` where the axis is swept whole.
+    pub fn declared(self) -> Option<u32> {
+        match self {
+            DeviceAxis::Swept => None,
+            DeviceAxis::Window(p) => Some(p),
+            DeviceAxis::Pitch(p) => Some(p.declared()),
+        }
+    }
+}
+
+/// ⭐ A NAMED WALK AXIS. `NAME` is the ONE spelling of the axis's `ItDim`/layout/split key — the
+/// matmul dims, the split maps, every declared matmul walk and every pitch
+/// ([`TensorArg::with_pitch`]) read it from here, so the axis vocabulary cannot fork into
+/// per-file string literals. SEALED: the axes are the four markers below.
+pub trait WalkAxis: private::SealedAxis {
+    const NAME: &'static str;
+}
+
+/// M — the row / token / request axis (`mb`). Carried across the PT array rows.
+pub struct MbAxis;
+impl WalkAxis for MbAxis {
+    const NAME: &'static str = "mb";
+}
+
+/// The batch axis (`y`) — a GQA group's query head, or the request in the request-axis form.
+pub struct YAxis;
+impl WalkAxis for YAxis {
+    const NAME: &'static str = "y";
+}
+
+/// K — the reduction stick axis (`in`).
+pub struct InAxis;
+impl WalkAxis for InAxis {
+    const NAME: &'static str = "in";
+}
+
+/// N — the output stick axis (`out`).
+pub struct OutAxis;
+impl WalkAxis for OutAxis {
+    const NAME: &'static str = "out";
+}
+
+/// The VALUE a [`WalkAxis`] marker names — the axis a [`Pitch`] carries as the one it was stated
+/// on, and the key of [`crate::wire::BackGap`]. Minted only from a marker ([`DimName::of`]), so
+/// no pitch names its axis by a free string; the wire spelling is read at serialization alone
+/// (`DimName::wire`). Ordered by that spelling, so a back gap serializes its axes sorted by
+/// their wire names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DimName(&'static str);
+
+impl DimName {
+    /// The name the marker `A` states.
+    pub fn of<A: WalkAxis>() -> DimName {
+        DimName(A::NAME)
+    }
+
+    /// The axis's wire spelling — read where the back gap serializes, and nowhere else.
+    pub(crate) fn wire(self) -> &'static str {
+        self.0
+    }
+}
+
+/// The KIND of axis a [`Pitch`] is stated on — rows or the operand's stick — the one fact the
+/// back-gap law reads besides its two extents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PitchAxis {
+    /// A non-stick axis: the swept extent is the op's whole `N_` sweep along it, element for
+    /// element.
+    Rows,
+    /// The operand's STICK axis, in sticks of this format: the swept extent rounds UP to whole
+    /// sticks and the declared extent is whole sticks — torch-spyre's law
+    /// (`torch_spyre/_inductor/codegen/superdsc.py:1630-1633`: `dev_dim_size *= stick_size`,
+    /// `it_dim_size` rounded up to whole sticks), and dxp's own order of operations (it rounds a
+    /// stick dim's size to whole sticks, then adds the gap, `dsc/dsc2.cpp:3930-3956`, and requires
+    /// the gap to be a multiple of the stick's inner repeat, `:2921-2923`). CARD-PROVEN by step 0
+    /// of the rope plan (2026-11-19): 40/40 cells bit-exact, the wire `{"out": {"-1": "128"}}` —
+    /// the gap in ELEMENTS — accepted by dxp.
+    Stick(Df),
+}
+
+/// ⭐⭐⭐ THE BACK-GAP LAW, IN ONE TYPE — a pitch past an axis's swept extent, its gap computed
+/// ONCE, by [`Pitch::past`], and nowhere else:
+///
+/// `gap = declared − swept`, where `swept` is the op's WHOLE swept extent along the axis (its
+/// `N_`, never one core's — an HBM view's capacity IS `N_`, core fold included,
+/// `dsc/dsc2.cpp:3626-3632`) and, on the stick axis, rounded up to whole sticks
+/// ([`PitchAxis::Stick`]). The vendor's inductor states the same law
+/// (`backGap[dim] = dev_dim_size − it_dim_size`, `torch_spyre/_inductor/codegen/superdsc.py:
+/// 1686-1691`).
+///
+/// MEASURED on the card (nickm5, 2026-11-08; branch `tp-allreduce` `5d64673767`): a sum whose
+/// stick axis the cores split read the gap fill past block 0 with `pitch − per-core extent` (max
+/// abs 79 / 236 / 548 / 236 at J = 2, 4, 8 `[1, 2048]` and J = 4 `[4, 2048]`), and with
+/// `pitch − whole extent` every cell's output md5 equalled its card add chain's. A multi-stick
+/// row band of a taller parent read and wrote bit-exact with `backGapCore_[mb] = parent − rows`
+/// (`0e55fb8ab1`, `76d187281c`).
+///
+/// The gap is a [`NonZeroU32`]: an extent AT the swept one is no pitch ([`Pitch::past`] answers
+/// `None` and the axis stays [`DeviceAxis::Swept`]), so every reader — the address readers
+/// through [`Pitch::declared`], the walk through [`Pitch::gap`] — takes a value that cannot be
+/// zero or negative, and none of them re-derives or re-checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pitch {
+    /// The axis the pitch is stated on — the key its back gap is written under
+    /// ([`crate::wire::BackGap`]).
+    dim: DimName,
+    /// The kind of axis the pitch was built on — kept so a time-tiled trip re-builds it through
+    /// the same constructor ([`Pitch::per_trip`]) instead of re-deciding which law applies.
+    axis: PitchAxis,
+    declared: u32,
+    gap: NonZeroU32,
+}
+
+impl Pitch {
+    /// THE ONE CONSTRUCTOR: the axis `dim`, of kind `axis`, which the op sweeps `swept` elements
+    /// of (its WHOLE sweep), in an allocation `declared` elements long along it. `Ok(None)` when
+    /// `declared` IS the (stick-rounded) swept extent — no pitch. Refused by name: a `declared`
+    /// SHORTER than the swept extent (the next step would land inside this one), and on the stick
+    /// axis a `declared` that is not whole sticks (no allocation is a fraction of a stick).
+    pub fn past(
+        dim: DimName,
+        axis: PitchAxis,
+        swept: u32,
+        declared: u32,
+    ) -> Result<Option<Pitch>, SuperDscError> {
+        let swept = match axis {
+            PitchAxis::Rows => swept,
+            PitchAxis::Stick(df) => {
+                let lanes = df.elems_per_stick();
+                if !declared.is_multiple_of(lanes) {
+                    return Err(SuperDscError(format!(
+                        "a stick axis declared {declared} elements long — an allocation is whole \
+                         {lanes}-element sticks"
+                    )));
+                }
+                swept.checked_next_multiple_of(lanes).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "a stick axis swept {swept} elements does not round to whole \
+                         {lanes}-element sticks inside u32"
+                    ))
+                })?
+            }
+        };
+        let gap = declared.checked_sub(swept).ok_or_else(|| {
+            SuperDscError(format!(
+                "an axis swept {swept} elements at a pitch of {declared} — a pitch shorter than \
+                 the extent would land the next step inside this one"
+            ))
+        })?;
+        Ok(NonZeroU32::new(gap).map(|gap| Pitch {
+            dim,
+            axis,
+            declared,
+            gap,
+        }))
+    }
+
+    /// The allocation's extent along the axis — what an ADDRESS reads.
+    pub fn declared(self) -> u32 {
+        self.declared
+    }
+
+    /// The elements the walk skips past the whole swept extent before the next outer step — what
+    /// `backGapCore_` carries. Never zero, by type.
+    pub fn gap(self) -> NonZeroU32 {
+        self.gap
+    }
+
+    /// The axis the pitch is stated on — the key of its back gap.
+    pub fn dim(self) -> DimName {
+        self.dim
+    }
+
+    /// ⭐ THE SAME PITCH OVER ONE TRIP OF A TIME-TILED OP — the axis swept `swept` elements a trip
+    /// (the trip's whole `N_` along it), the allocation unchanged. Built by the ONE constructor
+    /// ([`Pitch::past`]) over this pitch's own axis and declared extent, so the trip's gap is the
+    /// law's, never a re-derivation of it; `Ok(None)` when one trip sweeps the whole allocation.
+    pub fn per_trip(self, swept: u32) -> Result<Option<Pitch>, SuperDscError> {
+        Pitch::past(self.dim, self.axis, swept, self.declared)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TensorArg<const D: usize> {
     is_input: bool,
@@ -2448,17 +2682,19 @@ pub struct TensorArg<const D: usize> {
     /// convert) yet ADDRESS RowBlocked (the residual is RowBlocked, and a flat rank-3 read row-mixes). Default
     /// `false` = rank-based (`for_view_df`). Set via [`TensorArg::with_row_blocked`].
     row_blocked: bool,
-    /// Per-dim PHYSICAL device extent, distinct from this op's own iteration-space view of that dim
-    /// (`device_dims`/`op.iter.extent`) — torch-spyre's `arg.device_size` (`superdsc.py:447-469`), which
-    /// every stride/offset is derived from, NOT from `iteration_space[dim]`. `None` at an index means
-    /// "this tensor's physical extent for that dim IS the op's own iteration extent" (the overwhelmingly
-    /// common case — a tensor allocated exactly to the shape this one op produces/consumes), so every
-    /// existing call site is a no-op (`[None; D]` from `TensorArg::new`). `Some(phys)` declares the tensor
-    /// is actually a slice/reuse of a LARGER physical allocation along that dim (`phys > it_dim_size`) —
-    /// torch-spyre's `dev_dim_size > it_dim_size` case — so address/stride derivation for that dim must use
-    /// `phys`, not the op's logical extent, mirroring torch-spyre's `strides[dim] = strides[dim] //
-    /// dev_dim_size * it_dim_size` rescale exactly. Set via [`TensorArg::with_device_extent`].
-    device_extent: [Option<u32>; D],
+    /// Per-dim DEVICE AXIS ([`DeviceAxis`]): how each `layout` dim sits in its allocation, distinct
+    /// from this op's own iteration-space view of it (`device_dims`/`op.iter.extent`) —
+    /// torch-spyre's `arg.device_size` (`superdsc.py:447-469`), which every stride/offset is
+    /// derived from, NOT from `iteration_space[dim]`. [`DeviceAxis::Swept`] (every axis
+    /// [`TensorArg::new`] builds) means
+    /// "this tensor's physical extent for that dim IS the op's own iteration extent" — the
+    /// overwhelmingly common case. A WINDOW ([`TensorArg::with_device_extent`]) or a PITCH
+    /// ([`TensorArg::with_pitch`]) declares a LARGER physical allocation along the dim
+    /// (torch-spyre's `dev_dim_size > it_dim_size`), which every address reader folds over
+    /// ([`ArgView::declared_extents`]) — torch-spyre's `strides[dim] = strides[dim] //
+    /// dev_dim_size * it_dim_size` rescale exactly; only the walk tells the two apart. ONE SLOT PER
+    /// AXIS: one axis states one mechanism.
+    device_extent: [DeviceAxis; D],
     /// How this view presents the tensor's own frame, for the arrangement authority ([`ViewFrame`]).
     frame: ViewFrame,
     /// ⭐ THE ORDER dxp READS THIS TENSOR'S DIMS IN, when it is not `layout`'s. dxp takes
@@ -2518,10 +2754,41 @@ impl<const D: usize> TensorArg<D> {
             offset_elems: 0,
             df: Df::Fp16,
             row_blocked: false,
-            device_extent: [None; D],
+            device_extent: [DeviceAxis::Swept; D],
             frame: ViewFrame::Own,
             device_order: None,
         })
+    }
+
+    /// ⭐ A GATHER'S INDEX OPERAND — read through ([`Role::Index`]), every axis active,
+    /// HBM-resident, in the index table's own `df`. A CONSTRUCTOR: the arg is fresh from
+    /// [`Self::new`], so no axis states a pitch, and the df is stated at construction exactly as
+    /// `new` states [`Df::Fp16`] — the stick-pitch freeze ([`Self::with_df`]) has nothing to meet,
+    /// so this has no df refusal to propagate or to swallow. It fails only as `new` does.
+    ///
+    /// ⛔ `Role::Index`, NOT `Role::Input` — see [`Role::Index`]. Under `Input` the index shares
+    /// `primaryDsInfo_["INPUT"]` with the activation, which wins by insertion order, so the
+    /// index's own layout and stick size are never emitted. Both defects are pinned by
+    /// `the_index_operand_carries_the_vendors_own_dtype_and_its_own_layout`, fail-first-verified
+    /// by reverting each one.
+    fn index_operand(
+        name: String,
+        device_dims: [IterSym; D],
+        layout: [&'static str; D],
+        stick: &'static str,
+        df: Df,
+    ) -> Result<TensorArg<D>, SuperDscError> {
+        let index = TensorArg::new(
+            true,
+            name,
+            Role::Index,
+            [Scale::Active; D],
+            device_dims,
+            layout,
+            stick,
+            Allocation::Hbm,
+        )?;
+        Ok(TensorArg { df, ..index })
     }
 
     /// State the order dxp reads this tensor's dims in — innermost first — when it is not `layout`'s
@@ -2576,9 +2843,29 @@ impl<const D: usize> TensorArg<D> {
     /// Set the dataspace dtype (default [`Df::Fp16`]) — for the packed fp8 / int8 / fp32-merge tensors.
     /// Chains off [`TensorArg::new`]. The `wordLength` / `stickSize_` / `dataFormat_` emitted for this
     /// arg all derive from `df`, so declaring it here is the ONLY place a non-fp16 residency is chosen.
-    pub fn with_df(mut self, df: Df) -> TensorArg<D> {
+    /// Refused by name on a view whose stick axis already states a pitch (`state_df`, the one
+    /// writer of `df`).
+    pub fn with_df(mut self, df: Df) -> Result<TensorArg<D>, SuperDscError> {
+        self.state_df(df)?;
+        Ok(self)
+    }
+
+    /// THE ONE WRITER OF `df` — [`Self::with_df`] and the rank-erased [`AnyTensorArg::set_df`] both
+    /// go through it. ⛔ A STICK-AXIS PITCH FREEZES THE FORMAT: its gap was rounded to whole sticks
+    /// of the df it was stated under ([`PitchAxis::Stick`]), so re-formatting the view under it
+    /// would leave the gap in another format's sticks — refused by name, at build. Re-stating the
+    /// same df is no change and passes.
+    fn state_df(&mut self, df: Df) -> Result<(), SuperDscError> {
+        if df != self.df && matches!(self.device_extent[self.stick_idx], DeviceAxis::Pitch(_)) {
+            return Err(SuperDscError(format!(
+                "TensorArg '{}': the stick axis '{}' states a pitch in {:?} sticks — re-formatting \
+                 the view to {df:?} would leave its back gap in another format's sticks; state the \
+                 df before the pitch",
+                self.name, self.stick, self.df
+            )));
+        }
         self.df = df;
-        self
+        Ok(())
     }
 
     /// FORCE the RowBlocked device layout (see the `row_blocked` field). The fp32 RMSNorm island's
@@ -2592,19 +2879,114 @@ impl<const D: usize> TensorArg<D> {
     /// op's own iteration-space view of it — torch-spyre's `arg.device_size` (`superdsc.py:447-469`).
     /// `dim` must name one of `layout`'s entries (a `cargo build` `Err` otherwise, same discipline as
     /// [`TensorArg::new`]'s stick-dim witness). Chains off [`TensorArg::new`].
+    ///
+    /// The dim is a WINDOW of the allocation ([`DeviceAxis::Window`]): its extent reaches the
+    /// address readers, never a stride past the swept extent. An axis that already states a pitch
+    /// is refused by name — one axis, one mechanism.
     pub fn with_device_extent(
         mut self,
         dim: &'static str,
         phys_extent: u32,
     ) -> Result<TensorArg<D>, SuperDscError> {
-        let idx = self.layout.iter().position(|&d| d == dim).ok_or_else(|| {
+        self.state_window(dim, phys_extent)?;
+        Ok(self)
+    }
+
+    /// ⭐ ITERATE AXIS `A` WHOLE, THE NEXT OUTER STEP `declared` ELEMENTS ON — the walk's back gap
+    /// ([`DeviceAxis::Pitch`]). The axis is a [`WalkAxis`] marker, never a string: the pitch
+    /// carries its [`DimName`], the key its back gap is written under. The pitch is built HERE,
+    /// once, by [`Pitch::past`] over `A`'s WHOLE swept extent (`plan`'s — never one core's) and
+    /// `declared`; every reader takes it. A `declared` AT the swept extent is no pitch: the axis
+    /// stays [`DeviceAxis::Swept`]. Refused by name, at build: an `A` not in the layout; an axis
+    /// that already states a window (one axis, one mechanism); a pitch shorter than the sweep
+    /// ([`Pitch::past`]); and a pitch on an LX-resident view (the residency half of the law,
+    /// [`Allocation`]'s one statement of it). On the stick axis the sweep rounds UP to whole
+    /// sticks of the view's df ([`PitchAxis::Stick`], card-proven by step 0 of the rope plan,
+    /// 2026-11-19), and the df is then frozen under the pitch ([`Self::with_df`] refuses to change
+    /// it).
+    pub fn with_pitch<A: WalkAxis>(
+        mut self,
+        plan: &WorkPlan,
+        declared: u32,
+    ) -> Result<TensorArg<D>, SuperDscError> {
+        self.state_pitch::<A>(plan, declared)?;
+        Ok(self)
+    }
+
+    /// Where `dim` sits in this view's layout — the one lookup every per-axis statement makes.
+    fn axis_at(&self, dim: &'static str, what: &str) -> Result<usize, SuperDscError> {
+        self.layout.iter().position(|&d| d == dim).ok_or_else(|| {
             SuperDscError(format!(
-                "TensorArg '{}': device_extent dim '{dim}' is not in layout {:?}",
+                "TensorArg '{}': {what} dim '{dim}' is not in layout {:?}",
                 self.name, self.layout
             ))
+        })
+    }
+
+    /// THE ONE WRITER OF A [`DeviceAxis::Window`] — [`Self::with_device_extent`] and the
+    /// rank-erased [`AnyTensorArg::set_device_extent`] both go through it.
+    fn state_window(&mut self, dim: &'static str, phys_extent: u32) -> Result<(), SuperDscError> {
+        let idx = self.axis_at(dim, "device_extent")?;
+        if let DeviceAxis::Pitch(p) = self.device_extent[idx] {
+            return Err(SuperDscError(format!(
+                "TensorArg '{}': axis '{dim}' already states a pitch of {} — a window of a \
+                 {phys_extent}-long allocation is the other device mechanism for the axis, and one \
+                 axis states one",
+                self.name,
+                p.declared()
+            )));
+        }
+        self.device_extent[idx] = DeviceAxis::Window(phys_extent);
+        Ok(())
+    }
+
+    /// THE ONE WRITER OF A [`DeviceAxis::Pitch`] — [`Self::with_pitch`] and the rank-erased
+    /// [`AnyTensorArg::set_pitch`] both go through it. Re-stating a pitch over the same slot is
+    /// the same law again (the last statement holds); a window there is the other mechanism and
+    /// is refused.
+    fn state_pitch<A: WalkAxis>(
+        &mut self,
+        plan: &WorkPlan,
+        declared: u32,
+    ) -> Result<(), SuperDscError> {
+        let dim = A::NAME;
+        let idx = self.axis_at(dim, "pitch")?;
+        if let DeviceAxis::Window(p) = self.device_extent[idx] {
+            return Err(SuperDscError(format!(
+                "TensorArg '{}': axis '{dim}' already states a window of a {p}-long allocation — a \
+                 pitch of {declared} is the other device mechanism for the axis, and one axis \
+                 states one",
+                self.name
+            )));
+        }
+        // ⭐ THE STICK AXIS TAKES `PitchAxis::Stick`'s LAW, stated once: the sweep rounds UP to
+        // whole sticks of the view's df — which the pitch then freezes (`state_df`). Card-proven
+        // by step 0 of the rope plan (2026-11-19: 40/40 cells bit-exact, `{"out": {"-1": "128"}}`
+        // in ELEMENTS, accepted by dxp).
+        let axis = if idx == self.stick_idx {
+            PitchAxis::Stick(self.df)
+        } else {
+            PitchAxis::Rows
+        };
+        let swept = plan.extent(dim);
+        let pitch = Pitch::past(DimName::of::<A>(), axis, swept, declared).map_err(|e| {
+            SuperDscError(format!("TensorArg '{}': axis '{dim}': {}", self.name, e.0))
         })?;
-        self.device_extent[idx] = Some(phys_extent);
-        Ok(self)
+        if pitch.is_some() {
+            self.allocation.carries_pitch_on(&self.name, &[dim])?;
+        }
+        self.device_extent[idx] = pitch.map_or(DeviceAxis::Swept, DeviceAxis::Pitch);
+        Ok(())
+    }
+
+    /// The dims this view states a pitch on — what the residency half of the law reads.
+    fn pitched_dims(&self) -> Vec<&'static str> {
+        self.layout
+            .iter()
+            .zip(&self.device_extent)
+            .filter(|(_, a)| matches!(a, DeviceAxis::Pitch(_)))
+            .map(|(&d, _)| d)
+            .collect()
     }
 }
 
@@ -2644,9 +3026,11 @@ pub struct ArgView<'a> {
     pub df: Df,
     /// FORCE RowBlocked device addressing regardless of rank (the fp32 island `ElementArrangement`).
     pub row_blocked: bool,
-    /// Per-`layout`-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
-    /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg::device_extent`]).
-    pub device_extent: &'a [Option<u32>],
+    /// Per-`layout`-dim device axis (torch-spyre `arg.device_size`) — [`DeviceAxis::Swept`] means
+    /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg`]'s
+    /// `device_extent`). Every address reader reads [`Self::declared_extents`]; only the walk tells
+    /// a window ([`Self::window_extents`]) from a pitch ([`crate::wire::BackGap`]).
+    pub device_extent: &'a [DeviceAxis],
     /// How the view presents the tensor's own frame ([`ViewFrame`]).
     pub frame: ViewFrame,
     /// The order dxp reads the dims in, innermost first, when it is not `layout`'s (see
@@ -2655,6 +3039,27 @@ pub struct ArgView<'a> {
 }
 
 impl ArgView<'_> {
+    /// The physical extent every ADDRESS reader folds over, per `layout` dim — a window's and a
+    /// pitch's alike ([`DeviceAxis::declared`]); `None` where the axis is swept whole.
+    pub fn declared_extents(&self) -> Vec<Option<usize>> {
+        self.device_extent
+            .iter()
+            .map(|a| a.declared().map(|p| p as usize))
+            .collect()
+    }
+
+    /// The extent the walk's `maxDimSizes_` reads, per `layout` dim — a WINDOW's only. A pitch
+    /// never reaches it: there it would be a size cap, not a stride; its stride is the back gap.
+    pub fn window_extents(&self) -> Vec<Option<usize>> {
+        self.device_extent
+            .iter()
+            .map(|a| match *a {
+                DeviceAxis::Window(p) => Some(p as usize),
+                DeviceAxis::Swept | DeviceAxis::Pitch(_) => None,
+            })
+            .collect()
+    }
+
     /// The order dxp reads this view's dims in, innermost first: the stated order, else `layout`.
     pub fn device_dims_order(&self) -> &[&'static str] {
         self.device_order.map_or(self.layout, |o| o.dims)
@@ -2735,13 +3140,14 @@ impl AnyTensorArg {
     }
 
     /// Set the dtype on the wrapped arg (rank-erased) — the typed way for a matmul builder to declare
-    /// its fp8/int8 operands after construction, without a per-rank `with_df`. Mirrors [`TensorArg::with_df`].
-    pub fn set_df(&mut self, df: Df) {
+    /// its fp8/int8 operands after construction, without a per-rank `with_df`. Mirrors [`TensorArg::with_df`]:
+    /// the same one writer of `df`, the same refusal by name on a stick-pitched view.
+    pub fn set_df(&mut self, df: Df) -> Result<(), SuperDscError> {
         match self {
-            AnyTensorArg::R1(t) => t.df = df,
-            AnyTensorArg::R2(t) => t.df = df,
-            AnyTensorArg::R3(t) => t.df = df,
-            AnyTensorArg::R4(t) => t.df = df,
+            AnyTensorArg::R1(t) => t.state_df(df),
+            AnyTensorArg::R2(t) => t.state_df(df),
+            AnyTensorArg::R3(t) => t.state_df(df),
+            AnyTensorArg::R4(t) => t.state_df(df),
         }
     }
 
@@ -2750,12 +3156,24 @@ impl AnyTensorArg {
     /// in the [`crate::placement::BundleLayout`] — the same name-keyed authority that resolves its
     /// address — so an operand declared LX-resident there is flipped here rather than by every
     /// builder growing a residency parameter. Byte-identical for every HBM tensor.
-    pub fn set_allocation(&mut self, allocation: Allocation) {
+    ///
+    /// ⛔ AN LX RESIDENCY ON A PITCHED VIEW IS REFUSED BY NAME, and the view is left as it was —
+    /// the residency half of the back-gap law, read from its one statement on [`Allocation`]
+    /// ([`TensorArg::with_pitch`] reads the same statement from the other side).
+    pub fn set_allocation(&mut self, allocation: Allocation) -> Result<(), SuperDscError> {
+        fn set<const D: usize>(
+            t: &mut TensorArg<D>,
+            allocation: Allocation,
+        ) -> Result<(), SuperDscError> {
+            allocation.carries_pitch_on(&t.name, &t.pitched_dims())?;
+            t.allocation = allocation;
+            Ok(())
+        }
         match self {
-            AnyTensorArg::R1(t) => t.allocation = allocation,
-            AnyTensorArg::R2(t) => t.allocation = allocation,
-            AnyTensorArg::R3(t) => t.allocation = allocation,
-            AnyTensorArg::R4(t) => t.allocation = allocation,
+            AnyTensorArg::R1(t) => set(t, allocation),
+            AnyTensorArg::R2(t) => set(t, allocation),
+            AnyTensorArg::R3(t) => set(t, allocation),
+            AnyTensorArg::R4(t) => set(t, allocation),
         }
     }
 
@@ -2784,26 +3202,38 @@ impl AnyTensorArg {
         }
     }
 
-    /// Rank-erased [`TensorArg::with_device_extent`] setter — declares one `layout` dim's TRUE
-    /// physical extent on an arg a builder already assembled. For the windowed dense matmul
+    /// Rank-erased [`TensorArg::with_device_extent`] — declares one `layout` dim a WINDOW of a
+    /// larger allocation on an arg a builder already assembled. For the windowed dense matmul
     /// (`assemble_matmul_windowed`), whose kernel is a K/N-tiled slice of the caller's own weight
-    /// buffer: the swept `in` extent is the tile's k while the allocation's is the tensor's, and the
-    /// stick-group stride must come from the allocation. PANICS if `dim` is not in the arg's layout,
-    /// same discipline as [`Self::set_scale_for_dim`].
-    pub fn set_device_extent(&mut self, dim: &'static str, phys_extent: u32) {
-        fn set<const D: usize>(t: &mut TensorArg<D>, dim: &'static str, phys_extent: u32) {
-            let idx = t
-                .layout
-                .iter()
-                .position(|&d| d == dim)
-                .unwrap_or_else(|| panic!("set_device_extent: '{dim}' not in {:?}", t.layout));
-            t.device_extent[idx] = Some(phys_extent);
-        }
+    /// buffer: the swept `in` extent is the tile's k while the allocation's is the tensor's. The
+    /// same refusals as [`TensorArg::with_device_extent`], by name: a dim not in the layout, an
+    /// axis that already states a pitch.
+    pub fn set_device_extent(
+        &mut self,
+        dim: &'static str,
+        phys_extent: u32,
+    ) -> Result<(), SuperDscError> {
         match self {
-            AnyTensorArg::R1(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R2(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R3(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R4(t) => set(t, dim, phys_extent),
+            AnyTensorArg::R1(t) => t.state_window(dim, phys_extent),
+            AnyTensorArg::R2(t) => t.state_window(dim, phys_extent),
+            AnyTensorArg::R3(t) => t.state_window(dim, phys_extent),
+            AnyTensorArg::R4(t) => t.state_window(dim, phys_extent),
+        }
+    }
+
+    /// Rank-erased [`TensorArg::with_pitch`] — a door that assembled its args through a
+    /// rank-generic builder (the convert band, the row-sliced contraction) states a pitch here,
+    /// over the same one slot. The same law and the same refusals, by name.
+    pub fn set_pitch<A: WalkAxis>(
+        &mut self,
+        plan: &WorkPlan,
+        declared: u32,
+    ) -> Result<(), SuperDscError> {
+        match self {
+            AnyTensorArg::R1(t) => t.state_pitch::<A>(plan, declared),
+            AnyTensorArg::R2(t) => t.state_pitch::<A>(plan, declared),
+            AnyTensorArg::R3(t) => t.state_pitch::<A>(plan, declared),
+            AnyTensorArg::R4(t) => t.state_pitch::<A>(plan, declared),
         }
     }
 
@@ -4781,24 +5211,14 @@ impl OpSpec {
             1 => {
                 let layout = [pins[0].0];
                 AnyTensorArg::R1(
-                    TensorArg::<1>::new(
-                        true,
+                    TensorArg::<1>::index_operand(
                         index_name,
-                        // ⛔ `Role::Index`, NOT `Role::Input` — see [`Role::Index`]. Under `Input` the
-                        // index shares `primaryDsInfo_["INPUT"]` with the activation, which wins by
-                        // insertion order, so the index's own layout and stick size are never emitted.
-                        // Both defects are pinned by
-                        // `the_index_operand_carries_the_vendors_own_dtype_and_its_own_layout`,
-                        // fail-first-verified by reverting each one.
-                        Role::Index,
-                        [Scale::Active],
                         self.iter.iter_syms(layout),
                         layout,
                         stick,
-                        Allocation::Hbm,
+                        df,
                     )
                     .ok()?
-                    .with_df(df)
                     // ⭐ THIS OP'S RUN OF THE TABLE — see [`EntryBase`]. Zero for every uncut gather,
                     // which is what `resolve_seg_base` already did with no offset at all.
                     .with_offset(first_entry.entries()),
@@ -4807,19 +5227,14 @@ impl OpSpec {
             2 => {
                 let layout = [pins[0].0, pins[1].0];
                 AnyTensorArg::R2(
-                    TensorArg::<2>::new(
-                        true,
+                    TensorArg::<2>::index_operand(
                         index_name,
-                        // `Role::Index` — same reason as the rank-1 arm above.
-                        Role::Index,
-                        [Scale::Active; 2],
                         self.iter.iter_syms(layout),
                         layout,
                         stick,
-                        Allocation::Hbm,
+                        df,
                     )
                     .ok()?
-                    .with_df(df)
                     .with_offset(first_entry.entries()),
                 )
             }
@@ -4841,14 +5256,14 @@ impl OpSpec {
     /// so this can never disagree with the decision that determined whether "y" exists — the ONE
     /// question, asked once, [`Self::attach_fused_epilogue`]'s `broadcast_batch` relies on instead of
     /// making the caller re-derive "is this op batched" (`batch > 1`) in a SECOND place that could
-    /// drift out of sync with `matmul_dims`'s own answer. "y" is hardcoded here (not imported from
-    /// `matmul::walk::YAxis::NAME`) deliberately: this module is the FOUNDATION `matmul/opspec.rs`
-    /// builds on, so importing from it backwards would invert that layering for one string constant.
+    /// drift out of sync with `matmul_dims`'s own answer. The name is [`YAxis::NAME`], the axis
+    /// vocabulary's one spelling, stated in this FOUNDATION module that `matmul/opspec.rs` builds
+    /// on.
     pub fn batch_dim_name(&self) -> Option<&'static str> {
         self.iter
             .dims()
             .iter()
-            .find(|d| d.name == "y")
+            .find(|d| d.name == YAxis::NAME)
             .map(|d| d.name)
     }
 

@@ -68,7 +68,8 @@ fn gathered_expert_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorl
     .expect("the gathered expert matmul builds");
     for arg in spec.args_mut() {
         if !matches!(arg.view().role, Role::Output | Role::Index) {
-            arg.set_df(<Fp8 as DataFormat>::DF);
+            arg.set_df(<Fp8 as DataFormat>::DF)
+                .expect("an operand with no stick pitch takes its df");
         }
     }
     let folds = SdscFoldSet::new(spec.iter.cores_used());

@@ -1116,7 +1116,10 @@ impl DeviceExtents {
     ///
     /// * `swept[i]` — this op's iteration extent for dim `i`.
     /// * `declared[i]` — the dim's TRUE PHYSICAL extent when the view is a WINDOW into a larger
-    ///   allocation (`TensorArg::with_device_extent`). **A declared extent WINS over everything
+    ///   allocation (`TensorArg::with_device_extent`) or iterated at a PITCH in one
+    ///   (`TensorArg::with_pitch`): the address readers hand it both
+    ///   (`ArgView::declared_extents`), the walk's `maxDimSizes_` a window's alone
+    ///   (`ArgView::window_extents`). **A declared extent WINS over everything
     ///   else**, including the `Materialized` collapse: the whole point is that the address steps by
     ///   the allocation, not by the window. `None` (every call site that does not opt in) falls back
     ///   to the span rule, so this is byte-identical wherever nothing is declared.
@@ -1259,22 +1262,6 @@ impl serde::Serialize for DeviceWalk {
 }
 
 impl DeviceWalk {
-    /// Whether dxp is left to rebuild this walk from `N_` (the `-1` per dim a stick-blocked start
-    /// ships with).
-    pub(crate) fn reconstructs(&self) -> bool {
-        matches!(self.0, Walk::Reconstruct { .. })
-    }
-
-    /// ⭐ A STICK-BLOCKED VIEW OF A TALLER ALLOCATION, pinned to the allocation's own extents. dxp
-    /// rebuilds a `-1` walk from the op's `N_`, so a view that sweeps `m` rows of a `rows`-row
-    /// stick-major tensor gets its stick-group stride from `m`, not `rows`: right for the first stick
-    /// and short by `rows - m` rows for every one after it. Pinned, dxp walks the tensor's own rows
-    /// (`maxDimSizes_` are the strides, innermost first, `dsc/dsc2.cpp:2971-2979`). `extents` are the
-    /// view's DEVICE extents, one per `layoutDimOrder_`.
-    pub(crate) fn of_window(extents: &[i64]) -> Self {
-        DeviceWalk(Walk::RowMajor(extents.to_vec()))
-    }
-
     /// The same walk with its dims in another order: entry `i` of the result is entry `from[i]` of
     /// this one (a paged pin follows its dim). `from` is a [`DeviceOrder`]'s positions — a permutation
     /// of `0..n`, proven where the order was stated — so the one thing left to hold is that it orders

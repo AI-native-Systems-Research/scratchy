@@ -23,9 +23,12 @@
 
 use crate::sdsc_abstract::{DeviceWalk, StickLayout};
 use crate::superdsc_error::SuperDscError;
-use crate::superdsc_opspec::{ArgView, OpSpec, Role, SdscFoldSet, WorkPlan};
+use crate::superdsc_opspec::{
+    ArgView, DeviceAxis, DimName, OpSpec, Role, SdscFoldSet, WalkAxis, WorkPlan,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 /// The `N_` iteration space for a matmul/bmm: mb=M, out=N, in=K (reduction),
 /// x=batch, y=1 (decoded from the fixture's primaryDsInfo_ layoutDimOrder_).
@@ -369,9 +372,77 @@ pub struct AllocNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexTensorType_: Option<&'static str>,
     pub startAddressCoreCorelet_: AddrFold,
+    /// ⭐ The walk's back gap — present exactly when the view states a pitch ([`BackGap`]).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backGapCore_: Option<serde_json::Value>,
+    pub backGapCore_: Option<BackGap>,
     pub coordinates_: Coordinates, // {coordInfo:{…}, coreIdToWkSlice_:{}}
+}
+
+/// The core key HBM's back gap is stated under: dxp reads an HBM view's gap at core `-1`
+/// (`dsc/dsc2.cpp:3943-3945`, `DT_CHECK(dimGap.count(-1))`), and the vendor inductor writes the
+/// same (`{"-1": str(gap)}`). Named once; the serializer and the fixtures read it.
+pub const HBM_GAP_CORE: &str = "-1";
+
+/// ⭐ `backGapCore_` — an HBM view's per-axis BACK GAP: the elements past an axis's WHOLE swept
+/// extent the walk skips before the next outer step
+/// ([`crate::superdsc_opspec::DeviceAxis::Pitch`]).
+///
+/// READ, NEVER RE-DERIVED: the only constructors ([`BackGap::of_hbm_view`] and the per-trip
+/// [`BackGap::of_axes`]) take each pitch's gap as [`crate::superdsc_opspec::Pitch::past`] built
+/// it, once, where the pitch was stated — so the gap is never re-computed at emit, a gap that
+/// disagrees with the view's pitch is unconstructable, and the reader has no arithmetic left to
+/// fail on. It cannot meet an LX view either: no LX view carries a pitch (the residency half of
+/// the law, refused at both of its writers, `TensorArg::with_pitch` and
+/// `AnyTensorArg::set_allocation`).
+///
+/// THE WIRE (`dsc/dsc2.cpp:1782-1791`, `coreGap[std::stoi(core)] = std::stoi(gap.string_value())`):
+/// `{"<axis>": {"-1": "<gap>"}}` — HBM keyed at core [`HBM_GAP_CORE`], the gap a JSON STRING (a
+/// number reads `""` and `stoi` throws, naming no field). The axis is the pitch's own
+/// [`DimName`]; its wire spelling is read here, at serialization, and nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackGap(BTreeMap<DimName, NonZeroU32>);
+
+impl BackGap {
+    /// The back gap of a view: each [`crate::superdsc_opspec::Pitch::gap`] under the axis it was
+    /// stated on. `None` when no axis states a pitch — the descriptor then carries no
+    /// `backGapCore_` at all. Infallible: there is no refusal left to reach.
+    pub fn of_hbm_view(v: &ArgView<'_>) -> Option<BackGap> {
+        BackGap::of_axes(v.device_extent)
+    }
+
+    /// The back gap of a view's axes — what [`Self::of_hbm_view`] reads, and what a time-tiled
+    /// trip restates over its per-trip axes ([`crate::superdsc_opspec::Pitch::per_trip`]). Each
+    /// pitch carries its own axis ([`crate::superdsc_opspec::Pitch::dim`]), so the gap is keyed
+    /// by the pitch itself, never by a layout position read beside it.
+    pub fn of_axes(axes: &[DeviceAxis]) -> Option<BackGap> {
+        let gaps: BTreeMap<DimName, NonZeroU32> = axes
+            .iter()
+            .filter_map(|axis| match axis {
+                DeviceAxis::Pitch(p) => Some((p.dim(), p.gap())),
+                DeviceAxis::Swept | DeviceAxis::Window(_) => None,
+            })
+            .collect();
+        (!gaps.is_empty()).then_some(BackGap(gaps))
+    }
+
+    /// The gap on axis `A`, in elements of that axis.
+    pub fn gap<A: WalkAxis>(&self) -> Option<NonZeroU32> {
+        self.0.get(&DimName::of::<A>()).copied()
+    }
+}
+
+impl Serialize for BackGap {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(self.0.len()))?;
+        for (axis, gap) in &self.0 {
+            m.serialize_entry(
+                axis.wire(),
+                &BTreeMap::from([(HBM_GAP_CORE, gap.get().to_string())]),
+            )?;
+        }
+        m.end()
+    }
 }
 
 /// ⭐ A DESCRIPTOR's `scheduleTree_` — ONE allocate node per operand of the op it was built from,
@@ -479,9 +550,9 @@ impl<'a> IntoIterator for &'a ScheduleTree {
 }
 
 /// One node of a [`ScheduleTree`], open for the edits a built descriptor takes — its start
-/// ADDRESSES (a relaunch shift, a trip advance) and its stick coordinate's per-time extent (a
-/// time tile). It hands out no `&mut AllocNode`, so a node cannot be replaced, and none of its
-/// fold factors can be reached.
+/// ADDRESSES (a relaunch shift, a trip advance), its stick coordinate's per-time extent and its
+/// back gap at a trip's sweep (a time tile). It hands out no `&mut AllocNode`, so a node cannot be
+/// replaced, and none of its fold factors can be reached.
 pub struct NodeEdit<'a>(&'a mut AllocNode);
 
 impl NodeEdit<'_> {
@@ -503,6 +574,13 @@ impl NodeEdit<'_> {
     /// Rewrite the stick coordinate at its per-time extent ([`Coordinates::divide_stick`]).
     pub fn divide_stick(&mut self, out_per_time: i64, eps: i64) {
         self.0.coordinates_.divide_stick(out_per_time, eps);
+    }
+
+    /// Restate the node's back gap at a time-tiled trip's — [`BackGap::of_axes`] over the trip's
+    /// axes, whose pitch on the tiled axis was re-built by
+    /// [`crate::superdsc_opspec::Pitch::per_trip`].
+    pub fn restate_back_gap(&mut self, gap: Option<BackGap>) {
+        self.0.backGapCore_ = gap;
     }
 }
 

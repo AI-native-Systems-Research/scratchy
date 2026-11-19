@@ -674,7 +674,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         .map_err(SuperDscError)?;
         for arg in spec.args_mut() {
             if !matches!(arg.view().role, Role::Output) {
-                arg.set_df(Df::Fp8);
+                arg.set_df(Df::Fp8)?;
             }
         }
         let folds = SdscFoldSet::new(spec.iter.cores_used());

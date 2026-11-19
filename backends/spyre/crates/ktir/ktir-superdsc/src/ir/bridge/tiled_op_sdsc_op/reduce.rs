@@ -371,6 +371,7 @@ pub fn reduce_opspec_df_divided(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32)),
         )
     } else {
@@ -387,6 +388,7 @@ pub fn reduce_opspec_df_divided(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32)),
         )
     };
@@ -410,6 +412,7 @@ pub fn reduce_opspec_df_divided(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32)),
         )
     } else {
@@ -426,6 +429,7 @@ pub fn reduce_opspec_df_divided(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32)),
         )
     };
@@ -813,6 +817,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(data_off),
         )
@@ -830,6 +835,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(data_off),
         )
@@ -856,6 +862,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(accum_off),
         )
@@ -873,6 +880,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             )
             .map_err(|e| e.0)?
             .with_df(df)
+            .map_err(|e| e.0)?
             .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(accum_off),
         )
@@ -1418,7 +1426,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 crate::work::EwDivision::Law,
             )
             .map_err(|e| crate::superdsc_error::SuperDscError(format!("{op_name}: {e}")))?;
-            crate::emit::apply_lx_residency(&mut op, layout);
+            crate::emit::apply_lx_residency(&mut op, layout)?;
             let folds = SdscFoldSet::new(op.iter.cores_used());
             ops.push(crate::emit::emit_sdsc_tiled(
                 &op_name,

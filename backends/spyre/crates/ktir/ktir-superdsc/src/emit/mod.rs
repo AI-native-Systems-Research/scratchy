@@ -29,8 +29,8 @@ use crate::sdsc_abstract::{FlatTag, KindTag, RowBlockedTag, StickKind, StickLayo
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
-    IndirectRole, ItDim, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet, StickExtent, TensorArg,
-    USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
+    IndirectRole, ItDim, MbAxis, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet, StickExtent,
+    TensorArg, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
     AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs, LayoutInfo,
@@ -118,11 +118,7 @@ pub(crate) fn view_stick_layout(
             .iter()
             .map(|&d| plan.extent(d) as usize)
             .collect::<Vec<_>>(),
-        &view
-            .device_extent
-            .iter()
-            .map(|o| o.map(|p| p as usize))
-            .collect::<Vec<_>>(),
+        &view.declared_extents(),
         view.layout
             .iter()
             .position(|&d| d == view.stick)
@@ -254,11 +250,7 @@ fn per_core_addr(
             .iter()
             .map(|&d| plan.extent(d) as usize)
             .collect::<Vec<_>>(),
-        &view
-            .device_extent
-            .iter()
-            .map(|o| o.map(|p| p as usize))
-            .collect::<Vec<_>>(),
+        &view.declared_extents(),
         layout
             .iter()
             .position(|&d| d == view.stick)
@@ -1055,22 +1047,13 @@ pub fn pointwise_untiled_slice_bytes_divided(
         Df::Fp16,
     );
     // The pin is sized under the budget its ops spend ([`crate::work::EwDivision::budget`]), or the
-    // slice it reserves and the slice each op's core walks are two different divisions.
-    //
-    // ⚠ THIS MINT IS UNWINDOWED BY CONSTRUCTION, and that is a LAW OF ITS SIGNATURE, not an
-    // oversight: the sizer takes `(rows, cols, n_inputs)` — no operand presentation — and the
-    // windowed fact is minted from the operand presentation at the ONE door that holds it
-    // (`pointwise_broadcast_opspec_from_tile`, via `TileOp::with_windowed`); this lookalike
-    // cannot state it. So the budget below is the byte law's (`for_bytes`), and it is only the
-    // right budget for an op whose operands are its own extents. A caller sizing a WINDOWED op
-    // through this function — a row band of a taller parent — would reserve the pin under a
-    // different division than the op's cores walk (the windowed-stick law's `of_cores(sticks)`),
-    // and the windowed refusal cannot fire here to catch it. No such caller exists in this tree
-    // today (the function has none at all); one that appears must thread the door-minted
-    // `TileOp` through instead of re-deriving the shape.
+    // slice it reserves and the slice each op's core walks are two different divisions. The budget
+    // is the byte law's for every elementwise op — a banded operand's stride safety is the door's
+    // pitch statement (`TensorArg::with_pitch`, the walk's back gap), never the budget's — so the
+    // sizer's `(rows, cols, n_inputs)` signature states everything the budget reads.
     let division = division.resolve(true, true);
     tile_op
-        .tile(division.budget(&tile_op).ok()?, division.splitter(), "out")
+        .tile(division.budget(&tile_op), division.splitter(), "out")
         .ok()
         .filter(|t| t.time_tile.is_none())
         .map(|t| {
@@ -1862,9 +1845,19 @@ pub fn pointwise_chunk_out_offset(cols_start: u32) -> u32 {
 /// producer keeps its own division, and `emit_sdsc_tiled` holds every op touching the tensor to it.
 ///
 /// A no-op (and byte-identical emission) for every bundle that declares no LX intermediates.
-pub(crate) fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
-    let Some(l) = layout else { return };
-    mark_lx_residency(op, l);
+///
+/// ⛔ An LX pin on an operand that states a pitch is a build error naming it — the residency half
+/// of the back-gap law, read at [`AnyTensorArg::set_allocation`]. A replicated plan keeps every
+/// extent of the plan it replaces, so every pitch the builder stated (its gap past the WHOLE
+/// sweep) is still the law's.
+///
+/// [`AnyTensorArg::set_allocation`]: crate::superdsc_opspec::AnyTensorArg::set_allocation
+pub(crate) fn apply_lx_residency(
+    op: &mut OpSpec,
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let Some(l) = layout else { return Ok(()) };
+    mark_lx_residency(op, l)?;
     if op
         .args()
         .last()
@@ -1872,6 +1865,7 @@ pub(crate) fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>)
     {
         op.iter = WorkPlan::replicate(op.iter.dims());
     }
+    Ok(())
 }
 
 /// The allocation half of the residency consult: every operand whose name is LX-pinned gets its LX
@@ -1879,16 +1873,17 @@ pub(crate) fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>)
 /// tensor (a prompt chunk's PV and row sum over the probabilities) is marked like a pointwise op is —
 /// and then held to the read law. Allocations only: a replicated producer's PLAN is set by the pointwise
 /// door ([`apply_lx_residency`]), before its folds are taken from it.
-fn mark_lx_residency(op: &mut OpSpec, l: &BundleLayout) {
+fn mark_lx_residency(op: &mut OpSpec, l: &BundleLayout) -> Result<(), SuperDscError> {
     for a in op.args_mut().iter_mut() {
         if l.lx_pin(a.arg_name()).is_some() {
             a.set_allocation(if l.lx_core_local(a.arg_name()) {
                 Allocation::LxCoreLocal
             } else {
                 Allocation::Lx
-            });
+            })?;
         }
     }
+    Ok(())
 }
 
 /// ⛔⛔⛔ THE CORE-LOCAL READ LAW, in the ONE emission path so no builder can route around it. Each core
@@ -2287,7 +2282,7 @@ fn assemble_pointwise_stated<T: crate::collective::Tp, O: KindTag>(
     if let Some(info) = info {
         op = op.with_op_info(info);
     }
-    apply_lx_residency(&mut op, layout);
+    apply_lx_residency(&mut op, layout)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
@@ -2533,10 +2528,7 @@ pub fn declared_axis_block_steps(v: &crate::superdsc_opspec::ArgView, iter: &Wor
             .iter()
             .map(|&d| iter.extent(d) as usize)
             .collect::<Vec<_>>(),
-        &v.device_extent
-            .iter()
-            .map(|o| o.map(|p| p as usize))
-            .collect::<Vec<_>>(),
+        &v.declared_extents(),
         stick_idx,
         &(0..v.layout.len())
             .map(|li| v.scale.get(li).map(|s| s.to_i64()).unwrap_or(1) > 0)
@@ -2898,7 +2890,7 @@ pub fn emit_sdsc_tiled<T: crate::collective::Tp>(
     let op = match layout {
         Some(l) if op.args().iter().any(|a| l.lx_pin(a.arg_name()).is_some()) => {
             let mut o = op.clone();
-            mark_lx_residency(&mut o, l);
+            mark_lx_residency(&mut o, l)?;
             marked = o;
             &marked
         }
@@ -2957,7 +2949,13 @@ fn own_extent_at(
     phys_extent: &impl Fn(&'static str) -> i64,
 ) -> i64 {
     let collapsed = !v.scale.get(i).is_none_or(Scale::is_active);
-    if collapsed && v.device_extent.get(i).copied().flatten().is_none() {
+    if collapsed
+        && v.device_extent
+            .get(i)
+            .copied()
+            .and_then(crate::superdsc_opspec::DeviceAxis::declared)
+            .is_none()
+    {
         1
     } else {
         phys_extent(v.layout[i])
@@ -3117,7 +3115,12 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         // exactly to this op's shape (the overwhelmingly common, and until now ONLY, case).
         let phys_extent = |d: &'static str| -> i64 {
             let idx = v.layout.iter().position(|&ld| ld == d);
-            let ov = idx.and_then(|i| v.device_extent.get(i).copied().flatten());
+            let ov = idx.and_then(|i| {
+                v.device_extent
+                    .get(i)
+                    .copied()
+                    .and_then(crate::superdsc_opspec::DeviceAxis::declared)
+            });
             ov.map(|p| p as i64)
                 .unwrap_or_else(|| op.iter.extent(d) as i64)
         };
@@ -3212,10 +3215,38 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         // per-trip address bump happens in `concrete_trips` at write time). The tiled dim
         // IS this operand's stick (refused above otherwise), so the entry rewritten is
         // the stick's, at the split it was built with.
+        //
+        // ⭐ A PITCH ON THE TILED AXIS IS RE-BUILT PER TRIP, BY ITS ONE CONSTRUCTOR. A trip sweeps
+        // `per_time_full_out` of the tiled (stick) axis — the trip's whole `N_` along it — so the
+        // pitch's gap past the sweep is the trip's: `Pitch::per_trip` re-builds it through
+        // `Pitch::past` over the pitch's own axis and declared extent, never re-deriving the
+        // arithmetic here. Every other axis keeps the pitch it was stated with; a view with no
+        // pitch on the tiled axis keeps its node's back gap untouched.
+        let trip_gap = match v.device_extent.get(oi).copied() {
+            Some(crate::superdsc_opspec::DeviceAxis::Pitch(p)) => {
+                let trip = p.per_trip(per_time_full_out as u32).map_err(|e| {
+                    SuperDscError(format!(
+                        "{op_name}: tensor {ti} ('{}') time-tiles its pitched axis '{tiled_dim}': \
+                         {}",
+                        v.name, e.0
+                    ))
+                })?;
+                let mut axes = v.device_extent.to_vec();
+                axes[oi] = trip.map_or(
+                    crate::superdsc_opspec::DeviceAxis::Swept,
+                    crate::superdsc_opspec::DeviceAxis::Pitch,
+                );
+                Some(crate::wire::BackGap::of_axes(&axes))
+            }
+            _ => None,
+        };
         for dsc_map in inner.dscs_.iter_mut() {
             for dsc in dsc_map.values_mut() {
                 if let Some(mut node) = dsc.scheduleTree_.edit().find(|n| n.operand() == ti) {
                     node.divide_stick(out_per_time, eps);
+                    if let Some(gap) = &trip_gap {
+                        node.restate_back_gap(gap.clone());
+                    }
                 }
             }
         }
@@ -3245,7 +3276,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
             .device_extent
             .get(si)
             .copied()
-            .flatten()
+            .and_then(crate::superdsc_opspec::DeviceAxis::declared)
             .map(|p| p as i64)
             .unwrap_or_else(|| op.iter.extent(tiled_dim) as i64);
         if phys > out_per_time && affine_strides[ti].get(tiled_dim).copied().unwrap_or(0) == 0 {
@@ -4108,6 +4139,19 @@ pub fn emit_sdsc(
             //
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
+            //
+            // ⛔ A WINDOW'S EXTENT ONLY, NEVER A PITCH'S (`ArgView::window_extents`). `maxDimSizes_`
+            // is a size CAP, never a stride (`dsc/dsc2.cpp:2806-2815`: a cap at or past a dim's
+            // capacity caps nothing, and an HBM view's capacity is `N_`, `:3626-3632`). A landing
+            // PAST the swept extent is moved by `backGapCore_` alone (`:2900-2926`), which a
+            // pitched axis carries below (`crate::wire::BackGap`); a walk pinned to a parent's
+            // extents is inert — the card measured `init_binary` byte-identical with and without
+            // the pin (2026-11-08, pointwise bands and bmm alike), and the granite-3.1-8b
+            // `[84, 128]`-of-`[672, 128]` score leg reads its query as standalone blocks
+            // (`BatchFrame::Blocks`), pinned walk or not. So an operand that strides past its
+            // sweep states a PITCH (the row bands, the convert band, the flat-frame contraction)
+            // or carries the stride in `N_` (the windowed matmul's kernel `in`,
+            // `assemble_matmul_windowed`, whose gap form waits for its card proof).
             maxDimSizes_: {
                 let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
                 let stick_pos = v
@@ -4117,10 +4161,7 @@ pub fn emit_sdsc(
                     .unwrap_or(usize::MAX);
                 let device: Vec<i64> = crate::sdsc_abstract::DeviceExtents::of_view(
                     &swept,
-                    &v.device_extent
-                        .iter()
-                        .map(|o| o.map(|p| p as usize))
-                        .collect::<Vec<_>>(),
+                    &v.window_extents(),
                     stick_pos,
                     &vec![true; v.layout.len()],
                     crate::sdsc_abstract::Span::Swept,
@@ -4130,25 +4171,6 @@ pub fn emit_sdsc(
                 .map(|&e| e as i64)
                 .collect();
                 let walk = sl.device_walk(&device);
-                // ⭐ A STICK-BLOCKED WINDOW OF A TALLER TENSOR, more than one stick wide, walks the
-                // tensor's own rows (`DeviceWalk::of_window`): left to `-1`, dxp strides its stick
-                // groups by the op's swept rows. MEASURED on granite-3.1-8b: each kv head's score
-                // contraction read its `[84, 128]` query slice of the `[672, 128]` head-major query
-                // with the second stick 84 rows in, the next kv head's first stick. A one-stick view
-                // has no second stick group, so every hd=64 bundle emits byte-identically.
-                let windowed = device
-                    .iter()
-                    .zip(&swept)
-                    .enumerate()
-                    .any(|(i, (&d, &s))| i != stick_pos && d > s as i64);
-                let multi_stick = swept
-                    .get(stick_pos)
-                    .is_some_and(|&e| e > v.df.elems_per_stick() as usize);
-                let walk = if walk.reconstructs() && windowed && multi_stick {
-                    crate::sdsc_abstract::DeviceWalk::of_window(&device)
-                } else {
-                    walk
-                };
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
                 let walk = if paged_dims.is_empty() {
@@ -4223,7 +4245,11 @@ pub fn emit_sdsc(
                 None | Some(IndirectRole::Value { .. }) => None,
             },
             startAddressCoreCorelet_: addr,
-            backGapCore_: None,
+            // ⭐ A PITCHED AXIS's walk — the gap past the WHOLE swept extent, built once where the
+            // pitch was stated (`Pitch::past`) and READ here, never re-derived
+            // (`crate::wire::BackGap::of_hbm_view`). `None` on every view that states no pitch, so
+            // every such descriptor is byte-identical.
+            backGapCore_: crate::wire::BackGap::of_hbm_view(v),
             coordinates_: coordinates,
         })
     })?;
@@ -5012,14 +5038,14 @@ pub(crate) fn convert_stick_df(op: OpFunc) -> Df {
 /// A dtype-convert's opspec: both operands keep their stick on `out`, addressed RowBlocked
 /// at rows>1 — the rank-3 `[mb,out,1]` staging every residual-style consumer reads.
 ///
-/// `band_multistick` states that at least one side is a row band of a taller parent whose
-/// width spans MORE THAN ONE of its own sticks — the [`assemble_convert_band`] form. Such a
-/// band's bytes are a stick-major tensor of the PARENT's, so the seam laws that keyed on
-/// `rows > 1` key on the band too: a non-narrowing convert presents rank-2 stick-major even
-/// at `rows == 1` (a rank-3 flat walk of a multi-stick band mis-strides the parent's column
-/// planes), and a narrowing one — which keeps rank-3 — extends its RowBlocked arrangement and
-/// its `mb` device extent (the parent's row count, set by [`assemble_convert_band`]) to the
-/// band, so the rank-3 walk strides the parent's planes at the parent's pitch.
+/// `banded` states that at least one side is a row band of a taller parent — the
+/// [`assemble_convert_band`] form. A band's bytes are a stick-major tensor of the PARENT's, so the
+/// seam laws that key on `rows > 1` key on the band too: a non-narrowing convert presents rank-2
+/// stick-major even at `rows == 1` (a rank-3 flat walk of a multi-stick band mis-strides the
+/// parent's column planes; at one stick the two walks coincide), and a narrowing one — which
+/// keeps rank-3 — extends its RowBlocked arrangement to the band. Every banded side states its
+/// `mb` PITCH (the parent's row count, stated by [`assemble_convert_band`] — the walk's back gap),
+/// so the walk strides the parent's planes at the parent's pitch, whatever the band's width.
 ///
 /// (The FLAT per-operand arrangement — BOTH operands stick `mb`, the DDL-equality form the
 /// deleted per-expert index-table chain needed — is gone with that chain; the probe record
@@ -5030,7 +5056,7 @@ fn convert_opspec(
     cols: u32,
     in_name: &str,
     o_name: &str,
-    band_multistick: bool,
+    banded: bool,
 ) -> Result<OpSpec, String> {
     let (in_df, out_df) = convert_dtypes(op);
     // A dtype-CONVERT touches BOTH its input and output dataspaces per core, so the stick-axis split
@@ -5089,14 +5115,14 @@ fn convert_opspec(
     // consecutive u32 entries — the arrangement the index's own declaration states, not a
     // residual's.
     let is_narrowing_convert = is_fp32_convert || matches!(op, OpFunc::Fp32ToInt32);
-    let stickmajor = (rows > 1 || band_multistick) && !is_narrowing_convert;
+    let stickmajor = (rows > 1 || banded) && !is_narrowing_convert;
     let time_tile = plan
         .time_tile_for_lx(|p, opt| pointwise_lx_resident(p, 2, opt, Df::Fp16), "out")
         .map_err(|e| e.0)?;
     // The fp32 convert (rank-3) must ADDRESS RowBlocked so it reads/writes the RowBlocked residual byte-for-
     // byte (a rank-3 flat read row-mixes). Force the per-tensor ElementArrangement on BOTH operands (the fp16
     // side reads RowBlocked x; the fp32 side writes RowBlocked x32). Only for multi-row fp32 converts.
-    let rb = is_fp32_convert && (rows > 1 || band_multistick);
+    let rb = is_fp32_convert && (rows > 1 || banded);
     let mk = |is_input: bool, name: &str, role: Role, df: Df| -> Result<AnyTensorArg, String> {
         // Both operands keep their stick on `out`; the pair addresses RowBlocked at rows>1
         // for the fp32 residual seam (`rb` below).
@@ -5116,6 +5142,7 @@ fn convert_opspec(
                 )
                 .map_err(|e| e.0)?
                 .with_df(df)
+                .map_err(|e| e.0)?
                 .with_row_blocked(rb_arg),
             ))
         } else {
@@ -5132,6 +5159,7 @@ fn convert_opspec(
                 )
                 .map_err(|e| e.0)?
                 .with_df(df)
+                .map_err(|e| e.0)?
                 .with_row_blocked(rb_arg),
             ))
         }
@@ -5300,11 +5328,11 @@ pub struct ConvertBand<'a> {
 /// `fp32todl16` reverses the roles — so ONE door serves both orientations: each side states its
 /// own window, and the door addresses each at its own corner. A band whose width is not the
 /// op's own `cols` is a build failure here (the convert's read IS the band; a wider or narrower
-/// one is a different computation), and a band spanning more than one stick declares its
-/// PARENT's row count as the `mb` device extent — the band's bytes are a stick-major tensor of
-/// the parent's, so without the declaration the walk strides the parent's column planes at the
-/// band's own fewer rows. Emit-time panic on a malformed spec = a `cargo build` error
-/// (guard-every-crash), same as the other `assemble_*`.
+/// one is a different computation), and every band states its PARENT's row count as the `mb`
+/// PITCH — the band's bytes are a stick-major tensor of the parent's, so the walk strides the
+/// parent's column planes at the parent's pitch, never at the band's own fewer rows. Emit-time
+/// panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the other
+/// `assemble_*`.
 pub fn assemble_convert_band<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &str,
@@ -5348,31 +5376,34 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
             crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
         })?;
     }
-    // The band's bytes stride at the PARENT's row count when the window crosses a column plane
-    // (more than one stick wide); a one-stick band never crosses one and needs no declaration —
-    // the card-proven rotate-half form, byte for byte. One predicate (`spans_one_stick`), read
-    // where each side needs it.
-    let band_multistick = [in_w, o_w]
-        .into_iter()
-        .flatten()
-        .any(|w| !w.spans_one_stick());
+    // A side that is a band of a taller parent strides at the PARENT's row count, whatever its
+    // width: one law, its pitch, stated on every banded side below.
+    let banded = in_w.is_some() || o_w.is_some();
     let mut op = convert_opspec(
         op_func_from_str(op_func),
         rows,
         cols,
         in_.name(),
         o.name(),
-        band_multistick,
+        banded,
     )
     .map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
     })?;
+    // ⛔ THE PARENT IS A PITCH, NOT A WINDOW — the band door's law (`AnyTensorArg::set_pitch`): the
+    // pinned walk is a size cap the card never strides by (MEASURED, microbenchmark 2026-11-08,
+    // branch `tp-allreduce` `76d187281c`), the back gap `parent − rows` is the stride. A one-stick
+    // band has no second column plane for the gap to move: the same law, the same addresses.
+    let plan = op.iter.clone();
     for (arg, w) in op.args_mut().iter_mut().zip([in_w, o_w]) {
         if let Some(w) = w {
             arg.set_offset_elems(w.dev().into_raw_elems());
-            if !w.spans_one_stick() {
-                arg.set_device_extent("mb", w.parent_rows());
-            }
+            arg.set_pitch::<MbAxis>(&plan, w.parent_rows())
+                .map_err(|e| {
+                    crate::superdsc_error::SuperDscError(format!(
+                        "assemble_convert_band {op_name}: {e}"
+                    ))
+                })?;
         }
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
