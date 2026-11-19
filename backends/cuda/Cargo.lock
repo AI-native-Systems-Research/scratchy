@@ -2514,6 +2514,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
+ "scratchy-quantizations",
  "scratchy-subtile",
  "scratchy-tensors",
  "serde_json",
