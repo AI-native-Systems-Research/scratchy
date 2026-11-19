@@ -148,6 +148,35 @@ impl SegRole {
     }
 }
 
+/// ⭐ ONE LAYER'S KV REGION — the bank of the KV segment that holds one (class, iteration) launch
+/// block's pools. Every layer's pools are their OWN device allocation, at the same intra-layer
+/// offsets for every layer of a class, so a layer's launch re-bases the KV slot by handing it this
+/// bank's region and nothing else: no shift, no packing against a region size. Bank 0 is the
+/// segment's own region (the first block, plus any pool no layer owns).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KvBank(u32);
+
+impl KvBank {
+    /// The KV segment's own region.
+    pub const BASE: KvBank = KvBank(0);
+
+    /// The bank a KV placement names ([`TensorPlacement::bank`]).
+    pub const fn of_placement(bank: u32) -> KvBank {
+        KvBank(bank)
+    }
+
+    /// The index into the segment's extra-bank list ([`BundleLayout::kv_bank_bytes`]), or `None`
+    /// for [`Self::BASE`].
+    pub const fn extra(self) -> Option<usize> {
+        (self.0 as usize).checked_sub(1)
+    }
+
+    /// The bank's number, as a placement and the bake's token stream spell it.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// One tensor's global placement in the packed bundle.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct TensorPlacement {
@@ -156,7 +185,8 @@ pub struct TensorPlacement {
     pub role: SegRole,
     pub segment: usize,
     /// Which BANK of that segment — see `bundle::Placement::bank`. 0 for everything except a
-    /// weight in a bundle whose weights need more than one device region.
+    /// weight in a bundle whose weights need more than one device region, and a layer's own KV
+    /// pools ([`KvBank`]).
     pub bank: u32,
     /// Byte offset WITHIN the segment region (128 B aligned), and within its BANK when banked.
     pub offset: u64,
@@ -227,6 +257,17 @@ pub struct BundleLayout {
     /// `bundle::Placement::bank` and `bank_weight_segment`.
     #[serde(default)]
     pub weight_bank_bytes: Vec<u64>,
+    /// ⭐ THE KV SEGMENT'S EXTRA BANKS: bytes of banks `1..N`, one per (class, iteration) launch
+    /// block past the first ([`KvBank`]); bank 0's bytes are [`Self::segment_bytes`] at
+    /// `SegRole::Kv`. Empty for a bundle that places no per-layer pools — every off-card bake —
+    /// and skipped from the serialization then, so those bundles' fingerprints do not carry it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kv_bank_bytes: Vec<u64>,
+    /// ⭐ WHICH KV BANK EACH PER-LAYER POOL TABLE'S LAYERS LIVE IN — keyed by the table's layer-0
+    /// tid (the key every per-layer table is owned by), one bank per iteration: the one statement
+    /// both the placements and the launch table read. The tables of one class share one list.
+    #[serde(skip)]
+    pub kv_block_banks: std::collections::BTreeMap<u32, Vec<KvBank>>,
     /// ⭐ THE SEGMENT BUDGET'S VERDICT on the non-per-layer weight tail — see [`WeightTail`].
     #[serde(default)]
     pub weight_tail: WeightTail,

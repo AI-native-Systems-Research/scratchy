@@ -3317,15 +3317,57 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         }
     }
     // ── GENERATE: for each launch (body c, iter j), the weight shift from ANY of c's per-layer
-    //    weight tables and the KV shift from c's per-layer KV tables. A body with no per-layer
-    //    weight/KV gets (0, 0, 0) — nothing to shift. The proof below then holds EVERY tensor of
-    //    the class to the entry, so which table generated it cannot matter; a class whose tables
-    //    DISAGREE is refused here with both readings named.
+    //    weight tables. A body with no per-layer weight gets (0, 0) — nothing to shift. The proof
+    //    below then holds EVERY weight of the class to the entry, so which table generated it
+    //    cannot matter; a class whose tables DISAGREE is refused here with both readings named.
+    //
+    //    The KV column is the layout's own: each launch block's pools are their own region
+    //    (`place_kv_pools`), so the launch names that block's bank and shifts nothing. A body's
+    //    banks are read through the tables it OWNS (`body_of_tid`, the weight column's own key),
+    //    never by its position.
+    use crate::lower_subtile_tape_to_superdsc::KvBank;
+    /// What one body's launches hand the KV slot.
+    enum BodyKv<'a> {
+        /// The banks of the per-layer pool tables this body owns, one per iteration.
+        Owns(&'a [KvBank]),
+        /// The body owns no per-layer pool: the only pools it can read sit in bank 0.
+        OwnsNone,
+    }
+    let body_kv: Vec<BodyKv<'_>> = (0..bodies.len())
+        .map(|b| {
+            let mut owned = bundle_layout
+                .kv_block_banks
+                .iter()
+                .filter(|(t0, _)| body_of_tid(**t0) == Some(b));
+            let Some((t0, first)) = owned.next() else {
+                return Ok(BodyKv::OwnsNone);
+            };
+            match owned.find(|(_, banks)| *banks != first) {
+                Some((t1, _)) => Err(SuperDscError(format!(
+                    "reroll-superdsc: body {b} owns pool tables t{t0} and t{t1}, which the layout \
+                     placed in different layers' regions — one launch hands the KV slot one \
+                     region, so no launch addresses both"
+                ))),
+                None => Ok(BodyKv::Owns(first)),
+            }
+        })
+        .collect::<Result<_, SuperDscError>>()?;
+    let launch_kv: Vec<KvBank> = launches
+        .iter()
+        .map(|&(body, iter)| match body_kv[body as usize] {
+            BodyKv::Owns(banks) => banks.get(iter as usize).copied().ok_or_else(|| {
+                SuperDscError(format!(
+                    "reroll-superdsc: body {body} launches layer {iter}, but its pool tables \
+                     hold {} layer(s)",
+                    banks.len()
+                ))
+            }),
+            BodyKv::OwnsNone => Ok(KvBank::BASE),
+        })
+        .collect::<Result<_, SuperDscError>>()?;
     let mut launch_w: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
-    let mut launch_kv: Vec<u64> = Vec::with_capacity(total_layers);
     for &(body, iter) in &launches {
         let mut w_entry: Option<(u8, u64)> = None;
-        let mut kv_entry: Option<u64> = None;
         for (t0, tids) in &per_layer {
             if body_of_tid(*t0) != Some(body as usize) {
                 continue;
@@ -3349,32 +3391,16 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                     )));
                 }
                 w_entry = Some(entry);
-            } else if p0.segment == kv_seg {
-                let entry = pj.offset.wrapping_sub(p0.offset);
-                if let Some(prev) = kv_entry
-                    && prev != entry
-                {
-                    return Err(SuperDscError(format!(
-                        "reroll-superdsc: body {body}'s per-layer KV tensors DISAGREE about layer \
-                         {iter}'s launch shift ({prev} vs {entry} B, generated from t{t0}) — k, v \
-                         and Kᵀ must advance together or the score reads one layer's keys against \
-                         another's values"
-                    )));
-                }
-                kv_entry = Some(entry);
             }
         }
         launch_w.push(w_entry.unwrap_or((0, 0)));
-        launch_kv.push(kv_entry.unwrap_or(0));
     }
     // ── PROVE, EVERY TENSOR, EVERY LAYER. The launch addresses
     //    `(bank: L.w_bank, offset: L.w_off + placement(t₀).offset)` — hold each per-layer weight
-    //    to the placement its layer actually got, and each per-layer KV tensor likewise. This is
-    //    the check the generator cannot make: generation read ONE tensor per segment per launch;
-    //    this holds ALL of them.
+    //    to the placement its layer actually got. This is the check the generator cannot make:
+    //    generation read ONE weight table per launch; this holds ALL of them.
     for (li, &(body, iter)) in launches.iter().enumerate() {
         let (wb, wo) = launch_w[li];
-        let ko = launch_kv[li];
         for (t0, tids) in &per_layer {
             if body_of_tid(*t0) != Some(body as usize) {
                 continue;
@@ -3385,48 +3411,34 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             ) else {
                 continue;
             };
-            if p0.segment == w_seg && matches!(p0.role, SegRole::Weight) {
-                if pj.bank as u8 != wb || pj.offset != wo.wrapping_add(p0.offset) {
-                    return Err(SuperDscError(format!(
-                        "reroll-superdsc: per-layer weight t{tid} (layer {layer} of body {body}, \
+            if p0.segment == w_seg
+                && matches!(p0.role, SegRole::Weight)
+                && (pj.bank as u8 != wb || pj.offset != wo.wrapping_add(p0.offset))
+            {
+                return Err(SuperDscError(format!(
+                    "reroll-superdsc: per-layer weight t{tid} (layer {layer} of body {body}, \
                          class-relative {iter}) is placed at bank {bank} offset {off}, but the \
                          launch table addresses it at bank {wb} offset {want} (shift {wo} + \
                          layer-0 offset {base}). Every layer must sit where the launch looks, or \
                          that layer reads another layer's weights.",
-                        tid = tids[iter as usize],
-                        layer = launch_layer[li],
-                        bank = pj.bank,
-                        off = pj.offset,
-                        want = wo.wrapping_add(p0.offset),
-                        wo = wo,
-                        base = p0.offset,
-                        body = body,
-                        iter = iter,
-                        wb = wb,
-                    )));
-                }
-            } else if p0.segment == kv_seg && pj.offset != ko.wrapping_add(p0.offset) {
-                return Err(SuperDscError(format!(
-                    "reroll-superdsc: per-layer KV tensor t{tid} (layer {layer} of body {body}) is \
-                     placed at offset {off}, but the launch table addresses it at {want} (shift \
-                     {ko} + layer-0 offset {base}). The score would read one layer's keys against \
-                     another's values.",
                     tid = tids[iter as usize],
                     layer = launch_layer[li],
+                    bank = pj.bank,
                     off = pj.offset,
-                    want = ko.wrapping_add(p0.offset),
-                    ko = ko,
+                    want = wo.wrapping_add(p0.offset),
+                    wo = wo,
                     base = p0.offset,
                     body = body,
+                    iter = iter,
+                    wb = wb,
                 )));
             }
         }
     }
-    // ⛔ AND A BODY READS ONLY PER-LAYER TENSORS IN THE KV SEGMENT. Every layer's launch shifts the
-    // whole segment by that layer's offset, so a tensor in it that is not one of a layer's own
-    // copies is read at its placement plus each layer's shift — another layer's keys, or bytes past
-    // the pools — by every launch after the first. (The prefix and suffix launch unshifted, so a
-    // tensor only they read is read where it sits.)
+    // ⛔ AND A BODY READS ONLY PER-LAYER TENSORS IN THE KV SEGMENT. Every layer's launch hands the
+    // KV slot that layer's own region, so a tensor in the segment that is not one of a layer's own
+    // copies — it sits in bank 0 — is read in another layer's region by every launch but bank 0's.
+    // (The prefix and suffix launch on bank 0, so a tensor only they read is read where it sits.)
     if launches.len() > 1 {
         let per_layer_tids: std::collections::HashSet<u32> =
             per_layer.values().flatten().copied().collect();
@@ -3442,27 +3454,14 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         }) {
             return Err(SuperDscError(format!(
                 "reroll-superdsc: a layer's body reads t{}, which is placed in the KV segment \
-                 (seg{kv_seg}) but is no layer's own tensor — each of the {} layer launches shifts \
-                 that segment by its layer's offset, so every layer past the first would read it \
+                 (seg{kv_seg}) but is no layer's own tensor — each of the {} layer launches hands \
+                 that segment its own layer's region, so every layer in another bank would read it \
                  elsewhere",
                 p.tid,
                 launches.len(),
             )));
         }
     }
-    // The PAGE stride: one pool page covers every layer of every class, so the stride is the
-    // extent of the packed per-layer KV — the max end over every class's LAST layer placement
-    // (classes are packed contiguously; per-class strides differ, which is exactly why this is a
-    // max and not a count × stride). 0 when there is no paged KV.
-    let kv_page_stride = per_layer
-        .values()
-        .filter_map(|tids| {
-            let last = tids.last()?;
-            let p = bundle_layout.placements.get(last)?;
-            (p.segment == kv_seg).then(|| p.offset + p.size)
-        })
-        .max()
-        .unwrap_or(0);
     // ⛔ AND ONE BANK PER LAUNCH GROUP. A launch is handed ONE base per segment, so a program whose
     // weight operands span two banks cannot be expressed AT ALL — there is no offset that reaches
     // both. `group_weight_banks` was accumulated over the ops as they were emitted, so this is the
@@ -3555,7 +3554,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         launches,
         launch_w,
         launch_kv,
-        kv_page_stride,
         prefix_weight_bank,
         suffix_weight_bank,
         kv_request_stride,

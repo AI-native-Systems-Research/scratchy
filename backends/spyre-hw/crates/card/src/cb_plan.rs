@@ -21,15 +21,28 @@ use crate::runtime::{
     BatchedCb, BatchedCompute, ByteSize, DevAddr, RdmaEnd, RdmaSend, Stream, prog_offset_base,
 };
 use crate::superdsc_exec::{LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT};
-use scratchy_target_spyre::bundle_code::NUM_SEGMENTS;
 use scratchy_target_spyre::bundle_code::collective::{
     CbStep, Rank, Sid, TpConsume, TpSend, WINDOW_SEGMENT, group_steps,
 };
+use scratchy_target_spyre::bundle_code::{KvBank, NUM_SEGMENTS};
 use scratchy_target_spyre::fold_plan;
+
+/// ⭐ THE SESSION'S REGIONS, AS ONE VALUE — the positional segments, the weight segment's extra
+/// banks and the KV segment's (one per layer past bank 0). A launch resolves every segment's base
+/// through these three together ([`segment_base`]).
+pub(crate) struct SegTables<'a> {
+    /// The positional segments (`Executor::seg_addr`).
+    pub(crate) seg: &'a [Option<DevAddr>; NUM_SEGMENTS],
+    /// The weight segment's extra banks (`Executor::weight_bank_addr`), bank `b ≥ 1` at `b - 1`.
+    pub(crate) banks: &'a [Option<DevAddr>],
+    /// The KV segment's extra banks (`Executor::kv_bank_addr`), bank `b ≥ 1` at `b - 1`.
+    pub(crate) kv_banks: &'a [DevAddr],
+}
 
 /// The base one segment's tensors resolve against for this launch — the weight
 /// BANK's region for the weight segment (bank 0 IS `seg_addr[WEIGHT]`; bank
-/// `b ≥ 1` is `banks[b - 1]`), the segment's own region otherwise. Shared by
+/// `b ≥ 1` is `banks[b - 1]`), the launch's own layer region for the KV segment
+/// ([`KvBank`]), the segment's own region otherwise. Shared by
 /// the walk and the canvas construction so the bank selection cannot drift
 /// between them. Refusals are the walk's own, verbatim — except that a bank slot which
 /// exists but holds no region yet, which the walk's old code only reached as
@@ -37,11 +50,17 @@ use scratchy_target_spyre::fold_plan;
 /// same unreachable-at-launch corner: prepare refuses a bank with no region
 /// before any launch can name it).
 fn segment_base<'a>(
-    seg: &'a [Option<DevAddr>; NUM_SEGMENTS],
-    banks: &'a [Option<DevAddr>],
+    tables: &SegTables<'a>,
     weight_bank: usize,
+    kv_bank: KvBank,
     i: usize,
 ) -> Result<&'a DevAddr> {
+    let (seg, banks) = (tables.seg, tables.banks);
+    if i == SEG_KV.get()
+        && let Some(b) = kv_bank.extra()
+    {
+        return Ok(&tables.kv_banks[b]);
+    }
     if i == SEG_WEIGHT.get() {
         match weight_bank.checked_sub(1) {
             None => seg[i]
@@ -104,8 +123,7 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
     oi: usize,
     request: u32,
     rep: i64,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
+    tables: &SegTables<'_>,
     where_: &LaunchWhere,
 ) -> Result<LaunchSite> {
     let op = &ops[oi];
@@ -133,13 +151,13 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
         .kv
         .weight_slot(off[SEG_WEIGHT.get()], where_.weight_bank);
     off[SEG_WEIGHT.get()] = weight_shift;
-    let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
+    let wbase = segment_base(tables, weight_bank, where_.kv_bank, SEG_WEIGHT.get())?;
     let mut ta = Vec::with_capacity(NUM_SEGMENTS);
     for (i, &sh) in off.iter().enumerate() {
         let base = if i == SEG_WEIGHT.get() {
             wbase
         } else {
-            segment_base(seg, banks, weight_bank, i)?
+            segment_base(tables, weight_bank, where_.kv_bank, i)?
         };
         ta.push(
             if sh > 0
@@ -326,8 +344,7 @@ pub(crate) fn base_addr_entry<T: ktir_superdsc::collective::Tp>(to: Rank<T>) -> 
 /// every launch fences.
 pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
     ops: &Ops<T>,
-    seg: &[Option<DevAddr>; NUM_SEGMENTS],
-    banks: &[Option<DevAddr>],
+    tables: &SegTables<'_>,
     where_: &LaunchWhere,
 ) -> Result<(Vec<BatchedCb>, bool)> {
     let mut items = Vec::new();
@@ -337,7 +354,7 @@ pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
     // request-outer, and every other op launches once.
     let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
     for l in fold_plan::launches(&kvs, where_.requests.count) {
-        let site = launch_site(ops, l.op, l.request, l.rep, seg, banks, where_)?;
+        let site = launch_site(ops, l.op, l.request, l.rep, tables, where_)?;
         barrier = true;
         items.extend(site_cbs(ops[l.op].site_tp(), site.batched_compute())?);
     }
@@ -368,12 +385,11 @@ impl WalkCanvas {
     /// canvas from this door is never empty.
     pub(crate) fn of_walk<T: ktir_superdsc::collective::Tp>(
         ops: &Ops<T>,
-        seg: &[Option<DevAddr>; NUM_SEGMENTS],
-        banks: &[Option<DevAddr>],
+        tables: &SegTables<'_>,
         where_: &LaunchWhere,
         stream: &Stream<'_>,
     ) -> Result<Self> {
-        let (items, barrier) = walk_items(ops, seg, banks, where_)?;
+        let (items, barrier) = walk_items(ops, tables, where_)?;
         Ok(Self {
             cbs: std::sync::Arc::new(stream.render_batch(&items, 1)?),
             barrier,

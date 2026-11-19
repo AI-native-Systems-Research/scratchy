@@ -205,8 +205,8 @@ pub use ktir_superdsc::reserved_tids::{
 // stayed right here. That is the seam: a third-party producer builds the same struct from its own
 // facts.
 pub use ktir_superdsc::placement::{
-    BundleLayout, RetileDescriptor, SegRole, SynthAlloc, TensorPlacement, WEIGHT_SPILL_SEGS,
-    WeightTail, align128, syn, synth_footprint_bytes,
+    BundleLayout, KvBank, RetileDescriptor, SegRole, SynthAlloc, TensorPlacement,
+    WEIGHT_SPILL_SEGS, WeightTail, align128, syn, synth_footprint_bytes,
 };
 // ⭐⭐⭐ AND THE EMITTER ITSELF NOW LIVES IN `ktir_superdsc::emit` — `emit_sdsc`/`emit_sdsc_tiled`, the
 // whole `assemble_*` family, `pw1`/`pw2`, `ArgBinding`/`EmittedOp`, `bmm_site` and the SFP constant
@@ -248,20 +248,24 @@ use ktir_superdsc::emit::EmittedOp;
 fn audit_layout_addresses(
     places: &[bundle::Placement],
     segment_bytes: &[u64; 7],
-    // Extents of weight banks 1..N (empty ⇒ one bank). A banked placement is bounded by ITS OWN
-    // bank, not by the segment total — see [`bundle::Placement::bank`].
+    // Extents of the weight and KV segments' banks 1..N (empty ⇒ one bank). A banked placement is
+    // bounded by ITS OWN bank, not by the segment total — see [`bundle::Placement::bank`].
     weight_bank_bytes: &[u64],
+    kv_bank_bytes: &[u64],
     fp: &str,
 ) {
     let mut fail: Vec<String> = Vec::new();
     let w_seg = SegRole::Weight.segment();
+    let kv_seg = SegRole::Kv.segment();
     // The extent a placement is checked against: its bank's, which for bank 0 (everything in an
     // unbanked bundle) is the segment's own total.
     let extent = |seg: usize, bank: u32| -> Option<u64> {
-        match (seg == w_seg, bank) {
-            (_, 0) => segment_bytes.get(seg).copied(),
-            (true, b) => weight_bank_bytes.get(b as usize - 1).copied(),
-            (false, _) => None,
+        let extra = (bank as usize).checked_sub(1);
+        match extra {
+            None => segment_bytes.get(seg).copied(),
+            Some(b) if seg == w_seg => weight_bank_bytes.get(b).copied(),
+            Some(b) if seg == kv_seg => kv_bank_bytes.get(b).copied(),
+            Some(_) => None,
         }
     };
 
@@ -272,16 +276,19 @@ fn audit_layout_addresses(
     // returns an OOM whose numbers deny each other (`requested_bytes` well under `free_space_bytes`),
     // because the free bytes are in the regions the request cannot reach. Nothing in that message
     // names a segment, a tensor, or a model. All of it is decided here, by constants.
-    // A weight BANK is a device region like any other, so it is bound by the same cap; checking the
-    // banks here is what stops banking from trading one over-size allocation for another.
-    for (b, &bytes) in weight_bank_bytes.iter().enumerate() {
-        if bytes > bundle::MAX_SEGMENT_BYTES {
-            fail.push(format!(
-                "weight bank {} packs {bytes} B, {} B past the {} B a single device region can hold",
-                b + 1,
-                bytes - bundle::MAX_SEGMENT_BYTES,
-                bundle::MAX_SEGMENT_BYTES,
-            ));
+    // A BANK is a device region like any other, so it is bound by the same cap; checking the banks
+    // here is what stops banking from trading one over-size allocation for another.
+    for (what, banks) in [("weight", weight_bank_bytes), ("KV", kv_bank_bytes)] {
+        for (b, &bytes) in banks.iter().enumerate() {
+            if bytes > bundle::MAX_SEGMENT_BYTES {
+                fail.push(format!(
+                    "{what} bank {} packs {bytes} B, {} B past the {} B a single device region can \
+                     hold",
+                    b + 1,
+                    bytes - bundle::MAX_SEGMENT_BYTES,
+                    bundle::MAX_SEGMENT_BYTES,
+                ));
+            }
         }
     }
     for (seg, &bytes) in segment_bytes.iter().enumerate() {
@@ -326,10 +333,12 @@ fn audit_layout_addresses(
         }
         let Some(cap) = extent(seg, p.bank) else {
             fail.push(format!(
-                "{} is in seg{seg} bank {}, which this bundle does not have ({} weight bank(s))",
+                "{} is in seg{seg} bank {}, which this bundle does not have ({} weight bank(s), \
+                 {} KV bank(s))",
                 p.id,
                 p.bank,
                 1 + weight_bank_bytes.len(),
+                1 + kv_bank_bytes.len(),
             ));
             continue;
         };
@@ -971,19 +980,21 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // seg1 (Weight) here — same condition as the emit branch + kernel0 (n_dev>16384 lm_head). Size = the
     // staged `[KB, n_dev]` f16 buffer (KB·n_dev·2, the retiled `[n_dev/64,KB,64]` footprint).
     // ── THE KV POOLS (seg2) ── every attention's K and V cache tensors, the pools the paged step's KV
-    //    write scatters into and its walk gathers from, resident across steps. Placed in layer order so
-    //    a re-rolled body reaches layer `v`'s pools at one uniform stride. On a CARD build only: the
-    //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
-    //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
-    //    by the address audit on the card it cannot fit, not on an emulator that never places them.
+    //    write scatters into and its walk gathers from, resident across steps — ONE DEVICE REGION PER
+    //    LAYER ([`place_kv_pools`]). On a CARD build only: the emulator runs the paged step as KTIR
+    //    over the cache tensors bound by tid, and never places them.
     let pools = if cfg!(feature = "spyre-lower") {
         kv_pool_tids(ir)
     } else {
         Vec::new()
     };
-    for &tid in &pools {
-        pack(tid, SegRole::Kv, &mut seg_bytes, &mut placements);
-    }
+    let (kv_bank_bytes, kv_block_banks) = place_kv_pools(
+        &pools,
+        per_layer_ext,
+        nbytes,
+        &mut seg_bytes,
+        &mut placements,
+    );
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
     let result = ir.result.index() as u32;
@@ -1603,6 +1614,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         inter_cursor: Default::default(),
         segment_bytes: seg_bytes,
         weight_bank_bytes,
+        kv_bank_bytes,
+        kv_block_banks,
         weight_tail,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
@@ -1940,6 +1953,92 @@ mod weight_tail_tests {
                 .all(|(t, p)| (p.segment, p.offset) == (before[t].segment, before[t].offset))
         );
     }
+}
+
+/// ⭐⭐ THE KV POOLS, ONE DEVICE REGION PER LAYER — every (class, iteration) launch block's pools
+/// are their own bank of the KV segment ([`KvBank`]), at the SAME intra-block offsets for every
+/// iteration of the class: each table of the class, in the map's own order, at the running sum of
+/// the widest of its layers' aligned sizes. A layer's launch therefore re-bases the KV slot by
+/// handing it that layer's region alone — the body bakes the class's intra-block offsets once —
+/// and the pool is the model's whole context whatever its total, with no packing against a region
+/// size: the largest allocation is one layer's pools.
+///
+/// The blocks are numbered class-major (bank 0 is the first class's first layer). Every table's
+/// layers are placed through the table's own list, which `per_layer_external_tids` files only at
+/// its loop's layer count. A pool no per-layer table names goes in bank 0 after that block, where
+/// the unshifted prefix and suffix launches read it. Off the card `pools` is empty and nothing is
+/// placed.
+///
+/// Returns the extra banks' bytes (banks `1..N`; bank 0's are written to `seg_bytes`) and each
+/// pool table's bank per iteration, keyed by the table's layer-0 tid.
+fn place_kv_pools(
+    pools: &[u32],
+    per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+    size_of: impl Fn(u32) -> u64,
+    seg_bytes: &mut [u64; 7],
+    placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
+) -> (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>) {
+    let kv_seg = SegRole::Kv.segment();
+    let is_pool: std::collections::BTreeSet<u32> = pools.iter().copied().collect();
+    let mut place = |tid: u32, bank: KvBank, offset: u64| {
+        placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Kv,
+                segment: kv_seg,
+                bank: bank.get(),
+                offset,
+                size: size_of(tid),
+            },
+        );
+    };
+    let mut bank_bytes: Vec<u64> = Vec::new();
+    let mut table_banks: std::collections::BTreeMap<u32, Vec<KvBank>> = Default::default();
+    for class in per_layer_ext {
+        let tables: Vec<(u32, &Vec<u32>)> = class
+            .iter()
+            .filter(|(t0, _)| is_pool.contains(t0))
+            .map(|(&t0, tids)| (t0, tids))
+            .collect();
+        let Some(&(_, first)) = tables.first() else {
+            continue;
+        };
+        // Each table's slot is as wide as its widest layer, so no layer's tensor reaches into
+        // the next table's slot.
+        let mut intra: Vec<u64> = Vec::with_capacity(tables.len());
+        let mut block = 0u64;
+        for (_, tids) in &tables {
+            intra.push(block);
+            let widest = tids.iter().map(|&t| size_of(t)).max().unwrap_or(0);
+            block = align128(block + widest);
+        }
+        let banks: Vec<KvBank> = (0..first.len())
+            .map(|j| KvBank::of_placement((bank_bytes.len() + j) as u32))
+            .collect();
+        bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
+        for ((t0, tids), &off) in tables.iter().zip(&intra) {
+            for (&tid, &bank) in tids.iter().zip(&banks) {
+                place(tid, bank, off);
+            }
+            table_banks.insert(*t0, banks.clone());
+        }
+    }
+    if bank_bytes.is_empty() {
+        bank_bytes.push(0);
+    }
+    let owned: std::collections::BTreeSet<u32> = per_layer_ext
+        .iter()
+        .flat_map(|class| class.values().flatten().copied())
+        .collect();
+    let mut tail = bank_bytes[0];
+    for &tid in pools.iter().filter(|t| !owned.contains(t)) {
+        place(tid, KvBank::BASE, tail);
+        tail = align128(tail + size_of(tid));
+    }
+    bank_bytes[0] = tail;
+    seg_bytes[kv_seg] = bank_bytes[0];
+    (bank_bytes.split_off(1), table_banks)
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -6509,6 +6608,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         placements,
         segment_bytes,
         weight_bank_bytes,
+        kv_bank_bytes,
+        // Read by the launch table (`lower_subtile_tape_to_ktir`), which carries each layer's bank
+        // as its own column; the placements below already name every pool's bank.
+        kv_block_banks: _,
         weight_tail,
         kernel_weights,
         scalarmul_scales,
@@ -6633,7 +6736,13 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     }
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
-    audit_layout_addresses(&places, &segment_bytes, weight_bank_bytes, "<layout>");
+    audit_layout_addresses(
+        &places,
+        &segment_bytes,
+        weight_bank_bytes,
+        kv_bank_bytes,
+        "<layout>",
+    );
     // ⭐ AND THE TAIL VERDICT IS THE PLACEMENTS' OWN. The runtime copies `[0, bytes)` of the named
     // slot into every borrowing session and nothing else, so a verdict that disagreed with where the
     // weights actually sit would hand a session a zero-filled embedding (argmax 0 every token) or
@@ -6647,6 +6756,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     bundle::BundleLayout {
         segment_bytes,
         weight_bank_bytes: std::borrow::Cow::Owned(weight_bank_bytes.clone()),
+        kv_bank_bytes: std::borrow::Cow::Owned(kv_bank_bytes.clone()),
         weight_tail: *weight_tail,
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(
@@ -7560,11 +7670,9 @@ pub struct RolledSuperDsc<T: ktir_superdsc::collective::Tp> {
     /// Per-launch weight-segment `(bank, offset)` — `launches`' addressing half, proven
     /// against the placements at cargo-build (see [`bundle::LayerLaunch`]).
     pub launch_w: Vec<(u8, u64)>,
-    /// Per-launch KV-segment offset, same contract.
-    pub launch_kv: Vec<u64>,
-    /// Bytes of ONE pool page — every layer of every class (`Σ_c n_c·stride_c`). 0 when
-    /// there is no paged KV.
-    pub kv_page_stride: u64,
+    /// Per-launch KV region — the layout's own bank for the launch's block
+    /// ([`BundleLayout::kv_block_banks`]).
+    pub launch_kv: Vec<KvBank>,
     /// The weight bank the PREFIX's weight operands live in, and the SUFFIX's — proven to be a single
     /// bank each (a launch has ONE base per segment). 0 when the group reads no weights.
     pub prefix_weight_bank: u32,
@@ -10718,6 +10826,103 @@ mod fingerprint_tests {
             bundle_fingerprint(&[a]),
             bundle_fingerprint(&[b]),
             "the descriptors differ, so the bundles do"
+        );
+    }
+}
+
+#[cfg(test)]
+mod kv_pool_placement_tests {
+    use super::*;
+
+    /// One class of `layers` iterations with a K and a V table, the tids `1000 + v` and `2000 + v`,
+    /// every pool `pool` bytes — the `per_layer_ext` shape [`place_kv_pools`] reads.
+    fn one_class(layers: u32) -> Vec<std::collections::BTreeMap<u32, Vec<u32>>> {
+        let mut class = std::collections::BTreeMap::new();
+        class.insert(1000, (0..layers).map(|v| 1000 + v).collect());
+        class.insert(2000, (0..layers).map(|v| 2000 + v).collect());
+        vec![class]
+    }
+
+    /// ⭐ EVERY LAYER OWNS ITS REGION: each launch block is its own bank, every bank holds the
+    /// same intra-block offsets (one baked body serves every layer), and bank 0's bytes are the
+    /// segment's own.
+    #[test]
+    fn every_layer_owns_its_region_at_the_same_offsets() {
+        let (layers, pool) = (4u32, 3 * 1024u64);
+        let per_layer_ext = one_class(layers);
+        let pools: Vec<u32> = (0..layers).flat_map(|v| [1000 + v, 2000 + v]).collect();
+        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
+        let (extra, banks) = place_kv_pools(
+            &pools,
+            &per_layer_ext,
+            |_| pool,
+            &mut seg_bytes,
+            &mut placements,
+        );
+        let kv = SegRole::Kv.segment();
+        assert_eq!(seg_bytes[kv], 2 * pool, "bank 0 holds one layer's K and V");
+        assert_eq!(
+            extra,
+            vec![2 * pool; layers as usize - 1],
+            "one bank per further layer"
+        );
+        let per_layer_banks: Vec<KvBank> = (0..layers).map(KvBank::of_placement).collect();
+        assert_eq!(
+            banks,
+            [(1000, per_layer_banks.clone()), (2000, per_layer_banks)]
+                .into_iter()
+                .collect(),
+            "both of the class's tables put layer v in bank v"
+        );
+        for v in 0..layers {
+            let (k, val) = (placements[&(1000 + v)], placements[&(2000 + v)]);
+            assert_eq!((k.bank, k.offset), (v, 0), "layer {v}'s K");
+            assert_eq!((val.bank, val.offset), (v, pool), "layer {v}'s V");
+        }
+    }
+
+    /// A table whose later layer is wider than layer 0 gets a slot as wide as that layer, so the
+    /// next table never starts inside it.
+    #[test]
+    fn a_wider_later_layer_widens_its_tables_slot() {
+        let per_layer_ext = one_class(2);
+        let pools = vec![1000, 1001, 2000, 2001];
+        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
+        let size_of = |t: u32| if t == 1001 { 2048 } else { 1024 };
+        place_kv_pools(
+            &pools,
+            &per_layer_ext,
+            size_of,
+            &mut seg_bytes,
+            &mut placements,
+        );
+        assert_eq!(placements[&2000].offset, 2048, "V starts past the widest K");
+        assert_eq!(placements[&2001].offset, 2048);
+    }
+
+    /// A pool no per-layer table names sits in bank 0, after that bank's block — where the
+    /// unshifted prefix and suffix launches read it.
+    #[test]
+    fn a_pool_no_layer_owns_sits_in_bank_0_after_its_block() {
+        let (layers, pool) = (3u32, 1024u64);
+        let per_layer_ext = one_class(layers);
+        let mut pools: Vec<u32> = (0..layers).flat_map(|v| [1000 + v, 2000 + v]).collect();
+        pools.push(9000);
+        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
+        let (extra, _) = place_kv_pools(
+            &pools,
+            &per_layer_ext,
+            |_| pool,
+            &mut seg_bytes,
+            &mut placements,
+        );
+        let lone = placements[&9000];
+        assert_eq!((lone.bank, lone.offset), (0, 2 * pool));
+        assert_eq!(seg_bytes[SegRole::Kv.segment()], 3 * pool);
+        assert_eq!(
+            extra,
+            vec![2 * pool; layers as usize - 1],
+            "the other banks are unchanged"
         );
     }
 }
