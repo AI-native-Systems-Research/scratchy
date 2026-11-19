@@ -45,8 +45,9 @@ use scratchy_target_cuda::step::{
     EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
     ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
     ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp,
-    GdnPrefillBf16, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8, RmsNormBf16,
-    RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes, norm_row_takes, quant_chain,
+    GdnPrefillBf16, GdnScratch, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8,
+    RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes, norm_row_takes,
+    quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -265,6 +266,7 @@ pub struct CanonicalGdn {
     pub conv_kernel: u32,
     pub sequence: ArenaSpan,
     pub scratch: ArenaSpan,
+    pub scratch_layout: GdnScratch,
 }
 
 /// One canonical's paged KV cache: the fields of a `scratchy_target_cuda::tape::KvTape`, its
@@ -1595,7 +1597,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         .flat_map(|s| s.parts().into_iter().flatten())
         .filter_map(|s| match s {
             CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, .. }) | CudaStep::GdnDecode(g) => {
-                Some((g.bundle.0, g.bundle_layout()?.bytes))
+                Some((g.bundle.0, g.layout.bundle.bytes))
             }
             // An fp8 weight's buffer is its e4m3 bytes and f32 scales (`step::fp8_weight`).
             CudaStep::RouterLogits(_)
@@ -1659,6 +1661,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
                     conv_kernel: g.conv_kernel.get(),
                     sequence: r.sequence,
                     scratch: r.scratch,
+                    scratch_layout: r.layout,
                 })
             }
             _ => None,
@@ -2270,8 +2273,10 @@ const TOKEN_ID_BYTES: u64 = 4;
 pub struct GdnRegions {
     /// `[slot, q_len, start, 0]` u32.
     pub sequence: ArenaSpan,
-    /// `gdn_scratch(bucket_m, …)`.
+    /// `layout`'s bytes.
     pub scratch: ArenaSpan,
+    /// The scratch's regions, `gdn_scratch(bucket_m, …)`: every GDN step's, and the tape's.
+    pub layout: GdnScratch,
     /// The geometry the scratch was sized by: the canonical's first `GatedDeltaNet`'s operand
     /// widths, which every GDN op must share. The key heads, their dim and the conv kernel are the
     /// model's (the facts' `Gdn`), the same for every op.
@@ -2441,10 +2446,13 @@ fn gdn_layers(plan: &CudaPlan) -> Vec<u32> {
     layers.into_iter().collect()
 }
 
-/// The GDN scratch's bytes at the bucket's rows, sized by the canonical's first `GatedDeltaNet`
+/// The GDN scratch's regions at the bucket's rows, sized by the canonical's first `GatedDeltaNet`
 /// (`qkv`'s, `z`'s and `a`'s widths), or `None` when it has none. A later GDN op of another
 /// geometry is refused by its lowering (`GdnPool`).
-fn gdn_scratch_bytes(plan: &CudaPlan, rows: u32) -> Option<Result<(u64, GdnWidths), ArenaRefusal>> {
+fn gdn_scratch_layout(
+    plan: &CudaPlan,
+    rows: u32,
+) -> Option<Result<(GdnScratch, GdnWidths), ArenaRefusal>> {
     let first = gdn_steps(plan).next()?;
     let cols = |k: usize| (first.node.inputs.get(k)).map_or(0, |r| plan.graph.shape(r.tensor).cols);
     let geometry = GdnWidths {
@@ -2454,7 +2462,7 @@ fn gdn_scratch_bytes(plan: &CudaPlan, rows: u32) -> Option<Result<(u64, GdnWidth
     };
     Some(
         gdn_scratch(rows, geometry.conv_dim, geometry.nv, geometry.value_dim)
-            .map(|s| (s.bytes, geometry))
+            .map(|s| (s, geometry))
             .ok_or(ArenaRefusal::TooLarge),
     )
 }
@@ -2560,18 +2568,19 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
             })
         })
         .transpose()?;
-    let gdn = gdn_scratch_bytes(plan, hidden.rows)
+    let gdn = gdn_scratch_layout(plan, hidden.rows)
         .map(|sized| {
-            let (scratch, geometry) = sized?;
+            let (layout, geometry) = sized?;
             Ok(GdnRegions {
                 sequence: ArenaSpan {
                     offset: ArenaOffset(place(GDN_SEQUENCE_BYTES)?),
                     bytes: GDN_SEQUENCE_BYTES,
                 },
                 scratch: ArenaSpan {
-                    offset: ArenaOffset(place(scratch)?),
-                    bytes: scratch,
+                    offset: ArenaOffset(place(layout.bytes)?),
+                    bytes: layout.bytes,
                 },
+                layout,
                 geometry,
             })
         })

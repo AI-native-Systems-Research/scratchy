@@ -153,6 +153,7 @@ u32_newtype! {
     MaxBlocksPerSeq,
     /// A tape's rows: its bucket's.
     BucketM,
+    ConvDim,
 }
 
 /// A rope's base frequency (`rope_theta`), as its exact `f64` bits, so a rotary table is `Eq`.
@@ -1430,18 +1431,42 @@ pub struct AttnDecodeSplit {
     pub min_tiles: MinTiles,
 }
 
-/// A decode bucket's attention ([`CudaStep::AttnDecode`]): the attention, and its split over keys.
+/// A decode bucket's attention ([`CudaStep::AttnDecode`]): the attention, its split over keys, and
+/// the split scratch its partials take at that split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AttnDecodeBf16 {
     pub attn: AttnPrefillBf16,
     pub split: AttnDecodeSplit,
+    pub scratch: AttnDecodeScratch,
+}
+
+/// Where a decode attention's split partials lie in the tape's split scratch
+/// ([`attn_decode_split_scratch_bytes`] at its stored split), written into its step when the step
+/// is emitted: the f32 rows from the scratch's start, each row's max and sum from `ml_offset`, and
+/// `bytes` in all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AttnDecodeScratch {
+    pub ml_offset: u64,
+    pub bytes: u64,
 }
 
 impl AttnDecodeBf16 {
-    /// `attn` at its head dim's split; `None` at a head dim with no decode kernel.
+    /// `attn` at its head dim's split and that split's scratch; `None` at a head dim with no decode
+    /// kernel, or when the scratch overflows `u64`.
     pub const fn of(attn: AttnPrefillBf16) -> Option<Self> {
-        match attn_decode_split_at(attn.head_dim.get()) {
-            Some(split) => Some(Self { attn, split }),
+        let Some(split) = attn_decode_split_at(attn.head_dim.get()) else {
+            return None;
+        };
+        match attn_decode_split_scratch_bytes(
+            split.splits.get(),
+            attn.kv_heads.get(),
+            attn.head_dim.get(),
+        ) {
+            Some((ml_offset, bytes)) => Some(Self {
+                attn,
+                split,
+                scratch: AttnDecodeScratch { ml_offset, bytes },
+            }),
             None => None,
         }
     }
@@ -1601,7 +1626,7 @@ pub const fn gdn_conv_dim(
 /// of `conv_out [rows, conv_dim]`, `g [rows, nv]`, `beta [rows, nv]` and `o [rows, value_dim]`,
 /// each a multiple of 256, and the total. Metal's `GdnScratchLayout`: the same regions in the same
 /// order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GdnScratch {
     pub conv_out: u64,
     pub g: u64,
@@ -1638,7 +1663,7 @@ pub const fn gdn_scratch(rows: u32, conv_dim: u32, nv: u32, value_dim: u32) -> O
 /// `c` channel `c`'s taps, oldest first, as the checkpoint's `[conv_dim, 1, K]`), `a_log [nv]`,
 /// `dt_bias [nv]` and `norm [head_v]` (the gated norm's plain gain), each a multiple of 256, and
 /// the total. f32 throughout, so no on-disk dtype reaches a kernel: bf16 to f32 is exact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GdnBundle {
     pub conv1d: u64,
     pub a_log: u64,
@@ -1747,6 +1772,17 @@ pub struct GatedDeltaNetBf16 {
     pub conv_kernel: ConvKernel,
     /// The gated norm's `eps` (`rms_norm_eps`).
     pub eps: RmsNormEps,
+    pub layout: GdnLayout,
+}
+
+/// A GDN step's layouts, written into its step when the step is emitted: the conv's channels
+/// ([`gdn_conv_dim`]), the scratch's regions at its rows (the tape's, [`gdn_scratch`]) and its
+/// bundle's ([`gdn_bundle`]). The player places its launches' operands by them as stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GdnLayout {
+    pub conv_dim: ConvDim,
+    pub scratch: GdnScratch,
+    pub bundle: GdnBundle,
 }
 
 impl GatedDeltaNetBf16 {
@@ -1755,40 +1791,9 @@ impl GatedDeltaNetBf16 {
         gdn_scale(self.head_k.get())
     }
 
-    /// The conv's channels, or `None` on overflow.
-    pub const fn conv_dim(&self) -> Option<u32> {
-        gdn_conv_dim(
-            self.num_k_heads.get(),
-            self.head_k.get(),
-            self.num_v_heads.get(),
-            self.head_v.get(),
-        )
-    }
-
     /// The value width, `num_v_heads · head_v`, or `None` on overflow.
     pub const fn value_dim(&self) -> Option<u32> {
         self.num_v_heads.get().checked_mul(self.head_v.get())
-    }
-
-    /// The scratch's regions at this step's rows, or `None` on overflow.
-    pub const fn scratch_layout(&self) -> Option<GdnScratch> {
-        let (Some(conv_dim), Some(value_dim)) = (self.conv_dim(), self.value_dim()) else {
-            return None;
-        };
-        gdn_scratch(self.rows.get(), conv_dim, self.num_v_heads.get(), value_dim)
-    }
-
-    /// The bundle's regions for this step's geometry, or `None` on overflow.
-    pub const fn bundle_layout(&self) -> Option<GdnBundle> {
-        let Some(conv_dim) = self.conv_dim() else {
-            return None;
-        };
-        gdn_bundle(
-            conv_dim,
-            self.conv_kernel.get(),
-            self.num_v_heads.get(),
-            self.head_v.get(),
-        )
     }
 }
 
@@ -2641,18 +2646,11 @@ impl CudaStep {
     /// The split scratch bytes the step writes: [`gemv_scratch_bytes`] of [`Self::gemv_split`], 0
     /// for a step that is no decode GEMV or runs at one split; a grouped GEMV's, the sum of its
     /// members' (each holds its partials at once); a decode attention's, its split partials
-    /// ([`attn_decode_scratch_bytes`], written by its split launch and read by its merge, the
+    /// ([`AttnDecodeScratch`], written by its split launch and read by its merge, the
     /// same step's second launch); `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        if let Self::AttnDecode(AttnDecodeBf16 { attn: a, split }) = self {
-            return match attn_decode_split_scratch_bytes(
-                split.splits.get(),
-                a.kv_heads.get(),
-                a.head_dim.get(),
-            ) {
-                Some((_, all)) => Some(all),
-                None => None,
-            };
+        if let Self::AttnDecode(AttnDecodeBf16 { scratch, .. }) = self {
+            return Some(scratch.bytes);
         }
         if let Self::GemvGroup(g) | Self::GemvGroupFp8(g) = self {
             return g.gemv_scratch_before(3);
@@ -3284,9 +3282,10 @@ impl CudaStep {
                     },
                 ..
             }) => {
-                let (Some(conv_dim), Some(value_dim)) = (g.conv_dim(), g.value_dim()) else {
+                let Some(value_dim) = g.value_dim() else {
                     return None;
                 };
+                let conv_dim = g.layout.conv_dim.get();
                 let (Some(qb), Some(vb), Some(hb)) = (
                     bf16_bytes(rows.get(), conv_dim),
                     bf16_bytes(rows.get(), value_dim),
@@ -3294,9 +3293,7 @@ impl CudaStep {
                 ) else {
                     return None;
                 };
-                let (Some(sc), Some(bu)) = (g.scratch_layout(), g.bundle_layout()) else {
-                    return None;
-                };
+                let (sc, bu) = (g.layout.scratch, g.layout.bundle);
                 Some(StepExtents {
                     reads: [
                         Some(span(qkv, qb)),

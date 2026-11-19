@@ -49,10 +49,9 @@ use crate::step::{
     GdnScan, GemmBf16, GemvBf16, GemvGroupBf16, GemvSplit, GroupMember, LayerScaleBf16,
     MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows,
     QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_split_scratch_bytes,
-    fp8_moe_layout, fp8_weight,
+    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight,
 };
-use crate::step::{AttnWindow, BucketM, Cols, HeadDim, NumExperts, Rows, Splits, TopK};
+use crate::step::{AttnWindow, BucketM, Cols, GdnLayout, HeadDim, NumExperts, Rows, Splits, TopK};
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
     KV_ELEM_BYTES, KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
@@ -2666,42 +2665,27 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 window,
                                 ..
                             },
-                        split: stored,
+                        split: AttnDecodeSplit { splits, min_tiles },
+                        scratch,
                     }) => {
                         let pool = kv.expect("`new` made a pool for a KV tape");
                         let l = layer.get() as usize;
                         let layout = pool.layer_layout(l);
                         // The split over keys (W6b): the step's `(splits, min_tiles)`, its
-                        // partials in the tape's split scratch, rows then maxima and sums.
-                        let AttnDecodeSplit { splits, min_tiles } = stored;
-                        let Some((rows_bytes, _)) = attn_decode_split_scratch_bytes(
-                            splits.get(),
-                            kv_heads.get(),
-                            head_dim.get(),
-                        ) else {
-                            // The scratch overflows u64: refused, nothing launched (`validate`
-                            // already refuses it, `CudaStep::gemv_scratch`).
-                            let error = KernelError::AttnDecodeShape {
-                                q_heads: q_heads.get(),
-                                kv_heads: kv_heads.get(),
-                                head_dim: head_dim.get(),
-                                block_size: layout.block_size,
-                                num_blocks: layout.num_blocks,
-                            };
-                            return Err((step, error));
-                        };
+                        // partials in the tape's split scratch where the step places them, rows
+                        // then maxima and sums.
                         let split = DecodeSplit {
                             splits: splits.get(),
                             min_tiles: min_tiles.get(),
                             o_split: partials,
-                            ml_split: partials.wrapping_byte_add(rows_bytes as usize),
+                            ml_split: partials.wrapping_byte_add(scratch.ml_offset as usize),
                         };
                         // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
                         // its rows are 1: `validate`), and the block table and sequence uploaded
                         // above, which `forward` checked: every block the keys `0 .. P + L` need is a
                         // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s,
                         // of its class's layout. The partials are the tape's split scratch, at least
-                        // this step's `attn_decode_scratch_bytes` (`CudaStep::gemv_scratch`, which
+                        // this step's `AttnDecodeScratch` bytes (`CudaStep::gemv_scratch`, which
                         // `validate` checked), no step's operand; the merge, launched after the split
                         // on this stream, reads them and writes `out`.
                         unsafe {
@@ -2958,14 +2942,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         weights: &[DeviceBuffer],
         stream: &Stream,
     ) -> Result<(), KernelError> {
-        let Some(bundle) = g.bundle_layout() else {
-            return Err(KernelError::GdnDecodeShape {
-                nk: g.num_k_heads.get(),
-                nv: g.num_v_heads.get(),
-                head_v: g.head_v.get(),
-                kernel: g.conv_kernel.get(),
-            });
-        };
+        let bundle = g.layout.bundle;
         let w = weights[g.bundle.0 as usize].ptr();
         let wat = |off: u64| {
             let off = usize::try_from(off).expect("a bundle offset fits the host's usize");
@@ -3020,18 +2997,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         weights: &[DeviceBuffer],
         stream: &Stream,
     ) -> Result<(), KernelError> {
-        // `validate` checked that the step's geometry is the tape's and its scratch and bundle
-        // sizes fit u64 (`extents`), and `new` that the tape's geometry is the pool's; were one
-        // to overflow, the conv launcher refuses the shape and nothing launches.
-        let (Some(conv_dim), Some(scratch), Some(bundle)) =
-            (g.conv_dim(), g.scratch_layout(), g.bundle_layout())
-        else {
-            return Err(KernelError::GdnConvShape {
-                rows: g.rows.get(),
-                conv_dim: 0,
-                kernel: g.conv_kernel.get(),
-            });
-        };
+        // `validate` checked that the step's geometry is the tape's, and `new` that the tape's
+        // geometry is the pool's; the layouts are the step's own, placed when it was emitted.
+        let GdnLayout {
+            conv_dim,
+            scratch,
+            bundle,
+        } = g.layout;
+        let conv_dim = conv_dim.get();
         let at = |base: ArenaOffset, off: u64| slot(ArenaOffset(base.0 + off));
         let w = weights[g.bundle.0 as usize].ptr();
         let wat = |off: u64| {

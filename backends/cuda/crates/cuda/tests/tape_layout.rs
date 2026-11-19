@@ -2266,6 +2266,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
             gdn_regions: Some(GdnRegions {
                 sequence: gdn.sequence,
                 scratch: gdn.scratch,
+                layout: gdn.scratch_layout,
                 geometry,
             }),
             moe: None,

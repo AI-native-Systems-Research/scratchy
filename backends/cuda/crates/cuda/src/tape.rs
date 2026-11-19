@@ -18,11 +18,11 @@ use crate::step::{
     CUDA_KV_BLOCK_SIZE, Cols, ConvKernel, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, FreqDim,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GemmBf16, GemvBf16,
-    HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, MoeWeight,
-    NumExperts, NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
-    RopeBf16, RopeTheta, RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows, TopK, VocabSize,
-    gdn_conv_dim, gdn_scratch, quant_chain, sort_index_regions,
+    GatedDeltaNetBf16, GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GdnScratch,
+    GemmBf16, GemvBf16, HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles,
+    MoeRouteBf16, MoeWeight, NumExperts, NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8,
+    RopeAppendBf16, RopeBf16, RopeTheta, RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows,
+    TopK, VocabSize, gdn_conv_dim, quant_chain, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -209,23 +209,12 @@ pub struct GdnTape {
     pub conv_kernel: ConvKernel,
     /// `[slot, q_len, start, 0]` u32: exactly 16 bytes at an aligned offset of its own.
     pub sequence: ArenaSpan,
-    /// The f32 scratch every GDN step passes its intermediates through:
-    /// `crate::step::gdn_scratch(bucket_m, …)`'s bytes.
+    /// The f32 scratch every GDN step passes its intermediates through: `scratch_layout`'s bytes.
     pub scratch: ArenaSpan,
-}
-
-impl GdnTape {
-    /// The scratch's bytes at `bucket_m` rows of this geometry, or `None` on overflow.
-    fn scratch_bytes(&self, bucket_m: u32) -> Option<u64> {
-        let value_dim = self.num_v_heads.get().checked_mul(self.head_v.get())?;
-        let conv_dim = gdn_conv_dim(
-            self.num_k_heads.get(),
-            self.head_k.get(),
-            self.num_v_heads.get(),
-            self.head_v.get(),
-        )?;
-        gdn_scratch(bucket_m, conv_dim, self.num_v_heads.get(), value_dim).map(|s| s.bytes)
-    }
+    /// The scratch's regions at the bucket's rows of this geometry
+    /// (`crate::step::gdn_scratch(bucket_m, …)`), placed when the tape was emitted: every GDN
+    /// step's [`crate::step::GdnLayout::scratch`].
+    pub scratch_layout: GdnScratch,
 }
 
 /// The tape's MoE scratch: the regions every MoE layer's routing and experts pass their runtime
@@ -1620,9 +1609,7 @@ impl CudaTape {
                 conv_kernel: conv_kernel.get(),
             });
         }
-        // A scratch whose size overflows is one no span can match: `want` 0 never equals a
-        // non-empty scratch's bytes, and an empty scratch is refused as shape below.
-        let scratch_want = gdn.scratch_bytes(self.bucket_m.get()).unwrap_or(0);
+        let scratch_want = gdn.scratch_layout.bytes;
         for (region, span, want) in [
             (Region::GdnSequence, gdn.sequence, GDN_SEQUENCE_BYTES),
             (Region::GdnScratch, gdn.scratch, scratch_want),
@@ -1777,13 +1764,15 @@ impl CudaTape {
                 if gdn.sequence != seq {
                     return Err(mismatch(Region::GdnSequence, seq, Some(gdn.sequence)));
                 }
-                // `extents` already sized the scratch, so its layout does not overflow.
                 let sc = ArenaSpan {
                     offset: scratch,
-                    bytes: g.scratch_layout().map_or(0, |l| l.bytes),
+                    bytes: g.layout.scratch.bytes,
                 };
                 if gdn.scratch != sc {
                     return Err(mismatch(Region::GdnScratch, sc, Some(gdn.scratch)));
+                }
+                if gdn.scratch_layout != g.layout.scratch {
+                    return Err(TapeError::GdnStepGeometry { step });
                 }
                 Ok(())
             }
@@ -2514,7 +2503,7 @@ mod tests {
         GemmBf16, KvUse, MoeRouteBf16, NormKernel, RmsNormBf16, RopeAppendBf16, RopeBf16,
         RopePairing, RouteProgram, WeightRead,
     };
-    use crate::step::{AttnScale, RmsNormEps, Scale, SoftCap};
+    use crate::step::{AttnScale, ConvDim, GdnLayout, RmsNormEps, Scale, SoftCap};
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
         ArenaSpan {
@@ -3504,6 +3493,23 @@ mod tests {
         conv_kernel: ConvKernel(4),
         sequence: span(GDN_SEQ, 16),
         scratch: span(GDN_SCRATCH, GDN_SCRATCH_BYTES),
+        scratch_layout: GDN_LAYOUT.scratch,
+    };
+
+    /// The GDN step's layouts at the tape's 64 rows, as its lowering places them.
+    const GDN_LAYOUT: GdnLayout = {
+        let (Some(conv_dim), Some(scratch), Some(bundle)) = (
+            gdn_conv_dim(1, 128, 1, 32),
+            crate::step::gdn_scratch(64, 288, 1, 32),
+            crate::step::gdn_bundle(288, 4, 1, 32),
+        ) else {
+            panic!("the fixture's GDN layouts fit");
+        };
+        GdnLayout {
+            conv_dim: ConvDim(conv_dim),
+            scratch,
+            bundle,
+        }
     };
 
     fn gdn_step(layer: u32, sequence: u64, scratch: u64) -> GatedDeltaNetBf16 {
@@ -3524,6 +3530,7 @@ mod tests {
             head_v: GdnHeadDim(32),
             conv_kernel: ConvKernel(4),
             eps: RmsNormEps::new(1e-6),
+            layout: GDN_LAYOUT,
         }
     }
 

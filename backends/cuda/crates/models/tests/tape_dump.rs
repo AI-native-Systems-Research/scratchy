@@ -47,7 +47,8 @@ use scratchy_target_cuda::step::{
     AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
     GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan, GemmBf16,
     GemmGroupBf16, GemvSplit, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16,
-    RopePairing, RouteProgram, SiluMulBf16,
+    RopePairing, RouteProgram, SiluMulBf16, attn_decode_split_scratch_bytes, gdn_bundle,
+    gdn_conv_dim, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, CudaTape, RotaryTable, WeightIx};
 use serde_json::{Map, Value, json};
@@ -266,6 +267,30 @@ fn attn(a: &AttnPrefillBf16) -> Value {
 }
 
 fn gdn(g: &GatedDeltaNetBf16) -> Value {
+    // The layouts the step carries are what the player derived from these keys at 99c60d50; the
+    // dump checks them against that derivation instead of printing them.
+    let (nk, hk, nv, hv) = (
+        g.num_k_heads.get(),
+        g.head_k.get(),
+        g.num_v_heads.get(),
+        g.head_v.get(),
+    );
+    let conv_dim = gdn_conv_dim(nk, hk, nv, hv).expect("a lowered GDN step's conv fits");
+    assert_eq!(
+        g.layout.conv_dim.get(),
+        conv_dim,
+        "the stored conv channels"
+    );
+    assert_eq!(
+        Some(g.layout.scratch),
+        gdn_scratch(g.rows.get(), conv_dim, nv, nv * hv),
+        "the stored GDN scratch"
+    );
+    assert_eq!(
+        Some(g.layout.bundle),
+        gdn_bundle(conv_dim, g.conv_kernel.get(), nv, hv),
+        "the stored GDN bundle"
+    );
     json!({"qkv": off(g.qkv), "z": off(g.z), "a": off(g.a), "b": off(g.b),
            "bundle": wix(g.bundle), "out": off(g.out), "scratch": off(g.scratch),
            "sequence": off(g.sequence), "layer": g.layer, "rows": g.rows,
@@ -407,7 +432,20 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::AttnDecode(a) => (
             "attn_decode_fp8kv_split + attn_decode_merge",
-            attn(&a.attn),
+            // The stored split scratch is what the player derived from the split at 99c60d50.
+            {
+                let at = attn_decode_split_scratch_bytes(
+                    a.split.splits.get(),
+                    a.attn.kv_heads.get(),
+                    a.attn.head_dim.get(),
+                );
+                assert_eq!(
+                    Some((a.scratch.ml_offset, a.scratch.bytes)),
+                    at,
+                    "the split scratch"
+                );
+                attn(&a.attn)
+            },
             json!({"attn_decode_split": [a.split.splits, a.split.min_tiles]}),
         ),
         CudaStep::GatedDeltaNet(g) => (
@@ -551,6 +589,22 @@ fn tape_header(stem: &str, t: &CudaTape) -> Value {
     let mut v = serde_json::to_value(t).expect("the tape serializes");
     let m: &mut Map<String, Value> = v.as_object_mut().expect("a tape is an object");
     m.remove("steps");
+    // The GDN scratch's stored regions are what `validate` derived from the header's own geometry
+    // at 99c60d50: checked against that derivation, not printed.
+    if let Some(g) = t.gdn {
+        let (nk, hk, nv, hv) = (
+            g.num_k_heads.get(),
+            g.head_k.get(),
+            g.num_v_heads.get(),
+            g.head_v.get(),
+        );
+        let conv_dim = gdn_conv_dim(nk, hk, nv, hv).expect("the tape's GDN conv fits");
+        let want = gdn_scratch(t.bucket_m.get(), conv_dim, nv, nv * hv);
+        assert_eq!(Some(g.scratch_layout), want, "the tape's GDN scratch");
+        (m.get_mut("gdn").and_then(Value::as_object_mut))
+            .expect("a GDN tape is an object")
+            .remove("scratch_layout");
+    }
     // The rope tables by hand, the theta decoded: what the forward fills them with.
     let rotary = |r: Option<RotaryTable>| {
         r.map_or(Value::Null, |r| {

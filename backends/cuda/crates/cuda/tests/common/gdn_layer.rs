@@ -36,11 +36,11 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemmGroupBf16, GroupMember,
-    NormKernel, RmsNormBf16, gdn_bundle,
+    AddBf16, CudaStep, GatedDeltaNetBf16, GdnLayout, GdnPrefillBf16, GemmBf16, GemmGroupBf16,
+    GroupMember, NormKernel, RmsNormBf16, gdn_bundle, gdn_conv_dim, gdn_scratch,
 };
 use scratchy_target_cuda::step::{
-    BucketM, Cols, ConvKernel, GdnHeadDim, GdnHeads, KDim, LayerId, NDim, Rows,
+    BucketM, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, KDim, LayerId, NDim, Rows,
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
@@ -197,6 +197,22 @@ const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
     })
 }
 
+/// The GDN step's layouts at `rows`, as its lowering places them.
+const fn gdn_layout(rows: u32) -> GdnLayout {
+    let (Some(conv_dim), Some(scratch), Some(bundle)) = (
+        gdn_conv_dim(NK, HEAD_K, NV, HEAD_V),
+        gdn_scratch(rows, CONV_DIM, NV, VALUE_DIM),
+        gdn_bundle(CONV_DIM, CONV_KERNEL, NV, HEAD_V),
+    ) else {
+        panic!("the fixture's GDN layouts fit");
+    };
+    GdnLayout {
+        conv_dim: ConvDim(conv_dim),
+        scratch,
+        bundle,
+    }
+}
+
 /// The GDN step over `qkv`, `z`, `a`, `b` into `out`, with the tape's `sequence` and `scratch`.
 pub const fn gdn_step(
     (qkv, z, a, b): (u64, u64, u64, u64),
@@ -221,11 +237,13 @@ pub const fn gdn_step(
         head_v: GdnHeadDim(HEAD_V),
         conv_kernel: ConvKernel(CONV_KERNEL),
         eps: scratchy_target_cuda::step::RmsNormEps::new(EPS),
+        layout: gdn_layout(rows),
     }
 }
 
-/// Layer 0's GDN state, its sequence region at `sequence` and its scratch (`bytes`) at `scratch`.
-const fn gdn_tape(sequence: u64, (scratch, bytes): (u64, u64)) -> Option<GdnTape> {
+/// Layer 0's GDN state, its sequence region at `sequence` and its scratch (`bytes`, laid out at
+/// `rows`) at `scratch`.
+const fn gdn_tape(sequence: u64, (scratch, bytes): (u64, u64), rows: u32) -> Option<GdnTape> {
     Some(GdnTape {
         layers: &[LAYER],
         num_k_heads: GdnHeads(NK),
@@ -235,6 +253,7 @@ const fn gdn_tape(sequence: u64, (scratch, bytes): (u64, u64)) -> Option<GdnTape
         conv_kernel: ConvKernel(CONV_KERNEL),
         sequence: span(sequence, 16),
         scratch: span(scratch, bytes),
+        scratch_layout: gdn_layout(rows).scratch,
     })
 }
 
@@ -298,7 +317,7 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
     ],
     rotary: None,
     kv: None,
-    gdn: gdn_tape(3416064, (3416320, 4210688)),
+    gdn: gdn_tape(3416064, (3416320, 4210688), 128),
     moe: None,
     rotary_local: None,
     gemv_scratch: None,
@@ -342,7 +361,7 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
     ],
     rotary: None,
     kv: None,
-    gdn: gdn_tape(6832128, (6832384, 8421376)),
+    gdn: gdn_tape(6832128, (6832384, 8421376), 256),
     moe: None,
     rotary_local: None,
     gemv_scratch: None,

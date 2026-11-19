@@ -234,6 +234,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
              conv_kernel,
              sequence,
              scratch,
+             scratch_layout,
          }| CanonicalGdn {
             layers: layers.to_vec(),
             num_k_heads: num_k_heads.get(),
@@ -243,6 +244,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
             conv_kernel: conv_kernel.get(),
             sequence,
             scratch,
+            scratch_layout,
         },
     );
     assert_eq!(gdn.as_ref(), lowered_gdn.as_ref(), "{name}: gdn");

@@ -10,8 +10,9 @@
 //! refusing arm into an arm of its own.
 
 use scratchy_target_cuda::step::{
-    AttnWindow, Cols, ConvKernel, GdnHeadDim, GdnHeads, HeadDim, HiddenSize, KDim, LayerId, NDim,
-    NTile, NumExperts, NumKvHeads, NumQHeads, RotDim, Rows, TopK, VocabSize,
+    AttnWindow, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, GdnLayout, HeadDim, HiddenSize,
+    KDim, LayerId, NDim, NTile, NumExperts, NumKvHeads, NumQHeads, RotDim, Rows, TopK, VocabSize,
+    gdn_bundle,
 };
 use std::num::NonZeroU32;
 
@@ -1575,6 +1576,12 @@ fn gated_delta_net(
     }
     let index = (cx.gdn_layers.iter().position(|&l| l == layer))
         .ok_or(CanonicalRefusal::GdnLayer { step })?;
+    let layout = GdnLayout {
+        conv_dim: ConvDim(conv_dim),
+        scratch: regions.layout,
+        bundle: gdn_bundle(conv_dim, conv_kernel, nv, head_v)
+            .ok_or(CanonicalRefusal::Arena(ArenaRefusal::TooLarge))?,
+    };
     Ok(GatedDeltaNetBf16 {
         qkv: at(qc),
         z: at(zc),
@@ -1592,6 +1599,7 @@ fn gated_delta_net(
         head_v: GdnHeadDim(head_v),
         conv_kernel: ConvKernel(conv_kernel),
         eps: RmsNormEps::new(cx.facts.facts.eps().get()),
+        layout,
     })
 }
 
