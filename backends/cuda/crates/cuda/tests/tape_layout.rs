@@ -13,6 +13,7 @@ mod common {
     pub mod mlp;
 }
 
+use scratchy_target_cuda::step::GemmNarrowBf16;
 use scratchy_target_cuda::step::{BlockSize, Cols, LayerId, NTile, NumKvHeads, NumQHeads, RotDim};
 use scratchy_target_cuda::step::{KDim, MaxBlocksPerSeq, NDim, Rows};
 use std::num::NonZeroU32;
@@ -181,14 +182,10 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     assert!(matches!(
         c.steps.as_slice(),
         [CudaStep::Gemv(GemvBf16 {
-            gemm: GemmBf16 {
-                a: ArenaOffset(0),
-                b: WeightIx(1),
-                m: Rows(1),
-                n: NDim(2048),
-                k: KDim(2048),
-                ..
-            },
+            a: ArenaOffset(0),
+            b: WeightIx(1),
+            n: NDim(2048),
+            k: KDim(2048),
             ..
         })]
     ));
@@ -1535,7 +1532,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     assert!(
         matches!(
             c.steps[8],
-            CudaStep::Gemv(GemvBf16 { gemm: GemmBf16 { m: Rows(1), residual, .. }, .. })
+            CudaStep::Gemv(GemvBf16 { residual, .. })
                 if residual.is_some()
         ),
         "step 8: {:?}",
@@ -1911,7 +1908,7 @@ fn a_narrow_gemm_takes_any_rows() {
         .expect("a 37-row narrow GEMM lowers");
     assert!(matches!(
         c.steps.as_slice(),
-        [CudaStep::GemmNarrow(GemmBf16 {
+        [CudaStep::GemmNarrow(GemmNarrowBf16 {
             m: Rows(37),
             n: NDim(64),
             k: KDim(8),
@@ -1922,7 +1919,7 @@ fn a_narrow_gemm_takes_any_rows() {
         .expect("a one-row narrow GEMM lowers");
     assert!(matches!(
         c.steps.as_slice(),
-        [CudaStep::GemmNarrow(GemmBf16 {
+        [CudaStep::GemmNarrow(GemmNarrowBf16 {
             m: Rows(1),
             n: NDim(16),
             k: KDim(1024),

@@ -45,8 +45,8 @@ use std::path::PathBuf;
 use scratchy_target_cuda::registry::{self, CudaModelEntry};
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
-    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan, GemmBf16,
-    GemmGroupBf16, GemvSplit, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16,
+    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan,
+    GemmGroupBf16, GemvSplit, Matmul, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16,
     RopePairing, RouteProgram, SiluMulBf16, attn_decode_split_scratch_bytes, gdn_bundle,
     gdn_conv_dim, gdn_scratch,
 };
@@ -209,9 +209,15 @@ fn gate_up_kernel(k: GateUpKernel) -> Value {
 
 // ── the payloads, as values ──
 
-fn gemm(g: &GemmBf16) -> Value {
+/// A matmul and the residual it adds (a one-row GEMV's; `null` on every other step).
+fn gemm((g, residual): (Matmul, Option<ArenaOffset>)) -> Value {
     json!({"a": off(g.a), "b": wix(g.b), "c": off(g.c), "m": g.m, "n": g.n, "k": g.k,
-           "residual": opt_off(g.residual)})
+           "residual": opt_off(residual)})
+}
+
+/// A one-weight GEMM step's [`gemm`].
+fn gemm_step(s: &CudaStep) -> Value {
+    gemm(s.gemm_view().expect("a one-weight GEMM step"))
 }
 
 fn group(g: &GemmGroupBf16) -> Value {
@@ -241,7 +247,7 @@ fn silu_mul(s: &SiluMulBf16) -> Value {
 }
 
 fn gate_up(g: &GateUpActBf16) -> Value {
-    json!({"gate": gemm(&g.gate), "up": gemm(&g.up), "out": off(g.out),
+    json!({"gate": gemm((g.gate.matmul(), None)), "up": gemm((g.up.matmul(), None)), "out": off(g.out),
            "kernel": gate_up_kernel(g.kernel), "act": act(g.act)})
 }
 
@@ -317,19 +323,19 @@ fn step_record(s: &CudaStep) -> Value {
                    "rows": e.rows, "hidden": e.hidden, "vocab": e.vocab}),
             Value::Null,
         ),
-        CudaStep::Gemm(g) => ("gemm_bf16_abt", gemm(g), Value::Null),
-        CudaStep::GemmNarrow(g) => ("gemm_narrow_bf16_abt", gemm(g), Value::Null),
+        CudaStep::Gemm(_) => ("gemm_bf16_abt", gemm_step(s), Value::Null),
+        CudaStep::GemmNarrow(_) => ("gemm_narrow_bf16_abt", gemm_step(s), Value::Null),
         CudaStep::Gemv(g) => (
             "gemv_bf16 (unsplit, split or residual by its arguments)",
-            gemm(&g.gemm),
+            gemm_step(s),
             splits(g.split),
         ),
-        CudaStep::GemmCol64(g) => ("gemm_col64_bf16_abt", gemm(g), Value::Null),
-        CudaStep::GemmFp8(g) => ("gemm_fp8_abt (128-col tiles)", gemm(g), Value::Null),
-        CudaStep::GemmCol64Fp8(g) => ("gemm_fp8_abt (64-col tiles)", gemm(g), Value::Null),
-        CudaStep::GemmNarrowFp8(g) => ("gemm_narrow_fp8_abt", gemm(g), Value::Null),
-        CudaStep::GemvFp8(g) => ("gemv_fp8_residual", gemm(&g.gemm), splits(g.split)),
-        CudaStep::GemvTcFp8(g) => ("gemv_fp8_b8", gemm(g), Value::Null),
+        CudaStep::GemmCol64(_) => ("gemm_col64_bf16_abt", gemm_step(s), Value::Null),
+        CudaStep::GemmFp8(_) => ("gemm_fp8_abt (128-col tiles)", gemm_step(s), Value::Null),
+        CudaStep::GemmCol64Fp8(_) => ("gemm_fp8_abt (64-col tiles)", gemm_step(s), Value::Null),
+        CudaStep::GemmNarrowFp8(_) => ("gemm_narrow_fp8_abt", gemm_step(s), Value::Null),
+        CudaStep::GemvFp8(g) => ("gemv_fp8_residual", gemm_step(s), splits(g.split)),
+        CudaStep::GemvTcFp8(_) => ("gemv_fp8_b8", gemm_step(s), Value::Null),
         CudaStep::GemmGroup(g) => ("gemm_group_bf16_abt", group(g), Value::Null),
         CudaStep::GemmNarrowGroup(g) => ("gemm_narrow_group_bf16_abt", group(g), Value::Null),
         CudaStep::GemmGroupFp8(g) => ("gemm_group_fp8_abt", group(g), Value::Null),

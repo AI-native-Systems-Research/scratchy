@@ -106,7 +106,6 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         m: Rows(m),
         n: NDim(n),
         k: KDim(k),
-        residual: None,
     })
 }
 
@@ -134,7 +133,6 @@ const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaSte
             m: Rows(rows),
             n: NDim(I),
             k: KDim(H),
-            residual: None,
         },
         up: GemmBf16 {
             a: ArenaOffset(n),
@@ -143,7 +141,6 @@ const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaSte
             m: Rows(rows),
             n: NDim(I),
             k: KDim(H),
-            residual: None,
         },
         out: ArenaOffset(out),
         kernel: GateUpKernel::Gemm,

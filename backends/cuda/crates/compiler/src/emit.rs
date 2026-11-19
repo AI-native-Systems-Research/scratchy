@@ -51,8 +51,9 @@ use scratchy_subtile::handoff::{
 };
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16,
-    GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemvBf16, LayerScaleBf16, MoeRouteBf16, MoeWeight,
-    NormAddBf16, RmsNormBf16, RouteProgram, RouterLogitsBf16, gdn_conv_dim,
+    GatedDeltaNetBf16, GdnPrefillBf16, GemmBf16, GemmCol64Bf16, GemmCol64Fp8, GemmFp8,
+    GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvTcFp8, LayerScaleBf16, MoeRouteBf16,
+    MoeWeight, NormAddBf16, RmsNormBf16, RouteProgram, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -93,7 +94,14 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "CudaStep",
                 "EmbedBf16",
                 "GemmBf16",
+                "GemmCol64Bf16",
+                "GemmNarrowBf16",
+                "GemmFp8",
+                "GemmCol64Fp8",
+                "GemmNarrowFp8",
                 "GemvBf16",
+                "GemvFp8",
+                "GemvTcFp8",
                 "GemvGroupBf16",
                 "GemvSplit",
                 "NormKernel",
@@ -519,19 +527,18 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             ..
         }) => Some((table, Role::Bf16([u64::from(vocab), u64::from(hidden)], 2))),
         CudaStep::Gemm(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemmCol64(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. })
-        | CudaStep::Gemv(GemvBf16 {
-            gemm: GemmBf16 { b, n, k, .. },
-            ..
-        }) => Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2))),
-        CudaStep::GemmFp8(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemmCol64Fp8(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemmNarrowFp8(GemmBf16 { b, n, k, .. })
-        | CudaStep::GemvFp8(GemvBf16 {
-            gemm: GemmBf16 { b, n, k, .. },
-            ..
-        }) => Some((b, Role::Fp8([u64::from(n), u64::from(k)]))),
+        | CudaStep::GemmCol64(GemmCol64Bf16 { b, n, k, .. })
+        | CudaStep::GemmNarrow(GemmNarrowBf16 { b, n, k, .. })
+        | CudaStep::Gemv(GemvBf16 { b, n, k, .. }) => {
+            Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
+        }
+        CudaStep::GemmFp8(GemmFp8 { b, n, k, .. })
+        | CudaStep::GemmCol64Fp8(GemmCol64Fp8 { b, n, k, .. })
+        | CudaStep::GemmNarrowFp8(GemmNarrowFp8 { b, n, k, .. })
+        | CudaStep::GemvFp8(GemvFp8 { b, n, k, .. })
+        | CudaStep::GemvTcFp8(GemvTcFp8 { b, n, k, .. }) => {
+            Some((b, Role::Fp8([u64::from(n), u64::from(k)])))
+        }
         CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. })
         | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. })
         | CudaStep::AddRmsNorm(AddRmsNormBf16 {
@@ -754,8 +761,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         // The tensor-core decode GEMVs (FP8 S8 T2) read their weights as their CUDA-core twins
         // do; a tensor-core gate/up's first part is itself, so it names its gate's (its second
         // part, the up's GEMV, the up's).
-        CudaStep::GemvTcFp8(g) => role(&CudaStep::GemvFp8(GemvBf16::of(g))),
-        CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(GemvBf16::of(t.fold.gate))),
+        CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(GemvFp8::of(t.fold.gate.matmul()))),
         CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(g))),
         CudaStep::ExpertGateUpTcFp8(t) => {
             role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(t.fold.gate)))

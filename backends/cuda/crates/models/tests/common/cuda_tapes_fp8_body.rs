@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
     CudaStep, ExpertGateUpActBf16, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpKernel, GateUpTcFp8, GemvBf16,
+    ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpKernel, GateUpTcFp8,
     GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
@@ -365,7 +365,7 @@ fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
     for (i, s) in tape.steps.iter().enumerate() {
         match *s {
             CudaStep::QuantRowsFp8(q) => assert_eq!(q.rows, Rows(1), "m=1 step {i}: one row"),
-            CudaStep::GemvFp8(GemvBf16 { gemm: g, .. }) => {
+            CudaStep::GemvFp8(g) => {
                 assert!(!gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1), "m=1 step {i}: {g:?}")
             }
             CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {

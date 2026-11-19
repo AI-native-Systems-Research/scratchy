@@ -9,6 +9,7 @@ use scratchy_subtile::fixtures::{
     rmsnorm_only_input, rope_rotate_only_input, silu_mul_only_input,
 };
 use scratchy_target_cuda::step::Cols;
+use scratchy_target_cuda::step::{GemmNarrowBf16, Matmul};
 use scratchy_target_cuda::step::{KDim, NDim, Rows};
 use std::num::NonZeroU32;
 
@@ -29,7 +30,7 @@ use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, Instr};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, colour_tape};
 use scratchy_subtile::tape_folding::FusedShape;
 use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_rule};
-use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16, GemvBf16};
+use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemvBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
@@ -525,14 +526,13 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     let c = lower_canonical(&gemm_m1(1024, 1024), FACTS, AT).expect("the one-row GEMM lowers");
     assert_eq!(
         c.steps,
-        [CudaStep::Gemv(GemvBf16::of(GemmBf16 {
+        [CudaStep::Gemv(GemvBf16::of(Matmul {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(c.colour_offsets[1]),
             m: Rows(1),
             n: NDim(1024),
             k: KDim(1024),
-            residual: None,
         }))]
     );
     assert_eq!(
@@ -551,12 +551,8 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     assert!(matches!(
         c.steps.as_slice(),
         [CudaStep::Gemv(GemvBf16 {
-            gemm: GemmBf16 {
-                m: Rows(1),
-                n: NDim(2048),
-                k: KDim(2048),
-                ..
-            },
+            n: NDim(2048),
+            k: KDim(2048),
             ..
         })]
     ));
@@ -569,7 +565,7 @@ fn a_decode_gemm_of_a_narrow_n_stays_on_the_narrow_gemm() {
     let c = lower_canonical(&gemm_m1(16, 1024), FACTS, AT).expect("the narrow one-row GEMM lowers");
     assert!(matches!(
         c.steps.as_slice(),
-        [CudaStep::GemmNarrow(GemmBf16 {
+        [CudaStep::GemmNarrow(GemmNarrowBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
             m: Rows(1),

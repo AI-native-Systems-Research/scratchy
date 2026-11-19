@@ -45,9 +45,9 @@ use scratchy_target_cuda::step::{
     EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
     ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
     ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp,
-    GdnPrefillBf16, GdnScratch, GemvBf16, GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8,
-    RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes, norm_row_takes,
-    quant_chain,
+    GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8, GemmNarrowFp8, GemvGroupBf16, GemvTcFp8,
+    MoeWeight, QuantChainError, QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, RopePairing,
+    gdn_scratch, gemv_tc_takes, norm_row_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -1733,10 +1733,8 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
 fn gemv_tc(s: CudaStep) -> CudaStep {
     let fp8 = |w: MoeWeight| matches!(w, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
     match s {
-        CudaStep::GemvFp8(GemvBf16 { gemm: g, .. })
-            if g.m == Rows(1) && gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1) =>
-        {
-            CudaStep::GemvTcFp8(g)
+        CudaStep::GemvFp8(g) if gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1) => {
+            CudaStep::GemvTcFp8(GemvTcFp8::of(g))
         }
         CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {
             let third = g.third.map_or(0, |t| t.n.get());
@@ -1859,10 +1857,10 @@ fn quantize_fp8_inputs(
                 }
             };
             match &mut s {
-                CudaStep::GemmFp8(g)
-                | CudaStep::GemmCol64Fp8(g)
-                | CudaStep::GemmNarrowFp8(g)
-                | CudaStep::GemvTcFp8(g) => g.a = q,
+                CudaStep::GemmFp8(GemmFp8 { a, .. })
+                | CudaStep::GemmCol64Fp8(GemmCol64Fp8 { a, .. })
+                | CudaStep::GemmNarrowFp8(GemmNarrowFp8 { a, .. })
+                | CudaStep::GemvTcFp8(GemvTcFp8 { a, .. }) => *a = q,
                 CudaStep::GemmGroupFp8(g)
                 | CudaStep::GemmNarrowGroupFp8(g)
                 | CudaStep::GemvGroupTcFp8(g) => g.a = q,

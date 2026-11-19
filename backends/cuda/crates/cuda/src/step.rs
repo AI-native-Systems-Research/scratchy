@@ -190,7 +190,7 @@ pub enum CudaStep {
     /// The narrow bf16 GEMM, lowered from `SubOp::MatmulTile` when `n` is at most
     /// [`GEMM_NARROW_BF16_MAX_N`] (`kernels/gemm_narrow_bf16.cu`): the operands of
     /// [`Self::Gemm`], another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
-    GemmNarrow(GemmBf16),
+    GemmNarrow(GemmNarrowBf16),
     /// The bf16 GEMV, a one-row GEMM, lowered from `SubOp::MatmulTile` of a one-row bucket whose
     /// `n` the narrow GEMM does not take (`kernels/gemv_bf16.cu`): the operands of [`Self::Gemm`]
     /// with `m = 1`, another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
@@ -294,7 +294,7 @@ pub enum CudaStep {
     /// of [`GEMM_COL64_TILE`]'s and not of [`GEMM_BF16_TILE`]'s, above
     /// [`GEMM_NARROW_BF16_MAX_N`]: the operands of [`Self::Gemm`], `kernels/gemm_bf16.cu`'s
     /// template at one 64-column B block (`scratchy_cuda_gemm_col64_bf16_abt`, #924).
-    GemmCol64(GemmBf16),
+    GemmCol64(GemmCol64Bf16),
     /// [`Self::Gemm`] of up to three weights off one input in one launch, lowered from the
     /// `SiblingMatmuls` fold (#1049): the q/k/v projections, or a GDN layer's `in_proj_qkv` and
     /// `in_proj_z` (`kernels/gemm_bf16.cu`'s grouped template, `scratchy_cuda_gemm_group_bf16_abt`).
@@ -344,14 +344,14 @@ pub enum CudaStep {
     /// [`Self::Gemm`] over an fp8 weight ([`Fp8Weight`]): `a` is the quant scratch, the e4m3 rows
     /// [`Self::QuantRowsFp8`] wrote, each row's f32 scale after them; `C = (A·Bᵀ) · w_scale[n] ·
     /// a_scale[m]`, rounded once to bf16. Its kernel is S3's.
-    GemmFp8(GemmBf16),
+    GemmFp8(GemmFp8),
     /// [`Self::GemmCol64`] over an fp8 weight, as [`Self::GemmFp8`].
-    GemmCol64Fp8(GemmBf16),
+    GemmCol64Fp8(GemmCol64Fp8),
     /// [`Self::GemmNarrow`] over an fp8 weight (the 27B's `in_proj_a`/`b`), as [`Self::GemmFp8`].
-    GemmNarrowFp8(GemmBf16),
+    GemmNarrowFp8(GemmNarrowFp8),
     /// [`Self::Gemv`] over an fp8 weight: `a` is the bf16 row, which the GEMV quantizes in its
     /// prologue (`kernels/gemv_fp8.cu`).
-    GemvFp8(GemvBf16),
+    GemvFp8(GemvFp8),
     /// [`Self::GemmGroup`] over fp8 weights, as [`Self::GemmFp8`] each.
     GemmGroupFp8(GemmGroupBf16),
     /// [`Self::GemmNarrowGroup`] over fp8 weights (the 27B's `in_proj_a` + `in_proj_b`), as
@@ -363,7 +363,7 @@ pub enum CudaStep {
     /// shapes [`gemv_tc_takes`] takes: `a` is the quant scratch, the one e4m3 row the step before
     /// wrote and its scale after it, as [`Self::GemmFp8`]'s; `c = bf16((a·Bᵀ) · w_scale · a_scale)`
     /// (with the residual's `with_residual` when it has one), WGMMA's fp8 accumulation.
-    GemvTcFp8(GemmBf16),
+    GemvTcFp8(GemvTcFp8),
     /// [`Self::GemvGroupFp8`] on the tensor cores, each member as [`Self::GemvTcFp8`].
     GemvGroupTcFp8(GemmGroupBf16),
     /// [`Self::GateUpAct`] of one row on the tensor cores: the gate and the up as B8's f32
@@ -754,13 +754,20 @@ pub enum GateUpKernel {
 impl GateUpKernel {
     /// The step `g` is on its own.
     pub const fn step(self, g: GemmBf16) -> CudaStep {
+        let g = g.matmul();
         match self {
-            Self::Gemm => CudaStep::Gemm(g),
-            Self::GemmCol64 => CudaStep::GemmCol64(g),
-            Self::Gemv(split) => CudaStep::Gemv(GemvBf16 { gemm: g, split }),
-            Self::GemmFp8 => CudaStep::GemmFp8(g),
-            Self::GemmCol64Fp8 => CudaStep::GemmCol64Fp8(g),
-            Self::GemvFp8(split) => CudaStep::GemvFp8(GemvBf16 { gemm: g, split }),
+            Self::Gemm => CudaStep::Gemm(GemmBf16::of(g)),
+            Self::GemmCol64 => CudaStep::GemmCol64(GemmCol64Bf16::of(g)),
+            Self::Gemv(split) => CudaStep::Gemv(GemvBf16 {
+                split,
+                ..GemvBf16::of(g)
+            }),
+            Self::GemmFp8 => CudaStep::GemmFp8(GemmFp8::of(g)),
+            Self::GemmCol64Fp8 => CudaStep::GemmCol64Fp8(GemmCol64Fp8::of(g)),
+            Self::GemvFp8(split) => CudaStep::GemvFp8(GemvFp8 {
+                split,
+                ..GemvFp8::of(g)
+            }),
         }
     }
 
@@ -905,15 +912,15 @@ pub enum GroupKind {
 
 impl GroupKind {
     /// A member as the step it is on its own (a GEMV at its shape's split, [`GemvBf16::of`]).
-    pub const fn step(self, g: GemmBf16) -> CudaStep {
+    pub const fn step(self, g: Matmul) -> CudaStep {
         match self {
-            Self::Gemm => CudaStep::Gemm(g),
-            Self::GemmNarrow => CudaStep::GemmNarrow(g),
+            Self::Gemm => CudaStep::Gemm(GemmBf16::of(g)),
+            Self::GemmNarrow => CudaStep::GemmNarrow(GemmNarrowBf16::of(g)),
             Self::Gemv => CudaStep::Gemv(GemvBf16::of(g)),
-            Self::GemmFp8 => CudaStep::GemmFp8(g),
-            Self::GemmNarrowFp8 => CudaStep::GemmNarrowFp8(g),
-            Self::GemvFp8 => CudaStep::GemvFp8(GemvBf16::of(g)),
-            Self::GemvTcFp8 => CudaStep::GemvTcFp8(g),
+            Self::GemmFp8 => CudaStep::GemmFp8(GemmFp8::of(g)),
+            Self::GemmNarrowFp8 => CudaStep::GemmNarrowFp8(GemmNarrowFp8::of(g)),
+            Self::GemvFp8 => CudaStep::GemvFp8(GemvFp8::of(g)),
+            Self::GemvTcFp8 => CudaStep::GemvTcFp8(GemvTcFp8::of(GemvFp8::of(g))),
         }
     }
 
@@ -959,15 +966,14 @@ impl GemmGroupBf16 {
     }
 
     /// Member `g` as the GEMM it computes.
-    pub const fn member(&self, g: GroupMember) -> GemmBf16 {
-        GemmBf16 {
+    pub const fn member(&self, g: GroupMember) -> Matmul {
+        Matmul {
             a: self.a,
             b: g.b,
             c: g.c,
             m: self.m,
             n: g.n,
             k: self.k,
-            residual: None,
         }
     }
 }
@@ -1062,23 +1068,193 @@ pub struct EmbedBf16 {
     pub vocab: VocabSize,
 }
 
-/// `C[m, n] = A[m, k] · B[n, k]ᵀ`, bf16 in and out, accumulated in f32.
+/// `C[m, n] = A[m, k] · B[n, k]ᵀ` before its kernel is chosen: what a matmul's lowering builds and
+/// a fold's members are, and every GEMM payload's operands ([`CudaStep::gemm_view`]).
 ///
 /// `A` and `C` are arena slots; `B` is a weight buffer in the checkpoint's `[N, K]` storage order
 /// (the IR states it as `[K, N]`; the bytes are the checkpoint's). `C` overlaps neither operand:
 /// CUDA's colour rule for a matmul reads its inputs across the step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct GemmBf16 {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Matmul {
     pub a: ArenaOffset,
     pub b: WeightIx,
     pub c: ArenaOffset,
     pub m: Rows,
     pub n: NDim,
     pub k: KDim,
-    /// The residual a one-row GEMV adds its output to (FP8 S8 W4a, the one-row bucket's
-    /// `MatvecEpilogue`): `c = bf16(bf16(a · Bᵀ) + residual)`, `add_bf16.cu`'s add, `residual` a
-    /// `[1, n]` arena slot the GEMV reads and `c` the add's own colour. `None` on every other step.
+}
+
+/// One payload per tiled GEMM kernel, each the [`Matmul`] it computes: `m` rows, no epilogue.
+macro_rules! gemm_payload {
+    ($($(#[$doc:meta])* $name:ident;)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub a: ArenaOffset,
+            pub b: WeightIx,
+            pub c: ArenaOffset,
+            pub m: Rows,
+            pub n: NDim,
+            pub k: KDim,
+        }
+
+        impl $name {
+            /// `g` on this kernel.
+            pub const fn of(g: Matmul) -> Self {
+                Self { a: g.a, b: g.b, c: g.c, m: g.m, n: g.n, k: g.k }
+            }
+
+            /// The matmul it computes.
+            pub const fn matmul(&self) -> Matmul {
+                Matmul { a: self.a, b: self.b, c: self.c, m: self.m, n: self.n, k: self.k }
+            }
+        }
+    )*};
+}
+
+gemm_payload! {
+    /// [`CudaStep::Gemm`]: bf16 `A` and `B`, `C` rounded once from f32, on [`GEMM_BF16_TILE`]s.
+    GemmBf16;
+    /// [`CudaStep::GemmCol64`]: [`GemmBf16`]'s operands on [`GEMM_COL64_TILE`]s.
+    GemmCol64Bf16;
+    /// [`CudaStep::GemmNarrow`]: [`GemmBf16`]'s operands, `n` at most [`GEMM_NARROW_BF16_MAX_N`].
+    GemmNarrowBf16;
+    /// [`CudaStep::GemmFp8`]: `a` the quant scratch (the e4m3 rows, each row's f32 scale after
+    /// them), `b` an fp8 weight ([`Fp8Weight`]); `C = (A·Bᵀ) · w_scale[n] · a_scale[m]`, rounded
+    /// once to bf16, on 128-column tiles.
+    GemmFp8;
+    /// [`CudaStep::GemmCol64Fp8`]: [`GemmFp8`]'s operands on 64-column tiles.
+    GemmCol64Fp8;
+    /// [`CudaStep::GemmNarrowFp8`]: [`GemmFp8`]'s operands on the narrow kernel.
+    GemmNarrowFp8;
+}
+
+/// [`CudaStep::Gemv`], a one-row bf16 GEMM: `c [1, n] = a [1, k] · Bᵀ`, at its K split. `residual`
+/// is the residual it adds its output to (FP8 S8 W4a, the one-row bucket's `MatvecEpilogue`): `c =
+/// bf16(bf16(a · Bᵀ) + residual)`, `add_bf16.cu`'s add, `residual` a `[1, n]` arena slot and `c`
+/// the add's own colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvBf16 {
+    pub a: ArenaOffset,
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub n: NDim,
+    pub k: KDim,
     pub residual: Option<ArenaOffset>,
+    pub split: GemvSplit,
+}
+
+/// [`CudaStep::GemvFp8`]: [`GemvBf16`] over an fp8 weight ([`Fp8Weight`]); `a` is the bf16 row,
+/// which the GEMV quantizes in its prologue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvFp8 {
+    pub a: ArenaOffset,
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub n: NDim,
+    pub k: KDim,
+    pub residual: Option<ArenaOffset>,
+    pub split: GemvSplit,
+}
+
+/// [`CudaStep::GemvTcFp8`]: [`GemvFp8`] on the tensor cores, no K split; `a` is the quant scratch,
+/// the one e4m3 row the step before wrote and its scale after it, as [`GemmFp8`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvTcFp8 {
+    pub a: ArenaOffset,
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub n: NDim,
+    pub k: KDim,
+    pub residual: Option<ArenaOffset>,
+}
+
+/// `g`'s one row: a GEMV's kernel rule chose it for one row only.
+const fn one_row(g: Matmul) -> Matmul {
+    assert!(g.m.get() == 1, "a GEMV computes one row");
+    g
+}
+
+impl GemvBf16 {
+    /// `g`, one row, at its shape's split (one pair), no residual.
+    pub const fn of(g: Matmul) -> Self {
+        let g = one_row(g);
+        Self {
+            a: g.a,
+            b: g.b,
+            c: g.c,
+            n: g.n,
+            k: g.k,
+            residual: None,
+            split: GemvSplit::of(g.n.get(), g.k.get(), 1),
+        }
+    }
+
+    /// The matmul it computes, without its residual.
+    pub const fn matmul(&self) -> Matmul {
+        Matmul {
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            m: Rows(1),
+            n: self.n,
+            k: self.k,
+        }
+    }
+}
+
+impl GemvFp8 {
+    /// As [`GemvBf16::of`].
+    pub const fn of(g: Matmul) -> Self {
+        let g = one_row(g);
+        Self {
+            a: g.a,
+            b: g.b,
+            c: g.c,
+            n: g.n,
+            k: g.k,
+            residual: None,
+            split: GemvSplit::of(g.n.get(), g.k.get(), 1),
+        }
+    }
+
+    /// As [`GemvBf16::matmul`].
+    pub const fn matmul(&self) -> Matmul {
+        Matmul {
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            m: Rows(1),
+            n: self.n,
+            k: self.k,
+        }
+    }
+}
+
+impl GemvTcFp8 {
+    /// `g` on the tensor cores, its residual kept.
+    pub const fn of(g: GemvFp8) -> Self {
+        Self {
+            a: g.a,
+            b: g.b,
+            c: g.c,
+            n: g.n,
+            k: g.k,
+            residual: g.residual,
+        }
+    }
+
+    /// As [`GemvBf16::matmul`].
+    pub const fn matmul(&self) -> Matmul {
+        Matmul {
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            m: Rows(1),
+            n: self.n,
+            k: self.k,
+        }
+    }
 }
 
 /// The one `n` the narrow GEMM takes off [`GEMM_NARROW_BF16_MULTIPLE`]: a one-column projection
@@ -1154,24 +1330,6 @@ impl GemvSplit {
     pub const fn of(n: u32, k: u32, pairs: u32) -> Self {
         Self {
             splits: Splits(gemv_splits(n, k, pairs)),
-        }
-    }
-}
-
-/// A dense decode GEMV ([`CudaStep::Gemv`], [`CudaStep::GemvFp8`]): the GEMM it computes, at
-/// its K split.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct GemvBf16 {
-    pub gemm: GemmBf16,
-    pub split: GemvSplit,
-}
-
-impl GemvBf16 {
-    /// `gemm` at its shape's split, one pair.
-    pub const fn of(gemm: GemmBf16) -> Self {
-        Self {
-            gemm,
-            split: GemvSplit::of(gemm.n.get(), gemm.k.get(), 1),
         }
     }
 }
@@ -2271,13 +2429,30 @@ pub struct StepExtents {
 }
 
 impl CudaStep {
+    /// A one-weight GEMM step's matmul (a GEMV's at its one row) and the residual it adds (a
+    /// one-row GEMV's, FP8 S8 W4a); `None` for every other step.
+    pub const fn gemm_view(&self) -> Option<(Matmul, Option<ArenaOffset>)> {
+        match self {
+            Self::Gemm(g) => Some((g.matmul(), None)),
+            Self::GemmCol64(g) => Some((g.matmul(), None)),
+            Self::GemmNarrow(g) => Some((g.matmul(), None)),
+            Self::GemmFp8(g) => Some((g.matmul(), None)),
+            Self::GemmCol64Fp8(g) => Some((g.matmul(), None)),
+            Self::GemmNarrowFp8(g) => Some((g.matmul(), None)),
+            Self::Gemv(g) => Some((g.matmul(), g.residual)),
+            Self::GemvFp8(g) => Some((g.matmul(), g.residual)),
+            Self::GemvTcFp8(g) => Some((g.matmul(), g.residual)),
+            _ => None,
+        }
+    }
+
     /// A decode GEMV's K split and its pairs (`gemv_splits`): the dense GEMV and a GEMV router at
     /// one pair, the expert GEMV at `m · top_k`; `None` for every other step. Every variant is
     /// named, so a new step states whether it is one.
     pub const fn gemv_split(&self) -> Option<(u32, u32, u32)> {
         match *self {
-            Self::Gemv(GemvBf16 { gemm, split }) | Self::GemvFp8(GemvBf16 { gemm, split }) => {
-                Some((gemm.n.get(), 1, split.splits.get()))
+            Self::Gemv(GemvBf16 { n, split, .. }) | Self::GemvFp8(GemvFp8 { n, split, .. }) => {
+                Some((n.get(), 1, split.splits.get()))
             }
             Self::RouterLogits(RouterLogitsBf16 {
                 experts,
@@ -2352,14 +2527,14 @@ impl CudaStep {
     /// The grouped kernel a GEMM step's kernel has (#1049), and the GEMM: `Some` for the tiled
     /// GEMM, the narrow GEMM and the GEMV, the three a `SiblingMatmuls` fold groups; `None` for
     /// every other step. Every variant is named, so a new step states whether it groups.
-    pub const fn group_kind(&self) -> Option<(GroupKind, GemmBf16)> {
+    pub const fn group_kind(&self) -> Option<(GroupKind, Matmul)> {
         match *self {
-            Self::Gemm(g) => Some((GroupKind::Gemm, g)),
-            Self::GemmNarrow(g) => Some((GroupKind::GemmNarrow, g)),
-            Self::Gemv(GemvBf16 { gemm: g, .. }) => Some((GroupKind::Gemv, g)),
-            Self::GemmFp8(g) => Some((GroupKind::GemmFp8, g)),
-            Self::GemmNarrowFp8(g) => Some((GroupKind::GemmNarrowFp8, g)),
-            Self::GemvFp8(GemvBf16 { gemm: g, .. }) => Some((GroupKind::GemvFp8, g)),
+            Self::Gemm(g) => Some((GroupKind::Gemm, g.matmul())),
+            Self::GemmNarrow(g) => Some((GroupKind::GemmNarrow, g.matmul())),
+            Self::Gemv(g) => Some((GroupKind::Gemv, g.matmul())),
+            Self::GemmFp8(g) => Some((GroupKind::GemmFp8, g.matmul())),
+            Self::GemmNarrowFp8(g) => Some((GroupKind::GemmNarrowFp8, g.matmul())),
+            Self::GemvFp8(g) => Some((GroupKind::GemvFp8, g.matmul())),
             Self::QuantRowsFp8(_)
             | Self::GemmCol64Fp8(_)
             | Self::GemmGroupFp8(_)
@@ -2509,19 +2684,19 @@ impl CudaStep {
             };
         }
         let g = match *self {
-            Self::GemmFp8(g)
-            | Self::GemmCol64Fp8(g)
-            | Self::GemmNarrowFp8(g)
-            | Self::GemvTcFp8(g) => g,
+            Self::GemmFp8(g) => g.matmul(),
+            Self::GemmCol64Fp8(g) => g.matmul(),
+            Self::GemmNarrowFp8(g) => g.matmul(),
+            Self::GemvTcFp8(g) => g.matmul(),
             Self::GemmGroupFp8(g) | Self::GemmNarrowGroupFp8(g) | Self::GemvGroupTcFp8(g) => {
                 g.member(g.first)
             }
-            Self::GateUpTcFp8(t) => t.fold.gate,
+            Self::GateUpTcFp8(t) => t.fold.gate.matmul(),
             Self::GateUpAct(GateUpActBf16 {
                 gate,
                 kernel: GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8,
                 ..
-            }) => gate,
+            }) => gate.matmul(),
             _ => return None,
         };
         Some((g.a, g.m.get(), g.k.get()))
@@ -2607,7 +2782,13 @@ impl CudaStep {
         // A tensor-core gate/up: itself (the quantized row, the gate's weight, the activation and
         // its quantization), then its up as the GEMV it is on its own (its weight).
         if let Self::GateUpTcFp8(t) = self {
-            return [Some(*self), Some(Self::GemvTcFp8(t.fold.up)), None];
+            return [
+                Some(*self),
+                Some(Self::GemvTcFp8(GemvTcFp8::of(GemvFp8::of(
+                    t.fold.up.matmul(),
+                )))),
+                None,
+            ];
         }
         if let Self::ExpertGateUpTcFp8(t) = self {
             return [Some(*self), Some(Self::ExpertGemvTcFp8(t.fold.up)), None];
@@ -2682,7 +2863,7 @@ impl CudaStep {
             Self::GemmGroup(g)
             | Self::GemmNarrowGroup(g)
             | Self::GemvGroup(GemvGroupBf16 { group: g, .. }) => {
-                Self::Gemm(g.member(g.first)).extents()
+                Self::Gemm(GemmBf16::of(g.member(g.first))).extents()
             }
             // Its parts' ([`Self::parts`]), each checked as the step it is; here the gate's.
             Self::ExpertGateUpGemmFp8(t) => Self::ExpertGemm(t.gate).extents(),
@@ -2710,55 +2891,14 @@ impl CudaStep {
                 })
             }
             // The quantized rows (the GEMV's: the bf16 row) and the fp8 weight with its scales.
-            Self::GemmFp8(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            })
-            | Self::GemmCol64Fp8(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            })
-            | Self::GemmNarrowFp8(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            })
-            | Self::GemvFp8(GemvBf16 {
-                gemm:
-                    GemmBf16 {
-                        a,
-                        b,
-                        c,
-                        m,
-                        n,
-                        k,
-                        residual,
-                    },
-                ..
-            })
-            | Self::GemvTcFp8(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            }) => {
+            Self::GemmFp8(_)
+            | Self::GemmCol64Fp8(_)
+            | Self::GemmNarrowFp8(_)
+            | Self::GemvFp8(_)
+            | Self::GemvTcFp8(_) => {
+                let Some((Matmul { a, b, c, m, n, k }, residual)) = self.gemm_view() else {
+                    return None;
+                };
                 let ab = match self {
                     Self::GemvFp8(_) => bf16_bytes(m.get(), k.get()),
                     _ => QuantRowsFp8 {
@@ -2821,46 +2961,10 @@ impl CudaStep {
                     in_place: false,
                 })
             }
-            Self::Gemm(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            })
-            | Self::GemmCol64(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            })
-            | Self::GemmNarrow(GemmBf16 {
-                a,
-                b,
-                c,
-                m,
-                n,
-                k,
-                residual,
-            })
-            | Self::Gemv(GemvBf16 {
-                gemm:
-                    GemmBf16 {
-                        a,
-                        b,
-                        c,
-                        m,
-                        n,
-                        k,
-                        residual,
-                    },
-                ..
-            }) => {
+            Self::Gemm(_) | Self::GemmCol64(_) | Self::GemmNarrow(_) | Self::Gemv(_) => {
+                let Some((Matmul { a, b, c, m, n, k }, residual)) = self.gemm_view() else {
+                    return None;
+                };
                 let (Some(ab), Some(bb), Some(cb)) = (
                     bf16_bytes(m.get(), k.get()),
                     bf16_bytes(n.get(), k.get()),
@@ -2960,7 +3064,7 @@ impl CudaStep {
             // the quant scratch's second slot (the up's weight is its part's: `parts`).
             Self::GateUpTcFp8(t) => {
                 let (Some(e), Some(qb)) = (
-                    Self::GemvTcFp8(t.fold.gate).extents(),
+                    Self::GemvTcFp8(GemvTcFp8::of(GemvFp8::of(t.fold.gate.matmul()))).extents(),
                     t.quant_write().bytes(),
                 ) else {
                     return None;
@@ -3780,20 +3884,14 @@ impl CudaStep {
         match self {
             Self::Embed(EmbedBf16 { table, .. }) => Some(table),
             Self::Gemm(GemmBf16 { b, .. })
-            | Self::GemmCol64(GemmBf16 { b, .. })
-            | Self::GemmNarrow(GemmBf16 { b, .. })
-            | Self::Gemv(GemvBf16 {
-                gemm: GemmBf16 { b, .. },
-                ..
-            })
-            | Self::GemmFp8(GemmBf16 { b, .. })
-            | Self::GemmCol64Fp8(GemmBf16 { b, .. })
-            | Self::GemmNarrowFp8(GemmBf16 { b, .. })
-            | Self::GemvFp8(GemvBf16 {
-                gemm: GemmBf16 { b, .. },
-                ..
-            })
-            | Self::GemvTcFp8(GemmBf16 { b, .. }) => Some(b),
+            | Self::GemmCol64(GemmCol64Bf16 { b, .. })
+            | Self::GemmNarrow(GemmNarrowBf16 { b, .. })
+            | Self::Gemv(GemvBf16 { b, .. })
+            | Self::GemmFp8(GemmFp8 { b, .. })
+            | Self::GemmCol64Fp8(GemmCol64Fp8 { b, .. })
+            | Self::GemmNarrowFp8(GemmNarrowFp8 { b, .. })
+            | Self::GemvFp8(GemvFp8 { b, .. })
+            | Self::GemvTcFp8(GemvTcFp8 { b, .. }) => Some(b),
             Self::RmsNorm(RmsNormBf16 { gain, .. })
             | Self::RouterNorm(RmsNormBf16 { gain, .. })
             | Self::AddRmsNorm(AddRmsNormBf16 {

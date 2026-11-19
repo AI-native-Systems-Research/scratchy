@@ -217,7 +217,6 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         m: Rows(m),
         n: NDim(n),
         k: KDim(k),
-        residual: None,
     })
 }
 

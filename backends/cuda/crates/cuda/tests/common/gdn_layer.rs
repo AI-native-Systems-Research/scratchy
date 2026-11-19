@@ -149,7 +149,6 @@ const fn gemm(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> GemmBf16 {
         m: Rows(m),
         n: NDim(n),
         k: KDim(k),
-        residual: None,
     }
 }
 

@@ -19,10 +19,10 @@ use crate::step::{
     ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, FreqDim,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
     GatedDeltaNetBf16, GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GdnScratch,
-    GemmBf16, GemvBf16, HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles,
-    MoeRouteBf16, MoeWeight, NumExperts, NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8,
-    RopeAppendBf16, RopeBf16, RopeTheta, RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows,
-    TopK, VocabSize, gdn_conv_dim, quant_chain, sort_index_regions,
+    HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, MoeWeight,
+    NumExperts, NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
+    RopeBf16, RopeTheta, RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows, TopK, VocabSize,
+    gdn_conv_dim, quant_chain, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -2430,15 +2430,7 @@ impl CudaTape {
     /// passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rows = match *s {
-            CudaStep::Gemv(GemvBf16 {
-                gemm: GemmBf16 { m, .. },
-                ..
-            })
-            | CudaStep::GemvFp8(GemvBf16 {
-                gemm: GemmBf16 { m, .. },
-                ..
-            })
-            | CudaStep::GemvTcFp8(GemmBf16 { m, .. }) => m,
+            CudaStep::Gemv(_) | CudaStep::GemvFp8(_) | CudaStep::GemvTcFp8(_) => Rows(1),
             CudaStep::AttnDecode(AttnDecodeBf16 {
                 attn: AttnPrefillBf16 { rows, .. },
                 ..
@@ -2494,6 +2486,7 @@ pub fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::step::{GemvBf16, Matmul};
     use crate::step::{KDim, LayerId, NDim, NumQHeads};
     use scratchy_subtile::subtile_ir::GainConvention;
 
@@ -2524,7 +2517,6 @@ mod tests {
             m: Rows(256),
             n: NDim(1024),
             k: KDim(512),
-            residual: None,
         }),
         CudaStep::RmsNorm(RmsNormBf16 {
             x: ArenaOffset(262144),
@@ -2574,7 +2566,6 @@ mod tests {
             m: Rows(m),
             n: NDim(n),
             k: KDim(k),
-            residual: None,
         })
     }
 
@@ -4183,14 +4174,13 @@ mod tests {
         input: TapeInput::Hidden(span(0, 1024)),
         result: span(1024, 2048),
         weight_bytes: &[0, 1048576],
-        steps: &[CudaStep::Gemv(GemvBf16::of(GemmBf16 {
+        steps: &[CudaStep::Gemv(GemvBf16::of(Matmul {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(1024),
             m: Rows(1),
             n: NDim(1024),
             k: KDim(512),
-            residual: None,
         }))],
         rotary: None,
         kv: None,
@@ -4220,14 +4210,13 @@ mod tests {
             result: span(0, 2),
             weight_bytes: &[64],
             steps: &const {
-                [CudaStep::Gemv(GemvBf16::of(GemmBf16 {
+                [CudaStep::Gemv(GemvBf16::of(Matmul {
                     a: ArenaOffset(0),
                     b: WeightIx(0),
                     c: ArenaOffset(1024),
                     m: Rows(1),
                     n: NDim(8),
                     k: KDim(4),
-                    residual: None,
                 }))]
             },
             rotary: None,
@@ -4241,27 +4230,11 @@ mod tests {
         assert_eq!(t.validate(), Ok(()));
     }
 
-    /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
-    /// than one row, is refused: the kernel reads one row of `a`.
+    /// A one-row GEMV tape validates; one in a bucket of more than one row is refused: the kernel
+    /// reads one row of `a` (a GEMV of more rows has no payload).
     #[test]
     fn a_gemv_is_one_row_of_a_one_row_bucket() {
         assert_eq!(ONE_ROW.validate(), Ok(()));
-        let two = CudaTape {
-            steps: Box::leak(Box::new([CudaStep::Gemv(GemvBf16::of(GemmBf16 {
-                a: ArenaOffset(0),
-                b: WeightIx(1),
-                c: ArenaOffset(1024),
-                m: Rows(2),
-                n: NDim(512),
-                k: KDim(256),
-                residual: None,
-            }))])),
-            ..ONE_ROW
-        };
-        assert_eq!(
-            two.validate(),
-            Err(TapeError::OneRowStep { step: 0, rows: 2 })
-        );
         let bucket = CudaTape {
             bucket_m: BucketM(2),
             ..ONE_ROW

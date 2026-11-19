@@ -47,8 +47,11 @@ fn every_stored_kernel_choice_is_its_constants_pick() {
             for (i, s) in tape.steps.iter().enumerate() {
                 let at = format!("{} m={} step {i}", entry.stem, tape.bucket_m);
                 match s {
-                    CudaStep::Gemv(g) | CudaStep::GemvFp8(g) => {
-                        assert_eq!(g.split, split(g.gemm.n.get(), g.gemm.k.get(), 1), "{at}");
+                    CudaStep::Gemv(g) => {
+                        assert_eq!(g.split, split(g.n.get(), g.k.get(), 1), "{at}");
+                    }
+                    CudaStep::GemvFp8(g) => {
+                        assert_eq!(g.split, split(g.n.get(), g.k.get(), 1), "{at}");
                     }
                     CudaStep::GemvGroup(g) | CudaStep::GemvGroupFp8(g) => {
                         let members = g.group.members();

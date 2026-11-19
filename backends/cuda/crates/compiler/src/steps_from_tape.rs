@@ -39,8 +39,9 @@ use scratchy_target_cuda::step::{
     GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE,
     GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE,
     GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16,
-    GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmGroupBf16, GemvBf16, GemvSplit,
-    GroupKind, GroupMember, HeadNorms, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel,
+    GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmCol64Bf16, GemmCol64Fp8, GemmFp8,
+    GemmGroupBf16, GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvSplit, GroupKind,
+    GroupMember, HeadNorms, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulKernel,
     MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS,
     ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
     RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
@@ -519,16 +520,22 @@ fn gate_up_act(
         up: None,
     };
     let mul = gated_mul(cx, s, split, computes)?;
-    let kernel = |g: &TapeStep<'_>| match lower_step(cx, g, computes)? {
-        Some(CudaStep::Gemm(g)) => Ok((GateUpKernel::Gemm, g)),
-        Some(CudaStep::GemmCol64(g)) => Ok((GateUpKernel::GemmCol64, g)),
-        Some(CudaStep::Gemv(GemvBf16 { gemm: g, split })) => Ok((GateUpKernel::Gemv(split), g)),
-        Some(CudaStep::GemmFp8(g)) => Ok((GateUpKernel::GemmFp8, g)),
-        Some(CudaStep::GemmCol64Fp8(g)) => Ok((GateUpKernel::GemmCol64Fp8, g)),
-        Some(CudaStep::GemvFp8(GemvBf16 { gemm: g, split })) => {
-            Ok((GateUpKernel::GemvFp8(split), g))
-        }
-        Some(_) | None => Err(refused()),
+    let kernel = |g: &TapeStep<'_>| {
+        let lowered = lower_step(cx, g, computes)?.ok_or_else(refused)?;
+        let kernel = match lowered {
+            CudaStep::Gemm(_) => GateUpKernel::Gemm,
+            CudaStep::GemmCol64(_) => GateUpKernel::GemmCol64,
+            CudaStep::Gemv(g) => GateUpKernel::Gemv(g.split),
+            CudaStep::GemmFp8(_) => GateUpKernel::GemmFp8,
+            CudaStep::GemmCol64Fp8(_) => GateUpKernel::GemmCol64Fp8,
+            CudaStep::GemvFp8(g) => GateUpKernel::GemvFp8(g.split),
+            _ => return Err(refused()),
+        };
+        // A projection feeding the activation folds no residual add.
+        let Some((g, None)) = lowered.gemm_view() else {
+            return Err(refused());
+        };
+        Ok((kernel, GemmBf16::of(g)))
     };
     let (gk, gate) = kernel(absorbed_step(s, gate, computes)?)?;
     let (uk, up) = kernel(absorbed_step(s, up, computes)?)?;
@@ -720,7 +727,7 @@ fn sibling_matmuls(
                 .and_then(CudaStep::group_kind)
                 .ok_or_else(refused)
         })
-        .collect::<Result<Vec<(GroupKind, GemmBf16)>, _>>()?;
+        .collect::<Result<Vec<(GroupKind, Matmul)>, _>>()?;
     let [(kind, first), rest @ ..] = lowered.as_slice() else {
         return Err(refused());
     };
@@ -748,7 +755,7 @@ fn sibling_matmuls(
     // fp8 or all bf16 (the shared fold's rule), and a mixed one is refused here.
     let same = (rest.iter())
         .all(|(k, g)| as_group(*k) == *kind && (g.a, g.m, g.k) == (first.a, first.m, first.k));
-    let member = |(_, g): &(GroupKind, GemmBf16)| GroupMember {
+    let member = |(_, g): &(GroupKind, Matmul)| GroupMember {
         b: g.b,
         c: g.c,
         n: g.n,
@@ -831,26 +838,29 @@ fn gemm(
     let mut inputs = s.inputs.iter();
     let a = activation(cx, s, 0, inputs.next())?;
     let b = weight_operand(cx, s, 1, inputs.next())?;
-    let mut gemm = GemmBf16 {
+    let mut lowered = kernel(Matmul {
         a: at(a),
         b,
         c: at(colour_of(cx, s.writes)),
         m: Rows(m),
         n: NDim(n),
         k: KDim(k),
-        residual: None,
-    };
+    });
     // FP8 S8 W4a: the residual add it folded writes the add's output (`a` the matvec's, `b` the
     // residual), of the matvec's one row, on the one-row GEMVs only.
     if let Some(add) = folded_residual(cx, s, computes)? {
-        let gemv = matches!(kernel(gemm), CudaStep::Gemv(_) | CudaStep::GemvFp8(_));
-        if !gemv || (add.a, add.rows, add.cols) != (gemm.c, Rows(1), Cols(n)) {
+        let (c, residual) = match &mut lowered {
+            CudaStep::Gemv(g) => (&mut g.c, &mut g.residual),
+            CudaStep::GemvFp8(g) => (&mut g.c, &mut g.residual),
+            _ => return Err(CanonicalRefusal::FusionShape { step }),
+        };
+        if (add.a, add.rows, add.cols) != (*c, Rows(1), Cols(n)) {
             return Err(CanonicalRefusal::FusionShape { step });
         }
-        gemm.c = add.out;
-        gemm.residual = Some(add.b);
+        *c = add.out;
+        *residual = Some(add.b);
     }
-    Ok(kernel(gemm))
+    Ok(lowered)
 }
 
 /// `RmsNorm { eps, gain }` as the bf16 RMSNorm: `x` (operand 0) a computed slot or the embedded
@@ -2583,10 +2593,10 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
 /// not depend on where the row sits; then an `m` of 2 or more and an `n` that is a multiple of
 /// 64 and not of 256 goes to the 64-column GEMM under its rule ([`gemm_col64_shape`]); otherwise `m = 1` goes to the GEMV under its rule
 /// ([`gemv_shape`]), and any other `m` to the tiled GEMM under its rule ([`gemm_shape`]).
-fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
+fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmShapeRule> {
     if n != 0 && n <= GEMM_NARROW_BF16_MAX_N && !n.is_multiple_of(GEMM_BF16_TILE.1) {
         gemm_narrow_shape(m, n, k)?;
-        return Ok(CudaStep::GemmNarrow);
+        return Ok(|g| CudaStep::GemmNarrow(GemmNarrowBf16::of(g)));
     }
     if m >= 2
         && n > GEMM_NARROW_BF16_MAX_N
@@ -2594,14 +2604,14 @@ fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmS
         && !n.is_multiple_of(GEMM_BF16_TILE.1)
     {
         gemm_col64_shape(m, n, k)?;
-        return Ok(CudaStep::GemmCol64);
+        return Ok(|g| CudaStep::GemmCol64(GemmCol64Bf16::of(g)));
     }
     if m == 1 {
         gemv_shape(n, k)?;
         return Ok(|g| CudaStep::Gemv(GemvBf16::of(g)));
     }
     gemm_shape(m, n, k)?;
-    Ok(CudaStep::Gemm)
+    Ok(|g| CudaStep::Gemm(GemmBf16::of(g)))
 }
 
 /// Which fp8 GEMM takes `(m, n, k)` (FP8 S2; the kernels are S3's and S4's): `k` a non-zero
@@ -2609,7 +2619,7 @@ fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmS
 /// `m = 1` the GEMV, any `n`; else `n` a multiple of 256 the tiled GEMM, of 64 the 64-column GEMM
 /// (both at `m` a multiple of 128), and below 64 a multiple of [`GEMM_NARROW_BF16_MULTIPLE`] (the
 /// bf16 output's 16-byte rows) the narrow GEMM, at any `m`.
-fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
+fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmShapeRule> {
     for (dim, value) in [("m", m), ("n", n)] {
         if value == 0 {
             return Err(GemmShapeRule::OffTile {
@@ -2643,11 +2653,11 @@ fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, G
         });
     }
     Ok(match (m, n) {
-        (1, _) => |g| CudaStep::GemvFp8(GemvBf16::of(g)),
-        _ if n.is_multiple_of(GEMM_BF16_TILE.1) => CudaStep::GemmFp8,
-        _ if n.is_multiple_of(GEMM_COL64_TILE.1) => CudaStep::GemmCol64Fp8,
+        (1, _) => |g| CudaStep::GemvFp8(GemvFp8::of(g)),
+        _ if n.is_multiple_of(GEMM_BF16_TILE.1) => |g| CudaStep::GemmFp8(GemmFp8::of(g)),
+        _ if n.is_multiple_of(GEMM_COL64_TILE.1) => |g| CudaStep::GemmCol64Fp8(GemmCol64Fp8::of(g)),
         _ if n < GEMM_COL64_TILE.1 && n.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) => {
-            CudaStep::GemmNarrowFp8
+            |g| CudaStep::GemmNarrowFp8(GemmNarrowFp8::of(g))
         }
         _ => {
             return Err(GemmShapeRule::Fp8OffTile {

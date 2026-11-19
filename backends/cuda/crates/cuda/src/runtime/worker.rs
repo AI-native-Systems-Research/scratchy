@@ -51,7 +51,10 @@ use crate::step::{
     QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight,
 };
-use crate::step::{AttnWindow, BucketM, Cols, GdnLayout, HeadDim, NumExperts, Rows, Splits, TopK};
+use crate::step::{
+    AttnWindow, BucketM, Cols, GdnLayout, GemmCol64Bf16, GemmCol64Fp8, GemmFp8, GemmNarrowBf16,
+    GemmNarrowFp8, GemvFp8, GemvTcFp8, HeadDim, NumExperts, Rows, Splits, TopK,
+};
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
     KV_ELEM_BYTES, KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
@@ -1552,17 +1555,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = 'launch: {
                 match *s {
-                    CudaStep::GemvFp8(GemvBf16 {
-                        gemm:
-                            GemmBf16 {
-                                a,
-                                b,
-                                c,
-                                n,
-                                k,
-                                residual,
-                                ..
-                            },
+                    CudaStep::GemvFp8(GemvFp8 {
+                        a,
+                        b,
+                        c,
+                        n,
+                        k,
+                        residual,
                         split,
                     }) => {
                         let b = Self::fp8_weight(weights, b, n.get(), k.get());
@@ -1641,7 +1640,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     // The tensor-core decode GEMVs (FP8 S8 T2, B8): `a` the quant scratch's row.
-                    CudaStep::GemvTcFp8(GemmBf16 {
+                    CudaStep::GemvTcFp8(GemvTcFp8 {
                         a,
                         b,
                         c,
@@ -1703,10 +1702,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::ExpertGateUpTcFp8(t) => {
                         Self::expert_gate_up_tc(&t, slot, partials, weights, stream)
                     }
-                    CudaStep::GemmFp8(GemmBf16 {
+                    CudaStep::GemmFp8(GemmFp8 {
                         a, b, c, m, n, k, ..
                     })
-                    | CudaStep::GemmCol64Fp8(GemmBf16 {
+                    | CudaStep::GemmCol64Fp8(GemmCol64Fp8 {
                         a, b, c, m, n, k, ..
                     }) => {
                         let col64 = matches!(s, CudaStep::GemmCol64Fp8(_));
@@ -1727,7 +1726,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GemmNarrowFp8(GemmBf16 {
+                    CudaStep::GemmNarrowFp8(GemmNarrowFp8 {
                         a, b, c, m, n, k, ..
                     }) => {
                         let (a, b) = (
@@ -1778,7 +1777,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             }
                         }
                     }
-                    CudaStep::GemmCol64(GemmBf16 {
+                    CudaStep::GemmCol64(GemmCol64Bf16 {
                         a, b, c, m, n, k, ..
                     }) => {
                         let b = weights[b.0 as usize].ptr();
@@ -1940,7 +1939,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GemmNarrow(GemmBf16 {
+                    CudaStep::GemmNarrow(GemmNarrowBf16 {
                         a, b, c, m, n, k, ..
                     }) => {
                         let b = weights[b.0 as usize].ptr();
@@ -1956,16 +1955,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::Gemv(GemvBf16 {
-                        gemm:
-                            GemmBf16 {
-                                a,
-                                b,
-                                c,
-                                n,
-                                k,
-                                residual,
-                                ..
-                            },
+                        a,
+                        b,
+                        c,
+                        n,
+                        k,
+                        residual,
                         split,
                     }) => {
                         let b = weights[b.0 as usize].ptr();
