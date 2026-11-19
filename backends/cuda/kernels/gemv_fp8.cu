@@ -52,7 +52,7 @@
 // projection and each pair is its own GEMV's bits. Only `c`'s `P · n` elements and, at `S > 1`,
 // the scratch's `S · P · n_pad` f32 are written.
 //
-// ThunderKittens' operations only (PLAN-tk100 §1), each checked against the pin:
+// ThunderKittens' operations only, each checked against the pin:
 //   - `tma::expect_bytes`, `tma::load_async` of an `sv` through a `gl` with an `sv` descriptor
 //     (`ops/group/util/tma.cuh`, `ops/group/memory/vec/tma.cuh:209`; the descriptor, e4m3 as
 //     `UINT8`, its zero fill, `types/global/tma.cuh:233`); `init_semaphore`, `wait`;

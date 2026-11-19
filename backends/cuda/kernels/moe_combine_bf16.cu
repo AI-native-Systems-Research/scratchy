@@ -8,7 +8,7 @@
 // pairs were sorted by expert (the prefill buckets), else `t · top_k + j` (the gathered decode
 // bucket). `down` is the expert GEMM's or GEMV's bf16 output, `scores` the route's f32 weights.
 //
-// ThunderKittens' warp vector (PLAN-tk100 §2 S4, §3.M M5): one warp per token row, 8 warps per CTA.
+// ThunderKittens' warp vector: one warp per token row, 8 warps per CTA.
 // The row is `hidden / 256` column chunks of a naive `rv_fl<256>`. Per chunk, the accumulator is
 // zeroed, then for each slot in order its down row's chunk is loaded (`warp::load`, bf16 to f32,
 // exact), scaled by the slot's score (`warp::mul`) and added (`warp::add`), and the chunk stored

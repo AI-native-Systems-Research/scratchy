@@ -11,7 +11,7 @@
 // with `softplus(x) = log1p(exp(x))` for `x ≤ 20`, else `x` (metal's `gdn_gating.metal`, its
 // threshold 20). Both are f32, into the step's scratch.
 //
-// ThunderKittens' warp vector (PLAN-tk100 §2 S4, §3.13): one warp per real token row, 8 warps per
+// ThunderKittens' warp vector: one warp per real token row, 8 warps per
 // CTA, any `nv` that is a non-zero multiple of 16 (`step::GDN_GATING_NV_MULTIPLE`). The warp walks
 // its row in `nv / 16` chunks of 16 columns, `nv` read from the views' column count. For each
 // chunk, the row's `a` and `b` are loaded as naive `rv_fl<16>` (`warp::load`, bf16 to f32, exact;

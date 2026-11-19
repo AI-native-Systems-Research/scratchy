@@ -7,7 +7,7 @@
 // sigmoid is the op struct `scratchy::ops::sigmoid`, `1 / (1 + expf(−g))`, Metal's and the shared
 // `GateScale`'s formula.
 //
-// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2), `gate_apply_bf16.cu`'s structure: one CTA per
+// ThunderKittens' 16-row tile, `gate_apply_bf16.cu`'s structure: one CTA per
 // block of 16 rows, one warpgroup of 4 warps. Warp `w` takes the 256-column tiles `w, w + 4, …` of
 // the block. Per tile, lane 0 of the warp TMA-loads `routed` and `shared` into plain shared tiles
 // `st_bf<16, 256, false>` (`tma::expect_bytes` on the stage's semaphore), the warp loads them into

@@ -1454,7 +1454,7 @@ pub fn plan_canonical(
 /// bucket (`CUDA_FOLD_PROJECTIONS`); the one-row bucket's matvecs take the residual add they alone
 /// feed as their epilogue (`CUDA_FUSIONS_ONE_ROW`'s first sweep), as Metal's one-row buckets do. No
 /// norm folds into a matvec (`matvec_norms`, and no `NormedMatvecs` row): a GEMV re-normalises
-/// its row in every CTA (/tmp/d-w4.md §1, the user's decision of 2026-11-09).
+/// its row in every CTA (the user's decision of 2026-11-09).
 pub const fn cuda_fold_facts(m: u64) -> ModelFoldFacts {
     ModelFoldFacts {
         fold_projections: CUDA_FOLD_PROJECTIONS,
@@ -1728,7 +1728,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
 }
 
 /// The decode fp8 GEMV `s` on the tensor cores when [`gemv_tc_takes`] takes its shape at one
-/// token row (FP8 S8 T2, /tmp/a-tc-plan.md §1): a GEMV, a GEMV group, a gate/up of one row (its
+/// token row (FP8 S8 T2): a GEMV, a GEMV group, a gate/up of one row (its
 /// activation at most [`ACT_QUANT_MAX_COLS`] columns), an expert GEMV or expert gate/up over an
 /// fp8 bank. Every other step is as it was; a gate/up's `q_act` is [`quantize_fp8_inputs`]'s to
 /// place.
@@ -1781,7 +1781,7 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
     }
 }
 
-/// The fp8 steps reading a quantized input (FP8 S2, §1c; S8 T2), each served from the quant
+/// The fp8 steps reading a quantized input (FP8 S2; S8 T2), each served from the quant
 /// scratch at the arena's end (`total`), in two slots: the first holds what a [`QuantRowsFp8`]
 /// writes, the second what a tensor-core gate/up's act + quantize writes (its `q_act`), each
 /// slot the largest such write's bytes. Before each reader (a grouped launch, a gate/up pair, an

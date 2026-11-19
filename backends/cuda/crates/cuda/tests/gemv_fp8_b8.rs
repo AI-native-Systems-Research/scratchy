@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! FP8 S8 T1 on the H100 (/tmp/a-tc-plan.md §1, §3.1, §5.2): B8, the tensor-core decode GEMV in its
+//! FP8 S8 T1 on the H100: B8, the tensor-core decode GEMV in its
 //! production form (`kernels/gemv_fp8_tc.cu`'s `gemv_fp8_b8_ker`), and the one-row act + quantize
-//! (`kernels/act_quant_fp8.cu`), at every row of §1's decode inventory of the three FP8 models. No
+//! (`kernels/act_quant_fp8.cu`), at every row of the decode inventory of the three FP8 models (`INVENTORY`). No
 //! tape launches them yet.
 //!
 //! - S3's f64 bound (`|gpu − ref| ≤ 2⁻⁷·|ref| + 2⁻¹¹·S`, `tests/gemm_fp8.rs`'s) at every shape,
@@ -144,7 +144,7 @@ enum Form {
     },
 }
 
-/// One row of §1's inventory.
+/// One row of the decode inventory.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     name: &'static str,
@@ -167,7 +167,7 @@ const TODAY_EXPERTS: u32 = 128;
 const SILU: GatedOp = GatedOp::Silu;
 const GELU: GatedOp = GatedOp::Gelu;
 
-/// §1's inventory: every one-row fp8 GEMV of the three models' decode tapes that B8 takes by
+/// The decode inventory: every one-row fp8 GEMV of the three models' decode tapes that B8 takes by
 /// shape (`n`, `k` multiples of 64), with its launches per token. The 27B's GDN a/b group (`n` 48)
 /// is not in it.
 const INVENTORY: &[Shape] = &[
@@ -1184,7 +1184,7 @@ fn share(c: &Case, (q, sc, act): (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer)) 
     r.expect("the quantize share");
 }
 
-/// T1's pod gate table (/tmp/a-tc-plan.md §5.2, recorded): every inventory row's today, B8, B8
+/// T1's pod gate table (recorded): every inventory row's today, B8, B8
 /// plus its measured quantize share (Q1, or the act + quantize for a down's input) and B8 plus 5
 /// µs, read-cold, A, B, A, B; the gain per token at both, as `T1_ROW` lines. A gate/up row's B8 is
 /// its two f32 members (the act + quantize after it is the down's share).

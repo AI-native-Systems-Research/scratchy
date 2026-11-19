@@ -10,7 +10,7 @@
 //   - `SoftCap`: `out = cap · tanh(x / cap)` (Gemma's final logits, cap 30), the op struct
 //     `scratchy::ops::soft_cap`; Metal's `tanh_soft_cap`.
 //
-// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2), `silu_mul_bf16.cu`'s structure with one operand:
+// ThunderKittens' 16-row tile, `silu_mul_bf16.cu`'s structure with one operand:
 // one CTA per block of 16 rows, one warpgroup of 4 warps. Warp `w` takes the 256-column tiles
 // `w, w + 4, …` of the block. Per tile, lane 0 of the warp TMA-loads `x` into a plain shared tile
 // `st_bf<16, 256, false>` (`tma::expect_bytes` on the stage's semaphore), the warp loads it into

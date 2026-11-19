@@ -359,11 +359,11 @@ pub const fn gemv_tc_f32_bytes(rows: u32, n: u32) -> Option<u64> {
 
 /// The weight bytes a decode fp8 GEMV launch reads at or above which it runs on the tensor cores
 /// ([`gemv_tc_takes`]). shortcut: 1, so every shape the kernel takes switches, until T1's
-/// measured table (/tmp/a-tc-plan.md §4) sets it.
+/// measured table of the tensor-core GEMV against the CUDA-core one sets it.
 pub const GEMV_TC_MIN_BYTES: u64 = 1;
 
 /// Whether a decode fp8 GEMV of members `ns` (0 for an absent one) over `k`, at `pairs` pairs,
-/// runs on the tensor cores (FP8 S8, /tmp/a-tc-plan.md §1): every member's `n` and `k` a non-zero
+/// runs on the tensor cores (FP8 S8): every member's `n` and `k` a non-zero
 /// multiple of [`GEMV_TC_N_MULTIPLE`], at most [`GEMV_TC_MAX_PAIRS`] pairs, and its weight bytes
 /// per launch (`pairs · Σ n · k`) at least [`GEMV_TC_MIN_BYTES`]. A function of the shape alone,
 /// beside [`gemv_splits`]: the lowering picks the kernel with it at expansion.

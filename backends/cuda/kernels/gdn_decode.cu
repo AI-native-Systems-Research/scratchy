@@ -38,7 +38,7 @@
 // launchers' `1 ≤ q_len ≤ rows` at `rows = 1`, so `q_len` is 1. The sequence record (slot, q_len,
 // fresh) is read on the device from the tape's GDN sequence region, never a host argument.
 //
-// ThunderKittens' operations only (PLAN-tk100 §1), each the one its stage's kernel uses: the
+// ThunderKittens' operations only, each the one its stage's kernel uses: the
 // `rv`/`sv` loads and stores, `warp::apply` with `gl::operator[]`, the `rv_fma` gap, `warp::mul`,
 // `add`, `sub`, `sum`, `copy`, `mul_col`, `row_sum`, `broadcast_col`, `row_map<fma_AxCtB>`, and
 // the op structs `silu`, `gdn_g`, `sigmoid`, `l2_inv`, `exp_of`, `rms_inv`. Instantiated for each

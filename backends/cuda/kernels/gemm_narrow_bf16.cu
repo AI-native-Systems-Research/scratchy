@@ -5,7 +5,7 @@
 // gated delta net's `a` and `b` projections are `[hidden, linear_num_value_heads]`: 16 columns in
 // qwen3.5-0.8b, 32 in 9b, which the tiled GEMM (`gemm_bf16.cu`, 256-column tiles) refuses.
 //
-// ThunderKittens' GEMM structure (PLAN-tk100 §3.2), as `gemv_bf16.cu`'s: a producer warp loads
+// ThunderKittens' GEMM structure, as `gemv_bf16.cu`'s: a producer warp loads
 // tiles with TMA, `tma::expect_bytes` before every load, into a ring of `STAGES` stages, and two
 // consumer warpgroups multiply them with WGMMA (`warpgroup::mma_ABt` against the `[N, K]` B,
 // `mma_async_wait` before each stage goes back to the producer). One CTA per 128 output rows, 64
@@ -242,7 +242,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_group_bf16_ker(
 
 // M7 (#857): the one-column projection, `c[r] = a[r, :] · b[0, :]` (a shared expert's gate,
 // `n = 1`). C's row stride is 2 bytes, below a tensor map's 16, so this is ThunderKittens' warp
-// vector (PLAN-tk100 §2 S4), not the tile GEMM above: one warp per row, 8 rows per CTA. The row
+// vector, not the tile GEMM above: one warp per row, 8 rows per CTA. The row
 // of `a` and B's one row are walked in `k / 256` chunks of naive `rv_fl<256>` (`warp::load`, bf16
 // to f32, exact), each chunk's products `warp::mul` then accumulated by `warp::add` in chunk
 // order, then summed by `warp::sum` (each lane's elements in order, then a fixed shuffle tree into

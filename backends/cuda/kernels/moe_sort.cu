@@ -14,7 +14,7 @@
 // (qwen3-5-moe) and 128 (Gemma 4 26B-A4B, #924). Nothing else depends on it.
 //
 // A stable counting sort in three stream-ordered launches, with no atomics, shuffles or ballots
-// (PLAN-tk100 §3.M M2): where order matters the work is serial, so the result is the same bits on
+//: where order matters the work is serial, so the result is the same bits on
 // every run.
 //   (a) One warp per chunk of 256 pairs (`step::MOE_SORT_CHUNK`). The counters are a shared
 //       `sv<int, E>`, zeroed by `warp::zero`. Lane 0 walks the chunk's pairs in pair order:
@@ -29,7 +29,7 @@
 //       `offsets[E]`. Lane 0 then writes `tile_expert` for the live tiles, expert by expert.
 //   (c) One warp per pair, 8 warps per CTA: `pos[p] = offsets[e] + base[c][e] + rank[p]` (integer
 //       scalars), and the token row bulk-copied into `rows[pos[p]]` through the warp's
-//       `sv_bf<2048>` (PLAN-tk100 §2 S3, as `embed_bf16.cu`), bit-exact, NaN payloads included.
+//       `sv_bf<2048>`, bit-exact, NaN payloads included.
 //       Past the pairs' CTAs, one warp per expert writes its run's padding rows from a zeroed
 //       buffer (`warp::zero`, then bulk stores).
 // The points where one warp's TK operations meet on one shared vector, each a `__syncwarp()`

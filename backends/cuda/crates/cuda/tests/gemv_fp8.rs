@@ -1034,7 +1034,7 @@ fn the_fp8_gemv_residual_epilogue_is_the_gemv_then_the_add_bit_for_bit() {
     );
 }
 
-/// FP8 S8 W4a's timing (the brief's §6.5): the fp8 GEMV with its residual epilogue beside the
+/// FP8 S8 W4a's timing: the fp8 GEMV with its residual epilogue beside the
 /// same GEMV without, by CUDA events, cold and hot, and the µs the epilogue adds per launch, at
 /// the 27B's o/out and down and the 35B's o (its real split, 4). The brief's stop rule is more than
 /// 2 µs added; recorded, not asserted (the clock ramp moves a run by about 35%), each line with its
@@ -1089,7 +1089,7 @@ fn the_w4_fused_end_times_are_recorded() {
     }
 }
 
-/// FP8 S8's full-wave gate/up GEMV (/tmp/d-m0.md §4): the one-row gate/up launch takes the plain
+/// FP8 S8's full-wave gate/up GEMV: the one-row gate/up launch takes the plain
 /// GEMV's `rows_per_warp`, not a fixed 4 rows. One gate/up of the tape's shapes, `(what, n, k,
 /// act, expert)`, `expert` the bank's `(experts, top_k)`: the 27B's dense (17,408 × 5,120, 544 ->
 /// 726 CTAs), Gemma's dense (2,112 × 2,816, GeGLU, 66 -> 132), the 35B's routed experts (8 picks

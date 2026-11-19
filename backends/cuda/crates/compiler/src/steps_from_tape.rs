@@ -780,7 +780,7 @@ fn gemm(
 ) -> Result<CudaStep, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
     // An fp8 weight's third operand is its per-channel scale, `[1, n]`. A block-scaled kind
-    // (`GemmWeight::Fp8Block`, FP8 §6) would get its own arm here, its scale `[n/bn, k/bk]`, and
+    // (`GemmWeight::Fp8Block`) would get its own arm here, its scale `[n/bn, k/bk]`, and
     // its own kernel family from `gemm_kernel`'s fp8 counterpart.
     let (act, wt, scale) = match (weight, node.inputs.as_slice()) {
         (GemmWeight::Fp8Dynamic, [act, wt, scale]) => (act, wt, Some(scale)),

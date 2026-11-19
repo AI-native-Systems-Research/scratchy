@@ -287,7 +287,7 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
 ///
 /// No norm folds into its matvecs (the shared `NormedMatvecs`): measured on the H100 at 38384fc6, a
 /// GEMV that normalises its own row does it in every CTA, 23-63 µs a launch at the 27B shapes, more
-/// than the norm's launch it saves (/tmp/d-w4.md §1; the user's decision of 2026-11-09).
+/// than the norm's launch it saves (the user's decision of 2026-11-09).
 pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
     // A decode attention's operands from 1 on are no consumer edges (Metal's row): its new K and V
     // (operands 3 and 4) name what its layer's append wrote, the cache its kernel reads. So the V

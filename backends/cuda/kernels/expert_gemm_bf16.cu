@@ -17,8 +17,7 @@
 // launcher's check; `N_BLOCK` only the B block's width, as `gemm_bf16.cu`'s two instances.
 //
 // Built from `kernels/gemm_bf16.cu` (ThunderKittens' `lcf` `matmul_template<2, 4, 8>`, adapted
-// from TK's `kernels/gemm/bf16_h100` at 67845f5f, MIT, see `thunderkittens/LICENSE`), PLAN-tk100
-// §3.M M3. Its producer, consumer and finish are that kernel's: swizzled `st_bf<64, 64>` input
+// from TK's `kernels/gemm/bf16_h100` at 67845f5f, MIT, see `thunderkittens/LICENSE`). Its producer, consumer and finish are that kernel's: swizzled `st_bf<64, 64>` input
 // tiles in a 4-stage ring, `rt_fl<16, 256>` accumulators, `warpgroup::mma_ABt` against the `[N, K]`
 // B (`b_stack_tile`), `tma::expect` and `tma::load_async` on the input semaphore, and
 // `warpgroup::mma_async_wait` before each stage's release. So every live tile's rows are the bits

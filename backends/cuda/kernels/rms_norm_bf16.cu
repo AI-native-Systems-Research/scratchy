@@ -25,7 +25,7 @@
 // The forms are `template <int FORM>`: the two passes, the reduction order and `rms_inv` are the
 // plain norm's code, so each output is the bits of today's `Add` then `RmsNorm`, or `RmsNorm` then
 // `Add`.
-// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2, §3.3): one CTA per block of 16 rows, one
+// ThunderKittens' 16-row tile: one CTA per block of 16 rows, one
 // warpgroup of 4 warps. Warp `w` takes the 256-column tiles `w, w + 4, …` of the block, in two
 // passes over `x`, each tile TMA-loaded by the warp's lane 0 into a plain `st_bf<16, 256, false>`
 // through a 2-stage ring per warp:

@@ -10,7 +10,7 @@
 // in f32, rounded once (metal's `gdn_rms_norm_gated.metal`). The gate is SiLU, not sigmoid, and
 // the gain is plain, not the zero-centred `1 + w` of qwen3.5's other norms.
 //
-// ThunderKittens' warp vector (PLAN-tk100 §2 S4, §3.15): one warp per `(t, h)` row, 8 warps per
+// ThunderKittens' warp vector: one warp per `(t, h)` row, 8 warps per
 // CTA, instantiated for `head_v` 32, 64, …, 256 (`HV`). The row's `o` is loaded as a naive
 // `rv_fl<HV>` (`warp::load` from the f32 `gl`, viewed `[rows · nv, head_v]`), its squares by
 // `warp::mul` and their sum by `warp::sum` (each lane's elements in order, then a fixed shuffle

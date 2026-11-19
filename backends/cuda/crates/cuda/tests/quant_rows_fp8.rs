@@ -75,7 +75,7 @@ fn device_quant(device: &CudaDevice, x: &[u16], rows: usize, cols: usize) -> (Ve
     (qd[..rows * cols].to_vec(), sd[..rows].to_vec())
 }
 
-/// Every `k` of the three FP8 checkpoints' fp8 GEMMs (FP8 plan §1a), and a partial last 256-column
+/// Every `k` of the three FP8 checkpoints' fp8 GEMMs, and a partial last 256-column
 /// tile (320): bytes and scales bit-identical to the host quantizer at 16 and 4096 rows, one row
 /// at each scale extreme (all zeros: the floor; one at ±448 times a large value).
 #[test]

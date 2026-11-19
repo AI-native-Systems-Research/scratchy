@@ -353,7 +353,7 @@ fn the_quant_scratch_liveness_check_holds_and_bites() {
     }
 }
 
-/// The decode tape's fp8 GEMVs on the tensor cores (FP8 S8 T2, /tmp/a-tc-plan.md §1, §2): every
+/// The decode tape's fp8 GEMVs on the tensor cores (FP8 S8 T2): every
 /// CUDA-core fp8 GEMV left is one `gemv_tc_takes` refuses; every quant write quantizes the one
 /// token row; every tensor-core gate/up's down, the step right after it, reads its act + quantize's
 /// write; and the quant scratch's liveness check holds.
