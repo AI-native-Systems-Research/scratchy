@@ -129,9 +129,10 @@ struct Cell {
     p_tid: u32,
     sin_tid_signed: u32,
     /// The per-column sign of the signed sin' table, READ from `rope_p_entry` (one call per
-    /// column; `±1` is never typed). The runner's fill builds `sin' = sign[col % hd]·sin` from
-    /// this array — the writer is the one statement of the sign law.
-    sin_sign: Vec<i64>,
+    /// column; `±1` is never typed) — the entry's own type. The runner's fill builds
+    /// `sin' = sign[col % hd]·sin` from this array — the writer is the one statement of the
+    /// sign law.
+    sin_sign: Vec<i8>,
     /// The probe synthetic's name (`t{out}_rot` or, for halfswap4, `t{out}_rs`) — the runner
     /// reads it back directly and compares it per `probe_kind`.
     probe_synth: String,
@@ -360,9 +361,10 @@ fn half_move_of(hd: u32, o_lo: u32, o_hi: u32) -> (i64, OpFunc) {
 }
 
 /// The signed sin' table's per-column sign, READ from `rope_p_entry` — one call per column,
-/// `±1` never typed. The ONE statement of the sign law: the runner's fill builds
-/// `sin' = sign[col % hd] · sin` from this array, so the op never carries a sign.
-fn sin_signs(hd: u32) -> Vec<i64> {
+/// `±1` never typed, the entry's own type carried through. The ONE statement of the sign law:
+/// the runner's fill builds `sin' = sign[col % hd] · sin` from this array, so the op never
+/// carries a sign.
+fn sin_signs(hd: u32) -> Vec<i8> {
     (0..hd)
         .map(|o| {
             let inn = (0..hd)
