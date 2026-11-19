@@ -3090,6 +3090,7 @@ dependencies = [
  "clap",
  "hf-hub-downloader",
  "inventory",
+ "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-tensors",

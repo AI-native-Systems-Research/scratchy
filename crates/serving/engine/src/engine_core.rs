@@ -260,9 +260,10 @@ impl EngineCore {
                 );
                 tracker = tracker.sharing_one_write_slot();
             }
-            // Hybrid sliding-window KV (gemma4): one null-padded block table per
-            // group over the ONE shared pool. `enable_hybrid` forces prefix
-            // caching off (sliding groups can't be rebuilt from a cached prefix).
+            // Hybrid sliding-window KV (every model with sliding-window layers): one
+            // null-padded block table per group over the ONE shared pool. Prefix caching
+            // stays as configured: a hit reuses the full group's cached prefix and each
+            // sliding group's in-window suffix.
             if let Some((num_blocks, groups)) = config.hybrid_kv.clone() {
                 let n_sliding = groups.iter().filter(|g| g.0).count();
                 let stores = executor.hybrid_kv_stores();

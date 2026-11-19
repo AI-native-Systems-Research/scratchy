@@ -235,6 +235,15 @@ pub trait Worker: Send {
         None
     }
 
+    /// Every layer's KV geometry for a model with sliding-window layers — whether each slides
+    /// (and its window), its KV heads and head dim — as the worker's compiled model states it.
+    /// The scheduler lays the hybrid KV pool out from it, the same geometry the worker lays its
+    /// own pool out from, so the two never disagree on the groups. `None` (the default): one
+    /// uniform pool.
+    fn kv_layer_geometry(&self) -> Option<Vec<scratchy_core_config::LayerKvGeometry>> {
+        None
+    }
+
     /// Whether this worker's DECODE path implements the hybrid sliding-window
     /// KV layout — separate paged cache groups per sliding window, addressed by
     /// the `sliding_groups` per-request block tables. A per-group decode wires this; a

@@ -1613,6 +1613,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-core-config"
+version = "0.1.0"
+dependencies = [
+ "scratchy-core-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "scratchy-core-model"
 version = "0.1.0"
 dependencies = [
@@ -1634,6 +1643,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "inventory",
+ "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-tensors",

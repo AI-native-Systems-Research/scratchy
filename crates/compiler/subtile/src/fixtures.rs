@@ -733,7 +733,7 @@ pub fn gemm_m1_only_input() -> LoweringInput {
 /// A codec shaped like a TurboQuant one.
 pub const TURBOQUANT_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
     head_dims: CodecHeadDims::PowerOfTwoAtMost(512),
-    hybrid_class: AttnMask::Causal,
+    coded_class: AttnMask::Causal,
     after_writer: &[
         Guarded {
             step: KvOperand::K,

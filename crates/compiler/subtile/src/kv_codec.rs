@@ -118,12 +118,12 @@ impl CodecHeadDims {
 
 /// A target's KV codec, as data.
 pub struct KvCodecFacts {
-    /// Every head dim the KV writers and attentions run at must be one of these, or nothing is
-    /// coded.
+    /// Every head dim the coded class's KV writers and attentions run at must be one of these, or
+    /// nothing is coded.
     pub head_dims: CodecHeadDims,
-    /// On an arch whose writers and attentions run at more than one head dim, the one class
-    /// coded; an arch with one head dim codes every class.
-    pub hybrid_class: AttnMask,
+    /// The one class coded, on every arch. A layer of another class (a sliding window) keeps its
+    /// KV dense, in a group of its own in the KV pool (`compute_hybrid_kv_layout`).
+    pub coded_class: AttnMask,
     /// After each coded KV writer — whether or not an attention reads its cache.
     pub after_writer: &'static [Guarded<KvOperand>],
     /// Around each coded attention of a decode form (one query row per sequence) ...
@@ -188,16 +188,17 @@ pub fn expand_kv_codec(
     facts: &KvCodecFacts,
 ) -> Result<LoweredDecode, KvCodecError> {
     let ops = &l.input.ops;
-    // A writer states the model's base head dim (the rope class's, off the op's
-    // own attention facts), an attention its class's.
+    let coded = |class: AttnMask| class == facts.coded_class;
+    // The coded class's head dims: a writer states the model's base head dim (the rope class's,
+    // off the op's own attention facts), an attention its class's.
     let mut dims: Vec<u32> = ops
         .iter()
         .filter_map(|od| match od.op {
-            SubOp::RopeAppend { .. } => od.op.rope_head_dim().map(|d| d.get()),
-            SubOp::KvAppend { head_dim, .. } => Some(head_dim.get()),
+            SubOp::RopeAppend { attn, .. } if coded(attn) => od.op.rope_head_dim().map(|d| d.get()),
+            SubOp::KvAppend { head_dim, attn, .. } if coded(attn) => Some(head_dim.get()),
             SubOp::AttnDecode {
                 mask, attention, ..
-            } => Some(attention.class(mask.class()).head_dim().get()),
+            } if coded(mask) => Some(attention.class(mask.class()).head_dim().get()),
             _ => None,
         })
         .collect();
@@ -206,8 +207,6 @@ pub fn expand_kv_codec(
     if dims.is_empty() || !dims.iter().all(|hd| facts.head_dims.admits(*hd)) {
         return Ok(l.clone());
     }
-    let hybrid = dims.len() > 1;
-    let coded = |class: AttnMask| !hybrid || class == facts.hybrid_class;
     let first_id = l.op_expansion.iter().flatten().map(|e| e.id.0 + 1).max();
     let mut x = Expander {
         l,

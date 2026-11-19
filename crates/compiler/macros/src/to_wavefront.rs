@@ -1106,20 +1106,15 @@ pub fn lower_decode_to_wavefront(
                 // ⭐ THE WINDOW SIZE, from the model's own bounds (the
                 // helper's doc states the law). A placeholder `1` on the
                 // causal arms never escapes the mask construction below.
-                let window = if matches!(
-                    node.op,
-                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention
-                ) {
+                let window = if node.op.slides() {
                     sliding_window_bound(tile, bx.model, node.op)?
                 } else {
                     // Causal: unused below; a placeholder value that never escapes.
                     std::num::NonZeroU32::MIN
                 };
-                let mask = match node.op {
-                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention => {
-                        AttnMask::SlidingWindow { window }
-                    }
-                    _ => AttnMask::Causal,
+                let mask = match node.op.slides() {
+                    true => AttnMask::SlidingWindow { window },
+                    false => AttnMask::Causal,
                 };
                 // The class's geometry off the facts — Causal is the global class,
                 // SlidingWindow the base (on a uniform model the two are equal).

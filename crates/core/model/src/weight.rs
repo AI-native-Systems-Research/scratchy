@@ -585,35 +585,6 @@ impl HfModelConfig {
             .or_else(|| self.head_dim())
     }
 
-    /// Per-layer KV geometry for the hybrid SWA KV layout:
-    /// `(is_sliding, num_kv_heads, head_size, sliding_window)` in layer order.
-    /// `None` unless [`Self::is_swa_hybrid`]. Sliding layers use the base dims;
-    /// full layers use the GLOBAL dims (gemma4: sliding 8×256 / full 2×512).
-    #[allow(clippy::type_complexity)]
-    pub fn hybrid_layer_geometry(&self) -> Option<Vec<(bool, usize, usize, Option<usize>)>> {
-        if !self.is_swa_hybrid() {
-            return None;
-        }
-        let types = self.layer_types()?;
-        let base_kv = self.num_kv_heads()?;
-        let base_hd = self.head_dim()?;
-        let global_kv = self.num_global_kv_heads()?;
-        let global_hd = self.global_head_dim()?;
-        let window = self.sliding_window();
-        Some(
-            types
-                .iter()
-                .map(|t| {
-                    if t == "sliding_attention" {
-                        (true, base_kv, base_hd, window)
-                    } else {
-                        (false, global_kv, global_hd, None)
-                    }
-                })
-                .collect(),
-        )
-    }
-
     /// Whether the model mixes full and sliding-window attention layers
     /// (gemma4: 5 `full_attention` + 25 `sliding_attention`) — the case the
     /// hybrid SWA KV allocator targets. Requires both a `sliding_window` and a

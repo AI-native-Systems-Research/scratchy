@@ -361,29 +361,15 @@ mod imp {
         let layers = model.num_hidden_layers() as usize;
         let kv_heads = model.num_key_value_heads() as usize;
         let head_dim = model.head_dim() as usize;
-        let per_layer = model.per_layer_kv_token_elems();
-        // Hybrid KV (gemma4 SWA): the SAME shared layout the worker builds —
-        // `compute_hybrid_kv_layout` over per-layer page proxies
-        // (`per_layer_kv_token_elems`, head_size 1 — only the ratio drives
-        // grouping), then the pool with `layer_to_tensor` sharing and the
-        // group layout attached. Uniform models (`per_layer == None`) keep
-        // the one-tensor-per-layer pool, byte-identical to before.
+        let kv_layers = model.kv_layer_geometry();
+        // Hybrid KV (every model with sliding-window layers): the SAME shared layout the worker
+        // builds — `compute_hybrid_kv_layout` over the compiled per-layer geometry
+        // (`kv_layer_geometry`), then the pool with `layer_to_tensor` sharing and the group layout
+        // attached. A model without sliding layers keeps the one-tensor-per-layer pool.
         let hybrid: Option<scratchy_core_config::HybridKvLayout> =
-            per_layer.as_ref().and_then(|elems| {
-                let max_e = *elems.iter().max()?;
-                let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
-                    .iter()
-                    .map(|&e| scratchy_core_config::LayerKvGeometry {
-                        is_sliding: e == max_e,
-                        // Page proxy: head_size 1 keeps the per-class page RATIO.
-                        num_kv_heads: e,
-                        head_size: 1,
-                        head_size_v: None,
-                        sliding_window: if e == max_e { Some(1) } else { None },
-                    })
-                    .collect();
+            kv_layers.as_ref().and_then(|geom| {
                 scratchy_core_config::compute_hybrid_kv_layout(
-                    &geom,
+                    geom,
                     scratchy_core_common::KvBlockTokens::new(BLOCK_SIZE).expect("16 > 0"),
                     usize::MAX / 2,
                     2, // bf16 elem bytes — only the (ignored) num_blocks read
