@@ -16,7 +16,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use scratchy_core_common::SamplingParams;
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::error::{ExecutorError, ExecutorResult};
@@ -38,9 +37,8 @@ use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
 use tracing::info;
 
 use crate::plan::{
-    block_table_u32, check_kv_cache_dtype, check_quantization_config, check_sampling,
-    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes,
-    scheduled_request,
+    block_table_u32, check_kv_cache_dtype, check_quantization_config, choose_bucket, emits_token,
+    fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes, scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -224,19 +222,16 @@ impl CudaServingWorker {
         self.model.as_ref().and_then(|m| m.kv)
     }
 
-    /// Admit a new request: its sampling refused unless greedy, then its whole prompt and block
-    /// table into the `InputBatch`.
+    /// Admit a new request: its whole prompt and block table into the `InputBatch`. Its sampling
+    /// is greedy: the API refused anything else at its door (the factory's `served()`).
     fn admit(
         &mut self,
         req_id: &str,
         prompt: &[u32],
-        params: Option<&SamplingParams>,
         blocks: Vec<usize>,
         num_computed_tokens: u32,
-    ) -> ExecutorResult<()> {
-        check_sampling(params).map_err(exec)?;
+    ) {
         (self.input_batch).add_request(req_id.to_string(), prompt, blocks, num_computed_tokens);
-        Ok(())
     }
 
     /// The scheduler's `num_computed_tokens` for `req_id` this step.
@@ -540,15 +535,14 @@ impl Worker for CudaServingWorker {
                 r.gdn.release(gdn_slot_key(id));
             }
         }
-        // 2. New requests: greedy sampling only, then their prompt and blocks (one KV cache group).
+        // 2. New requests: their prompt and blocks (one KV cache group).
         for nr in &sched.scheduled_new_reqs {
             self.admit(
                 &nr.req_id,
                 nr.prompt_token_ids.as_deref().unwrap_or(&[]),
-                nr.sampling_params.as_ref(),
                 nr.block_ids.first().cloned().unwrap_or_default(),
                 nr.num_computed_tokens,
-            )?;
+            );
         }
         // Cached requests: the scheduler ships each one's whole block table, which replaces the
         // old; a resumed request starts again from its `num_computed_tokens`.

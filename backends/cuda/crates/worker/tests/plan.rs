@@ -11,8 +11,8 @@ use scratchy_serving_engine::worker_factory::WorkerFactory;
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvClass, KvTape};
 use scratchy_target_cuda_worker::plan::{
     PlanError, QuantRefusal, block_table_u32, check_kv_cache_dtype, check_quantization_config,
-    check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token,
-    kv_block_bytes, logits_row, scheduled_request,
+    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes,
+    logits_row, scheduled_request,
 };
 use scratchy_target_cuda_worker::{CudaWorkerFactory, NO_NVCC};
 
@@ -252,7 +252,8 @@ fn only_the_e4m3_kv_cache_is_served() {
 
 #[test]
 fn greedy_sampling_is_served() {
-    assert_eq!(check_sampling(Some(&greedy())), Ok(()));
+    let served = CudaWorkerFactory.served();
+    assert_eq!(served.refusal(&greedy()), None);
     // Top-k, top-p and min-p keep the argmax at temperature 0.
     let filtered = SamplingParams {
         top_k: 20,
@@ -260,29 +261,32 @@ fn greedy_sampling_is_served() {
         min_p: 0.1,
         ..greedy()
     };
-    assert_eq!(check_sampling(Some(&filtered)), Ok(()));
+    assert_eq!(served.refusal(&filtered), None);
 }
 
-/// Every refusal names what to change.
+/// Every refusal names what to change. `prompt_logprobs` is refused at the door by the worker's
+/// `scores_prompts`, and a request with no params is checked there under the defaults.
 #[test]
 fn anything_but_greedy_is_refused_with_the_fix() {
-    let cases: Vec<(SamplingParams, PlanError, &str)> = vec![
+    use scratchy_serving_engine::worker_factory::Unserved;
+    let served = CudaWorkerFactory.served();
+    let cases: Vec<(SamplingParams, Unserved, &str)> = vec![
         (
             SamplingParams {
                 temperature: 0.7,
                 ..greedy()
             },
-            PlanError::NotGreedy { temperature: 0.7 },
+            Unserved::Sampling { temperature: 0.7 },
             "--temperature 0",
         ),
         (
             SamplingParams::default(),
-            PlanError::NotGreedy { temperature: 1.0 },
+            Unserved::Sampling { temperature: 1.0 },
             "\"temperature\": 0",
         ),
         (
             SamplingParams { n: 2, ..greedy() },
-            PlanError::Completions { n: 2 },
+            Unserved::Completions { n: 2 },
             "\"n\": 1",
         ),
         (
@@ -290,23 +294,15 @@ fn anything_but_greedy_is_refused_with_the_fix() {
                 logprobs: Some(5),
                 ..greedy()
             },
-            PlanError::Logprobs,
+            Unserved::Logprobs,
             "drop \"logprobs\"",
-        ),
-        (
-            SamplingParams {
-                prompt_logprobs: Some(1),
-                ..greedy()
-            },
-            PlanError::PromptLogprobs,
-            "drop \"prompt_logprobs\"",
         ),
         (
             SamplingParams {
                 repetition_penalty: 1.1,
                 ..greedy()
             },
-            PlanError::Penalties,
+            Unserved::Penalties,
             "\"repetition_penalty\": 1",
         ),
         (
@@ -314,7 +310,7 @@ fn anything_but_greedy_is_refused_with_the_fix() {
                 logit_bias: Some([(3, 1.0)].into()),
                 ..greedy()
             },
-            PlanError::LogitTransform {
+            Unserved::LogitTransform {
                 field: "logit_bias",
             },
             "drop \"logit_bias\"",
@@ -324,23 +320,18 @@ fn anything_but_greedy_is_refused_with_the_fix() {
                 allowed_token_ids: Some(vec![1]),
                 ..greedy()
             },
-            PlanError::LogitTransform {
+            Unserved::LogitTransform {
                 field: "allowed_token_ids",
             },
             "drop \"allowed_token_ids\"",
         ),
     ];
     for (params, want, fix) in cases {
-        let got = check_sampling(Some(&params)).unwrap_err();
+        let got = served.refusal(&params).expect("refused at the door");
         assert_eq!(got, want);
         let msg = got.to_string();
-        assert!(
-            msg.contains("samples greedily only") && msg.contains(fix),
-            "{msg} names {fix}"
-        );
+        assert!(msg.contains(fix), "{msg} names {fix}");
     }
-    let none = check_sampling(None).unwrap_err().to_string();
-    assert!(none.contains("--temperature 0"), "{none}");
 }
 
 /// The factory is named `cuda`, addresses KV in 64-token blocks, serves no cached prefix, and

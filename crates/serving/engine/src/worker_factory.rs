@@ -93,8 +93,8 @@ impl std::fmt::Display for Unserved {
         match self {
             Self::Penalties => write!(
                 f,
-                "this backend serves no repetition, presence or frequency penalty: leave them at \
-                 their defaults"
+                "this backend serves no repetition, presence or frequency penalty: drop them \
+                 (\"repetition_penalty\": 1, \"presence_penalty\": 0, \"frequency_penalty\": 0)"
             ),
             Self::Sampling { temperature } => write!(
                 f,
@@ -110,7 +110,7 @@ impl std::fmt::Display for Unserved {
             Self::LogitTransform { field } => {
                 write!(
                     f,
-                    "this backend does not serve {field}: drop it from the request"
+                    "this backend does not serve {field}: drop \"{field}\" from the request"
                 )
             }
         }

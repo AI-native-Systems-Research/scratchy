@@ -2592,7 +2592,7 @@ impl AsyncEngine {
     async fn submit_request(
         &self,
         request_id: String,
-        ec_request: EngineCoreRequest,
+        mut ec_request: EngineCoreRequest,
         num_prompt_tokens: u32,
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
         detokenizer: Option<IncrementalDetokenizer>,
@@ -2627,11 +2627,7 @@ impl AsyncEngine {
         // ⛔ AND SAMPLING THE BACKEND CANNOT SERVE, HERE TOO, for the same reason: refused in the
         // worker it fails a step the scheduler already formed (a 500, and an orphan step behind it);
         // refused here it is one request's 400, and the scheduler never admits it.
-        if let Some(why) =
-            (ec_request.sampling_params.as_ref()).and_then(|p| self.served.refusal(p))
-        {
-            return Err(crate::error::ServeError::Validation(why.to_string()));
-        }
+        self.check_served(&mut ec_request.sampling_params)?;
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::metrics::VllmMetrics::global();
@@ -3645,6 +3641,18 @@ impl AsyncEngine {
     /// score only the rows they sample would return `null`, which a client scoring prompts by
     /// likelihood (an eval harness's multiple-choice tasks) reads as an answer (#874). The logprobs
     /// of generated tokens (`logprobs`, `top_logprobs`) are a separate request field.
+    /// Refuse a request whose sampling the backend does not serve ([`Served::refusal`]). A request
+    /// with no sampling params runs under the defaults the core gives it
+    /// (`SamplingParams::default`), so they are set here and checked: the backend never sees a
+    /// request the door did not.
+    fn check_served(&self, params: &mut Option<SamplingParams>) -> ServeResult<()> {
+        let params = params.get_or_insert_with(SamplingParams::default);
+        match self.served.refusal(params) {
+            Some(why) => Err(ServeError::Validation(why.to_string())),
+            None => Ok(()),
+        }
+    }
+
     fn check_prompt_logprobs(&self, asked: Option<u32>) -> ServeResult<()> {
         match asked {
             Some(_) if !self.computes_prompt_logprobs => Err(ServeError::Validation(
@@ -5798,6 +5806,34 @@ mod tests {
         request.temperature = Some(0.0);
         let response = engine.completion(request).await.unwrap();
         assert_eq!(response.choices.len(), 1);
+    }
+
+    /// A request with no sampling params is checked under the defaults the core runs it with
+    /// (temperature 1), and refused by a greedy-only backend at the door; the params it then
+    /// carries are those defaults.
+    #[test]
+    fn a_request_with_no_sampling_params_is_checked_under_the_defaults() {
+        let mut engine = make_test_engine();
+        let mut none = None;
+        assert!(
+            engine.check_served(&mut none).is_ok(),
+            "everything is served"
+        );
+        let default = SamplingParams::default().temperature;
+        assert_eq!(
+            none.map(|p| p.temperature),
+            Some(default),
+            "the defaults are set"
+        );
+        engine.set_served(Served {
+            sampling: false,
+            ..Served::EVERYTHING
+        });
+        let mut none = None;
+        match engine.check_served(&mut none) {
+            Err(ServeError::Validation(msg)) => assert!(msg.contains("greedily only"), "{msg}"),
+            other => panic!("expected ServeError::Validation, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
