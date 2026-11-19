@@ -2107,7 +2107,8 @@ fn the_gdn_decode_fold_is_its_four_launches_bit_for_bit() {
 
 /// The chunk the chunked scan works in.
 const CHUNK: usize = 64;
-/// The chunked scan's lengths (/tmp/a-f6-plan.md §5, F6-1).
+/// The chunked scan's lengths (F6-1): one token, a chunk's edges either side, whole chunks, and
+/// the prefill buckets.
 const CHUNK_LENGTHS: [usize; 8] = [1, 2, 63, 64, 65, 128, 2048, 4096];
 
 /// `o` against a scan reference under the chunked bound, over the elements `keep` admits.
@@ -2297,7 +2298,7 @@ fn aligned(
     (x, bu)
 }
 
-/// The chunked bound must still bite (/tmp/a-f6-plan.md §2): a kernel computing a mutation would
+/// The chunked bound must still bite: a kernel computing a mutation would
 /// fail the real check. Each mutated f64 reference against the chunked scan's `o`, under the REAL
 /// reference's bound (the bound the real check applies; a mutation that grows the state would
 /// grow its own), puts at least half the judged elements out of it, at `q_len` 128 (two chunks),

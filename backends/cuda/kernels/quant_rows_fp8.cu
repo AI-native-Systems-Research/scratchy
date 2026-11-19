@@ -17,7 +17,7 @@
 // `amax` is exact under any reduction order (a max), so the same bf16 row gives the same scale
 // and the same bytes whichever kernel computes them: the FP8 GEMV's prologue (S4) must equal this.
 //
-// ThunderKittens' 16-row tile, `rms_norm_bf16.cu`'s structure (PLAN-tk100 §2 S2): one warp per 16
+// ThunderKittens' 16-row tile, `rms_norm_bf16.cu`'s structure: one warp per 16
 // rows, 4 warps per CTA, so `rows / 16` warps and a wide grid. Each warp walks its rows'
 // 256-column tiles in two passes, each tile TMA-loaded by its lane 0 into a plain
 // `st_bf<16, 256, false>` through a 2-stage ring:

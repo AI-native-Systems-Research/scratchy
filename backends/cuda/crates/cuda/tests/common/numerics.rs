@@ -579,7 +579,7 @@ pub const GDN_SCAN_REL: f64 = 1.0 / 16_384.0;
 pub const GDN_SCAN_STEP: f64 = 1.0 / 131_072.0;
 /// The chunked scan's (FP8 S8 F6a, `kernels/gdn_chunk_scan.cu`) relative term, `2⁻⁷`: the
 /// recurrent bound's form at 2⁷ × its coefficients, for the bf16 operands of its products
-/// (/tmp/a-f6-plan.md §2), to be fitted by its self-checks.
+/// to be fitted by its self-checks.
 pub const GDN_CHUNK_REL: f64 = 1.0 / 128.0;
 /// The chunked scan's per-token term, `2⁻¹⁰`.
 pub const GDN_CHUNK_STEP: f64 = 1.0 / 1_024.0;

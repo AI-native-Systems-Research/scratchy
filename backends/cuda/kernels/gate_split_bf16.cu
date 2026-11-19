@@ -10,7 +10,7 @@
 // Pure copies, so bit-exact. Metal's counterpart is `shaders/gate_split.metal`; transformers'
 // `Qwen3_5Attention` is `torch.chunk(q_proj(x).view(..., head_dim*2), 2, dim=-1)`.
 //
-// ThunderKittens' 16-row tile, copy only (PLAN-tk100 §2 S2): one CTA of one warp per block of 16
+// ThunderKittens' 16-row tile, copy only: one CTA of one warp per block of 16
 // rows. For each head h, lane 0 TMA-loads the plain shared tiles `st_bf<16, 256, false>` at qg's
 // column tiles 2h (the query) and 2h + 1 (the gate), `tma::expect_bytes` on the stage's
 // semaphore, and TMA-stores them to q and gate at column tile h. The bytes never leave shared

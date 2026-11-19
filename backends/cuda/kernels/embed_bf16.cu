@@ -5,7 +5,7 @@
 // row-major. A plain copy: the bytes are moved, never widened, so the result is the table's bits.
 // Metal's counterpart is `shaders/embed.metal` (one row per token, a plain copy).
 //
-// ThunderKittens' bulk copy through shared memory (PLAN-tk100 §2 S3). TK has no gather, so a
+// ThunderKittens' bulk copy through shared memory. TK has no gather, so a
 // `gl<int>` index read plus the bulk copy is its TK form. One warp per output row, 4 warps per
 // CTA. Every lane reads the row's id from the `gl<int>` token view (`gl::operator[]`; a u32 above
 // 2³¹ reads as negative). For an id in `[0, vocab)`, lane 0 bulk-loads the table row into the

@@ -7,7 +7,7 @@
 // expert indices as i32 `topk_idx [m, top_k]`. The picks are stored ascending: slot `top_k − 1` is
 // the best, as Metal writes `inds[K-1-r]` (`metal/shaders/moe_route.h`).
 //
-// ThunderKittens' warp vector (PLAN-tk100 §2 S4, §3.M M1): one warp per token row, 8 warps per CTA;
+// ThunderKittens' warp vector: one warp per token row, 8 warps per CTA;
 // a warp at or past `m` returns before reading anything. The row is one naive `rv_fl<256>`
 // (`warp::load`, bf16 to f32, exact), 8 logits per lane.
 //   - Softmax: `warp::max`, then `warp::sub` of the max BEFORE `warp::exp`, so the max element is

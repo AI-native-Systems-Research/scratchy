@@ -15,7 +15,7 @@
 // `table` is the tape's rotary table, [rows, rot_dim] bf16, row r laid out [cos(0..R/2) |
 // sin(0..R/2)] for token r's position (built on the host, `src/rotary.rs`).
 //
-// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2): one CTA of one warp per block of 16 rows,
+// ThunderKittens' 16-row tile: one CTA of one warp per block of 16 rows,
 // instantiated for rot_dim 64 (qwen3.5's partial rope) and 256 (Gemma 4's sliding layers, a full
 // rope on a 256-lane head: lane d < 128 pairs with lane d + 128). ThunderKittens'
 // `kernels/rotary/rotary.cu` (at the vendored 67845f5f) rotates the full head on [B, H, N, D]

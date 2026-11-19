@@ -22,7 +22,7 @@
 // and `β` the gating's (`[rows, nv]`), `o` is f32 `[rows, value_dim]`, all the step's scratch. `S`
 // is written back to the slot once, after the last real token.
 //
-// THE STATE AS A THUNDERKITTENS REGISTER TILE (PLAN-tk100 §2 S6, §3.14): grid (head_v / 32, nv), as
+// THE STATE AS A THUNDERKITTENS REGISTER TILE: grid (head_v / 32, nv), as
 // before; two warps per CTA, warp `w` holding value rows `row0 + 16w .. row0 + 16w + 16` of head h
 // as one `rt_fl<16, 128>` (64 f32 per lane). Per token, every step is a TK op:
 //   - q and k are loaded from shared memory as naive-layout `rv_fl<128>` (4 f32 per lane, each at a

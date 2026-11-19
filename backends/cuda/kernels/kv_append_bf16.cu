@@ -13,7 +13,7 @@
 // `RopeAppend` step, two launches on one stream), so it copies the rotated K; V is copied as
 // projected. Metal's counterpart of this copy is `shaders/kv_append.metal`.
 //
-// ThunderKittens' bulk copy, then a vector TMA store (PLAN-tk100 §2 S3). One warp per (token row
+// ThunderKittens' bulk copy, then a vector TMA store. One warp per (token row
 // t, kv head h) pair, 4 warps per CTA. Every lane reads the slot from the `gl<int>` slot view
 // (`gl::operator[]`; u32::MAX reads as −1, so it is taken back to u32). For a slot that writes,
 // lane 0 bulk-loads the 512-byte row-head of K and of V into two `sv_bf<256>` (`tma::load_async`,

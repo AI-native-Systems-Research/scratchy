@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Gated-DeltaNet chunked gated delta-rule scan for the H100 (FP8 S8 F6a, /tmp/a-f6-plan.md §2): the
+// Gated-DeltaNet chunked gated delta-rule scan for the H100 (FP8 S8 F6a): the
 // same recurrence as `gdn_scan.cu`, the same launcher contract, computed 64 tokens at a time on
 // the tensor cores (fla's `chunk_gated_delta_rule`, the WY/UT form). No tape launches it yet.
 //

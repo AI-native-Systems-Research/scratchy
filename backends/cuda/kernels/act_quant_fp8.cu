@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The one-row activation and its quantization (FP8 S8 T1, /tmp/a-tc-plan.md §2 option C; no tape
-// launches it yet): for each row `r` of the gate/up GEMV's f32 outputs `gate`, `up [rows, n]` (the
+// The one-row activation and its quantization (FP8 S8 T1; no tape launches it
+// yet): for each row `r` of the gate/up GEMV's f32 outputs `gate`, `up [rows, n]` (the
 // tensor-core GEMV's f32 store, `gemv_fp8_tc.cu`'s B8),
 //
 //     act[r, c] = bf16(OP(gate[r, c], up[r, c]))         OP = silu_mul or gelu_tanh_mul

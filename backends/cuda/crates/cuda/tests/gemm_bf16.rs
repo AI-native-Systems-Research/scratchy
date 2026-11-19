@@ -668,7 +668,7 @@ fn the_narrow_gemm_at_one_row_is_its_row_at_128() {
     );
 }
 
-/// Recorded, not required (PLAN-tk100 §8, R6): whether the GEMV's row is bit-identical to row 0
+/// Recorded, not required: whether the GEMV's row is bit-identical to row 0
 /// of the tiled GEMM on the same inputs. Both run WGMMA over 64-wide K steps in the same order,
 /// with N tiles of 64 and 256; the printed count says whether that gives the same bits. No
 /// assertion: `the_gemv_is_within_two_bounds_of_the_tiled_gemms_row` gates.

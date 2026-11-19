@@ -11,7 +11,7 @@
 // `[seed ++ x[0 .. q_len)]`, the CORRECT general shift (metal's `gdn_conv1d_varlen.metal`), so
 // `forward(T)` then `forward(1)` equals `forward(T + 1)`, a chunk shorter than `K − 1` included.
 //
-// ThunderKittens' warp vector (PLAN-tk100 §2 S4, §3.12): TK adds the container and the loads and
+// ThunderKittens' warp vector: TK adds the container and the loads and
 // stores here, no matrix multiply. One warp per (group of 128 channels, block of 64 tokens), 4
 // warps per CTA: grid (ceil(conv_dim / 128 / 4), ceil(rows / 64)). The warp's channels
 // `c0 .. c0 + 128` are a naive `rv_fl<128>` (lane `l` holds channels `c0 + l + 32i`). The kernel is

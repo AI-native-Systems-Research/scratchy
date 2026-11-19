@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Every CUDA kernel is written with ThunderKittens: a check of the kernels' source text, with no
-//! toolchain (AI-native-Systems-Research/scratchy#845; the rule is
-//! `aa-personal-space/cuda-moonshot/PLAN-tk100.md` §1.2-1.5).
+//! toolchain (AI-native-Systems-Research/scratchy#845; the rule is the table below).
 //!
 //! A kernel is a `.cu` file directly under `kernels/` (the vendored `kernels/thunderkittens/` is
 //! not one). It uses ThunderKittens when it passes every rule below. Each failure prints
@@ -29,11 +28,11 @@
 //! Device code is the body of every function marked `__global__` or `__device__` (and of every
 //! `constexpr` function, which `--expt-relaxed-constexpr` lets device code call), and every
 //! `__device__`, `__constant__` or `__managed__` variable. Everything else is host code: the
-//! `extern "C"` launchers and host helpers, which may use what kernels may not (PLAN-tk100 §1.3:
-//! `static_cast` of the launch arguments, libm such as `std::ceil` or `std::isfinite`).
+//! `extern "C"` launchers and host helpers, which may use what kernels may not: a `static_cast`
+//! of the launch arguments, libm such as `std::ceil` or `std::isfinite`.
 //!
-//! What this check does not see, and leaves to the verifier's reading (PLAN-tk100 §1.5: it reads
-//! source text, so it can be gamed):
+//! What this check does not see, and leaves to the verifier's reading (it reads source text, so it
+//! can be gamed):
 //! - macros: a `#define` can spell any construct, and a function marked device through a macro is
 //!   not seen as device code;
 //! - scalar loops over a TK register vector's or tile's data (`row[i][0] = row[i][0] * w + 1`),
@@ -45,7 +44,7 @@
 //!   and loops over a view's elements.
 //!
 //! Every kernel must pass every rule: the ports (TK-0 to TK-5b) emptied the list of kernels not yet
-//! rewritten, and the last one deleted it (PLAN-tk100 §1.5).
+//! rewritten, and the last one deleted it.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -1327,7 +1326,7 @@ fn ends_with_allocator(text: &str) -> bool {
 }
 
 /// The `)` that closes the call, when the cast opening at byte `at` of `bare` is TK's own idiom
-/// for carving shared memory (`aa-personal-space/cuda-moonshot/PLAN-tk100.md` §1.2 item 5), as
+/// for carving shared memory, as
 /// upstream's `mha_h100.cu` spells it: exactly `(int*)&__shm[0]` or `(int*)__shm` (spaces aside),
 /// as the whole argument of a TK allocator's constructor, `tma_swizzle_allocator
 /// al((int*)&__shm[0]);`. Stored anywhere else, or passed to anything else, the cast is refused

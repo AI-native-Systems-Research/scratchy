@@ -4,7 +4,7 @@
 // same shape (no broadcast). Each element is widened to f32 (exact), computed in f32 and rounded
 // once to bf16 (round-to-nearest-even). The expression is the plain-CUDA kernel's, `a / (1.0f + __expf(-g))`, now the op struct `scratchy::ops::gate_apply`.
 //
-// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2): one CTA per block of 16 rows, one warpgroup of
+// ThunderKittens' 16-row tile: one CTA per block of 16 rows, one warpgroup of
 // 4 warps. Warp `w` takes the 256-column tiles `w, w + 4, …` of the block. Per tile, lane 0 of
 // the warp TMA-loads both operands into plain shared tiles `st_bf<16, 256, false>`
 // (`tma::expect_bytes` on the stage's semaphore), the warp loads them into `rt_fl<16, 256>`

@@ -4,7 +4,7 @@
 // same shape (no broadcast). Each element is widened to f32 (exact), computed in f32 and rounded
 // once to bf16 (round-to-nearest-even). The sequence `half::bf16::from_f32(f32(a) + f32(b))` computes the same, so the result is bit-exact against it for normal inputs: one f32 addition, with nothing to contract into an FMA, and one RNE rounding (`base_types::convertor<bf16_2, float2>`). Metal's counterpart is `shaders/elementwise.metal`'s `residual_add`.
 //
-// ThunderKittens' 16-row tile (PLAN-tk100 §2 S2): one CTA per block of 16 rows, one warpgroup of
+// ThunderKittens' 16-row tile: one CTA per block of 16 rows, one warpgroup of
 // 4 warps. Warp `w` takes the 256-column tiles `w, w + 4, …` of the block. Per tile, lane 0 of
 // the warp TMA-loads both operands into plain shared tiles `st_bf<16, 256, false>`
 // (`tma::expect_bytes` on the stage's semaphore), the warp loads them into `rt_fl<16, 256>`

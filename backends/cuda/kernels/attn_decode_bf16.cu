@@ -14,7 +14,7 @@
 // query, at `kv_len − 1`, sees its own key and the W − 1 before it (metal's `window_lo`,
 // `attention.metal`).
 //
-// ThunderKittens' paged-KV tile attention (PLAN-tk100 §2 S5, §3.11): the machinery of
+// ThunderKittens' paged-KV tile attention: the machinery of
 // `attn_prefill_bf16.cu` (adapted from TK's `mha_h100.cu` at 67845f5f, MIT), with the GQA group
 // stacked as the rows of one query tile. What differs from the prefill, and why:
 //   - Grid `(kv_heads)`: one CTA per kv head g. Its `hr` query heads `g·hr .. g·hr + hr` are

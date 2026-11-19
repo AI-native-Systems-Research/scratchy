@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What a ThunderKittens TMA tile load and store do with a 64×64 bf16 box that runs past its
 //! array's edge, swizzled and plain (`kernels/tma_box_probe.cu`), on the H100: the GKE probe's R1
-//! cases (`/tmp/tk-probe/probe.cu` at c8d80fda; AI-native-Systems-Research/scratchy#846), the same
+//! cases (AI-native-Systems-Research/scratchy#846, its probe at c8d80fda), the same
 //! shapes, tile coordinates, sentinels and labels. The GEMV's and the narrow GEMM's choice of tiles
 //! rests on these facts (`kernels/gemv_bf16.cu`), so this is the port's first gate.
 //!
