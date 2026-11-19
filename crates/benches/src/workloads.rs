@@ -154,9 +154,13 @@ pub(crate) const RAG_TIMED_TOKENS: usize = 64;
 
 /// The answer cap. The multi-document QA benchmarks use 64, but the matrix's models open with a
 /// preamble (Granite 4.2: "Based solely on the provided documents..."), and at 64 tokens most
-/// answers ended before the answer: 1 of 6 right on MuSiQue. A reply still ends where the model
-/// ends it, so the cap only bounds a long one.
-pub(crate) const RAG_MAX_TOKENS: usize = 256;
+/// answers ended before the answer: 1 of 6 right on MuSiQue. A reasoning model's thinking counts
+/// against the cap too: at 256, gpt-oss-20b reasoned past it on most MuSiQue tasks and scored
+/// about 9% on every Mac. On 16 of its tasks at low reasoning effort (base M5), its answers ran
+/// 174 tokens at the median, 287 at the 90th percentile and 1,286 at most, so 2048 lets every one
+/// end, and 6 of the 16 were right. A reply still ends where the model ends it, so the cap only
+/// bounds a long one.
+pub(crate) const RAG_MAX_TOKENS: usize = 2048;
 
 /// A multi-document QA task as the benchmarks send it: the system prompt, each document as its
 /// own user message, then the question. `answers` is every accepted answer, the first the main
