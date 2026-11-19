@@ -45,8 +45,8 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_subtile::subtile_tape::Instr;
 use scratchy_target_cuda::step::{
-    AttnDecodeBf16, CudaStep, ExpertGateUpGemvBf16, ExpertGemvSplitBf16, GemmBf16, GemmGroupBf16,
-    GemvBf16, GemvGroupBf16, RopeAppendBf16,
+    AttnDecodeBf16, CudaStep, ExpertGateUpGemvBf16, ExpertGemvSplitBf16, GemmBf16, GemvBf16,
+    RopeAppendBf16,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput, WeightIx,
@@ -1519,13 +1519,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
         ]
     ));
     assert!(
-        matches!(
-            c.steps[1],
-            CudaStep::GemvGroup(GemvGroupBf16 {
-                group: GemmGroupBf16 { m: Rows(1), .. },
-                ..
-            })
-        ),
+        matches!(c.steps[1], CudaStep::GemvGroup(_)),
         "step 1: {:?}",
         c.steps[1]
     );

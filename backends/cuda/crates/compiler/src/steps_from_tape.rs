@@ -40,12 +40,12 @@ use scratchy_target_cuda::step::{
     GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE,
     GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16,
     GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmCol64Bf16, GemmCol64Fp8, GemmFp8,
-    GemmGroupBf16, GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvSplit, GroupKind,
-    GroupMember, HeadNorms, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulKernel,
-    MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS,
-    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
-    RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
-    SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvSplit, GroupKind, GroupMember, HeadNorms,
+    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulGroup, MatmulKernel, MoeRouteBf16,
+    MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
+    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ,
+    RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS,
+    ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::step::{AttnScale, RmsNormEps, Scale, SoftCap};
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
@@ -766,7 +766,7 @@ fn sibling_matmuls(
     if third.len() > 1 {
         return Err(refused());
     }
-    Ok(kind.grouped(GemmGroupBf16 {
+    Ok(kind.grouped(MatmulGroup {
         a: first.a,
         m: first.m,
         k: first.k,

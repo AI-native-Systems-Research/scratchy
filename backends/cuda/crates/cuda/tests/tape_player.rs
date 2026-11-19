@@ -1156,7 +1156,7 @@ fn k_direct(device: &CudaDevice, tape: &CudaTape, n: &[u16], wk: &[u16]) -> Vec<
     let CudaStep::GemmGroup(group) = tape.steps[1] else {
         panic!("step 1 is the q, k and v projections");
     };
-    let g = group.member(group.second);
+    let g = group.group().member(group.second);
     let (nb, wb) = (
         DeviceBuffer::upload(device, n).expect("upload n"),
         DeviceBuffer::upload(device, wk).expect("upload Wk"),

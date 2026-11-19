@@ -45,9 +45,10 @@ use scratchy_target_cuda::step::{
     EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
     ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
     ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, GatedOp,
-    GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8, GemmNarrowFp8, GemvGroupBf16, GemvTcFp8,
-    MoeWeight, QuantChainError, QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, RopePairing,
-    gdn_scratch, gemv_tc_takes, norm_row_takes, quant_chain,
+    GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8, GemmGroupFp8, GemmNarrowFp8,
+    GemmNarrowGroupFp8, GemvGroupTcFp8, GemvTcFp8, MoeWeight, QuantChainError, QuantRowsFp8,
+    RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes, norm_row_takes,
+    quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -1736,12 +1737,10 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
         CudaStep::GemvFp8(g) if gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1) => {
             CudaStep::GemvTcFp8(GemvTcFp8::of(g))
         }
-        CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {
+        CudaStep::GemvGroupFp8(g) => {
             let third = g.third.map_or(0, |t| t.n.get());
-            match g.m == Rows(1)
-                && gemv_tc_takes([g.first.n.get(), g.second.n.get(), third], g.k.get(), 1)
-            {
-                true => CudaStep::GemvGroupTcFp8(g),
+            match gemv_tc_takes([g.first.n.get(), g.second.n.get(), third], g.k.get(), 1) {
+                true => CudaStep::GemvGroupTcFp8(GemvGroupTcFp8::of(g.group())),
                 false => s,
             }
         }
@@ -1861,9 +1860,9 @@ fn quantize_fp8_inputs(
                 | CudaStep::GemmCol64Fp8(GemmCol64Fp8 { a, .. })
                 | CudaStep::GemmNarrowFp8(GemmNarrowFp8 { a, .. })
                 | CudaStep::GemvTcFp8(GemvTcFp8 { a, .. }) => *a = q,
-                CudaStep::GemmGroupFp8(g)
-                | CudaStep::GemmNarrowGroupFp8(g)
-                | CudaStep::GemvGroupTcFp8(g) => g.a = q,
+                CudaStep::GemmGroupFp8(GemmGroupFp8 { a, .. })
+                | CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8 { a, .. })
+                | CudaStep::GemvGroupTcFp8(GemvGroupTcFp8 { a, .. }) => *a = q,
                 CudaStep::GateUpAct(g) => (g.gate.a, g.up.a) = (q, q),
                 CudaStep::GateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
                 CudaStep::ExpertGemm(g) => g.a = q,

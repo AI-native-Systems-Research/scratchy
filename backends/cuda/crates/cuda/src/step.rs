@@ -304,7 +304,7 @@ pub enum CudaStep {
     /// `SiblingMatmuls` fold: a GDN layer's `in_proj_a` and `in_proj_b`
     /// (`kernels/gemm_narrow_bf16.cu`, `scratchy_cuda_gemm_narrow_group_bf16_abt`). Each member's
     /// output is the bits of its own [`Self::GemmNarrow`].
-    GemmNarrowGroup(GemmGroupBf16),
+    GemmNarrowGroup(GemmNarrowGroupBf16),
     /// [`Self::Gemv`] of up to three weights off one input in one launch, lowered from the
     /// `SiblingMatmuls` fold of a one-row bucket (`kernels/gemv_bf16.cu`,
     /// `scratchy_cuda_gemv_group_bf16_abt`). Each member takes its own K split
@@ -353,19 +353,19 @@ pub enum CudaStep {
     /// prologue (`kernels/gemv_fp8.cu`).
     GemvFp8(GemvFp8),
     /// [`Self::GemmGroup`] over fp8 weights, as [`Self::GemmFp8`] each.
-    GemmGroupFp8(GemmGroupBf16),
+    GemmGroupFp8(GemmGroupFp8),
     /// [`Self::GemmNarrowGroup`] over fp8 weights (the 27B's `in_proj_a` + `in_proj_b`), as
     /// [`Self::GemmFp8`] each.
-    GemmNarrowGroupFp8(GemmGroupBf16),
+    GemmNarrowGroupFp8(GemmNarrowGroupFp8),
     /// [`Self::GemvGroup`] over fp8 weights, as [`Self::GemvFp8`] each.
-    GemvGroupFp8(GemvGroupBf16),
+    GemvGroupFp8(GemvGroupFp8),
     /// [`Self::GemvFp8`] on the tensor cores (FP8 S8 T2, `kernels/gemv_fp8_tc.cu`'s B8), the
     /// shapes [`gemv_tc_takes`] takes: `a` is the quant scratch, the one e4m3 row the step before
     /// wrote and its scale after it, as [`Self::GemmFp8`]'s; `c = bf16((a·Bᵀ) · w_scale · a_scale)`
     /// (with the residual's `with_residual` when it has one), WGMMA's fp8 accumulation.
     GemvTcFp8(GemvTcFp8),
     /// [`Self::GemvGroupFp8`] on the tensor cores, each member as [`Self::GemvTcFp8`].
-    GemvGroupTcFp8(GemmGroupBf16),
+    GemvGroupTcFp8(GemvGroupTcFp8),
     /// [`Self::GateUpAct`] of one row on the tensor cores: the gate and the up as B8's f32
     /// members off the quantized row (its GEMV scratch, `2 · n` f32), then the act + quantize
     /// (`kernels/act_quant_fp8.cu`): `out = bf16(act(gate, up))`, and that row's e4m3 bytes and
@@ -925,20 +925,20 @@ impl GroupKind {
     }
 
     /// The grouped step of `g` (a GEMV group at each member's split, [`GemvGroupBf16::of`]).
-    pub const fn grouped(self, g: GemmGroupBf16) -> CudaStep {
+    pub const fn grouped(self, g: MatmulGroup) -> CudaStep {
         match self {
-            Self::Gemm => CudaStep::GemmGroup(g),
-            Self::GemmNarrow => CudaStep::GemmNarrowGroup(g),
+            Self::Gemm => CudaStep::GemmGroup(GemmGroupBf16::of(g)),
+            Self::GemmNarrow => CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(g)),
             Self::Gemv => CudaStep::GemvGroup(GemvGroupBf16::of(g)),
-            Self::GemmFp8 => CudaStep::GemmGroupFp8(g),
-            Self::GemmNarrowFp8 => CudaStep::GemmNarrowGroupFp8(g),
-            Self::GemvFp8 => CudaStep::GemvGroupFp8(GemvGroupBf16::of(g)),
-            Self::GemvTcFp8 => CudaStep::GemvGroupTcFp8(g),
+            Self::GemmFp8 => CudaStep::GemmGroupFp8(GemmGroupFp8::of(g)),
+            Self::GemmNarrowFp8 => CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8::of(g)),
+            Self::GemvFp8 => CudaStep::GemvGroupFp8(GemvGroupFp8::of(g)),
+            Self::GemvTcFp8 => CudaStep::GemvGroupTcFp8(GemvGroupTcFp8::of(g)),
         }
     }
 }
 
-/// One weight of a grouped GEMM ([`GemmGroupBf16`]): `B [n, k]` and its output `C [m, n]`.
+/// One weight of a grouped GEMM ([`MatmulGroup`]): `B [n, k]` and its output `C [m, n]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct GroupMember {
     pub b: WeightIx,
@@ -946,11 +946,13 @@ pub struct GroupMember {
     pub n: NDim,
 }
 
-/// Up to three GEMMs `C_i[m, n_i] = A[m, k] · B_i[n_i, k]ᵀ` that share `A`, in one launch: the
-/// `first` member is the fold's driver, the others its siblings in tape order. Each member is the
-/// [`GemmBf16`] [`Self::member`] names, whose kernel shape rule it meets on its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct GemmGroupBf16 {
+/// Up to three GEMMs `C_i[m, n_i] = A[m, k] · B_i[n_i, k]ᵀ` that share `A`, before their kernel is
+/// chosen: the `first` member is the fold's driver, the others its siblings in tape order. Each
+/// member is the [`Matmul`] [`Self::member`] names, whose kernel shape rule it meets on its own.
+/// What a `SiblingMatmuls` fold's lowering builds, and every group payload's
+/// ([`CudaStep::group`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatmulGroup {
     pub a: ArenaOffset,
     pub m: Rows,
     pub k: KDim,
@@ -959,7 +961,7 @@ pub struct GemmGroupBf16 {
     pub third: Option<GroupMember>,
 }
 
-impl GemmGroupBf16 {
+impl MatmulGroup {
     /// The members in order: `first`, `second`, then `third` when there is one.
     pub const fn members(&self) -> [Option<GroupMember>; 3] {
         [Some(self.first), Some(self.second), self.third]
@@ -974,6 +976,96 @@ impl GemmGroupBf16 {
             m: self.m,
             n: g.n,
             k: self.k,
+        }
+    }
+}
+
+/// One payload per grouped GEMM kernel of `m` rows, each the [`MatmulGroup`] it computes.
+macro_rules! gemm_group_payload {
+    ($($(#[$doc:meta])* $name:ident;)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub a: ArenaOffset,
+            pub m: Rows,
+            pub k: KDim,
+            pub first: GroupMember,
+            pub second: GroupMember,
+            pub third: Option<GroupMember>,
+        }
+
+        impl $name {
+            /// `g` on this kernel.
+            pub const fn of(g: MatmulGroup) -> Self {
+                Self {
+                    a: g.a,
+                    m: g.m,
+                    k: g.k,
+                    first: g.first,
+                    second: g.second,
+                    third: g.third,
+                }
+            }
+
+            /// The group it computes.
+            pub const fn group(&self) -> MatmulGroup {
+                MatmulGroup {
+                    a: self.a,
+                    m: self.m,
+                    k: self.k,
+                    first: self.first,
+                    second: self.second,
+                    third: self.third,
+                }
+            }
+        }
+    )*};
+}
+
+gemm_group_payload! {
+    /// [`CudaStep::GemmGroup`]: [`GemmBf16`]'s operands, per member.
+    GemmGroupBf16;
+    /// [`CudaStep::GemmNarrowGroup`]: [`GemmNarrowBf16`]'s operands, per member.
+    GemmNarrowGroupBf16;
+    /// [`CudaStep::GemmGroupFp8`]: [`GemmFp8`]'s operands, per member (`a` the quant scratch).
+    GemmGroupFp8;
+    /// [`CudaStep::GemmNarrowGroupFp8`]: [`GemmNarrowFp8`]'s operands, per member.
+    GemmNarrowGroupFp8;
+}
+
+/// [`CudaStep::GemvGroupTcFp8`]: [`GemvTcFp8`]'s operands, per member (`a` the quant scratch's
+/// one row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GemvGroupTcFp8 {
+    pub a: ArenaOffset,
+    pub k: KDim,
+    pub first: GroupMember,
+    pub second: GroupMember,
+    pub third: Option<GroupMember>,
+}
+
+impl GemvGroupTcFp8 {
+    /// `g`, one row, on the tensor cores.
+    pub const fn of(g: MatmulGroup) -> Self {
+        assert!(g.m.get() == 1, "a GEMV group computes one row");
+        Self {
+            a: g.a,
+            k: g.k,
+            first: g.first,
+            second: g.second,
+            third: g.third,
+        }
+    }
+
+    /// The group it computes.
+    pub const fn group(&self) -> MatmulGroup {
+        MatmulGroup {
+            a: self.a,
+            m: Rows(1),
+            k: self.k,
+            first: self.first,
+            second: self.second,
+            third: self.third,
         }
     }
 }
@@ -1334,57 +1426,125 @@ impl GemvSplit {
     }
 }
 
-/// A grouped decode GEMV ([`CudaStep::GemvGroup`], [`CudaStep::GemvGroupFp8`]): the group, and
-/// each member's K split, as [`GemmGroupBf16`]'s members (`third` exactly when it has one).
+/// A member of a grouped decode GEMV: its weight, output and width, as [`GroupMember`]'s, and its
+/// own K split ([`GemvSplit::of`] of its shape, one pair).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct GemvGroupBf16 {
-    pub group: GemmGroupBf16,
-    pub first: GemvSplit,
-    pub second: GemvSplit,
-    pub third: Option<GemvSplit>,
+pub struct GemvMember {
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub n: NDim,
+    pub split: GemvSplit,
 }
 
-impl GemvGroupBf16 {
-    /// `group` at each member's split, one pair.
-    pub const fn of(group: GemmGroupBf16) -> Self {
-        let k = group.k;
+impl GemvMember {
+    /// `g` at its shape's split over `k`.
+    pub const fn of(g: GroupMember, k: KDim) -> Self {
         Self {
-            group,
-            first: GemvSplit::of(group.first.n.get(), k.get(), 1),
-            second: GemvSplit::of(group.second.n.get(), k.get(), 1),
-            third: match group.third {
-                Some(m) => Some(GemvSplit::of(m.n.get(), k.get(), 1)),
-                None => None,
-            },
+            b: g.b,
+            c: g.c,
+            n: g.n,
+            split: GemvSplit::of(g.n.get(), k.get(), 1),
         }
     }
 
-    /// Each member's split, in [`GemmGroupBf16::members`]' order.
-    pub const fn splits(&self) -> [Option<GemvSplit>; 3] {
-        [Some(self.first), Some(self.second), self.third]
+    /// The member without its split.
+    pub const fn member(&self) -> GroupMember {
+        GroupMember {
+            b: self.b,
+            c: self.c,
+            n: self.n,
+        }
     }
+}
 
-    /// The GEMV scratch bytes of the members before `upto` (`upto` 3: all of them), each at its
-    /// stored split ([`gemv_scratch_bytes`]): member `i`'s partials start at the bytes before it.
-    /// `None` on overflow.
-    pub const fn gemv_scratch_before(&self, upto: usize) -> Option<u64> {
-        let (members, splits) = (self.group.members(), self.splits());
-        let mut total = 0u64;
-        let mut i = 0;
-        while i < upto && i < 3 {
-            if let (Some(g), Some(split)) = (members[i], splits[i]) {
-                let Some(bytes) = gemv_scratch_bytes(g.n.get(), 1, split.splits.get()) else {
-                    return None;
-                };
-                let Some(sum) = total.checked_add(bytes) else {
-                    return None;
-                };
-                total = sum;
+/// One payload per grouped decode GEMV kernel: one row, each member at its own K split, its
+/// partials at its own place in the GEMV scratch ([`Self::gemv_scratch_before`]).
+macro_rules! gemv_group_payload {
+    ($($(#[$doc:meta])* $name:ident;)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub a: ArenaOffset,
+            pub k: KDim,
+            pub first: GemvMember,
+            pub second: GemvMember,
+            pub third: Option<GemvMember>,
+        }
+
+        impl $name {
+            /// `g`, one row, at each member's split.
+            pub const fn of(g: MatmulGroup) -> Self {
+                assert!(g.m.get() == 1, "a GEMV group computes one row");
+                Self {
+                    a: g.a,
+                    k: g.k,
+                    first: GemvMember::of(g.first, g.k),
+                    second: GemvMember::of(g.second, g.k),
+                    third: match g.third {
+                        Some(t) => Some(GemvMember::of(t, g.k)),
+                        None => None,
+                    },
+                }
             }
-            i += 1;
+
+            /// The group it computes.
+            pub const fn group(&self) -> MatmulGroup {
+                MatmulGroup {
+                    a: self.a,
+                    m: Rows(1),
+                    k: self.k,
+                    first: self.first.member(),
+                    second: self.second.member(),
+                    third: match self.third {
+                        Some(t) => Some(t.member()),
+                        None => None,
+                    },
+                }
+            }
+
+            /// Each member's split, in [`MatmulGroup::members`]' order.
+            pub const fn splits(&self) -> [Option<GemvSplit>; 3] {
+                [
+                    Some(self.first.split),
+                    Some(self.second.split),
+                    match self.third {
+                        Some(t) => Some(t.split),
+                        None => None,
+                    },
+                ]
+            }
+
+            /// The GEMV scratch bytes of the members before `upto` (`upto` 3: all of them), each
+            /// at its stored split ([`gemv_scratch_bytes`]): member `i`'s partials start at the
+            /// bytes before it. `None` on overflow.
+            pub const fn gemv_scratch_before(&self, upto: usize) -> Option<u64> {
+                let (members, splits) = (self.group().members(), self.splits());
+                let mut total = 0u64;
+                let mut i = 0;
+                while i < upto && i < 3 {
+                    if let (Some(g), Some(split)) = (members[i], splits[i]) {
+                        let Some(bytes) = gemv_scratch_bytes(g.n.get(), 1, split.splits.get())
+                        else {
+                            return None;
+                        };
+                        let Some(sum) = total.checked_add(bytes) else {
+                            return None;
+                        };
+                        total = sum;
+                    }
+                    i += 1;
+                }
+                Some(total)
+            }
         }
-        Some(total)
-    }
+    )*};
+}
+
+gemv_group_payload! {
+    /// [`CudaStep::GemvGroup`]: [`GemvBf16`]'s operands, per member.
+    GemvGroupBf16;
+    /// [`CudaStep::GemvGroupFp8`]: [`GemvFp8`]'s operands, per member.
+    GemvGroupFp8;
 }
 
 /// The f32 scratch bytes a decode GEMV at `splits` writes: `splits · pairs · n_pad` f32, `n_pad`
@@ -2428,6 +2588,17 @@ pub struct StepExtents {
     pub in_place: bool,
 }
 
+/// A group payload's members' weights, in order: each group type names its members `first`,
+/// `second` and `third`, whatever its member type.
+macro_rules! member_weights {
+    ($g:expr) => {{
+        let g = $g;
+        let mut all = vec![&mut g.first.b, &mut g.second.b];
+        all.extend(g.third.as_mut().map(|t| &mut t.b));
+        all
+    }};
+}
+
 impl CudaStep {
     /// A one-weight GEMM step's matmul (a GEMV's at its one row) and the residual it adds (a
     /// one-row GEMV's, FP8 S8 W4a); `None` for every other step.
@@ -2589,15 +2760,15 @@ impl CudaStep {
     }
 
     /// A grouped GEMM step's kind and group; `None` for every other step.
-    pub const fn group(&self) -> Option<(GroupKind, GemmGroupBf16)> {
+    pub const fn group(&self) -> Option<(GroupKind, MatmulGroup)> {
         match *self {
-            Self::GemmGroup(g) => Some((GroupKind::Gemm, g)),
-            Self::GemmNarrowGroup(g) => Some((GroupKind::GemmNarrow, g)),
-            Self::GemvGroup(GemvGroupBf16 { group: g, .. }) => Some((GroupKind::Gemv, g)),
-            Self::GemmGroupFp8(g) => Some((GroupKind::GemmFp8, g)),
-            Self::GemmNarrowGroupFp8(g) => Some((GroupKind::GemmNarrowFp8, g)),
-            Self::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => Some((GroupKind::GemvFp8, g)),
-            Self::GemvGroupTcFp8(g) => Some((GroupKind::GemvTcFp8, g)),
+            Self::GemmGroup(g) => Some((GroupKind::Gemm, g.group())),
+            Self::GemmNarrowGroup(g) => Some((GroupKind::GemmNarrow, g.group())),
+            Self::GemvGroup(g) => Some((GroupKind::Gemv, g.group())),
+            Self::GemmGroupFp8(g) => Some((GroupKind::GemmFp8, g.group())),
+            Self::GemmNarrowGroupFp8(g) => Some((GroupKind::GemmNarrowFp8, g.group())),
+            Self::GemvGroupFp8(g) => Some((GroupKind::GemvFp8, g.group())),
+            Self::GemvGroupTcFp8(g) => Some((GroupKind::GemvTcFp8, g.group())),
             Self::GemvTcFp8(_)
             | Self::GateUpTcFp8(_)
             | Self::ExpertGemvTcFp8(_)
@@ -2688,8 +2859,11 @@ impl CudaStep {
             Self::GemmCol64Fp8(g) => g.matmul(),
             Self::GemmNarrowFp8(g) => g.matmul(),
             Self::GemvTcFp8(g) => g.matmul(),
-            Self::GemmGroupFp8(g) | Self::GemmNarrowGroupFp8(g) | Self::GemvGroupTcFp8(g) => {
-                g.member(g.first)
+            Self::GemmGroupFp8(_) | Self::GemmNarrowGroupFp8(_) | Self::GemvGroupTcFp8(_) => {
+                match self.group() {
+                    Some((_, g)) => g.member(g.first),
+                    None => return None,
+                }
             }
             Self::GateUpTcFp8(t) => t.fold.gate.matmul(),
             Self::GateUpAct(GateUpActBf16 {
@@ -2833,7 +3007,10 @@ impl CudaStep {
         if let Self::AttnDecode(AttnDecodeBf16 { scratch, .. }) = self {
             return Some(scratch.bytes);
         }
-        if let Self::GemvGroup(g) | Self::GemvGroupFp8(g) = self {
+        if let Self::GemvGroup(g) = self {
+            return g.gemv_scratch_before(3);
+        }
+        if let Self::GemvGroupFp8(g) = self {
             return g.gemv_scratch_before(3);
         }
         if let Self::GateUpAct(g) = self {
@@ -2860,18 +3037,19 @@ impl CudaStep {
     /// `validate` checks every member's through [`Self::parts`].
     pub const fn extents(&self) -> Option<StepExtents> {
         match *self {
-            Self::GemmGroup(g)
-            | Self::GemmNarrowGroup(g)
-            | Self::GemvGroup(GemvGroupBf16 { group: g, .. }) => {
-                Self::Gemm(GemmBf16::of(g.member(g.first))).extents()
+            Self::GemmGroup(_) | Self::GemmNarrowGroup(_) | Self::GemvGroup(_) => {
+                match self.group() {
+                    Some((_, g)) => Self::Gemm(GemmBf16::of(g.member(g.first))).extents(),
+                    None => None,
+                }
             }
             // Its parts' ([`Self::parts`]), each checked as the step it is; here the gate's.
             Self::ExpertGateUpGemmFp8(t) => Self::ExpertGemm(t.gate).extents(),
-            Self::GemmGroupFp8(g)
-            | Self::GemmNarrowGroupFp8(g)
-            | Self::GemvGroupFp8(GemvGroupBf16 { group: g, .. })
-            | Self::GemvGroupTcFp8(g) => match self.group() {
-                Some((kind, _)) => kind.step(g.member(g.first)).extents(),
+            Self::GemmGroupFp8(_)
+            | Self::GemmNarrowGroupFp8(_)
+            | Self::GemvGroupFp8(_)
+            | Self::GemvGroupTcFp8(_) => match self.group() {
+                Some((kind, g)) => kind.step(g.member(g.first)).extents(),
                 None => None,
             },
             // The bf16 rows; the e4m3 rows and their scales, the quant scratch.
@@ -3965,19 +4143,34 @@ impl CudaStep {
                 ..
             }) => Some(b),
             // A grouped GEMM's first member's; [`Self::weights_mut`] gives every member's.
-            Self::GemmGroup(GemmGroupBf16 { first, .. })
-            | Self::GemmNarrowGroup(GemmGroupBf16 { first, .. })
+            Self::GemmGroup(GemmGroupBf16 {
+                first: GroupMember { b, .. },
+                ..
+            })
+            | Self::GemmNarrowGroup(GemmNarrowGroupBf16 {
+                first: GroupMember { b, .. },
+                ..
+            })
             | Self::GemvGroup(GemvGroupBf16 {
-                group: GemmGroupBf16 { first, .. },
+                first: GemvMember { b, .. },
                 ..
             })
-            | Self::GemmGroupFp8(GemmGroupBf16 { first, .. })
-            | Self::GemmNarrowGroupFp8(GemmGroupBf16 { first, .. })
-            | Self::GemvGroupFp8(GemvGroupBf16 {
-                group: GemmGroupBf16 { first, .. },
+            | Self::GemmGroupFp8(GemmGroupFp8 {
+                first: GroupMember { b, .. },
                 ..
             })
-            | Self::GemvGroupTcFp8(GemmGroupBf16 { first, .. }) => Some(&mut first.b),
+            | Self::GemmNarrowGroupFp8(GemmNarrowGroupFp8 {
+                first: GroupMember { b, .. },
+                ..
+            })
+            | Self::GemvGroupFp8(GemvGroupFp8 {
+                first: GemvMember { b, .. },
+                ..
+            })
+            | Self::GemvGroupTcFp8(GemvGroupTcFp8 {
+                first: GroupMember { b, .. },
+                ..
+            }) => Some(b),
             Self::Add(_)
             | Self::SiluMul(_)
             | Self::Rope(_)
@@ -4004,23 +4197,13 @@ impl CudaStep {
     /// in order, every other step's [`Self::weight_mut`].
     pub fn weights_mut(&mut self) -> Vec<&mut WeightIx> {
         match self {
-            Self::GemmGroup(g)
-            | Self::GemmNarrowGroup(g)
-            | Self::GemvGroup(GemvGroupBf16 { group: g, .. })
-            | Self::GemmGroupFp8(g)
-            | Self::GemmNarrowGroupFp8(g)
-            | Self::GemvGroupFp8(GemvGroupBf16 { group: g, .. })
-            | Self::GemvGroupTcFp8(g) => {
-                let GemmGroupBf16 {
-                    first,
-                    second,
-                    third,
-                    ..
-                } = g;
-                let mut all = vec![&mut first.b, &mut second.b];
-                all.extend(third.as_mut().map(|t| &mut t.b));
-                all
-            }
+            Self::GemmGroup(g) => member_weights!(g),
+            Self::GemmNarrowGroup(g) => member_weights!(g),
+            Self::GemvGroup(g) => member_weights!(g),
+            Self::GemmGroupFp8(g) => member_weights!(g),
+            Self::GemmNarrowGroupFp8(g) => member_weights!(g),
+            Self::GemvGroupFp8(g) => member_weights!(g),
+            Self::GemvGroupTcFp8(g) => member_weights!(g),
             Self::GateUpAct(GateUpActBf16 { gate, up, .. })
             | Self::GateUpTcFp8(GateUpTcFp8 {
                 fold: GateUpActBf16 { gate, up, .. },

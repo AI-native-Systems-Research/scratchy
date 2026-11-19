@@ -42,6 +42,7 @@ use scratchy_target_cuda::step::{
 use scratchy_target_cuda::step::{
     BucketM, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, KDim, LayerId, NDim, Rows,
 };
+use scratchy_target_cuda::step::{GemmNarrowGroupBf16, MatmulGroup};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
 };
@@ -162,8 +163,8 @@ const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
 }
 
 /// The sibling projections of `a` (#1049's grouped GEMM): two members, `(b, c, n)` each.
-const fn group(a: u64, m: u32, members: [(u32, u64, u32); 2]) -> GemmGroupBf16 {
-    GemmGroupBf16 {
+const fn group(a: u64, m: u32, members: [(u32, u64, u32); 2]) -> MatmulGroup {
+    MatmulGroup {
         a: ArenaOffset(a),
         m: Rows(m),
         k: KDim(H),
@@ -299,12 +300,16 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
     steps: &[
         norm(0, 262144, 128),
-        CudaStep::GemmGroup(group(
+        CudaStep::GemmGroup(GemmGroupBf16::of(group(
             262144,
             128,
             [(2, 524288, CONV_DIM), (3, 2097152, VALUE_DIM)],
-        )),
-        CudaStep::GemmNarrowGroup(group(262144, 128, [(4, 2621440, NV), (5, 2625536, NV)])),
+        ))),
+        CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(group(
+            262144,
+            128,
+            [(4, 2621440, NV), (5, 2625536, NV)],
+        ))),
         CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
             (524288, 2097152, 2621440, 2625536),
             2629632,
@@ -343,12 +348,16 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
     steps: &[
         norm(0, 524288, 256),
-        CudaStep::GemmGroup(group(
+        CudaStep::GemmGroup(GemmGroupBf16::of(group(
             524288,
             256,
             [(2, 1048576, CONV_DIM), (3, 4194304, VALUE_DIM)],
-        )),
-        CudaStep::GemmNarrowGroup(group(524288, 256, [(4, 5242880, NV), (5, 5251072, NV)])),
+        ))),
+        CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(group(
+            524288,
+            256,
+            [(4, 5242880, NV), (5, 5251072, NV)],
+        ))),
         CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
             (1048576, 4194304, 5242880, 5251072),
             5259264,

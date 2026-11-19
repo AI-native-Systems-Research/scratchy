@@ -53,10 +53,17 @@ fn every_stored_kernel_choice_is_its_constants_pick() {
                     CudaStep::GemvFp8(g) => {
                         assert_eq!(g.split, split(g.n.get(), g.k.get(), 1), "{at}");
                     }
-                    CudaStep::GemvGroup(g) | CudaStep::GemvGroupFp8(g) => {
-                        let members = g.group.members();
+                    CudaStep::GemvGroup(g) => {
+                        let members = g.group().members();
                         for (m, stored) in members.iter().zip(g.splits()) {
-                            let want = m.map(|m| split(m.n.get(), g.group.k.get(), 1));
+                            let want = m.map(|m| split(m.n.get(), g.k.get(), 1));
+                            assert_eq!(stored, want, "{at}");
+                        }
+                    }
+                    CudaStep::GemvGroupFp8(g) => {
+                        let members = g.group().members();
+                        for (m, stored) in members.iter().zip(g.splits()) {
+                            let want = m.map(|m| split(m.n.get(), g.k.get(), 1));
                             assert_eq!(stored, want, "{at}");
                         }
                     }

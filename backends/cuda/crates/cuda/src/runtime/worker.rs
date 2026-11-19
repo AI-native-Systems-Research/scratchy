@@ -46,14 +46,15 @@ use crate::step::{
     ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16,
     ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
     GateSplitBf16, GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16,
-    GdnScan, GemmBf16, GemvBf16, GemvGroupBf16, GemvSplit, GroupMember, LayerScaleBf16,
-    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows,
-    QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight,
+    GdnScan, GemmBf16, GemvBf16, GemvSplit, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
+    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, QuantRowsFp8,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight,
 };
 use crate::step::{
-    AttnWindow, BucketM, Cols, GdnLayout, GemmCol64Bf16, GemmCol64Fp8, GemmFp8, GemmNarrowBf16,
-    GemmNarrowFp8, GemvFp8, GemvTcFp8, HeadDim, NumExperts, Rows, Splits, TopK,
+    AttnWindow, BucketM, Cols, GdnLayout, GemmCol64Bf16, GemmCol64Fp8, GemmFp8, GemmGroupFp8,
+    GemmNarrowBf16, GemmNarrowFp8, GemmNarrowGroupFp8, GemvFp8, GemvTcFp8, HeadDim, MatmulGroup,
+    NumExperts, Rows, Splits, TopK,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -1580,7 +1581,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GemvGroupFp8(gw @ GemvGroupBf16 { group: g, .. }) => {
+                    CudaStep::GemvGroupFp8(gw) => {
+                        let g = gw.group();
                         let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
                             .filter_map(|(i, m)| m.map(|m| (i, m)))
                             .collect();
@@ -1594,7 +1596,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         })
                         .collect();
-                        let splits = Self::member_splits(&gw, &present);
+                        let splits = Self::member_splits(gw.splits(), &present);
                         // Member `i`'s partials follow the members' before it, as the bf16 group's.
                         let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
                             .map(|(&(i, _), &sp)| {
@@ -1671,6 +1673,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::GemvGroupTcFp8(g) => {
+                        let g = g.group();
                         let (q, scale) = Self::fp8_rows(slot, g.a, 1, g.k.get());
                         let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (g.members())
                             .iter()
@@ -1744,7 +1747,30 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => {
+                    CudaStep::GemmGroupFp8(GemmGroupFp8 {
+                        a,
+                        m,
+                        k,
+                        first,
+                        second,
+                        third,
+                    })
+                    | CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8 {
+                        a,
+                        m,
+                        k,
+                        first,
+                        second,
+                        third,
+                    }) => {
+                        let g = MatmulGroup {
+                            a,
+                            m,
+                            k,
+                            first,
+                            second,
+                            third,
+                        };
                         let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> =
                             (g.members().iter())
                                 .flatten()
@@ -1999,6 +2025,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::GemmGroup(g) => {
+                        let g = g.group();
                         let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
                             .flatten()
                             .map(|m| {
@@ -2021,6 +2048,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::GemmNarrowGroup(g) => {
+                        let g = g.group();
                         let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
                             .flatten()
                             .map(|m| {
@@ -2041,7 +2069,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
-                    CudaStep::GemvGroup(gw @ GemvGroupBf16 { group: g, .. }) => {
+                    CudaStep::GemvGroup(gw) => {
+                        let g = gw.group();
                         let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
                             .filter_map(|(i, m)| m.map(|m| (i, m)))
                             .collect();
@@ -2054,7 +2083,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 )
                             })
                             .collect();
-                        let splits = Self::member_splits(&gw, &present);
+                        let splits = Self::member_splits(gw.splits(), &present);
                         // Member `i`'s partials follow the members' before it
                         // (`GemvGroupBf16::gemv_scratch_before`), null at one split.
                         let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
@@ -2978,9 +3007,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     }
 
     /// The stored K split of each of a GEMV group's present members (`present`, in member order).
-    fn member_splits(g: &GemvGroupBf16, present: &[(usize, GroupMember)]) -> Vec<u32> {
+    fn member_splits(splits: [Option<GemvSplit>; 3], present: &[(usize, GroupMember)]) -> Vec<u32> {
         (present.iter())
-            .map(|&(i, _)| g.splits()[i].map_or(1, |s| s.splits.get()))
+            .map(|&(i, _)| splits[i].map_or(1, |s| s.splits.get()))
             .collect()
     }
 

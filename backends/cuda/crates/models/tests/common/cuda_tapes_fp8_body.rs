@@ -20,7 +20,7 @@ use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
     CudaStep, ExpertGateUpActBf16, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
     ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpKernel, GateUpTcFp8,
-    GemvGroupBf16, MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
+    MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, TapeError, overlap,
@@ -368,7 +368,7 @@ fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
             CudaStep::GemvFp8(g) => {
                 assert!(!gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1), "m=1 step {i}: {g:?}")
             }
-            CudaStep::GemvGroupFp8(GemvGroupBf16 { group: g, .. }) => {
+            CudaStep::GemvGroupFp8(g) => {
                 let ns = [g.first.n.get(), g.second.n.get(), g.third.map_or(0, |t| t.n.get())];
                 assert!(!gemv_tc_takes(ns, g.k.get(), 1), "m=1 step {i}: {ns:?}");
             }

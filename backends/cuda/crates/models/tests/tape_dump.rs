@@ -45,10 +45,10 @@ use std::path::PathBuf;
 use scratchy_target_cuda::registry::{self, CudaModelEntry};
 use scratchy_target_cuda::step::{
     AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
-    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan,
-    GemmGroupBf16, GemvSplit, Matmul, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16,
-    RopePairing, RouteProgram, SiluMulBf16, attn_decode_split_scratch_bytes, gdn_bundle,
-    gdn_conv_dim, gdn_scratch,
+    GainConvention, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GdnScan, GemvSplit,
+    Matmul, MatmulGroup, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16, RopePairing,
+    RouteProgram, SiluMulBf16, attn_decode_split_scratch_bytes, gdn_bundle, gdn_conv_dim,
+    gdn_scratch,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, CudaTape, RotaryTable, WeightIx};
 use serde_json::{Map, Value, json};
@@ -220,7 +220,12 @@ fn gemm_step(s: &CudaStep) -> Value {
     gemm(s.gemm_view().expect("a one-weight GEMM step"))
 }
 
-fn group(g: &GemmGroupBf16) -> Value {
+/// A grouped step's [`group`].
+fn group_step(s: &CudaStep) -> Value {
+    group(&s.group().expect("a grouped GEMM step").1)
+}
+
+fn group(g: &MatmulGroup) -> Value {
     let members: Vec<Value> = (g.members().iter())
         .map(|m| {
             m.map_or(
@@ -309,6 +314,14 @@ fn splits(s: GemvSplit) -> Value {
     json!({"gemv_splits": s.splits})
 }
 
+/// A GEMV group's stored K split per member, the player's choice.
+fn group_splits(splits: [Option<GemvSplit>; 3]) -> Value {
+    let member_splits: Vec<Value> = (splits.iter())
+        .map(|m| m.map_or(Value::Null, |m| json!(m.splits)))
+        .collect();
+    json!({"gemv_splits": member_splits})
+}
+
 /// The norm's stored row-or-tiled kernel, the player's choice.
 fn norm_pick(n: &RmsNormBf16) -> Value {
     json!({"norm_row_takes": n.kernel == NormKernel::Row})
@@ -336,25 +349,23 @@ fn step_record(s: &CudaStep) -> Value {
         CudaStep::GemmNarrowFp8(_) => ("gemm_narrow_fp8_abt", gemm_step(s), Value::Null),
         CudaStep::GemvFp8(g) => ("gemv_fp8_residual", gemm_step(s), splits(g.split)),
         CudaStep::GemvTcFp8(_) => ("gemv_fp8_b8", gemm_step(s), Value::Null),
-        CudaStep::GemmGroup(g) => ("gemm_group_bf16_abt", group(g), Value::Null),
-        CudaStep::GemmNarrowGroup(g) => ("gemm_narrow_group_bf16_abt", group(g), Value::Null),
-        CudaStep::GemmGroupFp8(g) => ("gemm_group_fp8_abt", group(g), Value::Null),
-        CudaStep::GemmNarrowGroupFp8(g) => ("gemm_narrow_group_fp8_abt", group(g), Value::Null),
-        CudaStep::GemvGroup(g) | CudaStep::GemvGroupFp8(g) => {
-            let member_splits: Vec<Value> = (g.splits().iter())
-                .map(|m| m.map_or(Value::Null, |m| json!(m.splits)))
-                .collect();
-            let kernel = match s {
-                CudaStep::GemvGroup(_) => "gemv_group_bf16_abt",
-                _ => "gemv_group_fp8_abt",
-            };
-            (
-                kernel,
-                group(&g.group),
-                json!({"gemv_splits": member_splits}),
-            )
+        CudaStep::GemmGroup(_) => ("gemm_group_bf16_abt", group_step(s), Value::Null),
+        CudaStep::GemmNarrowGroup(_) => ("gemm_narrow_group_bf16_abt", group_step(s), Value::Null),
+        CudaStep::GemmGroupFp8(_) => ("gemm_group_fp8_abt", group_step(s), Value::Null),
+        CudaStep::GemmNarrowGroupFp8(_) => {
+            ("gemm_narrow_group_fp8_abt", group_step(s), Value::Null)
         }
-        CudaStep::GemvGroupTcFp8(g) => ("gemv_fp8_b8 (per member)", group(g), Value::Null),
+        CudaStep::GemvGroup(g) => (
+            "gemv_group_bf16_abt",
+            group_step(s),
+            group_splits(g.splits()),
+        ),
+        CudaStep::GemvGroupFp8(g) => (
+            "gemv_group_fp8_abt",
+            group_step(s),
+            group_splits(g.splits()),
+        ),
+        CudaStep::GemvGroupTcFp8(_) => ("gemv_fp8_b8 (per member)", group_step(s), Value::Null),
         CudaStep::RmsNorm(n) => (
             "rms_norm_bf16, or rms_norm_quant_row's row kernel when norm_row_takes",
             norm(n),
