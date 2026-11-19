@@ -62,8 +62,14 @@ pub(crate) struct BundleMeta {
     /// width, and a hybrid-attention arch gives classes different tables.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    /// A sin source also carries the table its rope reads (baked, `BakedSinTable`).
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    pub(crate) sin_srcs: Vec<(
+        usize,
+        usize,
+        scratchy_target_spyre::wiring::RotaryKind,
+        scratchy_target_spyre::wiring::BakedSinTable,
+    )>,
     pub(crate) result_id: usize,
     /// One per layer, in layer order.
     pub(crate) layers: Vec<LayerWiring>,

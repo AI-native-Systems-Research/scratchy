@@ -35,7 +35,14 @@ use scratchy_tensors::GpuTensor;
 // models crate (where `#[forward]` expands) names every wiring type through this crate's root,
 // and `PagedStep` carries the pair ([`PagedStep::extent`]) — so its literal needs the types in
 // reach through the same prefix every other wiring type uses.
-pub use ktir_superdsc::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
+pub use ktir_superdsc::sdsc_abstract::{
+    HeadWidth, QueryExtent, RotSign, RungCap, RungWidth, SignedSin, SinTable,
+};
+
+/// ⭐ A SIN SOURCE'S TABLE FORM, AS BAKED — [`SinTable`] over the bake's `&'static` sign list (a
+/// signed table's [`SignedSin::baked`], its width and one sign per stick of it), the fourth field
+/// of every [`Wiring::sin_srcs`] entry. The stagers read it; nothing at run time derives it.
+pub type BakedSinTable = SinTable<&'static [RotSign]>;
 
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
 // whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
@@ -643,6 +650,29 @@ impl RotaryKind {
     }
 }
 
+/// ⭐ THE SIN TABLE A ROPE SOURCE OF CLASS `kind` IS STAGED AS — read off the class head dim's
+/// rotate ([`ktir_superdsc::sdsc_abstract::RotateHalf::sin_table`], the one law over
+/// `rope_p_entry`) at EXPANSION, by the bake, which spells the answer into the wiring beside the
+/// source ([`Wiring::sin_srcs`]). A class head dim that is not whole sticks, or whose rotate has no
+/// factored form, has no rope that could read the table: a build error naming the model.
+pub fn sin_table_of(kind: RotaryKind, model: &str) -> SinTable<Vec<RotSign>> {
+    let hd = ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+        u64::from(kind.head_dim()),
+        model,
+    );
+    match ktir_superdsc::sdsc_abstract::RotateHalf::of(
+        hd,
+        ktir_superdsc::sdsc_abstract::Lanes::FP16,
+    ) {
+        Some(rotate) => rotate.sin_table(),
+        None => panic!(
+            "{model}: rotary class head_dim {} has no factored rotate-half form — its half \
+             straddles a stick, so no rope can read its table",
+            kind.head_dim()
+        ),
+    }
+}
+
 /// ⭐ THE PAGED STEP — what a paged forward's host fills each step, and the pool it fills it against.
 ///
 /// The attention reads its keys and values out of each layer's K and V POOLS (the cache tensors,
@@ -1089,21 +1119,24 @@ pub struct Wiring {
     /// Rotary `cos` / `sin` sources as `(id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K), so this is a list, not a pair;
     /// a hybrid-attention arch (gemma-4) additionally gives CLASSES different
-    /// rotary tables, so every source carries its own [`RotaryKind`].
+    /// rotary tables, so every source carries its own [`RotaryKind`]. A SIN source also carries
+    /// the table its rope reads ([`BakedSinTable`] — signed for a rotate of stick moves, plain for a
+    /// lane factor's), baked here so every stager reads one fact.
     pub cos_srcs: &'static [(u32, u32, RotaryKind)],
-    pub sin_srcs: &'static [(u32, u32, RotaryKind)],
+    pub sin_srcs: &'static [(u32, u32, RotaryKind, BakedSinTable)],
     /// Per-layer AttnDecode wiring, in layer order.
     pub layers: &'static [LayerWiring],
     pub geometry: Geometry,
-    /// ⭐ THE KERNEL-TABLE CLASS SETS — this program's DISTINCT rope head dims and DISTINCT
-    /// attention head dims, each sorted descending. Index `i` of the rope set ↔ the tid
-    /// `rope_p_class_tid(i)` holding that class's `[hd,hd]` P table; index `i` of the attention
-    /// set ↔ `identity_class_tid(i)` holding that class's `[hd,hd]` identity. Class 0 of each is
-    /// the widest and keeps the pre-class sentinel (`ROPE_P_TID`/`IDENTITY_TID`), so a uniform
-    /// model names the same tids it always did.
+    /// ⭐ THE KERNEL-TABLE CLASS SETS — the DISTINCT head dims of this program's ropes that read a
+    /// P table (`rope_p_table_class_hds`: empty, or the one-stick head `[64]` — a head whose half is
+    /// whole sticks rotates by stick moves and reads none) and its DISTINCT attention head dims,
+    /// each sorted descending. Index `i` of the rope set ↔ the tid `rope_p_class_tid(i)` holding
+    /// that class's `[hd,hd]` P table; index `i` of the attention set ↔ `identity_class_tid(i)`
+    /// holding that class's `[hd,hd]` identity. Class 0 of each is the widest and is the family's
+    /// sentinel (`ROPE_P_TID`/`IDENTITY_TID`).
     ///
-    /// ⛔ THE TABLES ARE BUILT AT LOAD, NOT BAKED AS LITERALS — a hybrid model's widest class is
-    /// `hd = 512` (gemma-4 production), and a 512² table is 262,144 f32 literals for one field,
+    /// ⛔ THE TABLES ARE BUILT AT LOAD, NOT BAKED AS LITERALS — a hybrid model's widest attention
+    /// class is `hd = 512` (gemma-4 production), and a 512² table is 262,144 f32 literals for one field,
     /// which is the expansion-cost rule broken in its most expensive form. The bake carries the
     /// class HEAD DIMS (a handful of u32s); `constant_acts` stages each class's table at load
     /// through the SAME shared helpers the emission used (`stage_kernel_table` + `rope_p_entry`),
@@ -2691,13 +2724,15 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     ));
 
     if hd >= 2 {
-        // ⭐ ONE ROPE-P PER ROPE CLASS, BUILT AT LOAD — the KERNEL of `rot = matmul(x, P)`, filled
-        // from the SHARED Kani-proven `rope_p_entry` so the on-card fill and the proof cannot
-        // drift, and staged through the kernel layout for the same reason as the identity. A
-        // composite single P is IMPOSSIBLE on a hybrid tape (the big class's contraction reads the
-        // small class's nonzero block as spurious ±1 terms), so one table per DISTINCT rope head
-        // dim. `hd >= 2` is the runtime's own guard on emitting a rope-P at all — a model with no
-        // rope has an empty class set and binds nothing, byte-identical to before.
+        // ⭐ ONE ROPE-P PER ROPE CLASS, BUILT AT LOAD — the KERNEL of the rope's lane-factor matmul,
+        // filled from the SHARED Kani-proven `rope_p_entry` so the on-card fill and the proof cannot
+        // drift, and staged through the kernel layout for the same reason as the identity. The class
+        // set holds only the ropes whose rotate READS a table (`rope_p_table_class_hds`: a one-stick
+        // head, whose lane matmul reads this table's stick-0 block); a head whose half is whole
+        // sticks rotates by stick moves and has no class, so nothing is staged for it. One table per
+        // class, never a composite (a wide class's contraction would read a narrow class's nonzero
+        // block as spurious ±1 terms). `hd >= 2` is the runtime's own guard on emitting a rope-P at
+        // all — a model with no table-reading rope has an empty class set and binds nothing.
         for (class, &hd_c) in env.rope_class_hds.iter().enumerate() {
             if hd_c < 2 {
                 continue;

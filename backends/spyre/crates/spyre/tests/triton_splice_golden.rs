@@ -29,7 +29,7 @@ use scratchy_subtile::subtile_ir::{
     EwKind, GainConvention, Range, Region, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion,
     TensorShape,
 };
-use scratchy_target_spyre::ktir_superdsc_door::{BundleAttnParams, lower as bundle_lower};
+use scratchy_target_spyre::ktir_superdsc_door::lower as bundle_lower;
 
 /// One program through the production door as a bundle of its own — the fp8 quantize set starts
 /// empty, which is what a one-program bundle's is.
@@ -37,12 +37,11 @@ fn door_lower(
     k: &ktir_superdsc::ktir_node::KtirNode,
     sym: &mut i64,
     layout: Option<&ktir_superdsc::placement::BundleLayout>,
-    attn: Option<BundleAttnParams>,
 ) -> Result<
     Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
     ktir_superdsc::emit::lower_ktir_to_superdsc::Error,
 > {
-    bundle_lower(k, sym, layout, attn, &mut QuantizedActivations::default())
+    bundle_lower(k, sym, layout, &mut QuantizedActivations::default())
 }
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 use scratchy_triton_splice::PagedRows;
@@ -108,7 +107,6 @@ fn spliced_rmsnorm_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
     }
@@ -172,7 +170,6 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {}", e.message));
 
@@ -305,7 +302,6 @@ fn spliced_silumul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
     }
@@ -397,7 +393,6 @@ fn a_column_chunked_silumul_splices_through_the_door() {
             .expect("spliced op carries its program"),
         &mut sym,
         Some(&layout),
-        None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered: {}", e.message));
 
@@ -506,7 +501,6 @@ fn spliced_elementwise_lowers_through_the_door() {
                     .expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
-                None,
             )
             .unwrap_or_else(|e| {
                 panic!(
@@ -613,7 +607,6 @@ fn spliced_dense_matmul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
     }
@@ -1171,7 +1164,6 @@ fn spliced_scalarmul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
     }
@@ -1239,7 +1231,6 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
                 .expect("spliced op carries its program"),
             &mut splice_sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (chunk {chunk_idx}): {}", e.message));
 
@@ -1432,6 +1423,17 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
             want[r * hd as usize + i + half] = x2 * c + x1 * s;
         }
     }
+    // ⭐ THE DEVICE FORM OF THE SIN TABLE — the kernel reads `sin'` for a rotate of stick moves
+    // (`SIN_SIGNED`), so the session is staged the worker's way: the plain table through its
+    // rotate's own `SinTable` (the one law). The host reference above keeps the plain table.
+    let mut sin_device = sin;
+    ktir_superdsc::sdsc_abstract::RotateHalf::of(
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(hd),
+        ktir_superdsc::sdsc_abstract::Lanes::FP16,
+    )
+    .unwrap_or_else(|| panic!("hd {hd} has a factored rotate"))
+    .sin_table()
+    .sign_heads(&mut sin_device);
 
     let mut session =
         scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
@@ -1442,7 +1444,7 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
             vec![
                 (0, x, vec![tall, hd as usize]),
                 (1, cos, vec![tall, hd as usize]),
-                (2, sin, vec![tall, hd as usize]),
+                (2, sin_device, vec![tall, hd as usize]),
             ],
             &[(3, 0)],
         )
@@ -1510,7 +1512,6 @@ fn batched_decode_odd_vocab_lm_head_splices() {
             .expect("spliced op carries its program"),
         &mut sym,
         Some(&layout),
-        None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
 }
@@ -1649,7 +1650,6 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
                 .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
-            None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
     }
@@ -1883,21 +1883,27 @@ fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
     }
 }
 
-/// The rope shapes that matter for the delivery scope: granite 2b (hd 64, the
-/// collapsed head-major form — 32 q-heads decode, 8 kv-heads decode) and 8b (hd 128,
-/// the slab form), at decode mq=1 and a prefill rung mq=31. (MQ, HEADS, HD).
+/// The rope shapes that matter for the delivery scope: granite 2b (hd 64, the lane factor
+/// — one matmul against P — 32 q-heads, 8 kv-heads) and 8b (hd 128, the stick factor — two
+/// half-moves), at decode mq=1 and prefill rungs; and gemma-4 12B's two classes (hd 256
+/// sliding Q16/K8, hd 512 global Q16/K1) at decode and the rungs 23/29/31. (MQ, HEADS, HD).
 const ROPE_SHAPES: &[(u32, u32, u32)] = &[
     (1, 32, 64),   // 2b decode, the q plane
     (1, 8, 64),    // 2b decode, the kv plane
     (31, 32, 64),  // 2b prefill rung
     (1, 32, 128),  // 8b decode, the q plane
     (1, 8, 128),   // 8b decode, the kv plane
-    (31, 32, 128), // 8b prefill rung (the slab form)
+    (31, 32, 128), // 8b prefill rung
     // The 8b's REAL prefill rung — mq=96 (the rung the card bakes) and the q
-    // plane's own head count at hd=128 (32 heads = the slab form at its widest
-    // head-major extent the 2b never reaches).
+    // plane's own head count at hd=128.
     (96, 8, 128),
     (96, 32, 128),
+    // gemma-4 12B: the bands' pitch is the head width, at every row count.
+    (1, 16, 256),
+    (23, 8, 256),
+    (29, 16, 256),
+    (1, 1, 512),
+    (31, 16, 512),
 ];
 
 #[test]
@@ -1940,19 +1946,15 @@ fn spliced_rope_lowers_through_the_door() {
             );
 
             // The program lowers through the production door under the walk's own
-            // layout. Rope's door arm reads `rows_are_requests` off
-            // `BundleAttnParams` — the bundle states NO geometry: the door mints
-            // each program's geometry from the program's own views (the
-            // hybrid-model law; gemma-4 carries two attention classes, so no
-            // per-bundle geometry exists to state here).
-            let attn_params =
-                scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams { rows_are_requests };
+            // layout — at BOTH row kinds, neither of which the rope's one form reads: the
+            // door takes no bundle fact, and mints each program's geometry from the
+            // program's own views (the hybrid-model law; gemma-4 carries two attention
+            // classes, so no per-bundle geometry exists to state here).
             let mut sym = 0i64;
             let _emitted = door_lower(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
-                Some(attn_params),
             )
             .unwrap_or_else(|e| {
                 panic!(
@@ -2855,7 +2857,7 @@ fn the_paged_attention_splices_with_its_contract() {
         scratchy_triton_splice::allocate_paged_cache(k, &layout)
             .unwrap_or_else(|e| panic!("{at}: {e}"));
         let mut sym = 0i64;
-        let ops = door_lower(k, &mut sym, Some(&layout), None)
+        let ops = door_lower(k, &mut sym, Some(&layout))
             .unwrap_or_else(|e| panic!("{at}: the walk lowers: {}", e.message));
         assert!(!ops.is_empty(), "{at}: the walk emitted nothing");
         let walking = ktir_superdsc::emit::loop_fold::flatten(k)
@@ -4053,7 +4055,6 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
             .expect("spliced op carries its program"),
         &mut sym,
         Some(&layout),
-        None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
     assert!(

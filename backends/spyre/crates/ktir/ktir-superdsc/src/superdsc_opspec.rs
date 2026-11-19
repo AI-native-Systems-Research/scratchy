@@ -2503,7 +2503,9 @@ impl WalkAxis for InAxis {
     const NAME: &'static str = "in";
 }
 
-/// N — the output stick axis (`out`).
+/// The output stick axis (`out`) — of a matmul (its N, the output columns) and of a pointwise view
+/// (the swept stick axis every operand of the op shares, e.g. the stick bands' band width). One
+/// marker, because both ops name that axis `out`.
 pub struct OutAxis;
 impl WalkAxis for OutAxis {
     const NAME: &'static str = "out";

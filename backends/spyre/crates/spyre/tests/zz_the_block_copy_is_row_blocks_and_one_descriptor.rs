@@ -76,9 +76,8 @@ fn the_row_blocked_copy_emits_the_per_stick_copys_descriptors() {
         let k = e.ktir.as_ref().expect("a program");
         let mut sym = 0i64;
         let mut q = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
-        let ops =
-            scratchy_target_spyre::ktir_superdsc_door::lower::<W>(k, &mut sym, None, None, &mut q)
-                .unwrap_or_else(|e| panic!("case {i}: {}", e.message));
+        let ops = scratchy_target_spyre::ktir_superdsc_door::lower::<W>(k, &mut sym, None, &mut q)
+            .unwrap_or_else(|e| panic!("case {i}: {}", e.message));
         assert_eq!(ops.len(), 1, "case {i}: one identity");
         for op in ops {
             all.push(serde_json::json!({

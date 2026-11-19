@@ -175,8 +175,14 @@ pub(crate) struct Parsed {
     /// per-position rotary row across heads.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    /// A sin source also carries the table its rope reads (baked, `BakedSinTable`).
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    pub(crate) sin_srcs: Vec<(
+        usize,
+        usize,
+        scratchy_target_spyre::wiring::RotaryKind,
+        scratchy_target_spyre::wiring::BakedSinTable,
+    )>,
     pub(crate) result_id: usize,
     pub(crate) capacity: usize,
     pub(crate) m_cap: usize,
@@ -237,6 +243,24 @@ pub(crate) fn wiring_to_parsed(
             .map(|&(i, w, k)| (i as usize, w as usize, k))
             .collect()
     };
+    // A sin source carries its table form beside its class, as the wiring bakes it.
+    #[cfg(not(feature = "spyre-hw"))]
+    let quads = |v: &'static [(
+        u32,
+        u32,
+        scratchy_target_spyre::wiring::RotaryKind,
+        scratchy_target_spyre::wiring::BakedSinTable,
+    )]|
+     -> Vec<(
+        usize,
+        usize,
+        scratchy_target_spyre::wiring::RotaryKind,
+        scratchy_target_spyre::wiring::BakedSinTable,
+    )> {
+        v.iter()
+            .map(|&(i, w, k, t)| (i as usize, w as usize, k, t))
+            .collect()
+    };
     let embed_src = w.embed_src as usize;
     Ok(Parsed {
         #[cfg(not(feature = "spyre-hw"))]
@@ -244,7 +268,7 @@ pub(crate) fn wiring_to_parsed(
         #[cfg(not(feature = "spyre-hw"))]
         cos_srcs: triples(w.cos_srcs),
         #[cfg(not(feature = "spyre-hw"))]
-        sin_srcs: triples(w.sin_srcs),
+        sin_srcs: quads(w.sin_srcs),
         result_id: w.result as usize,
         capacity,
         m_cap: (w.tensor_shapes[embed_src].0 as usize).max(1),

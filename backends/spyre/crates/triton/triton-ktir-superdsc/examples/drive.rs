@@ -165,10 +165,7 @@ fn main() {
         }
     }
     // THE GEOMETRY DOOR. `rope` cannot be dispatched from a runtime `Program`, so it gets its own
-    // entry point and the geometry is READ from the fixture's recorded constexprs. Note
-    // `rows_are_requests: false`, and it is a reading, not a default: the fixtures sweep
-    // `N_TOK` CONSECUTIVE POSITIONS of one sequence (`rope.py`'s `offs_m = off_h * N_TOK +
-    // start_m * BLOCK_M`), never one row per request.
+    // entry point and the geometry is READ from the fixture's recorded constexprs.
     //
     // ⛔ ATTENTION HAS NO ARM HERE, ON PURPOSE. The old `Program::Attn` arm routed through
     // `drive_attn` → `attn_at::<NQH, NKVH, HD>`, scratchy's prebuilt fragment-assembly lowering
@@ -194,7 +191,7 @@ fn main() {
             Some(triton_ktir_superdsc::drive_rope::<
                 ktir_superdsc::collective::TpWorld<1>,
             >(
-                &node, hd, n_tok, h * hd, rows, false, layout.as_ref()
+                &node, hd, n_tok, h * hd, rows, layout.as_ref()
             ))
         }
         _ => None,

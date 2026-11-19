@@ -50,7 +50,7 @@ use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{
     BundleLayout, SegRole, SynthAlloc, TensorPlacement, WeightTail, align128, synth_footprint_bytes,
 };
-use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
+use ktir_superdsc::reserved_tids::{rope_p_class_tid, rope_p_table_class_hds, scalarmul_scale_tid};
 use ktir_superdsc::superdsc_opspec::Df;
 use ktir_superdsc::wire::SEGMENT_SIZE;
 use ktir_superdsc::work::DeviceWidth;
@@ -501,17 +501,18 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     }
 
     // ── THE ROTATE MATRIX P ──────────────────────────────────────────────────────────────────────
-    // `rope_at` opens with `crate::place::act_name(ROPE_P_TID)` and reaches it from BOTH its forms —
-    // the head-major collapse as one `[hd, hd]` kernel matmul, the slab path as a per-slab ±I block
-    // — so a rope driven without this placement is not a wrong address, it is `resolve_seg_base`'s
-    // panic.
+    // A rope reads a staged P only when its rotate has a LANE factor (`RotateHalf::lane`, a head of
+    // one stick: `rope_at` matmuls the stream's stick-column rows against P's one-stick block); a
+    // head whose half is whole sticks rotates by stick moves and names no table. So the class set is
+    // `rope_p_table_class_hds` of this rope's head dim — no class or one — and P is placed per class
+    // at its class tid; a lane-factor rope driven without it is not a wrong address, it is
+    // `resolve_seg_base`'s panic.
     //
     // ⭐ AND ITS EXTENT IS READ, NOT INVENTED, WHICH IS WHY THIS ONE RESERVED CONST CAN BE PLACED
-    // HERE AT ALL. P is `[hd, hd]` fp16 — `rope_at` addresses it as
-    // `Stk::<KernelTag>::kernel(hd, hd, &p)` and scratchy places it at `hd * hd * 2` — and `hd` is
-    // stated by the program: `Region`'s own doc says the rope views its plane as `[rows·heads, hd]`,
-    // so the OUTPUT view's column count IS the head dim. Nothing is guessed, so the footprint guard
-    // keeps its teeth for P as well.
+    // HERE AT ALL. P is `[hd, hd]` fp16 — scratchy places it at `hd * hd * 2` — and `hd` is stated
+    // by the program: `Region`'s own doc says the rope views its plane as `[rows·heads, hd]`, so the
+    // OUTPUT view's column count IS the head dim. Nothing is guessed, so the footprint guard keeps
+    // its teeth for P as well.
     //
     // ⛔ IT IS A DEVICE CONSTANT AND NOT A PARAMETER, so it is placed with the per-launch inputs
     // (`SegRole::Activation`) and not in the output segment: scratchy's own comment at this
@@ -520,9 +521,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // ⇒ RoPE collapses to x·cos ⇒ wrong positional encoding".
     //
     // ⭐ THE CLASS SET IS REGISTERED WHERE P IS PLACED. `rope_p_class_tid(idx)` keys off
-    // `BundleLayout::rope_class_hds` (one entry per DISTINCT rope head dim, sorted descending,
-    // class 0 = the widest = `ROPE_P_TID`), and the door resolves this rope's `p_tid` off that same
-    // list — so the placement pass and the lowering read ONE registry, never two.
+    // `BundleLayout::rope_class_hds` (one entry per DISTINCT head dim of a rope that reads a table,
+    // sorted descending, class 0 = the widest = `ROPE_P_TID`), and the lowering resolves this rope's
+    // table off that same list (`BundleLayout::rope_p_tid`) — so the placement pass and the lowering
+    // read ONE registry, never two.
     let mut rope_class_hds: Vec<u32> = Vec::new();
     if matches!(node.program, Program::Rope) {
         let out = r.iter().find(|reg| reg.is_out).ok_or_else(|| Error {
@@ -545,18 +547,20 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
                 ),
             });
         }
-        // One rope program per single-kernel bundle, so one class — trivially the widest, and its
-        // ops name `ROPE_P_TID` exactly as a uniform model's do (the byte-identity law).
-        rope_class_hds.push(hd);
-        let size = synth_footprint_bytes(&[hd, hd], Df::Fp16);
-        pack(
-            name,
-            ROPE_P_TID,
-            SegRole::Activation,
-            size,
-            &mut placements,
-            &mut segment_bytes,
-        )?;
+        // One rope program per single-kernel bundle, so at most one class — trivially the widest,
+        // and its ops name `ROPE_P_TID` exactly as a uniform model's do (the byte-identity law).
+        rope_class_hds = rope_p_table_class_hds(std::iter::once(hd));
+        for (class, &hd_c) in rope_class_hds.iter().enumerate() {
+            let size = synth_footprint_bytes(&[hd_c, hd_c], Df::Fp16);
+            pack(
+                name,
+                rope_p_class_tid(class),
+                SegRole::Activation,
+                size,
+                &mut placements,
+                &mut segment_bytes,
+            )?;
+        }
     }
 
     // ── THE fp8 W8A8 CLAMP CONSTS ─────────────────────────────────────────────────────────────────
@@ -723,9 +727,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         weight_scale_folds: Vec::new(),
         // No head-major o_proj copies: the restructure is minted from a spyre bundle's
         // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
-        // The rope-P class set, filled where P itself is placed (see the Rope arm above). `drive_rope`
-        // resolves this rope's `p_tid` off it — the same registry the consumer ladder's door resolves
-        // through, so the two ladders cannot disagree about which P table a class reads.
+        // The rope-P class set, filled where P itself is placed (see the Rope arm above). The rope's
+        // lowering resolves its table off it (`BundleLayout::rope_p_tid`) — the same registry the
+        // consumer ladder's layout fills, so the two ladders cannot disagree about which P table a
+        // class reads.
         rope_class_hds,
         // No attention identity classes: `Attn` is refused BY NAME at this crate's doors, so no
         // `AttnDecode` program reaches layout to state a head dim.
@@ -856,8 +861,8 @@ fn convert_swept_tids(node: &KtirNode) -> std::collections::BTreeSet<u32> {
 /// The reserved device constants a `Program`'s entry point names without them being parameters, or
 /// `None` when it names none.
 ///
-/// ⛔ READ OFF THE BODIES, one by one. `rope_at` opens with `crate::place::act_name(ROPE_P_TID)`
-/// (the rotate matrix) and `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`, `IDENTITY_TID` and
+/// ⛔ READ OFF THE BODIES, one by one. A rope whose rotate has a lane factor names its class's P
+/// table (the rotate matrix) and `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`, `IDENTITY_TID` and
 /// `kct_resident_tid(k_id)`. None of those is a buffer a Triton kernel declares. Every other body
 /// names only its parameters and its own declared synthetics.
 ///

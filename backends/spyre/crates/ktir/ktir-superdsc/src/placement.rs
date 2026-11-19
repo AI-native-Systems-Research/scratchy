@@ -299,13 +299,14 @@ pub struct BundleLayout {
     /// existed.
     #[serde(default)]
     pub weight_scale_folds: Vec<(u32, f32)>,
-    /// ⭐ THE ROPE-P CLASS SET — this tape's DISTINCT rope head dims, sorted descending. Index `i` ↔
-    /// [`rope_p_class_tid`](crate::reserved_tids::rope_p_class_tid)`(i)` (class 0 = the widest =
-    /// `ROPE_P_TID`). One `[hd,hd]` P table per class: a hybrid (gemma-4) carries two rope head dims
-    /// and a composite single P is IMPOSSIBLE (the big class's contraction reads the small class's
-    /// nonzero block as spurious ±1 terms). The DOOR resolves a rope program's class index here —
-    /// the same registry lookup `scalarmul_scales` established — so the emitter, the placement pass
-    /// and the worker's load-time bind all agree on class↔tid by construction.
+    /// ⭐ THE ROPE-P CLASS SET — the DISTINCT head dims of this tape's ropes that READ a P table
+    /// (their rotate has a lane factor, [`crate::reserved_tids::rope_p_table_class_hds`]), sorted
+    /// descending: empty, or the one-stick head `[64]` — a rope whose half is whole sticks (granite's
+    /// 128, gemma-4's 256 and 512) rotates by stick moves and names no table. Index `i` ↔
+    /// [`rope_p_class_tid`](crate::reserved_tids::rope_p_class_tid)`(i)`, so the one class is class 0
+    /// = `ROPE_P_TID`. The lowering resolves a rope's table here ([`Self::rope_p_tid`]) — the same
+    /// registry lookup `scalarmul_scales` established — so the emitter, the placement pass and the
+    /// worker's load-time bind all agree on class↔tid by construction.
     #[serde(default)]
     pub rope_class_hds: Vec<u32>,
     /// ⭐ THE IDENTITY CLASS SET — this tape's DISTINCT `AttnDecode` head dims, sorted descending.
@@ -823,6 +824,17 @@ impl BundleLayout {
     /// The identity behind an emitted operand's spelling, or `None` if nothing minted it.
     pub fn id_of(&self, name: &str) -> Option<PlaceId> {
         self.ids.borrow().get(name).copied()
+    }
+
+    /// ⭐ THE P TABLE A ROPE OF HEAD DIM `hd` READS — its class's tid off [`Self::rope_class_hds`]
+    /// ([`rope_p_class_tid`](crate::reserved_tids::rope_p_class_tid) of its index), or `None` when
+    /// the registry holds no class for it. The ONE class ↔ tid resolution on the emitting side: the
+    /// rope's lowering asks it for a rotate whose lane factor reads a table, and for no other.
+    pub fn rope_p_tid(&self, hd: u32) -> Option<u32> {
+        self.rope_class_hds
+            .iter()
+            .position(|&h| h == hd)
+            .map(crate::reserved_tids::rope_p_class_tid)
     }
 
     /// ⭐⭐⭐ THE PLACEMENT-AUTHORITY MINT — a [`Win`] over a tensor THIS layout places.

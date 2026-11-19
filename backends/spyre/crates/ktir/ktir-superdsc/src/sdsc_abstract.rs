@@ -477,15 +477,12 @@ impl MatM {
     pub const fn of_query_rows(mq: QueryRowCount) -> MatM {
         MatM(mq.get())
     }
-    /// Exactly ONE row: the per-(request, head) forms, where the request and the head are carried
-    /// by each op's own base offset rather than by this extent.
-    pub(crate) const fn single_row() -> MatM {
-        MatM(1)
-    }
-    /// A whole head-major buffer's rows (`heads * mq`) — the collapsed RoPE form sweeps them all in
-    /// one op.
-    pub const fn of_head_major_rows(rows: u32) -> MatM {
-        MatM(rows)
+    /// The stick-column rows of a stick-major tensor — its tall-narrow `[sticks · rows, lanes]`
+    /// image, as [`RowCount::of_stick_column_rows`] states it (this reads that product, never
+    /// restates it). RoPE's lane factor sweeps them all in one op: one `[lanes, lanes]` kernel
+    /// serves every stick of every head and every row.
+    pub const fn of_stick_column_rows(rows: RowCount) -> MatM {
+        MatM(rows.get())
     }
     /// A node's token rows — the dense projections, the lm-head, the fp8 W8A8 chain.
     pub const fn of_token_rows(m: u32) -> MatM {
@@ -501,11 +498,6 @@ impl MatM {
 pub struct MatN(u32);
 
 impl MatN {
-    /// One head's feature width — the value matmul's and RoPE's output columns. Takes the typed
-    /// [`HeadWidth`], so the width is whole sticks by construction and no reader re-derives it.
-    pub const fn of_head_dim(hd: HeadWidth) -> MatN {
-        MatN(hd.get())
-    }
     /// The score block's kv window — the column count of one online-softmax block (one stick per
     /// fold sub-block by design). Takes the block's own typed width, so the score matmul's N and
     /// the reduce sweep that consumes it are one quantity by construction.
@@ -534,7 +526,7 @@ pub struct MatK(u32);
 
 impl MatK {
     /// One head's feature width — the score matmul contracts Q·Kᵀ over it. Takes the typed
-    /// [`HeadWidth`], same reason as [`MatN::of_head_dim`].
+    /// [`HeadWidth`], so the width is whole sticks by construction and no reader re-derives it.
     pub const fn of_head_dim(hd: HeadWidth) -> MatK {
         MatK(hd.get())
     }
@@ -1639,9 +1631,10 @@ impl StickLayout {
 
     /// The device element offset of multi-index `corner` for the ORIGINAL view `dims` under this
     /// (`for_view`-classified) layout — BYTE-IDENTICAL to `dev_off(dims, stick_idx, corner)`. Stick-
-    /// blocked kinds delegate to [`dev_off`](Self::dev_off) on the 2-D `(corner[0], corner[1])`; `Flat`
-    /// folds `corner` row-major over `dims` (the free `dev_off` else-branch). `dims`/`corner` are the
-    /// SAME slices passed to `for_view`.
+    /// blocked kinds fold the row coordinate `corner[0]` and the FEATURE coordinate — every later
+    /// axis, the stick axis innermost, each axis outside it stepping by the declared extent of
+    /// everything inside it — through [`dev_off_stk`]; `Flat` folds `corner` row-major over `dims`
+    /// (the free `dev_off` else-branch). `dims`/`corner` are the SAME slices passed to `for_view`.
     ///
     /// `ext` is a [`DeviceExtents`], not a bare slice, so the vector an address is folded over can only
     /// come from [`DeviceExtents::of_view`] — the one place a view's declared physical extent is
@@ -1666,12 +1659,29 @@ impl StickLayout {
             // the end of the operand. `cols` is inert in this formula, so this is byte-identical
             // whenever `dims[0] == self.rows` (every non-broadcast view) and whenever the stick-axis
             // corner is 0 (any unsplit stick dim).
-            Addressing::StickBlocked => dev_off_stk(
-                &[*dims.first().unwrap_or(&self.rows), self.cols],
-                1,
-                &[corner[0], corner[1]],
-                self.lanes(),
-            ),
+            //
+            // ⭐ THE FEATURE COORDINATE IS EVERY AXIS AFTER THE ROWS, not `corner[1]` alone. A
+            // stick-blocked view is its row axis over the stick-major plane's columns, and every
+            // later axis is a column axis: the stick axis innermost, each axis outside it stepping by
+            // the DECLARED extent of everything inside it (`dims` is the view's `DeviceExtents` — a
+            // window's allocation or a pitch's declared extent where one is stated). A `[mb, out, y]`
+            // band view of `y` heads `hd` apart puts head `y`'s band at column `y·hd + out`. A fold
+            // of `corner[1]` alone would drop every outer column coordinate and start a core owning
+            // another head at head 0's band, its start colliding with that core's. At rank 2, and
+            // wherever every outer corner is 0, this is the `(corner[0], corner[1])` fold exactly.
+            Addressing::StickBlocked => {
+                let (mut col, mut inner) = (0usize, 1usize);
+                for (&c, &e) in corner.iter().zip(dims).skip(1) {
+                    col += c * inner;
+                    inner *= e;
+                }
+                dev_off_stk(
+                    &[*dims.first().unwrap_or(&self.rows), self.cols],
+                    1,
+                    &[corner[0], col],
+                    self.lanes(),
+                )
+            }
         }
     }
 }
@@ -2320,11 +2330,12 @@ impl Stk<KernelTag> {
 /// [`PagedKvPool::kt_write_off`] / [`PagedKvPool::v_write_off`] are the typed doors, and the
 /// layout tests state the address law through `StickLayout` directly.)
 /// THE RoPE ROTATE-HALF PERMUTATION MATRIX ENTRY `P[inn][o]` for a head of width `hd` (even). RoPE
-/// computes `out = x·cos + rot·sin` with `rot = matmul(x, P)`; this P makes `rot` the NeoX rotate-half:
+/// computes `out = x·cos + rot·sin` with `rot = x·P`; this P makes `rot` the NeoX rotate-half:
 /// `rot[o] = -x[o+half]` for `o < half`, `+x[o-half]` for `o >= half` (half = hd/2). SINGLE SOURCE OF
-/// TRUTH shared by (a) the worker's `ROPE_P` seg0-activation fill (`spyre_worker.rs`) and (b) the Kani
-/// proof (`rope_permutation_matrix_is_rotate_half`) — so there is NO transcription gap between the code
-/// that RUNS on-card and the code that is PROVEN. Pure integer (no heap) ⇒ CBMC-tractable.
+/// TRUTH shared by (a) the worker's `ROPE_P` seg0-activation fill (`spyre_worker.rs`), (b) the Kani
+/// proof (`rope_permutation_matrix_is_rotate_half`) and (c) [`RotateHalf::of`], which reads the rope's
+/// device factors off it — so there is NO transcription gap between the code that RUNS on-card, the
+/// code that is LOWERED and the code that is PROVEN. Pure integer (no heap) ⇒ CBMC-tractable.
 /// ```
 /// use ktir_superdsc::sdsc_abstract::rope_p_entry;
 /// // hd=4, half=2: rot[0]=-x[2], rot[1]=-x[3], rot[2]=+x[0], rot[3]=+x[1].
@@ -2340,6 +2351,294 @@ pub fn rope_p_entry(hd: usize, inn: usize, o: usize) -> i8 {
         1 // rot[o] = +x[o-half]    (o >= half)
     } else {
         0
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ ROTATE-HALF, FACTORED OVER THE DEVICE'S STICKS — derived from [`rope_p_entry`], the one
+/// statement of its pairing and sign, by [`RotateHalf::of`]. Nothing else states either: the rope's
+/// lowering emits what these factors say, and the table the worker stages is `rope_p_entry` itself.
+///
+/// Rotate-half is a signed permutation of a head's columns. Over a head of whole sticks it factors
+/// into two device moves, each found by searching `rope_p_entry` where that move would put an output
+/// column's source:
+///
+/// * the STICK factor ([`Self::stick_moves`]) — whole sticks move, every lane in place, each run of
+///   them under one sign. The rope lowers each [`StickMove`] as ONE whole-tensor band MULTIPLY of
+///   the moved sticks by the SIGNED sin table ([`Self::sin_table`]: the run's sign lives in the
+///   table, so the multiply carries none) over pitched stick bands of the token stream: no matmul,
+///   no P, no `rot` tensor. Empty when the permutation does not keep lanes in place.
+/// * the LANE factor ([`Self::lane`]) — lanes permute inside each stick, every stick in place, the
+///   same lanes and signs in every stick. The rope lowers it as ONE matmul of the stream's
+///   stick-column rows against the staged P's one-stick block (K = N = one stick, so it can never be
+///   multi-stick or corelet-split). `None` when the permutation does not keep sticks in place.
+///
+/// An identity factor emits nothing. `rope_p_entry` pairs `o` with `o ± hd/2`, so at fp16 the stick
+/// factor is the whole rotate when `hd/2` is whole sticks (128, 256, 512: two runs, one negated) and
+/// the lane factor is the whole rotate when the head is one stick (64). A head whose half straddles
+/// a stick (an odd stick count above one) keeps neither in place, and [`Self::of`] answers `None`:
+/// it has no factored device form, and the rope's bake refuses it by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotateHalf {
+    /// The head width the factors are of — the one statement of how many sticks the stick factor
+    /// covers and how wide a signed table's head is.
+    width: HeadWidth,
+    moves: Vec<StickMove>,
+    lane: Option<LaneSwap>,
+}
+
+/// One run of the stick factor: output sticks `[dst, dst + sticks)` of a head are the input sticks
+/// `[src, src + sticks)` of the same head, every lane in place, times [`Self::sign`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StickMove {
+    src: u32,
+    dst: u32,
+    sticks: u32,
+    sign: RotSign,
+}
+
+impl StickMove {
+    /// The first input stick the run reads, within the head.
+    pub const fn src(self) -> u32 {
+        self.src
+    }
+    /// The first output stick the run writes, within the head.
+    pub const fn dst(self) -> u32 {
+        self.dst
+    }
+    /// How many whole sticks the run moves.
+    pub const fn sticks(self) -> u32 {
+        self.sticks
+    }
+    /// The sign every moved element carries.
+    pub const fn sign(self) -> RotSign {
+        self.sign
+    }
+}
+
+/// The sign of one nonzero [`rope_p_entry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotSign {
+    Plus,
+    Minus,
+}
+
+impl RotSign {
+    /// The sign `rope_p_entry` states, or `None` for an entry that pairs nothing.
+    fn of_entry(e: i8) -> Option<RotSign> {
+        match e {
+            1 => Some(RotSign::Plus),
+            -1 => Some(RotSign::Minus),
+            _ => None,
+        }
+    }
+}
+
+/// The lane factor's witness: the head's in-stick permutation moves lanes, so its rope reads the
+/// staged P. Minted only by [`RotateHalf::of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneSwap {
+    lanes: Lanes,
+}
+
+impl LaneSwap {
+    /// The width the lane matmul contracts and writes — ONE stick of the rope's lanes, so its kernel
+    /// is the staged P's stick-0 `[lanes, lanes]` block: the lane permutation every stick shares.
+    pub const fn width(self) -> BlockCols {
+        BlockCols::of_one_stick(self.lanes)
+    }
+}
+
+impl RotateHalf {
+    /// ⭐ THE ONE DERIVATION — rotate-half over the sticks of a head `hd` wide at `lanes`, read off
+    /// [`rope_p_entry`]; `None` when the head has no factored form.
+    ///
+    /// The stick factor first: for every output column, its source at the SAME lane of some input
+    /// stick. If every output stick reads one input stick under one sign, those are the moves (runs
+    /// merged where both sides step one stick and the sign holds). Otherwise the lane factor: for
+    /// every output column, its source in its OWN stick, the same lane and sign in every stick. A
+    /// permutation that moves nothing rotates nothing, so it is `None` as well.
+    pub fn of(hd: HeadWidth, lanes: Lanes) -> Option<RotateHalf> {
+        let (l, n) = (lanes.n(), hd.sticks());
+        let entry = |inn: u32, o: u32| {
+            RotSign::of_entry(rope_p_entry(hd.as_usize(), inn as usize, o as usize))
+        };
+        // The stick factor: every lane of output stick `s` reads one input stick, under one sign.
+        let stick_of = |s: u32| -> Option<(u32, RotSign)> {
+            let mut src = None;
+            for j in 0..l {
+                let hit = (0..n).find_map(|si| entry(si * l + j, s * l + j).map(|sg| (si, sg)))?;
+                if *src.get_or_insert(hit) != hit {
+                    return None;
+                }
+            }
+            src
+        };
+        if let Some(map) = (0..n).map(stick_of).collect::<Option<Vec<_>>>() {
+            if (0..n).zip(&map).all(|(s, &m)| m == (s, RotSign::Plus)) {
+                return None;
+            }
+            let mut moves: Vec<StickMove> = Vec::new();
+            for (dst, (src, sign)) in (0..n).zip(map) {
+                match moves.last_mut() {
+                    Some(m)
+                        if m.dst + m.sticks == dst && m.src + m.sticks == src && m.sign == sign =>
+                    {
+                        m.sticks += 1;
+                    }
+                    _ => moves.push(StickMove {
+                        src,
+                        dst,
+                        sticks: 1,
+                        sign,
+                    }),
+                }
+            }
+            return Some(RotateHalf {
+                width: hd,
+                moves,
+                lane: None,
+            });
+        }
+        // The lane factor: every output column reads its own stick, at the lane and under the sign
+        // stick 0 states for its lane.
+        let lane_of = |o: u32| (0..l).find_map(|j| entry((o / l) * l + j, o).map(|sg| (j, sg)));
+        let mut moves_lanes = false;
+        for j in 0..l {
+            let first = lane_of(j)?;
+            for s in 1..n {
+                if lane_of(s * l + j)? != first {
+                    return None;
+                }
+            }
+            moves_lanes |= first != (j, RotSign::Plus);
+        }
+        if moves_lanes {
+            Some(RotateHalf {
+                width: hd,
+                moves: Vec::new(),
+                lane: Some(LaneSwap { lanes }),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The stick factor's moves — empty when the stick factor is the identity.
+    pub fn stick_moves(&self) -> &[StickMove] {
+        &self.moves
+    }
+
+    /// The lane factor — `None` when it is the identity.
+    pub fn lane(&self) -> Option<LaneSwap> {
+        self.lane
+    }
+
+    /// ⭐ DOES A ROPE OF HEAD DIM `hd` READ A STAGED P TABLE? — its rotate's lane factor moves lanes
+    /// ([`Self::lane`]), at the rope's fp16 lanes. THE predicate the rope-P class registry is built
+    /// on ([`crate::reserved_tids::rope_p_table_class_hds`]), so a class exists exactly for the
+    /// ropes whose lowering names a table. A head dim that is not whole sticks, or has no factored
+    /// form, reads none: its rope refuses at its own bake.
+    pub fn reads_lane_table(hd: u32) -> bool {
+        HeadWidth::try_whole_sticks(hd)
+            .and_then(|w| Self::of(w, Lanes::FP16))
+            .is_some_and(|r| r.lane.is_some())
+    }
+
+    /// ⭐ THE SIN TABLE THIS ROTATE READS — [`SinTable::Signed`] with every output stick's sign when
+    /// it rotates by stick moves (each move's own sign, over the sticks it writes),
+    /// [`SinTable::Plain`] when its lane factor's P carries the sign. The ONE statement of `sin'`'s
+    /// law: the worker stages by it, the bake bakes it beside each sin source, the rope kernel's
+    /// `SIN_SIGNED` and the rope's lowering read it — so the table a rope multiplies by and the table
+    /// it was staged as are one fact.
+    pub fn sin_table(&self) -> SinTable<Vec<RotSign>> {
+        if self.moves.is_empty() {
+            return SinTable::Plain;
+        }
+        // One sign per stick of the head: the stick factor writes every output stick exactly once.
+        let mut signs = vec![RotSign::Plus; self.width.sticks() as usize];
+        for m in &self.moves {
+            for s in m.dst..m.dst + m.sticks {
+                signs[s as usize] = m.sign;
+            }
+        }
+        SinTable::Signed(SignedSin {
+            width: self.width,
+            signs,
+        })
+    }
+}
+
+/// ⭐⭐⭐ WHICH SIN TABLE A ROPE READS — where its rotate keeps the sign ([`RotateHalf::sin_table`],
+/// the one derivation). `S` is the sign list's storage: owned where it is derived, `&'static` where
+/// the bake has spelled it into the wiring. A cos table has no form: only a sin source carries one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SinTable<S> {
+    /// The rotate keeps it — a lane factor's P carries the ±1 — and the rope reads the plain `sin`.
+    Plain,
+    /// The table keeps it: `sin' = sign · sin`, every head's output stick `s` at its sign
+    /// ([`SignedSin`]); the rope multiplies the moved sticks by `sin'` directly.
+    Signed(SignedSin<S>),
+}
+
+/// ⭐ A SIGNED TABLE'S FORM — the class's [`HeadWidth`] and ONE sign per stick of it. The width is
+/// the head every stager chunks by, so no stager names a head dim; and the sign list is one per
+/// stick BY CONSTRUCTION — [`RotateHalf::sin_table`] builds it at the width it is of, and the bake's
+/// spelling goes through [`Self::baked`], a `const fn` whose length law is a build error in the
+/// static that holds it. A width and a sign list that disagree are unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SignedSin<S> {
+    width: HeadWidth,
+    signs: S,
+}
+
+impl SignedSin<&'static [RotSign]> {
+    /// The bake's spelling of a signed table: `signs` must hold one sign per stick of `width`. The
+    /// wiring is a `static`, so this assert runs at compile time — a mismatched spelling does not
+    /// build.
+    pub const fn baked(width: HeadWidth, signs: &'static [RotSign]) -> Self {
+        assert!(
+            signs.len() == width.sticks() as usize,
+            "SignedSin: a signed sin table holds one sign per stick of its head width"
+        );
+        SignedSin { width, signs }
+    }
+}
+
+impl<S: AsRef<[RotSign]>> SignedSin<S> {
+    /// The head width the table's signs are per-stick of.
+    pub fn width(&self) -> HeadWidth {
+        self.width
+    }
+
+    /// The per-stick signs, stick 0 first — exactly [`HeadWidth::sticks`] of them.
+    pub fn signs(&self) -> &[RotSign] {
+        self.signs.as_ref()
+    }
+}
+
+impl<S: AsRef<[RotSign]>> SinTable<S> {
+    /// ⭐ `sin'`'S ONE LAW, over any row-major buffer of whole heads of the table's own width (one
+    /// head after another, row after row): every stick of every head times its sign. A plain table
+    /// is left as it is. Every stager — the card's, the emulator's, the bake's numeric gate — calls
+    /// this and nothing else, and none of them states a head width: the table carries it.
+    pub fn sign_heads(&self, buf: &mut [f32]) {
+        let SinTable::Signed(t) = self else {
+            return;
+        };
+        for head in buf.chunks_mut(t.width.as_usize()) {
+            for (stick, sign) in head.chunks_mut(POOL_STICK as usize).zip(t.signs()) {
+                if *sign == RotSign::Minus {
+                    for v in stick {
+                        *v = -*v;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the rope's program reads the SIGNED table — the rope kernel's `SIN_SIGNED`.
+    pub fn is_signed(&self) -> bool {
+        matches!(self, SinTable::Signed(_))
     }
 }
 
@@ -3876,8 +4175,8 @@ impl ElemCount {
 
 /// THE COLUMN EXTENT ONE REDUCE/POINTWISE OP SWEEPS — a score-block width. Constructed only through
 /// doors that NAME which width it is: one stick ([`Self::of_one_stick`]), one slot window
-/// ([`Self::of_slot_window`]), one row window ([`Self::of_row_window`]), the head dim
-/// ([`Self::of_head_dim`]) / one head slab ([`Self::of_head_slab`]), or a residual feature extent
+/// ([`Self::of_slot_window`]), one row window ([`Self::of_row_window`]), one head slab
+/// ([`Self::of_head_slab`]), or a residual feature extent
 /// ([`Self::of_feature_cols`]). At hd=64/mq≤64 the block widths are all 64; the door records which
 /// one a slot really holds.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -3888,11 +4187,6 @@ impl BlockCols {
     /// online-softmax state buffers.
     pub const fn of_one_stick(lanes: Lanes) -> BlockCols {
         BlockCols(lanes.n())
-    }
-    /// A head-dim-wide sweep — the `[rows, hd]` output-accumulator buffers. Takes the typed
-    /// [`HeadWidth`], so the width is whole sticks by construction.
-    pub const fn of_head_dim(hd: HeadWidth) -> BlockCols {
-        BlockCols(hd.get())
     }
     /// A residual-stream feature extent (hidden/intermediate columns) — outside the attention
     /// row-and-width run.

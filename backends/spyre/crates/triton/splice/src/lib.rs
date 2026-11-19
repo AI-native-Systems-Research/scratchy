@@ -79,8 +79,8 @@
 //!
 //! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
 //! against the door: `rope_at` derives every fact it needs (`mq`, `total`, `hd`) from the
-//! PROGRAM's own views and access tiles, and the one bundle fact (`rows_are_requests`)
-//! is re-read by the door off `BundleAttnParams` AFTER the splice returns. The kernel
+//! PROGRAM's own views and access tiles, and it reads no bundle fact at all (its one form
+//! serves every row count and row kind). The kernel
 //! states the builder's own view extents (`[mq·heads, hd]`) and takes one `[heads, half]`
 //! access tile per position, which is what the door's first-tile read needs.
 //!
@@ -3455,6 +3455,25 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
     ce("HALF", Val::Int(i128::from(hd.get() / 2)))?;
     ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
     ce("R_START", Val::Int(i128::from(r_start)))?;
+    // ⭐ WHICH SIN TABLE THE ROPE READS — where its rotate keeps the sign, the one derivation
+    // (`RotateHalf::sin_table`, over `rope_p_entry`) the worker stages by: a rotate of stick moves
+    // reads the SIGNED table, a lane factor's (its P carries the sign) the plain one.
+    let rotate = ktir_superdsc::sdsc_abstract::RotateHalf::of(
+        hd,
+        ktir_superdsc::sdsc_abstract::Lanes::FP16,
+    )
+    .ok_or_else(|| {
+        format!(
+            "triton splice: rope t{}: head_dim {} has no factored rotate-half form (its half \
+             straddles a stick)",
+            out.tensor.index(),
+            hd.get()
+        )
+    })?;
+    ce(
+        "SIN_SIGNED",
+        Val::Int(i128::from(rotate.sin_table().is_signed())),
+    )?;
     Ok(())
 }
 

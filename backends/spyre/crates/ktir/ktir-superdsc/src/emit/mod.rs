@@ -4580,14 +4580,6 @@ pub fn rb_df(name: &str, rows: u32, cols: u32, df: Df) -> Stk<RowBlockedTag> {
     .expect("token-stream matmul operand is RowBlocked by construction")
 }
 
-/// Mint a `Flat` (head-major, row-major) output handle `[rows, cols]` — the per-head attention
-/// pointwise/reduce path (`head_major`). Its `Stk<FlatTag>` type is what the builder reads to know the
-/// op is head-major (a `RowBlocked` output ⇒ residual token stream). df annotation-only.
-pub(crate) fn fl(name: &str, rows: u32, cols: u32) -> Stk<FlatTag> {
-    Stk::<FlatTag>::new(name, StickLayout::flat(rows as usize, cols as usize))
-        .expect("head-major operand is Flat by construction")
-}
-
 /// Output-handle helpers for the pointwise/reduce builders, where the `Stk` layout is ANNOTATION-ONLY —
 /// the builder reads only `o.name()` and `O::kind()`, never the dims — so the output is minted by NAME.
 /// `rbo` = RowBlocked (residual token stream), `flo` = Flat (head-major / per-head attention). The KIND

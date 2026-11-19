@@ -9,8 +9,8 @@ use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MbAxis, OpFunc, OpInfo, OpSpec, Role, Scale,
-    SdscFoldSet, TensorArg,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MbAxis, OpFunc, OpInfo, OpSpec, OutAxis, Role,
+    Scale, SdscFoldSet, TensorArg,
 };
 use crate::work::{CoreDivision, EwDivision};
 
@@ -1524,6 +1524,153 @@ pub fn stick_runs_chunks(total: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// ⭐ PITCHED STICK BANDS THROUGH ONE ELEMENTWISE OP — `bands` bands of `band_sticks` whole sticks of
+/// a stick-major `[rows, bands · pitch_sticks · lanes]` plane. Every operand ([`BandAt`]) reads or
+/// writes its own band `b` at stick `b · pitch_sticks + stick` of its plane, every row, every lane
+/// in place; the op is any elementwise op over them (a copy, a negation, a multiply). RoPE's stick
+/// factor is this op with a head a band ([`crate::sdsc_abstract::StickMove`]); the op knows nothing
+/// of heads.
+#[derive(Clone, Copy, Debug)]
+pub struct StickBands {
+    /// The plane's rows — the op sweeps them all.
+    pub rows: u32,
+    /// The bands, one every `pitch_sticks` sticks of the plane.
+    pub bands: u32,
+    /// Each band's width, in whole sticks.
+    pub band_sticks: u32,
+    /// The stick step from one band to the next — the plane is `bands · pitch_sticks` sticks wide.
+    pub pitch_sticks: u32,
+    pub df: Df,
+}
+
+/// One operand of a [`StickBands`] op: a tensor of the plane, and the stick its FIRST band starts
+/// at (the next band is one pitch on).
+#[derive(Clone, Copy, Debug)]
+pub struct BandAt<'a> {
+    pub name: &'a str,
+    pub stick: u32,
+}
+
+/// [`StickBands`] as `func` over `[mb = rows, out = band, y = bands]`. Every operand lays the plane
+/// out `["mb", "out", "y"]` — a stick's rows innermost, a stick column `rows` sticks long, the band's
+/// columns, then the bands — and states the band PITCH on `out` ([`TensorArg::with_pitch`]: the
+/// band's next step `pitch_sticks` sticks on, the gap past the band the walk's back gap, which the
+/// view's own type derives). Each starts at its first band's stick column through the plane's own
+/// coordinate law ([`crate::addr::rc_of`]).
+///
+/// ⭐ THE ELEMENTWISE LAW'S DIVISION, `y` INCLUDED: the cores the op's bytes pay for
+/// ([`EwDivision::budget`]), spread rows-first over EVERY axis by the law's own splitter, plus its
+/// time tile. A core may own any `(rows, sticks, bands)` slice, because the per-core start folds
+/// every coordinate of the view — the bands' through the declared pitch
+/// (`StickLayout::off_view`'s feature fold) — so there is no division of this op's own.
+///
+/// ⏳ THE BUDGET IS THE BYTE LAW, the general rule every elementwise op divides by — not a knob
+/// this op adds. Whether a band multiply's few bytes would run faster spread over every core
+/// (gemma-4's hd 512 K plane at one row takes one core under the law; its four sticks could take
+/// four) is PENDING THE CARD TIMING (`examples/rope_fast_cells.rs`); a measured win is a change to
+/// the law for every op that divides by it, never a branch here.
+pub fn stick_bands_opspec(
+    func: OpFunc,
+    inputs: &[BandAt<'_>],
+    output: BandAt<'_>,
+    bands: StickBands,
+) -> Result<OpSpec, String> {
+    let StickBands {
+        rows,
+        bands: n,
+        band_sticks,
+        pitch_sticks,
+        df,
+    } = bands;
+    if rows == 0 || n == 0 || band_sticks == 0 {
+        return Err(format!(
+            "stick_bands -> '{}': {n} band(s) of {band_sticks} stick(s) over {rows} row(s) — a band \
+             is at least one stick of at least one row",
+            output.name
+        ));
+    }
+    if let Some(b) = inputs
+        .iter()
+        .chain(std::iter::once(&output))
+        .find(|b| b.stick + band_sticks > pitch_sticks)
+    {
+        return Err(format!(
+            "stick_bands -> '{}': '{}' starts its {band_sticks}-stick band at stick {} of a \
+             {pitch_sticks}-stick pitch — a band lies inside its pitch, or it reads the next band's \
+             sticks",
+            output.name, b.name, b.stick
+        ));
+    }
+    let lanes = df.elems_per_stick();
+    let plane_cols = n * pitch_sticks * lanes;
+    let tile_op = crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(
+        rows,
+        band_sticks * lanes,
+        n,
+        inputs.len() as u32 + 1,
+        df,
+    );
+    let law = EwDivision::Law.resolve(false, false);
+    let tiled = tile_op
+        .tile(EwDivision::Law.budget(&tile_op), law.splitter(), "out")
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    let layout = ["mb", "out", "y"];
+    let arg = |is_input: bool, b: BandAt<'_>| -> Result<AnyTensorArg, String> {
+        Ok(AnyTensorArg::R3(
+            TensorArg::<3>::new(
+                is_input,
+                b.name.to_string(),
+                Role::Output,
+                [Scale::Active; 3],
+                plan.iter_syms(layout),
+                layout,
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            // A1-API: `with_df` is fallible once a stick pitch can freeze the df (A1 addition A07);
+            // the df is stated BEFORE the pitch, as the freeze requires.
+            .with_df(df)
+            .map_err(|e| e.0)?
+            // The plane is stick-major at every rank — `[rows, bands · pitch]`, the arrangement
+            // every other view of it states — so the rank-3 view is addressed as one.
+            .with_row_blocked(true)
+            // A1-API: `TensorArg::with_pitch::<OutAxis>` — the pitch on the STICK axis, named by
+            // its marker type; the back gap (`pitch − band`, whole sticks) is A1's `Pitch::past`.
+            .with_pitch::<OutAxis>(&plan, pitch_sticks * lanes)
+            .map_err(|e| e.0)?
+            .with_offset(
+                crate::addr::rc_of(rows, plane_cols, 0, b.stick * lanes, df).into_raw_elems(),
+            ),
+        ))
+    };
+    let ins = inputs
+        .iter()
+        .map(|&b| arg(true, b))
+        .collect::<Result<Vec<_>, _>>()?;
+    let out = arg(false, output)?;
+    Ok(OpSpec::new(func, plan, ins, out)
+        .map_err(|e| e.0)?
+        .with_time_tile(time_tile))
+}
+
+/// [`stick_bands_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_stick_bands<T: crate::collective::Tp>(
+    op_name: &str,
+    func: OpFunc,
+    inputs: &[BandAt<'_>],
+    output: BandAt<'_>,
+    bands: StickBands,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp<T>, String> {
+    let op = stick_bands_opspec(func, inputs, output, bands)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_stick_bands {op_name}: {e}"))
+}
+
 /// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
 /// read from the source starting `src_elems` elements in, written through the index from the
 /// destination's base plus `dst_elems`.
@@ -2400,6 +2547,178 @@ mod stick_runs_tests {
     #[test]
     fn a_pitch_under_a_run_is_refused() {
         assert!(stick_runs_copy_opspec("t1", "t2", runs(32, 64)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stick_bands_tests {
+    use super::*;
+
+    /// A gemma sliding layer's 16 heads at 256 wide (4 sticks), the band each head's two-stick
+    /// half: `rows` rows of the plane.
+    fn bands(rows: u32) -> StickBands {
+        StickBands {
+            rows,
+            bands: 16,
+            band_sticks: 2,
+            pitch_sticks: 4,
+            df: Df::Fp16,
+        }
+    }
+
+    /// The rope's first half-multiply: `rs[lo] = x[hi] · sin'[lo]`.
+    fn half_multiply(rows: u32) -> Result<OpSpec, String> {
+        stick_bands_opspec(
+            OpFunc::Multiply,
+            &[
+                BandAt {
+                    name: "t1",
+                    stick: 2,
+                },
+                BandAt {
+                    name: "t2",
+                    stick: 0,
+                },
+            ],
+            BandAt {
+                name: "t3",
+                stick: 0,
+            },
+            bands(rows),
+        )
+    }
+
+    /// One view's per-core start addresses, in core order.
+    fn starts(node: &serde_json::Value) -> Vec<u64> {
+        let mut v: Vec<(u64, u64)> = node["startAddressCoreCorelet_"]["data_"]
+            .as_object()
+            .expect("a start-address map")
+            .iter()
+            .map(|(k, a)| {
+                let core = k
+                    .trim_start_matches('[')
+                    .split(',')
+                    .next()
+                    .and_then(|c| c.trim().parse().ok())
+                    .expect("a core key");
+                let addr = a.as_str().and_then(|s| s.parse().ok()).expect("an address");
+                (core, addr)
+            })
+            .collect();
+        v.sort_unstable();
+        v.into_iter().map(|(_, a)| a).collect()
+    }
+
+    /// Every operand states the band pitch on its stick axis and starts at its own band's stick
+    /// column.
+    #[test]
+    fn every_operand_states_the_band_pitch_on_its_stick_axis() {
+        // A1-API: `DeviceAxis` / `Pitch` / `PitchAxis` / `DimName` are the per-axis device
+        // mechanism and the one back-gap law A1 types (`Pitch::past` is its one constructor,
+        // keyed by the axis's marker).
+        use crate::superdsc_opspec::{DeviceAxis, DimName, Pitch, PitchAxis};
+        let op = half_multiply(23).expect("the band op builds");
+        let pitch = Pitch::past(
+            DimName::of::<OutAxis>(),
+            PitchAxis::Stick(Df::Fp16),
+            2 * 64,
+            4 * 64,
+        )
+        .expect("a band inside its pitch")
+        .expect("a pitch past the band");
+        let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
+        assert_eq!(v.len(), 3, "x, sin', rs");
+        for (i, side) in v.iter().enumerate() {
+            assert_eq!(side.layout, ["mb", "out", "y"], "operand {i}");
+            assert_eq!(
+                side.device_extent,
+                [
+                    DeviceAxis::Swept,
+                    DeviceAxis::Pitch(pitch),
+                    DeviceAxis::Swept
+                ],
+                "operand {i}: the band pitch"
+            );
+        }
+        // Stick 2 of the `[23, 16 · 256]` plane is two stick columns of 23 rows in.
+        assert_eq!(
+            (v[0].offset_elems, v[1].offset_elems, v[2].offset_elems),
+            (2 * 23 * 64, 0, 0)
+        );
+    }
+
+    /// The walk's back gap is the rest of the pitch past the band, on every view, in ELEMENTS,
+    /// HBM-keyed and a string.
+    #[test]
+    fn the_back_gap_is_the_pitch_past_the_band() {
+        let op = half_multiply(23).expect("the band op builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("band_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        let alloc: Vec<&serde_json::Value> = v["dscs_"][0]["band_o1"]["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .filter(|n| n["nodeType_"] == "allocate")
+            .collect();
+        assert_eq!(alloc.len(), 3, "x, sin' and rs");
+        for n in alloc {
+            // A1-API: `wire::BackGap`'s wire spelling, `{axis: {"-1": "<pitch − swept>"}}`.
+            assert_eq!(
+                n["backGapCore_"],
+                serde_json::json!({"out": {"-1": "128"}}),
+                "{}",
+                n["name_"]
+            );
+        }
+    }
+
+    /// ⭐ THE BANDS SPLIT ACROSS CORES, AND A CORE OWNING ANOTHER BAND STARTS AT IT. At one row
+    /// (decode) the op's bytes pay for 4 cores, and the elementwise law gives them to the band's two
+    /// sticks AND two groups of 8 bands: the second group's cores start 8 bands — 8 · 256 columns of
+    /// the one-row plane — in, through the view's declared pitch, not at band 0 (the start fold that
+    /// read only the `(row, column)` corner put every core at band 0 and refused the split by
+    /// collision).
+    #[test]
+    fn a_core_owning_another_band_starts_at_its_band() {
+        let op = half_multiply(1).expect("the band op builds");
+        assert_eq!(op.iter.split_of("out"), 2, "the band's two sticks");
+        assert_eq!(op.iter.split_of("y"), 2, "the bands split too");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = crate::emit::emit_sdsc("band_o1", &op, &folds, None).expect("it emits");
+        let v = serde_json::to_value(&sdsc).expect("the op serializes");
+        let tree = v["dscs_"][0]["band_o1"]["scheduleTree_"]
+            .as_array()
+            .expect("a tree");
+        let out = tree
+            .iter()
+            .rev()
+            .find(|n| n["nodeType_"] == "allocate")
+            .expect("the output's allocate node");
+        let s = starts(out);
+        let base = *s.iter().min().expect("a start");
+        let mut rel: Vec<u64> = s.iter().map(|a| a - base).collect();
+        rel.sort_unstable();
+        // fp16 bytes: a stick column of one row is 64 elements; a group of 8 bands is 8 · 256.
+        assert_eq!(rel, vec![0, 64 * 2, 8 * 256 * 2, (8 * 256 + 64) * 2]);
+    }
+
+    /// A band past its pitch would read or write the next band's sticks.
+    #[test]
+    fn a_band_past_its_pitch_is_refused() {
+        let past = |stick| {
+            stick_bands_opspec(
+                OpFunc::Identity,
+                &[BandAt { name: "t1", stick }],
+                BandAt {
+                    name: "t2",
+                    stick: 0,
+                },
+                bands(23),
+            )
+        };
+        assert!(past(3).is_err());
+        assert!(past(2).is_ok());
     }
 }
 

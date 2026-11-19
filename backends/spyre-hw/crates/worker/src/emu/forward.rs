@@ -88,7 +88,7 @@ pub(crate) fn forward_chunk(
         .cos_srcs
         .iter()
         .map(|&(_, _, k)| k)
-        .chain(b.sin_srcs.iter().map(|&(_, _, k)| k))
+        .chain(b.sin_srcs.iter().map(|&(_, _, k, _)| k))
         .collect();
     // Per-class, per-position `[class_head_dim]` rows.
     //
@@ -211,12 +211,12 @@ pub(crate) fn forward_chunk(
         for (ci, &(cid, w, kind)) in b.cos_srcs.iter().enumerate() {
             dynamic.push((cid as u64, tile(&cos_tab[ci], w, kind), vec![rows, w]));
         }
-        for (ci, &(sid, w, kind)) in b.sin_srcs.iter().enumerate() {
-            dynamic.push((
-                sid as u64,
-                tile(&sin_tab[n_cos + ci], w, kind),
-                vec![rows, w],
-            ));
+        for (ci, &(sid, w, kind, table)) in b.sin_srcs.iter().enumerate() {
+            // The table the rope reads: SIGNED for a rotate of stick moves — the baked form through
+            // its one law (`SinTable::sign_heads`), never derived here.
+            let mut sin = tile(&sin_tab[n_cos + ci], w, kind);
+            table.sign_heads(&mut sin);
+            dynamic.push((sid as u64, sin, vec![rows, w]));
         }
         dynamic
     };

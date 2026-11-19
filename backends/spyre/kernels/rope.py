@@ -49,6 +49,13 @@ form this kernel used to state; a per-row node states `MQ = 1` at `R_START =
 ri·H`. cos/sin take the same corner: position `p`'s angles are rows
 `[p·H, (p+1)·H)` of the head-replicated table, so the region's rows are exactly
 `[R_START, R_START + MQ·H)`.
+
+⭐ THE SIN TABLE (`SIN_SIGNED`): a rope whose rotate keeps its sign in the TABLE — every head dim
+whose half is whole sticks (`RotateHalf::sin_table`, the one law over `rope_p_entry`, which the
+splice reads for this constexpr and the worker stages by) — reads `sin' = sign · sin` and multiplies
+each half by its OWN half of it, with no sign in the kernel: `out1 = x1·cos + x2·sin'_lo`,
+`out2 = x2·cos + x1·sin'_hi`. A one-stick head (its rotate's P carries the sign) reads the plain
+table and the minus above.
 """
 
 import triton
@@ -59,7 +66,8 @@ import triton.language as tl
 def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
              H: tl.constexpr, MQ: tl.constexpr,
              HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
-             Y_TOTAL: tl.constexpr, R_START: tl.constexpr):
+             Y_TOTAL: tl.constexpr, R_START: tl.constexpr,
+             SIN_SIGNED: tl.constexpr):
     tl.static_assert(HALF + HALF == HEAD_DIM)
     # ⭐ THE LOOP RUNS OVER THE SHORTER AXIS — positions or heads — so the program holds
     # `min(MQ, H)` bodies and stops growing with the chunk. The trip count is constexpr either
@@ -76,23 +84,25 @@ def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
     if MQ > H:
         if H > 1:
             if R_START == 0:
-                _rope_per_head(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF)
+                _rope_per_head(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF,
+                               SIN_SIGNED)
             else:
                 _rope_per_position(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM,
-                                   HALF, Y_TOTAL, R_START)
+                                   HALF, Y_TOTAL, R_START, SIN_SIGNED)
         else:
             _rope_per_position(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF,
-                               Y_TOTAL, R_START)
+                               Y_TOTAL, R_START, SIN_SIGNED)
     else:
         _rope_per_position(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF,
-                           Y_TOTAL, R_START)
+                           Y_TOTAL, R_START, SIN_SIGNED)
 
 
 @triton.jit
 def _rope_per_position(desc_x, desc_cos, desc_sin, desc_o,
                        H: tl.constexpr, MQ: tl.constexpr,
                        HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
-                       Y_TOTAL: tl.constexpr, R_START: tl.constexpr):
+                       Y_TOTAL: tl.constexpr, R_START: tl.constexpr,
+                       SIN_SIGNED: tl.constexpr):
     # The x/out views over the worker-staged plane, `[rows*heads, hd]` — the full
     # TENSOR re-tiled (Y_TOTAL), so the row-windowed tile corners stay in bounds.
     # The cos/sin views are the same-bytes head-replicated tables, `[tbl_rows*H,
@@ -124,17 +134,25 @@ def _rope_per_position(desc_x, desc_cos, desc_sin, desc_o,
         x1 = x_desc.load([offs_m, 0])
         x2 = x_desc.load([offs_m, HALF])
         c = cos_desc.load([offs_m, 0])
-        s = sin_desc.load([offs_m, 0])
-        # rotate_half, per half: the MINUS is on the second half's contribution to
-        # the first, which is `cat(-x2, x1)` written out.
-        o_desc.store([offs_m, 0], x1 * c - x2 * s)
-        o_desc.store([offs_m, HALF], x2 * c + x1 * s)
+        if SIN_SIGNED:
+            # The table carries the rotate's sign: each half reads its own half of `sin'`.
+            s1 = sin_desc.load([offs_m, 0])
+            s2 = sin_desc.load([offs_m, HALF])
+            o_desc.store([offs_m, 0], x1 * c + x2 * s1)
+            o_desc.store([offs_m, HALF], x2 * c + x1 * s2)
+        else:
+            s = sin_desc.load([offs_m, 0])
+            # rotate_half, per half: the MINUS is on the second half's contribution to
+            # the first, which is `cat(-x2, x1)` written out.
+            o_desc.store([offs_m, 0], x1 * c - x2 * s)
+            o_desc.store([offs_m, HALF], x2 * c + x1 * s)
 
 
 @triton.jit
 def _rope_per_head(desc_x, desc_cos, desc_sin, desc_o,
                    H: tl.constexpr, MQ: tl.constexpr,
-                   HEAD_DIM: tl.constexpr, HALF: tl.constexpr):
+                   HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
+                   SIN_SIGNED: tl.constexpr):
     # PER HEAD, over the plane as it is: `[MQ, H * HEAD_DIM]`, one `[MQ, HALF]` tile per head
     # half. Same bytes as the tall view (row p, column h*HEAD_DIM + d is tall row p*H + h,
     # column d), and the cos/sin tables are the same head-replicated bytes, so each head's
@@ -154,6 +172,12 @@ def _rope_per_head(desc_x, desc_cos, desc_sin, desc_o,
         x1 = x_desc.load([0, col])
         x2 = x_desc.load([0, col + HALF])
         c = cos_desc.load([0, col])
-        s = sin_desc.load([0, col])
-        o_desc.store([0, col], x1 * c - x2 * s)
-        o_desc.store([0, col + HALF], x2 * c + x1 * s)
+        if SIN_SIGNED:
+            s1 = sin_desc.load([0, col])
+            s2 = sin_desc.load([0, col + HALF])
+            o_desc.store([0, col], x1 * c + x2 * s1)
+            o_desc.store([0, col + HALF], x2 * c + x1 * s2)
+        else:
+            s = sin_desc.load([0, col])
+            o_desc.store([0, col], x1 * c - x2 * s)
+            o_desc.store([0, col + HALF], x2 * c + x1 * s)

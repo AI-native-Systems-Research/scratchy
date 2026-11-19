@@ -1,112 +1,154 @@
 // SPDX-License-Identifier: Apache-2.0
-//! DOES THE `y`-BATCHED ROTATE ADDRESS THE SAME BYTES AS THE PER-HEAD ONE? Differenced out of the
-//! EMITTED per-core start addresses, never predicted — the rule this file exists to obey.
+//! DO THE ROTATE'S FACTORS COMPUTE THE ROTATE `P` STATES? Element for element, at every head dim the
+//! workspace's ropes run — the rule this file exists to obey: the factors the lowering emits
+//! (`RotateHalf::of`, read off `rope_p_entry`) are checked against the one statement of the pairing
+//! and sign, `x · P`, never against a restatement of it.
 //!
-//! The per-head form (one `[mq,hd]` P matmul per head, `hd`-wide contraction) is CARD-PROVEN coherent
-//! on granite-8b. The `y`-batched form (one op per slab, heads on `y`, one-stick contraction, the ±I
-//! block read out of P at its own (in-slab, out-slab) coordinate) measured 4% FASTER and produced
-//! output in which the model says its own prompt looks jumbled. So one of them addresses different
-//! bytes, and this says which — at hd=128, where a wrong slab or a transposed kernel coordinate is
-//! expressible, and at hd=64, where it is not.
+//! The lowering emits rotate-half as its factors: whole-stick moves under one sign each (a head whose
+//! half is whole sticks — 128, 256, 512) or ONE in-stick lane permutation against P's one-stick block
+//! (a one-stick head — 64). Either factorization reproducing `x · P` is the whole premise of a rope
+//! with no `[hd, hd]` contraction; a transposed pairing would silently compute `-rotate_half` (P is NOT
+//! symmetric — its transpose is the inverse rotation), which is fluent-but-wrong output, not a crash.
 
-use ktir_superdsc::addr::{DevOff, Feat, Idx, Nest, Row};
+use ktir_superdsc::addr::{Feat, Idx, Nest};
+use ktir_superdsc::sdsc_abstract::{HeadWidth, Lanes, RotSign, RotateHalf, rope_p_entry};
 use ktir_superdsc::superdsc_opspec::Df;
 
-const HD: u32 = 128;
 const STK: u32 = 64;
 const HEADS: u32 = 32;
 const MQ: u32 = 21;
 
-/// P's `[hd,hd]` kernel nest, as both the emitter and the worker's `stage_2d` see it: `row` = the
-/// contraction index `inn`, `feat` = the output index `o` (the stick axis).
-fn p_nest() -> Nest {
-    Nest::new(&["row", "feat"], &[HD, HD], Df::Fp16)
+/// `x · P` for one head of `hd`: `rot[o] = Σ_inn x[inn] · P[inn][o]` — the worker's own fill law
+/// (`stage_kernel_table(hd, |inn, o| rope_p_entry(hd, inn, o))`), contracted whole.
+fn by_p(hd: u32, x: &[i64]) -> Vec<i64> {
+    (0..hd)
+        .map(|o| {
+            (0..hd)
+                .map(|inn| {
+                    x[inn as usize] * i64::from(rope_p_entry(hd as usize, inn as usize, o as usize))
+                })
+                .sum()
+        })
+        .collect()
 }
 
-/// THE WORKER'S OWN FILL LAW, so the test compares against what is actually in the buffer:
-/// `stage_2d(StickLayout::kernel(hd,hd), |inn, o| rope_p_entry(hd, inn, o))`.
-fn p_value_at(inn: u32, o: u32) -> i8 {
-    ktir_superdsc::sdsc_abstract::rope_p_entry(HD as usize, inn as usize, o as usize)
-}
-
-/// ⭐ THE BLOCK THE `y`-BATCHED FORM READS for output slab `s`, and what is really in it. If the
-/// (in-slab, out-slab) coordinate is transposed, this finds it: P is NOT symmetric — its transpose is
-/// the INVERSE rotation, so a swap flips the sign of both halves and the rotation silently becomes
-/// `-rotate_half`, which is fluent-but-wrong output, not a crash.
-#[test]
-fn the_block_the_slab_form_reads_is_plus_or_minus_identity() {
-    let n_slabs = HD / STK;
-    for s in 0..n_slabs {
-        let p_in = if s < n_slabs / 2 {
-            s + n_slabs / 2
-        } else {
-            s - n_slabs / 2
+/// The factors applied to one head of `hd`: each stick move copies its sticks lane-for-lane under
+/// its sign; a lane factor contracts every stick against P's stick-0 `[lanes, lanes]` block — the
+/// block the lowering's one-stick kernel reads out of the staged table.
+fn by_factors(hd: u32, x: &[i64]) -> Vec<i64> {
+    let r = RotateHalf::of(HeadWidth::of_whole_sticks(hd), Lanes::FP16)
+        .unwrap_or_else(|| panic!("hd {hd} has a factored form"));
+    let mut rot = vec![i64::MIN; hd as usize];
+    for m in r.stick_moves() {
+        let sign = match m.sign() {
+            RotSign::Plus => 1,
+            RotSign::Minus => -1,
         };
-        // The emitter's own coordinate for the block.
-        let base = p_nest()
-            .view()
-            .at(Idx::<Row>::n(p_in * STK))
-            .slab(s)
-            .dev()
-            .into_raw_elems();
-        // Read the 64x64 window the op declares at that base, through the [64,64] KERNEL law
-        // (`in*64 + out`), and check it is exactly ±I — the whole premise of the collapse.
-        let want_sign: i8 = if s < n_slabs / 2 { -1 } else { 1 };
-        for i in 0..STK {
-            for o in 0..STK {
-                let flat = base + i * STK + o;
-                // Invert the [hd,hd] kernel law to learn which (inn, o') that byte really holds.
-                let (grp, rem) = (flat / (HD * STK), flat % (HD * STK));
-                let (inn, lane) = (rem / STK, rem % STK);
-                let o_real = grp * STK + lane;
-                let got = p_value_at(inn, o_real);
-                let expect = if i == o { want_sign } else { 0 };
-                assert_eq!(
-                    got, expect,
-                    "s={s} p_in={p_in} block[{i},{o}] -> P[{inn},{o_real}] = {got}, want {expect} \
-                     (the block must be {want_sign}*I; a transposed coordinate flips both signs)"
-                );
+        for k in 0..m.sticks() {
+            for j in 0..STK {
+                let (o, inn) = ((m.dst() + k) * STK + j, (m.src() + k) * STK + j);
+                rot[o as usize] = sign * x[inn as usize];
             }
         }
     }
+    if let Some(lane) = r.lane() {
+        let w = lane.width().get();
+        for o in 0..hd {
+            let (s, j) = (o / w, o % w);
+            rot[o as usize] = (0..w)
+                .map(|i| {
+                    x[(s * w + i) as usize]
+                        * i64::from(rope_p_entry(hd as usize, i as usize, j as usize))
+                })
+                .sum();
+        }
+    }
+    rot
 }
 
-/// AND THE ROTATE THE TWO FORMS COMPUTE MUST AGREE, element for element: the per-head form contracts
-/// the WHOLE head dim against P, the slab form contracts ONE stick against a ±I block. Same answer, or
-/// the collapse is not a collapse.
+/// ⭐ THE FACTORS COMPUTE `x · P` at every head dim the ropes run, and the non-identity factor is
+/// the expected one: the lane factor alone at one stick, two stick moves (one negated) above it.
+/// Every output column is written (a move set that left one unwritten shows `i64::MIN`).
 #[test]
-fn both_forms_compute_the_same_rotate() {
-    let n_slabs = HD / STK;
-    // x[h][d] = a value distinguishable per (head, dim), so a wrong head or slab shows up.
-    let x = |h: u32, d: u32| (h * HD + d) as i32;
-    for h in [0u32, 1, HEADS - 1] {
-        for o in 0..HD {
-            // PER-HEAD: rot[o] = sum_inn x[inn] * P[inn, o]
-            let per_head: i32 = (0..HD)
-                .map(|inn| x(h, inn) * i32::from(p_value_at(inn, o)))
-                .sum();
-            // SLAB FORM: output slab s = o/64 draws ONLY from input slab p_in through ±I.
-            let s = o / STK;
-            let p_in = if s < n_slabs / 2 {
-                s + n_slabs / 2
-            } else {
-                s - n_slabs / 2
-            };
-            let sign: i32 = if s < n_slabs / 2 { -1 } else { 1 };
-            let slab_form = sign * x(h, p_in * STK + o % STK);
-            assert_eq!(
-                per_head, slab_form,
-                "h={h} o={o}: the slab form must reproduce the per-head rotate"
-            );
+fn the_factors_compute_the_p_rotate_at_every_head_dim() {
+    // (head dim, stick moves, lane factor) — the expectation table, one row per head dim in use.
+    for (hd, moves, lane) in [
+        (64u32, 0usize, true),
+        (128, 2, false),
+        (256, 2, false),
+        (512, 2, false),
+    ] {
+        let r = RotateHalf::of(HeadWidth::of_whole_sticks(hd), Lanes::FP16)
+            .unwrap_or_else(|| panic!("hd {hd} has a factored form"));
+        assert_eq!(r.stick_moves().len(), moves, "hd {hd}: stick moves");
+        assert_eq!(r.lane().is_some(), lane, "hd {hd}: lane factor");
+        // x[d] distinguishable per head and per dim, so a wrong stick or lane shows up.
+        for h in [0u32, 1, HEADS - 1] {
+            let x: Vec<i64> = (0..hd).map(|d| i64::from(h * hd + d) + 1).collect();
+            assert_eq!(by_factors(hd, &x), by_p(hd, &x), "hd {hd} head {h}");
         }
     }
 }
 
-/// THE OPERAND OFFSETS the slab form uses, differenced through the nest — the source reads input slab
-/// `p_in` and writes output slab `s`, both in the `[mq, heads*hd]` token stream, and both must step one
-/// stick PLANE per slab and `mq*hd` per head.
+/// ⭐ THE SIGNED TABLE CARRIES THE ROTATE'S SIGN — the 4-op form's whole premise. For a rotate of
+/// stick moves, `rotate_half(x) · sin` (the `x · P` contraction times the plain table) equals each
+/// move's plain lane-for-lane copy of `x` times `sin'` (`SinTable::sign_heads` of the plain table),
+/// column for column; a lane factor's table stays plain (its P carries the sign).
 #[test]
-fn the_slab_form_steps_planes_and_heads_through_the_token_stream() {
+fn the_signed_table_carries_the_rotates_sign() {
+    for hd in [128u32, 256, 512] {
+        let r = RotateHalf::of(HeadWidth::of_whole_sticks(hd), Lanes::FP16)
+            .unwrap_or_else(|| panic!("hd {hd} has a factored form"));
+        let table = r.sin_table();
+        assert!(
+            table.is_signed(),
+            "hd {hd}: stick moves read the signed table"
+        );
+        let x: Vec<i64> = (0..hd).map(|d| i64::from(d) + 1).collect();
+        let sin: Vec<f32> = (0..hd).map(|d| (d % 13) as f32 + 1.0).collect();
+        let mut signed = sin.clone();
+        table.sign_heads(&mut signed);
+        let rot = by_p(hd, &x);
+        for m in r.stick_moves() {
+            for k in 0..m.sticks() {
+                for j in 0..STK {
+                    let o = ((m.dst() + k) * STK + j) as usize;
+                    let inn = ((m.src() + k) * STK + j) as usize;
+                    assert_eq!(
+                        rot[o] as f32 * sin[o],
+                        x[inn] as f32 * signed[o],
+                        "hd {hd} column {o}"
+                    );
+                }
+            }
+        }
+    }
+    let lane = RotateHalf::of(HeadWidth::of_whole_sticks(STK), Lanes::FP16)
+        .unwrap_or_else(|| panic!("hd {STK} has a factored form"));
+    assert!(
+        !lane.sin_table().is_signed(),
+        "a lane factor's P carries the sign; its table is plain"
+    );
+}
+
+/// A head whose half straddles a stick — an odd stick count above one — keeps neither lanes nor
+/// sticks in place: no factored form, so its rope's bake refuses it by name rather than emitting a
+/// rotate that computes something else.
+#[test]
+fn a_half_that_straddles_a_stick_has_no_factored_form() {
+    assert!(RotateHalf::of(HeadWidth::of_whole_sticks(192), Lanes::FP16).is_none());
+    assert!(!RotateHalf::reads_lane_table(192));
+    assert!(RotateHalf::reads_lane_table(64));
+    assert!(!RotateHalf::reads_lane_table(128));
+}
+
+/// THE BANDS STEP PLANES AND HEADS THROUGH THE TOKEN STREAM, differenced through the nest: in the
+/// `[mq, heads·hd]` stream a stick move's band starts one stick PLANE (`mq · 64`) per stick into its
+/// head, and the next head's band is `mq · hd` on — the pitch the band op states on `out` (`hd`
+/// columns, i.e. `mq · hd` elements of the stick-major plane).
+#[test]
+fn the_bands_step_planes_and_heads_through_the_token_stream() {
+    const HD: u32 = 128;
     let nest = Nest::new(&["row", "feat"], &[MQ, HEADS * HD], Df::Fp16);
     let at = |h: u32, s: u32| {
         nest.view()
@@ -118,15 +160,14 @@ fn the_slab_form_steps_planes_and_heads_through_the_token_stream() {
         assert_eq!(
             at(h, 1) - at(h, 0),
             MQ * STK,
-            "h={h}: one slab is one stick plane"
+            "h={h}: one stick is one stick plane"
         );
     }
     for s in 0..HD / STK {
         assert_eq!(at(1, s) - at(0, s), MQ * HD, "s={s}: one head is mq*hd");
     }
-    // And the base the op is given for (head 0, slab s) is exactly `s` planes in.
+    // And the base the band op is given for (head 0, stick s) is exactly `s` planes in.
     for s in 0..HD / STK {
         assert_eq!(at(0, s), s * MQ * STK, "s={s}: the op's own base");
     }
-    let _ = DevOff::ZERO;
 }

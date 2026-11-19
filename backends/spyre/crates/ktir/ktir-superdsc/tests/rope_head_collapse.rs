@@ -45,9 +45,10 @@ fn the_head_major_view_is_the_token_stream_at_every_row_count() {
 }
 
 /// THE COS/SIN CONTRACT. The worker stages the angle table stick-scattered: position `p`, element `i`
-/// goes to `(i/64)*(mq*64) + p*64 + (i%64)`. The collapsed RoPE reads it as `[heads*mq, hd]` row
-/// `h*mq + p`. Those must be the same address, or every head but head 0 rotates at the wrong
-/// position — fluent output, wrong attention geometry, no crash.
+/// goes to `(i/64)*(mq*64) + p*64 + (i%64)`. A `[heads*mq, hd]` reader of it sees row `h*mq + p` (the
+/// rope's legs read the table whole, as the `[mq, total]` plane those are the same bytes of). Those
+/// must be the same address, or every head but head 0 rotates at the wrong position — fluent output,
+/// wrong attention geometry, no crash.
 #[test]
 fn the_staged_angles_land_where_the_collapsed_read_expects() {
     for mq in [1usize, 2, 4, 8, 32] {
@@ -70,7 +71,8 @@ fn the_staged_angles_land_where_the_collapsed_read_expects() {
 
 /// The collapse's precondition. It holds only while a head IS one stick: above that the head's dims
 /// span several device sticks and the flat `[heads*mq, hd]` view stops being contiguous, which is why
-/// the emitter keeps the slab form for `hd > 64`.
+/// a head wider than a stick rotates by whole-stick moves (`RotateHalf`'s stick factor) and never
+/// reads a `[heads*mq, hd]` view.
 #[test]
 fn the_collapse_is_refused_above_one_stick_per_head() {
     use ktir_superdsc::superdsc_opspec::Fp16;

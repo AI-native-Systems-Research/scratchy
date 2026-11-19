@@ -476,7 +476,7 @@ fn emit_superdsc_wiring(
             }
         }
     };
-    let rot_srcs = |want_cos: bool| -> Vec<(u32, u32, proc_macro2::TokenStream)> {
+    let rot_srcs = |want_cos: bool| -> Vec<(u32, u32, bool)> {
         lwd.bindings()
             .iter()
             .enumerate()
@@ -490,7 +490,7 @@ fn emit_superdsc_wiring(
                     SourceBinding::Cos { local } | SourceBinding::Sin { local } => *local,
                     _ => false,
                 };
-                (i as u32, gk.tensor_shapes[i].1, rot_kind(local))
+                (i as u32, gk.tensor_shapes[i].1, local)
             })
             .collect()
     };
@@ -501,15 +501,51 @@ fn emit_superdsc_wiring(
             model.source_stem
         );
     }
-    let pair_toks = |v: &[(u32, u32, proc_macro2::TokenStream)]| -> Vec<proc_macro2::TokenStream> {
-        v.iter()
-            .map(|(i, w, k)| {
-                let (i, w) = (u32l(*i), u32l(*w));
-                quote! { (#i, #w, #k) }
-            })
-            .collect()
+    // ⭐ A SIN SOURCE CARRIES THE TABLE ITS ROPE READS — its class head dim's rotate's own
+    // `SinTable` (`wiring::sin_table_of`, the one law over `rope_p_entry`), spelled here beside the
+    // source so every stager reads it and none derives it. A signed table is spelled through
+    // `SignedSin::baked`, whose one-sign-per-stick law is const-evaluated in the wiring static.
+    let sin_table = |local: bool| -> proc_macro2::TokenStream {
+        let kind = superdsc_rotary_kind(model, hd, f64::from(theta), local);
+        match scratchy_target_spyre::wiring::sin_table_of(kind, &model.source_stem) {
+            scratchy_target_spyre::wiring::SinTable::Plain => {
+                quote! { ::scratchy_target_spyre::wiring::SinTable::Plain }
+            }
+            scratchy_target_spyre::wiring::SinTable::Signed(t) => {
+                let width = u32l(t.width().get());
+                let signs = t.signs().iter().map(|s| match s {
+                    scratchy_target_spyre::wiring::RotSign::Plus => {
+                        quote! { ::scratchy_target_spyre::wiring::RotSign::Plus }
+                    }
+                    scratchy_target_spyre::wiring::RotSign::Minus => {
+                        quote! { ::scratchy_target_spyre::wiring::RotSign::Minus }
+                    }
+                });
+                quote! {
+                    ::scratchy_target_spyre::wiring::SinTable::Signed(
+                        ::scratchy_target_spyre::wiring::SignedSin::baked(
+                            ::scratchy_target_spyre::wiring::HeadWidth::of_whole_sticks(#width),
+                            &[#(#signs),*],
+                        )
+                    )
+                }
+            }
+        }
     };
-    let (cos_toks, sin_toks) = (pair_toks(&cos_v), pair_toks(&sin_v));
+    let cos_toks: Vec<proc_macro2::TokenStream> = cos_v
+        .iter()
+        .map(|&(i, w, local)| {
+            let (i, w, k) = (u32l(i), u32l(w), rot_kind(local));
+            quote! { (#i, #w, #k) }
+        })
+        .collect();
+    let sin_toks: Vec<proc_macro2::TokenStream> = sin_v
+        .iter()
+        .map(|&(i, w, local)| {
+            let (i, w, k, s) = (u32l(i), u32l(w), rot_kind(local), sin_table(local));
+            quote! { (#i, #w, #k, #s) }
+        })
+        .collect();
     let embed_src_lit = u32l(embed_src);
 
     let shapes = gk.tensor_shapes.iter().map(|(r, c)| {
@@ -3582,13 +3618,11 @@ pub(crate) fn dump_wavefront_mega(
                                 // applied upstream of both consumers, moved to the consumer that
                                 // wants it.
                                 let unrolled = superdsc::unroll_layers::<$W>(&rolled);
-                                let unrolled_params = rolled.attn_params;
                                 let pre = if card {
                                     superdsc::emit_bundle::<$W>(
                                         &rolled.prefix,
                                         Some(&rolled.layout),
                                         superdsc::FoldGrouping::Split,
-                                        rolled.attn_params,
                                         dump,
                                     )
                                 } else {
@@ -3620,11 +3654,6 @@ pub(crate) fn dump_wavefront_mega(
                                         if card { &b.ops } else { &unrolled },
                                         Some(&rolled.layout),
                                         superdsc::FoldGrouping::Split,
-                                        if card {
-                                            rolled.attn_params
-                                        } else {
-                                            unrolled_params
-                                        },
                                         dump,
                                     );
                                     match r {
@@ -3677,7 +3706,6 @@ pub(crate) fn dump_wavefront_mega(
                                                     &b.ops,
                                                     Some(&rolled.layout),
                                                     superdsc::FoldGrouping::Fused,
-                                                    rolled.attn_params,
                                                     dump,
                                                 )
                                                 .map(superdsc::bundle::SiblingFp::from)
@@ -3704,7 +3732,6 @@ pub(crate) fn dump_wavefront_mega(
                                         &rolled.suffix,
                                         Some(&rolled.layout),
                                         superdsc::FoldGrouping::Split,
-                                        rolled.attn_params,
                                         dump,
                                     )
                                 } else {
@@ -3810,7 +3837,6 @@ pub(crate) fn dump_wavefront_mega(
                                                         } else {
                                                             superdsc::unroll_layers::<$W>(&rr)
                                                         };
-                                                        let rung_params = rr.attn_params;
                                                         // ONE FP per body class; a failed body emit
                                                         // leaves the rung unbaked — the runtime falls
                                                         // back to the next rung up.
@@ -3831,15 +3857,6 @@ pub(crate) fn dump_wavefront_mega(
                                                                 },
                                                                 Some(&rr.layout),
                                                                 superdsc::FoldGrouping::Split,
-                                                                // THIS rung's own params — `rr` was
-                                                                // lowered at `rung`, so its swept
-                                                                // extent is `rung`'s and not the
-                                                                // ceiling bundle's.
-                                                                if card {
-                                                                    rr.attn_params
-                                                                } else {
-                                                                    rung_params
-                                                                },
                                                                 dump,
                                                             ) {
                                                                 Ok(rfp) => {
@@ -3869,7 +3886,6 @@ pub(crate) fn dump_wavefront_mega(
                                                                         &b.ops,
                                                                         Some(&rr.layout),
                                                                         superdsc::FoldGrouping::Fused,
-                                                                        rr.attn_params,
                                                                         dump,
                                                                     )
                                                                     .map(

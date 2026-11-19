@@ -363,18 +363,6 @@ pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(Subtile
     folds
 }
 
-/// The bundle's [`crate::ktir_superdsc_door::BundleAttnParams`] — `None` for a graph with no
-/// attention node. The row kind is the one fact no program states (see the field).
-pub(crate) fn attn_bundle_params<F: RopeForm>(
-    ir: &SubtileIR<F>,
-    rows_are_requests: bool,
-) -> Option<crate::ktir_superdsc_door::BundleAttnParams> {
-    ir.nodes
-        .iter()
-        .any(|n| matches!(n.op, SubOp::AttnDecode { .. }))
-        .then_some(crate::ktir_superdsc_door::BundleAttnParams { rows_are_requests })
-}
-
 // ════════════════════════════════════════════════════════════════════════════════════
 //  THE CHAINED HEAD'S HAND-MINTED PROGRAMS (#603)
 // ════════════════════════════════════════════════════════════════════════════════════
@@ -1333,9 +1321,6 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows)?;
-    // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
-    // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
-    let attn_params = attn_bundle_params(ir, rows_are_requests);
     let mut sym_id_base: i64 = 0;
     let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
     let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(programs.len());
@@ -1354,7 +1339,6 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 e,
                 &mut sym_id_base,
                 Some(&bundle_layout),
-                attn_params,
                 &mut fp8_quantized,
             )
             .map_err(|err| {
@@ -1442,10 +1426,11 @@ pub struct BundleWiring {
     /// double-applies the scale. (An attention-scale fold's node is NOT host-routed — it still
     /// runs, at the scale 1.0 the same arm rewrote it to.)
     pub weight_scale_folds: Vec<(u32, f32)>,
-    /// ⭐ THE KERNEL-TABLE CLASS SETS — this graph's DISTINCT rope head dims (`rope_class_hds`)
-    /// and attention head dims (`attn_class_hds`), sorted descending, published off the
+    /// ⭐ THE KERNEL-TABLE CLASS SETS — the DISTINCT head dims of this graph's ropes that read a P
+    /// table (`rope_class_hds`, `rope_p_table_class_hds`: empty, or the one-stick head `[64]`) and
+    /// its DISTINCT attention head dims (`attn_class_hds`), sorted descending, published off the
     /// `BundleLayout` registry this walk threads: the ONE-source law `scalarmul_scales` states
-    /// above, applied to the class sets. The door resolves a rope program's class index off the
+    /// above, applied to the class sets. The rope's lowering resolves its table off the
     /// LAYOUT's list (`BundleLayout::rope_class_hds`, the registry mechanism
     /// `scalarmul_scales` established), so the worker's load-time table binds must be THAT list
     /// and not a second derivation free to disagree — the runtime's
@@ -1788,10 +1773,11 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
             .collect(),
-        // ⭐ THE CLASS REGISTRIES, here too — the door resolves a rope/attn program's P/identity
-        // class through these, and this pass lowers through the door. Same shared helper, same
-        // tape, so the wiring's answer and the placement pass's cannot disagree.
-        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
+        // ⭐ THE CLASS REGISTRIES, here too — the rope's lowering resolves its P table and the door
+        // an attn program's identity class through these, and this pass lowers through the door.
+        // Same shared helper, same tape, so the wiring's answer and the placement pass's cannot
+        // disagree.
+        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_table_class_hds(
             ir.nodes
                 .iter()
                 .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
@@ -3105,9 +3091,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // the tape walk would have, and the real pass in `ktir_groups_via_superdsc` finds each one already
     // declared and resolves the identical address. The symbol counter and the fp8-quantize set are
     // throwaways because only the layout is wanted; the descriptors are dropped.
-    // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
-    // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
-    let attn_params = attn_bundle_params(ir, rows_are_requests);
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
     let pools = crate::lower_subtile_tape_to_superdsc::kv_pool_tids(ir);
@@ -3133,7 +3116,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                 k,
                 &mut declare_syms,
                 Some(&bundle_layout),
-                attn_params,
                 &mut declare_fp8,
             )
             .map_err(|err| {
@@ -3661,7 +3643,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         suffix_weight_bank,
         kv_request_stride,
         suffix_in_tid,
-        attn_params,
     })
 }
 

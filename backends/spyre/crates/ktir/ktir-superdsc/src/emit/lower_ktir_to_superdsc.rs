@@ -36,8 +36,8 @@
 use super::{
     ConvertBand, ConvertBandSide, EmittedOp, In, assemble_convert, assemble_convert_band,
     assemble_pointwise_broadcast_off, bmm_site, check_pointwise_cols, check_pointwise_cols_df,
-    emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
-    pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
+    emit_sdsc_tiled, op_func_from_str, pointwise_broadcast_opspec_df, pointwise_chunk_out_offset,
+    pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
@@ -5133,9 +5133,15 @@ pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
 
 /// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const — the
 /// consumer side of `with_config_head_dim`, exactly as main's `LowerRope` was.
+///
+/// ⛔ NO ROW KIND AND NO TABLE TID. The rope is ONE form at every row count and row kind, so it
+/// takes no row kind; and the P table a lane-factor rotate reads is resolved here, off the layout's
+/// own class registry ([`BundleLayout::rope_p_tid`]), for exactly the ropes that read one — a door
+/// that resolved it for every rope would refuse every rope that reads none.
 pub struct RopeAt<'a> {
     pub name: &'a str,
-    /// x, cos, sin, out — main's `inputs[0..3]` and `output`.
+    /// x, cos, sin, out — main's `inputs[0..3]` and `output`. `sin` is the table the rotate's own
+    /// [`SinTable`](crate::sdsc_abstract::SinTable) names: SIGNED for a rotate of stick moves.
     pub x: String,
     pub cos: String,
     pub sin: String,
@@ -5143,36 +5149,43 @@ pub struct RopeAt<'a> {
     pub t: u32,
     pub mq: u32,
     pub total: u32,
-    /// ⭐ THE ROPE-P CLASS TID this rope's `matmul(x, P)` names. One `[hd,hd]` P per DISTINCT rope
-    /// head dim in the tape (a hybrid model carries two, and a composite single P is impossible: the
-    /// big class's contraction reads the small class's nonzero block as spurious ±1 terms). The DOOR
-    /// resolves the class index off the shared `rope_class_hds` registry, so the emitter and the
-    /// placement pass cannot disagree about which table a class reads.
-    pub p_tid: u32,
     pub sym_id_base: &'a mut i64,
     pub layout: Option<&'a BundleLayout>,
-    pub rows_are_requests: bool,
 }
 
-/// main's `lower_rope_node` (main 8696-9528) BODY, at its const head dim. Everything below the
-/// `let x = …` binding is main's text.
+/// RoPE, `out = x·cos + rotate_half(x)·sin`, at its const head dim — the reference's own form
+/// (torch-spyre runs Gemma-4's rope as Hugging Face writes it, `x*cos + cat(-x2, x1)*sin`), lowered
+/// op by op from the rotate's factors.
 ///
-/// ⭐⭐ `HD` IS A CONST GENERIC HERE, and that is the point of this function's whole shape.
+/// ⭐⭐⭐ ONE BODY FOR EVERY ROW COUNT, EVERY ROW KIND AND EVERY HEAD DIM, FOUR OPS. The rotate is
+/// [`RotateHalf::of`](crate::sdsc_abstract::RotateHalf::of)'s factors — the one derivation of
+/// rotate-half's pairing and sign, read off `rope_p_entry` — and `rs = rotate_half(x)·sin` lowers
+/// by whichever factor the head has:
 ///
-/// The head dim is a constant of the MODEL, but this emitter is ONE binary serving every model, so inside
-/// it the value only becomes known when the proc macro runs. That is why `Shape::<0,0,0,0>` and the
-/// `_of(hd, df)` twins existed: an escape hatch for "the const generic cannot be used here". The escape
-/// hatch is what made the head-dim-dependent fork below a RUNTIME branch, and a runtime branch is what no
-/// compile-time guard can hold onto.
+/// * each STICK move is ONE whole-tensor band MULTIPLY — the move's sticks of every head of `x`
+///   times the SIGNED table's own sticks, written straight into `rs` — over the pitched stick bands
+///   of the token stream (`[mb = mq, out = the move's sticks, y = heads]`, a head the band and its
+///   step the head width, the back gap the view's own type derives;
+///   [`assemble_stick_bands`](crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_bands)). The
+///   move's sign lives in the TABLE (`sin' = sign·sin`, `RotateHalf::sin_table`, staged by the
+///   worker from the same law), so the multiply carries none, and there is no `rot` tensor at all;
+/// * a LANE factor is ONE matmul of the stream's stick-column rows `[sticks · mq, lanes]` against the
+///   staged P's one-stick block (P carries the sign, the table is plain) into `rot`, then
+///   `rs = rot · sin` — the row-expansion law (`StickLayout::addr_eq`, Kani
+///   `row_expansion_is_byte_identical`) makes that view the token stream's own bytes at every `mq`;
 ///
-/// The fix is a SINGLE dispatch from the value to the const (see the caller), after which everything here
-/// is const. `shape.rs`'s own module doc asked for exactly this: "any branch on them would have to be
-/// written as a branch on a const, which shows up as a special case in review instead of hiding inside an
-/// offset expression."
+/// around them `xc = x·cos` and `out = xc + rs`, whole-tensor over the `[mq, total]` plane. A head
+/// whose half is whole sticks is `xc` + its two half-multiplies + `out`; a one-stick head is `xc` +
+/// P + `rs` + `out` — from the same lines, at every `mq`.
 ///
-/// What it buys immediately: the collapsed RoPE form and the slab RoPE form become TWO INSTANTIATIONS
-/// rather than two arms of one function, so "a head_dim-128 bundle takes the slab path" is a fact the
-/// compiler knows.
+/// ⛔ NO FORM IS CHOSEN BY A COUNT. No line here reads `mq`, a row kind or a head count to pick an
+/// arm, and no op contracts a `[hd, hd]` P: the half-swap's read — a stride across head-sized
+/// groups of sticks — is the device's back gap, which the bands' pitched views state, so the
+/// rotate is a whole-tensor elementwise op at every head dim whose half is whole sticks.
+///
+/// ⭐⭐ `HD` IS A CONST GENERIC — the head dim is a constant of the MODEL, and this emitter is one
+/// binary serving every model, so it becomes one only through the single value→const dispatch at
+/// the caller (`with_config_head_dim`). Inside, every head-dim fact is a function of the const.
 pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
     a: RopeAt<'_>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
@@ -5185,10 +5198,8 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         t,
         mq,
         total,
-        p_tid,
         sym_id_base,
         layout,
-        rows_are_requests,
     } = a;
     // ⭐ THE HEAD WIDTH IS A TYPE — nonzero and a whole number of sticks by construction, so the
     // old `hd == 0` and part-stick cases cannot be written here at all.
@@ -5200,416 +5211,125 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         ));
     }
     let heads = total / hd;
-    // ROW COUNT: 1 = decode, mq>1 = PREFILL (a [mq, total] roped Q/K). The rope emits one mb=1 [1,hd]
-    // block per (row r, head h) — the PROVEN mb=1 primitive. Looping ONLY over heads (mq implicitly 1)
-    // was THE prefill bug: it wrote row 0 for every head and NEVER rows 1..mq → roped Q/K collapsed to
-    // row 0 → K-cache 1 slot → garbage (measured on-card). CRUCIAL: a [mq,total] activation is
-    // STICK-SCATTERED (dev_off: [r,c]→(c/64)·(mq·64)+r·64+c%64), so the (r,h) block's DEVICE offset is
-    // rope_prefill_block_offset(r,h,mq,hd)=h·mq·hd+r·hd, NOT the naïve flat r·total+h·hd (that wrote
-    // where the attention matmul never reads for r>0 — a baked-but-still-1-row false start). Kani
-    // `rope_prefill_bijection_*`: off == dev_off([mq,total],1,[r,h·hd]) (producer==consumer) + bijection.
-    // hd>stick in PREFILL: head h spans hd/stick NON-contiguous device sticks (each row r-scattered by
-    // mq·stick), so a contiguous [1,hd] block can't address it — hd>stick prefill takes the SLAB path
-    // below (per-(row,head,slab) [1,stick] ops). The rotate-half is realized there as a signed slab-swap
-    // (rot slab s = ±x slab s±n_slabs/2), which needs half=hd/2 to be a whole number of sticks, i.e.
-    // n_slabs even (hd a multiple of 2·stick) — true for every real hd>64 (128/256/512). Guard only the
-    // odd-n_slabs case (never a real head_dim) as a build error (not an on-card crash).
-    if hdw.sticks() > 1 && !hdw.sticks().is_multiple_of(2) {
+    // ⭐ THE ROTATE, FACTORED — read off `rope_p_entry` by the ONE derivation, at the rope's fp16
+    // lanes. A head whose half straddles a stick has no factored form: a build error, by name.
+    let lanes = crate::sdsc_abstract::Lanes::FP16;
+    let Some(rotate) = crate::sdsc_abstract::RotateHalf::of(hdw, lanes) else {
         return err(format!(
-            "RoPE prefill (t{t}, mq={mq}): head_dim {hd} spans an ODD stick count ({ns}); the \
-             rotate-half slab-swap needs half=hd/2 to be a whole number of sticks (an even stick \
-             count). Real head_dims (128/256/512) satisfy this.",
-            ns = hdw.sticks(),
+            "RopeRotate t{t}: head_dim {hd} spans {} stick(s), and at that width rotate-half's \
+             pairing (`rope_p_entry`) neither moves whole sticks with their lanes in place nor \
+             keeps every column inside its own stick — its half straddles a stick, so it has no \
+             factored device form",
+            hdw.sticks()
         ));
-    }
-    // ⭐ THE CLASS TID, NOT THE BARE SENTINEL — the ONE P this rope's head dim class reads. A uniform
-    // model's door resolves class 0, which IS `ROPE_P_TID`, so its ops and bytes are unchanged.
-    let p = crate::place::act_name(p_tid);
+    };
     use SynthRole as R;
     let out_id = PlaceId::Act(t);
-    let rot = syn(layout, out_id.synth(R::Rot)); // x · P  (rotate-half, synthetic seg3)
     let xc = syn(layout, out_id.synth(R::Xc)); // x · cos
-    let rs = syn(layout, out_id.synth(R::Rs)); // rot · sin
-    // PER-(row,head) [1,hd] at the DEVICE offset rope_prefill_block_offset(r,h,mq,hd) — the roped Q/K
-    // tensor is [mq, heads·hd] sticked on its last dim, so head h row r's hd dims are one 64-stick at
-    // h·mq·hd+r·hd (hd==STK). A single FULL [mq,heads,hd] op would device-stick differently and mismatch
-    // the attention matmul's [mq,total] read; per-(r,h) [1,hd] blocks match it exactly (Kani-proven).
-    // cos/sin are the worker's [mq,total] per-position head-tiled table, read at row r's head-0 slice.
-    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(mq as usize * heads as usize * 4);
-    let ew_ph = |ops: &mut Vec<EmittedOp<T>>,
-                 name: String,
-                 f: &'static str,
-                 a: &str,
-                 aoff: crate::addr::DevOff,
-                 b: &str,
-                 boff: crate::addr::DevOff,
-                 o: &str,
-                 ooff: crate::addr::DevOff,
-                 sib: &mut i64|
-     -> Result<(), Error> {
-        // MULTI-STICK AT head_dim > 64, AND THAT IS A REAL DIFFERENCE: at rows==1 a `[1,hd]` op is two
-        // sticks at head_dim 128, and the work splitter divides a multi-stick `out` ACROSS CORES — 2
-        // cores where head_dim 64 uses 1. No working model has run these ops in that mode, and this
-        // file documents a dxp defect in exactly that regime (`cols > 64` ⇒ split across cores).
-        //
-        // Splitting them stick-wide the way prefill's RoPE already is does NOT work: `rot` is produced
-        // by a `[1, hd]` matmul, so reading it as `[1, stick]` slices declares a second arrangement for
-        // one tensor and the arrangement authority rejects the bundle. Making decode stick-wide means
-        // making the P matmul stick-wide too, which is a different rotate formulation, not a slice.
-        //
-        // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: every rope buffer — x/cos/sin (the worker's
-        // `[mq, total]` plane) and the rot/xc/rs intermediates — is `[mq, total]` in elements, and this
-        // op's `[1, hd]` window rides a `rope_prefill_block_offset` corner of it. The mint reads the
-        // handle's dims as the BOUND (#731's door), so the annotation lie is now a refusal; the builder
-        // reads name + kind only, so the emission is byte-identical.
-        let op = pointwise_broadcast_opspec_df(
-            op_func_from_str(f),
-            1,
-            hd,
-            &[
-                In::sliced(&rb(a, mq, total), aoff).ew(),
-                In::sliced(&rb(b, mq, total), boff).ew(),
-            ],
-            o,
-            ooff.into(),
-            false, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
-            Df::Fp16,
-            layout,
-            EwDivision::Law,
-        )
-        .map_err(|e| Error { message: e })?;
-        ops.push(emit_sdsc_tiled(
-            &name,
-            &op,
-            &SdscFoldSet::new(op.iter.cores_used()),
-            sib,
-            layout,
-        )?);
-        Ok(())
-    };
-    // ── HEAD-MAJOR COLLAPSE, AT ANY ROW COUNT ───────────────────────────────────────────────────
-    // This used to be `mq == 1` only, and the note below measures what that costs: ~40 per-(row,head)
-    // ops per op-type, ~150 extra ops a layer, "the single largest unaccounted-for chunk of the perf
-    // gap". It is also a fixed cost — the body goes 271 ops a layer at one request to 372 at two, and
-    // then only +16 per further request — so a batch pays it in full and amortizes none of it.
-    //
-    // The collapse generalizes. Head `h` row `r` of the roped `[mq, heads*hd]` tensor sits at
-    // `h*mq*hd + r*hd`, and a `[heads*mq, hd]` view indexed `h*mq + r` gives exactly `(h*mq+r)*hd` —
-    // the SAME bytes at any `mq`, which is `addr_eq`'s row-expansion law (Kani
-    // `row_expansion_is_byte_identical`), not an mq=1 coincidence.
-    //
-    // cos/sin need one change: at one row every head shares the angles, so they are read mb-broadcast
-    // from a single row; above one row they vary per POSITION and must be read per-row. The worker's
-    // staging already suits it — element `(p, h*hd+d)` lands at `h*mq*64 + p*64 + d`, which IS row
-    // `h*mq+p`, column `d` of the `[heads*mq, hd]` view.
-    //
-    // Scoped to a decode batch: prefill's own bundles are proven on hardware and stay byte-identical.
-    let collapse_rows = if mq == 1 {
-        Some(heads)
-    } else if rows_are_requests {
-        Some(heads * mq)
-    } else {
-        None
-    };
-    if let Some(rows) = collapse_rows
-        // ⭐ FROM THE TYPE. `HD` is a const generic now, so this is a compile-time constant and the two
-        // RoPE forms below are two instantiations of this function rather than two runtime arms.
-        .filter(|_| crate::addr::Shape::<HD, 0, 0, 0>::head_major_collapse_valid_here(Df::Fp16))
-    {
-        // ⛔ DECLARE BEFORE USE. This branch (`hd == stick`, the head-major collapse) referenced
-        // `rot`/`xc`/`rs` without ever declaring them, so they fell to `resolve_seg_base`'s bump —
-        // which handed all three the SAME address. Rope is `rot = x·P`, `xc = x·cos`,
-        // `rs = rot·sin`, `out = xc + rs`: three of its four intermediates were one buffer.
-        if let Some(l) = layout {
-            for r in [R::Rot, R::Xc, R::Rs] {
-                l.synth(out_id.synth(r), &[rows, hd]);
-            }
+    let rs = syn(layout, out_id.synth(R::Rs)); // rotate_half(x) · sin
+    // ⛔ DECLARE BEFORE USE, AT THE TRUE FULL EXTENT. An undeclared intermediate falls to
+    // `resolve_seg_base`'s bump, which can hand several the SAME address; and sized by whichever
+    // access declares first, one half-multiply's bands would reserve half the plane — the
+    // bump-allocator defect `BundleLayout::synth` exists to kill.
+    if let Some(l) = layout {
+        for r in [R::Xc, R::Rs] {
+            l.synth(out_id.synth(r), &[mq, total]);
         }
-        // rot = x[rows,hd] @ P[hd,hd] — the same P kernel for every row (m=rows GEMM, k=n=hd).
+    }
+    let rows_all = crate::sdsc_abstract::RowCount::of_query_rows(
+        crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+    );
+    let cols_all = crate::sdsc_abstract::BlockCols::of_feature_cols(total);
+    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(rotate.stick_moves().len() + 4);
+    // cos/sin are the worker's head-TILED `[mq, total]` tables (`tile_one` replicates the hd-wide row
+    // across `total/hd` heads), so a whole-tensor read sees, for every head, its position's angles.
+    ops.push(pw2(
+        &format!("rope_xc_o{t}"),
+        "multiply",
+        rows_all,
+        cols_all,
+        In::full(&rb(&x, mq, total)),
+        In::full(&rb(&cos, mq, total)),
+        &rb(&xc, mq, total),
+        sym_id_base,
+        layout,
+    )?);
+    // ── THE STICK FACTOR: one band multiply per move, straight into `rs` ─────────────────────────
+    // A move multiplies its sticks of EVERY head of `x` by the signed table at its OWN output
+    // sticks and writes them to the same output sticks of `rs`, every row, every lane in place: the
+    // heads are the bands, the head width their pitch.
+    for m in rotate.stick_moves() {
+        ops.push(
+            crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_bands(
+                &format!("rope_rs_s{}_o{t}", m.dst()),
+                op_func_from_str("multiply"),
+                &[
+                    crate::ir::bridge::tiled_op_sdsc_op::BandAt {
+                        name: &x,
+                        stick: m.src(),
+                    },
+                    crate::ir::bridge::tiled_op_sdsc_op::BandAt {
+                        name: &sin,
+                        stick: m.dst(),
+                    },
+                ],
+                crate::ir::bridge::tiled_op_sdsc_op::BandAt {
+                    name: &rs,
+                    stick: m.dst(),
+                },
+                crate::ir::bridge::tiled_op_sdsc_op::StickBands {
+                    rows: mq,
+                    bands: heads,
+                    band_sticks: m.sticks(),
+                    pitch_sticks: hdw.sticks(),
+                    df: Df::Fp16,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error { message: e })?,
+        );
+    }
+    // ── THE LANE FACTOR: one matmul against the staged P, then `rs = rot · sin` ─────────────────
+    // Every stick of the stream permutes its lanes the same way, so ONE `[lanes, lanes]` kernel —
+    // the staged P's stick-0 block, which IS the lane permutation every stick shares — serves every
+    // stick-column row of every head and every row. K = N = one stick: never multi-stick, never
+    // corelet-split. P carries the sign, so the table this rope reads is the plain one.
+    if let Some(lane) = rotate.lane() {
+        let p_tid = layout.and_then(|l| l.rope_p_tid(hd)).ok_or_else(|| Error {
+            message: format!(
+                "RopeRotate t{t}: head_dim {hd}'s rotate moves lanes inside a stick, so it reads a \
+                 staged P table, and BundleLayout.rope_class_hds {:?} holds no class for it \
+                 (registry desync — the placement pass and this lowering disagree about which P \
+                 table it reads)",
+                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
+            ),
+        })?;
+        let p = crate::place::act_name(p_tid);
+        let rot = syn(layout, out_id.synth(R::Rot)); // rotate_half(x)
+        if let Some(l) = layout {
+            l.synth(out_id.synth(R::Rot), &[mq, total]);
+        }
+        let width = lane.width().get();
+        let m = MatM::of_stick_column_rows(crate::sdsc_abstract::RowCount::of_stick_column_rows(
+            heads * hdw.sticks(),
+            mq,
+        ));
         ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
-            crate::sdsc_abstract::MatM::of_head_major_rows(rows),
-            crate::sdsc_abstract::MatN::of_head_dim(hdw),
-            crate::sdsc_abstract::MatK::of_head_dim(hdw),
+            m,
+            MatN::one_stick(lanes),
+            MatK::one_stick(lanes),
             crate::sdsc_abstract::MatY::unbatched(),
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
             ),
-            &rb(&x, rows, hd),
+            &rb(&x, m.get(), width),
             crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+            &Stk::<KernelTag>::kernel(width as usize, width as usize, &p),
             crate::addr::DevOff::ZERO,
-            &rb(&rot, rows, hd),
+            &rb(&rot, m.get(), width),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
-        )?);
-        let hh = |name: &str| fl(name, rows, hd);
-        // One row of angles shared by every head at mq==1; per-row above that.
-        let (cos_h, sin_h) = (hh(&cos), hh(&sin));
-        let cos_in = if mq == 1 {
-            In::mb_at(&cos_h, crate::addr::DevOff::ZERO)
-        } else {
-            In::full(&cos_h)
-        };
-        let sin_in = if mq == 1 {
-            In::mb_at(&sin_h, crate::addr::DevOff::ZERO)
-        } else {
-            In::full(&sin_h)
-        };
-        // The collapse's typed extents: `rows` is the head-major-collapsed view's row extent
-        // (`heads*mq`, where `heads` may be nqh or nkvh), swept head-dim wide.
-        let hm_rows = crate::sdsc_abstract::RowCount::of_head_major_rows(rows);
-        let hd_cols = crate::sdsc_abstract::BlockCols::of_head_dim(hdw);
-        ops.push(pw2(
-            &format!("rope_xc_o{t}"),
-            "multiply",
-            hm_rows,
-            hd_cols,
-            In::full(&hh(&x)),
-            cos_in,
-            &hh(&xc),
-            sym_id_base,
-            layout,
-        )?);
-        ops.push(pw2(
-            &format!("rope_rs_o{t}"),
-            "multiply",
-            hm_rows,
-            hd_cols,
-            In::full(&hh(&rot)),
-            sin_in,
-            &hh(&rs),
-            sym_id_base,
-            layout,
-        )?);
-        ops.push(pw2(
-            &format!("rope_add_o{t}"),
-            "add",
-            hm_rows,
-            hd_cols,
-            In::full(&hh(&xc)),
-            In::full(&hh(&rs)),
-            &hh(&out),
-            sym_id_base,
-            layout,
-        )?);
-        return Ok(ops);
-    }
-    // ── PREFILL (mq>1) hd>stick: SLAB rope ──────────────────────────────────────────────────────────
-    // A head's hd dims span n_slabs = hd/stick device STICKS, each a [1,stick] block r-scattered by
-    // mq·stick in the stick-scattered [mq,total] tensor — a contiguous [1,hd] block (and thus the [hd,hd]
-    // P-matmul) can't address them. So rope per-(row r, head h, slab s): out_s = x_s·cos_s + rot_s·sin_s,
-    // where the rotate-half `rot_s` = (s < n/2 ? -x_{s+n/2} : +x_{s-n/2}) is a SIGNED SLAB-SWAP — half=hd/2
-    // is n_slabs/2 whole sticks (guarded even above), so no cross-stick P-matmul is needed. All offsets are
-    // dev_off([mq,total],1,·) (Kani dev_off); cos/sin read head-0's slab s (the head-tiled table serves
-    // every head). At mq==1 or hd==stick this reduces to the loop below (one slab), so hd>stick is the
-    // only caller. rot_s's sign is folded into the final add/subtract (rs_s carries the magnitude).
-    // ANY `mq`, not just prefill. The slab form emits STICK-WIDE ops; the `[1, hd]` form below is
-    // MULTI-STICK at head_dim > 64, and the work splitter divides a multi-stick `out` across CORES —
-    // 2 cores at head_dim 128 where head_dim 64 uses 1. That per-core mode is one no working model has
-    // run these ops in, and this file documents a dxp defect in exactly it. The slab form also drops
-    // the `[hd,hd]` P matmul entirely: the rotate becomes a signed SLAB SWAP, so there is no `rot`
-    // tensor and no worker-staged permutation on this path at all.
-    //
-    // The body is already row-batched over `mq`, so `mq == 1` is one row and needs no special case.
-    // head_dim 64 never reaches here (`hd > stick` is false), so granite-3.1-2b is untouched.
-    if hdw.sticks() > 1 {
-        let stk = Fp16::ELEMS_PER_STICK;
-        let (hd_u, stk_u) = (hd as usize, stk as usize);
-        let n_slabs = hd_u / stk_u;
-        // `dev_off(&[mq,total],1,[r,col])` IS `Nest(["row","feat"],[mq,total])`; going through the
-        // nest means this loop names a COORDINATE and never writes a stride.
-        let doff =
-            |r: usize, col: usize| crate::addr::rc_of(mq, total, r as u32, col as u32, Df::Fp16);
-        let ew_slab = |ops: &mut Vec<EmittedOp<T>>,
-                       name: String,
-                       f: &'static str,
-                       a: &str,
-                       aoff: crate::addr::DevOff,
-                       b: &str,
-                       boff: crate::addr::DevOff,
-                       o: &str,
-                       ooff: crate::addr::DevOff,
-                       sib: &mut i64|
-         -> Result<(), Error> {
-            // ⭐ TRUE EXTENTS (`[mq, total]`), not `rbo`'s `1×64` annotation — the slab windows are
-            // corners of the same `[mq, total]` plane `ew_ph` reads (see its note); the mint reads the
-            // dims as the bound and the builder reads name + kind only.
-            let op = pointwise_broadcast_opspec_df(
-                op_func_from_str(f),
-                mq,
-                stk,
-                &[
-                    In::sliced(&rb(a, mq, total), aoff).ew(),
-                    In::sliced(&rb(b, mq, total), boff).ew(),
-                ],
-                o,
-                ooff.into(),
-                // cols == stk, and `stickmajor` needs cols > 64, so it cannot fire either way — this
-                // is the same rank-3 flat form regardless of the row count.
-                true,
-                Df::Fp16,
-                layout,
-                EwDivision::Law,
-            )
-            .map_err(|e| Error { message: e })?;
-            ops.push(emit_sdsc_tiled(
-                &name,
-                &op,
-                &SdscFoldSet::new(op.iter.cores_used()),
-                sib,
-                layout,
-            )?);
-            Ok(())
-        };
-        // ⭐⭐⭐⭐⭐ THREE WHOLE-TENSOR OPS + ONE ROTATE PER HEAD, instead of 3·heads·n_slabs stick blocks.
-        // At granite-8b (hd=128, nqh 32 + nkvh 8) that is 240 ops a layer → 43, and RoPE was the single
-        // largest op family in the decode body (38% of its 611 non-weight ops).
-        //
-        // ⭐ WHY IT IS WORTH THE OPS AND NOTHING ELSE: fitting both models' measured layer time against
-        // their op counts and `wstride` gives `layer_ms = ops·0.83 µs + weight_MB / 137 GB/s`, and the
-        // weight stream is already at 91% of the 150 GB/s IBM's own cost model fits as peak. So per-op
-        // overhead is the ONLY bs=1 lever left, and 197 fewer ops a layer is ~6.5 ms/token at 8b.
-        //
-        // ⛔ SO DO NOT PRICE A COLLAPSE IN MACs. `c1b7e3b7`'s message blames its 8·64·64 identity-matmul
-        // MACs; the mode data says that explanation is unsupported. This one ADDS a `[mq,hd]·[hd,hd]` P
-        // matmul per head (655 K MACs a layer at 8b, against ~200 M for the projections) and wins. Judge
-        // a collapse on LAUNCHES and on the region draw, and measure it paired.
-        //
-        // THE ROTATE IS THE P MATMUL AGAIN, which this path had dropped in favour of a signed slab
-        // swap. The swap is what forced the per-block form: it reads slab `s ± n_slabs/2`, a
-        // PERMUTATION of the stick planes, and a pointwise op has one offset and one uniform stride per
-        // operand — so the read cannot be expressed whole-tensor (the same rank-2 wall the finalize and
-        // the mask hit). P carries the swap AND its sign inside a kernel, so every consumer downstream
-        // reads its own block: `rs = rot·sin` and `out = xc + rs` become plain elementwise ops, and the
-        // ∓ that used to split the combine by half is gone with it.
-        //
-        // At hd == stick this branch is not taken at all (the head-major collapse above owns that case,
-        // and granite-2b is untouched byte-for-byte).
-        let _ = &ew_slab; // the per-block emitter stays for the paths below
-        // Declare the intermediates at their TRUE full extent, for the reason the mq>1 branch below
-        // records: sized by whichever access declares first, a per-head matmul window would reserve ONE
-        // head and under-reserve by `heads` — the bump-allocator defect `synth` exists to kill.
-        if let Some(l) = layout {
-            for r in [R::Rot, R::Xc, R::Rs] {
-                l.synth(out_id.synth(r), &[mq, total]);
-            }
-        }
-        // ⛔⛔⛔ DECODE ONLY (`mq == 1`), AND THE PREFILL EVIDENCE IS WHY. Emitted at EVERY `mq`, this form
-        // is measured WRONG on granite-8b's prompt: the reply reads fluently but says the PROMPT looks
-        // jumbled ("the text is a bit jumbled, I'll help you rephrase it"), and TTFT DOUBLES (279.7 vs
-        // 124.7 ms) while the decode ITL improves — a mis-encoded prompt that decode then continues
-        // fluently from. The addresses are not the cause and that is checked, not assumed:
-        // `tests/zz_rope_rot_addr_equiv.rs` proves the ±I block is the right (in-slab, out-slab)
-        // coordinate (P is NOT symmetric, so a transposed one would silently negate the rotation), that
-        // the slab form reproduces the per-head rotate element for element, and that the offsets step one
-        // plane per slab and `mq*hd` per head. So the defect is in the FORM at `mq > 1` — the same shape
-        // of finding as the score leg's ("every emitted address is correct and decode is still
-        // incoherent"), and the row axis being degenerate at `mq == 1` is exactly what hides it.
-        let rot_slab_form = mq == 1;
-        for s in (0..n_slabs).filter(|_| rot_slab_form) {
-            // P's nonzero block for this output slab: `rope_p_entry` pairs `o` with `o ± hd/2`, and
-            // `hd/2` is `n_slabs/2` whole sticks (guarded even above), so the partner is a whole slab.
-            let p_in = if s < n_slabs / 2 {
-                s + n_slabs / 2
-            } else {
-                s - n_slabs / 2
-            };
-            // The ±I block as a COORDINATE on P's own `[in, out]` kernel nest — the same law `attn_krep`
-            // reads the identity's diagonal block through, never the product it works out to.
-            let p_off = crate::addr::Nest::new(&["row", "feat"], &[hd, hd], Df::Fp16)
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(p_in as u32 * stk))
-                .slab(s as u32)
-                .dev();
-            // REQUEST 0, and the op sweeps every row from there: RoPE's rotate covers the whole chunk,
-            // so the stream's row axis is swept work rather than a coordinate this site names.
-            let a_place = crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
-                crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                heads,
-                hdw,
-                0,
-                0,
-                p_in as u32,
-                Df::Fp16,
-            );
-            let o_place = crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
-                crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                heads,
-                hdw,
-                0,
-                0,
-                s as u32,
-                Df::Fp16,
-            );
-            ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                &if n_slabs == 1 {
-                    format!("rope_rot_o{t}")
-                } else {
-                    format!("rope_rot_s{s}_o{t}")
-                },
-                crate::sdsc_abstract::MatM::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatY::of_gqa_group(heads, a_place, o_place),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_head_batched(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&x, mq, total),
-                a_place,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                p_off,
-                &rb(&rot, mq, total),
-                o_place,
-                sym_id_base,
-                layout,
-            )?);
-        }
-        // PREFILL KEEPS THE PER-HEAD P MATMUL — the form measured coherent on granite-8b (`7d27d734`),
-        // one `[mq,hd]` window per head with the whole head dim contracted. `heads` ops instead of
-        // `n_slabs`, and the prompt is right.
-        for h in (0..heads as usize).filter(|_| !rot_slab_form) {
-            let off_h = doff(0, h * hd_u);
-            ops.push(assemble_matmul_off(
-                &format!("rope_rot_h{h}_o{t}"),
-                crate::sdsc_abstract::MatM::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::MatN::of_head_dim(hdw),
-                crate::sdsc_abstract::MatK::of_head_dim(hdw),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&x, mq, total),
-                off_h,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                crate::addr::DevOff::ZERO,
-                &rb(&rot, mq, total),
-                off_h,
-                sym_id_base,
-                layout,
-            )?);
-        }
-        // The three elementwise legs, each over the WHOLE tensor: same bytes the per-block ops covered,
-        // one op instead of `heads * n_slabs`. cos/sin are the worker's head-TILED table at this site's
-        // full width (`tile_one` replicates the hd-wide row across `total/hd` heads), so a whole-tensor
-        // read sees, for every head, exactly the head-0 slice the per-block form read.
-        let rows_all = crate::sdsc_abstract::RowCount::of_query_rows(
-            crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-        );
-        let cols_all = crate::sdsc_abstract::BlockCols::of_feature_cols(total);
-        ops.push(pw2(
-            &format!("rope_xc_o{t}"),
-            "multiply",
-            rows_all,
-            cols_all,
-            In::full(&rb(&x, mq, total)),
-            In::full(&rb(&cos, mq, total)),
-            &rb(&xc, mq, total),
             sym_id_base,
             layout,
         )?);
@@ -5624,269 +5344,20 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             sym_id_base,
             layout,
         )?);
-        // ADD, unconditionally: P already carries the rotate's sign, so there is no first-half/
-        // second-half split left to make this op two ops (which the stick planes' interleaving would
-        // have forced — first-half slabs are every OTHER plane, not a contiguous run).
-        ops.push(pw2(
-            &format!("rope_out_o{t}"),
-            "add",
-            rows_all,
-            cols_all,
-            In::full(&rb(&xc, mq, total)),
-            In::full(&rb(&rs, mq, total)),
-            &rb(&out, mq, total),
-            sym_id_base,
-            layout,
-        )?);
-        return Ok(ops);
     }
-    // ── PREFILL (mq>1) hd==stick: PER-HEAD ROW-BATCHED rope (2026-07-28, TTFT) ──────────────────
-    // The general per-(row,head) loop below emits 4 ops per (row,head) — at granite prefill that is
-    // mq(31)*nqh(32)*4 = 3968 ops for Q plus mq*nkvh*4 = 992 for K, i.e. ~83% of the ENTIRE 5990-op
-    // prefill body. Decode dodges this via the mq==1 head-batch short-circuit above; prefill had no
-    // equivalent.
-    //
-    // Heads CANNOT be batched at mq>1: head h row r lives at `h*mq*hd + r*hd`, so consecutive heads
-    // are mq*hd apart while an op's own row stride is hd. But for a FIXED head the rows ARE
-    // contiguous at stride hd, which is exactly what a [mq, hd] op wants:
-    //   * x/rot/xc/rs/out: base `h*mq*hd`, internal dev_off(r,d) = r*hd + d  (cols=hd=stick, so the
-    //     op is rank-3 flat and the address is base + r*hd + d) -> matches
-    //     rope_prefill_block_offset(r,h,mq,hd) = h*mq*hd + r*hd exactly, for every r.
-    //   * cos/sin: the worker stages them [mq,total] stick-scattered, so element (r,i) sits at
-    //     (i/64)*(mq*64) + r*64 + (i%64); for head-0's slice (i<hd=64) that is just r*hd + i — a
-    //     contiguous [mq,hd] block at offset 0. The table is head-tiled, so head 0's slice serves
-    //     every head (same fact the per-row path relies on via rope_prefill_cos_offset).
-    // So one [mq,hd] op per head replaces mq of them: 4*mq*heads -> 4*heads ops (Q: 3968 -> 128,
-    // K: 992 -> 32). Mathematically identical work, just not unrolled over rows.
-    // Gated to hd==stick (the multi-slab hd>stick case is handled by the slab path above) and to
-    // mq>1, so decode (mq==1) never reaches here and its emission is untouched.
-    // ⭐ FROM THE TYPE — `HD` is this function's const generic, so the gate is a compile-time constant.
-    // ⛔ AND NOTE THE `mq > 1` TERM IS A *WIDTH* TEST, NOT A KIND TEST: it reads "more than one query row",
-    // which is true of a prefill chunk AND of a decode batch. The comment below claims "decode (mq==1)
-    // never reaches here", and that is FALSE for a BATCHED decode, whose mq is the batch width. The kind
-    // is `rows_are_requests`; the count cannot stand in for it.
-    if mq > 1 && crate::addr::Shape::<HD, 0, 0, 0>::head_major_collapse_valid_here(Df::Fp16) {
-        // Declare the rope intermediates at their TRUE full extent. Without this they are sized by
-        // whichever access declares first, which was the per-head `[mq,hd]` matmul — ONE head, so the
-        // tensor under-reserved by a factor of `heads` (the exact bump-allocator defect
-        // `BundleLayout::synth` exists to kill). It also makes the whole-tensor `[heads*mq, hd]` reads
-        // below the ones that speak for the layout, since a per-head access no longer covers the
-        // footprint and so no longer declares. Scoped to the mq>1 branch so decode's allocation —
-        // and therefore its bundle fingerprint — is untouched.
-        if let Some(l) = layout {
-            for r in [R::Rot, R::Xc, R::Rs] {
-                l.synth(out_id.synth(r), &[heads * mq, hd]);
-            }
-        }
-        let ew_rows = |ops: &mut Vec<EmittedOp<T>>,
-                       name: String,
-                       f: &'static str,
-                       rows: u32,
-                       a: &str,
-                       aoff: crate::addr::DevOff,
-                       b: &str,
-                       boff: crate::addr::DevOff,
-                       o: &str,
-                       ooff: crate::addr::DevOff,
-                       sib: &mut i64|
-         -> Result<(), Error> {
-            // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: this branch reads every buffer as the
-            // `[rows, hd]` image — the same elements the `[heads*mq, hd]` synth above reserves (the
-            // callers pass `all = heads*mq`) — so the handle states the swept window's own extent. The
-            // mint reads the dims as the bound; the builder reads name + kind only.
-            let op = pointwise_broadcast_opspec_df(
-                op_func_from_str(f),
-                rows,
-                hd,
-                &[
-                    In::sliced(&rb(a, rows, hd), aoff).ew(),
-                    In::sliced(&rb(b, rows, hd), boff).ew(),
-                ],
-                o,
-                ooff.into(),
-                // cols == hd == stick, so `stickmajor` cannot fire (it needs cols>64) and this stays
-                // the SAME rank-3 flat form the per-row path used — only the row count differs.
-                false,
-                Df::Fp16,
-                layout,
-                EwDivision::Law,
-            )
-            .map_err(|e| Error { message: e })?;
-            ops.push(emit_sdsc_tiled(
-                &name,
-                &op,
-                &SdscFoldSet::new(op.iter.cores_used()),
-                sib,
-                layout,
-            )?);
-            Ok(())
-        };
-        // ⭐⭐⭐⭐⭐ ONE MATMUL FOR EVERY HEAD AND EVERY ROW — no per-head loop and NO BATCH AXIS.
-        //
-        // `heads` ops become ONE (32 -> 1 at granite). `P` is the SAME rotation for every head and every
-        // row, so this never needed a `y` axis at all: sweep `m = heads*mq` rows against the shared 2-D
-        // kernel `[hd, hd]` and every head is covered.
-        //
-        // ⛔ THE `y`-BATCHED FORM IS WHAT DOES NOT WORK, AND THE REASON IS ARRANGEMENT, NOT STRIDES.
-        // Measured on granite-3.1-2b fp8 (mq=7):
-        //
-        //   tensor 't729': device arrangement StickLayout { rows: 32, cols: 448, Flat }
-        //   conflicts with the earlier StickLayout { rows: 7, cols: 2048 }
-        //
-        // A `y`-batched rank-3 view makes `y` the LEADING (rows) axis, and a tensor gets ONE device
-        // arrangement per bundle. The rank-2 sweep has no such problem: `[heads*mq, hd]` is EXACTLY the
-        // arrangement the three pointwise legs below already read, and the comment there proves the
-        // bytes line up — row `j = h*mq + r` lands at `j*hd = h*mq*hd + r*hd`, which is
-        // `rope_prefill_block_offset(r, h, mq, hd)` for every `(h, r)`.
-        //
-        // So the per-head loop was never buying correctness; it was one op per head doing what one op
-        // over all rows does, because the row axis already enumerates (head, row) contiguously.
-        ops.push(assemble_matmul_off(
-            &format!("rope_rot_o{t}"),
-            crate::sdsc_abstract::MatM::of_token_rows(heads * mq),
-            crate::sdsc_abstract::MatN::of_head_dim(hdw),
-            crate::sdsc_abstract::MatK::of_head_dim(hdw),
-            crate::sdsc_abstract::MatY::unbatched(),
-            crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                bmm_site::TapeLoweringSite::witness(),
-            ),
-            &rb(&x, heads * mq, hd),
-            crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-            crate::addr::DevOff::ZERO,
-            &rb(&rot, heads * mq, hd),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
-        )?);
-        // ── The three POINTWISE legs collapse to ONE op EACH, across all heads. ──────────────────
-        // These were `heads` ops apiece (160 of the 402 trips in a granite prefill layer body — the
-        // single largest family, 40%) purely because they inherited the per-head loop. They do not
-        // need it: at `rows = heads*mq` the op's own row stride is `hd`, so row `j = h*mq + r` lands
-        // at `j*hd = h*mq*hd + r*hd` — EXACTLY `rope_prefill_block_offset(r,h,mq,hd)`, for every
-        // (h,r). So x/rot/xc/rs/out tile the whole tensor contiguously with no gaps and no reorder.
-        //
-        // cos/sin line up too, WITHOUT restaging: the worker writes element (r,i) of its [mq,total]
-        // table at `(i/64)*(mq*64) + r*64 + (i%64)`, and for i = h*hd+d (hd==stick) that is
-        // `h*mq*hd + r*hd + d` — the same row-major `[heads*mq, hd]` image this op reads. The table
-        // is head-tiled (every head holds the same row), so head h's copy already sits at row h*mq+r.
-        // Byte-identical bytes, read whole instead of `heads` times at offset 0.
-        //
-        // The rank-3 flat form is unchanged: `cols == hd == stick`, so `stickmajor` still cannot fire
-        // (it needs cols>64) — only the row count differs, exactly as when this loop went per-row →
-        // per-head. Decode (mq==1) never reaches this branch.
-        let all = heads * mq;
-        ew_rows(
-            &mut ops,
-            format!("rope_xc_o{t}"),
-            "multiply",
-            all,
-            &x,
-            crate::addr::DevOff::ZERO,
-            &cos,
-            crate::addr::DevOff::ZERO,
-            &xc,
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-        )?;
-        ew_rows(
-            &mut ops,
-            format!("rope_rs_o{t}"),
-            "multiply",
-            all,
-            &rot,
-            crate::addr::DevOff::ZERO,
-            &sin,
-            crate::addr::DevOff::ZERO,
-            &rs,
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-        )?;
-        ew_rows(
-            &mut ops,
-            format!("rope_add_o{t}"),
-            "add",
-            all,
-            &xc,
-            crate::addr::DevOff::ZERO,
-            &rs,
-            crate::addr::DevOff::ZERO,
-            &out,
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-        )?;
-        return Ok(ops);
-    }
-    for r in 0..mq {
-        // Row r's cos/sin slice = dev_off row r head 0 (per-position, head-tiled ⇒ serves every head).
-        let coff = crate::addr::rc_of(mq, total, r, 0, Df::Fp16);
-        for h in 0..heads {
-            // DEVICE offset of row r, head h's [1,hd] block in the stick-scattered [mq,total] tensor
-            // (== dev_off([mq,total],1,[r,h·hd]) for hd==STK). mq=1 ⇒ h·hd (decode, byte-identical).
-            // `[row, head, feat]` corner. `rope_prefill_block_offset`'s `h*mq*hd + r*hd` is that
-            // nest's hd == stick special case; the nest is right at every hd.
-            let off = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, heads, hd], Df::Fp16)
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(r))
-                .at(crate::addr::Idx::<crate::addr::Head>::n(h))
-                .dev();
-            // rot[r,h] = x[r,h]·P  (per-head [1,hd] @ [hd,hd] kernel; same P kernel, mb=1)
-            ops.push(assemble_matmul_off(
-                &format!("rope_rot_r{r}_h{h}_o{t}"),
-                crate::sdsc_abstract::MatM::single_row(),
-                crate::sdsc_abstract::MatN::of_head_dim(hdw),
-                crate::sdsc_abstract::MatK::of_head_dim(hdw),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&x, 1, hd),
-                off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                crate::addr::DevOff::ZERO,
-                &rb(&rot, 1, hd),
-                off,
-                sym_id_base,
-                layout,
-            )?);
-            ew_ph(
-                &mut ops,
-                format!("rope_xc_r{r}_h{h}_o{t}"),
-                "multiply",
-                &x,
-                off,
-                &cos,
-                coff,
-                &xc,
-                off,
-                sym_id_base,
-            )?; // x·cos
-            ew_ph(
-                &mut ops,
-                format!("rope_rs_r{r}_h{h}_o{t}"),
-                "multiply",
-                &rot,
-                off,
-                &sin,
-                coff,
-                &rs,
-                off,
-                sym_id_base,
-            )?; // rot·sin
-            ew_ph(
-                &mut ops,
-                format!("rope_add_r{r}_h{h}_o{t}"),
-                "add",
-                &xc,
-                off,
-                &rs,
-                off,
-                &out,
-                off,
-                sym_id_base,
-            )?; // xc+rs
-        }
-    }
+    // ADD, unconditionally: `rs` carries the rotate's sign (in the table, or in P), so there is no
+    // first-half/second-half split left to make this op two.
+    ops.push(pw2(
+        &format!("rope_out_o{t}"),
+        "add",
+        rows_all,
+        cols_all,
+        In::full(&rb(&xc, mq, total)),
+        In::full(&rb(&rs, mq, total)),
+        &rb(&out, mq, total),
+        sym_id_base,
+        layout,
+    )?);
     Ok(ops)
 }
 
@@ -6213,8 +5684,8 @@ pub enum OperandOrigin {
     Windowed,
 }
 
-/// ⭐ THE HEAD-MAJOR o_proj HANDOFF, for the matmul door — the caller-side twin of the spyre
-/// door's `BundleAttnParams` head-major fact, carrying the ONE thing this side keys the B-operand
+/// ⭐ THE HEAD-MAJOR o_proj HANDOFF, for the matmul door — the caller-side head-major fact,
+/// carrying the ONE thing this side keys the B-operand
 /// swap on: the o matmul's weight tid, named by the bundle facts (dataflow-found, see that
 /// struct's own doc), never by a shape. `None` for every producer whose caller states no
 /// handoff — those bake exactly what they baked before this existed.

@@ -44,13 +44,13 @@ fn run_rope_with_p(pbuild: &dyn Fn(usize, usize) -> f64) -> (Vec<f64>, Vec<f64>)
     let cos = AbsTensor {
         name: "cos".into(),
         base: cb,
-        dims: vec![1, HD],
+        dims: vec![HEADS, HD],
         stick_idx: 1,
     };
     let sin = AbsTensor {
         name: "sin".into(),
         base: sb,
-        dims: vec![1, HD],
+        dims: vec![HEADS, HD],
         stick_idx: 1,
     };
     let rot = AbsTensor {
@@ -87,9 +87,12 @@ fn run_rope_with_p(pbuild: &dyn Fn(usize, usize) -> f64) -> (Vec<f64>, Vec<f64>)
             mem.set(x.addr(&[h, d]), xf(h, d));
         }
     }
-    for d in 0..HD {
-        mem.set(cos.addr(&[0, d]), cf(d));
-        mem.set(sin.addr(&[0, d]), sf(d));
+    // The worker's head-TILED table: every head's row holds its position's angles, read whole.
+    for h in 0..HEADS {
+        for d in 0..HD {
+            mem.set(cos.addr(&[h, d]), cf(d));
+            mem.set(sin.addr(&[h, d]), sf(d));
+        }
     }
     for i in 0..HD {
         for j in 0..HD {
@@ -97,7 +100,8 @@ fn run_rope_with_p(pbuild: &dyn Fn(usize, usize) -> f64) -> (Vec<f64>, Vec<f64>)
         }
     }
 
-    // EXACT emitted op-DAG (lower_rope_node): rot=x·P; xc=x·cos(mb); rs=rot·sin(mb); out=xc+rs.
+    // EXACT emitted op-DAG (`rope_at`'s lane factor): rot=x·P; xc=x·cos; rs=rot·sin; out=xc+rs —
+    // cos/sin the worker's head-tiled table, read whole (no mb broadcast at any row count).
     let ops = vec![
         AbsOp::Matmul {
             a: x.clone(),
@@ -109,7 +113,7 @@ fn run_rope_with_p(pbuild: &dyn Fn(usize, usize) -> f64) -> (Vec<f64>, Vec<f64>)
             a: x.clone(),
             ab: Bcast::None,
             b: Some(cos.clone()),
-            bb: Bcast::Mb,
+            bb: Bcast::None,
             o: xc.clone(),
         },
         AbsOp::Ew {
@@ -117,7 +121,7 @@ fn run_rope_with_p(pbuild: &dyn Fn(usize, usize) -> f64) -> (Vec<f64>, Vec<f64>)
             a: rot.clone(),
             ab: Bcast::None,
             b: Some(sin.clone()),
-            bb: Bcast::Mb,
+            bb: Bcast::None,
             o: rs.clone(),
         },
         AbsOp::Ew {

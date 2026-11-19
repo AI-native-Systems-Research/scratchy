@@ -394,8 +394,8 @@ fn emit_regions<T: ktir_superdsc::collective::Tp>(
                     origin: emit::lower_ktir_to_superdsc::OperandOrigin::Staged,
                     // ⭐ NO HEAD-MAJOR o_proj HANDOFF HERE. That fact is minted from a spyre
                     // BUNDLE's attention-output row count (mq == 1 over a multi-slab head dim) and
-                    // lives on the spyre door's `BundleAttnParams`; this Triton producer states no
-                    // bundle facts, so it keeps the pre-restructure emission.
+                    // is the spyre caller's to state; this Triton producer states no bundle facts,
+                    // so its matmul takes no head-major handoff.
                     headmajor: None,
                 },
             )
@@ -565,7 +565,6 @@ pub fn drive_rope<T: ktir_superdsc::collective::Tp>(
     mq: u32,
     total: u32,
     rows: RopeRows,
-    rows_are_requests: bool,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     let name = node.func.name;
@@ -636,26 +635,6 @@ pub fn drive_rope<T: ktir_superdsc::collective::Tp>(
             ),
         });
     }
-    // ⭐ THE ROPE-P CLASS TID, RESOLVED OFF THE SHARED REGISTRY — the same resolution the consumer
-    // ladder's door performs (`scratchy-target-spyre`'s `ktir_superdsc_door`): the class index of
-    // this program's head dim in `BundleLayout::rope_class_hds`, then `rope_p_class_tid(idx)`
-    // (class 0 = the widest = `ROPE_P_TID`, so a uniform model's ops name the sentinel exactly as
-    // before). A head dim the registry does not hold is a registry desync — the placement pass and
-    // this lowering disagree about which P table the rope reads — and it is refused BY NAME rather
-    // than guessed at class 0, because a wrong class is a wrong `[hd, hd]` contraction with nothing
-    // downstream to catch it.
-    let p_tid = layout
-        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == head_dim))
-        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
-        .ok_or_else(|| Error {
-            stage: "geometry",
-            message: format!(
-                "{name}: rope head_dim {head_dim} absent from BundleLayout.rope_class_hds {:?} \
-                 (registry desync — the layout's class set and this rope's head dim disagree, so \
-                 which P table it reads is not a fact either of them states)",
-                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
-            ),
-        })?;
     let mut sym = 0i64;
     let a = emit::lower_ktir_to_superdsc::RopeAt {
         name,
@@ -666,14 +645,13 @@ pub fn drive_rope<T: ktir_superdsc::collective::Tp>(
         t: out.tid,
         mq,
         total,
-        p_tid,
         sym_id_base: &mut sym,
         layout,
-        rows_are_requests,
     };
     // THE DOOR. Enumerated, so a head dim outside the set is a refusal naming it rather than a
-    // monomorphisation nobody asked for; 64/128/256 are the head dims this tree's models state
-    // (`rope.py`'s `HEAD_DIM = 128`, and the crate's own slab path exists for hd > 64).
+    // monomorphisation nobody asked for; 64/128/256 are the head dims this tree's fixtures state
+    // (`rope.py`'s `HEAD_DIM = 128`). The table a lane-factor rotate reads is the lowering's to
+    // resolve off `layout` — the registry the consumer ladder's layout fills the same way.
     let out = match head_dim {
         64 => emit::lower_ktir_to_superdsc::rope_at::<T, 64>(a),
         128 => emit::lower_ktir_to_superdsc::rope_at::<T, 128>(a),
@@ -1022,28 +1000,33 @@ mod rope_from_the_fixture {
         node_for(&m, Program::Rope).expect("node_for")
     }
 
-    /// ⭐ THE LAYOUT SERVES A ROPE NOW. It used to refuse the program outright for naming
-    /// `ROPE_P_TID`; P's extent is `[hd, hd]` at the head dim the output view states, so it is
-    /// placed, and this is the test that the refusal is gone rather than merely reworded.
+    /// ⭐ A WHOLE-STICK-HALF ROPE PLACES NO ROTATE MATRIX. `rope_kv8`'s head is 128 wide — its half
+    /// one whole stick — so `rope_at` rotates it by two stick moves and names no P table
+    /// (`RotateHalf`'s lane factor is the identity at this width). The layout therefore registers
+    /// no rope-P class and places nothing at `ROPE_P_TID`: a placement here would be a table nothing
+    /// reads, staged every launch. (The one-stick head's positive case — P placed, and the lowering
+    /// resolving its tid off the registry — is `spliced_rope_lowers_through_the_door` at hd 64.)
     #[test]
-    fn the_layout_places_ropes_rotate_matrix() {
+    fn a_whole_stick_half_rope_places_no_rotate_matrix() {
         let node = rope_kv8();
         let l = layout::for_node(&node).expect("the layout must serve a rope");
-        let p = l
-            .placements
-            .get(&ktir_superdsc::reserved_tids::ROPE_P_TID)
-            .expect("P is placed");
-        // `[128, 128]` fp16 — the head dim the fixture's own `HEAD_DIM` states, doubled by the
-        // element size, and NOT a number this module chose.
-        assert_eq!(p.size, 128 * 128 * 2);
-        // Its name is in `ids` too, which is the half `resolve_seg_base` reaches first: a placement
-        // without one is invisible there and takes the build down as an undeclared synthetic.
+        assert!(
+            l.rope_class_hds.is_empty(),
+            "a 128-wide head reads no P table, so it takes no class: {:?}",
+            l.rope_class_hds
+        );
+        assert!(
+            l.placements
+                .get(&ktir_superdsc::reserved_tids::ROPE_P_TID)
+                .is_none(),
+            "nothing reads a P at hd 128, so none is placed"
+        );
         assert!(
             l.id_of(&ktir_superdsc::place::act_name(
                 ktir_superdsc::reserved_tids::ROPE_P_TID
             ))
-            .is_some(),
-            "a placement without its `ids` entry is the panic this places P to avoid"
+            .is_none(),
+            "and no name for one is minted"
         );
     }
 
@@ -1064,7 +1047,6 @@ mod rope_from_the_fixture {
             256,
             1024,
             RopeRows::HeadMajor,
-            false,
             Some(&l),
         ) {
             Err(e) => e,
@@ -1159,7 +1141,6 @@ mod rope_from_the_fixture {
             256,
             1024,
             RopeRows::TokenMajor,
-            false,
             Some(&l),
         ) else {
             panic!("the narrow angle table must be refused");
@@ -1186,7 +1167,6 @@ mod rope_from_the_fixture {
             256,
             512,
             RopeRows::TokenMajor,
-            false,
             Some(&l),
         ) {
             Err(e) => e,

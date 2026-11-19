@@ -3,7 +3,7 @@
 //!
 //! The W=1 text defect (auditor ruling 2026-10-27), pinned at the layout law it broke: the owner
 //! session's bodies are ONE-REQUEST bodies, and the door rules their gathered reads broadcast-form
-//! (`BundleAttnParams::gathers_kv`: "a one-request body gathers only as a chunk, whose read IS the
+//! (the door's ruling: "a one-request body gathers only as a chunk, whose read IS the
 //! broadcast row"). The deleted solo loop staged that row — a FLAT `[cap]` f16 buffer, valid where
 //! the request's history holds the slot. The W=1 arm staged the fold's BLOCKS instead
 //! (`decode_batch_prefix_mask_f16`, stick-blocked per pass), and the fused body read them FLAT:

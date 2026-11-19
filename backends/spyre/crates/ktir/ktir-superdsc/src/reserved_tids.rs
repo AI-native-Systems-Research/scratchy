@@ -304,25 +304,31 @@ impl TidRegion {
 /// and declares its own region, which the compile-time disjointness proof then covers.
 pub const KV_BLOCK_INDEX_TID: u32 = u32::MAX - 120;
 
-/// ⭐⭐⭐⭐⭐ THE ROPE-P **CLASS** REGION — one P placement per DISTINCT rope head dim.
+/// ⭐⭐⭐⭐⭐ THE ROPE-P **CLASS** REGION — one P placement per class of the rope-P class set.
 ///
-/// A hybrid-attention model (gemma-4) carries TWO rope classes in one tape — sliding `hd` and a wider
-/// global `hd` — and a composite single P is IMPOSSIBLE, not merely awkward: the big class's
-/// `[hd,hd]` contraction sweeps every input lane, so it would read the small class's nonzero block as
-/// spurious ±1 terms. Each class needs its OWN `[hd_c, hd_c]` table and its OWN seg0 placement.
+/// ## The one class the factored rotate leaves
+/// The rope lowers rotate-half by its device factors
+/// ([`RotateHalf`](crate::sdsc_abstract::RotateHalf)), and only a LANE factor reads a staged P. At
+/// fp16 the one head with a lane factor is the one-stick head (`hd` 64); a head whose half is whole
+/// sticks (128, 256, 512 — granite's 128, gemma-4's 256 sliding and 512 global) rotates by stick
+/// moves and names no table. So the class set ([`rope_p_table_class_hds`]) is empty or `[64]`, its
+/// one class is class 0, and class 0 is [`ROPE_P_TID`] itself: no bake names a slot of this region.
+/// The slots stay declared — and so inside the compile-time disjointness proof — because an id
+/// already baked into an artifact is never repointed; the region is reserved, not reused.
 ///
-/// ## Class ordering, and why class 0 keeps the old sentinel
-/// Classes are the tape's DISTINCT rope head dims sorted DESCENDING, so class 0 is the widest. Class 0
-/// answers [`ROPE_P_TID`] itself: a UNIFORM model (every rope node one head dim) has exactly one class,
-/// so its ops still name `ROPE_P_TID` and its bundle is byte-identical to the pre-class layout. Classes
-/// `1..N-1` take this region's slots. The alternative — renumbering every class — would change the tid a
-/// uniform model's ops name, for no benefit and one silent-repoint risk more.
+/// ## Class ordering, and why class 0 is the sentinel
+/// Classes are the set's head dims sorted DESCENDING, so class 0 is the widest, and class 0 answers
+/// [`ROPE_P_TID`], the family's sentinel: the one class's ops name it, and no slot of this region.
+/// Classes `1..N-1` would take this region's slots, each with its OWN `[hd_c, hd_c]` table and seg0
+/// placement — a composite single P is IMPOSSIBLE, since a wide class's contraction sweeps every input
+/// lane and would read a narrow class's nonzero block as spurious ±1 terms.
 ///
 /// [`rope_p_class_hds`]: crate::reserved_tids::rope_p_class_hds
 pub const ROPE_P_CLASS_BASE: u32 = u32::MAX - 121;
 
-/// Reserved tid for the rope-P table of rope class `idx` (distinct rope head dims, sorted descending;
-/// class 0 = the widest = [`ROPE_P_TID`] itself, so a uniform model's bundle is unchanged).
+/// Reserved tid for the rope-P table of class `idx` of the rope-P class set
+/// ([`rope_p_table_class_hds`], sorted descending; class 0 = the widest = [`ROPE_P_TID`] itself). The
+/// set holds at most the one-stick head, so class 0 is the one class a bake names.
 pub fn rope_p_class_tid(idx: usize) -> u32 {
     if idx == 0 {
         // ⭐ DOCUMENTED WHY: class 0 IS the old single-class tid. Keeping it there is what makes a
@@ -408,6 +414,21 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
     out
 }
 
+/// ⭐ THE ROPE-P CLASS SET — the DISTINCT head dims, in class order ([`rope_p_class_hds`]), of the
+/// ropes that READ a P table: those whose rotate-half has a LANE factor
+/// ([`RotateHalf::reads_lane_table`](crate::sdsc_abstract::RotateHalf::reads_lane_table)). At fp16
+/// that is exactly the one-stick head (64), so the set is empty or `[64]`: a rope whose half is whole
+/// sticks rotates by stick moves and names no table, so its head dim takes no class, no placement
+/// and no staged table. EVERY producer of the rope registry calls this — the placement pass, the
+/// wiring's registries and the Triton layout — so the class set and the lowering's reads are one
+/// law.
+pub fn rope_p_table_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
+    rope_p_class_hds(hds)
+        .into_iter()
+        .filter(|&hd| crate::sdsc_abstract::RotateHalf::reads_lane_table(hd))
+        .collect()
+}
+
 /// ⭐⭐⭐ THE PAGED STEP's HOST SOURCES — spyre-inference's own attention operands besides the pools:
 /// the mask stack, the page index table, the KV write index, the query row index and `kv_row_pool`,
 /// and a decode batch's `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk`.
@@ -466,10 +487,11 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
         base: KV_BLOCK_INDEX_TID,
         slots: 1,
     },
-    // ⭐ THE ROPE-P CLASS REGION — one slot per rope head-dim class past the first (class 0 keeps
-    // `ROPE_P_TID`; see [`rope_p_class_tid`] for why). 8 slots: two classes is the gemma-4 shape, and
-    // a model with more DISTINCT rope head dims than that is a config error the region's own overflow
-    // assert turns into a bake refusal.
+    // ⭐ THE ROPE-P CLASS REGION — one slot per rope-P class past the first (class 0 keeps
+    // `ROPE_P_TID`; see [`rope_p_class_tid`] for why). The class set is at most the one-stick head
+    // (see [`ROPE_P_CLASS_BASE`]), so no bake names a slot; the 8 stay reserved because an id baked
+    // into an artifact is never repointed, and the region's own overflow assert refuses a class
+    // set past them at the bake.
     TidRegion {
         name: "rope_p_class",
         base: ROPE_P_CLASS_BASE,
@@ -1013,4 +1035,20 @@ fn the_class_set_is_distinct_and_descending() {
     assert_eq!(rope_p_class_hds([64u32].into_iter()), vec![64]);
     let empty: std::iter::Empty<u32> = std::iter::empty();
     assert_eq!(rope_p_class_hds(empty), Vec::<u32>::new());
+}
+
+/// ⭐ ONLY A LANE-FACTOR ROPE TAKES A P CLASS — the one-stick head (64), whose half-swap is inside
+/// its stick. A head whose half is whole sticks (128, 256, 512) rotates by stick moves and reads no
+/// table, so a gemma-4 tape (256 sliding, 512 global) and a granite-8b tape (128) place none.
+#[test]
+fn only_a_lane_factor_rope_takes_a_p_class() {
+    assert_eq!(
+        rope_p_table_class_hds([512u32, 256, 64, 128, 64].into_iter()),
+        vec![64]
+    );
+    assert_eq!(
+        rope_p_table_class_hds([512u32, 256, 256].into_iter()),
+        Vec::<u32>::new()
+    );
+    assert_eq!(rope_p_table_class_hds([64u32].into_iter()), vec![64]);
 }

@@ -135,14 +135,12 @@ fn main() {
             Ok(l) => l,
             Err(e) => refused!(e.stage, e.message),
         };
-        // `rows_are_requests` is false: these are prefill token rows, not one row per decode request.
         match triton_ktir_superdsc::drive_rope::<ktir_superdsc::collective::TpWorld<1>>(
             &node,
             hd,
             n_tok,
             h * hd,
             rows,
-            false,
             Some(&layout),
         ) {
             Err(e) => refused!(e.stage, e.message),

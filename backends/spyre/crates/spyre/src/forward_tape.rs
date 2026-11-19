@@ -252,12 +252,20 @@ pub fn kernel_values(
         }
         ForwardKernel::Cos(i) | ForwardKernel::Sin(i) => {
             let want_cos = matches!(step.kernel, ForwardKernel::Cos(_));
-            let srcs = if want_cos {
-                &shape.cos_srcs
+            // A sin source carries the table its rope reads, baked beside it; a cos source has none.
+            let (w, kind, table) = if want_cos {
+                let &(_, w, kind) = shape
+                    .cos_srcs
+                    .get(i)
+                    .ok_or_else(|| format!("no rotary source {i}"))?;
+                (w, kind, None)
             } else {
-                &shape.sin_srcs
+                let &(_, w, kind, table) = shape
+                    .sin_srcs
+                    .get(i)
+                    .ok_or_else(|| format!("no rotary source {i}"))?;
+                (w, kind, Some(table))
             };
-            let &(_, w, kind) = srcs.get(i).ok_or_else(|| format!("no rotary source {i}"))?;
             let (w, kind_hd) = (w as usize, kind.head_dim() as usize);
             let mut col = vec![0.0f32; rows * w];
             for r in 0..rows {
@@ -269,11 +277,13 @@ pub fn kernel_values(
                 // hybrid-attention arch (gemma-4) gives sliding and global
                 // layers different tables, and the wrong one is silent garbage.
                 let (c, sn) = crate::manifest::rope_cos_sin_kind(pos, kind);
-                col[r * w..(r + 1) * w].copy_from_slice(&tile_rotary_row(
-                    if want_cos { &c } else { &sn },
-                    w,
-                    kind_hd,
-                ));
+                let mut row = tile_rotary_row(if want_cos { &c } else { &sn }, w, kind_hd);
+                // ⭐ THE DEVICE FORM: `sin'` for a rope whose rotate keeps its sign in the table —
+                // the baked form through its one law (`SinTable::sign_heads`), never derived here.
+                if let Some(t) = table {
+                    t.sign_heads(&mut row);
+                }
+                col[r * w..(r + 1) * w].copy_from_slice(&row);
             }
             if inp.stick_major {
                 stick_scatter(rows, w, &col)
@@ -393,7 +403,13 @@ pub struct ForwardShape {
     /// ⛔ BORROWED FROM THE EMITTED `Wiring`, NOT COPIED OUT OF IT. `to_vec()`-ing these
     /// duplicated a `&'static` slice the macro put in the binary, once per forward, per token.
     pub cos_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
-    pub sin_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
+    /// A sin source also carries the table its rope reads ([`crate::wiring::BakedSinTable`]).
+    pub sin_srcs: &'static [(
+        u32,
+        u32,
+        crate::wiring::RotaryKind,
+        crate::wiring::BakedSinTable,
+    )],
     /// ⭐ THE BUNDLE'S PAGED STEPS — every attention class's tables' tids, one step per class
     /// (a hybrid model's sliding and global layers carry different tables), `[]` when the bundle's
     /// attention reads no paged step. A projection of the wiring's own field, never a caller's
@@ -621,7 +637,11 @@ mod tests {
             rows: 3,
             embed_src: 0,
             cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
-            sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
+            // hd 64: a lane-factor class, so its table is the plain one.
+            sin_srcs: &[
+                (6, 64, KIND, crate::wiring::SinTable::Plain),
+                (8, 64, KIND, crate::wiring::SinTable::Plain),
+            ],
             paged: vec![STEP],
             n_consts: 3,
             phase: ForwardPhase::Prefill,

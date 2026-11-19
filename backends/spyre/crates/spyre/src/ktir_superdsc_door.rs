@@ -17,13 +17,10 @@
 //! own configs; every build-time refusal here (a geometry with no arm is a loud bake error citing
 //! `geometry_sources()`) is unchanged.
 //!
-//! ⭐⭐ AND THAT IS ALSO WHY THE MODEL'S AND THE BUNDLE'S OWN FACTS LIVE HERE. [`BundleAttnParams`] is
-//! `ibm/main`'s `lower_one_node` parameter set for the attention path — the head geometry and the
-//! attention multiplier off `SubOp::AttnDecode`, the swept rung and the row kind off the walk — and it
-//! is an ARGUMENT of [`lower`], not a record on the program. `AttnFacts` was that record, and it let
-//! the emulator (which executes the ops) and the card (which read the record) compute different
-//! attention; the leaf crate now reads the six operand identities and the resident capacity out of the
-//! program itself (`attn_operands`) and takes these four from whoever crossed the door.
+//! ⭐⭐ AND THE DOOR TAKES NO BUNDLE FACT BESIDE THE LAYOUT. Every fact a body needs is read off its
+//! program (`attn_operands`, the rope's own views) or off the layout. No body reads the row kind —
+//! the rope is one form at every row count and row kind — and nothing rides beside the program as
+//! a record, so the emulator (which executes the ops) and the card cannot read two answers.
 //!
 //! ⛔ THE NEWTYPE BELOW IS THE ORPHAN RULE, NOT A DESIGN. `OnHeadDim` is `scratchy-subtile`'s
 //! trait and the rope entry point is `ktir-superdsc`'s — neither is local, so the impl needs a type
@@ -39,45 +36,6 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{
 use ktir_superdsc::emit::whole_function::{lower_function, lower_walk};
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
-
-/// ⭐⭐⭐ THE FOUR THINGS THE PROGRAM CANNOT STATE — `ibm/main`'s `lower_one_node` PARAMETERS, at the
-/// site that now needs them.
-///
-/// main lowered each node during the tape walk, so it read these straight off what it had in hand:
-/// the head geometry and the attention multiplier from `node.op`'s `SubOp::AttnDecode` payload (the
-/// numbers the `#[forward]` macro parsed out of the model config), and `active_cap` /
-/// `rows_are_requests` from its own walk parameters, threaded down from the ladder driver. This split
-/// lowers per BUNDLE instead, one pass later, so the same four facts are stated for the bundle at the
-/// same place they were read — and they are read ONCE, off the graph's own `AttnDecode` nodes, by
-/// [`crate::lower_subtile_tape_to_ktir::attn_bundle_params`].
-///
-/// ⛔ THIS IS NOT A RECORD ON THE PROGRAM, AND THE DIFFERENCE IS THE WHOLE POINT. `AttnFacts` hung
-/// eleven fields off [`KtirNode`], so information flowed `SubtileIR → AttnFacts → SuperDSC` past the
-/// IR: a third-party producer could not fill it, and the emulator (which runs the ops) and the card
-/// (which read the record) were not obliged to agree. Seven of those eleven are now read out of the
-/// program by `attn_operands`; these four are ARGUMENTS of the call, one value per bundle, supplied by
-/// the caller on THIS side of the geometry door — which is where model and bundle facts legitimately
-/// live (see the module header). A Triton producer's caller states its own, from its own configs.
-///
-/// `None` for a bundle with no attention node: an attention program arriving without these is a build
-/// error naming them, never a descriptor built on a default.
-#[derive(Clone, Copy, Debug)]
-pub struct BundleAttnParams {
-    /// main's `lower_one_node(.., rows_are_requests, ..)`.
-    ///
-    /// ⛔ THE GEOMETRY IS NO LONGER HERE, AND THE REASON IS THE HYBRID MODEL. This used to carry the
-    /// bundle's ONE `SubOp::AttnDecode { geom }` — a fact under the assumption that one `#[forward]`
-    /// expansion has one attention geometry. Gemma-4 falsifies that assumption: its sliding layers run
-    /// (nqh=16, nkvh=8, hd=256) and every sixth layer runs a GLOBAL class (nqh=16, nkvh=1, hd=512), so
-    /// one graph carries TWO and no per-bundle value can describe both. The program's own views state
-    /// the geometry of the attention they compute (`q`'s view is `[mq, nqh·hd]`, a kv stream's is
-    /// `[·, nkvh·hd]`, and its first access tile on `q` is `hd` wide), so the door MINTS the geometry
-    /// there — the same reading rope already does for its head dim, and the same direction the scale,
-    /// `mq` and the swept extent all took: facts the program states are read from the program, and a
-    /// fact only the caller knows stays a caller's argument. The row KIND is the one that stays: no
-    /// program states it, for the reason its own comment gives.
-    pub rows_are_requests: bool,
-}
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE DISPATCH — by the node kind the producer wrote into the program's name.
@@ -100,14 +58,10 @@ pub struct BundleAttnParams {
 /// and gate/up another once — main's per-BUNDLE set, which the walk dropped when the matmuls moved
 /// onto it and now takes back. Every buffer a program WRITES is forgotten before it lowers and again
 /// after ([`lk::WrittenBuffers`]), so a held quantize only ever names the bytes a later matmul reads.
-///
-/// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the two bodies whose
-/// device laws need a fact no program states.
 pub fn lower<T: ktir_superdsc::collective::Tp>(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
     quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // ⛔ WHAT THIS PROGRAM WRITES IS NOT THE QUANTIZE ANY EARLIER PROGRAM TOOK, before it lowers
@@ -117,7 +71,7 @@ pub fn lower<T: ktir_superdsc::collective::Tp>(
     for &t in written.tids() {
         quantized.written(t);
     }
-    let ops = lower_kind(k, sym_id_base, layout, attn_params, quantized);
+    let ops = lower_kind(k, sym_id_base, layout, quantized);
     for &t in written.tids() {
         quantized.written(t);
     }
@@ -129,7 +83,6 @@ fn lower_kind<T: ktir_superdsc::collective::Tp>(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
     quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // The name is still the program's identity for the emulator (which keys functions by it) and for
@@ -238,7 +191,7 @@ fn lower_kind<T: ktir_superdsc::collective::Tp>(
         Program::LmLast => lower_function(k, layout, sym_id_base, None, quantized),
         // An all-gather consume's block copy — the same pure-copy arm of the walk.
         Program::BlockCopy => lower_function(k, layout, sym_id_base, None, quantized),
-        Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
+        Program::Rope => rope(name, &r, sym_id_base, layout),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
         // above, whose head geometry has to become const generics on this side.
@@ -258,13 +211,12 @@ pub fn lower_op<T: ktir_superdsc::collective::Tp>(
     e: &EmittedOp<T>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
     quantized: &mut QuantizedActivations,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     let k = e.ktir.as_ref().ok_or_else(|| Error {
         message: format!("{}: no KTIR program to lower", e.op_name),
     })?;
-    let mut ops = lower(k, sym_id_base, layout, attn_params, quantized)?;
+    let mut ops = lower(k, sym_id_base, layout, quantized)?;
     for o in &mut ops {
         o.tp_consume = e.tp_consume;
     }
@@ -306,7 +258,6 @@ fn rope<T: ktir_superdsc::collective::Tp>(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 3)?;
     // ⛔ THE WHOLE-TENSOR ROW WINDOW, THE 2a LAW — for BOTH forms below. `rope.py`'s per-row form states a
@@ -354,7 +305,6 @@ fn rope<T: ktir_superdsc::collective::Tp>(
             },
             sym_id_base,
             layout,
-            attn_params,
         );
     }
     // The rope program views `x` as `[rows·heads, hd]`, so the view's COLUMN extent is the head dim.
@@ -405,7 +355,6 @@ fn rope<T: ktir_superdsc::collective::Tp>(
         RopePlane { hd, mq, total },
         sym_id_base,
         layout,
-        attn_params,
     )
 }
 
@@ -427,53 +376,33 @@ fn rope_at_geometry<T: ktir_superdsc::collective::Tp>(
     plane: RopePlane,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     let RopePlane { hd, mq, total } = plane;
-    // ⛔ THE ROW KIND, AS A PARAMETER — main's `LowerRope::rows_are_requests`, which main also took as
-    // a parameter and for the reason its own comment gives. It decides whether the head-major collapse
-    // may span the query rows, which is a DEVICE law: the rope program never receives the fact and
-    // emits the same ops either way, so no program can state it. A rope in a bundle with no attention
-    // node has no requests to have rows of, which is main's own `false` at that call site.
-    let rows_are_requests = attn_params.is_some_and(|p| p.rows_are_requests);
     // ⭐⭐ THE ONE PLACE THE HEAD DIM STOPS BEING A VALUE, the same door `lower_one_node` crossed for
     // the SubtileIR path: the arms are every head dim the workspace's model configs declare, and a
     // head dim with no arm is a loud bake error answered by a `config.json`.
+    //
+    // ⛔ NO ROW KIND AND NO P TID CROSS HERE. The rope is one form at every row count and row kind,
+    // so the row kind has nothing to choose; and the P table a lane-factor rotate reads is resolved
+    // by the lowering itself, off the layout's class registry (`BundleLayout::rope_p_tid`) — for the
+    // ropes that read one, and no other.
     if hd == 0 {
         return err(format!("{name}: the `x` view states a zero head dim"));
     }
-    // ⭐ THE ROPE-P CLASS TID — which `[hd,hd]` P table this rope's `matmul(x, P)` names. The class
-    // set is the bake's OWN registry (`BundleLayout::rope_class_hds`, the same registry mechanism
-    // `scalarmul_scales` established), so the emitter, the placement pass and the worker's load-time
-    // bind all resolve class↔tid through ONE list. A rope arriving with no registry, or a head dim
-    // the registry does not hold, is a desync — refuse it rather than guessing class 0.
-    let p_tid = layout
-        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == hd))
-        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
-        .ok_or_else(|| Error {
-            message: format!(
-                "{name}: rope head_dim {hd} absent from BundleLayout.rope_class_hds {:?} (registry \
-                 desync — the placement pass and this lowering disagree about the tape's rope \
-                 classes, so which P table this rope reads is not a fact either of them states)",
-                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
-            ),
-        })?;
     scratchy_subtile::model_geometry::with_config_head_dim(
         scratchy_ir::model_facts::HeadDim::new(hd),
         RopeAt(
             lk::RopeAt {
-            name,
-            x: ins[0].name(),
-            cos: ins[1].name(),
-            sin: ins[2].name(),
-            out: out.name(),
-            t: out.tid,
-            mq,
-            total,
-            p_tid,
-            sym_id_base,
+                name,
+                x: ins[0].name(),
+                cos: ins[1].name(),
+                sin: ins[2].name(),
+                out: out.name(),
+                t: out.tid,
+                mq,
+                total,
+                sym_id_base,
                 layout,
-                rows_are_requests,
             },
             core::marker::PhantomData::<T>,
         ),
@@ -481,9 +410,9 @@ fn rope_at_geometry<T: ktir_superdsc::collective::Tp>(
     .ok_or_else(|| Error {
         message: format!(
             "{name}: head_dim {hd} has no const-generic instantiation. The head dim parameterises \
-             the device layout (slabs = head_dim/lanes, and the head-major collapse is valid only at \
-             head_dim == lanes), so it must be a const, not a value. The instantiations are read \
-             from the model configs in scope ({}); this head dim belongs to none of them.",
+             the device layout (the rotate's stick and lane factors are functions of head_dim and \
+             the lanes), so it must be a const, not a value. The instantiations are read from the \
+             model configs in scope ({}); this head dim belongs to none of them.",
             scratchy_subtile::model_geometry::geometry_sources(),
         ),
     })?

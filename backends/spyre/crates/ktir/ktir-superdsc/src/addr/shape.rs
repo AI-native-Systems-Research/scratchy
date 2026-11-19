@@ -85,37 +85,6 @@ impl<const HD: u32, const NQH: u32, const NKVH: u32, const CAP: u32> Shape<HD, N
         Slabs::new(if HD < lanes { 1 } else { HD / lanes })
     }
 
-    /// Is a tensor's `[rows, heads*head_dim]` form BYTE-IDENTICAL to its `[heads*rows, head_dim]`
-    /// head-major view? Only when a head is exactly one stick: element `(r, h*hd+d)` sits at
-    /// `((h*hd+d)/lanes)*(rows*lanes) + r*lanes + (d%lanes)`, and the head-major view puts the same
-    /// element at `(d/lanes)*(heads*rows*lanes) + (h*rows+r)*lanes + (d%lanes)`. Those agree for every
-    /// `(h, r, d)` iff `hd == lanes`, and diverge for most of them otherwise.
-    ///
-    /// Several emitter fast paths collapse a per-head loop into one whole-tensor op using exactly this
-    /// identity — the batched attention, and both RoPE row-batches. They are NOT arbitrary
-    /// head_dim-64 special cases: this is their precondition, and it genuinely fails above one stick.
-    /// Stating it here means the condition reads as the property it is, and a future format whose
-    /// lanes differ gets the right answer instead of one keyed to the number 64.
-    /// ⭐ FROM `HD`, THE TYPE'S OWN CONST — no argument, because there is nothing to pass.
-    ///
-    /// This crate is driven by a PROC MACRO that reads `head_dim` out of the model config at expansion
-    /// time and interpolates it as a literal (`codegen.rs`), so the head dim is a COMPILE-TIME CONSTANT.
-    /// Asking this question with a runtime `hd` demotes a constant to a value, and a value cannot be
-    /// guarded at build time — which is why the hd=64 / hd=128 divergence has been a runtime branch
-    /// rather than two instantiations, and why every attempt to lock it down had nothing to hold onto.
-    pub const fn head_major_collapse_valid_here(df: Df) -> bool {
-        HD == df.elems_per_stick()
-    }
-
-    // ⛔⛔⛔ THE RUNTIME TWIN IS DELETED. It took the head dim as a VALUE — `Shape::<0,0,0,0>` built and
-    // then bypassed — so every site that used it was a place where a `cargo build` error was
-    // IMPOSSIBLE: a constant the proc macro already knows, demoted to something only a runtime branch
-    // could test. Its own doc said "do not add new callers" and carried a ⏭ to remove it once the
-    // lowering gained `HD` as a const generic. The lowering has, so it is gone, and
-    // [`Self::head_major_collapse_valid_here`] — which reads `HD` off the type — is the only way left
-    // to ask. The predicate can no longer be reached with a value, so it can no longer be answered too
-    // late to matter.
-
     /// GQA group size — how many query heads share one kv head.
     pub const fn gqa() -> Gqa {
         Gqa::new(match NQH.checked_div(NKVH) {
@@ -150,32 +119,3 @@ impl<const HD: u32, const NQH: u32, const NKVH: u32, const CAP: u32> Shape<HD, N
         Nest::new(&["head", "row", "feat"], &[NQH, rows.get(), HD], df)
     }
 }
-
-// ⭐⭐ THE COLLAPSE FACT, PINNED AT BUILD TIME — module-level `const _: ()` so it SELF-EVALUATES.
-//
-// ⛔ A NAMED associated const would be INERT: it is only checked if something forces it, and "never used"
-// is a warning, not an error. That mistake has already been made in this tree (an inverted
-// `CHUNK_FITS_ONE_PAGE` compiled clean), so these live at module level where the compiler must evaluate
-// them.
-//
-// What they pin is the precondition of every emitter fast path that collapses a per-head loop into one
-// whole-tensor op: `[rows, heads*hd]` is byte-identical to `[heads*rows, hd]` ONLY when a head is exactly
-// one stick. head_dim 64 satisfies it; head_dim 128 does not. Those two facts decide which RoPE form and
-// which attention form a bundle gets, and until now they were computed from a runtime `hd`.
-const _: () = assert!(
-    Shape::<64, 32, 8, 128>::head_major_collapse_valid_here(Df::Fp16),
-    "head_dim 64 IS one fp16 stick, so the head-major collapse must be valid — the batched attention and      both RoPE row-batches are gated on exactly this"
-);
-const _: () = assert!(
-    !Shape::<128, 32, 8, 128>::head_major_collapse_valid_here(Df::Fp16),
-    "head_dim 128 spans TWO fp16 sticks, so the head-major collapse must be INVALID. This is the fact      that sends a head_dim-128 bundle down the slab RoPE path — the one commented `PREFILL (mq>1)` — and      therefore the reason a decode batch at head_dim 128 is emitted by prefill machinery"
-);
-// The same law, from the OTHER direction: fp8 packs 128 lanes to a stick, so at fp8 a 128-wide head IS
-// one stick. The condition is about LANES, never about the number 64 — pinning both formats keeps a
-// future format honest.
-const _: () = assert!(Shape::<128, 32, 8, 128>::head_major_collapse_valid_here(
-    Df::Fp8
-));
-const _: () = assert!(!Shape::<64, 32, 8, 128>::head_major_collapse_valid_here(
-    Df::Fp8
-));

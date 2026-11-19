@@ -33,7 +33,7 @@ pub mod ir;
 /// lowering. `lower()`'s name-keyed dispatch (our naming convention, so ours to read), the two arms
 /// that monomorphise a model's head geometry — whose match arms `scratchy-subtile`'s `build.rs`
 /// generates from the configs in scope, i.e. OUR model inventory — the two orphan-rule newtypes those
-/// arms need, and `BundleAttnParams`. Everything else — the emitter, the assemblers, main's eight
+/// arms need. Everything else — the emitter, the assemblers, main's eight
 /// `lower_*_node` bodies, the fp8 W8A8 descriptors — is `ktir_superdsc::emit`.
 ///
 /// ⛔ IT WAS CALLED `lower_ktir_to_superdsc`, THE SAME NAME AS THE CRATE MODULE THAT HOLDS THE ACTUAL

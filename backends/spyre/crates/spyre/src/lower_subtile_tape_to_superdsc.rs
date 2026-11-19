@@ -1149,34 +1149,33 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         }
         seg_bytes[w] = window.end();
     }
-    // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
-    // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
-    // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
-    // a FIXED permutation-sign matrix the worker synthesizes + binds (it is NOT a
-    // model/safetensors weight, so it gets the reserved id ROPE_P_TID). Place it in
-    // seg0 (ACTIVATION, re-bound per step like RMS_SEED/ATTN_SCALE) — NOT seg1 (WEIGHT):
-    // a seg1 weight is only H2D'd at PrepareModel, where the worker binds ONLY the
-    // manifest's model weights, so a synthetic seg1 P stays ZERO ⇒ rot=matmul(x,0)=0 ⇒
-    // RoPE collapses to `x·cos` (rotate-half/sin term DROPPED) ⇒ wrong positional
-    // encoding ⇒ wrong content. Same P for every head/position/layer of one CLASS.
+    // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── A rope whose rotate has a
+    // LANE factor — the one-stick head, 64 at fp16 — emits `rot = x·P` as one matmul of the
+    // stream's stick-column rows against P's one-stick block (`rope_at`). P is a FIXED
+    // permutation-sign matrix the worker synthesizes + binds (it is NOT a model/safetensors
+    // weight, so it gets the reserved id ROPE_P_TID). Place it in seg0 (ACTIVATION, re-bound per
+    // step like RMS_SEED/ATTN_SCALE) — NOT seg1 (WEIGHT): a seg1 weight is only H2D'd at
+    // PrepareModel, where the worker binds ONLY the manifest's model weights, so a synthetic seg1
+    // P stays ZERO ⇒ rot=matmul(x,0)=0 ⇒ RoPE collapses to `x·cos` (rotate-half/sin term DROPPED)
+    // ⇒ wrong positional encoding ⇒ wrong content. Same P for every head/position/layer of one
+    // CLASS.
     //
-    // ⭐⭐ ONE P PER DISTINCT ROPE HEAD DIM, NOT ONE AT THE MAX. The max-fold this replaced was
-    // itself a half-fix: it stopped a global layer's P from addressing past its footprint, but the
-    // VALUE the macro emitted was still staged at the BASE head dim — so on gemma-4
-    // tiny-allglobal a `[64,64]` table sat in a `[128,128]` placement and the global class's rope
-    // rotated pairs ±32 (half=32 for a 128-wide head) with lanes 64..127 left at cos-only
-    // (dump-proven: first divergence `t107` at op2, the roped K). A composite single P is
-    // IMPOSSIBLE — the big class's `[hd,hd]` contraction sweeps every input lane, so it would read
-    // the small class's nonzero block as spurious ±1 terms — so each class gets its OWN table,
-    // OWN placement, OWN tid (`rope_p_class_tid`). Class 0 (the widest, set sorted descending)
-    // keeps `ROPE_P_TID`, so a UNIFORM model's ops name the same tid and its bundle is
-    // byte-identical.
+    // ⭐⭐ ONE P PER CLASS, AND THE CLASS SET IS AT MOST THE ONE-STICK HEAD. A head whose half is
+    // whole sticks (128, 256, 512) rotates by stick moves and reads no table, so it takes no class:
+    // the set is empty or `[64]`, its one class is class 0, and class 0 is `ROPE_P_TID`, the
+    // family's sentinel. The per-class machinery is general (each class its OWN table, placement
+    // and tid, `rope_p_class_tid`), because a composite single P is IMPOSSIBLE: a wide class's
+    // `[hd,hd]` contraction sweeps every input lane and would read a narrow class's nonzero block
+    // as spurious ±1 terms.
     //
-    // ⛔ THE CLASS SET IS THE SHARED REGISTRY, NOT A LOCAL DERIVATION. The door resolves a rope
-    // program's class off `BundleLayout::rope_class_hds` and the worker's load-time bind builds
-    // each class's table from the same list the macro bakes into the wiring — so THIS loop's set
-    // (via the shared `rope_p_class_hds` helper) is the one source of truth for all three.
-    let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
+    // ⛔ THE CLASS SET IS THE SHARED REGISTRY, NOT A LOCAL DERIVATION. The rope's lowering resolves
+    // its table off `BundleLayout::rope_class_hds` (`BundleLayout::rope_p_tid`) and the worker's
+    // load-time bind builds each class's table from the same list the macro bakes into the wiring —
+    // so THIS loop's set (via the shared `rope_p_table_class_hds` helper) is the one source of truth
+    // for all three. ⭐ ONLY THE ROPES THAT READ A TABLE TAKE A CLASS: a one-stick head's rotate is
+    // its lane factor, one matmul against P; a head whose half is whole sticks rotates by stick
+    // moves and names no table, so it is placed none and bound none.
+    let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_table_class_hds(
         ir.nodes
             .iter()
             .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
@@ -1548,8 +1547,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // NOTE: ATTN_SCALE_TID is intentionally absent — the attention scale is no longer a reserved
         // per-step const; it flows through `scalarmul_scales` (config attention_multiplier) whose
         // placements are proven seg0 by the scale loop above.
+        // `ROPE_P_TID` is rope class 0's tid, so the class loop below checks it whenever it is placed.
         let mut checked: Vec<u32> = vec![
-            ROPE_P_TID,
             ATTN_MASK_TID,
             ATTN_CAUSAL_TID,
             RMS_HALF_TID,
@@ -2616,6 +2615,38 @@ pub fn rope_table_periods<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::H
         })
         .collect()
 }
+
+/// ⭐ THE DEVICE FORM OF EACH ROPE SIN SOURCE — keyed by the sin source's tid (the rope node's
+/// third input): the table its rope's rotate reads, which carries its own head width
+/// ([`ktir_superdsc::sdsc_abstract::RotateHalf::sin_table`], the one law the worker stages by).
+/// The gate's DEVICE leg stages a sin source in this form — the signed table for a rotate of stick
+/// moves, as the worker does — while the golden reads the logical table the IR states; the
+/// transform between the two is `SinTable::sign_heads` and nothing else.
+pub fn rope_sin_tables<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<std::collections::HashMap<u32, RopeSinTable>, String> {
+    use ktir_superdsc::sdsc_abstract::{HeadWidth, Lanes, RotateHalf};
+    ir.nodes
+        .iter()
+        .filter_map(|n| n.op.rope_head_dim().map(|d| (n, d.get())))
+        .map(|(n, hd)| {
+            let table = HeadWidth::try_whole_sticks(hd)
+                .and_then(|w| RotateHalf::of(w, Lanes::FP16))
+                .map(|r| r.sin_table())
+                .ok_or_else(|| {
+                    format!(
+                        "numeric gate: a rope at head_dim {hd} has no factored rotate-half form, \
+                         so no device table exists for its sin source"
+                    )
+                })?;
+            Ok((n.inputs[2].tensor.index() as u32, table))
+        })
+        .collect()
+}
+
+/// A rope sin source's derived table form ([`rope_sin_tables`]).
+pub type RopeSinTable =
+    ktir_superdsc::sdsc_abstract::SinTable<Vec<ktir_superdsc::sdsc_abstract::RotSign>>;
 
 /// The fp8 payload's synth normalizer — see the payload arm of the gate's weights
 /// loop: codes at `synth × C` (e4m3 normals), the magnitude `1/C` riding the
@@ -4160,6 +4191,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
     // per [`rope_table_periods`] — not as flat noise.
     let rope_table_half = rope_table_periods(ir);
+    let rope_sin = rope_sin_tables(ir)?;
     // ⭐ THE PROBE'S REAL-ROW COUNT — [`PrefillGate::pad`]: the staging fact this probe's tables
     // follow, `None` for the rung's full rows.
     let pad = prefill.and_then(|p| p.pad);
@@ -4316,7 +4348,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         } else {
             (t.rows as usize) * (t.cols as usize)
         };
-        let vals = if scale_rows.contains(&tid) {
+        let mut vals = if scale_rows.contains(&tid) {
             vec![1.0; n]
         } else if let Some(v) = staged_rope.get(&tid) {
             v.clone()
@@ -4327,6 +4359,12 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         } else {
             (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
         };
+        // ⭐ THE DEVICE FORM: a rope sin source the kernel reads SIGNED is staged signed — the
+        // worker's own transform (`SinTable::sign_heads`) over the same logical table the golden
+        // reads, so the two legs differ by exactly the device representation and nothing else.
+        if let Some(table) = rope_sin.get(&tid) {
+            table.sign_heads(&mut vals);
+        }
         match pool_class.get(&tid) {
             Some((p, hd)) => {
                 let pool = crate::paged_step::pool_of_rows(p, *hd, &blocks, &vals, step_rows.start())
@@ -7457,14 +7495,10 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
 /// it, [`attach_reroll`] addresses it, and [`drain_emitted_bundles`] hands it to the macro. It is
 /// content-addressed, so emitting the same ops at the same grouping twice (the ladder's ceiling
 /// rung IS the body) does nothing the second time.
-///
-/// `attn_params` is [`RolledSuperDsc::attn_params`] — the four attention facts no KTIR states, which
-/// main's own walk held as parameters. It is `None` for a bundle with no attention node.
 pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
-    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
     dump: DumpRoot<'_>,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
@@ -7476,7 +7510,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     // nothing to do. The ladder's ceiling rung IS the body, so this fires on every rolled model.
     let fp = {
         let _pc = crate::pc::Pc::start("fp");
-        bundle_fp(ops, layout, fold, attn_params)
+        bundle_fp(ops, layout, fold)
     };
     // ⛔ THE CHECK AND THE EMIT ARE ONE STEP PER FINGERPRINT. Ladder rungs bake in parallel, and two
     // rungs can be one program: a decode batch pads its walk to whole chunks, so at two sequences
@@ -7500,7 +7534,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params, dump)?
+        emit_bundle_inner(ops, layout, fold, dump)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -7540,9 +7574,7 @@ fn bundle_fp<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
-    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> String {
-    let _ = attn_params;
     let base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
     let stamped = match layout {
         Some(l) => {
@@ -7798,7 +7830,6 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
-    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
     dump: DumpRoot<'_>,
 ) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
@@ -7816,7 +7847,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
         )));
     }
 
-    let fp = bundle_fp(ops, layout, fold, attn_params);
+    let fp = bundle_fp(ops, layout, fold);
     let kept: Vec<&EmittedOp<T>> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp<T>>;
     let ops: &[EmittedOp<T>] = if kept.len() == ops.len() {
@@ -7835,7 +7866,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
     let groups = if cfg!(feature = "spyre-lower") {
         PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, dump)
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, dump)
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
@@ -8163,19 +8194,6 @@ pub struct RolledSuperDsc<T: ktir_superdsc::collective::Tp> {
     /// `suffix_in_tid`, so the placement aliases them — the body→suffix seam threads
     /// in place like the per-iter residual. `u32::MAX` if there is no suffix.
     pub suffix_in_tid: u32,
-    /// ⭐ THE FOUR ATTENTION FACTS NO KTIR PROGRAM STATES — `ibm/main`'s own `lower_one_node`
-    /// parameters, published from the walk that had them to the bundle emit that needs them.
-    ///
-    /// main lowered nodes DURING this walk, so `SubOp::AttnDecode`'s geometry and multiplier were in
-    /// its hand and the rung and row kind were its own parameters. The KTIR split lowers one pass
-    /// later, per bundle, so the facts ride here — beside `kv_request_stride` and for the same stated
-    /// reason: it is the emitter's number travelling to the consumer rather than being re-derived
-    /// there, where a second derivation would be free to disagree. `None` when the graph has no
-    /// attention node. See [`crate::ktir_superdsc_door::BundleAttnParams`].
-    ///
-    /// ⛔ NOT A RECORD ON THE PROGRAM. `AttnFacts` was that, and it let the emulator and the card
-    /// compute different attention; these are arguments of [`emit_bundle`], stated once per bundle.
-    pub attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 }
 
 impl<T: ktir_superdsc::collective::Tp> RolledSuperDsc<T> {
@@ -8532,7 +8550,6 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     fp: &str,
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
-    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
     dump: DumpRoot<'_>,
 ) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
@@ -8573,16 +8590,11 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         }
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
         // ⭐ `lower_op`: a collective's consume carries its `tp_consume` onto every op it lowers to.
-        let lowered = crate::ktir_superdsc_door::lower_op(
-            e,
-            &mut sym_id_base,
-            layout,
-            attn_params,
-            &mut fp8_quantized,
-        )
-        .map_err(|err| {
-            SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
-        })?;
+        let lowered =
+            crate::ktir_superdsc_door::lower_op(e, &mut sym_id_base, layout, &mut fp8_quantized)
+                .map_err(|err| {
+                    SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
+                })?;
         // A walk's trips, as many as one launch group holds, in each launch (as dxp unrolls
         // torch-spyre's walk into its one).
         let lowered =
@@ -10016,7 +10028,6 @@ mod tests {
             extract.ktir.as_ref().unwrap(),
             &mut sym,
             Some(&layout),
-            None,
             &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         );
         let why = match stripped {
@@ -10047,7 +10058,6 @@ mod tests {
             extract.ktir.as_ref().unwrap(),
             &mut sym,
             Some(&layout),
-            None,
             &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         );
         let why = match stripped {
