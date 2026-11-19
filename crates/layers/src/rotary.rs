@@ -34,7 +34,9 @@ pub struct YarnRopeScaling {
     pub beta_fast: f64,
     pub beta_slow: f64,
     pub mscale: f64,
-    pub mscale_all_dim: f64,
+    /// `None` where the config omits it (gpt-oss): no denominator, so the cos/sin carry
+    /// YaRN's attention temperature `yarn_get_mscale(factor, mscale)` whole.
+    pub mscale_all_dim: Option<f64>,
     pub original_max_position_embeddings: usize,
 }
 
@@ -341,14 +343,11 @@ pub fn yarn_cos_sin_table(
     //   mscale = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
     // into the cos/sin cache (mscale_all_dim^2 is handled separately in the attention
     // softmax scale). For DeepSeek V2-Lite mscale==mscale_all_dim so this is 1.0;
-    // for any config omitting the pair (gpt-oss) the parse defaults are HF's
-    // 1.0/1.0, so the ratio is likewise 1.0 — plain interpolation.
+    // a config omitting the pair (gpt-oss) has no denominator, so the cos/sin carry
+    // YaRN's attention temperature `0.1·ln(factor)+1`, as HF, mlx-lm and vLLM put on
+    // gpt-oss's q and k.
     let mscale_num = yarn_get_mscale(factor, yarn.mscale);
-    let mscale_den = if yarn.mscale_all_dim != 0.0 {
-        yarn_get_mscale(factor, yarn.mscale_all_dim)
-    } else {
-        1.0
-    };
+    let mscale_den = (yarn.mscale_all_dim).map_or(1.0, |m| yarn_get_mscale(factor, m));
     let mscale = (mscale_num / mscale_den) as f32;
 
     let inv_freqs: Vec<f64> = (0..half)
@@ -639,19 +638,27 @@ mod yarn_tests {
     use super::*;
 
     /// gpt-oss rope parameters: theta 150000, YaRN factor 32,
-    /// original context 4096, beta 32/1, and NO mscale pair — the
-    /// parse defaults (HF signature 1.0/1.0) make the mscale ratio
-    /// 1.0, i.e. plain interpolation with no attention temperature.
-    /// This is exactly what mlx-lm/vLLM compute for gpt-oss.
+    /// original context 4096, beta 32/1, and NO mscale pair, which
+    /// parses to mscale 1 and no mscale_all_dim: the table carries YaRN's
+    /// attention temperature, as HF (`get_mscale(factor)` when the pair
+    /// is absent), mlx-lm (`YarnRoPE(mscale=1, mscale_all_dim=0)`) and
+    /// vLLM (`yarn_get_mscale(factor)`) compute for gpt-oss.
     fn gpt_oss_yarn() -> YarnRopeScaling {
         YarnRopeScaling {
             factor: 32.0,
             beta_fast: 32.0,
             beta_slow: 1.0,
             mscale: 1.0,
-            mscale_all_dim: 1.0,
+            mscale_all_dim: None,
             original_max_position_embeddings: 4096,
         }
+    }
+
+    /// gpt-oss's YaRN attention temperature, spelled as HF's
+    /// `_compute_yarn_parameters` does for a config without the pair:
+    /// `0.1·ln(factor) + 1` at factor 32.
+    fn gpt_oss_attention_temperature() -> f64 {
+        0.1 * 32f64.ln() + 1.0
     }
 
     const GPT_OSS_HEAD_DIM: usize = 64;
@@ -705,10 +712,11 @@ mod yarn_tests {
             &gpt_oss_yarn(),
         );
         let half = GPT_OSS_HEAD_DIM / 2;
+        let t = gpt_oss_attention_temperature();
         for pos in [0usize, 1, 4095, 4096, 8192, 131_071] {
             for i in 0..half {
                 let angle = reference_yarn_angle(pos, i);
-                let (cos_ref, sin_ref) = (angle.cos() as f32, angle.sin() as f32);
+                let (cos_ref, sin_ref) = ((angle.cos() * t) as f32, (angle.sin() * t) as f32);
                 let row = pos * GPT_OSS_HEAD_DIM;
                 assert!(
                     (table[row + i] - cos_ref).abs() <= 1e-6,
@@ -724,41 +732,50 @@ mod yarn_tests {
         }
     }
 
-    /// With the HF-default mscale pair (any equal pair), the cos/sin
-    /// are NOT scaled: position 0 is exactly (1.0, 0.0) and every
-    /// entry stays within [-1, 1]. This is the regression pin for the
-    /// mscale parse defaults — the pre-fix default (mscale_all_dim
-    /// 0.0 → numerator-only) folded `0.1·ln(32)+1 ≈ 1.3466` into
-    /// every value.
+    /// Without the mscale pair (gpt-oss) every cos/sin carries YaRN's
+    /// attention temperature `0.1·ln(32)+1 ≈ 1.3466`: position 0 is
+    /// exactly (temperature, 0.0), and every entry lies within
+    /// ±temperature. This pins the parse default: an absent
+    /// `mscale_all_dim` read as 1.0 instead made the ratio 1.0, so
+    /// gpt-oss ran with every attention logit ~1.81× too soft against
+    /// HF, mlx-lm and vLLM (teacher-forced on MuSiQue prompts, scratchy's
+    /// top token left mlx-lm's greedy one at 7.4% of tokens, 1.8% fixed).
     #[test]
-    fn yarn_hf_default_mscale_pair_is_plain_interpolation() {
+    fn yarn_without_mscale_pair_carries_the_attention_temperature() {
         let table = yarn_cos_sin_table(
             GPT_OSS_HEAD_DIM,
             GPT_OSS_MAX_POS,
             GPT_OSS_THETA,
             &gpt_oss_yarn(),
         );
+        let t = gpt_oss_attention_temperature() as f32;
         let half = GPT_OSS_HEAD_DIM / 2;
-        for i in 0..GPT_OSS_HEAD_DIM {
-            assert_eq!(table[i], if i < half { 1.0 } else { 0.0 });
-        }
-        // No temperature anywhere: sample every 97th row (prime
-        // stride) rather than all 131072 — the value law is per-entry.
+        let (cos0, sin0) = table[..GPT_OSS_HEAD_DIM].split_at(half);
+        assert!(cos0.iter().all(|&c| c == t), "cos at position 0: {cos0:?}");
+        assert!(
+            sin0.iter().all(|&s| s == 0.0),
+            "sin at position 0: {sin0:?}"
+        );
+        // Sample every 97th row (prime stride) rather than all 131072 —
+        // the value law is per-entry.
         for pos in (0..GPT_OSS_MAX_POS).step_by(97) {
             for &v in &table[pos * GPT_OSS_HEAD_DIM..(pos + 1) * GPT_OSS_HEAD_DIM] {
-                assert!(v.abs() <= 1.0, "cos/sin exceeds 1.0 at pos {pos}: {v}");
+                assert!(
+                    v.abs() <= t,
+                    "cos/sin exceeds the temperature at pos {pos}: {v}"
+                );
             }
         }
     }
 
-    /// An UNEQUAL pair scales cos/sin by the mscale ratio, and
-    /// `mscale_all_dim == 0.0` falls back to a denominator of 1.0
-    /// (the `!= 0.0` guard). Position 0 isolates the ratio exactly:
-    /// cos(0)·mscale, sin(0)·mscale.
+    /// An UNEQUAL pair scales cos/sin by the mscale ratio, and a stated
+    /// `mscale_all_dim` of 0.0 is a denominator of 1.0 (`yarn_get_mscale`
+    /// at mscale 0), as HF reads a falsy one. Position 0 isolates the
+    /// ratio exactly: cos(0)·mscale, sin(0)·mscale.
     #[test]
     fn yarn_unequal_mscale_pair_scales_cos_sin() {
         let mut yarn = gpt_oss_yarn();
-        yarn.mscale_all_dim = 0.707;
+        yarn.mscale_all_dim = Some(0.707);
         let ratio = (yarn_get_mscale(32.0, 1.0) / yarn_get_mscale(32.0, 0.707)) as f32;
         let table = yarn_cos_sin_table(GPT_OSS_HEAD_DIM, 64, GPT_OSS_THETA, &yarn);
         let half = GPT_OSS_HEAD_DIM / 2;
@@ -767,8 +784,8 @@ mod yarn_tests {
             assert_eq!(table[half + i], 0.0);
         }
 
-        // mscale_all_dim == 0.0 → denominator 1.0.
-        yarn.mscale_all_dim = 0.0;
+        // A stated mscale_all_dim of 0.0 → denominator 1.0.
+        yarn.mscale_all_dim = Some(0.0);
         let table = yarn_cos_sin_table(GPT_OSS_HEAD_DIM, 64, GPT_OSS_THETA, &yarn);
         assert_eq!(table[0], yarn_get_mscale(32.0, 1.0) as f32);
     }

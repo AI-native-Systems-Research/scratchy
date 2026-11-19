@@ -3891,6 +3891,10 @@ fn emit_weights_struct(
                 ) => {
                     let orig = original_max_position_embeddings as usize;
                     let rope_hd = yarn_rope_head_dim.unwrap_or(head_dim);
+                    let mscale_all_dim = match mscale_all_dim {
+                        Some(m) => quote! { ::core::option::Option::Some(#m) },
+                        None => quote! { ::core::option::Option::None },
+                    };
                     quote! {
                         let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                         let rotary = crate::__gpu::rotary::RotaryCache::new_yarn_from_gpuweights(
@@ -7866,9 +7870,9 @@ pub(crate) fn fill_canonical_params(
         match &model.rope_scaling {
             Some(crate::config::RopeScaling::Yarn {
                 factor,
-                mscale_all_dim,
+                mscale_all_dim: Some(mscale_all_dim),
                 ..
-            }) if *mscale_all_dim != 0.0 => {
+            }) => {
                 let mm = if *factor <= 1.0 {
                     1.0_f64
                 } else {

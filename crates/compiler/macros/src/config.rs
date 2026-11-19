@@ -368,7 +368,8 @@ pub enum RopeScaling {
         beta_fast: f64,
         beta_slow: f64,
         mscale: f64,
-        mscale_all_dim: f64,
+        /// `None` where the config omits it (gpt-oss).
+        mscale_all_dim: Option<f64>,
         original_max_position_embeddings: u64,
     },
 }
@@ -2611,17 +2612,14 @@ fn extract_rope_scaling(json: &serde_json::Value) -> Option<RopeScaling> {
             let factor = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let beta_fast = rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0);
             let beta_slow = rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            // HF signature parity: `YarnRotaryEmbedding.__init__(mscale=1.0,
-            // mscale_all_dim=1.0)`. gpt-oss omits the pair — with the 1.0/1.0
-            // defaults the mscale ratio is 1.0 (plain interpolation, no
-            // attention temperature), which is what mlx-lm/vLLM compute for
-            // it. Every in-tree yarn config carries an explicit pair, so this
-            // default is dead code for them.
+            // A config that omits the pair (gpt-oss) gets YaRN's attention temperature
+            // `0.1·ln(factor)+1` on its cos/sin, as every reference computes it: HF's
+            // `_compute_yarn_parameters` falls back to `get_mscale(factor)` when the pair is
+            // absent, mlx-lm's `YarnRoPE` defaults to `mscale=1, mscale_all_dim=0`, and vLLM's
+            // `YaRNScalingRotaryEmbedding` scales by `yarn_get_mscale(factor)`. An absent
+            // `mscale_all_dim` stays absent: the table divides by nothing.
             let mscale = rs.get("mscale").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let mscale_all_dim = rs
-                .get("mscale_all_dim")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1.0);
+            let mscale_all_dim = rs.get("mscale_all_dim").and_then(|v| v.as_f64());
             let original_max_position_embeddings = rs
                 .get("original_max_position_embeddings")
                 .and_then(|v| v.as_u64())
@@ -3999,14 +3997,14 @@ mod tests {
     }
 
     /// A yarn `rope_scaling` block that omits the mscale pair (gpt-oss)
-    /// parses to HF's signature defaults 1.0/1.0 — with that pair the
-    /// cos/sin mscale ratio is exactly 1.0 (plain interpolation, no
-    /// attention temperature), which is what mlx-lm/vLLM compute for
-    /// gpt-oss. The pre-fix default (`mscale_all_dim` 0.0) made the
-    /// ratio `0.1·ln(factor)+1 ≈ 1.3466` at factor 32 — a wrong
-    /// attention temperature folded into the cache.
+    /// parses to mscale 1 and no mscale_all_dim, so the cos/sin carry
+    /// YaRN's attention temperature `0.1·ln(factor)+1 ≈ 1.3466` at factor
+    /// 32 — what HF (`get_mscale(factor)` when the pair is absent), mlx-lm
+    /// (`YarnRoPE(mscale=1, mscale_all_dim=0)`) and vLLM compute for it.
+    /// Read as 1.0, an absent `mscale_all_dim` made the ratio 1.0 and ran
+    /// gpt-oss with attention ~1.81× too soft.
     #[test]
-    fn yarn_config_without_mscale_pair_parses_to_hf_defaults() {
+    fn yarn_config_without_mscale_pair_keeps_the_attention_temperature() {
         let json = serde_json::json!({
             "rope_scaling": {
                 "type": "yarn",
@@ -4029,7 +4027,7 @@ mod tests {
                 assert_eq!(beta_fast, 32.0);
                 assert_eq!(beta_slow, 1.0);
                 assert_eq!(mscale, 1.0);
-                assert_eq!(mscale_all_dim, 1.0);
+                assert_eq!(mscale_all_dim, None);
                 assert_eq!(original_max_position_embeddings, 4096);
             }
             other => panic!("expected Yarn scaling, got {other:?}"),
