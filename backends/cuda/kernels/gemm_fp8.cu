@@ -57,9 +57,9 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -770,7 +770,7 @@ int launch_abt(const void* a, const void* a_scale, const void* b, const void* b_
                                         scale_view(a_scale, m), scale_view(b_scale, n)};
         return launch<mmt>(G, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -790,7 +790,7 @@ int launch_gate_up(const void* a, const void* a_scale, const void* gate, const v
                                         scale_view(up_scale, n)};
         return launch<mmt>(G, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -892,7 +892,7 @@ int launch_group(const void* a, const void* a_scale, const void* const* b,
                                         int(count)};
         return launch<mmt>(G, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -977,7 +977,7 @@ extern "C" int scratchy_cuda_gemm_fp8_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
@@ -1149,7 +1149,7 @@ extern "C" int scratchy_cuda_expert_gemm_fp8(const void* a, const void* a_scale,
                                                              tile_expert, c, rows, n, k,
                                                              max_tiles, expert_rows, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -1195,7 +1195,7 @@ extern "C" int scratchy_cuda_expert_gemm_fp8_variant(
         return k_step == 128 ? go(expert_gemm_e128_col64_m64_k128_fp8_mmt{})
                              : go(expert_gemm_e128_col64_m64_k64_fp8_mmt{});
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -1260,6 +1260,6 @@ extern "C" int scratchy_cuda_expert_gate_up_gemm_fp8(
         return silu ? go(expert_gate_up_e128_silu_fp8_mmt{})
                     : go(expert_gate_up_e128_gelu_fp8_mmt{});
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

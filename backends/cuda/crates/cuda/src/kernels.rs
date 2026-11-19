@@ -14,16 +14,13 @@ use std::ffi::c_void;
 use std::fmt;
 
 use crate::kernel_consts::{
-    ROPE_PAIRING_HALF_HEAD, ROPE_PAIRING_HALF_ROTATED, ROUTE_SOFTMAX_TOPK,
+    CUDA_ERR_HOST, ROPE_PAIRING_HALF_HEAD, ROPE_PAIRING_HALF_ROTATED, ROUTE_SOFTMAX_TOPK,
     ROUTE_TOPK_SCALED_SOFTMAX,
 };
 use crate::step::RopePairing;
 
 /// `SCRATCHY_CUDA_ERR_SHAPE` in the `.cu` launchers: the shape was refused, nothing launched.
 const ERR_SHAPE: i32 = -1;
-/// `SCRATCHY_CUDA_ERR_HOST` in the `.cu` launchers: a C++ exception was caught on the host side
-/// (e.g. a failed tensor-map encode).
-const ERR_HOST: i32 = -2;
 
 unsafe extern "C" {
     // The kernels with no attribute to set: each `_prepare` only loads its kernels (#1048), so a
@@ -1596,7 +1593,7 @@ fn check(code: i32, shape: KernelError) -> Result<(), KernelError> {
     match code {
         0 => Ok(()),
         ERR_SHAPE => Err(shape),
-        ERR_HOST => Err(KernelError::HostException),
+        CUDA_ERR_HOST => Err(KernelError::HostException),
         code => Err(KernelError::Cuda(code)),
     }
 }

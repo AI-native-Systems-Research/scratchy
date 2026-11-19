@@ -48,9 +48,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -398,7 +398,7 @@ static bool decode_refused(uint32_t q_heads, uint32_t kv_heads, uint32_t head_di
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value =
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value =
 // the cudaError_t cudaLaunchKernel returned for THIS launch.
 //
 // Refused before any pointer is touched: `head_dim` not 512; `q_heads` or `kv_heads` zero, or
@@ -424,7 +424,7 @@ extern "C" int scratchy_cuda_attn_decode_d512_fp8kv(
         return launch_decode(q, k_cache, v_cache, block_table, sequence, out, q_heads, kv_heads,
                              num_blocks, scale, window, 1, 1, nullptr, nullptr, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -449,6 +449,6 @@ extern "C" int scratchy_cuda_attn_decode_d512_fp8kv_split(
                              num_blocks, scale, window, splits, min_tiles, o_split, ml_split,
                              stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

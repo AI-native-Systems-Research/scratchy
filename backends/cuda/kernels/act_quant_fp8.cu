@@ -43,9 +43,9 @@
 
 using namespace kittens;
 
-// The launcher's return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors them.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -166,7 +166,7 @@ extern "C" int scratchy_cuda_act_quant_fp8_prepare(void) {
                                                  SMEM_BYTES));
 }
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; scratchy::CUDA_ERR_HOST = a
 // C++ exception was caught; any other value = the launch's cudaError_t.
 //
 // `rows` rows of `act = bf16(OP(gate, up))` from `gate`, `up [rows, n]` f32, then their
@@ -205,7 +205,7 @@ extern "C" int scratchy_cuda_act_quant_fp8(const void* gate, const void* up, voi
         return static_cast<int>(cudaLaunchKernel(ker, grid, block, args, SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -298,7 +298,7 @@ extern "C" int scratchy_cuda_expert_act_quant_fp8_prepare(void) {
     return static_cast<int>(cudaFuncGetAttributes(&attr, expert_act_quant_fp8_ker<base_ops::copy2>));
 }
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; scratchy::CUDA_ERR_HOST = a
 // C++ exception was caught; any other value = the launch's cudaError_t.
 //
 // FP8 S8 P1: rows `r < offsets[experts]` of `act = bf16(OP(gate, up))` from `gate`, `up [rows,
@@ -339,11 +339,11 @@ extern "C" int scratchy_cuda_expert_act_quant_fp8(const void* gate, const void* 
         return static_cast<int>(
             cudaLaunchKernel(ker, grid, block, args, 0, static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; scratchy::CUDA_ERR_HOST = a
 // C++ exception was caught; any other value = the launch's cudaError_t.
 //
 // FP8 S8 P3(b): rows `r < offsets[experts]` of `x [rows, cols]` bf16 (the fused expert gate + up +
@@ -381,6 +381,6 @@ extern "C" int scratchy_cuda_expert_quant_fp8(const void* x, void* q, void* scal
                                                  block, args, 0,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

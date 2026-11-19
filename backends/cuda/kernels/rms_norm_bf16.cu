@@ -90,10 +90,9 @@
 
 using namespace kittens;
 
-// The launcher's return codes that are not a `cudaError_t` (which is non-negative).
-// `src/kernels.rs` mirrors them.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -505,7 +504,7 @@ extern "C" int scratchy_cuda_rms_norm_bf16_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
@@ -526,7 +525,7 @@ extern "C" int scratchy_cuda_rms_norm_bf16(const void* x, const void* gain, void
         return launch<NORM>(x, gain, y, x, y, rows, cols, eps, gain_offset,
                             static_cast<cudaStream_t>(stream));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -546,7 +545,7 @@ extern "C" int scratchy_cuda_rms_norm_unit_bf16(const void* x, void* y, uint32_t
         return launch<UNIT>(x, x, y, x, y, rows, cols, eps, 0.0f,
                             static_cast<cudaStream_t>(stream));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -568,7 +567,7 @@ extern "C" int scratchy_cuda_add_rms_norm_bf16(const void* a, const void* b, con
         return launch<ADD_NORM>(a, gain, y, b, sum, rows, cols, eps, gain_offset,
                                 static_cast<cudaStream_t>(stream));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -590,6 +589,6 @@ extern "C" int scratchy_cuda_norm_add_bf16(const void* x, const void* gain, cons
         return launch<NORM_ADD>(x, gain, out, residual, out, rows, cols, eps, gain_offset,
                                 static_cast<cudaStream_t>(stream));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

@@ -79,9 +79,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -590,7 +590,7 @@ int dense(const void* a, const void* b, void* c, void* partials, uint32_t n, uin
         }
         return launch<false>(G, n, 1, splits, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -659,7 +659,7 @@ int launch_group(const void* a, const void* const* b, void* const* c, void* cons
             rblock(REDUCE_THREADS);
         return static_cast<int>(cudaLaunchKernel(gemv_reduce_group_ker, rgrid, rblock, rargs, 0, s));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -699,7 +699,7 @@ int expert(const void* a, const void* b, const void* topk_idx, void* c, void* pa
                        int(each),   int(splits), pair_rows != 0 ? 1 : int(top_k), rg, 0};
         return launch<true>(G, n, uint32_t(pairs), splits, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -758,7 +758,7 @@ int dense_gate_up(const void* a, const void* gate, const void* up, void* c, void
                           dense_globals(a, up, c, up_partials, n, k, splits, each)};
         return launch_gate_up_act<false>(act, G, n, 1, splits, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -806,7 +806,7 @@ int expert_gate_up(const void* a, const void* gate, const void* up, const void* 
         gate_up_globals G{view(gate, partials), view(up, up_partials)};
         return launch_gate_up_act<true>(act, G, n, uint32_t(pairs), splits, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -896,7 +896,7 @@ extern "C" int scratchy_cuda_gate_up_gemv_bf16_prepare(void) {
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
@@ -925,7 +925,7 @@ extern "C" int scratchy_cuda_gemv_split_bf16_abt(const void* a, const void* b, v
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //

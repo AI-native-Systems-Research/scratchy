@@ -22,9 +22,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -132,7 +132,7 @@ bool refused(uint32_t rows, uint32_t cols, uint32_t tile_row, uint32_t tile_col)
 
 // The load case: `src` `[rows, cols]` bf16, `poison` and `dump` `[64, 64]` bf16, all 16-byte
 // aligned device pointers; `swizzled` non-zero for the swizzled tile. 0 = launched;
-// SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a C++ exception
+// SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; scratchy::CUDA_ERR_HOST = a C++ exception
 // was caught (e.g. tensor-map encode); any other value = the launch's cudaError_t. Asynchronous on
 // `stream`.
 extern "C" int scratchy_cuda_tma_box_probe_load(const void* src, const void* poison, void* dump,
@@ -154,7 +154,7 @@ extern "C" int scratchy_cuda_tma_box_probe_load(const void* src, const void* poi
                 : launch_load<plain_tile>(sp, pp, dp, rows, cols, tile_row, tile_col, s);
         return static_cast<int>(e);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -178,6 +178,6 @@ extern "C" int scratchy_cuda_tma_box_probe_store(const void* pattern, void* dst,
                           : launch_store<plain_tile>(pp, dp, rows, cols, tile_row, tile_col, s);
         return static_cast<int>(e);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

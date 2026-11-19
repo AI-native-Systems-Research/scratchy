@@ -25,9 +25,9 @@
 
 using namespace kittens;
 
-// Launcher return codes that are not a `cudaError_t`. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 namespace {
 
@@ -154,7 +154,7 @@ int launch_merge(const void* o_split, const void* ml_split, const void* sequence
 // `q_heads` or `kv_heads` zero, `q_heads` not a multiple of `kv_heads`, or a group above 16;
 // `scale` not finite or not above 0; `window` not a multiple of 64; `splits` zero or above 64;
 // `min_tiles` zero or above 128; a dimension or the window above INT_MAX; a null pointer.
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t of the
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught; any other value = the cudaError_t of the
 // launch. Asynchronous on `stream`.
 extern "C" int scratchy_cuda_attn_decode_merge(const void* o_split, const void* ml_split,
                                                const void* sequence, void* out, uint32_t q_heads,
@@ -181,6 +181,6 @@ extern "C" int scratchy_cuda_attn_decode_merge(const void* o_split, const void* 
         return launch_merge<D512>(o_split, ml_split, sequence, out, q_heads, kv_heads, scale,
                                  window, splits, min_tiles, stream);
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }

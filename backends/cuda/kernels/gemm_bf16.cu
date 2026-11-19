@@ -34,10 +34,9 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
 
-// Launcher return codes that are not a `cudaError_t`. `cudaError_t` is non-negative, so negative
-// codes cannot collide with it. `src/kernels.rs` mirrors these two values.
+// The launcher's shape refusal, a return code no `cudaError_t` is (those are non-negative);
+// `src/kernels.rs` mirrors it. Its host-exception code is the shared `scratchy::CUDA_ERR_HOST`.
 #define SCRATCHY_CUDA_ERR_SHAPE (-1)
-#define SCRATCHY_CUDA_ERR_HOST (-2)
 
 // One thread block per SM of an H100 SXM. Each block loops over output tiles until none are left,
 // so correctness does not depend on this number; only speed does.
@@ -460,12 +459,12 @@ static int launch_abt(const void* a, const void* b, void* c, uint32_t m, uint32_
                                                  args, GEMM_BF16_ABT_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode);
+// scratchy::CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode);
 // any other value = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads
 // or clears the runtime's last-error state, so an error an earlier, unrelated call left behind is
 // never reported as this launch's.
@@ -533,7 +532,7 @@ extern "C" int scratchy_cuda_gemm_group_bf16_abt(const void* a, const void* cons
                                                  args, GEMM_BF16_ABT_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
@@ -563,7 +562,7 @@ static int launch_gate_up(const void* a, const void* gate, const void* up, void*
                                                  args, GEMM_BF16_ABT_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
+        return scratchy::CUDA_ERR_HOST;
     }
 }
 
