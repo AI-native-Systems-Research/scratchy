@@ -6,8 +6,25 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_forward_compiler_macro::QuantMethod;
 use scratchy_forward_compiler_macro::target::{
-    DispatchCx, LoadCx, ModelCx, ModelEmission, TargetEmitter,
+    DispatchCx, LoadCx, ModelCx, ModelEmission, Preset, TargetEmitter,
 };
+
+/// The quant presets metal lowers: the MLX affine presets reach the tape as dense codes the
+/// kernels dequantize, and `nvfp4` as metal's own E2M1 qmv/qmm. Every other preset's kernels
+/// (Marlin, Bnb4, Fp8, Ggml) have no metal realization.
+pub const METAL_PRESETS: &[Preset] = &[
+    Preset::MlxAffineB2G64Attn4Router8Qembed,
+    Preset::MlxAffineB2G64Qembed,
+    Preset::MlxAffineB3G64Attn4Router8Qembed,
+    Preset::MlxAffineB3G64Qembed,
+    Preset::MlxAffineB4G128,
+    Preset::MlxAffineB4G128Qembed,
+    Preset::MlxAffineB4G32,
+    Preset::MlxAffineB4G64,
+    Preset::MlxAffineB4G64Mlp8Router8,
+    Preset::MlxAffineB4G64Qembed,
+    Preset::Nvfp4,
+];
 
 /// The metal target's emitter.
 pub struct Metal {
@@ -34,11 +51,9 @@ impl TargetEmitter for Metal {
             })
     }
 
-    /// The MLX affine presets reach the tape as dense codes the kernels dequantize, and `nvfp4`
-    /// as metal's own E2M1 qmv/qmm; every other preset's kernels (Marlin, Bnb4, Fp8, Ggml) have
-    /// no metal realization.
-    fn lowers_preset(&self, preset: &str) -> bool {
-        preset.starts_with("mlx-affine-") || preset == "nvfp4"
+    /// [`METAL_PRESETS`].
+    fn presets(&self) -> &'static [Preset] {
+        METAL_PRESETS
     }
 
     /// A checked-in quantized config lowers as its preset would: MLX affine or NVFP4.
@@ -247,5 +262,20 @@ impl TargetEmitter for Metal {
 
     fn loaded_model(&self, cx: &DispatchCx<'_>) -> TokenStream {
         crate::dispatch::emit(cx)
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::{METAL_PRESETS, Preset};
+
+    /// The set is every MLX affine preset and `nvfp4`, the rule metal's kernels follow: a new MLX
+    /// affine preset fails here until it is listed.
+    #[test]
+    fn metal_lowers_every_mlx_affine_preset_and_nvfp4() {
+        let rule: Vec<Preset> = (Preset::ALL.iter().copied())
+            .filter(|p| p.name().starts_with("mlx-affine-") || *p == Preset::Nvfp4)
+            .collect();
+        assert_eq!(METAL_PRESETS, rule.as_slice());
     }
 }
