@@ -1,0 +1,42 @@
+name: CodeQL
+
+# Code scanning for main. GitHub's default setup scans only main, and the site's JavaScript lives on
+# the site branch, so each branch scans itself with its own codeql.yml, and default setup is off:
+# GitHub refuses a workflow's results while it is on.
+#
+# It scans what default setup scanned, when it did: each push to main, and once a week for new
+# queries. Pull requests aren't scanned, as default setup didn't scan those from forks, which is
+# nearly all of them, and the Rust scan takes half an hour.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, python, ruby, rust]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
