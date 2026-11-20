@@ -229,6 +229,10 @@ pub(crate) fn run_card_launch(
     b: &BundleMeta,
     width: ktir_superdsc::sdsc_abstract::RungWidth,
     sampler: SamplerLaws<'_>,
+    // ⭐ THE FUNDED POOL — the compile gate: only `Worker::initialize_cache` mints the token
+    // (`SuperDscBundle::fund_kv_pool`), so a launch before the engine has divided its budget
+    // into pages does not build.
+    funded: &scratchy_target_spyre_card::superdsc_exec::Funded,
 ) -> ExecutorResult<BatchOut> {
     let SamplerLaws {
         seeds,
@@ -507,7 +511,7 @@ pub(crate) fn run_card_launch(
                     ))
                 })?;
             let t_submit = std::time::Instant::now();
-            pf.submit_step(mq, seq_pos).map_err(|e| {
+            pf.submit_step(mq, seq_pos, funded).map_err(|e| {
                 werr(format!(
                     "superdsc decode submit (mq={mq}, at={seq_pos}): {e}"
                 ))
@@ -578,7 +582,7 @@ pub(crate) fn run_card_launch(
         // A middle prompt chunk: no suffix runs and nothing is read back.
         (LogitsWanted::None, _) => {
             pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
+                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded, funded))
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
@@ -591,7 +595,7 @@ pub(crate) fn run_card_launch(
         // stick comes back raw, exactly like a decode's.
         (LogitsWanted::LastRow, Some((seat, seat_width))) => {
             pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
+                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice, funded))
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
@@ -1411,6 +1415,7 @@ pub(crate) fn superdsc_forward_chunk(
     ladders: PrefillLadders<'_>,
     // The prompt chunks' wiring — every rung of both ladders binds its tensor ids.
     prefill_meta: Option<&BundleMeta>,
+    funded: &scratchy_target_spyre_card::superdsc_exec::Funded,
     Chunk {
         state: req,
         id,
@@ -1498,6 +1503,7 @@ pub(crate) fn superdsc_forward_chunk(
                     draw: req.draw.as_ref(),
                 },
             },
+            funded,
         )?;
         pick = match out {
             BatchOut::Done(p) => p,
@@ -1556,6 +1562,7 @@ pub(crate) fn superdsc_forward_packed(
     rung: PrefixRung,
     tails: &[PackedTail],
     tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
+    funded: &scratchy_target_spyre_card::superdsc_exec::Funded,
 ) -> ExecutorResult<Vec<Option<u32>>> {
     let (meta, sess) = prefix.packed_parts(rung);
     let (w, s) = (rung.width(), rung.seqs());
@@ -1592,6 +1599,7 @@ pub(crate) fn superdsc_forward_packed(
             want_logits: LogitsWanted::LastRow,
             laws: SeatLaws::Packed { draws: &draws },
         },
+        funded,
     )? {
         BatchOut::Done(picked) => picked.ok_or_else(|| {
             werr(
@@ -1642,6 +1650,7 @@ pub(crate) fn forward_chunk(
     b: &BundleMeta,
     // The prompt chunks' wiring, which every rung of both prompt ladders binds.
     prefill_meta: Option<&BundleMeta>,
+    funded: &scratchy_target_spyre_card::superdsc_exec::Funded,
     Chunk {
         state: req,
         id,
@@ -1667,6 +1676,7 @@ pub(crate) fn forward_chunk(
             prefix: prefill_prefix,
         },
         prefill_meta,
+        funded,
         Chunk {
             state: req,
             id,

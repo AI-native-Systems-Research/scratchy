@@ -59,13 +59,6 @@ pub struct SpyreWorker {
     pub(crate) model_path: String,
     pub(crate) is_shutdown: bool,
     pub(crate) model: Option<Loaded>,
-    /// ⭐ THE FUNDED POOL'S TOKEN — minted by [`Worker::initialize_cache`] (the engine's own
-    /// division: its budget over the bundle's page stride, held to the programs' addressing
-    /// bound) and carried by every launch. `None` only before that door has run; the engine
-    /// calls it before its first `execute_model`, and the card's launch doors take the token
-    /// itself so an unfunded launch is a COMPILE error everywhere the worker owns the shape.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) funded: Option<scratchy_target_spyre_card::superdsc_exec::Funded>,
     pub(crate) requests: HashMap<String, ReqState>,
     /// ⭐ #32 (c4) — THE IN-FLIGHT DECODE QUEUE: submitted-but-uncollected batched decode
     /// steps, oldest first. Every decode step goes through submit → defer → drain; a step
@@ -116,8 +109,6 @@ impl SpyreWorker {
             model_path,
             is_shutdown: false,
             model: None,
-            #[cfg(feature = "spyre-hw")]
-            funded: None,
             requests: HashMap::new(),
             #[cfg(feature = "spyre-hw")]
             in_flight: Default::default(),

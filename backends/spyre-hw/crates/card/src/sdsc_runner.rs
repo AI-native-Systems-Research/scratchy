@@ -689,9 +689,18 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         n_new: usize,
         seq_pos: usize,
         activations: &[scratchy_target_spyre::wiring::Bind],
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<Vec<f32>> {
         Ok(self
-            .run_step_inner(n_new, seq_pos, activations, &[], &[], StepLogits::ReadBack)?
+            .run_step_inner(
+                n_new,
+                seq_pos,
+                activations,
+                &[],
+                &[],
+                StepLogits::ReadBack,
+                funded,
+            )?
             .unwrap_or_default())
     }
 
@@ -702,6 +711,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         n_new: usize,
         seq_pos: usize,
         activations: &[scratchy_target_spyre::wiring::Bind],
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<()> {
         self.run_step_inner(
             n_new,
@@ -710,6 +720,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             &[],
             &[],
             StepLogits::LeftOnDevice,
+            funded,
         )?;
         Ok(())
     }
@@ -730,6 +741,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         seq_pos: usize,
         activations: &[scratchy_target_spyre::wiring::Bind],
         activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<()> {
         self.run_step_inner(
             n_new,
@@ -738,6 +750,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             activations_f16,
             &[],
             StepLogits::LeftOnDevice,
+            funded,
         )?;
         Ok(())
     }
@@ -749,6 +762,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         seq_pos: usize,
         activations: &[scratchy_target_spyre::wiring::Bind],
         activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<Vec<f32>> {
         Ok(self
             .run_step_inner(
@@ -758,6 +772,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
                 activations_f16,
                 &[],
                 StepLogits::ReadBack,
+                funded,
             )?
             .unwrap_or_default())
     }
@@ -776,6 +791,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<Option<Vec<f32>>> {
         self.run_step_inner(
             n_new,
@@ -784,6 +800,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             activations_f16,
             activations_i32,
             logits,
+            funded,
         )
     }
 
@@ -806,7 +823,13 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// what waits this submission out; `predict`'s tail sync is the drain this
     /// door exists to not run. Call `stage_step_acts` first: this door submits
     /// whatever the shadow holds.
-    pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
+    pub fn submit_step(
+        &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        funded: &crate::superdsc_exec::Funded,
+    ) -> Result<()> {
+        let _ = funded; // the token is the compile gate; the pool is already funded
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
         let t0 = std::time::Instant::now();
@@ -1031,9 +1054,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
         activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<Option<Vec<f32>>> {
         self.stage_step_acts(activations, activations_f16, activations_i32)?;
-        self.run_staged_step(n_new, seq_pos, logits)
+        self.run_staged_step(n_new, seq_pos, logits, funded)
     }
 
     /// Run the step whatever the shadow holds — every input already staged
@@ -1043,7 +1067,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         n_new: usize,
         seq_pos: usize,
         logits: StepLogits,
+        funded: &crate::superdsc_exec::Funded,
     ) -> Result<Option<Vec<f32>>> {
+        let _ = funded; // the token is the compile gate; the pool is already funded
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         let want = match logits {
             StepLogits::ReadBack => LogitsRead::ReadBack,

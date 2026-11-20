@@ -122,7 +122,7 @@ impl Worker for SpyreWorker {
                  allocated at (pages + the null page) × unit bytes and zero-filled; the ladder's \
                  rungs adopted the owner's regions"
             );
-            self.funded = Some(funded);
+            loaded.funded = Some(funded);
         }
         #[cfg(not(feature = "spyre-hw"))]
         let _ = num_gpu_blocks;
@@ -465,8 +465,14 @@ impl Worker for SpyreWorker {
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
-                let picks =
-                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
+                let picks = superdsc_forward_packed(
+                    &sh,
+                    &mut sb.prefill_prefix,
+                    rung,
+                    group,
+                    input_batch,
+                    model.funded()?,
+                )?;
                 for (t, pick) in group.iter().zip(picks) {
                     order.push(t.id.clone());
                     sampled.push(pick);
@@ -706,6 +712,7 @@ impl Worker for SpyreWorker {
                         want_logits: LogitsWanted::PerRequestDeferred,
                         laws: SeatLaws::Batch { draws: &draws },
                     },
+                    model.funded()?,
                 )? {
                     BatchOut::Deferred(sub) => sub,
                     BatchOut::Done(_) => {

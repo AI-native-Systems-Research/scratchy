@@ -276,11 +276,17 @@ pub(crate) fn run_request_step(
         // logits, no host argmax, anywhere: the idx stick is the only answer that
         // comes back.
         let db = select_decode(&model.decode, start + n);
+        // The card's launch doors take the pool's funding token — the one
+        // runtime edge is `Loaded::funded`, everything below it is compile-gated.
+        #[cfg(feature = "spyre-hw")]
+        let funded = model.funded()?;
         match forward_chunk(
             &sh,
             &mut model.session,
             db,
             model.batched_prefill.as_ref(),
+            #[cfg(feature = "spyre-hw")]
+            funded,
             Chunk {
                 state: req,
                 id,
