@@ -939,7 +939,12 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }
         | SubOp::ExpertAct { .. }
-        | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        | SubOp::Mean
+        | SubOp::SliceCols { .. }
+        | SubOp::MlaRopeQ { .. }
+        | SubOp::MlaAppend { .. }
+        | SubOp::HeadMatmul { .. }
+        | SubOp::MlaAttend { .. } => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
         // pipeline sends this rank's operand fragment into every peer's window and waits for every
         // peer's before the consume launches (`bundle::collective::cb_pipeline`). What IS a program

@@ -110,6 +110,11 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::GatedDeltaNet
         | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }
+        | SubOp::SliceCols { .. }
+        | SubOp::MlaRopeQ { .. }
+        | SubOp::MlaAppend { .. }
+        | SubOp::HeadMatmul { .. }
+        | SubOp::MlaAttend { .. }
         | SubOp::CaptureHidden { .. }
         | SubOp::DraftConv { .. }
         | SubOp::DraftAttention { .. }

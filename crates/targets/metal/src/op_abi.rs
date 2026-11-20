@@ -124,6 +124,14 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn { .. } => {
             FRESH.reads_across()
         }
+        // Multi-head latent attention: each kernel reads other lanes of its rows than the one it
+        // writes (a column window, a lane pair, a head's block, every head's query) into a buffer
+        // of its own.
+        L::SliceCols { .. }
+        | L::MlaRopeQ { .. }
+        | L::MlaAppend { .. }
+        | L::HeadMatmul { .. }
+        | L::MlaAttend { .. } => FRESH.reads_across(),
         // Splash's drafter: a convolution reads the row before each row of a block, an attention
         // every row of it, each into a buffer of its own; a capture copies its rows out, a context
         // commit writes the ring and a selection the drafter's runtime outputs, each publishing

@@ -539,6 +539,19 @@ u32_newtype!(
     RowsPerToken,
     /// Elements an elementwise kernel's buffer holds: its threads past it write nothing.
     ElementCount,
+    /// The simdgroups of a threadgroup.
+    SimdgroupCount,
+    /// The output rows one simdgroup of a per-head matmul computes.
+    RowsPerSimdgroup,
+    /// The partitions a split attention divides each sequence's cached rows into.
+    KvPartitions,
+    /// A buffer row's elements: an MLA attention partial's (its max, its sum, then its lanes).
+    PartialStride,
+    /// The threads of a threadgroup.
+    ThreadCount,
+    /// The lanes of a latent attention's cached row one of the paged pool's K and V stores
+    /// holds.
+    HalfRow,
     /// A reshape's row divisor (`num_tokens / d` rows — the vision merger's factor).
     RowsDivisor,
     /// Iterations of a rolled loop.

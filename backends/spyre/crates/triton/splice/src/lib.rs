@@ -432,6 +432,11 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }
         | SubOp::Mean
+        | SubOp::SliceCols { .. }
+        | SubOp::MlaRopeQ { .. }
+        | SubOp::MlaAppend { .. }
+        | SubOp::HeadMatmul { .. }
+        | SubOp::MlaAttend { .. }
         // ⛔ AND THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the
         // 2a routing above made the macro's patterns for THOSE kinds unreachable
         // (unreachable_patterns is `-D warnings`), and the remaining members are a

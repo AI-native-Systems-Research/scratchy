@@ -6344,6 +6344,229 @@ fn lower_one(
             return lower_moe_step(p, block, *step, w, at, moe_scratch_bytes);
         }
 
+        // ── Multi-head latent attention, its column window and its per-head matmul ──
+        I::SliceCols(Slot(input), Slot(out), offset, in_width, width) => {
+            let n = eff_m * width.get();
+            LoweredCommand {
+                kernel: KernelId::SliceCols,
+                library: "slice_cols",
+                function: pick_specialized_symbol(
+                    "slice_cols_f16",
+                    "slice_cols_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::SliceColsConstants {
+                    in_cols: *in_width,
+                    offset: *offset,
+                    cols: *width,
+                    elements: super::ids::ElementCount(n),
+                }
+                .into_baked(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *input,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 1,
+                    },
+                ]),
+            }
+        }
+        I::HeadMatmul(hm) => lower_head_matmul(p, hm, w, eff_m, bucket_m, layer_offset)?,
+        I::MlaRopeQ(Slot(q), Slot(out), mla) => {
+            let threads = mla_row_threads(mla.q_head());
+            LoweredCommand {
+                kernel: KernelId::MlaRopeQ,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_rope_q_f16",
+                    "mla_rope_q_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: None,
+                    attend: None,
+                    row: Some(mla_row(p, threads)?),
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, mla.heads().get(), 1),
+                    threads_per_threadgroup: (threads.get(), 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *q,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 1,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::Positions,
+                        binding_index: 2,
+                    },
+                    mla_cos_sin(w, 3)?,
+                ]),
+            }
+        }
+        I::MlaAppend(Slot(latent), Slot(k_pe), Slot(out), LayerId(layer), mla) => {
+            let kv_layer = super::ids::LayerId(*layer + layer_offset);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            let threads = mla_row_threads(mla.row());
+            LoweredCommand {
+                kernel: KernelId::MlaAppend,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_append_f16",
+                    "mla_append_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: Some(mla_cache(p, crate::BLOCKS_PER_CHUNK)?),
+                    attend: None,
+                    row: Some(mla_row(p, threads)?),
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, 1, 1),
+                    threads_per_threadgroup: (threads.get(), 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *latent,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *k_pe,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 2,
+                    },
+                    runtime(RuntimeBindingKind::Positions, 3),
+                    mla_cos_sin(w, 4)?,
+                    runtime(RuntimeBindingKind::SlotMapping { layer: kv_layer }, 5),
+                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 6),
+                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 7),
+                ]),
+            }
+        }
+        I::MlaAttend(Slot(q_latent), Slot(q), Slot(out), LayerId(layer), mla) => {
+            let kv_layer = super::ids::LayerId(*layer + layer_offset);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            let tiling = mla_attend_tiling(mla.heads().get(), mla.latent().get(), bucket_m)?;
+            let parts = tiling.parts.get();
+            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
+            let constants = || {
+                super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: Some(cache),
+                    attend: Some(tiling),
+                    row: None,
+                }
+                .into_baked()
+            };
+            let m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                set_axis: None,
+                axis: crate::tape::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(bucket_m),
+            });
+            let output = Binding::ArenaSlot {
+                slot: *out,
+                binding_index: 0,
+            };
+            // A partitioned attention writes its partials, a merge reads them into the output.
+            let (written, partials) = match parts {
+                1 => (output, None),
+                _ => (
+                    Binding::Scratch { binding_index: 8 },
+                    Some(4 * bucket_m * mla.heads().get() * parts * tiling.partial.get()),
+                ),
+            };
+            let attend = LoweredCommand {
+                kernel: KernelId::MlaAttend,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_attend_f16",
+                    "mla_attend_bf16",
+                    p.act_dtype(),
+                ),
+                constants: constants(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, mla.heads().get() / tiling.heads_per_tg.get(), parts),
+                    threads_per_threadgroup: (32 * tiling.simdgroups.get(), 1, 1),
+                    m_scaling,
+                },
+                bindings: baked(vec![
+                    written,
+                    Binding::ArenaSlot {
+                        slot: *q_latent,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q,
+                        binding_index: 2,
+                    },
+                    runtime(RuntimeBindingKind::SeqUsedK, 3),
+                    runtime(RuntimeBindingKind::BlockTable { layer: kv_layer }, 4),
+                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 5),
+                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 7),
+                ]),
+            };
+            let Some(bytes) = partials else {
+                return dispatched(vec![attend]);
+            };
+            *splitk_scratch_bytes = (*splitk_scratch_bytes).max(bytes);
+            let merge = LoweredCommand {
+                kernel: KernelId::MlaAttendMerge,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_attend_merge_f16",
+                    "mla_attend_merge_bf16",
+                    p.act_dtype(),
+                ),
+                constants: constants(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, mla.heads().get(), 1),
+                    threads_per_threadgroup: (tiling.merge_threads.get(), 1, 1),
+                    m_scaling,
+                },
+                bindings: baked(vec![output, Binding::Scratch { binding_index: 1 }]),
+            };
+            return dispatched(vec![attend, merge]);
+        }
         // ── Qwen3.5 Gated-DeltaNet: conv1d → gating → scan → gated-RMSNorm ──
         //
         // One coarse op lowers to FOUR compute commands that pass f32
@@ -7371,6 +7594,202 @@ fn route_draft_commit(step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCom
             GatedCommand { command, gate }
         })
         .collect()
+}
+
+/// The rotary table an MLA rope reads, at `binding_index`: its row's site's cos/sin.
+fn mla_cos_sin(w: RowSources<'_>, binding_index: u8) -> Result<Binding, LoweringError> {
+    let ix = w.of(WeightKind::CosSin, 0)?;
+    Ok(source(ix, WeightTensor::Weight, LayerId(0), binding_index))
+}
+
+/// The paged cache an MLA kernel addresses: the model's KV page, in chunks of `blocks_per_chunk`
+/// blocks (0: one base), each row its K and V halves (the facts' latent rows, the pool's
+/// geometry).
+fn mla_cache(
+    p: &ModelFacts,
+    blocks_per_chunk: u32,
+) -> Result<super::kernel_constants::MlaCacheConstants, LoweringError> {
+    Ok(super::kernel_constants::MlaCacheConstants {
+        block_size: super::ids::BlockSize(base(p)?.page().get()),
+        blocks_per_chunk: super::ids::BlocksPerChunk(blocks_per_chunk),
+        half_row: super::ids::HalfRow(super::facts::latent(p)?.half_row()),
+    })
+}
+
+/// An MLA row kernel's threads and its rope's pairing, the facts' own.
+fn mla_row(
+    p: &ModelFacts,
+    threads: super::ids::ThreadCount,
+) -> Result<super::kernel_constants::MlaRowConstants, LoweringError> {
+    let pairing = super::kernel_constants::MlaPairing::of(super::facts::rope(p)?.pairing())
+        .ok_or(LoweringError::ModelLacks(super::lowered::Lacked::Rope))?;
+    Ok(super::kernel_constants::MlaRowConstants { threads, pairing })
+}
+
+/// How an MLA attention spreads over threadgroups: each serves the largest divisor of the heads
+/// up to [`MLA_HEADS_PER_TG`], over as many simdgroups (up to 32, a power of two) as merge their
+/// latent partials in [`MLA_MERGE_BYTES`] of threadgroup memory. A decode-shaped bucket (up to
+/// [`crate::op_abi::METAL_VERIFY_ROWS`] rows, each a whole context) splits each sequence's cached
+/// rows into [`MLA_DECODE_PARTS`] partitions, whose partials — each its softmax max and sum, then
+/// its latent lanes, f32 — a merge combines; a prefill-shaped one has rows enough to fill the GPU
+/// unsplit. A `latent` too wide for one simdgroup's partials in the budget has no tiling.
+pub fn mla_attend_tiling(
+    heads: u32,
+    latent: u32,
+    bucket_m: u32,
+) -> Result<super::kernel_constants::MlaAttendTiling, LoweringError> {
+    let served = (1..=MLA_HEADS_PER_TG.min(heads))
+        .rev()
+        .find(|d| heads.is_multiple_of(*d))
+        .unwrap_or(1);
+    let lanes = 4 * latent;
+    let simdgroups = (0..=MLA_MAX_SIMDGROUPS.ilog2())
+        .rev()
+        .map(|p| 1u32 << p)
+        .find(|sg| sg * lanes <= MLA_MERGE_BYTES)
+        .ok_or(LoweringError::MlaMergeOverflow {
+            latent,
+            budget: MLA_MERGE_BYTES,
+        })?;
+    let parts = match bucket_m <= crate::op_abi::METAL_VERIFY_ROWS {
+        true => MLA_DECODE_PARTS,
+        false => 1,
+    };
+    Ok(super::kernel_constants::MlaAttendTiling {
+        heads_per_tg: super::ids::NumQHeads(served),
+        simdgroups: super::ids::SimdgroupCount(simdgroups),
+        parts: super::ids::KvPartitions(parts),
+        partial: super::ids::PartialStride(latent + 2),
+        merge_threads: super::ids::ThreadCount(MLA_MERGE_THREADS),
+    })
+}
+
+/// The threads an MLA row kernel (the query rotation, the cache write) runs a threadgroup: a lane
+/// each of a `lanes`-wide row, rounded to a power of two, up to [`MLA_ROW_THREADS`]; past it each
+/// thread takes several.
+fn mla_row_threads(lanes: u32) -> super::ids::ThreadCount {
+    super::ids::ThreadCount(lanes.next_power_of_two().clamp(32, MLA_ROW_THREADS))
+}
+
+/// The most threads an MLA row kernel runs a threadgroup.
+const MLA_ROW_THREADS: u32 = 1024;
+
+/// The partitions a decode-shaped bucket's MLA attention splits each sequence's cached rows into.
+/// Hand-tuned: measured on GLM-4.7-Flash on an M3 Pro (1024-token decode: 8 partitions 53.1
+/// tok/s, 16 51.8, 32 49.1).
+const MLA_DECODE_PARTS: u32 = 8;
+
+/// The threads of an MLA merge threadgroup: one head's latent lanes, several a thread.
+const MLA_MERGE_THREADS: u32 = 256;
+
+/// The most query heads an MLA attention threadgroup serves. Hand-tuned: a head's query and
+/// output lanes of a cached row are a thread's registers, and more than one spills them (measured
+/// on GLM-4.7-Flash on an M3 Pro, 1024-token decode: 1 head 51.8 tok/s, 2 46.8, 4 42.7, at 16
+/// partitions).
+const MLA_HEADS_PER_TG: u32 = 1;
+
+/// The threadgroup memory an MLA attention's merge holds its simdgroups' latent partials in: half
+/// a threadgroup's 32 KiB, a hand-picked budget.
+const MLA_MERGE_BYTES: u32 = 16 * 1024;
+
+/// The most simdgroups an MLA attention threadgroup runs: a threadgroup's 1024 threads.
+const MLA_MAX_SIMDGROUPS: u32 = 32;
+
+/// The threadgroup memory every Metal target holds (`threadgroup_memory_bytes` in
+/// [`crate::tape::targets`]).
+const METAL_THREADGROUP_BYTES: u32 = 32768;
+
+// The attention's threadgroup memory: its simdgroups' latent partials (`tg_o`, within
+// MLA_MERGE_BYTES by the tiling) and each served head's softmax max and sum per simdgroup (`tg_m`,
+// `tg_l`, f32). At the most heads and simdgroups the tiling picks, they fit a threadgroup.
+const _: () = assert!(
+    MLA_MERGE_BYTES + 2 * 4 * MLA_HEADS_PER_TG * MLA_MAX_SIMDGROUPS <= METAL_THREADGROUP_BYTES,
+    "MLA attention: the merge budget and the softmax partials overflow a threadgroup"
+);
+
+/// A per-head matmul threadgroup's simdgroups, and the output rows each computes. Hand-picked, not
+/// swept.
+const HEAD_MATMUL_SIMDGROUPS: u32 = 8;
+const HEAD_MATMUL_ROWS_PER_SG: u32 = 4;
+
+/// A per-head matmul's command: the affine kernel over packed blocks, or the dense one.
+fn lower_head_matmul(
+    p: &ModelFacts,
+    hm: &crate::tape::step::HeadMatmul,
+    w: RowSources<'_>,
+    eff_m: u32,
+    bucket_m: u32,
+    layer_offset: u32,
+) -> Result<LoweredCommand, LoweringError> {
+    use crate::tape::step::HeadWeight;
+    let layer = super::ids::LayerId(hm.layer.0 + layer_offset);
+    let ix = w.of(WeightKind::Linear, 0)?;
+    let heads = hm.heads.get();
+    let n = hm.n.get();
+    let (function, affine, mut bindings) = match hm.weight {
+        HeadWeight::Affine { group_size, bits } => (
+            head_qmv_static_name(p.act_dtype(), scale_dtype_for(p)),
+            Some((group_size, bits)),
+            affine_weight_bindings(ix, layer).to_vec(),
+        ),
+        HeadWeight::Dense => (
+            pick_specialized_symbol("head_mv_f16", "head_mv_bf16", p.act_dtype()),
+            None,
+            vec![source(ix, WeightTensor::Weight, layer, 0)],
+        ),
+    };
+    bindings.extend([
+        Binding::ArenaSlot {
+            slot: hm.input.0,
+            binding_index: 3,
+        },
+        Binding::ArenaSlot {
+            slot: hm.output.0,
+            binding_index: 4,
+        },
+    ]);
+    Ok(LoweredCommand {
+        kernel: KernelId::HeadMatmul,
+        library: "head_matmul",
+        function,
+        constants: super::kernel_constants::HeadMatmulConstants {
+            heads: super::ids::NumQHeads(heads),
+            k: hm.lanes.k(),
+            n_head: super::ids::NDim(n / heads),
+            in_stride: hm.lanes.stride(),
+            simdgroups: super::ids::SimdgroupCount(HEAD_MATMUL_SIMDGROUPS),
+            rows_per_simdgroup: super::ids::RowsPerSimdgroup(HEAD_MATMUL_ROWS_PER_SG),
+            affine,
+        }
+        .into_baked(),
+        dispatch: DispatchShape {
+            threadgroups: (
+                eff_m,
+                n.div_ceil(HEAD_MATMUL_SIMDGROUPS * HEAD_MATMUL_ROWS_PER_SG),
+                1,
+            ),
+            threads_per_threadgroup: (32, HEAD_MATMUL_SIMDGROUPS, 1),
+            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                set_axis: None,
+                axis: crate::tape::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(bucket_m),
+            }),
+        },
+        bindings: baked(bindings),
+    })
+}
+
+/// `head_qmv_<act>_s_<scale>`.
+fn head_qmv_static_name(act: MetalDtype, scale: ScaleDtype) -> &'static str {
+    match (act, scale) {
+        (MetalDtype::F16, ScaleDtype::F16) => "head_qmv_f16_s_f16",
+        (MetalDtype::F16, ScaleDtype::Bf16) => "head_qmv_f16_s_bf16",
+        (MetalDtype::Bf16, ScaleDtype::F16) => "head_qmv_bf16_s_f16",
+        (MetalDtype::Bf16, ScaleDtype::Bf16) => "head_qmv_bf16_s_bf16",
+        (MetalDtype::Int4, _) => {
+            panic!("metal lowering: Int4 dtype not yet wired through kernel symbol picker")
+        }
+    }
 }
 
 /// Pick the f16-or-bf16 specialization for a kernel that follows the

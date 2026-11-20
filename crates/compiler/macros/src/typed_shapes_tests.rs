@@ -435,7 +435,7 @@ fn the_typed_qwen2_vl_unrolls_on_every_config() {
 fn every_typed_carrier_unrolls_on_every_config() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let carriers = carriers(&arch);
-    assert_eq!(carriers.len(), 30, "the carriers under dsl/");
+    assert_eq!(carriers.len(), 31, "the carriers under dsl/");
     let mut configs = 0;
     let mut failed = Vec::new();
     for (stem, vision) in &carriers {
@@ -477,8 +477,16 @@ fn head_facts(
     model: &crate::config::ModelParams,
 ) -> scratchy_ir::model_facts::ModelFacts {
     let width = crate::codegen::target_width(program, inferred);
-    crate::codegen::fill_canonical_params(model, 1, false, &Default::default(), Some(width), false)
-        .0
+    crate::codegen::fill_canonical_params(
+        model,
+        1,
+        None,
+        None,
+        &Default::default(),
+        Some(width),
+        false,
+    )
+    .0
 }
 
 /// An in-checkpoint head reads its target's lent lm_head through `as_dim`: its own width stated as

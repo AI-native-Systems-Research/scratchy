@@ -506,19 +506,30 @@ pub enum OpKind {
     /// Qwen2.5-VL vision towers; expected reuse by future ViT-RoPE
     /// architectures.
     VisionRope,
-    /// MLA kv_a split: decomposes `[T, kv_lora_rank + qk_rope_head_dim]`
-    /// into `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`.
-    /// DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`. Tuple-returning;
-    /// the 2-target binding is handled in `Stmt::AssignTuple`. Used
-    /// exclusively by DeepSeek V2/V3.
+    /// Multi-head latent attention's kv_a split: `[T, kv_lora_rank + qk_rope_head_dim]` into
+    /// `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`, the compressed latent then
+    /// the one rope key every head shares. DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`;
+    /// tuple-returning, the 2-target binding handled in `Stmt::AssignTuple`.
     MlaSplit,
-    /// MLA full attention: applies interleaved RoPE to q_pe / k_pe, writes
-    /// compressed KV to paged cache, assembles full K and V from cached
-    /// kv_b + k_pe, runs flash attention, then slices the output to
-    /// `v_head_dim`. Consumes `q, kv_b, k_pe` plus externs
-    /// `(positions, rotary, kv_cache[layer], block_table)`. Output:
-    /// `[T, num_attention_heads * v_head_dim]`. Used by DeepSeek V2/V3.
+    /// Multi-head latent attention's cache write: rotates each query head's rope part (its last
+    /// `qk_rope_head_dim` lanes, after `qk_nope_head_dim` un-roped ones) and the shared rope key,
+    /// pairing lanes `(2i, 2i + 1)`, and writes the token's latent row `[kv_latent | roped k_pe]`
+    /// to the layer's paged cache. DSL form: `(q, kv_latent, k_pe) = mla_append(q, kv_latent,
+    /// k_pe, positions, rotary, kv_cache[layer])`; `kv_latent` passes through.
+    MlaAppend,
+    /// Absorbed multi-head latent attention over the cache [`OpKind::MlaAppend`] wrote: each
+    /// head's latent query (its no-rope query folded through its key decompression, a
+    /// [`OpKind::HeadMatmul`]) and its rotated rope part scored against every cached latent row
+    /// up to its position, scaled by `1/sqrt(qk_nope_head_dim + qk_rope_head_dim)`; out, each
+    /// head's softmax-weighted latent rows. DSL form: `latent = mla_attention(q_latent, q, k_pe,
+    /// kv_cache[layer], block_table)`, `k_pe` the cache writer's output. Output: `[T,
+    /// num_attention_heads * kv_lora_rank]`.
     MlaAttention,
+    /// A matmul per head: each of the weight's `H` blocks (`[H, K, N]`) times the first `K` lanes
+    /// of its head's part of `x` (`x` is `H` equal parts), into that head's `N` output lanes.
+    /// MLX's `MultiLinear`; MLA's query absorption (`embed_q`) and value decompression
+    /// (`unembed_out`). DSL form: `y = head_matmul(x, w[layer])`. Output: `[T, H * N]`.
+    HeadMatmul,
     /// MoE block — gate routing + top-K fused GEMM for routed experts
     /// plus an optional shared expert. The DSL form is the same across
     /// every MoE arch: `moe_out = moe_block(x, moe[layer])`. Mirrors
@@ -670,6 +681,13 @@ impl OpKind {
         matches!(self, Self::SlidingAttention | Self::SinkSlidingAttention)
     }
 
+    /// The op caches its keys rotated, with no rotate-on-read form: its cache's spans cannot be
+    /// relocated and re-roped. Multi-head latent attention's rope key is part of its compressed
+    /// latent row.
+    pub fn ropes_keys_at_write(self) -> bool {
+        matches!(self, Self::MlaAppend)
+    }
+
     /// Map a DSL op-call ident to its `OpKind`. Binary operators
     /// (currently just `*`) do not flow through this path.
     pub fn from_name(name: &str) -> Option<Self> {
@@ -722,7 +740,9 @@ impl OpKind {
             // (`ast::Expr::Reshape`), never a call by name: not listed
             // in `from_name`.
             "mla_split" => Some(Self::MlaSplit),
+            "mla_append" => Some(Self::MlaAppend),
             "mla_attention" => Some(Self::MlaAttention),
+            "head_matmul" => Some(Self::HeadMatmul),
             "moe_block" => Some(Self::Moe),
             "gemma_moe" => Some(Self::GemmaMoe),
             "gptoss_moe" => Some(Self::GptOssMoe),
@@ -780,7 +800,9 @@ impl OpKind {
             Self::Mul => "mul",
             Self::Reshape => "reshape",
             Self::MlaSplit => "mla_split",
+            Self::MlaAppend => "mla_append",
             Self::MlaAttention => "mla_attention",
+            Self::HeadMatmul => "head_matmul",
             Self::Moe => "moe_block",
             Self::GemmaMoe => "gemma_moe",
             Self::GptOssMoe => "gptoss_moe",

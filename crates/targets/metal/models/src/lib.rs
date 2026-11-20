@@ -78,6 +78,10 @@ pub mod gemma4_moe;
 #[path = "arch/glm4_moe.rs"]
 pub mod glm4_moe;
 
+#[cfg(compiled_arch = "glm4_moe_lite")]
+#[path = "arch/glm4_moe_lite.rs"]
+pub mod glm4_moe_lite;
+
 #[cfg(compiled_arch = "gpt_oss")]
 #[path = "arch/gpt_oss.rs"]
 pub mod gpt_oss;
