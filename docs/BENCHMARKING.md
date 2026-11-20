@@ -487,10 +487,9 @@ to the requests in flight beside it, or to none where it ran alone. In a prompt-
 joules per correct answer is the joules its requests took, a wrong one's too, over how many were
 right. The page's summary map compares scratchy's against its rival's at 2 and 4 users, where
 end-to-end time was before. A run from before per-request joules shows each cell's whole joules
-per right answer in every bucket. A cell whose answers were forced was not scored; a cell the
-accuracy table does not score, most of its answers cut off at the length limit or answered in
-reasoning, has no accuracy to divide by; and a cell the power log missed part of has no energy. None
-of them has a ratio, and its square says which.
+per right answer in every bucket. A cell whose answers were forced was not scored; a cell most of
+whose requests failed has no accuracy to divide by; and a cell the power log missed part of has no
+energy. None of them has a ratio, and its square says which.
 
 **Each MuSiQue cell its own share of the dev set:** `bench serve --task-share i/k` splits the dev
 set's questions that fit into k disjoint shares, one a cell, each in the dev set's mix of 2-, 3-
