@@ -19,7 +19,9 @@
 //!
 //! [`steps_from_tape`]: crate::steps_from_tape
 
-use scratchy_target_cuda::step::{AddNormRowBf16, NormRowBf16};
+use scratchy_target_cuda::step::{
+    AddNormRowBf16, BucketKind, BucketM, ManyRows, NormRowBf16, OneRow,
+};
 use scratchy_target_cuda::step::{
     AttnWindow, Cols, FreqDim, HeadDim, HiddenSize, IntermediateSize, MaxTiles, NDim, NumExperts,
     NumKvHeads, RotDim, Rows, TileRows, TopK, VocabSize,
@@ -55,10 +57,13 @@ use scratchy_target_cuda::step::{
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
-    MoeTape, RotaryTable, TapeInput, WeightIx, moe_region_bytes_at, moe_tiles_at, overlap,
+    MoeTape, RotaryTable, TapeInput, TapeSteps, WeightIx, moe_region_bytes_at, moe_tiles_at,
+    overlap,
 };
 
-use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step};
+use crate::steps_from_tape::{
+    Lower, StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step,
+};
 
 /// What CUDA's opcode lowering reads beside the canonical: the model's typed facts (the handoff's
 /// own [`ModelFacts`]), and what the handoff states beside them, the rope's base frequencies and
@@ -214,6 +219,70 @@ pub struct CudaPlan {
     pub facts: LoweringFacts,
 }
 
+/// A canonical's steps, by its bucket's kind ([`Lower`]): a one-row bucket's take every kind, a
+/// bucket of more rows' no one-row kind. The static tape's [`TapeSteps`] of the same kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalSteps {
+    OneRow(Vec<CudaStep>),
+    Rows(Vec<CudaStep<ManyRows>>),
+}
+
+impl CanonicalSteps {
+    /// The steps in launch order, as a one-row bucket's would hold them.
+    pub fn steps(&self) -> Vec<CudaStep> {
+        match self {
+            Self::OneRow(s) => s.clone(),
+            Self::Rows(s) => s.iter().map(|s| s.widen()).collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::OneRow(s) => s.len(),
+            Self::Rows(s) => s.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every step's weight indices, for the weight table's rewrite ([`CudaStep::weights_mut`]).
+    pub(crate) fn weights_mut(&mut self) -> Vec<&mut WeightIx> {
+        match self {
+            Self::OneRow(s) => s.iter_mut().flat_map(CudaStep::weights_mut).collect(),
+            Self::Rows(s) => s.iter_mut().flat_map(CudaStep::weights_mut).collect(),
+        }
+    }
+
+    /// The steps with [`fold_expert_gate_up`] applied.
+    pub(crate) fn fold_expert_gate_up(self) -> Self {
+        match self {
+            Self::OneRow(s) => Self::OneRow(fold_expert_gate_up(s)),
+            Self::Rows(s) => Self::Rows(fold_expert_gate_up(s)),
+        }
+    }
+
+    /// The steps as the static tape of a bucket of `bucket_m` rows holds them, leaked to
+    /// `'static` (a tape's steps are static data).
+    pub fn tape_steps(&self, bucket_m: u32) -> TapeSteps {
+        match self {
+            Self::OneRow(s) => TapeSteps::OneRow(Box::leak(s.clone().into_boxed_slice())),
+            Self::Rows(s) => TapeSteps::Rows {
+                bucket_m: BucketM(bucket_m),
+                steps: Box::leak(s.clone().into_boxed_slice()),
+            },
+        }
+    }
+}
+
+impl CudaCanonical {
+    /// [`CanonicalSteps::steps`].
+    pub fn steps(&self) -> Vec<CudaStep> {
+        self.steps.steps()
+    }
+}
+
 /// One decode canonical, lowered: the parts of one bucket's `CudaTape`, every one a constant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaCanonical {
@@ -234,7 +303,7 @@ pub struct CudaCanonical {
     pub weight_bytes: Vec<u64>,
     /// One step per launch, in tape order: each kept `Compute` but a view, and each fold's
     /// driver; a view or a `Compute` a fold absorbed has none.
-    pub steps: Vec<CudaStep>,
+    pub steps: CanonicalSteps,
     /// The rotary table, after every colour: `Some` exactly when the canonical binds a
     /// `Cos { local: false }` source.
     pub rotary: Option<RotaryTable>,
@@ -1525,6 +1594,16 @@ pub fn lower_canonical(
 // Public only so tests can reach refusals `lower_canonical` cannot; not part of the crate's API.
 #[doc(hidden)]
 pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
+    // The one place a bucket's kind is chosen: its embedded hidden's rows. A plan with no single
+    // embedded hidden has no bucket; it lowers as a one-row bucket would, and the arena refuses it.
+    match embedded_hidden(&plan) {
+        Ok(h) if h.rows != 1 => lower_plan_as::<ManyRows>(plan),
+        _ => lower_plan_as::<OneRow>(plan),
+    }
+}
+
+/// [`lower_plan`] of a bucket of kind `B`: its steps lowered through `B` ([`Lower`]).
+fn lower_plan_as<B: Lower>(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let arena = arena_layout(&plan);
     let kv = kv_cache(&plan);
     let gdn_layers = gdn_layers(&plan);
@@ -1556,9 +1635,9 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let computes: Vec<TapeStep<'_>> = tape_steps(&plan).collect();
     let mut steps = (computes.iter())
         .filter_map(|s| match plan.folds.role(s.writes) {
-            StepRole::Kept => lower_step(&cx, s, &computes).transpose(),
+            StepRole::Kept => lower_step::<B>(&cx, s, &computes).transpose(),
             StepRole::Drives(_) => {
-                lower_driver(&cx, s, plan.folds.driven(s.writes), &computes).transpose()
+                lower_driver::<B>(&cx, s, plan.folds.driven(s.writes), &computes).transpose()
             }
             StepRole::Absorbed { .. } | StepRole::Epilogue { .. } => None,
         })
@@ -1570,7 +1649,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let head = match (plan.facts.embed_vocab(), arena.tokens) {
         (Some(vocab), Some(tokens)) => {
             let (e, hidden) = embedded_hidden_source(&plan).map_err(CanonicalRefusal::Arena)?;
-            let step = embed(
+            let step = embed::<B>(
                 tokens.offset,
                 WeightIx(e as u32),
                 ArenaOffset(arena.offsets[0]),
@@ -1598,7 +1677,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`), which its extents read. A fused
     // step's are its parts' (#1049: the expert gate/up GEMV's two expert GEMVs).
     let bundles: BTreeMap<u32, u64> = (steps.iter())
-        .flat_map(|s| s.parts().into_iter().flatten())
+        .flat_map(|s| B::widen(*s).parts().into_iter().flatten())
         .filter_map(|s| match s {
             CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, .. }) | CudaStep::GdnDecode(g) => {
                 Some((g.bundle.0, g.layout.bundle.bytes))
@@ -1656,7 +1735,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     // The arena placed the GDN regions exactly when a step is a `GatedDeltaNet`, and every one
     // lowered with the first's geometry.
     let gdn = arena.gdn.and_then(|r| {
-        steps.iter().find_map(|s| match s {
+        steps.iter().find_map(|s| match B::widen(*s) {
             CudaStep::GatedDeltaNet(GdnPrefillBf16 { gdn: g, .. }) | CudaStep::GdnDecode(g) => {
                 Some(CanonicalGdn {
                     layers: gdn_layers.clone(),
@@ -1674,11 +1753,11 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         })
     });
     // The tensor-core decode GEMVs first: a gate/up's f32 rows are GEMV scratch.
-    let steps: Vec<CudaStep> = steps.into_iter().map(gemv_tc).collect();
+    let steps: Vec<CudaStep<B>> = steps.into_iter().map(B::gemv_tc).collect();
     // The GEMV scratch, sized by the lowered steps, at the arena's end: the largest split step's
     // partials (one GEMV runs at a time), `None` when no step splits.
     let scratch = (steps.iter())
-        .map(CudaStep::gemv_scratch)
+        .map(|s| B::widen(*s).gemv_scratch())
         .try_fold(0u64, |most, s| Some(most.max(s?)))
         .ok_or(CanonicalRefusal::Arena(ArenaRefusal::TooLarge))?;
     let (gemv_scratch, total_bytes) = match scratch {
@@ -1694,7 +1773,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             (Some(span), end)
         }
     };
-    let (steps, total_bytes) = quantize_fp8_inputs(steps, total_bytes)?;
+    let (steps, total_bytes) = quantize_fp8_inputs::<B>(steps, total_bytes)?;
     Ok(CudaCanonical {
         bucket_m: arena.bucket_m,
         colour_bytes: arena.bytes,
@@ -1703,7 +1782,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         input,
         result,
         weight_bytes,
-        steps,
+        steps: B::canonical(steps),
         rotary: rotary_table(arena.rotary, plan.facts.table_class(false), &plan.facts)?,
         rotary_local: rotary_table(
             arena.rotary_local,
@@ -1736,7 +1815,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
 /// activation at most [`ACT_QUANT_MAX_COLS`] columns), an expert GEMV or expert gate/up over an
 /// fp8 bank. Every other step is as it was; a gate/up's `q_act` is [`quantize_fp8_inputs`]'s to
 /// place.
-fn gemv_tc(s: CudaStep) -> CudaStep {
+pub(crate) fn gemv_tc(s: CudaStep) -> CudaStep {
     match s {
         CudaStep::GemvFp8(g) if gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1) => {
             CudaStep::GemvTcFp8(GemvTcFp8::of(g))
@@ -1801,10 +1880,10 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
 /// liveness is checked ([`quant_chain`]). Returns the steps and the arena's new end; a tape with
 /// no such step is as it was. A CUDA-core one-row GEMV quantizes its row in its own prologue
 /// (S4), so it reads its bf16 row.
-fn quantize_fp8_inputs(
-    steps: Vec<CudaStep>,
+fn quantize_fp8_inputs<B: Lower>(
+    steps: Vec<CudaStep<B>>,
     total: u64,
-) -> Result<(Vec<CudaStep>, u64), CanonicalRefusal> {
+) -> Result<(Vec<CudaStep<B>>, u64), CanonicalRefusal> {
     let steps = fp8_moe_prefill(steps);
     let too_large = || CanonicalRefusal::Arena(ArenaRefusal::TooLarge);
     let align = |b: u64| {
@@ -1812,8 +1891,8 @@ fn quantize_fp8_inputs(
             .ok_or_else(too_large)
     };
     let mut most = [0u64; 2];
-    for s in &steps {
-        if let Some((x, rows, cols)) = s.quantized_input() {
+    for &s in &steps {
+        if let Some((x, rows, cols)) = B::widen(s).quantized_input() {
             let q = QuantRowsFp8 {
                 x,
                 q: x,
@@ -1822,7 +1901,7 @@ fn quantize_fp8_inputs(
             };
             most[0] = most[0].max(q.bytes().ok_or_else(too_large)?);
         }
-        if let Some(q) = s.quant_write() {
+        if let Some(q) = B::widen(s).quant_write() {
             most[1] = most[1].max(q.bytes().ok_or_else(too_large)?);
         }
     }
@@ -1843,7 +1922,7 @@ fn quantize_fp8_inputs(
         if let CudaStep::ExpertActQuant(t) = &mut s {
             t.q_act = slots[1];
         }
-        if let Some((x, rows, cols)) = s.quantized_input() {
+        if let Some((x, rows, cols)) = B::widen(s).quantized_input() {
             let held = (live.iter().flatten())
                 .find(|l| (l.x, l.rows, l.cols) == (x, Rows(rows), Cols(cols)));
             let q = match held {
@@ -1863,8 +1942,9 @@ fn quantize_fp8_inputs(
             match &mut s {
                 CudaStep::GemmFp8(GemmFp8 { a, .. })
                 | CudaStep::GemmCol64Fp8(GemmCol64Fp8 { a, .. })
-                | CudaStep::GemmNarrowFp8(GemmNarrowFp8 { a, .. })
-                | CudaStep::GemvTcFp8(GemvTcFp8 { a, .. }) => *a = q,
+                | CudaStep::GemmNarrowFp8(GemmNarrowFp8 { a, .. }) => *a = q,
+                // The one-row kind, through its bucket's kind.
+                CudaStep::GemvTcFp8(g) => B::get_mut(g).a = q,
                 CudaStep::GemmGroupFp8(GemmGroupFp8 { a, .. })
                 | CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8 { a, .. })
                 | CudaStep::GemvGroupTcFp8(GemvGroupTcFp8 { a, .. }) => *a = q,
@@ -1887,7 +1967,7 @@ fn quantize_fp8_inputs(
         }
         // A slot no longer holds its input's quantization once the step writes those rows; a step
         // with no extents may write anything.
-        let writes: Option<Vec<ArenaSpan>> = (s.parts().into_iter().flatten())
+        let writes: Option<Vec<ArenaSpan>> = (B::widen(s).parts().into_iter().flatten())
             .map(|p| p.extents().map(|e| [Some(e.writes), e.second_write]))
             .collect::<Option<Vec<_>>>()
             .map(|w| w.into_iter().flatten().flatten().collect());
@@ -1905,13 +1985,14 @@ fn quantize_fp8_inputs(
             }
             *l = None;
         }
-        if let Some(q) = s.quant_write() {
+        if let Some(q) = B::widen(s).quant_write() {
             live[1] = Some(q);
         }
         out.push(s);
     }
-    let out = fold_norm_quants(out);
-    quant_chain(&out).map_err(CanonicalRefusal::QuantChain)?;
+    let out = B::fold_norm_quants(out);
+    let read: Vec<CudaStep> = out.iter().map(|&s| B::widen(s)).collect();
+    quant_chain(&read).map_err(CanonicalRefusal::QuantChain)?;
     let end = match most {
         [0, 0] => total,
         [_, b] => (slots[1].0.checked_add(align(b)?)).ok_or_else(too_large)?,
@@ -1924,7 +2005,7 @@ fn quantize_fp8_inputs(
 /// its down reads becomes the act + quantize over the live rows, which writes the down's quantized
 /// input (at the quant scratch's second slot, set by [`quantize_fp8_inputs`]). Every step's bits
 /// are the chain's it replaces; every other step is as it was.
-fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
+fn fp8_moe_prefill<B: BucketKind>(mut steps: Vec<CudaStep<B>>) -> Vec<CudaStep<B>> {
     for i in 0..steps.len() {
         let later = &steps[i + 1..];
         match steps[i] {
@@ -1977,7 +2058,7 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
 /// the quant scratch holds what it held. Every other step is as it was. Run on a model's tapes
 /// after its weight table merged the indices naming one checkpoint tensor (`emit::lower_model`):
 /// the gate's and the up's bank are then one index exactly when they are one tensor.
-pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
+pub(crate) fn fold_expert_gate_up<B: BucketKind>(steps: Vec<CudaStep<B>>) -> Vec<CudaStep<B>> {
     let fuses = |gate: &ExpertGemmFp8, up: &ExpertGemmFp8, act: &ExpertActQuantFp8| {
         let shared = |g: &ExpertGemmFp8| {
             (
@@ -2046,7 +2127,7 @@ const fn norm_row(n: RmsNormBf16) -> NormRowBf16 {
 /// A one-row norm or add-norm whose `y` the next step quantizes, with that quant write folded in
 /// (FP8 S8 N3, [`norm_row_takes`]): one launch writes the norm and its quantization, one step
 /// fewer. Every other step is as it was; the quant scratch holds what it held, at the same step.
-fn fold_norm_quants(steps: Vec<CudaStep>) -> Vec<CudaStep> {
+pub(crate) fn fold_norm_quants(steps: Vec<CudaStep>) -> Vec<CudaStep> {
     let folds = |n: RmsNormBf16, q: QuantRowsFp8| {
         (q.x, q.rows, q.cols) == (n.y, n.rows, n.cols) && norm_row_takes(n.rows.get(), n.cols.get())
     };

@@ -39,7 +39,7 @@
 //! finds them without naming the model crate.
 
 use scratchy_target_cuda::step::{
-    BlockSize, BucketM, ConvKernel, GdnHeadDim, GdnHeads, HeadDim, MaxBlocksPerSeq, NumKvHeads,
+    BlockSize, ConvKernel, GdnHeadDim, GdnHeads, HeadDim, MaxBlocksPerSeq, NumKvHeads,
 };
 use scratchy_target_cuda::step::{ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8, MoeBank};
 use std::collections::{BTreeMap, HashMap};
@@ -56,9 +56,7 @@ use scratchy_target_cuda::step::{
     GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvTcFp8, LayerScaleBf16, MoeRouteBf16,
     MoeWeight, NormAddBf16, RmsNormBf16, RouteProgram, RouterLogitsBf16, gdn_conv_dim,
 };
-use scratchy_target_cuda::tape::{
-    ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, TapeSteps, WeightIx,
-};
+use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
@@ -498,7 +496,11 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
     }
     model.weights = weight_table(input, &mut model.tapes)?;
     for tape in &mut model.tapes {
-        tape.steps = crate::canonical::fold_expert_gate_up(std::mem::take(&mut tape.steps));
+        let steps = std::mem::replace(
+            &mut tape.steps,
+            crate::canonical::CanonicalSteps::OneRow(Vec::new()),
+        );
+        tape.steps = steps.fold_expert_gate_up();
     }
     Ok(model)
 }
@@ -842,8 +844,8 @@ pub fn weight_table(
     let mut roles: Vec<Option<Role>> = vec![None; n];
     for tape in tapes.iter() {
         for step in tape
-            .steps
-            .iter()
+            .steps()
+            .into_iter()
             .flat_map(|s| s.parts().into_iter().flatten())
         {
             let Some((WeightIx(ix), role)) = role(&step) else {
@@ -1001,10 +1003,8 @@ pub fn weight_table(
         }
     }
     for tape in tapes.iter_mut() {
-        for step in &mut tape.steps {
-            for w in step.weights_mut() {
-                w.0 = remap[w.0 as usize] as u32;
-            }
+        for w in tape.steps.weights_mut() {
+            w.0 = remap[w.0 as usize] as u32;
         }
         for (ix, bytes) in tape.weight_bytes.iter_mut().enumerate() {
             if remap[ix] != ix {
@@ -1086,10 +1086,8 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         gemv_scratch,
         greedy,
     } = c;
-    // A bucket of more rows holds no one-row kind: the lowering picks one at one row only, so the
-    // expansion stops here, at compile time, were it ever to.
-    let steps = TapeSteps::leaked(BucketM(*bucket_m), steps)
-        .expect("a one-row kind lowers at one row only");
+    // The canonical's steps are already of the bucket's kind (`Lower`).
+    let steps = steps.tape_steps(*bucket_m);
     CudaTape {
         arena: ArenaLayout {
             colour_bytes: baked(colour_bytes),

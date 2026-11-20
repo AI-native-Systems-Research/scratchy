@@ -65,7 +65,9 @@ use scratchy_target_cuda::step::Matvec;
 use scratchy_target_cuda::step::{
     AttnDecodeBf16, CudaStep, GemvBf16, RopeAppendBf16, gdn_bundle, gdn_scratch,
 };
-use scratchy_target_cuda::step::{FreqDim, KDim, ManyRows, NDim, NumExperts, RotDim, Rows};
+use scratchy_target_cuda::step::{
+    BucketKind, FreqDim, KDim, ManyRows, NDim, NumExperts, RotDim, Rows,
+};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError,
     TapeInput, TapeSteps, WeightIx,
@@ -3715,7 +3717,7 @@ fn qwen_route_at_128() -> &'static [CudaTape] {
             })
             .collect();
         vec![CudaTape {
-            steps: TapeSteps::leaked(tape.bucket_m(), &steps).expect("the bucket's kinds"),
+            steps: TapeSteps::OneRow(Box::leak(steps.into_boxed_slice())),
             ..tape
         }]
     })
@@ -3791,18 +3793,36 @@ fn ga_table() -> Vec<BlockId> {
 
 /// `t` with every attention step and KV class unwindowed: the same layer's full causal twin.
 fn unwindowed(t: &CudaTape) -> CudaTape {
-    let steps: Vec<CudaStep> = (t.steps())
-        .map(|s| match s {
+    /// `s` with its prefill attention unwindowed, in a bucket of either kind.
+    fn prefill<B: BucketKind>(s: CudaStep<B>) -> CudaStep<B> {
+        match s {
             CudaStep::AttnPrefill(a) => {
                 CudaStep::AttnPrefill(AttnPrefillBf16 { window: None, ..a })
             }
-            CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => CudaStep::AttnDecode(
-                AttnDecodeBf16::of(AttnRowBf16 { window: None, ..a })
-                    .expect("a head dim with a decode kernel"),
-            ),
             s => s,
-        })
-        .collect();
+        }
+    }
+    let steps = match t.steps {
+        TapeSteps::OneRow(steps) => {
+            let steps: Vec<CudaStep> = (steps.iter())
+                .map(|&s| match s {
+                    CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => CudaStep::AttnDecode(
+                        AttnDecodeBf16::of(AttnRowBf16 { window: None, ..a })
+                            .expect("a head dim with a decode kernel"),
+                    ),
+                    s => prefill(s),
+                })
+                .collect();
+            TapeSteps::OneRow(Box::leak(steps.into_boxed_slice()))
+        }
+        TapeSteps::Rows { bucket_m, steps } => {
+            let steps: Vec<CudaStep<ManyRows>> = steps.iter().map(|&s| prefill(s)).collect();
+            TapeSteps::Rows {
+                bucket_m,
+                steps: Box::leak(steps.into_boxed_slice()),
+            }
+        }
+    };
     let kv = t.kv.map(|kv| {
         let classes: Vec<KvClass> = (kv.classes.iter())
             .map(|c| KvClass { window: None, ..*c })
@@ -3812,11 +3832,7 @@ fn unwindowed(t: &CudaTape) -> CudaTape {
             ..kv
         }
     });
-    CudaTape {
-        steps: TapeSteps::leaked(t.bucket_m(), &steps).expect("the bucket's kinds"),
-        kv,
-        ..*t
-    }
+    CudaTape { steps, kv, ..*t }
 }
 
 /// The layer at m = 1 and 512 as CUDA's compiler lowers it, their unwindowed twins, then

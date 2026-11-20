@@ -11,7 +11,7 @@ use scratchy_subtile::fixtures::{
 use scratchy_target_cuda::step::Cols;
 use scratchy_target_cuda::step::GemmNarrowBf16;
 use scratchy_target_cuda::step::Matvec;
-use scratchy_target_cuda::step::{KDim, NDim, Rows};
+use scratchy_target_cuda::step::{KDim, NDim, OneRow, Rows};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
@@ -290,7 +290,8 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
     rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
     let facts = facts_of(64, 32, None, 1e4);
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
-    let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
+    let steps = c.steps();
+    let [CudaStep::Rope(rope)] = steps.as_slice() else {
         panic!("expected one Rope, got {:?}", c.steps);
     };
     let table = c
@@ -494,9 +495,9 @@ fn the_silu_and_its_projections_fold_into_the_mul_it_gates() {
     let c = lower_canonical(&l, FACTS, AT_256).expect("the MLP block lowers");
     assert_eq!(c.steps.len(), 4, "seven ops, three absorbed: {:?}", c.steps);
     assert!(
-        matches!(c.steps[1], CudaStep::GateUpAct(_)),
+        matches!(c.steps()[1], CudaStep::GateUpAct(_)),
         "the gate/up launch: {:?}",
-        c.steps[1]
+        c.steps()[1]
     );
 }
 
@@ -526,7 +527,7 @@ fn gemm_m1(n: u32, k: u32) -> LoweredDecode {
 fn a_decode_gemm_lowers_to_the_gemv() {
     let c = lower_canonical(&gemm_m1(1024, 1024), FACTS, AT).expect("the one-row GEMM lowers");
     assert_eq!(
-        c.steps,
+        c.steps(),
         [CudaStep::Gemv(GemvBf16::of(Matvec {
             a: ArenaOffset(0),
             b: WeightIx(1),
@@ -549,7 +550,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     let c = lower_canonical(&with_hidden(gemm_m1_only_input()), FACTS, AT)
         .expect("gemm_m1_only lowers");
     assert!(matches!(
-        c.steps.as_slice(),
+        c.steps().as_slice(),
         [CudaStep::Gemv(GemvBf16 {
             n: NDim(2048),
             k: KDim(2048),
@@ -564,7 +565,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
 fn a_decode_gemm_of_a_narrow_n_stays_on_the_narrow_gemm() {
     let c = lower_canonical(&gemm_m1(16, 1024), FACTS, AT).expect("the narrow one-row GEMM lowers");
     assert!(matches!(
-        c.steps.as_slice(),
+        c.steps().as_slice(),
         [CudaStep::GemmNarrow(GemmNarrowBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
@@ -834,7 +835,8 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
             inputs: c.inputs,
         })
         .collect();
-    let e = lower_fused(&cx, mul, fusion, &without_silu).expect_err("the Silu is missing");
+    let e =
+        lower_fused::<OneRow>(&cx, mul, fusion, &without_silu).expect_err("the Silu is missing");
     assert!(e.to_string().contains("producer slot"), "{e}");
     assert!(matches!(
         e,
@@ -977,7 +979,7 @@ fn lower_second_add(
         writes: all[1].writes,
         inputs: &replaced,
     };
-    match lower_step(&cx, &s, &all) {
+    match lower_step::<OneRow>(&cx, &s, &all) {
         Err(e) => {
             eprintln!("refused: {e}");
             e
@@ -1160,8 +1162,8 @@ fn a_model_with_a_table_embeds_its_token_ids_first() {
     let c = lower_canonical(&l, facts, AT_128).expect("the token-id tape lowers");
     assert_eq!(c.steps.len(), hidden.steps.len() + 1, "one more step");
     assert_eq!(
-        &c.steps[1..],
-        hidden.steps.as_slice(),
+        &c.steps()[1..],
+        hidden.steps().as_slice(),
         "then the same steps"
     );
     let tokens = ArenaSpan {
@@ -1169,7 +1171,7 @@ fn a_model_with_a_table_embeds_its_token_ids_first() {
         bytes: 128 * 4,
     };
     assert_eq!(
-        c.steps[0],
+        c.steps()[0],
         CudaStep::Embed(EmbedBf16 {
             tokens: tokens.offset,
             table: WeightIx(0),
@@ -1236,7 +1238,8 @@ fn a_tied_head_reads_the_tables_buffer() {
     for c in &model.tapes {
         let m = c.bucket_m;
         assert_eq!(c.weight_bytes, [256 * 512 * 2, 1024, 0], "m={m}");
-        let Some(CudaStep::Gemm(head)) = c.steps.last() else {
+        let steps = c.steps();
+        let Some(CudaStep::Gemm(head)) = steps.last() else {
             panic!("m={m}: the tape ends with the lm_head");
         };
         assert_eq!(head.b, WeightIx(0), "m={m}: the lm_head reads the table");

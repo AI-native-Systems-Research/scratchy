@@ -195,7 +195,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
     assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
     assert_eq!(
         tape.steps().collect::<Vec<_>>(),
-        *lowered_steps,
+        lowered_steps.steps(),
         "{name}: steps"
     );
     assert_eq!(rotary, *lowered_rotary, "{name}: rotary");

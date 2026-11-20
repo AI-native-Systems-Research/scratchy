@@ -408,6 +408,13 @@ pub trait BucketKind: Copy + Debug + PartialEq + Eq {
         + PartialEq
         + Eq
         + Serialize;
+
+    /// `s` as a one-row bucket's step holds it: itself, or a bucket of more rows' every kind (none
+    /// of them one-row).
+    fn widen(s: CudaStep<Self>) -> CudaStep;
+
+    /// A one-row kind's payload, to change: there is none in a bucket of more rows.
+    fn get_mut<T: Copy + Debug + PartialEq + Eq + Serialize>(x: &mut Self::OneRow<T>) -> &mut T;
 }
 
 /// A one-row bucket's [`BucketKind`]: every step kind.
@@ -420,10 +427,28 @@ pub enum ManyRows {}
 
 impl BucketKind for OneRow {
     type OneRow<T: Copy + Debug + PartialEq + Eq + Serialize> = T;
+
+    fn widen(s: CudaStep) -> CudaStep {
+        s
+    }
+
+    fn get_mut<T: Copy + Debug + PartialEq + Eq + Serialize>(x: &mut T) -> &mut T {
+        x
+    }
 }
 
 impl BucketKind for ManyRows {
     type OneRow<T: Copy + Debug + PartialEq + Eq + Serialize> = Never<T>;
+
+    fn widen(s: CudaStep<ManyRows>) -> CudaStep {
+        s.widen()
+    }
+
+    fn get_mut<T: Copy + Debug + PartialEq + Eq + Serialize>(x: &mut Never<T>) -> &mut T {
+        match *x {
+            Never::Never(i, _) => match i {},
+        }
+    }
 }
 
 /// A payload no value has: a one-row kind's in a bucket of more rows.
@@ -513,73 +538,6 @@ impl CudaStep<ManyRows> {
             Self::ExpertGateUpTcFp8(x) => CudaStep::ExpertGateUpTcFp8(x),
             Self::RmsNormQuantFp8(n) => n.never(),
             Self::AddRmsNormQuantFp8(n) => n.never(),
-        }
-    }
-}
-
-impl CudaStep {
-    /// The step as a bucket of more rows holds it; `None` for a one-row kind, which no such
-    /// bucket holds.
-    pub const fn narrow(self) -> Option<CudaStep<ManyRows>> {
-        match self {
-            Self::Embed(x) => Some(CudaStep::Embed(x)),
-            Self::Gemm(x) => Some(CudaStep::Gemm(x)),
-            Self::GemmNarrow(x) => Some(CudaStep::GemmNarrow(x)),
-            Self::Gemv(_) => None,
-            Self::RmsNorm(x) => Some(CudaStep::RmsNorm(x)),
-            Self::Add(x) => Some(CudaStep::Add(x)),
-            Self::SiluMul(x) => Some(CudaStep::SiluMul(x)),
-            Self::Rope(x) => Some(CudaStep::Rope(x)),
-            Self::GateSplit(x) => Some(CudaStep::GateSplit(x)),
-            Self::GateApply(x) => Some(CudaStep::GateApply(x)),
-            Self::RopeAppend(x) => Some(CudaStep::RopeAppend(x)),
-            Self::AttnPrefill(x) => Some(CudaStep::AttnPrefill(x)),
-            Self::AttnDecode(_) => None,
-            Self::GatedDeltaNet(x) => Some(CudaStep::GatedDeltaNet(x)),
-            Self::RouterLogits(x) => Some(CudaStep::RouterLogits(x)),
-            Self::MoeRoute(x) => Some(CudaStep::MoeRoute(x)),
-            Self::ExpertSort(x) => Some(CudaStep::ExpertSort(x)),
-            Self::ExpertSortFp8(x) => Some(CudaStep::ExpertSortFp8(x)),
-            Self::ExpertActQuant(x) => Some(CudaStep::ExpertActQuant(x)),
-            Self::ExpertGateUpGemmFp8(x) => Some(CudaStep::ExpertGateUpGemmFp8(x)),
-            Self::ExpertGemm(x) => Some(CudaStep::ExpertGemm(x)),
-            Self::ExpertGemmFp8(x) => Some(CudaStep::ExpertGemmFp8(x)),
-            Self::ExpertGemv(x) => Some(CudaStep::ExpertGemv(x)),
-            Self::ExpertGemvFp8(x) => Some(CudaStep::ExpertGemvFp8(x)),
-            Self::ExpertCombine(x) => Some(CudaStep::ExpertCombine(x)),
-            Self::GateScale(x) => Some(CudaStep::GateScale(x)),
-            Self::Scale(x) => Some(CudaStep::Scale(x)),
-            Self::RmsNormUnit(x) => Some(CudaStep::RmsNormUnit(x)),
-            Self::GeluMul(x) => Some(CudaStep::GeluMul(x)),
-            Self::LayerScale(x) => Some(CudaStep::LayerScale(x)),
-            Self::SoftCap(x) => Some(CudaStep::SoftCap(x)),
-            Self::GatherLastRow(x) => Some(CudaStep::GatherLastRow(x)),
-            Self::RouterNorm(x) => Some(CudaStep::RouterNorm(x)),
-            Self::GemmCol64(x) => Some(CudaStep::GemmCol64(x)),
-            Self::GemmGroup(x) => Some(CudaStep::GemmGroup(x)),
-            Self::GemmNarrowGroup(x) => Some(CudaStep::GemmNarrowGroup(x)),
-            Self::GemvGroup(x) => Some(CudaStep::GemvGroup(x)),
-            Self::AddRmsNorm(x) => Some(CudaStep::AddRmsNorm(x)),
-            Self::NormAdd(x) => Some(CudaStep::NormAdd(x)),
-            Self::GateUpAct(x) => Some(CudaStep::GateUpAct(x)),
-            Self::ExpertGateUpAct(x) => Some(CudaStep::ExpertGateUpAct(x)),
-            Self::ExpertGateUpActFp8(x) => Some(CudaStep::ExpertGateUpActFp8(x)),
-            Self::GdnDecode(x) => Some(CudaStep::GdnDecode(x)),
-            Self::QuantRowsFp8(x) => Some(CudaStep::QuantRowsFp8(x)),
-            Self::GemmFp8(x) => Some(CudaStep::GemmFp8(x)),
-            Self::GemmCol64Fp8(x) => Some(CudaStep::GemmCol64Fp8(x)),
-            Self::GemmNarrowFp8(x) => Some(CudaStep::GemmNarrowFp8(x)),
-            Self::GemvFp8(_) => None,
-            Self::GemmGroupFp8(x) => Some(CudaStep::GemmGroupFp8(x)),
-            Self::GemmNarrowGroupFp8(x) => Some(CudaStep::GemmNarrowGroupFp8(x)),
-            Self::GemvGroupFp8(x) => Some(CudaStep::GemvGroupFp8(x)),
-            Self::GemvTcFp8(_) => None,
-            Self::GemvGroupTcFp8(x) => Some(CudaStep::GemvGroupTcFp8(x)),
-            Self::GateUpTcFp8(x) => Some(CudaStep::GateUpTcFp8(x)),
-            Self::ExpertGemvTcFp8(x) => Some(CudaStep::ExpertGemvTcFp8(x)),
-            Self::ExpertGateUpTcFp8(x) => Some(CudaStep::ExpertGateUpTcFp8(x)),
-            Self::RmsNormQuantFp8(_) => None,
-            Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 }
@@ -4635,21 +4593,24 @@ const fn sort_layout(
     })
 }
 
-impl CudaStep {
+impl<B: BucketKind> CudaStep<B> {
     /// The weight index the step reads, for the compiler to rewrite (two indices naming one
     /// checkpoint tensor become one). Each arm is [`Self::extents`]' `weight`.
     pub fn weight_mut(&mut self) -> Option<&mut WeightIx> {
         match self {
             Self::Embed(EmbedBf16 { table, .. }) => Some(table),
+            // The one-row kinds, through their bucket's kind.
+            Self::Gemv(g) => Some(&mut B::get_mut(g).b),
+            Self::GemvFp8(g) => Some(&mut B::get_mut(g).b),
+            Self::GemvTcFp8(g) => Some(&mut B::get_mut(g).b),
+            Self::RmsNormQuantFp8(t) => Some(&mut B::get_mut(t).norm.gain),
+            Self::AddRmsNormQuantFp8(t) => Some(&mut B::get_mut(t).fold.norm.gain),
             Self::Gemm(GemmBf16 { b, .. })
             | Self::GemmCol64(GemmCol64Bf16 { b, .. })
             | Self::GemmNarrow(GemmNarrowBf16 { b, .. })
-            | Self::Gemv(GemvBf16 { b, .. })
             | Self::GemmFp8(GemmFp8 { b, .. })
             | Self::GemmCol64Fp8(GemmCol64Fp8 { b, .. })
-            | Self::GemmNarrowFp8(GemmNarrowFp8 { b, .. })
-            | Self::GemvFp8(GemvFp8 { b, .. })
-            | Self::GemvTcFp8(GemvTcFp8 { b, .. }) => Some(b),
+            | Self::GemmNarrowFp8(GemmNarrowFp8 { b, .. }) => Some(b),
             Self::RmsNorm(RmsNormBf16 { gain, .. })
             | Self::RouterNorm(RmsNormBf16 { gain, .. })
             | Self::AddRmsNorm(AddRmsNormBf16 {
@@ -4658,18 +4619,6 @@ impl CudaStep {
             })
             | Self::NormAdd(NormAddBf16 {
                 norm: RmsNormBf16 { gain, .. },
-                ..
-            })
-            | Self::RmsNormQuantFp8(RmsNormQuantFp8 {
-                norm: NormRowBf16 { gain, .. },
-                ..
-            })
-            | Self::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
-                fold:
-                    AddNormRowBf16 {
-                        norm: NormRowBf16 { gain, .. },
-                        ..
-                    },
                 ..
             }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),

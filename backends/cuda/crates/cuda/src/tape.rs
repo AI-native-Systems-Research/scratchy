@@ -480,20 +480,6 @@ pub enum TapeSteps {
 }
 
 impl TapeSteps {
-    /// `steps` as a bucket of `bucket_m` rows holds them, leaked to `'static` (a tape's steps are
-    /// static data: the emitter's, and a test's); `None` when a bucket of more than one row is
-    /// given a one-row kind.
-    pub fn leaked(bucket_m: BucketM, steps: &[CudaStep]) -> Option<Self> {
-        if bucket_m == BucketM(1) {
-            return Some(Self::OneRow(Box::leak(steps.to_vec().into_boxed_slice())));
-        }
-        let rows: Option<Vec<CudaStep<ManyRows>>> = steps.iter().map(|s| s.narrow()).collect();
-        Some(Self::Rows {
-            bucket_m,
-            steps: Box::leak(rows?.into_boxed_slice()),
-        })
-    }
-
     /// The bucket's token count `M`.
     pub const fn bucket_m(self) -> BucketM {
         match self {
@@ -2619,7 +2605,9 @@ mod tests {
         GemmBf16, KvUse, MoeRouteBf16, NormKernel, RmsNormBf16, RopeAppendBf16, RopeBf16,
         RopePairing, RouteProgram, WeightRead,
     };
-    use crate::step::{AttnScale, ConvDim, GdnLayout, RmsNormEps, Scale, SoftCap};
+    use crate::step::{
+        AttnScale, BucketKind, ConvDim, GdnLayout, OneRow, RmsNormEps, Scale, SoftCap,
+    };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
         ArenaSpan {
@@ -2675,20 +2663,23 @@ mod tests {
         greedy: None,
     };
 
-    /// [`GOOD_STEPS`] as a tape's steps read.
-    fn good_steps() -> Vec<CudaStep> {
-        GOOD_STEPS.iter().map(|s| s.widen()).collect()
+    /// `steps` as [`GOOD`]'s bucket of 256 rows holds them.
+    fn rows(steps: &[CudaStep<ManyRows>]) -> TapeSteps {
+        TapeSteps::Rows {
+            bucket_m: GOOD.bucket_m(),
+            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+        }
     }
 
     /// `GOOD` with its steps replaced by `step` alone.
-    fn with_step(step: CudaStep) -> CudaTape {
+    fn with_step(step: CudaStep<ManyRows>) -> CudaTape {
         CudaTape {
-            steps: TapeSteps::leaked(GOOD.bucket_m(), &[step]).expect("a bucket\'s kinds"),
+            steps: rows(&[step]),
             ..GOOD
         }
     }
 
-    fn gemm(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> CudaStep {
+    fn gemm<B: BucketKind>(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> CudaStep<B> {
         CudaStep::Gemm(GemmBf16 {
             a: ArenaOffset(a),
             b: WeightIx(b),
@@ -2709,7 +2700,7 @@ mod tests {
     const TOKENS: u64 = 1310720;
     const VOCAB: u32 = 100;
 
-    fn embed_step(tokens: u64, rows: u32, vocab: u32) -> CudaStep {
+    fn embed_step<B: BucketKind>(tokens: u64, rows: u32, vocab: u32) -> CudaStep<B> {
         CudaStep::Embed(EmbedBf16 {
             tokens: ArenaOffset(tokens),
             table: WeightIx(0),
@@ -2720,7 +2711,7 @@ mod tests {
         })
     }
 
-    fn token_tape(steps: &[CudaStep]) -> CudaTape {
+    fn token_tape(steps: &[CudaStep<ManyRows>]) -> CudaTape {
         CudaTape {
             arena: ArenaLayout {
                 total_bytes: TOKENS + 1024,
@@ -2731,12 +2722,12 @@ mod tests {
                 vocab: VocabSize(VOCAB),
             },
             weight_bytes: &[102400, 1048576, 2048],
-            steps: TapeSteps::leaked(GOOD.bucket_m(), steps).expect("a bucket's kinds"),
+            steps: rows(steps),
             ..GOOD
         }
     }
 
-    fn embedded(rest: &[CudaStep]) -> CudaTape {
+    fn embedded(rest: &[CudaStep<ManyRows>]) -> CudaTape {
         let mut steps = vec![embed_step(TOKENS, 256, VOCAB)];
         steps.extend_from_slice(rest);
         token_tape(&steps)
@@ -2744,7 +2735,7 @@ mod tests {
 
     #[test]
     fn a_token_id_tape_validates() {
-        assert_eq!(embedded(&good_steps()).validate(), Ok(()));
+        assert_eq!(embedded(GOOD_STEPS).validate(), Ok(()));
         let e = embed_step(TOKENS, 256, VOCAB)
             .extents()
             .expect("the embed's extents");
@@ -2768,7 +2759,7 @@ mod tests {
     #[test]
     fn a_token_id_tape_starts_with_its_embed() {
         assert_eq!(
-            token_tape(&good_steps()).validate(),
+            token_tape(GOOD_STEPS).validate(),
             Err(TapeError::EmbedMissing { first: Some(0) })
         );
         assert_eq!(
@@ -2785,7 +2776,7 @@ mod tests {
             Err(TapeError::EmbedMisplaced { step: 0 })
         );
         let mut steps = vec![embed_step(TOKENS, 256, VOCAB)];
-        steps.extend(good_steps());
+        steps.extend_from_slice(GOOD_STEPS);
         steps.push(embed_step(TOKENS, 256, VOCAB));
         assert_eq!(
             token_tape(&steps).validate(),
@@ -2826,7 +2817,7 @@ mod tests {
                     span: input_span,
                     vocab: VocabSize(vocab),
                 },
-                ..embedded(&good_steps())
+                ..embedded(GOOD_STEPS)
             };
             assert_eq!(
                 t.validate(),
@@ -2859,7 +2850,7 @@ mod tests {
     fn an_embed_table_declared_short_is_refused() {
         let t = CudaTape {
             weight_bytes: &[102400 - 2, 1048576, 2048],
-            ..embedded(&good_steps())
+            ..embedded(GOOD_STEPS)
         };
         assert_eq!(
             t.validate(),
@@ -3024,7 +3015,7 @@ mod tests {
     }
 
     /// A soft-cap over `[256, 1024]` at colour 1 (`[262144, 786432)`), writing at `out`.
-    fn soft_cap(out: u64) -> CudaStep {
+    fn soft_cap<B: BucketKind>(out: u64) -> CudaStep<B> {
         CudaStep::SoftCap(crate::step::SoftCapBf16 {
             x: ArenaOffset(262144),
             out: ArenaOffset(out),
@@ -3206,7 +3197,7 @@ mod tests {
 
     /// A 64-token rope over `[64, 2048]` reading `x` from colour 1, the table from the arena's
     /// last 8192 bytes, and writing colour 2.
-    fn rope(table: u64) -> CudaStep {
+    fn rope<B: BucketKind>(table: u64) -> CudaStep<B> {
         CudaStep::Rope(RopeBf16 {
             x: ArenaOffset(262144),
             table: ArenaOffset(table),
@@ -3223,8 +3214,7 @@ mod tests {
     #[test]
     fn a_rope_reads_its_table() {
         let t = CudaTape {
-            steps: TapeSteps::leaked(GOOD.bucket_m(), &[rope(TABLE_AT)])
-                .expect("a bucket\'s kinds"),
+            steps: rows(&[rope(TABLE_AT)]),
             ..with_rotary(TABLE_AT, TABLE)
         };
         assert_eq!(t.validate(), Ok(()));
@@ -3243,8 +3233,7 @@ mod tests {
     #[test]
     fn rotary_mismatch() {
         let t = CudaTape {
-            steps: TapeSteps::leaked(GOOD.bucket_m(), &[rope(TABLE_AT - 256)])
-                .expect("a bucket\'s kinds"),
+            steps: rows(&[rope(TABLE_AT - 256)]),
             ..with_rotary(TABLE_AT, TABLE)
         };
         assert_eq!(
@@ -3278,7 +3267,7 @@ mod tests {
 
     /// `k [256, 512]` at 262144 and `v` at 524288 (colour 1's halves), rotated K into colour 2,
     /// written to KV layer `layer`.
-    fn rope_append(layer: u32, slot_mapping: u64) -> CudaStep {
+    fn rope_append<B: BucketKind>(layer: u32, slot_mapping: u64) -> CudaStep<B> {
         CudaStep::RopeAppend(RopeAppendBf16 {
             k: ArenaOffset(262144),
             v: ArenaOffset(524288),
@@ -3297,7 +3286,7 @@ mod tests {
     }
 
     /// `q [256, 2 · 256]` at 262144 over KV layer 0, into colour 2.
-    fn attn(block_table: u64, sequence: u64, kv_heads: u32) -> CudaStep {
+    fn attn<B: BucketKind>(block_table: u64, sequence: u64, kv_heads: u32) -> CudaStep<B> {
         CudaStep::AttnPrefill(AttnPrefillBf16 {
             q: ArenaOffset(262144),
             block_table: ArenaOffset(block_table),
@@ -3331,13 +3320,13 @@ mod tests {
     };
 
     /// `GOOD`'s colours with the rotary table and the three KV regions after them, and `steps`.
-    fn kv_tape(kv: KvTape, steps: &[CudaStep]) -> CudaTape {
+    fn kv_tape(kv: KvTape, steps: &[CudaStep<ManyRows>]) -> CudaTape {
         CudaTape {
             arena: ArenaLayout {
                 total_bytes: KV_TOTAL,
                 ..GOOD.arena
             },
-            steps: TapeSteps::leaked(GOOD.bucket_m(), steps).expect("a bucket's kinds"),
+            steps: rows(steps),
             rotary: Some(RotaryTable {
                 span: span(KV_ROTARY, TABLE),
                 rot_dim: RotDim(64),
@@ -3353,7 +3342,7 @@ mod tests {
     fn a_kv_tape_validates() {
         let steps = [rope_append(0, KV_SLOTS), attn(KV_TABLE, KV_SEQ, 2)];
         assert_eq!(kv_tape(KV, &steps).validate(), Ok(()));
-        let [Some(e0), Some(e1)] = steps.map(|s| s.extents()) else {
+        let [Some(e0), Some(e1)] = steps.map(|s| s.widen().extents()) else {
             panic!("both steps' extents fit u64");
         };
         assert_eq!(e0.kv, Some((0, KvUse::Write)));
@@ -3557,7 +3546,7 @@ mod tests {
     }
 
     /// A split of `qg [64, 2048]` at 0 into `q [64, 1024]` at 262144 and the gate at `gate`.
-    fn gate_split(gate: u64) -> CudaStep {
+    fn gate_split<B: BucketKind>(gate: u64) -> CudaStep<B> {
         CudaStep::GateSplit(GateSplitBf16 {
             qg: ArenaOffset(0),
             q: ArenaOffset(262144),
@@ -3657,12 +3646,12 @@ mod tests {
         }
     }
 
-    fn good_gdn_step() -> CudaStep {
+    fn good_gdn_step<B: BucketKind>() -> CudaStep<B> {
         CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(0, GDN_SEQ, GDN_SCRATCH)))
     }
 
     /// The GDN tape of `gdn` and `steps`.
-    fn gdn_tape(gdn: Option<GdnTape>, steps: &[CudaStep]) -> CudaTape {
+    fn gdn_tape(gdn: Option<GdnTape>, steps: &[CudaStep<ManyRows>]) -> CudaTape {
         CudaTape {
             arena: ArenaLayout {
                 colour_bytes: &[36864, 4096, 128, 128, 4096],
@@ -3672,7 +3661,10 @@ mod tests {
             input: TapeInput::Hidden(span(0, 36864)),
             result: span(41472, 4096),
             weight_bytes: &[0, GDN_BUNDLE_BYTES],
-            steps: TapeSteps::leaked(BucketM(64), steps).expect("a bucket's kinds"),
+            steps: TapeSteps::Rows {
+                bucket_m: BucketM(64),
+                steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            },
             rotary: None,
             kv: None,
             gdn,
@@ -4270,14 +4262,14 @@ mod tests {
     fn the_embed_writes_exactly_colour_0() {
         let elsewhere = CudaStep::Embed(EmbedBf16 {
             out: ArenaOffset(262144),
-            ..match embed_step(TOKENS, 256, VOCAB) {
+            ..match embed_step::<ManyRows>(TOKENS, 256, VOCAB) {
                 CudaStep::Embed(e) => e,
                 _ => unreachable!("an embed"),
             }
         });
         let narrow = CudaStep::Embed(EmbedBf16 {
             hidden: HiddenSize(256),
-            ..match embed_step(TOKENS, 256, VOCAB) {
+            ..match embed_step::<ManyRows>(TOKENS, 256, VOCAB) {
                 CudaStep::Embed(e) => e,
                 _ => unreachable!("an embed"),
             }
@@ -4367,7 +4359,7 @@ mod tests {
     /// one-row bucket, by its types).
     #[test]
     fn a_decode_attention_is_one_row_of_a_one_row_bucket() {
-        let decode = |kv_heads| match attn(KV_TABLE, KV_SEQ, kv_heads) {
+        let decode = |kv_heads| match attn::<OneRow>(KV_TABLE, KV_SEQ, kv_heads) {
             CudaStep::AttnPrefill(a) => CudaStep::AttnDecode(
                 AttnDecodeBf16::of(AttnRowBf16 {
                     q: a.q,
@@ -4690,7 +4682,7 @@ mod tests {
     /// `KvStepGeometry`.
     #[test]
     fn a_kv_step_has_its_layers_class() {
-        let append = |cols, head_dim| match rope_append(0, KV_SLOTS) {
+        let append = |cols, head_dim| match rope_append::<ManyRows>(0, KV_SLOTS) {
             CudaStep::RopeAppend(r) => CudaStep::RopeAppend(RopeAppendBf16 {
                 cols,
                 head_dim,
@@ -4698,7 +4690,8 @@ mod tests {
             }),
             _ => unreachable!(),
         };
-        let attend = |kv_heads, head_dim, window| match attn(KV_TABLE, KV_SEQ, kv_heads) {
+        let attend = |kv_heads, head_dim, window| match attn::<ManyRows>(KV_TABLE, KV_SEQ, kv_heads)
+        {
             CudaStep::AttnPrefill(a) => CudaStep::AttnPrefill(AttnPrefillBf16 {
                 head_dim,
                 window,
@@ -4778,7 +4771,7 @@ mod tests {
         };
         let two = CudaTape {
             rotary_local: Some(local(at)),
-            steps: TapeSteps::leaked(GOOD.bucket_m(), &[rope(at)]).expect("a bucket\'s kinds"),
+            steps: rows(&[rope(at)]),
             ..grown(with_rotary(TABLE_AT, TABLE))
         };
         assert_eq!(two.validate(), Ok(()));
@@ -4789,7 +4782,7 @@ mod tests {
         assert_eq!(alone.validate(), Err(TapeError::KvClasses));
         let over = CudaTape {
             rotary_local: Some(local(TABLE_AT)),
-            steps: TapeSteps::leaked(GOOD.bucket_m(), &[]).expect("a bucket's kinds"),
+            steps: rows(&[]),
             ..two
         };
         assert_eq!(
@@ -4801,7 +4794,7 @@ mod tests {
         );
         let outside = CudaTape {
             rotary_local: Some(local(ROTARY_TOTAL + TABLE)),
-            steps: TapeSteps::leaked(GOOD.bucket_m(), &[]).expect("a bucket's kinds"),
+            steps: rows(&[]),
             ..two
         };
         assert!(

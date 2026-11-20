@@ -11,9 +11,9 @@
 
 use scratchy_target_cuda::step::AttnRowBf16;
 use scratchy_target_cuda::step::{
-    AttnWindow, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, GdnLayout, HeadDim, HiddenSize,
-    KDim, LayerId, NDim, NTile, NumExperts, NumKvHeads, NumQHeads, RotDim, Rows, TopK, VocabSize,
-    gdn_bundle,
+    AttnWindow, BucketKind, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, GdnLayout, HeadDim,
+    HiddenSize, KDim, LayerId, ManyRows, NDim, NTile, NumExperts, NumKvHeads, NumQHeads, OneRow,
+    RotDim, Rows, TopK, VocabSize, gdn_bundle,
 };
 use scratchy_target_cuda::step::{
     ExpertGateUpActFp8, ExpertGateUpGemvFp8, ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8,
@@ -110,16 +110,16 @@ pub struct TapeStep<'a> {
 /// Lower the op of one kept `Compute` on the tape to its CUDA step, or to none for a view.
 /// `computes` is every `Compute` of the tape, in which a `GateApply` finds its gate's `GateSplit`
 /// and an attention its layer's `RopeAppend`.
-pub fn lower_step(
+pub fn lower_step<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     computes: &[TapeStep<'_>],
-) -> Result<Option<CudaStep>, CanonicalRefusal> {
+) -> Result<Option<CudaStep<B>>, CanonicalRefusal> {
     use EwKind as E;
     use SubOp as L;
     let op = &s.node.op;
     let step = match op {
-        L::MatmulTile { n, weight } => gemm(cx, s, *n, *weight, computes),
+        L::MatmulTile { n, weight } => gemm::<B>(cx, s, *n, *weight, computes),
         L::RmsNorm { eps, gain } => rms_norm(cx, s, *eps, *gain).map(CudaStep::RmsNorm),
         L::Elementwise(E::Add) => add(cx, s).map(CudaStep::Add),
         L::Reshape { .. } => return view(cx, s).map(|()| None),
@@ -144,7 +144,7 @@ pub fn lower_step(
         .map(CudaStep::RopeAppend),
         L::AttnDecode {
             attention, mask, ..
-        } => attention_step(
+        } => attention_step::<B>(
             cx,
             s,
             attention.class(mask.class()),
@@ -174,8 +174,8 @@ pub fn lower_step(
             k,
             weight,
             bundle,
-        } => expert_matmul(cx, s, (*proj, *n, k.get()), (*weight, *bundle), computes),
-        L::ExpertGatedAct { act } => expert_gated_act(cx, s, *act, computes),
+        } => expert_matmul::<B>(cx, s, (*proj, *n, k.get()), (*weight, *bundle), computes),
+        L::ExpertGatedAct { act } => expert_gated_act::<B>(cx, s, *act, computes),
         L::ExpertUnsort => return expert_unsort(cx, s, computes).map(|()| None),
         L::ExpertCombine { hidden, shared } => {
             expert_combine(cx, s, *hidden, shared.0.is_some(), computes)
@@ -262,12 +262,12 @@ pub fn lower_step(
 /// `[vocab, hidden]` bf16 `table` by the `rows` u32 token ids at `tokens`. Not lowered from a tape
 /// op: the shared tape's first ops read the embedded hidden as a source, which this step fills.
 /// The shape rule is the launcher's ([`EMBED_BF16_COLS`]), stated at expansion.
-pub fn embed(
+pub fn embed<B: Lower>(
     tokens: ArenaOffset,
     table: WeightIx,
     out: ArenaOffset,
     (rows, hidden, vocab): (u32, u32, u32),
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let refuse = |rule| CanonicalRefusal::EmbedShape {
         rows,
         hidden,
@@ -303,25 +303,25 @@ pub fn embed(
 
 /// Lower the `Compute` driving `fusion` to the fused kernel's CUDA step. `computes` is every
 /// `Compute` of the tape, in which a fold's absorbed steps are found by the slots its shape names.
-pub fn lower_fused(
+pub fn lower_fused<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     fusion: &Fusion<CudaFusion>,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     match fusion.kernel {
         CudaFusion::SiluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
         CudaFusion::GeluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::GeluMul),
         CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
-        CudaFusion::SiblingMatmuls => sibling_matmuls(cx, s, fusion.shape, computes, false),
-        CudaFusion::SiblingMatvecs => sibling_matmuls(cx, s, fusion.shape, computes, true),
-        CudaFusion::AddRmsNorm => add_rms_norm(cx, s, fusion.shape, computes),
-        CudaFusion::NormAdd => norm_add(cx, s, fusion.shape, computes),
-        CudaFusion::GateUpSiluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Silu),
-        CudaFusion::GateUpGeluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Gelu),
-        CudaFusion::ExpertGateUpAct => expert_gate_up_act(cx, s, fusion.shape, computes),
+        CudaFusion::SiblingMatmuls => sibling_matmuls::<B>(cx, s, fusion.shape, computes, false),
+        CudaFusion::SiblingMatvecs => sibling_matmuls::<B>(cx, s, fusion.shape, computes, true),
+        CudaFusion::AddRmsNorm => add_rms_norm::<B>(cx, s, fusion.shape, computes),
+        CudaFusion::NormAdd => norm_add::<B>(cx, s, fusion.shape, computes),
+        CudaFusion::GateUpSiluMul => gate_up_act::<B>(cx, s, fusion.shape, computes, GatedOp::Silu),
+        CudaFusion::GateUpGeluMul => gate_up_act::<B>(cx, s, fusion.shape, computes, GatedOp::Gelu),
+        CudaFusion::ExpertGateUpAct => expert_gate_up_act::<B>(cx, s, fusion.shape, computes),
         CudaFusion::RopeAppendSibling | CudaFusion::RopeAppendNormed => {
-            rope_append_folded(cx, s, computes).map(CudaStep::RopeAppend)
+            rope_append_folded::<B>(cx, s, computes).map(CudaStep::RopeAppend)
         }
         // A one-row matvec's residual add is no command of its own: [`lower_driver`] lowers the
         // matvec, whose lowering reads it ([`folded_residual`]).
@@ -338,7 +338,7 @@ pub fn lower_fused(
 /// and `v` become the raw projections, the gains [`RopeAppendBf16::norms`]). Each absorbed step is
 /// lowered as the step it is on its own and must match: head views of the step's head dim, the
 /// stored gain convention and one `eps`.
-fn rope_append_folded(
+fn rope_append_folded<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     computes: &[TapeStep<'_>],
@@ -350,13 +350,14 @@ fn rope_append_folded(
         _ => None,
     });
     let q_rope = match sibling {
-        Some(sibling) => match lower_step(cx, absorbed_step(s, sibling, computes)?, computes)? {
+        Some(sibling) => match lower_step::<B>(cx, absorbed_step(s, sibling, computes)?, computes)?
+        {
             Some(CudaStep::Rope(q)) => Some(q),
             Some(_) | None => return Err(refused()),
         },
         None => None,
     };
-    let Some(CudaStep::RopeAppend(mut r)) = lower_step(cx, s, computes)? else {
+    let Some(CudaStep::RopeAppend(mut r)) = lower_step::<B>(cx, s, computes)? else {
         return Err(refused());
     };
     for f in cx.folds.driven(s.writes) {
@@ -386,8 +387,8 @@ fn rope_append_folded(
                 let (Some(qg), Some(kg)) = (q_gain, k_gain) else {
                     return Err(refused());
                 };
-                let lowered = |slot: SlotId| -> Result<Option<CudaStep>, CanonicalRefusal> {
-                    lower_step(cx, absorbed_step(s, slot, computes)?, computes)
+                let lowered = |slot: SlotId| -> Result<Option<CudaStep<B>>, CanonicalRefusal> {
+                    lower_step::<B>(cx, absorbed_step(s, slot, computes)?, computes)
                 };
                 let (Some(CudaStep::RmsNorm(qn)), Some(CudaStep::RmsNorm(kn))) =
                     (lowered(qg.step)?, lowered(kg.step)?)
@@ -402,7 +403,7 @@ fn rope_append_folded(
                 let (Some(unit), None) = (units.next(), units.next()) else {
                     return Err(refused());
                 };
-                let Some(CudaStep::RmsNormUnit(vn)) = lower_step(cx, unit, computes)? else {
+                let Some(CudaStep::RmsNormUnit(vn)) = lower_step::<B>(cx, unit, computes)? else {
                     return Err(refused());
                 };
                 let Some(rq) = r.q.as_mut() else {
@@ -445,12 +446,12 @@ fn rope_append_folded(
 /// Lower a `Compute` that drives the folds `driven` (in the order they were applied): the last
 /// that is a command of its own through [`lower_fused`], or, when every one is a one-row matvec's
 /// residual epilogue (FP8 S8 W4a), the step itself through [`lower_step`], which reads it.
-pub fn lower_driver(
+pub fn lower_driver<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     driven: &[Fusion<CudaFusion>],
     computes: &[TapeStep<'_>],
-) -> Result<Option<CudaStep>, CanonicalRefusal> {
+) -> Result<Option<CudaStep<B>>, CanonicalRefusal> {
     let end = |f: &&Fusion<CudaFusion>| {
         matches!(
             f.kernel,
@@ -458,8 +459,8 @@ pub fn lower_driver(
         )
     };
     match driven.iter().rfind(|f| !end(f)) {
-        Some(f) => lower_fused(cx, s, f, computes).map(Some),
-        None => lower_step(cx, s, computes),
+        Some(f) => lower_fused::<B>(cx, s, f, computes).map(Some),
+        None => lower_step::<B>(cx, s, computes),
     }
 }
 
@@ -467,7 +468,7 @@ pub fn lower_driver(
 /// `MatvecEpilogue` with an add and no other stage), lowered as the step it is on its own: its `a`
 /// is the matvec's output, its `b` the residual, its `out` what the matvec writes. `None` when
 /// `s` took no epilogue.
-fn folded_residual(
+fn folded_residual<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     computes: &[TapeStep<'_>],
@@ -494,7 +495,7 @@ fn folded_residual(
     ) else {
         return Err(refused());
     };
-    match lower_step(cx, absorbed_step(s, add, computes)?, computes)? {
+    match lower_step::<B>(cx, absorbed_step(s, add, computes)?, computes)? {
         Some(CudaStep::Add(a)) => Ok(Some(a)),
         Some(_) | None => Err(refused()),
     }
@@ -505,13 +506,13 @@ fn folded_residual(
 /// ([`lower_step`], [`gated_mul`]), as one launch. Both projections must have lowered to the same
 /// GEMM kernel (the tiled, 64-column or GEMV one) over one `a`, `m`, `n` and `k`, and the
 /// activation must read their outputs; anything else is refused, never split apart.
-fn gate_up_act(
+fn gate_up_act<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
     computes: &[TapeStep<'_>],
     act: GatedOp,
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let step = s.step;
     let FusedShape::Gated {
         activation,
@@ -528,9 +529,10 @@ fn gate_up_act(
         up: None,
     };
     let mul = gated_mul(cx, s, split, computes)?;
-    let lowered = |g: &TapeStep<'_>| lower_step(cx, g, computes)?.ok_or_else(refused);
-    let gate_step = lowered(absorbed_step(s, gate, computes)?)?;
-    let up_step = lowered(absorbed_step(s, up, computes)?)?;
+    let lowered = |g: &TapeStep<'_>| lower_step::<B>(cx, g, computes)?.ok_or_else(refused);
+    // Read as a one-row bucket's steps: a GEMV pair is only ever a one-row bucket's.
+    let gate_step = B::widen(lowered(absorbed_step(s, gate, computes)?)?);
+    let up_step = B::widen(lowered(absorbed_step(s, up, computes)?)?);
     // Both projections on one kernel (a GEMV's at one split): the pair as that kernel's payloads.
     let proj = match (gate_step, up_step) {
         (CudaStep::Gemm(gate), CudaStep::Gemm(up)) => GateUpProj::Gemm { gate, up },
@@ -567,23 +569,23 @@ fn gate_up_act(
 /// and up `ExpertMatmul`s its shape names, each lowered as the step it is on its own, as one
 /// launch. Both must be the gathered expert GEMV over the token rows, of one bundle layout and
 /// geometry, and the activation SwiGLU or GeGLU over their regions.
-fn expert_gate_up_act(
+fn expert_gate_up_act<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let step = s.step;
     let FusedShape::ExpertGated { gate, up } = shape else {
         return Err(CanonicalRefusal::FusionShape { step });
     };
     let refused = || CanonicalRefusal::FusionShape { step };
-    let (act, mul) = match lower_step(cx, s, computes)? {
+    let (act, mul) = match lower_step::<B>(cx, s, computes)? {
         Some(CudaStep::SiluMul(m)) => (GatedOp::Silu, m),
         Some(CudaStep::GeluMul(m)) => (GatedOp::Gelu, m),
         Some(_) | None => return Err(refused()),
     };
-    let lowered = |g: &TapeStep<'_>| lower_step(cx, g, computes)?.ok_or_else(refused);
+    let lowered = |g: &TapeStep<'_>| lower_step::<B>(cx, g, computes)?.ok_or_else(refused);
     let gate = lowered(absorbed_step(s, gate, computes)?)?;
     let up = lowered(absorbed_step(s, up, computes)?)?;
     // Each may read its own weight (a fixture's gate and up are two sources until the weight
@@ -638,12 +640,12 @@ fn expert_gate_up_act(
 /// The `AddRmsNorm` fold (#1049): the driving `RmsNorm` and the `Add` its shape names, each
 /// lowered as the step it is on its own ([`lower_step`]), as one launch writing both. The norm
 /// must read the add's output whole: anything else is refused, never split apart.
-fn add_rms_norm(
+fn add_rms_norm<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let step = s.step;
     let FusedShape::ResidualNorm { add: slot } = shape else {
         return Err(CanonicalRefusal::FusionShape { step });
@@ -651,8 +653,8 @@ fn add_rms_norm(
     let refused = || CanonicalRefusal::FusionShape { step };
     let add_step = absorbed_step(s, slot, computes)?;
     let (Some(CudaStep::RmsNorm(norm)), Some(CudaStep::Add(add))) = (
-        lower_step(cx, s, computes)?,
-        lower_step(cx, add_step, computes)?,
+        lower_step::<B>(cx, s, computes)?,
+        lower_step::<B>(cx, add_step, computes)?,
     ) else {
         return Err(refused());
     };
@@ -670,12 +672,12 @@ fn add_rms_norm(
 /// The `NormAdd` fold (#1049): the driving `Add` and the `RmsNorm` its shape names, each lowered
 /// as the step it is on its own, as one launch: the norm's output is the add's, and the add's
 /// other operand its residual. The add must read the norm's output whole.
-fn norm_add(
+fn norm_add<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let step = s.step;
     let FusedShape::NormAdd { norm: slot, .. } = shape else {
         return Err(CanonicalRefusal::FusionShape { step });
@@ -683,8 +685,8 @@ fn norm_add(
     let refused = || CanonicalRefusal::FusionShape { step };
     let norm_step = absorbed_step(s, slot, computes)?;
     let (Some(CudaStep::Add(add)), Some(CudaStep::RmsNorm(norm))) = (
-        lower_step(cx, s, computes)?,
-        lower_step(cx, norm_step, computes)?,
+        lower_step::<B>(cx, s, computes)?,
+        lower_step::<B>(cx, norm_step, computes)?,
     ) else {
         return Err(refused());
     };
@@ -718,13 +720,13 @@ fn absorbed_step<'c, 'a>(
 /// ([`CudaFusion::SiblingMatvecs`], the one-row bucket's row, FP8 S8 W4b): a one-row bf16 narrow
 /// group launches as the GEMV group, each member under the GEMV's rule ([`gemv_shape`]); a lone
 /// narrow GEMM keeps its kernel.
-fn sibling_matmuls(
+fn sibling_matmuls<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
     computes: &[TapeStep<'_>],
     matvecs: bool,
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let step = s.step;
     let FusedShape::SiblingMatmuls { slots } = shape else {
         return Err(CanonicalRefusal::FusionShape { step });
@@ -742,7 +744,7 @@ fn sibling_matmuls(
     let refused = || CanonicalRefusal::FusionShape { step };
     let lowered = (members.iter())
         .map(|m| {
-            (lower_step(cx, m, computes)?.as_ref())
+            (lower_step::<B>(cx, m, computes)?.map(B::widen).as_ref())
                 .and_then(CudaStep::group_kind)
                 .ok_or_else(refused)
         })
@@ -826,13 +828,13 @@ fn sibling_matmuls(
 /// The IR states the weight as `[K, N]`; the bytes are the checkpoint's `[N, K]`, which is what
 /// both kernels take (metal's `gemm.metal` the same). So `k` is the weight's IR rows (as metal's
 /// `steps_from_tape::matmul` reads it), `n` the op's, and `m` the output's rows.
-fn gemm(
+fn gemm<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     n: u32,
     weight: GemmWeight,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
     // An fp8 weight's third operand is its per-channel scale, `[1, n]`. A block-scaled kind
     // (`GemmWeight::Fp8Block`) would get its own arm here, its scale `[n/bn, k/bk]`, and
@@ -856,8 +858,8 @@ fn gemm(
     };
     let k = cx.graph.shape(wt.tensor).rows;
     let kernel = match weight {
-        GemmWeight::Dense => gemm_kernel(m, n, k),
-        GemmWeight::Fp8Dynamic => gemm_fp8_kernel(m, n, k),
+        GemmWeight::Dense => gemm_kernel::<B>(m, n, k),
+        GemmWeight::Fp8Dynamic => gemm_fp8_kernel::<B>(m, n, k),
         GemmWeight::Affine { .. } => {
             return Err(CanonicalRefusal::GemmWeight {
                 step,
@@ -890,11 +892,9 @@ fn gemm(
     });
     // FP8 S8 W4a: the residual add it folded writes the add's output (`a` the matvec's, `b` the
     // residual), of the matvec's one row, on the one-row GEMVs only.
-    if let Some(add) = folded_residual(cx, s, computes)? {
-        let (c, residual) = match &mut lowered {
-            CudaStep::Gemv(g) => (&mut g.c, &mut g.residual),
-            CudaStep::GemvFp8(g) => (&mut g.c, &mut g.residual),
-            _ => return Err(CanonicalRefusal::FusionShape { step }),
+    if let Some(add) = folded_residual::<B>(cx, s, computes)? {
+        let Some((c, residual)) = B::residual(&mut lowered) else {
+            return Err(CanonicalRefusal::FusionShape { step });
         };
         if (add.a, add.rows, add.cols) != (*c, Rows(1), Cols(n)) {
             return Err(CanonicalRefusal::FusionShape { step });
@@ -1372,14 +1372,14 @@ fn window_rule(
 /// `PrefixK` and `PrefixV`; operand 3 that layer's `RopeAppend` and operand 4 the V it read. Both
 /// kernels read K and V from the cache the `RopeAppend` wrote, not from operands 3 and 4, which
 /// stay live up to here because the IR says the attention reads them.
-fn attention_step(
+fn attention_step<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     geom: HeadGeometry,
     scale: f32,
     mask: AttnMask,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
     let op = node.op.name();
     let rows = cx.graph.shape(node.output.tensor).rows;
@@ -1496,35 +1496,17 @@ fn attention_step(
         scale: AttnScale::new(scale),
         window: (cx.facts.window(class)).map(AttnWindow),
     };
-    match rows {
-        // A decode bucket's attention at its head dim's split over keys (W6b).
-        1 => {
-            // The one row the decode attention computes.
-            let row = AttnRowBf16 {
-                q: attn.q,
-                block_table: attn.block_table,
-                sequence: attn.sequence,
-                out: attn.out,
-                layer: attn.layer,
-                q_heads: attn.q_heads,
-                kv_heads: attn.kv_heads,
-                head_dim: attn.head_dim,
-                scale: attn.scale,
-                window: attn.window,
-            };
-            AttnDecodeBf16::of(row)
-                .map(CudaStep::AttnDecode)
-                .ok_or(CanonicalRefusal::AttnShape {
-                    step,
-                    rows,
-                    head_dim,
-                    rule: AttnShapeRule::HeadDim {
-                        want: g.head_dim().get(),
-                    },
-                })
-        }
-        _ => Ok(CudaStep::AttnPrefill(attn)),
-    }
+    B::attention(
+        attn,
+        CanonicalRefusal::AttnShape {
+            step,
+            rows,
+            head_dim,
+            rule: AttnShapeRule::HeadDim {
+                want: g.head_dim().get(),
+            },
+        },
+    )
 }
 
 /// The model layer of a `GatedDeltaNet`'s weight bundle (operand 4): a `SourceBinding::Weight`
@@ -2324,13 +2306,13 @@ fn expert_sort(
 /// `ExpertGatedAct`); operand 1 is the sort, whose picks name each pair's expert. A sorted
 /// bucket's grouped GEMM over the expert-padded tiles; a gathered bucket's expert GEMV, the gate
 /// and up reading each pair's token row of the sort's `x`.
-fn expert_matmul(
+fn expert_matmul<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     (proj, n, top_k): (ExpertProj, u32, u32),
     (weight, bundle): (ExpertWeight, ExpertBundle),
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
     if let ExpertWeight::Affine(_) = weight {
         return Err(moe_refusal(s, MoeShapeRule::Affine));
     }
@@ -2455,13 +2437,13 @@ fn expert_matmul(
 /// the MoE scratch's rows: `act(gate) · up` from the gate and up projections (operands 0 and 1)
 /// into the activation rows, every row of the regions (a sorted bucket's padding rows hold `+0.0`,
 /// its rows past the live tiles stale data no step reads). Any other activation is refused.
-fn expert_gated_act(
+fn expert_gated_act<B: Lower>(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     act: GatedAct,
     computes: &[TapeStep<'_>],
-) -> Result<CudaStep, CanonicalRefusal> {
-    let kernel: fn(SiluMulBf16) -> CudaStep = match act {
+) -> Result<CudaStep<B>, CanonicalRefusal> {
+    let kernel: fn(SiluMulBf16) -> CudaStep<B> = match act {
         GatedAct::Silu => CudaStep::SiluMul,
         GatedAct::Gelu => CudaStep::GeluMul,
         _ => return Err(moe_refusal(s, MoeShapeRule::Activation)),
@@ -2657,6 +2639,138 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
     Ok(())
 }
 
+/// What lowering a bucket of one kind takes ([`BucketKind`]): the one-row kernels' arms are
+/// [`OneRow`]'s alone, so a bucket of more rows lowers to no one-row kind by its type. The canonical
+/// picks the kind once, from its bucket's rows (`canonical::lower_plan`).
+/// A matmul kernel's step constructor, in a bucket of kind `B`.
+pub type Kernel<B> = fn(Matmul) -> CudaStep<B>;
+
+pub trait Lower: BucketKind {
+    /// The GEMV a matmul of `m` rows lowers to, under its rule: a one-row bucket's at one row;
+    /// none in a bucket of more rows.
+    fn gemv(m: u32, n: u32, k: u32) -> Result<Option<Kernel<Self>>, GemmShapeRule>;
+
+    /// [`Self::gemv`]'s fp8 GEMV.
+    fn gemv_fp8(m: u32) -> Option<Kernel<Self>>;
+
+    /// The attention `attn` lowers to: a one-row bucket's decode attention at one row (`refuse` at
+    /// a head dim with no decode kernel); the prefill attention otherwise.
+    fn attention(
+        attn: AttnPrefillBf16,
+        refuse: CanonicalRefusal,
+    ) -> Result<CudaStep<Self>, CanonicalRefusal>;
+
+    /// A one-row GEMV's output and residual, which the residual add it folds rewrites; `None` for
+    /// every other step.
+    fn residual(step: &mut CudaStep<Self>) -> Option<(&mut ArenaOffset, &mut Option<ArenaOffset>)>;
+
+    /// The decode GEMVs on the tensor cores where they take the shape (`canonical::gemv_tc`); a
+    /// bucket of more rows has none.
+    fn gemv_tc(s: CudaStep<Self>) -> CudaStep<Self>;
+
+    /// The one-row norms folded with their quantization (`canonical::fold_norm_quants`); a bucket
+    /// of more rows has none.
+    fn fold_norm_quants(steps: Vec<CudaStep<Self>>) -> Vec<CudaStep<Self>>;
+
+    /// `steps` as the canonical holds them.
+    fn canonical(steps: Vec<CudaStep<Self>>) -> crate::canonical::CanonicalSteps;
+}
+
+impl Lower for OneRow {
+    fn gemv(m: u32, n: u32, k: u32) -> Result<Option<Kernel<OneRow>>, GemmShapeRule> {
+        if m != 1 {
+            return Ok(None);
+        }
+        gemv_shape(n, k)?;
+        Ok(Some(|g| CudaStep::Gemv(GemvBf16::of(matvec(g)))))
+    }
+
+    fn gemv_fp8(m: u32) -> Option<Kernel<OneRow>> {
+        (m == 1).then_some(|g| CudaStep::GemvFp8(GemvFp8::of(matvec(g))))
+    }
+
+    fn attention(
+        attn: AttnPrefillBf16,
+        refuse: CanonicalRefusal,
+    ) -> Result<CudaStep, CanonicalRefusal> {
+        if attn.rows != Rows(1) {
+            return Ok(CudaStep::AttnPrefill(attn));
+        }
+        // A decode bucket's attention at its head dim's split over keys (W6b), on the one row it
+        // computes.
+        let row = AttnRowBf16 {
+            q: attn.q,
+            block_table: attn.block_table,
+            sequence: attn.sequence,
+            out: attn.out,
+            layer: attn.layer,
+            q_heads: attn.q_heads,
+            kv_heads: attn.kv_heads,
+            head_dim: attn.head_dim,
+            scale: attn.scale,
+            window: attn.window,
+        };
+        AttnDecodeBf16::of(row)
+            .map(CudaStep::AttnDecode)
+            .ok_or(refuse)
+    }
+
+    fn residual(step: &mut CudaStep) -> Option<(&mut ArenaOffset, &mut Option<ArenaOffset>)> {
+        match step {
+            CudaStep::Gemv(g) => Some((&mut g.c, &mut g.residual)),
+            CudaStep::GemvFp8(g) => Some((&mut g.c, &mut g.residual)),
+            _ => None,
+        }
+    }
+
+    fn gemv_tc(s: CudaStep) -> CudaStep {
+        crate::canonical::gemv_tc(s)
+    }
+
+    fn fold_norm_quants(steps: Vec<CudaStep>) -> Vec<CudaStep> {
+        crate::canonical::fold_norm_quants(steps)
+    }
+
+    fn canonical(steps: Vec<CudaStep>) -> crate::canonical::CanonicalSteps {
+        crate::canonical::CanonicalSteps::OneRow(steps)
+    }
+}
+
+impl Lower for ManyRows {
+    fn gemv(_: u32, _: u32, _: u32) -> Result<Option<Kernel<ManyRows>>, GemmShapeRule> {
+        Ok(None)
+    }
+
+    fn gemv_fp8(_: u32) -> Option<Kernel<ManyRows>> {
+        None
+    }
+
+    fn attention(
+        attn: AttnPrefillBf16,
+        _: CanonicalRefusal,
+    ) -> Result<CudaStep<ManyRows>, CanonicalRefusal> {
+        Ok(CudaStep::AttnPrefill(attn))
+    }
+
+    fn residual(
+        _: &mut CudaStep<ManyRows>,
+    ) -> Option<(&mut ArenaOffset, &mut Option<ArenaOffset>)> {
+        None
+    }
+
+    fn gemv_tc(s: CudaStep<ManyRows>) -> CudaStep<ManyRows> {
+        s
+    }
+
+    fn fold_norm_quants(steps: Vec<CudaStep<ManyRows>>) -> Vec<CudaStep<ManyRows>> {
+        steps
+    }
+
+    fn canonical(steps: Vec<CudaStep<ManyRows>>) -> crate::canonical::CanonicalSteps {
+        crate::canonical::CanonicalSteps::Rows(steps)
+    }
+}
+
 /// `g` as the one row its GEMV computes: only the selectors' one-row arms below call it, where
 /// `m == 1` picked the GEMV.
 const fn matvec(g: Matmul) -> Matvec {
@@ -2675,7 +2789,7 @@ const fn matvec(g: Matmul) -> Matvec {
 /// not depend on where the row sits; then an `m` of 2 or more and an `n` that is a multiple of
 /// 64 and not of 256 goes to the 64-column GEMM under its rule ([`gemm_col64_shape`]); otherwise `m = 1` goes to the GEMV under its rule
 /// ([`gemv_shape`]), and any other `m` to the tiled GEMM under its rule ([`gemm_shape`]).
-fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmShapeRule> {
+fn gemm_kernel<B: Lower>(m: u32, n: u32, k: u32) -> Result<Kernel<B>, GemmShapeRule> {
     if n != 0 && n <= GEMM_NARROW_BF16_MAX_N && !n.is_multiple_of(GEMM_BF16_TILE.1) {
         gemm_narrow_shape(m, n, k)?;
         return Ok(|g| CudaStep::GemmNarrow(GemmNarrowBf16::of(g)));
@@ -2688,9 +2802,8 @@ fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmSha
         gemm_col64_shape(m, n, k)?;
         return Ok(|g| CudaStep::GemmCol64(GemmCol64Bf16::of(g)));
     }
-    if m == 1 {
-        gemv_shape(n, k)?;
-        return Ok(|g| CudaStep::Gemv(GemvBf16::of(matvec(g))));
+    if let Some(gemv) = B::gemv(m, n, k)? {
+        return Ok(gemv);
     }
     gemm_shape(m, n, k)?;
     Ok(|g| CudaStep::Gemm(GemmBf16::of(g)))
@@ -2701,7 +2814,7 @@ fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmSha
 /// `m = 1` the GEMV, any `n`; else `n` a multiple of 256 the tiled GEMM, of 64 the 64-column GEMM
 /// (both at `m` a multiple of 128), and below 64 a multiple of [`GEMM_NARROW_BF16_MULTIPLE`] (the
 /// bf16 output's 16-byte rows) the narrow GEMM, at any `m`.
-fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmShapeRule> {
+fn gemm_fp8_kernel<B: Lower>(m: u32, n: u32, k: u32) -> Result<Kernel<B>, GemmShapeRule> {
     for (dim, value) in [("m", m), ("n", n)] {
         if value == 0 {
             return Err(GemmShapeRule::OffTile {
@@ -2734,8 +2847,10 @@ fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, Gem
             tile: GEMM_BF16_TILE.0,
         });
     }
-    Ok(match (m, n) {
-        (1, _) => |g| CudaStep::GemvFp8(GemvFp8::of(matvec(g))),
+    if let Some(gemv) = B::gemv_fp8(m) {
+        return Ok(gemv);
+    }
+    Ok(match n {
         _ if n.is_multiple_of(GEMM_BF16_TILE.1) => |g| CudaStep::GemmFp8(GemmFp8::of(g)),
         _ if n.is_multiple_of(GEMM_COL64_TILE.1) => |g| CudaStep::GemmCol64Fp8(GemmCol64Fp8::of(g)),
         _ if n < GEMM_COL64_TILE.1 && n.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) => {

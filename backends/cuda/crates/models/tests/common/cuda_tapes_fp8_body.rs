@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
-    CudaStep, GateUpActBf16, GateUpProj,
+    BucketKind, CudaStep, GateUpActBf16, GateUpProj,
     MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{TapeSteps, 
@@ -300,6 +300,21 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
     }
 }
 
+/// `steps` with step `i` dropped (`edit` `None`) or with the quant write `edit` inserted at `i`,
+/// leaked to `'static`.
+fn edited<B: BucketKind>(
+    steps: &[CudaStep<B>],
+    i: usize,
+    edit: Option<QuantRowsFp8>,
+) -> &'static [CudaStep<B>] {
+    let mut steps = steps.to_vec();
+    match edit {
+        None => drop(steps.remove(i)),
+        Some(q) => steps.insert(i, CudaStep::QuantRowsFp8(q)),
+    }
+    Box::leak(steps.into_boxed_slice())
+}
+
 /// The quant scratch's liveness check, on the real tapes: each passes, and each loses it when a
 /// quant write is dropped (its GEMM then reads rows nobody wrote for it) or doubled (the first
 /// copy is overwritten unread), through `quant_chain` and through `CudaTape::validate`.
@@ -323,12 +338,20 @@ fn the_quant_scratch_liveness_check_holds_and_bites() {
             Err(QuantChainError::Overwritten { step: i }),
             "m={m}: write {i} doubled"
         );
-        for (what, steps, error) in [
-            ("dropped", dropped, QuantChainError::Unquantized { step: i }),
-            ("doubled", doubled, QuantChainError::Overwritten { step: i }),
+        // The same edit of the tape's own steps, of its bucket's kind.
+        let edited = |edit: Option<QuantRowsFp8>| match tape.steps {
+            TapeSteps::OneRow(steps) => TapeSteps::OneRow(edited(steps, i, edit)),
+            TapeSteps::Rows { bucket_m, steps } => TapeSteps::Rows {
+                bucket_m,
+                steps: edited(steps, i, edit),
+            },
+        };
+        for (what, edit, error) in [
+            ("dropped", None, QuantChainError::Unquantized { step: i }),
+            ("doubled", Some(q), QuantChainError::Overwritten { step: i }),
         ] {
             let bad = CudaTape {
-                steps: TapeSteps::leaked(tape.bucket_m(), &steps).expect("the bucket's kinds"),
+                steps: edited(edit),
                 ..*tape
             };
             assert_eq!(

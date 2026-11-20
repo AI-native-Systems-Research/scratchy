@@ -14,7 +14,9 @@ mod common {
 }
 
 use scratchy_target_cuda::step::GemmNarrowBf16;
-use scratchy_target_cuda::step::{BlockSize, Cols, LayerId, NTile, NumKvHeads, NumQHeads, RotDim};
+use scratchy_target_cuda::step::{
+    BlockSize, Cols, LayerId, NTile, NumKvHeads, NumQHeads, OneRow, RotDim,
+};
 use scratchy_target_cuda::step::{KDim, MaxBlocksPerSeq, NDim, Rows};
 use std::num::NonZeroU32;
 
@@ -179,7 +181,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     let c = lower_with(&with_hidden(gemm_m1_only_input()), QWEN3_5_FACTS)
         .expect("a one-row GEMM lowers");
     assert!(matches!(
-        c.steps.as_slice(),
+        c.steps().as_slice(),
         [CudaStep::Gemv(GemvBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
@@ -1476,7 +1478,7 @@ fn attn_only(m: u32, a: Attention) -> LoweredDecode {
 #[test]
 fn a_one_row_attention_lowers_to_the_decode_attention() {
     let c = lower_with(&attn_layer(1), QWEN3_5_FACTS).expect("the attention layer lowers at m = 1");
-    let attn: Vec<_> = (c.steps.iter())
+    let attn: Vec<_> = (c.steps().iter())
         .filter_map(|s| match s {
             CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => Some(*a),
             CudaStep::AttnPrefill(_) => panic!("a one-row attention on the prefill kernel"),
@@ -1511,29 +1513,29 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     // (FP8 S8 W4c), the attention; the projections GEMVs (q, k and v one grouped GEMV, #1049), the
     // residual add in the o projection's epilogue (FP8 S8 W4a).
     assert!(matches!(
-        c.steps[5..7],
+        c.steps()[5..7],
         [
             CudaStep::RopeAppend(RopeAppendBf16 { q: Some(_), .. }),
             CudaStep::AttnDecode(_)
         ]
     ));
     assert!(
-        matches!(c.steps[1], CudaStep::GemvGroup(_)),
+        matches!(c.steps()[1], CudaStep::GemvGroup(_)),
         "step 1: {:?}",
-        c.steps[1]
+        c.steps()[1]
     );
     assert!(
         matches!(
-            c.steps[8],
+            c.steps()[8],
             CudaStep::Gemv(GemvBf16 { residual, .. })
                 if residual.is_some()
         ),
         "step 8: {:?}",
-        c.steps[8]
+        c.steps()[8]
     );
     // That test reads `qn` (the rope's input), `kr` and `v` (the append's) and `attn` back from
     // the arena after the forward: no step after the one writing each overwrites it.
-    let CudaStep::RopeAppend(append @ RopeAppendBf16 { q: Some(rope), .. }) = c.steps[5] else {
+    let CudaStep::RopeAppend(append @ RopeAppendBf16 { q: Some(rope), .. }) = c.steps()[5] else {
         unreachable!("matched above");
     };
     let row = |at: ArenaOffset, cols: u32| span(at.0, 2 * u64::from(cols));
@@ -1543,7 +1545,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
         ("v", row(append.v, append.cols.get()), 5),
         ("attn", row(a.out, a.q_heads.get() * a.head_dim.get()), 6),
     ] {
-        for (i, s) in c.steps.iter().enumerate().skip(from + 1) {
+        for (i, s) in c.steps().iter().enumerate().skip(from + 1) {
             let e = s.extents().expect("extents fit");
             for w in [Some(e.writes), e.second_write].into_iter().flatten() {
                 let (r0, w0) = (read.offset.0, w.offset.0);
@@ -1779,7 +1781,7 @@ fn the_gdn_layer_numbers() {
         let c = lower_with(&gdn_layer(m), QWEN3_5_GDN_FACTS).expect("the GDN layer lowers");
         assert_eq!(c.total_bytes, total, "m = {m}");
         assert_eq!(c.weight_bytes[6], BUNDLE_BYTES, "m = {m}: the bundle");
-        let names: Vec<_> = (c.steps.iter())
+        let names: Vec<_> = (c.steps().iter())
             .map(|s| match s {
                 CudaStep::RmsNorm(_) => "RmsNorm",
                 CudaStep::Gemm(_) => "Gemm",
@@ -1900,7 +1902,7 @@ fn a_narrow_gemm_takes_any_rows() {
     let c = lower_with(&with_hidden(chain_input(37, 8, &[64])), QWEN3_5_FACTS)
         .expect("a 37-row narrow GEMM lowers");
     assert!(matches!(
-        c.steps.as_slice(),
+        c.steps().as_slice(),
         [CudaStep::GemmNarrow(GemmNarrowBf16 {
             m: Rows(37),
             n: NDim(64),
@@ -1911,7 +1913,7 @@ fn a_narrow_gemm_takes_any_rows() {
     let c = lower_with(&with_hidden(chain_input(1, 1024, &[16])), QWEN3_5_FACTS)
         .expect("a one-row narrow GEMM lowers");
     assert!(matches!(
-        c.steps.as_slice(),
+        c.steps().as_slice(),
         [CudaStep::GemmNarrow(GemmNarrowBf16 {
             m: Rows(1),
             n: NDim(16),
@@ -2261,7 +2263,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
             }),
             moe: None,
         };
-        lower_step(&cx, &computes[5], &computes)
+        lower_step::<OneRow>(&cx, &computes[5], &computes)
     };
     let own = GdnWidths {
         conv_dim: 6144,
@@ -2287,7 +2289,8 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
 fn one_gemm(m: u32, k: u32, n: u32, facts: LoweringFacts) -> CudaStep {
     let c = lower_with(&with_hidden(chain_input(m, k, &[n])), facts)
         .unwrap_or_else(|e| panic!("m={m} k={k} n={n}: {e}"));
-    let [step] = c.steps.as_slice() else {
+    let steps = c.steps();
+    let [step] = steps.as_slice() else {
         panic!("expected one step, got {:?}", c.steps);
     };
     *step
@@ -2404,7 +2407,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
             "m={m}: [m, hidden] bf16"
         );
         let (mut norms, mut routes, mut gelus, mut experts) = (0, 0, 0, 0);
-        for step in &c.steps {
+        for step in &c.steps() {
             match *step {
                 CudaStep::RouterNorm(n) => {
                     norms += 1;
@@ -2460,7 +2463,8 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
             }
         }
         assert_eq!((norms, routes, gelus, experts), (1, 1, 1, 3), "m={m}");
-        let sorts = (c.steps.iter()).filter(|s| matches!(s, CudaStep::ExpertSort(_)));
+        let steps = c.steps();
+        let sorts = (steps.iter()).filter(|s| matches!(s, CudaStep::ExpertSort(_)));
         assert_eq!(
             sorts.count(),
             usize::from(m > 1),
@@ -2587,7 +2591,7 @@ fn a_router_norm_of_another_router_is_refused() {
 #[test]
 fn a_gemma_moe_under_qwen_facts_is_off_the_256_tile() {
     let c = lower_with(&gemma_moe(512), QWEN3_5_FACTS).unwrap_or_else(|e| panic!("{e}"));
-    let routers: Vec<_> = (c.steps.iter())
+    let routers: Vec<_> = (c.steps().iter())
         .filter_map(|s| match *s {
             CudaStep::RouterLogits(r) => Some((r.experts, r.kernel)),
             _ => None,
@@ -2670,7 +2674,7 @@ fn a_sliding_layer_lowers_with_its_class() {
             Some(scratchy_target_cuda::step::AttnWindow(1024)),
             "m={m}"
         );
-        for step in &c.steps {
+        for step in &c.steps() {
             match *step {
                 CudaStep::Rope(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
                 CudaStep::RopeAppend(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
