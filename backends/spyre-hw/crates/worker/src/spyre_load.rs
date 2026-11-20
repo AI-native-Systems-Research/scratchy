@@ -1477,29 +1477,30 @@ impl SpyreWorker {
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
                 // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its own region of
-                // the KV segment, at the decode wiring's own page count (the model's context). Nothing
-                // here sizes it: the OWNER session allocates the regions once, and every other session
-                // aliases them.
+                // the KV segment, at the decode wiring's own page count (the pool, which the bake's
+                // mint proves holds the model's context). Nothing here sizes it: the OWNER session
+                // allocates the regions once, and every other session aliases them.
                 let step = wirings.decode.paged.ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
                 let pool_need_bytes = code.layout.kv_pool_bytes();
                 let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
-                // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
-                // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
-                // model's own limit, up to the pool.
-                let capacity = step.capacity();
+                // ⭐ THE CONTEXT THIS RUN SERVES — the MODEL'S context as the bake states it (the
+                // step's `context`, the AttnDecode's `valid_len`), never the pool's capacity: the
+                // pool may hold more pages than any one request may attend, and the mint proved it
+                // holds the context, so a declaration past the model's own limit is REFUSED, never
+                // clamped, and an unset flag serves the model's limit.
+                let context = step.context as usize;
                 served_context_v = match self.declared_context {
-                    Some(d) if d > capacity => {
+                    Some(d) if d > context => {
                         return Err(werr(format!(
-                            "--max-model-len {d} is past the {capacity} positions the bake's KV pool \
-                             holds ({} page(s) of {} slots) — serve a shorter context",
-                            step.pages, step.page_slots
+                            "--max-model-len {d} is past the {context} positions of the model's own \
+                             context the bake carries — serve a shorter context"
                         )));
                     }
                     Some(d) => d.max(1),
-                    None => max_model_len.min(capacity).max(1),
+                    None => max_model_len.min(context).max(1),
                 };
                 //
                 // ── THE BATCHED-PREFILL ANCHOR BUNDLE, resolved here because the census below

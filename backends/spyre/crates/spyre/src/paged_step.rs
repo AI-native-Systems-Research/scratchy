@@ -981,6 +981,9 @@ mod tests {
             pages: 4,
             unit_elems: unit_of(2, 64, 4),
             page_slots: 4,
+            // The pool holds exactly the context's four pages; fixtures that widen the pool
+            // past it state their own `context`, never a wider walk.
+            context: 16,
             rows: 3,
             nkvh: 2,
             // Two kv heads of one query head each, one stick a head: the fold's own floor law
@@ -1720,6 +1723,61 @@ mod tests {
                 pos: walk as usize * 4 - 1,
             }];
             fits(full, &card_batch_sources(&body, &seqs).unwrap(), &[]);
+        }
+    }
+
+    /// ⭐⭐ THE POOL MAY BE WIDER THAN THE CONTEXT — #1305's law, typed: the per-request regions
+    /// (the page table, the mask stack) are sized by the step's WALK — the context's pages at the
+    /// whole walk — never by the pool's pages, so widening the pool to fund more concurrent
+    /// requests grows no request's buffers (the #1305 defect: ~2.4 MB a page of mask stack and
+    /// page table, 16 GB wasted on a 2b whose pool grew past its context). Only the
+    /// pool-indexed static (`kv_row_pool`) grows with the pool, because the pool indexes it by
+    /// page; and the scheduler's budget ([`PagedStep::capacity`]) is the pool's while a
+    /// request's own bound ([`PagedStep::context`]) is the context's — two facts, two fields.
+    #[test]
+    fn a_pool_wider_than_its_context_grows_no_requests_buffers() {
+        // A 16-page pool of 4-slot pages over a 16-slot (4-page) context, one decode row at the
+        // whole walk — the wiring's own spelling of a pool funded past the model's context.
+        let s = PagedStep {
+            pages: 16,
+            rows: 1,
+            extent: pair(1, 1),
+            ..step()
+        };
+        assert_eq!(s.capacity(), 64, "the scheduler's budget is the pool's");
+        assert_eq!(s.context, 16, "a request's bound is the context's");
+        let size = |tid: u32| {
+            s.card_placements()
+                .iter()
+                .find(|(t, ..)| *t == tid)
+                .map(|&(.., b)| b)
+                .unwrap()
+        };
+        // The per-request regions: the walk's 4 pages, NOT the pool's 16 — the one law this
+        // test exists for.
+        assert_eq!(size(s.page_table), 4 * s.card_walk_step());
+        assert_eq!(size(s.mask), (4 * 1 * 4 * 2) as u64);
+        // The pool-indexed static: the pool's own 16 pages.
+        let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64;
+        assert_eq!(size(s.kv_row_pool), 16 * run * 4);
+        let statics = card_statics(&s).unwrap();
+        assert_eq!(
+            ints(&statics
+                .iter()
+                .find(|(t, _)| *t == s.kv_row_pool)
+                .unwrap()
+                .1)
+            .len(),
+            16 * run as usize,
+            "the staged pool covers every page the pool holds"
+        );
+        // And every ladder rung over the context's pages is a walk of this pool the worker can
+        // stage: the rungs are the CONTEXT's buckets, each a prefix of the pool's pages.
+        for b in scratchy_triton_splice::walk_buckets(4) {
+            assert!(
+                s.on_body(s.rows, s.paged_rows, b * s.page_slots).is_some(),
+                "rung {b} is a walk of the pool"
+            );
         }
     }
 

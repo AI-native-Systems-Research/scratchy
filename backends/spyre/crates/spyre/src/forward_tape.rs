@@ -590,6 +590,9 @@ mod tests {
         pages: 4,
         unit_elems: unit_of(2, 64, 4),
         page_slots: 4,
+        // The pool holds exactly the context's four pages — the fixture's split is at the
+        // boundary, the shape every real step held before the pool and the context parted.
+        context: 16,
         rows: 3,
         nkvh: 2,
         q_width: 128,

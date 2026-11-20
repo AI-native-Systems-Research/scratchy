@@ -1978,9 +1978,29 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// ⭐ THE CONTEXT'S PAGES — the whole pages a request's attention may cover: the AttnDecode's own
+/// `valid_len` (the model's context, minted at the bridge as the prefix capacity), rounded up to
+/// whole pages. THE POOL MUST HOLD IT — the one statement of that law: a cache of fewer pages than
+/// the context it must serve is a mint bug, refused here by name, never a silently-dropped walk.
+/// Every reader that pairs a context with a pool (the splice's walk, the wiring's step) consults
+/// THIS function, so the pool-holds-context law is stated once.
+pub fn context_pages(valid_len: u32, pages: u32, what: &str) -> Result<u32, String> {
+    let block = SchedulerBlockTokens::REFERENCE.get();
+    let context = valid_len.div_ceil(block);
+    if context > pages {
+        return Err(format!(
+            "triton splice: the {what} holds {pages} page(s) of {block} slots but its attention's \
+             valid_len is {valid_len} position(s), spanning {context} page(s) — the pool cannot \
+             hold the context it must serve"
+        ));
+    }
+    Ok(context)
+}
+
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
-/// swept extent in pages. Every page of the pool at `ActiveCap::FULL` (a decode step's keys can sit
-/// anywhere below the capacity), and at `ActiveCap::NONE` (a prompt chunk baked with no resident
+/// swept extent in pages. Every page of the CONTEXT at `ActiveCap::FULL` (a decode step's keys can
+/// sit anywhere below the model's context — never below the pool, which may hold more pages than
+/// any one request may attend), and at `ActiveCap::NONE` (a prompt chunk baked with no resident
 /// prefix) the pages its own `mq` rows fill.
 ///
 /// Blocks past a sequence's length carry a fully-masked tile, so a walk wider than the context costs
@@ -1988,31 +2008,32 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(pages: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
+pub fn walk_pages(context: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
     let swept = active_cap.resolve(
-        pages * SchedulerBlockTokens::REFERENCE.get(),
+        context * SchedulerBlockTokens::REFERENCE.get(),
         ktir_superdsc::sdsc_abstract::POOL_STICK,
     );
     let walked = if swept == 0 { mq } else { swept };
     walked
         .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(pages)
+        .min(context)
 }
 
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
 /// kv buckets are the powers of two from one block up to `max_model_len`, plus `max_model_len`
-/// itself, and the kernel is specialized on `num_blocks = ceil(kv / block)` of each. Over a pool of
-/// `pages` pages that is every power of two below `pages`, then `pages`. A step runs on the smallest
-/// rung whose walk reaches its context, so a walk is at most about twice the context it serves —
-/// "the extra padding each bucket costs is absorbed by the mask".
-pub fn walk_buckets(pages: u32) -> Vec<u32> {
+/// itself, and the kernel is specialized on `num_blocks = ceil(kv / block)` of each. Over a context
+/// of `context` pages that is every power of two below `context`, then `context`. A step runs on the
+/// smallest rung whose walk reaches its context, so a walk is at most about twice the context it
+/// serves — "the extra padding each bucket costs is absorbed by the mask". The rungs are a law of
+/// the CONTEXT (the model's own limit on a request), never of the pool, which may be wider.
+pub fn walk_buckets(context: u32) -> Vec<u32> {
     let mut buckets = Vec::new();
     let mut b = 1u32;
-    while b < pages {
+    while b < context {
         buckets.push(b);
         b *= 2;
     }
-    buckets.push(pages);
+    buckets.push(context);
     buckets
 }
 
@@ -2140,7 +2161,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // the model's 16-bit dtype). The op states none of them either, so none reaches here today; a
     // field added for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
-        valid_len: _,
+        valid_len,
         layout: _,
         producer,
         softmax_state: _,
@@ -2214,6 +2235,14 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let pages = decl.units() as u32;
     whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
+    // ⭐ THE WALK COVERS THE CONTEXT, NOT THE POOL — the request's attention is capped at the
+    // model's own context (the AttnDecode's `valid_len`), and the pool may hold more pages than
+    // that. `context_pages` is the one statement of the pool-holds-context law, refused by name.
+    let context = context_pages(
+        *valid_len,
+        pages,
+        &format!("AttnDecode t{}'s pool", node.output.tensor.index()),
+    )?;
     // ⭐ THE WALK'S EXTENT IS PER-REQUEST FOR A PREFILL CHUNK, THE GRAPH'S ROWS FOR THE BATCHED
     // KERNELS. The prefill kernel walks ONE request's pages — at one request the two are the same
     // number, which is why one `mq` served until S > 1; a packed rung's walk must cover one
@@ -2221,9 +2250,9 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // decode kernel (one query row) and the batched kernel (the request axis carried inside one
     // launch) keep the graph's row count, exactly as before.
     let blocks = if batch || decode {
-        walk_pages(pages, mq, active_cap)
+        walk_pages(context, mq, active_cap)
     } else {
-        walk_pages(pages, query_rows.per_request().get(), active_cap)
+        walk_pages(context, query_rows.per_request().get(), active_cap)
     };
     let tids = PagedStepTids::RESERVED;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
@@ -5311,6 +5340,26 @@ mod walk_on_the_card {
                 "mq={mq} blocks={blocks} hd={hd}: some op writes the stored output {out}"
             );
         }
+    }
+
+    /// ⭐ THE POOL HOLDS THE CONTEXT — `context_pages`'s own law, pinned at its near-misses: a
+    /// context that spans whole pages of the pool is served, a context that is no whole number of
+    /// pages spans its pages rounded UP (the walk must cover the whole context, never a prefix of
+    /// it), and a context past the pool's pages is REFUSED by name, both counts in the message —
+    /// never a walk that silently drops the tail the pool cannot hold.
+    #[test]
+    fn the_pool_holds_the_context_or_refuses_by_name() {
+        let block = SchedulerBlockTokens::REFERENCE.get();
+        assert_eq!(context_pages(block, 1, "pool").unwrap(), 1);
+        assert_eq!(context_pages(4 * block, 4, "pool").unwrap(), 4);
+        assert_eq!(
+            context_pages(block + 1, 2, "pool").unwrap(),
+            2,
+            "a context past a page boundary spans the next whole page"
+        );
+        let err = context_pages(5 * block, 4, "AttnDecode t3's pool").unwrap_err();
+        assert!(err.contains("cannot hold the context"), "{err}");
+        assert!(err.contains("AttnDecode t3's pool"), "{err}");
     }
 
     /// ⭐⭐ THE DECODE TRIP IN torch-spyre's FORM — its compiled program's, at head dim 64 and 128: one

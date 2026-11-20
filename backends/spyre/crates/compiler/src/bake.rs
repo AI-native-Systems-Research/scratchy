@@ -884,6 +884,7 @@ fn emit_superdsc_wiring(
             let (rr, cp, cm) = (u32l(p.rep_rows), u32l(p.chunk_pages), u32l(p.chunk_masks));
             let zero = u32l(p.int32_zero);
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
+            let context = u32l(p.context);
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             // ⭐ THE STATE UNIT — the declaration's Σ of the planes' per-unit elems, minted with
             // the state's tensors at the bridge and carried by the step's own mint.
@@ -949,7 +950,8 @@ fn emit_superdsc_wiring(
                 ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
                     rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm, int32_zero: #zero,
-                    pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
+                    pages: #pages, page_slots: #slots, context: #context,
+                    rows: #rows, nkvh: #nkvh, q_width: #q_width,
                     head_size: #head_size, walk: #walk, unit_elems: #unit,
                     page_id_realization: #page_realization,
                     paged_rows: #paged_rows,
@@ -3433,18 +3435,21 @@ pub(crate) fn dump_wavefront_mega(
                                             )
                                         };
                                         // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
-                                        // `num_blocks` buckets over this bundle's pool
-                                        // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
-                                        // baked walks `ceiling_walk` pages — the whole pool for a
-                                        // decode bake, the chunk's own pages for a prompt chunk
-                                        // baked with no resident prefix — and every other bucket
-                                        // is a rung, so each step walks the fewest pages that
-                                        // reach its context.
-                                        let pool_pages =
+                                        // `num_blocks` buckets over this bundle's CONTEXT
+                                        // (`scratchy_target_spyre::paged_step::walk_buckets`) —
+                                        // the model's own limit on a request, never the pool,
+                                        // which may hold more pages than any request may
+                                        // attend. The body just
+                                        // baked walks `ceiling_walk` pages — the whole context
+                                        // for a decode bake, the chunk's own pages for a prompt
+                                        // chunk baked with no resident prefix — and every other
+                                        // bucket is a rung, so each step walks the fewest pages
+                                        // that reach its context.
+                                        let context_pages =
                                             cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                                         let ceiling_walk =
                                             scratchy_target_spyre::paged_step::walk_pages(
-                                                pool_pages,
+                                                context_pages,
                                                 prefill_mq.unwrap_or(decode_rows),
                                                 active_cap,
                                             );
@@ -3500,7 +3505,7 @@ pub(crate) fn dump_wavefront_mega(
                                         let prefix_free_chunk = is_prefill
                                             && active_cap
                                                 == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
-                                        let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
+                                        let sweep = scratchy_target_spyre::paged_step::walk_buckets(context_pages)
                                             .into_iter()
                                             .filter(|&b| {
                                                 if prefix_free_chunk {

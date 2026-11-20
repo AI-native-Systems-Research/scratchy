@@ -2387,9 +2387,7 @@ const ATTN_SHAPES: &[AttnShape] = &[
 /// The attention fixture's decode-position model: how many positions the mask says are valid
 /// this step (`= decode_position + 1`). For a rope-appended cache the prefix segment is
 /// `valid_len - 1` rows (the new row arrives through the separate new-k/new-v segments); for a
-/// pre-populated cache the whole region is valid. 33 keeps the rope-appended prefix region
-/// non-degenerate (`lower_region` slices it to 32 rows).
-const ATTN_VALID_LEN: u32 = 33;
+/// pre-populated cache the whole region is valid.
 
 /// One attention node (plus its RopeAppend producer when the shape wants one) as a
 /// `lower_region`-bound `SubtileIR` — the ONLY construction that can mint the Tiled stage's
@@ -2409,7 +2407,12 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     // The pre-populated prefix's own region rows (the emulator-threaded extent main's
     // builder read directly); the rope-appended one is sliced by `lower_region` below.
     const PREPOP_ROWS: u32 = 32;
-    let valid_len = ATTN_VALID_LEN;
+    // ⭐ THE FIXTURE STATES THE PRODUCTION INVARIANT: the cache holds exactly the context, so
+    // `valid_len` is the shape's own `cap` — what `to_wavefront` mints as the prefix capacity
+    // and what the cache rows are minted at. A pool WIDER than its context is the paged-step
+    // fixtures' law (`paged_step.rs`), proven there — the goldens bake the boundary shape every
+    // real model held before the pool and the context parted.
+    let valid_len = s.cap;
     // The new block's rows: at decode the one new row; at prefill the chunk's own `mq` rows
     // (the one-pass condition `seq_len == mq`).
     let new_len = if mq > 1 { mq } else { 1 };

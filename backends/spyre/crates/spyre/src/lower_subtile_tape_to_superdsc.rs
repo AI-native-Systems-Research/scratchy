@@ -11065,14 +11065,8 @@ mod kv_pool_placement_tests {
         states.push(
             scratchy_subtile::handoff::KvStateDecl::new(
                 vec![
-                    scratchy_subtile::handoff::KvStatePlane {
-                        source: 9000,
-                        per_unit_elems: pool,
-                    },
-                    scratchy_subtile::handoff::KvStatePlane {
-                        source: 9100,
-                        per_unit_elems: pool,
-                    },
+                    scratchy_subtile::handoff::KvStatePlane::new(9000, pool),
+                    scratchy_subtile::handoff::KvStatePlane::new(9100, pool),
                 ],
                 page,
                 page.get(),

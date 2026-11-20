@@ -673,6 +673,14 @@ pub struct PagedStep {
     pub unit_elems: u32,
     /// Token slots per page — the scheduler's block size.
     pub page_slots: u32,
+    /// ⭐ THE CONTEXT A REQUEST'S ATTENTION MAY COVER, in slots — the model's context (the
+    /// AttnDecode's `valid_len`, minted at the bridge as the prefix capacity), NOT the pool's
+    /// capacity: per-request facts ([`Self::walk`]'s ceiling, the ladder's rungs, the staged page
+    /// table and mask stack, the served context) derive from THIS, never from [`Self::pages`] —
+    /// a pool wider than the context funds more concurrent requests, never a wider request. The
+    /// pool must hold it ([`scratchy_triton_splice::context_pages`]'s law, refused at the mint),
+    /// so `context ≤ pages · page_slots` holds of every step that exists.
+    pub context: u32,
     /// Query rows one forward of this bundle carries.
     pub rows: u32,
     /// KV heads per layer.
@@ -684,7 +692,8 @@ pub struct PagedStep {
     /// ([`crate::paged_step::BatchChunking::of`]).
     pub head_size: u32,
     /// Blocks of the page table this bundle's attention walks — the bake's
-    /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
+    /// `scratchy_triton_splice::walk_pages` for the rung over the CONTEXT's pages, so at most the
+    /// context's own pages ([`Self::context`]), never the pool's.
     pub walk: u32,
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
@@ -723,7 +732,9 @@ impl PagedStep {
         self.pages - 1
     }
 
-    /// The pool's token capacity: every page's slots.
+    /// The pool's token capacity: every page's slots — the SCHEDULER'S budget (how many tokens'
+    /// worth of pages the pool is), never a per-request bound; that is [`Self::context`], which
+    /// the pool must hold.
     pub const fn capacity(self) -> usize {
         self.pages as usize * self.page_slots as usize
     }
@@ -731,7 +742,8 @@ impl PagedStep {
     /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers. A step whose positions end at
     /// or below this can run on the bundle from ANY start: the mask stack decides which walked keys each
     /// row attends, so a prompt chunk over a cached prefix is this bundle's to run whenever the prefix
-    /// and the chunk both sit inside the walk. A step that ends past it would lose keys.
+    /// and the chunk both sit inside the walk. A step that ends past it would lose keys. Capped by the
+    /// context ([`Self::context`]), never by the pool.
     pub const fn reach(self) -> usize {
         self.walk as usize * self.page_slots as usize
     }
@@ -792,11 +804,19 @@ impl PagedStep {
     }
 
     /// ⭐ THE STEP'S CARD PLACEMENTS — `(tid, seat, bytes)` for every source this bundle's attention
-    /// reads, sized for the pool's whole walk (a body walking fewer blocks stages and reads a
-    /// prefix). The one statement the bake places by (`compute_bundle_layout`) and the card stagers
+    /// reads, sized for the step's own whole walk (a body walking fewer blocks stages and reads a
+    /// prefix). The one statement the bake places by (`compute_bundle_layout`, at
+    /// `ActiveCap::FULL`, where the walk is the context's whole pages) and the card stagers
     /// ([`crate::paged_step::card_step_sources`], [`crate::paged_step::card_batch_sources`],
     /// [`crate::paged_step::card_statics`]) stage within; `self` is the bundle's own step, at its
     /// whole walk.
+    ///
+    /// ⭐ THE PER-REQUEST REGIONS ARE WALK-SIZED, NEVER POOL-SIZED — the page table and the mask
+    /// stack are staged per request, so sizing them by [`Self::pages`] made every request's
+    /// buffers grow with the pool (#1305's defect: ~2.4 MB a page, 16 GB wasted on a 2b whose
+    /// pool grew past its context). They are sized by [`Self::walk`] — the CONTEXT's pages at the
+    /// whole walk — and only the pool-indexed statics ([`Self::card_kv_row_pool_bytes`]) stay
+    /// pool-sized, because the pool indexes them by page.
     pub fn card_placements(self) -> Vec<(u32, CardSeat, u64)> {
         let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
         let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
@@ -831,7 +851,7 @@ impl PagedStep {
                 // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID — window `r`'s three tables (page
                 // table, mask stack, query rows) at
                 // [`ktir_superdsc::reserved_tids::paged_window_tid`] `r`, each its own region
-                // sized the ONE-REQUEST size (the pool's whole walk, as ever), the windows
+                // sized the ONE-REQUEST size (the step's whole walk, as ever), the windows
                 // packed in window order after the write rows. Window 0's tids ARE the step's
                 // own sentinels, so at one request the rows are exactly today's — same tids,
                 // same sizes, same order, byte for byte.
@@ -845,12 +865,12 @@ impl PagedStep {
                         (
                             window_tid(r, 1),
                             CardSeat::Step,
-                            u64::from(self.pages) * self.card_walk_step(),
+                            u64::from(self.walk) * self.card_walk_step(),
                         ),
                         (
                             window_tid(r, 2),
                             CardSeat::Step,
-                            u64::from(self.pages) * w * slots * 2,
+                            u64::from(self.walk) * w * slots * 2,
                         ),
                         (window_tid(r, 0), CardSeat::Step, sticks(w)),
                     ]);
