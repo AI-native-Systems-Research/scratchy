@@ -776,6 +776,9 @@ o2_cases! {
     // dense-router (no scales sibling) + sigmoid-bias (noaux_tc) MoE, first
     // q/k/v attention biases on the affine stack.
     "glm4-moe/glm-4.5-air" => o2_glm_4_5_air_mlx("mlx-community/GLM-4.5-Air-3bit", Sampled);
+    // mlx-affine-b4-g64-qembed: GLM-4.7-Flash — multi-head latent attention (absorbed, its
+    // per-head embed_q / unembed_out), glm4-moe's MoE half.
+    "glm4-moe-lite/glm-4.7-flash" => o2_glm_4_7_flash_mlx("mlx-community/GLM-4.7-Flash-4bit", Sampled);
     // gpt-oss: 120b is the first 2-bit checkpoint (mlx-affine-b2-g64-qembed,
     // uniform 2-bit INCLUDING the router); 20b rides b4-qembed as the quality
     // sanity anchor for the same arch (YaRN rope, attention sinks, biased
