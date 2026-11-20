@@ -1369,6 +1369,19 @@ impl SpyreWorker {
         // `kv_cache_num_blocks_override` hands the engine exactly the pool that exists.
         #[allow(unused_mut, unused_assignments)]
         let mut funded_pages_o: Option<u64> = None;
+        // ⭐ THE PREFILL FAMILY'S ARENA PICKS — minted beside the census's ladder charge: for
+        // each shared scratch segment (`SHARED_SCRATCH_SEGS`), the family's WIDEST rung that
+        // places bytes there, named by bundle fingerprint. The census charges each arena once
+        // at its width; the rung wave below consumes the SAME picks (borrowers marked before
+        // prepare, arenas shared after it), so the charge and the sharing are one statement.
+        // `None` on the emulator, which builds no wave.
+        #[allow(unused_mut, unused_assignments)]
+        let mut family_arenas_o: Option<
+            Vec<(
+                scratchy_target_spyre_card::superdsc_exec::SegIdx,
+                String,
+            )>,
+        > = None;
         // The context the sized pool will actually serve (tokens) — the ONE context law's answer
         // (`resolve_served_context`) over the declaration and what the budget funds, decided in
         // the SuperDsc branch below where budget, page stride and launch rows first meet, and
@@ -1747,57 +1760,110 @@ impl SpyreWorker {
                         anchor_live_bytes / (1024 * 1024),
                     );
                 }
-                // ⛔⛔⛔ AND THE LADDER'S RUNGS, charged as the static bytes their own bundles
-                // state — the pre-fragmentation law, restored. The rungs' device halves
-                // allocate AFTER the pool is funded (the funding site below takes clean
-                // regions first, inside `load_model`), so the budget must already hold their
-                // bytes or the rungs land on memory the pool spent. Charged exactly as the
-                // old `ladder_rung_bytes` census stated it: every rung bundle's NON-RESIDENT
-                // segments (all but the weight home the rung aliases and the KV pool it
-                // adopts) — the prefill rungs past the anchor's own (whose live segments
-                // `anchor_live_bytes` already charged once), every decode batch rung, and the
-                // prefix-capable rungs. The spilled tails are NOT re-charged here:
-                // `tail_bytes × borrowers` above already counted every borrowing session's
-                // copy, this ladder included.
+                // ⛔⛔⛔ AND THE LADDER'S RUNGS — charged as the prefill FAMILY'S SHARED-SCRATCH
+                // ARENAS plus every rung's PRIVATE remainder. The rungs' device halves allocate
+                // AFTER the pool is funded (the funding site below takes clean regions first,
+                // inside `load_model`), so the budget must already hold their bytes. The prefill
+                // family — the ladder's rungs past the anchor and the prefix-capable rungs —
+                // never runs two launches at once (every prefill-shaped launch is collected
+                // in-call by the host thread; only decode defers, and decode keeps private
+                // regions), so the family's shared scratch segments (seg0 and the colour
+                // segments seg5/seg6, `SHARED_SCRATCH_SEGS`) back onto ONE arena per segment,
+                // owned by the family's WIDEST rung for that segment and charged ONCE at that
+                // width instead of once per rung (measured on #1305: 1038 → 3203 pool pages).
+                // Every rung's PRIVATE segments (the mask constants, the logits) are still
+                // charged per rung, and the decode rungs are charged whole — they overlap
+                // prefill. The ANCHOR keeps its own private scratch (it prepares before the
+                // wave's arena owners exist) and its live bytes are already charged above.
+                //
+                // ⭐ ONE table, TWO consumers: the arena picks below are the SAME picks the rung
+                // wave executes (borrowers marked before prepare, arenas shared after it),
+                // carried to it in `family_arenas_o` — the census's charge and the wave's
+                // sharing are one statement, so they cannot disagree.
                 let ladder_rung_bytes: u64 = {
                     let weight = scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT.get();
                     let kv = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
-                    let non_resident =
-                        |lay: &scratchy_target_spyre::bundle_code::BundleLayout<'static>| {
-                            lay.segment_bytes
-                                .iter()
-                                .enumerate()
-                                .filter(|(i, _)| *i != weight && *i != kv)
-                                .map(|(_, b)| *b)
-                                .sum::<u64>()
-                        };
+                    let shared: Vec<usize> =
+                        scratchy_target_spyre_card::superdsc_exec::SHARED_SCRATCH_SEGS
+                            .iter()
+                            .map(|s| s.get())
+                            .collect();
+                    // The family, exactly as the wave builds it: prefill rungs past the
+                    // anchor's own, plus the prefix-capable rungs. Static bundle references,
+                    // resolved once here.
                     let anchor_rung_m = g0
                         .prefill_rungs
                         .iter()
                         .filter(|(rm, _)| *rm > 1)
                         .min_by_key(|(rm, _)| *rm)
                         .map(|(rm, _)| *rm);
-                    g0.prefill_rungs
+                    let family: Vec<
+                        &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+                    > = g0
+                        .prefill_rungs
                         .iter()
                         .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
                         .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
                         .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .map(|rc| non_resident(&rc.layout))
-                        .sum::<u64>()
+                        .chain(
+                            g0.prefill_prefix
+                                .iter()
+                                .filter(|(pmq, _, sent)| *pmq > 1 && !sent.is_empty())
+                                .filter_map(|(_, _, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
+                                .filter_map(
+                                    scratchy_target_spyre::bundle_code::bundle::<World>,
+                                ),
+                        )
+                        .collect();
+                    // The arenas: per shared segment, the WIDEST family rung owns it. Skipped
+                    // when the family places nothing in the segment — no arena is charged and
+                    // no rung borrows it.
+                    let mut arenas: Vec<(
+                        scratchy_target_spyre_card::superdsc_exec::SegIdx,
+                        String,
+                    )> = Vec::new();
+                    let mut arena_bytes: u64 = 0;
+                    for seg in scratchy_target_spyre_card::superdsc_exec::SHARED_SCRATCH_SEGS {
+                        let i = seg.get();
+                        let widest = family
+                            .iter()
+                            .filter(|rc| rc.layout.segment_bytes[i] > 0)
+                            .max_by_key(|rc| rc.layout.segment_bytes[i]);
+                        if let Some(owner) = widest {
+                            arena_bytes += owner.layout.segment_bytes[i];
+                            arenas.push((seg, owner.fp.to_string()));
+                        }
+                    }
+                    family_arenas_o = Some(arenas);
+                    // Every rung's PRIVATE remainder: its non-resident segments minus the
+                    // shared ones (charged once above as the arenas).
+                    let private =
+                        |lay: &scratchy_target_spyre::bundle_code::BundleLayout<'static>| {
+                            lay.segment_bytes
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, b)| *b > 0 && *i != weight && *i != kv && !shared.contains(i))
+                                .map(|(_, b)| *b)
+                                .sum::<u64>()
+                        };
+                    arena_bytes
+                        + family.iter().map(|rc| private(&rc.layout)).sum::<u64>()
                         + g0.decode_rungs
                             .iter()
                             .filter(|(rn, _, _, _)| rn.get() > 1)
                             .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
                             .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|rc| non_resident(&rc.layout))
-                            .sum::<u64>()
-                        + g0
-                            .prefill_prefix
-                            .iter()
-                            .filter(|(pmq, _, sent)| *pmq > 1 && !sent.is_empty())
-                            .filter_map(|(_, _, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
-                            .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|rc| non_resident(&rc.layout))
+                            .map(|rc| {
+                                // Decode rungs are PRIVATE whole: non-resident segments,
+                                // shared set included.
+                                rc.layout
+                                    .segment_bytes
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| *i != weight && *i != kv)
+                                    .map(|(_, b)| *b)
+                                    .sum::<u64>()
+                            })
                             .sum::<u64>()
                 };
                 // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
@@ -2133,7 +2199,12 @@ impl SpyreWorker {
                                                 &rung_pool,
                                                 &rung_spill,
                                             );
-                                            (rm, r)
+                                            // The bundle rides beside the build result: the
+                                            // family-arena wave below names each rung's
+                                            // segment extents and its arena owners by bundle
+                                            // fingerprint, so the identity must survive the
+                                            // fan-out.
+                                            (rm, rcode, r)
                                         })
                                         .collect::<Vec<_>>()
                                 })
@@ -2703,6 +2774,44 @@ impl SpyreWorker {
                     Err(p) => std::panic::resume_unwind(p),
                 };
                 let _t_joins = _t_wave.elapsed();
+                // ⭐⭐ MARK THE FAMILY'S ARENA BORROWERS — BEFORE any of them prepares. The
+                // prefill family (the ladder's rungs and the prefix rungs) shares its scratch
+                // segments as ONE arena each (`SHARED_SCRATCH_SEGS`), owned by the family's
+                // WIDEST rung for that segment — the SAME picks the census charged, carried in
+                // `family_arenas_o`. Marking here means a borrower's prepare leaves a 128 B
+                // placeholder where its private scratch would have been, and the share below
+                // points it at the arena: the family's scratch cost is its WIDEST rung's, not
+                // the sum over the ladder (measured on #1305: 1038 → 3203 pool pages). Decode
+                // rungs and the anchor keep private scratch — decode overlaps prefill, and the
+                // anchor prepares before the wave's owners exist.
+                let family_arenas = family_arenas_o
+                    .expect("the census minted the family arena picks before any session built");
+                for (seg, owner_fp) in &family_arenas {
+                    for (_, rc, built) in ladder_built.iter_mut() {
+                        if rc.fp.as_ref() != owner_fp.as_str()
+                            && let Ok(sess) = built
+                        {
+                            sess.mark_borrowed(*seg).map_err(|e| {
+                                werr(format!(
+                                    "marking the prefill family's seg{} scratch borrowed: {e}",
+                                    seg.get()
+                                ))
+                            })?;
+                        }
+                    }
+                    for (job, built) in prefix_jobs.iter().zip(prefix_built_sessions.iter_mut()) {
+                        if job.rcode.fp.as_ref() != owner_fp.as_str()
+                            && let Ok(sess) = built
+                        {
+                            sess.mark_borrowed(*seg).map_err(|e| {
+                                werr(format!(
+                                    "marking the prefix family's seg{} scratch borrowed: {e}",
+                                    seg.get()
+                                ))
+                            })?;
+                        }
+                    }
+                }
                 let (ladder_prepared, prefix_prepared, decode_prepared) =
                     std::thread::scope(|scope| {
                         fn joined<R>(hs: Vec<std::thread::ScopedJoinHandle<'_, R>>) -> Vec<R> {
@@ -2721,10 +2830,11 @@ impl SpyreWorker {
                         // driver path and paid 3755 ms for ~a tenth of that in device work.
                         let hl: Vec<_> = ladder_built
                             .into_iter()
-                            .map(|(rm, built)| {
+                            .map(|(rm, rc, built)| {
                                 scope.spawn(move || {
                                     (
                                         rm,
+                                        rc,
                                         built.and_then(|mut rs| {
                                             rs.prepare_in_rank_order()?;
                                             Ok(rs)
@@ -2771,6 +2881,104 @@ impl SpyreWorker {
                             .collect();
                         (joined(hl), joined(hp), joined(hd))
                     });
+                // ⭐⭐ SHARE THE FAMILY'S ARENAS — every borrower prepared against a 128 B
+                // placeholder for the segments it marked; point each at its arena now, taken
+                // from the SAME census picks that charged them. The owner is found by bundle
+                // fingerprint in whichever family list carries it; the split keeps the owner
+                // session borrowed immutably while every other rung (in both lists) takes the
+                // arena mutably. A failed owner is fatal here, not skippable: its borrowers
+                // hold placeholders that nothing else can fill.
+                for (seg, owner_fp) in &family_arenas {
+                    let in_ladder = ladder_prepared
+                        .iter()
+                        .position(|(_, rc, _)| rc.fp.as_ref() == owner_fp.as_str());
+                    match in_ladder {
+                        Some(oi) => {
+                            let (lo, hi) = ladder_prepared.split_at_mut(oi);
+                            let ((_, _, owner_res), rest) =
+                                hi.split_first_mut().expect("the position came from the list");
+                            let owner = owner_res.as_mut().unwrap_or_else(|e| {
+                                panic!(
+                                    "the seg{} family arena's owner ({owner_fp}) failed to \
+                                     prepare: {e} — every rung the bake shipped must load",
+                                    seg.get()
+                                )
+                            });
+                            for (_, _, built) in lo.iter_mut().chain(rest.iter_mut()) {
+                                if let Ok(sess) = built {
+                                    sess.share_scratch_seg_from(owner, *seg).map_err(|e| {
+                                        werr(format!(
+                                            "sharing the seg{} family arena: {e}",
+                                            seg.get()
+                                        ))
+                                    })?;
+                                }
+                            }
+                            for (job, built) in
+                                prefix_jobs.iter().zip(prefix_prepared.iter_mut())
+                            {
+                                if job.rcode.fp.as_ref() != owner_fp.as_str()
+                                    && let Ok(sess) = built
+                                {
+                                    sess.share_scratch_seg_from(owner, *seg).map_err(|e| {
+                                        werr(format!(
+                                            "sharing the seg{} family arena with the prefix \
+                                             rung (w={}, s={}): {e}",
+                                            seg.get(),
+                                            job.pmq,
+                                            job.seqs
+                                        ))
+                                    })?;
+                                }
+                            }
+                        }
+                        None => {
+                            // The arena's owner is a PREFIX rung: every ladder rung and every
+                            // other prefix rung borrows from it.
+                            let pi = prefix_jobs
+                                .iter()
+                                .position(|job| job.rcode.fp.as_ref() == owner_fp.as_str())
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "the census named {owner_fp} the owner of the seg{} \
+                                         family arena, but no family rung carries that bundle — \
+                                         both are fields of the one census, so this is a load bug",
+                                        seg.get()
+                                    )
+                                });
+                            let (plo, phi) = prefix_prepared.split_at_mut(pi);
+                            let (owner_res, rest) =
+                                phi.split_first_mut().expect("the position came from the list");
+                            let owner = owner_res.as_mut().unwrap_or_else(|e| {
+                                panic!(
+                                    "the seg{} family arena's owner ({owner_fp}) failed to \
+                                     prepare: {e} — every rung the bake shipped must load",
+                                    seg.get()
+                                )
+                            });
+                            for (_, _, built) in ladder_prepared.iter_mut() {
+                                if let Ok(sess) = built {
+                                    sess.share_scratch_seg_from(owner, *seg).map_err(|e| {
+                                        werr(format!(
+                                            "sharing the seg{} family arena: {e}",
+                                            seg.get()
+                                        ))
+                                    })?;
+                                }
+                            }
+                            for built in plo.iter_mut().chain(rest.iter_mut()) {
+                                if let Ok(sess) = built {
+                                    sess.share_scratch_seg_from(owner, *seg).map_err(|e| {
+                                        werr(format!(
+                                            "sharing the seg{} family arena with a prefix rung: {e}",
+                                            seg.get()
+                                        ))
+                                    })?;
+                                }
+                            }
+                        }
+                    }
+                }
                 let _t_all = _t_wave.elapsed();
                 info!(
                     "[spyre-worker] sendnn: ladder device half: {} session(s) prepared in {:.0} ms \
@@ -2795,7 +3003,7 @@ impl SpyreWorker {
                     std::thread::scope(|scope| {
                         let handles: Vec<_> = ladder_prepared
                             .into_iter()
-                            .map(|(rm, built)| {
+                            .map(|(rm, _rc, built)| {
                                 let ss = &ss;
                                 let spill = &spill_images;
                                 scope.spawn(move || {

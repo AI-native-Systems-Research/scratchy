@@ -542,6 +542,31 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             .for_each(|((_, e), (_, o))| e.adopt_funded_kv(o));
     }
 
+    /// Declare, BEFORE prepare, that `seg` will be borrowed — the wave-built rung's route to
+    /// [`Executor::mark_borrowed`] (the constructors take their borrowed list at build; a session
+    /// that only learns its family role after the build marks it here, between build and
+    /// `prepare_in_rank_order`). Rank-wide, like every segment decision.
+    pub fn mark_borrowed(&mut self, seg: SegIdx) -> Result<()> {
+        for (_, e) in self.ranks.iter_mut() {
+            e.mark_borrowed(seg)?;
+        }
+        Ok(())
+    }
+
+    /// Point every rank's borrowed `seg` at the family arena — rank r shares rank r's arena, the
+    /// same rank-matching the alias uses. The arena's OWNER is the family rung the census named
+    /// for this segment (its prepare already ran); see [`Executor::share_scratch_seg_from`].
+    pub fn share_scratch_seg_from(
+        &mut self,
+        owner: &SuperDscSession<'a, 'c, T>,
+        seg: SegIdx,
+    ) -> Result<()> {
+        for ((_, e), (_, o)) in self.ranks.iter_mut().zip(owner.ranks.iter()) {
+            e.share_scratch_seg_from(o, seg)?;
+        }
+        Ok(())
+    }
+
     /// ⭐ RANK 0 — the card whose readback a step returns. In a sharded world every value the host
     /// reads (the picked token, the logits row) is replicated across the ranks — the forward ends in
     /// the whole hidden state on every rank, so each rank's suffix computes the same row — so one

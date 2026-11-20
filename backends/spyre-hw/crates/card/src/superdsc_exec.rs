@@ -375,6 +375,42 @@ impl HostShadow {
 /// more than one segment (see `scratchy_spyre_bundle::MAX_SEGMENT_BYTES`).
 pub const SEG_RESIDENT: [SegIdx; 2] = [SEG_WEIGHT, SEG_KV];
 
+/// COLOUR A (seg5) — the first intermediate colour segment (the spill slot's co-tenant colour
+/// when a bundle's weights spill past the weight home).
+pub const SEG_COLOR_A: SegIdx = SegIdx::known::<5>();
+/// COLOUR B (seg6) — the second intermediate colour segment.
+pub const SEG_COLOR_B: SegIdx = SegIdx::known::<6>();
+
+/// ⭐⭐ THE SCRATCH SEGMENTS A MUTUALLY-EXCLUSIVE FAMILY SHARES AS ONE ARENA EACH — seg0
+/// (intermediate) and the intermediate COLOURS seg5/seg6. The whole ladder of prefill rungs
+/// executes one launch at a time (every prefill-shaped launch is collected in-call by the host
+/// thread — only the decode launch is submitted-then-deferred, and decode keeps private
+/// regions), so their scratch lifetimes are ordered by the host's own awaits and the WIDEST
+/// rung's region can back them all: every borrower addresses its OWN placement, which its bake
+/// proved inside its own `segment_bytes`, so the one law the arena must hold is FIT — a
+/// borrower's extent ≤ the arena's region, a fact the loader's census holds when it picks the
+/// WIDEST family rung as the segment's owner ([`Executor::share_scratch_seg_from`]). The
+/// port of #1305's family arena, worker-side.
+///
+/// ⛔ THE PROOF THAT SHARING IS SOUND, NOT ASSUMED. A shared arena means rung B can read bytes
+/// rung A left behind. That is exactly what every rung already does to ITSELF: a serving run
+/// executes the same rung for prompt after prompt with only boot-time zeroing, so rung B's
+/// second execution already reads rung B's first-execution leftovers — correct output there
+/// proves each bundle writes every scratch location it later reads, at the granularity that
+/// affects output, within its own execution. A's leftovers at a location B reads before
+/// writing would break B's SECOND execution on today's binary already; they don't, so
+/// cross-rung leftovers are as harmless as the rung's own.
+///
+/// ⛔ AND THE EXCLUSIONS ARE MECHANISM, NOT TASTE:
+/// - seg1/seg2 — resident; they take the PLACEMENT-EQUALITY alias ([`Executor::alias_seg_from`]),
+///   which sharing is not (a rung's placements differ from the owner's by design).
+/// - seg3 (mask/activation) — per-session STAGED CONSTANTS (the sampler's tables, the pool's
+///   tables) land at rung-local offsets, and the step's input DMAs target it; sharing it would
+///   need bounded staging into a foreign region.
+/// - seg4 (logits) — D2H'd WHOLE each step, so a borrower sharing a wider arena pays the whole
+///   arena's readback every token.
+pub const SHARED_SCRATCH_SEGS: [SegIdx; 3] = [SEG_INTERMEDIATE, SEG_COLOR_A, SEG_COLOR_B];
+
 /// Whether `i` names a resident segment (see [`SEG_RESIDENT`]).
 fn is_resident_seg(i: usize) -> bool {
     SEG_RESIDENT.iter().any(|s| s.get() == i)
@@ -2436,6 +2472,48 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             );
         }
         self.seg_borrowed[seg.get()] = true;
+        Ok(())
+    }
+
+    /// ⭐⭐ POINT A BORROWED SCRATCH SEGMENT AT ITS FAMILY'S ARENA, TAKEN FROM THE OWNER SESSION —
+    /// the mutually-exclusive family's region-sharing counterpart of [`Self::alias_seg_from`].
+    /// Where the alias proves two layouts IDENTICAL (same placements, same extents — weights and
+    /// KV are placed the same in every rung), this needs NO proof at all: the census charged the
+    /// arena when it picked the family's WIDEST rung as the segment's owner, so the borrower's
+    /// extent fits the arena's region BY THAT PICK (that is what "widest" means), the segment is
+    /// one of [`SHARED_SCRATCH_SEGS`] BY TYPE (a resident or staged segment is not nameable
+    /// here), and the caller's wave declared the segment borrowed before prepare by the SAME
+    /// census's marking. The borrower keeps its OWN placements and addresses them in the arena;
+    /// that is the entire point, since a ladder's rungs place their scratch differently.
+    ///
+    /// The mutual exclusion is the CALLER's law (see [`SHARED_SCRATCH_SEGS`]'s doc): every launch
+    /// of this family is collected in-call by the host thread, so no two sharers touch the arena
+    /// concurrently.
+    ///
+    /// Marks the segment aliased so this session's preamble can never H2D a stale host shadow
+    /// over the family's live data — the same guard [`Self::alias_seg_from`] sets.
+    pub fn share_scratch_seg_from(
+        &mut self,
+        owner: &Executor<'a, '_, T>,
+        seg: SegIdx,
+    ) -> Result<()> {
+        let i = seg.get();
+        // The owner prepared — the wave joined its prepare before any sharing.
+        let src = owner.seg_addr[i]
+            .as_ref()
+            .expect("the arena owner prepared — its segment is allocated");
+        let c0 = src
+            .chunk0()
+            .filter(|_| src.is_single_chunk())
+            .ok_or_else(|| anyhow!("share_scratch_seg(seg{i}): arena region is MULTI-CHUNK"))?;
+        self.seg_addr[i] = Some(DevAddr::from_chunk(c0));
+        self.seg_aliased[i] = true;
+        debug!(
+            "[sdsc-superdsc] share_scratch_seg(seg{i}): dst now SHARES the family arena ({} B \
+             for {} B of placement)",
+            c0.size.0,
+            self.segment_bytes[i]
+        );
         Ok(())
     }
 
