@@ -41,11 +41,11 @@ use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 /// How the target's kernels want an MLP's gate and up projections stored.
 ///
 /// ⛔ NOT A `bool`. It decides the NAME of an emitted field, and the emitted load body recovers
-/// that field's sources by splitting the name on `__fused__` — so the wrong answer is not a
+/// that field's sources by splitting the name on `_fused_` — so the wrong answer is not a
 /// wrong flag, it is a field that resolves to no safetensors key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MlpPacking {
-    /// ONE buffer holding both, named `{gate}__fused__{up}` — a fused-MLP kernel reads a
+    /// ONE buffer holding both, named `{gate}_fused_{up}` — a fused-MLP kernel reads a
     /// single packed weight.
     Packed,
     /// Two weights: an MLP of two matmuls plus a `SiluMul`, with no packed-buffer kernel.
@@ -85,21 +85,20 @@ pub struct WeightAbi {
 /// base. This is a target bridge's `base` exactly — two spellings of one base is what this file
 /// exists to prevent.
 fn accessor_base(program: &Program, id: WeightId) -> String {
-    program.weights.path(id).join("_")
+    scratchy_forward_compiler_frontend::typed_emit::field_name(program.weights.path(id))
 }
 
-/// The field name of a gate/up pair PACKED INTO ONE weight: `{gate}__fused__{up}` plus the
-/// layer, which is the spelling the load body inverts by splitting on `__fused__`.
+/// The field name of a gate/up pair PACKED INTO ONE weight: `{gate}_fused_{up}` plus the
+/// layer, which is the spelling the load body inverts by splitting on `_fused_`.
 fn fused_field_name(
     program: &Program,
     gate: WeightId,
     up: WeightId,
     index: Option<UnrollIndex>,
 ) -> syn::Ident {
-    let base = format!(
-        "{}__fused__{}",
-        accessor_base(program, gate),
-        accessor_base(program, up)
+    let base = scratchy_forward_compiler_frontend::typed_emit::fused_name(
+        &accessor_base(program, gate),
+        &accessor_base(program, up),
     );
     match index {
         Some(i) => quote::format_ident!("{}_{}", base, i.0),
@@ -504,7 +503,7 @@ mod tests {
     /// one walk, which is the whole reason a target's inline producer could be deleted.
     ///
     /// The packed name is load-bearing, not cosmetic: the emitted load body recovers the
-    /// sources by splitting it on `__fused__`, so a different spelling is a field that resolves
+    /// sources by splitting it on `_fused_`, so a different spelling is a field that resolves
     /// to no safetensors key.
     #[test]
     fn packing_gate_up_is_one_field_named_for_both_and_unpacking_is_two() {
@@ -525,7 +524,7 @@ mod tests {
             .map(|a| a.name.to_string())
             .collect();
         assert!(
-            names.contains(&"mlp_gate_proj__fused__mlp_up_proj".to_string()),
+            names.contains(&"mlp_gate_proj_fused_mlp_up_proj".to_string()),
             "packed pair must be ONE field named for both halves, got {names:?}"
         );
         assert!(
@@ -535,7 +534,7 @@ mod tests {
         let fused = packed
             .accessors
             .iter()
-            .find(|a| a.name.to_string().contains("__fused__"))
+            .find(|a| a.name.to_string().contains("_fused_"))
             .expect("fused accessor");
         assert_eq!(
             fused.source_weights,
@@ -562,7 +561,7 @@ mod tests {
             "unpacked must be two fields, got {split_names:?}"
         );
         assert!(
-            !split_names.iter().any(|n| n.contains("__fused__")),
+            !split_names.iter().any(|n| n.contains("_fused_")),
             "unpacked must name no packed buffer: {split_names:?}"
         );
     }

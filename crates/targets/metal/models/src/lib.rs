@@ -1,8 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Two lints the emitted code still trips (#1320, pending): weight field names spelled from DSL
-// paths (`{gate}__fused__{up}`, ModernBERT's `Wo`), and the baked `tp_world_size` literal's cast.
-#![allow(non_snake_case)]
-#![allow(clippy::unnecessary_cast)]
 //! The selected models, compiled for metal: one `pub mod <arch>` per arch the scope selects
 //! (`scratchy-models`' features), each holding its models' baked tapes, pools and weights. The
 //! build script runs every selected arch through the shared pipeline with metal's emitter into

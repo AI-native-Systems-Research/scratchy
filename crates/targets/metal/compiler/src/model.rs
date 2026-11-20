@@ -817,7 +817,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             .collect();
         let embed_base = weight_paths
             .iter()
-            .map(|p| p.join("_"))
+            .map(|p| scratchy_forward_compiler_frontend::typed_emit::field_name(p))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
         // Each DSL weight whose own subtree declares a `shared_expert`, by id: the bank a MoE op
@@ -885,7 +885,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         *slots_dec = arena;
         metal_steps.insert(*canonical, lowered);
         // THE WEIGHTS STRUCT, from the tape's bindings. Metal's one ABI fact in it: a gate/up
-        // pair is ONE packed `__fused__` buffer.
+        // pair is ONE packed `_fused_` buffer.
         let abi = WeightAbi {
             mlp: if fused_mlp {
                 MlpPacking::Packed

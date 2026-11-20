@@ -3533,7 +3533,7 @@ fn emit_weights_struct(
                     quote! { (#suffix, #rows_lit) }
                 })
                 .collect();
-            let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+            let tp_world_lit = proc_macro2::Literal::usize_unsuffixed(usize::from(tp_world_size));
             calls.push(quote! {
                 for __l in 0..#num_hidden_layers {
                     let __pp = ::std::format!(
@@ -3551,7 +3551,7 @@ fn emit_weights_struct(
                         &__pp,
                         &[ #(#pairs),* ],
                         tp_rank as usize,
-                        #tp_world_lit as usize,
+                        #tp_world_lit,
                     )?;
                 }
             });
@@ -4873,7 +4873,7 @@ fn emit_unindexed_let(
     packed_concat: bool,
 ) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
-    let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+    let tp_world_lit = proc_macro2::Literal::usize_unsuffixed(usize::from(tp_world_size));
     let sharded = tp_world_size > 1;
     match plan {
         FieldLoad::Embedding(prefix) => {
@@ -4885,7 +4885,7 @@ fn emit_unindexed_let(
             if sharded && kind == ShardKind::ShardDim0 {
                 quote! {
                     let #name = crate::__gpu::layers::Embedding::load_sharded(
-                        gw, #prefix, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #prefix, tp_rank as usize, #tp_world_lit,
                     )?;
                 }
             } else {
@@ -4953,12 +4953,12 @@ fn emit_unindexed_let(
             match (sharded, kind) {
                 (true, ShardKind::ShardDim0) => quote! {
                     let #name = crate::__gpu::layers::LinearLayer::load_dense_sharded(
-                        gw, #prefix, 0usize, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #prefix, 0usize, tp_rank as usize, #tp_world_lit,
                     )?;
                 },
                 (true, ShardKind::ShardDim1) => quote! {
                     let #name = crate::__gpu::layers::LinearLayer::load_dense_sharded(
-                        gw, #prefix, 1usize, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #prefix, 1usize, tp_rank as usize, #tp_world_lit,
                     )?;
                 },
                 _ => quote! {
@@ -4992,7 +4992,7 @@ fn emit_unindexed_let(
                         &[ #(#prefixes),* ],
                         stream,
                         tp_rank as usize,
-                        #tp_world_lit as usize,
+                        #tp_world_lit,
                     )?;
                 }
             } else {
@@ -5812,7 +5812,7 @@ fn emit_layered_load_body(
     // Literal `[b0, b1, ...]` per-layer bits slice for the mixed loaders.
     let per_layer_bits_lit: Option<TokenStream> =
         per_layer_bits.map(|bits| quote! { &[ #(#bits),* ] });
-    let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+    let tp_world_lit = proc_macro2::Literal::usize_unsuffixed(usize::from(tp_world_size));
     let sharded = tp_world_size > 1;
     // Build the `<root>.0.` form for `layered_suffix` /
     // `layer_templated_prefix_expr` consumers. `None` for decoder bodies.
@@ -5867,7 +5867,7 @@ fn emit_layered_load_body(
             if sharded && kind == ShardKind::ShardDim0 {
                 quote! {
                     crate::__gpu::load_layered_embedding_sharded(
-                        gw, #n_lit, #dec_root_lit, #suffix, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #n_lit, #dec_root_lit, #suffix, tp_rank as usize, #tp_world_lit,
                     )?
                 }
             } else {
@@ -5925,12 +5925,12 @@ fn emit_layered_load_body(
             match (sharded, kind, is_vision) {
                 (true, ShardKind::ShardDim0, _) => quote! {
                     crate::__gpu::load_layered_linear_dense_sharded(
-                        gw, #n_lit, #dec_root_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #n_lit, #dec_root_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit,
                     )?
                 },
                 (true, ShardKind::ShardDim1, _) => quote! {
                     crate::__gpu::load_layered_linear_dense_sharded(
-                        gw, #n_lit, #dec_root_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #n_lit, #dec_root_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit,
                     )?
                 },
                 (_, _, true) => {
@@ -5984,7 +5984,7 @@ fn emit_layered_load_body(
                         &[ #(#suffixes),* ],
                         stream,
                         tp_rank as usize,
-                        #tp_world_lit as usize,
+                        #tp_world_lit,
                     )?
                 }
             } else if is_vision {
@@ -9508,13 +9508,11 @@ mod tests {
             ts.contains("load_layered_linear_dense_concat_sharded"),
             "tp=4 gate_up concat must route to concat_sharded (got: {ts})",
         );
-        // The macro bakes `tp_world_size` as an unsuffixed integer
-        // literal cast to `usize` (e.g. `4 as usize`). Asserting on
-        // the bare `4 as usize` token sequence — the unsuffixed form
-        // is `proc_macro2::Literal::u8_unsuffixed`'s contract.
+        // The macro bakes `tp_world_size` as an unsuffixed `usize` literal (`4`), after the
+        // shard rank: `proc_macro2::Literal::usize_unsuffixed`'s spelling, no cast.
         assert!(
-            ts.contains("4 as usize"),
-            "expected `4 as usize` for baked tp_world_size literal (got: {ts})",
+            ts.contains("tp_rank as usize , 4"),
+            "expected the baked tp_world_size literal `4` after the shard rank (got: {ts})",
         );
     }
 }
