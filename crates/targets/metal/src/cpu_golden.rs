@@ -793,7 +793,7 @@ pub fn affine_dequantize_b4_bf16(
 }
 
 pub use scratchy_state_decoder_gdn::reference::{
-    gdn_causal_conv1d, gdn_gating, gdn_recurrent, gdn_rms_norm_gated,
+    GatingInputs, RecurrentInputs, gdn_causal_conv1d, gdn_gating, gdn_recurrent, gdn_rms_norm_gated,
 };
 
 #[cfg(test)]

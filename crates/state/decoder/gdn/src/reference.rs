@@ -52,6 +52,18 @@ pub fn gdn_causal_conv1d(
     }
 }
 
+/// The inputs of [`gdn_gating`]: `a`,`b` are `[num_tokens, num_heads]`; `a_log`,`dt_bias` are
+/// `[num_heads]`.
+#[derive(Clone, Copy, Debug)]
+pub struct GatingInputs<'a> {
+    pub a: &'a [f32],
+    pub b: &'a [f32],
+    pub a_log: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub num_heads: usize,
+    pub num_tokens: usize,
+}
+
 /// GDN input-dependent gating.
 ///
 /// `g[t,h]    = -exp(A_log[h]) · softplus(a[t,h] + dt_bias[h])`  (log-decay, ≤0)
@@ -59,17 +71,15 @@ pub fn gdn_causal_conv1d(
 ///
 /// `a`,`b`: `[num_tokens, num_heads]`; `a_log`,`dt_bias`: `[num_heads]`.
 /// softplus uses the numerically-stable threshold (20.0) from the kernel.
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_gating(
-    a: &[f32],
-    b: &[f32],
-    a_log: &[f32],
-    dt_bias: &[f32],
-    g_out: &mut [f32],
-    beta_out: &mut [f32],
-    num_heads: usize,
-    num_tokens: usize,
-) {
+pub fn gdn_gating(inputs: &GatingInputs<'_>, g_out: &mut [f32], beta_out: &mut [f32]) {
+    let GatingInputs {
+        a,
+        b,
+        a_log,
+        dt_bias,
+        num_heads,
+        num_tokens,
+    } = *inputs;
     assert_eq!(a.len(), num_tokens * num_heads);
     assert_eq!(b.len(), num_tokens * num_heads);
     assert_eq!(a_log.len(), num_heads);
@@ -82,6 +92,22 @@ pub fn gdn_gating(
             beta_out[idx] = 1.0 / (1.0 + (-b[idx]).exp());
         }
     }
+}
+
+/// The inputs of [`gdn_recurrent`], with the shapes its doc gives.
+#[derive(Clone, Copy, Debug)]
+pub struct RecurrentInputs<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub g: &'a [f32],
+    pub beta: &'a [f32],
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub head_k: usize,
+    pub head_v: usize,
+    pub num_tokens: usize,
+    pub scale: f32,
 }
 
 /// Recurrent gated delta-rule scan (single sequence, zero initial state).
@@ -97,21 +123,20 @@ pub fn gdn_gating(
 /// ```
 /// `q`,`k`: `[T, num_k_heads·head_k]`; `v`,`o`: `[T, num_v_heads·head_v]`;
 /// `g`,`beta`: `[T, num_v_heads]`. `scale` = 1/sqrt(head_k).
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_recurrent(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    g: &[f32],
-    beta: &[f32],
-    o: &mut [f32],
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_k: usize,
-    head_v: usize,
-    num_tokens: usize,
-    scale: f32,
-) {
+pub fn gdn_recurrent(inputs: &RecurrentInputs<'_>, o: &mut [f32]) {
+    let RecurrentInputs {
+        q,
+        k,
+        v,
+        g,
+        beta,
+        num_k_heads,
+        num_v_heads,
+        head_k,
+        head_v,
+        num_tokens,
+        scale,
+    } = *inputs;
     let key_dim = num_k_heads * head_k;
     let value_dim = num_v_heads * head_v;
     assert_eq!(q.len(), num_tokens * key_dim);
@@ -209,7 +234,6 @@ mod tests {
     /// The golden checksums + core[0] were produced by the reference script and
     /// validate the math end-to-end on CPU (Mac), independent of any GPU kernel.
     #[test]
-    #[allow(clippy::approx_constant)] // -0.693_147_2 is a golden test oracle, not LN_2
     fn test_gdn_pipeline_golden() {
         let (nk, nv, hk, hv, kk, t) = (2usize, 4usize, 4usize, 4usize, 4usize, 6usize);
         let key_dim = nk * hk;
@@ -249,16 +273,41 @@ mod tests {
         // 3. gating
         let mut g = vec![0f32; t * nv];
         let mut beta = vec![0f32; t * nv];
-        gdn_gating(&a, &b, &a_log, &dt_bias, &mut g, &mut beta, nv, t);
+        let gating = GatingInputs {
+            a: &a,
+            b: &b,
+            a_log: &a_log,
+            dt_bias: &dt_bias,
+            num_heads: nv,
+            num_tokens: t,
+        };
+        gdn_gating(&gating, &mut g, &mut beta);
         let g_sum: f32 = g.iter().sum();
         let beta_sum: f32 = beta.iter().sum();
         assert!((g_sum - (-24.235_298)).abs() < 1e-3, "g_sum {g_sum}");
         assert!((beta_sum - 14.095_717).abs() < 1e-3, "beta_sum {beta_sum}");
-        assert!((g[0] - (-0.693_147_2)).abs() < 1e-5, "g[0] {}", g[0]);
+        assert!(
+            (g[0] + std::f32::consts::LN_2).abs() < 1e-5,
+            "g[0] {}",
+            g[0]
+        );
 
         // 4. recurrent gated delta-rule scan
         let mut o = vec![0f32; t * value_dim];
-        gdn_recurrent(&q, &k, &v, &g, &beta, &mut o, nk, nv, hk, hv, t, scale);
+        let scan = RecurrentInputs {
+            q: &q,
+            k: &k,
+            v: &v,
+            g: &g,
+            beta: &beta,
+            num_k_heads: nk,
+            num_v_heads: nv,
+            head_k: hk,
+            head_v: hv,
+            num_tokens: t,
+            scale,
+        };
+        gdn_recurrent(&scan, &mut o);
         let o_abs: f32 = o.iter().map(|x| x.abs()).sum();
         assert!((o_abs - 0.6908325).abs() < 1e-3, "o_abs {o_abs}");
 

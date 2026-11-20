@@ -5,28 +5,9 @@
 //! Mamba-2 reads as the same geometry. `scratchy-ir` re-exports these from its `model_facts`, so
 //! every model's emitted `FACTS` states its layers through the same paths.
 
+use scratchy_tensors::positive;
 use scratchy_tensors::typed::typenum::U2;
 use scratchy_tensors::typed::{Add, Dim, DimN, Equals, Mul};
-
-/// A positive count or extent: the constructor refuses zero.
-macro_rules! positive {
-    ($($(#[$m:meta])* $name:ident($t:ty)),* $(,)?) => {$(
-        $(#[$m])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-        pub struct $name($t);
-        impl $name {
-            /// The quantity, refused at zero.
-            pub const fn new(v: $t) -> Self {
-                assert!(v > 0, concat!(stringify!($name), " is a positive quantity"));
-                Self(v)
-            }
-            /// The quantity as a number.
-            pub const fn get(self) -> $t {
-                self.0
-            }
-        }
-    )*};
-}
 
 positive! {
     /// A Gated-DeltaNet head count (key or value side).

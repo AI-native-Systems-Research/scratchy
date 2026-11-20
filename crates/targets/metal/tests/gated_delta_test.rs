@@ -17,7 +17,9 @@ mod common;
 use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::{bake, baked_build};
-use scratchy_target_metal::cpu_golden::{gdn_causal_conv1d, gdn_gating, gdn_rms_norm_gated};
+use scratchy_target_metal::cpu_golden::{
+    GatingInputs, gdn_causal_conv1d, gdn_gating, gdn_rms_norm_gated,
+};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
     CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots,
@@ -341,7 +343,15 @@ fn gdn_gating_matches_reference() {
 
     let mut g_ref = vec![0f32; n];
     let mut beta_ref = vec![0f32; n];
-    gdn_gating(&a, &b, &a_log, &dt_bias, &mut g_ref, &mut beta_ref, nv, t);
+    let gating = GatingInputs {
+        a: &a,
+        b: &b,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        num_heads: nv,
+        num_tokens: t,
+    };
+    gdn_gating(&gating, &mut g_ref, &mut beta_ref);
 
     let key = PipelineKey::new(
         "gdn_gating",
