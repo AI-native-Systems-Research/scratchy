@@ -15,20 +15,18 @@ name: Release (crates.io)
 # re-running a release that stopped part-way publishes only what is missing,
 # and re-running one that finished publishes nothing. crates.io limits how many
 # NEW crates one account publishes: a burst of 5, then one every 10 minutes.
-# The first release is more new crates than that, so either raise the limit
-# first (below) or expect to re-run it, at least 10 minutes apart, until every
+# A first publish of many crates either asks help@crates.io to raise the
+# account's limit first or re-runs, at least 10 minutes apart, until every
 # crate is up.
 #
 # workflow_dispatch runs the same publish as a dry run, uploading nothing.
 #
-# Before the first release:
-#   CARGO_REGISTRY_TOKEN  a repo secret (Settings → Secrets and variables →
-#                         Actions): a crates.io API token with the publish-new
-#                         and publish-update scopes, from an owner of the crates
-#   the new-crate limit   ask help@crates.io to raise the publishing account's
-#                         new-crate limit to at least the number of crates this
-#                         publishes (`publish != false` members), so the first
-#                         release publishes them in one run
+# Authentication is crates.io Trusted Publishing: the job trades GitHub's OIDC token for a
+# short-lived crates.io token (rust-lang/crates-io-auth-action), so the repo holds no crates.io
+# secret. Each crate's crates.io settings name this repo and this workflow file as its trusted
+# publisher. Trusted Publishing can only be set on a crate that already exists, so a crate's first
+# version is published by hand, by whoever becomes its first owner, and only then does this
+# workflow publish it. A new crate added to the published set later starts the same way.
 
 on:
   release:
@@ -37,6 +35,8 @@ on:
 
 permissions:
   contents: read
+  # The OIDC token the crates.io token exchange needs.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,10 +91,16 @@ jobs:
           echo "exclude=${exclude}" >> "$GITHUB_OUTPUT"
           echo "remaining=${remaining}" >> "$GITHUB_OUTPUT"
 
+      # A real release only: a dry run uploads nothing and needs no token.
+      - name: crates.io token (Trusted Publishing)
+        id: auth
+        if: github.event_name == 'release' && steps.published.outputs.remaining != '0'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
       - name: Publish
         if: steps.published.outputs.remaining != '0'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           # `a && b || c` is an if-else only while `b` is truthy, and '' is not: the empty
           # value has to be the fallback, or a release would dry-run too.
           DRY_RUN: ${{ github.event_name != 'release' && '--dry-run' || '' }}
