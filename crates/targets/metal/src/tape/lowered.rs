@@ -2948,6 +2948,10 @@ pub enum Lacked {
     FinalSoftcap,
     /// The target a head reads.
     Target,
+    /// A multi-head latent attention's cached rows.
+    Latent,
+    /// A roped attention's rotary facts, in a lane pairing its kernels take.
+    Rope,
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the
@@ -3038,6 +3042,9 @@ pub enum LoweringError {
     /// A GDN conv whose `kernel` taps or `drafts` drafted tokens a step its kernel's token block
     /// ([`crate::tape::ids::GdnConvBlock`]) does not cover.
     GdnConvBlockShort { kernel: u32, drafts: u32 },
+    /// An MLA attention whose `latent` lanes of f32 partials, for even one simdgroup, overflow
+    /// the merge's threadgroup `budget` bytes.
+    MlaMergeOverflow { latent: u32, budget: u32 },
 }
 
 /// A scratch buffer whose size scales with the KV cap rung: of the [`ScratchKind`]s, the ones a
@@ -3053,6 +3060,12 @@ pub enum RungScratch {
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MlaMergeOverflow { latent, budget } => write!(
+                f,
+                "an MLA attention's merge holds a simdgroup's {latent} latent lanes as f32 \
+                 ({} bytes), past its {budget}-byte threadgroup budget",
+                4 * latent
+            ),
             Self::UnstagedHeadDim { head_dim } => write!(
                 f,
                 "RopeAppendNormed's threadgroup staging holds a head of at most {} (got {head_dim})",

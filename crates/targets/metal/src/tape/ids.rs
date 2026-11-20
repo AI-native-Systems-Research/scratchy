@@ -549,6 +549,9 @@ u32_newtype!(
     PartialStride,
     /// The threads of a threadgroup.
     ThreadCount,
+    /// The lanes of a latent attention's cached row one of the paged pool's K and V stores
+    /// holds.
+    HalfRow,
     /// A reshape's row divisor (`num_tokens / d` rows — the vision merger's factor).
     RowsDivisor,
     /// Iterations of a rolled loop.

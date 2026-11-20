@@ -1284,6 +1284,42 @@ pub fn compile_carrier(
                 }
             }
         };
+        // Per-variant latent KV rows: a multi-head latent attention's cached row, from the mint its
+        // facts carry (`codegen::mla_of`). Emitted only when some variant caches one.
+        let latent_kv_row_tokens = {
+            let half = |a: &DispatchArm| {
+                let sm = solved.iter().find(|sm| a.model_ident == sm.mod_name);
+                sm.and_then(|sm| codegen::mla_of(&sm.fuf, sm.model))
+                    .map(|mla| mla.half_row() as usize)
+            };
+            match arch_dispatch_arms.iter().all(|a| half(a).is_none()) {
+                true => proc_macro2::TokenStream::new(),
+                false => {
+                    let arms = arch_dispatch_arms.iter().map(|a| {
+                        let variant_ident = pascal_case(&a.model_ident);
+                        let body = match half(a) {
+                            Some(h) => quote! {
+                                ::core::option::Option::Some(::scratchy_forward_compiler::KvRow {
+                                    kv_heads: 1,
+                                    head_size: #h,
+                                })
+                            },
+                            None => quote! { ::core::option::Option::None },
+                        };
+                        quote! { Weights::#variant_ident(_) => #body, }
+                    });
+                    quote! {
+                        fn latent_kv_row(
+                            &self,
+                        ) -> ::core::option::Option<::scratchy_forward_compiler::KvRow> {
+                            match self {
+                                #(#arms)*
+                            }
+                        }
+                    }
+                }
+            }
+        };
         // Per-variant `rope_on_read` arms — spans / position-independent KV.
         // Rope-on-read is the universal default for rope-using models; this
         // mirrors the `ROPE_ON_READ` CanonicalParams const (both derive from
@@ -1525,6 +1561,7 @@ pub fn compile_carrier(
             #gdn_runtime_config_tokens
             #kv_layer_geometry_tokens
             #spec_drafts_tokens
+            #latent_kv_row_tokens
             #rope_on_read_tokens
             #head_tokens
         };

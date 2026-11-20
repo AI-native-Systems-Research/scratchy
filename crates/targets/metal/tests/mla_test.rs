@@ -20,6 +20,7 @@ use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::lowering::mla_attend_tiling;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -417,16 +418,42 @@ fn rotary(positions: usize, rope: usize) -> Vec<f32> {
         .collect()
 }
 
-/// `x`'s rope part rotated at `pos`, lanes `(2i, 2i + 1)` paired.
-fn rotate(x: &[f32], table: &[f32], rope: usize, pos: usize) -> Vec<f32> {
+/// How a rope part's lanes pair, as slot 15 (`MLA_PAIRING`) states it.
+#[derive(Clone, Copy, Debug)]
+enum Pairing {
+    /// Lanes `(2i, 2i + 1)`: slot value 0.
+    Interleaved,
+    /// Lanes `(i, i + rope / 2)`, the NeoX split: slot value 1.
+    Halves,
+}
+
+impl Pairing {
+    const ALL: [Self; 2] = [Self::Interleaved, Self::Halves];
+
+    fn constant(self) -> ConstantValue {
+        uint(
+            15,
+            match self {
+                Self::Interleaved => 0,
+                Self::Halves => 1,
+            },
+        )
+    }
+}
+
+/// `x`'s rope part rotated at `pos`, its lanes paired as `pairing` states.
+fn rotate(x: &[f32], table: &[f32], rope: usize, pos: usize, pairing: Pairing) -> Vec<f32> {
     let (half, row) = (rope / 2, &table[pos * rope..]);
     (0..rope)
         .map(|d| {
-            let (c, s) = (row[d / 2], row[half + d / 2]);
-            let (x0, x1) = (x[d & !1], x[d | 1]);
-            match d % 2 {
-                0 => x0 * c - x1 * s,
-                _ => x1 * c + x0 * s,
+            let (f, first, i0, i1) = match pairing {
+                Pairing::Interleaved => (d / 2, d % 2 == 0, d & !1, d | 1),
+                Pairing::Halves => (d % half, d < half, d % half, d % half + half),
+            };
+            let (c, s, x0, x1) = (row[f], row[half + f], x[i0], x[i1]);
+            match first {
+                true => x0 * c - x1 * s,
+                false => x1 * c + x0 * s,
             }
         })
         .collect()
@@ -448,34 +475,47 @@ fn mla_rope_q_rotates_each_heads_rope_part() {
     let rows = positions.len();
     let q = fill(rows * g.heads * g.q_head(), 29);
     let table = rotary(512, g.rope);
-    let mut constants = g.constants();
-    constants.push(uint(13, 32));
-    let key = PipelineKey::new("mla", "mla_rope_q_bf16", constants);
-    let pso = baked_build(&cache, &key).expect("mla_rope_q pipeline");
-    let out = common::shared_zeroed(&device, q.len() * 2);
-    if !common::dispatch_threadgroups(
-        &device,
-        &pso,
-        &[
-            &bf16_buf(&device, &q),
-            &out,
-            &common::shared_slice(&device, &positions),
-            &bf16_buf(&device, &table),
-        ],
-        size(rows, g.heads, 1),
-        size(32, 1, 1),
-    ) {
-        return;
-    }
-    let mut want = Vec::new();
-    for (t, &pos) in positions.iter().enumerate() {
-        for h in 0..g.heads {
-            let head = &q[(t * g.heads + h) * g.q_head()..][..g.q_head()];
-            want.extend_from_slice(&head[..g.nope]);
-            want.extend(rotate(&head[g.nope..], &table, g.rope, pos as usize));
+    for pairing in Pairing::ALL {
+        let mut constants = g.constants();
+        constants.push(uint(13, 32));
+        constants.push(pairing.constant());
+        let key = PipelineKey::new("mla", "mla_rope_q_bf16", constants);
+        let pso = baked_build(&cache, &key).expect("mla_rope_q pipeline");
+        let out = common::shared_zeroed(&device, q.len() * 2);
+        if !common::dispatch_threadgroups(
+            &device,
+            &pso,
+            &[
+                &bf16_buf(&device, &q),
+                &out,
+                &common::shared_slice(&device, &positions),
+                &bf16_buf(&device, &table),
+            ],
+            size(rows, g.heads, 1),
+            size(32, 1, 1),
+        ) {
+            return;
         }
+        let mut want = Vec::new();
+        for (t, &pos) in positions.iter().enumerate() {
+            for h in 0..g.heads {
+                let head = &q[(t * g.heads + h) * g.q_head()..][..g.q_head()];
+                want.extend_from_slice(&head[..g.nope]);
+                want.extend(rotate(
+                    &head[g.nope..],
+                    &table,
+                    g.rope,
+                    pos as usize,
+                    pairing,
+                ));
+            }
+        }
+        assert_close(
+            &format!("mla_rope_q {pairing:?}"),
+            &BF16.decode(&out, q.len()),
+            &want,
+        );
     }
-    assert_close("mla_rope_q", &BF16.decode(&out, q.len()), &want);
 }
 
 /// Each token's `[latent | rotated key]` lands at its slot in the pool's K and V halves (slots
@@ -486,7 +526,7 @@ fn mla_append_writes_each_tokens_latent_row() {
     let Some((device, cache)) = setup() else {
         return;
     };
-    for g in [
+    for (g, pairing) in [
         Geom {
             heads: 2,
             latent: 64,
@@ -500,7 +540,10 @@ fn mla_append_writes_each_tokens_latent_row() {
             nope: 192,
             rope: 64,
         },
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|g| Pairing::ALL.map(|p| (g, p)))
+    {
         let (block_size, bpc, blocks) = (4usize, 2usize, 6usize);
         let marker = 7.0;
         let pool = Pool::new(&device, g, blocks, block_size, bpc, marker);
@@ -515,6 +558,7 @@ fn mla_append_writes_each_tokens_latent_row() {
         let mut constants = g.constants();
         constants.extend(pool.cache_constants(g, 8));
         constants.push(uint(13, threads));
+        constants.push(pairing.constant());
         let key = PipelineKey::new("mla", "mla_append_bf16", constants);
         let pso = baked_build(&cache, &key).expect("mla_append pipeline");
         let out = common::shared_zeroed(&device, rows * g.rope * 2);
@@ -539,7 +583,10 @@ fn mla_append_writes_each_tokens_latent_row() {
             return;
         }
         let rotated: Vec<Vec<f32>> = (0..rows)
-            .map(|t| rotate(&k_pe[t * g.rope..], &table, g.rope, positions[t] as usize))
+            .map(|t| {
+                let pos = positions[t] as usize;
+                rotate(&k_pe[t * g.rope..], &table, g.rope, pos, pairing)
+            })
             .collect();
         let want_out: Vec<f32> = rotated.iter().flatten().map(|&x| BF16.round(x)).collect();
         assert_close(
@@ -593,13 +640,35 @@ fn mla_attend_matches_reference() {
         rope: 64,
     };
     // (geometry, heads a threadgroup serves, its simdgroups, the partitions of each sequence's
-    // rows: one writes the output, more write partials the merge combines).
-    for (g, heads_per_tg, simdgroups, parts) in [
+    // rows: one writes the output, more write partials the merge combines). First the tilings
+    // the lowering ships, a decode-shaped (1-row) and a prefill-shaped (64-row) bucket's of each
+    // geometry, then hand-picked ones it does not pick.
+    let shipped = [small, glm].into_iter().flat_map(|g| {
+        [1u32, 64].map(|bucket_m| {
+            let t = mla_attend_tiling(g.heads as u32, g.latent as u32, bucket_m)
+                .expect("a tiling for the geometry");
+            let n = |x: u32| x as usize;
+            (
+                g,
+                n(t.heads_per_tg.get()),
+                n(t.simdgroups.get()),
+                n(t.parts.get()),
+            )
+        })
+    });
+    let shipped: Vec<_> = shipped.collect();
+    // GLM-4.7-Flash's decode tiling, the one its decode runs, stated as well as derived.
+    assert!(
+        shipped
+            .iter()
+            .any(|&(g, h, s, p)| g.latent == glm.latent && (h, s, p) == (1, 8, 8))
+    );
+    for (g, heads_per_tg, simdgroups, parts) in shipped.into_iter().chain([
         (small, 2usize, 32usize, 1usize),
         (small, 4, 2, 3),
         (glm, 4, 8, 16),
         (glm, 2, 4, 1),
-    ] {
+    ]) {
         let (block_size, bpc, blocks, max_blocks) = (4usize, 2usize, 10usize, 6usize);
         let pool = Pool::new(&device, g, blocks, block_size, bpc, 0.0);
         // Sequence 0: 9 cached rows, its last 3 this step's; sequence 1: 6, its last 2.
