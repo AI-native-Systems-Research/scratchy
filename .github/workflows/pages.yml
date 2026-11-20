@@ -1,7 +1,9 @@
 name: Pages
 
-# The site branch's own runs of main's site build (site-build.yml on main, which states the build
-# once): it checks out main at the root and this branch at site/, lints, tests and renders.
+# The only workflow that deploys the site. It runs main's site build (site-build.yml on main, which
+# states the build once): it checks out main at the root and this branch at site/, lints, tests,
+# renders, and deploys. It runs on a push to this branch, and main starts it (a workflow_dispatch on
+# this branch) when what the site renders from main changes.
 on:
   push:
     branches: [site]
@@ -9,8 +11,8 @@ on:
   # without deploying.
   pull_request:
     branches: [site]
-  # Also started on a metal round's branch by its bot (metal-round.yml on main), which builds
-  # without deploying: only the site branch and main deploy.
+  # Started on this branch by main's pages.yml, which deploys; and on a metal round's branch by its
+  # bot (metal-round.yml on main), which only builds: only this branch deploys.
   workflow_dispatch:
 
 permissions:
@@ -18,8 +20,7 @@ permissions:
   pages: write
   id-token: write
 
-# One deploy at a time, shared with main's Pages runs; let an in-flight run finish rather than
-# cancelling it. Anything but this branch (a pull request, or a dispatch on a metal round's branch)
+# One deploy at a time; let an in-flight run finish rather than cancelling it. Anything but this branch (a pull request, or a dispatch on a metal round's branch)
 # only builds, in a group of its own superseded by its next run, so it never queues behind or
 # cancels a deploy.
 concurrency:
