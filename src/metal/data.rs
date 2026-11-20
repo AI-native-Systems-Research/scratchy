@@ -24,7 +24,8 @@ pub struct Run {
     /// Models the runner left out on this machine, and why (memory).
     #[serde(default)]
     pub skipped_models: Option<Vec<Skipped>>,
-    /// The file it was read from, for the link to it.
+    /// The file it was read from, relative to the site's root: where it is published, and what its
+    /// runs table row links to.
     #[serde(skip)]
     pub file: PathBuf,
 }
@@ -623,10 +624,6 @@ pub struct TaskCell {
     /// scored (chat turns, the shared-prefix questions).
     #[serde(default)]
     pub accuracy: Option<f64>,
-    /// Answers that opened as reasoning: a request whose thinking could not be turned off (a span
-    /// query), so its accuracy and tokens are no like-for-like with a plain answer's.
-    #[serde(default)]
-    pub thinking_answers: Option<u32>,
     /// Answers that ran to their cap rather than ending on their own.
     #[serde(default)]
     pub capped_answers: Option<u32>,
@@ -786,7 +783,6 @@ impl TaskCell {
             accuracy: accuracy.or(self.accuracy.filter(|_| right.is_none())),
             accuracy_by_group: accuracy_by_group.or_else(|| self.accuracy_by_group.clone()),
             capped_answers: part(self.capped_answers),
-            thinking_answers: part(self.thinking_answers),
             total_output_tokens: (self.total_output_tokens)
                 .map(|t| (t as f64 * n as f64 / whole as f64).round() as u64),
             ttfts_ms: ttfts,

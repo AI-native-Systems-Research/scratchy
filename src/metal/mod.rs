@@ -18,6 +18,7 @@ mod tasks;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 
 use dioxus::prelude::*;
 
@@ -44,8 +45,11 @@ use numbers::{
 /// The run files, relative to the site's root; copied to the same place under _site/,
 /// where each run table links to its own.
 pub const DATA: &str = "data/metal";
-/// The runs a newer one replaced, relative to the site's root: only Over time reads them.
+/// The runs a newer one replaced, relative to the site's root: Over time and each machine's runs
+/// table read them, and they are published like [`DATA`]'s.
 pub const HISTORY: &str = "data/metal/history";
+/// Every folder of runs the page reads, each published under _site/ as it is.
+const PUBLISHED: [&str; 2] = [DATA, HISTORY];
 
 // --------------------------------------------------------------------- load
 
@@ -59,25 +63,25 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
 /// and the ones a newer run replaced ([`HISTORY`]), for Over time.
 fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
     let (mut files, mut errors) = (Vec::new(), Vec::new());
-    for dir in dirs {
-        let dir = site.root.join(dir);
+    for &rel in dirs {
+        let dir = site.root.join(rel);
         // history/ may not exist yet; the page's own folder must.
         let Ok(listed) = datafile::list(&dir) else {
-            if *dir == *site.root.join(DATA) {
+            if rel == DATA {
                 return Err(format!("{}: not found", dir.display()));
             }
             continue;
         };
         for f in listed {
             match f {
-                Ok(f) => files.push(f),
+                Ok(f) => files.push((f, rel)),
                 Err(e) => errors.push(e),
             }
         }
     }
     files.sort();
     let mut runs = Vec::new();
-    for f in files {
+    for (f, rel) in files {
         let name = f
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -117,7 +121,7 @@ fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
         run.mark_short();
         run.mark_mem_below_weights();
         run.mark_ttft_too_soon();
-        run.file = f;
+        run.file = Path::new(rel).join(name);
         runs.push(run);
     }
     if errors.is_empty() {
@@ -402,7 +406,7 @@ pub(super) fn runs_table(runs: &[&Run], about: Element) -> Element {
                 for run in runs.iter().rev() {
                     {
                         let [(_, flags), (_, kv)] = settings(run);
-                        let file = run.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let file = run.file.display();
                         rsx! {
                             TableRow {
                                 TableCell { "{run.generated_utc.minute()} UTC" }
@@ -413,7 +417,7 @@ pub(super) fn runs_table(runs: &[&Run], about: Element) -> Element {
                                 TableCell { code { "{flags}" } }
                                 TableCell { "{engine_versions(run)}" }
                                 TableCell { "{pinned(run)}" }
-                                TableCell { a { href: "{DATA}/{file}", "json.gz" } }
+                                TableCell { a { href: "{file}", "json.gz" } }
                             }
                         }
                     }
@@ -2886,7 +2890,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
-    let all_runs = load_from(site, &[DATA, HISTORY])?;
+    let all_runs = load_from(site, &PUBLISHED)?;
     let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -2956,13 +2960,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     )?;
     let out = site.out.join("metal.html");
     fs::write(&out, html).map_err(|e| format!("{}: {e}", out.display()))?;
-    let dest = site.out.join(DATA);
-    fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    for run in &runs {
-        if let Some(name) = run.file.file_name() {
-            fs::copy(&run.file, dest.join(name))
-                .map_err(|e| format!("{}: {e}", run.file.display()))?;
-        }
+    // Every run the page reads is published where its runs table row links.
+    for dir in PUBLISHED {
+        let dest = site.out.join(dir);
+        fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    for run in &all_runs {
+        fs::copy(site.root.join(&run.file), site.out.join(&run.file))
+            .map_err(|e| format!("{}: {e}", run.file.display()))?;
     }
     Ok(format!(
         "metal page: {count} runs on {n_machines} machines -> {}",
@@ -3182,7 +3187,6 @@ mod tests {
                     let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                     c.prompt_tokens = Some(vec![Some(3200); n]);
                     c.timed_answers = forced;
-                    c.thinking_answers = Some(0);
                     c.capped_answers = Some(0);
                     c.accuracy = Some(0.5);
                     c.task_right = Some((0..n).map(|k| Some(k % 2 == 0)).collect());
@@ -3236,25 +3240,15 @@ mod tests {
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("no energy on one side"));
         assert!(!html.contains("each cell&#39;s whole"));
-        // A cell the accuracy table does not score has no joules a correct answer: its square
-        // says why, as the table does, and names the side. Most of scratchy's answers cut off:
+        // A cell's answers cut off at the length limit, every one, are still its answers: its
+        // accuracy, and so its joules a correct answer, stand.
         shape(&mut runs, false, true);
         for c in runs[0].models[0].tasks.iter_mut().flatten() {
             c.capped_answers = c.completed;
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("scratchy: cut off: 8 of 8 answers hit the length limit"));
-        assert!(!html.contains("×1.80 vs oMLX"), "no square has a ratio");
-        // Most of oMLX's answered in reasoning:
-        shape(&mut runs, false, true);
-        for c in runs[0].models[0].tasks_omlx.iter_mut().flatten() {
-            c.thinking_answers = c.completed;
-        }
-        let machines = super::index(&runs);
-        let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("oMLX: answered in reasoning: 16 of 16"));
-        assert!(!html.contains("×1.80 vs oMLX"), "no square has a ratio");
+        assert!(html.contains("×1.80 vs oMLX"), "cut off, and still scored");
     }
 
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
@@ -3401,7 +3395,7 @@ mod tests {
         let m = &mut runs[0].models[0];
         let cell = |acc: f64, capped: u32| -> super::data::TaskCell {
             serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
-                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "completed": 400, "num_tasks": 400, "accuracy": acc,
                 "capped_answers": capped, "median_ttft_ms": 4000.0,
                 "accuracy_by_group": {"2": 0.3, "3": 0.2, "4": 0.1}}))
             .unwrap()
@@ -3418,15 +3412,12 @@ mod tests {
         assert!(html.contains("25% ±4.2"), "scratchy's, with its range");
         assert!(html.contains("2-hop 30%, 3-hop 20%, 4-hop 10%"));
         assert!(
-            html.contains("cut off: 331 of 400 answers hit the length limit"),
-            "oMLX's, held back"
+            html.contains("10% ±2.9"),
+            "oMLX's, 331 of its 400 answers cut off, shown all the same"
         );
         // Above the table, a plot: scratchy's dot over its range, oMLX's reason on its own line.
         assert!(html.contains("Each dot is an engine"), "the plot's note");
-        assert!(
-            html.contains("oMLX: 331 of 400 cut off"),
-            "a held-back mark says why, in short"
-        );
+        assert!(!html.contains("cut off:"), "no mark is held back");
         assert!(html.contains("left: 25.00%"), "scratchy's dot at its 25%");
         assert!(
             at("Each dot is an engine") < at("Table view"),
@@ -3568,6 +3559,38 @@ mod tests {
             .expect("a run named .gz is refused");
         assert!(err.contains(&format!("{stem}.gz")), "{err}");
         assert!(err.contains(".json.gz"), "{err}");
+    }
+
+    /// Every run the page lists links to a file the site publishes, a replaced run's in history/
+    /// too.
+    #[test]
+    fn every_run_links_to_a_published_file() {
+        let replaced = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("links", &[REQUESTS_FIXTURE]);
+        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+        let history = site.root.join(super::HISTORY);
+        std::fs::create_dir_all(&history).unwrap();
+        gzip(
+            &fixtures.join(replaced),
+            &history.join(format!("{replaced}.gz")),
+        );
+        let assets = crate::chrome::Published {
+            styles: String::new(),
+            favicon: String::new(),
+        };
+        super::build(&site, &assets).unwrap();
+        let html = std::fs::read_to_string(site.out.join("metal.html")).unwrap();
+        let links: std::collections::BTreeSet<&str> = (html.split("href=\"").skip(1))
+            .filter_map(|s| s.split('"').next())
+            .filter(|l| l.starts_with(super::DATA))
+            .collect();
+        assert!(
+            links.iter().any(|l| l.ends_with(&format!("{replaced}.gz"))),
+            "no link to the replaced run: {links:?}"
+        );
+        for l in &links {
+            assert!(site.out.join(l).is_file(), "{l} is not published");
+        }
     }
 
     #[test]
@@ -3935,7 +3958,7 @@ mod tests {
         let m = &mut runs[0].models[0];
         let cell = |acc: f64| -> super::data::TaskCell {
             serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
-                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "completed": 400, "num_tasks": 400, "accuracy": acc,
                 "capped_answers": 0, "median_ttft_ms": 4000.0}))
             .unwrap()
         };
@@ -3982,7 +4005,7 @@ mod tests {
         tasks.push(
             serde_json::from_value(serde_json::json!({
                 "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
-                "accuracy": 0.48, "thinking_answers": 0, "capped_answers": 0,
+                "accuracy": 0.48, "capped_answers": 0,
                 "median_ttft_ms": 4000.0,
             }))
             .unwrap(),
@@ -4012,7 +4035,7 @@ mod tests {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let cell: super::data::TaskCell = serde_json::from_value(serde_json::json!({
             "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
-            "accuracy": 0.48, "thinking_answers": 0, "capped_answers": 0,
+            "accuracy": 0.48, "capped_answers": 0,
             "median_ttft_ms": 4000.0, "median_e2el_ms": 7500.0, "mean_output_tokens": 23.0,
             "accuracy_by_group": {"2": 0.53, "3": 0.46, "4": 0.38},
         }))
@@ -4454,7 +4477,7 @@ mod tests {
             let id = |i: usize| format!("{}{i}", if other { "x" } else { "t" });
             serde_json::json!({"workload": "rag", "conc": 4, "load": "users",
                 "completed": n, "failed": 0, "num_tasks": n, "timed_answers": false,
-                "accuracy": 0.5, "capped_answers": 0, "thinking_answers": 0,
+                "accuracy": 0.5, "capped_answers": 0,
                 "task_share": share,
                 "task_ids": (0..n).map(id).collect::<Vec<_>>(),
                 "task_groups": (0..n).map(|i| 2 + (i % 3)).collect::<Vec<_>>(),
@@ -4551,7 +4574,6 @@ mod tests {
                     _ => 3,
                 };
                 c.timed_answers = false;
-                c.thinking_answers = Some(0);
                 c.task_share = Some(format!("{k}/3"));
                 c.accuracy = Some(base + 0.01 * f64::from(k));
                 c.num_tasks = Some(100);
