@@ -6456,7 +6456,7 @@ fn lower_one(
                 ),
                 constants: super::kernel_constants::MlaConstants {
                     mla: *mla,
-                    cache: Some(mla_cache(p, crate::BLOCKS_PER_CHUNK)?),
+                    cache: Some(mla_cache(p, *mla, crate::BLOCKS_PER_CHUNK)?),
                     attend: None,
                     row_threads: Some(threads),
                 }
@@ -6499,7 +6499,7 @@ fn lower_one(
             };
             let tiling = mla_attend_tiling(*mla, bucket_m);
             let parts = tiling.parts.get();
-            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
+            let cache = mla_cache(p, *mla, attention_blocks_per_chunk(chunked))?;
             let constants = || {
                 super::kernel_constants::MlaConstants {
                     mla: *mla,
@@ -7603,14 +7603,16 @@ fn mla_cos_sin(w: RowSources<'_>, binding_index: u8) -> Result<Binding, Lowering
 }
 
 /// The paged cache an MLA kernel addresses: the model's KV page, in chunks of `blocks_per_chunk`
-/// blocks (0: one base).
+/// blocks (0: one base), each row its K and V halves (`Mla::half_row`, the pool's geometry).
 fn mla_cache(
     p: &ModelFacts,
+    mla: crate::tape::step::Mla,
     blocks_per_chunk: u32,
 ) -> Result<super::kernel_constants::MlaCacheConstants, LoweringError> {
     Ok(super::kernel_constants::MlaCacheConstants {
         block_size: super::ids::BlockSize(base(p)?.page().get()),
         blocks_per_chunk: super::ids::BlocksPerChunk(blocks_per_chunk),
+        half_row: super::ids::HeadDim(mla.half_row()),
     })
 }
 

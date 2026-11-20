@@ -391,11 +391,12 @@ impl Pool {
         (BF16.decode(&self.k, n), BF16.decode(&self.v, n))
     }
 
-    fn cache_constants(&self, max_blocks: usize) -> Vec<ConstantValue> {
+    fn cache_constants(&self, g: Geom, max_blocks: usize) -> Vec<ConstantValue> {
         vec![
             uint(4, self.block_size),
             uint(5, max_blocks),
             uint(6, self.blocks_per_chunk),
+            uint(14, g.half()),
         ]
     }
 }
@@ -512,7 +513,7 @@ fn mla_append_writes_each_tokens_latent_row() {
         // Fewer threads than lanes: each thread takes several.
         let threads = 256usize;
         let mut constants = g.constants();
-        constants.extend(pool.cache_constants(8));
+        constants.extend(pool.cache_constants(g, 8));
         constants.push(uint(13, threads));
         let key = PipelineKey::new("mla", "mla_append_bf16", constants);
         let pso = baked_build(&cache, &key).expect("mla_append pipeline");
@@ -644,7 +645,7 @@ fn mla_attend_matches_reference() {
         let q = fill(rows * g.heads * g.q_head(), 47);
         let scale = 1.0 / (g.q_head() as f32).sqrt();
         let mut constants = g.constants();
-        constants.extend(pool.cache_constants(max_blocks));
+        constants.extend(pool.cache_constants(g, max_blocks));
         constants.extend([
             ConstantValue::float(7, scale),
             uint(8, heads_per_tg),
