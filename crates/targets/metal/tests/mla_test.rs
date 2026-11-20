@@ -447,7 +447,9 @@ fn mla_rope_q_rotates_each_heads_rope_part() {
     let rows = positions.len();
     let q = fill(rows * g.heads * g.q_head(), 29);
     let table = rotary(512, g.rope);
-    let key = PipelineKey::new("mla", "mla_rope_q_bf16", g.constants());
+    let mut constants = g.constants();
+    constants.push(uint(13, 32));
+    let key = PipelineKey::new("mla", "mla_rope_q_bf16", constants);
     let pso = baked_build(&cache, &key).expect("mla_rope_q pipeline");
     let out = common::shared_zeroed(&device, q.len() * 2);
     if !common::dispatch_threadgroups(
@@ -460,7 +462,7 @@ fn mla_rope_q_rotates_each_heads_rope_part() {
             &bf16_buf(&device, &table),
         ],
         size(rows, g.heads, 1),
-        size(g.q_head().next_power_of_two(), 1, 1),
+        size(32, 1, 1),
     ) {
         return;
     }
@@ -507,8 +509,11 @@ fn mla_append_writes_each_tokens_latent_row() {
         let latent = fill(rows * g.latent, 31);
         let k_pe = fill(rows * g.rope, 37);
         let table = rotary(64, g.rope);
+        // Fewer threads than lanes: each thread takes several.
+        let threads = 256usize;
         let mut constants = g.constants();
         constants.extend(pool.cache_constants(8));
+        constants.push(uint(13, threads));
         let key = PipelineKey::new("mla", "mla_append_bf16", constants);
         let pso = baked_build(&cache, &key).expect("mla_append pipeline");
         let out = common::shared_zeroed(&device, rows * g.rope * 2);
@@ -528,7 +533,7 @@ fn mla_append_writes_each_tokens_latent_row() {
                 &pool.v,
             ],
             size(rows, 1, 1),
-            size(g.row().next_power_of_two(), 1, 1),
+            size(threads, 1, 1),
         ) {
             return;
         }

@@ -48,6 +48,8 @@ constant constexpr uint HM_N = HM_HEADS * HM_N_HEAD;
 constant constexpr uint HM_ROW_BYTES = HM_BITS_SET ? 4u * ((HM_K * HM_BITS + 31u) / 32u) : 0u;
 constant constexpr uint HM_PACKS = HM_K / 8u;
 constant constexpr uint HM_GROUPS = HM_BITS_SET ? HM_K / HM_GROUP : 1u;
+static_assert(!HM_BITS_SET || (HM_K % HM_GROUP == 0u && HM_GROUP % 8u == 0u),
+              "an affine row is whole groups, each whole packs of eight codes");
 
 // Pack `p`'s eight codes of the row at `row`, as one 64-bit little-endian word.
 inline ulong hm_pack(device const uchar* row, uint p) {

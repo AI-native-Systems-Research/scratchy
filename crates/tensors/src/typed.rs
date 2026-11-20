@@ -383,7 +383,8 @@ impl<K: Dim, N, B, G: Tiles<K>, L> std::ops::Deref for Q2<K, N, B, G, L> {
 #[repr(transparent)]
 pub struct Q3<H, K: Dim, N, B, G: Tiles<K>, L> {
     layer: L,
-    shape: PhantomData<fn() -> (H, K, N)>,
+    heads: PhantomData<fn() -> H>,
+    shape: PhantomData<fn() -> (K, N)>,
     codes: PhantomData<fn() -> (B, G)>,
 }
 
@@ -816,6 +817,7 @@ impl<H: Dim, K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> 
     fn wrap(Checked(layer): Checked<L>) -> Self {
         Self {
             layer,
+            heads: PhantomData,
             shape: PhantomData,
             codes: PhantomData,
         }

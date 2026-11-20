@@ -5776,7 +5776,7 @@ fn lower_one(
         }
         I::HeadMatmul(hm) => lower_head_matmul(p, hm, w, eff_m, bucket_m, layer_offset)?,
         I::MlaRopeQ(Slot(q), Slot(out), mla) => {
-            let q_head = mla.q_head();
+            let threads = mla_row_threads(mla.q_head());
             LoweredCommand {
                 kernel: KernelId::MlaRopeQ,
                 library: "mla",
@@ -5789,11 +5789,12 @@ fn lower_one(
                     mla: *mla,
                     cache: None,
                     attend: None,
+                    row_threads: Some(threads),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (eff_m, mla.heads().get(), 1),
-                    threads_per_threadgroup: (q_head.next_power_of_two().max(32), 1, 1),
+                    threads_per_threadgroup: (threads.get(), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -5823,6 +5824,7 @@ fn lower_one(
                 kind,
                 binding_index,
             };
+            let threads = mla_row_threads(mla.row());
             LoweredCommand {
                 kernel: KernelId::MlaAppend,
                 library: "mla",
@@ -5835,11 +5837,12 @@ fn lower_one(
                     mla: *mla,
                     cache: Some(mla_cache(p, crate::BLOCKS_PER_CHUNK)?),
                     attend: None,
+                    row_threads: Some(threads),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (eff_m, 1, 1),
-                    threads_per_threadgroup: (mla.row().next_power_of_two().max(32), 1, 1),
+                    threads_per_threadgroup: (threads.get(), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         set_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -5881,6 +5884,7 @@ fn lower_one(
                     mla: *mla,
                     cache: Some(cache),
                     attend: Some(tiling),
+                    row_threads: None,
                 }
                 .into_baked()
             };
@@ -7024,6 +7028,16 @@ fn mla_attend_tiling(
     }
 }
 
+/// The threads an MLA row kernel (the query rotation, the cache write) runs a threadgroup: a lane
+/// each of a `lanes`-wide row, rounded to a power of two, up to [`MLA_ROW_THREADS`]; past it each
+/// thread takes several.
+fn mla_row_threads(lanes: u32) -> super::ids::ThreadCount {
+    super::ids::ThreadCount(lanes.next_power_of_two().clamp(32, MLA_ROW_THREADS))
+}
+
+/// The most threads an MLA row kernel runs a threadgroup.
+const MLA_ROW_THREADS: u32 = 1024;
+
 /// The partitions a decode-shaped bucket's MLA attention splits each sequence's cached rows into.
 /// Hand-tuned: measured on GLM-4.7-Flash on an M3 Pro (1024-token decode: 8 partitions 53.1
 /// tok/s, 16 51.8, 32 49.1).
@@ -7038,11 +7052,12 @@ const MLA_MERGE_THREADS: u32 = 256;
 /// partitions).
 const MLA_HEADS_PER_TG: u32 = 1;
 
-/// The threadgroup memory an MLA attention's merge holds its simdgroups' latent partials in.
+/// The threadgroup memory an MLA attention's merge holds its simdgroups' latent partials in: half
+/// a threadgroup's 32 KiB, a hand-picked budget.
 const MLA_MERGE_BYTES: u32 = 16 * 1024;
 
-/// A per-head matmul threadgroup's simdgroups, and the output rows each computes. Hand-tuned, the
-/// MLX `qmv` family's shape (`quantized_qmv.metal`).
+/// A per-head matmul threadgroup's simdgroups, and the output rows each computes. Hand-picked, not
+/// swept.
 const HEAD_MATMUL_SIMDGROUPS: u32 = 8;
 const HEAD_MATMUL_ROWS_PER_SG: u32 = 4;
 

@@ -8422,18 +8422,35 @@ pub fn emit_kv_layer_geometry_arm_body(
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
     let num_hidden_layers = model.text.layers.get();
-    // A multi-head latent attention's cache: every layer's one row per token, held as the pool's
-    // K and V halves of its single kv head.
-    if fuf.nodes.iter().any(|n| n.op.ropes_keys_at_write()) {
+    // A layer whose cache a multi-head latent attention writes holds one latent row per token, as
+    // the pool's K and V halves of its single kv head; any other layer, the config's heads.
+    let latent_layers: std::collections::BTreeSet<usize> = (fuf.nodes.iter())
+        .filter(|n| n.op == OpKind::MlaAppend)
+        .flat_map(|n| &n.inputs)
+        .filter_map(|i| match i {
+            FufInput::Extern {
+                kind: crate::classified::ExternKind::KvCache,
+                index: Some(l),
+            } => Some(l.0 as usize),
+            _ => None,
+        })
+        .collect();
+    if !latent_layers.is_empty() {
         let mla = crate::to_wavefront::mla_geometry(&model.bounds, model)
             .unwrap_or_else(|e| panic!("{}: its latent cache: {e}", model.source_stem));
         let half = mla.half_row() as usize;
-        let layers = (0..num_hidden_layers).map(|_| {
+        let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as usize;
+        let head_dim = model.text.head_dim.get() as usize;
+        let layers = (0..num_hidden_layers).map(|l| {
+            let (kv_heads, head_size) = match latent_layers.contains(&l) {
+                true => (1usize, half),
+                false => (num_kv, head_dim),
+            };
             quote! {
                 ::scratchy_forward_compiler::LayerKvGeometry {
                     is_sliding: false,
-                    num_kv_heads: 1,
-                    head_size: #half,
+                    num_kv_heads: #kv_heads,
+                    head_size: #head_size,
                     head_size_v: ::core::option::Option::None,
                     sliding_window: ::core::option::Option::None,
                 }
