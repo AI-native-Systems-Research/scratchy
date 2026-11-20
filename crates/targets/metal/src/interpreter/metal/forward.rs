@@ -468,6 +468,8 @@ pub fn build_mrope_cos_sin_override(
     dtype: super::lowered::MetalDtype,
 ) -> Vec<u8> {
     use super::lowered::MetalDtype;
+    use scratchy_layers::rotary::RopeFreqDim;
+    use scratchy_tensors::{RopeTheta, RotDim};
     let half = rot_dim / 2;
     // `[3, n]` (band-split) vs `[n]` (broadcast all bands to one position).
     let is_3d = positions.len() == 3 * n_tokens;
@@ -505,11 +507,12 @@ pub fn build_mrope_cos_sin_override(
     };
     // The angles are the shared builder's (`inv_freq[i] = 1 / θ^(2i/rot_dim)`, identical to the
     // RotaryCache builder); the layout and the element type are metal's.
+    let rot = RotDim::new(u32::try_from(rot_dim).expect("a rotary width fits u32"));
     scratchy_layers::rotary::rotary_table_rows(
         n_tokens,
-        rot_dim,
-        rot_dim,
-        rope_theta,
+        rot,
+        RopeFreqDim::Rot(rot),
+        RopeTheta::new(rope_theta),
         pos,
         |t, i, c, s| {
             let row = t * rot_dim;
