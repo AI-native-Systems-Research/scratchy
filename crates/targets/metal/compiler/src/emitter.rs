@@ -116,6 +116,26 @@ impl TargetEmitter for Metal {
             rope_context_init,
             ..
         } = cx;
+        // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
+        // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
+        // dtype). `RmsNorm::load`'s `take_as_dtype` then converts the
+        // gain only when a checkpoint ships a different dtype (e.g. a
+        // standard HF bf16 export feeding an `_s_f16_` Llama arm) — the
+        // mlx zero-copy gain path is preserved on the matching case.
+        let body = quote! {
+            gw.set_rmsnorm_scale_dtype(
+                <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
+            );
+            #packed_splits_prelude
+            #(#lets)*
+            Ok(#weights_ctor {
+                #(#field_shorthand,)*
+                #rotary_deferred_init
+                #rope_context_init
+                metal_pool: ::std::sync::OnceLock::new(),
+                metal_guest: ::std::sync::OnceLock::new(),
+            })
+        };
         quote! {
             /// The `stream` is `()` and unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
@@ -129,38 +149,7 @@ impl TargetEmitter for Metal {
                 max_model_len: usize,
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                // Bring the relocated `load*` extension traits into scope so
-                // the path-syntax `LinearLayer::load_dense_or_ggml(...)`,
-                // `RmsNorm::load(...)`, `Embedding::load(...)`,
-                // `AffineQuantEmbedding::load(...)`, … calls the body
-                // emits below resolve.
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _, MetalAffineEmbedOps as _, MetalLinearLayerOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    FusedMoEOps as _, SharedFusedMoEOps as _, DeepSeekV2MoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                    GptOssMoEOps as _,
-                };
-                // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
-                // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
-                // dtype). `RmsNorm::load`'s `take_as_dtype` then converts the
-                // gain only when a checkpoint ships a different dtype (e.g. a
-                // standard HF bf16 export feeding an `_s_f16_` Llama arm) — the
-                // mlx zero-copy gain path is preserved on the matching case.
-                gw.set_rmsnorm_scale_dtype(
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
-                );
-                #packed_splits_prelude
-                #(#lets)*
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_deferred_init
-                    #rope_context_init
-                    metal_pool: ::std::sync::OnceLock::new(),
-                    metal_guest: ::std::sync::OnceLock::new(),
-                })
+                #body
             }
         }
     }

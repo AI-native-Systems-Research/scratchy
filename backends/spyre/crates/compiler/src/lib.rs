@@ -50,6 +50,27 @@ impl TargetEmitter for Spyre {
             rope_context_init,
             ..
         } = cx;
+        let body = quote! {
+            #packed_splits_prelude
+            // ⛔ THE QUANT PRELUDES, because the `#lets` below are the shared per-accessor
+            // load plans and they REFERENCE these bindings (`__fp8_dtype`, `__marlin_ws`,
+            // `__bnb_code`). Omitting them does not disable quant — it emits a load body
+            // that names an undefined local. Each prelude elides itself when the model has
+            // no accessor of that kind, so a dense model is unaffected.
+            #marlin_prelude
+            #bnb4_prelude
+            #fp8_prelude
+            #(#lets)*
+            #rope_rows
+            #rotary_load
+            #rotary_local_load
+            Ok(#weights_ctor {
+                #(#field_shorthand,)*
+                #rotary_init
+                #rotary_local_init
+                #rope_context_init
+            })
+        };
         quote! {
             /// It builds the real `Weights` through `crate::__gpu`'s loader `*Ops`, which
             /// `scratchy-target-spyre` provides (backed by the neutral allocator-generic
@@ -62,39 +83,7 @@ impl TargetEmitter for Spyre {
                 max_model_len: usize,
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _,
-                };
-                use crate::__gpu::layers_quant::{
-                    MarlinLoadOps as _, Fp8LoadOps as _, Fp8BlockLoadOps as _, Bnb4bitLoadOps as _,
-                    AffineQuantEmbeddingOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    DeepSeekV2MoEOps as _, DeepSeekV2Fp8BlockMoEOps as _,
-                    DeepSeekV2GgmlMoEOps as _, FusedMoEOps as _, SharedFusedMoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                };
-                use crate::__gpu::rotary::CudaRotaryExt as _;
-                #packed_splits_prelude
-                // ⛔ THE QUANT PRELUDES, because the `#lets` below are the shared per-accessor
-                // load plans and they REFERENCE these bindings (`__fp8_dtype`, `__marlin_ws`,
-                // `__bnb_code`). Omitting them does not disable quant — it emits a load body
-                // that names an undefined local. Each prelude elides itself when the model has
-                // no accessor of that kind, so a dense model is unaffected.
-                #marlin_prelude
-                #bnb4_prelude
-                #fp8_prelude
-                #(#lets)*
-                #rope_rows
-                #rotary_load
-                #rotary_local_load
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_init
-                    #rotary_local_init
-                    #rope_context_init
-                })
+                #body
             }
         }
     }

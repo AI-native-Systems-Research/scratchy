@@ -663,13 +663,13 @@ impl MetalNvfp4Ops for Nvfp4Linear {
 // ---------------------------------------------------------------------------
 
 /// Load extension trait on the neutral [`AffineQuantEmbedding`].
-pub trait MetalAffineEmbedOps {
+pub trait AffineQuantEmbeddingOps {
     fn load(weights: &mut GpuWeights, prefix: &str, group_size: u32, bits: u32) -> Result<Self>
     where
         Self: Sized;
 }
 
-impl MetalAffineEmbedOps for AffineQuantEmbedding {
+impl AffineQuantEmbeddingOps for AffineQuantEmbedding {
     /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
     /// (`U32`, `[vocab, ceil(hidden*bits/32)]`), `<prefix>.scales`
     /// (`F16`, `[vocab, hidden / group_size]`), `<prefix>.biases`
@@ -701,7 +701,7 @@ impl MetalAffineEmbedOps for AffineQuantEmbedding {
 }
 
 // ---------------------------------------------------------------------------
-// MetalLinearLayerOps — metal-only `LinearLayer` quant constructors
+// LinearLayerQuantOps — metal-only `LinearLayer` quant constructors
 // ---------------------------------------------------------------------------
 
 /// Metal-only forward-time quant constructors on the neutral [`LinearLayer`]
@@ -714,7 +714,7 @@ impl MetalAffineEmbedOps for AffineQuantEmbedding {
 /// Re-exported so the macro-emitted `crate::__gpu::…`
 /// `LinearLayer::load_affine_quant(...)` / `load_nvfp4_quant(...)` path-syntax
 /// calls resolve.
-pub trait MetalLinearLayerOps {
+pub trait LinearLayerQuantOps {
     fn load_affine_quant(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -771,7 +771,7 @@ pub trait MetalLinearLayerOps {
         Self: Sized;
 }
 
-impl MetalLinearLayerOps for LinearLayer {
+impl LinearLayerQuantOps for LinearLayer {
     /// Load an MLX-affine int4 quantized linear layer (Metal-only).
     /// Reads `<prefix>.weight` + `<prefix>.scales` + `<prefix>.biases`
     /// (and optional `<prefix>.bias`) from the safetensors. Wraps
@@ -901,14 +901,14 @@ impl MetalLinearLayerOps for LinearLayer {
 }
 
 // ---------------------------------------------------------------------------
-// MetalEmbeddingOps — metal-only `Embedding` dequant-at-load constructor
+// EmbeddingDequantOps — metal-only `Embedding` dequant-at-load constructor
 // ---------------------------------------------------------------------------
 
 /// Metal-only dequant-at-load constructor on the neutral [`Embedding`] type.
 /// Defined + impl'd here (orphan rule) since `Embedding` lives in
 /// `scratchy-layers`. Re-exported so any macro-emitted / compiler
 /// `Embedding::load_affine_dequant(...)` path-syntax call resolves.
-pub trait MetalEmbeddingOps {
+pub trait EmbeddingDequantOps {
     fn load_affine_dequant<W: WeightSource + ?Sized>(
         weights: &mut W,
         prefix: &str,
@@ -919,10 +919,10 @@ pub trait MetalEmbeddingOps {
         Self: Sized;
 }
 
-impl MetalEmbeddingOps for Embedding {
+impl EmbeddingDequantOps for Embedding {
     /// MLX-affine int4 → BF16 dequantize-at-load (Metal-only).
     ///
-    /// Sibling of [`MetalLinearLayerOps::load_affine_dequant_as_dense`] for
+    /// Sibling of [`LinearLayerQuantOps::load_affine_dequant_as_dense`] for
     /// quantized token embeddings. CPU-dequantizes `<prefix>.{weight,scales,
     /// biases}` via the neutral [`affine_dequant_b4`] helper and wraps the
     /// resulting `[vocab_size, hidden_size]` BF16 tensor in an `Embedding`.

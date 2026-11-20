@@ -68,7 +68,7 @@ mod typed_shapes;
 mod typed_shapes_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target: one body, since
 // the target is a compile-time singleton — there is no second target in the build to
-// compromise for. Packing gate/up into a single `__fused__`
+// compromise for. Packing gate/up into a single `_fused_`
 // buffer is a target's kernel ABI, so it arrives as a bool argument rather than a second walk.
 pub mod weight_bindings;
 pub mod weight_vocab;
@@ -1812,6 +1812,11 @@ fn emit_arch_dispatcher(
         .iter()
         .map(|a| (pascal_case(&a.model_ident), a.model_ident.clone()))
         .collect();
+    for (i, (v, m)) in dispatch_variants.iter().enumerate() {
+        if let Some((_, other)) = dispatch_variants[..i].iter().find(|(w, _)| w == v) {
+            panic!("models `{other}` and `{m}` spell the same `Weights` variant `{v}`");
+        }
+    }
     let dispatch_models: Vec<(String, u8)> = arms
         .iter()
         .map(|a| (a.source_stem.clone(), a.tp_world_size))
@@ -1912,15 +1917,23 @@ fn emit_arch_dispatcher(
     })
 }
 
-/// PascalCase a snake_case ident while preserving underscores
-/// between segments (they're version separators in our model names).
+/// UpperCamelCase a snake_case model ident, as rustc's `non_camel_case_types` spells it: each
+/// segment capitalized, the underscores dropped except between two digits, where they stay as the
+/// version separators of our model names (`granite_3_1_8b_instruct` → `Granite3_1_8bInstruct`).
 fn pascal_case(ident: &Ident) -> Ident {
     let s = ident.to_string();
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut capitalize_next = true;
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         if c == '_' {
-            out.push('_');
+            let digits = |j: Option<usize>| {
+                j.and_then(|j| chars.get(j))
+                    .is_some_and(char::is_ascii_digit)
+            };
+            if digits(i.checked_sub(1)) && digits(Some(i + 1)) {
+                out.push('_');
+            }
             capitalize_next = true;
         } else if capitalize_next {
             out.extend(c.to_uppercase());
@@ -1947,6 +1960,20 @@ fn emit_model_stub_items(fuf: &fuf::Fuf) -> proc_macro2::TokenStream {
 mod tests {
     use super::*;
     use crate::quantization::{BnbQuantType, Fp8ActivationScheme, GptqLayout, QuantMethod};
+
+    /// A model's `Weights` variant is UpperCamelCase as rustc's lint spells it: underscores only
+    /// between two digits.
+    #[test]
+    fn a_weights_variant_is_upper_camel_case_with_its_version_separators() {
+        let v = |s: &str| pascal_case(&Ident::new(s, Span::call_site())).to_string();
+        assert_eq!(v("granite_3_1_8b_instruct"), "Granite3_1_8bInstruct");
+        assert_eq!(
+            v("gemma_4_26b_a4b_it_mlx_affine_b4_g64"),
+            "Gemma4_26bA4bItMlxAffineB4G64"
+        );
+        assert_eq!(v("qwen3_5_0_8b"), "Qwen3_5_0_8b");
+        assert_eq!(v("smollm2_135m"), "Smollm2_135m");
+    }
 
     /// A head reading its target's KV compiles the rungs up to the first holding its verify rows —
     /// Gemma 4's assistant at 3 rows: 1, 2 and 4 of the default ladder; at 8 rows, through 8 — and

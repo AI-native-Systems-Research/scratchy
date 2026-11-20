@@ -19,6 +19,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use scratchy_forward_compiler_macro::target::Named;
 use serde::ser::{self, Serialize};
 use std::fmt;
 
@@ -31,14 +32,20 @@ use std::fmt;
 /// the same literal is 2 tokens.
 ///
 /// Emitted at the top of the same block as the tape (see `metal_static_tape`), so the aliases
-/// and the paths [`module_of`] hands out are defined in ONE place and cannot drift apart.
-pub(crate) fn alias_preamble() -> TokenStream {
-    quote! {
-        use ::scratchy_target_metal::tape::lowered as __tl;
-        use ::scratchy_target_metal::tape::constants as __tc;
-        use ::scratchy_target_metal::tape::ids as __ti;
-        use ::scratchy_target_metal::dflash2 as __td;
-    }
+/// and the paths [`module_of`] hands out are defined in ONE place and cannot drift apart. Each is
+/// emitted only where the block's body (`named`) uses it, so no alias goes unused.
+pub(crate) fn alias_preamble(named: &Named) -> TokenStream {
+    let alias = |name: &str, path: TokenStream| {
+        let id = quote::format_ident!("{name}");
+        named.has(name).then(|| quote! { use #path as #id; })
+    };
+    let aliases = [
+        alias("__tl", quote!(::scratchy_target_metal::tape::lowered)),
+        alias("__tc", quote!(::scratchy_target_metal::tape::constants)),
+        alias("__ti", quote!(::scratchy_target_metal::tape::ids)),
+        alias("__td", quote!(::scratchy_target_metal::dflash2)),
+    ];
+    quote! { #(#aliases)* }
 }
 
 /// The module each tape type lives in — the single per-type fact the

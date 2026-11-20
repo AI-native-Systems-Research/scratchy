@@ -613,13 +613,14 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     let instruction_alias = quote! {
         #[allow(non_camel_case_types, dead_code)]
         type __I = ::scratchy_forward_compiler::Instruction;
-        use ::scratchy_forward_compiler::Instruction::*;
     };
 
     // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
     // tape_index only. Non-canonical buckets share their canonical
     // sibling's slices via the FORWARD_TABLE entries below.
     let mut static_slices: Vec<TokenStream> = Vec::new();
+    // Whether any static slice holds a row: the rows spell their variants through the glob.
+    let mut any_instruction = false;
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
@@ -627,6 +628,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         let (lowered, _, _, _, _) = &canonical_lowered[wp];
         let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
         let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
+        any_instruction |=
+            !lowered.backbone.instances.is_empty() || !lowered.lm_head.instances.is_empty();
         static_slices.push(emit_bucket_static_slice(
             &backbone_static_ident,
             &lowered.backbone.instances,
@@ -814,7 +817,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             .collect();
         let embed_base = weight_paths
             .iter()
-            .map(|p| p.join("_"))
+            .map(|p| scratchy_forward_compiler_frontend::typed_emit::field_name(p))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
         // Each DSL weight whose own subtree declares a `shared_expert`, by id: the bank a MoE op
@@ -882,7 +885,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         *slots_dec = arena;
         metal_steps.insert(*canonical, lowered);
         // THE WEIGHTS STRUCT, from the tape's bindings. Metal's one ABI fact in it: a gate/up
-        // pair is ONE packed `__fused__` buffer.
+        // pair is ONE packed `_fused_` buffer.
         let abi = WeightAbi {
             mlp: if fused_mlp {
                 MlpPacking::Packed
@@ -1424,13 +1427,21 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     // its colours'.
     let metal_ranked_slots = proc_macro2::Literal::usize_unsuffixed(metal_arena_slots as usize);
     let metal_arena_types = metal_arena_types.tokens();
+    // The dims markers and the typed `Act`, each only where the arena's types name it.
+    let arena_named = scratchy_forward_compiler_macro::target::Named::of(&metal_arena_types);
+    let arena_dims = arena_named
+        .has("__dims")
+        .then(|| quote! { use super::__dims; });
+    let arena_act = arena_named
+        .has("Act")
+        .then(|| quote! { use ::scratchy_tensors::typed::Act; });
     metal_arena_bytes_statics.push(quote! {
         /// The model's arena: the colours and arenas its buckets' colourings make, and its slots
         /// ranked by their bytes.
         #[cfg(scratchy_target = "metal")]
         mod __arena {
-            use super::__dims;
-            use ::scratchy_tensors::typed::Act;
+            #arena_dims
+            #arena_act
             #metal_arena_types
             /// [`super::METAL_BUCKETS`]' arena slots, ranked by the bytes their colours host.
             pub(super) static RANKED: ::scratchy_target_metal::interpreter::metal::RankedSlots<
@@ -1618,7 +1629,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
             let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
-            let rot_dim_lit2 = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
+            let rot_dim_lit2 = proc_macro2::Literal::usize_unsuffixed(rot_dim_val as usize);
             quote! {
                 /// The rotary cos/sin rows a forward of `n` tokens at `positions` (`[n]`, or MRoPE's
                 /// `[3, n]`) reads in place of the position-indexed cache — its positions then each
@@ -1632,7 +1643,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                         ::scratchy_target_metal::interpreter::metal::build_mrope_cos_sin_override(
                             positions,
                             n,
-                            #rot_dim_lit2 as usize,
+                            #rot_dim_lit2,
                             #rope_theta_lit,
                             [#t_lit, #h_lit, #w_lit],
                             <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.act_dtype(),
@@ -1655,10 +1666,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     let mrope_runtime_block = quote! {
         let mut __mrope_ident_vec: ::std::vec::Vec<u32> = ::std::vec::Vec::new();
         let __rope_rows = if !ctx.positions.as_raw().raw_ptr().is_null() {
-            let __pos_all = ::std::slice::from_raw_parts(
+            let __pos_all = unsafe { ::std::slice::from_raw_parts(
                 ctx.positions.as_raw().raw_ptr() as *const u32,
                 ctx.positions.as_raw().numel(),
-            );
+            ) };
             metal_rope_rows(__pos_all, n)
         } else {
             ::core::option::Option::None
@@ -1861,7 +1872,6 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             ctx: &crate::__gpu::ForwardCtx,
             device: &crate::__gpu::GpuDevice,
         ) -> &'w ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Weights> {
-            use ::scratchy_forward_compiler::CanonicalParams as _;
             use ::scratchy_target_metal::interpreter::metal::__re::{Buffer, MTLResourceOptions};
 
             wm.metal_pool.get_or_init(|| {
@@ -2239,6 +2249,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         /// `MetalWorkerPool::forward`, and copies the tape_index's
         /// terminal arena slot out as a fresh `OwnedTensor` of
         /// `[num_tokens, vocab_size]` f16 logits.
+        ///
+        /// # Safety
+        /// Every non-null view in `ctx` points at host-visible memory of its numel, as
+        /// `with_forward_inputs` reads it.
         #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -2281,51 +2295,51 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             let input_ids: &[u32] = if ctx.input_ids.as_raw().raw_ptr().is_null() {
                 &[]
             } else {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     ctx.input_ids.as_raw().raw_ptr() as *const u32,
                     n,
-                )
+                ) }
             };
             let positions: &[u32] = if ctx.positions.as_raw().raw_ptr().is_null() {
                 &[]
             } else {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     ctx.positions.as_raw().raw_ptr() as *const u32,
                     n,
-                )
+                ) }
             };
             let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                ::std::option::Option::Some(unsafe { ::std::slice::from_raw_parts(
                     ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
                     n,
-                ))
+                ) })
             } else {
                 ::std::option::Option::None
             };
             let cu_seqlens_q = if !ctx.cu_seqlens_q.as_raw().raw_ptr().is_null() {
                 let cu_n = ctx.cu_seqlens_q.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                ::std::option::Option::Some(unsafe { ::std::slice::from_raw_parts(
                     ctx.cu_seqlens_q.as_raw().raw_ptr() as *const u32,
                     cu_n,
-                ))
+                ) })
             } else {
                 ::std::option::Option::None
             };
             let seq_used_k = if !ctx.seqused_k.as_raw().raw_ptr().is_null() {
                 let su_n = ctx.seqused_k.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                ::std::option::Option::Some(unsafe { ::std::slice::from_raw_parts(
                     ctx.seqused_k.as_raw().raw_ptr() as *const u32,
                     su_n,
-                ))
+                ) })
             } else {
                 ::std::option::Option::None
             };
             let block_table = if !ctx.block_table.as_raw().raw_ptr().is_null() {
                 let bt_n = ctx.block_table.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                ::std::option::Option::Some(unsafe { ::std::slice::from_raw_parts(
                     ctx.block_table.as_raw().raw_ptr() as *const u32,
                     bt_n,
-                ))
+                ) })
             } else {
                 ::std::option::Option::None
             };
@@ -2335,14 +2349,14 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             let sliding_slot_mappings: ::std::vec::Vec<&[u32]> = ctx
                 .sliding_slot_mappings
                 .iter()
-                .map(|v| ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, n))
+                .map(|v| unsafe { ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, n) })
                 .collect();
             let sliding_block_tables: ::std::vec::Vec<&[u32]> = ctx
                 .sliding_block_tables
                 .iter()
                 .map(|v| {
                     let sbt_n = v.as_raw().numel();
-                    ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, sbt_n)
+                    unsafe { ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, sbt_n) }
                 })
                 .collect();
 
@@ -2353,7 +2367,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             let sampled_rows: &[u32] = match ctx.sampled_rows.as_ref() {
                 ::std::option::Option::Some(view) => {
                     let raw = view.as_raw();
-                    ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
+                    unsafe { ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel()) }
                 }
                 ::std::option::Option::None => {
                     last_rows = ::scratchy_target_metal::interpreter::metal::ForwardInputs::last_rows(
@@ -2370,84 +2384,84 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             // per seq, a step code per seq). `None` for non-hybrid arches
             // (ctx fields are None).
             let gdn_state_indices = ctx.gdn_state_indices.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const i32,
                     tv.as_raw().numel(),
-                )
+                ) }
             });
             let gdn_is_fresh = ctx.gdn_is_fresh.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u32,
                     tv.as_raw().numel(),
-                )
+                ) }
             });
             // Vision externs (vision towers): read as raw bytes from the
             // ctx TensorViews. `freqs` is f32, `pixels` is the model
             // dtype; the worker copies bytes verbatim. `None` for text.
             let vision_rope_freqs = ctx.vision_rope_freqs.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let pixels = ctx.pixels.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let pos_embeds = ctx.pos_embeds.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let target_hidden = ctx.target_hidden.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             // Qwen2.5-VL windowed-attention externs (i32/u32 byte
             // views; `None` on non-windowed towers and text bodies).
             let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let vision_cu_seqlens_window = ctx.vision_cu_seqlens_window.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let vision_window_index = ctx.vision_window_index.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let vision_reverse_indices = ctx.vision_reverse_indices.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             let vision_position_ids = ctx.vision_position_ids.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             // Multimodal splice: vision embeddings (bytes) + a per-source-
             // row destination map built from `embed_patches`. Text-only
             // batches leave `embed_patches` empty → both `None` (no-op).
             let mm_embeds = ctx.mm_embeds.map(|tv| {
-                ::std::slice::from_raw_parts(
+                unsafe { ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u8,
                     tv.as_raw().size_bytes(),
-                )
+                ) }
             });
             // ALWAYS materialized (all-`u32::MAX` for text-only batches):
             // the splice command sits in every decoder tape, so the kernel
@@ -2526,6 +2540,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         /// `endEncoding`. Lets the caller (the executor's argmax
         /// dispatch, today) append its own dispatches onto the same
         /// CB so forward + tail share one commit and one host wait.
+        ///
+        /// # Safety
+        /// Every non-null view in `ctx` points at host-visible memory of its numel, as
+        /// `with_forward_inputs` reads it.
         #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_with_metal_followup(
@@ -2557,7 +2575,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             // handle clone — no copy) so the caller can read
             // `[sampled rows, vocab_size]` f16 logits without taking
             // ownership of the worker's arena.
-            with_forward_inputs(ctx, num_tokens, |inputs| {
+            unsafe { with_forward_inputs(ctx, num_tokens, |inputs| {
                 let rows = #terminal_rows;
                 // Adapter: pool's tail receives `(encoder, worker, runtime, bucket)`
                 // and returns `Result<(), ForwardError>`. The public hook
@@ -2606,12 +2624,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                                 assert!((row as usize) < n, "hidden row {row} past the forward's {n} rows");
                                 // SAFETY: the backbone slot holds `[n, HIDDEN_SIZE]` 2-byte rows (the
                                 // bucket's arena is sized for at least `n`), and `row < n`.
-                                out.extend_from_slice(unsafe {
-                                    ::std::slice::from_raw_parts(
-                                        (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
-                                        row_bytes,
-                                    )
-                                });
+                                out.extend_from_slice(::std::slice::from_raw_parts(
+                                    (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
+                                    row_bytes,
+                                ));
                             }
                         }
                         let buf = worker.arena[spec.terminal_slot as usize].clone();
@@ -2638,7 +2654,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                     },
                     tail_adapter,
                 )
-            })
+            }) }
             .and_then(::core::convert::identity)
             // A command buffer the GPU failed (an out-of-memory, say) fails this step, not the
             // worker thread: the executor fails its requests and schedules again. Any other error
@@ -2684,7 +2700,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                     >,
                 ) -> ::core::result::Result<(), ::std::string::String> {
                     let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
-                    with_forward_inputs(ctx, num_tokens, |inputs| self.0.then(inputs, encoder))
+                    unsafe { with_forward_inputs(ctx, num_tokens, |inputs| self.0.then(inputs, encoder)) }
                         .and_then(::core::convert::identity)
                         .map_err(|e| format!("Onto::then: {e}"))
                 }
@@ -2727,7 +2743,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 }
             }
             let pool = resident_metal_pool(wm, ctx, device);
-            with_forward_inputs(ctx, num_tokens, |inputs| pool.forward_onto(inputs, encoder))
+            unsafe { with_forward_inputs(ctx, num_tokens, |inputs| pool.forward_onto(inputs, encoder)) }
                 .and_then(::core::convert::identity)
                 .map(|onto| ::std::boxed::Box::new(Onto(onto))
                     as ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>)
@@ -2747,6 +2763,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         /// across iters because the K-step decode shape is fixed).
         ///
         /// [`ChainStepHandle`]: ::scratchy_target_metal::model::ChainStepHandle
+        ///
+        /// # Safety
+        /// Every non-null view in `ctx` points at host-visible memory of its numel, as
+        /// `with_forward_inputs` reads it.
         #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_chain_with_encoder(
@@ -2757,7 +2777,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             body: ::scratchy_target_metal::model::MetalChainBody<'_>,
         ) -> ::core::result::Result<(), ::std::string::String> {
             let pool = resident_metal_pool(wm, ctx, device);
-            with_forward_inputs(ctx, num_tokens, |inputs| {
+            unsafe { with_forward_inputs(ctx, num_tokens, |inputs| {
                 // The bucket of iter 0's tokens, at the door. The chain's shape is constant across
                 // iters, so every iter plays it, at its tokens.
                 let bucket = pool
@@ -2838,7 +2858,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                     },
                 )
                 .map_err(|e| format!("MetalWorkerPool::with_chain_encoder: {e}"))
-            })
+            }) }
             .map_err(|e| format!("forward_chain_with_encoder: {e}"))
             .and_then(::core::convert::identity)
         }
@@ -2854,6 +2874,9 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         BackboneLayout::Encoder => quote! {},
     };
     let static_slices_emit = quote! { #(#static_slices)* };
+    // The variant glob only where a static slice spells its rows through it.
+    let instruction_glob =
+        any_instruction.then(|| quote! { use ::scratchy_forward_compiler::Instruction::*; });
 
     let items = quote! {
         #canonical_params_impl
@@ -2861,6 +2884,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         #weight_accessors_impl
 
         #instruction_alias
+        #instruction_glob
 
         #static_slices_emit
 

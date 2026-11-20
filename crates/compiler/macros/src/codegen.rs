@@ -2706,14 +2706,14 @@ fn emit_fingerprint_check(
                         if shape.last() != Some(&#cols) {
                             return false;
                         }
-                        __EXPERT_INPUT_SEEN = true;
+                        __expert_input_seen = true;
                     }
                 }
             });
             quote! {
-                let mut __EXPERT_INPUT_SEEN = false;
+                let mut __expert_input_seen = false;
                 #(#probes)*
-                if !__EXPERT_INPUT_SEEN {
+                if !__expert_input_seen {
                     return false;
                 }
             }
@@ -3533,7 +3533,7 @@ fn emit_weights_struct(
                     quote! { (#suffix, #rows_lit) }
                 })
                 .collect();
-            let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+            let tp_world_lit = proc_macro2::Literal::usize_unsuffixed(usize::from(tp_world_size));
             calls.push(quote! {
                 for __l in 0..#num_hidden_layers {
                     let __pp = ::std::format!(
@@ -3551,7 +3551,7 @@ fn emit_weights_struct(
                         &__pp,
                         &[ #(#pairs),* ],
                         tp_rank as usize,
-                        #tp_world_lit as usize,
+                        #tp_world_lit,
                     )?;
                 }
             });
@@ -4877,7 +4877,7 @@ fn emit_unindexed_let(
     packed_concat: bool,
 ) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
-    let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+    let tp_world_lit = proc_macro2::Literal::usize_unsuffixed(usize::from(tp_world_size));
     let sharded = tp_world_size > 1;
     match plan {
         FieldLoad::Embedding(prefix) => {
@@ -4888,13 +4888,13 @@ fn emit_unindexed_let(
             let kind = shard_kind_for_dotted_prefix(prefix);
             if sharded && kind == ShardKind::ShardDim0 {
                 quote! {
-                    let #name = crate::__gpu::layers::Embedding::load_sharded(
-                        gw, #prefix, tp_rank as usize, #tp_world_lit as usize,
+                    let #name = <crate::__gpu::layers::Embedding as crate::__gpu::layers::EmbeddingOps>::load_sharded(
+                        gw, #prefix, tp_rank as usize, #tp_world_lit,
                     )?;
                 }
             } else {
                 quote! {
-                    let #name = crate::__gpu::layers::Embedding::load(gw, #prefix)?;
+                    let #name = <crate::__gpu::layers::Embedding as crate::__gpu::layers::EmbeddingOps>::load(gw, #prefix)?;
                 }
             }
         }
@@ -4914,7 +4914,7 @@ fn emit_unindexed_let(
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
-                let #name = crate::__gpu::layers::AffineQuantEmbedding::load(
+                let #name = <crate::__gpu::layers::AffineQuantEmbedding as crate::__gpu::layers_quant::AffineQuantEmbeddingOps>::load(
                     gw, #prefix, #gs_lit, #bits_lit,
                 )?;
             }
@@ -4930,19 +4930,19 @@ fn emit_unindexed_let(
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
-                let #name = crate::__gpu::layers::Embedding::load_affine_dequant(
+                let #name = <crate::__gpu::layers::Embedding as crate::__gpu::layers_quant::EmbeddingDequantOps>::load_affine_dequant(
                     gw, #prefix, #gs_lit, #bits_lit,
                 )?;
             }
         }
         FieldLoad::RmsNorm(prefix, eps) => quote! {
-            let #name = crate::__gpu::layers::RmsNorm::load(gw, #prefix, #eps)?;
+            let #name = <crate::__gpu::layers::RmsNorm as crate::__gpu::layers::RmsNormOps>::load(gw, #prefix, #eps)?;
         },
         FieldLoad::GatedDeltaNet(prefix) => quote! {
-            let #name = crate::__gpu::layers::GatedDeltaNetLayer::load(gw, #prefix)?;
+            let #name = <crate::__gpu::layers::GatedDeltaNetLayer as crate::__gpu::layers::GatedDeltaNetOps>::load(gw, #prefix)?;
         },
         FieldLoad::LayerNorm(prefix, eps) => quote! {
-            let #name = crate::__gpu::layers::LayerNorm::load(gw, #prefix, #eps)?;
+            let #name = <crate::__gpu::layers::LayerNorm as crate::__gpu::layers::LayerNormOps>::load(gw, #prefix, #eps)?;
         },
         FieldLoad::LinearDense(prefix) => {
             // Per-Linear shard kind: q/k/v/gate/up/lm_head/embed →
@@ -4956,13 +4956,13 @@ fn emit_unindexed_let(
             let kind = shard_kind_for_dotted_prefix(prefix);
             match (sharded, kind) {
                 (true, ShardKind::ShardDim0) => quote! {
-                    let #name = crate::__gpu::layers::LinearLayer::load_dense_sharded(
-                        gw, #prefix, 0usize, tp_rank as usize, #tp_world_lit as usize,
+                    let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_dense_sharded(
+                        gw, #prefix, 0usize, tp_rank as usize, #tp_world_lit,
                     )?;
                 },
                 (true, ShardKind::ShardDim1) => quote! {
-                    let #name = crate::__gpu::layers::LinearLayer::load_dense_sharded(
-                        gw, #prefix, 1usize, tp_rank as usize, #tp_world_lit as usize,
+                    let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_dense_sharded(
+                        gw, #prefix, 1usize, tp_rank as usize, #tp_world_lit,
                     )?;
                 },
                 _ => quote! {
@@ -4971,7 +4971,7 @@ fn emit_unindexed_let(
                     // back to dense safetensors path. Transparent on
                     // every existing safetensors model since the
                     // GGUF map is empty there.
-                    let #name = crate::__gpu::layers::LinearLayer::load_dense_or_ggml(gw, #prefix)?;
+                    let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_dense_or_ggml(gw, #prefix)?;
                 },
             }
         }
@@ -4984,19 +4984,19 @@ fn emit_unindexed_let(
             // has no sharded variant.
             if packed_concat {
                 quote! {
-                    let #name = crate::__gpu::layers::LinearLayer::load_dense_concat_packed(
+                    let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_dense_concat_packed(
                         gw,
                         &[ #(#prefixes),* ],
                     )?;
                 }
             } else if sharded {
                 quote! {
-                    let #name = crate::__gpu::layers::LinearLayer::load_dense_concat_sharded(
+                    let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_dense_concat_sharded(
                         gw,
                         &[ #(#prefixes),* ],
                         stream,
                         tp_rank as usize,
-                        #tp_world_lit as usize,
+                        #tp_world_lit,
                     )?;
                 }
             } else {
@@ -5005,7 +5005,7 @@ fn emit_unindexed_let(
                     // first (when every prefix has a quantized linear),
                     // falls back to the existing safetensors concat
                     // path. Transparent on safetensors models.
-                    let #name = crate::__gpu::layers::LinearLayer::load_dense_concat_or_ggml(
+                    let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_dense_concat_or_ggml(
                         gw,
                         &[ #(#prefixes),* ],
                         stream,
@@ -5020,7 +5020,7 @@ fn emit_unindexed_let(
             // global, not per-block / per-rank). The `LinearLayer`
             // wrapper carries the tensor through to the body's
             // gemm op via `dense_weight()`.
-            let #name = crate::__gpu::layers::LinearLayer::load_raw(gw, #key)?;
+            let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers::LinearLayerOps>::load_raw(gw, #key)?;
         },
         FieldLoad::RawTensor(key) => quote! {
             let #name = gw.take(#key)?;
@@ -5044,7 +5044,7 @@ fn emit_unindexed_let(
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             let inf_lit = proc_macro2::Literal::u32_unsuffixed(*in_features);
             quote! {
-                let #name = crate::__gpu::layers::LinearLayer::load_affine_quant(
+                let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers_quant::LinearLayerQuantOps>::load_affine_quant(
                     gw,
                     #prefix,
                     #gs_lit,
@@ -5072,7 +5072,7 @@ fn emit_unindexed_let(
                 })
                 .collect();
             quote! {
-                let #name = crate::__gpu::layers::LinearLayer::load_affine_dequant_concat_as_dense(
+                let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers_quant::LinearLayerQuantOps>::load_affine_dequant_concat_as_dense(
                     gw,
                     &[#(#prefix_lits),*],
                     #gs_lit,
@@ -5094,7 +5094,7 @@ fn emit_unindexed_let(
                 .iter()
                 .map(|p| syn::LitStr::new(p, proc_macro2::Span::call_site()));
             quote! {
-                let #name = crate::__gpu::layers::LinearLayer::load_affine_quant_rows_concat(
+                let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers_quant::LinearLayerQuantOps>::load_affine_quant_rows_concat(
                     gw,
                     &[#(#prefix_lits),*],
                     #gs_lit,
@@ -5110,7 +5110,7 @@ fn emit_unindexed_let(
             // `Instruction::Nvfp4Qmm`.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             quote! {
-                let #name = crate::__gpu::layers::LinearLayer::load_nvfp4_quant(
+                let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers_quant::LinearLayerQuantOps>::load_nvfp4_quant(
                     gw,
                     #prefix,
                     #gs_lit,
@@ -5132,7 +5132,7 @@ fn emit_unindexed_let(
                 })
                 .collect();
             quote! {
-                let #name = crate::__gpu::layers::LinearLayer::load_nvfp4_quant_concat(
+                let #name = <crate::__gpu::layers::LinearLayer as crate::__gpu::layers_quant::LinearLayerQuantOps>::load_nvfp4_quant_concat(
                     gw,
                     &[#(#prefix_lits),*],
                     #gs_lit,
@@ -5198,7 +5198,7 @@ fn emit_unindexed_let(
             if prefixes.len() == 1 {
                 let prefix = &prefixes[0];
                 quote! {
-                    let #name = crate::__gpu::layers::MarlinLinear::load(
+                    let #name = <crate::__gpu::layers::MarlinLinear as crate::__gpu::layers_quant::MarlinLoadOps>::load(
                         gw,
                         #prefix,
                         marlin_storage,
@@ -5208,7 +5208,7 @@ fn emit_unindexed_let(
                 }
             } else {
                 quote! {
-                    let #name = crate::__gpu::layers::MarlinLinear::load_concat(
+                    let #name = <crate::__gpu::layers::MarlinLinear as crate::__gpu::layers_quant::MarlinLoadOps>::load_concat(
                         gw,
                         &[ #(#prefixes),* ],
                         marlin_storage,
@@ -5223,7 +5223,7 @@ fn emit_unindexed_let(
                 let prefix = &prefixes[0];
                 quote! {
                     let #name = crate::__gpu::layers::Fp8AnyLinear::Std(
-                        crate::__gpu::layers::Fp8Linear::load(
+                        <crate::__gpu::layers::Fp8Linear as crate::__gpu::layers_quant::Fp8LoadOps>::load(
                             gw,
                             #prefix,
                             __fp8_dtype,
@@ -5233,7 +5233,7 @@ fn emit_unindexed_let(
             } else {
                 quote! {
                     let #name = crate::__gpu::layers::Fp8AnyLinear::Std(
-                        crate::__gpu::layers::Fp8Linear::load_concat(
+                        <crate::__gpu::layers::Fp8Linear as crate::__gpu::layers_quant::Fp8LoadOps>::load_concat(
                             gw,
                             &[ #(#prefixes),* ],
                             __fp8_dtype,
@@ -5247,7 +5247,7 @@ fn emit_unindexed_let(
                 let prefix = &prefixes[0];
                 quote! {
                     let #name = crate::__gpu::layers::Fp8AnyLinear::Block(
-                        crate::__gpu::layers::Fp8BlockLinear::load(
+                        <crate::__gpu::layers::Fp8BlockLinear as crate::__gpu::layers_quant::Fp8BlockLoadOps>::load(
                             gw,
                             #prefix,
                             __fp8_dtype,
@@ -5257,7 +5257,7 @@ fn emit_unindexed_let(
             } else {
                 quote! {
                     let #name = crate::__gpu::layers::Fp8AnyLinear::Block(
-                        crate::__gpu::layers::Fp8BlockLinear::load_concat(
+                        <crate::__gpu::layers::Fp8BlockLinear as crate::__gpu::layers_quant::Fp8BlockLoadOps>::load_concat(
                             gw,
                             &[ #(#prefixes),* ],
                             __fp8_dtype,
@@ -5282,7 +5282,7 @@ fn emit_unindexed_let(
                 let prefix = &prefixes[0];
                 let out = &outs[0];
                 quote! {
-                    let #name = crate::__gpu::layers::Bnb4bitLinear::load(
+                    let #name = <crate::__gpu::layers::Bnb4bitLinear as crate::__gpu::layers_quant::Bnb4bitLoadOps>::load(
                         gw,
                         #prefix,
                         __bnb_code,
@@ -5294,7 +5294,7 @@ fn emit_unindexed_let(
                 }
             } else {
                 quote! {
-                    let #name = crate::__gpu::layers::Bnb4bitLinear::load_concat(
+                    let #name = <crate::__gpu::layers::Bnb4bitLinear as crate::__gpu::layers_quant::Bnb4bitLoadOps>::load_concat(
                         gw,
                         &[ #(#prefixes),* ],
                         __bnb_code,
@@ -5330,7 +5330,7 @@ fn emit_unindexed_let(
             let n_expert_group = *n_expert_group;
             let topk_group = *topk_group;
             quote! {
-                let #name = crate::__gpu::layers_moe::DeepSeekV2MoELayer::load(
+                let #name = <crate::__gpu::layers_moe::DeepSeekV2MoELayer as crate::__gpu::layers_moe::DeepSeekV2MoEOps>::load(
                     gw,
                     #prefix,
                     #n_routed_experts,
@@ -5371,7 +5371,7 @@ fn emit_unindexed_let(
             let n_expert_group = *n_expert_group;
             let topk_group = *topk_group;
             quote! {
-                let #name = crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoELayer::load(
+                let #name = <crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoELayer as crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoEOps>::load(
                     gw,
                     #prefix,
                     #n_routed_experts,
@@ -5413,7 +5413,7 @@ fn emit_unindexed_let(
             let n_expert_group = *n_expert_group;
             let topk_group = *topk_group;
             quote! {
-                let #name = crate::__gpu::layers_moe::DeepSeekV2GgmlMoELayer::load_gguf(
+                let #name = <crate::__gpu::layers_moe::DeepSeekV2GgmlMoELayer as crate::__gpu::layers_moe::DeepSeekV2GgmlMoEOps>::load_gguf(
                     gw,
                     #prefix,
                     #n_routed_experts,
@@ -5447,7 +5447,7 @@ fn emit_unindexed_let(
                 let gate_bits = gate_bits.unwrap_or(bits.up());
                 let bits = bits.tokens();
                 quote! {
-                    let #name = crate::__gpu::layers_moe::FusedMoELayer::load_affine(
+                    let #name = <crate::__gpu::layers_moe::FusedMoELayer as crate::__gpu::layers_moe::FusedMoEOps>::load_affine(
                         gw,
                         #prefix,
                         #num_experts,
@@ -5461,7 +5461,7 @@ fn emit_unindexed_let(
                 }
             } else {
                 quote! {
-                    let #name = crate::__gpu::layers_moe::FusedMoELayer::load(
+                    let #name = <crate::__gpu::layers_moe::FusedMoELayer as crate::__gpu::layers_moe::FusedMoEOps>::load(
                         gw,
                         #prefix,
                         #num_experts,
@@ -5492,7 +5492,7 @@ fn emit_unindexed_let(
                 let gate_bits = gate_bits.unwrap_or(bits.up());
                 let bits = bits.tokens();
                 quote! {
-                    let #name = crate::__gpu::layers_moe::SharedFusedMoELayer::load_affine(
+                    let #name = <crate::__gpu::layers_moe::SharedFusedMoELayer as crate::__gpu::layers_moe::SharedFusedMoEOps>::load_affine(
                         gw,
                         #prefix,
                         #num_experts,
@@ -5507,7 +5507,7 @@ fn emit_unindexed_let(
                 }
             } else {
                 quote! {
-                    let #name = crate::__gpu::layers_moe::SharedFusedMoELayer::load(
+                    let #name = <crate::__gpu::layers_moe::SharedFusedMoELayer as crate::__gpu::layers_moe::SharedFusedMoEOps>::load(
                         gw,
                         #prefix,
                         #num_experts,
@@ -5530,7 +5530,7 @@ fn emit_unindexed_let(
             let hidden_size = *hidden_size;
             let affine = gemma_router_affine_ts(*affine);
             quote! {
-                let #name = crate::__gpu::layers_moe::GemmaRouterLayer::load(
+                let #name = <crate::__gpu::layers_moe::GemmaRouterLayer as crate::__gpu::layers_moe::Gemma4RouterOps>::load(
                     gw,
                     #prefix,
                     #num_experts,
@@ -5555,7 +5555,7 @@ fn emit_unindexed_let(
             let group_size = *group_size;
             let bits = *bits;
             quote! {
-                let #name = crate::__gpu::layers_moe::SwitchGluExpertsLayer::load(
+                let #name = <crate::__gpu::layers_moe::SwitchGluExpertsLayer as crate::__gpu::layers_moe::SwitchGluExpertsOps>::load(
                     gw,
                     #prefix,
                     #num_experts,
@@ -5587,7 +5587,7 @@ fn emit_unindexed_let(
             let (group_size, bits) = affine.unwrap_or((64, 4));
             let gate_bits = gate_bits.unwrap_or(bits);
             quote! {
-                let #name = crate::__gpu::layers_moe::GptOssMoELayer::load(
+                let #name = <crate::__gpu::layers_moe::GptOssMoELayer as crate::__gpu::layers_moe::GptOssMoEOps>::load(
                     gw,
                     #prefix,
                     #num_experts,
@@ -5816,7 +5816,7 @@ fn emit_layered_load_body(
     // Literal `[b0, b1, ...]` per-layer bits slice for the mixed loaders.
     let per_layer_bits_lit: Option<TokenStream> =
         per_layer_bits.map(|bits| quote! { &[ #(#bits),* ] });
-    let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+    let tp_world_lit = proc_macro2::Literal::usize_unsuffixed(usize::from(tp_world_size));
     let sharded = tp_world_size > 1;
     // Build the `<root>.0.` form for `layered_suffix` /
     // `layer_templated_prefix_expr` consumers. `None` for decoder bodies.
@@ -5871,7 +5871,7 @@ fn emit_layered_load_body(
             if sharded && kind == ShardKind::ShardDim0 {
                 quote! {
                     crate::__gpu::load_layered_embedding_sharded(
-                        gw, #n_lit, #dec_root_lit, #suffix, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #n_lit, #dec_root_lit, #suffix, tp_rank as usize, #tp_world_lit,
                     )?
                 }
             } else {
@@ -5929,12 +5929,12 @@ fn emit_layered_load_body(
             match (sharded, kind, is_vision) {
                 (true, ShardKind::ShardDim0, _) => quote! {
                     crate::__gpu::load_layered_linear_dense_sharded(
-                        gw, #n_lit, #dec_root_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #n_lit, #dec_root_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit,
                     )?
                 },
                 (true, ShardKind::ShardDim1, _) => quote! {
                     crate::__gpu::load_layered_linear_dense_sharded(
-                        gw, #n_lit, #dec_root_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit as usize,
+                        gw, #n_lit, #dec_root_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit,
                     )?
                 },
                 (_, _, true) => {
@@ -5988,7 +5988,7 @@ fn emit_layered_load_body(
                         &[ #(#suffixes),* ],
                         stream,
                         tp_rank as usize,
-                        #tp_world_lit as usize,
+                        #tp_world_lit,
                     )?
                 }
             } else if is_vision {
@@ -6288,7 +6288,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers_moe::DeepSeekV2MoELayer::load(
+                        <crate::__gpu::layers_moe::DeepSeekV2MoELayer as crate::__gpu::layers_moe::DeepSeekV2MoEOps>::load(
                             gw,
                             &#p,
                             #n_routed_experts,
@@ -6316,7 +6316,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers::GatedDeltaNetLayer::load(gw, &#p)
+                        <crate::__gpu::layers::GatedDeltaNetLayer as crate::__gpu::layers::GatedDeltaNetOps>::load(gw, &#p)
                     })
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
@@ -6366,7 +6366,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoELayer::load(
+                        <crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoELayer as crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoEOps>::load(
                             gw,
                             &#p,
                             #n_routed_experts,
@@ -6417,7 +6417,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers_moe::DeepSeekV2GgmlMoELayer::load_gguf(
+                        <crate::__gpu::layers_moe::DeepSeekV2GgmlMoELayer as crate::__gpu::layers_moe::DeepSeekV2GgmlMoEOps>::load_gguf(
                             gw,
                             &#p,
                             #n_routed_experts,
@@ -6465,7 +6465,7 @@ fn emit_layered_load_body(
                 quote! {
                     (0u32..#n_lit)
                         .map(|layer: u32| -> ::anyhow::Result<_> {
-                            crate::__gpu::layers_moe::FusedMoELayer::load_affine(
+                            <crate::__gpu::layers_moe::FusedMoELayer as crate::__gpu::layers_moe::FusedMoEOps>::load_affine(
                                 gw,
                                 &#p,
                                 #num_experts,
@@ -6483,7 +6483,7 @@ fn emit_layered_load_body(
                 quote! {
                     (0u32..#n_lit)
                         .map(|layer: u32| -> ::anyhow::Result<_> {
-                            crate::__gpu::layers_moe::FusedMoELayer::load(
+                            <crate::__gpu::layers_moe::FusedMoELayer as crate::__gpu::layers_moe::FusedMoEOps>::load(
                                 gw,
                                 &#p,
                                 #num_experts,
@@ -6526,7 +6526,7 @@ fn emit_layered_load_body(
                 quote! {
                     (0u32..#n_lit)
                         .map(|layer: u32| -> ::anyhow::Result<_> {
-                            crate::__gpu::layers_moe::SharedFusedMoELayer::load_affine(
+                            <crate::__gpu::layers_moe::SharedFusedMoELayer as crate::__gpu::layers_moe::SharedFusedMoEOps>::load_affine(
                                 gw,
                                 &#p,
                                 #num_experts,
@@ -6545,7 +6545,7 @@ fn emit_layered_load_body(
                 quote! {
                     (0u32..#n_lit)
                         .map(|layer: u32| -> ::anyhow::Result<_> {
-                            crate::__gpu::layers_moe::SharedFusedMoELayer::load(
+                            <crate::__gpu::layers_moe::SharedFusedMoELayer as crate::__gpu::layers_moe::SharedFusedMoEOps>::load(
                                 gw,
                                 &#p,
                                 #num_experts,
@@ -6577,7 +6577,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers_moe::GemmaRouterLayer::load(
+                        <crate::__gpu::layers_moe::GemmaRouterLayer as crate::__gpu::layers_moe::Gemma4RouterOps>::load(
                             gw,
                             &#p,
                             #num_experts,
@@ -6619,7 +6619,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers_moe::SwitchGluExpertsLayer::load(
+                        <crate::__gpu::layers_moe::SwitchGluExpertsLayer as crate::__gpu::layers_moe::SwitchGluExpertsOps>::load(
                             gw,
                             &#p,
                             #num_experts,
@@ -6666,7 +6666,7 @@ fn emit_layered_load_body(
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
-                        crate::__gpu::layers_moe::GptOssMoELayer::load(
+                        <crate::__gpu::layers_moe::GptOssMoELayer as crate::__gpu::layers_moe::GptOssMoEOps>::load(
                             gw,
                             &#p,
                             #num_experts,
@@ -9521,13 +9521,11 @@ mod tests {
             ts.contains("load_layered_linear_dense_concat_sharded"),
             "tp=4 gate_up concat must route to concat_sharded (got: {ts})",
         );
-        // The macro bakes `tp_world_size` as an unsuffixed integer
-        // literal cast to `usize` (e.g. `4 as usize`). Asserting on
-        // the bare `4 as usize` token sequence — the unsuffixed form
-        // is `proc_macro2::Literal::u8_unsuffixed`'s contract.
+        // The macro bakes `tp_world_size` as an unsuffixed `usize` literal (`4`), after the
+        // shard rank: `proc_macro2::Literal::usize_unsuffixed`'s spelling, no cast.
         assert!(
-            ts.contains("4 as usize"),
-            "expected `4 as usize` for baked tp_world_size literal (got: {ts})",
+            ts.contains("tp_rank as usize , 4"),
+            "expected the baked tp_world_size literal `4` after the shard rank (got: {ts})",
         );
     }
 }
@@ -10062,7 +10060,7 @@ mod fingerprint_tests {
         );
         assert!(
             squash.contains("\"backbone.layers.87.mixer.experts.0.up_proj.weight\"")
-                && squash.contains("__EXPERT_INPUT_SEEN"),
+                && squash.contains("__expert_input_seen"),
             "the width gate falls through to the per-expert spellings (Nemotron-3 Super's MTP \
              sidecar ships `experts.<e>.up_proj`, no pre-stacked `switch_mlp`): {ts}"
         );

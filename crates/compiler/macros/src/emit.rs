@@ -32,7 +32,7 @@ pub fn weight_field_stem(
     id: WeightId,
     index: Option<UnrollIndex>,
 ) -> String {
-    let stem = weights.path(id).join("_");
+    let stem = scratchy_forward_compiler_frontend::typed_emit::field_name(weights.path(id));
     match index {
         Some(i) => format!("{stem}_{}", i.0),
         None => stem,

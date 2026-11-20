@@ -11,7 +11,7 @@
 use anyhow::Result;
 use scratchy_tensors::{layer_weight_path_with_root, vision_block_weight_path};
 
-use crate::layers::{LinearLayer, MetalLinearLayerOps, RmsNorm};
+use crate::layers::{LinearLayer, LinearLayerQuantOps, RmsNorm};
 use crate::layers::{LinearLayerOps, RmsNormOps};
 use crate::weights::GpuWeights;
 

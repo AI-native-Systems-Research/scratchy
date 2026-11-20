@@ -129,6 +129,41 @@ impl ModelCx<'_> {
     }
 }
 
+/// What a body of emitted tokens names: every identifier. Read in one pass, so an emitter writes
+/// a `use` only where the code it guards needs it and the emitted code has no unused import.
+#[derive(Default)]
+pub struct Named {
+    idents: std::collections::HashSet<String>,
+}
+
+impl Named {
+    /// What `body` names.
+    pub fn of(body: &TokenStream) -> Named {
+        let mut named = Named::default();
+        named.read(body.clone());
+        named
+    }
+
+    /// Adds what `body` names.
+    pub fn read(&mut self, body: TokenStream) {
+        use proc_macro2::TokenTree;
+        for t in body {
+            match t {
+                TokenTree::Group(g) => self.read(g.stream()),
+                TokenTree::Ident(a) => {
+                    self.idents.insert(a.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether it names the identifier `ident` (`hosts`).
+    pub fn has(&self, ident: &str) -> bool {
+        self.idents.contains(ident)
+    }
+}
+
 /// One canonical model's emission on a target: its weights struct, and the items its module holds
 /// beside it.
 pub struct ModelEmission {
