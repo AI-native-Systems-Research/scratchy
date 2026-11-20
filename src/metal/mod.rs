@@ -2979,13 +2979,33 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 mod tests {
     use dioxus::prelude::Element;
 
+    /// The JSON text of the fixture named `name` (its `.json` name), read from its `.gz`.
+    pub(super) fn fixture_text(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURES)
+            .join(format!("{name}.gz"));
+        crate::datafile::read_json_gz(&path).unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    /// The `.json` names of the fixtures directly in `tests/fixtures/metal`, sorted.
+    fn fixture_names() -> Vec<String> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+        (crate::datafile::list(&dir).expect(FIXTURES).into_iter())
+            .map(|p| p.expect("a fixture"))
+            .map(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_end_matches(".gz")
+                    .to_string()
+            })
+            .collect()
+    }
+
     /// The named runs of `site/tests/fixtures/metal`, parsed.
     fn fixtures(names: &[&str]) -> Vec<Run> {
         (names.iter())
-            .map(|name| {
-                let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
-                serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
-            })
+            .map(|name| serde_json::from_str(&fixture_text(name)).expect(name))
             .collect()
     }
 
@@ -3488,7 +3508,7 @@ mod tests {
     }
 
     /// A site whose published runs are the named fixtures alone: a fresh folder under the system's
-    /// temp dir named for `tag`, its data/metal holding each fixture gzipped, as a data PR
+    /// temp dir named for `tag`, its data/metal holding each fixture's `.gz`, as a data PR
     /// publishes it.
     fn site_with(tag: &str, names: &[&str]) -> crate::Site {
         let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
@@ -3500,7 +3520,7 @@ mod tests {
         for name in names {
             let file = std::path::Path::new(name).file_name().unwrap();
             let gz = format!("{}.gz", file.to_string_lossy());
-            gzip(&fixtures.join(name), &data.join(gz));
+            std::fs::copy(fixtures.join(format!("{name}.gz")), data.join(gz)).unwrap();
         }
         crate::Site {
             repo: root.clone(),
@@ -3509,13 +3529,25 @@ mod tests {
         }
     }
 
-    /// Writes `from`'s bytes gzipped to `to`.
-    fn gzip(from: &std::path::Path, to: &std::path::Path) {
-        use std::io::Write;
-        let bytes = std::fs::read(from).expect("a fixture");
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        gz.write_all(&bytes).unwrap();
-        std::fs::write(to, gz.finish().unwrap()).unwrap();
+    /// No fixture is stored as a plain `.json`, however deep in `tests/fixtures`.
+    #[test]
+    fn no_fixture_is_stored_as_plain_json() {
+        fn plain(dir: &std::path::Path, found: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).expect("a fixture folder") {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    plain(&path, found);
+                } else if path.extension().is_some_and(|x| x == "json") {
+                    found.push(path.display().to_string());
+                }
+            }
+        }
+        let mut found = Vec::new();
+        plain(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
+            &mut found,
+        );
+        assert!(found.is_empty(), "gzip these fixtures: {found:?}");
     }
 
     #[test]
@@ -3537,8 +3569,7 @@ mod tests {
     fn a_plain_json_in_data_is_refused() {
         let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
         let site = site_with("plain", &[]);
-        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
-        std::fs::copy(fixtures.join(name), site.root.join(super::DATA).join(name)).unwrap();
+        std::fs::write(site.root.join(super::DATA).join(name), fixture_text(name)).unwrap();
         let err = super::load(&site).err().expect("a plain JSON is refused");
         assert!(err.contains(name), "{err}");
         assert!(err.contains("gzip"), "{err}");
@@ -3548,12 +3579,12 @@ mod tests {
     fn a_run_named_without_gz_is_refused() {
         let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
         let site = site_with("unnamed", &[]);
-        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
         let stem = name.trim_end_matches(".json");
-        gzip(
-            &fixtures.join(name),
-            &site.root.join(super::DATA).join(format!("{stem}.gz")),
-        );
+        let gz = site.root.join(super::DATA).join(format!("{stem}.gz"));
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURES)
+            .join(format!("{name}.gz"));
+        std::fs::copy(fixture, gz).unwrap();
         let err = super::load(&site)
             .err()
             .expect("a run named .gz is refused");
@@ -4262,11 +4293,8 @@ mod tests {
     /// cells kept it, so a run from before draws no empty energy map.
     #[test]
     fn a_grid_draws_its_energy_only_where_its_run_kept_it() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-27T031941Z-f9739363.json"
-        );
-        let text = std::fs::read_to_string(path).unwrap();
+        let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let text = fixture_text(name);
         let run: Run = serde_json::from_str(&text).unwrap();
         let m = &run.models[0];
         let g = super::ShapeGrid::of(m, &run, super::Slice::Answer(64)).expect("a map");
@@ -4293,11 +4321,8 @@ mod tests {
     fn a_run_of_scratchy_alone_keeps_the_last_engines_and_frozen_launches() {
         use super::data::{BORROWED_FROZEN, Run, Scenario};
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
-        );
-        let text = std::fs::read_to_string(path).expect("the published M5 Max run");
+        let name = "apple-m5-max-2026-10-14T111352Z-987b06a2.json";
+        let text = fixture_text(name);
         let mut later: serde_json::Value = serde_json::from_str(&text).unwrap();
         later["generated_utc"] = "2026-10-21T12:00:00Z".into();
         for m in later["models"].as_array_mut().unwrap() {
@@ -4351,11 +4376,8 @@ mod tests {
     fn an_engine_measured_at_another_shape_is_not_carried() {
         use super::data::{BORROWED_FROZEN, Run};
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
-        );
-        let text = std::fs::read_to_string(path).expect("the published M5 Max run");
+        let name = "apple-m5-max-2026-10-14T111352Z-987b06a2.json";
+        let text = fixture_text(name);
         let mut later: serde_json::Value = serde_json::from_str(&text).unwrap();
         later["generated_utc"] = "2026-10-21T12:00:00Z".into();
         later["config"]["scaling"]["grid_input"] = serde_json::json!([128, 1024, 4096, 32768]);
@@ -4390,11 +4412,8 @@ mod tests {
     fn a_rival_is_not_borrowed_across_a_change_in_sampling() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
-        );
-        let text = std::fs::read_to_string(path).unwrap();
+        let name = "apple-m3-pro-2026-10-25T150928Z-1bf86114.json";
+        let text = fixture_text(name);
         let mut full: serde_json::Value = serde_json::from_str(&text).unwrap();
         full["generated_utc"] = "2026-10-24T12:00:00Z".into();
         let ours = full["models"][0]["tasks"].clone();
@@ -4432,11 +4451,8 @@ mod tests {
     fn an_accuracy_cell_is_borrowed_only_at_its_own_size() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
-        );
-        let text = std::fs::read_to_string(path).unwrap();
+        let name = "apple-m3-pro-2026-10-25T150928Z-1bf86114.json";
+        let text = fixture_text(name);
         let with_accuracy = |n: u32, when: &str, rival: bool| -> Run {
             let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
             v["generated_utc"] = when.into();
@@ -4466,11 +4482,8 @@ mod tests {
     fn a_shared_musique_cell_is_borrowed_cut_to_this_runs_head() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
-        );
-        let text = std::fs::read_to_string(path).unwrap();
+        let name = "apple-m3-pro-2026-10-25T150928Z-1bf86114.json";
+        let text = fixture_text(name);
         // Request i of a cell: task t<i> (x<i> where `other`), first token at i + 1 ms, right
         // where i is even.
         let cell = |n: usize, share: &str, other: bool| {
@@ -4596,11 +4609,8 @@ mod tests {
     #[test]
     fn a_timeline_starts_again_where_the_sampling_changed() {
         use super::data::Run;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
-        );
-        let text = std::fs::read_to_string(path).unwrap();
+        let name = "apple-m3-pro-2026-10-25T150928Z-1bf86114.json";
+        let text = fixture_text(name);
         let two = |sample: Option<&str>| -> Vec<Run> {
             let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
             old["generated_utc"] = "2026-10-24T12:00:00Z".into();
@@ -4633,11 +4643,8 @@ mod tests {
     fn a_quick_runs_dataset_cells_borrow_the_rival_under_the_same_task_cap() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
-        );
-        let text = std::fs::read_to_string(path).expect("the dataset quick run");
+        let name = "apple-m3-pro-2026-10-25T150928Z-1bf86114.json";
+        let text = fixture_text(name);
         // An earlier run that timed oMLX TurboQuant on the same workloads (its cells stand in for
         // a full run's: the rule does not look at the numbers).
         let mut full: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -4706,11 +4713,8 @@ mod tests {
     fn open_loop_cells_are_neither_lent_nor_borrowed() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
-        );
-        let text = std::fs::read_to_string(path).expect("the dataset quick run");
+        let name = "apple-m3-pro-2026-10-25T150928Z-1bf86114.json";
+        let text = fixture_text(name);
         let stacked: serde_json::Value = serde_json::from_str(&text).unwrap();
         // The same cells, as an open-loop run records them: each a rate step.
         let open = |v: &serde_json::Value, when: &str| {
@@ -4787,10 +4791,7 @@ mod tests {
     #[test]
     fn dataset_runs_give_their_workloads_a_timeline() {
         use super::data::Run;
-        let read = |name: &str| -> Run {
-            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
-            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
-        };
+        let read = |name: &str| -> Run { serde_json::from_str(&fixture_text(name)).unwrap() };
         let runs = vec![
             read("apple-m3-pro-2026-10-25T150928Z-1bf86114.json"),
             read("apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"),
@@ -4813,11 +4814,8 @@ mod tests {
     fn a_quick_run_after_a_full_run_borrows_its_engines() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
-        );
-        let text = std::fs::read_to_string(path).expect("the M3 Pro's full run");
+        let name = "apple-m3-pro-2026-10-21T145041Z-a7820fbc.json";
+        let text = fixture_text(name);
         let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
         quick["generated_utc"] = "2026-10-22T12:00:00Z".into();
         quick["config"]["scaling"]["grid_output"] = serde_json::json!([64]);
@@ -4853,12 +4851,8 @@ mod tests {
     fn a_run_in_the_quick_shape_reads_every_view_from_its_own_grid() {
         use super::data::{At, Run};
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
-        );
-        let mut v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let name = "apple-m5-max-2026-10-14T111352Z-987b06a2.json";
+        let mut v: serde_json::Value = serde_json::from_str(&fixture_text(name)).unwrap();
         let (ins, users) = ([128u32, 1024, 4096, 32768], [1u32, 4, 8, 16]);
         v["config"]["scaling"] = serde_json::json!({
             "axes": ["grid"], "grid_input": ins, "grid_output": [64, 512, 2048],
@@ -4920,12 +4914,8 @@ mod tests {
     fn splash_cells_are_read_where_it_ran_and_omlx_stays_the_rival() {
         use super::data::Run;
         use super::numbers::Engine;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
-        );
-        let mut v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let name = "apple-m3-pro-2026-10-21T145041Z-a7820fbc.json";
+        let mut v: serde_json::Value = serde_json::from_str(&fixture_text(name)).unwrap();
         let qwen = (v["models"].as_array().unwrap().iter())
             .position(|m| m["stem"] == "qwen3.6-35b-a3b")
             .unwrap();
@@ -4949,13 +4939,7 @@ mod tests {
     /// Over time takes every run of a Mac it is given.
     #[test]
     fn over_time_takes_every_run_it_is_given() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut names: Vec<String> = (std::fs::read_dir(root.join(FIXTURES)).expect(FIXTURES))
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
+        let names = fixture_names();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let site = site_with("over-time", &names);
         let runs = super::load(&site).expect("the fixtures");
@@ -4978,8 +4962,7 @@ mod tests {
     fn machines_order_by_memory_and_take_their_set_by_it() {
         use super::data::Run;
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
-            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+            serde_json::from_str(&fixture_text(name)).unwrap()
         };
         let mut base = read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
         base["machine"]["chip"] = "Apple M5".into();
@@ -5030,8 +5013,7 @@ mod tests {
         use super::data::Run;
         // The M3 Pro's 2026-10-27 run at f9739363, a newer one replaced.
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
-            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+            serde_json::from_str(&fixture_text(name)).unwrap()
         };
         let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
         small["config"]["default_set"] = "small".into();
@@ -5064,8 +5046,7 @@ mod tests {
         use super::data::Run;
         // The M3 Pro's 2026-10-27 run at f9739363, a newer one replaced.
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
-            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+            serde_json::from_str(&fixture_text(name)).unwrap()
         };
         let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
         small["config"]["default_set"] = "small".into();
@@ -5093,16 +5074,10 @@ mod tests {
     #[test]
     fn published_cells_that_stopped_answers_early_are_marked_short() {
         use super::numbers::{Engine, Metric, SHORT, cfmt, marks_note, short};
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut by_engine = std::collections::BTreeMap::<&str, usize>::new();
-        let mut files: Vec<_> = (std::fs::read_dir(root.join(FIXTURES)).expect(FIXTURES))
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
-        files.sort();
-        for f in files {
-            let mut run: Run = serde_json::from_str(&std::fs::read_to_string(&f).unwrap())
-                .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        for f in fixture_names() {
+            let mut run: Run =
+                serde_json::from_str(&fixture_text(&f)).unwrap_or_else(|e| panic!("{f}: {e}"));
             run.mark_dead();
             run.mark_short();
             for m in &run.models {
@@ -5142,20 +5117,12 @@ mod tests {
     fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
         use super::numbers::{Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
         use crate::DASH;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut runs: Vec<Run> = Vec::new();
-        for dir in [FIXTURES] {
-            let mut files: Vec<_> = (std::fs::read_dir(root.join(dir)).expect(dir))
-                .map(|e| e.unwrap().path())
-                .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                .collect();
-            files.sort();
-            for f in files {
-                let mut run: Run = serde_json::from_str(&std::fs::read_to_string(&f).unwrap())
-                    .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
-                run.mark_dead();
-                runs.push(run);
-            }
+        for f in fixture_names() {
+            let mut run: Run =
+                serde_json::from_str(&fixture_text(&f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+            run.mark_dead();
+            runs.push(run);
         }
         let mut dead = std::collections::BTreeMap::<(String, String, &str, &str), usize>::new();
         for r in &runs {
@@ -5207,12 +5174,8 @@ mod tests {
     #[test]
     fn the_benchs_dead_server_and_timeout_verdicts_reach_the_page() {
         use super::numbers::{Metric, failed_note, timing};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
-        );
-        let mut json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let name = "apple-m3-pro-2026-10-21T145041Z-a7820fbc.json";
+        let mut json: serde_json::Value = serde_json::from_str(&fixture_text(name)).unwrap();
         json["config"]["failures_counted"] = true.into();
         let cells = json["models"][0]["scaling"].as_array_mut().unwrap();
         // As the bench writes them: a dead server's cell, and one that timed out.
@@ -5236,9 +5199,7 @@ mod tests {
     /// recorded: its cells are never re-judged by their answer tokens, however few.
     #[test]
     fn a_run_that_counted_its_failures_is_not_re_judged() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let file = root.join("tests/fixtures/metal/apple-m3-pro-2026-10-13T010519Z-cc51e0d8.json");
-        let text = std::fs::read_to_string(&file).expect("the published M3 Pro run");
+        let text = fixture_text("apple-m3-pro-2026-10-13T010519Z-cc51e0d8.json");
         let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
         let judged = |json: &serde_json::Value| {
             let mut run: Run = serde_json::from_value(json.clone()).expect("a run");
@@ -5265,12 +5226,8 @@ mod tests {
     fn a_timeline_takes_the_rival_only_from_the_runs_that_measured_it() {
         use super::data::Run;
         use super::numbers::{Engine, Metric};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
-        );
-        let full: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let name = "apple-m5-max-2026-10-14T111352Z-987b06a2.json";
+        let full: serde_json::Value = serde_json::from_str(&fixture_text(name)).unwrap();
         let quick = |when: &str| {
             let mut v = full.clone();
             v["generated_utc"] = when.into();
@@ -5321,11 +5278,10 @@ mod tests {
     /// and `mem` (every scaling cell's peak memory), in MiB, for the rule tests below: the run's
     /// other fields stay real, so it loads as one does. Returns the run and the model's index.
     fn with_memory(rss: f64, mem: f64) -> (Run, usize) {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let file = root.join("tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
-        let mut json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&file).expect("a published run"))
-                .expect("json");
+        let mut json: serde_json::Value = serde_json::from_str(&fixture_text(
+            "apple-m3-pro-2026-10-21T145041Z-a7820fbc.json",
+        ))
+        .expect("json");
         let at = (json["models"].as_array().expect("models").iter())
             .position(|m| m["model_id"] == "mlx-community/Qwen3.6-35B-A3B-4bit")
             .expect("qwen3.6-35b-a3b in the run");
