@@ -11,118 +11,8 @@ mod weights;
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_forward_compiler_macro::target::{
-    BakeCx, DispatchCx, ExtTrait, LoadCx, Named, StructCx, TargetEmitter, WeightsStruct,
-    ext_trait_imports,
+    BakeCx, DispatchCx, LoadCx, StructCx, TargetEmitter, WeightsStruct,
 };
-
-/// The loader `*Ops` extension traits a spyre loader body calls (path syntax:
-/// `LinearLayer::load_dense_or_ggml(...)`, `RotaryCache::new_from_stream(...)`, …), each with the
-/// calls it serves. `load_fn` brings into scope only the ones its body calls.
-const LOADER_TRAITS: &[ExtTrait] = &[
-    ExtTrait {
-        path: "crate::__gpu::layers::LinearLayerOps",
-        calls: &[
-            "LinearLayer::load_dense",
-            "LinearLayer::load_raw",
-            "LinearLayer::load_dense_or_ggml",
-            "LinearLayer::load_dense_concat_or_ggml",
-            "LinearLayer::load_dense_sharded",
-            "LinearLayer::load_dense_concat_packed",
-            "LinearLayer::load_dense_concat",
-            "LinearLayer::load_dense_concat_sharded",
-            "LinearLayer::load_affine_quant",
-            "LinearLayer::load_affine_dequant_as_dense",
-            "LinearLayer::load_affine_dequant_concat_as_dense",
-            "LinearLayer::load_nvfp4_quant",
-            "LinearLayer::load_nvfp4_quant_concat",
-        ],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers::EmbeddingOps",
-        calls: &[
-            "Embedding::load",
-            "Embedding::load_sharded",
-            "Embedding::load_affine_dequant",
-        ],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers::RmsNormOps",
-        calls: &["RmsNorm::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers::LayerNormOps",
-        calls: &["LayerNorm::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers::GatedDeltaNetOps",
-        calls: &["GatedDeltaNetLayer::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_quant::MarlinLoadOps",
-        calls: &[
-            "MarlinLinear::load",
-            "MarlinLinear::load_concat",
-            "MarlinLinear::load_awq",
-            "MarlinLinear::load_awq_concat",
-            "MarlinLinear::load_gptq",
-            "MarlinLinear::load_gptq_concat",
-        ],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_quant::Fp8LoadOps",
-        calls: &["Fp8Linear::load", "Fp8Linear::load_concat"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_quant::Fp8BlockLoadOps",
-        calls: &["Fp8BlockLinear::load", "Fp8BlockLinear::load_concat"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_quant::Bnb4bitLoadOps",
-        calls: &["Bnb4bitLinear::load", "Bnb4bitLinear::load_concat"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_quant::AffineQuantEmbeddingOps",
-        calls: &["AffineQuantEmbedding::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::DeepSeekV2MoEOps",
-        calls: &["DeepSeekV2MoELayer::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::DeepSeekV2Fp8BlockMoEOps",
-        calls: &["DeepSeekV2Fp8BlockMoELayer::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::DeepSeekV2GgmlMoEOps",
-        calls: &["DeepSeekV2GgmlMoELayer::load_gguf"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::FusedMoEOps",
-        calls: &["FusedMoELayer::load", "FusedMoELayer::load_affine"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::SharedFusedMoEOps",
-        calls: &[
-            "SharedFusedMoELayer::load",
-            "SharedFusedMoELayer::load_affine",
-        ],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::Gemma4RouterOps",
-        calls: &["GemmaRouterLayer::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::layers_moe::SwitchGluExpertsOps",
-        calls: &["SwitchGluExpertsLayer::load"],
-    },
-    ExtTrait {
-        path: "crate::__gpu::rotary::CudaRotaryExt",
-        calls: &[
-            "RotaryCache::new_from_stream",
-            "RotaryCache::new_longrope_from_stream",
-        ],
-    },
-];
 
 /// The spyre target's emitter.
 pub struct Spyre;
@@ -181,8 +71,6 @@ impl TargetEmitter for Spyre {
                 #rope_context_init
             })
         };
-        // The loader `*Ops` extension traits the body's calls need, and no other.
-        let traits = ext_trait_imports(LOADER_TRAITS, &Named::of(&body));
         quote! {
             /// It builds the real `Weights` through `crate::__gpu`'s loader `*Ops`, which
             /// `scratchy-target-spyre` provides (backed by the neutral allocator-generic
@@ -195,7 +83,6 @@ impl TargetEmitter for Spyre {
                 max_model_len: usize,
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                #traits
                 #body
             }
         }

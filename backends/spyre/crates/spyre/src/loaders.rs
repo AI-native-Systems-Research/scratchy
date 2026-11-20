@@ -20,6 +20,7 @@ use anyhow::Result;
 use scratchy_tensors::{layer_weight_path_with_root, vision_block_weight_path};
 
 use crate::layers::{LinearLayer, LinearLayerOps, RmsNorm, RmsNormOps};
+use crate::layers_quant::LinearLayerQuantOps;
 use crate::weights::GpuWeights;
 
 // Fully-neutral layered loaders shared from scratchy-layers (every backend).

@@ -23,7 +23,8 @@ pub use scratchy_quantizations::layers_quant::{
 };
 // Metal quant load Ops (the macro imports these from `crate::__gpu::layers::…`).
 pub use crate::layers_quant::{
-    MetalAffineEmbedOps, MetalAffineQuantOps, MetalEmbeddingOps, MetalLinearLayerOps, MetalNvfp4Ops,
+    AffineQuantEmbeddingOps, EmbeddingDequantOps, LinearLayerQuantOps, MetalAffineQuantOps,
+    MetalNvfp4Ops,
 };
 
 /// Metal dense-load surface for [`LinearLayer`]. Neutral loads delegate to the
