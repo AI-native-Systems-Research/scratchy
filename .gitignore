@@ -1,6 +1,8 @@
 *~
 
 /target/
+# The site branch, checked out here as a worktree.
+/site/
 # crates/targets/metal/tui is its own standalone workspace (excluded from the root one,
 # see root Cargo.toml) — its build output lands here, not under /target/.
 /crates/targets/metal/tui/target/

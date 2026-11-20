@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # A perf PR's merge gate, as one script: the standard cell set, main against
 # the PR, on this pod, back to back — writing the progress entry the spyre
-# page charts (site/data/spyre/progress/<pr>.json) directly, so the gate's
-# numbers and the site's data are the same numbers.
+# page charts (data/spyre/progress/<pr>.json.gz on the site branch, written
+# into a site/ worktree). Open its own PR with --base site once the perf PR
+# merges.
 #
 # The standard cell set (the sweep grid's own parameters, from the
 # .sweep-legs cells.tsv the 10-19 sweep ran):
@@ -293,7 +294,13 @@ sha40() { [ ${#1} -eq 40 ] && case "$1" in *[!0-9a-fA-F]*) false ;; *) true ;; e
 sha40 "$HEAD" || { echo "REFUSING: --head is not a full 40-hex commit sha" >&2; exit 64; }
 sha40 "$BASE" || { echo "REFUSING: --base is not a full 40-hex commit sha" >&2; exit 64; }
 case "$RUNS" in ''|*[!0-9]*|0|1) echo "REFUSING: --runs must be at least 2 (the file needs two runs a side)" >&2; exit 64 ;; esac
-OUT="${OUT:-$REPO/site/data/spyre/progress}"
+if [ -z "$OUT" ]; then
+  [ -e "$REPO/site/.git" ] || {
+    echo "REFUSING: $REPO/site is not a worktree of the site branch (git worktree add site <upstream>/site); a plain site/ folder holding only target/ and _site/ can be removed first" >&2
+    exit 69
+  }
+  OUT="$REPO/site/data/spyre/progress"
+fi
 
 # ---- the standard cell set (cells.tsv's own parameters) -----------------------
 M2B=ibm-granite/granite-3.1-2b-instruct
@@ -388,7 +395,7 @@ if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
 fi
 
 mkdir -p "$OUT"
-DEST="$OUT/$PR.json"
+DEST="$OUT/$PR.json.gz"
 [ -e "$DEST" ] && { echo "REFUSING: $DEST already exists — never overwrite a landed entry" >&2; exit 65; }
 
 # ---- the pod env (verbatim, from the legs) ------------------------------------
@@ -615,6 +622,7 @@ fi
 python3 - "$PR" "$TITLE" "$HEAD" "$BASE" "$RUNS_JSONL" "$DEST" "$(hostname)" "$RUNS" "$CORES" "$SELECTED" <<'PY'
 import collections
 import datetime
+import gzip
 import json
 import os
 import sys
@@ -724,9 +732,8 @@ entry = {
     "cells": [cells[k] for k in sorted(cells)],
 }
 tmp = dest + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(entry, f, indent=2)
-    f.write("\n")
+with open(tmp, "wb") as f:
+    f.write(gzip.compress((json.dumps(entry, indent=2) + "\n").encode(), 9, mtime=0))
 os.replace(tmp, dest)
 print(dest)
 PY

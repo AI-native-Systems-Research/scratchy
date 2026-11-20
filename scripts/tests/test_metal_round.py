@@ -6,10 +6,17 @@
     python3 -m unittest discover -s scripts/tests
 """
 
+import argparse
+import base64
+import contextlib
+import gzip
+import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import metal_round  # noqa: E402
@@ -165,6 +172,41 @@ class Collect(unittest.TestCase):
             [comment(1, text="```json\n[]\n```"), comment(2, run())], on_main)
         self.assertEqual([i for i, _ in rejected], [1])
         self.assertIn("Apple M3 Pro", newest)
+
+
+class Commit(unittest.TestCase):
+    """A finished round's runs go to the site branch's data/metal, gzipped."""
+
+    def collect_into(self, out_dir):
+        cs = [comment(i, run(chip=c)) for i, c in enumerate(metal_round.MACHINES)]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(cs, f)
+        with mock.patch.object(metal_round, "on_main", lambda sha, ref: True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            metal_round.main(["collect", "--comments", f.name, "--out-dir", out_dir])
+        return json.loads(out.getvalue())
+
+    def test_collect_writes_each_run_gzipped_under_the_sites_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            summary = self.collect_into(d)
+            self.assertTrue(summary["complete"])
+            self.assertIn("apple-m3-pro-2026-10-21T102354Z-aa000000.json.gz", summary["files"])
+            for name in summary["files"]:
+                self.assertTrue(name.endswith(".json.gz"), name)
+                with open(f"{d}/{name}", "rb") as f:
+                    back = json.loads(gzip.decompress(f.read()))
+                self.assertIn(back["machine"]["chip"], metal_round.MACHINES)
+
+    def test_the_commit_adds_the_gzipped_runs_to_the_site_branchs_data(self):
+        with tempfile.TemporaryDirectory() as d:
+            summary = self.collect_into(d)
+            a = argparse.Namespace(repo="o/r", branch="metal-round/1", head="abc", dir=d,
+                                   headline="h", files=summary["files"])
+            adds = metal_round.commit_input(a)["variables"]["input"]["fileChanges"]["additions"]
+        self.assertEqual([x["path"] for x in adds],
+                         [f"data/metal/{n}" for n in summary["files"]])
+        back = json.loads(gzip.decompress(base64.b64decode(adds[0]["contents"])))
+        self.assertEqual(back, run(chip=metal_round.MACHINES[0]))
 
 
 if __name__ == "__main__":

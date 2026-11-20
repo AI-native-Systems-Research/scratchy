@@ -597,10 +597,9 @@ chip="$(sysctl -n machdep.cpu.brand_string)"
 slug="$(echo "${chip}" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9-]//g')"
 : "${OUT_DIR:="${ROOT}/bench_results/metal_matrix"}"
 RAW="${OUT_DIR}/${slug}"
-# Named <machine>-<start time>-<sha8>.json, the name site/src/metal/ requires,
-# so a finished run drops straight into site/data/metal/ and a second run of
-# one commit on one day never overwrites the first. One timestamp feeds
-# both the name and generated_utc, so the two can never disagree.
+# Named <machine>-<start time>-<sha8>.json (gzipped when copied to the site
+# branch), so two runs of one commit never collide. One timestamp feeds both
+# the name and generated_utc.
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 stamp="${STARTED_UTC//:/}"
 JSON="${OUT_DIR}/${slug}-${stamp}-$(git -C "${ROOT}" rev-parse HEAD | cut -c1-8).json"
