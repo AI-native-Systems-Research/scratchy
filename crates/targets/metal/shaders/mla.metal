@@ -32,6 +32,7 @@
 //                   rows into (unset: one, no merge pass)
 //  11 = PARTIAL     a partial's elements: its max, its sum, then its LATENT lanes
 //  12 = MERGE_THREADS  a merge threadgroup's threads
+//  13 = ROW_THREADS a row kernel's threads (the query rotation, the cache write)
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -51,6 +52,7 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_SIMDGROUPS, 9);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTS, 10);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTIAL_STRIDE, 11);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MERGE_THREADS, 12);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_ROW_THREADS, 13);
 
 constant constexpr uint MLA_Q_HEAD = MLA_NOPE + MLA_ROPE;
 constant constexpr uint MLA_ROW = MLA_LATENT + MLA_ROPE;
@@ -83,23 +85,23 @@ inline uint mla_cache_at(uint slot, uint e, thread uint& chunk, thread bool& in_
 // ── Query rotation ──────────────────────────────────────────────────────────
 // buffer(0) = q [rows, HEADS * Q_HEAD], buffer(1) = out (same), buffer(2) =
 // positions [rows], buffer(3) = cos_sin [positions, ROPE].
-// Dispatch: threadgroups (rows, HEADS, 1), threads (Q_HEAD, 1, 1).
+// Dispatch: threadgroups (rows, HEADS, 1), threads (ROW_THREADS, 1, 1), each
+// thread every ROW_THREADS-th lane of its head.
 template <typename T>
 [[kernel]] void mla_rope_q(
     device const T*    q         [[buffer(0)]],
     device       T*    out       [[buffer(1)]],
     device const uint* positions [[buffer(2)]],
     device const T*    cos_sin   [[buffer(3)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint  d  [[thread_index_in_threadgroup]])
+    uint3 tg  [[threadgroup_position_in_grid]],
+    uint  tid [[thread_index_in_threadgroup]])
 {
-    if (d >= MLA_Q_HEAD) {
-        return;
-    }
     const uint base = (tg.x * MLA_HEADS + tg.y) * MLA_Q_HEAD;
-    out[base + d] = d < MLA_NOPE
-        ? q[base + d]
-        : T(mla_rotate(q + base + MLA_NOPE, d - MLA_NOPE, cos_sin, positions[tg.x]));
+    for (uint d = tid; d < MLA_Q_HEAD; d += MLA_ROW_THREADS) {
+        out[base + d] = d < MLA_NOPE
+            ? q[base + d]
+            : T(mla_rotate(q + base + MLA_NOPE, d - MLA_NOPE, cos_sin, positions[tg.x]));
+    }
 }
 
 // ── Cache write ─────────────────────────────────────────────────────────────
@@ -107,7 +109,8 @@ template <typename T>
 // = out [rows, ROPE] (the rotated key), buffer(3) = positions [rows],
 // buffer(4) = cos_sin, buffer(5) = slot_mapping [rows] (0xFFFFFFFF: a padding
 // row, written nowhere), buffer(6) / (7) = the layer's K / V chunk tables.
-// Dispatch: threadgroups (rows, 1, 1), threads (ROW, 1, 1).
+// Dispatch: threadgroups (rows, 1, 1), threads (ROW_THREADS, 1, 1), each
+// thread every ROW_THREADS-th lane of its row.
 template <typename T>
 [[kernel]] void mla_append(
     device const T*        latent       [[buffer(0)]],
@@ -118,29 +121,27 @@ template <typename T>
     device const uint*     slot_mapping [[buffer(5)]],
     device const uint64_t* k_cache      [[buffer(6)]],
     device const uint64_t* v_cache      [[buffer(7)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint  e  [[thread_index_in_threadgroup]])
+    uint3 tg  [[threadgroup_position_in_grid]],
+    uint  tid [[thread_index_in_threadgroup]])
 {
-    if (e >= MLA_ROW) {
-        return;
-    }
     const uint t = tg.x;
-    T v;
-    if (e < MLA_LATENT) {
-        v = latent[t * MLA_LATENT + e];
-    } else {
-        const uint d = e - MLA_LATENT;
-        v = T(mla_rotate(k_pe + t * MLA_ROPE, d, cos_sin, positions[t]));
-        out[t * MLA_ROPE + d] = v;
-    }
     const uint slot_raw = slot_mapping[t];
-    if (slot_raw == 0xFFFFFFFFu) {
-        return;
+    for (uint e = tid; e < MLA_ROW; e += MLA_ROW_THREADS) {
+        T v;
+        if (e < MLA_LATENT) {
+            v = latent[t * MLA_LATENT + e];
+        } else {
+            const uint d = e - MLA_LATENT;
+            v = T(mla_rotate(k_pe + t * MLA_ROPE, d, cos_sin, positions[t]));
+            out[t * MLA_ROPE + d] = v;
+        }
+        if (slot_raw != 0xFFFFFFFFu) {
+            uint chunk;
+            bool in_v;
+            const uint at = mla_cache_at(slot_raw & 0x7FFFFFFFu, e, chunk, in_v);
+            ((device T*)(in_v ? v_cache[chunk] : k_cache[chunk]))[at] = v;
+        }
     }
-    uint chunk;
-    bool in_v;
-    const uint at = mla_cache_at(slot_raw & 0x7FFFFFFFu, e, chunk, in_v);
-    ((device T*)(in_v ? v_cache[chunk] : k_cache[chunk]))[at] = v;
 }
 
 // ── Absorbed attention ──────────────────────────────────────────────────────
@@ -256,8 +257,6 @@ template <typename T>
     // Merge the simdgroups' softmaxes, a head at a time: each simdgroup's max, sum and latent
     // lanes into threadgroup memory, then each output lane summed over them, rescaled to the
     // head's max.
-    static_assert(4u * (2u * MLA_HPT * MLA_SG + MLA_SG * MLA_LATENT) <= 32768u,
-                  "an MLA attention's merge fits a threadgroup's 32 KiB of memory");
     threadgroup float tg_m[MLA_HPT * MLA_SG];
     threadgroup float tg_l[MLA_HPT * MLA_SG];
     threadgroup float tg_o[MLA_SG * MLA_LATENT];

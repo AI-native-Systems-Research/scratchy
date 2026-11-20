@@ -1412,11 +1412,13 @@ pub struct MlaAttendTiling {
 
 /// `KernelId::MlaRopeQ` / `MlaAppend` / `MlaAttend` (`mla.metal`): the geometry (slots 0 to 3),
 /// the cache (4 to 6, the writer's and the attention's), and the attention's and its merge's: the
-/// softmax scale (7) and the tiling (8 to 12).
+/// softmax scale (7) and the tiling (8 to 12); a row kernel's, its threads (13).
 pub struct MlaConstants {
     pub mla: crate::tape::step::Mla,
     pub cache: Option<MlaCacheConstants>,
     pub attend: Option<MlaAttendTiling>,
+    /// A row kernel's threads (slot 13): the query rotation's and the cache write's.
+    pub row_threads: Option<crate::tape::ids::ThreadCount>,
 }
 
 impl From<MlaConstants> for Vec<ConstantValue> {
@@ -1443,6 +1445,9 @@ impl From<MlaConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(10), t.parts.get()));
             v.push(ConstantValue::uint(ConstSlot(11), t.partial.get()));
             v.push(ConstantValue::uint(ConstSlot(12), t.merge_threads.get()));
+        }
+        if let Some(threads) = c.row_threads {
+            v.push(ConstantValue::uint(ConstSlot(13), threads.get()));
         }
         v
     }
