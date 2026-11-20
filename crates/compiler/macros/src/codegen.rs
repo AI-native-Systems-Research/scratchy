@@ -3733,7 +3733,10 @@ fn emit_weights_struct(
         quote! {}
     };
     let rotary_load: TokenStream = if uses_rotary {
-        let head_dim = model.text.head_dim.get() as usize;
+        // A multi-head latent attention's rope runs over its rope part alone (`qk_rope_head_dim`),
+        // every head's and the shared key's.
+        let head_dim = (model.bounds.get("qk_rope_head_dim"))
+            .map_or(model.text.head_dim.get() as usize, |&v| v as usize);
         let rope_theta = model.text.rope_theta.get();
         let partial = model
             .scalars
@@ -7406,6 +7409,20 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
     })
 }
 
+/// Where a forward's roped keys are rotated: at the KV write when one of its ops caches its keys
+/// rotated with no rotate-on-read form ([`OpKind::ropes_keys_at_write`]), so no span of its cache
+/// can be relocated; else on each read of the cache (rope-on-read, every other roped model's KV).
+/// `None` for a forward without rotary.
+pub fn fuf_kv_rope(fuf: &Fuf) -> Option<scratchy_ir::model_facts::KvRope> {
+    use scratchy_ir::model_facts::KvRope;
+    fuf_uses_rotary(fuf).then(
+        || match fuf.nodes.iter().any(|n| n.op.ropes_keys_at_write()) {
+            true => KvRope::AtWrite,
+            false => KvRope::OnRead,
+        },
+    )
+}
+
 /// The layers whose ops read or write the paged KV cache, ascending: every layer of a uniform
 /// decoder, a recurrent hybrid's attention layers only (its Mamba / Gated-DeltaNet layers hold
 /// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors. The
@@ -7773,7 +7790,8 @@ pub fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
 pub(crate) fn fill_canonical_params(
     model: &ModelParams,
     tp_world_size: u8,
-    uses_rotary: bool,
+    // Where the forward's keys rotate ([`fuf_kv_rope`]); `None` for a forward without rotary.
+    kv_rope: Option<scratchy_ir::model_facts::KvRope>,
     kv_layers: &KvCacheLayers,
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
@@ -8137,15 +8155,15 @@ pub(crate) fn fill_canonical_params(
                 (u32::try_from(sliding_window).ok())
                     .and_then(positive)
                     .map(mf::AttnWindow::new),
-                // A roped model's keys rotate on read (every one: rope-on-read is its KV); a model
-                // without rope states none.
-                uses_rotary.then(|| {
+                // Where a roped model's keys rotate ([`fuf_kv_rope`]); a model without rope states
+                // none.
+                kv_rope.map(|kv_rope| {
                     mf::Rope::new(
                         match rope_proportional {
                             true => mf::RopePairing::Proportional,
                             false => mf::RopePairing::Standard,
                         },
-                        mf::KvRope::OnRead,
+                        kv_rope,
                         model.mrope_section.map(mf::MropeSection::new),
                     )
                 }),
@@ -8403,6 +8421,27 @@ pub fn emit_kv_layer_geometry_arm_body(
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
     let num_hidden_layers = model.text.layers.get();
+    // A multi-head latent attention's cache: every layer's one row per token, held as the pool's
+    // K and V halves of its single kv head.
+    if fuf.nodes.iter().any(|n| n.op.ropes_keys_at_write()) {
+        let mla = crate::to_wavefront::mla_geometry(&model.bounds, model)
+            .unwrap_or_else(|e| panic!("{}: its latent cache: {e}", model.source_stem));
+        let half = mla.half_row() as usize;
+        let layers = (0..num_hidden_layers).map(|_| {
+            quote! {
+                ::scratchy_forward_compiler::LayerKvGeometry {
+                    is_sliding: false,
+                    num_kv_heads: 1,
+                    head_size: #half,
+                    head_size_v: ::core::option::Option::None,
+                    sliding_window: ::core::option::Option::None,
+                }
+            }
+        });
+        return Some(quote! {
+            ::core::option::Option::Some(::std::vec![ #(#layers),* ])
+        });
+    }
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
@@ -8571,7 +8610,7 @@ pub fn emit_model(
     let (model_facts, mla_consts) = fill_canonical_params(
         model,
         tp_world_size,
-        fuf_uses_rotary(fuf),
+        fuf_kv_rope(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
         emitter.compresses_kv(),
@@ -8840,8 +8879,7 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts =
-                fill_canonical_params(&model, 1, false, &every_layer(&model), None, false).0;
+            let facts = fill_canonical_params(&model, 1, None, &every_layer(&model), None, false).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -8948,7 +8986,7 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
+        let (facts, mla) = fill_canonical_params(&m, 1, None, &every_layer(&m), None, false);
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -8964,7 +9002,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 1, None, &every_layer(&m), None, false).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -8996,7 +9034,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 2, None, &every_layer(&m), None, false).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -9042,7 +9080,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 8, None, &every_layer(&m), None, false).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
