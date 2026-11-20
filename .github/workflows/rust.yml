@@ -143,6 +143,13 @@ jobs:
         run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
           --lib -- tcp_store multinode
 
+      # The crates a release publishes to crates.io (every root member without
+      # `publish = false`) still package: each depends only on versioned crates
+      # in that set or on crates.io. A dry run without verification, so it builds
+      # nothing; the release workflow's publish verifies each build.
+      - name: The published crates package
+        run: cargo publish --workspace --dry-run --no-verify
+
       # The scheduler is backend-neutral — its tests need no hardware, and no
       # other step runs them (deps of `-p` test steps don't run transitively,
       # and the workspace clippy is lib+bins only). Includes the multi-wave

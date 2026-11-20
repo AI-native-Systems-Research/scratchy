@@ -3,6 +3,7 @@ name = "scratchy-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "The scratchy CLI's common core: every command, its arguments and `run`, shared by each target's binary (`scr` on Apple silicon, `spyre` on IBM Spyre)"
 
 # A library, no binary: each target's CLI crate (`crates/targets/<target>/cli`) parses its command
@@ -60,7 +61,7 @@ scratchy-serving-api = { workspace = true, optional = true }
 scratchy-core-model = { workspace = true }
 # The compiled variants' dumps (`BackboneDumpRegistration`), which `model info` and its stem
 # completion walk.
-scratchy-forward-compiler = { path = "../../compiler" }
+scratchy-forward-compiler = { workspace = true }
 # The model scope's compiled HF registry (`compiled_hf_registry()`), which `model names`
 # completes from. A target's binary turns it on (`features = ["model"]`).
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }

@@ -3,7 +3,8 @@ name = "scratchy-serving-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Worker/process management and distributed coordination for vLLM Rust port"
+repository.workspace = true
+description = "Worker/process management and distributed coordination for scratchy"
 
 [features]
 default = []

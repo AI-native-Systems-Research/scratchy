@@ -3,6 +3,7 @@ name = "scratchy-spec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Speculative-decoding build scope: which drafters compile alongside the selected models (`spec/<drafter>` from scratchy-cli)."
 
 [features]

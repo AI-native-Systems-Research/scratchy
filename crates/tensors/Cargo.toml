@@ -3,7 +3,11 @@ name = "scratchy-tensors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Backend-neutral GPU tensor core for scratchy: GpuTensor descriptor, DType, the DeviceAllocator transfer trait, and GGML quant metadata. No backend — every backend sits on top of this."
+# The target-neutrality guard reads this repository's whole tree (`../..`): it runs here, not
+# from a published package.
+exclude = ["tests/cfg_neutrality.rs"]
 
 [features]
 

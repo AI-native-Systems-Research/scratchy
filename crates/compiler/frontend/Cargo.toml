@@ -3,6 +3,8 @@ name = "scratchy-forward-compiler-frontend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "The front end of scratchy's forward compiler: parses a model's Python forward spec, classifies it, and emits typed Rust"
 
 # The forward compiler's front end: the Python-costume parser, the classifier and the program it
 # builds, the shape dims, the config rules and the weights manifest, and the typed-Rust emit pass
@@ -19,4 +21,4 @@ syn = "3"
 proc-macro2 = "1"
 serde_json = { workspace = true }
 # The compiler ids the front end shares with the rest of the compiler.
-scratchy-tensors = { path = "../../tensors" }
+scratchy-tensors = { workspace = true }

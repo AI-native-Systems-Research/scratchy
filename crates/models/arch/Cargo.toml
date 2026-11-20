@@ -3,6 +3,7 @@ name = "scratchy-models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "The models — every arch's DSL carrier and configs — and the model scope a build compiles, as features"
 # Named build script (not build.rs) so the process shows as
 # `build-script-scratchy-forwards` instead of the opaque `build-script-build`.
@@ -718,7 +719,7 @@ hf-completions = ["dep:ureq", "dep:scratchy-forward-compiler-macro"]
 [dependencies]
 # The quant presets the scope names: its build script publishes them as `links` metadata, which
 # cargo hands to this crate's build script, a direct dependent (`DEP_SCRATCHY_QUANTIZATIONS_PRESETS`).
-scratchy-quantizations = { path = "../quantization" }
+scratchy-quantizations = { workspace = true }
 
 [build-dependencies]
 # The scope's metadata (`ScopeMetadata`), and the selected arches the registry resolves.

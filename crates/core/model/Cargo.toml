@@ -3,7 +3,8 @@ name = "scratchy-core-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model loading, weight management, and tensor abstractions for vLLM Rust port"
+repository.workspace = true
+description = "Model loading, weight management, and tensor abstractions for scratchy"
 
 [features]
 default = []

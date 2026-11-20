@@ -3,6 +3,7 @@ name = "scratchy-target-metal-models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "The selected models, compiled for metal: the model scope `scratchy-models` states, through the shared pipeline with metal's emitter"
 
 [features]
@@ -22,12 +23,12 @@ vision = ["dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-t
 scratchy-models = { path = "../../../models/arch", default-features = false }
 # What the emitted code names.
 scratchy-target-metal = { path = ".." }
-scratchy-forward-compiler = { path = "../../../compiler" }
-scratchy-layers = { path = "../../../layers" }
+scratchy-forward-compiler = { workspace = true }
+scratchy-layers = { workspace = true }
 # The dim markers and typed weight handles each model's emitted `Weights` holds.
-scratchy-tensors = { path = "../../../tensors" }
-scratchy-quantizations = { path = "../../../models/quantization" }
-scratchy-vision = { path = "../../../models/vision", optional = true }
+scratchy-tensors = { workspace = true }
+scratchy-quantizations = { workspace = true }
+scratchy-vision = { workspace = true, optional = true }
 # The `BakedTokenizer`s the build bakes register against.
 scratchy-core-model = { workspace = true }
 anyhow = { workspace = true }

@@ -3,6 +3,7 @@ name = "scratchy-target-metal-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "The metal worker: the serving `Worker` over the metal target, registered as a `WorkerFactory`"
 
 [features]
@@ -24,7 +25,7 @@ scratchy-serving-scheduler = { workspace = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-core-model = { workspace = true }
-scratchy-forward-compiler = { path = "../../../compiler" }
+scratchy-forward-compiler = { workspace = true }
 # The selected models, compiled for metal: their loaders, tapes and pools, found through the
 # emitted registry rows.
 scratchy-target-metal-models = { path = "../models" }

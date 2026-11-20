@@ -3,6 +3,7 @@ name = "scratchy-models-build"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "The models build driver: every selected arch's DSL carrier through the shared pipeline, for the target whose emitter the calling build script hands it"
 
 # A build-dependency of each target's models crate. Target-neutral: the target is the

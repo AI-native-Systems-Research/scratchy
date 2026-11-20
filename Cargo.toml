@@ -51,6 +51,7 @@ exclude = ["crates/targets/metal/tui", "backends/spyre-hw"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/AI-native-Systems-Research/scratchy"
 
 [workspace.dependencies]
 # Type-level unsigned integers: a dim's number as a type, so a law between dims is a bound rustc
@@ -182,24 +183,32 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # `main()`.
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "stream", "rustls-no-provider"] }
 
-# Internal workspace crates
-scratchy-core-common = { path = "crates/core/common" }
-scratchy-core-config = { path = "crates/core/config" }
-scratchy-serving-scheduler = { path = "crates/serving/scheduler" }
-scratchy-serving-engine = { path = "crates/serving/engine" }
-scratchy-serving-api = { path = "crates/serving/api" }
-scratchy-serving-worker = { path = "crates/serving/worker" }
+# Internal workspace crates: one row each, the one place an internal crate's path and
+# version are written. Members take them with `workspace = true`; a release bumps
+# `[workspace.package] version` and the version in each row here.
+scratchy-core-common = { version = "0.1.0", path = "crates/core/common" }
+scratchy-core-config = { version = "0.1.0", path = "crates/core/config" }
+scratchy-serving-scheduler = { version = "0.1.0", path = "crates/serving/scheduler" }
+scratchy-serving-engine = { version = "0.1.0", path = "crates/serving/engine" }
+scratchy-serving-api = { version = "0.1.0", path = "crates/serving/api" }
+scratchy-serving-worker = { version = "0.1.0", path = "crates/serving/worker" }
 scratchy-target-metal-worker = { path = "crates/targets/metal/worker" }
-scratchy-core-model = { path = "crates/core/model" }
+scratchy-core-model = { version = "0.1.0", path = "crates/core/model" }
 # We own Hub downloads (that crate's manifest says why). Do not reach for the
 # `hf-hub` crate to avoid it: 1.0 depends on hf-xet non-optionally — no
 # feature, builder method or env var disables it — costing 111 crates and a C
 # cryptography toolchain, and it has no download resume (huggingface/hf-hub#196).
-hf-hub-downloader = { path = "crates/core/hf-hub-downloader" }
-scratchy-quantizations = { path = "crates/models/quantization" }
-scratchy-vision = { path = "crates/models/vision" }
-scratchy-forward-compiler = { path = "crates/compiler" }
-scratchy-serving-transport = { path = "crates/serving/transport" }
+hf-hub-downloader = { package = "scratchy-hf-hub-downloader", version = "0.1.0", path = "crates/core/hf-hub-downloader" }
+scratchy-quantizations = { version = "0.1.0", path = "crates/models/quantization" }
+scratchy-vision = { version = "0.1.0", path = "crates/models/vision" }
+scratchy-forward-compiler = { version = "0.1.0", path = "crates/compiler" }
+scratchy-serving-transport = { version = "0.1.0", path = "crates/serving/transport" }
+scratchy-tensors = { version = "0.1.0", path = "crates/tensors" }
+scratchy-tp-world = { version = "0.1.0", path = "crates/core/tp-world" }
+scratchy-layers = { version = "0.1.0", path = "crates/layers" }
+scratchy-ir = { version = "0.1.0", path = "crates/compiler/ir" }
+scratchy-forward-compiler-frontend = { version = "0.1.0", path = "crates/compiler/frontend" }
+scratchy-subtile = { version = "0.1.0", path = "crates/compiler/subtile" }
 scratchy-bench = { path = "crates/benches" }
 scratchy-cli = { path = "crates/cli/scr", default-features = false }
 

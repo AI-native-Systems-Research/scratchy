@@ -3,7 +3,8 @@ name = "scratchy-serving-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Engine core loop and request lifecycle for vLLM Rust port"
+repository.workspace = true
+description = "Engine core loop and request lifecycle for scratchy"
 
 [features]
 default = []
