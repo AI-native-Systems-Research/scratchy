@@ -1747,11 +1747,6 @@ mod tests {
         let b_stick = ctx.hbm.borrow_mut().allocate(STICK_BYTES);
         let a = a_stick * STICK_BYTES;
         let b = b_stick * STICK_BYTES;
-        // Allocations are LAZY (reserved, committed on write), so B's zeroed stick is COMMITTED
-        // here: the law under test is that a grown A cannot swallow a neighbour holding bytes.
-        ctx.hbm
-            .borrow_mut()
-            .write_bytes(b, &vec![0u8; STICK_BYTES as usize]);
         // Grow A in place until its buffer covers B's whole stick: any address at
         // or past B's base now resolves to B, not A (see `resolves_to_base`).
         let grown_elems = ((b - a + STICK_BYTES) / 4) as usize;

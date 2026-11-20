@@ -59,14 +59,6 @@ pub struct HBMSimulator {
     /// base byte address -> raw allocation bytes, ORDERED by base so an interior address finds its
     /// allocation by a range lookup (see [`find_allocation`])
     allocations: BTreeMap<i64, Vec<u8>>,
-    /// ⭐ base byte address -> RESERVED bytes: the extent an allocation may grow to and a view
-    /// over its base may claim, WITHOUT committing a single byte of host memory. An allocation's
-    /// declared extent is an ADDRESSING BOUND (the paged KV pools' views declare the most one
-    /// pool region may hold — a whole segment a plane), and committing it eagerly zeroed a
-    /// buffer the run only ever touches a funded prefix of; the bytes commit on WRITE
-    /// ([`HBMSimulator::write_bytes`] grows the backing buffer), and a read past what was
-    /// written zero-pads exactly as it always did past a zeroed allocation's tail.
-    reserved: BTreeMap<i64, i64>,
     /// next unallocated byte address (stick-aligned); starts at 0x10000
     pub next_ptr: i64,
 }
@@ -82,7 +74,6 @@ impl HBMSimulator {
         HBMSimulator {
             size_bytes: size_gb * 1024 * 1024 * 1024,
             allocations: BTreeMap::new(),
-            reserved: BTreeMap::new(),
             next_ptr: 0x10000,
         }
     }
@@ -96,13 +87,9 @@ impl HBMSimulator {
             "next_ptr must be stick-aligned"
         );
         let ptr = self.next_ptr;
-        // ⭐ LAZY: the extent is RESERVED, never committed — a write commits bytes
-        // ([`HBMSimulator::write_bytes`]), a read past what was written zero-pads, and a view
-        // over the base may claim the whole reserved extent (see `reserved`'s doc).
-        self.reserved
+        self.allocations
             .entry(ptr)
-            .and_modify(|r| *r = (*r).max(size))
-            .or_insert(size);
+            .or_insert_with(|| vec![0u8; size.max(0) as usize]);
         let advanced = ptr + size;
         self.next_ptr = (advanced + STICK_BYTES - 1) & !(STICK_BYTES - 1);
         ptr / STICK_BYTES
@@ -181,22 +168,8 @@ impl HBMSimulator {
     /// swallow the base of the one the bump allocator placed after it. Attributing an
     /// interior pointer under those conditions can name the wrong tensor, so a bounds check
     /// built on it would report defects that are artifacts of the lookup.
-    ///
-    /// The RESERVED extent counts: an allocation's address range is reserved at
-    /// [`allocate`](Self::allocate) even before any write commits its bytes, and a view over
-    /// the base may claim the whole reservation (the paged pools' views declare the
-    /// reservation, not the funded prefix a run touches).
     pub fn allocation_len_at_base(&self, byte_addr: i64) -> Option<usize> {
-        match (
-            self.allocations.get(&byte_addr),
-            self.reserved.get(&byte_addr),
-        ) {
-            (None, None) => None,
-            (committed, reserved) => Some(
-                committed.map_or(0, Vec::len)
-                    .max(reserved.copied().unwrap_or(0).max(0) as usize),
-            ),
-        }
+        self.allocations.get(&byte_addr).map(Vec::len)
     }
 
     /// Whether an interior address `byte_addr` past `base` still resolves to `base`'s own
@@ -446,10 +419,6 @@ mod tests {
         let mut hbm = HBMSimulator::default();
         let a = hbm.allocate(STICK_BYTES) * STICK_BYTES;
         let b = hbm.allocate(STICK_BYTES) * STICK_BYTES;
-        // Allocations are LAZY (reserved, committed on write — see `reserved`'s doc), so B's
-        // zeroed stick is COMMITTED here: the law under test is that a grown A cannot swallow
-        // a neighbour that HOLDS bytes.
-        hbm.write_bytes(b, &vec![0u8; STICK_BYTES as usize]);
         assert!(hbm.resolves_to_base(a, a + STICK_BYTES - 1));
         // Grow `a` past `b`'s base: `a`'s buffer now covers `b`'s address, but an address at or
         // past `b` resolves to `b`.

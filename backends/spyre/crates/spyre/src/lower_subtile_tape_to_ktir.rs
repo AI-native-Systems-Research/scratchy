@@ -2022,10 +2022,15 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     show(&expected)
                 )));
             }
-            if cap as usize != p.capacity() {
+            // ⭐ THE BOUND MUST HOLD THE CONTEXT — the step's capacity is the pool's ADDRESSING
+            // BOUND (units_max pages), and the tape's pool is the model's context; the bound
+            // exists to address at least that, so a context past it is unaddressable. The bound
+            // may exceed the context by any amount — what a run FUNDS is the worker's census,
+            // never this check.
+            if cap as usize > p.capacity() {
                 return Err(SuperDscError(format!(
-                    "the attention's K pool holds {cap} slots but the paged step states {} — one \
-                     pool, two capacities",
+                    "the attention's K pool holds {cap} slots but the pool's addressing bound is \
+                     {} — the bound must hold the context",
                     p.capacity()
                 )));
             }
