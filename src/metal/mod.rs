@@ -18,6 +18,7 @@ mod tasks;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::Path;
 
 use dioxus::prelude::*;
 
@@ -44,8 +45,11 @@ use numbers::{
 /// The run files, relative to the site's root; copied to the same place under _site/,
 /// where each run table links to its own.
 pub const DATA: &str = "data/metal";
-/// The runs a newer one replaced, relative to the site's root: only Over time reads them.
+/// The runs a newer one replaced, relative to the site's root: Over time and each machine's runs
+/// table read them, and they are published like [`DATA`]'s.
 pub const HISTORY: &str = "data/metal/history";
+/// Every folder of runs the page reads, each published under _site/ as it is.
+const PUBLISHED: [&str; 2] = [DATA, HISTORY];
 
 // --------------------------------------------------------------------- load
 
@@ -59,25 +63,25 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
 /// and the ones a newer run replaced ([`HISTORY`]), for Over time.
 fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
     let (mut files, mut errors) = (Vec::new(), Vec::new());
-    for dir in dirs {
-        let dir = site.root.join(dir);
+    for &rel in dirs {
+        let dir = site.root.join(rel);
         // history/ may not exist yet; the page's own folder must.
         let Ok(listed) = datafile::list(&dir) else {
-            if *dir == *site.root.join(DATA) {
+            if rel == DATA {
                 return Err(format!("{}: not found", dir.display()));
             }
             continue;
         };
         for f in listed {
             match f {
-                Ok(f) => files.push(f),
+                Ok(f) => files.push((f, rel)),
                 Err(e) => errors.push(e),
             }
         }
     }
     files.sort();
     let mut runs = Vec::new();
-    for f in files {
+    for (f, rel) in files {
         let name = f
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -117,7 +121,7 @@ fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
         run.mark_short();
         run.mark_mem_below_weights();
         run.mark_ttft_too_soon();
-        run.file = f;
+        run.file = Path::new(rel).join(name);
         runs.push(run);
     }
     if errors.is_empty() {
@@ -402,7 +406,7 @@ pub(super) fn runs_table(runs: &[&Run], about: Element) -> Element {
                 for run in runs.iter().rev() {
                     {
                         let [(_, flags), (_, kv)] = settings(run);
-                        let file = run.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let file = run.file.display();
                         rsx! {
                             TableRow {
                                 TableCell { "{run.generated_utc.minute()} UTC" }
@@ -413,7 +417,7 @@ pub(super) fn runs_table(runs: &[&Run], about: Element) -> Element {
                                 TableCell { code { "{flags}" } }
                                 TableCell { "{engine_versions(run)}" }
                                 TableCell { "{pinned(run)}" }
-                                TableCell { a { href: "{DATA}/{file}", "json.gz" } }
+                                TableCell { a { href: "{file}", "json.gz" } }
                             }
                         }
                     }
@@ -2886,7 +2890,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
-    let all_runs = load_from(site, &[DATA, HISTORY])?;
+    let all_runs = load_from(site, &PUBLISHED)?;
     let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -2956,13 +2960,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     )?;
     let out = site.out.join("metal.html");
     fs::write(&out, html).map_err(|e| format!("{}: {e}", out.display()))?;
-    let dest = site.out.join(DATA);
-    fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    for run in &runs {
-        if let Some(name) = run.file.file_name() {
-            fs::copy(&run.file, dest.join(name))
-                .map_err(|e| format!("{}: {e}", run.file.display()))?;
-        }
+    // Every run the page reads is published where its runs table row links.
+    for dir in PUBLISHED {
+        let dest = site.out.join(dir);
+        fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    }
+    for run in &all_runs {
+        fs::copy(site.root.join(&run.file), site.out.join(&run.file))
+            .map_err(|e| format!("{}: {e}", run.file.display()))?;
     }
     Ok(format!(
         "metal page: {count} runs on {n_machines} machines -> {}",
@@ -3554,6 +3559,38 @@ mod tests {
             .expect("a run named .gz is refused");
         assert!(err.contains(&format!("{stem}.gz")), "{err}");
         assert!(err.contains(".json.gz"), "{err}");
+    }
+
+    /// Every run the page lists links to a file the site publishes, a replaced run's in history/
+    /// too.
+    #[test]
+    fn every_run_links_to_a_published_file() {
+        let replaced = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("links", &[REQUESTS_FIXTURE]);
+        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
+        let history = site.root.join(super::HISTORY);
+        std::fs::create_dir_all(&history).unwrap();
+        gzip(
+            &fixtures.join(replaced),
+            &history.join(format!("{replaced}.gz")),
+        );
+        let assets = crate::chrome::Published {
+            styles: String::new(),
+            favicon: String::new(),
+        };
+        super::build(&site, &assets).unwrap();
+        let html = std::fs::read_to_string(site.out.join("metal.html")).unwrap();
+        let links: std::collections::BTreeSet<&str> = (html.split("href=\"").skip(1))
+            .filter_map(|s| s.split('"').next())
+            .filter(|l| l.starts_with(super::DATA))
+            .collect();
+        assert!(
+            links.iter().any(|l| l.ends_with(&format!("{replaced}.gz"))),
+            "no link to the replaced run: {links:?}"
+        );
+        for l in &links {
+            assert!(site.out.join(l).is_file(), "{l} is not published");
+        }
     }
 
     #[test]
