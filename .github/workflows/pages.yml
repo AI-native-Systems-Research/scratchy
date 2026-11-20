@@ -34,7 +34,7 @@ jobs:
 
   # A required check, so it reports on every pull request: it builds the site only when the pull
   # request changes what the site renders from main.
-  site:
+  build:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
