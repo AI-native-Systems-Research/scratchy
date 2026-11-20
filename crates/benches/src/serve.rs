@@ -43,6 +43,9 @@ struct RequestResult {
     success: bool,
     /// The text the stream carried, for `--save-detailed`.
     generated_text: String,
+    /// Whether the server sent any of that text as reasoning ([`Generated::Reasoning`]), more
+    /// than whitespace: `generated_text` then opens with the thinking, before the answer.
+    reasoned: bool,
     /// Why the request failed; empty when it didn't (vLLM's `errors` entry).
     error: String,
     /// `usage.prompt_tokens_details.cached_tokens`, where the server sent it: the prompt tokens
@@ -67,6 +70,7 @@ impl RequestResult {
             start_time,
             success: false,
             generated_text: String::new(),
+            reasoned: false,
             error,
             cached_tokens: None,
             prompt_tokens: None,
@@ -227,6 +231,7 @@ fn send_body(
     let mut finish_reason: Option<String> = None;
     let mut chunks = 0usize;
     let mut generated_text = String::new();
+    let mut reasoned = false;
     let mut last_choices_time: Option<Instant> = None;
     // Why the stream says the request failed, if it does: the first one wins.
     let mut failure: Option<String> = None;
@@ -283,8 +288,9 @@ fn send_body(
                     if let Some(r) = parsed["choices"][0]["finish_reason"].as_str() {
                         finish_reason = Some(r.to_string());
                     }
-                    if let Some(text) = chunk_text(&parsed) {
-                        generated_text.push_str(text);
+                    if let Some(generated) = chunk_text(&parsed) {
+                        reasoned |= generated.is_reasoning();
+                        generated_text.push_str(generated.text());
                     }
                     if is_progress(&parsed) {
                         let now = Instant::now();
@@ -342,6 +348,7 @@ fn send_body(
         start_time,
         success: first_token_time.is_some(),
         generated_text,
+        reasoned,
         error: String::new(),
         cached_tokens,
         prompt_tokens,
@@ -414,22 +421,48 @@ fn only_a_role(chunk: &serde_json::Value) -> bool {
         })
 }
 
+/// Generated text a streamed chunk carries, by the field it came in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Generated<'a> {
+    /// `text` on the completions API, `delta.content` on chat.
+    Answer(&'a str),
+    /// A reasoning model's thinking, in a field of its own: `delta.reasoning` (scratchy) or
+    /// `delta.reasoning_content` (vLLM, oMLX).
+    Reasoning(&'a str),
+}
+
+impl<'a> Generated<'a> {
+    fn text(self) -> &'a str {
+        match self {
+            Generated::Answer(t) | Generated::Reasoning(t) => t,
+        }
+    }
+
+    /// Thinking with something in it: a template that turns thinking off can still open the
+    /// reply with an empty think block, which a server streams as whitespace reasoning.
+    fn is_reasoning(self) -> bool {
+        matches!(self, Generated::Reasoning(t) if !t.trim().is_empty())
+    }
+}
+
 /// The generated text a streamed chunk carries: `text` on the completions API;
-/// on chat, `delta.content`, or a reasoning model's thinking, which scratchy
-/// streams as `delta.reasoning` and vLLM as `delta.reasoning_content`. A
-/// thinking chunk is a generated token like any other, as vLLM's bench counts
-/// it. Keepalive and closing chunks carry none.
-fn chunk_text(chunk: &serde_json::Value) -> Option<&str> {
+/// on chat, `delta.content`, or a reasoning model's thinking. A thinking chunk
+/// is a generated token like any other, as vLLM's bench counts it. Keepalive
+/// and closing chunks carry none.
+fn chunk_text(chunk: &serde_json::Value) -> Option<Generated<'_>> {
+    fn non_empty(v: &serde_json::Value) -> Option<&str> {
+        v.as_str().filter(|s| !s.is_empty())
+    }
     let first = chunk["choices"].as_array()?.first()?;
     let delta = &first["delta"];
-    [
-        &first["text"],
-        &delta["content"],
-        &delta["reasoning"],
-        &delta["reasoning_content"],
-    ]
-    .into_iter()
-    .find_map(|t| t.as_str().filter(|s| !s.is_empty()))
+    ([&first["text"], &delta["content"]].into_iter())
+        .find_map(non_empty)
+        .map(Generated::Answer)
+        .or_else(|| {
+            ([&delta["reasoning"], &delta["reasoning_content"]].into_iter())
+                .find_map(non_empty)
+                .map(Generated::Reasoning)
+        })
 }
 
 /// A request whose whole multi-token output arrived in one `choices` chunk
@@ -1981,12 +2014,11 @@ fn task_metrics(
             .filter_map(|(r, t)| right(r, t))
             .collect::<Vec<_>>(),
     );
-    // Answers that open as a thought: a request whose `enable_thinking: false` did not reach the
-    // template (a span query has no template kwargs), so its accuracy and tokens count reasoning
-    // too and are no like-for-like with a plain answer.
-    let thought = (ok.iter())
-        .filter(|(r, _)| opens_as_thought(&r.generated_text))
-        .count();
+    // Answers that carry reasoning: a model's that reasons whatever `enable_thinking` says, or one
+    // whose `enable_thinking: false` did not reach the template (a span query has no template
+    // kwargs). Their accuracy and tokens count the thinking too, so they are not like for like
+    // with a plain answer.
+    let thought = ok.iter().filter(|(r, _)| carries_reasoning(r)).count();
     let capped = ok.iter().filter(|(r, t)| capped(r, t)).count();
     let cached: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
@@ -2127,9 +2159,16 @@ fn add_task_requests(
     );
 }
 
-/// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
-/// matrix's reasoning models write when thinking reaches them as plain text ("We need to...",
-/// "Okay, let's see"), as span queries do.
+/// Whether an answer carries reasoning: the server sent some of it as reasoning, in a field of its
+/// own, or its text opens as a thought where nothing marked it as one.
+fn carries_reasoning(r: &RequestResult) -> bool {
+    r.reasoned || opens_as_thought(&r.generated_text)
+}
+
+/// Whether text no field marked as reasoning opens as reasoning rather than the answer: a think
+/// tag or channel header, where a server passes the model's raw output on (mlx_lm.server), or the
+/// openings the matrix's reasoning models write when thinking reaches them as plain text ("We
+/// need to...", "Okay, let's see"), as span queries do.
 fn opens_as_thought(text: &str) -> bool {
     let t = text.trim_start();
     [
@@ -2336,23 +2375,27 @@ mod tests {
         );
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"index":0,"text":" four"}]}"#)),
-            Some(" four")
+            Some(Generated::Answer(" four"))
         );
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
-            Some("hi")
+            Some(Generated::Answer("hi"))
         );
         // A reasoning model's thinking, as scratchy and vLLM stream it, is generated text too.
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"delta":{"reasoning":"Hmm"}}]}"#)),
-            Some("Hmm")
+            Some(Generated::Reasoning("Hmm"))
         );
         assert_eq!(
             chunk_text(&c(
                 r#"{"choices":[{"delta":{"content":null,"reasoning_content":"so"}}]}"#
             )),
-            Some("so")
+            Some(Generated::Reasoning("so"))
         );
+        // Thinking marks the answer as reasoned; an empty think block's whitespace does not.
+        assert!(Generated::Reasoning("We need find").is_reasoning());
+        assert!(!Generated::Reasoning("\n\n").is_reasoning());
+        assert!(!Generated::Answer("We need to answer").is_reasoning());
         assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
     }
 
@@ -2725,6 +2768,12 @@ mod tests {
         let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
         let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert_eq!(j["thinking_answers"], 1);
+        // gpt-oss's thinking, sent as reasoning, carries it whatever its words: its terser
+        // openings ("We need find...", "We need answer:...") match no opening the text rule knows.
+        let mut terse = answered("We need find the capital. Paris.", 9, None);
+        terse.reasoned = true;
+        let j = task_metrics(&[terse], &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["thinking_answers"], 1);
         let no_usage = vec![answered("Paris", 1, None)];
         let j = task_metrics(&no_usage, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert!(j["mean_cached_tokens"].is_null(), "no count is not zero");
@@ -2962,6 +3011,7 @@ mod tests {
             start_time: 0.0,
             success: true,
             generated_text: String::new(),
+            reasoned: false,
             error: String::new(),
             cached_tokens: None,
             prompt_tokens: None,
