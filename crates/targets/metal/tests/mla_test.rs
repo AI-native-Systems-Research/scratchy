@@ -567,31 +567,32 @@ fn mla_append_writes_each_tokens_latent_row() {
 
 /// Every row of each sequence over its sequence's cached latent rows up to its own position:
 /// two sequences of several rows, their blocks scattered across chunks, heads served several to a
-/// threadgroup.
+/// threadgroup over fewer simdgroups than it has rows, and more.
 #[test]
 fn mla_attend_matches_reference() {
     let Some((device, cache)) = setup() else {
         return;
     };
-    for (g, heads_per_tg) in [
-        (
-            Geom {
-                heads: 4,
-                latent: 64,
-                nope: 16,
-                rope: 16,
-            },
-            2usize,
-        ),
-        (
-            Geom {
-                heads: 20,
-                latent: 512,
-                nope: 192,
-                rope: 64,
-            },
-            4,
-        ),
+    let small = Geom {
+        heads: 4,
+        latent: 64,
+        nope: 16,
+        rope: 16,
+    };
+    // GLM-4.7-Flash's geometry.
+    let glm = Geom {
+        heads: 20,
+        latent: 512,
+        nope: 192,
+        rope: 64,
+    };
+    // (geometry, heads a threadgroup serves, its simdgroups, the partitions of each sequence's
+    // rows: one writes the output, more write partials the merge combines).
+    for (g, heads_per_tg, simdgroups, parts) in [
+        (small, 2usize, 32usize, 1usize),
+        (small, 4, 2, 3),
+        (glm, 4, 8, 16),
+        (glm, 2, 4, 1),
     ] {
         let (block_size, bpc, blocks, max_blocks) = (4usize, 2usize, 10usize, 6usize);
         let pool = Pool::new(&device, g, blocks, block_size, bpc, 0.0);
@@ -639,10 +640,18 @@ fn mla_attend_matches_reference() {
         let scale = 1.0 / (g.q_head() as f32).sqrt();
         let mut constants = g.constants();
         constants.extend(pool.cache_constants(max_blocks));
-        constants.extend([ConstantValue::float(7, scale), uint(8, heads_per_tg)]);
-        let key = PipelineKey::new("mla", "mla_attend_bf16", constants);
+        constants.extend([
+            ConstantValue::float(7, scale),
+            uint(8, heads_per_tg),
+            uint(9, simdgroups),
+            uint(10, parts),
+            uint(11, g.latent + 2),
+            uint(12, 256),
+        ]);
+        let key = PipelineKey::new("mla", "mla_attend_bf16", constants.clone());
         let pso = baked_build(&cache, &key).expect("mla_attend pipeline");
         let out = common::shared_zeroed(&device, rows * g.heads * g.latent * 2);
+        let partials = common::shared_zeroed(&device, rows * g.heads * parts * (g.latent + 2) * 4);
         if !common::dispatch_threadgroups(
             &device,
             &pso,
@@ -655,13 +664,27 @@ fn mla_attend_matches_reference() {
                 &k_table,
                 &v_table,
                 &common::shared_slice(&device, &cu),
+                &partials,
                 &pool_k,
                 &pool_v,
             ],
-            size(rows, g.heads / heads_per_tg, 1),
-            size(1024, 1, 1),
+            size(rows, g.heads / heads_per_tg, parts),
+            size(32 * simdgroups, 1, 1),
         ) {
             return;
+        }
+        if parts > 1 {
+            let key = PipelineKey::new("mla", "mla_attend_merge_bf16", constants);
+            let merge = baked_build(&cache, &key).expect("mla_attend_merge pipeline");
+            if !common::dispatch_threadgroups(
+                &device,
+                &merge,
+                &[&out, &partials],
+                size(rows, g.heads, 1),
+                size(256, 1, 1),
+            ) {
+                return;
+            }
         }
         let mut want = vec![0.0f32; rows * g.heads * g.latent];
         for row in 0..rows {
@@ -690,7 +713,10 @@ fn mla_attend_matches_reference() {
             }
         }
         assert_close(
-            &format!("mla_attend heads={}", g.heads),
+            &format!(
+                "mla_attend heads={} per_tg={heads_per_tg} simdgroups={simdgroups} parts={parts}",
+                g.heads
+            ),
             &BF16.decode(&out, want.len()),
             &want,
         );

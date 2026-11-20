@@ -27,6 +27,11 @@
 //   6 = BLOCKS_PER_CHUNK
 //   7 = SCALE       the softmax scale
 //   8 = HEADS_PER_TG  query heads an attention threadgroup serves
+//   9 = SIMDGROUPS  an attention threadgroup's simdgroups
+//  10 = PARTS       the partitions an attention splits each sequence's cached
+//                   rows into (unset: one, no merge pass)
+//  11 = PARTIAL     a partial's elements: its max, its sum, then its LATENT lanes
+//  12 = MERGE_THREADS  a merge threadgroup's threads
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -42,6 +47,10 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MAX_BLOCKS, 5);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_BLOCKS_PER_CHUNK, 6);
 SCRATCHY_CONSTANT_OPTIONAL(float, MLA_SCALE, 7);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_HEADS_PER_TG, 8);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_SIMDGROUPS, 9);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTS, 10);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTIAL_STRIDE, 11);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MERGE_THREADS, 12);
 
 constant constexpr uint MLA_Q_HEAD = MLA_NOPE + MLA_ROPE;
 constant constexpr uint MLA_ROW = MLA_LATENT + MLA_ROPE;
@@ -139,23 +148,33 @@ template <typename T>
 // LATENT], buffer(2) = q [rows, HEADS * Q_HEAD] (rotated: its rope parts are
 // read), buffer(3) = seq_used_k [seqs], buffer(4) = block_table [seqs,
 // MAX_BLOCKS], buffer(5) / (6) = the layer's K / V chunk tables, buffer(7) =
-// cu_seqlens_q [seqs + 1].
+// cu_seqlens_q [seqs + 1], buffer(8) = the partials (PARTS > 1): per row,
+// head and partition, its softmax max, its sum, then its LATENT weighted
+// lanes, all f32.
 //
 // Row `t` of sequence `s` attends to the first `seq_used_k[s] - (cu[s + 1] -
 // 1 - t)` cached rows of `s`: its own position and every one before it. A
-// head's query over a cached row is its latent query · the row's latent plus
+// head's score over a cached row is its latent query · the row's latent plus
 // its rope part · the row's rotated key, both scaled by SCALE.
 //
-// Dispatch: threadgroups (rows, HEADS / HEADS_PER_TG, 1), threads (1024, 1,
-// 1): 32 simdgroups split the cached rows, each lane holds ELEMS contiguous
-// lanes of a row (and of each served head's query), and the simdgroups'
-// online softmaxes combine at the end (MLX `sdpa_vector`'s merge).
-constant constexpr uint MLA_SG = 32u;
+// Dispatch: threadgroups (rows, HEADS / HEADS_PER_TG, PARTS), threads (32 *
+// SIMDGROUPS, 1, 1). Partition `p` takes a contiguous `1 / PARTS` of the row's
+// cached rows, its simdgroups every SIMDGROUPS-th of them; lane `l` holds lanes
+// `l + 32 j` of a cached row and of each served head's query. Its simdgroups'
+// online softmaxes merge in threadgroup memory, a head at a time: into `out`
+// when there is one partition, else into the partials `mla_attend_merge`
+// combines. Fewer simdgroups leave each thread more registers for its heads.
+constant constexpr uint MLA_SG = MLA_SIMDGROUPS_SET ? MLA_SIMDGROUPS : 1u;
 constant constexpr uint MLA_ELEMS = (MLA_ROW + 31u) / 32u;
 constant constexpr uint MLA_HPT = MLA_HEADS_PER_TG_SET ? MLA_HEADS_PER_TG : 1u;
+constant constexpr uint MLA_NPARTS = MLA_PARTS_SET ? MLA_PARTS : 1u;
+// A partial: its max, its sum, then its latent lanes.
+constant constexpr uint MLA_PARTIAL = MLA_PARTIAL_STRIDE;
+static_assert(!MLA_PARTS_SET || MLA_PARTIAL >= MLA_LATENT + 2u,
+              "an MLA partial holds its max, its sum and its latent lanes");
 
 template <typename T>
-[[kernel, max_total_threads_per_threadgroup(1024)]] void mla_attend(
+[[kernel]] void mla_attend(
     device       T*        out          [[buffer(0)]],
     device const T*        q_latent     [[buffer(1)]],
     device const T*        q            [[buffer(2)]],
@@ -164,21 +183,24 @@ template <typename T>
     device const uint64_t* k_cache      [[buffer(5)]],
     device const uint64_t* v_cache      [[buffer(6)]],
     device const uint*     cu_seqlens_q [[buffer(7)]],
+    device       float*    partials     [[buffer(8)]],
     uint3 tg   [[threadgroup_position_in_grid]],
     uint  sg   [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
 {
     const uint row = tg.x;
     const uint head0 = tg.y * MLA_HPT;
+    const uint part = tg.z;
     uint seq = 0;
     while (cu_seqlens_q[seq + 1u] <= row) {
         ++seq;
     }
     const uint kv_len = seq_used_k[seq] - (cu_seqlens_q[seq + 1u] - 1u - row);
+    const uint span = (kv_len + MLA_NPARTS - 1u) / MLA_NPARTS;
+    const uint first = part * span;
+    const uint last = min(first + span, kv_len);
     device const uint* blocks = block_table + seq * MLA_MAX_BLOCKS;
 
-    // This lane's lanes of a row: [e0, e0 + MLA_ELEMS).
-    const uint e0 = lane * MLA_ELEMS;
     float qr[MLA_HPT * MLA_ELEMS];
     float o[MLA_HPT * MLA_ELEMS];
     float m[MLA_HPT];
@@ -186,7 +208,7 @@ template <typename T>
     for (uint h = 0; h < MLA_HPT; ++h) {
         const uint head = head0 + h;
         for (uint j = 0; j < MLA_ELEMS; ++j) {
-            const uint e = e0 + j;
+            const uint e = lane + 32u * j;
             float v = 0.0f;
             if (e < MLA_LATENT) {
                 v = float(q_latent[(row * MLA_HEADS + head) * MLA_LATENT + e]);
@@ -201,18 +223,17 @@ template <typename T>
     }
 
     float k[MLA_ELEMS];
-    for (uint pos = sg; pos < kv_len; pos += MLA_SG) {
+    for (uint pos = first + sg; pos < last; pos += MLA_SG) {
         const uint slot = (blocks[pos / MLA_BLOCK_SIZE] & 0x7FFFFFFFu) * MLA_BLOCK_SIZE
             + pos % MLA_BLOCK_SIZE;
+        uint chunk;
+        bool in_v;
+        const uint at = mla_cache_at(slot, 0u, chunk, in_v);
+        device const T* k_row = (device const T*)k_cache[chunk] + at;
+        device const T* v_row = (device const T*)v_cache[chunk] + at;
         for (uint j = 0; j < MLA_ELEMS; ++j) {
-            const uint e = e0 + j;
-            k[j] = 0.0f;
-            if (e < MLA_ROW) {
-                uint chunk;
-                bool in_v;
-                const uint at = mla_cache_at(slot, e, chunk, in_v);
-                k[j] = float(((device const T*)(in_v ? v_cache[chunk] : k_cache[chunk]))[at]);
-            }
+            const uint e = lane + 32u * j;
+            k[j] = e < MLA_HALF ? float(k_row[e]) : (e < MLA_ROW ? float(v_row[e - MLA_HALF]) : 0.0f);
         }
         for (uint h = 0; h < MLA_HPT; ++h) {
             float s = 0.0f;
@@ -225,42 +246,99 @@ template <typename T>
             const float p = exp(s - m_new);
             l[h] = l[h] * factor + p;
             for (uint j = 0; j < MLA_ELEMS; ++j) {
-                const bool latent_lane = e0 + j < MLA_LATENT;
+                const bool latent_lane = lane + 32u * j < MLA_LATENT;
                 o[h * MLA_ELEMS + j] = o[h * MLA_ELEMS + j] * factor + (latent_lane ? p * k[j] : 0.0f);
             }
             m[h] = m_new;
         }
     }
 
-    // Merge the simdgroups' softmaxes: each head's max and sum over them, then
-    // each output lane's sum through a [lane][simdgroup] transpose.
+    // Merge the simdgroups' softmaxes, a head at a time: each simdgroup's max, sum and latent
+    // lanes into threadgroup memory, then each output lane summed over them, rescaled to the
+    // head's max.
+    static_assert(4u * (2u * MLA_HPT * MLA_SG + MLA_SG * MLA_LATENT) <= 32768u,
+                  "an MLA attention's merge fits a threadgroup's 32 KiB of memory");
     threadgroup float tg_m[MLA_HPT * MLA_SG];
     threadgroup float tg_l[MLA_HPT * MLA_SG];
-    threadgroup float tg_o[MLA_SG * 32u];
+    threadgroup float tg_o[MLA_SG * MLA_LATENT];
     if (lane == 0) {
         for (uint h = 0; h < MLA_HPT; ++h) {
             tg_m[h * MLA_SG + sg] = m[h];
             tg_l[h * MLA_SG + sg] = l[h];
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint tid = sg * 32u + lane;
     for (uint h = 0; h < MLA_HPT; ++h) {
-        // Lane `i` stands for simdgroup `i`'s partial.
-        const float mi = tg_m[h * MLA_SG + lane];
-        const float m_all = simd_max(mi);
-        const float factor = mi == -INFINITY ? 0.0f : exp(mi - m_all);
-        const float l_all = simd_sum(tg_l[h * MLA_SG + lane] * factor);
         for (uint j = 0; j < MLA_ELEMS; ++j) {
-            tg_o[lane * MLA_SG + sg] = o[h * MLA_ELEMS + j];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Simdgroup `sg` now holds lane `sg`'s element `j` of every simdgroup.
-            const float merged = simd_sum(tg_o[sg * 32u + lane] * factor);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const uint e = sg * MLA_ELEMS + j;
-            if (lane == 0 && e < MLA_LATENT) {
-                out[(row * MLA_HEADS + head0 + h) * MLA_LATENT + e] = T(merged / l_all);
+            const uint e = lane + 32u * j;
+            if (e < MLA_LATENT) {
+                tg_o[sg * MLA_LATENT + e] = o[h * MLA_ELEMS + j];
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m_all = -INFINITY;
+        for (uint s = 0; s < MLA_SG; ++s) {
+            m_all = max(m_all, tg_m[h * MLA_SG + s]);
+        }
+        float l_all = 0.0f;
+        for (uint s = 0; s < MLA_SG; ++s) {
+            const float ms = tg_m[h * MLA_SG + s];
+            l_all += ms == -INFINITY ? 0.0f : tg_l[h * MLA_SG + s] * exp(ms - m_all);
+        }
+        const uint head = head0 + h;
+        device float* partial = partials + ((row * MLA_HEADS + head) * MLA_NPARTS + part) * MLA_PARTIAL;
+        if (MLA_NPARTS > 1u && tid == 0) {
+            partial[0] = m_all;
+            partial[1] = l_all;
+        }
+        for (uint e = tid; e < MLA_LATENT; e += 32u * MLA_SG) {
+            float acc = 0.0f;
+            for (uint s = 0; s < MLA_SG; ++s) {
+                const float ms = tg_m[h * MLA_SG + s];
+                acc += ms == -INFINITY ? 0.0f : tg_o[s * MLA_LATENT + e] * exp(ms - m_all);
+            }
+            if (MLA_NPARTS > 1u) {
+                partial[2u + e] = acc;
+            } else {
+                out[(row * MLA_HEADS + head) * MLA_LATENT + e] = T(acc / l_all);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ── The partitions' merge ───────────────────────────────────────────────────
+// buffer(0) = out [rows, HEADS * LATENT], buffer(1) = the partials
+// `mla_attend` wrote. Each head's lanes: the PARTS partials' weighted lanes,
+// each rescaled to the head's max over them, over their sums.
+// Dispatch: threadgroups (rows, HEADS, 1), threads (MERGE_THREADS, 1, 1).
+template <typename T>
+[[kernel]] void mla_attend_merge(
+    device       T*     out      [[buffer(0)]],
+    device const float* partials [[buffer(1)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 at [[thread_position_in_threadgroup]])
+{
+    const uint tid = at.x;
+    const uint row = tg.x;
+    const uint head = tg.y;
+    device const float* p = partials + (row * MLA_HEADS + head) * MLA_NPARTS * MLA_PARTIAL;
+    float m_all = -INFINITY;
+    for (uint i = 0; i < MLA_NPARTS; ++i) {
+        m_all = max(m_all, p[i * MLA_PARTIAL]);
+    }
+    float l_all = 0.0f;
+    for (uint i = 0; i < MLA_NPARTS; ++i) {
+        const float mi = p[i * MLA_PARTIAL];
+        l_all += mi == -INFINITY ? 0.0f : p[i * MLA_PARTIAL + 1u] * exp(mi - m_all);
+    }
+    for (uint e = tid; e < MLA_LATENT; e += MLA_MERGE_THREADS) {
+        float acc = 0.0f;
+        for (uint i = 0; i < MLA_NPARTS; ++i) {
+            const float mi = p[i * MLA_PARTIAL];
+            acc += mi == -INFINITY ? 0.0f : p[i * MLA_PARTIAL + 2u + e] * exp(mi - m_all);
+        }
+        out[(row * MLA_HEADS + head) * MLA_LATENT + e] = T(acc / l_all);
     }
 }
 
@@ -270,3 +348,5 @@ SCRATCHY_KERNEL(mla_append_f16, mla_append<half>)
 SCRATCHY_KERNEL(mla_append_bf16, mla_append<bfloat>)
 SCRATCHY_KERNEL(mla_attend_f16, mla_attend<half>)
 SCRATCHY_KERNEL(mla_attend_bf16, mla_attend<bfloat>)
+SCRATCHY_KERNEL(mla_attend_merge_f16, mla_attend_merge<half>)
+SCRATCHY_KERNEL(mla_attend_merge_bf16, mla_attend_merge<bfloat>)
