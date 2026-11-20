@@ -14,3 +14,7 @@ anyhow = { workspace = true }
 memmap2 = { workspace = true }
 # A dim's number as a type (`typed::Dim::Num`), a law between dims a bound on those numbers.
 typenum = { workspace = true }
+
+[dev-dependencies]
+# The manifest guard in tests/cfg_neutrality.rs reads `cargo metadata`'s JSON.
+serde_json = { workspace = true }
