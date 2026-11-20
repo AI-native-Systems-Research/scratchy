@@ -36,6 +36,11 @@ kv-fp8 = []
 # THE 16-BIT KV CACHE, NAMED (`kv/dense` through scratchy-kv): it wins over `kv-fp8`, so a build
 # that names it stores every model's KV dense with the default features still on.
 kv-dense = []
+# THE CHIP THIS BUILD BAKES FOR — ktir-core's `snt1p0` (Spyre generation 1), forwarded from
+# both the bake and the runtime, as `tp-<W>` is (the bake runs as a build dependency, whose
+# features cargo does not unify with the binary's). No default: a build that names no chip
+# fails in ktir-core's `compile_error!`, never silently picks one.
+snt1p0 = ["scratchy-target-spyre-compiler/snt1p0", "scratchy-target-spyre/snt1p0"]
 
 [dependencies]
 # THE MODEL SCOPE: which models, heads and quant presets — `scratchy-models`' own features,

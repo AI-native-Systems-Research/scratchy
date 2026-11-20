@@ -24,6 +24,10 @@ spyre-emu = ["scratchy-target-spyre/spyre-emu"]
 tp-2 = ["scratchy-target-spyre/tp-2"]
 tp-4 = ["scratchy-target-spyre/tp-4"]
 tp-8 = ["scratchy-target-spyre/tp-8"]
+# THE CHIP THIS BUILD BAKES FOR — ktir-core's `snt1p0` (Spyre generation 1), forwarded from
+# scratchy-target-spyre. No default: a build that names no chip fails in ktir-core's
+# `compile_error!`, never silently picks one.
+snt1p0 = ["scratchy-target-spyre/snt1p0"]
 
 [dependencies]
 # The shared pipeline this crate's emitter plugs into (`target::TargetEmitter`), and the passes the

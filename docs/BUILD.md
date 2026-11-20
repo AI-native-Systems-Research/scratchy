@@ -12,7 +12,7 @@ exists, not adding to it.
 
 ```bash
 cargo build -p scratchy-target-metal-cli --release --features model/llama-3.2-3b      # scr
-cargo build -p scratchy-target-spyre-cli --release --features spyre-emu,model/granite-3.1-2b-instruct  # spyre
+cargo build -p scratchy-target-spyre-cli --release --features spyre-emu,model/granite-3.1-2b-instruct,snt1p0  # spyre
 ```
 
 Each binary links its one target. Add
@@ -25,6 +25,15 @@ cache is int8, fixed at build time — see
 [int8 KV](#int8-kv--the-metal-kv-cache-fixed-at-build-time); the spyre KV cache
 is float8 by default on card (`spyre-hw`) builds — see
 [fp8 KV](#fp8-kv--the-spyre-kv-cache-float8-by-default-on-card-builds).
+
+## Every spyre build names its chip
+
+A spyre build names the chip it bakes for: `snt1p0`, Spyre generation 1 (the card whose
+geometry `ktir-core`'s `DeviceGen` table states). Naming none is a **compile error** in
+`ktir-core` — the same law the model scope holds (no silent default) — so every spyre
+command names it: `-F snt1p0` on the CLI/worker/models crates, which forward it down to
+`ktir-core` the way `tp-<W>` is forwarded, or `-F ktir-core/snt1p0` for the ktir and
+Triton crates that only depend on `ktir-core` itself.
 
 ## There is no default model, quant or drafter scope
 

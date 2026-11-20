@@ -71,7 +71,10 @@ cargo build --release -p scratchy-target-metal-cli --features model/llama-3.2-3b
     the worker and the `spyre` CLI. It depends on `backends/spyre`, never the
     reverse, and may depend on what CI cannot reach. Build `spyre` from there:
     `cd backends/spyre-hw && cargo build --release
-    --features spyre-emu,model/granite-3.1-2b-instruct` (`spyre-hw` on a card host).
+    --features spyre-emu,model/granite-3.1-2b-instruct,snt1p0` (`spyre-hw` on a card
+    host). Every spyre build names its chip (`snt1p0`, Spyre generation 1): ktir-core's
+    `compile_error!` refuses a build that names none — the ktir/triton crates that
+    only depend on ktir-core name it as `ktir-core/snt1p0`.
     **The seam**: the card workspace resolves `flex-rs` by path into a sibling
     senlib-rs checkout (IBM-internal git) — the tree, the senlib-rs checkout and,
     on a card host, senlib-rs-red sit as siblings under one parent. Even a
@@ -125,10 +128,10 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
       --exclude scratchy-target-metal-models \
       --exclude scratchy-target-metal-worker -- -D warnings &&
     cd backends/spyre &&
-    cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings &&
+    cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct,scratchy-target-spyre-models/snt1p0 -- -D warnings &&
     cd ../spyre-hw &&
     cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli --all-targets \
-      --features spyre-emu,model/granite-3.1-8b-instruct -- -D warnings'
+      --features spyre-emu,model/granite-3.1-8b-instruct,snt1p0 -- -D warnings'
 ```
 The macOS metal CI job runs locally via `scripts/act-local.sh` when present.
 

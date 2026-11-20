@@ -27,6 +27,10 @@ tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/
 kv-fp8 = ["scratchy-target-spyre-models/kv-fp8"]
 # THE 16-BIT KV CACHE, NAMED (`kv/dense` through scratchy-kv): wins over `kv-fp8` in the bake.
 kv-dense = ["scratchy-target-spyre-models/kv-dense"]
+# THE CHIP THIS BUILD BAKES FOR — ktir-core's `snt1p0` (Spyre generation 1), forwarded from
+# the bake and the runtime, as `spyre-emu` is. No default: a build that names no chip fails
+# in ktir-core's `compile_error!`, never silently picks one.
+snt1p0 = ["scratchy-target-spyre/snt1p0", "scratchy-target-spyre-models/snt1p0"]
 # THE ON-CARD ALLOC-CENSUS WINDOW (flex-rs's zero-alloc proof instrument): frames
 # `arm()`..`disarm()` around N collected decode steps in the serving loop, so the
 # steady-state per-step allocation count is measurable on a real serve, not only in

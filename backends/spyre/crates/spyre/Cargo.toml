@@ -11,6 +11,9 @@ description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR targ
 tp-2 = ["ktir-superdsc/tp-2"]
 tp-4 = ["ktir-superdsc/tp-4"]
 tp-8 = ["ktir-superdsc/tp-8"]
+# THE CHIP THIS BUILD BAKES FOR (`snt1p0` = Spyre generation 1): ktir-core's selection, whose
+# `compile_error!` makes a build that names no chip fail rather than silently pick one. No default.
+snt1p0 = ["ktir-core/snt1p0"]
 # THE CARD's runtime (flex-rs, the resident executor, the session the worker drives) is not this
 # crate's: it is `scratchy-target-spyre-card`'s, which depends on this one. Here a card build adds
 # only its device compile.

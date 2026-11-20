@@ -10,6 +10,11 @@ description = "IBM Spyre's card runtime for scratchy: the typed card surface ove
 tp-2 = ["scratchy-target-spyre/tp-2"]
 tp-4 = ["scratchy-target-spyre/tp-4"]
 tp-8 = ["scratchy-target-spyre/tp-8"]
+# THE CHIP THIS CARD RUNS — WHERE THE TWO `snt1p0`S MEET: ktir-core's (the baked facts the
+# executor launches against, forwarded through scratchy-target-spyre) and flex-rs's (the
+# allocator that carves the card's LPDDR, which the workspace row already names). One feature,
+# both sides. No default: a build that names no chip fails in ktir-core's `compile_error!`.
+snt1p0 = ["scratchy-target-spyre/snt1p0", "flex-rs/snt1p0"]
 # Flex-rs's zero-alloc proof instrument, compiled in: the `census` module that
 # frames `arm()`..`disarm()` around the serving loop's collected decode steps.
 # The binary registers the allocator itself (the CLI's feature of the same
