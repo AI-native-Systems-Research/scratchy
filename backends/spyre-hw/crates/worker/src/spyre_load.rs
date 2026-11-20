@@ -1842,7 +1842,7 @@ impl SpyreWorker {
                             lay.segment_bytes
                                 .iter()
                                 .enumerate()
-                                .filter(|(i, b)| *b > 0 && *i != weight && *i != kv && !shared.contains(i))
+                                .filter(|(i, b)| **b > 0 && *i != weight && *i != kv && !shared.contains(i))
                                 .map(|(_, b)| *b)
                                 .sum::<u64>()
                         };
@@ -2952,7 +2952,7 @@ impl SpyreWorker {
                             let owner = owner_res.as_mut().unwrap_or_else(|e| {
                                 panic!(
                                     "the seg{} family arena's owner ({owner_fp}) failed to \
-                                     prepare: {e} — every rung the bake shipped must load",
+                                     prepare: {e:?} — every rung the bake shipped must load",
                                     seg.get()
                                 )
                             });
