@@ -33,6 +33,7 @@ arch-gemma3 = []
 arch-gemma4 = []
 arch-gemma4-moe = []
 arch-glm4-moe = []
+arch-glm4-moe-lite = []
 arch-gpt-oss = []
 arch-granite = []
 arch-llama = []
@@ -156,6 +157,9 @@ all-arches = [
 # glm4-moe (1 configs)
 "glm-4.5-air" = ["arch-glm4-moe"]
 "glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
+
+# glm4-moe-lite (1 configs)
+"glm-4.7-flash" = ["arch-glm4-moe-lite"]
 
 # gpt-oss (4 configs)
 "gpt-oss-120b" = ["arch-gpt-oss"]
@@ -358,6 +362,9 @@ all-arches = [
 "glm4-moe" = [
     "glm-4.5-air",
     "glm-4.5-air-parity-tiny",
+]
+"glm4-moe-lite" = [
+    "glm-4.7-flash",
 ]
 "gpt-oss" = [
     "gpt-oss-120b",

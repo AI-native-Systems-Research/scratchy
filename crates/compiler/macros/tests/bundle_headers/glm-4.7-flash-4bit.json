@@ -1,0 +1,104 @@
+{
+ "repo": "mlx-community/GLM-4.7-Flash-4bit",
+ "configs": [
+  "glm4-moe-lite/glm-4.7-flash"
+ ],
+ "head": false,
+ "bundles": {
+  "mlp": "model.layers.1.mlp"
+ },
+ "quantization": {
+  "group_size": 64,
+  "bits": 4
+ },
+ "tensors": {
+  "model.layers.1.mlp.gate.e_score_correction_bias": [
+   64
+  ],
+  "model.layers.1.mlp.gate.weight": [
+   64,
+   2048
+  ],
+  "model.layers.1.mlp.shared_experts.down_proj.biases": [
+   2048,
+   24
+  ],
+  "model.layers.1.mlp.shared_experts.down_proj.scales": [
+   2048,
+   24
+  ],
+  "model.layers.1.mlp.shared_experts.down_proj.weight": [
+   2048,
+   192
+  ],
+  "model.layers.1.mlp.shared_experts.gate_proj.biases": [
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.shared_experts.gate_proj.scales": [
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.shared_experts.gate_proj.weight": [
+   1536,
+   256
+  ],
+  "model.layers.1.mlp.shared_experts.up_proj.biases": [
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.shared_experts.up_proj.scales": [
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.shared_experts.up_proj.weight": [
+   1536,
+   256
+  ],
+  "model.layers.1.mlp.switch_mlp.down_proj.biases": [
+   64,
+   2048,
+   24
+  ],
+  "model.layers.1.mlp.switch_mlp.down_proj.scales": [
+   64,
+   2048,
+   24
+  ],
+  "model.layers.1.mlp.switch_mlp.down_proj.weight": [
+   64,
+   2048,
+   192
+  ],
+  "model.layers.1.mlp.switch_mlp.gate_proj.biases": [
+   64,
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.switch_mlp.gate_proj.scales": [
+   64,
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.switch_mlp.gate_proj.weight": [
+   64,
+   1536,
+   256
+  ],
+  "model.layers.1.mlp.switch_mlp.up_proj.biases": [
+   64,
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.switch_mlp.up_proj.scales": [
+   64,
+   1536,
+   32
+  ],
+  "model.layers.1.mlp.switch_mlp.up_proj.weight": [
+   64,
+   1536,
+   256
+  ]
+ }
+}

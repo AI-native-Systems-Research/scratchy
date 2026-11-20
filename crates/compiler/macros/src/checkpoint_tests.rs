@@ -253,8 +253,9 @@ fn names_of(c: &Checked, id: WeightId) -> Vec<String> {
 }
 
 /// A stored shape in the manifest's orientation: a matrix stored `[out, in]` read `[in, out]` (an
-/// embedding table as stored), a kernel `[out, in, ..]` read `[in · .., out]`; first padded as the
-/// loader pads it (`__pad_to_mult8__`, on the stored axis).
+/// embedding table as stored), a per-head matmul's blocks `[heads, out, in]` read `[heads, in,
+/// out]` (a rank-3 declaration), a kernel `[out, in, ..]` read `[in · .., out]`; first padded as
+/// the loader pads it (`__pad_to_mult8__`, on the stored axis).
 fn oriented(c: &Checked, id: WeightId, stored: &[u64]) -> Vec<u64> {
     let path = c.program.weights.path(id).join(".");
     let mut s = stored.to_vec();
@@ -267,9 +268,17 @@ fn oriented(c: &Checked, id: WeightId, stored: &[u64]) -> Vec<u64> {
     match s.as_slice() {
         [rows, cols] if tables(&c.program).contains(&id) || raw => vec![*rows, *cols],
         [out, inp] => vec![*inp, *out],
+        [heads, out, inp] if declared_rank(c, id) == Some(3) => vec![*heads, *inp, *out],
         [out, rest @ ..] if !rest.is_empty() => vec![rest.iter().product(), *out],
         _ => s,
     }
+}
+
+/// The rank of weight `id`'s declaration.
+fn declared_rank(c: &Checked, id: WeightId) -> Option<usize> {
+    c.manifest
+        .lookup(c.program.weights.path(id))
+        .map(|s| s.len())
 }
 
 fn eval(c: &Checked, d: &Dim) -> Option<u64> {
