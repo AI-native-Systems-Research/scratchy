@@ -80,7 +80,8 @@ fn metal_lowers_the_mlx_affine_and_nvfp4_presets_only() {
         let dense = load_dir(
             &dir,
             &spec,
-            &Scope::all().with_quants(Vec::<String>::new()),
+            &Scope::all()
+                .with_quants(Vec::<scratchy_forward_compiler_macro::target::Preset>::new()),
             &metal,
         )
         .unwrap_or_else(|e| panic!("load {arch} dense: {e}"));

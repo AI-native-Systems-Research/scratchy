@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use proc_macro2::TokenStream;
+/// The quant presets and their schemes, typed: what a target's [`TargetEmitter::presets`] lists.
+pub use scratchy_quantizations::{Preset, Scheme};
 
 use crate::classified::Program;
 use crate::config::ModelParams;
@@ -147,11 +149,10 @@ pub trait TargetEmitter: Sync {
         Ok(())
     }
 
-    /// Whether the target lowers the quant preset `preset` (`quant/<preset>`). A preset it does
-    /// not lower is no variant of any model.
-    fn lowers_preset(&self, preset: &str) -> bool {
-        let _ = preset;
-        true
+    /// The quant presets (`quant/<preset>`) the target lowers, as a const of its own. A preset
+    /// it does not list is no variant of any model.
+    fn presets(&self) -> &'static [Preset] {
+        Preset::ALL
     }
 
     /// Whether the target lowers a checkpoint whose own config states `method` (a checked-in

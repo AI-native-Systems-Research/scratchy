@@ -134,7 +134,8 @@ mod imp {
         fn emitted_by_this_build(&self) -> bool {
             let selected = scratchy_quantizations::enabled_presets();
             match &self.preset {
-                Some(p) => selected.contains(&p.as_str()),
+                Some(p) => scratchy_quantizations::Preset::from_name(p)
+                    .is_some_and(|p| selected.contains(&p)),
                 None => {
                     let path = Path::new(CONFIGS)
                         .join(&self.arch)
@@ -153,7 +154,10 @@ mod imp {
                             e.as_str()
                                 .or_else(|| e.as_object()?.keys().next().map(String::as_str))
                         })
-                        .any(|p| selected.contains(&p))
+                        .any(|p| {
+                            scratchy_quantizations::Preset::from_name(p)
+                                .is_some_and(|p| selected.contains(&p))
+                        })
                 }
             }
         }

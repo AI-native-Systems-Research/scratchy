@@ -12,9 +12,11 @@ pub mod affine;
 pub mod ggml_quant;
 pub mod gguf;
 pub mod layers_quant;
+#[macro_use]
 mod presets;
+mod preset;
 
-pub use presets::enabled_presets;
+pub use preset::{Preset, Scheme, enabled_presets};
 
 pub use affine::affine_dequant_b4_to_dtype;
 pub use ggml_quant::{GgmlDType, GgmlStorage};

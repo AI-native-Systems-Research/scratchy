@@ -6,8 +6,17 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_forward_compiler_macro::QuantMethod;
 use scratchy_forward_compiler_macro::target::{
-    DispatchCx, LoadCx, ModelCx, ModelEmission, TargetEmitter,
+    DispatchCx, LoadCx, ModelCx, ModelEmission, Preset, Scheme, TargetEmitter,
 };
+
+/// The schemes metal lowers: the MLX affine presets reach the tape as dense codes the kernels
+/// dequantize, and NVFP4 as metal's own E2M1 qmv/qmm. Every other scheme's kernels (Marlin, Bnb4,
+/// Fp8, Ggml) have no metal realization.
+const METAL_SCHEMES: &[Scheme] = &[Scheme::MlxAffine, Scheme::Nvfp4];
+
+/// The quant presets metal lowers: every preset of [`METAL_SCHEMES`].
+pub const METAL_PRESETS: &[Preset] =
+    &Preset::of_schemes::<{ Preset::count_of(METAL_SCHEMES) }>(METAL_SCHEMES);
 
 /// The metal target's emitter.
 pub struct Metal {
@@ -34,11 +43,9 @@ impl TargetEmitter for Metal {
             })
     }
 
-    /// The MLX affine presets reach the tape as dense codes the kernels dequantize, and `nvfp4`
-    /// as metal's own E2M1 qmv/qmm; every other preset's kernels (Marlin, Bnb4, Fp8, Ggml) have
-    /// no metal realization.
-    fn lowers_preset(&self, preset: &str) -> bool {
-        preset.starts_with("mlx-affine-") || preset == "nvfp4"
+    /// [`METAL_PRESETS`].
+    fn presets(&self) -> &'static [Preset] {
+        METAL_PRESETS
     }
 
     /// A checked-in quantized config lowers as its preset would: MLX affine or NVFP4.

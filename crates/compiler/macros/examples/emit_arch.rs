@@ -42,11 +42,12 @@ fn main() {
     //   - `emit_arch qwen3` — no argument at all: every preset and every stem
     //     in the arch, the legacy bare-invocation behaviour.
     let quants = args.next().map(|presets| {
-        presets
-            .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect::<std::collections::HashSet<_>>()
+        (presets.split(',').map(str::trim).filter(|p| !p.is_empty()))
+            .map(|p| {
+                scratchy_forward_compiler_macro::target::Preset::from_name(p)
+                    .unwrap_or_else(|| panic!("`{p}` names no quant preset"))
+            })
+            .collect::<Vec<_>>()
     });
     // The models to emit, as explicit stems of this arch — a value too: the
     // scope is never read out of the environment here. Zero stems = every

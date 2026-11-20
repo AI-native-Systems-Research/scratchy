@@ -73,12 +73,10 @@ fn main() {
             .collect(),
         mtp: cfg!(feature = "mtp"),
         mtp_heads: cfg!(feature = "mtp-heads"),
-        presets: std::env::var("DEP_SCRATCHY_QUANTIZATIONS_PRESETS")
-            .expect("scratchy-quantizations publishes its presets (`links` metadata)")
-            .split(',')
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect(),
+        presets: scratchy_models_build::presets_of(
+            &std::env::var("DEP_SCRATCHY_QUANTIZATIONS_PRESETS")
+                .expect("scratchy-quantizations publishes its presets (`links` metadata)"),
+        ),
     };
     metadata.publish();
 

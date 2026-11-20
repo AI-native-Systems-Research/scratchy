@@ -14,9 +14,9 @@
 
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
-use scratchy_forward_compiler_macro::target::TargetEmitter;
+use scratchy_forward_compiler_macro::target::{Preset, TargetEmitter};
 use scratchy_forward_compiler_macro::{
-    CarrierError, Scope, compile_carrier, parse_python_file, render_tokens,
+    CarrierError, Scope, compile_carrier, declared_presets, parse_python_file, render_tokens,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct ScopeMetadata {
     pub features: Vec<String>,
     pub mtp: bool,
     pub mtp_heads: bool,
-    pub presets: Vec<String>,
+    pub presets: Vec<Preset>,
 }
 
 impl ScopeMetadata {
@@ -41,7 +41,8 @@ impl ScopeMetadata {
         println!("cargo::metadata=features={}", self.features.join(","));
         println!("cargo::metadata=mtp={}", self.mtp);
         println!("cargo::metadata=mtp_heads={}", self.mtp_heads);
-        println!("cargo::metadata=presets={}", self.presets.join(","));
+        let names: Vec<&str> = self.presets.iter().map(|p| p.name()).collect();
+        println!("cargo::metadata=presets={}", names.join(","));
     }
 
     /// Read it back in the build script of a crate depending on `scratchy-models`.
@@ -64,7 +65,7 @@ impl ScopeMetadata {
             features: list(var("FEATURES")),
             mtp: var("MTP") == "true",
             mtp_heads: var("MTP_HEADS") == "true",
-            presets: list(var("PRESETS")),
+            presets: presets_of(&var("PRESETS")),
         }
     }
 
@@ -152,8 +153,16 @@ fn reroot_crate(ts: TokenStream, mod_name: &str, shared: &[&str]) -> TokenStream
     out.into_iter().collect()
 }
 
+/// The presets a build's published scope names (`scratchy-quantizations`' `presets` metadata, the
+/// one place they cross as text), each read into its [`Preset`].
+pub fn presets_of(names: &str) -> Vec<Preset> {
+    (names.split(',').filter(|p| !p.is_empty()))
+        .map(|p| Preset::from_name(p).unwrap_or_else(|| panic!("`{p}` names no quant preset")))
+        .collect()
+}
+
 /// The quant presets enabled for one arch: its `quantizations.json` ∩ the enabled presets.
-fn enabled_quants(qpath: &Path, enabled_presets: &HashSet<&str>) -> Vec<String> {
+fn enabled_quants(qpath: &Path, enabled_presets: &HashSet<Preset>) -> Vec<Preset> {
     // Only watch the file if it EXISTS. `rerun-if-changed` on a missing path
     // makes cargo rerun the build script on every build — and 6 arches (the
     // vision ones + modernbert) ship no quantizations.json. Adds/removes of the
@@ -161,23 +170,10 @@ fn enabled_quants(qpath: &Path, enabled_presets: &HashSet<&str>) -> Vec<String> 
     if qpath.is_file() {
         println!("cargo:rerun-if-changed={}", qpath.display());
     }
-    let mut enabled: Vec<String> = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(qpath)
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(arr) = json.get("quantizations").and_then(|v| v.as_array())
-    {
-        for entry in arr {
-            let name = match entry {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Object(o) if o.len() == 1 => o.keys().next().unwrap().clone(),
-                _ => continue,
-            };
-            if enabled_presets.contains(name.as_str()) {
-                enabled.push(name);
-            }
-        }
-    }
-    enabled
+    let declared = declared_presets(qpath).unwrap_or_else(|e| panic!("{e}"));
+    (declared.into_iter())
+        .filter(|p| enabled_presets.contains(p))
+        .collect()
 }
 
 /// Every selected arch: `(dsl path, mod name, configs dir)`, sorted, for the scope.
@@ -214,8 +210,8 @@ pub fn selected_arches(root: &Path, scope: &Scope) -> Vec<(PathBuf, String, Path
 }
 
 /// The union of the enabled presets across the selected arches' own `quantizations.json`s.
-pub fn quant_union(arches: &[(PathBuf, String, PathBuf)], presets: &[String]) -> BTreeSet<String> {
-    let presets: HashSet<&str> = presets.iter().map(String::as_str).collect();
+pub fn quant_union(arches: &[(PathBuf, String, PathBuf)], presets: &[Preset]) -> BTreeSet<Preset> {
+    let presets: HashSet<Preset> = presets.iter().copied().collect();
     arches
         .iter()
         .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &presets))
