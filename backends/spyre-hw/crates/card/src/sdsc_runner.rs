@@ -319,41 +319,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         )
     }
 
-    /// Allocate every segment at FULL size but populate none — no weights bound, so staging no-ops.
-    ///
-    /// This exists for the batched-prefill session, whose 2.6 GB seg1 reservation is what PLACES the
-    /// decode session's weight region: borrowing (a 128 B placeholder) instead moves decode's weights
-    /// ~2.6 GB earlier in HBM and costs 1.8 tok/s, measured. The placement effect comes from the
-    /// ALLOCATION, not from the bytes — and those bytes are dead, since the session is aliased onto
-    /// decode's copy immediately afterwards. So reserving without populating keeps the placement and
-    /// drops the bind + stage (6.97s of startup for granite-3.1-8b, measured).
-    ///
-    /// `load_consts` — the prefill wiring's own staged-constant list. The general mint puts the
-    /// sampler's nine tables in EVERY prefill rung too, and they sit in the session's own seg3
-    /// (never aliased), so the anchor stages its own copy exactly as a borrowing rung does.
-    pub fn new_reserving(
-        cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
-        code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
-        dims: SessionDims,
-        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
-        // The pool's own tables, for the same reason the borrowing constructor takes them.
-        pool_statics: &[(u32, Vec<u8>)],
-        spilled_tail: &[u32],
-    ) -> Result<Self> {
-        Self::new_inner(
-            cards,
-            code,
-            dims,
-            Staged {
-                weights: None,
-                load_consts,
-                pool_statics,
-            },
-            &[],
-            spilled_tail,
-        )
-    }
-
     /// Every constructor, composed: the HOST half then the DEVICE half. The ladder fan-outs are
     /// the one caller that splits them (see
     /// [`build_borrowing_with_consts`](Self::build_borrowing_with_consts) and

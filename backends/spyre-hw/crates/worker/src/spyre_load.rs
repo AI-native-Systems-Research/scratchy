@@ -1692,144 +1692,46 @@ impl SpyreWorker {
                 // said 62,601 MB, the allocator was holding ~92 GB when decode's first extra bank asked
                 // for 17.06 GB against 10.62 GB free, and the run died at `prepare: weight bank 1`
                 // (2026-10-09, wall 9). The anchor's LIVE segments are charged unconditionally — its
-                // build is fatal, so they are mandatory — and its SPARE only under the policy below.
-                // The optional ladders (prefill rungs past the anchor, decode rungs, the prefix-capable
-                // prefill) stay UNCHARGED on purpose — the charging policy predates the
-                // every-rung-must-load law and is unchanged here: their builds are FATAL now, so a
-                // config whose ladders do not fit dies at build rather than running degraded.
-                let (anchor_live_bytes, anchor_spare_bytes) = match prefill_code {
+                // build is fatal, so they are mandatory. The optional ladders (prefill rungs past the
+                // anchor, decode rungs, the prefix-capable prefill) stay UNCHARGED on purpose — the
+                // charging policy predates the every-rung-must-load law and is unchanged here: their
+                // builds are FATAL now, so a config whose ladders do not fit dies at build rather than
+                // running degraded.
+                //
+                // ⛔ THE ANCHOR ALWAYS BORROWS — the spare (a full twin of the weight home) was
+                // placement steering worth 1.8 tok/s on granite-3.1-2b, and reserving it ate the
+                // KV pool's memory: charged ahead of the pool, a reserve shrank the remainder the
+                // engine divides by up to a whole model's worth of weights. The anchor's LIVE
+                // segments are charged unconditionally — its build is fatal, so they are
+                // mandatory — and it borrows the weight home exactly as every ladder rung does.
+                let anchor_live_bytes: u64 = match prefill_code {
                     Some(pc) => {
                         let weight = scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT.get();
                         let kv = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
-                        let live: u64 = pc
-                            .layout
+                        pc.layout
                             .segment_bytes
                             .iter()
                             .enumerate()
                             .filter(|(i, _)| *i != weight && *i != kv)
                             .map(|(_, b)| *b)
-                            .sum();
-                        let spare: u64 = pc.layout.segment_bytes[weight]
-                            + pc.layout.weight_bank_bytes.iter().sum::<u64>();
-                        (live, spare)
+                            .sum()
                     }
-                    None => (0, 0),
+                    None => 0,
                 };
-                // ⛔⛔⛔ AND THE LADDER THE SPARE HAS TO SURVIVE. Every borrowing session still
-                // allocates its OWN regions for every segment EXCEPT the two it aliases (seg1/seg2
-                // hold 128 B placeholders, and the banks follow seg1), and the prefill ladder
-                // builds those on a background thread WHILE the decode session stages — so rung
-                // segments land interleaved with decode's own banks. The pool budget above charges
-                // none of this ON PURPOSE: a rung that cannot allocate is a WARN and a narrower
-                // ladder, never a dead run. The RESERVE decision has no such license. The spare is
-                // permanent placement, and granting it against headroom the ladder is about to
-                // consume does not degrade the rungs — it kills the OWNER: the rung allocations
-                // succeed, and decode's mandatory bank is the allocation that finds the card full.
-                //
-                // 🛑 MEASURED on gemma-4-31b fp8 (2026-10-14, 4096 ctx × 2 rows): the census said
-                // 86,633 MB ≤ the 88,473 MB that --gpu-memory-utilization 0.90 funds, so the anchor
-                // RESERVED; the ladder's rungs then took ~24,500 MB of real non-resident segments
-                // while decode staged, and the run died at `prepare: weight bank 1 alloc of
-                // 15622566400 B failed` with 2,196,278,528 B free — the same `weight bank 1` wall
-                // gemma-4-26b hit at wall 9, one census layer further down. Charged here, the 31b
-                // borrows and mandatory + ladder + pool fits the tensor domain with room to spare.
-                //
-                // Charged as the build will allocate it, so the count stays honest in both
-                // directions: the entries the ladder loops themselves SKIP are not charged (`rm`
-                // and `rn` ≤ 1 name sessions already built, and the narrowest `rm > 1` is the
-                // anchor's own bundle — `prefill_code` above — whose live segments
-                // `anchor_live_bytes` already charges; the skip is read off the entry list, not a
-                // second derivation of `prefill_m`). The prefix-capable prefill and the decode
-                // batch rungs build soft after the join and are charged for the same reason: their
-                // allocations are real whenever they succeed.
-                let seg_weight = scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT.get();
-                let seg_kv = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
-                let non_resident =
-                    |lay: &scratchy_target_spyre::bundle_code::BundleLayout<'static>| {
-                        lay.segment_bytes
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| *i != seg_weight && *i != seg_kv)
-                            .map(|(_, b)| *b)
-                            .sum::<u64>()
-                    };
-                let anchor_rung_m = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm)
-                    .map(|(rm, _)| *rm);
-                let ladder_rung_bytes: u64 = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
-                    .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
-                    .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                    .map(|rc| non_resident(&rc.layout))
-                    .sum::<u64>()
-                    + g0.decode_rungs
-                        .iter()
-                        .filter(|(rn, _, _, _)| rn.get() > 1)
-                        .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
-                        .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .map(|rc| non_resident(&rc.layout))
-                        .sum::<u64>()
-                    + g0.prefill_prefix
-                        .iter()
-                        // Every prefix rung builds — solo AND packed: a packed rung's
-                        // activations are its product's (s windows of width rows), charged
-                        // exactly as the solo rung's are.
-                        .filter(|rung| rung.0 > 1)
-                        .filter_map(|(_, _, psent)| psent.strip_prefix(SUPERDSC_SENTINEL))
-                        .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .map(|rc| non_resident(&rc.layout))
-                        .sum::<u64>();
                 // ⛔ DEVICE REGIONS ARE NEVER FREED — `DevAddr`'s own doc: "device memory lives until
-                // process exit". The anchor's spare is not a loan the alias later returns:
-                // `alias_seg_from` repoints the borrower's descriptors and the borrower's own regions
-                // stay on the allocator's books forever. So the spare is PLACEMENT LUXURY — its
-                // allocation is what places decode's weight region, worth 1.8 tok/s on
-                // granite-3.1-2b, measured — never a load requirement, and it is taken ONLY when the
-                // card funds it: mandatory residency plus the spare plus the ladder's real rung
-                // segments must fit inside what `--gpu-memory-utilization` allots — the KV pool is
-                // funded from the REMAINDER, so it is never a charge against this decision. A model
-                // that fails that check BORROWS exactly
+                // process exit". A borrower's own regions stay on the allocator's books forever, so
+                // the spare was never a loan the alias returns: it was PLACEMENT LUXURY — its
+                // allocation is what placed decode's weight region, worth 1.8 tok/s on
+                // granite-3.1-2b, measured — never a load requirement. The anchor borrows exactly
                 // like every ladder rung — 128 B placeholders now, `adopt_from_owner` onto decode's
                 // regions once the owner is built — costing the placement effect, not the run.
-                let anchor_mandatory_bytes = non_kv_bytes + anchor_live_bytes;
-                let anchor_reserves = prefill_code.is_some()
-                    && (anchor_mandatory_bytes + anchor_spare_bytes + ladder_rung_bytes)
-                        <= (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization)
-                            as u64;
-                let non_kv_bytes = non_kv_bytes
-                    + anchor_live_bytes
-                    + if anchor_reserves {
-                        anchor_spare_bytes
-                    } else {
-                        0
-                    };
+                let non_kv_bytes = non_kv_bytes + anchor_live_bytes;
                 if prefill_code.is_some() {
                     tracing::info!(
-                        "superdsc paged: prefill anchor {} — its {} MB spare (a twin of the weight \
-                         home) {} inside the {} MB that \
-                         --gpu-memory-utilization {:.2} funds beyond the {} MB of mandatory \
-                         residency plus the {} MB the ladder's rungs allocate",
-                        if anchor_reserves {
-                            "RESERVES"
-                        } else {
-                            "BORROWS"
-                        },
-                        anchor_spare_bytes / (1024 * 1024),
-                        if anchor_reserves {
-                            "fits"
-                        } else {
-                            "does NOT fit"
-                        },
-                        (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization) as u64
-                            / (1024 * 1024),
-                        self.gpu_memory_utilization,
-                        anchor_mandatory_bytes / (1024 * 1024),
-                        ladder_rung_bytes / (1024 * 1024),
+                        "superdsc paged: prefill anchor BORROWS the weight home — its live {} MB \
+                         charged, its spare (a twin of the weight home) left to the KV pool's \
+                         remainder",
+                        anchor_live_bytes / (1024 * 1024),
                     );
                 }
                 // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
@@ -1848,13 +1750,16 @@ impl SpyreWorker {
                         non_kv_bytes / (1024 * 1024),
                     )));
                 }
-                // ⭐ THE KV BUDGET IS THE REMAINDER — what the funded tensor capacity holds beyond
-                // the non-KV residency the census just charged. Carried to `Loaded`, so
-                // `determine_available_memory` hands the engine this one number and
-                // `compute_kv_blocks` divides it by the page stride (capped at the programs'
-                // addressing bound, `PagedStep::host_blocks`) — the ENGINE owns the funded page
-                // count, and `initialize_cache` allocates each layer's pool region at it.
-                let kv_budget_bytes = funded - non_kv_bytes;
+                // ⭐ THE KV BUDGET IS THE REMAINDER MINUS THE NULL PAGE — what the funded tensor
+                // capacity holds beyond the non-KV residency the census just charged, less one
+                // page's bytes: funding allocates `(pages + the null page) × unit bytes` per
+                // bank, so a budget the engine may divide into N whole pages must already have
+                // page 0's bytes spent. Carried to `Loaded`, so `determine_available_memory`
+                // hands the engine this one number and `compute_kv_blocks` divides it by the
+                // page stride (capped at the programs' addressing bound,
+                // `PagedStep::host_blocks`) — the ENGINE owns the funded page count, and
+                // `initialize_cache` allocates each layer's pool region at it.
+                let kv_budget_bytes = funded - non_kv_bytes - pool_stride_bytes;
                 kv_budget_bytes_v = Some(kv_budget_bytes);
                 pool_stride_bytes_v = Some(pool_stride_bytes);
                 info!(
@@ -1922,9 +1827,9 @@ impl SpyreWorker {
                 //    runs batched through it, then its seg2 KV is copied to the decode session. If the
                 //    prefill slot's fp == the decode fp (the prefill reroll did NOT bake → C4 fell
                 //    back), prefill=None ⇒ the worker uses the sequential mq=1 path. ──
-                // `prefill_code` (the anchor bundle), `anchor_reserves` (its capacity policy) and the
-                // KV pool's own demand were all derived UP AT THE CENSUS — the budget reads them, so
-                // they exist before this point. The session build below is their first consumer.
+                // `prefill_code` (the anchor bundle) and the KV pool's own demand were all derived
+                // UP AT THE CENSUS — the budget reads them, so they exist before this point. The
+                // session build below is their first consumer.
                 let (mut prefill_ss, prefill_m) = match prefill_code {
                     Some(pcode) => {
                         // The baked prefill m (query rows). run_step MUST use exactly this m.
@@ -1987,41 +1892,17 @@ impl SpyreWorker {
                             .unwrap_or(&wirings.decode)
                             .verify_class_placements(pl)
                             .map_err(werr)?;
-                        // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
-                        // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
-                        // reservation is what places decode's own weight region. Making it borrow (a
-                        // 128 B placeholder) moved decode's weights ~2.6 GB earlier in HBM and cost
-                        // ~1.8 tok/s of DECODE throughput, measured: 36.5 tok/s with this session
-                        // owning its weights vs 34.7 with it borrowing. Decode is weight-BANDWIDTH-
-                        // bound (2.43 GB per token at ~84 GB/s), so where that region lands is
-                        // load-bearing. The effect is NON-LINEAR in session count — 1→2 sessions cost
-                        // 1.8 tok/s, 2→7 cost 0.1 — which is the signature of the FIRST allocation
-                        // ahead of decode mattering, not of per-session overhead.
-                        // The ladder rungs below still borrow, so the ladder stays affordable: this
-                        // costs ONE spare weight copy (exactly what the worker held before the ladder
-                        // existed), not one per rung.
-                        // `pdir` is the NARROWEST rung (see the anchor note above), so this
-                        // reservation is the same size at every ladder ceiling.
-                        let _t = std::time::Instant::now();
-                        // RESERVES seg1 at full size without populating it. The comment above is
-                        // still the reason this session must not BORROW: its 2.6 GB reservation places
-                        // decode's weight region, worth 1.8 tok/s. But that is the ALLOCATION talking,
-                        // not the bytes -- this session is aliased onto decode's copy a few lines
-                        // below, so everything staged here was overwritten by a pointer swap. Keeping
-                        // the reservation and dropping the write saves the bind + stage (6.97s
-                        // measured) and the `weights.clone()` of a ~2.6 GB host buffer with it.
-                        //
-                        // ⛔ BUT THE RESERVATION IS LUXURY, AND LUXURY IS BUDGETED (wall 9,
-                        // 2026-10-09). Device regions are NEVER freed, so the anchor's spare — a
-                        // twin of SEG_WEIGHT, every extra bank, and a second KV pool — is permanent
-                        // dead placement, and at gemma-4-26b scale (~26 GB of spare on a 96 GiB
-                        // tensor domain) it starved decode's own banks: `prepare: weight bank 1
-                        // alloc of 17057081344 B failed` with 10.6 GB free. `anchor_reserves`
-                        // (decided at the census, against the card's funded capacity) keeps the
-                        // measured granite behavior exactly where the card pays for it, and takes
-                        // the BORROWING form — identical to every ladder rung: placeholders here,
-                        // `adopt_from_owner` onto decode's regions after the owner is built — when
-                        // it does not. What that costs is the placement effect, never the run.
+                        // ⛔ THE ANCHOR BORROWS, ALWAYS. Owning its weights was placement steering —
+                        // the 2.6 GB reservation placed decode's weight region and was worth ~1.8
+                        // tok/s of decode on granite-3.1-2b (36.5 vs 34.7, measured) — but device
+                        // regions are NEVER freed, so the spare is permanent dead placement, and at
+                        // gemma-4-26b scale (~26 GB of spare on a 96 GiB tensor domain) it starved
+                        // decode's own banks: `prepare: weight bank 1 alloc of 17057081344 B failed`
+                        // with 10.6 GB free (wall 9, 2026-10-09), and at granite-8b/mml-12288 it ate
+                        // the KV pool's remainder outright (2026-11-20). The anchor takes the
+                        // BORROWING form — identical to every ladder rung: placeholders here,
+                        // `adopt_from_owner` onto decode's regions after the owner is built. What
+                        // that costs is the placement effect, never the run.
                         // ⭐ THE PREFILL WIRING'S OWN STAGED CONSTANTS — the general mint puts
                         // the sampler's nine tables in every prefill rung, and they sit in each
                         // session's own seg3 (never aliased), so every prefill session stages
@@ -2034,34 +1915,20 @@ impl SpyreWorker {
                         // The pool's own tables, staged per prefill session — see
                         // [`prefill_pool_statics`] for why they cannot be aliased.
                         let anchor_pool = prefill_pool_statics(wirings)?;
-                        let pss = if anchor_reserves {
-                            SuperDscSession::new_reserving(
-                                cards,
-                                pcode,
-                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
-                                    vocab,
-                                    kv_dim,
-                                    num_blocks,
-                                },
-                                prefill_consts,
-                                &anchor_pool,
-                                &spill_tids,
-                            )
-                        } else {
-                            SuperDscSession::new_borrowing_with_consts(
-                                cards,
-                                pcode,
-                                scratchy_target_spyre_card::sdsc_runner::SessionDims {
-                                    vocab,
-                                    kv_dim,
-                                    num_blocks,
-                                },
-                                &RESIDENT_SEGS.map(|(seg, _)| seg),
-                                prefill_consts,
-                                &anchor_pool,
-                                &spill_tids,
-                            )
-                        }
+                        let _t = std::time::Instant::now();
+                        let pss = SuperDscSession::new_borrowing_with_consts(
+                            cards,
+                            pcode,
+                            scratchy_target_spyre_card::sdsc_runner::SessionDims {
+                                vocab,
+                                kv_dim,
+                                num_blocks,
+                            },
+                            &RESIDENT_SEGS.map(|(seg, _)| seg),
+                            prefill_consts,
+                            &anchor_pool,
+                            &spill_tids,
+                        )
                         .map_err(|e| werr_chain("build SuperDSC PREFILL dxp session", &e))?;
                         info!(
                             "[spyre-worker] sendnn: SUPERDSC PREFILL session ready (bundle {}, \
