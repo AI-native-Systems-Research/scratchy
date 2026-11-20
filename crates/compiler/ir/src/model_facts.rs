@@ -15,6 +15,8 @@ use core::marker::PhantomData;
 use scratchy_tensors::typed::typenum::U2;
 use scratchy_tensors::typed::{Add, Dim, DimN, Divides, Equals, FitsIn, Mul};
 pub use scratchy_tensors::{ActDtype, ScaleDtype};
+// A head's width and its rotated lanes live with the shared rotary builder's other inputs.
+pub use scratchy_tensors::{HeadDim, RotDim};
 
 /// A positive count or extent: the constructor refuses zero.
 macro_rules! positive {
@@ -41,8 +43,6 @@ positive! {
     QueryHeads(u32),
     /// Key/value heads (`num_key_value_heads`, sharded).
     KvHeads(u32),
-    /// The leading lanes of a head that rotary rotates.
-    RotDim(u32),
     /// Query heads per kv head — the GQA group size, minted once by
     /// [`HeadGeometry::new`](HeadGeometry::new) beside its divisibility law, so no reader
     /// re-derives the division.
@@ -79,30 +79,6 @@ positive! {
     PoolKernel(u32),
     /// The input width of a vision tower's patch embedding.
     InFeatures(usize),
-}
-
-/// One head's width. Deliberately outside `positive!`: its storage IS the non-zero its
-/// law states, so [`HeadDim::nonzero`](HeadDim::nonzero) is a field read, not a
-/// re-proven conversion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HeadDim(std::num::NonZeroU32);
-impl HeadDim {
-    /// The width, refused at zero.
-    pub const fn new(v: u32) -> Self {
-        match std::num::NonZeroU32::new(v) {
-            Some(nz) => Self(nz),
-            None => panic!("HeadDim is a positive quantity"),
-        }
-    }
-    /// The width as a number.
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-    /// The width as a non-zero — the storage already is one, so no caller re-proves
-    /// the law this type states.
-    pub const fn nonzero(self) -> std::num::NonZeroU32 {
-        self.0
-    }
 }
 
 /// A finite `f32`: the constructor refuses NaN and infinity, and, where `$positive`, a value not
