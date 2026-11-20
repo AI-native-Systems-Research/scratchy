@@ -7,11 +7,8 @@ name: Metal round
 # the site branch, commits those runs, gzipped, into data/metal there in one commit, opens a PR to
 # the site branch for an admin to merge, and closes the issue: a closed issue is a finished round.
 #
-# issue_comment runs this file as it is on main, and runs no code but main's and the renderer on
-# the site branch: it trusts the site branch as it trusts main, both protected, merged only by an
-# admin. Even so the renderer runs with no token: neither checkout keeps its credentials, and its
-# step has GH_TOKEN emptied. The runs it reads are data, checked by the site build before they are
-# committed.
+# issue_comment runs this file as it is on main. It also renders the protected site branch,
+# with no token.
 on:
   issue_comment:
     types: [created, edited, deleted]
@@ -89,11 +86,7 @@ jobs:
           echo "commit=$(jq -r .complete summary.json)" >> "$GITHUB_OUTPUT"
           echo "files=$(jq -c .files summary.json)" >> "$GITHUB_OUTPUT"
 
-      # The site build reads every field the page needs, so it is the check that the runs render.
-      # The site lives on the site branch and reads main's docs and DSLs from the folder above it,
-      # so it goes at site/ in this main checkout, as the site branch's pages.yml lays it out. Its lint and
-      # tests read only the renderer's own fixtures, which the runs do not touch: rendering is the
-      # check, and the round's PR runs the whole build (pages.yml on the site branch).
+      # Check the runs render: the site branch at site/ in this main checkout.
       - if: steps.collect.outputs.commit == 'true'
         uses: actions/checkout@v7
         with:
@@ -111,7 +104,6 @@ jobs:
 
       - if: steps.collect.outputs.commit == 'true'
         name: Build the site with the round's runs
-        # The renderer is the site branch's code: it never sees the job's token.
         env:
           GH_TOKEN: ''
         run: |
@@ -144,9 +136,7 @@ jobs:
           name: round
           path: round
 
-      # A branch from the site branch named for the issue, and the runs on it in one commit made
-      # through the API rather than git push: GitHub signs a commit made this way, and the
-      # branch rules take signed commits only.
+      # One API commit on a branch from site: GitHub signs commits made this way.
       - name: Commit the runs to a new branch
         env:
           FILES: ${{ needs.collect.outputs.files }}
@@ -168,10 +158,7 @@ jobs:
             --body "The newest quick run of each Mac, gzipped, as collected on #$ISSUE. Pages was started on this branch by the bot. If its check does not show here, push a signed empty commit to $BRANCH to start it.")
           echo "PR=$pr" >> "$GITHUB_ENV"
 
-      # A push made with this token starts no workflows, so start the site build on the branch by
-      # hand: the branch is the site branch's, whose pages.yml builds without deploying anywhere
-      # but site. If it does not count toward the branch rules, a signed empty commit pushed to
-      # the branch starts it the usual way.
+      # This token's push starts no workflows, so start the build on the branch by hand.
       - name: Start the checks
         run: gh workflow run pages.yml -R "$REPO" --ref "$BRANCH"
 

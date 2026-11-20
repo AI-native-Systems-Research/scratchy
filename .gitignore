@@ -1,8 +1,7 @@
 *~
 
 /target/
-# The site lives on the site branch; a developer checks it out here as a worktree
-# (git worktree add site origin/site) to build or preview it.
+# The site branch, checked out here as a worktree.
 /site/
 # crates/targets/metal/tui is its own standalone workspace (excluded from the root one,
 # see root Cargo.toml) — its build output lands here, not under /target/.

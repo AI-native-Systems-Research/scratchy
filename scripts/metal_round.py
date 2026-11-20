@@ -129,9 +129,7 @@ def stamp(run):
 
 
 def site_file(run):
-    """The site's name for a run's file, and its bytes: the bench script's JSON, gzipped with no
-    name or time in its header, so this code packs the same run to the same bytes (another
-    gzip tool may make other bytes)."""
+    """A run's file name and gzipped bytes, as the site branch stores it."""
     text = json.dumps(run, indent=2) + "\n"
     return f"{stamp(run)}.gz", gzip.compress(text.encode(), compresslevel=9, mtime=0)
 

@@ -1,12 +1,8 @@
 name: Pages
 
-# Main never builds or deploys the site. The site and its data live on the site branch, whose own
-# pages.yml builds and deploys it. Main only asks for a rebuild when what the site renders from main
-# changes (docs, CONTRIBUTING.md, the DSLs), so the live pages stay current.
-#
-# This file must stay at this path on main: a workflow_dispatch finds its workflow by the file on
-# the default branch, then runs the dispatched branch's copy. Main's rebuild request and the metal
-# round bot both dispatch pages.yml that way.
+# Main never builds the site; the site branch's pages.yml does. This only asks it to rebuild
+# when main's docs or DSLs change. It must stay at this path: a dispatch finds its workflow by
+# the file on main.
 on:
   push:
     branches: [main]
@@ -20,7 +16,6 @@ permissions:
   contents: read
 
 jobs:
-  # Start the site branch's Pages run, which builds main's head with the site branch and deploys.
   rebuild-site:
     if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest

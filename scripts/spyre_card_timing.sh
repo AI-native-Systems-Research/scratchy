@@ -69,9 +69,8 @@
 #   CORES   the cores serve and client are pinned to (default 48-95)
 #
 # Exits non-zero on any refusal; a failed cell fails the whole run. On the
-# pod, run it from a synced checkout with a worktree of the site branch at
-# site/, which carries site/data/spyre/ (the torch ratios come from the
-# newest sweep file there, gzipped JSON).
+# pod, run it with a worktree of the site branch at site/ (the torch ratios
+# come from its newest sweep file).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -225,7 +224,6 @@ if set(runs) != expected:
     refuse(f"the measured set is {sorted(runs)}, need exactly {sorted(expected)}")
 
 try:
-    # The site keeps its sweeps gzipped; a plain one (the self-test's) reads as is.
     with (gzip.open if sweep_path.endswith(".gz") else open)(sweep_path, "rt") as f:
         sweep = json.load(f)
 except (OSError, ValueError) as e:
