@@ -223,7 +223,9 @@ impl PoolPages {
 }
 
 /// ⭐ THE SESSION'S RESIDENCY, READ OFF THE BAKE'S OWN LAYOUT AND STEP — the fixed bytes are
-/// every segment's but the KV segment's (the pools are the pages, charged per page), minus
+/// every segment's extent but the KV segment's ([`BundleLayout::segment_extents`]: the
+/// intermediate segment covers every synthetic the door declared; the pools are the pages,
+/// charged per page), minus
 /// the row pool's bytes when the session's step reads it (those bytes ride inside the
 /// intermediate segment's total, and they are per-page too — the step's own
 /// [`card_kv_row_pool_bytes`](crate::wiring::PagedStep::card_kv_row_pool_bytes), never a
@@ -238,11 +240,11 @@ pub fn session_residency(
 ) -> Residency {
     let kv_seg = SegRole::Kv.segment();
     let mut fixed: u64 = layout
-        .segment_bytes
-        .iter()
+        .segment_extents()
+        .into_iter()
         .enumerate()
         .filter(|&(seg, _)| seg != kv_seg)
-        .map(|(_, &bytes)| bytes)
+        .map(|(_, bytes)| bytes)
         .sum();
     let mut page: u64 = page_cols
         .iter()
@@ -432,5 +434,24 @@ mod tests {
         let no_step = session_residency(&layout, &[512, 512], None);
         assert_eq!(no_step.fixed(), not_reading.fixed());
         assert_eq!(no_step.page(), not_reading.page());
+    }
+
+    /// The residency's fixed bytes hold every synthetic the door declared: the intermediate
+    /// segment's extent is the synthetic allocator's high-water mark once the synthetics run past
+    /// the packed intermediates, and the packed extent while none is declared.
+    #[test]
+    fn session_residency_charges_the_declared_synthetics() {
+        let mut layout = BundleLayout::default();
+        layout.segment_bytes = [8192, 200, 3072, 400, 0, 0, 0];
+        layout.synth = std::cell::RefCell::new(ktir_superdsc::placement::SynthAlloc::new(8192));
+        assert_eq!(
+            session_residency(&layout, &[512], None).fixed().get(),
+            8192 + 200 + 400
+        );
+        layout.synth(ktir_superdsc::place::SynthId::Act(900), &[4, 64]);
+        assert_eq!(layout.segment_extents(), [8704, 200, 3072, 400, 0, 0, 0]);
+        let reading = session_residency(&layout, &[512], None);
+        assert_eq!(reading.fixed().get(), 8704 + 200 + 400);
+        assert_eq!(reading.page().get(), crate::wiring::pool_page_bytes(512));
     }
 }

@@ -6615,7 +6615,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     let BundleLayout {
         ids,
         placements,
-        segment_bytes,
+        // Read through `BundleLayout::segment_extents`, which covers every synthetic.
+        segment_bytes: _,
         weight_bank_bytes,
         kv_bank_bytes,
         // Read by the launch table (`lower_subtile_tape_to_ktir`), which carries each layer's bank
@@ -6727,22 +6728,14 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         );
     }
 
-    // ⛔ THE INTERMEDIATE SEGMENT MUST COVER EVERY SYNTH, WHENEVER IT WAS DECLARED. The SubtileIR
-    // walk grows this itself, right after its own node loop — but a synth can also be minted LATER,
-    // by `ktir_to_superdsc::lower` running inside `emit_bundle_inner`, long after that walk returned
-    // and its `segment_bytes` were final. Those intermediates then sat past the segment's end and
-    // every one of them was an address defect (MEASURED: 1777 of them, `t0_kt0 spans
-    // [6799360, 6803456) of seg0, which is only 6799360 B`).
-    //
-    // ⭐ SO THE GROW BELONGS HERE, not at either producer. This is the ONE place the final
-    // `segment_bytes` are produced, and it already reads `synth` for the placements above — so
-    // covering the allocator's high-water mark is a fact about the allocation rather than a step a
-    // caller can forget. A no-op for the SubtileIR path, which already grew it.
-    let mut segment_bytes = *segment_bytes;
-    let seg_i = SegRole::Intermediate.segment();
-    if synth.high_water() > segment_bytes[seg_i] {
-        segment_bytes[seg_i] = synth.high_water();
-    }
+    // ⛔ THE INTERMEDIATE SEGMENT MUST COVER EVERY SYNTH, WHENEVER IT WAS DECLARED. A synth can be
+    // minted by `ktir_to_superdsc::lower` running inside `emit_bundle_inner`, long after the
+    // SubtileIR walk returned and its `segment_bytes` were final; such an intermediate sits past the
+    // packed segment's end, an address defect (MEASURED: 1777 of them, `t0_kt0 spans
+    // [6799360, 6803456) of seg0, which is only 6799360 B`). The layout's own extents
+    // (`BundleLayout::segment_extents`) cover the allocator's high-water mark, and the session's
+    // residency reads the same extents.
+    let segment_bytes = l.segment_extents();
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
     audit_layout_addresses(

@@ -1459,6 +1459,18 @@ impl BundleLayout {
         self.synth.borrow_mut().take(name, bytes);
     }
 
+    /// ⭐ THE SEGMENT EXTENTS THIS LAYOUT ADDRESSES — [`Self::segment_bytes`], the Intermediate
+    /// segment grown to the synthetic allocator's high-water mark ([`SynthAlloc::high_water`]).
+    /// Every synthetic sits above the packed intermediates, so the packed extent alone ends below
+    /// the last one the door declared. The one statement the bake's segment table and the
+    /// session's residency read.
+    pub fn segment_extents(&self) -> [u64; 7] {
+        let mut extents = self.segment_bytes;
+        let seg = SegRole::Intermediate.segment();
+        extents[seg] = extents[seg].max(self.synth.borrow().high_water());
+        extents
+    }
+
     /// THE arrangement authority. Record that tensor `name` is addressed through `want`; a later op that
     /// addresses it NON-equivalently ([`StickLayout::addr_eq`]) is a build `Err` naming the tensor.
     /// `addr_eq` is true for the same layout, and for a byte-identical RESHAPE (same total elements, both
