@@ -38,14 +38,14 @@ pub use scratchy_layers::layers::*;
 pub use scratchy_quantizations::{AffineQuantEmbedding, AffineQuantLinear, Nvfp4Linear};
 
 // ---------------------------------------------------------------------------
-// LinearLayer — dense load Ops (real) + quant constructors (bail)
+// LinearLayer — dense load Ops (real; the quant constructors are `layers_quant`'s)
 // ---------------------------------------------------------------------------
 
 /// Spyre load surface for [`LinearLayer`]. Mirrors the cuda `LinearLayerOps`
 /// trait NAMES + SIGNATURES exactly (the macro calls these by path-syntax), but
 /// the stream parameter is the host `LoadStream` (= `()`) rather than a
 /// `CUstream`. All dense loads are allocator-generic host reads; the quant
-/// constructors are `bail!` stubs (kernel-bound, not yet implemented).
+/// constructors are `layers_quant::LinearLayerQuantOps`.
 pub trait LinearLayerOps: Sized {
     fn load_dense(weights: &mut GpuWeights, prefix: &str) -> Result<Self>;
     fn load_raw(weights: &mut GpuWeights, key: &str) -> Result<Self>;
@@ -74,36 +74,6 @@ pub trait LinearLayerOps: Sized {
         stream: LoadStream,
         rank: usize,
         world: usize,
-    ) -> Result<Self>;
-
-    // Quant constructors — kernel-bound, not yet implemented on spyre. A
-    // bf16/fp16 checkpoint never reaches these, but the macro emits the call
-    // site for every model variant so they must type-check.
-    fn load_affine_quant(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
-        expected_in_features: u32,
-    ) -> Result<Self>;
-    fn load_affine_dequant_as_dense(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
-    ) -> Result<Self>;
-    fn load_affine_dequant_concat_as_dense(
-        weights: &mut GpuWeights,
-        prefixes: &[&str],
-        group_size: u32,
-        bits: u32,
-        expected_in_features: u32,
-    ) -> Result<Self>;
-    fn load_nvfp4_quant(weights: &mut GpuWeights, prefix: &str, group_size: u32) -> Result<Self>;
-    fn load_nvfp4_quant_concat(
-        weights: &mut GpuWeights,
-        prefixes: &[&str],
-        group_size: u32,
     ) -> Result<Self>;
 }
 
@@ -312,68 +282,6 @@ impl LinearLayerOps for LinearLayer {
 
         Ok(Self::Dense(Linear::new(packed_weight, packed_bias)))
     }
-
-    // ── Quant constructors — kernel-bound, not yet implemented on spyre ──
-
-    fn load_affine_quant(
-        _weights: &mut GpuWeights,
-        _prefix: &str,
-        _group_size: u32,
-        _bits: u32,
-        _expected_in_features: u32,
-    ) -> Result<Self> {
-        anyhow::bail!("scratchy-target-spyre: load_affine_quant load not yet implemented")
-    }
-
-    fn load_affine_dequant_as_dense(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
-    ) -> Result<Self> {
-        let weight = affine_dequant_b4(weights, prefix, group_size, bits, DType::BF16)?;
-        let bias_name = format!("{prefix}.bias");
-        let bias = if weights.contains(&bias_name) {
-            Some(weights.take(&bias_name)?)
-        } else {
-            None
-        };
-        Ok(Self::Dense(Linear::new(weight, bias)))
-    }
-
-    fn load_affine_dequant_concat_as_dense(
-        weights: &mut GpuWeights,
-        prefixes: &[&str],
-        group_size: u32,
-        bits: u32,
-        expected_in_features: u32,
-    ) -> Result<Self> {
-        let weight = affine_dequant_b4_concat(
-            weights,
-            prefixes,
-            group_size,
-            bits,
-            DType::BF16,
-            expected_in_features,
-        )?;
-        Ok(Self::Dense(Linear::new(weight, None)))
-    }
-
-    fn load_nvfp4_quant(
-        _weights: &mut GpuWeights,
-        _prefix: &str,
-        _group_size: u32,
-    ) -> Result<Self> {
-        anyhow::bail!("scratchy-target-spyre: load_nvfp4_quant load not yet implemented")
-    }
-
-    fn load_nvfp4_quant_concat(
-        _weights: &mut GpuWeights,
-        _prefixes: &[&str],
-        _group_size: u32,
-    ) -> Result<Self> {
-        anyhow::bail!("scratchy-target-spyre: load_nvfp4_quant_concat load not yet implemented")
-    }
 }
 
 // ── MLX-affine int4 → dense host dequant (the P2 slow-reference path) ───────
@@ -461,7 +369,7 @@ fn affine_dequant_b4_bytes(
 }
 
 /// Dequantize one MLX-affine int4 prefix into a dense `[N, K]` host tensor.
-fn affine_dequant_b4(
+pub(crate) fn affine_dequant_b4(
     weights: &mut GpuWeights,
     prefix: &str,
     group_size: u32,
@@ -475,7 +383,7 @@ fn affine_dequant_b4(
 /// Concat sibling of [`affine_dequant_b4`]: CPU-dequantizes each prefix's
 /// affine triple, byte-concats the `[N, K]` results along dim 0 into one
 /// packed buffer. All sources must share `K`, `group_size`, `bits`, `dtype_out`.
-fn affine_dequant_b4_concat(
+pub(crate) fn affine_dequant_b4_concat(
     weights: &mut GpuWeights,
     prefixes: &[&str],
     group_size: u32,
@@ -533,12 +441,12 @@ fn affine_dequant_b4_concat(
 }
 
 // ---------------------------------------------------------------------------
-// Embedding — dense load Ops (real) + affine-dequant constructor (bail)
+// Embedding — dense load Ops (real; the affine dequant is `layers_quant`'s)
 // ---------------------------------------------------------------------------
 
 /// Spyre load surface for [`Embedding`] (dense table load + vocab-parallel
-/// shard). `load_affine_dequant` is the kernel-bound quant path — `bail!` for
-/// now (a bf16/fp16 checkpoint never reaches it).
+/// shard). The MLX-affine dequant-at-load constructor is
+/// `layers_quant::EmbeddingDequantOps`.
 pub trait EmbeddingOps: Sized {
     fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self>;
     fn load_sharded(
@@ -546,12 +454,6 @@ pub trait EmbeddingOps: Sized {
         prefix: &str,
         rank: usize,
         world: usize,
-    ) -> Result<Self>;
-    fn load_affine_dequant(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
     ) -> Result<Self>;
 }
 
@@ -575,16 +477,6 @@ impl EmbeddingOps for Embedding {
         }
         let weight_name = format!("{prefix}.weight");
         let weight = weights.take_shard(&weight_name, 0, rank, world)?;
-        Ok(Self::new(weight))
-    }
-
-    fn load_affine_dequant(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
-    ) -> Result<Self> {
-        let weight = affine_dequant_b4(weights, prefix, group_size, bits, DType::BF16)?;
         Ok(Self::new(weight))
     }
 }

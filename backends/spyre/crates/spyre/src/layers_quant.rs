@@ -29,6 +29,7 @@
 
 use anyhow::Result;
 
+use crate::layers::{Embedding, Linear, LinearLayer, affine_dequant_b4, affine_dequant_b4_concat};
 use crate::weights::GpuWeights;
 use scratchy_layers::layers::{Bnb4bitLinear, Fp8BlockLinear, Fp8Linear, MarlinLinear};
 use scratchy_quantizations::AffineQuantEmbedding;
@@ -48,6 +49,123 @@ pub trait AffineQuantEmbeddingOps {
 impl AffineQuantEmbeddingOps for AffineQuantEmbedding {
     fn load(_gw: &mut GpuWeights, _prefix: &str, _group_size: u32, _bits: u32) -> Result<Self> {
         anyhow::bail!("scratchy-target-spyre: AffineQuantEmbedding load not yet implemented")
+    }
+}
+
+/// Spyre's quant constructors for [`LinearLayer`]: the MLX-affine dequant-at-load path is real,
+/// the forward-time affine and NVFP4 kernels are `bail!` stubs (kernel-bound, not yet
+/// implemented). A bf16/fp16 checkpoint never reaches these, but the macro emits the call site
+/// for every model variant so they must type-check.
+pub trait LinearLayerQuantOps: Sized {
+    fn load_affine_quant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self>;
+    fn load_affine_dequant_as_dense(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self>;
+    fn load_affine_dequant_concat_as_dense(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self>;
+    fn load_nvfp4_quant(weights: &mut GpuWeights, prefix: &str, group_size: u32) -> Result<Self>;
+    fn load_nvfp4_quant_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+    ) -> Result<Self>;
+}
+
+impl LinearLayerQuantOps for LinearLayer {
+    fn load_affine_quant(
+        _weights: &mut GpuWeights,
+        _prefix: &str,
+        _group_size: u32,
+        _bits: u32,
+        _expected_in_features: u32,
+    ) -> Result<Self> {
+        anyhow::bail!("scratchy-target-spyre: load_affine_quant load not yet implemented")
+    }
+
+    fn load_affine_dequant_as_dense(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = affine_dequant_b4(weights, prefix, group_size, bits, DType::BF16)?;
+        let bias_name = format!("{prefix}.bias");
+        let bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        Ok(Self::Dense(Linear::new(weight, bias)))
+    }
+
+    fn load_affine_dequant_concat_as_dense(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
+    ) -> Result<Self> {
+        let weight = affine_dequant_b4_concat(
+            weights,
+            prefixes,
+            group_size,
+            bits,
+            DType::BF16,
+            expected_in_features,
+        )?;
+        Ok(Self::Dense(Linear::new(weight, None)))
+    }
+
+    fn load_nvfp4_quant(
+        _weights: &mut GpuWeights,
+        _prefix: &str,
+        _group_size: u32,
+    ) -> Result<Self> {
+        anyhow::bail!("scratchy-target-spyre: load_nvfp4_quant load not yet implemented")
+    }
+
+    fn load_nvfp4_quant_concat(
+        _weights: &mut GpuWeights,
+        _prefixes: &[&str],
+        _group_size: u32,
+    ) -> Result<Self> {
+        anyhow::bail!("scratchy-target-spyre: load_nvfp4_quant_concat load not yet implemented")
+    }
+}
+
+/// Spyre's MLX-affine int4 → BF16 dequant-at-load constructor for [`Embedding`].
+pub trait EmbeddingDequantOps: Sized {
+    fn load_affine_dequant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self>;
+}
+
+impl EmbeddingDequantOps for Embedding {
+    fn load_affine_dequant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = affine_dequant_b4(weights, prefix, group_size, bits, DType::BF16)?;
+        Ok(Self::new(weight))
     }
 }
 
