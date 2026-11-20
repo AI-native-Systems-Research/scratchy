@@ -1586,16 +1586,19 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 /// itself, never a division of the graph's rows), checked here against the graph it describes: the
 /// pair's held product must equal the attention's `mq` rows, and a pair that does not is refused by
 /// name — a bake bug, never a silently-wrong per-request width the layout would size by.
-/// `page_index_scale` is the page-id scale the bundle's lowered programs state
+/// `page_id_realization` is how the executor reading this step's staged page ids spaces the
+/// gathered view's entries ([`crate::paged_step::PageIdRealization`]). The card bake passes the
+/// DEVICE realization — `EntrySpacing` of the scale the bundle's lowered programs state
 /// ([`ktir_superdsc::emit::whole_function::page_index_scale`]'s fold over them, minted by
-/// [`graph_wiring`] on the SAME lowered programs the bake emits) — threaded in, never re-derived
-/// here: this walk reads the graph, and the scale is a fact of the programs' own views.
+/// [`graph_wiring`] on the SAME lowered programs the bake emits) — and the emulator gate passes
+/// the stride realization, the emulator's own law. Threaded in, never re-derived here: this walk
+/// reads the graph, and the realization is a fact of the executor, not of it.
 pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
-    page_index_scale: u32,
+    page_id_realization: crate::paged_step::PageIdRealization,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
@@ -1652,7 +1655,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             head_size: attention.class(mask.class()).head_dim().get(),
             walk,
             paged_rows,
-            page_index_scale,
+            page_id_realization,
             extent: query_rows,
         };
         match out {
@@ -1907,7 +1910,13 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // union of its matmul consumers' view regions (the widen keeps the tied embed
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
-    let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows, page_index_scale)?;
+    let paged = paged_step_of_ir(
+        ir,
+        active_cap,
+        paged_rows,
+        query_rows,
+        crate::paged_step::PageIdRealization::EntrySpacing(page_index_scale),
+    )?;
     let attn_mask = match (masks.first().copied(), paged) {
         (Some((_, cap)), Some(p)) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own

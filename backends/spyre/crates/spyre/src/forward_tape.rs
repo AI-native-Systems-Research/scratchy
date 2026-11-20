@@ -584,7 +584,7 @@ mod tests {
         head_size: 64,
         walk: 4,
         paged_rows: crate::paged_step::PagedRows::Sequence,
-        page_index_scale: 1,
+        page_id_realization: crate::paged_step::PageIdRealization::EntrySpacing(1),
         // One request of the graph's 3 rows — the mint's own spelling, const: the pair's held
         // product IS the `rows` above, and each `None` arm is a fixture bug the const panic
         // names (const panic takes a literal, so the messages are).

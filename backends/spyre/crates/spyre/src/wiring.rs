@@ -683,16 +683,22 @@ pub struct PagedStep {
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
     pub paged_rows: crate::paged_step::PagedRows,
-    /// ⭐ THE PAGE ID'S SCALE — what the host multiplies a scheduler page id by when it stages the
-    /// page table for THIS bundle: the stride law of the views the bundle's page-table gathers
-    /// read, minted once at the lowering off the program's own `Strides`
-    /// ([`ktir_superdsc::emit::whole_function::page_index_scale`]) and carried here so the stager
-    /// consumes it and nothing else. A bundle whose gathered views pack their entries densely —
-    /// every folded-row reader, the sequence decode kernel's flat `kv_row_pool`, any dense table —
-    /// states 1 and stages exactly the bytes it always did; a bundle whose units interleave planes
-    /// states the interleave. ONE table, ONE law: a bundle whose gathers disagree is refused at
-    /// the mint, never staged for one of them.
-    pub page_index_scale: u32,
+    /// ⭐ THE PAGE ID'S REALIZATION — how the executor reading THIS bundle's staged page ids
+    /// spaces the gathered view's entries ([`crate::paged_step::PageIdRealization`]). The BAKE
+    /// is the card's, so the baked field is the DEVICE realization
+    /// ([`PageIdRealization::EntrySpacing`]): dxp spaces a gather's entries by their own dims,
+    /// so the staged id carries the view's stride-over-entry scale — minted once at the lowering
+    /// off the program's own `Strides`
+    /// ([`ktir_superdsc::emit::whole_function::page_index_scale`]) and carried here so the card
+    /// stager ([`crate::paged_step::card_step_sources`]) consumes it and nothing else spells the
+    /// multiply. A bundle whose gathered views pack densely — every folded-row reader, the
+    /// sequence decode kernel's flat `kv_row_pool`, any dense table — states scale 1 and stages
+    /// exactly the bytes it always did; a bundle whose units interleave planes states the
+    /// interleave. The EMULATOR's stagers never read this field: their executor honors the view's
+    /// own stride, so they stage the raw id — the stride realization, stated at their own call
+    /// sites as the emulator's law. ONE table, ONE law ([`crate::paged_step::staged_page_id`]):
+    /// a bundle whose gathers disagree is refused at the mint, never staged for one of them.
+    pub page_id_realization: crate::paged_step::PageIdRealization,
     /// ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, capacity)`, minted once
     /// at the bake from the rung (never a division of [`Self::rows`]) and threaded here so the
     /// card stager and the layout state the per-request laws off the ONE pair the splice already

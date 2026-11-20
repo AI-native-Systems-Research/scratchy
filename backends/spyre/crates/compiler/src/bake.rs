@@ -885,7 +885,19 @@ fn emit_superdsc_wiring(
             let zero = u32l(p.int32_zero);
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
-            let page_scale = u32l(p.page_index_scale);
+            let page_realization = match p.page_id_realization {
+                scratchy_target_spyre::paged_step::PageIdRealization::EntrySpacing(scale) => {
+                    let scale = u32l(scale);
+                    quote! {
+                        ::scratchy_target_spyre::paged_step::PageIdRealization::EntrySpacing(
+                            #scale,
+                        )
+                    }
+                }
+                scratchy_target_spyre::paged_step::PageIdRealization::ViewStride => quote! {
+                    ::scratchy_target_spyre::paged_step::PageIdRealization::ViewStride
+                },
+            };
             let (q_width, head_size) = (u32l(p.q_width), u32l(p.head_size));
             // ⭐ THE EXTENT PAIR, re-minted in the wiring's own static by the ONE mint
             // (`QueryExtent::of_baked_rung`, the same constructor the bake's codegen minted
@@ -935,7 +947,8 @@ fn emit_superdsc_wiring(
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
                     rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm, int32_zero: #zero,
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
-                    head_size: #head_size, walk: #walk, page_index_scale: #page_scale,
+                    head_size: #head_size, walk: #walk,
+                    page_id_realization: #page_realization,
                     paged_rows: #paged_rows,
                     extent: #extent,
                 })

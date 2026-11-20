@@ -1617,11 +1617,11 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         ActiveCap::FULL,
         paged_rows,
         query_rows,
-        // ⭐ THE SCALE IS A WIRING FACT, NOT A PLACEMENT ONE — this pass mints the step for its
-        // PLACEMENTS alone (the reserved tids' sizes below), which no page-id scale moves; the
-        // step that ships is [`graph_wiring`]'s, whose scale is the fold over the bundle's own
-        // lowered programs. The dense 1 here never reaches a stager.
-        1,
+        // ⭐ THE REALIZATION IS A WIRING FACT, NOT A PLACEMENT ONE — this pass mints the step for
+        // its PLACEMENTS alone (the reserved tids' sizes below), which no page-id realization
+        // moves; the step that ships is [`graph_wiring`]'s, whose realization is the card bake's
+        // own. The stride realization here never reaches a stager.
+        crate::paged_step::PageIdRealization::ViewStride,
     )? {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
@@ -4189,17 +4189,16 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
     // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
     // chunk's rows are one sequence's (the bake's `rows_are_requests`).
-    // ⭐ THE SCALE IS THE EXECUTOR'S, AND THIS GATE'S EXECUTOR IS THE EMULATOR. The view's own
-    // stride is what the emulator executes (`entry at raw id × view stride`), so the ids it stages
-    // are RAW — scale 1, the realization of the same unit-major view whose CARD realization scales
-    // the id by stride/entry because dxp spaces gather entries by their own dims. One view law,
-    // two executors, each consuming it the way it executes.
+    // ⭐ THE REALIZATION IS THE EXECUTOR'S, AND THIS GATE'S EXECUTOR IS THE EMULATOR. The view's
+    // own stride is what the emulator executes (`entry at raw id × view stride`), so this gate
+    // passes the STRIDE realization — a type, not a value — where the card bake passes the
+    // device's entry spacing. One view law, two executors, each staged the way it executes.
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         rung.active_cap,
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
         rung.query_rows,
-        1,
+        crate::paged_step::PageIdRealization::ViewStride,
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {

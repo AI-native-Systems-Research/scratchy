@@ -221,13 +221,49 @@ pub const INT32_ELEMS_PER_STICK: usize =
     <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
 
+/// ⭐ HOW THE EXECUTOR READING A STAGED PAGE ID SPACES THE GATHERED VIEW'S ENTRIES — the one
+/// fact that decides what number the table holds. Two executors, two realizations of ONE view
+/// law:
+///
+/// * [`PageIdRealization::ViewStride`] — the EMULATOR: it executes the view's own `Strides`
+///   (a gather's entry `j` at `base + stride[0] · index[j]`), so the id it reads is the RAW
+///   scheduler page — the stride already carries whatever interleave the view states.
+/// * [`PageIdRealization::EntrySpacing`] — the CARD (dxp): a gather's entries are spaced by
+///   their own dims (`id × entry size`, GatherIndexConversion — no gather-path code reads the
+///   view's `Strides`), so the id must carry the view's stride-over-entry scale itself.
+///
+/// The scale is minted once at the lowering off the programs' own `Strides`
+/// ([`ktir_superdsc::emit::whole_function::page_index_scale`]) and rides the step as the DEVICE
+/// realization ([`PagedStep::page_id_realization`] — the bake is the card's). The host/emu
+/// stagers state the stride realization at their own call sites — the emulator's law is the
+/// emulator's, never read off a card-baked field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageIdRealization {
+    /// The executor honors the gathered view's own stride: stage the RAW page id.
+    ViewStride,
+    /// The executor spaces a gather's entries by their own dims: stage the page id TIMES the
+    /// view's stride-over-entry scale.
+    EntrySpacing(u32),
+}
+
+/// ⭐ THE ONE SPELLING OF "STAGE A PAGE ID" — every stager of a page index table consumes this
+/// fn and nothing else states the multiply. A second spelling is the defect this type deleted:
+/// the card's window table staged raw ids while the host table scaled them, and every prefill
+/// page gather on the card read the null page.
+pub const fn staged_page_id(page: u32, realization: PageIdRealization) -> i32 {
+    match realization {
+        PageIdRealization::ViewStride => page as i32,
+        PageIdRealization::EntrySpacing(scale) => page as i32 * scale as i32,
+    }
+}
+
 /// The page index table: `[walk, INT32_ELEMS_PER_STICK]` int32, row `i` holding block `i`'s page at
 /// column 0 — `table[:, 0] = block_table[s, :walk]`, the block table's own zeros past the request's
-/// blocks. Each id is the SCHEDULER's page id times the bundle's
-/// [`page_index_scale`](PagedStep::page_index_scale) — the stride law of the views this bundle's
-/// page-table gathers read, minted at the lowering off the programs' own strides: a bundle whose
-/// gathered views pack densely stages the raw id, and a bundle whose units interleave planes stages
-/// the id the view's own stride names.
+/// blocks. Each id is staged by the ONE law ([`staged_page_id`]) at the HOST/EMU realization
+/// ([`PageIdRealization::ViewStride`]): this table feeds the emulator, which executes the gathered
+/// view's own stride, so its ids are the RAW scheduler pages — the interleave the view states
+/// rides in the stride the emulator honors. The card's windows stage the device realization
+/// ([`card_step_sources`]).
 pub fn page_table(
     step: &PagedStep,
     blocks: &[u32],
@@ -236,7 +272,7 @@ pub fn page_table(
     check(step, step.rows as usize, blocks, rows)?;
     let mut t = vec![0i32; step.walk as usize * INT32_ELEMS_PER_STICK];
     for (i, &page) in blocks.iter().take(step.walk as usize).enumerate() {
-        t[i * INT32_ELEMS_PER_STICK] = page as i32 * step.page_index_scale as i32;
+        t[i * INT32_ELEMS_PER_STICK] = staged_page_id(page, PageIdRealization::ViewStride);
     }
     Ok(t)
 }
@@ -689,15 +725,22 @@ pub fn card_step_sources(
     let mut int32 = Vec::with_capacity(cap * 2 + 1);
     for r in 0..cap {
         let tid = |table: u32| ktir_superdsc::reserved_tids::paged_window_tid(r as u32, table);
-        // THE PAGE INDEX TABLE — request `r`'s page ids one block per trip; an empty window's
-        // rows stay zero.
+        // THE PAGE INDEX TABLE — request `r`'s page ids one block per trip, staged by the ONE law
+        // ([`staged_page_id`]) at THIS bundle's own realization: the card's launch realizes a
+        // gathered view by ENTRY SPACING (dxp spaces entries by their own dims), so a bundle whose
+        // views interleave planes stages the id times its scale — the step's own
+        // [`PagedStep::page_id_realization`], the device realization the bake minted. A decode
+        // bundle's scale is 1 (its page id indexes the flat `kv_row_pool`, never a gather), so its
+        // windows are byte-identical to the raw id. An empty window's rows stay zero — the null
+        // page, unchanged by any scale.
         let mut table = vec![0u8; walk * trip];
         // THE MASK STACK — request `r`'s stack, or the fully-masked tile of an empty window.
         let mut mask = vec![MASKED; walk * w * slots];
         if let Some(req) = reqs.get(r) {
             for (i, &page) in req.blocks.iter().take(walk).enumerate() {
                 let at = i * trip;
-                table[at..at + 4].copy_from_slice(&(page as i32).to_le_bytes());
+                table[at..at + 4]
+                    .copy_from_slice(&staged_page_id(page, step.page_id_realization).to_le_bytes());
             }
             let scattered = card_mask(&mask_stack_of(step, w, &req.rows), &[walk * w, slots]);
             mask[..scattered.len()].copy_from_slice(&scattered);
@@ -929,7 +972,7 @@ mod tests {
             head_size: 64,
             walk: 4,
             paged_rows: PagedRows::Sequence,
-            page_index_scale: 1,
+            page_id_realization: PageIdRealization::EntrySpacing(1),
             extent: pair(3, 1),
         }
     }
@@ -1279,32 +1322,75 @@ mod tests {
     /// scheduler page id TIMES the scale; a bundle whose views pack densely stages it raw. Same
     /// step, same blocks, one field — the law the lowering minted off the views' own strides.
     #[test]
-    fn the_stager_multiplies_the_page_id_by_the_bundle_s_scale() {
+    fn one_fn_stages_a_page_id_per_realization() {
+        // THE STRIDE REALIZATION — the emulator's: it executes the view's own stride, so the id
+        // is the raw scheduler page.
+        assert_eq!(staged_page_id(2, PageIdRealization::ViewStride), 2);
+        // THE ENTRY-SPACING REALIZATION — the card's: dxp spaces a gather's entries by their own
+        // dims, so the id carries the view's stride-over-entry scale itself.
+        assert_eq!(staged_page_id(2, PageIdRealization::EntrySpacing(2)), 4);
+        assert_eq!(staged_page_id(2, PageIdRealization::EntrySpacing(1)), 2);
+        // The null page is the null page at every scale — an empty window's rows stay zero.
+        assert_eq!(staged_page_id(0, PageIdRealization::EntrySpacing(2)), 0);
+    }
+
+    /// The HOST/EMU table stages the RAW page id whatever the step's device realization states:
+    /// the emulator honors the view's own stride, so a card-baked scale must not reach it — the
+    /// realization is the executor's, never read off the step on this path.
+    #[test]
+    fn the_host_table_stages_the_raw_page_id() {
         let rows = StepRows {
             start: 5,
             real: nz(2),
         };
         let blocks = [2u32, 0];
-        // DENSE (scale 1): the raw scheduler id — the decode bundle's own shape, byte-identical
-        // to the wire before the scale existed.
-        let dense = step();
-        let col0 = |s: &crate::wiring::PagedStep| -> Vec<i32> {
-            page_table(s, &blocks, &rows)
-                .unwrap()
-                .iter()
-                .step_by(INT32_ELEMS_PER_STICK)
-                .copied()
+        let mut strided = step();
+        strided.page_id_realization = PageIdRealization::EntrySpacing(2);
+        let col0 = page_table(&strided, &blocks, &rows)
+            .unwrap()
+            .iter()
+            .step_by(INT32_ELEMS_PER_STICK)
+            .copied()
+            .collect::<Vec<i32>>();
+        assert_eq!(col0, vec![2, 0, 0, 0], "the emulator reads the raw id");
+    }
+
+    /// The CARD's window table stages the step's own device realization: a unit-major prefill
+    /// bundle (scale 2) stages the id times its scale — what dxp's entry spacing reads — while a
+    /// dense bundle (scale 1, every decode) stages the raw id, byte-identical to before.
+    #[test]
+    fn the_card_window_table_stages_the_device_realization() {
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
+        let blocks = [2u32, 0];
+        let window_col0 = |s: &PagedStep| -> Vec<i32> {
+            let card = card_step_sources(
+                s,
+                &[RequestStep {
+                    blocks: &blocks,
+                    rows,
+                }],
+            )
+            .unwrap();
+            let pitch = s.card_walk_step() as usize;
+            ints(card.words(s.page_table).unwrap())
+                .into_iter()
+                .step_by(pitch / 4)
                 .collect()
         };
-        assert_eq!(col0(&dense), vec![2, 0, 0, 0], "scale 1 stages the raw id");
-        // STRIDED (scale 2): the unit-major prefill bundle's shape — one unit holds both
-        // planes, so page `p`'s plane entry sits `p·2` entries from the plane's base.
         let mut strided = step();
-        strided.page_index_scale = 2;
+        strided.page_id_realization = PageIdRealization::EntrySpacing(2);
         assert_eq!(
-            col0(&strided),
+            window_col0(&strided),
             vec![4, 0, 0, 0],
-            "scale 2 stages the id the view's own stride names"
+            "the card's entry spacing reads the id times the view's scale"
+        );
+        assert_eq!(
+            window_col0(&step()),
+            vec![2, 0, 0, 0],
+            "a dense bundle's windows stage the raw id"
         );
     }
 
