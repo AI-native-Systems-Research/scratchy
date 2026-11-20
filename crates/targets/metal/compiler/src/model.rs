@@ -1628,12 +1628,15 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                     positions: &[u32],
                     n: usize,
                 ) -> ::core::option::Option<::std::vec::Vec<u8>> {
+                    const ROT: ::scratchy_tensors::RotDim = ::scratchy_tensors::RotDim::new(#rot_dim_lit2);
+                    const THETA: ::scratchy_tensors::RopeTheta =
+                        ::scratchy_tensors::RopeTheta::new(#rope_theta_lit);
                     ::core::option::Option::Some(
                         ::scratchy_target_metal::interpreter::metal::build_mrope_cos_sin_override(
                             positions,
                             n,
-                            #rot_dim_lit2 as usize,
-                            #rope_theta_lit,
+                            ROT,
+                            THETA,
                             [#t_lit, #h_lit, #w_lit],
                             <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.act_dtype(),
                         ),

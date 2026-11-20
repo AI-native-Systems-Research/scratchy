@@ -5,6 +5,7 @@
 //! text-token broadcast, and the row layout / dtype — all without a GPU.
 
 use scratchy_target_metal::interpreter::metal::{MetalDtype, build_mrope_cos_sin_override};
+use scratchy_tensors::{RopeTheta, RotDim};
 
 // Qwen3.5-VL text-decoder rope params (partial rotary 0.25 * head_dim 256).
 const ROT_DIM: usize = 64;
@@ -13,7 +14,9 @@ const THETA: f64 = 100_000.0;
 const SECTION: [u32; 3] = [11, 11, 10]; // T/H/W pair split (sums to HALF)
 
 fn build(positions: &[u32], n: usize) -> Vec<u8> {
-    build_mrope_cos_sin_override(positions, n, ROT_DIM, THETA, SECTION, MetalDtype::Bf16)
+    const ROT: RotDim = RotDim::new(ROT_DIM as u32);
+    const ROPE_THETA: RopeTheta = RopeTheta::new(THETA);
+    build_mrope_cos_sin_override(positions, n, ROT, ROPE_THETA, SECTION, MetalDtype::Bf16)
 }
 
 /// Each rotary pair `i` of a `[3, n]` build must equal pair `i` of a 1D
