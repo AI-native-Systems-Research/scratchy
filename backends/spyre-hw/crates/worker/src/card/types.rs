@@ -358,20 +358,17 @@ impl PrefixLadder {
 }
 
 impl SuperDscBundle {
-    /// ⭐ FUND THE POOL — the engine's `initialize_cache` door, and the ONLY mint of the
-    /// [`Funded`] token every launch takes. The decode session is the pool's owner on every
-    /// card; it funds each rank's regions at `(pages + the null page) × unit bytes` per bank,
-    /// and EVERY other session this bundle holds — the prefill ladder (anchor and rungs, each
-    /// a borrower of the pool), the decode batch rungs, the prefix-capable rungs — adopts the
-    /// owner's funded regions on its own card, pairwise per rank.
+    /// ⭐ FUND THE POOL — the engine's `initialize_cache` door. The decode session is the
+    /// pool's owner on every card; it funds each rank's regions at `(pages + the null page) ×
+    /// unit bytes` per bank, and EVERY other session this bundle holds — the prefill ladder
+    /// (anchor and rungs, each a borrower of the pool), the decode batch rungs, the
+    /// prefix-capable rungs — adopts the owner's funded regions on its own card, pairwise per
+    /// rank. The engine's own order (init_cache before the serving loop) is the contract.
     pub(crate) fn fund_kv_pool(
         &mut self,
         pages: u64,
-    ) -> scratchy_serving_worker::error::ExecutorResult<
-        scratchy_target_spyre_card::superdsc_exec::Funded,
-    > {
-        let funded = self
-            .decode
+    ) -> scratchy_serving_worker::error::ExecutorResult<()> {
+        self.decode
             .fund_kv_pool(pages)
             .map_err(|e| crate::spyre_worker::werr_chain("fund the KV pool", &e))?;
         let SuperDscBundle {
@@ -389,7 +386,7 @@ impl SuperDscBundle {
         for rung in prefill_prefix.iter_mut() {
             rung.sess.adopt_funded_kv(decode);
         }
-        Ok(funded)
+        Ok(())
     }
 
     /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1

@@ -161,11 +161,6 @@ pub(crate) struct Loaded {
     /// layer-group split — selected from the baked bundle shape.
     #[cfg(feature = "spyre-hw")]
     pub(crate) session: SendnnSession,
-    /// ⭐ THE FUNDED POOL'S TOKEN — minted by [`Worker::initialize_cache`] (the engine's own
-    /// division: its budget over the bundle's page stride, held to the programs' addressing
-    /// bound) and carried by every launch. `None` only before that door has run.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) funded: Option<scratchy_target_spyre_card::superdsc_exec::Funded>,
     /// m=1 decode program metas, one per rung, ASCENDING by reach ([`BundleMeta::reach`]). The
     /// generation loop runs the smallest rung that reaches the current position — on the emulator the
     /// page walk's rungs, so a step walks the fewest pages its context fills; never empty. The
@@ -327,31 +322,3 @@ impl SampledDraw {
 
 #[cfg(feature = "spyre-hw")]
 pub(crate) use crate::card::types::*;
-
-#[cfg(feature = "spyre-hw")]
-impl Loaded {
-    /// ⭐ THE POOL'S FUNDING, AS A LAUNCH SEES IT — the ONE place the "funded before any
-    /// forward" order is checked. Everything below this door takes `&Funded` and cannot
-    /// compile unfunded; only this edge is runtime, because `execute_model`'s signature is
-    /// the shared engine's `Worker` trait (crates/serving), fixed and model-agnostic, so the
-    /// spyre-specific token cannot ride it. The shared engine's init_cache ALWAYS precedes
-    /// the serving loop (load_model → determine_available_memory → compute_kv_blocks →
-    /// initialize_cache → execute_model, in `crates/serving/api/src/init.rs`), so the `None`
-    /// arm names a flow that cannot run, not one to handle. Typing the `Worker` lifecycle
-    /// itself — an uninitialized-worker → ready-worker transition in crates/serving — is the
-    /// follow-up that removes this edge; it is engine-wide and touches metal, and is NOT
-    /// made here.
-    pub(crate) fn funded(
-        &self,
-    ) -> scratchy_serving_worker::error::ExecutorResult<
-        scratchy_target_spyre_card::superdsc_exec::Funded,
-    > {
-        // The token is `Copy` and carries no borrow: a launch holds it beside the
-        // mutable session borrow without overlapping it.
-        self.funded.ok_or_else(|| {
-            crate::spyre_worker::werr(
-                "the KV pool was never funded — initialize_cache must run before any forward",
-            )
-        })
-    }
-}

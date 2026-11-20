@@ -389,23 +389,6 @@ pub struct KvDim(pub usize);
 /// Physical pages in the resident pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PoolPages(pub i64);
-/// ⭐ THE POOL IS FUNDED — the typestate token only [`Executor::fund_kv_pool`] mints (the
-/// engine's `initialize_cache` door, walking every session the model loaded). Every launch door
-/// takes `&Funded`, so a KV-touching forward before the engine has divided its budget into pages
-/// is a COMPILE ERROR, not a runtime refusal: the count exists only after the division, and the
-/// type says so.
-#[derive(Clone, Copy, Debug)]
-pub struct Funded {
-    /// The page count the engine funded — `initialize_cache`'s own division.
-    pages: u64,
-}
-
-impl Funded {
-    /// The funded page count (the engine's own number, read back for its logs).
-    pub fn pages(&self) -> u64 {
-        self.pages
-    }
-}
 /// An ABSOLUTE sequence position — how many positions are already resident for this forward.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SeqPos(pub i64);
@@ -3075,7 +3058,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 // `(pages + the null page) × unit bytes` — is the ENGINE's division, and only
                 // [`Self::fund_kv_pool`] knows the page count. Until then the segment is a
                 // placeholder exactly like a borrowed one: the address exists, the region does
-                // not, and no launch can run (launches take the [`Funded`] token funding mints).
+                // not, and the engine's own order (init_cache before the serving loop) is what
+                // keeps every launch behind the funding.
                 128
             } else if self.segment_bytes[i] > 0 {
                 self.segment_bytes[i]
@@ -6407,14 +6391,15 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// Only the pool's OWNER funds: a borrower ([`Self::adopt_funded_kv`]) takes these regions.
     /// Both bank 0 (`seg_addr[SEG_KV]`) and every extra bank are allocated, zero-filled by the
     /// device's own walk, and repointed; the 128 B placeholders prepare left behind are dropped.
+    /// The engine's own order — init_cache before the serving loop — is the contract, as it is
+    /// for every backend.
     ///
     /// # Errors
     /// A region alloc or the zero walk.
-    pub fn fund_kv_pool(&mut self, pages: u64) -> Result<Funded> {
+    pub fn fund_kv_pool(&mut self, pages: u64) -> Result<()> {
         if self.kv_bank_unit_bytes.is_empty() {
-            // This bundle carries no KV pools (stateless); nothing to fund, and the token still
-            // mints so the caller's shape never branches on the bundle.
-            return Ok(Funded { pages });
+            // This bundle carries no KV pools (stateless); nothing to fund.
+            return Ok(());
         }
         if self.seg_borrowed[SEG_KV.get()] {
             bail!("fund_kv_pool: this session BORROWS the pool — only the owner funds it");
@@ -6444,7 +6429,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             (null_plus * self.kv_bank_unit_bytes[0]).max(128),
             self.kv_bank_addr.len()
         );
-        Ok(Funded { pages })
+        Ok(())
     }
 
     /// A borrower's half of [`Executor::fund_kv_pool`]: take the owner's funded regions, both

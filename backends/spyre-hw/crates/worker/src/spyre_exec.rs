@@ -108,21 +108,21 @@ impl Worker for SpyreWorker {
         // stride and held the count to the programs' addressing bound; this door is where that
         // count becomes device regions: every layer's pool bank at `(pages + the null page) ×
         // its unit bytes`, zero-filled, on every card, with every ladder rung adopting the
-        // owner's regions. The token it mints rides every launch from here on.
+        // owner's regions. The engine's own order — init_cache before the serving loop — is
+        // the contract, as it is for every backend.
         #[cfg(feature = "spyre-hw")]
         {
             let Some(loaded) = self.model.as_mut() else {
                 return Err(werr("initialize_cache: no model is loaded"));
             };
-            let funded = match &mut loaded.session {
+            match &mut loaded.session {
                 SendnnSession::SuperDsc(sb) => sb.fund_kv_pool(num_gpu_blocks as u64)?,
-            };
+            }
             tracing::info!(
                 "[spyre-worker] KV pool funded at {num_gpu_blocks} page(s) — every layer's bank \
                  allocated at (pages + the null page) × unit bytes and zero-filled; the ladder's \
                  rungs adopted the owner's regions"
             );
-            loaded.funded = Some(funded);
         }
         #[cfg(not(feature = "spyre-hw"))]
         let _ = num_gpu_blocks;
@@ -463,19 +463,10 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
-                // Hoisted above the session borrow: the token is read once, before
-                // `sb` holds the model.
-                let funded = model.funded()?;
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
-                let picks = superdsc_forward_packed(
-                    &sh,
-                    &mut sb.prefill_prefix,
-                    rung,
-                    group,
-                    input_batch,
-                    &funded,
-                )?;
+                let picks =
+                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
                 for (t, pick) in group.iter().zip(picks) {
                     order.push(t.id.clone());
                     sampled.push(pick);
@@ -633,8 +624,6 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
-                // The token rides beside the shared facts, above the session borrow.
-                let funded = model.funded()?;
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let DecodeSeat { seqs, sess } = sb.decode_seat(ri);
                 tracing::debug!(
@@ -717,7 +706,6 @@ impl Worker for SpyreWorker {
                         want_logits: LogitsWanted::PerRequestDeferred,
                         laws: SeatLaws::Batch { draws: &draws },
                     },
-                    &funded,
                 )? {
                     BatchOut::Deferred(sub) => sub,
                     BatchOut::Done(_) => {

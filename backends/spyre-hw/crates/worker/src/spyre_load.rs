@@ -3195,8 +3195,6 @@ impl SpyreWorker {
             hidden,
             vocab,
             session,
-            #[cfg(feature = "spyre-hw")]
-            funded: None,
             decode,
             prefill,
             batched_prefill,
