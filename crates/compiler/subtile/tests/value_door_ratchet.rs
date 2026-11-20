@@ -39,6 +39,7 @@ const ROOTS: &[&str] = &[
     "crates/targets",
     "backends/spyre/crates",
     "backends/spyre-hw/crates",
+    "backends/cuda/crates",
 ];
 
 /// The directories whose files are not library code.

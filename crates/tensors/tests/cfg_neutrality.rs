@@ -1,6 +1,5 @@
 //! Architectural guard: target-specific `cfg` gates (any target under `crates/targets/` or
-//! `backends/`, or the removed `cuda`) are a code smell this workspace forbids outside of dedicated
-//! test code.
+//! `backends/`) are a code smell this workspace forbids outside of dedicated test code.
 //!
 //! Principle, not a file list: a backend is selected by which target crate the
 //! binary links (unconditional `dep:` + a feature on the *binary*), and dispatch
@@ -45,10 +44,10 @@ fn has_word(hay: &str, needle: &str) -> bool {
 const TARGET_HOMES: &[&str] = &["crates/targets", "backends"];
 
 /// The targets' names: each directory under a [`TARGET_HOMES`] entry, read off the tree so a new
-/// target is checked without a word here, and the removed CUDA backend's, so it does not creep
-/// back. A home that is gone fails here, rather than its targets silently leaving the check.
+/// target is checked without a word here. A home that is gone fails here, rather than its targets
+/// silently leaving the check.
 fn target_names() -> Vec<String> {
-    let mut names = vec!["cuda".to_string()];
+    let mut names = Vec::new();
     for home in TARGET_HOMES {
         let dir = workspace_root().join(home);
         let entries = fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));

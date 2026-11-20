@@ -1,0 +1,64 @@
+vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs.
+Briefly describe the major milestones in the development of artificial intelligence from 1950 to 2020.
+Compare and contrast artificial intelligence with human intelligence in terms of processing information.
+Describe the basic components of a neural network and how it can be trained.
+Write a short story about a robot that dreams for the first time.
+Analyze the impact of the COVID-19 pandemic on global economic structures and future business models.
+Explain the cultural significance of the Mona Lisa painting, and how its perception might vary in Western versus Eastern societies.
+Translate the following English sentence into Japanese, French, and Swahili: 'The early bird catches the worm.'
+What is the difference between a list and a tuple in Python? Give one example of when to use each.
+Write a Python function that returns the n-th Fibonacci number iteratively, and explain its time complexity.
+Explain what a race condition is and how a mutex prevents it.
+What does the SQL statement SELECT name FROM users WHERE age > 30 ORDER BY name do?
+Write a bash one-liner that counts the lines of every .txt file in the current directory.
+Explain the difference between TCP and UDP, with one use case for each.
+What is 17 multiplied by 23? Show your working.
+A train leaves at 9:40 and arrives at 13:15. How long is the journey?
+If a shirt costs 40 dollars after a 20 percent discount, what was its original price?
+Solve for x: 3x + 7 = 25.
+What is the sum of the interior angles of a hexagon?
+Explain why the square root of 2 is irrational.
+Summarize the causes of the French Revolution in three sentences.
+Who was Ada Lovelace, and why is she remembered?
+Explain how photosynthesis works, in simple terms.
+Why is the sky blue?
+What causes the seasons on Earth?
+Describe the water cycle.
+What is the difference between weather and climate?
+Explain how vaccines train the immune system.
+What are the main differences between mitosis and meiosis?
+Explain the theory of plate tectonics.
+What is inflation, and how do central banks try to control it?
+Explain the concept of opportunity cost with an everyday example.
+Give three tips for writing a clear email to a busy colleague.
+Write a haiku about autumn rain.
+Write a limerick about a cat who learns to code.
+Write the opening paragraph of a mystery novel set in a lighthouse.
+Describe a sunrise over the ocean in vivid language.
+Write a polite message declining a meeting invitation.
+Rewrite this sentence in the passive voice: The committee approved the new budget.
+Correct the grammar in this sentence: Me and him goes to the store yesterday.
+Give a synonym and an antonym for the word "generous".
+Explain the meaning of the idiom "to bite off more than you can chew".
+Translate "Where is the train station?" into Spanish, German and Italian.
+What is the capital of Australia, and why is it not Sydney?
+List the planets of the solar system in order from the Sun.
+What is the tallest mountain in Africa?
+Name three works by William Shakespeare and say what each is about in one sentence.
+Explain the rules of chess for how a knight moves.
+What is the difference between a virus and a bacterium?
+How does a refrigerator keep food cold?
+Explain how a binary search works and when it can be used.
+What is the difference between machine learning and traditional programming?
+Explain what a hash table is and why lookups are fast on average.
+What is recursion? Give a simple example.
+Explain the difference between latency and throughput.
+Describe how a web browser loads a page after you type a URL.
+What are the benefits and risks of nuclear power?
+Give a short argument for and against working from home.
+Plan a simple three-day itinerary for a first visit to Paris.
+Suggest a healthy breakfast and explain why it is healthy.
+How should a beginner start learning to play the guitar?
+Explain the difference between "affect" and "effect".
+What is the Pythagorean theorem, and how is it used?
+Describe the life cycle of a butterfly.

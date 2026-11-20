@@ -33,6 +33,7 @@ pub mod config;
 pub use config::{Scope, selected_config_paths, total_models_emitted};
 pub mod emit;
 pub mod fuf;
+pub mod handoff;
 pub mod interpreter_codegen;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
 pub mod quantization;

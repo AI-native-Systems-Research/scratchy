@@ -486,6 +486,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                     std::num::NonZeroU32::new(8192).unwrap(),
                 ),
                 wp.num_tokens as u32,
+                scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
@@ -758,6 +759,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             &bridge_model,
             prefix,
             m as u32,
+            scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
