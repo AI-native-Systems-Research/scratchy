@@ -389,6 +389,23 @@ pub struct KvDim(pub usize);
 /// Physical pages in the resident pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PoolPages(pub i64);
+/// ⭐ THE POOL IS FUNDED — the typestate token only [`Executor::fund_kv_pool`] mints (the
+/// engine's `initialize_cache` door, walking every session the model loaded). Every launch door
+/// takes `&Funded`, so a KV-touching forward before the engine has divided its budget into pages
+/// is a COMPILE ERROR, not a runtime refusal: the count exists only after the division, and the
+/// type says so.
+#[derive(Clone, Copy, Debug)]
+pub struct Funded {
+    /// The page count the engine funded — `initialize_cache`'s own division.
+    pages: u64,
+}
+
+impl Funded {
+    /// The funded page count (the engine's own number, read back for its logs).
+    pub fn pages(&self) -> u64 {
+        self.pages
+    }
+}
 /// An ABSOLUTE sequence position — how many positions are already resident for this forward.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SeqPos(pub i64);
@@ -1259,13 +1276,20 @@ pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     /// by segment.
     weight_bank_aliased: Vec<bool>,
     /// ⭐ THE KV SEGMENT'S EXTRA BANKS' REGIONS — one per layer past bank 0, index `b - 1`
-    /// ([`KvBank::extra`]); bank 0 IS `seg_addr[SEG_KV]`. Filled once: by [`Self::prepare`] for the
-    /// pool's owner, by [`Self::alias_seg_from`] with the owner's own regions for a borrower (a
-    /// session borrows the whole pool or none of it — `seg_borrowed[SEG_KV]`). The pools hold no
-    /// host bytes, so a bank is a region to zero-fill or alias, never to stage.
+    /// ([`KvBank::extra`]); bank 0 IS `seg_addr[SEG_KV]`. Both hold 128 B placeholders out of
+    /// [`Self::prepare`] (the pool is not yet funded there); [`Self::fund_kv_pool`] allocates the
+    /// owner's real regions at `(pages + the null page) × unit bytes` and every borrower adopts
+    /// them (a session borrows the whole pool or none of it — `seg_borrowed[SEG_KV]`). The pools
+    /// hold no host bytes, so a bank is a region to zero-fill or adopt, never to stage.
     kv_bank_addr: Vec<DevAddr>,
-    /// The bundle's KV bank extents ([`bundle::BundleLayout::kv_bank_bytes`]).
+    /// The bundle's KV bank extents ([`bundle::BundleLayout::kv_bank_bytes`]) — the pool's
+    /// ADDRESSING BOUND per bank, not its funded size.
     kv_bank_bytes: &'static [u64],
+    /// The pool's per-bank UNIT bytes ([`bundle::BundleLayout::kv_bank_unit_bytes`]) — bank 0
+    /// first, one entry per bank. The funded extent of bank `b` is `(pages + 1) × unit[b]`, and
+    /// the page stride the engine divides the budget by is their sum
+    /// ([`bundle::BundleLayout::kv_block_bytes`]).
+    kv_bank_unit_bytes: &'static [u64],
     /// One slot's host side (see [`HostShadow`]): a real staging/mirror buffer, or the typed
     /// statement that the slot is device-only. Sized by [`Executor::stage_weights`] from the
     /// bundle's own role statement (see [`Executor::host_owned_seg`]).
@@ -1713,6 +1737,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
             kv_bank_addr: Vec::new(),
             kv_bank_bytes: &code.layout.kv_bank_bytes,
+            kv_bank_unit_bytes: &code.layout.kv_bank_unit_bytes,
             seg_host: [const { HostShadow::Host(HostBuf::empty()) }; NUM_SEGMENTS],
             read_ring: Vec::new(),
             read_ring_free: Vec::new(),
@@ -3044,6 +3069,14 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 // replaces this address with the owner's region, so allocating the full extent
                 // would reserve device memory only to drop it immediately.
                 128
+            } else if i == SEG_KV.get() && !self.kv_bank_unit_bytes.is_empty() {
+                // ⭐ THE KV POOL IS NOT FUNDED HERE. `segment_bytes[SEG_KV]` is the pool's
+                // ADDRESSING BOUND (a whole 16 GiB region per bank); the funded extent —
+                // `(pages + the null page) × unit bytes` — is the ENGINE's division, and only
+                // [`Self::fund_kv_pool`] knows the page count. Until then the segment is a
+                // placeholder exactly like a borrowed one: the address exists, the region does
+                // not, and no launch can run (launches take the [`Funded`] token funding mints).
+                128
             } else if self.segment_bytes[i] > 0 {
                 self.segment_bytes[i]
             } else {
@@ -3077,21 +3110,22 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 })?,
             );
         }
-        // ⭐ AND ONE REGION PER LAYER PAST BANK 0 — each layer's KV pools are their own allocation
-        // (`place_kv_pools`). A borrowing session takes the owner's regions at
-        // [`Self::alias_seg_from`] and allocates none.
-        if !self.seg_borrowed[SEG_KV.get()] {
-            self.kv_bank_addr = self
-                .kv_bank_bytes
-                .iter()
-                .enumerate()
-                .map(|(b, &bytes)| {
-                    DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
-                        anyhow!("prepare: KV bank {} alloc of {bytes} B failed: {e}", b + 1)
-                    })
+        // ⭐ AND ONE PLACEHOLDER PER LAYER PAST BANK 0 — each layer's KV pools are their own
+        // region (`place_kv_pools`), but like bank 0 they are NOT FUNDED HERE: `kv_bank_bytes`
+        // is the bank's ADDRESSING BOUND, and the funded extent is the engine's division.
+        // [`Self::fund_kv_pool`] allocates the owner's real regions; a borrower adopts the
+        // owner's. The placeholder keeps the address existing for the same reason a borrowed
+        // segment's does.
+        self.kv_bank_addr = self
+            .kv_bank_bytes
+            .iter()
+            .enumerate()
+            .map(|(b, _)| {
+                DevAddr::alloc(self.card, ByteSize(128), MemoryType::Tensor).map_err(|e| {
+                    anyhow!("prepare: KV bank {} placeholder alloc failed: {e}", b + 1)
                 })
-                .collect::<Result<_>>()?;
-        }
+            })
+            .collect::<Result<_>>()?;
         lap("seg-alloc", &mut t0);
         // ⭐ THE REGION BASES, ONCE PER SESSION. A card HMI fault names a device address; these
         // lines are what turns that address into "which segment/bank, which offset" — chunk0's
@@ -3232,19 +3266,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 )?;
             }
         }
-        // ⭐ AND EVERY LAYER'S KV REGION IS BORN ZEROS, like seg2 itself, by the device's own fill.
-        // A borrowed pool is the owner's, already filled and holding live KV; a reserve-only
-        // session is about to be aliased — the same pass the segment loop gives seg2.
-        if !self.seg_borrowed[SEG_KV.get()] && !reserve_only {
-            let stream = self.stream_ref()?;
-            for (b, addr) in self.kv_bank_addr.iter().enumerate() {
-                fill_zero_walk(
-                    stream,
-                    addr,
-                    &format!("prepare: KV bank {} zero fill", b + 1),
-                )?;
-            }
-        }
+        // ⭐ THE KV POOL'S ZERO FILL IS GONE FROM HERE — it belongs to the funding
+        // ([`Self::fund_kv_pool`]): the pool's regions do not exist until the engine has
+        // divided its budget into pages, so there is nothing here to fill. A reserve-only
+        // session is about to be aliased and a borrowed one already reads the owner's.
         lap("tensor-h2d", &mut t0);
         self.stream_ref()?
             .synchronize()
@@ -6368,6 +6393,68 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             self.kv_bank_addr = owner.kv_bank_addr.clone();
         }
         Ok(())
+    }
+
+    /// ⭐ FUND THE KV POOL — the one door that turns the pool's placeholders into regions.
+    ///
+    /// The engine owns the page count end to end: it divided its budget
+    /// (`determine_available_memory`) by the stride (`kv_block_bytes`, the sum of this bundle's
+    /// per-bank unit bytes) and capped it at the programs' addressing bound, and THAT count is the
+    /// `pages` handed here. The funded extent of bank `b` is `(pages + the null page) ×
+    /// kv_bank_unit_bytes[b]` — the null page is page 0, the one every pre-attention slot reads so
+    /// an unfilled row gathers zeros, exactly as the bound-sized pool always had it.
+    ///
+    /// Only the pool's OWNER funds: a borrower ([`Self::adopt_funded_kv`]) takes these regions.
+    /// Both bank 0 (`seg_addr[SEG_KV]`) and every extra bank are allocated, zero-filled by the
+    /// device's own walk, and repointed; the 128 B placeholders prepare left behind are dropped.
+    ///
+    /// # Errors
+    /// A region alloc or the zero walk.
+    pub fn fund_kv_pool(&mut self, pages: u64) -> Result<Funded> {
+        if self.kv_bank_unit_bytes.is_empty() {
+            // This bundle carries no KV pools (stateless); nothing to fund, and the token still
+            // mints so the caller's shape never branches on the bundle.
+            return Ok(Funded { pages });
+        }
+        if self.seg_borrowed[SEG_KV.get()] {
+            bail!("fund_kv_pool: this session BORROWS the pool — only the owner funds it");
+        }
+        let null_plus = pages + 1;
+        let mut funded: Vec<DevAddr> = Vec::with_capacity(self.kv_bank_unit_bytes.len());
+        for (b, &unit) in self.kv_bank_unit_bytes.iter().enumerate() {
+            let bytes = null_plus * unit;
+            let addr =
+                DevAddr::alloc(self.card, ByteSize(bytes.max(128)), MemoryType::Tensor).map_err(
+                    |e| anyhow!("fund_kv_pool: bank {b} alloc of {bytes} B failed: {e}"),
+                )?;
+            fill_zero_walk(
+                self.stream_ref()?,
+                &addr,
+                &format!("fund_kv_pool: KV bank {b} zero fill ({bytes} B)"),
+            )?;
+            funded.push(addr);
+        }
+        // Bank 0 IS the KV segment; the rest are the extra banks, index `b - 1`.
+        let extra = funded.split_off(1);
+        self.seg_addr[SEG_KV.get()] = Some(funded.pop().expect("unit list is non-empty"));
+        self.kv_bank_addr = extra;
+        debug!(
+            "[sdsc-superdsc] fund_kv_pool: {pages} page(s) + the null page — bank0 {} B, {} extra \
+             bank(s)",
+            (null_plus * self.kv_bank_unit_bytes[0]).max(128),
+            self.kv_bank_addr.len()
+        );
+        Ok(Funded { pages })
+    }
+
+    /// A borrower's half of [`Executor::fund_kv_pool`]: take the owner's funded regions, both
+    /// bank 0 and every extra bank, exactly as [`Self::alias_seg_from`] took its placeholders.
+    /// The placement equality that door proved covers the pool: every bundle of the model places
+    /// its pools through the one `place_kv_pools`, so the owner's funded regions are this
+    /// bundle's.
+    pub fn adopt_funded_kv(&mut self, owner: &Executor<'a, '_, T>) {
+        self.seg_addr[SEG_KV.get()] = owner.seg_addr[SEG_KV.get()].clone();
+        self.kv_bank_addr = owner.kv_bank_addr.clone();
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────

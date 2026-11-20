@@ -103,6 +103,28 @@ impl Worker for SpyreWorker {
         num_gpu_blocks: usize,
         _num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
+        // ⭐ THE ENGINE'S DIVISION, SPENT HERE — and nowhere else. The engine divided its budget
+        // (`determine_available_memory`, the census's funded-remainder) by the bundle's page
+        // stride and held the count to the programs' addressing bound; this door is where that
+        // count becomes device regions: every layer's pool bank at `(pages + the null page) ×
+        // its unit bytes`, zero-filled, on every card, with every ladder rung adopting the
+        // owner's regions. The token it mints rides every launch from here on.
+        #[cfg(feature = "spyre-hw")]
+        {
+            let Some(loaded) = self.model.as_mut() else {
+                return Err(werr("initialize_cache: no model is loaded"));
+            };
+            let funded = match &mut loaded.session {
+                SendnnSession::SuperDsc(sb) => sb.fund_kv_pool(num_gpu_blocks as u64)?,
+            };
+            info!(
+                "[spyre-worker] KV pool funded at {num_gpu_blocks} page(s) — every layer's bank \
+                 allocated at (pages + the null page) × unit bytes and zero-filled; the ladder's \
+                 rungs adopted the owner's regions"
+            );
+            self.funded = Some(funded);
+        }
+        #[cfg(not(feature = "spyre-hw"))]
         let _ = num_gpu_blocks;
         Ok(())
     }

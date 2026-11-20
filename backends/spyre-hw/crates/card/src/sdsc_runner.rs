@@ -556,6 +556,27 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         self.each(|e| e.prepare()).map(drop)
     }
 
+    /// ⭐ FUND THE POOL — the engine's `initialize_cache` door, and the ONLY mint of the
+    /// [`crate::superdsc_exec::Funded`] token every launch takes. The engine computed `pages`
+    /// itself (its budget divided by the bundle's page stride, capped at the programs' addressing
+    /// bound); this session's ranks are each their card's owner, so each funds its own card's
+    /// regions at `(pages + the null page) × unit bytes` per bank and every borrower rung adopts
+    /// them ([`Self::adopt_funded_kv`]) right after.
+    pub fn fund_kv_pool(&mut self, pages: u64) -> Result<crate::superdsc_exec::Funded> {
+        let mut funded = self.each_parallel("FundKv", |e| e.fund_kv_pool(pages))?;
+        Ok(funded.swap_remove(0))
+    }
+
+    /// A borrower's half of [`Self::fund_kv_pool`]: every rank takes the owner's funded regions —
+    /// bank 0 and every extra bank — pairwise per card. The placement equality
+    /// [`Executor::alias_seg_from`] already proved covers the pool.
+    pub fn adopt_funded_kv(&mut self, owner: &SuperDscSession<'a, 'c, T>) {
+        self.ranks
+            .iter_mut()
+            .zip(owner.ranks.iter())
+            .for_each(|((_, e), (_, o))| e.adopt_funded_kv(o));
+    }
+
     /// ⭐ RANK 0 — the card whose readback a step returns. In a sharded world every value the host
     /// reads (the picked token, the logits row) is replicated across the ranks — the forward ends in
     /// the whole hidden state on every rank, so each rank's suffix computes the same row — so one
