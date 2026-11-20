@@ -2165,10 +2165,8 @@ fn reroll_tokens(
 
 // The emu's ONE width is LX-derived per model (`emu_prefill_lx_width`
 // below): the widest ladder rung whose fp8 gemms' INTRA-NODE tiles fit a
-// core's 2 MiB LX. This constant is the COLLISION-FREE CEILING on that
-// derivation — the largest width the emu will ever bake. 31 is prime +
-// ≤32 (LX-safe) + collides with no common dim (head_dim 64/128, half
-// 32/64, n_heads, hidden, intermediate, block_size 64). Read by
+// core's 2 MiB LX. This constant is the upper bound on that derivation —
+// the largest width the emu will ever bake. Read by
 // dump_wavefront_mega and its pinned test.
 const PREFILL_LX_SAFE: u32 = 31;
 
@@ -2178,9 +2176,7 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// m=31 → 69 ms ⇒ ~42 ms + ~0.7 ms/row), so one width is wrong both ways — too narrow re-pays
 /// the fixed term on every extra chunk, too wide computes padding rows that carry no tokens.
 ///
-/// The prefill tape is CONCRETE, so a rung may equal a structural model dim (128 is
-/// granite-8b's head_dim). The low rungs are `2^k − 1` and collide with none of the
-/// power-of-two dims (head_dim, block_size, cap, hidden, intermediate).
+/// The prefill tape is CONCRETE, so a rung may equal a structural model dim.
 ///
 /// The 63-row ceiling is GONE (2026-07-29): the new-token block is now folded as `mq_pad/64`
 /// stick-wide sub-blocks, so a chunk may span more than one stick. 96 is HARDWARE-PROVEN.
@@ -2256,6 +2252,17 @@ const PREFILL_RUNGS: [u32; 27] = [
 /// The widest rung a SUB-BLOCKED causal block is baked at (see [`PREFILL_RUNGS`]). Read by the
 /// ladder in `dump_wavefront_mega`.
 const SUB_BLOCKED_PREFILL_CEILING: u32 = 128;
+
+/// ⭐ SOLO DECODE IS ONE ROW — the worker's fast per-token path bakes the decode tape at one row
+/// (one request's one token); wider row counts are batch-ladder rungs, addressed by fingerprint,
+/// never through the solo wiring. ONE named constant at every site that states the count, and
+/// ONE predicate for every guard that tests for it.
+const SOLO_DECODE_ROWS: u32 = 1;
+
+/// The one predicate for "this bake is the solo decode" (see [`SOLO_DECODE_ROWS`]).
+fn is_solo_decode(rows: u32) -> bool {
+    rows == SOLO_DECODE_ROWS
+}
 
 // ⛔ THE POOL SIZES ITS SLACK FROM THIS CEILING, so the two cannot be allowed to drift.
 //
@@ -2580,7 +2587,7 @@ pub(crate) fn dump_wavefront_mega(
             decode_bounds,
             &bridge,
             scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
-            1,
+            SOLO_DECODE_ROWS,
         )
     };
     let first = lower_at(prefix_len);
@@ -4146,7 +4153,7 @@ pub(crate) fn dump_wavefront_mega(
                                             }
                                             // The one-request bundle stays THE decode bundle for
                                             // every path that predates the ladder.
-                                            if decode_rows <= 1 {
+                                            if is_solo_decode(decode_rows) {
                                                 fx.push(BakeEffect::DecodeFp(bfp));
                                             }
                                         }
@@ -4229,7 +4236,7 @@ pub(crate) fn dump_wavefront_mega(
                     //
                     // ⛔ AND THE DECODE SLOT TAKES THE CONCRETE, SINGLE-REQUEST GRAPH ONLY. There is
                     // one slot but several non-prefill emissions, so a plain `else` is last-write-
-                    // wins. `decode_rows == 1` keeps a wider batch-ladder rung out: a rung is the
+                    // wins. `is_solo_decode` keeps a wider batch-ladder rung out: a rung is the
                     // same tape baked at B rows and is addressed by FINGERPRINT, not through this
                     // wiring.
                     // ⛔ AND A PREFILL WIRING SHIPS ONLY FOR A PREFILL THAT BAKED. The
@@ -4240,7 +4247,7 @@ pub(crate) fn dump_wavefront_mega(
                     // measured consequence. A rung that did not bake stamps NEITHER
                     // slot: falling through to the decode arm would ship the m=31
                     // prefill wiring as the DECODE wiring (the prefill rung call passes
-                    // `decode_rows == 1`), overwriting the real decode wiring after the fact
+                    // `is_solo_decode`), overwriting the real decode wiring after the fact
                     // and poisoning every step's staging (MEASURED: V7b tiny8 — the
                     // same ten PROBE11 clobbers, now routed through the decode slot).
                     // Stamped per call, so a failed WIDER rung cannot overwrite a
@@ -4262,7 +4269,7 @@ pub(crate) fn dump_wavefront_mega(
                         } else {
                             prefill_fp_stamped.then_some(WiringSlot::Prefill)
                         }
-                    } else if decode_rows == 1 {
+                    } else if is_solo_decode(decode_rows) {
                         Some(WiringSlot::Decode)
                     } else {
                         None
@@ -4444,7 +4451,7 @@ pub(crate) fn dump_wavefront_mega(
             None, // decode path (Store + PagedAttnCompute) -- no prefill width
             1,    // no prefill rung: no packed count to state
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-            1,
+            SOLO_DECODE_ROWS,
         );
 
         // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
@@ -4556,7 +4563,7 @@ pub(crate) fn dump_wavefront_mega(
                 None,
                 1,
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                1,
+                SOLO_DECODE_ROWS,
                 Some(&sf.sources),
             );
             commit_bake(&sharded_world, &tp_lwd, fx);
@@ -4723,9 +4730,7 @@ pub(crate) fn dump_wavefront_mega(
         // equal to the 256-row build's.
         //
         // The EMU bakes ONE width instead (no `spyre-lower`): the LX-derived width from
-        // the model's own fp8 gemms (`emu_prefill_lx_width`, module level) — the old
-        // constant `prefix_len.min(PREFILL_LX_SAFE)` refused ~40 s into gemma-4-12b's
-        // first chat (rung 31's fp8 epilogue needs 2,887,680 B against a 2 MiB core).
+        // the model's own fp8 gemms (`emu_prefill_lx_width`, module level).
         let prefill_m: u32 = if cfg!(feature = "spyre-lower") {
             admitted_ceiling
         } else {
