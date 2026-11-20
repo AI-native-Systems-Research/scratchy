@@ -232,7 +232,7 @@ pub const INT32_ELEMS_PER_STICK: usize =
 ///   their own dims (`id × entry size`, GatherIndexConversion — no gather-path code reads the
 ///   view's `Strides`), so the id must carry the view's stride-over-entry scale itself.
 ///
-/// The scale is minted once at the lowering off the programs' own `Strides`
+/// The scale is minted once at the lowering off the programs' own page-table readers
 /// ([`ktir_superdsc::emit::whole_function::page_index_scale`]) and rides the step as the DEVICE
 /// realization ([`PagedStep::page_id_realization`] — the bake is the card's). The host/emu
 /// stagers state the stride realization at their own call sites — the emulator's law is the

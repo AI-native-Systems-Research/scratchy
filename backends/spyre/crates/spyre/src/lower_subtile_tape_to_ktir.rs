@@ -1739,13 +1739,14 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // One program's binding order, the `(mask tid, capacity)` it reads when it reads one, the
     // ARRANGEMENT FACTS its propagation marked — the staggered parameters this program's
     // consumers must stage already permuted (empty for every program with no staggered
-    // convert; a decoder layer contributes nothing) — and the program's PAGE-ID SCALE (1 when
-    // no gather of its reads the page table; the fold below demands the non-1 answers agree).
+    // convert; a decoder layer contributes nothing) — and the program's PAGE-ID SCALE
+    // (`None` when no op of its reads the page table; the fold below demands the stated
+    // answers agree and that SOME program reads the table).
     type WiredProgram = (
         NodeArgs,
         Option<(u32, u32)>,
         Vec<(u32, ktir_superdsc::element_arrangement::ElementArrangement)>,
-        u32,
+        Option<u32>,
     );
     let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
         use rayon::prelude::*;
@@ -1788,22 +1789,43 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     .into_iter()
                     .collect::<Vec<_>>();
                     // ⭐ THE PAGE-ID SCALE off the SAME lowered program — the one derivation
-                    // (the program's own view strides), read here so the wiring's staged page
-                    // ids and the emitted gather descriptors cannot disagree about the layout
-                    // they address.
+                    // (every reader of the page table, each by its consumer view), read here
+                    // so the wiring's staged page ids and the emitted gather descriptors
+                    // cannot disagree about the layout they address. ⛔ ASKED ONLY OF A
+                    // PROGRAM THAT BINDS THE TABLE: a paged program that binds the page table
+                    // yet reads it nowhere — neither gathered through nor chained — is a
+                    // page id nothing stages a law for, and it is a bake error naming the
+                    // program, never a silent default of 1. A program that does not bind the
+                    // table (every non-attention op, the KV write) states no fact: `None`,
+                    // which the FOLD below passes over.
                     // ⭐ A WALKING program states its page gathers in the walk's body, which only
                     // [`loop_fold::flatten`] — the same statement the whole-function door lowers —
                     // states inline: the scale is read off that FLAT node, the one form both doors
                     // share. A program with no walk flattens to itself, so every dense program
                     // reads identically.
-                    let flat = ktir_superdsc::emit::loop_fold::flatten(&k)
-                        .map_err(|e| SuperDscError(e.message))?;
-                    let flat_k = flat.as_ref().map(|f| &f.node).unwrap_or(&k);
-                    let scale = ktir_superdsc::emit::whole_function::page_index_scale(
-                        flat_k,
-                        scratchy_triton_splice::PagedStepTids::RESERVED.page_table,
-                    )
-                    .map_err(|e| SuperDscError(e.message))?;
+                    let page_table_tid = scratchy_triton_splice::PagedStepTids::RESERVED.page_table;
+                    let scale = if k.bindings.iter().any(|b| b.get() == page_table_tid) {
+                        let flat = ktir_superdsc::emit::loop_fold::flatten(&k)
+                            .map_err(|e| SuperDscError(e.message))?;
+                        let flat_k = flat.as_ref().map(|f| &f.node).unwrap_or(&k);
+                        match ktir_superdsc::emit::whole_function::page_index_scale(
+                            flat_k,
+                            page_table_tid,
+                        ) {
+                            Ok(Some(s)) => Some(s),
+                            Ok(None) => {
+                                return Err(SuperDscError(format!(
+                                    "the program {} binds the page table t{page_table_tid} but \
+                                     reads it nowhere — neither gathered through nor chained — so \
+                                     no law stages its page ids",
+                                    k.func.name
+                                )));
+                            }
+                            Err(e) => return Err(SuperDscError(e.message)),
+                        }
+                    } else {
+                        None
+                    };
                     let mask = match k.mask {
                         // ⭐ THE CAPACITY IS THE K POOL's: the paged walk's parameters are `[q, out,
                         // k pool, v pool, page table, mask]`, and the K pool is the layer's K cache
@@ -1845,26 +1867,28 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect()
     };
     // ⭐ THE PAGE-ID SCALE, folded over the SAME lowered programs the bake emits — the one
-    // derivation ([`ktir_superdsc::emit::whole_function::page_index_scale`], which reads each
-    // program's own view strides), consumed here and never restated: a bundle's page table is
-    // ONE table, so every program that gathers through it must state the SAME scale, and a
+    // derivation ([`ktir_superdsc::emit::whole_function::page_index_scale`], which reads every
+    // reader of the page table, each by its consumer view), consumed here and never restated:
+    // a bundle's page table is ONE table, so every program that reads it — a gather through
+    // it, or a chained run whose position comes out of it — must state the SAME scale, and a
     // disagreement between PROGRAMS is the same defect as one within a program — refused by
-    // name, never staged for one of them. Programs with no gather through the page table state
-    // 1 (their page ids reach only tables staged in page units by their own laws), so the fold
-    // is over the non-1 answers alone.
-    let mut page_index_scale: u32 = 1;
-    {
+    // name, never staged for one of them. ⛔ THE TABLE MUST BE READ — that law is stated once,
+    // at the call site above: a program that binds the page table and reads it nowhere is a
+    // bake error there, naming the program. An EMPTY fold is therefore not an unread table —
+    // it is a bundle no program of which binds one (no paged step; the value below feeds
+    // [`paged_step_of_ir`], which answers `None` for exactly those bundles).
+    let page_index_scale: u32 = {
         let mut stated: Vec<u32> = Vec::new();
         for lowered in &per_node {
             for wired in lowered.iter().flatten() {
-                if wired.3 != 1 && !stated.contains(&wired.3) {
-                    stated.push(wired.3);
+                if let Some(s) = wired.3 && !stated.contains(&s) {
+                    stated.push(s);
                 }
             }
         }
         match stated.as_slice() {
-            [] => {}
-            [only] => page_index_scale = *only,
+            [] => 1,
+            [only] => *only,
             many => {
                 return Err(SuperDscError(format!(
                     "the bundle's programs state {} different page-id scales ({many:?}) through \
@@ -1873,7 +1897,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 )));
             }
         }
-    }
+    };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     // ⭐ THE MASK FAMILY, not one mask: a packed rung's attention is spliced once per
     // window and window r's program binds its OWN mask stack (`paged_window_tid(r, ·)`),

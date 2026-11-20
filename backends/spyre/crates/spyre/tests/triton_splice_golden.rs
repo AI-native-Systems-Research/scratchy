@@ -2921,6 +2921,8 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         s.active_cap(),
         PagedRows::Sequence,
         mismatch,
+        // The test executes through the emulator, whose law is the stride realization.
+        scratchy_target_spyre::paged_step::PageIdRealization::ViewStride,
     )
     .expect_err("the step mint refuses a pair the graph disagrees with");
     assert!(
@@ -3064,6 +3066,8 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         s.active_cap(),
         PagedRows::Sequence,
         pair_of_one_request(s.mq),
+        // The test executes through the emulator, whose law is the stride realization.
+        scratchy_target_spyre::paged_step::PageIdRealization::ViewStride,
     )
     .expect("the paged step derives")
     .expect("the graph has attention");
@@ -3372,6 +3376,8 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         s.active_cap(),
         PagedRows::Batch,
         batch_pair_of_one_row_each(s.mq),
+        // The test executes through the emulator, whose law is the stride realization.
+        scratchy_target_spyre::paged_step::PageIdRealization::ViewStride,
     )
     .expect("the paged step derives")
     .expect("the graph has attention");

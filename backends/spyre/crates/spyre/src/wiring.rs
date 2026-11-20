@@ -688,7 +688,7 @@ pub struct PagedStep {
     /// is the card's, so the baked field is the DEVICE realization
     /// ([`PageIdRealization::EntrySpacing`]): dxp spaces a gather's entries by their own dims,
     /// so the staged id carries the view's stride-over-entry scale — minted once at the lowering
-    /// off the program's own `Strides`
+    /// off the program's own page-table readers
     /// ([`ktir_superdsc::emit::whole_function::page_index_scale`]) and carried here so the card
     /// stager ([`crate::paged_step::card_step_sources`]) consumes it and nothing else spells the
     /// multiply. A bundle whose gathered views pack densely — every folded-row reader, the
