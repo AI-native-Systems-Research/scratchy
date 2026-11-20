@@ -1327,12 +1327,14 @@ impl From<HeadMatmulConstants> for Vec<ConstantValue> {
     }
 }
 
-/// The paged cache an MLA kernel reads or writes: its block's rows, and the chunks it is held in
-/// (`mla.metal` slots 4 to 6; slot 5, the block table's stride, is the tape's KV cap rung).
+/// The paged cache an MLA kernel reads or writes: its block's rows, the chunks it is held in, and
+/// the lanes of a row its K store holds (`mla.metal` slots 4 to 6 and 14; slot 5, the block
+/// table's stride, is the tape's KV cap rung).
 #[derive(Clone, Copy)]
 pub struct MlaCacheConstants {
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
+    pub half_row: HeadDim,
 }
 
 /// How an MLA attention spreads over threadgroups: the query heads one serves, and its
@@ -1375,6 +1377,7 @@ impl From<MlaConstants> for Vec<ConstantValue> {
                 ConstSlot(6),
                 cache.blocks_per_chunk.get(),
             ));
+            v.push(ConstantValue::uint(ConstSlot(14), cache.half_row.get()));
         }
         if let Some(t) = c.attend {
             v.push(ConstantValue::float(ConstSlot(7), m.scale().get()));

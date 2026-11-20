@@ -6,8 +6,7 @@
 //
 // The cache holds one row per token of a layer: the compressed latent
 // (LATENT lanes) then the rotated shared rope key (ROPE lanes), `ROW` wide in
-// all. The paged pool holds the row as its K and V halves, `HALF = ROW / 2`
-// lanes each: lane `e` of a row sits in the K store when `e < HALF`, else at
+// all. The paged pool holds the row as its K and V halves, HALF lanes each: lane `e` of a row sits in the K store when `e < HALF`, else at
 // `e - HALF` in the V store, both at the token's slot of the layer's one
 // kv head. A block is `BLOCK_SIZE` rows; a store binding is the layer's chunk
 // table (a physical block derefs `table[block / BLOCKS_PER_CHUNK]`, then block
@@ -22,7 +21,7 @@
 //   1 = LATENT      the compressed latent's width
 //   2 = NOPE        a query head's un-rotated part
 //   3 = ROPE        a query head's rotated part, the shared key's width
-//   4 = BLOCK_SIZE  rows per paged block
+//   4 = BLOCK_SIZE  rows per paged block (with 5, 6 and 14: the cache's)
 //   5 = MAX_BLOCKS  the block table's row stride
 //   6 = BLOCKS_PER_CHUNK
 //   7 = SCALE       the softmax scale
@@ -33,6 +32,8 @@
 //  11 = PARTIAL     a partial's elements: its max, its sum, then its LATENT lanes
 //  12 = MERGE_THREADS  a merge threadgroup's threads
 //  13 = ROW_THREADS a row kernel's threads (the query rotation, the cache write)
+//  14 = HALF        the lanes of a row the pool's K store holds; the rest are
+//                   the V store's
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -53,10 +54,11 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTS, 10);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTIAL_STRIDE, 11);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MERGE_THREADS, 12);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_ROW_THREADS, 13);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_HALF_ROW, 14);
 
 constant constexpr uint MLA_Q_HEAD = MLA_NOPE + MLA_ROPE;
 constant constexpr uint MLA_ROW = MLA_LATENT + MLA_ROPE;
-constant constexpr uint MLA_HALF = MLA_ROW / 2u;
+constant constexpr uint MLA_HALF = MLA_HALF_ROW;
 constant constexpr uint MLA_HALF_ROPE = MLA_ROPE / 2u;
 
 // Lane `d` of a rope part `x` (ROPE lanes) rotated at `pos`: its pair's
