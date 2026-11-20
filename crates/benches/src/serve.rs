@@ -41,8 +41,11 @@ struct RequestResult {
     /// Timestamp (seconds since benchmark start) when request was sent.
     start_time: f64,
     success: bool,
-    /// The text the stream carried, for `--save-detailed`.
-    generated_text: String,
+    /// What the server sent as the answer ([`Generated::Answer`]): what a dataset task scores.
+    answer: String,
+    /// What it sent as reasoning, in a field of its own ([`Generated::Reasoning`]): generated and
+    /// timed like the answer, never scored.
+    reasoning: String,
     /// Why the request failed; empty when it didn't (vLLM's `errors` entry).
     error: String,
     /// `usage.prompt_tokens_details.cached_tokens`, where the server sent it: the prompt tokens
@@ -56,6 +59,11 @@ struct RequestResult {
 }
 
 impl RequestResult {
+    /// Everything the server generated, its reasoning then its answer, as it streamed them.
+    fn generated(&self) -> String {
+        format!("{}{}", self.reasoning, self.answer)
+    }
+
     fn failed(start_time: f64, e2el: f64, error: String) -> Self {
         eprintln!("Request failed: {error}");
         RequestResult {
@@ -66,7 +74,8 @@ impl RequestResult {
             chunks: 0,
             start_time,
             success: false,
-            generated_text: String::new(),
+            answer: String::new(),
+            reasoning: String::new(),
             error,
             cached_tokens: None,
             prompt_tokens: None,
@@ -226,7 +235,8 @@ fn send_body(
     let mut prompt_tokens: Option<usize> = None;
     let mut finish_reason: Option<String> = None;
     let mut chunks = 0usize;
-    let mut generated_text = String::new();
+    let mut answer = String::new();
+    let mut reasoning = String::new();
     let mut last_choices_time: Option<Instant> = None;
     // Why the stream says the request failed, if it does: the first one wins.
     let mut failure: Option<String> = None;
@@ -283,8 +293,10 @@ fn send_body(
                     if let Some(r) = parsed["choices"][0]["finish_reason"].as_str() {
                         finish_reason = Some(r.to_string());
                     }
-                    if let Some(text) = chunk_text(&parsed) {
-                        generated_text.push_str(text);
+                    match chunk_text(&parsed) {
+                        Some(Generated::Answer(t)) => answer.push_str(t),
+                        Some(Generated::Reasoning(t)) => reasoning.push_str(t),
+                        None => {}
                     }
                     if is_progress(&parsed) {
                         let now = Instant::now();
@@ -341,7 +353,8 @@ fn send_body(
         chunks,
         start_time,
         success: first_token_time.is_some(),
-        generated_text,
+        answer,
+        reasoning,
         error: String::new(),
         cached_tokens,
         prompt_tokens,
@@ -414,22 +427,34 @@ fn only_a_role(chunk: &serde_json::Value) -> bool {
         })
 }
 
+/// Generated text a streamed chunk carries, by the field it came in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Generated<'a> {
+    /// `text` on the completions API, `delta.content` on chat.
+    Answer(&'a str),
+    /// A reasoning model's thinking, in a field of its own: `delta.reasoning` (scratchy) or
+    /// `delta.reasoning_content` (vLLM, oMLX).
+    Reasoning(&'a str),
+}
+
 /// The generated text a streamed chunk carries: `text` on the completions API;
-/// on chat, `delta.content`, or a reasoning model's thinking, which scratchy
-/// streams as `delta.reasoning` and vLLM as `delta.reasoning_content`. A
-/// thinking chunk is a generated token like any other, as vLLM's bench counts
-/// it. Keepalive and closing chunks carry none.
-fn chunk_text(chunk: &serde_json::Value) -> Option<&str> {
+/// on chat, `delta.content`, or a reasoning model's thinking. A thinking chunk
+/// is a generated token like any other, as vLLM's bench counts it. Keepalive
+/// and closing chunks carry none.
+fn chunk_text(chunk: &serde_json::Value) -> Option<Generated<'_>> {
+    fn non_empty(v: &serde_json::Value) -> Option<&str> {
+        v.as_str().filter(|s| !s.is_empty())
+    }
     let first = chunk["choices"].as_array()?.first()?;
     let delta = &first["delta"];
-    [
-        &first["text"],
-        &delta["content"],
-        &delta["reasoning"],
-        &delta["reasoning_content"],
-    ]
-    .into_iter()
-    .find_map(|t| t.as_str().filter(|s| !s.is_empty()))
+    ([&first["text"], &delta["content"]].into_iter())
+        .find_map(non_empty)
+        .map(Generated::Answer)
+        .or_else(|| {
+            ([&delta["reasoning"], &delta["reasoning_content"]].into_iter())
+                .find_map(non_empty)
+                .map(Generated::Reasoning)
+        })
 }
 
 /// A request whose whole multi-token output arrived in one `choices` chunk
@@ -920,7 +945,7 @@ fn add_detailed_json(obj: &mut serde_json::Map<String, serde_json::Value>, run: 
     );
     put(
         "generated_texts",
-        serde_json::json!(rs.iter().map(|r| &r.generated_text).collect::<Vec<_>>()),
+        serde_json::json!(rs.iter().map(RequestResult::generated).collect::<Vec<_>>()),
     );
     put(
         "errors",
@@ -1825,8 +1850,9 @@ fn run_tasks(
             .map(|(r, t)| {
                 serde_json::json!({
                     "reference": t.score.reference(),
-                    "answer": r.generated_text,
-                    "score": r.success.then(|| t.score.score(&r.generated_text)),
+                    "answer": r.answer,
+                    "reasoning": r.reasoning,
+                    "score": r.success.then(|| t.score.score(&r.answer)),
                     "answer_tokens": r.output_tokens,
                 })
             })
@@ -1851,8 +1877,7 @@ fn run_tasks(
 }
 
 /// Whether an answer ran to its cap rather than ending on its own: the server's `length`, or where
-/// it sent no reason, its answer tokens ([`answer_tokens`]). One rule, for accuracy and
-/// `capped_answers` alike.
+/// it sent no reason, its answer tokens ([`answer_tokens`]). What `capped_answers` counts.
 fn ran_to_cap(
     r: &RequestResult,
     t: &crate::workloads::Task,
@@ -1871,13 +1896,13 @@ fn task_tpot(r: &RequestResult, tokens: usize) -> Option<f64> {
     (tokens > 1 && r.chunks > 1).then(|| (r.e2el - r.ttft) / (tokens - 1) as f64)
 }
 
-/// An answer's tokens: the server's usage count, or counted from its text where it sent none (a
-/// span query's stream carries no usage).
+/// An answer's tokens, its reasoning's with them: the server's usage count, or counted from its
+/// text where it sent none (a span query's stream carries no usage).
 fn answer_tokens(r: &RequestResult, count_tokens: &dyn Fn(&str) -> usize) -> usize {
     if r.output_tokens > 0 {
         r.output_tokens
     } else {
-        count_tokens(&r.generated_text)
+        count_tokens(&r.generated())
     }
 }
 
@@ -1962,15 +1987,14 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
-    let capped = |r: &RequestResult, t: &crate::workloads::Task| ran_to_cap(r, t, count_tokens);
     // Over every task sent that has a right answer (null for a workload with none: chat turns,
-    // the shared-prefix questions). A request that failed scores wrong, as does an answer that ran
-    // to its cap, whose text may hold the answer somewhere in a ramble that never gave it. Over
-    // the answered only, an engine that failed the hard tasks would score higher.
+    // the shared-prefix questions), each scored on its answer alone. A request that failed gave
+    // no answer, so it scores wrong: over the answered only, an engine that failed the hard tasks
+    // would score higher.
     let right = |r: &RequestResult, t: &crate::workloads::Task| {
         t.score.scored().then(|| {
-            if r.success && !capped(r, t) {
-                t.score.score(&r.generated_text)
+            if r.success {
+                t.score.score(&r.answer)
             } else {
                 0.0
             }
@@ -1981,13 +2005,9 @@ fn task_metrics(
             .filter_map(|(r, t)| right(r, t))
             .collect::<Vec<_>>(),
     );
-    // Answers that open as a thought: a request whose `enable_thinking: false` did not reach the
-    // template (a span query has no template kwargs), so its accuracy and tokens count reasoning
-    // too and are no like-for-like with a plain answer.
-    let thought = (ok.iter())
-        .filter(|(r, _)| opens_as_thought(&r.generated_text))
+    let capped = (ok.iter())
+        .filter(|(r, t)| ran_to_cap(r, t, count_tokens))
         .count();
-    let capped = ok.iter().filter(|(r, t)| capped(r, t)).count();
     let cached: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
         .collect();
@@ -2019,7 +2039,6 @@ fn task_metrics(
         // Null where the server sent no cached-token count, not 0.
         "mean_cached_tokens": mean(&cached),
         "accuracy": accuracy,
-        "thinking_answers": thought,
         "capped_answers": capped,
     });
     // Task by task, where the dataset names its tasks: which were sent, in order, their group,
@@ -2125,23 +2144,6 @@ fn add_task_requests(
             })
             .collect::<Vec<_>>()
     );
-}
-
-/// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
-/// matrix's reasoning models write when thinking reaches them as plain text ("We need to...",
-/// "Okay, let's see"), as span queries do.
-fn opens_as_thought(text: &str) -> bool {
-    let t = text.trim_start();
-    [
-        "<think>",
-        "<|channel|>analysis",
-        "We need to",
-        "Okay, let's",
-        "Okay, so",
-        "Let me ",
-    ]
-    .iter()
-    .any(|p| t.starts_with(p))
 }
 
 fn print_task_summary(dataset: &str, j: &serde_json::Value) {
@@ -2336,22 +2338,22 @@ mod tests {
         );
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"index":0,"text":" four"}]}"#)),
-            Some(" four")
+            Some(Generated::Answer(" four"))
         );
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
-            Some("hi")
+            Some(Generated::Answer("hi"))
         );
         // A reasoning model's thinking, as scratchy and vLLM stream it, is generated text too.
         assert_eq!(
             chunk_text(&c(r#"{"choices":[{"delta":{"reasoning":"Hmm"}}]}"#)),
-            Some("Hmm")
+            Some(Generated::Reasoning("Hmm"))
         );
         assert_eq!(
             chunk_text(&c(
                 r#"{"choices":[{"delta":{"content":null,"reasoning_content":"so"}}]}"#
             )),
-            Some("so")
+            Some(Generated::Reasoning("so"))
         );
         assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
     }
@@ -2415,7 +2417,6 @@ mod tests {
             &docs,
             "Capital of France?",
             &[answer.to_string()],
-            crate::workloads::Rule::AnyAnswer,
             crate::workloads::RAG_MAX_TOKENS,
         )
     }
@@ -2534,7 +2535,7 @@ mod tests {
         ok.prompt_tokens = Some(1800);
         // A span answer: no usage, so its 3 tokens come from its text.
         let mut span = req(0, 3, 0.2, 0.4);
-        span.generated_text = "a b c".into();
+        span.answer = "a b c".into();
         let one = req(1, 1, 0.1, 0.1);
         // Six tokens in one chunk, then an empty closing chunk: no interval to time (#1212).
         let at_once = req(6, 1, 0.3, 0.4);
@@ -2562,7 +2563,7 @@ mod tests {
     fn a_timed_cell_records_no_score_of_any_kind() {
         let words = |t: &str| t.split_whitespace().count();
         let mut r = req(2, 2, 0.1, 0.5);
-        r.generated_text = "Lyon.".into();
+        r.answer = "Lyon.".into();
         let mut t = rag("Paris");
         t.label = Some(crate::workloads::TaskLabel {
             id: "a".into(),
@@ -2599,7 +2600,7 @@ mod tests {
         let words = |t: &str| t.split_whitespace().count();
         let answered = |text: &str| {
             let mut r = req(2, 2, 0.1, 0.5);
-            r.generated_text = text.into();
+            r.answer = text.into();
             r
         };
         let labelled = |id: &str, hops: u32| {
@@ -2639,18 +2640,19 @@ mod tests {
         assert!(j.get("task_ids").is_none() && j.get("accuracy_by_group").is_none());
     }
 
-    /// A server that sends neither usage nor a finish reason: an answer whose text runs to its cap
-    /// counts as capped, for accuracy and capped_answers alike, and one that ended short of its
-    /// cap is not.
+    /// A server that sends neither usage nor a finish reason: an answer whose text, its reasoning
+    /// with it, runs to its cap counts as capped, and one that ended short of its cap is not.
+    /// Capped or not, an answer is scored on what it says.
     #[test]
-    fn a_capped_answer_with_no_usage_is_capped_by_one_rule() {
+    fn a_capped_answer_with_no_usage_is_capped_by_its_text() {
         let words = |t: &str| t.split_whitespace().count();
         let task = rag("Paris");
         let mut ramble = req(0, 1, 0.1, 0.5);
-        ramble.generated_text = format!("Paris {}", "and ".repeat(task.max_tokens));
+        ramble.reasoning = "and ".repeat(task.max_tokens - 1);
+        ramble.answer = "Paris".into();
         let mut short = req(0, 1, 0.1, 0.5);
-        short.generated_text = "Paris".into();
-        assert!(ran_to_cap(&ramble, &task, &words), "counted from its text");
+        short.answer = "Paris".into();
+        assert!(ran_to_cap(&ramble, &task, &words), "its reasoning counted");
         assert!(!ran_to_cap(&short, &task, &words));
         assert_eq!(
             answer_tokens(&short, &words),
@@ -2666,7 +2668,7 @@ mod tests {
             7,
         );
         assert_eq!(j["capped_answers"], 1, "the cell counts it the same way");
-        assert_eq!(j["accuracy"], 0.0, "and scores it wrong");
+        assert_eq!(j["accuracy"], 1.0, "and scores its answer");
     }
 
     /// A result is stamped with the wall clock its requests ran over: from its duration back to
@@ -2682,9 +2684,9 @@ mod tests {
         assert!(none.get("started_unix_s").is_none());
     }
 
-    /// A dataset workload's metrics: accuracy over every task sent, a failed request or a capped
-    /// answer scoring wrong; cached prompt tokens from the server's usage (null where it sent
-    /// none); and the failed and empty answers counted apart.
+    /// A dataset workload's metrics: accuracy over every task sent, each scored on its answer
+    /// alone, a failed request scoring wrong; cached prompt tokens from the server's usage (null
+    /// where it sent none); and the failed and empty answers counted apart.
     #[test]
     fn a_workloads_metrics_score_the_answers_and_read_the_cache() {
         // A span answer's tokens, where the server sent no count: a word a token, here.
@@ -2692,7 +2694,7 @@ mod tests {
         let tokenizer = &words;
         let answered = |text: &str, tokens: usize, cached: Option<usize>| {
             let mut r = req(tokens, tokens, 0.1, 0.5);
-            r.generated_text = text.into();
+            r.answer = text.into();
             r.cached_tokens = cached;
             r.prompt_tokens = Some(100);
             r
@@ -2720,26 +2722,33 @@ mod tests {
         assert_eq!(j["dataset"], "musique");
         assert_eq!(j["task_seed"], 7);
         assert_eq!(j["empty_answers"], 0);
-        assert_eq!(j["thinking_answers"], 0);
         assert_eq!(j["capped_answers"], 0);
-        let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
-        let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
-        assert_eq!(j["thinking_answers"], 1);
+        assert!(j.get("thinking_answers").is_none());
+        // Reasoning is never the answer: the right answer in the thinking scores nothing, and the
+        // answer after it is scored as it is.
+        let mut thought = answered("Lyon.", 9, None);
+        thought.reasoning = "We need find the capital. Paris.".into();
+        let j = task_metrics(&[thought], &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["accuracy"], 0.0, "Paris only in its reasoning");
+        let mut thought = answered("Paris.", 9, None);
+        thought.reasoning = "Lyon? No.".into();
+        let j = task_metrics(&[thought], &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["accuracy"], 1.0, "Paris in its answer");
         let no_usage = vec![answered("Paris", 1, None)];
         let j = task_metrics(&no_usage, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert!(j["mean_cached_tokens"].is_null(), "no count is not zero");
-        // An answer that ran to its cap scores wrong, though the answer is somewhere in it.
+        // An answer that ran to its cap is counted as capped, and scored on what it says.
         let ramble = format!("Paris {}", "and ".repeat(crate::workloads::RAG_MAX_TOKENS));
         let capped = vec![answered(&ramble, crate::workloads::RAG_MAX_TOKENS, None)];
         let j = task_metrics(&capped, &tasks[..1], tokenizer, 1.0, "musique", 7);
-        assert_eq!(j["accuracy"], 0.0);
+        assert_eq!(
+            (&j["capped_answers"], &j["accuracy"]),
+            (&1.into(), &1.0.into())
+        );
         // A span answer has no usage: its tokens are counted from its text.
         let span = vec![answered(&ramble, 0, None)];
         let j = task_metrics(&span, &tasks[..1], tokenizer, 1.0, "musique", 7);
-        assert_eq!(
-            j["accuracy"], 0.0,
-            "counted from its text, it ran to its cap"
-        );
+        assert_eq!(j["capped_answers"], 1, "counted from its text");
         // A span answer has no usage: its cap shows in the server's finish reason, not its count.
         let mut span = answered("The question asks", 0, None);
         span.finish_reason = Some("length".into());
@@ -2794,8 +2803,8 @@ mod tests {
         assert!(shared_prefix_workload(&none, &text).1.is_none());
     }
 
-    /// A streamed chat answer comes back with its text and the server's cached and prompt token
-    /// counts, read from the usage chunk.
+    /// A streamed chat answer comes back with its text, its reasoning apart from it, and the
+    /// server's cached and prompt token counts, read from the usage chunk.
     #[test]
     fn a_chat_answer_brings_its_text_and_cached_tokens() {
         use std::io::{Read as _, Write as _};
@@ -2806,6 +2815,7 @@ mod tests {
             let mut req = [0u8; 8192];
             let _ = s.read(&mut req);
             let events = [
+                r#"{"choices":[{"delta":{"reasoning":"Lyon? No: "},"finish_reason":null}]}"#,
                 r#"{"choices":[{"delta":{"content":"Par"},"finish_reason":null}]}"#,
                 r#"{"choices":[{"delta":{"content":"is"},"finish_reason":"stop"}]}"#,
                 r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":96}}}"#,
@@ -2836,7 +2846,10 @@ mod tests {
         );
         server.join().unwrap();
         assert!(r.success, "failed: {}", r.error);
-        assert_eq!(r.generated_text, "Paris");
+        assert_eq!(
+            (r.answer.as_str(), r.reasoning.as_str()),
+            ("Paris", "Lyon? No: ")
+        );
         assert_eq!(r.output_tokens, 2);
         assert_eq!(r.cached_tokens, Some(96));
         assert_eq!(r.prompt_tokens, Some(120));
@@ -2893,7 +2906,7 @@ mod tests {
         drop(client);
         server.join().unwrap();
         assert!(r.success, "failed: {}", r.error);
-        assert_eq!(r.generated_text, "Paris");
+        assert_eq!(r.answer, "Paris");
         assert!(
             r.ttft >= 0.3,
             "TTFT {:.3} s stopped at the role chunk",
@@ -2961,7 +2974,8 @@ mod tests {
             chunks,
             start_time: 0.0,
             success: true,
-            generated_text: String::new(),
+            answer: String::new(),
+            reasoning: String::new(),
             error: String::new(),
             cached_tokens: None,
             prompt_tokens: None,
@@ -2998,7 +3012,8 @@ mod tests {
         let ok = RequestResult {
             itl: vec![0.02, 0.03],
             start_time: 0.5,
-            generated_text: "Hi there".into(),
+            reasoning: "Hmm. ".into(),
+            answer: "Hi there".into(),
             ..req(3, 3, 0.1, 0.15)
         };
         let failed = RequestResult::failed(0.7, 2.0, "status 500: boom".into());
@@ -3020,7 +3035,7 @@ mod tests {
                 "itls": [[0.02, 0.03], []],
                 "latencies": [0.15, 2.0],
                 "start_times": [0.5, 0.7],
-                "generated_texts": ["Hi there", ""],
+                "generated_texts": ["Hmm. Hi there", ""],
                 "errors": ["", "status 500: boom"],
                 "chunks": [3, 0],
             })

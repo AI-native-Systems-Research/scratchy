@@ -44,12 +44,11 @@ pub(crate) struct TaskLabel {
 /// How a task's answer is scored: a text comparison, so it costs no run time.
 #[derive(Clone)]
 pub(crate) enum Score {
-    /// The answer, or one of its aliases, is in the response, else token F1 at least 0.5 (the
-    /// multi-document QA benchmarks' rule), as `rule` says its source scores it.
+    /// The answer names the expected answer or one of its aliases, word for word
+    /// ([`crate::scoring::gives_any`]).
     Contains {
         answer: String,
         aliases: Vec<String>,
-        rule: Rule,
     },
     /// LongBench v2: the letter the response picks, A to D.
     Choice(String),
@@ -61,12 +60,8 @@ impl Score {
     /// The reference answer, as the scorer reads it.
     pub(crate) fn reference(&self) -> String {
         match self {
-            Score::Contains {
-                answer, aliases, ..
-            } if aliases.is_empty() => answer.clone(),
-            Score::Contains {
-                answer, aliases, ..
-            } => {
+            Score::Contains { answer, aliases } if aliases.is_empty() => answer.clone(),
+            Score::Contains { answer, aliases } => {
                 format!("{answer} (or {})", aliases.join(", "))
             }
             Score::Choice(letter) => letter.clone(),
@@ -84,23 +79,15 @@ impl Score {
     pub(crate) fn score(&self, response: &str) -> f64 {
         match self {
             Score::None => 0.0,
-            // Each source scored as its own benchmark scores it ([`crate::scoring`]), whether or
-            // not this task has aliases.
-            Score::Contains {
-                answer,
-                aliases,
-                rule,
-            } => {
-                let right = match rule {
-                    Rule::OneAnswer => crate::scoring::contains_or_f1(response, answer),
-                    Rule::AnyAnswer => {
-                        let all: Vec<&str> = std::iter::once(answer.as_str())
-                            .chain(aliases.iter().map(String::as_str))
-                            .collect();
-                        crate::scoring::any_contains_or_f1(response, &all)
-                    }
-                };
-                if right { 1.0 } else { 0.0 }
+            Score::Contains { answer, aliases } => {
+                let all: Vec<&str> = std::iter::once(answer.as_str())
+                    .chain(aliases.iter().map(String::as_str))
+                    .collect();
+                if crate::scoring::gives_any(response, &all) {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             Score::Choice(letter) => {
                 let picked = crate::longbench::extract_answer(response);
@@ -112,18 +99,6 @@ impl Score {
             }
         }
     }
-}
-
-/// Which of [`crate::scoring`]'s rules a multi-document QA source scores by. They differ only where
-/// an expected answer has no tokens (punctuation only).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Rule {
-    /// 2WikiMultihopQA's and HotpotQA's: [`crate::scoring::contains_or_f1`], one answer. Their
-    /// loaders need the `datasets` feature.
-    #[cfg_attr(not(any(feature = "datasets", test)), allow(dead_code))]
-    OneAnswer,
-    /// MuSiQue's and MS MARCO's: [`crate::scoring::any_contains_or_f1`], any of the answers.
-    AnyAnswer,
 }
 
 /// How a multi-document QA dataset words its prompt: the system prompt, and each document's line,
@@ -170,7 +145,6 @@ pub(crate) fn rag_task(
     documents: &[(String, String)],
     question: &str,
     answers: &[String],
-    rule: Rule,
     max_tokens: usize,
 ) -> Task {
     let label = prompt.label;
@@ -195,11 +169,7 @@ pub(crate) fn rag_task(
             "cross": [{"system": prompt.system}, {"plus": docs}, {"user": question}]
         })),
         max_tokens,
-        score: Score::Contains {
-            answer,
-            aliases,
-            rule,
-        },
+        score: Score::Contains { answer, aliases },
         label: None,
     }
 }
@@ -462,42 +432,26 @@ pub(crate) fn stratified<T>(
 mod tests {
     use super::*;
 
+    /// A RAG answer is right when it names the answer or an alias, word for word, and wrong when it
+    /// names only part of one.
     #[test]
-    fn a_rag_answer_is_right_by_substring_alias_or_f1() {
+    fn a_rag_answer_is_right_when_it_names_the_answer_or_an_alias() {
         let s = Score::Contains {
             answer: "Barack Obama".into(),
             aliases: vec!["Obama".into()],
-            rule: Rule::AnyAnswer,
         };
         assert_eq!(s.score("It was barack obama."), 1.0);
         assert_eq!(s.score("Obama"), 1.0);
         assert_eq!(s.score("President Barack Hussein Obama"), 1.0);
         assert_eq!(s.score("George Bush"), 0.0);
-    }
-
-    /// A source scores by its own benchmark's rule whether or not a task has aliases: the two
-    /// differ where neither the expected answer nor the response has a word (an empty answer to a
-    /// punctuation-only one), and a MuSiQue task without aliases keeps MuSiQue's.
-    #[test]
-    fn a_source_keeps_its_own_rule_without_aliases() {
-        let by = |rule| Score::Contains {
-            answer: "!".into(),
+        let s = Score::Contains {
+            answer: "John Quincy Adams".into(),
             aliases: vec![],
-            rule,
         };
-        let response = "";
         assert_eq!(
-            by(Rule::AnyAnswer).score(response),
-            crate::scoring::any_contains_or_f1(response, &["!"]) as u8 as f64
-        );
-        assert_eq!(
-            by(Rule::OneAnswer).score(response),
-            crate::scoring::contains_or_f1(response, "!") as u8 as f64
-        );
-        assert_ne!(
-            by(Rule::AnyAnswer).score(response),
-            by(Rule::OneAnswer).score(response),
-            "the rules differ here, so the test tells them apart"
+            s.score("John Adams"),
+            0.0,
+            "part of the answer is not the answer"
         );
     }
 
@@ -521,7 +475,6 @@ mod tests {
             &docs,
             "What is the capital?",
             &["Paris".into()],
-            Rule::OneAnswer,
             RAG_MAX_TOKENS,
         );
         assert_eq!(t.messages.len(), 3, "system, one document, the question");
@@ -643,7 +596,7 @@ mod tests {
         for (prompt, label) in [(&DOCUMENTS, "Document"), (&PASSAGES, "Passage")] {
             for docs in &doc_sets {
                 for question in ["Who?", "", "What is {title}?"] {
-                    let t = rag_task(prompt, docs, question, &["x".into()], Rule::OneAnswer, 64);
+                    let t = rag_task(prompt, docs, question, &["x".into()], 64);
                     let new_plain: Vec<(String, String)> = (t.messages.iter())
                         .map(|m| {
                             (

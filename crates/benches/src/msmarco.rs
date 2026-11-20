@@ -89,7 +89,6 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
         &q.passages,
         &q.question,
         &q.answers,
-        crate::workloads::Rule::AnyAnswer,
         max_tokens,
     )
 }
@@ -182,16 +181,16 @@ fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate response against any acceptable answer.
-///
-/// Returns 1.0 if any answer is a substring match or token F1 >= 0.5.
+/// 1.0 where the response names one of the accepted answers word for word ([`crate::scoring::gives_any`]), else 0.0.
+/// MS MARCO's answers are written out in full, so one paraphrased scores 0.0 here: its
+/// [`token_f1`] is the reading of how close it came.
 fn evaluate(response: &str, answers: &[String], debug: bool) -> f64 {
     if debug {
         eprintln!("  answers: {:?}", answers);
         eprintln!("  response: {response}");
     }
     let all: Vec<&str> = answers.iter().map(String::as_str).collect();
-    if crate::scoring::any_contains_or_f1(response, &all) {
+    if crate::scoring::gives_any(response, &all) {
         1.0
     } else {
         0.0
@@ -542,12 +541,26 @@ mod tests {
     fn evaluate_exact_substring() {
         assert!(
             (evaluate(
-                "A corporation is a company authorized to act as a single entity.",
-                &["A corporation is a company or group of people authorized to act as a single entity".to_string()],
+                "Yes: a corporation is a company authorized to act as a single entity.",
+                &["A corporation is a company authorized to act as a single entity".to_string()],
                 false
             ) - 1.0)
                 .abs()
                 < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn evaluate_a_paraphrase_is_not_the_answer() {
+        let answers = [
+            "A corporation is a company or group of people authorized to act as a single entity"
+                .to_string(),
+        ];
+        let paraphrase = "A corporation is a company authorized to act as a single entity.";
+        assert!(evaluate(paraphrase, &answers, false).abs() < f64::EPSILON);
+        assert!(
+            token_f1(&answers, paraphrase) > 0.8,
+            "its F1 says how close it came"
         );
     }
 

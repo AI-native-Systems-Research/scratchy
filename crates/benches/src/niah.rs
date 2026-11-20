@@ -177,29 +177,18 @@ fn generate_chunked_context(
 // Evaluation
 // ---------------------------------------------------------------------------
 
+/// 1.0 where the response names the needle's number as a word of its own
+/// ([`crate::scoring::gives_any`]), else 0.0.
 fn evaluate(response: &str, debug: bool) -> f64 {
-    let response_lower = response.to_lowercase();
-    let expected_lower = EXPECTED_ANSWER.to_lowercase();
-
     if debug {
         eprintln!("  expected: {EXPECTED_ANSWER}");
         eprintln!("  response: {response}");
     }
-
-    if response_lower.contains(&expected_lower) {
-        return 1.0;
+    if crate::scoring::gives_any(response, &[EXPECTED_ANSWER]) {
+        1.0
+    } else {
+        0.0
     }
-    if let Ok(expected_num) = EXPECTED_ANSWER.parse::<i32>() {
-        for word in response.split_whitespace() {
-            let cleaned = word.trim_matches(|c: char| !c.is_numeric());
-            if let Ok(num) = cleaned.parse::<i32>()
-                && num == expected_num
-            {
-                return 1.0;
-            }
-        }
-    }
-    0.0
 }
 
 // ---------------------------------------------------------------------------
@@ -564,5 +553,10 @@ mod tests {
     #[test]
     fn evaluate_no_match_returns_zero() {
         assert!((evaluate("Nothing relevant here", false)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn evaluate_a_number_holding_its_digits_is_not_it() {
+        assert!(evaluate("It happened in 1973.", false).abs() < f64::EPSILON);
     }
 }

@@ -2,9 +2,8 @@
 // Copyright contributors to the vLLM project
 
 //! How the dataset benchmarks score an answer, in one place: the multi-document QA rule
-//! (`multihop`, `hotpotqa`, `musique`, `msmarco`, and `bench serve`'s dataset workloads) and the
-//! token F1 they report beside it. Each was written out in every benchmark; they are the same rule,
-//! and a test below holds each to the behaviour the benchmark had on its own.
+//! (`multihop`, `hotpotqa`, `musique`, `msmarco`, and `bench serve`'s dataset workloads), right or
+//! wrong, and the token F1 they report beside it.
 
 /// Tokens in `text` under the model's tokenizer, 0 where it does not encode: how the dataset
 /// benchmarks size a prompt.
@@ -57,100 +56,22 @@ pub(crate) fn best_token_f1(answers: &[String], actual: &str) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-/// Whether `response` answers with `expected`: it contains it, case-folded, or its token F1 against
-/// it is at least 0.5 (answers are short entities a model may wrap in a sentence). An expected
-/// answer with no tokens (punctuation only) is right only as a substring; an empty one is a
-/// substring of anything. This is `multihop`'s and `hotpotqa`'s rule, F1 computed as they compute
-/// it, which differs from [`token_f1`] only where the expected answer has no tokens.
-pub(crate) fn contains_or_f1(response: &str, expected: &str) -> bool {
-    let (resp, exp) = (response.to_lowercase(), expected.to_lowercase());
-    if resp.contains(&exp) {
-        return true;
-    }
-    let (et, rt) = (normalize_tokens(&exp), normalize_tokens(&resp));
-    if et.is_empty() {
-        return false;
-    }
-    let common = et.iter().filter(|t| rt.contains(t)).count();
-    if common == 0 {
-        return false;
-    }
-    let p = common as f64 / rt.len().max(1) as f64;
-    let r = common as f64 / et.len() as f64;
-    2.0 * p * r / (p + r) >= 0.5
-}
-
-/// Whether `response` answers with any of `answers`, by the rule `musique` and `msmarco` apply to
-/// each: a substring, or token F1 at least 0.5 as [`token_f1`] computes it.
-pub(crate) fn any_contains_or_f1(response: &str, answers: &[&str]) -> bool {
-    let resp = response.to_lowercase();
-    answers.iter().any(|a| {
-        let a = a.to_lowercase();
-        resp.contains(&a) || token_f1_lower(&a, &resp) >= 0.5
+/// Whether `answer` gives one of `accepted`: all of that answer's words, in order and side by
+/// side, are among the answer's ([`normalize_tokens`], case-folded), so "The answer is **Paris**."
+/// gives "Paris". Words, never characters: "I don't know" does not give "no", nor "Berlin" "in", nor
+/// "1922" "22". Every word: "John Adams" does not give "John Quincy Adams". An accepted answer with
+/// no words, only punctuation, is given by none.
+pub(crate) fn gives_any(answer: &str, accepted: &[&str]) -> bool {
+    let words = normalize_tokens(&answer.to_lowercase());
+    accepted.iter().any(|a| {
+        let wanted = normalize_tokens(&a.to_lowercase());
+        !wanted.is_empty() && (words.windows(wanted.len())).any(|w| w == wanted.as_slice())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The benchmarks' scorers as they were written in each, before this module: the reference
-    // every shared rule is held to.
-
-    fn multihop_evaluate(response: &str, expected: &str) -> f64 {
-        let resp_lower = response.to_lowercase();
-        let exp_lower = expected.to_lowercase();
-        if resp_lower.contains(&exp_lower) {
-            return 1.0;
-        }
-        let exp_tokens = normalize_tokens(&exp_lower);
-        let resp_tokens = normalize_tokens(&resp_lower);
-        if exp_tokens.is_empty() {
-            return 0.0;
-        }
-        let common: usize = exp_tokens
-            .iter()
-            .filter(|t| resp_tokens.contains(t))
-            .count();
-        if common == 0 {
-            return 0.0;
-        }
-        let precision = common as f64 / resp_tokens.len().max(1) as f64;
-        let recall = common as f64 / exp_tokens.len() as f64;
-        let f1 = 2.0 * precision * recall / (precision + recall);
-        if f1 >= 0.5 { 1.0 } else { 0.0 }
-    }
-
-    fn musique_evaluate(response: &str, expected: &str, aliases: &[String]) -> f64 {
-        let resp_lower = response.to_lowercase();
-        let all: Vec<&str> = std::iter::once(expected)
-            .chain(aliases.iter().map(|a| a.as_str()))
-            .collect();
-        for ans in &all {
-            let ans_lower = ans.to_lowercase();
-            if resp_lower.contains(&ans_lower) {
-                return 1.0;
-            }
-            if token_f1_lower(&ans_lower, &resp_lower) >= 0.5 {
-                return 1.0;
-            }
-        }
-        0.0
-    }
-
-    fn msmarco_evaluate(response: &str, answers: &[String]) -> f64 {
-        let resp_lower = response.to_lowercase();
-        for ans in answers {
-            let ans_lower = ans.to_lowercase();
-            if resp_lower.contains(&ans_lower) {
-                return 1.0;
-            }
-            if token_f1_lower(&ans_lower, &resp_lower) >= 0.5 {
-                return 1.0;
-            }
-        }
-        0.0
-    }
 
     /// Strings for the comparison: every short combination of a few words, case, punctuation and
     /// the empty and punctuation-only edges.
@@ -182,45 +103,42 @@ mod tests {
         out
     }
 
+    /// An answer is right when it names an accepted answer, whatever else it says, and wrong when
+    /// it names part of one or something that only shares its letters.
     #[test]
-    fn the_shared_rule_scores_as_multihop_and_hotpotqa_did() {
-        let cs = cases();
-        for r in &cs {
-            for e in &cs {
-                let was = multihop_evaluate(r, e) == 1.0;
-                assert_eq!(contains_or_f1(r, e), was, "response {r:?}, expected {e:?}");
-            }
+    fn an_answer_is_right_when_it_names_an_accepted_answer_in_words() {
+        for (answer, accepted) in [
+            ("Paris", "Paris"),
+            ("The answer is **Paris**.", "paris"),
+            ("February\u{202f}7,\u{202f}2018", "February 7, 2018"),
+            ("\"Niagara\" (the wedding episode)", "``Niagara ''"),
+            ("Born in 1922.", "1922"),
+        ] {
+            assert!(
+                gives_any(answer, &[accepted]),
+                "{answer:?} gives {accepted:?}"
+            );
         }
-    }
-
-    #[test]
-    fn the_shared_rule_scores_as_musique_and_msmarco_did() {
-        let cs = cases();
-        let lists: Vec<Vec<String>> = vec![
-            vec!["Paris".into()],
-            vec!["Barack Obama".into(), "Obama".into()],
-            vec!["".into()],
-            vec!["!".into(), "1912".into()],
-            vec![],
-        ];
-        for r in &cs {
-            for answers in &lists {
-                let refs: Vec<&str> = answers.iter().map(String::as_str).collect();
-                let now = any_contains_or_f1(r, &refs);
-                assert_eq!(
-                    now,
-                    msmarco_evaluate(r, answers) == 1.0,
-                    "msmarco {r:?} {answers:?}"
-                );
-                if let Some((first, rest)) = answers.split_first() {
-                    assert_eq!(
-                        now,
-                        musique_evaluate(r, first, rest) == 1.0,
-                        "musique {r:?} {answers:?}"
-                    );
-                }
-            }
+        for (answer, accepted) in [
+            ("I don't know", "no"),
+            ("Berlin", "in"),
+            ("1922", "22"),
+            ("John Adams", "John Quincy Adams"),
+            ("1763", "10 February 1763"),
+            ("Barack Clinton", "Barack Obama"),
+            ("!", "!"),
+            ("Paris", ""),
+        ] {
+            assert!(
+                !gives_any(answer, &[accepted]),
+                "{answer:?} gives {accepted:?}"
+            );
         }
+        assert!(
+            gives_any("Obama", &["Barack Obama", "Obama"]),
+            "any one of them"
+        );
+        assert!(!gives_any("Obama", &[]));
     }
 
     #[test]
