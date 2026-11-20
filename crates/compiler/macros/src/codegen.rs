@@ -3728,7 +3728,10 @@ fn emit_weights_struct(
         quote! {}
     };
     let rotary_load: TokenStream = if uses_rotary {
-        let head_dim = model.text.head_dim.get() as usize;
+        // A multi-head latent attention's rope runs over its rope part alone (`qk_rope_head_dim`),
+        // every head's and the shared key's.
+        let head_dim = (model.bounds.get("qk_rope_head_dim"))
+            .map_or(model.text.head_dim.get() as usize, |&v| v as usize);
         let rope_theta = model.text.rope_theta.get();
         let partial = model
             .scalars
@@ -7398,6 +7401,20 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
     })
 }
 
+/// Where a forward's roped keys are rotated: at the KV write when one of its ops caches its keys
+/// rotated with no rotate-on-read form ([`OpKind::ropes_keys_at_write`]), so no span of its cache
+/// can be relocated; else on each read of the cache (rope-on-read, every other roped model's KV).
+/// `None` for a forward without rotary.
+pub fn fuf_kv_rope(fuf: &Fuf) -> Option<scratchy_ir::model_facts::KvRope> {
+    use scratchy_ir::model_facts::KvRope;
+    fuf_uses_rotary(fuf).then(
+        || match fuf.nodes.iter().any(|n| n.op.ropes_keys_at_write()) {
+            true => KvRope::AtWrite,
+            false => KvRope::OnRead,
+        },
+    )
+}
+
 /// The layers whose ops read or write the paged KV cache, ascending: every layer of a uniform
 /// decoder, a recurrent hybrid's attention layers only (its Mamba / Gated-DeltaNet layers hold
 /// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors.
@@ -7789,7 +7806,8 @@ pub fn fuf_reads_target_hidden(fuf: &Fuf) -> bool {
 pub(crate) fn fill_canonical_params(
     model: &ModelParams,
     tp_world_size: u8,
-    uses_rotary: bool,
+    // Where the forward's keys rotate ([`fuf_kv_rope`]); `None` for a forward without rotary.
+    kv_rope: Option<scratchy_ir::model_facts::KvRope>,
     kv_layers: &KvCacheLayers,
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
@@ -8138,15 +8156,15 @@ pub(crate) fn fill_canonical_params(
                 (u32::try_from(sliding_window).ok())
                     .and_then(positive)
                     .map(mf::AttnWindow::new),
-                // A roped model's keys rotate on read (every one: rope-on-read is its KV); a model
-                // without rope states none.
-                uses_rotary.then(|| {
+                // Where a roped model's keys rotate ([`fuf_kv_rope`]); a model without rope states
+                // none.
+                kv_rope.map(|kv_rope| {
                     mf::Rope::new(
                         match rope_proportional {
                             true => mf::RopePairing::Proportional,
                             false => mf::RopePairing::Standard,
                         },
-                        mf::KvRope::OnRead,
+                        kv_rope,
                         model.mrope_section.map(mf::MropeSection::new),
                     )
                 }),
@@ -8404,6 +8422,27 @@ pub fn emit_kv_layer_geometry_arm_body(
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
     let num_hidden_layers = model.text.layers.get();
+    // A multi-head latent attention's cache: every layer's one row per token, held as the pool's
+    // K and V halves of its single kv head.
+    if fuf.nodes.iter().any(|n| n.op.ropes_keys_at_write()) {
+        let mla = crate::to_wavefront::mla_geometry(&model.bounds, model)
+            .unwrap_or_else(|e| panic!("{}: its latent cache: {e}", model.source_stem));
+        let half = mla.half_row() as usize;
+        let layers = (0..num_hidden_layers).map(|_| {
+            quote! {
+                ::scratchy_forward_compiler::LayerKvGeometry {
+                    is_sliding: false,
+                    num_kv_heads: 1,
+                    head_size: #half,
+                    head_size_v: ::core::option::Option::None,
+                    sliding_window: ::core::option::Option::None,
+                }
+            }
+        });
+        return Some(quote! {
+            ::core::option::Option::Some(::std::vec![ #(#layers),* ])
+        });
+    }
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
@@ -8572,7 +8611,7 @@ pub fn emit_model(
     let (model_facts, mla_consts) = fill_canonical_params(
         model,
         tp_world_size,
-        fuf_uses_rotary(fuf),
+        fuf_kv_rope(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
         emitter.kv_store(),
@@ -8844,7 +8883,7 @@ mod tests {
             let facts = fill_canonical_params(
                 &model,
                 1,
-                false,
+                None,
                 &every_layer(&model),
                 None,
                 crate::target::KvStore::Dense,
@@ -8959,7 +8998,7 @@ mod tests {
         let (facts, mla) = fill_canonical_params(
             &m,
             1,
-            false,
+            None,
             &every_layer(&m),
             None,
             crate::target::KvStore::Dense,
@@ -8982,7 +9021,7 @@ mod tests {
         let facts = fill_canonical_params(
             &m,
             1,
-            false,
+            None,
             &every_layer(&m),
             None,
             crate::target::KvStore::Dense,
@@ -9022,7 +9061,7 @@ mod tests {
         let facts = fill_canonical_params(
             &m,
             2,
-            false,
+            None,
             &every_layer(&m),
             None,
             crate::target::KvStore::Dense,
@@ -9076,7 +9115,7 @@ mod tests {
         let facts = fill_canonical_params(
             &m,
             8,
-            false,
+            None,
             &every_layer(&m),
             None,
             crate::target::KvStore::Dense,
@@ -9596,7 +9635,7 @@ mod tests {
             let path = configs.join(format!("{stem}.json"));
             let model = crate::config::load_file_declared(&path)
                 .unwrap_or_else(|e| panic!("{stem} loads: {e:?}"));
-            fill_canonical_params(&model, 1, false, &every_layer(&model), None, store)
+            fill_canonical_params(&model, 1, None, &every_layer(&model), None, store)
                 .0
                 .kv_codec()
         };

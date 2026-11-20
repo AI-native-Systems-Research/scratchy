@@ -6449,11 +6449,13 @@ impl Worker for MetalWorker {
         // the dense rows the engine would derive. The same cost the draft split
         // in `determine_available_memory` divides by.
         // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
-        // engine's every-layer row would overcount.
+        // engine's every-layer row would overcount; a model stating its layers' own KV geometry
+        // (a latent cache's one row per token) holds rows the config's heads do not describe.
         let model = self.model.as_deref()?;
         (int8_kv(model)
             || hybrid_kv_layout(model, block, METAL_KV_ELEM_BYTES).is_some()
-            || model.kv_cache_layers().is_some())
+            || model.kv_cache_layers().is_some()
+            || model.kv_layer_geometry().is_some())
         .then(|| target_block_bytes(model, block))
     }
 

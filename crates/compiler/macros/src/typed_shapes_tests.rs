@@ -480,7 +480,7 @@ fn head_facts(
     crate::codegen::fill_canonical_params(
         model,
         1,
-        false,
+        None,
         &Default::default(),
         Some(width),
         crate::target::KvStore::Dense,

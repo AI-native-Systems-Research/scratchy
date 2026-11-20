@@ -1295,9 +1295,9 @@ pub fn compile_carrier(
                 std::collections::BTreeMap::new();
             for sm in &solved {
                 let key = sm.mod_name.clone();
-                per_variant
-                    .entry(key)
-                    .or_insert_with(|| codegen::fuf_uses_rotary(&sm.fuf));
+                per_variant.entry(key).or_insert_with(|| {
+                    codegen::fuf_kv_rope(&sm.fuf) == Some(scratchy_ir::model_facts::KvRope::OnRead)
+                });
             }
             if per_variant.values().all(|&v| !v) {
                 proc_macro2::TokenStream::new()
