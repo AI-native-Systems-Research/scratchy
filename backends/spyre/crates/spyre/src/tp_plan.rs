@@ -172,6 +172,7 @@ mod tests {
                     ActiveCap::FULL,
                     false,
                     one_row_one_request(),
+                    &[],
                 ) {
                     NodeLowering::Ops(v) => ops.extend(v),
                     NodeLowering::Unhandled(why) => panic!("the collective did not lower: {why}"),
@@ -258,6 +259,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_row_one_request(),
+                &[],
             )
             .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
@@ -300,6 +302,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_row_one_request(),
+                &[],
             )
             .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
@@ -442,6 +445,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_row_one_request(),
+                &[],
             )
             .unwrap();
             let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
@@ -522,6 +526,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_row_one_request(),
+                &[],
             )
             .unwrap();
             let at = |tid: u32| {
@@ -588,6 +593,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_row_one_request(),
+                &[],
             )
             .unwrap();
             let partial = ir
@@ -653,6 +659,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_row_one_request(),
+                &[],
             )
             .unwrap();
             let groups = ktir_groups(&ops, FoldGrouping::Split, None).unwrap();
@@ -705,6 +712,7 @@ mod tests {
                 scratchy_triton_splice::PagedRows::Sequence,
                 &[],
                 one_row_one_request(),
+                &[],
             )
             .expect("the sublayer lays out")
         }

@@ -322,6 +322,7 @@ mod tests {
             Default::default(),
             vec![None; n],
             Vec::new(),
+            Vec::new(),
         )
         .expect("a sourceless tape names no embed row")
     }

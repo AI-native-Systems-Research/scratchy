@@ -274,6 +274,7 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
                     // One request of the graph's m rows — the S=1 prefill pair (no
                     // AttnDecode here; the pair still states what the graph is).
                     superdsc_pair_of_one_request(m),
+                    &[],
                 )
                 .unwrap_or_else(|e| panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}"));
             let windowed: Vec<&str> = ops
@@ -385,6 +386,7 @@ fn a_whole_row_rmsnorm_never_enters_the_windowed_path() {
         superdsc::ActiveCap::FULL,
         false,
         superdsc_pair_of_one_request(m),
+        &[],
     )
     .expect("lower the granite-shaped norm");
     for e in &ops {
@@ -427,6 +429,7 @@ fn an_extra_consumer_of_the_split_refuses_the_fusion() {
                 superdsc::ActiveCap::FULL,
                 false,
                 superdsc_pair_of_one_request(m),
+                &[],
             )
             .expect("lower the refused sandwich");
         // NO windowed program was minted...

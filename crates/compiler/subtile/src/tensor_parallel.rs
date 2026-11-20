@@ -1118,6 +1118,26 @@ pub fn shard_lowered<T: World, E: crate::handoff::EmbedState>(
             .map(|&(w, r)| (at(w), at(r)))
             .collect(),
     );
+    // ⭐ THE STATES UNDER THE SLICE — each plane's per-unit elems follow its own source's
+    // column law ([`KvStateDecl::shard_cols`]), the ONE restatement-free view of a sharded
+    // state; the planes' source indices are the shard's own and need no mapping.
+    let kv_states = lowered
+        .kv_states()
+        .iter()
+        .map(|d| {
+            let cols: Vec<(u64, u64)> = d
+                .planes()
+                .iter()
+                .map(|p| {
+                    let full = lowered.input.sources[p.source()];
+                    let local = sharded.sources[p.source()].local_shape::<T>(full);
+                    (u64::from(local.cols), u64::from(full.cols))
+                })
+                .collect();
+            d.shard_cols(&cols)
+        })
+        .collect();
+    let out = out.with_kv_states(kv_states);
     Ok((out, sharded))
 }
 

@@ -885,6 +885,9 @@ fn emit_superdsc_wiring(
             let zero = u32l(p.int32_zero);
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
+            // ⭐ THE STATE UNIT — the declaration's Σ of the planes' per-unit elems, minted with
+            // the state's tensors at the bridge and carried by the step's own mint.
+            let unit = u32l(p.unit_elems);
             let page_realization = match p.page_id_realization {
                 scratchy_target_spyre::paged_step::PageIdRealization::EntrySpacing(scale) => {
                     let scale = u32l(scale);
@@ -947,7 +950,7 @@ fn emit_superdsc_wiring(
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
                     rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm, int32_zero: #zero,
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
-                    head_size: #head_size, walk: #walk,
+                    head_size: #head_size, walk: #walk, unit_elems: #unit,
                     page_id_realization: #page_realization,
                     paged_rows: #paged_rows,
                     extent: #extent,
@@ -2562,7 +2565,8 @@ pub(crate) fn dump_wavefront_mega(
     // be baked at diverging capacities.
     //
     // The page is the one the forward's attention walks (`paged_step::SchedulerBlockTokens::REFERENCE.get()`).
-    let page_slots = scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
+    let page_slots_nz = scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.nz();
+    let page_slots = page_slots_nz.get();
     let prefix_len: std::num::NonZeroU32 = model
         .bounds
         .get("max_position_embeddings")
@@ -2584,6 +2588,7 @@ pub(crate) fn dump_wavefront_mega(
             &bridge,
             scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
             SOLO_DECODE_ROWS,
+            page_slots_nz,
         )
     };
     let first = lower_at(prefix_len);
@@ -3161,6 +3166,7 @@ pub(crate) fn dump_wavefront_mega(
                     active_cap,
                     scratchy_target_spyre::paged_step::PagedRows::of_requests(rows_are_requests),
                     query_rows,
+                    lwd.kv_states(),
                 ) {
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
@@ -3196,6 +3202,7 @@ pub(crate) fn dump_wavefront_mega(
                             // start==0 chunk, FULL for the continuation bundle.
                             rows_are_requests,
                             query_rows,
+                            lwd.kv_states(),
                         ) {
                             Ok(rolled) => {
                                 // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -3544,6 +3551,7 @@ pub(crate) fn dump_wavefront_mega(
                                                     rung,
                                                     rows_are_requests,
                                                     query_rows,
+                                                    lwd.kv_states(),
                                                 ) {
                                                     // Same device split as the ceiling rung above: the
                                                     // card bakes the ROLLED body, the emulator the
@@ -3983,6 +3991,7 @@ pub(crate) fn dump_wavefront_mega(
                                                 active_cap,
                                                 query_rows,
                                                 shards,
+                                                kv_states: lwd.kv_states(),
                                             };
                                             // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
                                             // from its emitted layout, so the twin's minted
@@ -4616,6 +4625,7 @@ pub(crate) fn dump_wavefront_mega(
                     &bridge,
                     scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
+                    page_slots_nz,
                 ) {
                     Ok(lwd_b) => {
                         let lwd_b = bake_tape(stem, lwd_b);
@@ -4795,6 +4805,7 @@ pub(crate) fn dump_wavefront_mega(
                 // causally, and chunk k attends the k*mq rows written so far.
                 scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                 pl,
+                page_slots_nz,
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -4935,6 +4946,7 @@ pub(crate) fn dump_wavefront_mega(
                     &bridge,
                     scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
+                    page_slots_nz,
                 ) {
                     Ok(lwd_p) => {
                         let lwd_p = bake_tape(stem, lwd_p);
@@ -5006,6 +5018,7 @@ pub(crate) fn dump_wavefront_mega(
                     &bridge,
                     scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                     w * s,
+                    page_slots_nz,
                 ) {
                     Ok(lwd_p) => {
                         let lwd_p = bake_tape(stem, lwd_p);

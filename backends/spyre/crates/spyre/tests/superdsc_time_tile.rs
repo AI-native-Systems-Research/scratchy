@@ -944,6 +944,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
                     .expect("64 requests is nonzero"),
             )
             .expect("64 rows fit a u32"),
+            &[],
         )
         .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) = superdsc::lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
@@ -958,6 +959,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
                 .expect("64 requests is nonzero"),
         )
         .expect("64 rows fit a u32"),
+        &[],
     )
     .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {

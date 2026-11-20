@@ -665,6 +665,12 @@ pub struct PagedStep {
     pub int32_zero: u32,
     /// Pages in each layer's pools — the scheduler's block count.
     pub pages: u32,
+    /// ⭐ THE STATE UNIT, IN ELEMENTS — the declaration's own Σ of the planes' per-unit elems
+    /// ([`scratchy_subtile::handoff::KvStateDecl::unit_elems`]), minted with the state's tensors
+    /// at the bridge and threaded through the step's mint. Every per-frame row count the
+    /// step's index laws state is a view of this one number over that frame's row width — the
+    /// growth unit holds EVERY plane, and no consumer restates the sum.
+    pub unit_elems: u32,
     /// Token slots per page — the scheduler's block size.
     pub page_slots: u32,
     /// Query rows one forward of this bundle carries.

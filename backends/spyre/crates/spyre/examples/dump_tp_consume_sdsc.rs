@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ActiveCap::FULL,
         false,
         one_row_one_request(),
+        &[],
     )
     .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
@@ -100,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ActiveCap::FULL,
         false,
         one_row_one_request(),
+        &[],
     )
     .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops

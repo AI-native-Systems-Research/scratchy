@@ -581,6 +581,7 @@ mod tests {
             Default::default(),
             vec![None; n_ops],
             Vec::new(),
+            Vec::new(),
         )
         .expect("a binding fixture names at most one embed row")
     }

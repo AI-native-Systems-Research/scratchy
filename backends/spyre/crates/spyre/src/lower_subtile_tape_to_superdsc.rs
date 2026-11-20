@@ -608,13 +608,22 @@ pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // a registry walk that minted its own pair from graph rows would agree with the
     // graph yet state the wrong per-request width the day a packed prefill arrives.
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // The resident KV states, as the handoff declared them — threaded to the node walk's
+    // attention/KV-writer arms (see [`compute_bundle_layout`]'s own parameter note).
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     let mut registry = scalar_registry(ir);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
-        let NodeLowering::Ops(ops) =
-            lower_one_node::<T, F>(node, ir, ActiveCap::FULL, rows_are_requests, query_rows)
+        let NodeLowering::Ops(ops) = lower_one_node::<T, F>(
+            node,
+            ir,
+            ActiveCap::FULL,
+            rows_are_requests,
+            query_rows,
+            kv_states,
+        )
         else {
             continue;
         };
@@ -711,9 +720,10 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 /// All sizes are f16 bytes (`rows*cols*2`), 128 B aligned. A build-time disjointness
 /// guard ([`bundle_layout_aliases`]) asserts no two SIMULTANEOUSLY-LIVE tensors in a
 /// segment overlap — a silent on-card aliasing write is a `cargo build` Err.
-/// THE KV POOLS — every attention's K and V cache tensors, each once, in layer order: what a card
-/// bake places in the KV segment ([`compute_bundle_layout`]) and an emulator bake leaves to the
-/// emulator, which holds them as the KTIR's own buffers.
+/// THE KV POOLS — the declared resident states' plane tensors, each once, in declaration order:
+/// what a card bake places in the KV segment ([`compute_bundle_layout`]) and an emulator bake
+/// leaves to the emulator, which holds them as the KTIR's own buffers. THE DECLARATION'S OWN
+/// VIEW ([`kv_states`]) — no op is read to learn which tensors hold a state.
 /// ⭐ THE EMITTER'S ROW PAD — `mq` rows padded up to whole fp16 sticks. THE one
 /// home of the pad every row-count statement takes: the emitter's own placement
 /// of the attention zero tensor (`compute_bundle_layout`, `mq_pad` off the
@@ -726,15 +736,12 @@ pub fn mq_pad(mq: usize) -> usize {
     mq.div_ceil(Fp16::ELEMS_PER_STICK as usize) * Fp16::ELEMS_PER_STICK as usize
 }
 
-pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
+pub fn kv_pool_tids(kv_states: &[scratchy_subtile::handoff::KvStateDecl]) -> Vec<u32> {
     let mut pools: Vec<u32> = Vec::new();
-    for n in &ir.nodes {
-        if let SubOp::AttnDecode { layout: kv, .. } = &n.op {
-            for t in [kv.cache_tensor(), kv.v_cache_tensor()] {
-                let tid = t.index() as u32;
-                if !pools.contains(&tid) {
-                    pools.push(tid);
-                }
+    for d in kv_states {
+        for p in d.planes() {
+            if !pools.contains(&(p.source() as u32)) {
+                pools.push(p.source() as u32);
             }
         }
     }
@@ -756,6 +763,11 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The graph's query extents, minted by the bake — threaded to the registry walk below,
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // ⭐ THE RESIDENT KV STATES, AS THE HANDOFF DECLARED THEM at their mint (the bridge's
+    // `prefix_for`) — the ONE statement of every state's planes and growth unit. The pool set,
+    // the unit structure and the placements below are views of these declarations: no op is read
+    // to learn which tensors hold a state, and no plane total is re-derived from tensor shapes.
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -943,22 +955,15 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         seg_bytes[seg] = align128(off + sz);
     };
 
-    // The AttnDecode K/V cache tensors are SOURCES, but they are the KV POOLS, placed in seg2
+    // The resident KV states' cache tensors are SOURCES, but they are the KV POOLS, placed in seg2
     // (SegRole::Kv) below (search "THE KV POOLS"). If the source loop ALSO packs them into the
     // Activation segment, that Activation slot is never used — a DEAD HOLE that the per-step
     // whole-Activation-segment H2D re-ships every decode step (the O(cap) decode preamble cliff,
     // measured: 50 ms @cap=4096 vs 8 ms @cap=256). Skip them here; their only placement is seg2.
-    let prefix_kv_tids: std::collections::HashSet<u32> = ir
-        .nodes
+    // The set is the DECLARED states' planes — the same declaration the placement below places.
+    let prefix_kv_tids: std::collections::HashSet<u32> = kv_states
         .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { layout: kv, .. } => Some([
-                kv.cache_tensor().index() as u32,
-                kv.v_cache_tensor().index() as u32,
-            ]),
-            _ => None,
-        })
-        .flatten()
+        .flat_map(|d| d.planes().iter().map(|p| p.source() as u32))
         .collect();
 
     // Sources first (deterministic id order): weights → seg1, activations → seg3 (Activation role).
@@ -979,73 +984,26 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // GARBAGE logits (on-card-observed: KSPLIT output empty/EOS while the bundle loaded fine). Place each in
     // seg1 (Weight) here — same condition as the emit branch + kernel0 (n_dev>16384 lm_head). Size = the
     // staged `[KB, n_dev]` f16 buffer (KB·n_dev·2, the retiled `[n_dev/64,KB,64]` footprint).
-    // ── THE KV POOLS (seg2) ── every attention's K and V cache tensors, the pools the paged step's KV
+    // ── THE KV POOLS (seg2) ── every layer's K and V cache tensors, the pools the paged step's KV
     //    write scatters into and its walk gathers from, resident across steps — ONE DEVICE REGION PER
     //    LAYER ([`place_kv_pools`]). On a CARD build only: the emulator runs the paged step as KTIR
     //    over the cache tensors bound by tid, and never places them.
-    // ⭐ THE STATE UNITS THE PLANNER PLACES — one per attention op, derived ONCE here from the
-    // tensors' own footprints: each plane's per-unit bytes are its whole device footprint over
-    // its page count (`rows / SchedulerBlockTokens::REFERENCE` — the same whole-pages law the
-    // splice's `pool_pages` checks), and the unit count is that page count. The op's two planes
-    // must state the same unit (one pool, one index law); the planner refuses a disagreement
-    // BETWEEN attentions by name. On an emulator bake (no `spyre-lower`) the pools are the
-    // emulator's own buffers and no unit is placed — the same gate as the pool set, one statement.
-    let (pools, state_units): (Vec<u32>, Vec<KvStateUnit>) = if cfg!(feature = "spyre-lower") {
-        let pools = kv_pool_tids(ir);
-        let mut state_units: Vec<KvStateUnit> = Vec::new();
-        for n in &ir.nodes {
-            if let SubOp::AttnDecode { layout: kv, .. } = &n.op {
-                let planes = [
-                    (kv.cache_tensor().index() as u32, "K"),
-                    (kv.v_cache_tensor().index() as u32, "V"),
-                ];
-                let mut per_unit = [0u64; 2];
-                let mut units = [0u64; 2];
-                for (i, &(tid, what)) in planes.iter().enumerate() {
-                    let rows = ir.tensors[tid as usize].rows as u64;
-                    let block =
-                        u64::from(scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get());
-                    if rows == 0 || !rows.is_multiple_of(block) {
-                        return Err(SuperDscError(format!(
-                            "kv pool layout: the {what} cache t{tid} is {rows} rows, which is \
-                             not a whole number of {block}-slot pages"
-                        )));
-                    }
-                    units[i] = rows / block;
-                    per_unit[i] = nbytes(tid) / units[i];
-                }
-                if per_unit[0] != per_unit[1] || units[0] != units[1] {
-                    return Err(SuperDscError(format!(
-                        "kv pool layout: t{}/t{} disagree about the state unit ({} units of {} B \
-                         vs {} of {}) — one attention's planes are one pool",
-                        planes[0].0,
-                        planes[1].0,
-                        units[0],
-                        per_unit[0],
-                        units[1],
-                        per_unit[1]
-                    )));
-                }
-                state_units.push(KvStateUnit {
-                    k: planes[0].0,
-                    v: planes[1].0,
-                    per_unit_bytes: per_unit[0],
-                    units: units[0],
-                });
-            }
-        }
-        (pools, state_units)
-    } else {
-        (Vec::new(), Vec::new())
+    // ⭐ THE POOL SET AND THE UNIT STRUCTURE ARE THE DECLARATION'S — `kv_states`, minted with the
+    // tensors themselves (the bridge's `prefix_for`): the pool set is the declarations' planes,
+    // and every byte figure the placement needs is a view of a declaration ([`KvStateDecl`]).
+    // On an emulator bake (no `spyre-lower`) the pools are the emulator's own buffers and no
+    // unit is placed — the same gate as the pool set, one statement.
+    // The ONE dtype fact the byte views take: each plane's bytes-per-element, read off its own
+    // tensor's device footprint — never a hardcoded format, never a second census.
+    let width_of = |tid: u32| -> u64 {
+        let t = &ir.tensors[tid as usize];
+        nbytes(tid) / u64::from(t.rows) / u64::from(t.cols)
     };
-    let (kv_bank_bytes, kv_block_banks) = place_kv_pools(
-        &pools,
-        &state_units,
-        per_layer_ext,
-        nbytes,
-        &mut seg_bytes,
-        &mut placements,
-    )?;
+    let (kv_bank_bytes, kv_block_banks) = if cfg!(feature = "spyre-lower") {
+        place_kv_pools(kv_states, per_layer_ext, &width_of, &mut seg_bytes, &mut placements)
+    } else {
+        (Vec::new(), Default::default())
+    };
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
     let result = ir.result.index() as u32;
@@ -1586,7 +1544,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows, query_rows)?;
+    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows, query_rows, kv_states)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -1622,6 +1580,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // moves; the step that ships is [`graph_wiring`]'s, whose realization is the card bake's
         // own. The stride realization here never reaches a stager.
         crate::paged_step::PageIdRealization::ViewStride,
+        kv_states,
     )? {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
@@ -1753,9 +1712,14 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect(),
     };
     // ⭐ THE CACHE IS ALLOCATED ROW-OUTERMOST, as spyre-inference's `allocate_pages` allocates it
-    // (`head_major_kv_layout`) — before any op addresses it.
-    for &tid in &pools {
-        layout.allocate_row_outermost(tid)?;
+    // (`head_major_kv_layout`) — before any op addresses it. The pool set is the declared
+    // states' planes, and the allocation is stated only where those planes are PLACED: a card
+    // bake places them (above, [`place_kv_pools`]); an emulator bake holds them as its own
+    // buffers and places nothing — the same gate as the placement, one statement.
+    if cfg!(feature = "spyre-lower") {
+        for tid in kv_pool_tids(kv_states) {
+            layout.allocate_row_outermost(tid)?;
+        }
     }
     Ok(layout)
 }
@@ -2011,128 +1975,63 @@ mod weight_tail_tests {
     }
 }
 
-/// ⭐ ONE ATTENTION'S RESIDENT STATE, AS THE PLANNER SEES IT — the K and V plane tids (the op's
-/// own order), each plane's per-unit bytes, and the unit count. The CALLER derives all of it once
-/// from the tensors' own footprints; the planner never re-derives any of it. The unit itself (a
-/// page of `SchedulerBlockTokens::REFERENCE` slots holding both planes) is stated ONCE at the
-/// splice ([`scratchy_triton_splice::kv_unit_elems`]) and consumed here — the per-unit bytes this
-/// carries are that statement in bytes, read off the tensor the op names.
-pub(crate) struct KvStateUnit {
-    pub k: u32,
-    pub v: u32,
-    pub per_unit_bytes: u64,
-    pub units: u64,
-}
-
-/// A pool class's tables, paired into whole units: `(K layer-0 tid, K tids, V layer-0 tid, V tids,
-/// unit index)`.
-type PairedPoolTables<'a> = Vec<(u32, &'a Vec<u32>, u32, &'a Vec<u32>, usize)>;
+/// A pool class's tables, grouped by declaration: each entry is one declaration and its planes'
+/// tables (`(layer-0 tid, per-layer tids)` per plane, in the declaration's own plane order).
+type PairedPoolTables<'a> =
+    Vec<(&'a scratchy_subtile::handoff::KvStateDecl, Vec<(u32, &'a Vec<u32>)>)>;
 
 /// Each pool table's bank per iteration, keyed by the table's layer-0 tid.
 type PoolTableBanks = std::collections::BTreeMap<u32, Vec<KvBank>>;
 
 /// ⭐⭐ THE KV POOLS, UNIT-MAJOR, ONE DEVICE REGION PER LAYER — every (class, iteration) launch
 /// block's pools are their own bank of the KV segment ([`KvBank`]), and inside a bank the state is
-/// laid out BY UNIT, not by table: one growth unit (a page) holds BOTH planes of one attention —
-/// K at the unit's base, V at `+per_unit_bytes` — so a plane's address is
+/// laid out BY UNIT, not by table: one growth unit (a page) holds EVERY plane of one layer's
+/// state — each plane at its offset in the unit — so a plane's address is
 /// `bank base + unit × unit_bytes + plane_offset_in_unit` and NOTHING depends on how many units
 /// exist. That is the one law every reader consumes: the kernels' cache-descriptor spans and page
 /// strides and the step's index laws (the interleave rides in the index values, the plane offsets
-/// in the bases) all state it through [`scratchy_triton_splice::kv_unit_elems`], and this
-/// placement is its byte form. A layer's launch re-bases the KV slot by handing it that layer's
-/// region alone — the body bakes the class's intra-block (plane) offsets once — and the pool is
-/// the model's whole context whatever its total: the largest allocation is one layer's pools.
+/// in the bases) all state it through the declaration, and this placement is its byte form. A
+/// layer's launch re-bases the KV slot by handing it that layer's region alone — the body bakes
+/// the class's intra-block (plane) offsets once — and the pool is the model's whole context
+/// whatever its total: the largest allocation is one layer's pools.
+///
+/// ⭐ THE PLACEMENT CONSUMES THE DECLARATION AND NOTHING ELSE — `kv_states`, minted with the
+/// tensors themselves (the bridge's `prefix_for`): the pool set is the declarations' planes, a
+/// plane's offset in the unit is the declaration's own prefix sum
+/// ([`KvStateDecl::plane_offset_bytes`]), its declared span is
+/// [`KvStateDecl::plane_span_bytes`], and the bank's bytes per layer are `units × unit_bytes`.
+/// No op is read, no plane total is re-derived from tensor shapes, and every invariant the layout
+/// rests on (a layer's two planes file in the same class, a plane's footprint is its declared
+/// dense bytes, the unit stride is 128-aligned) is TRUE BY CONSTRUCTION from that mint — so this
+/// function states no refusal of its own.
 ///
 /// The blocks are numbered class-major (bank 0 is the first class's first layer). Every table's
 /// layers are placed through the table's own list, which `per_layer_external_tids` files only at
-/// its loop's layer count. A pool no per-layer table names goes in bank 0 after that block, where
-/// the unshifted prefix and suffix launches read it — paired and unit-major the same way. Off the
-/// card `pools` is empty and nothing is placed.
-///
-/// ⛔ REFUSED, BY NAME (a bake bug, never a silently-wrong layout):
-///  * a pool table no attention states as one of its planes;
-///  * a class whose pool tables do not pair into whole (K, V) units — the paged kernels' one
-///    shared index law serves a pool as units, so a class with an unpaired plane cannot be placed;
-///  * a per-unit plane size that is not 128-aligned — the unit stride is the SUM of the planes'
-///    per-unit bytes (no padding inside a unit, or the kernels' `PAGE_STRIDE` law and the layout
-///    would be two statements), and a plane offset must keep its plane stick-aligned;
-///  * units (or per-unit bytes) that disagree between attentions — one pool serves one context,
-///    and the step's one index table serves every layer of it;
-///  * a layer whose tensor's own footprint is not the span its unit states.
+/// its loop's layer count. A declaration no per-layer table names goes in bank 0 after that
+/// block, where the unshifted prefix and suffix launches read it — unit-major the same way. Off
+/// the card `kv_states` places nothing (the caller gates on `spyre-lower`).
 ///
 /// Returns the extra banks' bytes (banks `1..N`; bank 0's are written to `seg_bytes`) and each
 /// pool table's bank per iteration, keyed by the table's layer-0 tid. Each bank's bytes are the
 /// sum over its class's units of `units × unit_bytes` — the same total the extent-stacked layout
 /// gave, so the worker's bank arithmetic does not move.
 fn place_kv_pools(
-    pools: &[u32],
-    state_units: &[KvStateUnit],
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-    size_of: impl Fn(u32) -> u64,
+    width_of: &impl Fn(u32) -> u64,
     seg_bytes: &mut [u64; 7],
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-) -> Result<(Vec<u64>, PoolTableBanks), SuperDscError> {
+) -> (Vec<u64>, PoolTableBanks) {
+    use scratchy_subtile::handoff::KvStateDecl;
     let kv_seg = SegRole::Kv.segment();
-    let is_pool: std::collections::BTreeSet<u32> = pools.iter().copied().collect();
-    // ⭐ THE UNITS ARE THE PAIRING — each attention names its two planes by tid, and a unit naming
-    // a tid that is no pool (or a tid another attention already claimed) is a caller bug, refused
-    // by name. A pool tid no unit and no per-layer table ever names is caught at the end, when
-    // every pool must have its placement.
-    let mut plane_of: std::collections::BTreeMap<u32, usize> = Default::default();
-    for (i, u) in state_units.iter().enumerate() {
-        for &tid in [&u.k, &u.v] {
-            if !is_pool.contains(&tid) {
-                return Err(SuperDscError(format!(
-                    "kv pool layout: attention {i} states t{tid} as a cache plane, but the pool \
-                     set does not hold it"
-                )));
-            }
-            if plane_of.insert(tid, i).is_some() {
-                return Err(SuperDscError(format!(
-                    "kv pool layout: t{tid} is stated as a cache plane by more than one attention"
-                )));
-            }
+    // ⭐ THE DECLARATIONS ARE THE PAIRING — each plane tid names its declaration (and its place
+    // in it) directly; the pool set is exactly the declarations' planes.
+    let mut plane_of: std::collections::BTreeMap<u32, (&KvStateDecl, usize)> = Default::default();
+    for d in kv_states {
+        for (i, p) in d.planes().iter().enumerate() {
+            plane_of.insert(p.source() as u32, (d, i));
         }
     }
-    // ⛔ ONE UNIT LAW, ONE CONTEXT. The splice states the unit once
-    // (`kv_unit_elems`); these bytes are its byte form, and a disagreement between attentions is
-    // a bake bug (the step's one index table serves every layer), refused here rather than
-    // papered over with a widest-slot packing.
-    let first = state_units.first();
-    for u in state_units {
-        let Some(f) = first else { unreachable!("an empty pool set places no units") };
-        if u.per_unit_bytes != f.per_unit_bytes || u.units != f.units {
-            return Err(SuperDscError(format!(
-                "kv pool layout: attention planes disagree about the state unit (t{}/t{}: \
-                 {} units of {} B vs t{}/t{}: {} of {}) — one pool serves one context, and the \
-                 step's one index table serves every layer of it",
-                u.k,
-                u.v,
-                u.units,
-                u.per_unit_bytes,
-                f.k,
-                f.v,
-                f.units,
-                f.per_unit_bytes
-            )));
-        }
-        if u.per_unit_bytes % 128 != 0 {
-            return Err(SuperDscError(format!(
-                "kv pool layout: t{}/t{} state a {}-byte plane per unit, which is not \
-                 128-aligned — the unit stride is the SUM of the planes' per-unit bytes (one \
-                 statement, no padding inside a unit), so a plane this size cannot keep its \
-                 plane offset stick-aligned",
-                u.k, u.v, u.per_unit_bytes
-            )));
-        }
-    }
-    // The placement a plane gets: its bank, its plane offset in the unit, and the SPAN the plane's
-    // descriptors declare from that base — K's the whole interleaved bank (`units × unit_bytes`,
-    // the same total the extent-stacked layout gave per pair), V's that minus its own plane
-    // offset (the byte form of the splice door's `kv_offset_plane_rows`: the rows an offset-based
-    // descriptor declares). Each lands exactly on its pair's region end; neither declares past it.
-    let span_of = |u: &KvStateUnit| -> u64 { u.units * 2 * u.per_unit_bytes };
-    let v_span_of = |u: &KvStateUnit| -> u64 { u.units * 2 * u.per_unit_bytes - u.per_unit_bytes };
     let mut place = |tid: u32, bank: KvBank, offset: u64, span: u64| {
         placements.insert(
             tid,
@@ -2151,89 +2050,77 @@ fn place_kv_pools(
     for class in per_layer_ext {
         let tables: Vec<(u32, &Vec<u32>)> = class
             .iter()
-            .filter(|(t0, _)| is_pool.contains(t0))
+            .filter(|(t0, _)| plane_of.contains_key(t0))
             .map(|(&t0, tids)| (t0, tids))
             .collect();
         if tables.is_empty() {
             continue;
         }
-        // ⭐ THE CLASS'S TABLES PAIR INTO WHOLE UNITS, in the map's own order: a table whose
-        // layer-0 tid is some attention's K pairs with the table whose layer-0 tid is that
-        // attention's V. A leftover table is refused — the kernels read the class's pools as
-        // units, never as singly-placed tables.
+        // ⭐ THE CLASS'S TABLES GROUP INTO WHOLE UNITS, in the map's own order: a table whose
+        // layer-0 tid is one plane of a declaration groups with the tables of that declaration's
+        // every other plane — a layer's planes are per-layer externals of the same class body, so
+        // the grouping closes by construction.
         let mut paired: PairedPoolTables<'_> = Vec::new();
         let mut taken: std::collections::BTreeSet<u32> = Default::default();
-        for &(t0, tids) in &tables {
+        for &(t0, _tids) in &tables {
             if taken.contains(&t0) {
                 continue;
             }
-            let Some(&ui) = plane_of.get(&t0) else {
-                return Err(SuperDscError(format!(
-                    "kv pool layout: pool t{t0} is no attention's K or V plane — the paged \
-                     kernels read a pool as units, so an unpaired plane cannot be placed"
-                )));
-            };
-            let u = &state_units[ui];
-            let other = if t0 == u.k { u.v } else { u.k };
-            let Some(&(_, v_tids)) = tables.iter().find(|(t, _)| *t == other) else {
-                return Err(SuperDscError(format!(
-                    "kv pool layout: pool t{t0}'s attention states t{other} as its other plane, \
-                     which this class's tables do not hold — an unpaired plane cannot be placed"
-                )));
-            };
-            taken.insert(t0);
-            taken.insert(other);
-            paired.push((t0, tids, other, v_tids, ui));
+            let (decl, _) = plane_of[&t0];
+            taken.extend(decl.planes().iter().map(|p| p.source() as u32));
+            let plane_tables: Vec<(u32, &Vec<u32>)> = decl
+                .planes()
+                .iter()
+                .map(|p| {
+                    let t = p.source() as u32;
+                    let ts = tables
+                        .iter()
+                        .find(|(x, _)| *x == t)
+                        .map(|&(_, ts)| ts)
+                        .unwrap_or_else(|| {
+                            unreachable!(
+                                "a layer's cache tables file in the same class's per-layer maps"
+                            )
+                        });
+                    (t, ts)
+                })
+                .collect();
+            paired.push((decl, plane_tables));
         }
-        let Some(&(first_k, _, _, _, _)) = paired.first() else {
-            continue;
-        };
-        // ⭐ INTRA-BLOCK OFFSETS ARE PLANE OFFSETS IN THE UNIT — the same for every iteration of
-        // the class (the body bakes them once). Each pair's unit stride is the sum of its planes'
-        // per-unit bytes; the bank holds `units` of them per layer.
-        let mut intra: Vec<(u64, u64)> = Vec::with_capacity(paired.len());
+        // ⭐ INTRA-BLOCK OFFSETS ARE THE DECLARATION'S PLANE OFFSETS — the same for every
+        // iteration of the class (the body bakes them once). Each declaration's slot is one unit
+        // stride wide per unit; the bank holds `units` of them per layer.
+        let mut intra: Vec<Vec<u64>> = Vec::with_capacity(paired.len());
         let mut block = 0u64;
-        for (kt, _, _, _, _) in &paired {
-            let per_unit = state_units[plane_of[kt]].per_unit_bytes;
-            intra.push((block, block + per_unit));
-            block += 2 * per_unit;
+        for (decl, plane_tables) in &paired {
+            let w = width_of(plane_tables[0].0);
+            intra.push(
+                (0..decl.planes().len())
+                    .map(|i| block + decl.plane_offset_bytes(i, w))
+                    .collect(),
+            );
+            block += decl.units() * decl.unit_bytes(w);
         }
-        let unit_count = state_units[plane_of[&first_k]].units;
-        block *= unit_count;
-        let banks: Vec<KvBank> = (0..paired.first().map(|(_, t, _, _, _)| t.len()).unwrap_or(0))
+        let banks: Vec<KvBank> = (0..paired.first()
+            .map(|(_, ts)| ts.first().map(|t| t.1.len()).unwrap_or(0))
+            .unwrap_or(0))
             .map(|j| KvBank::of_placement((bank_bytes.len() + j) as u32))
             .collect();
         bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
-        for ((kt, k_tids, vt, v_tids, ui), &(off_k, off_v)) in paired.iter().zip(&intra) {
-            if k_tids.len() != v_tids.len() {
-                return Err(SuperDscError(format!(
-                    "kv pool layout: t{kt} has {} layer(s) but its V plane t{vt} has {} — a \
-                     unit's planes place one layer each",
-                    k_tids.len(),
-                    v_tids.len()
-                )));
-            }
-            for ((&ktid, &vtid), &bank) in k_tids.iter().zip(v_tids.iter()).zip(&banks) {
-                // A layer's own footprint must be its plane's dense bytes (`units × per_unit`),
-                // or its placement would lie about the pool it names — the PLACEMENT spans are
-                // the interleaved bank (K) and that minus the plane offset (V), stated by the
-                // unit.
-                for tid in [ktid, vtid] {
-                    if size_of(tid) != state_units[*ui].units * state_units[*ui].per_unit_bytes {
-                        return Err(SuperDscError(format!(
-                            "kv pool layout: layer pool t{tid} is {} bytes, but its unit states \
-                             {} units of {} B — a layer's tensor must be the pool its unit names",
-                            size_of(tid),
-                            state_units[*ui].units,
-                            state_units[*ui].per_unit_bytes
-                        )));
-                    }
+        for ((decl, plane_tables), offs) in paired.iter().zip(&intra) {
+            for (&(t0, tids), &off) in plane_tables.iter().zip(offs) {
+                // ⭐ THE FAMILY'S KEY NAMES THE PLANE — the table's layer-0 tid is the
+                // declaration's own plane source (the filter above kept only those), and every
+                // layer's tid of the family is that same plane of that same declaration: one
+                // baked body serves every layer, so the per-layer tid never re-derives which
+                // plane it is.
+                let (_, plane) = plane_of[&t0];
+                for (&tid, &bank) in tids.iter().zip(&banks) {
+                    let w = width_of(tid);
+                    place(tid, bank, off, decl.plane_span_bytes(plane, w));
                 }
-                place(ktid, bank, off_k, span_of(&state_units[*ui]));
-                place(vtid, bank, off_v, v_span_of(&state_units[*ui]));
+                table_banks.insert(t0, banks.clone());
             }
-            table_banks.insert(*kt, banks.clone());
-            table_banks.insert(*vt, banks.clone());
         }
     }
     if bank_bytes.is_empty() {
@@ -2243,38 +2130,29 @@ fn place_kv_pools(
         .iter()
         .flat_map(|class| class.values().flatten().copied())
         .collect();
-    // ⭐ THE TAIL POOLS PAIR AND INTERLEAVE THE SAME WAY — bank 0 after the classes' block, each
-    // pair one unit stride wide, so an unrolled bundle's pools are as unit-major as a rolled one's.
+    // ⭐ THE TAIL POOLS INTERLEAVE THE SAME WAY — bank 0 after the classes' block, each
+    // declaration one unit stride wide, so an unrolled bundle's pools are as unit-major as a
+    // rolled one's. A declaration's planes straddle the classes only together: both are
+    // per-layer externals of the same layer, so both file in the same class or neither does.
     let mut tail = bank_bytes[0];
-    for u in state_units {
-        if owned.contains(&u.k) || owned.contains(&u.v) {
-            if owned.contains(&u.k) != owned.contains(&u.v) {
-                return Err(SuperDscError(format!(
-                    "kv pool layout: t{}/t{} straddle the per-layer classes — one plane is a \
-                     class table and the other is not",
-                    u.k, u.v
-                )));
-            }
+    for d in kv_states {
+        if d.planes().iter().any(|p| owned.contains(&(p.source() as u32))) {
             continue;
         }
-        place(u.k, KvBank::BASE, tail, span_of(u));
-        place(u.v, KvBank::BASE, tail + u.per_unit_bytes, v_span_of(u));
-        tail += span_of(u);
+        let w = width_of(d.planes()[0].source() as u32);
+        for (i, p) in d.planes().iter().enumerate() {
+            place(
+                p.source() as u32,
+                KvBank::BASE,
+                tail + d.plane_offset_bytes(i, w),
+                d.plane_span_bytes(i, w),
+            );
+        }
+        tail += d.units() * d.unit_bytes(w);
     }
     bank_bytes[0] = tail;
     seg_bytes[kv_seg] = bank_bytes[0];
-    // ⛔ EVERY POOL LEAVES WITH A PLACEMENT — a pool tid no unit names and no per-layer table
-    // carries would silently keep no address at all, so it is refused by name here, at the end,
-    // where the set of placed tids is complete.
-    for &tid in pools {
-        if !placements.contains_key(&tid) {
-            return Err(SuperDscError(format!(
-                "kv pool layout: pool t{tid} is no attention's K or V plane — the paged kernels \
-                 read a pool as units, so an unpaired plane cannot be placed"
-            )));
-        }
-    }
-    Ok((bank_bytes.split_off(1), table_banks))
+    (bank_bytes.split_off(1), table_banks)
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -4111,8 +3989,12 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
     // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
     // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(ir, rung.query_rows)
-        .map_err(|e| e.0)?;
+    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(
+        ir,
+        rung.query_rows,
+        rung.kv_states,
+    )
+    .map_err(|e| e.0)?;
     let load_consts =
         crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
     let load_const_tids: std::collections::HashSet<u32> =
@@ -4199,6 +4081,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
         rung.query_rows,
         crate::paged_step::PageIdRealization::ViewStride,
+        rung.kv_states,
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
@@ -4432,6 +4315,10 @@ pub struct GateRung<'a> {
     /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
     /// ranks at once ([`numeric_gate_sharded`]).
     pub shards: Option<&'a [scratchy_subtile::tensor_parallel::SourceShard]>,
+    /// ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the rung's own
+    /// fact, threaded to the probe's walk lowering ([`crate::lower_subtile_tape_to_ktir`]) so
+    /// the gate lowers the graph's pools under the same declaration the bundle was baked with.
+    pub kv_states: &'a [scratchy_subtile::handoff::KvStateDecl],
 }
 
 #[cfg(feature = "spyre-emu")]
@@ -4690,6 +4577,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             active_cap: rung.active_cap,
             query_rows: rung.query_rows,
             shards,
+            kv_states: rung.kv_states,
             scope,
         });
     }
@@ -5337,6 +5225,7 @@ struct ShardedGate<'a, T: ktir_superdsc::collective::Tp, F: RopeForm> {
     active_cap: ActiveCap,
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
+    kv_states: &'a [scratchy_subtile::handoff::KvStateDecl],
     scope: String,
 }
 
@@ -5375,6 +5264,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         active_cap,
         query_rows,
         shards,
+        kv_states,
         scope,
     } = gate;
     // The world the bake sharded the rung for is the rung's type.
@@ -5397,6 +5287,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         active_cap,
         query_rows,
         shards: Some(shards),
+        kv_states,
     };
     let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
     for me in &ranks {
@@ -8705,6 +8596,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
     active_cap: ActiveCap,
     rows_are_requests: bool,
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8713,6 +8605,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
         active_cap,
         rows_are_requests,
         query_rows,
+        kv_states,
     )
 }
 
@@ -9118,6 +9011,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(4),
+            &[],
         )
         .expect("a layout for a plain matmul bundle");
 
@@ -9236,6 +9130,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(1),
+            &[],
         )
         .expect("plain lays out");
         let l_minted = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
@@ -9244,6 +9139,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(1),
+            &[],
         )
         .expect("the minted graph lays out");
 
@@ -9341,6 +9237,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(4),
+            &[],
         )
         .expect("the minted graph lays out");
 
@@ -9667,6 +9564,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 extent,
+                &[],
             )
             .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
@@ -9753,12 +9651,13 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(mq),
+            &[],
         )
         .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(&node, &ir, false, one_request_of(mq))
+        >(&node, &ir, false, one_request_of(mq), &[])
         .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -9789,7 +9688,7 @@ mod tests {
         let mut programs = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(&node, &ir, false, one_request_of(mq))
+        >(&node, &ir, false, one_request_of(mq), &[])
         .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -9872,6 +9771,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(1),
+            &[],
         )
         .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
@@ -9887,6 +9787,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(1),
+            &[],
         )
         .expect("the fp16 layout mints");
         let p = layout
@@ -9969,6 +9870,7 @@ mod tests {
             ActiveCap::FULL,
             false,
             one_request_of(1),
+            &[],
         )
         .expect("two-fp8-matmul lowering");
         let quantizes = ops
@@ -10058,6 +9960,7 @@ mod tests {
             ActiveCap::FULL,
             false,
             one_request_of(1),
+            &[],
         )
         .expect("the folded residual shape lowers");
 
@@ -10134,6 +10037,7 @@ mod tests {
             ActiveCap::FULL,
             false,
             one_request_of(1),
+            &[],
         )
         .expect("the refused residual shape still lowers");
 
@@ -10638,6 +10542,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             one_request_of(1),
+            &[],
         )
         .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
@@ -10655,6 +10560,7 @@ mod tests {
             ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             one_request_of(1),
+            &[],
         )
         .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(
@@ -10955,6 +10861,7 @@ mod tests {
                 ActiveCap::FULL,
                 false,
                 one_request_of(1),
+                &[],
             )
             .unwrap();
             // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
@@ -11084,15 +10991,20 @@ mod kv_pool_placement_tests {
         vec![class]
     }
 
-    /// The class's one attention: planes `1000`/`2000`, one unit of `pool` bytes a plane — the
-    /// `state_units` shape [`place_kv_pools`] reads.
-    fn one_unit(pool: u64) -> Vec<KvStateUnit> {
-        vec![KvStateUnit {
-            k: 1000,
-            v: 2000,
-            per_unit_bytes: pool,
-            units: 1,
-        }]
+    /// One declared state: planes `1000`/`2000`, one page, `pool` ELEMS a plane per unit. The
+    /// fixture plays the bridge — it states the declaration, not a derivation of it. The tests
+    /// read it at width 1 (one byte per element), so a plane's per-unit bytes are `pool`.
+    fn one_state(pool: u64) -> scratchy_subtile::handoff::KvStateDecl {
+        let page = std::num::NonZeroU32::new(128).expect("128 != 0");
+        scratchy_subtile::handoff::KvStateDecl::new(
+            vec![
+                scratchy_subtile::handoff::KvStatePlane::new(1000, pool),
+                scratchy_subtile::handoff::KvStatePlane::new(2000, pool),
+            ],
+            page,
+            page.get(),
+        )
+        .expect("one page is a whole number of pages")
     }
 
     /// ⭐ EVERY LAYER OWNS ITS REGION: each launch block is its own bank, every bank holds the
@@ -11105,17 +11017,14 @@ mod kv_pool_placement_tests {
     fn every_layer_owns_its_region_at_the_same_offsets() {
         let (layers, pool) = (4u32, 3 * 1024u64);
         let per_layer_ext = one_class(layers);
-        let pools: Vec<u32> = (0..layers).flat_map(|v| [1000 + v, 2000 + v]).collect();
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
         let (extra, banks) = place_kv_pools(
-            &pools,
-            &one_unit(pool),
+            &[one_state(pool)],
             &per_layer_ext,
-            |_| pool,
+            &|_| 1,
             &mut seg_bytes,
             &mut placements,
-        )
-        .unwrap();
+        );
         let kv = SegRole::Kv.segment();
         assert_eq!(seg_bytes[kv], 2 * pool, "bank 0 holds one layer's K and V");
         assert_eq!(
@@ -11144,56 +11053,40 @@ mod kv_pool_placement_tests {
         }
     }
 
-    /// ⭐ A LAYER WHOSE TENSOR IS NOT ITS UNIT'S POOL REFUSES — the widest-slot packing is gone
-    /// (one pool serves one context; the step's one index table serves every layer), so a layer
-    /// whose own footprint disagrees with its unit is a bake bug, named.
+    /// A state no per-layer table names sits in bank 0, after that bank's block — where the
+    /// unshifted prefix and suffix launches read it — unit-major like every other state: its K
+    /// at the tail, its V at `+per_unit`, the state one span wide.
     #[test]
-    fn a_layer_whose_tensor_is_not_its_units_pool_refuses() {
-        let per_layer_ext = one_class(2);
-        let pools = vec![1000, 1001, 2000, 2001];
-        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let size_of = |t: u32| if t == 1001 { 2048 } else { 1024 };
-        let err = place_kv_pools(
-            &pools,
-            &one_unit(1024),
-            &per_layer_ext,
-            size_of,
-            &mut seg_bytes,
-            &mut placements,
-        )
-        .unwrap_err();
-        assert!(
-            err.0.contains("t1001"),
-            "the refusal names the layer: {err:?}"
-        );
-    }
-
-    /// A pool no per-layer table names sits in bank 0, after that bank's block — where the
-    /// unshifted prefix and suffix launches read it — PAIRED and unit-major like every other
-    /// pool: its K at the tail, its V at `+per_unit`, the pair one span wide.
-    #[test]
-    fn a_pool_no_layer_owns_sits_in_bank_0_after_its_block() {
+    fn a_state_no_layer_owns_sits_in_bank_0_after_its_block() {
         let (layers, pool) = (3u32, 1024u64);
         let per_layer_ext = one_class(layers);
-        let mut pools: Vec<u32> = (0..layers).flat_map(|v| [1000 + v, 2000 + v]).collect();
-        pools.extend([9000, 9100]);
-        let mut units = one_unit(pool);
-        units.push(KvStateUnit {
-            k: 9000,
-            v: 9100,
-            per_unit_bytes: pool,
-            units: 1,
-        });
+        let mut states = vec![one_state(pool)];
+        let page = std::num::NonZeroU32::new(128).expect("128 != 0");
+        states.push(
+            scratchy_subtile::handoff::KvStateDecl::new(
+                vec![
+                    scratchy_subtile::handoff::KvStatePlane {
+                        source: 9000,
+                        per_unit_elems: pool,
+                    },
+                    scratchy_subtile::handoff::KvStatePlane {
+                        source: 9100,
+                        per_unit_elems: pool,
+                    },
+                ],
+                page,
+                page.get(),
+            )
+            .expect("one page is a whole number of pages"),
+        );
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
         let (extra, _) = place_kv_pools(
-            &pools,
-            &units,
+            &states,
             &per_layer_ext,
-            |_| pool,
+            &|_| 1,
             &mut seg_bytes,
             &mut placements,
-        )
-        .unwrap();
+        );
         let (k, v) = (placements[&9000], placements[&9100]);
         assert_eq!((k.bank, k.offset), (0, 2 * pool));
         assert_eq!((v.bank, v.offset), (0, 2 * pool + pool), "V rides its unit");
@@ -11202,30 +11095,6 @@ mod kv_pool_placement_tests {
             extra,
             vec![2 * pool; layers as usize - 1],
             "the other banks are unchanged"
-        );
-    }
-
-    /// ⛔ AN UNPAIRED POOL REFUSES — the paged kernels read a pool as units (one page holds both
-    /// planes), so a table no attention states as one of its planes cannot be placed.
-    #[test]
-    fn an_unpaired_pool_refuses() {
-        let (layers, pool) = (3u32, 1024u64);
-        let per_layer_ext = one_class(layers);
-        let mut pools: Vec<u32> = (0..layers).flat_map(|v| [1000 + v, 2000 + v]).collect();
-        pools.push(9000);
-        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let err = place_kv_pools(
-            &pools,
-            &one_unit(pool),
-            &per_layer_ext,
-            |_| pool,
-            &mut seg_bytes,
-            &mut placements,
-        )
-        .unwrap_err();
-        assert!(
-            err.0.contains("t9000"),
-            "the refusal names the pool: {err:?}"
         );
     }
 }

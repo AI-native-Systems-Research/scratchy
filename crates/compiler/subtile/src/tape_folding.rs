@@ -1990,6 +1990,7 @@ mod tests {
             Default::default(),
             op_expansion,
             Vec::new(),
+            Vec::new(),
         )
         .expect("a fold fixture names at most one embed row");
         fold_lowered(&lowered, table, model)

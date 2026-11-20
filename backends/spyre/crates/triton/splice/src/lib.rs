@@ -613,6 +613,9 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     // being lowered. Every other interception ignores it, exactly as the decode and batch
     // arms of `lower_attn` read the graph's rows and never the pair's split.
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the KV writer's arm
+    // below is their reader ([`lower_kv_write`]); every other interception ignores them.
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<Vec<EmittedOp<T>>, String> {
     // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
     // program is emitted; the flatten-back (tail) and the middle (norm) self-identify
@@ -682,7 +685,7 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     if let SubOp::RopeAppend { .. } = &node.op {
         return Ok(vec![
             lower_one(node, ir, rows_are_requests)?,
-            lower_kv_write(node, ir)?,
+            lower_kv_write(node, ir, kv_states)?,
         ]);
     }
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
@@ -1942,29 +1945,6 @@ pub fn kv_write_row() -> TritonKernelRow {
     }
 }
 
-/// The pool a cache tensor is: `pages` of `SchedulerBlockTokens::REFERENCE` slots at `kv_width = nkvh · hd` per slot.
-/// Refused unless the cache is exactly that — a whole number of pages of the stated width.
-fn pool_pages<F: scratchy_subtile::subtile_ir::RopeForm>(
-    ir: &SubtileIR<F>,
-    cache: &scratchy_subtile::subtile_ir::TensorRegion,
-    kv_width: u32,
-    what: &str,
-) -> Result<u32, String> {
-    let t = &ir.tensors[cache.tensor.index()];
-    let block = SchedulerBlockTokens::REFERENCE.get();
-    if t.cols != kv_width || t.rows == 0 || !t.rows.is_multiple_of(block) {
-        return Err(format!(
-            "triton splice: the {what} cache t{} is [{}, {}], which is not a whole number of \
-             {block}-slot pages at {kv_width} columns — the pool it is read as is \
-             [pages, nkvh, {block}, hd] over exactly those bytes",
-            cache.tensor.index(),
-            t.rows,
-            t.cols
-        ));
-    }
-    Ok(t.rows / SchedulerBlockTokens::REFERENCE.get())
-}
-
 /// A region that is its whole tensor, `rows × cols` — what a kernel viewing the tensor from corner
 /// `[0, 0]` requires of its operand.
 fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
@@ -2040,59 +2020,66 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
 /// [`triton_ktir_superdsc::layout::allocate_paged_cache`], where the one-kernel layout lives.
 pub use triton_ktir_superdsc::layout::allocate_paged_cache;
 
-/// ⭐ THE STATE UNIT, IN ELEMENTS — ONE statement of the paged KV pool's growth unit: a unit (one
-/// page of `page_slots` slots) holds BOTH planes, K then V, each `nkvh · page_slots · head_size`
-/// elements, so the unit stride is their SUM. The pool is laid out UNIT-MAJOR —
-/// `address(plane, unit) = bank base + unit · unit_elems + plane's offset in the unit` — so
-/// nothing about a plane's addressing depends on how many units exist. Every consumer of that
-/// fact comes through here: the kernels' cache-descriptor spans and page strides (the constexprs
-/// this splice binds, at the pool's own page size — a whole number of
-/// `SchedulerBlockTokens::REFERENCE`-slot pages, [`pool_pages`]'s law), the step's index laws
-/// (`paged_step`, at the step's own `page_slots` — the same number, by the pool's law), and
+/// ⭐ THE STATE UNIT, IN ELEMENTS — ONE statement, and it is the DECLARATION's own
+/// ([`KvStateDecl::unit_elems`], minted with the state's tensors at the bridge): a unit (one
+/// page of `page_slots` slots) holds EVERY plane, and the unit stride is the SUM of the planes'
+/// per-unit elems. The pool is laid out UNIT-MAJOR — `address(plane, unit) = bank base + unit ·
+/// unit_elems + plane's offset in the unit` — so nothing about a plane's addressing depends on
+/// how many units exist. Every consumer of that fact comes through here: the kernels'
+/// cache-descriptor spans and page strides (the constexprs this splice binds, at the pool's own
+/// page size), the step's index laws (`paged_step`, at the step's own minted `unit_elems`), and
 /// `place_kv_pools`'s per-unit bytes (its caller's). A second spelling of it anywhere is the
-/// defect. Both planes of one `AttnDecode` state the same geometry — each pool is checked to be
-/// `pages` pages of `nkvh · head_size` columns ([`pool_pages`]) — so the sum is twice one plane's
-/// per-unit elements.
-pub fn kv_unit_elems(nkvh: u32, head_size: u32, page_slots: u32) -> u32 {
-    2 * nkvh * page_slots * head_size
+/// defect — no `K + V` pair total is restated here, the declaration's sum is read as-is.
+pub fn kv_unit_elems(decl: &scratchy_subtile::handoff::KvStateDecl) -> u32 {
+    decl.unit_elems() as u32
 }
 
-/// The SPAN a paged KV plane's cache descriptor states, in its own frame's rows: the unit stride
-/// ([`kv_unit_elems`]) over `pages` units, divided by that frame's row width. The frame is each
-/// kernel's own — the prefill kernel reads whole pages (`nkvh · page_slots · hd` a row), the
-/// decode kernel folded rows (`page_slots · hd`), the batched kernel `page / rows_per_page`, the
-/// KV write `head_size` — and the descriptor's row STRIDE is that same width (the interleave
-/// rides in the index values, never in the stride), so the span is the one number a plane's
-/// allocation and reach are stated in. `NUM_PAGES` stays the scheduler's page count, a different
-/// fact no cache descriptor states as an extent.
-pub fn kv_span_rows(
-    nkvh: u32,
-    head_size: u32,
-    page_slots: u32,
-    pages: u32,
-    frame_row_elems: u32,
-) -> u32 {
-    kv_unit_elems(nkvh, head_size, page_slots) * pages / frame_row_elems
+/// The SPAN the FIRST plane's (K's) cache descriptor states, in its own frame's rows: the plane's
+/// extent from the bank start ([`KvStateDecl::plane_span_elems`] over all the declaration's
+/// units), divided by that frame's row width. The frame is each kernel's own — the prefill
+/// kernel reads whole pages (`nkvh · page_slots · hd` a row), the decode kernel folded rows
+/// (`page_slots · hd`), the batched kernel `page / rows_per_page`, the KV write `head_size` —
+/// and the descriptor's row STRIDE is that same width (the interleave rides in the index values,
+/// never in the stride), so the span is the one number a plane's allocation and reach are stated
+/// in. `NUM_PAGES` stays the scheduler's page count, a different fact no cache descriptor states
+/// as an extent.
+pub fn kv_span_rows(decl: &scratchy_subtile::handoff::KvStateDecl, frame_row_elems: u32) -> u32 {
+    decl.plane_span_elems(0) as u32 / frame_row_elems
 }
 
-/// The rows the OFFSET plane's cache descriptor states, in its own frame: the V plane's base sits
-/// `nkvh · page_slots · head_size` elements into every unit (half of [`kv_unit_elems`]), so the
-/// rows its shared-index addressing reaches — and its descriptor must declare, exactly, from that
-/// base — are the span ([`kv_span_rows`]) minus the plane's own offset rows. One law, so that no
-/// view of the pool declares past its region: the K plane's descriptors (based at the bank start)
+/// The rows the OFFSET plane's (V's) cache descriptor states, in its own frame: the plane's base
+/// sits its offset elements into every unit (the declaration's own prefix sum), so the rows its
+/// shared-index addressing reaches — and its descriptor must declare, exactly, from that base —
+/// are its extent from its own base ([`KvStateDecl::plane_span_elems`]). One law, so that no view
+/// of the pool declares past its region: the K plane's descriptors (based at the bank start)
 /// state the span, the V plane's (based at the offset) state this, and each lands exactly on the
 /// bank's end — the hardware addresses the declared extent, so a view declaring past it is a
 /// defect even where no access lands there. The prefill frame needs no split: its stride already
 /// carries the unit law, so both of its planes declare the page count.
 pub fn kv_offset_plane_rows(
-    nkvh: u32,
-    head_size: u32,
-    page_slots: u32,
-    pages: u32,
+    decl: &scratchy_subtile::handoff::KvStateDecl,
     frame_row_elems: u32,
 ) -> u32 {
-    kv_span_rows(nkvh, head_size, page_slots, pages, frame_row_elems)
-        - nkvh * page_slots * head_size / frame_row_elems
+    decl.plane_span_elems(1) as u32 / frame_row_elems
+}
+
+/// The declaration that owns a pool tensor — the one whose planes name the pool's source index.
+/// A pool no declaration names is a state the bridge never declared, refused here by name (a
+/// bake bug), never silently lowered.
+pub fn decl_of_pool<'a>(
+    kv_states: &'a [scratchy_subtile::handoff::KvStateDecl],
+    pool: &scratchy_subtile::subtile_ir::TensorRegion,
+) -> Result<&'a scratchy_subtile::handoff::KvStateDecl, String> {
+    let want = pool.tensor.index();
+    kv_states
+        .iter()
+        .find(|d| d.planes().iter().any(|p| p.source() == want))
+        .ok_or_else(|| {
+            format!(
+                "triton splice: pool t{want} is no state the handoff declared — its KV state was \
+                 never minted with its tensors at the bridge"
+            )
+        })
 }
 
 /// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's rows (one sequence's:
@@ -2125,6 +2112,10 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // agreement check below refuses a mint that does not describe the graph being lowered.
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     paged_rows: PagedRows,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the ONE statement
+    // of this node's pools' unit structure, page count and plane offsets. No pool's shape is
+    // read back out of the graph to learn any of it.
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<Vec<EmittedOp<T>>, String> {
     let batch = paged_rows == PagedRows::Batch;
     let decode = !batch && node.output.region.rows.len == 1;
@@ -2216,14 +2207,11 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             query_rows.requests().get(),
         ));
     }
-    let kv_width = nkvh * hd.get();
-    let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
-    if pool_pages(ir, &node.inputs[2], kv_width, "V")? != pages {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: the K and V pools differ in pages",
-            node.output.tensor.index()
-        ));
-    }
+    // ⭐ THE POOL'S FACTS OFF THE DECLARATION — its page count is the declared units, never a
+    // read-back of the pool tensor's shape; the K and V inputs are the declaration's own two
+    // planes (the same unit count by construction, so no cross-check exists to state).
+    let decl = decl_of_pool(kv_states, &node.inputs[1])?;
+    let pages = decl.units() as u32;
     whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
     // ⭐ THE WALK'S EXTENT IS PER-REQUEST FOR A PREFILL CHUNK, THE GRAPH'S ROWS FOR THE BATCHED
@@ -2290,10 +2278,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             (
                 "KV_ROWS",
                 kv_span_rows(
-                    nkvh,
-                    hd.get(),
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    pages,
+                    decl,
                     nkvh * SchedulerBlockTokens::REFERENCE.get() * hd.get()
                         / chunking.rows_per_page,
                 ),
@@ -2301,10 +2286,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             (
                 "V_ROWS",
                 kv_offset_plane_rows(
-                    nkvh,
-                    hd.get(),
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    pages,
+                    decl,
                     nkvh * SchedulerBlockTokens::REFERENCE.get() * hd.get()
                         / chunking.rows_per_page,
                 ),
@@ -2378,10 +2360,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             "KV_ROWS",
             if decode {
                 kv_span_rows(
-                    nkvh,
-                    hd.get(),
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    pages,
+                    decl,
                     SchedulerBlockTokens::REFERENCE.get() * hd.get(),
                 )
             } else {
@@ -2398,10 +2377,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         sizes.push((
             "V_ROWS",
             kv_offset_plane_rows(
-                nkvh,
-                hd.get(),
-                SchedulerBlockTokens::REFERENCE.get(),
-                pages,
+                decl,
                 SchedulerBlockTokens::REFERENCE.get() * hd.get(),
             ),
         ));
@@ -2415,10 +2391,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // ⭐ THE PAGE STRIDE, FROM THE ONE UNIT STATEMENT — the prefill kernel reads a plane a whole
         // page a row, and the unit-major pool puts unit `p` at `p · PAGE_STRIDE` elements from the
         // plane's base. Bound here from [`kv_unit_elems`]; the kernel restates no geometry.
-        sizes.push((
-            "PAGE_STRIDE",
-            kv_unit_elems(nkvh, hd.get(), SchedulerBlockTokens::REFERENCE.get()),
-        ));
+        sizes.push(("PAGE_STRIDE", kv_unit_elems(decl)));
     }
     for (k, v) in sizes {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -2523,6 +2496,10 @@ pub fn lower_kv_write<
 >(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the pools' unit
+    // structure and plane offsets are read from the declaration, never from the pool tensors'
+    // shapes.
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<EmittedOp<T>, String> {
     let row = kv_write_row();
     let (src, file, entry, program) = match &row {
@@ -2572,13 +2549,10 @@ pub fn lower_kv_write<
     }
     whole(ir, &node.output, rows, kv_width, "rotated K")?;
     whole(ir, &node.inputs[3], rows, kv_width, "V")?;
-    let pages = pool_pages(ir, &node.inputs[4], kv_width, "K")?;
-    if pool_pages(ir, &node.inputs[5], kv_width, "V")? != pages {
-        return Err(format!(
-            "triton splice: RopeAppend t{}: the K and V pools differ in pages",
-            node.output.tensor.index()
-        ));
-    }
+    // ⭐ THE POOL'S FACTS OFF THE DECLARATION — its planes' extents are the declaration's own
+    // views, never a read-back of the pool tensors' shapes; the K and V caches are the
+    // declaration's own two planes (the same unit count by construction).
+    let decl = decl_of_pool(kv_states, &node.inputs[4])?;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
@@ -2603,26 +2577,8 @@ pub fn lower_kv_write<
         // stays `HEAD_SIZE`, and V's base carries the plane offset: K declares the span
         // ([`kv_span_rows`]), V the span minus its own offset rows ([`kv_offset_plane_rows`]) —
         // each landing exactly on the bank's end, no view declaring past its region.
-        (
-            "K_ROWS",
-            kv_span_rows(
-                nkvh,
-                hd.get(),
-                SchedulerBlockTokens::REFERENCE.get(),
-                pages,
-                hd.get(),
-            ),
-        ),
-        (
-            "V_ROWS",
-            kv_offset_plane_rows(
-                nkvh,
-                hd.get(),
-                SchedulerBlockTokens::REFERENCE.get(),
-                pages,
-                hd.get(),
-            ),
-        ),
+        ("K_ROWS", kv_span_rows(decl, hd.get())),
+        ("V_ROWS", kv_offset_plane_rows(decl, hd.get())),
     ] {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
@@ -4093,6 +4049,20 @@ mod production_ktir_dump {
     //! production emits.
     use super::*;
 
+    /// The declared paged KV state a spec below mirrors — the door's own mint
+    /// ([`KvStateDecl::paged_kv`]), so the fixture states the pool's unit law through the
+    /// same one constructor the bridge does, never a second spelling of it.
+    pub(crate) fn decl(kv_width: u32, pages: u32) -> scratchy_subtile::handoff::KvStateDecl {
+        scratchy_subtile::handoff::KvStateDecl::paged_kv(
+            0,
+            1,
+            kv_width,
+            SchedulerBlockTokens::REFERENCE.nz(),
+            pages * SchedulerBlockTokens::REFERENCE.get(),
+        )
+        .expect("the fixture's pages are whole")
+    }
+
     const PAGED_DECODE: &str = include_str!("../../../../kernels/page_attn_head_major_decode.py");
     const PAGED_PREFILL: &str = include_str!("../../../../kernels/page_attn_head_major_prefill.py");
     const PAGED_KV_WRITE: &str =
@@ -4537,10 +4507,7 @@ mod production_ktir_dump {
                     "KV_ROWS",
                     Val::Int(i128::from(if decode {
                         kv_span_rows(
-                            8,
-                            hd as u32,
-                            SchedulerBlockTokens::REFERENCE.get(),
-                            pages as u32,
+                            &decl(8 * hd as u32, pages as u32),
                             SchedulerBlockTokens::REFERENCE.get() * hd as u32,
                         )
                     } else {
@@ -4555,10 +4522,7 @@ mod production_ktir_dump {
                 ces.push((
                     "V_ROWS",
                     Val::Int(i128::from(kv_offset_plane_rows(
-                        8,
-                        hd as u32,
-                        SchedulerBlockTokens::REFERENCE.get(),
-                        pages as u32,
+                        &decl(8 * hd as u32, pages as u32),
                         SchedulerBlockTokens::REFERENCE.get() * hd as u32,
                     ))),
                 ));
@@ -4571,11 +4535,10 @@ mod production_ktir_dump {
                 ces.push(("PADDED_QUERY_LEN", Val::Int(mq)));
                 ces.push((
                     "PAGE_STRIDE",
-                    Val::Int(i128::from(kv_unit_elems(
-                        8,
-                        hd as u32,
-                        SchedulerBlockTokens::REFERENCE.get(),
-                    ))),
+                    Val::Int(i128::from(kv_unit_elems(&decl(
+                        8 * hd as u32,
+                        pages as u32,
+                    )))),
                 ));
                 (
                     PAGED_PREFILL,
@@ -4618,11 +4581,7 @@ mod production_ktir_dump {
                 ("PADDED_QUERY_LEN", Val::Int(64)),
                 (
                     "PAGE_STRIDE",
-                    Val::Int(i128::from(kv_unit_elems(
-                        8,
-                        64,
-                        SchedulerBlockTokens::REFERENCE.get(),
-                    ))),
+                    Val::Int(i128::from(kv_unit_elems(&decl(8 * 64, 4)))),
                 ),
                 ("SCALE", Val::Float(0.125)),
             ];
@@ -4686,10 +4645,7 @@ mod production_ktir_dump {
                         (
                             "KV_ROWS",
                             Val::Int(i128::from(kv_span_rows(
-                                8,
-                                hd as u32,
-                                SchedulerBlockTokens::REFERENCE.get(),
-                                2048,
+                                &decl(8 * hd as u32, 2048),
                                 8 * SchedulerBlockTokens::REFERENCE.get() * hd as u32
                                     / c.rows_per_page,
                             ))),
@@ -4697,10 +4653,7 @@ mod production_ktir_dump {
                         (
                             "V_ROWS",
                             Val::Int(i128::from(kv_offset_plane_rows(
-                                8,
-                                hd as u32,
-                                SchedulerBlockTokens::REFERENCE.get(),
-                                2048,
+                                &decl(8 * hd as u32, 2048),
                                 8 * SchedulerBlockTokens::REFERENCE.get() * hd as u32
                                     / c.rows_per_page,
                             ))),
@@ -4742,20 +4695,14 @@ mod production_ktir_dump {
                         (
                             "K_ROWS",
                             Val::Int(i128::from(kv_span_rows(
-                                nkvh as u32,
-                                hd as u32,
-                                SchedulerBlockTokens::REFERENCE.get(),
-                                4,
+                                &decl(nkvh as u32 * hd as u32, 4),
                                 hd as u32,
                             ))),
                         ),
                         (
                             "V_ROWS",
                             Val::Int(i128::from(kv_offset_plane_rows(
-                                nkvh as u32,
-                                hd as u32,
-                                SchedulerBlockTokens::REFERENCE.get(),
-                                4,
+                                &decl(nkvh as u32 * hd as u32, 4),
                                 hd as u32,
                             ))),
                         ),
@@ -5247,6 +5194,7 @@ mod production_ktir_dump {
 #[cfg(test)]
 mod walk_on_the_card {
     use super::*;
+    use crate::production_ktir_dump::decl;
     use ktir_superdsc::emit::loop_fold::{WalkTrips, flatten};
 
     fn walk(mq: i128, blocks: i128) -> KtirNode {
@@ -5294,10 +5242,7 @@ mod walk_on_the_card {
                 "KV_ROWS",
                 i128::from(if decode {
                     kv_span_rows(
-                        8,
-                        hd as u32,
-                        SchedulerBlockTokens::REFERENCE.get(),
-                        2048,
+                        &decl(8 * hd as u32, 2048),
                         SchedulerBlockTokens::REFERENCE.get() * hd as u32,
                     )
                 } else {
@@ -5310,10 +5255,7 @@ mod walk_on_the_card {
             sizes.push((
                 "V_ROWS",
                 i128::from(kv_offset_plane_rows(
-                    8,
-                    hd as u32,
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    2048,
+                    &decl(8 * hd as u32, 2048),
                     SchedulerBlockTokens::REFERENCE.get() * hd as u32,
                 )),
             ));
@@ -5322,11 +5264,7 @@ mod walk_on_the_card {
             sizes.push(("PADDED_QUERY_LEN", mq));
             sizes.push((
                 "PAGE_STRIDE",
-                i128::from(kv_unit_elems(
-                    8,
-                    hd as u32,
-                    SchedulerBlockTokens::REFERENCE.get(),
-                )),
+                i128::from(kv_unit_elems(&decl(8 * hd as u32, 2048))),
             ));
         }
         for (k, v) in sizes {
@@ -5557,20 +5495,14 @@ mod walk_on_the_card {
             (
                 "KV_ROWS",
                 kv_span_rows(
-                    kv_heads,
-                    hd,
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    2048,
+                    &decl(kv_heads * hd, 2048),
                     kv_heads * SchedulerBlockTokens::REFERENCE.get() * hd / c.rows_per_page,
                 ),
             ),
             (
                 "V_ROWS",
                 kv_offset_plane_rows(
-                    kv_heads,
-                    hd,
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    2048,
+                    &decl(kv_heads * hd, 2048),
                     kv_heads * SchedulerBlockTokens::REFERENCE.get() * hd / c.rows_per_page,
                 ),
             ),
@@ -7042,20 +6974,14 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             (
                 "K_ROWS",
                 i128::from(kv_span_rows(
-                    nkvh as u32,
-                    hd as u32,
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    4,
+                    &decl(nkvh as u32 * hd as u32, 4),
                     hd as u32,
                 )),
             ),
             (
                 "V_ROWS",
                 i128::from(kv_offset_plane_rows(
-                    nkvh as u32,
-                    hd as u32,
-                    SchedulerBlockTokens::REFERENCE.get(),
-                    4,
+                    &decl(nkvh as u32 * hd as u32, 4),
                     hd as u32,
                 )),
             ),

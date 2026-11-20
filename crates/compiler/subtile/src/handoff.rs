@@ -277,6 +277,252 @@ pub enum SourceBinding {
     },
 }
 
+// ── The resident KV state's declaration ──────────────────────────────
+
+/// One plane of a layer's resident KV state: the minted source index of the plane's
+/// tensor, and its ELEMENT COUNT PER GROWTH UNIT — one page of the state's token slots,
+/// each slot of the plane's own row width. Fields are PRIVATE: a plane reaches a
+/// declaration only through [`KvStateDecl::new`] / [`KvStateDecl::paged_kv`] /
+/// [`KvStateDecl::shard_cols`], the constructors that state the whole-pages law.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvStatePlane {
+    source: usize,
+    per_unit_elems: u64,
+}
+
+impl KvStatePlane {
+    /// The plane's own mint — its source index and per-unit element count.
+    pub fn new(source: usize, per_unit_elems: u64) -> Self {
+        Self {
+            source,
+            per_unit_elems,
+        }
+    }
+
+    /// The plane's minted source index.
+    pub fn source(&self) -> usize {
+        self.source
+    }
+
+    /// The plane's element count per growth unit.
+    pub fn per_unit_elems(&self) -> u64 {
+        self.per_unit_elems
+    }
+}
+
+/// A state whose row count is not a whole number of growth units is unrepresentable — its
+/// unit count would not exist. Refused AT THE MINT (a compile-time error in the bake),
+/// never re-checked downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartialKvStatePage {
+    pub rows: u32,
+    pub page_slots: u32,
+}
+
+/// ⭐ ONE LAYER'S RESIDENT KV STATE — DECLARED WHERE ITS TENSORS ARE MINTED (the bridge's
+/// `prefix_for`, at the moment it pushes the layer's cache sources), carried in the
+/// handoff, and consumed by the planner and the splice door. Nobody else re-derives any of
+/// it: no op is read to learn a state's shape, and no `K + V` total is restated anywhere
+/// downstream. The state is its planes (in the splice's operand order) plus ONE GROWTH
+/// UNIT — a page of `page_slots` token slots holding EVERY plane — and every figure a
+/// consumer needs is a VIEW of this one declaration:
+///  * UNIT COUNT is `rows / page_slots` — whole by construction (the minting constructor
+///    refuses a partial page);
+///  * UNIT BYTES, at the plane dtype's bytes-per-element, is the SUM of the planes'
+///    per-unit elems times that width — the sum over planes, never a restated pair total;
+///  * A PLANE'S OFFSET IN THE UNIT is the prefix sum of the planes before it;
+///  * A PLANE'S EXTENT from its own base is the whole bank (`units × unit bytes`) minus
+///    its offset.
+///
+/// The elem forms below are the same views before the dtype conversion; the byte forms
+/// take the width as their ONE argument, so rows and bytes can never be two spellings of
+/// the law.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvStateDecl {
+    planes: Vec<KvStatePlane>,
+    page_slots: std::num::NonZeroU32,
+    rows: u32,
+}
+
+impl KvStateDecl {
+    /// The minting constructor — whole pages only (see [`PartialKvStatePage`]).
+    pub fn new(
+        planes: Vec<KvStatePlane>,
+        page_slots: std::num::NonZeroU32,
+        rows: u32,
+    ) -> Result<Self, PartialKvStatePage> {
+        if rows % page_slots.get() != 0 {
+            return Err(PartialKvStatePage {
+                rows,
+                page_slots: page_slots.get(),
+            });
+        }
+        Ok(Self {
+            planes,
+            page_slots,
+            rows,
+        })
+    }
+
+    /// ⭐ THE PAGED K/V STATE'S OWN MINT — the ONE statement of what one layer's attention cache
+    /// planes hold per growth unit: a page of `page_slots` token slots, each slot `kv_width`
+    /// elements (`kv_heads · head_dim`) on EACH of the K and V planes. The bridge's `prefix_for`
+    /// mints its declarations here, and every fixture that states a paged KV state consumes this
+    /// same constructor — a per-unit element count for a paged K or V plane spelled anywhere else
+    /// is the law stated twice.
+    pub fn paged_kv(
+        k_source: usize,
+        v_source: usize,
+        kv_width: u32,
+        page_slots: std::num::NonZeroU32,
+        rows: u32,
+    ) -> Result<Self, PartialKvStatePage> {
+        let per_unit = u64::from(page_slots.get()) * u64::from(kv_width);
+        Self::new(
+            vec![
+                KvStatePlane {
+                    source: k_source,
+                    per_unit_elems: per_unit,
+                },
+                KvStatePlane {
+                    source: v_source,
+                    per_unit_elems: per_unit,
+                },
+            ],
+            page_slots,
+            rows,
+        )
+    }
+
+    /// UNIT COUNT — whole by construction.
+    pub fn units(&self) -> u64 {
+        u64::from(self.rows) / u64::from(self.page_slots.get())
+    }
+
+    /// The declaration's planes, in the splice's operand order.
+    pub fn planes(&self) -> &[KvStatePlane] {
+        &self.planes
+    }
+
+    /// The growth unit's token slots — one page.
+    pub fn page_slots(&self) -> u32 {
+        self.page_slots.get()
+    }
+
+    /// The state's declared row count.
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// UNIT ELEMS — the sum over planes.
+    pub fn unit_elems(&self) -> u64 {
+        self.planes.iter().map(|p| p.per_unit_elems).sum()
+    }
+
+    /// A PLANE'S OFFSET IN THE UNIT, in elems — the prefix sum of the planes before it.
+    pub fn plane_offset_elems(&self, plane: usize) -> u64 {
+        self.planes[..plane].iter().map(|p| p.per_unit_elems).sum()
+    }
+
+    /// A PLANE'S EXTENT from its own base, in elems — the whole bank minus its offset.
+    pub fn plane_span_elems(&self, plane: usize) -> u64 {
+        self.units() * self.unit_elems() - self.plane_offset_elems(plane)
+    }
+
+    /// UNIT BYTES at one elems→bytes width — the sum over planes, the ONE statement.
+    pub fn unit_bytes(&self, width: u64) -> u64 {
+        self.unit_elems() * width
+    }
+
+    /// A PLANE'S OFFSET IN THE UNIT, in bytes.
+    pub fn plane_offset_bytes(&self, plane: usize, width: u64) -> u64 {
+        self.plane_offset_elems(plane) * width
+    }
+
+    /// A PLANE'S EXTENT from its own base, in bytes.
+    pub fn plane_span_bytes(&self, plane: usize, width: u64) -> u64 {
+        self.plane_span_elems(plane) * width
+    }
+
+    /// The declaration as ONE TP RANK holds it: `cols[plane]` is that plane's source's
+    /// `(local_cols, full_cols)` under the world's column slice, and a plane's per-unit
+    /// elems scale by exactly that ratio — a growth unit is a page of the plane's rows,
+    /// so its elems follow the columns' own slice law. Rows and the page are every
+    /// rank's alike, so the whole-page law holds un-rechecked. A per-unit elem count
+    /// that is not a WHOLE multiple of `full_cols` is no slice this handoff states — a
+    /// build panic naming both numbers, never a runtime fact.
+    pub fn shard_cols(&self, cols: &[(u64, u64)]) -> Self {
+        let planes = self
+            .planes
+            .iter()
+            .zip(cols)
+            .map(|(p, &(local, full))| {
+                // ⭐ THE SLICE LAW, STATED EXACTLY: a growth unit is a page of the plane's
+                // rows, so its elems must be a WHOLE multiple of the source's full column
+                // count — a remainder truncates slots silently, which is not a slice this
+                // handoff states. The panic names both numbers.
+                let per_full = p
+                    .per_unit_elems
+                    .checked_div(full)
+                    .filter(|&q| q * full == p.per_unit_elems)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "a resident KV state plane's per-unit elems ({}) are not a whole \
+                             multiple of its source's full column count ({}) — no TP slice of \
+                             it exists",
+                            p.per_unit_elems, full
+                        )
+                    });
+                KvStatePlane {
+                    source: p.source,
+                    per_unit_elems: per_full * local,
+                }
+            })
+            .collect();
+        Self {
+            planes,
+            page_slots: self.page_slots,
+            rows: self.rows,
+        }
+    }
+}
+
+#[cfg(test)]
+mod kv_state_decl_tests {
+    use super::*;
+
+    fn one_state(per_unit: u64) -> KvStateDecl {
+        KvStateDecl::new(
+            vec![KvStatePlane::new(0, per_unit), KvStatePlane::new(1, per_unit)],
+            std::num::NonZeroU32::new(128).expect("128 != 0"),
+            128,
+        )
+        .expect("one page is a whole number of pages")
+    }
+
+    /// ⛔ NEAR-MISS: a plane whose per-unit elems are NOT a whole multiple of its source's
+    /// full column count is no slice — the mint panics naming BOTH numbers, never truncates
+    /// (the old `checked_div` silently dropped the remainder while its panic text claimed
+    /// this law).
+    #[test]
+    #[should_panic(
+        expected = "per-unit elems (300) are not a whole multiple of its source's full column count (128)"
+    )]
+    fn a_partial_column_slice_refuses_naming_both_numbers() {
+        let _ = one_state(300).shard_cols(&[(64, 128), (64, 128)]);
+    }
+
+    /// The whole multiple slices exactly: `local/full` of the per-unit elems, page and rows
+    /// untouched (every rank's alike).
+    #[test]
+    fn a_whole_column_slice_scales_the_per_unit_elems() {
+        let sharded = one_state(256).shard_cols(&[(64, 128), (64, 128)]);
+        assert_eq!(sharded.planes()[0].per_unit_elems(), 128);
+        assert_eq!(sharded.page_slots(), 128);
+        assert_eq!(sharded.rows(), 128);
+    }
+}
+
 /// What an arena slot holds at a step: a FUF tile's output (`(tile, output)`, the key
 /// [`SlotMap`] colours), or a graph source (the embedded hidden, which a target's colour 0 is).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -386,6 +632,12 @@ pub struct LoweredDecode<E: EmbedState = Option<EmbedRow>> {
     /// names — a KV encode packs the cache half its writer filled, a coded attention reads the
     /// K/V its stage steps staged. Every other read is an operand.
     pub unnamed_reads: Vec<(usize, usize)>,
+    /// ⭐ THE RESIDENT KV STATES THIS TAPE DECLARES — minted with their tensors (the bridge's
+    /// `prefix_for`), one per layer, and re-derived by nobody: the planner's placement and the
+    /// splice door consume these and nothing else. An op-rewritten tape carries them unchanged
+    /// (an op rewrite keeps every source at its index, so the planes' source indices stay
+    /// valid).
+    kv_states: Vec<KvStateDecl>,
 }
 
 impl LoweredDecode {
@@ -398,6 +650,7 @@ impl LoweredDecode {
         norm_gain_add_tiles: std::collections::HashMap<usize, u32>,
         op_expansion: Vec<Option<Expansion>>,
         unnamed_reads: Vec<(usize, usize)>,
+        kv_states: Vec<KvStateDecl>,
     ) -> Result<Self, TwoEmbedRows> {
         let mut rows = (bindings.iter().enumerate())
             .filter(|(_, b)| matches!(b, SourceBinding::EmbeddedHidden))
@@ -415,6 +668,7 @@ impl LoweredDecode {
             norm_gain_add_tiles,
             op_expansion,
             unnamed_reads,
+            kv_states,
         })
     }
 
@@ -435,6 +689,7 @@ impl LoweredDecode {
                 norm_gain_add_tiles: self.norm_gain_add_tiles,
                 op_expansion: self.op_expansion,
                 unnamed_reads: self.unnamed_reads,
+                kv_states: self.kv_states,
             }),
             None => Err(NoEmbedRow),
         }
@@ -452,6 +707,11 @@ impl<E: EmbedState> LoweredDecode<E> {
     /// What each source is bound to (parallel to `input.sources`).
     pub fn bindings(&self) -> &[SourceBinding] {
         &self.bindings
+    }
+
+    /// The resident KV states this tape declares (see [`Self`]'s own `kv_states` note).
+    pub fn kv_states(&self) -> &[KvStateDecl] {
+        &self.kv_states
     }
 
     /// This tape's bindings and embed row over a rewritten forward — the form every op-rewriting
@@ -480,6 +740,17 @@ impl<E: EmbedState> LoweredDecode<E> {
             norm_gain_add_tiles,
             op_expansion,
             unnamed_reads,
+            kv_states: self.kv_states.clone(),
+        }
+    }
+
+    /// This tape over its states re-declared for one TP rank ([`KvStateDecl::shard_cols`] — the
+    /// planes' source indices are the shard's own, so only the per-unit elems move). The form
+    /// [`crate::tensor_parallel::shard_lowered`] returns.
+    pub fn with_kv_states(self, kv_states: Vec<KvStateDecl>) -> Self {
+        Self {
+            kv_states,
+            ..self
         }
     }
 }

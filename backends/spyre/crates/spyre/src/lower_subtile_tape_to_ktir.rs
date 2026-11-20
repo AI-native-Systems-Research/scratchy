@@ -881,6 +881,10 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // the bake ([`QueryExtent::of_baked_rung`]) and threaded down to the attention splice beside
     // `active_cap`. Only `AttnDecode` spends it; every other op reads the graph's rows.
     query_rows: QueryExtent,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the attention and
+    // KV-writer splices read their pool's declaration ([`KvStateDecl`]) and nothing else; every
+    // other arm ignores them.
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> NodeLowering<T> {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -1035,13 +1039,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
         SubOp::MatmulTile { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1084,7 +1088,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // draw reads the FOLDED tail's answer rows (the `[S, vocab]` window the
         // mint states on the node), which is `lower_all`'s machinery.
         SubOp::Sample { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1103,7 +1107,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // the split's own lowering emitted (`lower_all`'s interception), so the
         // one-op path is only for the norms that are NOT a sandwich seat.
         SubOp::RmsNorm { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1117,7 +1121,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // ⭐ A KV WRITER LOWERS TO ITS ROTATION AND ITS PAGED WRITE — `lower_all` emits both, the
         // scatter into the pools right after the rotation it stores.
         SubOp::RopeAppend { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1139,7 +1143,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             {
                 return HostRouted("ScalarMulWeightFold");
             }
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1169,6 +1173,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 active_cap,
                 query_rows,
                 scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
+                kv_states,
             ) {
                 // ⭐ THE PREFILL FAMILY — a packed rung's attention lowers to one op per window
                 // (the splice's own law), so the family extends the op list whole; a solo rung's
@@ -1213,6 +1218,9 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     rows_are_requests: bool,
     // The rung's query extent pair — threaded to the attention splice ([`lower_one_node`]).
     query_rows: QueryExtent,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the layout's pool
+    // set and unit structure are views of these (see [`compute_bundle_layout`]).
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     // GLOBAL ≤7-segment memory layout (task #55) computed ONCE for the whole bundle.
     // Every op resolves each tensor's HBM address from this (by `t{id}` name) so a
@@ -1229,6 +1237,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
         query_rows,
+        kv_states,
     )?;
     let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
@@ -1244,7 +1253,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests, query_rows) {
+        match lower_one_node(node, ir, active_cap, rows_are_requests, query_rows, kv_states) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1288,9 +1297,10 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     active_cap: ActiveCap,
     rows_are_requests: bool,
     query_rows: QueryExtent,
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
-        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows)?;
+        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows, kv_states)?;
     // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     let attn_params = attn_bundle_params(ir, rows_are_requests);
@@ -1599,6 +1609,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
     paged_rows: scratchy_triton_splice::PagedRows,
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     page_id_realization: crate::paged_step::PageIdRealization,
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
@@ -1616,15 +1627,17 @@ pub fn paged_step_of_ir<F: RopeForm>(
                 n.output.tensor.index()
             ))
         })?;
-        let rows = ir.tensors[cache.tensor.index()].rows;
-        if rows == 0 || !rows.is_multiple_of(slots) {
-            return Err(SuperDscError(format!(
-                "AttnDecode t{}: its K cache holds {rows} slots, not a whole number of \
-                 {slots}-slot pages",
-                n.output.tensor.index()
-            )));
-        }
-        let (pages, mq) = (rows / slots, n.output.region.rows.len);
+        // ⭐ THE POOL'S FACTS OFF THE DECLARATION — its page count is the declared units and its
+        // unit the declared Σ of the planes' per-unit elems ([`KvStateDecl`]), whole by the
+        // mint's own construction; no tensor shape is read back and no whole-pages law is
+        // restated here. A pool no declaration names is refused by name (a bake bug).
+        let decl = scratchy_triton_splice::decl_of_pool(kv_states, cache)
+            .map_err(SuperDscError)?;
+        let (pages, unit_elems, mq) = (
+            decl.units() as u32,
+            decl.unit_elems() as u32,
+            n.output.region.rows.len,
+        );
         if query_rows.graph_rows().get() != mq {
             return Err(SuperDscError(format!(
                 "AttnDecode t{}: the graph runs {mq} query row(s) but the rung's minted extent \
@@ -1648,6 +1661,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             chunk_masks: tids.chunk_masks,
             int32_zero: tids.int32_zero,
             pages,
+            unit_elems,
             page_slots: slots,
             rows: mq,
             nkvh: attention.class(mask.class()).kv_heads().get(),
@@ -1690,6 +1704,9 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // below, never re-derived from graph rows: a walk that minted its own pair would agree
     // with the graph yet state the wrong per-request width the day a packed prefill arrives.
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — threaded to the
+    // node walk's attention/KV-writer arms and the paged step below.
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -1704,7 +1721,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let _ = weight_ids;
     let registries = WiringRegistries {
         scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry::<T, F>(
-            ir, paged_rows, query_rows,
+            ir, paged_rows, query_rows, kv_states,
         )?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
@@ -1767,6 +1784,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     ActiveCap::FULL,
                     paged_rows == scratchy_triton_splice::PagedRows::Batch,
                     query_rows,
+                    kv_states,
                 ) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
@@ -1940,6 +1958,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         paged_rows,
         query_rows,
         crate::paged_step::PageIdRealization::EntrySpacing(page_index_scale),
+        kv_states,
     )?;
     let attn_mask = match (masks.first().copied(), paged) {
         (Some((_, cap)), Some(p)) => {
@@ -2289,6 +2308,9 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The graph's query extents, minted by the bake — threaded to the node walk, never
     // re-derived from graph rows (see [`graph_wiring`]'s own parameter note).
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // The resident KV states, as the handoff declared them — threaded to the node walk's
+    // attention/KV-writer arms (see [`graph_wiring`]'s own parameter note).
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<
     std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
     SuperDscError,
@@ -2299,7 +2321,7 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .iter()
         .filter(|n| matches!(n.op, SubOp::Sample { .. }))
     {
-        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows) {
+        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows, kv_states) {
             NodeLowering::Ops(v) => v,
             NodeLowering::HostRouted(_) => continue,
             NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
@@ -2545,6 +2567,9 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     rows_are_requests: bool,
     // The rung's query extent pair — threaded to the attention splice ([`lower_one_node`]).
     query_rows: QueryExtent,
+    // ⭐ THE RESIDENT KV STATES, as the handoff declared them at their mint — the layout's pool
+    // set and unit structure are views of these (see [`compute_bundle_layout`]).
+    kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let _pc = crate::pc::Pc::start("producer");
@@ -2585,6 +2610,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &per_layer_ext,
         query_rows,
+        kv_states,
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
@@ -2997,7 +3023,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                         group_weight_banks[seg].insert(p.bank);
                     }
                 }
-                match lower_one_node(n, ir, active_cap, rows_are_requests, query_rows) {
+                match lower_one_node(n, ir, active_cap, rows_are_requests, query_rows, kv_states) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
                             prefix.extend(v);
@@ -3099,7 +3125,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     let attn_params = attn_bundle_params(ir, rows_are_requests);
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
-    let pools = crate::lower_subtile_tape_to_superdsc::kv_pool_tids(ir);
+    let pools = crate::lower_subtile_tape_to_superdsc::kv_pool_tids(kv_states);
     let body_op_lists: Vec<&Vec<EmittedOp<T>>> = bodies.iter().map(|b| &b.ops).collect();
     for ops in std::iter::once(&prefix)
         .chain(body_op_lists.iter().copied())

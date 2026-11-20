@@ -104,6 +104,9 @@ pub enum BridgeError {
     NoKernel { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
     UnrealizedExpertActivation { tile: TileId, act: String },
+    /// A layer's resident KV state was minted at a row count that is not a whole number of
+    /// growth units (pages) — see [`scratchy_subtile::handoff::PartialKvStatePage`].
+    PartialKvStatePage(scratchy_subtile::handoff::PartialKvStatePage),
 }
 
 impl BridgeError {
@@ -160,6 +163,12 @@ impl std::fmt::Display for BridgeError {
                 "tile {} moe_block: the config declares expert activation `{act}`, which no \
                  expert body realizes (a gated `silu` bank or an ungated `relu2` one)",
                 tile.0
+            ),
+            Self::PartialKvStatePage(e) => write!(
+                f,
+                "a resident KV state of {rows} rows is not a whole number of {page}-slot pages",
+                rows = e.rows,
+                page = e.page_slots
             ),
             Self::UnsupportedWeight { tile, detail } => {
                 write!(
@@ -256,6 +265,12 @@ struct Builder<'a> {
     /// The construct being expanded, while its ops are pushed.
     expanding: Option<ExpansionId>,
     expansions: u32,
+    /// ⭐ THE RESIDENT STATE'S GROWTH UNIT — one page of this many token slots. AN ARGUMENT,
+    /// NOT A MODEL FACT: the caller (the bake) passes the serving step's own page, the one
+    /// the attention walks; the bridge states no value of its own.
+    page_slots: std::num::NonZeroU32,
+    /// The resident KV states minted so far — one per layer, at its `prefix_for` pair.
+    kv_states: Vec<scratchy_subtile::handoff::KvStateDecl>,
 }
 
 /// The expert half of a MoE block, which every router shares.
@@ -485,14 +500,29 @@ impl<'a> Builder<'a> {
     /// one layer's K and V caches share a width, and a second call from the SAME class finds its
     /// pair; a wrong pairing would be caught by the SubtileIR shape validator, which refuses a
     /// cache region wider than its source.
-    fn prefix_for(&mut self, layer: u64, kvdim: u32) -> (usize, usize) {
+    fn prefix_for(&mut self, layer: u64, kvdim: u32) -> Result<(usize, usize), BridgeError> {
         if let Some(pp) = self.prefix.get(&(layer, kvdim)) {
-            return *pp;
+            return Ok(*pp);
         }
         let pk = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixK { layer });
         let pv = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixV { layer });
+        // ⭐ THE RESIDENT STATE IS DECLARED HERE, AT ITS MINT — the planes this pair just
+        // minted plus the ONE growth unit they grow by, through the paged K/V state's own
+        // mint ([`KvStateDecl::paged_kv`], the one statement of a plane's per-unit elems).
+        // The planner's placement and the splice door consume this declaration and nothing
+        // else re-derives it: no op is read to learn the state's shape, and no K+V total is
+        // restated downstream.
+        let decl = scratchy_subtile::handoff::KvStateDecl::paged_kv(
+            pk,
+            pv,
+            kvdim,
+            self.page_slots,
+            self.prefix_len,
+        )
+        .map_err(BridgeError::PartialKvStatePage)?;
+        self.kv_states.push(decl);
         self.prefix.insert((layer, kvdim), (pk, pv));
-        (pk, pv)
+        Ok((pk, pv))
     }
 }
 
@@ -598,6 +628,7 @@ pub fn lower_decode_to_wavefront(
     model: &BridgeModel<'_>,
     prefix_len: PrefixCapacity,
     num_tokens: u32,
+    page_slots: std::num::NonZeroU32,
 ) -> Result<LoweredDecode, BridgeError> {
     // The config params and the typed facts are ONE model — the bake holds them
     // together, so the bridge takes them together.
@@ -668,6 +699,8 @@ pub fn lower_decode_to_wavefront(
         op_expansion: Vec::new(),
         expanding: None,
         expansions: 0,
+        page_slots,
+        kv_states: Vec::new(),
     };
 
     // The result is the last value-producing op (the lm_head GEMM).
@@ -979,7 +1012,7 @@ pub fn lower_decode_to_wavefront(
                 // WIDTH is this layer's own k-rope width — a hybrid model's
                 // classes have different kv widths, so the cache the append
                 // writes must be THIS class's.
-                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols)?;
                 let qi = bx.push_op(
                     SubOp::rope_rotate(head_dim),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
@@ -1030,7 +1063,7 @@ pub fn lower_decode_to_wavefront(
                 // append writes must be THIS class's (the same rule the rope
                 // arm's `prefix_for(layer, k_cols)` follows).
                 let k_cols = bx.out_cols(tile, 0, "kv_append k cols")?;
-                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols)?;
                 let ki = bx.push_op(
                     // `Causal` by default; the consuming attention arm backpatches
                     // `SlidingWindow` for sliding layers.
@@ -1127,7 +1160,7 @@ pub fn lower_decode_to_wavefront(
                 // The prefix cache at THIS layer's class width — a hybrid model's
                 // sliding and global layers have different kv widths, and the cache
                 // this attention reads is the one its own class's RopeAppend wrote.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width())?;
                 if let AttnMask::SlidingWindow { window } = mask {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
@@ -1197,7 +1230,7 @@ pub fn lower_decode_to_wavefront(
                 // The prefix cache at THIS layer's class width — a hybrid
                 // model's sliding and global layers have different kv widths,
                 // and the cache this attention reads is its own class's.
-                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width())?;
                 let idx = bx.push_op(
                     SubOp::attn_decode(attention, bx.prefix_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],
@@ -2053,6 +2086,7 @@ pub fn lower_decode_to_wavefront(
         bx.norm_gain_add_tiles,
         bx.op_expansion,
         Vec::new(),
+        bx.kv_states,
     )
     .map_err(BridgeError::TwoEmbedRows)
 }

@@ -43,6 +43,7 @@ pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
             &bridge_model,
             PrefixCapacity::new(std::num::NonZeroU32::new(8192).expect("8192 != 0")),
             num_tokens,
+            scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.nz(),
         )
         .ok()
     });

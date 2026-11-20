@@ -563,10 +563,21 @@ mod tests {
         theta_bits: 1_232_348_160, // f32::to_bits(1e6), spelled as bits: const-evaluable.
     };
 
+    /// The unit this fixture's geometry declares — the MINT's own statement
+    /// ([`KvStateDecl::paged_kv`], the bridge's constructor), so the fixture states its planes'
+    /// width and its page and never the sum.
+    fn unit_of(nkvh: u32, head_size: u32, page_slots: u32) -> u32 {
+        let page = ::core::num::NonZeroU32::new(page_slots).expect("a fixture's page is nonzero");
+        scratchy_subtile::handoff::KvStateDecl::paged_kv(0, 1, nkvh * head_size, page, page_slots)
+            .expect("a fixture's page is whole")
+            .unit_elems() as u32
+    }
+
     /// A granite-shaped step: 4 pages of 4 slots, 2 kv heads, a 3-row bundle walking every block.
     /// The reserved sentinels, as every real wiring's step carries them — window 0's tids in the
     /// card stagers and the placements ARE these.
-    const STEP: crate::wiring::PagedStep = crate::wiring::PagedStep {
+    fn step() -> crate::wiring::PagedStep {
+        crate::wiring::PagedStep {
         mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
         page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
         write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
@@ -577,6 +588,7 @@ mod tests {
         chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
         int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
         pages: 4,
+        unit_elems: unit_of(2, 64, 4),
         page_slots: 4,
         rows: 3,
         nkvh: 2,
@@ -602,7 +614,8 @@ mod tests {
                 ::core::panic!("the fixture's three rows by one request name a rung")
             }
         },
-    };
+        }
+    }
 
     fn shape() -> ForwardShape {
         ForwardShape {
@@ -610,7 +623,7 @@ mod tests {
             embed_src: 0,
             cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
             sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
-            paged: Some(STEP),
+            paged: Some(step()),
             n_consts: 3,
             phase: ForwardPhase::Prefill,
         }
@@ -645,8 +658,9 @@ mod tests {
     #[test]
     fn the_paged_steps_are_the_card_steps_tables() {
         let rows = crate::paged_step::StepRows::new(9, 3).expect("three rows is three rows");
+        let step = step();
         let card = crate::paged_step::card_step_sources(
-            &STEP,
+            &step,
             &[crate::paged_step::RequestStep {
                 blocks: &[3, 1, 0],
                 rows,
@@ -654,19 +668,19 @@ mod tests {
         )
         .expect("staged");
         let inp = inputs(Some(&card));
-        for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {
+        for t in [step.page_table, step.write_rows, step.query_rows] {
             match staged(ForwardKernel::Paged, t, &inp).expect("a table") {
                 Staged::I32(w) => assert_eq!(Some(w.as_slice()), card.words(t), "t{t}"),
                 _ => panic!("t{t}: an index table staged as anything but int32 words"),
             }
         }
-        match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
+        match staged(ForwardKernel::Paged, step.mask, &inp).expect("a mask stack") {
             Staged::F32(v) => assert_eq!(&v[..], &card.masks[0].1[..]),
             _ => panic!("a mask stack is a value tensor"),
         }
         // The pool's statics are staged at load, so the tape has no step for them.
         assert!(shape().steps().iter().all(|s| {
-            s.tensor != PlaceId::Act(STEP.kv_row_pool) && s.tensor != PlaceId::Act(STEP.int32_zero)
+            s.tensor != PlaceId::Act(step.kv_row_pool) && s.tensor != PlaceId::Act(step.int32_zero)
         }));
     }
 
@@ -675,7 +689,8 @@ mod tests {
     #[test]
     fn a_paged_step_with_no_blocks_refuses_rather_than_reading_page_zero() {
         let inp = inputs(None);
-        for t in [STEP.page_table, STEP.mask, STEP.write_rows, STEP.query_rows] {
+        let step = step();
+        for t in [step.page_table, step.mask, step.write_rows, step.query_rows] {
             match staged(ForwardKernel::Paged, t, &inp) {
                 Err(e) => assert!(e.contains("page 0 is a REAL page"), "t{t}: {e}"),
                 Ok(_) => panic!("t{t} staged with no blocks"),
@@ -686,10 +701,11 @@ mod tests {
     /// A decode batch's tape stages the batch's own tables, never one sequence's.
     #[test]
     fn a_decode_batch_stages_its_own_tables() {
+        let step = step();
         let batch = ForwardShape {
             paged: Some(crate::wiring::PagedStep {
                 paged_rows: crate::paged_step::PagedRows::Batch,
-                ..STEP
+                ..step
             }),
             ..shape()
         };
@@ -700,14 +716,14 @@ mod tests {
             .map(|s| s.tensor)
             .collect();
         for t in [
-            STEP.rep_rows,
-            STEP.chunk_pages,
-            STEP.chunk_masks,
-            STEP.write_rows,
+            step.rep_rows,
+            step.chunk_pages,
+            step.chunk_masks,
+            step.write_rows,
         ] {
             assert!(tids.contains(&PlaceId::Act(t)), "t{t}");
         }
-        for t in [STEP.page_table, STEP.mask, STEP.query_rows] {
+        for t in [step.page_table, step.mask, step.query_rows] {
             assert!(!tids.contains(&PlaceId::Act(t)), "t{t}");
         }
     }

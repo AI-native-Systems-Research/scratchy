@@ -794,6 +794,7 @@ pub fn front_end_lowered(input: LoweringInput) -> LoweredDecode {
         HashMap::from([(0, 100)]),
         vec![None; n],
         Vec::new(),
+        Vec::new(),
     )
     .expect("a fixture of weight sources names no embed row")
 }

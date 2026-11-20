@@ -258,6 +258,7 @@ mod tests {
             Default::default(),
             vec![None; 2],
             Vec::new(),
+            Vec::new(),
         )
         .expect("one embed row")
     }

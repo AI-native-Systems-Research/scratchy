@@ -16,7 +16,7 @@
 //!   `h` of the token at `block · page_slots + offset` at row
 //!   `(block · 2·nkvh + h) · page_slots + offset` — the pool is UNIT-MAJOR (one page holds both
 //!   planes, K then V), so the row the index names carries the interleave and each plane's base
-//!   carries its own offset in the unit ([`scratchy_triton_splice::kv_unit_elems`], the one
+//!   carries its own offset in the unit ([`scratchy_subtile::handoff::KvStateDecl::unit_elems`], the one
 //!   statement);
 //! * the QUERY ROW INDEX `[rows]` int32 — `_build_query_row_tables`: the sequence's rows of the
 //!   query. A forward here is one sequence whose padded rows already repeat its last real row (the
@@ -37,7 +37,7 @@ use crate::wiring::PagedStep;
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
 pub use scratchy_triton_splice::{
-    BatchChunking, PagedRows, SchedulerBlockTokens, kv_unit_elems, walk_buckets, walk_pages,
+    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages,
 };
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
@@ -305,7 +305,7 @@ fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
 
 /// The KV write index: one `[rows]` index per kv head, one after another — head `h` of row `r`'s
 /// token at cache row `(page · unit_rows + h) · page_slots + slot`, at the row's position, where
-/// `unit_rows` is the unit stride ([`kv_unit_elems`]) over the write frame's own row width
+/// `unit_rows` is the unit stride (the declaration's [`KvStateDecl::unit_elems`], carried as [`PagedStep::unit_elems`]) over the write frame's own row width
 /// (`head_size` elements): the pool is unit-major, so the interleave rides in the row the index
 /// names and each plane's base carries its own offset in the unit. One statement, consumed.
 pub fn write_rows(
@@ -320,7 +320,7 @@ pub fn write_rows(
         step.rows as usize,
     );
     let unit_rows =
-        kv_unit_elems(step.nkvh, step.head_size, step.page_slots) as usize / step.head_size as usize;
+        step.unit_elems as usize / step.head_size as usize;
     let mut w = Vec::with_capacity(nkvh * q);
     for h in 0..nkvh {
         for r in 0..q {
@@ -382,13 +382,13 @@ pub fn query_rows(step: &PagedStep) -> Vec<i32> {
 }
 
 /// `kv_row_pool`: `[pages, nkvh, 1]`, page `p`'s kv head `kv` at folded-cache row
-/// `p · unit_rows + kv`, where `unit_rows` is the unit stride ([`kv_unit_elems`]) over the folded
+/// `p · unit_rows + kv`, where `unit_rows` is the unit stride (the declaration's [`KvStateDecl::unit_elems`], carried as [`PagedStep::unit_elems`]) over the folded
 /// row's own width (`page_slots · head_size` elements) — the pool is unit-major, so the interleave
 /// rides in the value and each plane's base carries its own offset in the unit. One statement,
 /// consumed.
 pub fn kv_row_pool(step: &PagedStep) -> Vec<i32> {
     let unit_rows =
-        kv_unit_elems(step.nkvh, step.head_size, step.page_slots) / (step.page_slots * step.head_size);
+        step.unit_elems / (step.page_slots * step.head_size);
     (0..step.pages)
         .flat_map(|p| (0..step.nkvh).map(move |kv| (p * unit_rows + kv) as i32))
         .collect()
@@ -456,7 +456,7 @@ pub struct BatchSeq<'a> {
 ///   slot (`query_row_ids.repeat(blocks_per_chunk)`);
 /// * the page ids are each sequence's blocks down the block-slot axis, zero past them;
 /// * both index tables as the kernel gathers: entry `e`'s row `a` at `e · P + a` holding
-///   `x · U + a`, `U` the unit's rows in this frame ([`kv_unit_elems`] over the frame's row width —
+///   `x · U + a`, `U` the unit's rows in this frame ([`PagedStep::unit_elems`] over the frame's row width —
 ///   the pool is unit-major, the interleave in the value) — at `P = 1` theirs but for the stride;
 ///   at `P = nkvh` (a chunk under Triton's gather floor in pages) folded by kv head, the
 ///   per-sequence decode kernel's `kv_row_pool` form, which their batched builder never stages
@@ -513,7 +513,7 @@ pub fn batch_sources(
     let words = |w: Vec<i32>| -> Vec<u8> { w.into_iter().flat_map(i32::to_le_bytes).collect() };
     // Each entry as the `rows_per_page` rows the kernel gathers it by. The QUERY rows are dense in
     // the batch's own query buffer (`rep · P + a`); the PAGE ids are rows of the unit-major pool
-    // (`x · unit_rows + a`, `unit_rows` the unit stride `kv_unit_elems` over this frame's own row
+    // (`x · unit_rows + a`, `unit_rows` the unit stride [`PagedStep::unit_elems`] over this frame's own row
     // width `nkvh · page_slots · head_size / rows_per_page` — the interleave rides in the value,
     // each plane's base carrying its own offset in the unit). Two laws, two closures.
     let per = chunking.rows_per_page as i32;
@@ -522,7 +522,7 @@ pub fn batch_sources(
             .flat_map(|&v| (0..per).map(move |a| v * per + a))
             .collect()
     };
-    let unit_rows = (kv_unit_elems(step.nkvh, step.head_size, step.page_slots) as i32)
+    let unit_rows = step.unit_elems as i32
         / (step.nkvh as i32 * step.page_slots as i32 * step.head_size as i32 / per);
     let fold_pages = |x: &[i32]| -> Vec<i32> {
         x.iter()
@@ -569,7 +569,7 @@ pub fn batch_sources(
     // unit-major write law (`write_rows`'s own): the interleave in the row, the plane offset in the
     // base.
     let unit_rows =
-        kv_unit_elems(step.nkvh, step.head_size, step.page_slots) as usize / step.head_size as usize;
+        step.unit_elems as usize / step.head_size as usize;
     let mut write = Vec::with_capacity(nkvh * b);
     for h in 0..nkvh {
         for r in 0..b {
@@ -760,7 +760,7 @@ pub fn card_step_sources(
     // The unit-major write law (`write_rows`'s own): the interleave in the row, the plane offset
     // in the base.
     let unit_rows =
-        kv_unit_elems(step.nkvh, step.head_size, step.page_slots) as usize / step.head_size as usize;
+        step.unit_elems as usize / step.head_size as usize;
     for h in 0..nkvh {
         for r in 0..cap {
             match reqs.get(r) {
@@ -870,7 +870,7 @@ pub fn card_statics(step: &PagedStep) -> Result<Vec<(u32, Vec<u8>)>, PagedStepEr
 
 /// A pool holding token-major cache rows: row `t` of `cache` (`[·, nkvh · hd]`) laid into its page —
 /// head `h` at pool row `(blocks[t / page_slots] · unit_rows + h) · page_slots + t % page_slots`,
-/// `unit_rows` the unit stride ([`kv_unit_elems`]) over the write frame's own row width — the
+/// `unit_rows` the unit stride (the declaration's [`KvStateDecl::unit_elems`], carried as [`PagedStep::unit_elems`]) over the write frame's own row width — the
 /// pool is UNIT-MAJOR, so this one plane's span (`pages · unit_rows` write rows) carries the other
 /// plane's rows as the zeros the allocation already holds — for every `t < valid`; every other row
 /// zero. Returned as the pool's PREFIX through the last page a row lands on (empty when `valid` is
@@ -912,8 +912,7 @@ pub fn pool_of_rows(
         .map(|&p| p as usize + 1)
         .max()
         .unwrap_or(0);
-    let unit_rows =
-        kv_unit_elems(step.nkvh, hd as u32, step.page_slots) as usize / hd;
+    let unit_rows = step.unit_elems as usize / hd;
     let mut pool = vec![0f32; pages * unit_rows * hd];
     for t in 0..valid {
         let page = blocks[t / slots] as usize;
@@ -947,6 +946,23 @@ mod tests {
         .expect("the fixture's rows fit a u32")
     }
 
+    /// The unit a fixture's geometry declares — the MINT's own statement
+    /// ([`scratchy_subtile::handoff::KvStateDecl::paged_kv`], the same constructor the bridge
+    /// uses), so a fixture states its planes' width and its page and never the sum: the unit is
+    /// the declaration's Σ over the planes, read back as the step's own minted field.
+    fn unit_of(nkvh: u32, head_size: u32, page_slots: u32) -> u32 {
+        let page = std::num::NonZeroU32::new(page_slots).expect("a fixture's page is nonzero");
+        scratchy_subtile::handoff::KvStateDecl::paged_kv(
+            0,
+            1,
+            nkvh * head_size,
+            page,
+            page_slots,
+        )
+        .expect("a fixture's page is whole")
+        .unit_elems() as u32
+    }
+
     fn step() -> PagedStep {
         // The reserved sentinels, as every real wiring's step carries them (`PagedStepTids::RESERVED`
         // through `paged_step_of_ir`) — window 0's tids in the card stagers and the placements ARE
@@ -963,6 +979,7 @@ mod tests {
             chunk_masks: tids.chunk_masks,
             int32_zero: tids.int32_zero,
             pages: 4,
+            unit_elems: unit_of(2, 64, 4),
             page_slots: 4,
             rows: 3,
             nkvh: 2,
@@ -1497,6 +1514,7 @@ mod tests {
     fn the_card_holds_the_mask_stack_stick_major() {
         let s = PagedStep {
             page_slots: 128,
+            unit_elems: unit_of(2, 64, 128),
             ..step()
         };
         let rows = StepRows {
@@ -1528,6 +1546,7 @@ mod tests {
         assert_ne!(mask, &logical, "two sticks a row: not the row-major bytes");
         let b = PagedStep {
             page_slots: 128,
+            unit_elems: unit_of(2, 64, 128),
             ..batch()
         };
         let seqs = [BatchSeq {
@@ -2167,16 +2186,18 @@ mod tests {
     #[test]
     fn cached_rows_land_on_their_pages() {
         let s = step();
-        let hd = 2;
-        // Five cached tokens, token t's values t·10 + (head·2 + d).
+        // The head size is the STEP'S OWN declared geometry — the same agreement production
+        // states (the declaration's unit is minted at this width), never a second spelling of it.
+        let (hd, nkvh) = (s.head_size as usize, s.nkvh as usize);
+        // Five cached tokens, token t's values t·10 + (head·hd + d).
         let cache: Vec<f32> = (0..5)
-            .flat_map(|t| (0..4).map(move |j| (t * 10 + j) as f32))
+            .flat_map(|t| (0..nkvh * hd).map(move |j| (t * 10 + j) as f32))
             .collect();
         let pool = pool_of_rows(&s, hd, &[3, 1], &cache, 5).unwrap();
         // Token 4 is block 1 (page 1) slot 0: head 1 at pool row 1·16 + 1·4 + 0 = 20 — the
         // unit-major write law (a unit's write rows are 2·nkvh·page_slots = 16).
-        assert_eq!(&pool[20 * hd..21 * hd], &[42.0, 43.0]);
+        assert_eq!(&pool[20 * hd..20 * hd + 2], &[104.0, 105.0]);
         // Token 0 is page 3 slot 0, head 0 at pool row 3·16 = 48.
-        assert_eq!(&pool[48 * hd..49 * hd], &[0.0, 1.0]);
+        assert_eq!(&pool[48 * hd..48 * hd + 2], &[0.0, 1.0]);
     }
 }

@@ -179,6 +179,7 @@ fn run_tail(
         superdsc::ActiveCap::FULL,
         false,
         pair_of_one_request(ir.tensors[ir.result.index()].rows),
+        &[],
     )
     .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     // The window is stated EXPLICITLY: this hand-lowered test graph minted no LX
@@ -239,6 +240,7 @@ fn the_prefill_lm_head_tail_extracts_the_last_row() {
         superdsc::ActiveCap::FULL,
         false,
         pair_of_one_request(m),
+        &[],
     )
     .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     let lmlast: Vec<&str> = ops
@@ -344,6 +346,7 @@ fn the_tail_at_m1_still_matches_the_reference() {
         superdsc::ActiveCap::FULL,
         false,
         pair_of_one_request(m),
+        &[],
     )
     .unwrap_or_else(|e| panic!("lower the m=1 tail: {e:?}"));
     let lmlast: Vec<&str> = ops
@@ -463,6 +466,7 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
         superdsc::ActiveCap::FULL,
         false,
         pair_of_one_request(m),
+        &[],
     )
     .unwrap_or_else(|e| panic!("lower the collision graph: {e:?}"));
     let lmlast: Vec<&str> = ops
