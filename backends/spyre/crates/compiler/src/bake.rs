@@ -3432,16 +3432,16 @@ pub(crate) fn dump_wavefront_mega(
                                         // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
                                         // `num_blocks` buckets over this bundle's pool
                                         // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
-                                        // baked walks `ceiling_walk` pages — the whole pool for a
+                                        // baked walks `ceiling_walk` pages — the whole context for a
                                         // decode bake, the chunk's own pages for a prompt chunk
                                         // baked with no resident prefix — and every other bucket
                                         // is a rung, so each step walks the fewest pages that
                                         // reach its context.
-                                        let pool_pages =
+                                        let context_pages =
                                             cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
                                         let ceiling_walk =
                                             scratchy_target_spyre::paged_step::walk_pages(
-                                                pool_pages,
+                                                cap,
                                                 prefill_mq.unwrap_or(decode_rows),
                                                 active_cap,
                                             );
@@ -3497,7 +3497,7 @@ pub(crate) fn dump_wavefront_mega(
                                         let prefix_free_chunk = is_prefill
                                             && active_cap
                                                 == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
-                                        let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
+                                        let sweep = scratchy_target_spyre::paged_step::walk_buckets(context_pages)
                                             .into_iter()
                                             .filter(|&b| {
                                                 if prefix_free_chunk {

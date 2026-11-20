@@ -2371,13 +2371,6 @@ const ATTN_SHAPES: &[AttnShape] = &[
     },
 ];
 
-/// The attention fixture's decode-position model: how many positions the mask says are valid
-/// this step (`= decode_position + 1`). For a rope-appended cache the prefix segment is
-/// `valid_len - 1` rows (the new row arrives through the separate new-k/new-v segments); for a
-/// pre-populated cache the whole region is valid. 33 keeps the rope-appended prefix region
-/// non-degenerate (`lower_region` slices it to 32 rows).
-const ATTN_VALID_LEN: u32 = 33;
-
 /// One attention node (plus its RopeAppend producer when the shape wants one) as a
 /// `lower_region`-bound `SubtileIR` — the ONLY construction that can mint the Tiled stage's
 /// `KvCacheLayout`/`KvCacheProducer`/`SoftmaxStateId` witnesses, because their constructors are
@@ -2396,7 +2389,9 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     // The pre-populated prefix's own region rows (the emulator-threaded extent main's
     // builder read directly); the rope-appended one is sliced by `lower_region` below.
     const PREPOP_ROWS: u32 = 32;
-    let valid_len = ATTN_VALID_LEN;
+    // The cache's rows: the bridge's valid_len is the context it bakes against, and every
+    // fixture's cache IS that context.
+    let valid_len = s.cap;
     // The new block's rows: at decode the one new row; at prefill the chunk's own `mq` rows
     // (the one-pass condition `seq_len == mq`).
     let new_len = if mq > 1 { mq } else { 1 };

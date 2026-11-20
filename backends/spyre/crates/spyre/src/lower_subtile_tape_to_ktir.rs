@@ -1610,7 +1610,10 @@ pub fn paged_step_of_ir<F: RopeForm>(
     let mut out: Option<crate::wiring::PagedStep> = None;
     for n in &ir.nodes {
         let SubOp::AttnDecode {
-            mask, attention, ..
+            valid_len,
+            mask,
+            attention,
+            ..
         } = &n.op
         else {
             continue;
@@ -1641,7 +1644,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
                 query_rows.requests().get(),
             )));
         }
-        let walk = scratchy_triton_splice::walk_pages(pages, mq, active_cap);
+        let walk = scratchy_triton_splice::walk_pages(*valid_len, mq, active_cap);
         let step = crate::wiring::PagedStep {
             mask: tids.mask,
             page_table: tids.page_table,

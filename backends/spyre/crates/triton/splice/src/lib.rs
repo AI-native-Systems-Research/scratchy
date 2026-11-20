@@ -2050,8 +2050,9 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
-/// swept extent in pages. Every page of the pool at `ActiveCap::FULL` (a decode step's keys can sit
-/// anywhere below the capacity), and at `ActiveCap::NONE` (a prompt chunk baked with no resident
+/// swept extent in pages. Every page of the context at `ActiveCap::FULL` (a decode step's keys can sit
+/// anywhere below it); the pool may hold more pages than the context, and the walk never reaches past
+/// the context. At `ActiveCap::NONE` (a prompt chunk baked with no resident
 /// prefix) the pages its own `mq` rows fill.
 ///
 /// Blocks past a sequence's length carry a fully-masked tile, so a walk wider than the context costs
@@ -2059,15 +2060,12 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(pages: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
-    let swept = active_cap.resolve(
-        pages * SchedulerBlockTokens::REFERENCE.get(),
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-    );
+pub fn walk_pages(context: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
+    let swept = active_cap.resolve(context, ktir_superdsc::sdsc_abstract::POOL_STICK);
     let walked = if swept == 0 { mq } else { swept };
     walked
         .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(pages)
+        .min(context.div_ceil(SchedulerBlockTokens::REFERENCE.get()))
 }
 
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
@@ -2131,7 +2129,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // state and dots are f16). The op states neither, so neither reaches here today; a field added
     // for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
-        valid_len: _,
+        valid_len,
         layout: _,
         producer,
         softmax_state: _,
@@ -2215,9 +2213,9 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // decode kernel (one query row) and the batched kernel (the request axis carried inside one
     // launch) keep the graph's row count, exactly as before.
     let blocks = if batch || decode {
-        walk_pages(pages.get(), mq, active_cap)
+        walk_pages(*valid_len, mq, active_cap)
     } else {
-        walk_pages(pages.get(), query_rows.per_request().get(), active_cap)
+        walk_pages(*valid_len, query_rows.per_request().get(), active_cap)
     };
     let tids = PagedStepTids::RESERVED;
     // ⭐ THE POOLS' FORMAT IS THE TAPE'S — the writer this attention's cache names
@@ -4920,7 +4918,7 @@ mod production_ktir_dump {
             block: SchedulerBlockTokens::REFERENCE,
             pages: PoolPages::new(nz(4)),
             blocks: WalkBlocks::new(nz(walk_pages(
-                4,
+                4 * SchedulerBlockTokens::REFERENCE.get(),
                 64,
                 ktir_superdsc::ktir_node::ActiveCap::NONE,
             ))),

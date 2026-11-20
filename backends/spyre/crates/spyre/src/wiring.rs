@@ -678,7 +678,7 @@ pub struct PagedStep {
     /// ([`crate::paged_step::BatchChunking::of`]).
     pub head_size: u32,
     /// Blocks of the page table this bundle's attention walks — the bake's
-    /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
+    /// `scratchy_triton_splice::walk_pages` for the rung, so at most the context's pages.
     pub walk: u32,
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
@@ -770,7 +770,7 @@ impl PagedStep {
     }
 
     /// ⭐ THE STEP'S CARD PLACEMENTS — `(tid, seat, bytes)` for every source this bundle's attention
-    /// reads, sized for the pool's whole walk (a body walking fewer blocks stages and reads a
+    /// reads, sized for the step's own walk (a body walking fewer blocks stages and reads a
     /// prefix). The one statement the bake places by (`compute_bundle_layout`) and the card stagers
     /// ([`crate::paged_step::card_step_sources`], [`crate::paged_step::card_batch_sources`],
     /// [`crate::paged_step::card_statics`]) stage within; `self` is the bundle's own step, at its
@@ -809,7 +809,7 @@ impl PagedStep {
                 // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID — window `r`'s three tables (page
                 // table, mask stack, query rows) at
                 // [`ktir_superdsc::reserved_tids::paged_window_tid`] `r`, each its own region
-                // sized the ONE-REQUEST size (the pool's whole walk, as ever), the windows
+                // sized the ONE-REQUEST size (the step's walk), the windows
                 // packed in window order after the write rows. Window 0's tids ARE the step's
                 // own sentinels, so at one request the rows are exactly today's — same tids,
                 // same sizes, same order, byte for byte.
@@ -823,12 +823,12 @@ impl PagedStep {
                         (
                             window_tid(r, 1),
                             CardSeat::Step,
-                            u64::from(self.pages) * self.card_walk_step(),
+                            u64::from(self.walk) * self.card_walk_step(),
                         ),
                         (
                             window_tid(r, 2),
                             CardSeat::Step,
-                            u64::from(self.pages) * w * slots * 2,
+                            u64::from(self.walk) * w * slots * 2,
                         ),
                         (window_tid(r, 0), CardSeat::Step, sticks(w)),
                     ]);
