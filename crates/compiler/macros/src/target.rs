@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use proc_macro2::TokenStream;
-/// The quant presets, typed: what a target's [`TargetEmitter::presets`] lists.
-pub use scratchy_quantizations::Preset;
+/// The quant presets and their schemes, typed: what a target's [`TargetEmitter::presets`] lists.
+pub use scratchy_quantizations::{Preset, Scheme};
 
 use crate::classified::Program;
 use crate::config::ModelParams;

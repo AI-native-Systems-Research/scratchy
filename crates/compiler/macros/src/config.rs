@@ -397,6 +397,11 @@ pub enum ConfigError {
         path: PathBuf,
         reason: &'static str,
     },
+    /// A `quantizations.json` entry that names no preset (`scratchy_quantizations::Preset`).
+    UnknownPreset {
+        path: PathBuf,
+        name: String,
+    },
     /// A `#[vision_forward]` config (verbatim HF VL-wrapper
     /// checkpoint) is missing a field the per-family `vision_*`
     /// bound derivation needs, or its arch family is unknown to
@@ -462,6 +467,11 @@ impl std::fmt::Display for ConfigError {
             Self::BadQuantizations { path, reason } => {
                 write!(f, "{}: {reason}", path.display())
             }
+            Self::UnknownPreset { path, name } => write!(
+                f,
+                "{}: `{name}` names no quant preset (scratchy-quantizations' `presets.rs`)",
+                path.display()
+            ),
             Self::VisionDerivation { path, reason } => {
                 write!(f, "vision config {}: {reason}", path.display())
             }
@@ -585,7 +595,7 @@ pub struct Scope {
     /// The quant presets the enabled `quant/<preset>` features named, as the
     /// build computed them. `None` = unset = legacy behaviour (every
     /// backend-applicable preset; see `quant_preset_active`).
-    quants: Option<std::collections::HashSet<String>>,
+    quants: Option<std::collections::HashSet<crate::target::Preset>>,
 }
 
 /// The selected-models predicate's data. Cargo feature names are one flat namespace with no
@@ -682,15 +692,14 @@ impl Scope {
         }
     }
 
-    /// The same scope with its presets stated: `Some` of exactly these names — an empty
+    /// The same scope with its presets stated: `Some` of exactly these — an empty
     /// iteration is the build's "no quant features enabled" (dense-only), a non-empty one
     /// is the forwarded `quant/<preset>` union — replacing the every-preset `None` default.
-    pub fn with_quants<I, S>(mut self, presets: I) -> Scope
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.quants = Some(presets.into_iter().map(Into::into).collect());
+    pub fn with_quants(
+        mut self,
+        presets: impl IntoIterator<Item = crate::target::Preset>,
+    ) -> Scope {
+        self.quants = Some(presets.into_iter().collect());
         self
     }
 
@@ -931,15 +940,14 @@ fn load_dir_mode(
     //
     // And a preset is active only where the target lowers it
     // (`TargetEmitter::presets`): one it has no kernels for is no
-    // variant of any model. A name no `Preset` states (no Cargo feature,
-    // so no build can select it) is no variant either.
-    let quant_preset_active = |preset_name: &str| -> bool {
+    // variant of any model.
+    let quant_preset_active = |preset: crate::target::Preset| -> bool {
         if let Some(q) = &enabled_quants
-            && !q.contains(preset_name)
+            && !q.contains(&preset)
         {
             return false;
         }
-        crate::target::Preset::from_name(preset_name).is_some_and(|p| target.presets().contains(&p))
+        target.presets().contains(&preset)
     };
 
     // An in-checkpoint head's configs are the selected configs of its target arches that carry it.
@@ -970,9 +978,9 @@ fn load_dir_mode(
     // dense/bf16 one below, not alongside it. Deliberately arch-wide, not
     // per-base: `quantizations.json` is arch-wide too, so there is no
     // per-model "just this one dense" escape hatch today.
-    let arch_has_active_quant = declared_preset_names(&dir.join("quantizations.json"))?
-        .iter()
-        .any(|name| quant_preset_active(name));
+    let arch_has_active_quant = declared_presets(&dir.join("quantizations.json"))?
+        .into_iter()
+        .any(quant_preset_active);
 
     let mut out: Vec<ModelParams> = Vec::new();
     // Remember each base's raw JSON so we can deep-merge overlays
@@ -1057,7 +1065,7 @@ fn load_dir_mode(
     // overlay loop below keeps unclaimable presets out while still
     // synthesizing the affine variant.
     let quantizations_path = dir.join("quantizations.json");
-    let presets = declared_preset_names(&quantizations_path)?;
+    let presets = declared_presets(&quantizations_path)?;
     if !presets.is_empty() {
         // Presets live in the shared `quantization` crate.
         // Walk up from `dir` (which is `<crate>/configs/`) to find
@@ -1086,13 +1094,14 @@ fn load_dir_mode(
             found.ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?
         };
 
-        for preset_name in &presets {
+        for &preset in &presets {
+            let preset_name = preset.name();
             // Quant feature scoping (the scope's `quants`) + the target's lowering (`TargetEmitter::presets`
             // — see
             // `quant_preset_active`'s definition above for the full
             // reasoning, shared with the dense-suppression pre-check so the
             // two can't drift apart).
-            if !quant_preset_active(preset_name) {
+            if !quant_preset_active(preset) {
                 continue;
             }
             let preset_path = preset_root.join(format!("{preset_name}.json"));
@@ -1387,14 +1396,18 @@ fn read_json_file(path: &Path) -> Result<(String, serde_json::Value), ConfigErro
     Ok((contents, json))
 }
 
-/// Preset names declared in an arch's `quantizations.json` (empty if the
-/// arch has none). Each entry is either a bare preset name (`"fp8-..."`,
-/// `"ggml"`) or a single-key object carrying registration data for that
-/// preset's runtime side (the object form's structured fields are picked up
-/// separately by `load_gguf_spec` — this only needs the names). Shared by
-/// the dense-suppression pre-check and the overlay-synthesis loop in
-/// `load_dir_mode` so they can never see a different preset list.
-fn declared_preset_names(quantizations_path: &Path) -> Result<Vec<String>, ConfigError> {
+/// The presets declared in an arch's `quantizations.json` (empty if the
+/// arch has none), each entry read once into its [`crate::target::Preset`]:
+/// a bare preset name (`"fp8-..."`, `"ggml"`) or a single-key object carrying
+/// registration data for that preset's runtime side (the object form's
+/// structured fields are picked up separately by `load_gguf_spec` — this only
+/// needs the names). An entry that names no preset is refused, with the entry
+/// and its file. Shared by the dense-suppression pre-check and the
+/// overlay-synthesis loop in `load_dir_mode` so they can never see a
+/// different preset list.
+pub fn declared_presets(
+    quantizations_path: &Path,
+) -> Result<Vec<crate::target::Preset>, ConfigError> {
     if !quantizations_path.is_file() {
         return Ok(Vec::new());
     }
@@ -1406,7 +1419,7 @@ fn declared_preset_names(quantizations_path: &Path) -> Result<Vec<String>, Confi
             path: quantizations_path.to_path_buf(),
             reason: "expected `{\"quantizations\": [<entry>, ...]}` array",
         })?;
-    Ok(entries
+    entries
         .iter()
         .filter_map(|v| {
             if let Some(s) = v.as_str() {
@@ -1419,7 +1432,13 @@ fn declared_preset_names(quantizations_path: &Path) -> Result<Vec<String>, Confi
                 None
             }
         })
-        .collect())
+        .map(|name| {
+            crate::target::Preset::from_name(&name).ok_or_else(|| ConfigError::UnknownPreset {
+                path: quantizations_path.to_path_buf(),
+                name,
+            })
+        })
+        .collect()
 }
 
 /// Per-arch GGUF registration data harvested from `quantizations.json`.
@@ -2242,10 +2261,13 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
     // A variant is its config's stem (dense) or `<config>-<preset>`, as the variant loop of
     // `load_dir_mode` names it.
-    let presets = declared_preset_names(&dir.join("quantizations.json"))?;
+    let presets = declared_presets(&dir.join("quantizations.json"))?;
     let config_of = |variant: &str| {
         (spec.head_targets.iter()).find(|(config, _)| {
-            config == variant || presets.iter().any(|p| format!("{config}-{p}") == variant)
+            config == variant
+                || presets
+                    .iter()
+                    .any(|p| format!("{config}-{}", p.name()) == variant)
         })
     };
     let mut published_as = Vec::new();
@@ -3043,6 +3065,38 @@ mod tests {
     use super::*;
     use crate::target::Shared;
 
+    /// A `quantizations.json` entry is read once into its `Preset`, bare or one-key object; one
+    /// that names no preset is refused with the entry and its file, not skipped.
+    #[test]
+    fn a_declared_preset_is_typed_and_an_unknown_one_is_refused() {
+        let path = std::env::temp_dir().join(format!(
+            "scratchy-declared-presets-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"quantizations": ["awq-gemm", {"ggml": {"qk_permute": true}}]}"#,
+        )
+        .expect("write the fixture");
+        let got = declared_presets(&path).expect("two known presets");
+        assert_eq!(
+            got,
+            [crate::target::Preset::AwqGemm, crate::target::Preset::Ggml]
+        );
+        std::fs::write(
+            &path,
+            r#"{"quantizations": ["awq-gemm", "mlx-afine-b4-g64"]}"#,
+        )
+        .expect("write the fixture");
+        let err = declared_presets(&path).expect_err("a mistyped preset");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&err, ConfigError::UnknownPreset { name, .. } if name == "mlx-afine-b4-g64"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("mlx-afine-b4-g64"), "{err}");
+    }
+
     /// Absolute path to `crates/models/arch/<arch>/configs/` from
     /// this crate's manifest dir, for tests that load real configs.
     fn repo_model_archs(arch: &str) -> PathBuf {
@@ -3110,7 +3164,7 @@ mod tests {
         let dense = load_dir(
             dir,
             &spec,
-            &Scope::all().with_quants(Vec::<String>::new()),
+            &Scope::all().with_quants(Vec::<crate::target::Preset>::new()),
             &Shared,
         )
         .unwrap_or_else(|e| panic!("load {} dense: {e}", dir.display()));

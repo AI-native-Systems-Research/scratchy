@@ -30,7 +30,7 @@ mod arch_spec;
 mod cfg;
 pub mod codegen;
 pub mod config;
-pub use config::{Scope, selected_config_paths, total_models_emitted};
+pub use config::{Scope, declared_presets, selected_config_paths, total_models_emitted};
 pub mod emit;
 pub mod fuf;
 pub mod handoff;

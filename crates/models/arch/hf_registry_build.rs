@@ -46,33 +46,13 @@
 //! cost is never paid and the registry is simply emitted empty.
 
 use rayon::prelude::*;
+use scratchy_forward_compiler_macro::target::Preset;
 use scratchy_forward_compiler_macro::{QuantMethod, QuantizationConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-
-/// Declared preset-family → Hub library/quant tag correspondence (data, not
-/// logic — same status as `quantizations.json`'s own preset tables).
-/// Presets not listed here fall back to their name's leading `-`-delimited
-/// token, which already matches for most families (`gptq-sym` → `gptq`,
-/// `awq-gemm` → `awq`).
-const PRESET_TAG_OVERRIDES: &[(&str, &str)] = &[
-    ("ggml", "gguf"),
-    ("bnb-nf4-dq", "bitsandbytes"),
-    ("ct-int4-sym", "compressed-tensors"),
-    ("gptq-sym-desc_act", "gptq"),
-];
-
-fn preset_hub_tag(preset: &str) -> &str {
-    for (name, tag) in PRESET_TAG_OVERRIDES {
-        if *name == preset {
-            return tag;
-        }
-    }
-    preset.split('-').next().unwrap_or(preset)
-}
 
 /// One compiled model's discriminating shape — enough to tell apart
 /// siblings the Hub's own tags/architectures class conflate (MoE vs dense
@@ -107,12 +87,13 @@ type Shape = (i64, i64, Option<i64>);
 /// says how many with a `cargo:warning` rather than dropping them silently.
 pub fn resolve_hf_registry(
     targets: &[(String, PathBuf)],
-    enabled_quant_presets: &BTreeSet<String>,
+    enabled_quant_presets: &BTreeSet<Preset>,
     repo_root: &Path,
 ) -> Vec<String> {
+    // Each preset's Hub library / quantization tag is its scheme's (`Scheme::hub_tag`).
     let quant_tags: BTreeSet<&str> = enabled_quant_presets
         .iter()
-        .map(|p| preset_hub_tag(p))
+        .map(|p| p.scheme().hub_tag())
         .collect();
     let allowed_methods = compiled_quant_methods(enabled_quant_presets, repo_root);
 
@@ -428,7 +409,7 @@ fn verify(
 /// uses to interpret a real checkpoint's config) into its `QuantMethod`.
 /// Empty for a dense/bf16 build (no quant preset enabled).
 fn compiled_quant_methods(
-    enabled_quant_presets: &BTreeSet<String>,
+    enabled_quant_presets: &BTreeSet<Preset>,
     repo_root: &Path,
 ) -> Vec<QuantMethod> {
     let presets_dir = repo_root
@@ -439,7 +420,8 @@ fn compiled_quant_methods(
     enabled_quant_presets
         .iter()
         .filter_map(|preset| {
-            let text = std::fs::read_to_string(presets_dir.join(format!("{preset}.json"))).ok()?;
+            let text = std::fs::read_to_string(presets_dir.join(format!("{}.json", preset.name())))
+                .ok()?;
             let json: serde_json::Value = serde_json::from_str(&text).ok()?;
             QuantizationConfig::parse(&json)
                 .ok()
