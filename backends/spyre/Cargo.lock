@@ -1685,6 +1685,7 @@ version = "0.1.0"
 dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "scratchy-tp-world",
 ]
