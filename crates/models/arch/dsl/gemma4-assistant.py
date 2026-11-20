@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 @forward
 def gemma4_assistant():
-    embeds = embed(input_ids, target_embed_tokens) * sqrt(backbone_hidden_size)
+    embeds = embed(input_ids, target_embed_tokens) * sqrt_bf16(backbone_hidden_size)
     hidden_states = gemm(concat(embeds, target_hidden), pre_projection)
     for layer in range(num_hidden_layers):
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer])

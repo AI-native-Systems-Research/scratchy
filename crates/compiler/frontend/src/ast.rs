@@ -119,11 +119,13 @@ pub enum Expr {
     /// A numeric scalar literal (f64). Only valid as an operand to
     /// `Add` / `Mul`; not a standalone assignment.
     ScalarLit(f64),
-    /// `sqrt(<bound_name>)` — a compile-time scalar whose value is
-    /// `(bounds[name] as f64).sqrt()`. Resolved at CFG-build time
-    /// (where per-model bounds are known). Used e.g. by Gemma's
-    /// embedding scale `embed(ids, w) * sqrt(hidden_size)`.
-    SqrtBound(Ident),
+    /// `sqrt(<bound_name>)` / `sqrt_bf16(<bound_name>)` — a compile-time
+    /// scalar whose value is `(bounds[name] as f64).sqrt()`, rounded to
+    /// bf16 when `bf16 == true`. Resolved at CFG-build time (where
+    /// per-model bounds are known). Used e.g. by Gemma's embedding scale
+    /// `embed(ids, w) * sqrt_bf16(hidden_size)`, which HF, vLLM and
+    /// mlx-lm all hold as a bf16 tensor.
+    SqrtBound { name: Ident, bf16: bool },
     /// `scalar(<name>)` / `recip_scalar(<name>)` — a compile-time
     /// scalar read from `ModelParams.scalars` (non-integer top-level
     /// fields of the model's `config.json`). Resolved at CFG-build

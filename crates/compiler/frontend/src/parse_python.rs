@@ -1353,7 +1353,7 @@ fn lower_expr(e: &PyExpr, span: Span) -> Result<Expr, String> {
 }
 
 /// `gemm(x, w)`, `rmsnorm(x, w)`, … plus the compile-time forms
-/// `sqrt(bound)`, `scalar(key)` / `recip_scalar(key)`, and
+/// `sqrt(bound)` / `sqrt_bf16(bound)`, `scalar(key)` / `recip_scalar(key)`, and
 /// `reshape(source, [dims])`.
 fn lower_call(
     func: &PyExpr,
@@ -1373,9 +1373,12 @@ fn lower_call(
         _ => Err(err(at, usage)),
     };
     match (op.as_str(), args) {
-        ("sqrt", _) => Ok(Expr::SqrtBound(name_arg(
-            "`sqrt(<bound_name>)` takes exactly one bound identifier",
-        )?)),
+        ("sqrt" | "sqrt_bf16", _) => Ok(Expr::SqrtBound {
+            name: name_arg(
+                "`sqrt(<bound_name>)` / `sqrt_bf16(<bound_name>)` takes exactly one bound identifier",
+            )?,
+            bf16: op == "sqrt_bf16",
+        }),
         ("scalar" | "recip_scalar", _) => Ok(Expr::ConfigScalar {
             name: name_arg(
                 "`scalar(<name>)` / `recip_scalar(<name>)` takes exactly one config key identifier",

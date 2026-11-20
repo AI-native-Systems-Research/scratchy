@@ -943,6 +943,11 @@ def sqrt(x):
     return math.sqrt(x)
 
 
+def sqrt_bf16(x):
+    """DSL `sqrt_bf16(<bound>)`: sqrt rounded to bf16, as HF / vLLM hold Gemma's embed scale."""
+    return torch.tensor(math.sqrt(x), dtype=torch.bfloat16).item()
+
+
 def scalar_weight_mul(x, w):
     return x * w
 

@@ -550,7 +550,7 @@ impl<'a> Unroller<'a> {
             }
             // Scalar literal — rides along as a tile input (rank-0, a broadcastable scalar).
             Expr::ScalarLit(v) => Ok(FufInput::Scalar(*v)),
-            Expr::SqrtBound(_) => unreachable!(
+            Expr::SqrtBound { .. } => unreachable!(
                 "Expr::SqrtBound should have been folded to Expr::ScalarLit by \
                  cfg.rs::fold_scalars before reaching the unroller"
             ),
