@@ -1476,16 +1476,21 @@ impl SpyreWorker {
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
-                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its own region of
-                // the KV segment, at the decode wiring's own page count (the pool, which the bake's
-                // mint proves holds the model's context). Nothing here sizes it: the OWNER session
-                // allocates the regions once, and every other session aliases them.
+                // ⭐ THE KV POOL'S ADDRESSING BOUND, NOT ITS FUNDED SIZE — the bake states the
+                // bound (`PagedStep::pages` = units_max, the 16 GiB segment ceiling ÷ the page's
+                // bytes; every layer's pool region spans exactly it), and the census below states
+                // what this run FUNDS: the card's remainder beyond the non-KV residency. The page
+                // stride is the one number both share — the bound's bytes over the bound's pages
+                // IS the page's bytes — so the engine can divide the funded budget by it. Nothing
+                // allocates the bound: the OWNER session allocates each layer's region at the
+                // funded page count (in `initialize_cache`, after every session is built), and
+                // every other session aliases it.
                 let step = wirings.decode.paged.ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
-                let pool_need_bytes = code.layout.kv_pool_bytes();
-                let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
+                let pool_bound_bytes = code.layout.kv_pool_bytes();
+                let pool_stride_bytes = pool_bound_bytes / u64::from(step.pages).max(1);
                 // ⭐ THE CONTEXT THIS RUN SERVES — the MODEL'S context as the bake states it (the
                 // step's `context`, the AttnDecode's `valid_len`), never the pool's capacity: the
                 // pool may hold more pages than any one request may attend, and the mint proved it
@@ -1782,30 +1787,28 @@ impl SpyreWorker {
                 // stay on the allocator's books forever. So the spare is PLACEMENT LUXURY — its
                 // allocation is what places decode's weight region, worth 1.8 tok/s on
                 // granite-3.1-2b, measured — never a load requirement, and it is taken ONLY when the
-                // card funds it: mandatory residency plus BOTH KV pools (decode's and the anchor's
-                // twin) plus the spare plus the ladder's real rung segments must fit inside what
-                // `--gpu-memory-utilization` allots. A model that fails that check BORROWS exactly
+                // card funds it: mandatory residency plus the spare plus the ladder's real rung
+                // segments must fit inside what `--gpu-memory-utilization` allots — the KV pool is
+                // funded from the REMAINDER, so it is never a charge against this decision. A model
+                // that fails that check BORROWS exactly
                 // like every ladder rung — 128 B placeholders now, `adopt_from_owner` onto decode's
                 // regions once the owner is built — costing the placement effect, not the run.
                 let anchor_mandatory_bytes = non_kv_bytes + anchor_live_bytes;
                 let anchor_reserves = prefill_code.is_some()
-                    && (anchor_mandatory_bytes
-                        + anchor_spare_bytes
-                        + 2 * pool_need_bytes
-                        + ladder_rung_bytes)
+                    && (anchor_mandatory_bytes + anchor_spare_bytes + ladder_rung_bytes)
                         <= (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization)
                             as u64;
                 let non_kv_bytes = non_kv_bytes
                     + anchor_live_bytes
                     + if anchor_reserves {
-                        anchor_spare_bytes + pool_need_bytes
+                        anchor_spare_bytes
                     } else {
                         0
                     };
                 if prefill_code.is_some() {
                     tracing::info!(
                         "superdsc paged: prefill anchor {} — its {} MB spare (a twin of the weight \
-                         home + a second {} MB KV pool) {} inside the {} MB that \
+                         home) {} inside the {} MB that \
                          --gpu-memory-utilization {:.2} funds beyond the {} MB of mandatory \
                          residency plus the {} MB the ladder's rungs allocate",
                         if anchor_reserves {
@@ -1814,7 +1817,6 @@ impl SpyreWorker {
                             "BORROWS"
                         },
                         anchor_spare_bytes / (1024 * 1024),
-                        pool_need_bytes / (1024 * 1024),
                         if anchor_reserves {
                             "fits"
                         } else {
@@ -1832,29 +1834,35 @@ impl SpyreWorker {
                 // from six. See `CardMemory::tensor_capacity`.
                 let funded =
                     (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization) as u64;
-                if non_kv_bytes + pool_need_bytes > funded {
+                if non_kv_bytes > funded {
                     return Err(werr(format!(
                         "the Spyre card's {} MB of tensor memory × --gpu-memory-utilization {:.2} funds \
-                         {} MB, but this model's sessions reserve {} MB beside the bake's {} MB KV \
-                         pool. Raise --gpu-memory-utilization, or use a smaller model.",
+                         {} MB, but this model's sessions reserve {} MB of non-KV residency. Raise \
+                         --gpu-memory-utilization, or use a smaller model.",
                         card_bytes.tensor_capacity() / (1024 * 1024),
                         self.gpu_memory_utilization,
                         funded / (1024 * 1024),
                         non_kv_bytes / (1024 * 1024),
-                        pool_need_bytes / (1024 * 1024),
                     )));
                 }
-                // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own
-                // bytes by its own page — the two counts are then one count.
-                kv_budget_bytes_v = Some(pool_need_bytes);
+                // ⭐ THE KV BUDGET IS THE REMAINDER — what the funded tensor capacity holds beyond
+                // the non-KV residency the census just charged. Carried to `Loaded`, so
+                // `determine_available_memory` hands the engine this one number and
+                // `compute_kv_blocks` divides it by the page stride (capped at the programs'
+                // addressing bound, `PagedStep::host_blocks`) — the ENGINE owns the funded page
+                // count, and `initialize_cache` allocates each layer's pool region at it.
+                let kv_budget_bytes = funded - non_kv_bytes;
+                kv_budget_bytes_v = Some(kv_budget_bytes);
                 pool_stride_bytes_v = Some(pool_stride_bytes);
                 info!(
-                    "superdsc paged: KV pool {} page(s) of {} slot(s) = {capacity} positions ({} MB), \
-                     as the bake placed it; serving {served_context_v} — {} block(s) offered to the \
-                     scheduler, page 0 kept for padded rows' writes",
-                    step.pages,
+                    "superdsc paged: KV pool funded at {} MB of the {} MB remainder ({} page(s) of \
+                     {} slot(s) at {} KB/page), addressing bound {} page(s); serving \
+                     {served_context_v} — page 0 kept for padded rows' writes",
+                    kv_budget_bytes / (1024 * 1024),
+                    funded / (1024 * 1024),
+                    kv_budget_bytes / pool_stride_bytes.max(1),
                     step.page_slots,
-                    pool_need_bytes / (1024 * 1024),
+                    pool_stride_bytes / 1024,
                     step.host_blocks(),
                 );
                 // What the DECODE bake placed — one call, and its own refusal.

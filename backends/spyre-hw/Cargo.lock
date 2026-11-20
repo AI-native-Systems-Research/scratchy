@@ -976,15 +976,6 @@ dependencies = [
 [[package]]
 name = "flex-rs"
 version = "0.1.0"
-dependencies = [
- "libc",
- "rustix",
- "senlib-boot",
- "senlib-chip",
- "senlib-host",
- "senlib-rs",
- "tracing",
-]
 
 [[package]]
 name = "fluent-uri"
@@ -1666,12 +1657,6 @@ checksum = "28d0a00925a9f930d679b6789b721e3a7f9ed110f41b86d2497caa780c3a070a"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -2475,19 +2460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags",
- "errno",
- "libc",
- "linux-raw-sys",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "rustls"
 version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3045,51 +3017,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "senlib-boot"
-version = "0.1.0"
-dependencies = [
- "log",
- "senlib-chip",
- "senlib-host",
- "senlib-rs",
- "senlib-rs-export-controlled",
-]
-
-[[package]]
-name = "senlib-chip"
-version = "0.1.0"
-dependencies = [
- "libc",
- "senlib-errata",
- "senlib-host",
-]
-
-[[package]]
-name = "senlib-errata"
-version = "0.1.0"
-
-[[package]]
-name = "senlib-host"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "senlib-rs"
-version = "0.1.0"
-dependencies = [
- "libc",
- "senlib-chip",
- "senlib-errata",
- "senlib-host",
-]
-
-[[package]]
-name = "senlib-rs-export-controlled"
-version = "0.1.0"
 
 [[package]]
 name = "seq-macro"
