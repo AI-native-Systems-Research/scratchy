@@ -1,8 +1,8 @@
-//! metal.html, from data/metal/*.json.gz.
+//! metal.html, from data/metal/<machine>/*.json.gz.
 //!
 //! Each data file is one run of scripts/bench_metal_matrix.sh, gzipped and
-//! otherwise unedited, named <machine>-<YYYY-MM-DDTHHMMSSZ>-<sha8>.json.gz (older
-//! runs: <machine>-<YYYY-MM-DD>-<sha8>.json.gz). The page reads them at site-build
+//! otherwise unedited, in its Mac's folder: <machine>/<YYYY-MM-DDTHHMMSSZ>-<sha8>.json.gz
+//! (older runs: <machine>/<YYYY-MM-DD>-<sha8>.json.gz). The page reads them at site-build
 //! time, so it cannot drift from what the runner measured.
 //!
 //! The page is a section a dataset the runs measured, the random-token grid
@@ -42,50 +42,77 @@ use numbers::{
     timing,
 };
 
-/// The run files, relative to the site's root; copied to the same place under _site/,
-/// where each run table links to its own.
+/// The run files, relative to the site's root: a folder a Mac, named for its chip
+/// ([`slug`]), holding every run of it. Copied to the same place under _site/, where each run
+/// table links to its own.
 pub const DATA: &str = "data/metal";
-/// The runs a newer one replaced, relative to the site's root: Over time and each machine's runs
-/// table read them, and they are published like [`DATA`]'s.
-pub const HISTORY: &str = "data/metal/history";
-/// Every folder of runs the page reads, each published under _site/ as it is.
-const PUBLISHED: [&str; 2] = [DATA, HISTORY];
+
+/// How many of each Mac's newest runs the page shows outside Over time: the current one, and the
+/// previous one its change badges compare it with.
+const SHOWN: usize = 2;
 
 // --------------------------------------------------------------------- load
 
-/// Every run file, checked. Fails naming each bad file, so one build reports
-/// all of them rather than the first.
+/// The runs the page shows outside Over time: each Mac's [`SHOWN`] newest, checked. Fails naming
+/// each bad file, so one build reports all of them rather than the first.
 fn load(site: &Site) -> Result<Vec<Run>, String> {
-    load_from(site, &[DATA])
+    let mut runs = newest(read(site)?, SHOWN);
+    borrow_earlier(&mut runs);
+    Ok(runs)
 }
 
-/// [`load`], over every run file in `dirs` (relative to the site): the page's own runs, or those
-/// and the ones a newer run replaced ([`HISTORY`]), for Over time.
-fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
+/// Every run file, checked, for Over time: [`load`], and the older runs a newer one replaced.
+fn load_all(site: &Site) -> Result<Vec<Run>, String> {
+    let mut runs = read(site)?;
+    borrow_earlier(&mut runs);
+    Ok(runs)
+}
+
+/// Each machine's `n` newest of `runs`, by when each ran, in the order given.
+fn newest(mut runs: Vec<Run>, n: usize) -> Vec<Run> {
+    let keep: Vec<bool> = (runs.iter())
+        .map(|r| {
+            (runs.iter())
+                .filter(|o| o.machine.chip == r.machine.chip && o.generated_utc > r.generated_utc)
+                .count()
+                < n
+        })
+        .collect();
+    let mut keep = keep.into_iter();
+    runs.retain(|_| keep.next().unwrap_or(false));
+    runs
+}
+
+/// Every run file in [`DATA`]'s machine folders, parsed and marked, with each one's [`Run::file`]
+/// set. A file directly in [`DATA`], or one whose folder or name does not match its run, is an
+/// error naming it.
+fn read(site: &Site) -> Result<Vec<Run>, String> {
+    let data = site.root.join(DATA);
     let (mut files, mut errors) = (Vec::new(), Vec::new());
-    for &rel in dirs {
-        let dir = site.root.join(rel);
-        // history/ may not exist yet; the page's own folder must.
-        let Ok(listed) = datafile::list(&dir) else {
-            if rel == DATA {
-                return Err(format!("{}: not found", dir.display()));
-            }
-            continue;
-        };
+    let folders = datafile::folders(&data).map_err(|e| format!("{}: {e}", data.display()))?;
+    for f in datafile::list(&data).map_err(|e| format!("{}: {e}", data.display()))? {
+        errors.push(match f {
+            Ok(f) => format!(
+                "{}: a run goes in its Mac's folder, {DATA}/<machine>/",
+                f.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(e) => e,
+        });
+    }
+    for folder in folders {
+        let listed = datafile::list(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
         for f in listed {
             match f {
-                Ok(f) => files.push((f, rel)),
+                Ok(f) => files.push(f),
                 Err(e) => errors.push(e),
             }
         }
     }
     files.sort();
     let mut runs = Vec::new();
-    for (f, rel) in files {
-        let name = f
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    for f in files {
+        let at = f.strip_prefix(&data).unwrap_or(&f).to_path_buf();
+        let name = at.to_string_lossy().into_owned();
         let text = match datafile::read_json_gz(&f) {
             Ok(t) => t,
             Err(e) => {
@@ -103,12 +130,12 @@ fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
         // The start time keeps two runs of one commit on one day apart; names
         // from before it carry only the date.
         let (machine, sha8) = (slug(run.machine.chip.as_str()), run.repo.sha8());
-        let named = |when: &str| datafile::named(&format!("{machine}-{when}-{sha8}"));
+        let named = |when: &str| datafile::named_in(&machine, &format!("{when}-{sha8}"));
         let want = named(&run.generated_utc.stamp());
         if name != want && name != named(run.generated_utc.date()) {
             errors.push(format!(
                 "{name}: name it {want} ({})",
-                datafile::named("<machine>-<start time>-<sha8>")
+                datafile::named_in("<machine>", "<start time>-<sha8>")
             ));
         }
         for m in run.models.iter().filter(|m| m.weights().is_none()) {
@@ -121,11 +148,10 @@ fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
         run.mark_short();
         run.mark_mem_below_weights();
         run.mark_ttft_too_soon();
-        run.file = Path::new(rel).join(name);
+        run.file = Path::new(DATA).join(at);
         runs.push(run);
     }
     if errors.is_empty() {
-        borrow_earlier(&mut runs);
         Ok(runs)
     } else {
         Err(errors
@@ -2890,7 +2916,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
-    let all_runs = load_from(site, &PUBLISHED)?;
+    let all_runs = load_all(site)?;
     let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -2898,7 +2924,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         rsx! {
             p {
                 "No runs published yet. Run " code { "scripts/bench_metal_matrix.sh" } " and copy its JSON, gzipped, into "
-                code { "{DATA}/" } " on the site branch."
+                code { "{DATA}/<machine>/" } " on the site branch."
             }
         }
     } else {
@@ -2961,12 +2987,12 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let out = site.out.join("metal.html");
     fs::write(&out, html).map_err(|e| format!("{}: {e}", out.display()))?;
     // Every run the page reads is published where its runs table row links.
-    for dir in PUBLISHED {
-        let dest = site.out.join(dir);
-        fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    }
     for run in &all_runs {
-        fs::copy(site.root.join(&run.file), site.out.join(&run.file))
+        let dest = site.out.join(&run.file);
+        if let Some(dir) = dest.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        fs::copy(site.root.join(&run.file), &dest)
             .map_err(|e| format!("{}: {e}", run.file.display()))?;
     }
     Ok(format!(
@@ -3507,9 +3533,23 @@ mod tests {
         assert!(html.contains("Users"));
     }
 
+    /// Where the site publishes the fixture named `name` (its `.json` name), relative to
+    /// [`super::DATA`]: in its Mac's folder, under its name less the machine,
+    /// `<machine>/<start time>-<sha8>.json.gz`.
+    fn published(name: &str) -> String {
+        let run: Run = serde_json::from_str(&fixture_text(name)).expect(name);
+        let machine = super::slug(run.machine.chip.as_str());
+        let file = std::path::Path::new(name).file_name().unwrap();
+        let file = file.to_string_lossy();
+        let stem = (file.trim_end_matches(".json"))
+            .strip_prefix(&format!("{machine}-"))
+            .unwrap_or_else(|| panic!("{name} is not named for its machine, {machine}"));
+        crate::datafile::named_in(&machine, stem)
+    }
+
     /// A site whose published runs are the named fixtures alone: a fresh folder under the system's
-    /// temp dir named for `tag`, its data/metal holding each fixture's `.gz`, as a data PR
-    /// publishes it.
+    /// temp dir named for `tag`, its data/metal holding each fixture's `.gz` in its Mac's folder
+    /// ([`published`]), as a data PR publishes it.
     fn site_with(tag: &str, names: &[&str]) -> crate::Site {
         let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
         let root = std::env::temp_dir().join(format!("metal-site-{}-{tag}", std::process::id()));
@@ -3518,9 +3558,9 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(root.join("_site")).unwrap();
         for name in names {
-            let file = std::path::Path::new(name).file_name().unwrap();
-            let gz = format!("{}.gz", file.to_string_lossy());
-            std::fs::copy(fixtures.join(format!("{name}.gz")), data.join(gz)).unwrap();
+            let to = data.join(published(name));
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(fixtures.join(format!("{name}.gz")), to).unwrap();
         }
         crate::Site {
             repo: root.clone(),
@@ -3556,22 +3596,23 @@ mod tests {
         let site = site_with("gzipped", &[name]);
         let runs = super::load(&site).expect("the gzipped run");
         assert_eq!(runs.len(), 1);
-        let file = runs[0]
-            .file
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(file, format!("{name}.gz"));
+        assert_eq!(
+            runs[0].file,
+            std::path::Path::new(super::DATA)
+                .join("apple-m3-pro/2026-10-27T031941Z-f9739363.json.gz")
+        );
     }
 
     #[test]
     fn a_plain_json_in_data_is_refused() {
         let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
         let site = site_with("plain", &[]);
-        std::fs::write(site.root.join(super::DATA).join(name), fixture_text(name)).unwrap();
+        let plain = site.root.join(super::DATA).join(published(name));
+        let plain = plain.with_extension("");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        std::fs::write(&plain, fixture_text(name)).unwrap();
         let err = super::load(&site).err().expect("a plain JSON is refused");
-        assert!(err.contains(name), "{err}");
+        assert!(err.contains("2026-10-27T031941Z-f9739363.json:"), "{err}");
         assert!(err.contains("gzip"), "{err}");
     }
 
@@ -3579,8 +3620,11 @@ mod tests {
     fn a_run_named_without_gz_is_refused() {
         let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
         let site = site_with("unnamed", &[]);
-        let stem = name.trim_end_matches(".json");
-        let gz = site.root.join(super::DATA).join(format!("{stem}.gz"));
+        let gz = site
+            .root
+            .join(super::DATA)
+            .join("apple-m3-pro/2026-10-27T031941Z-f9739363.gz");
+        std::fs::create_dir_all(gz.parent().unwrap()).unwrap();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(FIXTURES)
             .join(format!("{name}.gz"));
@@ -3588,24 +3632,112 @@ mod tests {
         let err = super::load(&site)
             .err()
             .expect("a run named .gz is refused");
-        assert!(err.contains(&format!("{stem}.gz")), "{err}");
+        assert!(err.contains("2026-10-27T031941Z-f9739363.gz"), "{err}");
         assert!(err.contains(".json.gz"), "{err}");
     }
 
-    /// Every run the page lists links to a file the site publishes, a replaced run's in history/
-    /// too.
+    /// The three M3 Pro fixtures [`newest_two_show`] and [`over_time_reads_every_run`] read, oldest
+    /// first.
+    const THREE_RUNS: [&str; 3] = [
+        "apple-m3-pro-2026-10-26T043309Z-2a9661c3.json",
+        "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
+        REQUESTS_FIXTURE,
+    ];
+
+    /// The files of `runs`, relative to [`super::DATA`], sorted.
+    fn files_of(runs: &[Run]) -> Vec<String> {
+        let mut files: Vec<String> = (runs.iter())
+            .map(|r| {
+                (r.file.strip_prefix(super::DATA).unwrap())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// With three runs of one Mac in its folder, the page's current sections read its newest two.
     #[test]
-    fn every_run_links_to_a_published_file() {
-        let replaced = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
-        let site = site_with("links", &[REQUESTS_FIXTURE]);
-        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
-        let history = site.root.join(super::HISTORY);
-        std::fs::create_dir_all(&history).unwrap();
+    fn newest_two_show() {
+        let site = site_with("newest-two", &THREE_RUNS);
+        let runs = super::load(&site).expect("the runs");
+        assert_eq!(
+            files_of(&runs),
+            [published(THREE_RUNS[1]), published(THREE_RUNS[2])]
+        );
+    }
+
+    /// With three runs of one Mac in its folder, Over time reads all three.
+    #[test]
+    fn over_time_reads_every_run() {
+        let site = site_with("every-run", &THREE_RUNS);
+        let runs = super::load_all(&site).expect("the runs");
+        assert_eq!(files_of(&runs), THREE_RUNS.map(published));
+    }
+
+    /// A run in another Mac's folder is refused, naming the file and the folder it belongs in.
+    #[test]
+    fn a_run_in_another_macs_folder_is_refused() {
+        let name = "apple-m4-max-2026-10-28T041936Z-dbe48cd2.json";
+        let site = site_with("wrong-mac", &[]);
+        let wrong = site
+            .root
+            .join(super::DATA)
+            .join("apple-m3-pro/2026-10-28T041936Z-dbe48cd2.json.gz");
+        std::fs::create_dir_all(wrong.parent().unwrap()).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURES)
+            .join(format!("{name}.gz"));
+        std::fs::copy(fixture, wrong).unwrap();
+        let err = super::load_all(&site)
+            .err()
+            .expect("the wrong folder is refused");
+        assert!(
+            err.contains("apple-m3-pro/2026-10-28T041936Z-dbe48cd2.json.gz: name it apple-m4-max/2026-10-28T041936Z-dbe48cd2.json.gz"),
+            "{err}"
+        );
+    }
+
+    /// A run directly in data/metal, outside any Mac's folder, is refused, naming it.
+    #[test]
+    fn a_run_outside_a_macs_folder_is_refused() {
+        let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("flat", &[]);
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURES)
+            .join(format!("{name}.gz"));
         std::fs::copy(
-            fixtures.join(format!("{replaced}.gz")),
-            history.join(format!("{replaced}.gz")),
+            fixture,
+            site.root.join(super::DATA).join(format!("{name}.gz")),
         )
         .unwrap();
+        let err = super::load_all(&site).err().expect("a flat run is refused");
+        assert!(err.contains(&format!("{name}.gz")), "{err}");
+        assert!(err.contains("its Mac's folder"), "{err}");
+    }
+
+    /// Every run the page lists links to a file the site publishes, a replaced run's too: the
+    /// oldest of three of one Mac, which the page reads only for the grid the newer two left out.
+    #[test]
+    fn every_run_links_to_a_published_file() {
+        use std::io::Write;
+        let grid = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let replaced = published(grid);
+        let site = site_with("links", &[grid, REQUESTS_FIXTURE]);
+        // A third run, newer than both: the requests run again, a day later.
+        let mut again: serde_json::Value =
+            serde_json::from_str(&fixture_text(REQUESTS_FIXTURE)).unwrap();
+        again["generated_utc"] = "2026-11-03T23:05:45Z".into();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(again.to_string().as_bytes()).unwrap();
+        let newer =
+            (site.root.join(super::DATA)).join("apple-m3-pro/2026-11-03T230545Z-f9dc285a.json.gz");
+        std::fs::write(newer, gz.finish().unwrap()).unwrap();
+        assert!(
+            !files_of(&super::load(&site).unwrap()).contains(&replaced),
+            "the grid run is replaced"
+        );
         let assets = crate::chrome::Published {
             styles: String::new(),
             favicon: String::new(),
@@ -3617,7 +3749,7 @@ mod tests {
             .filter(|l| l.starts_with(super::DATA))
             .collect();
         assert!(
-            links.iter().any(|l| l.ends_with(&format!("{replaced}.gz"))),
+            links.iter().any(|l| l.ends_with(&replaced)),
             "no link to the replaced run: {links:?}"
         );
         for l in &links {
@@ -4943,7 +5075,7 @@ mod tests {
         let names = fixture_names();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let site = site_with("over-time", &names);
-        let runs = super::load(&site).expect("the fixtures");
+        let runs = super::load_all(&site).expect("the fixtures");
         let machines = super::index(&runs);
         // The M3 Pro fixtures hold two runs of the current round's gpt-oss-20b, a week apart:
         // Over time draws them, not just the newest.
