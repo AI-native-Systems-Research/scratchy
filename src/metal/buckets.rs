@@ -46,6 +46,14 @@ pub fn in_bucket(c: &TaskCell, buckets: Buckets, timing: RequestTiming, at: usiz
         .collect()
 }
 
+/// How many of a cell's requests bucket `at` of `buckets` holds, timed or not: what tells a bucket
+/// with no request from one whose requests kept no `timing` (a TPOT of a one-token answer).
+pub fn sent_in(c: &TaskCell, buckets: Buckets, at: usize) -> usize {
+    (c.prompt_tokens.iter().flatten().flatten())
+        .filter(|&&p| bucket(buckets, p) == at)
+        .count()
+}
+
 /// The median of a cell's requests' `timing` in bucket `at` of `buckets`; None with none there.
 pub fn median_in(c: &TaskCell, buckets: Buckets, timing: RequestTiming, at: usize) -> Option<f64> {
     median(in_bucket(c, buckets, timing, at))
@@ -181,6 +189,22 @@ mod tests {
             "none that long"
         );
         assert!(bucketed(&c));
+    }
+
+    /// A bucket's requests sent, timed or not: what tells no request this long from requests
+    /// none of whose timing was kept.
+    #[test]
+    fn a_bucket_counts_its_requests_sent() {
+        let c = cell(
+            &[Some(2600), Some(2700), Some(3000), None],
+            &[Some(100.0), Some(200.0), Some(300.0), Some(400.0)],
+            &[None, None, Some(30.0), None],
+        );
+        assert_eq!(sent_in(&c, MUSIQUE, 2), 2);
+        let timed = in_bucket(&c, MUSIQUE, RequestTiming::Tpot, 2);
+        assert!(timed.is_empty(), "none timed");
+        assert_eq!(sent_in(&c, MUSIQUE, 3), 1);
+        assert_eq!(sent_in(&c, MUSIQUE, 0), 0);
     }
 
     /// A cell from before cells kept prompt counts has no bucket of anything.
