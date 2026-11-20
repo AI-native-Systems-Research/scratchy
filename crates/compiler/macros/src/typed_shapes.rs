@@ -843,22 +843,21 @@ pub mod ops {
         (Act(PhantomData), Act(PhantomData))
     }
 
+    /// A multi-head latent attention's query row: `H` heads of a no-rope then a rope part.
+    pub type MlaQuery = Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>;
+
     /// `mla_append(q, kv_latent, k_pe, positions, rotary, kv_cache) -> (q, kv_latent, k_pe)`:
     /// multi-head latent attention's cache write. Each head of `q` is a no-rope part (`Nd`) then a
     /// rope part (`Rd`), which it rotates; the shared rope key is rotated and the token's latent
     /// row (`kv_latent`, then the rotated key) is written to the layer's cache.
     pub fn mla_append<T>(
-        q: Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
+        q: Act<T, MlaQuery>,
         kv_latent: Act<T, KvLoraRank>,
         k_pe: Act<T, QkRopeHeadDim>,
         _positions: Tokens<T>,
         _rotary: Rotary,
         _kv_cache: KvCache,
-    ) -> (
-        Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
-        Act<T, KvLoraRank>,
-        Act<T, QkRopeHeadDim>,
-    ) {
+    ) -> (Act<T, MlaQuery>, Act<T, KvLoraRank>, Act<T, QkRopeHeadDim>) {
         (q, kv_latent, k_pe)
     }
 
@@ -868,7 +867,7 @@ pub mod ops {
     /// are read from, `k_pe` the cache writer's output; out, each head's attended latent.
     pub fn mla_attention<T>(
         _q_latent: Act<T, Mul<NumAttentionHeads, KvLoraRank>>,
-        _q: Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
+        _q: Act<T, MlaQuery>,
         _k_pe: Act<T, QkRopeHeadDim>,
         _kv_cache: KvCache,
         _block_table: BlockTable,
