@@ -1,8 +1,8 @@
 name: Pages
 
-# Main never builds the site; the site branch's pages.yml does. This only asks it to rebuild
-# when main's docs or DSLs change. It must stay at this path: a dispatch finds its workflow by
-# the file on main.
+# The site branch's pages.yml builds and deploys the site. Main asks it to rebuild when main's docs
+# or DSLs change, and checks a pull request that changes them builds the site, without deploying.
+# It must stay at this path: a dispatch finds its workflow by the file on main.
 on:
   push:
     branches: [main]
@@ -10,14 +10,20 @@ on:
       - 'docs/**'
       - 'CONTRIBUTING.md'
       - 'crates/models/arch/dsl/**'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rebuild-site:
-    if: ${{ !github.event.repository.fork }}
+    if: ${{ github.event_name != 'pull_request' && !github.event.repository.fork }}
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -25,3 +31,40 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref site
+
+  # A required check, so it reports on every pull request: it builds the site only when the pull
+  # request changes what the site renders from main.
+  site:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: changed
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --name-only "$BASE" HEAD -- docs CONTRIBUTING.md crates/models/arch/dsl | grep -q .; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No docs or DSL change: the site is unaffected."
+          fi
+
+      - if: steps.changed.outputs.build == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: site
+          path: site
+
+      - if: steps.changed.outputs.build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: steps.changed.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: site
+
+      - if: steps.changed.outputs.build == 'true'
+        run: cargo run --locked --release --manifest-path site/Cargo.toml
