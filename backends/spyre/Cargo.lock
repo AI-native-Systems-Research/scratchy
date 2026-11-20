@@ -1632,6 +1632,7 @@ dependencies = [
  "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "serde_json",
 ]
@@ -1752,6 +1753,15 @@ dependencies = [
  "ktir-superdsc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "scratchy-state-decoder-gdn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scratchy-tensors",
+ "tracing",
 ]
 
 [[package]]

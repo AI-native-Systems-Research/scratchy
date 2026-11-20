@@ -393,10 +393,10 @@ pub mod weights {
 }
 pub use weights::GpuWeights;
 
-// Backend-neutral pools (storage generic over the mem type) the `ForwardCtx`
-// names, defaulted to the metal `PoolMem` so the macro's `crate::__gpu::{kv_cache,
-// gdn_state}` paths + the worker's `scratchy_target_metal::{kv_cache, gdn_state}`
-// resolve under the flipped alias.
+// The metal kernels' recurrent-state dtype, and the backend-neutral KV pool (storage generic over
+// the mem type) the `ForwardCtx` names, defaulted to the metal `PoolMem` so the macro's
+// `crate::__gpu::kv_cache` path + the worker's `scratchy_target_metal::kv_cache` resolve under
+// the flipped alias.
 pub mod gdn_state;
 pub mod kv_cache;
 

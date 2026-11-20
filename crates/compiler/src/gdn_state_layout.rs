@@ -42,7 +42,7 @@ pub struct GdnStateLayout {
 }
 
 /// Runtime GDN config a hybrid arch reports to the worker so it can size and
-/// allocate the `scratchy_layers::gdn_state::GdnStatePool`. Backend-neutral:
+/// allocate the `scratchy_state_decoder_gdn::pool::GdnStatePool`. Backend-neutral:
 /// carries the per-layer dims + the per-global-layer linear-attention mask. The
 /// `num_slots` (= `max_num_seqs`) is supplied by the worker, not the model.
 ///
@@ -67,8 +67,8 @@ pub struct GdnRuntimeConfig {
 
 impl GdnRuntimeConfig {
     /// A slot's checkpoints: the model's drafts.
-    pub fn checkpoint_rows(&self) -> scratchy_layers::gdn_state::CheckpointRows {
-        scratchy_layers::gdn_state::CheckpointRows(self.spec_drafts)
+    pub fn checkpoint_rows(&self) -> scratchy_state_decoder_gdn::pool::CheckpointRows {
+        scratchy_state_decoder_gdn::pool::CheckpointRows(self.spec_drafts)
     }
 
     /// Number of GDN (linear-attention) layers.
@@ -77,8 +77,8 @@ impl GdnRuntimeConfig {
     }
 
     /// The state geometry the GDN state pool allocates each linear layer.
-    pub fn state_dims(&self) -> scratchy_layers::gdn_state::GdnStateDims {
-        scratchy_layers::gdn_state::GdnStateDims {
+    pub fn state_dims(&self) -> scratchy_state_decoder_gdn::pool::GdnStateDims {
+        scratchy_state_decoder_gdn::pool::GdnStateDims {
             conv_dim: self.conv_dim as usize,
             conv_kernel: self.conv_kernel as usize,
             num_v_heads: self.num_v_heads as usize,

@@ -2097,7 +2097,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                             gdn_state_indices: alloc(
                                 max_m
                                     * ::std::mem::size_of::<
-                                        ::scratchy_target_metal::gdn_state::GdnSeqSlots,
+                                        ::scratchy_state_decoder_gdn::pool::GdnSeqSlots,
                                     >() as u64,
                             ),
                             gdn_is_fresh: alloc(max_m * 4),

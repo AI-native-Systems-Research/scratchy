@@ -17,11 +17,12 @@ mod common;
 use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::{bake, baked_build};
-use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::{
-    CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots,
-    GdnSlot, GdnStart, GdnStateDims, GdnStep, RecordArea,
+use scratchy_state_decoder_gdn::pool::{
+    CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
+    GdnStateDims, GdnStep, RecordArea,
 };
+use scratchy_target_metal::detect_device;
+use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -2472,11 +2473,11 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
     );
 }
 
-/// [`gdn_conv1d_varlen_resumes_from_checkpoint`] for the recurrent (ssm) state, whose verify
-/// step records its draft rows and whose next step replays the kept ones from its base entry
-/// (`gdn_state` module docs): the resumed row is bit for bit the one a step that never saw the
-/// rejected drafts computes. Each step's code carries the slot's draft lane and record area as the
-/// slot allocator tracks them ([`GdnStep::after`]).
+/// [`gdn_conv1d_varlen_resumes_from_checkpoint`] for the recurrent (ssm) state, whose verify step
+/// records its draft rows and whose next step replays the kept ones from its base entry
+/// (`scratchy_state_decoder_gdn::pool` module docs): the resumed row is bit for bit the one a step
+/// that never saw the rejected drafts computes. Each step's code carries the slot's draft lane and
+/// record area as the slot allocator tracks them ([`GdnStep::after`]).
 #[test]
 fn gdn_scan_varlen_resumes_from_checkpoint() {
     let Some(di) = detect_device() else {

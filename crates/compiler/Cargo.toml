@@ -37,6 +37,7 @@ scratchy-core-config = { workspace = true }
 # `scratchy_tensors::GpuWeightsHandle`. Acyclic — scratchy-layers deps only
 # tensors + quantizations + core-model, none of which dep this crate.
 scratchy-layers = { workspace = true }
+scratchy-state-decoder-gdn = { workspace = true }
 # `scratchy-vision` (backend-neutral vision host glue) supplies
 # `MmMetadata` for the dispatcher's `ScratchyMmRegistration`. Optional and
 # pulled in by the `vision` feature; the crate itself is backend-dep-free.

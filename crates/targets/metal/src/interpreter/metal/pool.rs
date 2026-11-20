@@ -2064,7 +2064,7 @@ fn begin_step<W: CanonicalParams>(
             .unrotated_blocks
             .store(step_has_unrotated_blocks(inputs, global), Relaxed);
     }
-    let plain = |c: &u32| crate::gdn_state::GdnStep::decode(*c).is_plain();
+    let plain = |c: &u32| scratchy_state_decoder_gdn::pool::GdnStep::decode(*c).is_plain();
     worker.worker.gdn_plain.store(
         inputs
             .gdn_is_fresh

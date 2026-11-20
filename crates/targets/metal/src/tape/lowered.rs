@@ -1365,7 +1365,8 @@ pub enum RuntimeBindingKind {
         layer: LayerId,
     },
     /// The draft lanes' conv checkpoints for a linear-attention layer of a model that drafts
-    /// (`scratchy_layers::gdn_state::DraftLanes`): a verify step's window after each of its rows.
+    /// (`scratchy_state_decoder_gdn::pool::DraftLanes`): a verify step's window after each of its
+    /// rows.
     GdnConvLanes {
         layer: LayerId,
     },
@@ -1374,8 +1375,8 @@ pub enum RuntimeBindingKind {
     GdnSsmLanes {
         layer: LayerId,
     },
-    /// `[num_seqs]` `GdnSeqSlots` (`scratchy_layers::gdn_state`, the shaders' `gdn_state.h`) —
-    /// per batched sequence (cu_seqlens order) its state-pool slot, the snapshot a restore reads
+    /// `[num_seqs]` `GdnSeqSlots` (`scratchy_state_decoder_gdn::pool`, the shaders' `gdn_state.h`)
+    /// — per batched sequence (cu_seqlens order) its state-pool slot, the snapshot a restore reads
     /// its start state from and the snapshots a save stores into, 6 i32s. Written per forward by
     /// the worker.
     GdnStateIndices,

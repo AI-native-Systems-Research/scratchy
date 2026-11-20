@@ -21,9 +21,10 @@ mod common;
 
 use common::{Dtype, shared_bytes};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_state_decoder_gdn::pool::{GdnSave, GdnSeqSlots, GdnSlot};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots, GdnSlot};
+use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,

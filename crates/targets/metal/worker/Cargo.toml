@@ -24,6 +24,7 @@ scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-core-model = { workspace = true }
 scratchy-forward-compiler = { workspace = true }
+scratchy-state-decoder-gdn = { workspace = true }
 # The selected models, compiled for metal: their loaders, tapes and pools, found through the
 # emitted registry rows.
 scratchy-target-metal-models = { path = "../models" }

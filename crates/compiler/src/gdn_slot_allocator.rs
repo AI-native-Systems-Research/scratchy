@@ -25,8 +25,8 @@
 //! ## Speculative decoding
 //!
 //! A verify step runs a sequence's drafts through its recurrent state, so a rejected draft would
-//! stay in it. The verify step leaves the state it started from in the slot and records its rows
-//! in the sequence's draft lane ([`scratchy_layers::gdn_state`]); [`GdnSlotAllocator::verified`]
+//! stay in it. The verify step leaves the state it started from in the slot and records its rows in
+//! the sequence's draft lane ([`scratchy_state_decoder_gdn::pool`]); [`GdnSlotAllocator::verified`]
 //! records how many drafts were kept, and the request's next step replays its rows up to the last
 //! kept one.
 //!
@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use scratchy_layers::gdn_state::{
+use scratchy_state_decoder_gdn::pool::{
     CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
     GdnStep, RecordArea,
 };
@@ -167,9 +167,9 @@ impl GdnSlotAllocator {
 
     /// One step's GDN inputs, for its sequences in `cu_seqlens` order: each sequence's
     /// [`GdnSeqSlots`] (`state_indices`) and its [`GdnStep`] code. A verify step (`drafts > 0`)
-    /// keeps what a rejected draft needs undone (`gdn_state` module docs) in the sequence's draft
-    /// lane; a sequence whose step does not verify gives its lane back, once every sequence's
-    /// inputs are built (module docs).
+    /// keeps what a rejected draft needs undone (`scratchy_state_decoder_gdn::pool` module docs)
+    /// in the sequence's draft lane; a sequence whose step does not verify gives its lane back,
+    /// once every sequence's inputs are built (module docs).
     ///
     /// ⭐ WHERE A SEQUENCE'S STATE STARTS COMES FROM WHERE IT STANDS, not from whether this
     /// allocator has seen the id before:

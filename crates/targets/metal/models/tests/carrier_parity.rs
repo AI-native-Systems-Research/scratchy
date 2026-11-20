@@ -430,12 +430,12 @@ mod imp {
         // our single sequence, marked fresh on the prefill step — the oracle
         // zero-inits state — and carried into every decode step after it.
         let gdn_pool = model.gdn_runtime_config().map(|gdn_cfg| unsafe {
-            scratchy_target_metal::gdn_state::GdnStatePool::new(
+            scratchy_state_decoder_gdn::pool::GdnStatePool::new(
                 layers,
                 &gdn_cfg.linear_layers,
                 1,
                 // A lane for a model that drafts: its tapes bind one, though this one never does.
-                scratchy_target_metal::gdn_state::DraftLanes::new(gdn_cfg.checkpoint_rows(), 1),
+                scratchy_state_decoder_gdn::pool::DraftLanes::new(gdn_cfg.checkpoint_rows(), 1),
                 gdn_cfg.state_dims(),
                 scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
                 |bytes| {
@@ -452,8 +452,8 @@ mod imp {
         });
 
         // Recurrent-state slot 0 for our one sequence: its `state_indices` record.
-        let gdn_idx = scratchy_target_metal::gdn_state::GdnSeqSlots::plain(
-            scratchy_target_metal::gdn_state::GdnSlot::new(0),
+        let gdn_idx = scratchy_state_decoder_gdn::pool::GdnSeqSlots::plain(
+            scratchy_state_decoder_gdn::pool::GdnSlot::new(0),
         )
         .words();
 

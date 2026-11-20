@@ -15,8 +15,8 @@
 //! field (metal is single-device).
 
 use crate::TensorView;
-use crate::gdn_state::GdnStatePool;
 use crate::kv_cache::KvCachePool;
+use scratchy_state_decoder_gdn::pool::GdnStatePool;
 
 /// Rows of a forward's final (post-norm) hidden states — the lm_head's input — copied out for
 /// the caller, row-major in the model dtype: what a multi-token-prediction head reads next.
@@ -68,9 +68,10 @@ pub struct ForwardCtx<'a> {
     /// `conv_state`/`ssm_state` here, indexed by [`Self::gdn_state_indices`].
     /// `None` for non-hybrid arches.
     pub gdn_state: Option<&'a GdnStatePool<crate::PoolMem>>,
-    /// Per-sequence GDN state records, a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) a
-    /// sequence flattened to `GdnSeqSlots::WORDS` i32s (`[num_seqs * 6]` elements, read whole).
-    /// `None` for non-hybrid arches.
+    /// Per-sequence GDN state records, a
+    /// [`GdnSeqSlots`](scratchy_state_decoder_gdn::pool::GdnSeqSlots) a sequence flattened to
+    /// `GdnSeqSlots::WORDS` i32s (`[num_seqs * 6]` elements, read whole). `None` for non-hybrid
+    /// arches.
     pub gdn_state_indices: Option<TensorView<'a>>,
     /// Per-sequence GDN fresh flags, shape `[num_seqs]` u32 — 1 on a
     /// sequence's first (fresh) forward. `None` for non-hybrid arches.

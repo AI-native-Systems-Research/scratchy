@@ -29,8 +29,8 @@ use tracing::info;
 
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::VerifySeqs;
+use scratchy_state_decoder_gdn::pool::{DraftLanes, GdnSave, GdnSlot, GdnStatePool};
 use scratchy_target_metal::dtype::DType as GpuDType;
-use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
 use scratchy_target_metal::kv_cache::KvCachePool;
 
 use scratchy_target_metal::OwnedTensor;
@@ -660,18 +660,17 @@ fn draft_budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudg
     }
 }
 
-/// The draft lanes of a hybrid target's Gated-DeltaNet pool (`gdn_state`'s module docs), no more
-/// than `max_num_seqs`: twice the sequences a head's budget drafts for — a step's drafting
-/// sequences hold one each, and as many again may wait, skipped by the scheduler, to replay
-/// theirs; the head drafts nothing for a sequence that finds every lane held — or one a sequence
-/// when an n-gram or draft model drafts for each. `None` when the run drafts nothing (or the
-/// target's kernels keep no draft state).
+/// The draft lanes of a hybrid target's Gated-DeltaNet pool (`scratchy_state_decoder_gdn::pool`'s
+/// module docs), no more than `max_num_seqs`: twice the sequences a head's budget drafts for — a
+/// step's drafting sequences hold one each, and as many again may wait, skipped by the scheduler,
+/// to replay theirs; the head drafts nothing for a sequence that finds every lane held — or one a
+/// sequence when an n-gram or draft model drafts for each. `None` when the run drafts nothing (or
+/// the target's kernels keep no draft state).
 fn gdn_draft_lanes(
     verify_seqs: VerifySeqs,
     cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
     max_num_seqs: usize,
-) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
-    use scratchy_target_metal::gdn_state::DraftLanes;
+) -> Option<DraftLanes> {
     let count = match verify_seqs {
         VerifySeqs::Off => return None,
         VerifySeqs::Head(budget) => max_num_seqs.min(2 * budget.max_seqs()),
@@ -1478,7 +1477,7 @@ impl MetalWorker {
     fn gdn_lanes(
         &self,
         cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
-    ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
+    ) -> Option<DraftLanes> {
         gdn_draft_lanes(self.config.verify_seqs, cfg, self.max_num_seqs_resolved())
     }
 
@@ -7158,7 +7157,7 @@ impl Worker for MetalWorker {
             let num_slots = snapshots_from + self.gdn_snapshot_cap;
             let next = std::cell::Cell::new(0usize);
             let gdn_pool = unsafe {
-                scratchy_target_metal::gdn_state::GdnStatePool::new(
+                GdnStatePool::new(
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
@@ -7303,7 +7302,7 @@ impl Worker for MetalWorker {
             .as_ref()
             .and_then(|m| m.gdn_runtime_config())
             .map(|cfg| {
-                scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
+                GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
                     self.max_num_seqs_resolved(),
                     self.gdn_lanes(&cfg),

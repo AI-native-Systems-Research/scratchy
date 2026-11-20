@@ -32,7 +32,8 @@ use std::sync::Arc;
 use scratchy_core_config::{compact_kv_layer_to_tensor, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value};
-use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
+use scratchy_state_decoder_gdn::pool::{GdnSeqSlots, GdnSlot, GdnStatePool};
+use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::interpreter::metal::{
     BLOCKS_PER_CHUNK, MetalDtype, MetalRungs, TerminalReads,
 };
@@ -384,7 +385,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 &cfg.linear_layers,
                 1,
                 // A lane for a model that drafts: its tapes bind one, though this one never does.
-                scratchy_target_metal::gdn_state::DraftLanes::new(cfg.checkpoint_rows(), 1),
+                scratchy_state_decoder_gdn::pool::DraftLanes::new(cfg.checkpoint_rows(), 1),
                 cfg.state_dims(),
                 GDN_SSM_STATE_DTYPE,
                 |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
