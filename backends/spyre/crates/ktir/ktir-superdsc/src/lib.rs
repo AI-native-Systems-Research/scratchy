@@ -110,3 +110,8 @@ pub mod wire;
 /// space is cut across cores (`core_split`, `CoreSplit`, `DeviceWidth`, `distribute_cores`,
 /// `core_to_wk_slice`, the matmul cost search).
 pub mod work;
+/// ⭐⭐⭐ TORCH-SPYRE'S WORK DIVISION, PORTED — the ONE type (`WorkDivision`) that decides how
+/// one op's iteration space is cut across cores, minted once by the ported three-pass law and
+/// consumed by every op lowering. Replaces the scratchpad-division probe: the device FORM is
+/// the op's own, at its stated dims.
+pub mod work_division;
