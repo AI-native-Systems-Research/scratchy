@@ -1,0 +1,43 @@
+[package]
+name = "scratchy-target-cuda-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "`cuda`: the scratchy CLI on NVIDIA H100 — the shared commands, served through the CUDA worker"
+
+[features]
+# The in-process engine (`cuda chat`); `serve` adds the HTTP server.
+default = ["chat"]
+chat = ["scratchy-cli/chat"]
+serve = ["scratchy-cli/serve"]
+claude = ["scratchy-cli/claude"]
+bench = ["scratchy-cli/bench"]
+bench-datasets = ["scratchy-cli/bench-datasets"]
+guided-decoding = ["scratchy-cli/guided-decoding"]
+otel = ["scratchy-cli/otel"]
+tls = ["scratchy-cli/tls"]
+metrics = ["scratchy-cli/metrics"]
+# The kernels and the runtime that plays a tape (`scratchy-target-cuda`'s `nvcc`): needs nvcc from
+# CUDA 12.8+ on PATH to build, and an sm_90 GPU (H100) to run. Without it the binary builds
+# anywhere and refuses to build a worker, naming this feature.
+nvcc = ["scratchy-target-cuda-worker/nvcc"]
+
+[[bin]]
+name = "cuda"
+path = "src/main.rs"
+
+[dependencies]
+# The shared commands (`scratchy_cli::run`), with model-name completion.
+scratchy-cli = { workspace = true, features = ["model"] }
+# The CUDA worker: the `WorkerFactory` the engine serves through. `main.rs` anchors it.
+scratchy-target-cuda-worker = { workspace = true }
+# THE MODEL SCOPE, for CLI feature reachability: `--features model/<stem>` selects through
+# scratchy-models' own features, as `scr`'s `model` alias does (the same package, so the same
+# features). `quant` likewise: `--features quant/fp8-dynamic-per-channel`, the one preset CUDA
+# builds.
+model = { package = "scratchy-models", path = "../../../../crates/models/arch", default-features = false }
+quant = { package = "scratchy-quantizations", path = "../../../../crates/models/quantization", default-features = false }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }

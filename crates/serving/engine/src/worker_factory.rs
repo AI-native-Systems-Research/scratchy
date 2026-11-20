@@ -11,11 +11,113 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use scratchy_core_common::SamplingParams;
 use scratchy_core_model::hub;
 use scratchy_core_model::weight::HfModelConfig;
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::worker::Worker;
+
+/// The sampling a backend serves, one capability per field: what [`WorkerFactory::served`]
+/// declares, in the form of `Worker::scores_prompts` (which answers for `prompt_logprobs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Served {
+    /// Sampling above temperature 0. Without it only greedy decoding is served: temperature 0,
+    /// where top-k, top-p and min-p keep the argmax ([`SamplingParams::is_greedy`]).
+    pub sampling: bool,
+    /// The penalties that read a request's history: repetition, presence, frequency.
+    pub penalties: bool,
+    /// More than one completion per request (`n > 1`).
+    pub completions: bool,
+    /// Per-token `logprobs`.
+    pub logprobs: bool,
+    /// The transforms that can move the argmax: a logit bias, an allowed-token list, bad words,
+    /// guided decoding.
+    pub logit_transforms: bool,
+}
+
+impl Served {
+    /// Every capability: a backend that samples, penalizes, completes `n` times, scores and
+    /// transforms.
+    pub const EVERYTHING: Self = Self {
+        sampling: true,
+        penalties: true,
+        completions: true,
+        logprobs: true,
+        logit_transforms: true,
+    };
+
+    /// The first thing `p` asks for that the backend does not serve, in this order: a penalty,
+    /// sampling, several completions, logprobs, a logit transform. `None` when it serves them
+    /// all.
+    pub fn refusal(&self, p: &SamplingParams) -> Option<Unserved> {
+        let transform = [
+            (p.logit_bias.is_some(), "logit_bias"),
+            (p.allowed_token_ids.is_some(), "allowed_token_ids"),
+            (p.bad_words_token_ids.is_some(), "bad_words"),
+            (p.guided_grammar.is_some(), "guided decoding"),
+        ]
+        .into_iter()
+        .find_map(|(set, field)| set.then_some(field));
+        if !self.penalties && p.reads_history() {
+            Some(Unserved::Penalties)
+        } else if !self.sampling && !p.is_greedy() {
+            Some(Unserved::Sampling {
+                temperature: p.temperature,
+            })
+        } else if !self.completions && p.n != 1 {
+            Some(Unserved::Completions { n: p.n })
+        } else if !self.logprobs && p.logprobs.is_some() {
+            Some(Unserved::Logprobs)
+        } else if !self.logit_transforms {
+            transform.map(|field| Unserved::LogitTransform { field })
+        } else {
+            None
+        }
+    }
+}
+
+/// What a request asks for that its backend does not serve ([`Served::refusal`]): the client's
+/// validation error, naming what to change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Unserved {
+    Penalties,
+    Sampling { temperature: f64 },
+    Completions { n: u32 },
+    Logprobs,
+    LogitTransform { field: &'static str },
+}
+
+impl std::fmt::Display for Unserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Penalties => write!(
+                f,
+                "this backend serves no repetition, presence or frequency penalty: drop them \
+                 (\"repetition_penalty\": 1, \"presence_penalty\": 0, \"frequency_penalty\": 0)"
+            ),
+            Self::Sampling { temperature } => write!(
+                f,
+                "this backend decodes greedily only: temperature {temperature} is not served \
+                 (pass \"temperature\": 0, or --temperature 0)"
+            ),
+            Self::Completions { n } => write!(
+                f,
+                "this backend serves one completion per request: n = {n} is not served (pass \
+                 \"n\": 1)"
+            ),
+            Self::Logprobs => write!(f, "this backend does not serve logprobs: drop \"logprobs\""),
+            Self::LogitTransform { field } => {
+                write!(
+                    f,
+                    "this backend does not serve {field}: drop \"{field}\" from the request"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Unserved {}
 
 /// Configuration for a backend's worker.
 ///
@@ -181,6 +283,17 @@ pub trait WorkerFactory: Sync {
     fn required_block_size(&self) -> Option<scratchy_core_common::KvBlockTokens> {
         None
     }
+
+    /// THE SAMPLING THIS BACKEND SERVES ([`Served`]), a fact of the build the API reads at its
+    /// request door ([`Served::refusal`]). The default serves everything.
+    ///
+    /// ⛔ READ BEFORE SCHEDULING, NOT IN THE WORKER. A worker that refuses a request it was
+    /// handed fails a step the scheduler already formed: the client gets a server error, and the
+    /// step queued behind it finds a request the worker never admitted. Read here, the request
+    /// is refused alone, as a validation error, and the scheduler never sees it.
+    fn served(&self) -> Served {
+        Served::EVERYTHING
+    }
 }
 
 inventory::collect!(&'static dyn WorkerFactory);
@@ -250,4 +363,71 @@ pub fn resolve_model_path(
     let gguf = gguf_file.map_or(hub::Gguf::Auto, hub::Gguf::File);
     hub::download(model_path, hf_token, gguf, observer)
         .map_err(|e| ExecutorError::WorkerInit(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Served, Unserved};
+    use scratchy_core_common::SamplingParams;
+
+    /// Greedy decoding of one completion, nothing else asked.
+    fn greedy() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        }
+    }
+
+    /// A backend that serves everything refuses nothing; one that serves nothing refuses each
+    /// request by the first capability it asks for, in `refusal`'s order.
+    #[test]
+    fn a_request_is_refused_by_the_first_capability_its_backend_lacks() {
+        let none = Served {
+            sampling: false,
+            penalties: false,
+            completions: false,
+            logprobs: false,
+            logit_transforms: false,
+        };
+        let hot = SamplingParams {
+            temperature: 0.7,
+            n: 2,
+            ..greedy()
+        };
+        assert_eq!(Served::EVERYTHING.refusal(&hot), None);
+        assert_eq!(none.refusal(&greedy()), None);
+        let cases = [
+            (
+                SamplingParams {
+                    presence_penalty: 0.5,
+                    ..hot.clone()
+                },
+                Unserved::Penalties,
+            ),
+            (hot.clone(), Unserved::Sampling { temperature: 0.7 }),
+            (
+                SamplingParams { n: 2, ..greedy() },
+                Unserved::Completions { n: 2 },
+            ),
+            (
+                SamplingParams {
+                    logprobs: Some(1),
+                    ..greedy()
+                },
+                Unserved::Logprobs,
+            ),
+            (
+                SamplingParams {
+                    allowed_token_ids: Some(vec![1]),
+                    ..greedy()
+                },
+                Unserved::LogitTransform {
+                    field: "allowed_token_ids",
+                },
+            ),
+        ];
+        for (params, want) in cases {
+            assert_eq!(none.refusal(&params), Some(want), "{want}");
+        }
+    }
 }

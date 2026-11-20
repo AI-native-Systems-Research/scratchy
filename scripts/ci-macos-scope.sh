@@ -12,15 +12,17 @@
 #       edge into one turns the macOS jobs red, instead of letting a PR that changes only that crate
 #       skip the jobs that build it. CI's rust-cache drops every workspace crate's build output
 #       before saving, so a workspace crate's `.fingerprint` entry is one this job compiled. The
-#       crates are the spyre workspace's (backends/spyre); the check reads both workspaces' build
-#       output, since the macOS tests job builds the KTIR crates in the spyre one. The card
-#       workspace (backends/spyre-hw) resolves against the senlib-rs stub every job that runs this
-#       synthesizes first (scripts/ci-senlib-stub.sh), so its metadata reads here like any other
-#       workspace's — and no macOS job compiles its crates, which is what the list states.
+#       crates are the spyre workspaces' (backends/spyre, backends/spyre-hw) and the CUDA one's
+#       (backends/cuda); the check reads every workspace's build output, since the macOS tests job
+#       builds the KTIR crates in the spyre one. The card workspace (backends/spyre-hw) resolves
+#       against the senlib-rs stub every job that runs this synthesizes first
+#       (scripts/ci-senlib-stub.sh), so its metadata reads here like any other workspace's — and no
+#       macOS job compiles its crates, which is what the list states.
 set -euo pipefail
 
-# One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
-# ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
+# One crate directory per line: the Spyre target and its triton re-host crates, and every CUDA
+# crate. Not ktir-core, ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first
+# two, and both depend on the third.
 MACOS_UNBUILT='backends/spyre/crates/spyre
 backends/spyre-hw/crates/card
 backends/spyre-hw/crates/builder
@@ -30,7 +32,12 @@ backends/spyre/crates/triton/splice
 backends/spyre/crates/triton/triton-frontend
 backends/spyre/crates/triton/triton-ktir
 backends/spyre/crates/triton/triton-ktir-superdsc
-backends/spyre/crates/triton/triton-numeric'
+backends/spyre/crates/triton/triton-numeric
+backends/cuda/crates/cuda
+backends/cuda/crates/compiler
+backends/cuda/crates/worker
+backends/cuda/crates/models
+backends/cuda/crates/cli'
 
 changed() {
     # Every crate directory, deepest first, so the first one holding a file is its owner:
@@ -59,6 +66,10 @@ changed() {
             backends/spyre/kernels/*) continue ;;
             # The card workspace's own manifest and lock: no macOS job builds that workspace.
             backends/spyre-hw/Cargo.toml | backends/spyre-hw/Cargo.lock) continue ;;
+            # The CUDA workspace's manifest and lock, its kernels (in no crate; only the listed
+            # CUDA crates read them) and its H100 scripts: no macOS job builds or reads them.
+            backends/cuda/Cargo.toml | backends/cuda/Cargo.lock) continue ;;
+            backends/cuda/kernels/* | backends/cuda/scripts/*) continue ;;
         esac
         while IFS= read -r dir; do
             case "$file" in "$dir"/*) owner=$dir; break ;; esac
@@ -74,22 +85,23 @@ changed() {
 }
 
 lock() {
-    # The listed directories' package names, from cargo's own manifest paths in the spyre
-    # workspaces; the build output checked is every workspace's. The card workspace's
+    # The listed directories' package names, from cargo's own manifest paths in the spyre and
+    # CUDA workspaces; the build output checked is every workspace's. The card workspace's
     # metadata reads against the senlib-rs stub the calling job synthesized
     # (scripts/ci-senlib-stub.sh) — resolution is all `--no-deps` metadata needs.
-    local metadata spyre spyre_hw packages names dir name
+    local metadata spyre spyre_hw cuda packages names dir name
     metadata=$(cargo metadata --no-deps --format-version 1)
     spyre=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre/Cargo.toml)
     spyre_hw=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/spyre-hw/Cargo.toml)
+    cuda=$(cargo metadata --no-deps --format-version 1 --manifest-path backends/cuda/Cargo.toml)
     packages=$(jq -r --arg root "$PWD/" \
         '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))\t\(.name)"' \
-        <<<"$spyre$spyre_hw")
+        <<<"$spyre$spyre_hw$cuda")
     names=""
     while IFS= read -r dir; do
         name=$(awk -F'\t' -v dir="$dir" '$1 == dir { print $2 }' <<<"$packages")
         if [ -z "$name" ]; then
-            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre or spyre-hw workspace crate" >&2
+            echo "scripts/ci-macos-scope.sh lists $dir, which holds no spyre, spyre-hw or cuda workspace crate" >&2
             exit 1
         fi
         names="$names${names:+|}$name"
@@ -97,7 +109,7 @@ lock() {
     local compiled
     local dirs=()
     for dir in "$(jq -r .target_directory <<<"$metadata")" "$(jq -r .target_directory <<<"$spyre")" \
-        "$(jq -r .target_directory <<<"$spyre_hw")"; do
+        "$(jq -r .target_directory <<<"$spyre_hw")" "$(jq -r .target_directory <<<"$cuda")"; do
         [ -d "$dir" ] && dirs+=("$dir")
     done
     compiled=$(find "${dirs[@]}" -mindepth 3 -maxdepth 3 -type d \

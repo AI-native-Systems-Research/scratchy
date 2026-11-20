@@ -1,0 +1,53 @@
+# One H100 pod for one run script. drive.sh fills in the fields named in braces from its
+# environment (README.md); the defaults it fills in are a GKE H100 node pool's.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD}
+  namespace: ${NAMESPACE}
+spec:
+  restartPolicy: Never
+  # Hard stop so a forgotten pod cannot hold an H100.
+  activeDeadlineSeconds: 14400
+  nodeSelector:
+    ${NODE_SELECTOR_KEY}: ${NODE_SELECTOR_VALUE}
+  # The H100 pool is tainted (GKE: nvidia.com/gpu=present:NoSchedule).
+  tolerations:
+    - key: ${TOLERATION_KEY}
+      operator: Equal
+      value: ${TOLERATION_VALUE}
+      effect: NoSchedule
+  containers:
+    - name: builder
+      # CUDA 12.9 satisfies ThunderKittens' 12.8+ requirement; gcc 11 on 22.04 handles C++20.
+      image: ${IMAGE}
+      command: ["sleep", "14400"]
+      # Big-model runs (the 35B checkpoint, the HF f32 reference) need reserved host memory and
+      # disk, or the cluster may evict the pod mid-run.
+      resources:
+        requests:
+          memory: 320Gi
+          ephemeral-storage: 400Gi
+        limits:
+          nvidia.com/gpu: 1
+          memory: 320Gi
+          ephemeral-storage: 400Gi
+      env:
+        - name: CUDA_COMPUTE_CAP
+          value: "90"
+        - name: SCRATCHY_GPU
+          value: h100
+        # GKE mounts the host driver (nvidia-smi, libnvidia-ml, libcuda) under
+        # /usr/local/nvidia; the image's defaults do not include it.
+        - name: PATH
+          value: /usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64:/usr/local/cuda/lib64
+        # A Hugging Face token for the checkpoint downloads, from a Kubernetes Secret when one
+        # exists (key `token`); the checkpoints these scripts pin are public, so none is needed.
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ${HF_SECRET}
+              key: token
+              optional: true

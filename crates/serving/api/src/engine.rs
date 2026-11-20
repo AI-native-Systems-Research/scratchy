@@ -61,6 +61,7 @@ use crate::tokenizer::Tokenizer;
 use crate::tool_parser::{
     DeltaToolCall, StreamingToolParserState, ToolCallParser, ToolParserDelta,
 };
+use scratchy_serving_engine::worker_factory::Served;
 
 /// Upper bound on `n` (completions per request), matching the OpenAI API's own limit. Without
 /// this, a client-supplied `n` feeds `Vec::with_capacity(n)`/`Vec::with_capacity(prompts*n)`
@@ -446,6 +447,9 @@ pub struct AsyncEngine {
     mm_processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
+    /// The sampling the backend serves (`WorkerFactory::served`), checked against every request
+    /// before it is submitted ([`Served::refusal`]). [`Served::EVERYTHING`] until set.
+    served: Served,
     /// Maximum time the step loop can have pending requests with no output
     /// before aborting them. Configurable for tests (default: 60s).
     no_progress_timeout: Duration,
@@ -487,6 +491,7 @@ impl AsyncEngine {
             #[cfg(feature = "multimodal")]
             mm_processor: None,
             is_pooling: false,
+            served: Served::EVERYTHING,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
     }
@@ -683,6 +688,12 @@ impl AsyncEngine {
 
     pub fn set_async_scheduling(&mut self, enabled: bool) {
         self.async_scheduling = enabled;
+    }
+
+    /// The sampling the backend serves (`WorkerFactory::served`), which every request is checked
+    /// against before it is submitted.
+    pub fn set_served(&mut self, served: Served) {
+        self.served = served;
     }
 
     /// Set the resolved multimodal processor (built from a scratchy
@@ -2581,7 +2592,7 @@ impl AsyncEngine {
     async fn submit_request(
         &self,
         request_id: String,
-        ec_request: EngineCoreRequest,
+        mut ec_request: EngineCoreRequest,
         num_prompt_tokens: u32,
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
         detokenizer: Option<IncrementalDetokenizer>,
@@ -2613,6 +2624,10 @@ impl AsyncEngine {
                 self.max_model_len
             )));
         }
+        // ⛔ AND SAMPLING THE BACKEND CANNOT SERVE, HERE TOO, for the same reason: refused in the
+        // worker it fails a step the scheduler already formed (a 500, and an orphan step behind it);
+        // refused here it is one request's 400, and the scheduler never admits it.
+        self.check_served(&mut ec_request.sampling_params)?;
         #[cfg(feature = "metrics")]
         {
             let metrics = crate::metrics::VllmMetrics::global();
@@ -3626,6 +3641,18 @@ impl AsyncEngine {
     /// score only the rows they sample would return `null`, which a client scoring prompts by
     /// likelihood (an eval harness's multiple-choice tasks) reads as an answer (#874). The logprobs
     /// of generated tokens (`logprobs`, `top_logprobs`) are a separate request field.
+    /// Refuse a request whose sampling the backend does not serve ([`Served::refusal`]). A request
+    /// with no sampling params runs under the defaults the core gives it
+    /// (`SamplingParams::default`), so they are set here and checked: the backend never sees a
+    /// request the door did not.
+    fn check_served(&self, params: &mut Option<SamplingParams>) -> ServeResult<()> {
+        let params = params.get_or_insert_with(SamplingParams::default);
+        match self.served.refusal(params) {
+            Some(why) => Err(ServeError::Validation(why.to_string())),
+            None => Ok(()),
+        }
+    }
+
     fn check_prompt_logprobs(&self, asked: Option<u32>) -> ServeResult<()> {
         match asked {
             Some(_) if !self.computes_prompt_logprobs => Err(ServeError::Validation(
@@ -5745,6 +5772,68 @@ mod tests {
         assert!(response.usage.prompt_tokens > 0);
         // completion_tokens is sum of both choices.
         assert!(response.usage.completion_tokens.unwrap_or(0) > 0);
+    }
+
+    /// Sampling the backend cannot serve is a validation error (a 400) when the request is
+    /// submitted: the scheduler never sees it, and a request the backend can serve still runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_unservable_sampling_is_refused_before_scheduling() {
+        let mut engine = make_test_engine();
+        // A backend that serves temperature 0 only, as its factory declares it.
+        engine.set_served(Served {
+            sampling: false,
+            ..Served::EVERYTHING
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
+        request.temperature = Some(0.7);
+        match engine.completion(request).await {
+            Err(ServeError::Validation(msg)) => {
+                assert!(msg.contains("greedily only"), "unexpected message: {msg}")
+            }
+            other => panic!("expected ServeError::Validation, got {other:?}"),
+        }
+        assert!(
+            engine.requests.lock().await.is_empty(),
+            "a refused request holds no state"
+        );
+
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
+        request.temperature = Some(0.0);
+        let response = engine.completion(request).await.unwrap();
+        assert_eq!(response.choices.len(), 1);
+    }
+
+    /// A request with no sampling params is checked under the defaults the core runs it with
+    /// (temperature 1), and refused by a greedy-only backend at the door; the params it then
+    /// carries are those defaults.
+    #[test]
+    fn a_request_with_no_sampling_params_is_checked_under_the_defaults() {
+        let mut engine = make_test_engine();
+        let mut none = None;
+        assert!(
+            engine.check_served(&mut none).is_ok(),
+            "everything is served"
+        );
+        let default = SamplingParams::default().temperature;
+        assert_eq!(
+            none.map(|p| p.temperature),
+            Some(default),
+            "the defaults are set"
+        );
+        engine.set_served(Served {
+            sampling: false,
+            ..Served::EVERYTHING
+        });
+        let mut none = None;
+        match engine.check_served(&mut none) {
+            Err(ServeError::Validation(msg)) => assert!(msg.contains("greedily only"), "{msg}"),
+            other => panic!("expected ServeError::Validation, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

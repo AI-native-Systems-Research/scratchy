@@ -4,9 +4,10 @@
 # crates/targets/metal/tui is its own standalone workspace (excluded from the root one,
 # see root Cargo.toml) — its build output lands here, not under /target/.
 /crates/targets/metal/tui/target/
-# backends/spyre is its own workspace too (see its Cargo.toml).
+# backends/spyre and backends/cuda are their own workspaces too (see their Cargo.toml).
 /backends/spyre/target/
 /backends/spyre-hw/target/
+/backends/cuda/target/
 **/*.rs.bk
 /bench_results/
 .claude/worktrees/

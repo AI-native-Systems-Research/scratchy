@@ -931,15 +931,16 @@ fn load_dir_mode(
     // legacy all-presets behaviour.
     //
     // And a preset is active only where the target lowers it
-    // (`TargetEmitter::lowers_preset`): one it has no kernels for is no
-    // variant of any model.
+    // (`TargetEmitter::presets`): one it has no kernels for is no
+    // variant of any model. A name no `Preset` states (no Cargo feature,
+    // so no build can select it) is no variant either.
     let quant_preset_active = |preset_name: &str| -> bool {
         if let Some(q) = &enabled_quants
             && !q.contains(preset_name)
         {
             return false;
         }
-        target.lowers_preset(preset_name)
+        crate::target::Preset::from_name(preset_name).is_some_and(|p| target.presets().contains(&p))
     };
 
     // An in-checkpoint head's configs are the selected configs of its target arches that carry it.
@@ -1039,7 +1040,7 @@ fn load_dir_mode(
     // identical Impl-set signatures share one emitted body. Without
     // that dedup, N sizes × M presets quickly blow up release-build
     // LLVM work.
-    // A target skips the quant variants it does not lower (`TargetEmitter::lowers_preset`, e.g.
+    // A target skips the quant variants it does not lower (`TargetEmitter::presets`, e.g.
     // awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml on one) —
     // their on-disk layouts route through `MarlinFusedGateUpSiluMul` /
     // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that its
@@ -1087,7 +1088,7 @@ fn load_dir_mode(
         };
 
         for preset_name in &presets {
-            // Quant feature scoping (the scope's `quants`) + the target's lowering (`TargetEmitter::lowers_preset`
+            // Quant feature scoping (the scope's `quants`) + the target's lowering (`TargetEmitter::presets`
             // — see
             // `quant_preset_active`'s definition above for the full
             // reasoning, shared with the dense-suppression pre-check so the

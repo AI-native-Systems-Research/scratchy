@@ -1,0 +1,22 @@
+[package]
+name = "scratchy-const-tokens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Any serde::Serialize value -> the tokens of a const expression constructing it, through a target's module table"
+
+# ⭐ ONE SERIALIZER FOR EVERY TARGET'S STATIC TAPES.
+#
+# A target's expansion-time bake renders its tape values as `static` constructor tokens. The walk
+# over serde's data model is the same for every target; the one per-target fact is which module
+# each type lives in, which the target hands in as a const table (`ModuleTable`). Metal's compiler
+# and CUDA's compiler both call it.
+#
+# A COMPILE-TIME crate, never linked into a runtime.
+[dependencies]
+serde = { workspace = true }
+proc-macro2 = "1"
+quote = "1"
+
+[dev-dependencies]
+syn = { version = "3", features = ["full"] }

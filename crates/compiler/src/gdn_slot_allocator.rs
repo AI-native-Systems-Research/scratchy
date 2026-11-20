@@ -2,7 +2,7 @@
 //! Per-request GDN recurrent-state slot allocator.
 //!
 //! A GDN layer keeps one recurrent-state slot per concurrently-resident
-//! sequence (see [`crate::gdn_state_layout::GdnStateLayout`]). Unlike the
+//! sequence (see `scratchy_subtile::gdn_state_layout::GdnStateLayout`). Unlike the
 //! paged KV cache there is no block paging: each active sequence owns exactly
 //! one slot for its whole lifetime, and the slot is recycled when the sequence
 //! finishes.
