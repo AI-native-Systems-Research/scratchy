@@ -1255,92 +1255,91 @@ def vision_rope(q, k, cos, sin):
     return rot2d(q), rot2d(k)
 
 
-# ── MLA (cuda mla_attention_eval) ──
+# ── MLA, absorbed (mla.metal): the cache holds one latent row a token ──
+
+
+def _mla_dims():
+    """(heads, nope, rope, latent): the latent attention's geometry."""
+    b = STATE["bounds"]
+    return (b["num_attention_heads"], b["qk_nope_head_dim"], b["qk_rope_head_dim"],
+            b["kv_lora_rank"])
+
+
+def _mla_rotate(t, positions):
+    """Interleaved rope (lanes (2i, 2i + 1) paired) of `t`'s `[n, parts, rope]` rope parts at
+    `positions`, theta the config's rope_theta."""
+    _, _, rope, _ = _mla_dims()
+    half = rope // 2
+    pos = torch.as_tensor(positions, dtype=torch.long)
+    inv = 1.0 / (STATE["mla_theta"] ** (torch.arange(0, half, dtype=torch.float64) * 2.0 / rope))
+    ang = pos.to(torch.float64).unsqueeze(1) * inv.unsqueeze(0)
+    cos, sin = ang.cos().float().unsqueeze(1), ang.sin().float().unsqueeze(1)  # [n, 1, half]
+    x0, x1 = t[..., 0::2], t[..., 1::2]
+    out = t.clone()
+    out[..., 0::2] = x0 * cos - x1 * sin
+    out[..., 1::2] = x1 * cos + x0 * sin
+    return out
 
 
 def mla_split(kv_a):
-    rank = STATE["bounds"]["kv_lora_rank"]
-    return kv_a[:, :rank], kv_a[:, rank:]
+    """(kv_latent, k_pe) = mla_split(kv_a): the compressed latent, then the rope key every head
+    shares."""
+    _, _, _, latent = _mla_dims()
+    return kv_a[:, :latent], kv_a[:, latent:]
 
 
-def mla_attention(q, kv_b, k_pe, positions, rotary, layer_cache, block_table):
-    """cuda eval: extract q_pe (per-head rope tail), interleaved-rope q_pe
-    and k_pe, write K/V to the cache, causal attention with MLA scale,
-    slice output to heads*v_head_dim."""
-    b = STATE["bounds"]
-    heads, nope, rope_d, vhd = b["num_attention_heads"], b["qk_nope_head_dim"], b["qk_rope_head_dim"], b["v_head_dim"]
-    qk_hd = nope + rope_d
+def mla_append(q, kv_latent, k_pe, positions, rotary, layer_cache):
+    """(q, kv_latent, k_pe) = mla_append(q, kv_latent, k_pe, positions, rotary, kv_cache[layer]):
+    each query head's rope part and the shared rope key rotated, and each token's row
+    `[latent | rotated key]` written to the layer's paged cache — its first half the K store's
+    row, its second the V store's (one cache head each). The latent passes through."""
+    heads, nope, rope, latent = _mla_dims()
     layer = STATE["layer_of"][id(layer_cache)]
+    n = q.shape[0]
+    qv = q.view(n, heads, nope + rope).clone()
+    qv[:, :, nope:] = _mla_rotate(qv[:, :, nope:], positions)
+    k_rot = _mla_rotate(k_pe.view(n, 1, rope), positions).view(n, rope)
+    row = torch.cat([kv_latent, k_rot], dim=-1)
+    half = (latent + rope) // 2
+    _paged_write(row[:, :half], row[:, half:], layer, 1, half)
+    return qv.reshape(n, heads * (nope + rope)), kv_latent, k_rot
+
+
+def head_matmul(x, w):
+    """head_matmul(x, w): head `h` of `x` (the first `k` lanes of its part of a row) times
+    `w[h]`, `w` the `[heads, k, n_head]` blocks."""
+    heads, k, n_head = w.shape
+    n = x.shape[0]
+    xh = x.view(n, heads, -1)
+    assert k <= xh.shape[-1], f"head_matmul: {k} lanes of a {xh.shape[-1]}-lane head part"
+    return torch.einsum("thk,hkn->thn", xh[:, :, :k], w).reshape(n, heads * n_head)
+
+
+def mla_attention(q_latent, q, k_pe, layer_cache, block_table):
+    """latent = mla_attention(q_latent, q, k_pe, kv_cache[layer], block_table): each head's latent
+    query and rotated rope part scored against every cached row up to its token's position
+    (`[latent | rotated key]`, read through the block table), scaled by the MLA scale; the
+    softmax-weighted cached latents out, `[n, heads · latent]`. `k_pe` is the cache writer's
+    output: the row it wrote is read back from the cache."""
+    heads, nope, rope, latent = _mla_dims()
     kcache, vcache = layer_cache
     n = q.shape[0]
-
-    # Per-head layout: q [n, heads, nope+rope] — rope tail is the LAST
-    # rope_d of each head.
-    qv = q.view(n, heads, qk_hd)
-    q_pe = qv[:, :, nope:]  # [n, heads, rope_d]
-
-    # Interleaved rope on q_pe / k_pe (pair (2i, 2i+1)).
-    theta = STATE["mla_theta"]
-    pos = torch.as_tensor(positions, dtype=torch.long)
-    half = rope_d // 2
-    inv = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float64) * 2.0 / rope_d))
-    ang = pos.to(torch.float64).unsqueeze(1) * inv.unsqueeze(0)
-    cos, sin = ang.cos().float(), ang.sin().float()  # [n, half]
-
-    def rot_i(t, hdim):
-        tv = t.view(n, -1, hdim)
-        x0 = tv[:, :, 0::2]
-        x1 = tv[:, :, 1::2]
-        out = tv.clone()
-        out[:, :, 0::2] = x0 * cos.unsqueeze(1) - x1 * sin.unsqueeze(1)
-        out[:, :, 1::2] = x1 * cos.unsqueeze(1) + x0 * sin.unsqueeze(1)
-        return out.reshape(n, -1)
-
-    q_pe_r = rot_i(q_pe.reshape(n, heads * rope_d), rope_d)
-    k_pe_r = rot_i(k_pe, rope_d)
-
-    # Assemble K: per head [kv_b_head | k_pe], V: kv_b per head padded…
-    # mla_assemble_k/v: K[t, h] = [kv_b[t, h*(nope+vhd) .. +nope] | k_pe[t]],
-    # V[t, h] = kv_b[t, h*(nope+vhd)+nope .. +vhd]. k_pe is SINGLE-HEAD
-    # ([T, rope_dim], impl_lib MlaAttention doc) — broadcast across heads.
-    kv_bv = kv_b.view(n, heads, nope + vhd)
-    k = torch.cat([kv_bv[:, :, :nope], k_pe_r.view(n, 1, rope_d).expand(n, heads, rope_d)], dim=-1)  # [n, heads, qk_hd]
-    v = kv_bv[:, :, nope:]  # [n, heads, vhd]
-
-    # Write paged cache at this step's slots (cache geometry: kv heads =
-    # q heads for MLA, head_dim = qk_hd for K... K and V widths differ, so
-    # the cache holds [nope+rope | pad] and [vhd] — the eval writes K at
-    # qk_head_dim and V zero-padded to qk_head_dim.
-    q_pe_final = q_pe_r.view(n, heads * rope_d)
-    qv = qv.clone()
-    qv[:, :, nope:] = q_pe_r.view(n, heads, rope_d)
-    q = qv.reshape(n, heads * qk_hd)
-
-    # attention: causal over cache positions, MLA scale, per-head over
-    # qk_hd; output sliced to vhd.
+    ql = q_latent.view(n, heads, latent)
+    qr = q.view(n, heads, nope + rope)[:, :, nope:]
     scale = STATE["mla_scale"]
-    k_full = torch.zeros(n, heads, qk_hd)
-    k_full[:, :, :] = k
-    v_full = torch.zeros(n, heads, qk_hd)
-    v_full[:, :, :vhd] = v
-    _paged_write(k.reshape(n, heads * qk_hd), v_full.reshape(n, heads * qk_hd), layer, heads, qk_hd)
     bt = STATE["block_table"]
-    out = torch.empty(n, heads, vhd)
+    out = torch.empty(n, heads, latent)
     for t in range(n):
-        p = STATE["positions"][t]
-        attend = p + 1
-        ks = torch.empty(attend, heads, qk_hd)
-        vs = torch.empty(attend, heads, qk_hd)
-        for j in range(attend):
-            blk, off = j // BLOCK_SIZE, j % BLOCK_SIZE
-            pb = bt[blk]
-            ks[j] = kcache[pb, :, off, :]
-            vs[j] = vcache[pb, :, off, :]
-        for h in range(heads):
-            scores = (ks[:, h, :] @ q.view(n, heads, qk_hd)[t, h]) * scale
-            probs = torch.softmax(scores, dim=0)
-            out[t, h] = (probs @ vs[:, h, :])[:vhd]
-    return out.reshape(n, heads * vhd)
+        attend = STATE["positions"][t] + 1
+        rows = torch.stack([
+            torch.cat([kcache[bt[j // BLOCK_SIZE], 0, j % BLOCK_SIZE],
+                       vcache[bt[j // BLOCK_SIZE], 0, j % BLOCK_SIZE]])
+            for j in range(attend)
+        ])  # [attend, latent + rope]
+        lat, pe = rows[:, :latent], rows[:, latent:]
+        scores = (ql[t] @ lat.T + qr[t] @ pe.T) * scale  # [heads, attend]
+        out[t] = torch.softmax(scores, dim=-1) @ lat
+    return out.reshape(n, heads * latent)
 
 
 # ── GDN (cpu_golden.rs gdn_* pipeline, exact order) ──
@@ -1839,7 +1838,10 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
         b = next((b for sfx, b in overrides if dsl.endswith(sfx)), q["bits"])
         return (b, q["group_size"])
 
-    banks, linears = [], []
+    # The per-head weights `head_matmul` reads: `[heads, k, n_head]` blocks, MLX `MultiLinear`'s
+    # `[heads, n_head, k]` on disk, each row packed along K.
+    head_keys = head_weight_keys(carrier_text)
+    banks, linears, heads = [], [], []
     for key, dims in manifest.items():
         if key.startswith("__"):
             continue
@@ -1855,6 +1857,8 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
             continue
         if len(dims) == 2 and key not in packed_targets:
             linears.append(key)
+        elif len(dims) == 3 and key in head_keys:
+            heads.append(key)
 
     # LatentMoE projections take nn.Linear's init whether or not they are quantized.
     for key, kind in banks:
@@ -1893,6 +1897,20 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
                 set_leaf(trees, key, l, w_hat)
             else:
                 set_leaf(trees, key, l, quantize_linear(w, bits, gs))
+            consumed.add(module)
+
+    for key in heads:
+        layered = key in layered_refs
+        for layer, w in enumerate(node_of(key) if layered else [node_of(key)]):
+            l = layer if layered else None
+            module = _ckpt_key(dsl_to_disk(key, renames), l, dec_root)
+            spec = width(module, key)
+            if spec is None:
+                continue
+            packed, scales, biases, w_hat = affine_quantize(w.transpose(1, 2), *spec)
+            w_hat = w_hat.transpose(1, 2).contiguous()
+            w_hat.affine_q = (packed, scales, biases)
+            set_leaf(trees, key, l, w_hat)
             consumed.add(module)
 
     for key, kind in banks:
@@ -1996,6 +2014,12 @@ def embed_keys_of(carrier_text):
         r"embed\(\s*input_ids\s*,\s*([A-Za-z_][A-Za-z_0-9.]*)\s*\)", carrier_text)}
 
 
+def head_weight_keys(carrier_text):
+    """The weights the carrier passes `head_matmul` (its second argument, layer-indexed or
+    not)."""
+    return set(re.findall(r"\bhead_matmul\([^,]+,\s*([A-Za-z_][A-Za-z_0-9.]*)", carrier_text))
+
+
 def is_tied(arch, cfg):
     """config.rs tie resolution: explicit config flag, else the arch's
     tie_default (gemma2/gemma3)."""
@@ -2094,6 +2118,7 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     # on disk verbatim, NOT a transposed Linear), discovered from the
     # carrier text exactly as the macro's embed matcher does.
     embed_keys = embed_keys_of(carrier_text)
+    head_keys = head_weight_keys(carrier_text)
 
     def resolve(key):
         """Tree walk: `a.b.c` → trees.a.b.c (Layered distributes)."""
@@ -2274,6 +2299,9 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
                 put(f"{pre}.weight", w.T)
             elif w.ndim == 3 and key.split(".")[-1] == "conv1d":
                 put(f"{pre}.weight", w)
+            elif w.ndim == 3 and key in head_keys:
+                # head_matmul `[heads, k, n_head]` → MLX MultiLinear `[heads, n_head, k]`
+                put(f"{pre}.weight", w.transpose(1, 2))
             else:
                 # Embedding [vocab, hidden] verbatim, norm gains [D],
                 # moe stacks
@@ -2769,9 +2797,15 @@ def main():
     g_hd = bounds.get("global_head_dim", head_dim)
     pattern = bounds.get("sliding_window_pattern", 0)
     remainder = bounds.get("sliding_window_global_remainder", pattern - 1 if pattern else 0)
+    # A latent attention's cache (`mla_append`) holds one `[latent | rope key]` row a token, its
+    # halves the K and V stores' rows under one cache head.
+    mla_half = (bounds["kv_lora_rank"] + bounds["qk_rope_head_dim"]) // 2 \
+        if re.search(r"\bmla_append\(", carrier) else None
     for l in range(depth):
         is_global = pattern > 0 and l % pattern == remainder
         l_kv, l_hd = (g_kv, g_hd) if is_global else (kv_heads, head_dim)
+        if mla_half is not None:
+            l_kv, l_hd = 1, mla_half
         STATE["kv_cache"].append((
             torch.zeros(NUM_BLOCKS, l_kv, BLOCK_SIZE, l_hd),
             torch.zeros(NUM_BLOCKS, l_kv, BLOCK_SIZE, l_hd),
@@ -2840,7 +2874,22 @@ def main():
     n_blocks_needed = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
     STATE["block_table"] = [i for i in range(n_blocks_needed)]
 
-    trees = round_to_stored(synth_trees(manifest, bounds, depth, carrier))
+    trees = synth_trees(manifest, bounds, depth, carrier)
+    # A latent attention's projections take nn.Linear's init (uniform, 1/sqrt(fan-in)), as a
+    # LatentMoE's do: at the generic 0.02 its scores are four 0.02 projections deep, the softmax
+    # is uniform, and nothing the scores are made of (the rope, its pairing, the scale) reaches
+    # the logits.
+    if re.search(r"\bmla_attention\(", carrier):
+        for key, dims in manifest.items():
+            dims = dims["shape"] if isinstance(dims, dict) else dims
+            if not key.startswith("self_attn.") or len(dims) < 2:
+                continue
+            fan_in = eval_formula(dims[-2], bounds)
+            for layer in range(depth):
+                w = getattr(trees.self_attn, key.split(".", 1)[1])[layer]
+                init = (torch.rand(*w.shape) * 2.0 - 1.0) / math.sqrt(fan_in)
+                set_leaf(trees, key, layer, init)
+    trees = round_to_stored(trees)
     STATE["oracle_quant"] = prepare_quantized(arch, cfg, manifest, bounds, trees, carrier)
     # codegen.rs `norm_weight_runtime_offset`: an MLX-affine checkpoint of a zero-centred arch
     # stores its RMSNorm gains sanitized — `mlx_lm.convert` pre-adds the 1.0 — and the compiled
