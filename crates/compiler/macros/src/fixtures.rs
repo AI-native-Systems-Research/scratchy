@@ -60,6 +60,16 @@ pub fn fuf_of(arch: &str, model: &ModelParams) -> (Program, Fuf) {
 
 /// The program and fused graph of `model` under `ast`.
 pub fn fuf_of_ast(arch: &str, model: &ModelParams, ast: &crate::ast::Ast) -> (Program, Fuf) {
+    let (program, fuf, _) = inferred_fuf_of_ast(arch, model, ast);
+    (program, fuf)
+}
+
+/// [`fuf_of_ast`] with the shapes it inferred, which the wavefront bridge also reads.
+pub fn inferred_fuf_of_ast(
+    arch: &str,
+    model: &ModelParams,
+    ast: &crate::ast::Ast,
+) -> (Program, Fuf, crate::shape::Inferred) {
     let mut program =
         crate::classify::classify_with(ast, crate::classified::Prelude::Decoder).expect("classify");
     program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
@@ -67,5 +77,5 @@ pub fn fuf_of_ast(arch: &str, model: &ModelParams, ast: &crate::ast::Ast) -> (Pr
     let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");
     let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
     fuf.annotate_storage_formats(&program, model);
-    (program, fuf)
+    (program, fuf, inferred)
 }

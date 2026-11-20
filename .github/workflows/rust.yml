@@ -22,8 +22,9 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux / amd64 — whole-workspace lint, of both workspaces: the root one's
-  # Linux-buildable members, and the Spyre target's own (backends/spyre).
+  # Linux / amd64 — whole-workspace lint, of the root one's Linux-buildable
+  # members, the Spyre target's own (backends/spyre) and the CUDA target's own
+  # (backends/cuda).
   #
   # Metal is Apple-only, so the root workspace is linted here without it; the
   # spyre workspace is linted at one model. The runner has no Spyre card, so
@@ -61,6 +62,7 @@ jobs:
             . -> target
             backends/spyre -> target
             backends/spyre-hw -> target
+            backends/cuda -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy. The
@@ -103,6 +105,15 @@ jobs:
       - name: Check the fp8 preset expands
         working-directory: backends/spyre
         run: cargo check -p scratchy-target-spyre-models --features scratchy-models/granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel
+
+      # The CUDA workspace (backends/cuda), every member and target, with no CUDA toolchain:
+      # the kernels compile only under its `nvcc` feature, which is off. One model, the 27B
+      # under the one preset CUDA builds; the other two FP8 models expand in linux-cuda.
+      - name: Clippy (cuda workspace)
+        working-directory: backends/cuda
+        run: cargo clippy --workspace --all-targets
+          --features scratchy-models/qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel
+          -- -D warnings
 
       # e_otel.rs, which needs `otel` and runs on any backend, type-checked
       # and linted: the macOS e2e step builds without `otel`. Here rather than
@@ -533,6 +544,49 @@ jobs:
       - name: Test (openblas-system)
         run: cargo test -p ktir-emulator --no-default-features --features optimizer,openblas-system --lib --tests
 
+  # ---------------------------------------------------------------------------
+  # Linux / amd64 — the CUDA target's host tests, with no CUDA toolchain and no
+  # GPU: the lowering and the tape and weight-table checks, the ThunderKittens
+  # source check over every kernel, and the three FP8 models expanded to their
+  # static tapes, checked against what CUDA's compiler lowers from the same
+  # canonicals. The kernels themselves build and run only on an H100
+  # (`nvcc`; backends/cuda/scripts), never here.
+  # ---------------------------------------------------------------------------
+  linux-cuda:
+    name: linux-amd64 (cuda, no toolchain)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backends/cuda
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cuda
+          workspaces: backends/cuda -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Host tests
+        run: cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
+      - name: ThunderKittens source check
+        run: cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens
+      # The worker links the models crate, so its tests name a model, through the CLI's aliases.
+      - name: Worker and CLI tests
+        run: cargo test -p scratchy-target-cuda-worker -p scratchy-target-cuda-cli
+          --features model/qwen3.8-27b-text-only,quant/fp8-dynamic-per-channel
+      - name: Tapes (Qwen3.8-27B)
+        run: cargo test -p scratchy-target-cuda-models
+          --features scratchy-models/qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel
+          --test cuda_tapes_27b_fp8 --test kernel_choices
+      - name: Tapes (Qwen3.6-35B-A3B)
+        run: cargo test -p scratchy-target-cuda-models
+          --features scratchy-models/qwen3.6-35b-a3b,scratchy-quantizations/fp8-dynamic-per-channel
+          --test cuda_tapes_35b_fp8 --test kernel_choices
+      - name: Tapes (Gemma 4 26B-A4B)
+        run: cargo test -p scratchy-target-cuda-models
+          --features scratchy-models/gemma-4-26b-a4b-it,scratchy-quantizations/fp8-dynamic-per-channel
+          --test cuda_tapes_gemma4_fp8 --test kernel_choices
+
   # ⭐ THE TRITON SPLICE'S OWN GATE. The splice is now the ONLY producer for the
   # spliced op kinds (unconditional in `lower_one_node`), so every job that builds
   # the spyre target compiles it — this job remains the one that runs the splice's
@@ -767,10 +821,11 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-      # site/, backends/spyre and backends/spyre-hw are their own workspaces, so the root --all
-      # above never reaches them.
+      # site/, backends/spyre, backends/spyre-hw and backends/cuda are their own workspaces, so
+      # the root --all above never reaches them.
       - run: cargo fmt --manifest-path site/Cargo.toml --all -- --check
       - run: cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
+      - run: cargo fmt --manifest-path backends/cuda/Cargo.toml --all -- --check
       # backends/spyre-hw is its own workspace too, but `cargo fmt` there resolves the
       # workspace's manifests and its flex-rs path dep reaches for the senlib-rs
       # sibling. rustfmt over the files needs no resolution at all — same config

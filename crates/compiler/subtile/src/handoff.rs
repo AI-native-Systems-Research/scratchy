@@ -54,6 +54,41 @@ pub enum BundleTensor {
     ExpertDownS,
 }
 
+/// Each bundle tensor's leaf in the HF checkpoint, after its bundle's checkpoint prefix
+/// (`…layers.N.router`, `…layers.N.experts`): the dense names the HF checkpoint ships, which a
+/// target that loads each bundle tensor as a weight of its own reads them by. Gemma 4's router
+/// (`router.proj.weight`, `router.scale`, `router.per_expert_scale`) and its fused experts
+/// (`experts.gate_up_proj`, the gate's rows then the up's per expert, and `experts.down_proj`). An
+/// affine bank's scales have no row: a dense checkpoint ships none.
+pub const BUNDLE_TENSOR_LEAVES: &[(BundleTensor, &str)] = &[
+    (BundleTensor::RouterGate, "proj.weight"),
+    (BundleTensor::RouterScale, "scale"),
+    (BundleTensor::RouterPerExpertScale, "per_expert_scale"),
+    (BundleTensor::ExpertGateW, "gate_up_proj"),
+    (BundleTensor::ExpertUpW, "gate_up_proj"),
+    (BundleTensor::ExpertDownW, "down_proj"),
+];
+
+/// Each expert tensor's leaf in a checkpoint that stores every expert apart (the compressed-tensors
+/// fp8 ones: Qwen3.6's `mlp.experts`, Gemma 4's `experts`), after the bank's prefix and the
+/// expert's index: `<bank>.{e}.<leaf>`. A per-channel fp8 projection is its e4m3 `weight` and its
+/// `weight_scale` (`[out, 1]`).
+pub const PER_EXPERT_TENSOR_LEAVES: &[(BundleTensor, &str)] = &[
+    (BundleTensor::ExpertGateW, "gate_proj.weight"),
+    (BundleTensor::ExpertGateS, "gate_proj.weight_scale"),
+    (BundleTensor::ExpertUpW, "up_proj.weight"),
+    (BundleTensor::ExpertUpS, "up_proj.weight_scale"),
+    (BundleTensor::ExpertDownW, "down_proj.weight"),
+    (BundleTensor::ExpertDownS, "down_proj.weight_scale"),
+];
+
+/// Whole-segment suffix rewrites of a bundle's checkpoint prefix, before its tensor's leaf
+/// ([`BUNDLE_TENSOR_LEAVES`]): the DSL's `experts.switch_glu` is MLX's layout, and the HF
+/// checkpoint keeps the experts at `experts`. Read only by the bundle-tensor names of the
+/// target-emitter handoff ([`TargetModelInput::bundle_tensor_names`]), never by a weight's own
+/// prefix, which every target's loader reads as it is.
+pub const BUNDLE_PREFIX_REWRITES: &[(&str, &str)] = &[("experts.switch_glu", "experts")];
+
 impl BundleTensor {
     /// The tensor's registry name — for dumps and the manifest, so no consumer keeps a
     /// parallel string table. Lowercase snake, matching the on-disk leaf it loads.
@@ -482,6 +517,70 @@ impl<E: EmbedState> LoweredDecode<E> {
             unnamed_reads,
         }
     }
+}
+
+/// ⭐ ONE MODEL, HANDED TO A TARGET'S EMITTER: the input of the macro's target-emitter seam.
+///
+/// The macro does not know which target compiler it is linked against. Cargo decides that: the
+/// macro crate's manifest renames a target compiler crate to the optional `target-emitter`
+/// dependency key (the backend feature that turns the key on names the crate), and the macro calls that
+/// crate's `emit::emit_model(&TargetModelInput) -> proc_macro2::TokenStream` and splices the
+/// tokens it returns into the model's module. Any target compiler crate can implement that
+/// function; what it lowers, what it refuses and what it emits are its own, and nothing about them
+/// crosses back.
+///
+/// So this carries only what the macro alone knows, all of it a fact about the MODEL: the
+/// canonical it lowered at each workload point, and the config facts a target reads beside a
+/// canonical. It names no backend.
+#[derive(Debug, Clone)]
+pub struct TargetModelInput {
+    /// The config stem (`qwen3.5-0.8b`), for the target's diagnostics.
+    pub stem: String,
+    /// One per workload point the shared front end lowered, in the macro's `(m, sk)` order.
+    pub buckets: Vec<TargetBucket>,
+    /// A workload point the shared front end refused, with its refusal; a target decides what
+    /// that means for it.
+    pub unlowered: Vec<(TargetPoint, String)>,
+    /// The model's facts (`scratchy_ir::model_facts`), the one statement of its attention classes,
+    /// rope, Gated-DeltaNet geometry, vocab and norm eps that every target's lowering reads.
+    pub facts: scratchy_ir::model_facts::ModelFacts,
+    /// The rope base frequencies, which the facts do not state: `rope_theta` (the global class's,
+    /// every class's on a uniform model) and a hybrid's sliding class's own
+    /// (`rope_local_base_freq`); `None` where the model states none.
+    pub rope_theta: Option<f64>,
+    pub rope_local_theta: Option<f64>,
+    /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp`), ascending: an
+    /// expert bundle whose shared expert the DSL states as ops of its own, which a target's
+    /// expert combine therefore must not add again (the single-owner rule).
+    pub dsl_shared_expert_bases: Vec<String>,
+    /// Each model weight a canonical binds (`SourceBinding::Weight { id, index }`), and the
+    /// checkpoint prefix it loads from (without the leaf, e.g. `.weight`). A tied `lm_head`'s is
+    /// the embedding table's: the checkpoint stores the one tensor once.
+    pub weight_prefixes: Vec<(u32, Option<UnrollIndex>, String)>,
+    /// The token-embedding table's prefix, which `SourceBinding::EmbeddedHidden` reads; `None`
+    /// when the model has no embedding table.
+    pub embed_prefix: Option<String>,
+    /// Each bundle tensor a canonical binds (`SourceBinding::BundleTensor { id, index, tensor }`)
+    /// that [`BUNDLE_TENSOR_LEAVES`] names, and its full checkpoint tensor name: the bundle's
+    /// prefix, rewritten by [`BUNDLE_PREFIX_REWRITES`], then the tensor's leaf.
+    pub bundle_tensor_names: Vec<(u32, Option<UnrollIndex>, BundleTensor, String)>,
+    /// The rows of each canonical's result the forward's caller reads: a decoder's sampled logits
+    /// ([`crate::sample_rows::ResultRows::Sampled`]), an encoder's every row.
+    pub rows: crate::sample_rows::ResultRows,
+}
+
+/// One workload point: `m` token rows, `sk` the KV-length bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetPoint {
+    pub m: u32,
+    pub sk: u32,
+}
+
+/// One workload point's canonical, from the shared front end.
+#[derive(Debug, Clone)]
+pub struct TargetBucket {
+    pub point: TargetPoint,
+    pub lowered: LoweredDecode,
 }
 
 /// One construct's expansion into ops (see [`LoweredDecode::op_expansion`]).
