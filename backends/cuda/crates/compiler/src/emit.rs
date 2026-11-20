@@ -1108,20 +1108,25 @@ pub fn emit_model(input: &TargetModelInput) -> TokenStream {
         "[cuda emit] {stem}: {} weights from the checkpoint",
         model.weights.iter().flatten().count()
     );
-    let preamble = CUDA_MODULES.preamble();
+    // Each block's aliases, only the ones its values name.
+    let tapes = quote! { &[ #(#tapes),* ] };
+    let tapes_named = scratchy_forward_compiler_macro::target::Named::of(&tapes);
+    let tapes_preamble = CUDA_MODULES.preamble_for(|alias| tapes_named.has(alias));
+    let weights_named = scratchy_forward_compiler_macro::target::Named::of(&weights);
+    let weights_preamble = CUDA_MODULES.preamble_for(|alias| weights_named.has(alias));
     let unlowered = (model.unlowered.iter()).map(|(m, why)| quote! { (#m, #why) });
     quote! {
         /// This model's CUDA tapes, one per bucket, ascending `bucket_m`: the one-row decode
         /// bucket, then the prefill buckets. What `CudaWorker::new` takes. Every field a
         /// constant lowered at expansion.
         pub static CUDA_TAPES: &[::scratchy_target_cuda::tape::CudaTape] = {
-            #preamble
-            &[ #(#tapes),* ]
+            #tapes_preamble
+            #tapes
         };
         /// How the checkpoint fills each weight index the tapes read, parallel to every tape's
         /// `weight_bytes`: what `runtime::load_weights` plays. `None` for an index no step reads.
         pub static CUDA_WEIGHTS: &[Option<::scratchy_target_cuda::weights::CudaWeight>] = {
-            #preamble
+            #weights_preamble
             #weights
         };
         /// The buckets CUDA did not lower, and why: today the buckets above one row and below
