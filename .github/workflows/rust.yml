@@ -165,6 +165,10 @@ jobs:
       - name: Slot-allocator unit tests (no backend feature)
         run: cargo test -p scratchy-forward-compiler --lib
 
+      # The GDN state pool is plain Rust: no backend, no GPU, and no other step runs its unit tests.
+      - name: GDN state-pool unit tests (no backend feature)
+        run: cargo test -p scratchy-state-decoder-gdn
+
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
       # invisible to it and no job anywhere compiles them. These three steps

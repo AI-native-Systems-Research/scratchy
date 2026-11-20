@@ -7,7 +7,7 @@
 //! methods (kernel-calling `forward`, `GpuWeights`-bound `load`) stay in the
 //! target crates as extension traits — this crate names no backend.
 
-pub mod gdn_state;
+pub use scratchy_state_decoder_gdn::pool as gdn_state;
 pub mod kv_cache;
 pub mod layers;
 pub mod layers_moe;

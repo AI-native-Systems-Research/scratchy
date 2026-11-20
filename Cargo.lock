@@ -3149,6 +3149,7 @@ dependencies = [
  "safetensors",
  "scratchy-core-model",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "serde_json",
  "tracing",
@@ -3314,6 +3315,15 @@ name = "scratchy-spec"
 version = "0.1.0"
 dependencies = [
  "scratchy-models",
+]
+
+[[package]]
+name = "scratchy-state-decoder-gdn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scratchy-tensors",
+ "tracing",
 ]
 
 [[package]]

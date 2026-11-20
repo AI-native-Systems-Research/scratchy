@@ -8,6 +8,7 @@ description = "Backend-neutral neural-network layer types (LinearLayer, norms, e
 
 [dependencies]
 scratchy-tensors = { workspace = true }
+scratchy-state-decoder-gdn = { workspace = true }   # GDN's state pool, re-exported as `gdn_state`
 scratchy-quantizations = { workspace = true }   # LinearLayer/MoE hold GgmlStorage + AffineQuant/Nvfp4 payloads
 scratchy-core-model = { workspace = true }               # GpuWeights LoRA merge uses LoraAdapterConfig
 serde_json = { workspace = true }                              # safetensors index.json parsing
