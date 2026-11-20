@@ -9445,6 +9445,141 @@ fn page_gather_of(
     ))
 }
 
+/// ⭐⭐⭐ THE PAGE ID'S SCALE — the ONE statement of a gathered view's stride law, and the only
+/// place the card's gather addressing and the host's page-id staging meet.
+///
+/// The device's gather addresses entry `i` of a value alloc at `i · skip_addr`, and `skip_addr`
+/// is DERIVED, not set: dxp multiplies the value alloc's per-dim capacities together
+/// (`GatherIndexConversion.cpp:393-424`, each paged dim clamped DOWN to its pin,
+/// `dsc2.cpp:3900-3908`) — the entry's own size, always. A view whose entries are spaced WIDER
+/// than their own extent — a unit-major pool, where one growth unit holds both planes and a
+/// plane's page `p` sits `p · stride[0]` elements from the plane's base — therefore cannot state
+/// its spacing in `skip_addr`. The spacing rides in the INDEX instead: the id the host stages is
+/// the scheduler page id times this scale, and `addr = idx · entry + base` lands the entry the
+/// view names. `addr = idx · skip + base` with a raw int32 `idx` carries any scale the view
+/// states — the measured `64·block + column` entry (superdsc_opspec' `PageExtent`) is a gather
+/// whose staged ids carry one.
+///
+/// The scale is read off the VALUE VIEW the program itself states — the `ktdp.construct_memory_view`
+/// its indirect tile names, whose `Strides` attribute is the compiled form of the kernel's own
+/// descriptor (`make_tensor_descriptor(..., strides=[stride0, 1])`): `stride[0] ÷ entry` where the
+/// entry is the tile's slab (the product of its non-indirect extents). A DENSE view — every view
+/// whose rows are packed — states `stride[0] == slab`, so its scale is 1 and the staged ids, the
+/// emitted descriptors and the bytes on the wire are UNCHANGED. Nothing here knows a kernel, a
+/// plane or a model: it is a law over the view.
+///
+/// `page_table_tid` selects WHICH gathers speak: only the ones indexed through the page table —
+/// the one table whose raw values are scheduler page ids. A gather through any other index
+/// buffer (`kv_row_pool`, a chunk table, a query-row table) states its own index law where its
+/// stager mints it, and reads here as no fact at all. A page id no gather reads as a row index
+/// reaches only tables staged in page units by their own laws (the sequence decode kernel's
+/// `kv_row_pool` slab), so the empty set's scale is 1.
+///
+/// ⛔ EVERY gather through the page table must state the SAME scale — one table, one law. Two
+/// that disagree is a program that reads two layouts through one buffer, and it is refused by
+/// name here, at the one statement, rather than staged for one of them.
+pub fn page_index_scale(k: &KtirNode, page_table_tid: u32) -> Result<u32, Error> {
+    let f = &k.func;
+    let mut scale: Option<u32> = None;
+    for g in gathers_of(k)? {
+        if g.index_tid != page_table_tid {
+            continue;
+        }
+        let Some(tile) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
+            return err(format!(
+                "{}: the gather's tile states no defining op",
+                f.name
+            ));
+        };
+        // The VALUE VIEW — the tile's slot-0 operand's defining `ktdp.construct_memory_view`,
+        // the same resolution [`indirect_tile_param`](super::lower_ktir_to_superdsc) reads.
+        let Some(&view_v) = tile.operands.first() else {
+            return err(format!(
+                "{}: the gather's tile states no value operand",
+                f.name
+            ));
+        };
+        let Some(view) = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
+        else {
+            return err(format!(
+                "{}: the gather's value operand is not a `ktdp.construct_memory_view`",
+                f.name
+            ));
+        };
+        let strides = match view.attr(AttrKey::Strides) {
+            Some(Attr::IntList(s)) if !s.is_empty() => s.to_vec(),
+            _ => {
+                return err(format!(
+                    "{}: the gathered view states no strides — the scale of its page ids is \
+                     unknown, so the host cannot stage them",
+                    f.name
+                ));
+            }
+        };
+        // The ENTRY — the tile's slab, as [`page_gather_of`] reads it: the product of the
+        // non-indirect extents.
+        let d = match tile.attr(AttrKey::DimKinds) {
+            Some(Attr::StrList(kinds)) => kinds.iter().position(|k| *k == "indirect"),
+            _ => None,
+        };
+        let Some(d) = d else {
+            return err(format!(
+                "{}: the gather's tile states no indirect dim",
+                f.name
+            ));
+        };
+        let dims: Vec<i64> = tile
+            .attributes
+            .iter()
+            .find_map(|(key, v)| match (key, v) {
+                (AttrKey::Shape, Attr::IntList(d)) => Some(d.to_vec()),
+                _ => None,
+            })
+            .or_else(|| tile.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec))
+            .unwrap_or_default();
+        if dims.len() != strides.len() || d != 0 {
+            return err(format!(
+                "{}: a gather through the page table selects whole slabs along its LEADING dim \
+                 (this tile's indirect dim is {d} of {} with {} stride(s)) — the stride that \
+                 spaces its entries is strides[0], and no other dim's is",
+                f.name,
+                dims.len(),
+                strides.len()
+            ));
+        }
+        let slab: i64 = dims.iter().enumerate().filter(|(i, _)| *i != d).map(|(_, x)| *x).product();
+        let (stride0, slab) = (strides[0], slab);
+        if slab <= 0 || stride0 <= 0 || stride0 % slab != 0 {
+            return err(format!(
+                "{}: the gathered view strides its {}-element entries by {stride0} — not a \
+                 whole number of entries, so no integer scale stages its page ids",
+                f.name, slab
+            ));
+        }
+        let s = u32::try_from(stride0 / slab).map_err(|_| Error {
+            message: format!(
+                "{}: the gathered view's entry scale {stride0} / {slab} does not fit a u32",
+                f.name
+            ),
+        })?;
+        match scale {
+            Some(prev) if prev != s => {
+                return err(format!(
+                    "{}: two gathers through the page table state different id scales ({prev} \
+                     and {s}) — one table, one layout; a program that reads two through one \
+                     buffer is refused here",
+                    f.name
+                ));
+            }
+            _ => scale = Some(s),
+        }
+    }
+    Ok(scale.unwrap_or(1))
+}
+
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
 /// holds the REGIONS and not the ops — re-deriving any of these there would mean re-walking the
 /// chain without them. They ride together as one value because they are one op's row in the walk.

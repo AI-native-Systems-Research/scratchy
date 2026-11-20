@@ -1586,11 +1586,16 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 /// itself, never a division of the graph's rows), checked here against the graph it describes: the
 /// pair's held product must equal the attention's `mq` rows, and a pair that does not is refused by
 /// name — a bake bug, never a silently-wrong per-request width the layout would size by.
+/// `page_index_scale` is the page-id scale the bundle's lowered programs state
+/// ([`ktir_superdsc::emit::whole_function::page_index_scale`]'s fold over them, minted by
+/// [`graph_wiring`] on the SAME lowered programs the bake emits) — threaded in, never re-derived
+/// here: this walk reads the graph, and the scale is a fact of the programs' own views.
 pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    page_index_scale: u32,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
@@ -1647,6 +1652,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             head_size: attention.class(mask.class()).head_dim().get(),
             walk,
             paged_rows,
+            page_index_scale,
             extent: query_rows,
         };
         match out {
@@ -1727,14 +1733,16 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // UNROLLED graph: on granite-2b it was two thirds of the models build script, serially, for one
     // fact per program — its bindings — and one per mask. The fold below sees the results in node
     // order, so the first error and the mask check read exactly as the serial walk did.
-    // One program's binding order, the `(mask tid, capacity)` it reads when it reads one, and
-    // the ARRANGEMENT FACTS its propagation marked — the staggered parameters this program's
+    // One program's binding order, the `(mask tid, capacity)` it reads when it reads one, the
+    // ARRANGEMENT FACTS its propagation marked — the staggered parameters this program's
     // consumers must stage already permuted (empty for every program with no staggered
-    // convert; a decoder layer contributes nothing).
+    // convert; a decoder layer contributes nothing) — and the program's PAGE-ID SCALE (1 when
+    // no gather of its reads the page table; the fold below demands the non-1 answers agree).
     type WiredProgram = (
         NodeArgs,
         Option<(u32, u32)>,
         Vec<(u32, ktir_superdsc::element_arrangement::ElementArrangement)>,
+        u32,
     );
     let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
         use rayon::prelude::*;
@@ -1776,6 +1784,15 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     .map_err(|e| SuperDscError(e.message))?
                     .into_iter()
                     .collect::<Vec<_>>();
+                    // ⭐ THE PAGE-ID SCALE off the SAME lowered program — the one derivation
+                    // (the program's own view strides), read here so the wiring's staged page
+                    // ids and the emitted gather descriptors cannot disagree about the layout
+                    // they address.
+                    let scale = ktir_superdsc::emit::whole_function::page_index_scale(
+                        &k,
+                        scratchy_triton_splice::PagedStepTids::RESERVED.page_table,
+                    )
+                    .map_err(|e| SuperDscError(e.message))?;
                     let mask = match k.mask {
                         // ⭐ THE CAPACITY IS THE K POOL's: the paged walk's parameters are `[q, out,
                         // k pool, v pool, page table, mask]`, and the K pool is the layer's K cache
@@ -1809,12 +1826,43 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                         },
                         mask,
                         staggered,
+                        scale,
                     ));
                 }
                 Ok(out)
             })
             .collect()
     };
+    // ⭐ THE PAGE-ID SCALE, folded over the SAME lowered programs the bake emits — the one
+    // derivation ([`ktir_superdsc::emit::whole_function::page_index_scale`], which reads each
+    // program's own view strides), consumed here and never restated: a bundle's page table is
+    // ONE table, so every program that gathers through it must state the SAME scale, and a
+    // disagreement between PROGRAMS is the same defect as one within a program — refused by
+    // name, never staged for one of them. Programs with no gather through the page table state
+    // 1 (their page ids reach only tables staged in page units by their own laws), so the fold
+    // is over the non-1 answers alone.
+    let mut page_index_scale: u32 = 1;
+    {
+        let mut stated: Vec<u32> = Vec::new();
+        for lowered in &per_node {
+            for wired in lowered.iter().flatten() {
+                if wired.3 != 1 && !stated.contains(&wired.3) {
+                    stated.push(wired.3);
+                }
+            }
+        }
+        match stated.as_slice() {
+            [] => {}
+            [only] => page_index_scale = *only,
+            many => {
+                return Err(SuperDscError(format!(
+                    "the bundle's programs state {} different page-id scales ({many:?}) through \
+                     one page table — one table, one layout",
+                    many.len()
+                )));
+            }
+        }
+    }
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     // ⭐ THE MASK FAMILY, not one mask: a packed rung's attention is spliced once per
     // window and window r's program binds its OWN mask stack (`paged_window_tid(r, ·)`),
@@ -1830,7 +1878,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         ktir_superdsc::element_arrangement::ElementArrangement,
     > = Default::default();
     for lowered in per_node {
-        for (args, m, marks) in lowered? {
+        for (args, m, marks, _scale) in lowered? {
             if let Some(m) = m {
                 if let Some(&(_, prev_cap)) = masks.iter().find(|&&(_, c)| c != m.1) {
                     return Err(SuperDscError(format!(
@@ -1851,7 +1899,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // union of its matmul consumers' view regions (the widen keeps the tied embed
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
-    let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows)?;
+    let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows, page_index_scale)?;
     let attn_mask = match (masks.first().copied(), paged) {
         (Some((_, cap)), Some(p)) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own

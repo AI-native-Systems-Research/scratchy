@@ -223,7 +223,11 @@ pub const INT32_ELEMS_PER_STICK: usize =
 
 /// The page index table: `[walk, INT32_ELEMS_PER_STICK]` int32, row `i` holding block `i`'s page at
 /// column 0 — `table[:, 0] = block_table[s, :walk]`, the block table's own zeros past the request's
-/// blocks.
+/// blocks. Each id is the SCHEDULER's page id times the bundle's
+/// [`page_index_scale`](PagedStep::page_index_scale) — the stride law of the views this bundle's
+/// page-table gathers read, minted at the lowering off the programs' own strides: a bundle whose
+/// gathered views pack densely stages the raw id, and a bundle whose units interleave planes stages
+/// the id the view's own stride names.
 pub fn page_table(
     step: &PagedStep,
     blocks: &[u32],
@@ -232,7 +236,7 @@ pub fn page_table(
     check(step, step.rows as usize, blocks, rows)?;
     let mut t = vec![0i32; step.walk as usize * INT32_ELEMS_PER_STICK];
     for (i, &page) in blocks.iter().take(step.walk as usize).enumerate() {
-        t[i * INT32_ELEMS_PER_STICK] = page as i32;
+        t[i * INT32_ELEMS_PER_STICK] = page as i32 * step.page_index_scale as i32;
     }
     Ok(t)
 }
@@ -925,6 +929,7 @@ mod tests {
             head_size: 64,
             walk: 4,
             paged_rows: PagedRows::Sequence,
+            page_index_scale: 1,
             extent: pair(3, 1),
         }
     }
@@ -1266,6 +1271,40 @@ mod tests {
         assert_eq!(
             kv_row_pool(&s),
             vec![0, 1, 4, 5, 8, 9, 12, 13]
+        );
+    }
+
+    /// ⭐ THE PAGE ID'S SCALE, AT THE ONE PLACE IT BINDS — the stager. A bundle whose gathered
+    /// views interleave planes (unit-major, stride a whole multiple of the entry) stages the
+    /// scheduler page id TIMES the scale; a bundle whose views pack densely stages it raw. Same
+    /// step, same blocks, one field — the law the lowering minted off the views' own strides.
+    #[test]
+    fn the_stager_multiplies_the_page_id_by_the_bundle_s_scale() {
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
+        let blocks = [2u32, 0];
+        // DENSE (scale 1): the raw scheduler id — the decode bundle's own shape, byte-identical
+        // to the wire before the scale existed.
+        let dense = step();
+        let col0 = |s: &crate::wiring::PagedStep| -> Vec<i32> {
+            page_table(s, &blocks, &rows)
+                .unwrap()
+                .iter()
+                .step_by(INT32_ELEMS_PER_STICK)
+                .copied()
+                .collect()
+        };
+        assert_eq!(col0(&dense), vec![2, 0, 0, 0], "scale 1 stages the raw id");
+        // STRIDED (scale 2): the unit-major prefill bundle's shape — one unit holds both
+        // planes, so page `p`'s plane entry sits `p·2` entries from the plane's base.
+        let mut strided = step();
+        strided.page_index_scale = 2;
+        assert_eq!(
+            col0(&strided),
+            vec![4, 0, 0, 0],
+            "scale 2 stages the id the view's own stride names"
         );
     }
 

@@ -1617,6 +1617,11 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         ActiveCap::FULL,
         paged_rows,
         query_rows,
+        // ⭐ THE SCALE IS A WIRING FACT, NOT A PLACEMENT ONE — this pass mints the step for its
+        // PLACEMENTS alone (the reserved tids' sizes below), which no page-id scale moves; the
+        // step that ships is [`graph_wiring`]'s, whose scale is the fold over the bundle's own
+        // lowered programs. The dense 1 here never reaches a stager.
+        1,
     )? {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {

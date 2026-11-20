@@ -683,6 +683,16 @@ pub struct PagedStep {
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
     pub paged_rows: crate::paged_step::PagedRows,
+    /// ⭐ THE PAGE ID'S SCALE — what the host multiplies a scheduler page id by when it stages the
+    /// page table for THIS bundle: the stride law of the views the bundle's page-table gathers
+    /// read, minted once at the lowering off the program's own `Strides`
+    /// ([`ktir_superdsc::emit::whole_function::page_index_scale`]) and carried here so the stager
+    /// consumes it and nothing else. A bundle whose gathered views pack their entries densely —
+    /// every folded-row reader, the sequence decode kernel's flat `kv_row_pool`, any dense table —
+    /// states 1 and stages exactly the bytes it always did; a bundle whose units interleave planes
+    /// states the interleave. ONE table, ONE law: a bundle whose gathers disagree is refused at
+    /// the mint, never staged for one of them.
+    pub page_index_scale: u32,
     /// ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, capacity)`, minted once
     /// at the bake from the rung (never a division of [`Self::rows`]) and threaded here so the
     /// card stager and the layout state the per-request laws off the ONE pair the splice already
