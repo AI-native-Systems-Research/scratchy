@@ -4,10 +4,11 @@
 //!
 //! The worker runs one sequence per step (`max_num_seqs` is 1). Each step it takes the one
 //! scheduled request ([`scheduled_request`]), picks the bucket — the compiled tape — that holds
-//! the step's tokens ([`choose_bucket`]), pads the token ids and positions to that bucket
-//! ([`fill_inputs`]), hands the kernels the scheduler's block table ([`block_table_u32`]), and
-//! when the step reaches the end of the request's history ([`emits_token`]) takes the greedy
-//! token of its last real row ([`greedy_token`]).
+//! the step's tokens ([`choose_bucket`]), checks its tokens end inside the KV cache's length
+//! ([`Position`]), pads the token ids and positions to that bucket ([`fill_inputs`]), hands the
+//! kernels the scheduler's block table and GDN slot as the worker's pools' own ([`block_table`],
+//! [`gdn_slot`]), and when the step reaches the end of the request's history ([`emits_token`])
+//! takes the greedy token of its last real row ([`greedy_token`]).
 //!
 //! Sampling is greedy only in this build: the API refuses anything else at its door, from the
 //! factory's `served()`, so every request this plans for decodes greedily.
@@ -16,6 +17,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use scratchy_layers::gdn_state::{GdnStart, GdnStep};
+use scratchy_target_cuda::pool::{BlockId, GdnPoolConfig, KvPoolConfig, SlotId};
+use scratchy_target_cuda::step::{CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ};
 use scratchy_target_cuda::tape::KvTape;
 
 /// Why a step could not be planned. Every message names what to change.
@@ -25,10 +28,18 @@ pub enum PlanError {
     ManyRequests { req_ids: Vec<String> },
     /// No compiled bucket holds `tokens` rows; the largest is `largest`.
     NoBucket { tokens: usize, largest: u32 },
-    /// A position past the bucket's rows does not fit a `u32`.
-    Positions { start: u32, bucket_m: u32 },
-    /// Block-table entry `entry` is block `block`, which does not fit a `u32`.
-    Block { entry: usize, block: usize },
+    /// The step's tokens end at `tokens`, past the `max` a sequence's KV cache holds
+    /// ([`CUDA_MAX_POSITIONS`]).
+    KvTooLong { tokens: u64, max: u64 },
+    /// Block-table entry `entry` is block `block`, outside the KV pool's `num_blocks`
+    /// ([`KvPoolConfig::blocks`]).
+    KvBlockOutsidePool {
+        entry: usize,
+        block: usize,
+        num_blocks: u32,
+    },
+    /// The GDN slot allocator gave slot `slot`, outside the GDN pool's `num_slots`.
+    GdnSlotOutsidePool { slot: usize, num_slots: u32 },
     /// The result holds `elems` bf16 values, not `bucket_m` rows of logits with a row `row`.
     LogitsRow {
         elems: usize,
@@ -60,14 +71,23 @@ impl fmt::Display for PlanError {
                 f,
                 "the step runs {tokens} tokens; the largest compiled CUDA bucket holds {largest}"
             ),
-            Self::Positions { start, bucket_m } => write!(
+            Self::KvTooLong { tokens, max } => write!(
                 f,
-                "a step from position {start} in a bucket of {bucket_m} rows has positions past \
-                 u32"
+                "the sequence is {tokens} tokens; a block table holds at most {max}"
             ),
-            Self::Block { entry, block } => {
-                write!(f, "block-table entry {entry} is block {block}, past u32")
-            }
+            Self::KvBlockOutsidePool {
+                entry,
+                block,
+                num_blocks,
+            } => write!(
+                f,
+                "block-table entry {entry} is block {block}, outside the pool's {num_blocks} \
+                 blocks"
+            ),
+            Self::GdnSlotOutsidePool { slot, num_slots } => write!(
+                f,
+                "the GDN sequence's slot is {slot}, outside the pool's {num_slots} slots"
+            ),
             Self::LogitsRow {
                 elems,
                 bucket_m,
@@ -137,38 +157,80 @@ pub fn choose_bucket(bucket_ms: &[u32], tokens: usize) -> Result<(usize, u32), P
         })
 }
 
+/// The tokens a sequence's KV cache holds: [`CUDA_MAX_BLOCKS_PER_SEQ`] blocks of
+/// [`CUDA_KV_BLOCK_SIZE`].
+pub const CUDA_MAX_POSITIONS: u32 = CUDA_MAX_BLOCKS_PER_SEQ * CUDA_KV_BLOCK_SIZE;
+
+/// A step's first position, whose tokens end inside the KV cache's length
+/// ([`CUDA_MAX_POSITIONS`]). Only [`Self::of`] makes one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Position(u32);
+
+impl Position {
+    /// `start` for a step of `tokens`, or `KvTooLong` when they end past the cache's length.
+    pub fn of(start: u32, tokens: usize) -> Result<Self, PlanError> {
+        let end = u64::from(start) + tokens as u64;
+        let max = u64::from(CUDA_MAX_POSITIONS);
+        if end > max {
+            return Err(PlanError::KvTooLong { tokens: end, max });
+        }
+        Ok(Self(start))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// The tape's inputs for a step of `chunk` (the real token ids) from position `start` in a bucket
 /// of `bucket_m` rows, into the worker's reusable buffers: the ids padded with 0 to `bucket_m`,
 /// and the positions `start .. start + bucket_m`, the padding rows' included.
 pub fn fill_inputs(
     chunk: &[u32],
-    start: u32,
+    start: Position,
     bucket_m: u32,
     ids: &mut Vec<u32>,
     positions: &mut Vec<u32>,
-) -> Result<(), PlanError> {
+) {
     debug_assert!(
         chunk.len() <= bucket_m as usize,
         "the bucket holds the chunk"
     );
-    let end = start
-        .checked_add(bucket_m)
-        .ok_or(PlanError::Positions { start, bucket_m })?;
     ids.clear();
     ids.extend_from_slice(chunk);
     ids.resize(bucket_m as usize, 0);
     positions.clear();
-    positions.extend(start..end);
+    // The real rows end inside the cache's length (`Position`); a padding row's position is
+    // never read past the step's tokens, and saturates only for a bucket of 2³² − 8192 rows.
+    positions.extend((0..bucket_m).map(|row| start.get().saturating_add(row)));
+}
+
+/// The scheduler's block ids as blocks of the worker's KV pool `pool`, into `out`. A block outside
+/// it is refused.
+pub fn block_table(
+    blocks: &[usize],
+    pool: KvPoolConfig,
+    out: &mut Vec<BlockId>,
+) -> Result<(), PlanError> {
+    out.clear();
+    for (entry, &block) in blocks.iter().enumerate() {
+        let id = BlockId::of(block, pool).ok_or(PlanError::KvBlockOutsidePool {
+            entry,
+            block,
+            num_blocks: pool.blocks(),
+        })?;
+        out.push(id);
+    }
     Ok(())
 }
 
-/// The scheduler's block ids, as the `u32` entries the kernels read, into `out`.
-pub fn block_table_u32(blocks: &[usize], out: &mut Vec<u32>) -> Result<(), PlanError> {
-    out.clear();
-    for (entry, &block) in blocks.iter().enumerate() {
-        out.push(u32::try_from(block).map_err(|_| PlanError::Block { entry, block })?);
-    }
-    Ok(())
+/// The GDN slot allocator's `slot` as a slot of the worker's GDN pool `pool`. A slot outside it is
+/// refused.
+pub fn gdn_slot(slot: usize, pool: GdnPoolConfig) -> Result<SlotId, PlanError> {
+    SlotId::of(slot, pool).ok_or(PlanError::GdnSlotOutsidePool {
+        slot,
+        num_slots: pool.num_slots,
+    })
 }
 
 /// Whether a step of `tokens` from `start` samples a token: it reaches the end of the request's

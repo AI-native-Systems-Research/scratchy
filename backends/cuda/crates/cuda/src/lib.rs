@@ -41,6 +41,8 @@ pub mod kernel_consts;
 pub mod kernels;
 /// CUDA's per-opcode ABI as declared data: the colour rule, fusions and sampled rows.
 pub mod op_abi;
+/// The worker's KV and GDN pool sizes, and the block and slot ids of them a forward takes.
+pub mod pool;
 /// Every model compiled for CUDA in this binary: its stem, tapes and weight table.
 pub mod registry;
 /// The rotary table's rows, built on the host from the forward's token positions.

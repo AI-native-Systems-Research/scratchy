@@ -30,7 +30,7 @@ use scratchy_serving_engine::worker_factory::{
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 use scratchy_target_cuda::registry::{self, CudaModelEntry};
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, GdnPoolConfig, GdnSequence, Input, KvPoolConfig,
+    BlockId, CudaDevice, CudaWorker, DeviceBuffer, GdnPoolConfig, GdnSequence, Input, KvPoolConfig,
     KvSequence, load_weights,
 };
 use scratchy_target_cuda::tape::KvTape;
@@ -38,8 +38,9 @@ use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
 use tracing::info;
 
 use crate::plan::{
-    block_table_u32, check_kv_cache_dtype, check_quantization_config, choose_bucket, emits_token,
-    fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes, scheduled_request,
+    Position, block_table, check_kv_cache_dtype, check_quantization_config, choose_bucket,
+    emits_token, fill_inputs, gdn_fresh, gdn_slot, greedy_code, greedy_token, kv_block_bytes,
+    scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -180,7 +181,7 @@ pub(crate) struct CudaServingWorker {
     /// A step's token ids, positions and block table, reused.
     ids: Vec<u32>,
     positions: Vec<u32>,
-    table: Vec<u32>,
+    table: Vec<BlockId>,
     chunk: Vec<u32>,
 }
 
@@ -278,23 +279,28 @@ impl CudaServingWorker {
         }
         let history = batch.token_count(req_id);
         let blocks = batch.block_table(req_id).unwrap_or(&[]);
-        block_table_u32(blocks, &mut self.table).map_err(exec)?;
 
         let model = (self.model.as_mut()).ok_or_else(|| exec("no CUDA model is loaded"))?;
         let running = (self.running.as_mut())
             .ok_or_else(|| exec("the CUDA KV cache is not built (initialize_cache)"))?;
+        // The step's positions, blocks and GDN slot, each checked once here against the cache's
+        // length and the worker's own pools.
+        let first = Position::of(start, n).map_err(exec)?;
+        match running.tapes.kv_pool() {
+            Some(pool) => block_table(blocks, pool, &mut self.table).map_err(exec)?,
+            None => self.table.clear(),
+        }
         let tapes = model.entry.tapes;
         let bucket_ms: Vec<u32> = tapes.iter().map(|t| t.bucket_m.get()).collect();
         let (bucket, bucket_m) = choose_bucket(&bucket_ms, n).map_err(exec)?;
         let tape = &tapes[bucket];
         fill_inputs(
             &self.chunk,
-            start,
+            first,
             bucket_m,
             &mut self.ids,
             &mut self.positions,
-        )
-        .map_err(exec)?;
+        );
         let q_len = n as u32;
         let kv = tape.kv.map(|_| KvSequence {
             block_table: &self.table,
@@ -308,8 +314,9 @@ impl CudaServingWorker {
                 let (slots, codes) = running.gdn.step([row]).map_err(exec)?;
                 let fresh = gdn_fresh(codes[0], start)
                     .map_err(|e| exec(format!("request {req_id}: {e}")))?;
+                let pool = (running.tapes.gdn_pool()).expect("`new` made a pool for a GDN tape");
                 Some(GdnSequence {
-                    slot: slots[0].slot().index() as u32,
+                    slot: gdn_slot(slots[0].slot().index(), pool).map_err(exec)?,
                     q_len,
                     fresh,
                 })

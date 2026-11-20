@@ -39,6 +39,7 @@ use crate::kernel_consts::{
     NO_SLOT, NORM_ROW_FORM_ADD_NORM, NORM_ROW_FORM_NORM, NORM_ROW_FORM_NORM_ADD,
 };
 use crate::kernels::{self, DecodeSplit, KernelError};
+use crate::pool::{BlockId, GdnPoolConfig, KvPoolConfig, SlotId};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnDecodeBf16,
@@ -100,20 +101,6 @@ impl Input<'_> {
     }
 }
 
-/// The KV pool a worker allocates when its tapes attend: how many blocks each layer's K and V
-/// buffers hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvPoolConfig {
-    pub num_blocks: u32,
-}
-
-/// The GDN state pool a worker allocates when its tapes have Gated-DeltaNet layers: how many
-/// sequences' state each layer holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GdnPoolConfig {
-    pub num_slots: u32,
-}
-
 /// One forward's GDN sequence: its state's `slot` in the pool, its `q_len` real rows, and whether
 /// this is the sequence's first forward (`fresh`), whose kernels start from zero without reading
 /// the slot.
@@ -123,7 +110,7 @@ pub struct GdnPoolConfig {
 /// continues from whatever the slot holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GdnSequence {
-    pub slot: u32,
+    pub slot: SlotId,
     pub q_len: u32,
     pub fresh: bool,
 }
@@ -132,7 +119,7 @@ pub struct GdnSequence {
 /// already in the cache, and `q_len` new ones at positions `prefix_len .. prefix_len + q_len`.
 #[derive(Clone, Copy, Debug)]
 pub struct KvSequence<'s> {
-    pub block_table: &'s [u32],
+    pub block_table: &'s [BlockId],
     pub prefix_len: u32,
     pub q_len: u32,
 }
@@ -279,18 +266,9 @@ pub enum ForwardError {
     KvUnexpected,
     /// `q_len` is not in `1 ..= bucket_m`; nothing was enqueued.
     KvQueryLength { q_len: u32, bucket_m: u32 },
-    /// `prefix_len + q_len` is above the `max` tokens a block table holds; nothing was enqueued.
-    KvTooLong { tokens: u64, max: u64 },
     /// The block table has `got` entries; the sequence needs at least `need`, and the tape holds
     /// at most `max`. Nothing was enqueued.
     KvBlockTable { got: usize, need: usize, max: usize },
-    /// Block-table entry `entry` is block `block`, outside the pool's `num_blocks`; nothing was
-    /// enqueued.
-    KvBlockOutsidePool {
-        entry: usize,
-        block: u32,
-        num_blocks: u32,
-    },
     /// Block `block` is used by entries `first` and `second` of the block table; nothing was
     /// enqueued.
     KvBlockRepeated {
@@ -313,8 +291,6 @@ pub enum ForwardError {
     GdnMissing,
     /// The tape has no GDN layers and the forward was given a GDN sequence; nothing was enqueued.
     GdnUnexpected,
-    /// The GDN sequence's slot is not one of the pool's `num_slots`; nothing was enqueued.
-    GdnSlotOutsidePool { slot: u32, num_slots: u32 },
     /// The GDN sequence's `q_len` is not in `1 ..= bucket_m`; nothing was enqueued.
     GdnQueryLength { q_len: u32, bucket_m: u32 },
     /// The forward has both a KV sequence and a GDN sequence, and they disagree on whether it is
@@ -400,23 +376,10 @@ impl fmt::Display for ForwardError {
                 f,
                 "the sequence adds {q_len} tokens; the bucket takes 1 to {bucket_m}"
             ),
-            Self::KvTooLong { tokens, max } => write!(
-                f,
-                "the sequence is {tokens} tokens; a block table holds at most {max}"
-            ),
             Self::KvBlockTable { got, need, max } => write!(
                 f,
                 "the block table has {got} entries; the sequence needs {need}, and the tape \
                  holds at most {max}"
-            ),
-            Self::KvBlockOutsidePool {
-                entry,
-                block,
-                num_blocks,
-            } => write!(
-                f,
-                "block-table entry {entry} is block {block}, outside the pool's {num_blocks} \
-                 blocks"
             ),
             Self::KvBlockRepeated {
                 block,
@@ -448,10 +411,6 @@ impl fmt::Display for ForwardError {
             Self::GdnUnexpected => write!(
                 f,
                 "the bucket has no GDN layers and the forward was given a GDN sequence"
-            ),
-            Self::GdnSlotOutsidePool { slot, num_slots } => write!(
-                f,
-                "the GDN sequence's slot is {slot}, outside the pool's {num_slots} slots"
             ),
             Self::GdnQueryLength { q_len, bucket_m } => write!(
                 f,
@@ -1107,6 +1066,20 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         )
     }
 
+    /// The KV pool the worker was built with, which its [`BlockId`]s are of; `None` without one.
+    pub fn kv_pool(&self) -> Option<KvPoolConfig> {
+        (self.kv.as_ref()).map(|p| KvPoolConfig {
+            num_blocks: p.layout.num_blocks,
+        })
+    }
+
+    /// The GDN pool the worker was built with, which its [`SlotId`]s are of; `None` without one.
+    pub fn gdn_pool(&self) -> Option<GdnPoolConfig> {
+        (self.gdn.as_ref()).map(|p| GdnPoolConfig {
+            num_slots: p.layout.num_slots,
+        })
+    }
+
     /// Whether bucket `bucket`'s graph runs the greedy argmax after its last step, so a
     /// [`Self::forward_greedy`] takes it: its tape's [`CudaTape::greedy`].
     pub fn has_greedy(&self, bucket: usize) -> bool {
@@ -1293,13 +1266,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let gdn_sequence = match (tape.gdn, gdn) {
             (Some(gdn_tape), Some(seq)) => {
                 let pool = self.gdn.as_mut().expect("`new` made a pool for a GDN tape");
-                let num_slots = pool.layout.num_slots;
-                if seq.slot >= num_slots {
-                    return Err(ForwardError::GdnSlotOutsidePool {
-                        slot: seq.slot,
-                        num_slots,
-                    });
-                }
                 let bucket_m = tape.bucket_m;
                 if seq.q_len == 0 || seq.q_len > bucket_m.get() {
                     return Err(ForwardError::GdnQueryLength {
@@ -1307,7 +1273,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         bucket_m: bucket_m.get(),
                     });
                 }
-                pool.sequence_host = [seq.slot, seq.q_len, u32::from(seq.fresh), 0];
+                pool.sequence_host = [seq.slot.get(), seq.q_len, u32::from(seq.fresh), 0];
                 Some(gdn_tape.sequence)
             }
             (Some(_), None) => return Err(ForwardError::GdnMissing),
@@ -3836,11 +3802,9 @@ fn fill_sequence(
             bucket_m: bucket_m.get(),
         });
     }
+    // The plan bounded the tokens by the cache's length (`Position`); the block table's own
+    // bounds below refuse a sequence past what this tape's table holds.
     let tokens = u64::from(prefix_len) + u64::from(q_len);
-    let max = u64::from(kv.max_blocks_per_seq) * u64::from(kv.block_size);
-    if tokens > max {
-        return Err(ForwardError::KvTooLong { tokens, max });
-    }
     let need = tokens.div_ceil(u64::from(kv.block_size)) as usize;
     let max_entries = kv.max_blocks_per_seq.get() as usize;
     if block_table.len() < need || block_table.len() > max_entries {
@@ -3850,21 +3814,12 @@ fn fill_sequence(
             max: max_entries,
         });
     }
+    // Every block is the pool's ([`BlockId`]: below its blocks, its slots below `NO_SLOT`).
     let used = &block_table[..need];
-    // A slot is a u32 below `u32::MAX` (the padding sentinel), so a block past the last one whose
-    // slots fit is outside the pool too. A pool that large cannot be allocated on an H100.
-    let num_blocks = (pool.layout.num_blocks).min(NO_SLOT / kv.block_size.get());
     for (entry, &block) in used.iter().enumerate() {
-        if block >= num_blocks {
-            return Err(ForwardError::KvBlockOutsidePool {
-                entry,
-                block,
-                num_blocks,
-            });
-        }
         if let Some(first) = used[..entry].iter().position(|&b| b == block) {
             return Err(ForwardError::KvBlockRepeated {
-                block,
+                block: block.get(),
                 first,
                 second: entry,
             });
@@ -3878,7 +3833,9 @@ fn fill_sequence(
     }
     let table = &mut pool.block_table_host;
     table.fill(NO_SLOT);
-    table[..need].copy_from_slice(used);
+    for (entry, block) in table.iter_mut().zip(used) {
+        *entry = block.get();
+    }
     let block_size = kv.block_size;
     let slots = &mut pool.slot_mapping_host[..bucket_m.get() as usize];
     for (row, slot) in slots.iter_mut().enumerate() {
@@ -3886,7 +3843,7 @@ fn fill_sequence(
             // `pos < tokens`, so `pos / block_size < need`; the block is below `NO_SLOT /
             // block_size`, so the slot is below `NO_SLOT`.
             let pos = u64::from(prefix_len) + row as u64;
-            let block = used[(pos / u64::from(block_size)) as usize];
+            let block = used[(pos / u64::from(block_size)) as usize].get();
             block * block_size.get() + (pos % u64::from(block_size)) as u32
         } else {
             NO_SLOT

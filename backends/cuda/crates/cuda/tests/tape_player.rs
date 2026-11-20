@@ -56,8 +56,8 @@ use scratchy_target_cuda::kernels::{
 };
 use scratchy_target_cuda::rotary::rotary_rows;
 use scratchy_target_cuda::runtime::{
-    CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf,
-    KvPoolConfig, KvSequence, WorkerError,
+    BlockId, CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input,
+    KvHalf, KvPoolConfig, KvSequence, SlotId, WorkerError,
 };
 use scratchy_target_cuda::step::Matmul;
 use scratchy_target_cuda::step::MatmulKernel;
@@ -952,6 +952,14 @@ const POOL: Option<KvPoolConfig> = Some(KvPoolConfig {
     num_blocks: POOL_BLOCKS,
 });
 
+/// `ids` as blocks of the test's `pool`, each one of its blocks.
+fn blocks(ids: &[u32], pool: Option<KvPoolConfig>) -> Vec<BlockId> {
+    let pool = pool.expect("a KV pool");
+    (ids.iter())
+        .map(|&b| BlockId::of(b as usize, pool).expect("a block of the pool"))
+        .collect()
+}
+
 /// The embedded hidden of an `m`-row attention-layer bucket, under `seed`.
 fn layer_input(m: usize, seed: u64) -> Vec<u16> {
     bf16_inputs(m * AL_H, seed ^ m as u64)
@@ -975,9 +983,10 @@ fn read_pool(worker: &mut CudaWorker<'_>, half: KvHalf) -> Vec<Vec<u16>> {
 }
 
 /// The sequence's first `tokens` rows of a half of the pool (`blocks`), `[tokens, KV]`.
-fn gather(blocks: &[Vec<u16>], table: &[u32], tokens: usize) -> Vec<u16> {
+fn gather(blocks: &[Vec<u16>], table: &[BlockId], tokens: usize) -> Vec<u16> {
     let flat: Vec<u16> = blocks.iter().flatten().copied().collect();
-    gather_paged(&flat, table, tokens, (AL_KV_HEADS, 64, AL_HD))
+    let ids: Vec<u32> = table.iter().map(|b| b.get()).collect();
+    gather_paged(&flat, &ids, tokens, (AL_KV_HEADS, 64, AL_HD))
 }
 
 /// Check the attention output `attn` (`[m, Q]`, its first `q_len` rows) against the f64
@@ -1016,7 +1025,7 @@ fn check_attention(
 fn cache_mismatches(
     (k_blocks, v_blocks): (&[Vec<u16>], &[Vec<u16>]),
     (kr, v): (&[u16], &[u16]),
-    table: &[u32],
+    table: &[BlockId],
     (prefix_len, q_len): (usize, usize),
 ) -> usize {
     let k_rows = gather(k_blocks, table, prefix_len + q_len);
@@ -1039,7 +1048,8 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
     let mut pass = true;
     for (bucket, tape) in LAYER_BUCKETS.iter().enumerate() {
         let m = tape.bucket_m.get() as usize;
-        let block_table = &[11u32, 3, 14, 0][..m / 64];
+        let all = blocks(&[11, 3, 14, 0], POOL);
+        let block_table = &all[..m / 64];
         let x = layer_input(m, 0x0A1E);
         let positions = seq_positions(m, 0);
         let seq = KvSequence {
@@ -1263,7 +1273,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
     let table = layer_table(&device, &w);
     let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let tape = &ATTN_LAYER_M256;
-    let block_table = [11u32, 3, 14, 0, 7, 9, 2, 5];
+    let block_table = blocks(&[11, 3, 14, 0, 7, 9, 2, 5], POOL);
     let mut y = vec![0u16; 256 * AL_H];
     let a = KvSequence {
         block_table: &block_table[..4],
@@ -1306,7 +1316,7 @@ fn a_second_chunk_reads_the_first_from_the_cache() {
     );
     let a_blocks_changed = (block_table[..4].iter())
         .map(|&blk| {
-            let i = blk as usize;
+            let i = blk.get() as usize;
             mismatched_bits(&ka[i], &kb[i]) + mismatched_bits(&va[i], &vb[i])
         })
         .sum::<usize>();
@@ -1348,7 +1358,7 @@ fn a_short_chunk_pads() {
     let table = layer_table(&device, &w);
     let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let tape = &ATTN_LAYER_M128;
-    let block_table = [11u32, 3, 14];
+    let block_table = blocks(&[11, 3, 14], POOL);
     let mut y = vec![0u16; 128 * AL_H];
     let mut pass = true;
     let f1 = KvSequence {
@@ -1475,7 +1485,8 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
     assert_eq!(built, 9, "seven weights, one arena, one pool");
 
     let inputs = [layer_input(128, 0xA110), layer_input(256, 0xA110)];
-    let tables: [&[u32]; 2] = [&[11, 3], &[11, 3, 14, 0]];
+    let (short, long) = (blocks(&[11, 3], POOL), blocks(&[11, 3, 14, 0], POOL));
+    let tables: [&[BlockId]; 2] = [&short, &long];
     let mut firsts: [Option<Vec<u16>>; 2] = [None, None];
     let at_forwards = device.allocations();
     let mut free_after_first = None;
@@ -1523,7 +1534,7 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
     assert!(identical, "a bucket's result changed between forwards");
 }
 
-/// Each of the seven KV `ForwardError`s, before any copy (the result untouched), and a good
+/// Each of the five KV `ForwardError`s the forward makes, before any copy (the result untouched), and a good
 /// forward after them still right; `KvUnexpected` on the attention-gate tape.
 #[test]
 fn a_bad_sequence_is_refused_before_any_copy() {
@@ -1533,16 +1544,20 @@ fn a_bad_sequence_is_refused_before_any_copy() {
     let mut worker = CudaWorker::new(&device, &LAYER_BUCKETS, &table, POOL, None).expect("worker");
     let x = layer_input(128, 0xBAD);
     let pos = seq_positions(128, 0);
-    let good: &[u32] = &[11, 3];
+    let good_blocks = blocks(&[11, 3], POOL);
+    let repeated = blocks(&[11, 11], POOL);
+    let too_few = blocks(&[11], POOL);
+    let good: &[BlockId] = &good_blocks;
     let seq = |block_table, prefix_len, q_len| KvSequence {
         block_table,
         prefix_len,
         q_len,
     };
-    let long: Vec<u32> = (0..129).collect();
+    // 129 entries, each a block of the pool: one more than a block table holds.
+    let long = blocks(&(0..129).map(|b| b % POOL_BLOCKS).collect::<Vec<_>>(), POOL);
     let mut shifted = pos.clone();
     shifted[5] = 99;
-    let cases: [(Option<KvSequence<'_>>, &[u32], ForwardError); 8] = [
+    let cases: [(Option<KvSequence<'_>>, &[u32], ForwardError); 6] = [
         (None, &pos, ForwardError::KvMissing),
         (
             Some(seq(good, 0, 0)),
@@ -1561,14 +1576,6 @@ fn a_bad_sequence_is_refused_before_any_copy() {
             },
         ),
         (
-            Some(seq(good, 8192, 1)),
-            &pos,
-            ForwardError::KvTooLong {
-                tokens: 8193,
-                max: 8192,
-            },
-        ),
-        (
             Some(seq(&long, 0, 128)),
             &pos,
             ForwardError::KvBlockTable {
@@ -1578,16 +1585,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
             },
         ),
         (
-            Some(seq(&[11, 16], 0, 128)),
-            &pos,
-            ForwardError::KvBlockOutsidePool {
-                entry: 1,
-                block: 16,
-                num_blocks: 16,
-            },
-        ),
-        (
-            Some(seq(&[11, 11], 0, 128)),
+            Some(seq(&repeated, 0, 128)),
             &pos,
             ForwardError::KvBlockRepeated {
                 block: 11,
@@ -1622,7 +1620,7 @@ fn a_bad_sequence_is_refused_before_any_copy() {
         0,
         Input::Hidden(&x),
         &pos,
-        Some(&seq(&[11], 0, 128)),
+        Some(&seq(&too_few, 0, 128)),
         None,
         &mut y,
     );
@@ -1819,6 +1817,11 @@ const GDN_SLOTS: u32 = 4;
 const GDN_POOL: Option<GdnPoolConfig> = Some(GdnPoolConfig {
     num_slots: GDN_SLOTS,
 });
+
+/// `slot` of the GDN-layer tests' pool.
+fn gdn_slot(slot: u32) -> SlotId {
+    SlotId::of(slot as usize, GDN_POOL.expect("a GDN pool")).expect("a slot of the pool")
+}
 const G08: GdnDims = GdnDims {
     nk: 16,
     nv: 16,
@@ -2164,7 +2167,7 @@ fn the_gdn_layer_matches_the_cpu_reference_in_each_bucket() {
         let m = tape.bucket_m.get() as usize;
         let x = gdn_input(m, 0x6D1);
         let seq = GdnSequence {
-            slot: 1,
+            slot: gdn_slot(1),
             q_len: m as u32,
             fresh: true,
         };
@@ -2202,7 +2205,7 @@ fn the_gdn_layer_carries_its_state_across_two_chunks() {
     let mut y = vec![0u16; 256 * GL_H];
     let x1 = gdn_input(256, 0xC41);
     let s1 = GdnSequence {
-        slot: 2,
+        slot: gdn_slot(2),
         q_len: 200,
         fresh: true,
     };
@@ -2222,7 +2225,7 @@ fn the_gdn_layer_carries_its_state_across_two_chunks() {
     let (ring1, state1) = read_gdn(&mut worker, 2);
     let x2 = gdn_input(256, 0xC42);
     let s2 = GdnSequence {
-        slot: 2,
+        slot: gdn_slot(2),
         q_len: 150,
         fresh: false,
     };
@@ -2315,7 +2318,11 @@ fn the_gdn_layer_does_not_leak_state_into_a_fresh_sequence() {
             .expect("forward");
         y
     };
-    let seq = |slot, q_len, fresh| GdnSequence { slot, q_len, fresh };
+    let seq = |slot, q_len, fresh| GdnSequence {
+        slot: gdn_slot(slot),
+        q_len,
+        fresh,
+    };
     run(&mut worker, &gdn_input(256, 0xA01), seq(2, 256, true));
     run(&mut worker, &gdn_input(256, 0xA02), seq(2, 100, false));
     let xb = gdn_input(256, 0xB01);
@@ -2386,7 +2393,7 @@ fn the_gdn_layer_worker_allocates_once_and_no_forward_allocates() {
     {
         let m = GDN_BUCKETS[bucket].bucket_m;
         let seq = GdnSequence {
-            slot: bucket as u32,
+            slot: gdn_slot(bucket as u32),
             q_len: m.get(),
             fresh,
         };
@@ -2449,7 +2456,7 @@ fn a_bad_gdn_sequence_is_refused_before_any_copy() {
             &[],
             None,
             Some(&GdnSequence {
-                slot: 1,
+                slot: gdn_slot(1),
                 q_len: 128,
                 fresh: true,
             }),
@@ -2465,19 +2472,12 @@ fn a_bad_gdn_sequence_is_refused_before_any_copy() {
     );
     let pool_before = gdn_snapshot(&mut worker);
     let seq = |slot, q_len| GdnSequence {
-        slot,
+        slot: gdn_slot(slot),
         q_len,
         fresh: false,
     };
-    let cases: [(Option<GdnSequence>, ForwardError); 4] = [
+    let cases: [(Option<GdnSequence>, ForwardError); 3] = [
         (None, ForwardError::GdnMissing),
-        (
-            Some(seq(4, 128)),
-            ForwardError::GdnSlotOutsidePool {
-                slot: 4,
-                num_slots: 4,
-            },
-        ),
         (
             Some(seq(1, 0)),
             ForwardError::GdnQueryLength {
@@ -2647,7 +2647,7 @@ fn a_greedy_decode_copies_back_the_argmax_of_its_row() {
         worker.has_greedy(0) && !worker.has_greedy(1),
         "the one-row tape alone"
     );
-    let block_table = [11u32, 3, 14];
+    let block_table = blocks(&[11, 3, 14], POOL);
     let p0 = 100u32;
     let mut y = vec![0u16; 128 * AL_H];
     let prefill = KvSequence {
@@ -2747,7 +2747,7 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
         offset: at,
         bytes: 2 * cols as u64,
     };
-    let block_table = [11u32, 3, 14];
+    let block_table = blocks(&[11, 3, 14], POOL);
     let p0 = 100u32;
     let mut y = vec![0u16; 128 * AL_H];
     let prefill = KvSequence {
@@ -3776,8 +3776,9 @@ const GA_POOL: Option<KvPoolConfig> = Some(KvPoolConfig {
     num_blocks: GA_BLOCKS,
 });
 /// The sequence's block table: a permutation of the pool (7 is coprime with 48).
-fn ga_table() -> Vec<u32> {
-    (0..GA_BLOCKS).map(|b| (b * 7 + 5) % GA_BLOCKS).collect()
+fn ga_table() -> Vec<BlockId> {
+    let ids: Vec<u32> = (0..GA_BLOCKS).map(|b| (b * 7 + 5) % GA_BLOCKS).collect();
+    blocks(&ids, GA_POOL)
 }
 
 /// `t` with every attention step and KV class unwindowed: the same layer's full causal twin.
@@ -4033,7 +4034,7 @@ fn ga_forward(
     worker: &mut CudaWorker<'_>,
     b: usize,
     (p, len): (usize, usize),
-    table: &[u32],
+    table: &[BlockId],
     x: Option<u16>,
 ) -> Vec<u16> {
     let m = (gemma_attn_buckets()[b].bucket_m).get() as usize;
@@ -4065,7 +4066,7 @@ fn ga_forward(
 }
 
 /// Prefill positions `0 .. tokens` in 512-row chunks through bucket 1.
-fn ga_prefill(worker: &mut CudaWorker<'_>, tokens: usize, table: &[u32]) {
+fn ga_prefill(worker: &mut CudaWorker<'_>, tokens: usize, table: &[BlockId]) {
     for p in (0..tokens).step_by(512) {
         ga_forward(worker, 1, (p, 512.min(tokens - p)), table, None);
     }
@@ -4458,7 +4459,7 @@ fn gg_forward(
     worker: &mut CudaWorker<'_>,
     (tapes, b): (&[CudaTape], usize),
     (p, len): (usize, usize),
-    table: &[u32],
+    table: &[BlockId],
     input: &dyn Fn(usize) -> Vec<u16>,
 ) -> Vec<u16> {
     let m = (tapes[b].bucket_m).get() as usize;
@@ -4695,12 +4696,12 @@ fn gemma_attn_two_classes_share_the_pool() {
             };
             let mut k = vec![0u8; elems];
             worker
-                .read_kv(layer, KvHalf::K, block, &mut k)
+                .read_kv(layer, KvHalf::K, block.get(), &mut k)
                 .expect("read a cache block");
             before.push(k);
         }
     }
-    let unused: Vec<u32> = table[used..].to_vec();
+    let unused: Vec<BlockId> = table[used..].to_vec();
     let nan_rows = unused.len() * 64;
     for start in (0..nan_rows).step_by(512) {
         let len = 512.min(nan_rows - start);
@@ -4720,7 +4721,7 @@ fn gemma_attn_two_classes_share_the_pool() {
             };
             let mut k = vec![0u8; elems];
             worker
-                .read_kv(layer, KvHalf::K, block, &mut k)
+                .read_kv(layer, KvHalf::K, block.get(), &mut k)
                 .expect("read a cache block");
             after.push(k);
         }
@@ -4805,7 +4806,7 @@ fn a_graph_replay_is_the_per_launch_forward_bit_for_bit() {
     let layer_w = layer_table(&device, &layer_weights());
     let gdn_w = gdn_table(&device, &gdn_weights());
     let moe_w = moe_table(&device, &moe_weights());
-    let block_table = [11u32, 3, 14, 0];
+    let block_table = blocks(&[11, 3, 14, 0], POOL);
     let m_layer = (LAYER_BUCKETS[1].bucket_m).get() as usize;
     let m_gdn = (GDN_BUCKETS[1].bucket_m).get() as usize;
     let moe_tapes = moe_buckets();
@@ -4851,7 +4852,7 @@ fn a_graph_replay_is_the_per_launch_forward_bit_for_bit() {
                 positions: Vec::new(),
                 kv: None,
                 gdn: Some(GdnSequence {
-                    slot: 1,
+                    slot: gdn_slot(1),
                     q_len: m_gdn as u32,
                     fresh: true,
                 }),
@@ -5041,7 +5042,7 @@ fn the_one_row_folds_play_bit_for_bit() {
         Box::leak(Box::new(w4_tapes(&attn_layer(1), QWEN3_5_FACTS)));
     let w = layer_weights();
     let table = layer_table(&device, &w);
-    let block_table = [3u32];
+    let block_table = blocks(&[3], POOL);
     let seq = KvSequence {
         block_table: &block_table,
         prefix_len: 0,
@@ -5065,7 +5066,7 @@ fn the_one_row_folds_play_bit_for_bit() {
     let w = gdn_weights();
     let table = gdn_table(&device, &w);
     let gseq = GdnSequence {
-        slot: 1,
+        slot: gdn_slot(1),
         q_len: 1,
         fresh: true,
     };
@@ -5133,7 +5134,7 @@ fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
     let mlp_w = mlp_table(&device, &mlp_weights());
     let layer_w = layer_table(&device, &layer_weights());
     let gdn_w = gdn_table(&device, &gdn_weights());
-    let block_table = [11u32, 3, 14, 0];
+    let block_table = blocks(&[11, 3, 14, 0], POOL);
     let m_layer = (LAYER_BUCKETS[1].bucket_m).get() as usize;
     let m_gdn = (GDN_BUCKETS[1].bucket_m).get() as usize;
     let cases = [
@@ -5178,7 +5179,7 @@ fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
                 positions: Vec::new(),
                 kv: None,
                 gdn: Some(GdnSequence {
-                    slot: 1,
+                    slot: gdn_slot(1),
                     q_len: m_gdn as u32,
                     fresh: true,
                 }),
@@ -5284,7 +5285,7 @@ fn the_sampled_row_is_the_every_row_forwards_last_row_bit_for_bit() {
         pass &= shape == [0, 1];
         let mut worker = CudaWorker::new(&device, tapes, &table, POOL, None).expect("worker");
         let x = layer_input(m as usize, 0x0F20);
-        let block_table = [11u32, 3, 14, 0, 5];
+        let block_table = blocks(&[11, 3, 14, 0, 5], POOL);
         for (prefix_len, q_len) in [(0u32, 1u32), (0, 100), (0, m), (64, 128)] {
             let blocks = (prefix_len + q_len).div_ceil(64) as usize;
             let seq = KvSequence {

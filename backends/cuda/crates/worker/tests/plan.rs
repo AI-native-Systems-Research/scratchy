@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use scratchy_core_common::SamplingParams;
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::WorkerFactory;
+use scratchy_target_cuda::pool::{GdnPoolConfig, KvPoolConfig};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvClass, KvTape};
 use scratchy_target_cuda_worker::plan::{
-    PlanError, QuantRefusal, block_table_u32, check_kv_cache_dtype, check_quantization_config,
-    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes,
-    logits_row, scheduled_request,
+    PlanError, Position, QuantRefusal, block_table, check_kv_cache_dtype,
+    check_quantization_config, choose_bucket, emits_token, fill_inputs, gdn_fresh, gdn_slot,
+    greedy_code, greedy_token, kv_block_bytes, logits_row, scheduled_request,
 };
 use scratchy_target_cuda_worker::{CudaWorkerFactory, NO_NVCC};
 
@@ -66,36 +67,65 @@ fn the_bucket_is_chosen_by_its_rows_not_its_position() {
 #[test]
 fn inputs_are_padded_to_the_bucket_and_positions_run_through_it() {
     let (mut ids, mut positions) = (vec![9; 3], vec![9; 3]);
-    fill_inputs(&[5, 6, 7], 100, 8, &mut ids, &mut positions).unwrap();
+    let at = |start, tokens| Position::of(start, tokens).unwrap();
+    fill_inputs(&[5, 6, 7], at(100, 3), 8, &mut ids, &mut positions);
     assert_eq!(ids, [5, 6, 7, 0, 0, 0, 0, 0]);
     assert_eq!(positions, (100..108).collect::<Vec<u32>>());
     // A decode: one row, at its own position.
-    fill_inputs(&[42], 4095, 1, &mut ids, &mut positions).unwrap();
+    fill_inputs(&[42], at(4095, 1), 1, &mut ids, &mut positions);
     assert_eq!(
         (ids.as_slice(), positions.as_slice()),
         (&[42][..], &[4095][..])
     );
+}
+
+/// A step whose tokens end past the KV cache's length is refused: 8192 cached and one more.
+#[test]
+fn a_step_past_the_caches_length_is_refused() {
     assert_eq!(
-        fill_inputs(&[1], u32::MAX, 2, &mut ids, &mut positions),
-        Err(PlanError::Positions {
-            start: u32::MAX,
-            bucket_m: 2
+        Position::of(8192, 1),
+        Err(PlanError::KvTooLong {
+            tokens: 8193,
+            max: 8192
+        })
+    );
+    assert_eq!(Position::of(8191, 1).map(Position::get), Ok(8191));
+}
+
+#[test]
+fn the_block_table_is_the_schedulers_ids_as_blocks_of_the_pool() {
+    let mut out = Vec::new();
+    block_table(&[3, 1, 128], KvPoolConfig { num_blocks: 129 }, &mut out).unwrap();
+    assert_eq!(out.iter().map(|b| b.get()).collect::<Vec<_>>(), [3, 1, 128]);
+}
+
+/// A block outside the pool is refused: entry 1 is block 16 of a 16-block pool.
+#[test]
+fn a_block_outside_the_pool_is_refused() {
+    let mut out = Vec::new();
+    assert_eq!(
+        block_table(&[11, 16], KvPoolConfig { num_blocks: 16 }, &mut out),
+        Err(PlanError::KvBlockOutsidePool {
+            entry: 1,
+            block: 16,
+            num_blocks: 16
         })
     );
 }
 
+/// A GDN slot outside the pool is refused: slot 4 of a 4-slot pool.
 #[test]
-fn the_block_table_is_the_schedulers_ids_as_u32() {
-    let mut out = vec![7];
-    block_table_u32(&[3, 1, 128], &mut out).unwrap();
-    assert_eq!(out, [3, 1, 128]);
-    let past = u32::MAX as usize + 1;
+fn a_gdn_slot_outside_the_pool_is_refused() {
     assert_eq!(
-        block_table_u32(&[1, past], &mut out),
-        Err(PlanError::Block {
-            entry: 1,
-            block: past
+        gdn_slot(4, GdnPoolConfig { num_slots: 4 }),
+        Err(PlanError::GdnSlotOutsidePool {
+            slot: 4,
+            num_slots: 4
         })
+    );
+    assert_eq!(
+        gdn_slot(3, GdnPoolConfig { num_slots: 4 }).map(|s| s.get()),
+        Ok(3)
     );
 }
 
@@ -376,12 +406,11 @@ fn plan_request(prompt: usize, decodes: usize) -> Vec<Planned> {
             let (_, bucket_m) = choose_bucket(&BUCKETS, n).unwrap();
             fill_inputs(
                 &vec![7; n],
-                start as u32,
+                Position::of(start as u32, n).unwrap(),
                 bucket_m,
                 &mut ids,
                 &mut positions,
-            )
-            .unwrap();
+            );
             assert_eq!(ids.len(), bucket_m as usize);
             assert_eq!(positions[0], start as u32);
             let (_, codes) = gdn.step([GdnRow::new(42, 0, start as u32)]).unwrap();

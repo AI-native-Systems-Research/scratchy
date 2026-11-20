@@ -17,13 +17,11 @@ mod worker;
 use std::ffi::CStr;
 use std::fmt;
 
+pub use crate::pool::{BlockId, GdnPoolConfig, KvPoolConfig, SlotId};
 pub use buffer::DeviceBuffer;
 pub use device::{CudaDevice, DeviceError};
 pub use loader::load_weights;
-pub use worker::{
-    CudaWorker, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf, KvPoolConfig, KvSequence,
-    WorkerError,
-};
+pub use worker::{CudaWorker, ForwardError, GdnSequence, Input, KvHalf, KvSequence, WorkerError};
 
 /// A failed CUDA runtime call: which one, its `cudaError_t`, and `cudaGetErrorString`'s text.
 #[derive(Clone, Debug, PartialEq, Eq)]
