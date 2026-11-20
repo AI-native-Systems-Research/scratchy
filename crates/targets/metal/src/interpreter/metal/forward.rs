@@ -471,10 +471,6 @@ pub fn build_mrope_cos_sin_override(
     let half = rot_dim / 2;
     // `[3, n]` (band-split) vs `[n]` (broadcast all bands to one position).
     let is_3d = positions.len() == 3 * n_tokens;
-    // inv_freq[i] = 1 / θ^(2i/rot_dim) — identical to the RotaryCache builder.
-    let inv_freqs: Vec<f64> = (0..half)
-        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f64 / rot_dim as f64))
-        .collect();
     let sec0 = mrope_section[0] as usize;
     let sec01 = (mrope_section[0] + mrope_section[1]) as usize;
     let elem_bytes: usize = match dtype {
@@ -485,39 +481,42 @@ pub fn build_mrope_cos_sin_override(
         ),
     };
     let mut out = vec![0u8; n_tokens * rot_dim * elem_bytes];
-    let write = |out: &mut [u8], idx: usize, v: f32| {
-        let bytes: [u8; 2] = match dtype {
+    let bits = |v: f32| -> [u8; 2] {
+        match dtype {
             MetalDtype::F16 => half::f16::from_f32(v).to_bits().to_ne_bytes(),
             MetalDtype::Bf16 => half::bf16::from_f32(v).to_bits().to_ne_bytes(),
             MetalDtype::Int4 => unreachable!(),
-        };
-        out[idx * 2..idx * 2 + 2].copy_from_slice(&bytes);
-    };
-    for t in 0..n_tokens {
-        let (pos_t, pos_h, pos_w) = if is_3d {
-            (
-                positions[t],
-                positions[n_tokens + t],
-                positions[2 * n_tokens + t],
-            )
-        } else {
-            let p = positions.get(t).copied().unwrap_or(0);
-            (p, p, p)
-        };
-        let row = t * rot_dim;
-        for (i, &inv_f) in inv_freqs.iter().enumerate() {
-            let pos = if i < sec0 {
-                pos_t
-            } else if i < sec01 {
-                pos_h
-            } else {
-                pos_w
-            };
-            let angle = pos as f64 * inv_f;
-            write(&mut out, row + i, angle.cos() as f32);
-            write(&mut out, row + half + i, angle.sin() as f32);
         }
-    }
+    };
+    // Pair `i` of token `t` rotates under its band's position: T if `i < T`, H if `i < T+H`,
+    // else W; a `[n]` position drives every band.
+    let pos = |t: usize, i: usize| -> u32 {
+        if !is_3d {
+            return positions.get(t).copied().unwrap_or(0);
+        }
+        let band = if i < sec0 {
+            0
+        } else if i < sec01 {
+            1
+        } else {
+            2
+        };
+        positions[band * n_tokens + t]
+    };
+    // The angles are the shared builder's (`inv_freq[i] = 1 / θ^(2i/rot_dim)`, identical to the
+    // RotaryCache builder); the layout and the element type are metal's.
+    scratchy_layers::rotary::rotary_table_rows(
+        n_tokens,
+        rot_dim,
+        rot_dim,
+        rope_theta,
+        pos,
+        |t, i, c, s| {
+            let row = t * rot_dim;
+            out[(row + i) * 2..(row + i) * 2 + 2].copy_from_slice(&bits(c));
+            out[(row + half + i) * 2..(row + half + i) * 2 + 2].copy_from_slice(&bits(s));
+        },
+    );
     out
 }
 
