@@ -20,6 +20,10 @@
 //     `taken`, by the index TK passes, so no lane reads another's.
 //   - Tie rule: equal probabilities rank by the HIGHER expert index (the round takes the max
 //     index), #841's rule and Metal's packed key. Indices up to 255 are exact in f32.
+//   - Precision (#1283), both programs: the router logits are bf16, as HF transformers' Gemma 4
+//     router; vLLM computes them in f32 and breaks exact ties on the lower expert index, so a
+//     near-tie at the k-th pick can route a token differently. Measured on Gemma 4: no effect on
+//     the output.
 //   - NaN: TK's `max` returns the non-NaN operand, so a NaN probability is keyed −inf, the lowest.
 //     With every logit NaN, every key is −inf and every round still picks the highest untaken
 //     index: `top_k` distinct indices in [0, 256), and NaN scores.
