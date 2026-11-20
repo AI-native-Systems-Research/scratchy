@@ -4189,11 +4189,17 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
     // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
     // chunk's rows are one sequence's (the bake's `rows_are_requests`).
+    // ⭐ THE SCALE IS THE EXECUTOR'S, AND THIS GATE'S EXECUTOR IS THE EMULATOR. The view's own
+    // stride is what the emulator executes (`entry at raw id × view stride`), so the ids it stages
+    // are RAW — scale 1, the realization of the same unit-major view whose CARD realization scales
+    // the id by stride/entry because dxp spaces gather entries by their own dims. One view law,
+    // two executors, each consuming it the way it executes.
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         rung.active_cap,
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
         rung.query_rows,
+        1,
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
