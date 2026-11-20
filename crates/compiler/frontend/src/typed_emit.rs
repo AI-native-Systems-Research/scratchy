@@ -388,10 +388,27 @@ fn weight_type(
 }
 
 /// A weight's field in `Weights`: its dotted path, `_`-joined, in snake case (a checkpoint's
-/// `attn.Wo` is `attn_wo`). [`emit`] refuses two weights that spell one field.
-fn field_name<S: AsRef<str>>(path: &[S]) -> String {
+/// `attn.Wo` is `attn_wo`). [`emit`] refuses two weights that spell one field. Every name the
+/// targets spell from a weight's path is this one, so the field and its readers agree.
+pub fn field_name<S: AsRef<str>>(path: &[S]) -> String {
     let parts: Vec<&str> = path.iter().map(AsRef::as_ref).collect();
     parts.join("_").to_ascii_lowercase()
+}
+
+/// The separator of a gate/up pair packed into one weight: [`fused_name`].
+pub const FUSED: &str = "_fused_";
+
+/// The field of a gate/up pair packed into one weight: `{gate}_fused_{up}`, its two weights'
+/// [`field_name`]s. A part that already holds the separator would make the name ambiguous, so it
+/// is refused.
+pub fn fused_name(gate: &str, up: &str) -> String {
+    for part in [gate, up] {
+        assert!(
+            !part.contains(FUSED),
+            "a packed gate/up part `{part}` holds the fused separator `{FUSED}`"
+        );
+    }
+    format!("{gate}{FUSED}{up}")
 }
 
 /// Whether `e` is a scalar operand (it has no shape).

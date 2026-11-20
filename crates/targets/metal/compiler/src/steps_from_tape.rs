@@ -696,7 +696,9 @@ impl Recording<'_> {
             SourceBinding::Weight { id, .. }
             | SourceBinding::WeightScale { id, .. }
             | SourceBinding::BundleTensor { id, .. } => {
-                Ok(self.facts.weight_paths[*id as usize].join("_"))
+                Ok(scratchy_forward_compiler_frontend::typed_emit::field_name(
+                    &self.facts.weight_paths[*id as usize],
+                ))
             }
             _ => Err(self.no(i, Refused::NotAWeight(e))),
         }
@@ -1888,7 +1890,10 @@ impl Recording<'_> {
                 };
                 // One packed site, read for both weights.
                 let (eg, eu) = (self.weight_of(gate)?, self.weight_of(up)?);
-                let base = format!("{}__fused__{}", self.base(gate, eg)?, self.base(up, eu)?);
+                let base = scratchy_forward_compiler_frontend::typed_emit::fused_name(
+                    &self.base(gate, eg)?,
+                    &self.base(up, eu)?,
+                );
                 self.read_through(gate, WeightKind::Linear, eg, &base)?;
                 self.read_through(up, WeightKind::Linear, eu, &base)?;
                 let site = vec![WeightSlot {

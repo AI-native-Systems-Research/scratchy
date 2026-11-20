@@ -69,7 +69,7 @@ mod typed_shapes;
 mod typed_shapes_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target: one body, since
 // the target is a compile-time singleton — there is no second target in the build to
-// compromise for. Packing gate/up into a single `__fused__`
+// compromise for. Packing gate/up into a single `_fused_`
 // buffer is a target's kernel ABI, so it arrives as a bool argument rather than a second walk.
 pub mod weight_bindings;
 pub mod weight_vocab;
