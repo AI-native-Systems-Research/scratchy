@@ -1057,9 +1057,13 @@ fn summary_map(
                 }
             }
         };
-        let r = tasks::times(a, t, true).ok_or(match row.measure {
-            Measure::Timing(_) => "no timing on one side",
-            Measure::JoulesPerRight => "no right answer on one side",
+        let r = tasks::times(a, t, true).ok_or_else(|| match row.measure {
+            // The side the timing is missing on, by name ([`no_ratio_why`]).
+            Measure::Timing(timing) => {
+                let sides = [("scratchy", *ours, a), (rival.label(), *theirs, t)];
+                no_ratio_why(sides, bs, timing, b)
+            }
+            Measure::JoulesPerRight => "no right answer on one side".to_string(),
         })?;
         let from = (theirs.borrowed_from.as_ref())
             .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
@@ -1174,6 +1178,32 @@ fn summary_map(
         .flat_map(|block| ratio_labels(block, BLOCK_LABELS))
         .collect();
     map.render(&format!("{id}-summary-scale"))
+}
+
+/// Why a summary square has no ratio, naming the side it is missing: the engine that sent no
+/// request this long, or one whose requests this long kept no `timing` (a one-token answer has no
+/// TPOT); no requests this long, where neither engine sent one.
+fn no_ratio_why(
+    sides: [(&str, &TaskCell, Option<f64>); 2],
+    bs: buckets::Buckets,
+    timing: RequestTiming,
+    b: usize,
+) -> String {
+    let sent = sides.map(|(_, c, _)| buckets::sent_in(c, bs, b));
+    if sent == [0, 0] {
+        return "no requests this long".to_string();
+    }
+    let missing: Vec<String> = (sides.iter().zip(sent))
+        .filter(|((_, _, v), _)| v.is_none())
+        .map(|((name, _, _), n)| {
+            let (t, s) = (timing.title(), if n == 1 { "" } else { "s" });
+            match n {
+                0 => format!("{name} sent no request this long"),
+                n => format!("{name} timed none of its {n} request{s} this long ({t})"),
+            }
+        })
+        .collect();
+    missing.join("; ")
 }
 
 /// One machine and model's cells of a dataset, scratchy's and its rival's, by users count.
