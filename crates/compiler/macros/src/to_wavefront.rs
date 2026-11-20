@@ -251,6 +251,11 @@ struct Builder<'a> {
     /// Modeled prefix length for the KV-cache `Source` rows (structural;
     /// the host eval / GPU player binds the real length at run time).
     prefix_len: u32,
+    /// The pool `Source`'s rows — the context plus any extra rows
+    /// ([`KvPool::rows`]); the prefix `Source` segments are pushed at this
+    /// size, so a pool larger than its context bakes `Source`s that span
+    /// it while `valid_len` stays the context.
+    pool_rows: u32,
     /// Parallel to `ops`: the construct each op was expanded from.
     op_expansion: Vec<Option<Expansion>>,
     /// The construct being expanded, while its ops are pushed.
@@ -489,8 +494,8 @@ impl<'a> Builder<'a> {
         if let Some(pp) = self.prefix.get(&(layer, kvdim)) {
             return *pp;
         }
-        let pk = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixK { layer });
-        let pv = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixV { layer });
+        let pk = self.push_source(self.pool_rows, kvdim, SourceBinding::PrefixK { layer });
+        let pv = self.push_source(self.pool_rows, kvdim, SourceBinding::PrefixV { layer });
         self.prefix.insert((layer, kvdim), (pk, pv));
         (pk, pv)
     }
@@ -546,35 +551,93 @@ fn moe_counts(tile: TileId, experts: u32, k: u32) -> Result<(NumExperts, TopK), 
     }
 }
 
-/// The resident prefix-KV cache capacity (prefix `Source` rows == length-mask
-/// columns) a decode/prefill bundle is baked against. A model's decode and
-/// prefill bundles model the SAME on-device cache, so a build threads ONE value
+/// The CONTEXT a decode/prefill bundle is baked against: the attention's
+/// `valid_len` and the length-mask columns. A model's decode and prefill
+/// bundles model the SAME on-device cache, so a build threads ONE value
 /// to every [`lower_decode_to_wavefront`] call.
 ///
-/// Encoded as a distinct `NonZeroU32` newtype so the capacity can never be a
-/// bare placeholder — two states that both produced silent runtime failures are
+/// Encoded as a distinct `NonZeroU32` newtype so the context can never be
+/// a bare placeholder — two states that both produced silent runtime failures are
 /// now UNCONSTRUCTIBLE:
 ///   - `prefix_len = 0` made the SubtileIR prefix `Source` invalid (`NonZeroU32`
 ///     rules it out at the type level);
 ///   - a small literal capacity for the PREFILL bundle (the old
 ///     `else { 1 }`) baked a `[1, 1]` KTIR length mask, so the worker rejected
 ///     any prompt longer than one token (`positions 0..N exceed bundle prefix
-///     capacity 1`). The capacity is no longer an arbitrary `u32` a caller can
+///     capacity 1`). The context is no longer an arbitrary `u32` a caller can
 ///     set to `1` (or to an `m`/row count) — it is a `PrefixCapacity`, and every
 ///     bundle of one model receives the same one.
+///
+/// It is NOT the pool `Source`'s rows: the pool holds the context plus any
+/// extra rows ([`KvPool`]), and only [`KvPool::rows`] states those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefixCapacity(std::num::NonZeroU32);
 
 impl PrefixCapacity {
-    /// Wrap a proven-nonzero capacity. The caller holds the `NonZeroU32`, so
+    /// Wrap a proven-nonzero context. The caller holds the `NonZeroU32`, so
     /// there is no fallible/`unwrap` boundary here (the zero case is excluded by
     /// the argument type, not by a runtime check).
-    pub fn new(rows: std::num::NonZeroU32) -> Self {
+    pub const fn new(rows: std::num::NonZeroU32) -> Self {
         Self(rows)
     }
-    /// The prefix `Source` row count == the length-mask column width.
-    pub fn get(self) -> u32 {
+    /// The context: `valid_len`, the length-mask column width.
+    pub const fn get(self) -> u32 {
         self.0.get()
+    }
+}
+
+/// Pool rows beyond the context — memory the resident KV pool holds that
+/// no baked context reaches. [`ExtraRows::NONE`] is today's every bake
+/// (the pool IS the context); a pool sized by the card's tensor memory
+/// states its extra rows here, never by inflating the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtraRows(u32);
+
+impl ExtraRows {
+    /// No extra rows: the pool is exactly the context.
+    pub const NONE: Self = Self(0);
+    /// State the pool's rows beyond the context.
+    pub const fn new(rows: u32) -> Self {
+        Self(rows)
+    }
+    /// The extra rows.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The resident KV pool: the context every bundle is baked against, plus
+/// the extra rows the pool holds beyond it. The pool holds the context by
+/// construction (`rows = context + extra`, never zero), so a `Source`
+/// sized by [`KvPool::rows`] always spans the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvPool {
+    context: PrefixCapacity,
+    extra: ExtraRows,
+}
+
+impl KvPool {
+    /// The pool whose rows are exactly the context — today's every bake.
+    pub const fn at_context(context: PrefixCapacity) -> Self {
+        Self {
+            context,
+            extra: ExtraRows::NONE,
+        }
+    }
+    /// State the pool directly: a context plus the rows beyond it.
+    pub const fn new(context: PrefixCapacity, extra: ExtraRows) -> Self {
+        Self { context, extra }
+    }
+    /// The context: `valid_len`, the length-mask columns.
+    pub const fn context(self) -> PrefixCapacity {
+        self.context
+    }
+    /// The pool `Source`'s rows — the context plus the extra rows, nonzero
+    /// by construction. THE ONE statement of the pool's rows: every
+    /// `Source` and every size that spends the pool reads it here, never a
+    /// second derivation.
+    pub const fn rows(self) -> std::num::NonZeroU32 {
+        self.context.0.saturating_add(self.extra.0)
     }
 }
 
@@ -588,23 +651,27 @@ pub struct BridgeModel<'a> {
 /// Translate a decode FUF into a wavefront `LoweringInput`.
 ///
 /// `bounds` is the per-model integer bounds (tp-sharded if tp>1).
-/// `prefix_len` ([`PrefixCapacity`]) models the KV-cache prefix rows for the
-/// attention `Source` segments (structural only — the real length binds at run
-/// time); the decode and prefill bundles of one model MUST share it.
+/// `pool` ([`KvPool`]) models the resident KV pool: its context is the
+/// attention `Source` segments' valid rows and the length-mask columns
+/// (structural only — the real length binds at run time); its rows are the
+/// `Source` segments' baked size. The decode and prefill bundles of one
+/// model MUST share one pool.
 pub fn lower_decode_to_wavefront(
     fuf: &Fuf,
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
     model: &BridgeModel<'_>,
-    prefix_len: PrefixCapacity,
+    pool: KvPool,
     num_tokens: u32,
 ) -> Result<LoweredDecode, BridgeError> {
     // The config params and the typed facts are ONE model — the bake holds them
     // together, so the bridge takes them together.
     let (model, facts) = (model.params, model.facts);
-    // Unwrap the typed capacity to the raw row count once, at the boundary; the
-    // rest of the bridge keeps using a plain `u32`.
-    let prefix_len = prefix_len.get();
+    // Unwrap the typed pool to the plain counts once, at the boundary: the
+    // context is `valid_len` and the length-mask columns, the rows are the
+    // prefix `Source` size. The rest of the bridge keeps using plain `u32`s.
+    let prefix_len = pool.context().get();
+    let pool_rows = pool.rows().get();
     // The SAME eps resolver codegen uses (rms_norm_eps →
     // layer_norm_eps → vision_norm_eps → the 1e-5 default) — one
     // source of truth, always resolvable.
@@ -665,6 +732,7 @@ pub fn lower_decode_to_wavefront(
         eps,
         m,
         prefix_len,
+        pool_rows,
         op_expansion: Vec::new(),
         expanding: None,
         expansions: 0,

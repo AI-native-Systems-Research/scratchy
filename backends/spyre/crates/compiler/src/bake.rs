@@ -2586,7 +2586,9 @@ pub(crate) fn dump_wavefront_mega(
             inferred,
             decode_bounds,
             &bridge,
-            scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
+            scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
+            ),
             SOLO_DECODE_ROWS,
         )
     };
@@ -4618,7 +4620,11 @@ pub(crate) fn dump_wavefront_mega(
                     inferred,
                     decode_bounds,
                     &bridge,
-                    scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
+                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                            prefix_len,
+                        ),
+                    ),
                     seqs,
                 ) {
                     Ok(lwd_b) => {
@@ -4797,7 +4803,9 @@ pub(crate) fn dump_wavefront_mega(
                 // default), matching the decode bundle: at start=0 the runtime mask
                 // keeps 0 prefix rows so the prompt still attends only itself
                 // causally, and chunk k attends the k*mq rows written so far.
-                scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
+                scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                    scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
+                ),
                 pl,
             );
             match lowered {
@@ -4937,7 +4945,11 @@ pub(crate) fn dump_wavefront_mega(
                     inferred,
                     decode_bounds,
                     &bridge,
-                    scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
+                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                            prefix_len,
+                        ),
+                    ),
                     m,
                 ) {
                     Ok(lwd_p) => {
@@ -5008,7 +5020,11 @@ pub(crate) fn dump_wavefront_mega(
                     inferred,
                     decode_bounds,
                     &bridge,
-                    scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
+                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                            prefix_len,
+                        ),
+                    ),
                     w * s,
                 ) {
                     Ok(lwd_p) => {

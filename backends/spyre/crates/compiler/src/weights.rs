@@ -7,7 +7,7 @@ use quote::quote;
 use scratchy_forward_compiler_frontend::classified::{OpKind, Program, WeightId};
 use scratchy_forward_compiler_macro::target::{StructCx, WeightsStruct};
 use scratchy_forward_compiler_macro::to_wavefront::{
-    self, BridgeModel, LoweredDecode, PrefixCapacity, SourceBinding,
+    self, BridgeModel, KvPool, LoweredDecode, PrefixCapacity, SourceBinding,
 };
 use scratchy_forward_compiler_macro::weight_bindings::{
     self, EmbedStorage, MlpPacking, TapeWeights, WeightAbi,
@@ -41,7 +41,9 @@ pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
             inferred,
             bounds,
             &bridge_model,
-            PrefixCapacity::new(std::num::NonZeroU32::new(8192).expect("8192 != 0")),
+            KvPool::at_context(PrefixCapacity::new(
+                std::num::NonZeroU32::new(8192).expect("8192 != 0"),
+            )),
             num_tokens,
         )
         .ok()

@@ -447,8 +447,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 inferred,
                 &bounds,
                 &bridge_model,
-                scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
-                    std::num::NonZeroU32::new(8192).unwrap(),
+                scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                    scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                        std::num::NonZeroU32::new(8192).unwrap(),
+                    ),
                 ),
                 wp.num_tokens as u32,
             ) {
@@ -719,8 +721,10 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         use scratchy_target_metal::tape::step as st;
         let (m, stem) = (canonical.num_tokens, &model.source_stem);
         let bounds = bounds_for_wp(model, *canonical, tp_world_size);
-        let prefix = scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
-            std::num::NonZeroU32::new(8192).unwrap(),
+        let prefix = scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+            scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                std::num::NonZeroU32::new(8192).unwrap(),
+            ),
         );
         let l = match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
             fuf,

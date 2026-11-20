@@ -19,7 +19,7 @@ pub mod spans;
 pub use cache::{
     CacheConfig, CacheDType, HybridKvLayout, KVCacheConfig, KVCacheGroupSpec, KVCacheSpec,
     KVCacheSpecType, KVCacheTensor, LayerKvGeometry, MambaCacheMode, PrefixCachingHashAlgo,
-    compact_kv_layer_to_tensor, compute_hybrid_kv_layout,
+    blocks_within, compact_kv_layer_to_tensor, compute_hybrid_kv_layout,
 };
 pub use scheduler::{RunnerType, SchedulerConfig, SchedulerPolicy};
 pub use spans::SpansConfig;
