@@ -19,10 +19,13 @@ use crate::step::{
     ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, FreqDim,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
     GatedDeltaNetBf16, GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GdnScratch,
-    HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, MoeWeight,
-    NumExperts, NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16,
-    RopeBf16, RopeTheta, RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows, TopK, VocabSize,
-    gdn_conv_dim, quant_chain, sort_index_regions,
+    HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, NumExperts,
+    NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16, RopeBf16, RopeTheta,
+    RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows, TopK, VocabSize, gdn_conv_dim,
+    quant_chain, sort_index_regions,
+};
+use crate::step::{
+    ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8, ExpertGemvTcFp8, ExpertSortFp8,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -1806,7 +1809,9 @@ impl CudaTape {
             | CudaStep::ExpertSortFp8(_)
             | CudaStep::ExpertActQuant(_)
             | CudaStep::ExpertGemm(_)
+            | CudaStep::ExpertGemmFp8(_)
             | CudaStep::ExpertGemv(_)
+            | CudaStep::ExpertGemvFp8(_)
             | CudaStep::ExpertGemvTcFp8(_)
             | CudaStep::ExpertGateUpTcFp8(_)
             | CudaStep::ExpertCombine(_) => self.check_moe_step(step, s),
@@ -1828,6 +1833,7 @@ impl CudaTape {
             // Checked through their parts ([`CudaStep::parts`]).
             | CudaStep::GateUpAct(_)
             | CudaStep::ExpertGateUpAct(_)
+            | CudaStep::ExpertGateUpActFp8(_)
             | CudaStep::ExpertGateUpGemmFp8(_)
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
@@ -1887,10 +1893,13 @@ impl CudaTape {
         );
         // The tile rows are the bank's (FP8 S8 P3(a)): an fp8 bank's 64 when a step is one of its
         // expert steps, else 128.
-        let fp8 = self.steps.iter().any(|s| match s {
-            CudaStep::ExpertSortFp8(_) | CudaStep::ExpertActQuant(_) => true,
-            CudaStep::ExpertGemm(g) => matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own),
-            _ => false,
+        let fp8 = self.steps.iter().any(|s| {
+            matches!(
+                s,
+                CudaStep::ExpertSortFp8(_)
+                    | CudaStep::ExpertActQuant(_)
+                    | CudaStep::ExpertGemmFp8(_)
+            )
         });
         if moe.experts == NumExperts(0)
             || moe.top_k == TopK(0)
@@ -2109,7 +2118,9 @@ impl CudaTape {
                 | CudaStep::ExpertSortFp8(_)
                 | CudaStep::ExpertActQuant(_)
                 | CudaStep::ExpertGemm(_)
+                | CudaStep::ExpertGemmFp8(_)
                 | CudaStep::ExpertGemv(_)
+                | CudaStep::ExpertGemvFp8(_)
                 | CudaStep::ExpertGemvTcFp8(_)
                 | CudaStep::ExpertGateUpTcFp8(_)
                 | CudaStep::ExpertCombine(_)
@@ -2230,7 +2241,7 @@ impl CudaTape {
                 max_tiles,
                 ..
             })
-            | CudaStep::ExpertSortFp8(ExpertSortBf16 {
+            | CudaStep::ExpertSortFp8(ExpertSortFp8 {
                 topk_idx,
                 chunk_hist,
                 counts,
@@ -2265,26 +2276,37 @@ impl CudaTape {
                 want(Region::MoePos, pos, sort.pos)?;
                 want(Region::MoeRows, sorted_rows, sort.rows)
             }
-            CudaStep::ExpertGemm(
-                g @ ExpertGemmBf16 {
-                    a,
-                    offsets,
-                    tile_expert,
-                    c,
-                    max_tiles,
-                    experts,
-                    hidden,
-                    inter,
-                    ..
-                },
-            ) => {
+            CudaStep::ExpertGemm(ExpertGemmBf16 {
+                a,
+                offsets,
+                tile_expert,
+                c,
+                max_tiles,
+                experts,
+                hidden,
+                inter,
+                proj,
+                ..
+            })
+            | CudaStep::ExpertGemmFp8(ExpertGemmFp8 {
+                a,
+                offsets,
+                tile_expert,
+                c,
+                max_tiles,
+                experts,
+                hidden,
+                inter,
+                proj,
+                ..
+            }) => {
                 let sort = moe.sort.ok_or(geometry)?;
                 if max_tiles != moe.max_tiles || !same(experts.get(), hidden.get(), inter.get()) {
                     return Err(geometry);
                 }
                 want(Region::MoeOffsets, offsets, sort.offsets)?;
                 want(Region::MoeTileExpert, tile_expert, sort.tile_expert)?;
-                let (input, output) = moe.projection_regions(g.proj, Some(sort.rows));
+                let (input, output) = moe.projection_regions(proj, Some(sort.rows));
                 // An fp8 bank's GEMM reads the quant scratch (`quant_region`), which the last
                 // quant write before it filled from the projection's input rows.
                 let last = (self.steps[..step].iter().rev()).find_map(CudaStep::quant_write);
@@ -2295,9 +2317,9 @@ impl CudaTape {
                     CudaStep::ExpertSortFp8(_) => Some(true),
                     _ => None,
                 });
-                let fp8 = matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
+                let fp8 = matches!(s, CudaStep::ExpertGemmFp8(_));
                 // P3(a): an fp8 bank's rows are 64-row tiles, a bf16 bank's 128-row ones.
-                if (g.proj != ExpertProjection::Down && sort_fp8 != Some(fp8))
+                if (proj != ExpertProjection::Down && sort_fp8 != Some(fp8))
                     || moe.tile_rows != TileRows(crate::op_abi::expert_tile_rows(fp8))
                 {
                     return Err(geometry);
@@ -2316,7 +2338,7 @@ impl CudaTape {
             }
             CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
                 gemv:
-                    g @ ExpertGemvBf16 {
+                    ExpertGemvBf16 {
                         a,
                         topk_idx,
                         c,
@@ -2325,6 +2347,23 @@ impl CudaTape {
                         experts,
                         hidden,
                         inter,
+                        proj,
+                        ..
+                    },
+                ..
+            })
+            | CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 {
+                gemv:
+                    ExpertGemvFp8 {
+                        a,
+                        topk_idx,
+                        c,
+                        m,
+                        top_k,
+                        experts,
+                        hidden,
+                        inter,
+                        proj,
                         ..
                     },
                 ..
@@ -2336,9 +2375,9 @@ impl CudaTape {
                     return Err(geometry);
                 }
                 want(Region::MoeTopKIdx, topk_idx, moe.topk_idx)?;
-                let (input, output) = moe.projection_regions(g.proj, None);
+                let (input, output) = moe.projection_regions(proj, None);
                 // The gate and up read the token rows, an arena colour the step's extents check.
-                if g.proj.reads_pairs() {
+                if proj.reads_pairs() {
                     want(input.0, a, input.1)?;
                 }
                 want(output.0, c, output.1)
@@ -2346,7 +2385,7 @@ impl CudaTape {
             // The tensor-core expert GEMV (FP8 S8 T2): the GEMV's geometry and picks; its input is the
             // quant scratch (`quant_chain` checks it), and its output the projection's region.
             CudaStep::ExpertGemvTcFp8(
-                g @ ExpertGemvBf16 {
+                g @ ExpertGemvTcFp8 {
                     topk_idx,
                     c,
                     m,
@@ -2370,7 +2409,7 @@ impl CudaTape {
             // The tensor-core expert gate/up: its gate's geometry and picks, and its activation the
             // down's input rows (the act + quantize writes them and their quantization).
             CudaStep::ExpertGateUpTcFp8(t) => {
-                let g = t.fold.gate;
+                let g = t.gate;
                 if moe.sort.is_some()
                     || (g.m, g.top_k) != (Rows(self.bucket_m.get()), moe.top_k)
                     || !same(g.experts.get(), g.hidden.get(), g.inter.get())
@@ -2380,7 +2419,7 @@ impl CudaTape {
                 want(Region::MoeTopKIdx, g.topk_idx, moe.topk_idx)?;
                 let (down_input, _) =
                     moe.projection_regions(crate::step::ExpertProjection::Down, None);
-                want(down_input.0, t.fold.out, down_input.1)
+                want(down_input.0, t.out, down_input.1)
             }
             // The act + quantize (FP8 S8 P1) reads the tape's gate and up rows and the sort's
             // offsets, over the capacity rows at the bank's intermediate width.

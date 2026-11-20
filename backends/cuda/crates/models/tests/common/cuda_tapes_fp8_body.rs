@@ -18,8 +18,7 @@ use std::path::{Path, PathBuf};
 
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
-    CudaStep, ExpertGateUpActBf16, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertGemvSplitBf16, GateUpActBf16, GateUpProj,
+    CudaStep, GateUpActBf16, GateUpProj,
     MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
@@ -96,8 +95,9 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::ExpertSortFp8(_) => "ExpertSortFp8",
             CudaStep::ExpertActQuant(_) => "ExpertActQuant",
             CudaStep::ExpertGateUpGemmFp8(_) => "ExpertGateUpGemmFp8",
-            CudaStep::ExpertGemm(_) => "ExpertGemm",
-            CudaStep::ExpertGemv(_) => "ExpertGemv",
+            // A family's fp8 kernel counts under the family's name.
+            CudaStep::ExpertGemm(_) | CudaStep::ExpertGemmFp8(_) => "ExpertGemm",
+            CudaStep::ExpertGemv(_) | CudaStep::ExpertGemvFp8(_) => "ExpertGemv",
             CudaStep::ExpertCombine(_) => "ExpertCombine",
             CudaStep::GateScale(_) => "GateScale",
             CudaStep::Scale(_) => "Scale",
@@ -114,7 +114,7 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::AddRmsNorm(_) => "AddRmsNorm",
             CudaStep::NormAdd(_) => "NormAdd",
             CudaStep::GateUpAct(_) => "GateUpAct",
-            CudaStep::ExpertGateUpAct(_) => "ExpertGateUpAct",
+            CudaStep::ExpertGateUpAct(_) | CudaStep::ExpertGateUpActFp8(_) => "ExpertGateUpAct",
             CudaStep::GdnDecode(_) => "GdnDecode",
             CudaStep::QuantRowsFp8(_) => "QuantRowsFp8",
             CudaStep::GemmFp8(_) => "GemmFp8",
@@ -206,28 +206,14 @@ fn every_tape_has_the_fp8_steps() {
                 assert!(want, "m={m} step {i}: {s:?}");
             }
             let expert = match *s {
-                CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
-                | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
-                    gemv: ExpertGemvBf16 { weight, .. },
-                    ..
-                })
-                | CudaStep::ExpertGemvTcFp8(ExpertGemvBf16 { weight, .. })
-                | CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 {
-                    fold:
-                        ExpertGateUpActBf16 {
-                            gate: ExpertGemvBf16 { weight, .. },
-                            ..
-                        },
-                    ..
-                })
-                | CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
-                    fold:
-                        ExpertGateUpActBf16 {
-                            gate: ExpertGemvBf16 { weight, .. },
-                            ..
-                        },
-                    ..
-                }) => Some(weight),
+                CudaStep::ExpertGemm(g) => Some(g.moe_weight()),
+                CudaStep::ExpertGemmFp8(g) => Some(g.moe_weight()),
+                CudaStep::ExpertGemv(g) => Some(g.gemv.moe_weight()),
+                CudaStep::ExpertGemvFp8(g) => Some(g.gemv.moe_weight()),
+                CudaStep::ExpertGemvTcFp8(g) => Some(g.moe_weight()),
+                CudaStep::ExpertGateUpAct(g) => Some(g.fold.gate.moe_weight()),
+                CudaStep::ExpertGateUpActFp8(g) => Some(g.fold.gate.moe_weight()),
+                CudaStep::ExpertGateUpTcFp8(t) => Some(t.gate.moe_weight()),
                 _ => None,
             };
             if let Some(weight) = expert {
@@ -261,7 +247,7 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
                 "m={m} step {i}: the next step reads what it wrote"
             );
             let rows = match tape.steps.get(i + 1) {
-                Some(CudaStep::ExpertGemm(g)) => g.max_tiles.get() * 64,
+                Some(CudaStep::ExpertGemmFp8(g)) => g.max_tiles.get() * 64,
                 _ => m,
             };
             assert_eq!((q.q.0, q.rows), (at, Rows(rows)), "m={m} step {i}: its region, rows");
@@ -373,7 +359,10 @@ fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
                 assert!(!gemv_tc_takes(ns, g.k.get(), 1), "m=1 step {i}: {ns:?}");
             }
             CudaStep::GateUpAct(g) => panic!("m=1 step {i}: a CUDA-core gate/up {:?}", g.proj),
-            CudaStep::ExpertGateUpAct(_) | CudaStep::ExpertGemv(_) => {
+            CudaStep::ExpertGateUpAct(_)
+            | CudaStep::ExpertGateUpActFp8(_)
+            | CudaStep::ExpertGemv(_)
+            | CudaStep::ExpertGemvFp8(_) => {
                 panic!("m=1 step {i}: a CUDA-core expert GEMV")
             }
             _ => {}

@@ -44,11 +44,10 @@ use std::path::PathBuf;
 
 use scratchy_target_cuda::registry::{self, CudaModelEntry};
 use scratchy_target_cuda::step::{
-    AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
-    GainConvention, GateUpProj, GatedDeltaNetBf16, GatedOp, GdnScan, GemvSplit, Matmul,
-    MatmulGroup, MatmulKernel, MoeWeight, NormKernel, PairRows, RmsNormBf16, RopePairing,
-    RouteProgram, SiluMulBf16, attn_decode_split_scratch_bytes, gdn_bundle, gdn_conv_dim,
-    gdn_scratch,
+    AddRmsNormBf16, AttnPrefillBf16, CudaStep, ExpertProjection, GainConvention, GateUpProj,
+    GatedDeltaNetBf16, GatedOp, GdnScan, GemvSplit, Matmul, MatmulGroup, MatmulKernel, MoeWeight,
+    NormKernel, PairRows, RmsNormBf16, RopePairing, RouteProgram, SiluMulBf16,
+    attn_decode_split_scratch_bytes, gdn_bundle, gdn_conv_dim, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, CudaTape, RotaryTable, WeightIx};
 use serde_json::{Map, Value, json};
@@ -264,18 +263,42 @@ fn gate_up((gate, up): (Matmul, Matmul), out: ArenaOffset, kernel: Value, op: Ga
            "kernel": kernel, "act": act(op)})
 }
 
-fn expert_gemv(g: &ExpertGemvBf16) -> Value {
-    json!({"a": off(g.a), "rows": pair_rows(g.rows), "bundle": wix(g.bundle),
-           "weight": moe_weight(g.weight), "proj": projection(g.proj), "topk_idx": off(g.topk_idx),
-           "c": off(g.c), "m": g.m, "top_k": g.top_k, "experts": g.experts, "hidden": g.hidden,
-           "inter": g.inter})
+/// An expert GEMV of either bank precision (its `weight` the bank at its precision).
+macro_rules! expert_gemv {
+    ($g:expr) => {{
+        let g = $g;
+        json!({"a": off(g.a), "rows": pair_rows(g.rows), "bundle": wix(g.bundle),
+               "weight": moe_weight(g.moe_weight()), "proj": projection(g.proj),
+               "topk_idx": off(g.topk_idx), "c": off(g.c), "m": g.m, "top_k": g.top_k,
+               "experts": g.experts, "hidden": g.hidden, "inter": g.inter})
+    }};
 }
 
-fn expert_gemm(g: &ExpertGemmBf16) -> Value {
-    json!({"a": off(g.a), "bundle": wix(g.bundle), "weight": moe_weight(g.weight),
-           "proj": projection(g.proj), "offsets": off(g.offsets),
-           "tile_expert": off(g.tile_expert), "c": off(g.c), "max_tiles": g.max_tiles,
-           "experts": g.experts, "hidden": g.hidden, "inter": g.inter, "n_tile": g.n_tile})
+/// An expert GEMM of either bank precision.
+macro_rules! expert_gemm {
+    ($g:expr) => {{
+        let g = $g;
+        json!({"a": off(g.a), "bundle": wix(g.bundle), "weight": moe_weight(g.moe_weight()),
+               "proj": projection(g.proj), "offsets": off(g.offsets),
+               "tile_expert": off(g.tile_expert), "c": off(g.c), "max_tiles": g.max_tiles,
+               "experts": g.experts, "hidden": g.hidden, "inter": g.inter, "n_tile": g.n_tile})
+    }};
+}
+
+/// A sort of either form, under `kernel`.
+macro_rules! expert_sort {
+    ($kernel:expr, $e:expr) => {{
+        let e = $e;
+        (
+            $kernel,
+            json!({"x": off(e.x), "topk_idx": off(e.topk_idx),
+                   "chunk_hist": off(e.chunk_hist), "counts": off(e.counts),
+                   "offsets": off(e.offsets), "tile_expert": off(e.tile_expert),
+                   "pos": off(e.pos), "rows": off(e.rows), "m": e.m, "experts": e.experts,
+                   "top_k": e.top_k, "hidden": e.hidden, "max_tiles": e.max_tiles}),
+            Value::Null,
+        )
+    }};
 }
 
 fn attn(a: &AttnPrefillBf16) -> Value {
@@ -500,21 +523,8 @@ fn step_record(s: &CudaStep) -> Value {
             }}),
             Value::Null,
         ),
-        CudaStep::ExpertSort(e) | CudaStep::ExpertSortFp8(e) => {
-            let kernel = match s {
-                CudaStep::ExpertSort(_) => "moe_sort",
-                _ => "moe_sort_fp8_m64",
-            };
-            (
-                kernel,
-                json!({"x": off(e.x), "topk_idx": off(e.topk_idx),
-                       "chunk_hist": off(e.chunk_hist), "counts": off(e.counts),
-                       "offsets": off(e.offsets), "tile_expert": off(e.tile_expert),
-                       "pos": off(e.pos), "rows": off(e.rows), "m": e.m, "experts": e.experts,
-                       "top_k": e.top_k, "hidden": e.hidden, "max_tiles": e.max_tiles}),
-                Value::Null,
-            )
-        }
+        CudaStep::ExpertSort(e) => expert_sort!("moe_sort", e),
+        CudaStep::ExpertSortFp8(e) => expert_sort!("moe_sort_fp8_m64", e),
         CudaStep::ExpertActQuant(t) => (
             "expert_act_quant_fp8",
             json!({"act": silu_mul(&t.act), "op": act(t.op), "offsets": off(t.offsets),
@@ -523,7 +533,7 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::ExpertGateUpGemmFp8(t) => (
             "expert_gate_up_gemm_fp8 + expert_quant_fp8",
-            json!({"gate": expert_gemm(&t.gate), "up": expert_gemm(&t.up),
+            json!({"gate": expert_gemm!(&t.gate), "up": expert_gemm!(&t.up),
                    "act": json!({"act": silu_mul(&t.act.act), "op": act(t.act.op),
                                  "offsets": off(t.act.offsets), "experts": t.act.experts,
                                  "q_act": off(t.act.q_act)})}),
@@ -531,26 +541,42 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::ExpertGemm(g) => (
             "expert_gemm (tiled bf16 or fp8 m64, by its weight)",
-            expert_gemm(g),
+            expert_gemm!(g),
+            Value::Null,
+        ),
+        CudaStep::ExpertGemmFp8(g) => (
+            "expert_gemm (tiled bf16 or fp8 m64, by its weight)",
+            expert_gemm!(g),
             Value::Null,
         ),
         CudaStep::ExpertGemv(g) => (
             "expert_gemv (split bf16 or fp8, by its weight)",
-            expert_gemv(&g.gemv),
+            expert_gemv!(&g.gemv),
             splits(g.split),
         ),
-        CudaStep::ExpertGemvTcFp8(g) => ("gemv_fp8_b8 (per pair)", expert_gemv(g), Value::Null),
+        CudaStep::ExpertGemvFp8(g) => (
+            "expert_gemv (split bf16 or fp8, by its weight)",
+            expert_gemv!(&g.gemv),
+            splits(g.split),
+        ),
+        CudaStep::ExpertGemvTcFp8(g) => ("gemv_fp8_b8 (per pair)", expert_gemv!(g), Value::Null),
         CudaStep::ExpertGateUpAct(g) => (
             "expert_gate_up_gemv (bf16 or fp8, by its weight)",
-            json!({"gate": expert_gemv(&g.fold.gate), "up": expert_gemv(&g.fold.up),
+            json!({"gate": expert_gemv!(&g.fold.gate), "up": expert_gemv!(&g.fold.up),
+                   "out": off(g.fold.out), "act": act(g.fold.act)}),
+            splits(g.split),
+        ),
+        CudaStep::ExpertGateUpActFp8(g) => (
+            "expert_gate_up_gemv (bf16 or fp8, by its weight)",
+            json!({"gate": expert_gemv!(&g.fold.gate), "up": expert_gemv!(&g.fold.up),
                    "out": off(g.fold.out), "act": act(g.fold.act)}),
             splits(g.split),
         ),
         CudaStep::ExpertGateUpTcFp8(t) => (
             "act_quant_fp8 + gemv_fp8_b8 (per pair)",
-            json!({"fold": json!({"gate": expert_gemv(&t.fold.gate),
-                                  "up": expert_gemv(&t.fold.up), "out": off(t.fold.out),
-                                  "act": act(t.fold.act)}),
+            json!({"fold": json!({"gate": expert_gemv!(&t.gate),
+                                  "up": expert_gemv!(&t.up), "out": off(t.out),
+                                  "act": act(t.act)}),
                    "q_act": off(t.q_act)}),
             Value::Null,
         ),

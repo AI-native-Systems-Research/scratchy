@@ -14,6 +14,9 @@ use scratchy_target_cuda::step::{
     KDim, LayerId, NDim, NTile, NumExperts, NumKvHeads, NumQHeads, RotDim, Rows, TopK, VocabSize,
     gdn_bundle,
 };
+use scratchy_target_cuda::step::{
+    ExpertGateUpActFp8, ExpertGateUpGemvFp8, ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8,
+};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::{AttnClass, HeadGeometry};
@@ -41,7 +44,7 @@ use scratchy_target_cuda::step::{
     GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpProj, GatedDeltaNetBf16,
     GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmCol64Bf16, GemmCol64Fp8, GemmFp8,
     GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvSplit, GroupKind, GroupMember, HeadNorms,
-    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulGroup, MatmulKernel, MoeRouteBf16,
+    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulGroup, MatmulKernel, MoeBank, MoeRouteBf16,
     MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
     ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ,
     RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS,
@@ -575,48 +578,56 @@ fn expert_gate_up_act(
         Some(CudaStep::GeluMul(m)) => (GatedOp::Gelu, m),
         Some(_) | None => return Err(refused()),
     };
-    let gemv = |g: &TapeStep<'_>| match lower_step(cx, g, computes)? {
-        Some(CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. })) => Ok(g),
-        Some(_) | None => Err(refused()),
-    };
-    let gate = gemv(absorbed_step(s, gate, computes)?)?;
-    let up = gemv(absorbed_step(s, up, computes)?)?;
+    let lowered = |g: &TapeStep<'_>| lower_step(cx, g, computes)?.ok_or_else(refused);
+    let gate = lowered(absorbed_step(s, gate, computes)?)?;
+    let up = lowered(absorbed_step(s, up, computes)?)?;
     // Each may read its own weight (a fixture's gate and up are two sources until the weight
     // table merges a model's into one bank): the worker reads each slab from its own, so only
-    // the layout, the rows and the geometry must agree.
-    let pair = |g: &ExpertGemvBf16| {
-        let ExpertGemvBf16 {
-            a,
-            rows,
-            weight,
-            topk_idx,
-            m,
-            top_k,
-            experts,
-            hidden,
-            inter,
-            ..
-        } = *g;
-        (
-            a,
-            rows,
-            weight,
-            topk_idx,
-            (m, top_k, experts, hidden, inter),
-        )
-    };
-    let projections = (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up);
-    if !projections || pair(&gate) != pair(&up) || (mul.gate, mul.up) != (gate.c, up.c) {
-        return Err(refused());
+    // the bank, the rows and the geometry must agree. The pair is the bf16 or the fp8 bank's.
+    macro_rules! pair {
+        ($g:expr) => {
+            (
+                $g.a,
+                $g.rows,
+                $g.weight,
+                $g.topk_idx,
+                ($g.m, $g.top_k, $g.experts, $g.hidden, $g.inter),
+            )
+        };
     }
-    Ok(CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16::of(
-        ExpertGateUpActBf16 {
+    macro_rules! fold {
+        ($gate:expr, $up:expr, $fold:ident) => {{
+            let (gate, up) = ($gate, $up);
+            let projections =
+                (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up);
+            if !projections || pair!(gate) != pair!(up) || (mul.gate, mul.up) != (gate.c, up.c) {
+                return Err(refused());
+            }
+            $fold {
+                gate,
+                up,
+                out: mul.out,
+                act,
+            }
+        }};
+    }
+    match (gate, up) {
+        (
+            CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: gate, .. }),
+            CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: up, .. }),
+        ) => Ok(CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16::of(fold!(
             gate,
             up,
-            out: mul.out,
-            act,
-        },
-    )))
+            ExpertGateUpActBf16
+        )))),
+        (
+            CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 { gemv: gate, .. }),
+            CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 { gemv: up, .. }),
+        ) => Ok(CudaStep::ExpertGateUpActFp8(ExpertGateUpGemvFp8::of(
+            fold!(gate, up, ExpertGateUpActFp8),
+        ))),
+        _ => Err(refused()),
+    }
 }
 
 /// The `AddRmsNorm` fold (#1049): the driving `RmsNorm` and the `Add` its shape names, each
@@ -2290,11 +2301,10 @@ fn expert_matmul(
     let moe = expert_bundle(cx, s, bundle, (experts.get(), top_k))?;
     // Gemma's SwitchGLU bank is its own expert bank, with no router in it.
     let layout = match bundle {
-        ExpertBundle::SwitchGlu => MoeWeight::Own,
-        _ => MoeWeight::Bundle,
+        ExpertBundle::SwitchGlu => MoeBank::Own,
+        _ => MoeBank::Bundle,
     };
     let fp8 = matches!(weight, ExpertWeight::Fp8Dynamic);
-    let layout = fp8_layout(layout, fp8);
     let (projection, reads) = match proj {
         ExpertProj::Gate => (ExpertProjection::Gate, PairRows::Token),
         ExpertProj::Up => (ExpertProjection::Up, PairRows::Token),
@@ -2336,22 +2346,29 @@ fn expert_matmul(
             }
             PairRows::Pair => moe.act.offset,
         };
-        return Ok(CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(
-            ExpertGemvBf16 {
-                a,
-                rows: reads,
-                bundle,
-                weight: layout,
-                proj: projection,
-                topk_idx: moe.topk_idx.offset,
-                c: out.1.offset,
-                m: Rows(cx.tokens.unwrap_or(0)),
-                top_k: TopK(top_k),
-                experts: moe.experts,
-                hidden: moe.hidden,
-                inter: moe.inter,
-            },
-        )));
+        // The bf16 or the fp8 bank's GEMV, one field list.
+        macro_rules! gemv {
+            ($gemv:ident) => {
+                $gemv {
+                    a,
+                    rows: reads,
+                    bundle,
+                    weight: layout,
+                    proj: projection,
+                    topk_idx: moe.topk_idx.offset,
+                    c: out.1.offset,
+                    m: Rows(cx.tokens.unwrap_or(0)),
+                    top_k: TopK(top_k),
+                    experts: moe.experts,
+                    hidden: moe.hidden,
+                    inter: moe.inter,
+                }
+            };
+        }
+        return Ok(match fp8 {
+            true => CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8::of(gemv!(ExpertGemvFp8))),
+            false => CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(gemv!(ExpertGemvBf16))),
+        });
     };
     let (_, tn, tk) = GEMM_BF16_TILE;
     // The expert GEMM takes 64-column tiles when `n` is off the 256 one.
@@ -2368,20 +2385,29 @@ fn expert_matmul(
         PairRows::Token => sorted.rows.offset,
         PairRows::Pair => moe.act.offset,
     };
-    Ok(CudaStep::ExpertGemm(ExpertGemmBf16 {
-        a,
-        bundle,
-        weight: layout,
-        proj: projection,
-        offsets: sorted.offsets.offset,
-        tile_expert: sorted.tile_expert.offset,
-        c: out.1.offset,
-        max_tiles: moe.max_tiles,
-        experts: moe.experts,
-        hidden: moe.hidden,
-        inter: moe.inter,
-        n_tile: NTile(tn),
-    }))
+    // The bf16 or the fp8 bank's GEMM, one field list.
+    macro_rules! gemm {
+        ($gemm:ident) => {
+            $gemm {
+                a,
+                bundle,
+                weight: layout,
+                proj: projection,
+                offsets: sorted.offsets.offset,
+                tile_expert: sorted.tile_expert.offset,
+                c: out.1.offset,
+                max_tiles: moe.max_tiles,
+                experts: moe.experts,
+                hidden: moe.hidden,
+                inter: moe.inter,
+                n_tile: NTile(tn),
+            }
+        };
+    }
+    Ok(match fp8 {
+        true => CudaStep::ExpertGemmFp8(gemm!(ExpertGemmFp8)),
+        false => CudaStep::ExpertGemm(gemm!(ExpertGemmBf16)),
+    })
 }
 
 /// `ExpertGatedAct { act }` as the bf16 `SiluMul` (Qwen's SiLU) or `GeluMul` (Gemma's GELU) over

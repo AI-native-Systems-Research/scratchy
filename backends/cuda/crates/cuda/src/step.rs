@@ -241,7 +241,7 @@ pub enum CudaStep {
     /// row and scale (`rows`, e4m3 then the scales, `QuantRowsFp8`'s layout over the capacity rows),
     /// which the bank's gate and up read as their quantized input (`kernels/moe_sort.cu`,
     /// `scratchy_cuda_moe_sort_fp8`).
-    ExpertSortFp8(ExpertSortBf16),
+    ExpertSortFp8(ExpertSortFp8),
     /// An fp8 bank's act and its down's input quantization over the live rows in one launch (FP8 S8
     /// P1), in place of the act over every sorted row and a [`Self::QuantRowsFp8`] of them
     /// (`kernels/act_quant_fp8.cu`, `scratchy_cuda_expert_act_quant_fp8`).
@@ -255,9 +255,15 @@ pub enum CudaStep {
     /// One projection of every sorted pair, lowered from `SubOp::ExpertMatmul` of a sorted bucket:
     /// one grouped GEMM over the expert-padded tiles (`kernels/expert_gemm_bf16.cu`).
     ExpertGemm(ExpertGemmBf16),
+    /// [`Self::ExpertGemm`] over an fp8 bank (FP8 S8 P1): the sorted e4m3 rows times each expert's
+    /// e4m3 block and per-channel scales (`kernels/gemm_fp8.cu`, `scratchy_cuda_expert_gemm_fp8_m64`).
+    ExpertGemmFp8(ExpertGemmFp8),
     /// One projection of every pair, each from its own token row, lowered from
     /// `SubOp::ExpertMatmul` of a gathered bucket (`kernels/expert_gemv_bf16.cu`).
     ExpertGemv(ExpertGemvSplitBf16),
+    /// [`Self::ExpertGemv`] over an fp8 bank: the bf16 token rows, quantized in the GEMV's prologue
+    /// (`kernels/gemv_fp8.cu`, `scratchy_cuda_expert_gemv_fp8`).
+    ExpertGemvFp8(ExpertGemvSplitFp8),
     /// Each token's pair rows summed by its routing weights, lowered from `SubOp::ExpertCombine`
     /// (`kernels/moe_combine_bf16.cu`).
     ExpertCombine(ExpertCombineBf16),
@@ -331,6 +337,9 @@ pub enum CudaStep {
     /// `ExpertActivation` fold of a one-row bucket (#1049, `kernels/gemv_bf16.cu`'s expert gate/up
     /// GEMV): the bits of the two [`Self::ExpertGemv`]s then the activation's step.
     ExpertGateUpAct(ExpertGateUpGemvBf16),
+    /// [`Self::ExpertGateUpAct`] over an fp8 bank (`kernels/gemv_fp8.cu`'s expert gate/up GEMV):
+    /// the bits of the two [`Self::ExpertGemvFp8`]s then the activation's step.
+    ExpertGateUpActFp8(ExpertGateUpGemvFp8),
     /// A one-row bucket's [`Self::GatedDeltaNet`] in one launch (#1049,
     /// `kernels/gdn_decode.cu`): its operands, its conv, gating, scan and gated norm as the four
     /// kernels compute them at one token, so its output, conv ring and state are their bits. The
@@ -373,7 +382,7 @@ pub enum CudaStep {
     GateUpTcFp8(GateUpTcFp8),
     /// [`Self::ExpertGemv`] over an fp8 bank on the tensor cores (B8's expert form): `a` the
     /// quant scratch's rows, as [`Self::GemvTcFp8`]'s.
-    ExpertGemvTcFp8(ExpertGemvBf16),
+    ExpertGemvTcFp8(ExpertGemvTcFp8),
     /// [`Self::ExpertGateUpAct`] over an fp8 bank on the tensor cores, as [`Self::GateUpTcFp8`]:
     /// B8's expert form for the gate and the up (f32), then the act + quantize of the pairs' rows.
     ExpertGateUpTcFp8(ExpertGateUpTcFp8),
@@ -443,10 +452,14 @@ pub struct GateUpTcFp8 {
     pub q_act: ArenaOffset,
 }
 
-/// [`CudaStep::ExpertGateUpTcFp8`], as [`GateUpTcFp8`] for the experts' fold.
+/// [`CudaStep::ExpertGateUpTcFp8`], as [`GateUpTcFp8`] for the experts: `gate` and `up` its
+/// projections off the quantized token row, `out` and `act` the activation's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ExpertGateUpTcFp8 {
-    pub fold: ExpertGateUpActBf16,
+    pub gate: ExpertGemvTcFp8,
+    pub up: ExpertGemvTcFp8,
+    pub out: ArenaOffset,
+    pub act: GatedOp,
     pub q_act: ArenaOffset,
 }
 
@@ -470,35 +483,23 @@ impl GateUpTcFp8 {
 impl ExpertGateUpTcFp8 {
     /// As [`GateUpTcFp8::quant_write`], over the pairs' rows.
     pub const fn quant_write(&self) -> Option<QuantRowsFp8> {
-        let Some(rows) = self
-            .fold
-            .gate
-            .m
-            .get()
-            .checked_mul(self.fold.gate.top_k.get())
-        else {
+        let Some(rows) = self.gate.m.get().checked_mul(self.gate.top_k.get()) else {
             return None;
         };
         Some(QuantRowsFp8 {
-            x: self.fold.out,
+            x: self.out,
             q: self.q_act,
             rows: Rows(rows),
-            cols: Cols(self.fold.gate.inter.get()),
+            cols: Cols(self.gate.inter.get()),
         })
     }
 
     /// As [`GateUpTcFp8::gemv_scratch`], over the pairs' rows.
     pub const fn gemv_scratch(&self) -> Option<u64> {
-        let Some(rows) = self
-            .fold
-            .gate
-            .m
-            .get()
-            .checked_mul(self.fold.gate.top_k.get())
-        else {
+        let Some(rows) = self.gate.m.get().checked_mul(self.gate.top_k.get()) else {
             return None;
         };
-        gemv_tc_f32_bytes(rows, self.fold.gate.inter.get())
+        gemv_tc_f32_bytes(rows, self.gate.inter.get())
     }
 }
 
@@ -856,65 +857,77 @@ impl GateUpActBf16 {
     }
 }
 
-/// The routed experts' gate and up GEMVs and their activation: `gate` and `up` the two
-/// [`ExpertGemvBf16`]s it folds (the MoE scratch's gate and up regions, which this launch never
-/// writes), `out` the activation rows, `act` the activation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct ExpertGateUpActBf16 {
-    pub gate: ExpertGemvBf16,
-    pub up: ExpertGemvBf16,
-    pub out: ArenaOffset,
-    pub act: GatedOp,
-}
-
-impl ExpertGateUpActBf16 {
-    /// The activation it folds, over the gate and up regions.
-    pub const fn activation(&self) -> SiluMulBf16 {
-        SiluMulBf16 {
-            gate: self.gate.c,
-            up: self.up.c,
-            out: self.out,
-            rows: Rows(self.gate.m.get() * self.gate.top_k.get()),
-            cols: Cols(self.gate.inter.get()),
+/// The routed experts' gate and up GEMVs and their activation: `gate` and `up` the two expert
+/// GEMVs it folds (the MoE scratch's gate and up regions, which this launch never writes), `out`
+/// the activation rows, `act` the activation. One payload per kernel; with the K split each
+/// projection takes, chosen when the step is emitted ([`GemvSplit::of`] of the gate's shape at
+/// `m · top_k` pairs).
+macro_rules! expert_gate_up_payload {
+    ($($(#[$doc:meta])* $fold:ident, $name:ident($gemv:ident, $split:ident);)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $fold {
+            pub gate: $gemv,
+            pub up: $gemv,
+            pub out: ArenaOffset,
+            pub act: GatedOp,
         }
-    }
-}
 
-/// The routed experts' gate and up GEMVs in one launch ([`CudaStep::ExpertGateUpAct`]): the fold,
-/// and the K split each projection takes, chosen when the step is emitted ([`GemvSplit::of`] of
-/// the gate's shape at `m · top_k` pairs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct ExpertGateUpGemvBf16 {
-    pub fold: ExpertGateUpActBf16,
-    pub split: GemvSplit,
-}
-
-impl ExpertGateUpGemvBf16 {
-    /// `fold` at the split its gate's shape takes.
-    pub const fn of(fold: ExpertGateUpActBf16) -> Self {
-        Self {
-            fold,
-            split: ExpertGemvSplitBf16::split_of(&fold.gate),
+        impl $fold {
+            /// The activation it folds, over the gate and up regions.
+            pub const fn activation(&self) -> SiluMulBf16 {
+                SiluMulBf16 {
+                    gate: self.gate.c,
+                    up: self.up.c,
+                    out: self.out,
+                    rows: Rows(self.gate.m.get() * self.gate.top_k.get()),
+                    cols: Cols(self.gate.inter.get()),
+                }
+            }
         }
-    }
 
-    /// The GEMV scratch the fused launch writes: the gate's partials, then the up's.
-    pub const fn gemv_scratch(&self) -> Option<u64> {
-        let (n, _) = self.fold.gate.n_k();
-        let Some(pairs) = self
-            .fold
-            .gate
-            .m
-            .get()
-            .checked_mul(self.fold.gate.top_k.get())
-        else {
-            return None;
-        };
-        let Some(one) = gemv_scratch_bytes(n, pairs, self.split.splits.get()) else {
-            return None;
-        };
-        one.checked_mul(2)
-    }
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub fold: $fold,
+            pub split: GemvSplit,
+        }
+
+        impl $name {
+            /// `fold` at the split its gate's shape takes.
+            pub const fn of(fold: $fold) -> Self {
+                Self {
+                    fold,
+                    split: $split::split_of(&fold.gate),
+                }
+            }
+
+            /// The GEMV scratch the fused launch writes: the gate's partials, then the up's.
+            pub const fn gemv_scratch(&self) -> Option<u64> {
+                let (n, _) = self.fold.gate.n_k();
+                let Some(pairs) = self
+                    .fold
+                    .gate
+                    .m
+                    .get()
+                    .checked_mul(self.fold.gate.top_k.get())
+                else {
+                    return None;
+                };
+                let Some(one) = gemv_scratch_bytes(n, pairs, self.split.splits.get()) else {
+                    return None;
+                };
+                one.checked_mul(2)
+            }
+        }
+    )*};
+}
+
+expert_gate_up_payload! {
+    /// [`CudaStep::ExpertGateUpAct`]: over a bf16 bank.
+    ExpertGateUpActBf16, ExpertGateUpGemvBf16(ExpertGemvBf16, ExpertGemvSplitBf16);
+    /// [`CudaStep::ExpertGateUpActFp8`]: over an fp8 bank, the token row quantized in the prologue.
+    ExpertGateUpActFp8, ExpertGateUpGemvFp8(ExpertGemvFp8, ExpertGemvSplitFp8);
 }
 
 /// `sum = a + b` (one f32 add, rounded once), then `y` the [`RmsNormBf16`] of `sum`: `a`, `b`,
@@ -2220,6 +2233,27 @@ impl MoeWeight {
     }
 }
 
+/// Which bank an expert step reads its experts from: Qwen's MoE bundle (the router first) or
+/// Gemma's expert bank (no router). Its precision is its step's: a bf16 step reads [`moe_bundle`] or
+/// [`expert_bank`], an fp8 one [`fp8_moe_bundle`] with or without the router.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum MoeBank {
+    Bundle,
+    Own,
+}
+
+impl MoeBank {
+    /// The [`MoeWeight`] the bank is at `fp8` or bf16.
+    pub const fn weight(self, fp8: bool) -> MoeWeight {
+        match (self, fp8) {
+            (Self::Bundle, false) => MoeWeight::Bundle,
+            (Self::Own, false) => MoeWeight::Own,
+            (Self::Bundle, true) => MoeWeight::Fp8Bundle,
+            (Self::Own, true) => MoeWeight::Fp8Own,
+        }
+    }
+}
+
 /// `logits[m, experts] = x[m, hidden] · routerᵀ`, the router `[experts, hidden]` bf16 at byte 0
 /// of `bundle` (the MoE bundle, [`moe_bundle`], or Gemma's own projection, as `weight` says), into
 /// the tape's MoE logits region. Gemma's `x` is the MoE scratch's router-norm rows.
@@ -2267,25 +2301,68 @@ pub enum RouteProgram {
     },
 }
 
-/// The `P = m · top_k` (token, pick) pairs sorted by expert, stably: every live tile of the
-/// sorted rows written (a pair's token row, a padding row `+0.0`), and the index regions the
-/// grouped GEMM and the combine read. The regions are the tape's [`crate::tape::MoeTape`]'s.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct ExpertSortBf16 {
-    /// `[m, hidden]` bf16, the token rows.
-    pub x: ArenaOffset,
-    pub topk_idx: ArenaOffset,
-    pub chunk_hist: ArenaOffset,
-    pub counts: ArenaOffset,
-    pub offsets: ArenaOffset,
-    pub tile_expert: ArenaOffset,
-    pub pos: ArenaOffset,
-    pub rows: ArenaOffset,
-    pub m: Rows,
-    pub experts: NumExperts,
-    pub top_k: TopK,
-    pub hidden: HiddenSize,
-    pub max_tiles: MaxTiles,
+/// The `P = m · top_k` (token, pick) pairs sorted by expert, stably, and the index regions the
+/// grouped GEMM and the combine read (the tape's [`crate::tape::MoeTape`]'s): one payload per sort
+/// kernel.
+macro_rules! expert_sort_payload {
+    ($($(#[$doc:meta])* $name:ident;)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub x: ArenaOffset,
+            pub topk_idx: ArenaOffset,
+            pub chunk_hist: ArenaOffset,
+            pub counts: ArenaOffset,
+            pub offsets: ArenaOffset,
+            pub tile_expert: ArenaOffset,
+            pub pos: ArenaOffset,
+            pub rows: ArenaOffset,
+            pub m: Rows,
+            pub experts: NumExperts,
+            pub top_k: TopK,
+            pub hidden: HiddenSize,
+            pub max_tiles: MaxTiles,
+        }
+
+        impl $name {
+            /// The sort's region layout ([`SortLayout`]), or `None` on overflow.
+            pub const fn layout(&self) -> Option<SortLayout> {
+                sort_layout(self.m, self.top_k, self.experts, self.max_tiles, self.hidden)
+            }
+        }
+    )*};
+}
+
+impl ExpertSortFp8 {
+    /// `s` as the e4m3 sort: the same regions, `x` and `rows` then read and written as the token
+    /// rows' quantization and the sorted e4m3 rows.
+    pub const fn of(s: ExpertSortBf16) -> Self {
+        Self {
+            x: s.x,
+            topk_idx: s.topk_idx,
+            chunk_hist: s.chunk_hist,
+            counts: s.counts,
+            offsets: s.offsets,
+            tile_expert: s.tile_expert,
+            pos: s.pos,
+            rows: s.rows,
+            m: s.m,
+            experts: s.experts,
+            top_k: s.top_k,
+            hidden: s.hidden,
+            max_tiles: s.max_tiles,
+        }
+    }
+}
+
+expert_sort_payload! {
+    /// [`CudaStep::ExpertSort`]: `x` the `[m, hidden]` bf16 token rows; every live tile of the
+    /// sorted `rows` written (a pair's token row, a padding row `+0.0`).
+    ExpertSortBf16;
+    /// [`CudaStep::ExpertSortFp8`]: `x` the token rows' quantization in the quant scratch (its
+    /// [`QuantRowsFp8`]); each pair's sorted row its token's e4m3 row and scale (`rows`, e4m3 then
+    /// the scales, `QuantRowsFp8`'s layout over the capacity rows).
+    ExpertSortFp8;
 }
 
 /// The act of an fp8 bank's gate and up over its live rows (`offsets[experts]`, the sort's) and the
@@ -2316,8 +2393,8 @@ impl ExpertActQuantFp8 {
 /// [`CudaStep::ExpertGateUpGemmFp8`]: the chain it folds, each step as lowered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ExpertGateUpGemmFp8 {
-    pub gate: ExpertGemmBf16,
-    pub up: ExpertGemmBf16,
+    pub gate: ExpertGemmFp8,
+    pub up: ExpertGemmFp8,
     pub act: ExpertActQuantFp8,
 }
 
@@ -2364,31 +2441,50 @@ impl ExpertProjection {
 }
 
 /// `c[128t .. 128t + 128, :] = a[128t .. 128t + 128, :] · B_eᵀ` for every live tile `t` of the
-/// sorted rows, `e = tile_expert[t]`, `B_e` expert `e`'s `[n, k]` of the bundle's `proj`. A tile
-/// at or past `offsets[experts] / 128` is never read or written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct ExpertGemmBf16 {
-    pub a: ArenaOffset,
-    pub bundle: WeightIx,
-    /// The bundle's layout: Qwen's MoE bundle, or Gemma's expert bank.
-    pub weight: MoeWeight,
-    pub proj: ExpertProjection,
-    pub offsets: ArenaOffset,
-    pub tile_expert: ArenaOffset,
-    pub c: ArenaOffset,
-    pub max_tiles: MaxTiles,
-    pub experts: NumExperts,
-    pub hidden: HiddenSize,
-    pub inter: IntermediateSize,
-    /// The column tile, one of [`EXPERT_GEMM_N_TILES`]: 256 for every Qwen tape.
-    pub n_tile: NTile,
+/// sorted rows, `e = tile_expert[t]`, `B_e` expert `e`'s `[n, k]` of the bank's `proj`. A tile at
+/// or past `offsets[experts] / 128` is never read or written. One payload per grouped expert GEMM
+/// kernel.
+macro_rules! expert_gemm_payload {
+    ($($(#[$doc:meta])* $name:ident, fp8: $fp8:literal;)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub a: ArenaOffset,
+            pub bundle: WeightIx,
+            /// The bank: Qwen's MoE bundle, or Gemma's expert bank.
+            pub weight: MoeBank,
+            pub proj: ExpertProjection,
+            pub offsets: ArenaOffset,
+            pub tile_expert: ArenaOffset,
+            pub c: ArenaOffset,
+            pub max_tiles: MaxTiles,
+            pub experts: NumExperts,
+            pub hidden: HiddenSize,
+            pub inter: IntermediateSize,
+            /// The column tile, one of [`EXPERT_GEMM_N_TILES`]: 256 for every Qwen tape.
+            pub n_tile: NTile,
+        }
+
+        impl $name {
+            /// `(n, k)` of the projection.
+            pub const fn n_k(&self) -> (u32, u32) {
+                self.proj.n_k(self.hidden.get(), self.inter.get())
+            }
+
+            /// The buffer its bank is, at its precision.
+            pub const fn moe_weight(&self) -> MoeWeight {
+                self.weight.weight($fp8)
+            }
+        }
+    )*};
 }
 
-impl ExpertGemmBf16 {
-    /// `(n, k)` of the projection.
-    pub const fn n_k(&self) -> (u32, u32) {
-        self.proj.n_k(self.hidden.get(), self.inter.get())
-    }
+expert_gemm_payload! {
+    /// [`CudaStep::ExpertGemm`]: `a` the sorted bf16 rows, the bank bf16.
+    ExpertGemmBf16, fp8: false;
+    /// [`CudaStep::ExpertGemmFp8`]: `a` the sorted e4m3 rows and their scales (the fp8 sort's, or
+    /// the act's quantization for the down), the bank e4m3 with per-channel scales.
+    ExpertGemmFp8, fp8: true;
 }
 
 /// Which row of `a` pair `p = (token t, slot j)` reads.
@@ -2401,54 +2497,126 @@ pub enum PairRows {
 }
 
 /// `c[p, :] = a[row(p), :] · B_eᵀ` for each of the `m · top_k` pairs, `e = topk_idx[p]`, `B_e`
-/// expert `e`'s `[n, k]` of the bundle's `proj`; `row(p)` is the pair's token row for the gate and
-/// up projections, its own row for the down ([`PairRows`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct ExpertGemvBf16 {
-    pub a: ArenaOffset,
-    pub rows: PairRows,
-    pub bundle: WeightIx,
-    /// As [`ExpertGemmBf16::weight`].
-    pub weight: MoeWeight,
-    pub proj: ExpertProjection,
-    pub topk_idx: ArenaOffset,
-    pub c: ArenaOffset,
-    pub m: Rows,
-    pub top_k: TopK,
-    pub experts: NumExperts,
-    pub hidden: HiddenSize,
-    pub inter: IntermediateSize,
+/// expert `e`'s `[n, k]` of the bank's `proj`; `row(p)` is the pair's token row for the gate and
+/// up projections, its own row for the down ([`PairRows`]). One payload per gathered expert GEMV
+/// kernel.
+macro_rules! expert_gemv_payload {
+    ($($(#[$doc:meta])* $name:ident, fp8: $fp8:literal;)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub a: ArenaOffset,
+            pub rows: PairRows,
+            pub bundle: WeightIx,
+            /// The bank: Qwen's MoE bundle, or Gemma's expert bank.
+            pub weight: MoeBank,
+            pub proj: ExpertProjection,
+            pub topk_idx: ArenaOffset,
+            pub c: ArenaOffset,
+            pub m: Rows,
+            pub top_k: TopK,
+            pub experts: NumExperts,
+            pub hidden: HiddenSize,
+            pub inter: IntermediateSize,
+        }
+
+        impl $name {
+            /// `(n, k)` of the projection.
+            pub const fn n_k(&self) -> (u32, u32) {
+                self.proj.n_k(self.hidden.get(), self.inter.get())
+            }
+
+            /// The buffer its bank is, at its precision.
+            pub const fn moe_weight(&self) -> MoeWeight {
+                self.weight.weight($fp8)
+            }
+        }
+    )*};
 }
 
-/// The routed experts' decode GEMV ([`CudaStep::ExpertGemv`]): the projection, at its K split over
-/// `m · top_k` pairs, chosen when the step is emitted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct ExpertGemvSplitBf16 {
-    pub gemv: ExpertGemvBf16,
-    pub split: GemvSplit,
+expert_gemv_payload! {
+    /// [`CudaStep::ExpertGemv`]'s projection: `a` bf16, the bank bf16.
+    ExpertGemvBf16, fp8: false;
+    /// [`CudaStep::ExpertGemvFp8`]'s projection: `a` bf16, which the GEMV quantizes in its
+    /// prologue, the bank e4m3 with per-channel scales.
+    ExpertGemvFp8, fp8: true;
+    /// [`CudaStep::ExpertGemvTcFp8`]: `a` the quant scratch's rows, as [`GemvTcFp8`]'s, the bank
+    /// e4m3 with per-channel scales.
+    ExpertGemvTcFp8, fp8: true;
 }
 
-impl ExpertGemvSplitBf16 {
-    /// `gemv` at its shape's split.
-    pub const fn of(gemv: ExpertGemvBf16) -> Self {
+/// A routed experts' decode GEMV: the projection, at its K split over `m · top_k` pairs, chosen
+/// when the step is emitted. One payload per kernel.
+macro_rules! expert_gemv_split_payload {
+    ($($(#[$doc:meta])* $name:ident($gemv:ident);)*) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name {
+            pub gemv: $gemv,
+            pub split: GemvSplit,
+        }
+
+        impl $name {
+            /// `gemv` at its shape's split.
+            pub const fn of(gemv: $gemv) -> Self {
+                Self {
+                    gemv,
+                    split: Self::split_of(&gemv),
+                }
+            }
+
+            /// The split of `g`'s shape at its `m · top_k` pairs ([`GemvSplit::of`]).
+            pub const fn split_of(g: &$gemv) -> GemvSplit {
+                let (n, k) = g.n_k();
+                GemvSplit::of(n, k, g.m.get().saturating_mul(g.top_k.get()))
+            }
+        }
+    )*};
+}
+
+impl ExpertGemvTcFp8 {
+    /// `g` on the tensor cores.
+    pub const fn of(g: ExpertGemvFp8) -> Self {
         Self {
-            gemv,
-            split: Self::split_of(&gemv),
+            a: g.a,
+            rows: g.rows,
+            bundle: g.bundle,
+            weight: g.weight,
+            proj: g.proj,
+            topk_idx: g.topk_idx,
+            c: g.c,
+            m: g.m,
+            top_k: g.top_k,
+            experts: g.experts,
+            hidden: g.hidden,
+            inter: g.inter,
         }
     }
 
-    /// The split of `g`'s shape at its `m · top_k` pairs ([`GemvSplit::of`]).
-    pub const fn split_of(g: &ExpertGemvBf16) -> GemvSplit {
-        let (n, k) = g.n_k();
-        GemvSplit::of(n, k, g.m.get().saturating_mul(g.top_k.get()))
+    /// The CUDA-core GEMV of its shape, whose operands and extents it shares but its `a`.
+    pub const fn cuda_core(&self) -> ExpertGemvFp8 {
+        ExpertGemvFp8 {
+            a: self.a,
+            rows: self.rows,
+            bundle: self.bundle,
+            weight: self.weight,
+            proj: self.proj,
+            topk_idx: self.topk_idx,
+            c: self.c,
+            m: self.m,
+            top_k: self.top_k,
+            experts: self.experts,
+            hidden: self.hidden,
+            inter: self.inter,
+        }
     }
 }
 
-impl ExpertGemvBf16 {
-    /// `(n, k)` of the projection.
-    pub const fn n_k(&self) -> (u32, u32) {
-        self.proj.n_k(self.hidden.get(), self.inter.get())
-    }
+expert_gemv_split_payload! {
+    /// [`CudaStep::ExpertGemv`].
+    ExpertGemvSplitBf16(ExpertGemvBf16);
+    /// [`CudaStep::ExpertGemvFp8`].
+    ExpertGemvSplitFp8(ExpertGemvFp8);
 }
 
 /// `out[t, :] = Σ_j scores[t, j] · down[row(t, j), :]` over the `top_k` slots in order, in f32,
@@ -2639,6 +2807,95 @@ pub struct StepExtents {
     pub in_place: bool,
 }
 
+/// A grouped expert GEMM's [`CudaStep::extents`], the same for its bf16 and fp8 twins: `$step`
+/// the step, `$g` its payload, `$fp8` its precision.
+macro_rules! expert_gemm_extents {
+    ($step:expr, $g:expr, $fp8:literal) => {{
+        let g = $g;
+
+        let fp8 = $fp8;
+        let rows = g.max_tiles.get() as u64 * crate::op_abi::expert_tile_rows(fp8) as u64;
+        let (n, k) = g.n_k();
+        // An fp8 bank's rows are the quantized ones, e4m3 then their scales.
+        let ab = match $step.fp8_expert_rows() {
+            Some((a, rows, cols)) => QuantRowsFp8 {
+                x: a,
+                q: a,
+                rows: Rows(rows),
+                cols: Cols(cols),
+            }
+            .bytes(),
+            None => (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
+        };
+        let (Some(ab), Some(cb), Some(bu)) = (
+            ab,
+            (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
+            g.moe_weight()
+                .experts(g.experts.get(), g.hidden.get(), g.inter.get()),
+        ) else {
+            return None;
+        };
+        Some(StepExtents {
+            reads: [
+                Some(span(g.a, ab)),
+                Some(span(g.offsets, u32_bytes(g.experts.get() + 1))),
+                Some(span(g.tile_expert, u32_bytes(g.max_tiles.get()))),
+                None,
+            ],
+            writes: span(g.c, cb),
+            second_write: None,
+            weight: Some(WeightRead {
+                ix: g.bundle,
+                bytes: bu.bytes,
+            }),
+            kv: None,
+            gdn: None,
+            in_place: false,
+        })
+    }};
+}
+
+/// A gathered expert GEMV's [`CudaStep::extents`], the same for its bf16 and fp8 twins.
+macro_rules! expert_gemv_extents {
+    ($g:expr) => {{
+        let g = $g;
+
+        let Some(pairs) = g.m.get().checked_mul(g.top_k.get()) else {
+            return None;
+        };
+        let a_rows = match g.rows {
+            PairRows::Token => g.m,
+            PairRows::Pair => Rows(pairs),
+        };
+        let (n, k) = g.n_k();
+        let (Some(ab), Some(cb), Some(bu)) = (
+            bf16_bytes(a_rows.get(), k),
+            bf16_bytes(pairs, n),
+            g.moe_weight()
+                .experts(g.experts.get(), g.hidden.get(), g.inter.get()),
+        ) else {
+            return None;
+        };
+        Some(StepExtents {
+            reads: [
+                Some(span(g.a, ab)),
+                Some(span(g.topk_idx, u32_bytes(pairs))),
+                None,
+                None,
+            ],
+            writes: span(g.c, cb),
+            second_write: None,
+            weight: Some(WeightRead {
+                ix: g.bundle,
+                bytes: bu.bytes,
+            }),
+            kv: None,
+            gdn: None,
+            in_place: false,
+        })
+    }};
+}
+
 /// A group payload's members' weights, in order: each group type names its members `first`,
 /// `second` and `third`, whatever its member type.
 macro_rules! member_weights {
@@ -2688,6 +2945,13 @@ impl CudaStep {
                 };
                 Some((n, pairs, split.splits.get()))
             }
+            Self::ExpertGemvFp8(ExpertGemvSplitFp8 { gemv: g, split }) => {
+                let (n, _) = g.n_k();
+                let Some(pairs) = g.m.get().checked_mul(g.top_k.get()) else {
+                    return None;
+                };
+                Some((n, pairs, split.splits.get()))
+            }
             Self::RouterLogits(_)
             | Self::Embed(_)
             | Self::Gemm(_)
@@ -2708,6 +2972,7 @@ impl CudaStep {
             | Self::ExpertActQuant(_)
             | Self::ExpertGateUpGemmFp8(_)
             | Self::ExpertGemm(_)
+            | Self::ExpertGemmFp8(_)
             | Self::ExpertCombine(_)
             | Self::GateScale(_)
             | Self::Scale(_)
@@ -2727,6 +2992,7 @@ impl CudaStep {
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
             | Self::ExpertGateUpAct(_)
+            | Self::ExpertGateUpActFp8(_)
             | Self::GdnDecode(_)
             | Self::QuantRowsFp8(_)
             | Self::GemmFp8(_)
@@ -2780,7 +3046,9 @@ impl CudaStep {
             | Self::ExpertActQuant(_)
             | Self::ExpertGateUpGemmFp8(_)
             | Self::ExpertGemm(_)
+            | Self::ExpertGemmFp8(_)
             | Self::ExpertGemv(_)
+            | Self::ExpertGemvFp8(_)
             | Self::ExpertCombine(_)
             | Self::GateScale(_)
             | Self::Scale(_)
@@ -2798,6 +3066,7 @@ impl CudaStep {
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
             | Self::ExpertGateUpAct(_)
+            | Self::ExpertGateUpActFp8(_)
             | Self::GdnDecode(_)
             // The tensor-core kinds are picked after the fold groups (`gemv_tc_takes`).
             | Self::GemvTcFp8(_)
@@ -2850,7 +3119,9 @@ impl CudaStep {
             | Self::ExpertActQuant(_)
             | Self::ExpertGateUpGemmFp8(_)
             | Self::ExpertGemm(_)
+            | Self::ExpertGemmFp8(_)
             | Self::ExpertGemv(_)
+            | Self::ExpertGemvFp8(_)
             | Self::ExpertCombine(_)
             | Self::GateScale(_)
             | Self::Scale(_)
@@ -2865,6 +3136,7 @@ impl CudaStep {
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
             | Self::ExpertGateUpAct(_)
+            | Self::ExpertGateUpActFp8(_)
             | Self::GdnDecode(_)
             | Self::RmsNormQuantFp8(_)
             | Self::AddRmsNormQuantFp8(_) => None,
@@ -2879,7 +3151,7 @@ impl CudaStep {
     pub const fn quantized_input(&self) -> Option<(ArenaOffset, u32, u32)> {
         // An fp8 bank's down reads the quant scratch; its gate and up read the e4m3 sorted rows
         // (FP8 S8 P1, [`Self::ExpertSortFp8`]), which its sort reads the quant scratch for.
-        if let Self::ExpertGemm(ExpertGemmBf16 {
+        if let Self::ExpertGemmFp8(ExpertGemmFp8 {
             proj: ExpertProjection::Down,
             ..
         }) = *self
@@ -2891,10 +3163,7 @@ impl CudaStep {
         }
         // The tensor-core decode GEMVs (FP8 S8 T2): the expert form's token row or pairs' rows.
         if let Self::ExpertGemvTcFp8(g)
-        | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
-            fold: ExpertGateUpActBf16 { gate: g, .. },
-            ..
-        }) = *self
+        | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 { gate: g, .. }) = *self
         {
             let rows = match g.rows {
                 PairRows::Token => Some(g.m.get()),
@@ -2932,13 +3201,7 @@ impl CudaStep {
     /// gate's and up's, the sort's) or the activation rows (its down's, the quant scratch's), e4m3
     /// then their scales; `None` for every other step.
     pub const fn fp8_expert_rows(&self) -> Option<(ArenaOffset, u32, u32)> {
-        if let Self::ExpertGemm(
-            g @ ExpertGemmBf16 {
-                weight: MoeWeight::Fp8Bundle | MoeWeight::Fp8Own,
-                ..
-            },
-        ) = *self
-        {
+        if let Self::ExpertGemmFp8(g) = *self {
             // An fp8 bank's row tile (FP8 S8 P3(a)).
             let rows = g
                 .max_tiles
@@ -2984,8 +3247,8 @@ impl CudaStep {
         // The prefill's fused expert gate + up + act (FP8 S8 P3(b)): the chain it folds.
         if let Self::ExpertGateUpGemmFp8(t) = self {
             return [
-                Some(Self::ExpertGemm(t.gate)),
-                Some(Self::ExpertGemm(t.up)),
+                Some(Self::ExpertGemmFp8(t.gate)),
+                Some(Self::ExpertGemmFp8(t.up)),
                 Some(Self::ExpertActQuant(t.act)),
             ];
         }
@@ -3002,13 +3265,26 @@ impl CudaStep {
                 Some(g.act.step(g.activation())),
             ];
         }
+        if let Self::ExpertGateUpActFp8(ExpertGateUpGemvFp8 { fold: g, split }) = self {
+            return [
+                Some(Self::ExpertGemvFp8(ExpertGemvSplitFp8 {
+                    gemv: g.gate,
+                    split: *split,
+                })),
+                Some(Self::ExpertGemvFp8(ExpertGemvSplitFp8 {
+                    gemv: g.up,
+                    split: *split,
+                })),
+                Some(g.act.step(g.activation())),
+            ];
+        }
         // A tensor-core gate/up: itself (the quantized row, the gate's weight, the activation and
         // its quantization), then its up as the GEMV it is on its own (its weight).
         if let Self::GateUpTcFp8(t) = self {
             return [Some(*self), Some(Self::GemvTcFp8(t.up)), None];
         }
         if let Self::ExpertGateUpTcFp8(t) = self {
-            return [Some(*self), Some(Self::ExpertGemvTcFp8(t.fold.up)), None];
+            return [Some(*self), Some(Self::ExpertGemvTcFp8(t.up)), None];
         }
         // A norm with its quantization (FP8 S8 N3): itself (the norm's operands), then the
         // quantization as the quant write it equals.
@@ -3062,6 +3338,9 @@ impl CudaStep {
         if let Self::ExpertGateUpAct(g) = self {
             return g.gemv_scratch();
         }
+        if let Self::ExpertGateUpActFp8(g) = self {
+            return g.gemv_scratch();
+        }
         if let Self::GateUpTcFp8(t) = self {
             return t.gemv_scratch();
         }
@@ -3087,7 +3366,7 @@ impl CudaStep {
                 }
             }
             // Its parts' ([`Self::parts`]), each checked as the step it is; here the gate's.
-            Self::ExpertGateUpGemmFp8(t) => Self::ExpertGemm(t.gate).extents(),
+            Self::ExpertGateUpGemmFp8(t) => Self::ExpertGemmFp8(t.gate).extents(),
             Self::GemmGroupFp8(_)
             | Self::GemmNarrowGroupFp8(_)
             | Self::GemvGroupFp8(_)
@@ -3298,17 +3577,15 @@ impl CudaStep {
             }
             // As `GateUpTcFp8`, over the experts' token row and picks.
             Self::ExpertGateUpTcFp8(t) => {
-                let (Some(e), Some(q)) = (
-                    Self::ExpertGemvTcFp8(t.fold.gate).extents(),
-                    t.quant_write(),
-                ) else {
+                let (Some(e), Some(q)) = (Self::ExpertGemvTcFp8(t.gate).extents(), t.quant_write())
+                else {
                     return None;
                 };
                 let Some(qb) = q.bytes() else {
                     return None;
                 };
                 Some(StepExtents {
-                    writes: span(t.fold.out, e.writes.bytes),
+                    writes: span(t.out, e.writes.bytes),
                     second_write: Some(span(t.q_act, qb)),
                     ..e
                 })
@@ -3316,7 +3593,7 @@ impl CudaStep {
             // The quantized rows (the token row, or the pairs' own), as `ExpertGemv`'s otherwise.
             Self::ExpertGemvTcFp8(g) => {
                 let (Some(e), Some((_, rows, k))) = (
-                    Self::ExpertGemv(ExpertGemvSplitBf16::of(g)).extents(),
+                    Self::ExpertGemvFp8(ExpertGemvSplitFp8::of(g.cuda_core())).extents(),
                     self.quantized_input(),
                 ) else {
                     return None;
@@ -3339,6 +3616,19 @@ impl CudaStep {
             // The token rows and the picks; the activation rows.
             Self::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, split }) => {
                 let Some(e) = Self::ExpertGemv(ExpertGemvSplitBf16 {
+                    gemv: g.gate,
+                    split,
+                })
+                .extents() else {
+                    return None;
+                };
+                Some(StepExtents {
+                    writes: span(g.out, e.writes.bytes),
+                    ..e
+                })
+            }
+            Self::ExpertGateUpActFp8(ExpertGateUpGemvFp8 { fold: g, split }) => {
+                let Some(e) = Self::ExpertGemvFp8(ExpertGemvSplitFp8 {
                     gemv: g.gate,
                     split,
                 })
@@ -3790,82 +4080,10 @@ impl CudaStep {
                     in_place: false,
                 })
             }
-            Self::ExpertGemm(g) => {
-                let fp8 = matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
-                let rows = g.max_tiles.get() as u64 * crate::op_abi::expert_tile_rows(fp8) as u64;
-                let (n, k) = g.n_k();
-                // An fp8 bank's rows are the quantized ones, e4m3 then their scales.
-                let ab = match self.fp8_expert_rows() {
-                    Some((a, rows, cols)) => QuantRowsFp8 {
-                        x: a,
-                        q: a,
-                        rows: Rows(rows),
-                        cols: Cols(cols),
-                    }
-                    .bytes(),
-                    None => (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
-                };
-                let (Some(ab), Some(cb), Some(bu)) = (
-                    ab,
-                    (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
-                    g.weight
-                        .experts(g.experts.get(), g.hidden.get(), g.inter.get()),
-                ) else {
-                    return None;
-                };
-                Some(StepExtents {
-                    reads: [
-                        Some(span(g.a, ab)),
-                        Some(span(g.offsets, u32_bytes(g.experts.get() + 1))),
-                        Some(span(g.tile_expert, u32_bytes(g.max_tiles.get()))),
-                        None,
-                    ],
-                    writes: span(g.c, cb),
-                    second_write: None,
-                    weight: Some(WeightRead {
-                        ix: g.bundle,
-                        bytes: bu.bytes,
-                    }),
-                    kv: None,
-                    gdn: None,
-                    in_place: false,
-                })
-            }
-            Self::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => {
-                let Some(pairs) = g.m.get().checked_mul(g.top_k.get()) else {
-                    return None;
-                };
-                let a_rows = match g.rows {
-                    PairRows::Token => g.m,
-                    PairRows::Pair => Rows(pairs),
-                };
-                let (n, k) = g.n_k();
-                let (Some(ab), Some(cb), Some(bu)) = (
-                    bf16_bytes(a_rows.get(), k),
-                    bf16_bytes(pairs, n),
-                    g.weight
-                        .experts(g.experts.get(), g.hidden.get(), g.inter.get()),
-                ) else {
-                    return None;
-                };
-                Some(StepExtents {
-                    reads: [
-                        Some(span(g.a, ab)),
-                        Some(span(g.topk_idx, u32_bytes(pairs))),
-                        None,
-                        None,
-                    ],
-                    writes: span(g.c, cb),
-                    second_write: None,
-                    weight: Some(WeightRead {
-                        ix: g.bundle,
-                        bytes: bu.bytes,
-                    }),
-                    kv: None,
-                    gdn: None,
-                    in_place: false,
-                })
-            }
+            Self::ExpertGemm(g) => expert_gemm_extents!(self, g, false),
+            Self::ExpertGemmFp8(g) => expert_gemm_extents!(self, g, true),
+            Self::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => expert_gemv_extents!(g),
+            Self::ExpertGemvFp8(ExpertGemvSplitFp8 { gemv: g, .. }) => expert_gemv_extents!(g),
             Self::ExpertCombine(ExpertCombineBf16 {
                 down,
                 pos,
@@ -4070,32 +4288,36 @@ const fn aligned_after(at: u64, bytes: u64) -> Option<u64> {
     end.checked_next_multiple_of(GDN_ALIGN)
 }
 
-impl ExpertSortBf16 {
-    /// The sort's region layout ([`SortLayout`]), or `None` on overflow.
-    pub const fn layout(&self) -> Option<SortLayout> {
-        let Some(pairs) = self.m.get().checked_mul(self.top_k.get()) else {
-            return None;
-        };
-        let Some([chunk_hist, counts, offsets, tile_expert, pos, index_bytes]) =
-            sort_index_regions(pairs, self.experts.get(), self.max_tiles.get())
-        else {
-            return None;
-        };
-        let rows = self.max_tiles.get() as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
-        let Some(rows_bytes) = (rows * self.hidden.get() as u64).checked_mul(CUDA_ACT_BYTES) else {
-            return None;
-        };
-        Some(SortLayout {
-            pairs,
-            chunk_hist,
-            counts,
-            offsets,
-            tile_expert,
-            pos,
-            index_bytes,
-            rows_bytes,
-        })
-    }
+/// A sort's region layout ([`SortLayout`]) at its geometry, or `None` on overflow.
+const fn sort_layout(
+    m: Rows,
+    top_k: TopK,
+    experts: NumExperts,
+    max_tiles: MaxTiles,
+    hidden: HiddenSize,
+) -> Option<SortLayout> {
+    let Some(pairs) = m.get().checked_mul(top_k.get()) else {
+        return None;
+    };
+    let Some([chunk_hist, counts, offsets, tile_expert, pos, index_bytes]) =
+        sort_index_regions(pairs, experts.get(), max_tiles.get())
+    else {
+        return None;
+    };
+    let rows = max_tiles.get() as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
+    let Some(rows_bytes) = (rows * hidden.get() as u64).checked_mul(CUDA_ACT_BYTES) else {
+        return None;
+    };
+    Some(SortLayout {
+        pairs,
+        chunk_hist,
+        counts,
+        offsets,
+        tile_expert,
+        pos,
+        index_bytes,
+        rows_bytes,
+    })
 }
 
 impl CudaStep {
@@ -4147,15 +4369,20 @@ impl CudaStep {
             | Self::GdnDecode(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
+            | Self::ExpertGemmFp8(ExpertGemmFp8 { bundle, .. })
             | Self::ExpertGateUpGemmFp8(ExpertGateUpGemmFp8 {
-                gate: ExpertGemmBf16 { bundle, .. },
+                gate: ExpertGemmFp8 { bundle, .. },
                 ..
             })
             | Self::ExpertGemv(ExpertGemvSplitBf16 {
                 gemv: ExpertGemvBf16 { bundle, .. },
                 ..
             })
-            | Self::ExpertGemvTcFp8(ExpertGemvBf16 { bundle, .. })
+            | Self::ExpertGemvFp8(ExpertGemvSplitFp8 {
+                gemv: ExpertGemvFp8 { bundle, .. },
+                ..
+            })
+            | Self::ExpertGemvTcFp8(ExpertGemvTcFp8 { bundle, .. })
             | Self::ExpertGateUpAct(ExpertGateUpGemvBf16 {
                 fold:
                     ExpertGateUpActBf16 {
@@ -4164,12 +4391,16 @@ impl CudaStep {
                     },
                 ..
             })
-            | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
+            | Self::ExpertGateUpActFp8(ExpertGateUpGemvFp8 {
                 fold:
-                    ExpertGateUpActBf16 {
-                        gate: ExpertGemvBf16 { bundle, .. },
+                    ExpertGateUpActFp8 {
+                        gate: ExpertGemvFp8 { bundle, .. },
                         ..
                     },
+                ..
+            })
+            | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
+                gate: ExpertGemvTcFp8 { bundle, .. },
                 ..
             }) => Some(bundle),
             // The gate's; [`Self::weights_mut`] gives the up's too.
@@ -4248,11 +4479,14 @@ impl CudaStep {
             Self::ExpertGateUpAct(ExpertGateUpGemvBf16 {
                 fold: ExpertGateUpActBf16 { gate, up, .. },
                 ..
-            })
-            | Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
-                fold: ExpertGateUpActBf16 { gate, up, .. },
+            }) => vec![&mut gate.bundle, &mut up.bundle],
+            Self::ExpertGateUpActFp8(ExpertGateUpGemvFp8 {
+                fold: ExpertGateUpActFp8 { gate, up, .. },
                 ..
             }) => vec![&mut gate.bundle, &mut up.bundle],
+            Self::ExpertGateUpTcFp8(ExpertGateUpTcFp8 { gate, up, .. }) => {
+                vec![&mut gate.bundle, &mut up.bundle]
+            }
             // The head norms' gains a rope append reads (FP8 S8 W4c).
             Self::RopeAppend(RopeAppendBf16 {
                 norms: Some(HeadNorms { q_gain, k_gain, .. }),

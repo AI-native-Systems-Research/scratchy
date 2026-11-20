@@ -11,8 +11,8 @@ extern crate scratchy_target_cuda_models as _;
 
 use scratchy_target_cuda::registry;
 use scratchy_target_cuda::step::{
-    AttnDecodeSplit, CudaStep, ExpertGemvBf16, GdnScan, GemvSplit, MatmulKernel, NormKernel,
-    RmsNormBf16, attn_decode_split, gdn_scan_is_recurrent, gemv_splits, norm_row_takes,
+    AttnDecodeSplit, CudaStep, GdnScan, GemvSplit, MatmulKernel, NormKernel, RmsNormBf16, Rows,
+    TopK, attn_decode_split, gdn_scan_is_recurrent, gemv_splits, norm_row_takes,
 };
 use scratchy_target_cuda::step::{MinTiles, Splits};
 
@@ -24,9 +24,8 @@ fn split(n: u32, k: u32, pairs: u32) -> GemvSplit {
 }
 
 /// The split of an expert GEMV at its `m · top_k` pairs.
-fn expert_split(g: &ExpertGemvBf16) -> GemvSplit {
-    let (n, k) = g.n_k();
-    split(n, k, g.m.get().saturating_mul(g.top_k.get()))
+fn expert_split((n, k): (u32, u32), m: Rows, top_k: TopK) -> GemvSplit {
+    split(n, k, m.get().saturating_mul(top_k.get()))
 }
 
 /// The kernel a norm's rows and columns pick.
@@ -82,10 +81,20 @@ fn every_stored_kernel_choice_is_its_constants_pick() {
                         }
                     }
                     CudaStep::ExpertGemv(g) => {
-                        assert_eq!(g.split, expert_split(&g.gemv), "{at}");
+                        let e = g.gemv;
+                        assert_eq!(g.split, expert_split(e.n_k(), e.m, e.top_k), "{at}");
+                    }
+                    CudaStep::ExpertGemvFp8(g) => {
+                        let e = g.gemv;
+                        assert_eq!(g.split, expert_split(e.n_k(), e.m, e.top_k), "{at}");
                     }
                     CudaStep::ExpertGateUpAct(g) => {
-                        assert_eq!(g.split, expert_split(&g.fold.gate), "{at}");
+                        let e = g.fold.gate;
+                        assert_eq!(g.split, expert_split(e.n_k(), e.m, e.top_k), "{at}");
+                    }
+                    CudaStep::ExpertGateUpActFp8(g) => {
+                        let e = g.fold.gate;
+                        assert_eq!(g.split, expert_split(e.n_k(), e.m, e.top_k), "{at}");
                     }
                     CudaStep::RmsNorm(n) | CudaStep::RouterNorm(n) => {
                         assert_eq!(n.kernel, norm_kernel(n), "{at}");

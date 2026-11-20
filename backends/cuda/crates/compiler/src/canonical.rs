@@ -23,6 +23,9 @@ use scratchy_target_cuda::step::{
     AttnWindow, Cols, FreqDim, HeadDim, HiddenSize, IntermediateSize, MaxTiles, NDim, NumExperts,
     NumKvHeads, RotDim, Rows, TileRows, TopK, VocabSize,
 };
+use scratchy_target_cuda::step::{
+    ExpertGateUpGemvFp8, ExpertGemmFp8, ExpertGemvSplitFp8, ExpertGemvTcFp8, ExpertSortFp8,
+};
 use std::collections::BTreeMap;
 
 use scratchy_ir::model_facts::{Attention, AttnClass, HeadGeometry, ModelFacts};
@@ -43,10 +46,9 @@ use scratchy_target_cuda::step::RopeTheta;
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
     EXPERT_GATE_UP_FP8_INTER_MULTIPLE, EXPERT_GATE_UP_FP8_K_MULTIPLE, ExpertActQuantFp8,
-    ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
-    ExpertGemvSplitBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpActBf16, GateUpProj,
-    GateUpTcFp8, GatedOp, GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8, GemmGroupFp8,
-    GemmNarrowFp8, GemmNarrowGroupFp8, GemvGroupTcFp8, GemvTcFp8, MoeWeight, QuantChainError,
+    ExpertGateUpGemmFp8, ExpertGateUpTcFp8, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpActBf16,
+    GateUpProj, GateUpTcFp8, GatedOp, GdnPrefillBf16, GdnScratch, GemmCol64Fp8, GemmFp8,
+    GemmGroupFp8, GemmNarrowFp8, GemmNarrowGroupFp8, GemvGroupTcFp8, GemvTcFp8, QuantChainError,
     QuantRowsFp8, RmsNormBf16, RmsNormQuantFp8, RopePairing, gdn_scratch, gemv_tc_takes,
     norm_row_takes, quant_chain,
 };
@@ -1603,7 +1605,9 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             // An fp8 weight's buffer is its e4m3 bytes and f32 scales (`step::fp8_weight`).
             CudaStep::RouterLogits(_)
             | CudaStep::ExpertGemm(_)
+            | CudaStep::ExpertGemmFp8(_)
             | CudaStep::ExpertGemv(_)
+            | CudaStep::ExpertGemvFp8(_)
             | CudaStep::GemmFp8(_)
             | CudaStep::GemmCol64Fp8(_)
             | CudaStep::GemmNarrowFp8(_)
@@ -1732,7 +1736,6 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
 /// fp8 bank. Every other step is as it was; a gate/up's `q_act` is [`quantize_fp8_inputs`]'s to
 /// place.
 fn gemv_tc(s: CudaStep) -> CudaStep {
-    let fp8 = |w: MoeWeight| matches!(w, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
     match s {
         CudaStep::GemvFp8(g) if gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1) => {
             CudaStep::GemvTcFp8(GemvTcFp8::of(g))
@@ -1759,22 +1762,23 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
                 q_act: out,
             })
         }
-        CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. })
-            if g.m == Rows(1) && fp8(g.weight) =>
-        {
+        CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 { gemv: g, .. }) if g.m == Rows(1) => {
             let (n, k) = g.n_k();
             match gemv_tc_takes([n, 0, 0], k, g.top_k.get()) {
-                true => CudaStep::ExpertGemvTcFp8(g),
+                true => CudaStep::ExpertGemvTcFp8(ExpertGemvTcFp8::of(g)),
                 false => s,
             }
         }
-        CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold, .. })
-            if fold.gate.m == Rows(1) && fp8(fold.gate.weight) =>
+        CudaStep::ExpertGateUpActFp8(ExpertGateUpGemvFp8 { fold, .. })
+            if fold.gate.m == Rows(1) =>
         {
             let (n, k) = fold.gate.n_k();
             match n <= ACT_QUANT_MAX_COLS && gemv_tc_takes([n, n, 0], k, fold.gate.top_k.get()) {
                 true => CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
-                    fold,
+                    gate: ExpertGemvTcFp8::of(fold.gate),
+                    up: ExpertGemvTcFp8::of(fold.up),
+                    out: fold.out,
+                    act: fold.act,
                     q_act: fold.out,
                 }),
                 false => s,
@@ -1872,11 +1876,11 @@ fn quantize_fp8_inputs(
                     ..
                 }) => (gate.a, up.a) = (q, q),
                 CudaStep::GateUpTcFp8(t) => (t.gate.a, t.up.a) = (q, q),
-                CudaStep::ExpertGemm(g) => g.a = q,
+                CudaStep::ExpertGemmFp8(g) => g.a = q,
                 // The e4m3 sort reads the token rows' quantization (FP8 S8 P1).
                 CudaStep::ExpertSortFp8(sort) => sort.x = q,
                 CudaStep::ExpertGemvTcFp8(g) => g.a = q,
-                CudaStep::ExpertGateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
+                CudaStep::ExpertGateUpTcFp8(t) => (t.gate.a, t.up.a) = (q, q),
                 _ => unreachable!("`quantized_input` names only the fp8 steps it reads"),
             }
         }
@@ -1920,17 +1924,16 @@ fn quantize_fp8_inputs(
 /// input (at the quant scratch's second slot, set by [`quantize_fp8_inputs`]). Every step's bits
 /// are the chain's it replaces; every other step is as it was.
 fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
-    let fp8 = |g: &ExpertGemmBf16| matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
     for i in 0..steps.len() {
         let later = &steps[i + 1..];
         match steps[i] {
             CudaStep::ExpertSort(sort) => {
                 let gate = later.iter().any(|s| {
-                    matches!(s, CudaStep::ExpertGemm(g)
-                        if fp8(g) && g.proj == ExpertProjection::Gate && g.a == sort.rows)
+                    matches!(s, CudaStep::ExpertGemmFp8(g)
+                        if g.proj == ExpertProjection::Gate && g.a == sort.rows)
                 });
                 if gate {
-                    steps[i] = CudaStep::ExpertSortFp8(sort);
+                    steps[i] = CudaStep::ExpertSortFp8(ExpertSortFp8::of(sort));
                 }
             }
             CudaStep::SiluMul(act) | CudaStep::GeluMul(act) => {
@@ -1939,8 +1942,8 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
                     _ => GatedOp::Gelu,
                 };
                 let down = later.iter().find_map(|s| match s {
-                    CudaStep::ExpertGemm(g)
-                        if fp8(g) && g.proj == ExpertProjection::Down && g.a == act.out =>
+                    CudaStep::ExpertGemmFp8(g)
+                        if g.proj == ExpertProjection::Down && g.a == act.out =>
                     {
                         Some(*g)
                     }
@@ -1974,9 +1977,8 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
 /// after its weight table merged the indices naming one checkpoint tensor (`emit::lower_model`):
 /// the gate's and the up's bank are then one index exactly when they are one tensor.
 pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
-    let fp8 = |g: &ExpertGemmBf16| matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
-    let fuses = |gate: &ExpertGemmBf16, up: &ExpertGemmBf16, act: &ExpertActQuantFp8| {
-        let shared = |g: &ExpertGemmBf16| {
+    let fuses = |gate: &ExpertGemmFp8, up: &ExpertGemmFp8, act: &ExpertActQuantFp8| {
+        let shared = |g: &ExpertGemmFp8| {
             (
                 g.a,
                 g.bundle,
@@ -1987,8 +1989,7 @@ pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
             )
         };
         let capacity = gate.max_tiles.get().checked_mul(CUDA_FP8_EXPERT_TILE_ROWS);
-        fp8(gate)
-            && (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up)
+        (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up)
             && shared(gate) == shared(up)
             && (act.act.gate, act.act.up, act.offsets) == (gate.c, up.c, gate.offsets)
             && capacity == Some(act.act.rows.get())
@@ -2007,8 +2008,8 @@ pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
     let mut i = 0;
     while i < steps.len() {
         if let [
-            CudaStep::ExpertGemm(gate),
-            CudaStep::ExpertGemm(up),
+            CudaStep::ExpertGemmFp8(gate),
+            CudaStep::ExpertGemmFp8(up),
             CudaStep::ExpertActQuant(act),
             ..,
         ] = steps[i..]

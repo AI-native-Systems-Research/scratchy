@@ -2430,7 +2430,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                 CudaStep::GeluMul(_) => gelus += 1,
                 CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, .. }) => {
                     experts += 1;
-                    assert_eq!(g.weight, MoeWeight::Own, "m={m}");
+                    assert_eq!(g.moe_weight(), MoeWeight::Own, "m={m}");
                 }
                 // At one row the gate and up GEMVs and the GeGLU are one launch (#1049).
                 CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, .. }) => {
@@ -2438,7 +2438,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     experts += 2;
                     assert_eq!(g.act, scratchy_target_cuda::step::GatedOp::Gelu, "m={m}");
                     assert_eq!(
-                        (g.gate.weight, g.up.weight),
+                        (g.gate.moe_weight(), g.up.moe_weight()),
                         (MoeWeight::Own, MoeWeight::Own)
                     );
                 }
@@ -2450,7 +2450,11 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     } else {
                         64
                     };
-                    assert_eq!((g.weight, g.n_tile), (MoeWeight::Own, NTile(tile)), "m={m}");
+                    assert_eq!(
+                        (g.moe_weight(), g.n_tile),
+                        (MoeWeight::Own, NTile(tile)),
+                        "m={m}"
+                    );
                 }
                 CudaStep::SiluMul(_) => panic!("m={m}: a SiLU in a GeGLU block"),
                 _ => {}

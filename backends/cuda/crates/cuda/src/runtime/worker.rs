@@ -56,6 +56,10 @@ use crate::step::{
     GemmNarrowBf16, GemmNarrowFp8, GemmNarrowGroupFp8, GemvFp8, GemvTcFp8, HeadDim, Matmul,
     MatmulGroup, NumExperts, Rows, Splits, TopK,
 };
+use crate::step::{
+    ExpertGateUpActFp8, ExpertGateUpGemvFp8, ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8,
+    ExpertGemvTcFp8, ExpertSortFp8,
+};
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
     KV_ELEM_BYTES, KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
@@ -2213,11 +2217,15 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                     CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
+                    CudaStep::ExpertGemmFp8(g) => Self::expert_gemm_fp8(&g, slot, weights, stream),
                     CudaStep::ExpertGateUpGemmFp8(t) => {
                         Self::expert_gate_up_fp8(&t, slot, weights, stream)
                     }
                     CudaStep::ExpertGemv(ExpertGemvSplitBf16 { gemv: g, split }) => {
                         Self::expert_gemv(&g, split, slot, partials, weights, stream)
+                    }
+                    CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 { gemv: g, split }) => {
+                        Self::expert_gemv_fp8(&g, split, slot, partials, weights, stream)
                     }
                     CudaStep::GateUpAct(g) => {
                         let (Matmul { a, b, m, n, k, .. }, up_b, act) =
@@ -2274,6 +2282,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     }
                     CudaStep::ExpertGateUpAct(ExpertGateUpGemvBf16 { fold: g, split }) => {
                         Self::expert_gate_up(&g, split, slot, partials, weights, stream)
+                    }
+                    CudaStep::ExpertGateUpActFp8(ExpertGateUpGemvFp8 { fold: g, split }) => {
+                        Self::expert_gate_up_gemv_fp8(&g, split, slot, partials, weights, stream)
                     }
                     CudaStep::ExpertCombine(ExpertCombineBf16 {
                         down,
@@ -3140,7 +3151,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     /// Enqueue the e4m3 sort (FP8 S8 P1, at an fp8 bank's 64-row tiles: `kernels::moe_sort_fp8_m64`): `x` the token rows' quantization
     /// in the quant scratch, `rows` the sorted e4m3 rows, each e4m3 then its scales.
     fn expert_sort_fp8(
-        s: &ExpertSortBf16,
+        s: &ExpertSortFp8,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
         stream: &Stream,
     ) -> Result<(), KernelError> {
@@ -3248,12 +3259,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             kernel: "expert_gate_up_gemm_fp8",
             dims: [g.max_tiles.get(), g.inter.get(), g.hidden.get(), 0],
         };
-        let Some((a, rows, k)) = CudaStep::ExpertGemm(g).fp8_expert_rows() else {
+        let Some((a, rows, k)) = CudaStep::ExpertGemmFp8(g).fp8_expert_rows() else {
             return Err(refused());
         };
         let Some((b, expert_rows)) = Self::fp8_expert_slab(
             weights,
-            (g.bundle, g.weight),
+            (g.bundle, g.moe_weight()),
             ExpertProjection::Gate,
             (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
@@ -3310,38 +3321,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        if let Some((a, rows, k)) = CudaStep::ExpertGemm(*g).fp8_expert_rows() {
-            let Some((b, expert_rows)) = Self::fp8_expert_slab(
-                weights,
-                (g.bundle, g.weight),
-                g.proj,
-                (g.experts.get(), g.hidden.get(), g.inter.get()),
-            ) else {
-                return Err(KernelError::MoeShape {
-                    kernel: "expert_gemm_fp8",
-                    dims: [g.max_tiles.get(), n, k, 0],
-                });
-            };
-            // SAFETY: as the bf16 arm's below, with `a` the quant scratch's `rows*k` e4m3 bytes
-            // and `rows` f32 (`validate`), and the bank `fp8_moe_layout`'s bytes, expert 0's
-            // e4m3 block and scale row inside it.
-            return unsafe {
-                kernels::expert_gemm_fp8_m64(
-                    (Self::fp8_rows(&slot, a, rows, k), b),
-                    (
-                        slot(g.offsets).cast_const(),
-                        slot(g.tile_expert).cast_const(),
-                    ),
-                    slot(g.c),
-                    (g.max_tiles.get(), n, k, g.experts.get(), expert_rows),
-                    g.n_tile.get(),
-                    stream.0,
-                )
-            };
-        }
         let Some((b, expert_rows)) = Self::expert_slab(
             weights,
-            (g.bundle, g.weight),
+            (g.bundle, g.moe_weight()),
             g.proj,
             (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
@@ -3357,6 +3339,50 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         unsafe {
             kernels::expert_gemm_tiled_bf16(
                 (slot(g.a).cast_const(), b),
+                (
+                    slot(g.offsets).cast_const(),
+                    slot(g.tile_expert).cast_const(),
+                ),
+                slot(g.c),
+                (g.max_tiles.get(), n, k, g.experts.get(), expert_rows),
+                g.n_tile.get(),
+                stream.0,
+            )
+        }
+    }
+
+    /// [`Self::expert_gemm`] over an fp8 bank (`kernels::expert_gemm_fp8_m64`): the sorted e4m3
+    /// rows and their scales times each expert's e4m3 block and scale row.
+    fn expert_gemm_fp8(
+        g: &ExpertGemmFp8,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.n_k();
+        let Some((a, rows, k)) = CudaStep::ExpertGemmFp8(*g).fp8_expert_rows() else {
+            return Err(KernelError::MoeShape {
+                kernel: "expert_gemm_fp8",
+                dims: [g.max_tiles.get(), n, k, 0],
+            });
+        };
+        let Some((b, expert_rows)) = Self::fp8_expert_slab(
+            weights,
+            (g.bundle, g.moe_weight()),
+            g.proj,
+            (g.experts.get(), g.hidden.get(), g.inter.get()),
+        ) else {
+            return Err(KernelError::MoeShape {
+                kernel: "expert_gemm_fp8",
+                dims: [g.max_tiles.get(), n, k, 0],
+            });
+        };
+        // SAFETY: as `expert_gemm`'s, with `a` the quant scratch's `rows*k` e4m3 bytes
+        // and `rows` f32 (`validate`), and the bank `fp8_moe_layout`'s bytes, expert 0's
+        // e4m3 block and scale row inside it.
+        unsafe {
+            kernels::expert_gemm_fp8_m64(
+                (Self::fp8_rows(&slot, a, rows, k), b),
                 (
                     slot(g.offsets).cast_const(),
                     slot(g.tile_expert).cast_const(),
@@ -3425,7 +3451,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     /// A tensor-core expert GEMV (FP8 S8 T2): B8's expert form over the fp8 bank, the token row
     /// (its `top_k` pairs) or the pairs' own rows, quantized in the quant scratch.
     fn expert_gemv_tc(
-        g: &ExpertGemvBf16,
+        g: &ExpertGemvTcFp8,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
         weights: &[DeviceBuffer],
         stream: &Stream,
@@ -3437,7 +3463,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         };
         let Some((b, expert_rows)) = Self::fp8_expert_slab(
             weights,
-            (g.bundle, g.weight),
+            (g.bundle, g.moe_weight()),
             g.proj,
             (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
@@ -3477,21 +3503,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         weights: &[DeviceBuffer],
         stream: &Stream,
     ) -> Result<(), KernelError> {
-        let g = t.fold.gate;
+        let g = t.gate;
         let (n, k) = g.n_k();
         let refused = KernelError::MoeShape {
             kernel: "gemv_fp8_b8",
             dims: [g.m.get(), g.top_k.get(), n, k],
         };
-        let slab = |p: &ExpertGemvBf16| {
+        let slab = |p: &ExpertGemvTcFp8| {
             Self::fp8_expert_slab(
                 weights,
-                (p.bundle, p.weight),
+                (p.bundle, p.moe_weight()),
                 p.proj,
                 (p.experts.get(), p.hidden.get(), p.inter.get()),
             )
         };
-        let (Some((gate_w, expert_rows)), Some((up_w, _))) = (slab(&g), slab(&t.fold.up)) else {
+        let (Some((gate_w, expert_rows)), Some((up_w, _))) = (slab(&g), slab(&t.up)) else {
             return Err(refused);
         };
         let pairs = g.m.get().checked_mul(g.top_k.get()).ok_or(refused)?;
@@ -3518,9 +3544,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             )?;
             kernels::act_quant_fp8(
                 (gate.cast_const(), up.cast_const()),
-                (q_act.cast_mut(), s_act.cast_mut(), slot(t.fold.out)),
+                (q_act.cast_mut(), s_act.cast_mut(), slot(t.out)),
                 (pairs, n),
-                t.fold.act.code(),
+                t.act.code(),
                 stream.0,
             )
         }
@@ -3539,34 +3565,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
         let splits = split.splits;
-        if matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) {
-            let Some((b, expert_rows)) = Self::fp8_expert_slab(
-                weights,
-                (g.bundle, g.weight),
-                g.proj,
-                (g.experts.get(), g.hidden.get(), g.inter.get()),
-            ) else {
-                return Err(KernelError::MoeShape {
-                    kernel: "expert_gemv_fp8",
-                    dims: [g.m.get(), g.top_k.get(), n, k],
-                });
-            };
-            // SAFETY: as the bf16 launch's below, with the bank `fp8_moe_layout`'s bytes, expert
-            // 0's e4m3 block and scale row inside it; `a` is bf16, quantized in the prologue.
-            return unsafe {
-                kernels::expert_gemv_fp8(
-                    (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
-                    (slot(g.c), partials),
-                    (g.m.get(), g.top_k.get(), n, k),
-                    (g.experts.get(), expert_rows),
-                    (g.rows == PairRows::Pair, splits.get()),
-                    stream.0,
-                )
-            };
-        }
         let Some((b, expert_rows)) = Self::expert_slab(
             weights,
-            (g.bundle, g.weight),
+            (g.bundle, g.moe_weight()),
             g.proj,
             (g.experts.get(), g.hidden.get(), g.inter.get()),
         ) else {
@@ -3581,6 +3582,43 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // scratch, at least this step's partials' bytes, which `validate` checked).
         unsafe {
             kernels::expert_gemv_split_bf16(
+                (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
+                (slot(g.c), partials),
+                (g.m.get(), g.top_k.get(), n, k),
+                (g.experts.get(), expert_rows),
+                (g.rows == PairRows::Pair, splits.get()),
+                stream.0,
+            )
+        }
+    }
+
+    /// [`Self::expert_gemv`] over an fp8 bank (`kernels::expert_gemv_fp8`): the bf16 rows,
+    /// quantized in the GEMV's prologue.
+    fn expert_gemv_fp8(
+        g: &ExpertGemvFp8,
+        split: GemvSplit,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        partials: *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.n_k();
+        let splits = split.splits;
+        let Some((b, expert_rows)) = Self::fp8_expert_slab(
+            weights,
+            (g.bundle, g.moe_weight()),
+            g.proj,
+            (g.experts.get(), g.hidden.get(), g.inter.get()),
+        ) else {
+            return Err(KernelError::MoeShape {
+                kernel: "expert_gemv_fp8",
+                dims: [g.m.get(), g.top_k.get(), n, k],
+            });
+        };
+        // SAFETY: as `expert_gemv`'s, with the bank `fp8_moe_layout`'s bytes, expert
+        // 0's e4m3 block and scale row inside it; `a` is bf16, quantized in the prologue.
+        unsafe {
+            kernels::expert_gemv_fp8(
                 (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
                 (slot(g.c), partials),
                 (g.m.get(), g.top_k.get(), n, k),
@@ -3608,43 +3646,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             dims: [pairs, n, k, 0],
         };
         let splits = split.splits;
-        if matches!(g.gate.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) {
-            let slab = |e: &ExpertGemvBf16| {
-                Self::fp8_expert_slab(
-                    weights,
-                    (e.bundle, e.weight),
-                    e.proj,
-                    (e.experts.get(), e.hidden.get(), e.inter.get()),
-                )
-            };
-            let (Some((gate, rows)), Some((up, up_rows))) = (slab(&g.gate), slab(&g.up)) else {
-                return Err(refused);
-            };
-            if rows != up_rows {
-                return Err(refused);
-            }
-            // SAFETY: as the bf16 launch's below, for both fp8 slabs and their scale rows, each
-            // inside the bank's gate/up part (`fp8_moe_layout`).
-            return unsafe {
-                kernels::expert_gate_up_gemv_fp8(
-                    (
-                        slot(g.gate.a).cast_const(),
-                        gate,
-                        up,
-                        slot(g.gate.topk_idx).cast_const(),
-                    ),
-                    (slot(g.out), partials),
-                    (g.gate.m.get(), g.gate.top_k.get(), n, k),
-                    (g.gate.experts.get(), rows, splits.get()),
-                    g.act.code(),
-                    stream.0,
-                )
-            };
-        }
         let slab = |e: &ExpertGemvBf16| {
             Self::expert_slab(
                 weights,
-                (e.bundle, e.weight),
+                (e.bundle, e.moe_weight()),
                 e.proj,
                 (e.experts.get(), e.hidden.get(), e.inter.get()),
             )
@@ -3660,6 +3665,55 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `validate` checked).
         unsafe {
             kernels::expert_gate_up_gemv_bf16(
+                (
+                    slot(g.gate.a).cast_const(),
+                    gate,
+                    up,
+                    slot(g.gate.topk_idx).cast_const(),
+                ),
+                (slot(g.out), partials),
+                (g.gate.m.get(), g.gate.top_k.get(), n, k),
+                (g.gate.experts.get(), rows, splits.get()),
+                g.act.code(),
+                stream.0,
+            )
+        }
+    }
+
+    /// [`Self::expert_gate_up`] over an fp8 bank (`kernels::expert_gate_up_gemv_fp8`).
+    fn expert_gate_up_gemv_fp8(
+        g: &ExpertGateUpActFp8,
+        split: GemvSplit,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        partials: *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.gate.n_k();
+        let pairs = g.gate.m.get().saturating_mul(g.gate.top_k.get());
+        let refused = KernelError::GateUpShape {
+            kernel: "expert_gate_up_gemv_bf16",
+            dims: [pairs, n, k, 0],
+        };
+        let splits = split.splits;
+        let slab = |e: &ExpertGemvFp8| {
+            Self::fp8_expert_slab(
+                weights,
+                (e.bundle, e.moe_weight()),
+                e.proj,
+                (e.experts.get(), e.hidden.get(), e.inter.get()),
+            )
+        };
+        let (Some((gate, rows)), Some((up, up_rows))) = (slab(&g.gate), slab(&g.up)) else {
+            return Err(refused);
+        };
+        if rows != up_rows {
+            return Err(refused);
+        }
+        // SAFETY: as `expert_gate_up`'s, for both fp8 slabs and their scale rows, each
+        // inside the bank's gate/up part (`fp8_moe_layout`).
+        unsafe {
+            kernels::expert_gate_up_gemv_fp8(
                 (
                     slot(g.gate.a).cast_const(),
                     gate,

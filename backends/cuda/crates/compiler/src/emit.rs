@@ -41,6 +41,7 @@
 use scratchy_target_cuda::step::{
     BlockSize, BucketM, ConvKernel, GdnHeadDim, GdnHeads, HeadDim, MaxBlocksPerSeq, NumKvHeads,
 };
+use scratchy_target_cuda::step::{ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8, MoeBank};
 use std::collections::{BTreeMap, HashMap};
 
 use proc_macro2::TokenStream;
@@ -128,6 +129,14 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "MoeWeight",
                 "ExpertSortBf16",
                 "ExpertGemmBf16",
+                "ExpertGemmFp8",
+                "ExpertGemvFp8",
+                "ExpertGemvTcFp8",
+                "ExpertGemvSplitFp8",
+                "ExpertGateUpActFp8",
+                "ExpertGateUpGemvFp8",
+                "ExpertSortFp8",
+                "MoeBank",
                 "ExpertGemvBf16",
                 "ExpertProjection",
                 "PairRows",
@@ -610,7 +619,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         })
         | CudaStep::ExpertGemm(ExpertGemmBf16 {
             bundle,
-            weight: MoeWeight::Bundle,
+            weight: MoeBank::Bundle,
             experts,
             hidden,
             inter,
@@ -620,7 +629,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             gemv:
                 ExpertGemvBf16 {
                     bundle,
-                    weight: MoeWeight::Bundle,
+                    weight: MoeBank::Bundle,
                     experts,
                     hidden,
                     inter,
@@ -645,7 +654,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         // Gemma's expert bank: its gate, up and down sources name one bank.
         CudaStep::ExpertGemm(ExpertGemmBf16 {
             bundle,
-            weight: MoeWeight::Own,
+            weight: MoeBank::Own,
             experts,
             hidden,
             inter,
@@ -655,7 +664,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             gemv:
                 ExpertGemvBf16 {
                     bundle,
-                    weight: MoeWeight::Own,
+                    weight: MoeBank::Own,
                     experts,
                     hidden,
                     inter,
@@ -674,19 +683,19 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         })
-        | CudaStep::ExpertGemm(ExpertGemmBf16 {
+        | CudaStep::ExpertGemmFp8(ExpertGemmFp8 {
             bundle,
-            weight: MoeWeight::Fp8Bundle,
+            weight: MoeBank::Bundle,
             experts,
             hidden,
             inter,
             ..
         })
-        | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+        | CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 {
             gemv:
-                ExpertGemvBf16 {
+                ExpertGemvFp8 {
                     bundle,
-                    weight: MoeWeight::Fp8Bundle,
+                    weight: MoeBank::Bundle,
                     experts,
                     hidden,
                     inter,
@@ -709,19 +718,19 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             bundle,
             Role::Bf16([u64::from(experts), u64::from(hidden)], 2),
         )),
-        CudaStep::ExpertGemm(ExpertGemmBf16 {
+        CudaStep::ExpertGemmFp8(ExpertGemmFp8 {
             bundle,
-            weight: MoeWeight::Fp8Own,
+            weight: MoeBank::Own,
             experts,
             hidden,
             inter,
             ..
         })
-        | CudaStep::ExpertGemv(ExpertGemvSplitBf16 {
+        | CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8 {
             gemv:
-                ExpertGemvBf16 {
+                ExpertGemvFp8 {
                     bundle,
-                    weight: MoeWeight::Fp8Own,
+                    weight: MoeBank::Own,
                     experts,
                     hidden,
                     inter,
@@ -763,15 +772,18 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         // fold.
         CudaStep::GateUpAct(_)
         | CudaStep::ExpertGateUpAct(_)
+        | CudaStep::ExpertGateUpActFp8(_)
         | CudaStep::ExpertGateUpGemmFp8(_) => None,
         // The tensor-core decode GEMVs (FP8 S8 T2) read their weights as their CUDA-core twins
         // do; a tensor-core gate/up's first part is itself, so it names its gate's (its second
         // part, the up's GEMV, the up's).
         CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvTcFp8(t.gate)),
-        CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(g))),
-        CudaStep::ExpertGateUpTcFp8(t) => {
-            role(&CudaStep::ExpertGemv(ExpertGemvSplitBf16::of(t.fold.gate)))
-        }
+        CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8::of(
+            g.cuda_core(),
+        ))),
+        CudaStep::ExpertGateUpTcFp8(t) => role(&CudaStep::ExpertGemvFp8(ExpertGemvSplitFp8::of(
+            t.gate.cuda_core(),
+        ))),
         // A norm with its quantization (FP8 S8 N3) reads its norm's gain.
         CudaStep::RmsNormQuantFp8(t) => role(&CudaStep::RmsNorm(t.norm)),
         CudaStep::AddRmsNormQuantFp8(t) => role(&CudaStep::AddRmsNorm(t.fold)),
