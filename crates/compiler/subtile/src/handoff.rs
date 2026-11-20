@@ -510,7 +510,10 @@ mod kv_state_decl_tests {
 
     fn one_state(per_unit: u64) -> KvStateDecl {
         KvStateDecl::new(
-            vec![KvStatePlane::new(0, per_unit), KvStatePlane::new(1, per_unit)],
+            vec![
+                KvStatePlane::new(0, per_unit),
+                KvStatePlane::new(1, per_unit),
+            ],
             std::num::NonZeroU32::new(128).expect("128 != 0"),
             128,
         )
@@ -765,10 +768,7 @@ impl<E: EmbedState> LoweredDecode<E> {
     /// planes' source indices are the shard's own, so only the per-unit elems move). The form
     /// [`crate::tensor_parallel::shard_lowered`] returns.
     pub fn with_kv_states(self, kv_states: Vec<KvStateDecl>) -> Self {
-        Self {
-            kv_states,
-            ..self
-        }
+        Self { kv_states, ..self }
     }
 }
 

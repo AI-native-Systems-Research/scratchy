@@ -80,14 +80,8 @@ fn kv_write_spec(t: i128, nkvh: i128, hd: i128, block: i128, pages: i128) -> Ker
             ("T", t),
             ("NUM_KV_HEADS", nkvh),
             ("HEAD_SIZE", hd),
-            (
-                "K_ROWS",
-                2 * pages * nkvh * block,
-            ),
-            (
-                "V_ROWS",
-                2 * pages * nkvh * block - nkvh * block,
-            ),
+            ("K_ROWS", 2 * pages * nkvh * block),
+            ("V_ROWS", 2 * pages * nkvh * block - nkvh * block),
         ],
     )
 }
@@ -696,7 +690,10 @@ impl Batch {
                 // `2 · ROWS_PER_PAGE` rows — K declares that span, V (based at the plane offset)
                 // the span minus its own `ROWS_PER_PAGE` offset rows.
                 ("KV_ROWS", 2 * pages * self.rows_per_page),
-                ("V_ROWS", 2 * pages * self.rows_per_page - self.rows_per_page),
+                (
+                    "V_ROWS",
+                    2 * pages * self.rows_per_page - self.rows_per_page,
+                ),
             ],
         );
         k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
@@ -722,7 +719,10 @@ impl Batch {
             vec![
                 s.arg("q", vec![rows, width]),
                 i32_arg(rep_row_ids, vec![index_rows]),
-                f16_arg(&interleave_pool(&s.values("kp"), rpp, row_elems), span.clone()),
+                f16_arg(
+                    &interleave_pool(&s.values("kp"), rpp, row_elems),
+                    span.clone(),
+                ),
                 f16_arg(&interleave_pool(&s.values("vp"), rpp, row_elems), span),
                 i32_arg(&ids, vec![self.num_chunks as usize * index_rows]),
                 self.mask_rows(e, nkvh as usize, block as usize),

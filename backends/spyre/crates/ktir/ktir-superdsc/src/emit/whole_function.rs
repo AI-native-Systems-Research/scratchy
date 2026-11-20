@@ -9599,7 +9599,12 @@ fn direct_gather_scale(k: &KtirNode, tile: &Operation<'_>) -> Result<u32, Error>
             strides.len()
         ));
     }
-    let slab: i64 = dims.iter().enumerate().filter(|(i, _)| *i != d).map(|(_, x)| *x).product();
+    let slab: i64 = dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != d)
+        .map(|(_, x)| *x)
+        .product();
     let (stride0, slab) = (strides[0], slab);
     if slab <= 0 || stride0 <= 0 || stride0 % slab != 0 {
         return err(format!(

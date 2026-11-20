@@ -1039,13 +1039,25 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
+            match scratchy_triton_splice::lower_all(
+                node,
+                ir,
+                rows_are_requests,
+                query_rows,
+                kv_states,
+            ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
         SubOp::MatmulTile { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
+            match scratchy_triton_splice::lower_all(
+                node,
+                ir,
+                rows_are_requests,
+                query_rows,
+                kv_states,
+            ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1088,7 +1100,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // draw reads the FOLDED tail's answer rows (the `[S, vocab]` window the
         // mint states on the node), which is `lower_all`'s machinery.
         SubOp::Sample { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
+            match scratchy_triton_splice::lower_all(
+                node,
+                ir,
+                rows_are_requests,
+                query_rows,
+                kv_states,
+            ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1107,7 +1125,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // the split's own lowering emitted (`lower_all`'s interception), so the
         // one-op path is only for the norms that are NOT a sandwich seat.
         SubOp::RmsNorm { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
+            match scratchy_triton_splice::lower_all(
+                node,
+                ir,
+                rows_are_requests,
+                query_rows,
+                kv_states,
+            ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1121,7 +1145,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // ⭐ A KV WRITER LOWERS TO ITS ROTATION AND ITS PAGED WRITE — `lower_all` emits both, the
         // scatter into the pools right after the rotation it stores.
         SubOp::RopeAppend { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
+            match scratchy_triton_splice::lower_all(
+                node,
+                ir,
+                rows_are_requests,
+                query_rows,
+                kv_states,
+            ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1143,7 +1173,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             {
                 return HostRouted("ScalarMulWeightFold");
             }
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows, kv_states) {
+            match scratchy_triton_splice::lower_all(
+                node,
+                ir,
+                rows_are_requests,
+                query_rows,
+                kv_states,
+            ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1253,7 +1289,14 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests, query_rows, kv_states) {
+        match lower_one_node(
+            node,
+            ir,
+            active_cap,
+            rows_are_requests,
+            query_rows,
+            kv_states,
+        ) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1299,8 +1342,14 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     query_rows: QueryExtent,
     kv_states: &[scratchy_subtile::handoff::KvStateDecl],
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
-    let (programs, mut bundle_layout) =
-        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows, kv_states)?;
+    let (programs, mut bundle_layout) = lower_graph_to_ktir(
+        ir,
+        weight_ids,
+        active_cap,
+        rows_are_requests,
+        query_rows,
+        kv_states,
+    )?;
     // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     let attn_params = attn_bundle_params(ir, rows_are_requests);
@@ -1638,12 +1687,10 @@ pub fn paged_step_of_ir<F: RopeForm>(
         // compile-time constant of the generation and the declaration), NEVER the pages a
         // particular run funds: the worker picks those at run time, up to this bound minus the
         // null page.
-        let decl = scratchy_triton_splice::decl_of_pool(kv_states, cache)
-            .map_err(SuperDscError)?;
-        let unit_bytes =
-            decl.unit_bytes(u64::from(
-                ktir_superdsc::superdsc_opspec::Df::Fp16.word_length(),
-            ));
+        let decl = scratchy_triton_splice::decl_of_pool(kv_states, cache).map_err(SuperDscError)?;
+        let unit_bytes = decl.unit_bytes(u64::from(
+            ktir_superdsc::superdsc_opspec::Df::Fp16.word_length(),
+        ));
         let (pages, unit_elems, mq) = (
             scratchy_triton_splice::units_max(unit_bytes),
             decl.unit_elems() as u32,
@@ -1921,7 +1968,9 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let mut stated: Vec<u32> = Vec::new();
         for lowered in &per_node {
             for wired in lowered.iter().flatten() {
-                if let Some(s) = wired.3 && !stated.contains(&s) {
+                if let Some(s) = wired.3
+                    && !stated.contains(&s)
+                {
                     stated.push(s);
                 }
             }
@@ -2348,11 +2397,12 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .iter()
         .filter(|n| matches!(n.op, SubOp::Sample { .. }))
     {
-        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows, kv_states) {
-            NodeLowering::Ops(v) => v,
-            NodeLowering::HostRouted(_) => continue,
-            NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
-        };
+        let ops =
+            match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows, kv_states) {
+                NodeLowering::Ops(v) => v,
+                NodeLowering::HostRouted(_) => continue,
+                NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
+            };
         for e in ops {
             let Some(k) = e.ktir else { continue };
             out.extend(

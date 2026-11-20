@@ -4154,9 +4154,7 @@ mod production_ktir_dump {
     /// declaration, at the kernels' own `*fp16` cache width: the same fact `lower_attn` and
     /// `lower_kv_write` state for the descriptors, never a second spelling of it.
     pub(crate) fn span_units(d: &scratchy_subtile::handoff::KvStateDecl) -> u64 {
-        u64::from(units_max(
-            d.unit_bytes(u64::from(Df::Fp16.word_length())),
-        ))
+        u64::from(units_max(d.unit_bytes(u64::from(Df::Fp16.word_length()))))
     }
 
     const PAGED_DECODE: &str = include_str!("../../../../kernels/page_attn_head_major_decode.py");
@@ -5087,9 +5085,12 @@ mod production_ktir_dump {
             "paged_attn_decode_pool" | "paged_attn_prefill_walk" => attn(64, 2048),
             "paged_attn_decode_hd128" | "paged_attn_prefill_hd128" => attn(128, 4),
             "paged_attn_prefill_packed" => attn(64, 4),
-            "batched_decode" | "batched_decode_chunks" | "batched_decode_pair"
+            "batched_decode"
+            | "batched_decode_chunks"
+            | "batched_decode_pair"
             | "batched_decode_one_slot" => batched(64),
-            "batched_decode_hd128" | "batched_decode_chunks_hd128"
+            "batched_decode_hd128"
+            | "batched_decode_chunks_hd128"
             | "batched_decode_one_slot_hd128" => batched(128),
             "paged_kv_write" | "paged_kv_write_prompt" => write(8, 64),
             "paged_kv_write_rows" => write(2, 64),
@@ -5507,8 +5508,7 @@ mod walk_on_the_card {
 
     fn the_decode_trip_runs_one_kv_head_a_core_in_lx_at(hd: i128) {
         let node = walk_at(1, 4, hd);
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &mut layout, walk_cache_planes(hd as u32))
             .expect("the cache allocates");
         let mut sym = 0i64;
@@ -5675,10 +5675,7 @@ mod walk_on_the_card {
             ("NUM_QUERIES_PER_KV", group),
             ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
             ("HEAD_SIZE", hd),
-            (
-                "NUM_PAGES",
-                span_units(&decl(kv_heads * hd, 2048)) as u32,
-            ),
+            ("NUM_PAGES", span_units(&decl(kv_heads * hd, 2048)) as u32),
             ("ROWS_PER_PAGE", c.rows_per_page),
             (
                 "KV_ROWS",
@@ -5743,8 +5740,7 @@ mod walk_on_the_card {
             3,
             "each block slot's running max, sum and output"
         );
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &mut layout, batched_cache_planes(8, 64))
             .expect("the cache allocates");
         let mut sym = 0i64;
@@ -6353,8 +6349,7 @@ mod walk_on_the_card {
             flatten(&node).expect("the walk flattens").is_none(),
             "a single chunk states no loop"
         );
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &mut layout, batched_cache_planes(8, 64))
             .expect("the cache allocates");
         let mut sym = 0i64;
@@ -6489,8 +6484,7 @@ mod walk_on_the_card {
     #[test]
     fn a_two_stick_head_gathers_each_kv_heads_page_stick_major() {
         let node = walk_at(1, 4, 128);
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &mut layout, walk_cache_planes(128))
             .expect("the cache allocates");
         let mut sym = 0i64;
@@ -6968,8 +6962,7 @@ mod walk_on_the_card {
     #[test]
     fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_each_page_in_one_op() {
         let node = walk_at(64, 4, 128);
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
         allocate_paged_cache(&node, &mut layout, walk_cache_planes(128))
             .expect("the cache allocates");
         let mut sym = 0i64;
@@ -7137,8 +7130,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         let module = compile_kernel(&src, &spec, &[1]).expect("the kernel compiles");
         let node =
             triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the program mints");
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the program places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the program places");
         // The spec's own funded pool: four pages of `4·64·128` fp16 elements a plane.
         allocate_paged_cache(&node, &mut layout, [4 * 4 * 64 * 128 * 2; 2])
             .expect("the cache allocates");
@@ -7234,8 +7226,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         let module = compile_kernel(src, &spec, &[1]).expect("the write compiles");
         let node = triton_ktir_superdsc::node_for(&module, Program::PagedKvWrite)
             .expect("the write mints");
-        let mut layout =
-            triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
+        let mut layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
         allocate_paged_cache(
             &node,
             &mut layout,

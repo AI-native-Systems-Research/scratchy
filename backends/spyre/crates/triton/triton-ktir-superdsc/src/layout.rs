@@ -161,9 +161,7 @@ pub fn allocate_paged_cache(
                 "{}: the cache plane t{tid} is allocated at {bytes} B and seg{} then packs {} B, \
                  past the {SEGMENT_SIZE} B a segment is (`SEGMENT_SIZE`, which is also the \
                  addressing stride) — the funded pool does not fit one HBM region.",
-                node.func.name,
-                stub.segment,
-                layout.segment_bytes[stub.segment],
+                node.func.name, stub.segment, layout.segment_bytes[stub.segment],
             ));
         }
         layout

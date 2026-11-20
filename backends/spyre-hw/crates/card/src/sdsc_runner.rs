@@ -529,7 +529,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// per bank, and every borrower rung adopts them ([`Self::adopt_funded_kv`]) as it is
     /// built, through `adopt_from_owner`.
     pub fn fund_kv_pool(&mut self, pages: u64) -> Result<()> {
-        self.each_parallel("FundKv", |e| e.fund_kv_pool(pages)).map(drop)
+        self.each_parallel("FundKv", |e| e.fund_kv_pool(pages))
+            .map(drop)
     }
 
     /// A borrower's half of [`Self::fund_kv_pool`]: every rank takes the owner's funded regions —

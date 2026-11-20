@@ -69,11 +69,7 @@ fn gathered_program(stride0: Option<i64>) -> KtirNode {
                 4,
                 64,
             )
-            .with_attr(
-                a,
-                AttrKey::Strides,
-                Attr::IntList(a.ints(vec![stride0, 1])),
-            ),
+            .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(vec![stride0, 1]))),
             None => shape(
                 Operation::new(a, Some(v_val), OpKind::KtdpConstructMemoryView, &[p_val]),
                 4,
@@ -208,8 +204,7 @@ fn a_page_table_no_op_reads_answers_none() {
 fn a_view_without_strides_is_refused_by_name() {
     let k = gathered_program(None);
     let page_table = k.bindings[1].get();
-    let e = page_index_scale(&k, page_table)
-        .expect_err("a view with no strides names no id scale");
+    let e = page_index_scale(&k, page_table).expect_err("a view with no strides names no id scale");
     assert!(
         e.message.contains("states no strides"),
         "the refusal names the missing strides, got: {}",
@@ -253,20 +248,11 @@ fn two_gathers_with_different_scales_are_refused_by_name() {
     let zero = Ssa(7);
     let extra = vec![
         shape(
-            Operation::new(
-                a,
-                Some(v_half),
-                OpKind::KtdpConstructMemoryView,
-                &[Ssa(0)],
-            ),
+            Operation::new(a, Some(v_half), OpKind::KtdpConstructMemoryView, &[Ssa(0)]),
             4,
             32,
         )
-        .with_attr(
-            a,
-            AttrKey::Strides,
-            Attr::IntList(a.ints(vec![128, 1])),
-        ),
+        .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(vec![128, 1]))),
         shape(
             Operation::new(
                 a,
@@ -353,7 +339,8 @@ fn chained_program(
     // Parameters: %0 = gathered table, %1 = run table, %2 = page table.
     let (p_val, p_run, p_page) = (Ssa(0), Ssa(1), Ssa(2));
     let (v_k, v_run, v_page, zero, eight) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7));
-    let (pt_tile, ld, ext, mul, cast, ind, gld) = (Ssa(8), Ssa(9), Ssa(10), Ssa(11), Ssa(12), Ssa(13), Ssa(14));
+    let (pt_tile, ld, ext, mul, cast, ind, gld) =
+        (Ssa(8), Ssa(9), Ssa(10), Ssa(11), Ssa(12), Ssa(13), Ssa(14));
 
     let dim0 = a.expr(AffineExpr::Dim(0));
     let dim1 = a.expr(AffineExpr::Dim(1));
@@ -396,7 +383,12 @@ fn chained_program(
         .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(vec![1]))),
         // The chained read: page = the scalar at entry 0 of the page table's view.
         ishape(
-            Operation::new(a, Some(pt_tile), OpKind::KtdpConstructAccessTile, &[v_page, zero]),
+            Operation::new(
+                a,
+                Some(pt_tile),
+                OpKind::KtdpConstructAccessTile,
+                &[v_page, zero],
+            ),
             vec![1],
         ),
         ishape(
@@ -437,18 +429,16 @@ fn chained_program(
                 AffineMap {
                     num_dims: 2,
                     num_syms: 2,
-                    exprs: std::slice::from_ref(a.expr(AffineExpr::Add(
-                        a.expr(AffineExpr::Sym(0)),
-                        dim0,
-                    ))),
+                    exprs: std::slice::from_ref(
+                        a.expr(AffineExpr::Add(a.expr(AffineExpr::Sym(0)), dim0)),
+                    ),
                 },
                 AffineMap {
                     num_dims: 2,
                     num_syms: 2,
-                    exprs: std::slice::from_ref(a.expr(AffineExpr::Add(
-                        a.expr(AffineExpr::Sym(1)),
-                        dim1,
-                    ))),
+                    exprs: std::slice::from_ref(
+                        a.expr(AffineExpr::Add(a.expr(AffineExpr::Sym(1)), dim1)),
+                    ),
                 },
             ])),
         ),

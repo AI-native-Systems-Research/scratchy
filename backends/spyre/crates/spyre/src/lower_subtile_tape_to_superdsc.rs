@@ -623,8 +623,7 @@ pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             rows_are_requests,
             query_rows,
             kv_states,
-        )
-        else {
+        ) else {
             continue;
         };
         for k in ops
@@ -1000,7 +999,13 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         nbytes(tid) / u64::from(t.rows) / u64::from(t.cols)
     };
     let (kv_bank_bytes, kv_bank_unit_bytes, kv_block_banks) = if cfg!(feature = "spyre-lower") {
-        place_kv_pools(kv_states, per_layer_ext, &width_of, &mut seg_bytes, &mut placements)?
+        place_kv_pools(
+            kv_states,
+            per_layer_ext,
+            &width_of,
+            &mut seg_bytes,
+            &mut placements,
+        )?
     } else {
         (Vec::new(), Vec::new(), Default::default())
     };
@@ -1978,8 +1983,10 @@ mod weight_tail_tests {
 
 /// A pool class's tables, grouped by declaration: each entry is one declaration and its planes'
 /// tables (`(layer-0 tid, per-layer tids)` per plane, in the declaration's own plane order).
-type PairedPoolTables<'a> =
-    Vec<(&'a scratchy_subtile::handoff::KvStateDecl, Vec<(u32, &'a Vec<u32>)>)>;
+type PairedPoolTables<'a> = Vec<(
+    &'a scratchy_subtile::handoff::KvStateDecl,
+    Vec<(u32, &'a Vec<u32>)>,
+)>;
 
 /// Each pool table's bank per iteration, keyed by the table's layer-0 tid.
 type PoolTableBanks = std::collections::BTreeMap<u32, Vec<KvBank>>;
@@ -2139,7 +2146,8 @@ fn place_kv_pools(
                  shrink a declaration."
             )));
         }
-        let banks: Vec<KvBank> = (0..paired.first()
+        let banks: Vec<KvBank> = (0..paired
+            .first()
             .map(|(_, ts)| ts.first().map(|t| t.1.len()).unwrap_or(0))
             .unwrap_or(0))
             .map(|j| KvBank::of_placement((bank_bytes.len() + j) as u32))
@@ -2184,7 +2192,10 @@ fn place_kv_pools(
     let mut tail = bank_bytes[0];
     let mut tail_decls = 0u32;
     for d in kv_states {
-        if d.planes().iter().any(|p| owned.contains(&(p.source() as u32))) {
+        if d.planes()
+            .iter()
+            .any(|p| owned.contains(&(p.source() as u32)))
+        {
             continue;
         }
         tail_decls += 1;
@@ -11150,15 +11161,17 @@ mod kv_pool_placement_tests {
         let pool = 1024u64;
         let per_layer_ext: Vec<std::collections::BTreeMap<u32, Vec<u32>>> = Vec::new();
         let page = std::num::NonZeroU32::new(128).expect("128 != 0");
-        let states = vec![scratchy_subtile::handoff::KvStateDecl::new(
-            vec![
-                scratchy_subtile::handoff::KvStatePlane::new(9000, pool),
-                scratchy_subtile::handoff::KvStatePlane::new(9100, pool),
-            ],
-            page,
-            page.get(),
-        )
-        .expect("one page is a whole number of pages")];
+        let states = vec![
+            scratchy_subtile::handoff::KvStateDecl::new(
+                vec![
+                    scratchy_subtile::handoff::KvStatePlane::new(9000, pool),
+                    scratchy_subtile::handoff::KvStatePlane::new(9100, pool),
+                ],
+                page,
+                page.get(),
+            )
+            .expect("one page is a whole number of pages"),
+        ];
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
         let (extra, unit_bytes, _) = place_kv_pools(
             &states,

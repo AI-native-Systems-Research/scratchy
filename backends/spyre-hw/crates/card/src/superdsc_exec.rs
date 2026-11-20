@@ -2511,8 +2511,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         debug!(
             "[sdsc-superdsc] share_scratch_seg(seg{i}): dst now SHARES the family arena ({} B \
              for {} B of placement)",
-            c0.size.0,
-            self.segment_bytes[i]
+            c0.size.0, self.segment_bytes[i]
         );
         Ok(())
     }
@@ -6486,10 +6485,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let mut funded: Vec<DevAddr> = Vec::with_capacity(self.kv_bank_unit_bytes.len());
         for (b, &unit) in self.kv_bank_unit_bytes.iter().enumerate() {
             let bytes = null_plus * unit;
-            let addr =
-                DevAddr::alloc(self.card, ByteSize(bytes.max(128)), MemoryType::Tensor).map_err(
-                    |e| anyhow!("fund_kv_pool: bank {b} alloc of {bytes} B failed: {e}"),
-                )?;
+            let addr = DevAddr::alloc(self.card, ByteSize(bytes.max(128)), MemoryType::Tensor)
+                .map_err(|e| anyhow!("fund_kv_pool: bank {b} alloc of {bytes} B failed: {e}"))?;
             fill_zero_walk(
                 self.stream_ref()?,
                 &addr,

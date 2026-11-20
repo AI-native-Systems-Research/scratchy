@@ -578,45 +578,45 @@ mod tests {
     /// card stagers and the placements ARE these.
     fn step() -> crate::wiring::PagedStep {
         crate::wiring::PagedStep {
-        mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
-        page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
-        write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
-        query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
-        kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
-        rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
-        chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
-        chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
-        int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
-        pages: 4,
-        unit_elems: unit_of(2, 64, 4),
-        page_slots: 4,
-        // The pool holds exactly the context's four pages — the fixture's split is at the
-        // boundary, the shape every real step held before the pool and the context parted.
-        context: 16,
-        rows: 3,
-        nkvh: 2,
-        q_width: 128,
-        head_size: 64,
-        walk: 4,
-        paged_rows: crate::paged_step::PagedRows::Sequence,
-        page_id_realization: crate::paged_step::PageIdRealization::EntrySpacing(1),
-        // One request of the graph's 3 rows — the mint's own spelling, const: the pair's held
-        // product IS the `rows` above, and each `None` arm is a fixture bug the const panic
-        // names (const panic takes a literal, so the messages are).
-        extent: match crate::wiring::QueryExtent::of_baked_rung(
-            match crate::wiring::RungWidth::of_baked_rows(3) {
-                ::core::option::Option::Some(w) => w,
+            mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
+            page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
+            write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
+            query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
+            kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
+            rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
+            chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
+            chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
+            int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
+            pages: 4,
+            unit_elems: unit_of(2, 64, 4),
+            page_slots: 4,
+            // The pool holds exactly the context's four pages — the fixture's split is at the
+            // boundary, the shape every real step held before the pool and the context parted.
+            context: 16,
+            rows: 3,
+            nkvh: 2,
+            q_width: 128,
+            head_size: 64,
+            walk: 4,
+            paged_rows: crate::paged_step::PagedRows::Sequence,
+            page_id_realization: crate::paged_step::PageIdRealization::EntrySpacing(1),
+            // One request of the graph's 3 rows — the mint's own spelling, const: the pair's held
+            // product IS the `rows` above, and each `None` arm is a fixture bug the const panic
+            // names (const panic takes a literal, so the messages are).
+            extent: match crate::wiring::QueryExtent::of_baked_rung(
+                match crate::wiring::RungWidth::of_baked_rows(3) {
+                    ::core::option::Option::Some(w) => w,
+                    ::core::option::Option::None => {
+                        ::core::panic!("the fixture's three rows are a baked width")
+                    }
+                },
+                crate::wiring::RungCap::ONE,
+            ) {
+                ::core::option::Option::Some(e) => e,
                 ::core::option::Option::None => {
-                    ::core::panic!("the fixture's three rows are a baked width")
+                    ::core::panic!("the fixture's three rows by one request name a rung")
                 }
             },
-            crate::wiring::RungCap::ONE,
-        ) {
-            ::core::option::Option::Some(e) => e,
-            ::core::option::Option::None => {
-                ::core::panic!("the fixture's three rows by one request name a rung")
-            }
-        },
         }
     }
 

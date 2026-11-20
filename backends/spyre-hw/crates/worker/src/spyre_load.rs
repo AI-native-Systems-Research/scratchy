@@ -1378,10 +1378,7 @@ impl SpyreWorker {
         #[cfg(feature = "spyre-hw")]
         #[allow(unused_mut, unused_assignments)]
         let mut family_arenas_o: Option<
-            Vec<(
-                scratchy_target_spyre_card::superdsc_exec::SegIdx,
-                String,
-            )>,
+            Vec<(scratchy_target_spyre_card::superdsc_exec::SegIdx, String)>,
         > = None;
         // The context the sized pool will actually serve (tokens) — the ONE context law's answer
         // (`resolve_served_context`) over the declaration and what the budget funds, decided in
@@ -1811,9 +1808,7 @@ impl SpyreWorker {
                                 .iter()
                                 .filter(|(pmq, _, sent)| *pmq > 1 && !sent.is_empty())
                                 .filter_map(|(_, _, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
-                                .filter_map(
-                                    scratchy_target_spyre::bundle_code::bundle::<World>,
-                                ),
+                                .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>),
                         )
                         .collect();
                     // The arenas: per shared segment, the WIDEST family rung owns it. Skipped
@@ -1843,7 +1838,9 @@ impl SpyreWorker {
                             lay.segment_bytes
                                 .iter()
                                 .enumerate()
-                                .filter(|(i, b)| **b > 0 && *i != weight && *i != kv && !shared.contains(i))
+                                .filter(|(i, b)| {
+                                    **b > 0 && *i != weight && *i != kv && !shared.contains(i)
+                                })
                                 .map(|(_, b)| *b)
                                 .sum::<u64>()
                         };
@@ -1852,7 +1849,9 @@ impl SpyreWorker {
                         + g0.decode_rungs
                             .iter()
                             .filter(|(rn, _, _, _)| rn.get() > 1)
-                            .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
+                            .filter_map(|(_, _, sent, _)| {
+                                sent.as_str().strip_prefix(SUPERDSC_SENTINEL)
+                            })
                             .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                             .map(|rc| {
                                 // Decode rungs are PRIVATE whole: non-resident segments,
@@ -2896,8 +2895,9 @@ impl SpyreWorker {
                     match in_ladder {
                         Some(oi) => {
                             let (lo, hi) = ladder_prepared.split_at_mut(oi);
-                            let ((_, _, owner_res), rest) =
-                                hi.split_first_mut().expect("the position came from the list");
+                            let ((_, _, owner_res), rest) = hi
+                                .split_first_mut()
+                                .expect("the position came from the list");
                             let owner = owner_res.as_mut().unwrap_or_else(|e| {
                                 panic!(
                                     "the seg{} family arena's owner ({owner_fp}) failed to \
@@ -2915,9 +2915,7 @@ impl SpyreWorker {
                                     })?;
                                 }
                             }
-                            for (job, built) in
-                                prefix_jobs.iter().zip(prefix_prepared.iter_mut())
-                            {
+                            for (job, built) in prefix_jobs.iter().zip(prefix_prepared.iter_mut()) {
                                 if job.rcode.fp.as_ref() != owner_fp.as_str()
                                     && let Ok(sess) = built
                                 {
@@ -2948,8 +2946,9 @@ impl SpyreWorker {
                                     )
                                 });
                             let (plo, phi) = prefix_prepared.split_at_mut(pi);
-                            let (owner_res, rest) =
-                                phi.split_first_mut().expect("the position came from the list");
+                            let (owner_res, rest) = phi
+                                .split_first_mut()
+                                .expect("the position came from the list");
                             let owner = owner_res.as_mut().unwrap_or_else(|e| {
                                 panic!(
                                     "the seg{} family arena's owner ({owner_fp}) failed to \

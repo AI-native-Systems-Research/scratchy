@@ -319,8 +319,7 @@ pub fn write_rows(
         step.nkvh as usize,
         step.rows as usize,
     );
-    let unit_rows =
-        step.unit_elems as usize / step.head_size as usize;
+    let unit_rows = step.unit_elems as usize / step.head_size as usize;
     let mut w = Vec::with_capacity(nkvh * q);
     for h in 0..nkvh {
         for r in 0..q {
@@ -387,8 +386,7 @@ pub fn query_rows(step: &PagedStep) -> Vec<i32> {
 /// rides in the value and each plane's base carries its own offset in the unit. One statement,
 /// consumed.
 pub fn kv_row_pool(step: &PagedStep) -> Vec<i32> {
-    let unit_rows =
-        step.unit_elems / (step.page_slots * step.head_size);
+    let unit_rows = step.unit_elems / (step.page_slots * step.head_size);
     (0..step.pages)
         .flat_map(|p| (0..step.nkvh).map(move |kv| (p * unit_rows + kv) as i32))
         .collect()
@@ -568,8 +566,7 @@ pub fn batch_sources(
     // One token per real row, at its position; a padded row at the null slot. The row is the
     // unit-major write law (`write_rows`'s own): the interleave in the row, the plane offset in the
     // base.
-    let unit_rows =
-        step.unit_elems as usize / step.head_size as usize;
+    let unit_rows = step.unit_elems as usize / step.head_size as usize;
     let mut write = Vec::with_capacity(nkvh * b);
     for h in 0..nkvh {
         for r in 0..b {
@@ -584,7 +581,11 @@ pub fn batch_sources(
     Ok(StepSources {
         mask: (step.chunk_masks, chunk_masks, vec![c * e, slots]),
         int32: vec![
-            (step.rep_rows, words(fold_query(&rep)), vec![e * per as usize]),
+            (
+                step.rep_rows,
+                words(fold_query(&rep)),
+                vec![e * per as usize],
+            ),
             (
                 step.chunk_pages,
                 words(fold_pages(&pages)),
@@ -759,8 +760,7 @@ pub fn card_step_sources(
     let mut write: Vec<i32> = Vec::with_capacity(nkvh * cap * w);
     // The unit-major write law (`write_rows`'s own): the interleave in the row, the plane offset
     // in the base.
-    let unit_rows =
-        step.unit_elems as usize / step.head_size as usize;
+    let unit_rows = step.unit_elems as usize / step.head_size as usize;
     for h in 0..nkvh {
         for r in 0..cap {
             match reqs.get(r) {
@@ -952,15 +952,9 @@ mod tests {
     /// the declaration's Σ over the planes, read back as the step's own minted field.
     fn unit_of(nkvh: u32, head_size: u32, page_slots: u32) -> u32 {
         let page = std::num::NonZeroU32::new(page_slots).expect("a fixture's page is nonzero");
-        scratchy_subtile::handoff::KvStateDecl::paged_kv(
-            0,
-            1,
-            nkvh * head_size,
-            page,
-            page_slots,
-        )
-        .expect("a fixture's page is whole")
-        .unit_elems() as u32
+        scratchy_subtile::handoff::KvStateDecl::paged_kv(0, 1, nkvh * head_size, page, page_slots)
+            .expect("a fixture's page is whole")
+            .unit_elems() as u32
     }
 
     fn step() -> PagedStep {
@@ -1331,10 +1325,7 @@ mod tests {
         assert_eq!(query_rows(&s), vec![0, 1, 2]);
         // Unit-major: page `p`'s kv head `kv` at folded row `p · 2·nkvh + kv` (one unit holds both
         // planes, so a page's own rows are half the stride apart).
-        assert_eq!(
-            kv_row_pool(&s),
-            vec![0, 1, 4, 5, 8, 9, 12, 13]
-        );
+        assert_eq!(kv_row_pool(&s), vec![0, 1, 4, 5, 8, 9, 12, 13]);
     }
 
     /// ⭐ THE PAGE ID'S SCALE, AT THE ONE PLACE IT BINDS — the stager. A bundle whose gathered
@@ -1631,7 +1622,10 @@ mod tests {
         assert_eq!(pool.len(), decode.pages as usize * run);
         for p in 0..decode.pages as usize {
             // Unit-major: page `p`'s rows `p · 2·nkvh + kv`, the run's first words.
-            assert_eq!(&pool[p * run..p * run + 2], &[4 * p as i32, 4 * p as i32 + 1]);
+            assert_eq!(
+                &pool[p * run..p * run + 2],
+                &[4 * p as i32, 4 * p as i32 + 1]
+            );
             assert!(pool[p * run + 2..(p + 1) * run].iter().all(|&v| v == 0));
         }
         let zero = &statics
@@ -1762,12 +1756,7 @@ mod tests {
         assert_eq!(size(s.kv_row_pool), 16 * run * 4);
         let statics = card_statics(&s).unwrap();
         assert_eq!(
-            ints(&statics
-                .iter()
-                .find(|(t, _)| *t == s.kv_row_pool)
-                .unwrap()
-                .1)
-            .len(),
+            ints(&statics.iter().find(|(t, _)| *t == s.kv_row_pool).unwrap().1).len(),
             16 * run as usize,
             "the staged pool covers every page the pool holds"
         );
