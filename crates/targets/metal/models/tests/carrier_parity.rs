@@ -361,8 +361,11 @@ mod imp {
 
         // ── pools, sized from the loaded model (no per-arch constants) ──
         let layers = model.num_hidden_layers() as usize;
-        let kv_heads = model.num_key_value_heads() as usize;
-        let head_dim = model.head_dim() as usize;
+        // The one stated KV row: a latent model's (1, half_row), else the dense (kv_heads, head_dim).
+        let (kv_heads, head_dim) = model.latent_kv_row().map_or(
+            (model.num_key_value_heads() as usize, model.head_dim() as usize),
+            |row| (row.kv_heads, row.head_size),
+        );
         let kv_layers = model.kv_layer_geometry();
         // Hybrid KV (every model with sliding-window layers): the SAME shared layout the worker
         // builds — `compute_hybrid_kv_layout` over the compiled per-layer geometry

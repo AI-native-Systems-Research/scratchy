@@ -12,9 +12,10 @@
 // table (a physical block derefs `table[block / BLOCKS_PER_CHUNK]`, then block
 // `block % BLOCKS_PER_CHUNK` of it; BLOCKS_PER_CHUNK 0: one base).
 //
-// The rope pairs lanes `(2i, 2i + 1)` of a rope part, rotated by frequency
-// `i`'s cos and sin at the row's position (`cos_sin[pos]` holds the ROPE / 2
-// cosines, then the sines).
+// The rope pairs a rope part's lanes as PAIRING says (the model's rope facts:
+// adjacent `(2i, 2i + 1)`, or the halves `(i, i + ROPE / 2)`), each pair rotated
+// by its frequency's cos and sin at the row's position (`cos_sin[pos]` holds the
+// ROPE / 2 cosines, then the sines).
 //
 // Constants (compiled in; `MlaConstants`), every kernel's the same slots:
 //   0 = HEADS       query heads
@@ -34,6 +35,8 @@
 //  13 = ROW_THREADS a row kernel's threads (the query rotation, the cache write)
 //  14 = HALF        the lanes of a row the pool's K store holds; the rest are
 //                   the V store's
+//  15 = PAIRING     the rope's lane pairing: 0 adjacent `(2i, 2i + 1)`, 1 the
+//                   halves `(i, i + ROPE / 2)` (NeoX)
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -55,22 +58,29 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTIAL_STRIDE, 11);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MERGE_THREADS, 12);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_ROW_THREADS, 13);
 SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_HALF_ROW, 14);
+SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PAIRING, 15);
 
 constant constexpr uint MLA_Q_HEAD = MLA_NOPE + MLA_ROPE;
 constant constexpr uint MLA_ROW = MLA_LATENT + MLA_ROPE;
 constant constexpr uint MLA_HALF = MLA_HALF_ROW;
 constant constexpr uint MLA_HALF_ROPE = MLA_ROPE / 2u;
 
-// Lane `d` of a rope part `x` (ROPE lanes) rotated at `pos`: its pair's
-// partner is `d ^ 1`, the pair's frequency `d / 2`.
+// Lane `d` of a rope part `x` (ROPE lanes) rotated at `pos`. Interleaved
+// (PAIRING 0): its partner is `d ^ 1`, its frequency `d / 2`. Half-split
+// (PAIRING 1, NeoX): its partner is `d ± ROPE / 2`, its frequency `d % (ROPE / 2)`.
 template <typename T>
 inline float mla_rotate(device const T* x, uint d, device const T* cos_sin, uint pos) {
     device const T* row = cos_sin + pos * MLA_ROPE;
-    const float c = float(row[d / 2u]);
-    const float s = float(row[MLA_HALF_ROPE + d / 2u]);
-    const float x0 = float(x[d & ~1u]);
-    const float x1 = float(x[d | 1u]);
-    return (d & 1u) == 0u ? x0 * c - x1 * s : x1 * c + x0 * s;
+    const bool interleaved = MLA_PAIRING == 0u;
+    const uint f = interleaved ? d / 2u : d % MLA_HALF_ROPE;
+    const bool first = interleaved ? (d & 1u) == 0u : d < MLA_HALF_ROPE;
+    const uint i0 = interleaved ? (d & ~1u) : f;
+    const uint i1 = interleaved ? (d | 1u) : f + MLA_HALF_ROPE;
+    const float c = float(row[f]);
+    const float s = float(row[MLA_HALF_ROPE + f]);
+    const float x0 = float(x[i0]);
+    const float x1 = float(x[i1]);
+    return first ? x0 * c - x1 * s : x1 * c + x0 * s;
 }
 
 // The address of lane `e`'s store element at physical slot `slot`: whether it

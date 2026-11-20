@@ -701,6 +701,18 @@ fn kv_per_block_bytes(model: &dyn scratchy_target_metal::MetalWeights, block_siz
     ))
 }
 
+/// The KV row `model`'s pool holds one token of one layer as, in each of its K and V stores: its
+/// stated latent row (`ScratchyWeights::latent_kv_row`, a multi-head latent attention's), else its
+/// attention's KV heads × head dim. The one reader of a model's KV geometry for the pool.
+fn kv_row(model: &dyn scratchy_target_metal::MetalWeights) -> scratchy_forward_compiler::KvRow {
+    model
+        .latent_kv_row()
+        .unwrap_or(scratchy_forward_compiler::KvRow {
+            kv_heads: model.num_key_value_heads() as usize,
+            head_size: model.head_dim() as usize,
+        })
+}
+
 /// `kv_bytes_per_token` at `model`'s pool geometry: every layer that holds KV
 /// ([`kv_pool_tensors`]), its KV heads and head_dim, `dense_elem_bytes` wide when
 /// `codec` is dense.
@@ -714,8 +726,8 @@ fn pool_bytes_per_token(
         model
             .kv_cache_layers()
             .map_or(model.num_hidden_layers() as usize, <[u32]>::len),
-        model.num_key_value_heads() as usize,
-        model.head_dim() as usize,
+        kv_row(model).kv_heads,
+        kv_row(model).head_size,
         dense_elem_bytes,
     )
 }
@@ -821,8 +833,8 @@ fn draft_block_bytes(
     let lent = match scratch {
         DraftScratch::Own => 0,
         DraftScratch::Target => scratchy_target_metal::kv_int8::scratch_bytes_per_token(
-            model.num_key_value_heads() as usize,
-            model.head_dim() as usize,
+            kv_row(model).kv_heads,
+            kv_row(model).head_size,
         ),
     };
     let per_token = pool_bytes_per_token(model, codec, METAL_KV_ELEM_BYTES).saturating_sub(lent);
@@ -834,10 +846,8 @@ fn draft_store_block_bytes(
     model: &dyn scratchy_target_metal::MetalWeights,
     block_size: usize,
 ) -> usize {
-    model.num_key_value_heads() as usize
-        * block_size
-        * model.head_dim() as usize
-        * METAL_KV_ELEM_BYTES
+    let row = kv_row(model);
+    row.kv_heads * block_size * row.head_size * METAL_KV_ELEM_BYTES
 }
 
 /// ⭐ HOW THE KV POOL AND THE PREFIX CACHE'S RECURRENT-STATE SNAPSHOTS SHARE THE KV BUDGET (#495),
@@ -1653,8 +1663,7 @@ impl MetalWorker {
                 self.draft_is_head()
                     && int8_kv(target)
                     && int8_kv(draft)
-                    && target.num_key_value_heads() == draft.num_key_value_heads()
-                    && target.head_dim() == draft.head_dim()
+                    && kv_row(target) == kv_row(draft)
             }
             _ => false,
         };
@@ -3110,7 +3119,7 @@ impl MetalWorker {
             if !m.kv_codec().is_int8() {
                 return Vec::new();
             }
-            let (heads, head_dim) = (m.num_key_value_heads() as usize, m.head_dim() as usize);
+            let (heads, head_dim) = (kv_row(m).kv_heads, kv_row(m).head_size);
             let b = scratchy_target_metal::kv_int8::Int8BlockBytes::of(bs.get(), heads, head_dim);
             vec![b.codes(), b.scales(), b.scratch()]
         };
@@ -3268,8 +3277,8 @@ impl MetalWorker {
                 num_layers_draft,
                 draft_blocks,
                 self.config.block_size.get(),
-                model.num_key_value_heads() as usize,
-                model.head_dim() as usize,
+                kv_row(model.as_ref()).kv_heads,
+                kv_row(model.as_ref()).head_size,
                 draft_block_cap,
                 // Draft pool stays uniform (matching the uniform
                 // store sizing above): spec-decode is not
@@ -6449,13 +6458,13 @@ impl Worker for MetalWorker {
         // the dense rows the engine would derive. The same cost the draft split
         // in `determine_available_memory` divides by.
         // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
-        // engine's every-layer row would overcount; a model stating its layers' own KV geometry
-        // (a latent cache's one row per token) holds rows the config's heads do not describe.
+        // engine's every-layer row would overcount; a latent attention's pool holds its latent
+        // rows (`latent_kv_row`), which the config's heads do not describe.
         let model = self.model.as_deref()?;
         (int8_kv(model)
             || hybrid_kv_layout(model, block, METAL_KV_ELEM_BYTES).is_some()
             || model.kv_cache_layers().is_some()
-            || model.kv_layer_geometry().is_some())
+            || model.latent_kv_row().is_some())
         .then(|| target_block_bytes(model, block))
     }
 
@@ -6932,9 +6941,9 @@ impl Worker for MetalWorker {
         let blocks_per_chunk = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
         let num_layers_for_pool = model.num_hidden_layers() as usize;
         let num_chunks_total = num_gpu_blocks.div_ceil(blocks_per_chunk);
-        let per_block_elems = (model.num_key_value_heads() as usize)
+        let per_block_elems = kv_row(model.as_ref()).kv_heads
             * self.config.block_size.get()
-            * (model.head_dim() as usize);
+            * kv_row(model.as_ref()).head_size;
         // An arch with sliding-window layers: each layer's KV heads × head_dim from the
         // macro-emitted IR walk (`kv_layer_geometry`); each layer's buffers and pool chunks size
         // to their own class.
@@ -6962,8 +6971,8 @@ impl Worker for MetalWorker {
         // Slot s ↔ tensor s/2 (K at s%2==0, V at s%2==1) — must match the
         // pool's alloc order T0K, T0V, T1K, … (slot = c % n_slots). All
         // tensors are page-unified (same bytes) on the hybrid path, so
-        // every slot uses `per_block_elems`; the uniform path with a
-        // per-layer override (none today) keeps the per-layer sizing.
+        // every slot uses `per_block_elems`; a uniform pool stating its layers'
+        // geometry (a latent attention's) sizes each tensor from it.
         let slot_block_bytes = |slot: usize| match (&hybrid_layout, &per_layer_block_elems) {
             (None, Some(v)) => v[slot / 2] * elem_bytes,
             _ => per_block_elems * elem_bytes,
@@ -7029,8 +7038,8 @@ impl Worker for MetalWorker {
                 num_layers_for_pool,
                 num_gpu_blocks,
                 self.config.block_size.get(),
-                model.num_key_value_heads() as usize,
-                model.head_dim() as usize,
+                kv_row(model.as_ref()).kv_heads,
+                kv_row(model.as_ref()).head_size,
                 pool_block_cap,
                 // Hybrid: all tensors page-unified → uniform per_block_elems
                 // (None falls back to num_kv_heads·block_size·head_dim, which

@@ -7478,16 +7478,16 @@ fn kv_cache_scales(
 /// store's codec wherever its head table takes the model's rows (`codec_for`) — int8 at the heads a
 /// target's kernels code, float8 at whole sticks of its float8 format and the scales its config
 /// states — and dense everywhere else. A model a target would code but can't is named in the build
-/// output.
+/// output. `latent` is whether the forward caches latent rows ([`mla_of`]).
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
     kv_layers: &KvCacheLayers,
+    latent: bool,
     store: crate::target::KvStore,
 ) -> scratchy_forward_compiler::KvCodec {
     use scratchy_ir::{DenseReason, KvRows, codec_for};
-    let latent = model.bounds.get("kv_lora_rank").is_some_and(|&r| r > 0);
     let rows = match (kv_layers.any(), latent) {
         (false, _) => KvRows::None,
         (true, true) => KvRows::Latent,
@@ -7573,6 +7573,7 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             let pairing = match r.pairing() {
                 RopePairing::Standard => quote! { #m::RopePairing::Standard },
                 RopePairing::Proportional => quote! { #m::RopePairing::Proportional },
+                RopePairing::Interleaved => quote! { #m::RopePairing::Interleaved },
             };
             let kv_rope = match r.kv_rope() {
                 KvRope::AtWrite => quote! { #m::KvRope::AtWrite },
@@ -7587,13 +7588,37 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             }
             None => quote! { #m::NoMrope },
         };
+        // A latent attention's KV rows, through the constructor that states its laws.
+        let latent = a.latent().map(|mla| {
+            let (h, l, n, r, v) = (
+                u32_(mla.heads().get()),
+                u32_(mla.latent().get()),
+                u32_(mla.nope().get()),
+                u32_(mla.rope().get()),
+                u32_(mla.value().get()),
+            );
+            let scale = f32_(mla.scale().get());
+            quote! {
+                .with_latent(match #m::Mla::new(
+                    #m::QueryHeads::new(#h),
+                    #m::LatentRank::new(#l),
+                    #m::HeadDim::new(#n),
+                    #m::RotDim::new(#r),
+                    #m::HeadDim::new(#v),
+                    #m::AttnScale::new(#scale),
+                ) {
+                    ::core::result::Result::Ok(mla) => mla,
+                    ::core::result::Result::Err(_) => panic!("Mla: the fill minted it lawful"),
+                })
+            }
+        });
         quote! {
             #m::Attention::of::<#q, #base, #global, #mrope>(
                 #m::AttnScale::new(#scale),
                 #softcap,
                 #window,
                 #rope,
-            )
+            ) #latent
         }
     }));
     let vision = opt(f.vision().map(|v: Vision| {
@@ -7808,6 +7833,8 @@ pub(crate) fn fill_canonical_params(
     tp_world_size: u8,
     // Where the forward's keys rotate ([`fuf_kv_rope`]); `None` for a forward without rotary.
     kv_rope: Option<scratchy_ir::model_facts::KvRope>,
+    // The latent rows the forward caches its KV as ([`mla_of`]); `None` for per-head K and V.
+    latent: Option<scratchy_ir::model_facts::Mla>,
     kv_layers: &KvCacheLayers,
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
@@ -8121,7 +8148,14 @@ pub(crate) fn fill_canonical_params(
         is_bf16_scale || is_nvfp4
     };
 
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, kv_store);
+    let kv_codec = kv_codec_for(
+        model,
+        head_dim,
+        global_head_dim,
+        kv_layers,
+        latent.is_some(),
+        kv_store,
+    );
 
     let num_hidden_layers = model.text.layers.get();
 
@@ -8143,14 +8177,26 @@ pub(crate) fn fill_canonical_params(
                     mf::BlockSize::new(page),
                 )
             };
-            mf::Attention::new(
-                class(num_kv_heads, head_dim, rot_dim_val, base_block_size),
-                class(
-                    num_global_kv_heads,
-                    global_head_dim,
-                    global_rot_dim,
-                    resolved_global_block_size,
+            // A latent attention's classes state the rows its cache holds: one kv head of half a
+            // latent row in each of K and V, its rope part rotated ([`mf::Mla::half_row`]).
+            let (base_class, global_class) = match latent {
+                Some(mla) => {
+                    let row = class(1, mla.half_row(), mla.rope().get(), base_block_size);
+                    (row, row)
+                }
+                None => (
+                    class(num_kv_heads, head_dim, rot_dim_val, base_block_size),
+                    class(
+                        num_global_kv_heads,
+                        global_head_dim,
+                        global_rot_dim,
+                        resolved_global_block_size,
+                    ),
                 ),
+            };
+            let attention = mf::Attention::new(
+                base_class,
+                global_class,
                 mf::AttnScale::new(attn_scale),
                 (attn_softcap != 0.0).then(|| mf::SoftCap::new(attn_softcap)),
                 (u32::try_from(sliding_window).ok())
@@ -8160,15 +8206,22 @@ pub(crate) fn fill_canonical_params(
                 // none.
                 kv_rope.map(|kv_rope| {
                     mf::Rope::new(
-                        match rope_proportional {
-                            true => mf::RopePairing::Proportional,
-                            false => mf::RopePairing::Standard,
+                        // A latent attention's rope pairs adjacent lanes: the op's own pairing
+                        // (`OpKind::MlaAppend`).
+                        match (latent.is_some(), rope_proportional) {
+                            (true, _) => mf::RopePairing::Interleaved,
+                            (false, true) => mf::RopePairing::Proportional,
+                            (false, false) => mf::RopePairing::Standard,
                         },
                         kv_rope,
                         model.mrope_section.map(mf::MropeSection::new),
                     )
                 }),
-            )
+            );
+            match latent {
+                Some(mla) => attention.with_latent(mla),
+                None => attention,
+            }
         });
         let vision = positive(vision_num_heads).map(|heads| {
             mf::Vision::new(
@@ -8412,7 +8465,9 @@ pub fn emit_recurrent_state_arm_body(
 /// KV geometry for an arch with sliding-window layers, whatever its two classes' dims — a sliding
 /// layer at the base class's KV heads and head dim and the model's `sliding_window`, a full layer
 /// at the global class's (`global_head_dim`, `num_global_key_value_heads`; the base where the
-/// config states none). `None` (trait default: one uniform pool) for an arch with no sliding layer.
+/// config states none) — and a layer a multi-head latent attention caches at its latent rows
+/// ([`mla_of`]), sliding or not. `None` (trait default: one uniform pool) for an arch with
+/// neither.
 ///
 /// The per-layer class mask is read straight off the unrolled FUF: every sliding tile
 /// ([`OpKind::slides`]) carries its layer as the KvCache extern index, so the mask is exactly the
@@ -8422,44 +8477,6 @@ pub fn emit_kv_layer_geometry_arm_body(
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
     let num_hidden_layers = model.text.layers.get();
-    // A layer whose cache a multi-head latent attention writes holds one latent row per token, as
-    // the pool's K and V halves of its single kv head; any other layer, the config's heads.
-    let latent_layers: std::collections::BTreeSet<usize> = (fuf.nodes.iter())
-        .filter(|n| n.op == OpKind::MlaAppend)
-        .flat_map(|n| &n.inputs)
-        .filter_map(|i| match i {
-            FufInput::Extern {
-                kind: crate::classified::ExternKind::KvCache,
-                index: Some(l),
-            } => Some(l.0 as usize),
-            _ => None,
-        })
-        .collect();
-    if !latent_layers.is_empty() {
-        let mla = crate::to_wavefront::mla_geometry(&model.bounds, model)
-            .unwrap_or_else(|e| panic!("{}: its latent cache: {e}", model.source_stem));
-        let half = mla.half_row() as usize;
-        let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as usize;
-        let head_dim = model.text.head_dim.get() as usize;
-        let layers = (0..num_hidden_layers).map(|l| {
-            let (kv_heads, head_size) = match latent_layers.contains(&l) {
-                true => (1usize, half),
-                false => (num_kv, head_dim),
-            };
-            quote! {
-                ::scratchy_forward_compiler::LayerKvGeometry {
-                    is_sliding: false,
-                    num_kv_heads: #kv_heads,
-                    head_size: #head_size,
-                    head_size_v: ::core::option::Option::None,
-                    sliding_window: ::core::option::Option::None,
-                }
-            }
-        });
-        return Some(quote! {
-            ::core::option::Option::Some(::std::vec![ #(#layers),* ])
-        });
-    }
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
@@ -8467,20 +8484,23 @@ pub fn emit_kv_layer_geometry_arm_body(
             continue;
         }
         has_sliding = true;
-        for inp in &node.inputs {
-            if let FufInput::Extern {
-                kind: crate::classified::ExternKind::KvCache,
-                index: Some(l),
-            } = inp
-            {
-                let l = l.0 as usize;
-                if l < num_hidden_layers {
-                    sliding[l] = true;
-                }
+        for l in kv_cache_layers_of(node) {
+            if l < num_hidden_layers {
+                sliding[l] = true;
             }
         }
     }
-    if !has_sliding {
+    // A layer whose cache a multi-head latent attention writes holds one latent row per token, as
+    // the pool's K and V halves of its single kv head ([`mla_of`]'s geometry, the model's KV
+    // fact).
+    let latent = mla_of(fuf, model).map(|mla| {
+        let layers: std::collections::BTreeSet<usize> = (fuf.nodes.iter())
+            .filter(|n| n.op == OpKind::MlaAppend)
+            .flat_map(kv_cache_layers_of)
+            .collect();
+        (mla.half_row() as usize, layers)
+    });
+    if !has_sliding && latent.is_none() {
         return None;
     }
     let head_dim = model.text.head_dim.get() as usize;
@@ -8495,20 +8515,27 @@ pub fn emit_kv_layer_geometry_arm_body(
         .get("num_global_key_value_heads")
         .map(|&v| v as usize)
         .unwrap_or(num_kv);
-    let window = (model.bounds.get("sliding_window").copied()).unwrap_or_else(|| {
-        panic!(
-            "{}: sliding-attention tiles, but its config states no `sliding_window`",
-            model.source_stem
-        )
-    }) as usize;
-    let layers = sliding.iter().map(|&is_sliding| {
-        let (kv_heads, head_size, sliding_window) = match is_sliding {
-            true => (
-                num_kv,
-                head_dim,
-                quote! { ::core::option::Option::Some(#window) },
-            ),
-            false => (g_kv, g_hd, quote! { ::core::option::Option::None }),
+    let window = || {
+        (model.bounds.get("sliding_window").copied()).unwrap_or_else(|| {
+            panic!(
+                "{}: sliding-attention tiles, but its config states no `sliding_window`",
+                model.source_stem
+            )
+        }) as usize
+    };
+    let layers = sliding.iter().enumerate().map(|(l, &is_sliding)| {
+        let row = (latent.as_ref()).filter(|(_, layers)| layers.contains(&l));
+        let (kv_heads, head_size) = match (row, is_sliding) {
+            (Some(&(half, _)), _) => (1usize, half),
+            (None, true) => (num_kv, head_dim),
+            (None, false) => (g_kv, g_hd),
+        };
+        let sliding_window = match is_sliding {
+            true => {
+                let window = window();
+                quote! { ::core::option::Option::Some(#window) }
+            }
+            false => quote! { ::core::option::Option::None },
         };
         quote! {
             ::scratchy_forward_compiler::LayerKvGeometry {
@@ -8523,6 +8550,48 @@ pub fn emit_kv_layer_geometry_arm_body(
     Some(quote! {
         ::core::option::Option::Some(::std::vec![ #(#layers),* ])
     })
+}
+
+/// The layers whose paged cache node `node` names (`kv_cache[layer]`).
+fn kv_cache_layers_of(node: &crate::fuf::FufNode) -> impl Iterator<Item = usize> + '_ {
+    node.inputs.iter().filter_map(|i| match i {
+        FufInput::Extern {
+            kind: crate::classified::ExternKind::KvCache,
+            index: Some(l),
+        } => Some(l.0 as usize),
+        _ => None,
+    })
+}
+
+/// The multi-head latent attention a forward caches its KV as, when it does (an
+/// [`OpKind::MlaAppend`] writes its cache): its geometry from the config's bounds and its
+/// softmax scale. The one mint of the model's latent KV fact — its `FACTS` attention carries it
+/// ([`fill_canonical_params`]), and its per-layer KV geometry and KV rows are read off it.
+pub(crate) fn mla_of(fuf: &Fuf, model: &ModelParams) -> Option<scratchy_ir::model_facts::Mla> {
+    use scratchy_ir::model_facts as mf;
+    if !fuf.nodes.iter().any(|n| n.op == OpKind::MlaAppend) {
+        return None;
+    }
+    let bound = |key: &str| {
+        (model.bounds.get(key).copied())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: a multi-head latent attention, but its config states no positive `{key}`",
+                    model.source_stem
+                )
+            })
+    };
+    let mla = mf::Mla::new(
+        mf::QueryHeads::new(bound("num_attention_heads")),
+        mf::LatentRank::new(bound("kv_lora_rank")),
+        mf::HeadDim::new(bound("qk_nope_head_dim")),
+        mf::RotDim::new(bound("qk_rope_head_dim")),
+        mf::HeadDim::new(bound("v_head_dim")),
+        mf::AttnScale::new(mla_attn_scale(model)),
+    );
+    Some(mla.unwrap_or_else(|law| panic!("{}: its latent attention: {law}", model.source_stem)))
 }
 
 /// The lanes a DFlash2 drafter's block draft runs in a step, each its own `spec_verify_rows` block:
@@ -8629,6 +8698,7 @@ pub fn emit_model(
         model,
         tp_world_size,
         fuf_kv_rope(fuf),
+        mla_of(fuf, model),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
         emitter.kv_store(),
@@ -8901,6 +8971,7 @@ mod tests {
                 &model,
                 1,
                 None,
+                None,
                 &every_layer(&model),
                 None,
                 crate::target::KvStore::Dense,
@@ -9016,6 +9087,7 @@ mod tests {
             &m,
             1,
             None,
+            None,
             &every_layer(&m),
             None,
             crate::target::KvStore::Dense,
@@ -9038,6 +9110,7 @@ mod tests {
         let facts = fill_canonical_params(
             &m,
             1,
+            None,
             None,
             &every_layer(&m),
             None,
@@ -9078,6 +9151,7 @@ mod tests {
         let facts = fill_canonical_params(
             &m,
             2,
+            None,
             None,
             &every_layer(&m),
             None,
@@ -9132,6 +9206,7 @@ mod tests {
         let facts = fill_canonical_params(
             &m,
             8,
+            None,
             None,
             &every_layer(&m),
             None,
@@ -9652,7 +9727,7 @@ mod tests {
             let path = configs.join(format!("{stem}.json"));
             let model = crate::config::load_file_declared(&path)
                 .unwrap_or_else(|e| panic!("{stem} loads: {e:?}"));
-            fill_canonical_params(&model, 1, None, &every_layer(&model), None, store)
+            fill_canonical_params(&model, 1, None, None, &every_layer(&model), None, store)
                 .0
                 .kv_codec()
         };

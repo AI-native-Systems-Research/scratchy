@@ -241,7 +241,7 @@ mod dispatcher;
 
 // The target-neutral contracts: the model facts every loaded model answers, and the pure-config
 // `HfFingerprint` the per-variant sniff reads.
-pub use dispatcher::{HfFingerprint, LentWeight, ScratchyWeights};
+pub use dispatcher::{HfFingerprint, KvRow, LentWeight, ScratchyWeights};
 
 // Device-runtime multimodal forward surface (`PixelInput` / `EmbedPatch` /
 // `MultimodalForward`). The trait takes the neutral `ForwardDeviceHandle`

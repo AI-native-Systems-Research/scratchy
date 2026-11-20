@@ -5789,7 +5789,7 @@ fn lower_one(
                     mla: *mla,
                     cache: None,
                     attend: None,
-                    row_threads: Some(threads),
+                    row: Some(mla_row(p, threads)?),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -5835,9 +5835,9 @@ fn lower_one(
                 ),
                 constants: super::kernel_constants::MlaConstants {
                     mla: *mla,
-                    cache: Some(mla_cache(p, *mla, crate::BLOCKS_PER_CHUNK)?),
+                    cache: Some(mla_cache(p, crate::BLOCKS_PER_CHUNK)?),
                     attend: None,
-                    row_threads: Some(threads),
+                    row: Some(mla_row(p, threads)?),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -5876,15 +5876,15 @@ fn lower_one(
                 kind,
                 binding_index,
             };
-            let tiling = mla_attend_tiling(*mla, bucket_m);
+            let tiling = mla_attend_tiling(mla.heads().get(), mla.latent().get(), bucket_m)?;
             let parts = tiling.parts.get();
-            let cache = mla_cache(p, *mla, attention_blocks_per_chunk(chunked))?;
+            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
             let constants = || {
                 super::kernel_constants::MlaConstants {
                     mla: *mla,
                     cache: Some(cache),
                     attend: Some(tiling),
-                    row_threads: None,
+                    row: None,
                 }
                 .into_baked()
             };
@@ -6982,17 +6982,27 @@ fn mla_cos_sin(w: RowSources<'_>, binding_index: u8) -> Result<Binding, Lowering
 }
 
 /// The paged cache an MLA kernel addresses: the model's KV page, in chunks of `blocks_per_chunk`
-/// blocks (0: one base), each row its K and V halves (`Mla::half_row`, the pool's geometry).
+/// blocks (0: one base), each row its K and V halves (the facts' latent rows, the pool's
+/// geometry).
 fn mla_cache(
     p: &ModelFacts,
-    mla: crate::tape::step::Mla,
     blocks_per_chunk: u32,
 ) -> Result<super::kernel_constants::MlaCacheConstants, LoweringError> {
     Ok(super::kernel_constants::MlaCacheConstants {
         block_size: super::ids::BlockSize(base(p)?.page().get()),
         blocks_per_chunk: super::ids::BlocksPerChunk(blocks_per_chunk),
-        half_row: super::ids::HeadDim(mla.half_row()),
+        half_row: super::ids::HalfRow(super::facts::latent(p)?.half_row()),
     })
+}
+
+/// An MLA row kernel's threads and its rope's pairing, the facts' own.
+fn mla_row(
+    p: &ModelFacts,
+    threads: super::ids::ThreadCount,
+) -> Result<super::kernel_constants::MlaRowConstants, LoweringError> {
+    let pairing = super::kernel_constants::MlaPairing::of(super::facts::rope(p)?.pairing())
+        .ok_or(LoweringError::ModelLacks(super::lowered::Lacked::Rope))?;
+    Ok(super::kernel_constants::MlaRowConstants { threads, pairing })
 }
 
 /// How an MLA attention spreads over threadgroups: each serves the largest divisor of the heads
@@ -7001,33 +7011,36 @@ fn mla_cache(
 /// [`crate::op_abi::METAL_VERIFY_ROWS`] rows, each a whole context) splits each sequence's cached
 /// rows into [`MLA_DECODE_PARTS`] partitions, whose partials — each its softmax max and sum, then
 /// its latent lanes, f32 — a merge combines; a prefill-shaped one has rows enough to fill the GPU
-/// unsplit.
-fn mla_attend_tiling(
-    mla: crate::tape::step::Mla,
+/// unsplit. A `latent` too wide for one simdgroup's partials in the budget has no tiling.
+pub fn mla_attend_tiling(
+    heads: u32,
+    latent: u32,
     bucket_m: u32,
-) -> super::kernel_constants::MlaAttendTiling {
-    let heads = mla.heads().get();
+) -> Result<super::kernel_constants::MlaAttendTiling, LoweringError> {
     let served = (1..=MLA_HEADS_PER_TG.min(heads))
         .rev()
         .find(|d| heads.is_multiple_of(*d))
         .unwrap_or(1);
-    let lanes = 4 * mla.latent().get();
-    let simdgroups = (0..=5)
+    let lanes = 4 * latent;
+    let simdgroups = (0..=MLA_MAX_SIMDGROUPS.ilog2())
         .rev()
         .map(|p| 1u32 << p)
         .find(|sg| sg * lanes <= MLA_MERGE_BYTES)
-        .unwrap_or(1);
+        .ok_or(LoweringError::MlaMergeOverflow {
+            latent,
+            budget: MLA_MERGE_BYTES,
+        })?;
     let parts = match bucket_m <= crate::op_abi::METAL_VERIFY_ROWS {
         true => MLA_DECODE_PARTS,
         false => 1,
     };
-    super::kernel_constants::MlaAttendTiling {
+    Ok(super::kernel_constants::MlaAttendTiling {
         heads_per_tg: super::ids::NumQHeads(served),
         simdgroups: super::ids::SimdgroupCount(simdgroups),
         parts: super::ids::KvPartitions(parts),
-        partial: super::ids::PartialStride(mla.latent().get() + 2),
+        partial: super::ids::PartialStride(latent + 2),
         merge_threads: super::ids::ThreadCount(MLA_MERGE_THREADS),
-    }
+    })
 }
 
 /// The threads an MLA row kernel (the query rotation, the cache write) runs a threadgroup: a lane
@@ -7057,6 +7070,21 @@ const MLA_HEADS_PER_TG: u32 = 1;
 /// The threadgroup memory an MLA attention's merge holds its simdgroups' latent partials in: half
 /// a threadgroup's 32 KiB, a hand-picked budget.
 const MLA_MERGE_BYTES: u32 = 16 * 1024;
+
+/// The most simdgroups an MLA attention threadgroup runs: a threadgroup's 1024 threads.
+const MLA_MAX_SIMDGROUPS: u32 = 32;
+
+/// The threadgroup memory every Metal target holds (`threadgroup_memory_bytes` in
+/// [`crate::tape::targets`]).
+const METAL_THREADGROUP_BYTES: u32 = 32768;
+
+// The attention's threadgroup memory: its simdgroups' latent partials (`tg_o`, within
+// MLA_MERGE_BYTES by the tiling) and each served head's softmax max and sum per simdgroup (`tg_m`,
+// `tg_l`, f32). At the most heads and simdgroups the tiling picks, they fit a threadgroup.
+const _: () = assert!(
+    MLA_MERGE_BYTES + 2 * 4 * MLA_HEADS_PER_TG * MLA_MAX_SIMDGROUPS <= METAL_THREADGROUP_BYTES,
+    "MLA attention: the merge budget and the softmax partials overflow a threadgroup"
+);
 
 /// A per-head matmul threadgroup's simdgroups, and the output rows each computes. Hand-picked, not
 /// swept.

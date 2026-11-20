@@ -481,6 +481,7 @@ fn head_facts(
         model,
         1,
         None,
+        None,
         &Default::default(),
         Some(width),
         crate::target::KvStore::Dense,

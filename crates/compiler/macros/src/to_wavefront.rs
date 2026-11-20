@@ -81,6 +81,8 @@ pub enum BridgeError {
     /// draft ring op) but the model states no attention facts. Raised ONCE, at the bridge
     /// entry, before the walk — no per-arm presence check exists below it.
     NoAttentionFacts,
+    /// A multi-head latent attention op in a graph whose model facts state no latent KV rows.
+    NoLatentFacts { tile: TileId },
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
@@ -143,6 +145,12 @@ impl std::fmt::Display for BridgeError {
             Self::NoAttentionFacts => write!(
                 f,
                 "the graph has attention ops but the model states no attention facts"
+            ),
+            Self::NoLatentFacts { tile } => write!(
+                f,
+                "tile {}: a multi-head latent attention op, but the model facts state no latent \
+                 KV rows",
+                tile.0
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
             Self::TwoEmbedRows(e) => write!(f, "{e}"),
@@ -527,29 +535,6 @@ fn sliding_window_bound(
     )
 }
 
-/// The model's multi-head latent attention geometry, from its (rank-local) bounds and its
-/// config's softmax scale.
-pub(crate) fn mla_geometry(
-    bounds: &BTreeMap<String, u64>,
-    model: &ModelParams,
-) -> Result<scratchy_ir::model_facts::Mla, BridgeError> {
-    use scratchy_ir::model_facts as mf;
-    let bound = |key: &'static str| {
-        (bounds.get(key).copied())
-            .and_then(|v| u32::try_from(v).ok())
-            .filter(|&v| v > 0)
-            .ok_or(BridgeError::MissingBound { key })
-    };
-    Ok(mf::Mla::new(
-        mf::QueryHeads::new(bound("num_attention_heads")?),
-        mf::LatentRank::new(bound("kv_lora_rank")?),
-        mf::HeadDim::new(bound("qk_nope_head_dim")?),
-        mf::RotDim::new(bound("qk_rope_head_dim")?),
-        mf::HeadDim::new(bound("v_head_dim")?),
-        mf::AttnScale::new(crate::codegen::mla_attn_scale(model)),
-    ))
-}
-
 /// A per-head matmul's heads and each block's depth: its weight's `[heads, k, n_head]` shape.
 fn head_blocks(
     tile: TileId,
@@ -797,6 +782,8 @@ pub fn lower_decode_to_wavefront(
     // A graph that states none (a tower-only canonical) mints no attention
     // op and never asks.
     let attn = || attention.ok_or(BridgeError::NoAttentionFacts);
+    // The latent rows a multi-head latent attention caches its KV as: the facts' own geometry.
+    let latent = attention.and_then(|a| a.latent());
     let mut bx = Builder {
         fuf,
         model,
@@ -1707,7 +1694,7 @@ pub fn lower_decode_to_wavefront(
             // shared key and writes the token's latent row. The latent passes through, aliasing
             // its producer, as rope_append's V does.
             OpKind::MlaAppend => {
-                let mla = mla_geometry(&bx.bounds, bx.model)?;
+                let mla = latent.ok_or(BridgeError::NoLatentFacts { tile })?;
                 let q = bx.input_at(tile, 0)?;
                 let latent_inp = node.inputs.get(1).ok_or(BridgeError::MalformedOp {
                     tile,
@@ -1737,7 +1724,7 @@ pub fn lower_decode_to_wavefront(
             // the layer's cached latent rows; the block table reaches it through that layer's
             // cache, not as an operand.
             OpKind::MlaAttention => {
-                let mla = mla_geometry(&bx.bounds, bx.model)?;
+                let mla = latent.ok_or(BridgeError::NoLatentFacts { tile })?;
                 let q_latent = bx.input_at(tile, 0)?;
                 let q = bx.input_at(tile, 1)?;
                 let k_pe = bx.input_at(tile, 2)?;

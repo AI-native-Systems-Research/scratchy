@@ -1334,7 +1334,7 @@ impl From<HeadMatmulConstants> for Vec<ConstantValue> {
 pub struct MlaCacheConstants {
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
-    pub half_row: HeadDim,
+    pub half_row: crate::tape::ids::HalfRow,
 }
 
 /// How an MLA attention spreads over threadgroups: the query heads one serves, and its
@@ -1352,13 +1352,49 @@ pub struct MlaAttendTiling {
 
 /// `KernelId::MlaRopeQ` / `MlaAppend` / `MlaAttend` (`mla.metal`): the geometry (slots 0 to 3),
 /// the cache (4 to 6, the writer's and the attention's), and the attention's and its merge's: the
-/// softmax scale (7) and the tiling (8 to 12); a row kernel's, its threads (13).
+/// softmax scale (7) and the tiling (8 to 12); a row kernel's, its threads and pairing (13, 15).
 pub struct MlaConstants {
     pub mla: crate::tape::step::Mla,
     pub cache: Option<MlaCacheConstants>,
     pub attend: Option<MlaAttendTiling>,
-    /// A row kernel's threads (slot 13): the query rotation's and the cache write's.
-    pub row_threads: Option<crate::tape::ids::ThreadCount>,
+    /// A row kernel's: the query rotation's and the cache write's.
+    pub row: Option<MlaRowConstants>,
+}
+
+/// An MLA row kernel's threads (`mla.metal` slot 13) and its rope's lane pairing (slot 15).
+#[derive(Clone, Copy)]
+pub struct MlaRowConstants {
+    pub threads: crate::tape::ids::ThreadCount,
+    pub pairing: MlaPairing,
+}
+
+/// How an MLA rope pairs its lanes, as `mla.metal`'s PAIRING slot takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MlaPairing {
+    /// Adjacent lanes `(2i, 2i + 1)`.
+    Interleaved,
+    /// The rope part's halves `(i, i + rope / 2)` (NeoX).
+    Halves,
+}
+
+impl MlaPairing {
+    /// The pairing of a model's rope, when an MLA kernel takes it: proportional rope pairs across
+    /// a whole head, which a latent attention's rope part is not.
+    pub fn of(pairing: scratchy_ir::model_facts::RopePairing) -> Option<Self> {
+        use scratchy_ir::model_facts::RopePairing as P;
+        match pairing {
+            P::Interleaved => Some(Self::Interleaved),
+            P::Standard => Some(Self::Halves),
+            P::Proportional => None,
+        }
+    }
+
+    const fn slot_value(self) -> u32 {
+        match self {
+            Self::Interleaved => 0,
+            Self::Halves => 1,
+        }
+    }
 }
 
 impl From<MlaConstants> for Vec<ConstantValue> {
@@ -1387,8 +1423,9 @@ impl From<MlaConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(11), t.partial.get()));
             v.push(ConstantValue::uint(ConstSlot(12), t.merge_threads.get()));
         }
-        if let Some(threads) = c.row_threads {
-            v.push(ConstantValue::uint(ConstSlot(13), threads.get()));
+        if let Some(row) = c.row {
+            v.push(ConstantValue::uint(ConstSlot(13), row.threads.get()));
+            v.push(ConstantValue::uint(ConstSlot(15), row.pairing.slot_value()));
         }
         v
     }
