@@ -829,12 +829,9 @@ mod tests {
     /// A run's workloads, in the order it ran them.
     #[test]
     fn a_runs_workloads_are_read_in_its_order() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/metal/apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"
-        );
+        let name = "apple-m3-pro-2026-10-26T043309Z-2a9661c3.json";
         let run: super::super::data::Run =
-            serde_json::from_str(&std::fs::read_to_string(path).expect("the oMLX run")).unwrap();
+            serde_json::from_str(&super::super::tests::fixture_text(name)).unwrap();
         let m = &run.models[0];
         assert_eq!(
             workloads(m),
