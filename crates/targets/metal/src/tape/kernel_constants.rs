@@ -1301,8 +1301,8 @@ pub struct HeadMatmulConstants {
     pub n_head: NDim,
     pub in_stride: RowStride,
     /// A threadgroup's simdgroups (slot 6) and the output rows each computes (slot 7).
-    pub simdgroups: RowStride,
-    pub rows_per_simdgroup: RowStride,
+    pub simdgroups: crate::tape::ids::SimdgroupCount,
+    pub rows_per_simdgroup: crate::tape::ids::RowsPerSimdgroup,
     pub affine: Option<(
         crate::tape::ids::AffineGroupSize,
         crate::tape::ids::AffineBits,
@@ -1329,18 +1329,32 @@ impl From<HeadMatmulConstants> for Vec<ConstantValue> {
 
 /// The paged cache an MLA kernel reads or writes: its block's rows, and the chunks it is held in
 /// (`mla.metal` slots 4 to 6; slot 5, the block table's stride, is the tape's KV cap rung).
+#[derive(Clone, Copy)]
 pub struct MlaCacheConstants {
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
 }
 
+/// How an MLA attention spreads over threadgroups: the query heads one serves, and its
+/// simdgroups.
+#[derive(Clone, Copy)]
+pub struct MlaAttendTiling {
+    pub heads_per_tg: NumQHeads,
+    pub simdgroups: crate::tape::ids::SimdgroupCount,
+    /// The partitions each sequence's cached rows split into: one writes the output, more write
+    /// partials (each `partial` elements) a merge of `merge_threads` threads a head combines.
+    pub parts: crate::tape::ids::KvPartitions,
+    pub partial: crate::tape::ids::PartialStride,
+    pub merge_threads: crate::tape::ids::ThreadCount,
+}
+
 /// `KernelId::MlaRopeQ` / `MlaAppend` / `MlaAttend` (`mla.metal`): the geometry (slots 0 to 3),
-/// the cache (4 to 6, the writer's and the attention's), the softmax scale (7) and the query
-/// heads an attention threadgroup serves (8), the attention's alone.
+/// the cache (4 to 6, the writer's and the attention's), and the attention's and its merge's: the
+/// softmax scale (7) and the tiling (8 to 12).
 pub struct MlaConstants {
     pub mla: crate::tape::step::Mla,
     pub cache: Option<MlaCacheConstants>,
-    pub heads_per_tg: Option<NumQHeads>,
+    pub attend: Option<MlaAttendTiling>,
 }
 
 impl From<MlaConstants> for Vec<ConstantValue> {
@@ -1360,9 +1374,13 @@ impl From<MlaConstants> for Vec<ConstantValue> {
                 cache.blocks_per_chunk.get(),
             ));
         }
-        if let Some(heads) = c.heads_per_tg {
+        if let Some(t) = c.attend {
             v.push(ConstantValue::float(ConstSlot(7), m.scale().get()));
-            v.push(ConstantValue::uint(ConstSlot(8), heads.get()));
+            v.push(ConstantValue::uint(ConstSlot(8), t.heads_per_tg.get()));
+            v.push(ConstantValue::uint(ConstSlot(9), t.simdgroups.get()));
+            v.push(ConstantValue::uint(ConstSlot(10), t.parts.get()));
+            v.push(ConstantValue::uint(ConstSlot(11), t.partial.get()));
+            v.push(ConstantValue::uint(ConstSlot(12), t.merge_threads.get()));
         }
         v
     }

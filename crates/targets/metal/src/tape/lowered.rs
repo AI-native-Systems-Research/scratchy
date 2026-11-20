@@ -286,6 +286,9 @@ pub enum KernelId {
     /// Multi-head latent attention's absorbed attention over the cache
     /// (`mla_attend_<dtype>`, `mla.metal`).
     MlaAttend,
+    /// The merge of a partitioned MLA attention's partials (`mla_attend_merge_<dtype>`,
+    /// `mla.metal`).
+    MlaAttendMerge,
     /// Sum-along-axis-0 reduce for the `[split_k, M, N]` intermediate
     /// `AffineQmmTSplitK` produces. Maps to
     /// `splitk_reduce_sum_<dtype>` in `quantized_splitk_reduce.metallib`.
@@ -633,7 +636,8 @@ impl KernelId {
             | Self::HeadMatmul
             | Self::MlaRopeQ
             | Self::MlaAppend
-            | Self::MlaAttend => SeqScope::AllRows,
+            | Self::MlaAttend
+            | Self::MlaAttendMerge => SeqScope::AllRows,
         }
     }
 }

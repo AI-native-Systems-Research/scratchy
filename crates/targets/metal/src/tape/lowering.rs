@@ -5788,7 +5788,7 @@ fn lower_one(
                 constants: super::kernel_constants::MlaConstants {
                     mla: *mla,
                     cache: None,
-                    heads_per_tg: None,
+                    attend: None,
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -5834,7 +5834,7 @@ fn lower_one(
                 constants: super::kernel_constants::MlaConstants {
                     mla: *mla,
                     cache: Some(mla_cache(p, crate::BLOCKS_PER_CHUNK)?),
-                    heads_per_tg: None,
+                    attend: None,
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -5873,8 +5873,35 @@ fn lower_one(
                 kind,
                 binding_index,
             };
-            let served = mla_heads_per_tg(*mla);
-            LoweredCommand {
+            let tiling = mla_attend_tiling(*mla, bucket_m);
+            let parts = tiling.parts.get();
+            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
+            let constants = || {
+                super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: Some(cache),
+                    attend: Some(tiling),
+                }
+                .into_baked()
+            };
+            let m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                set_axis: None,
+                axis: crate::tape::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(bucket_m),
+            });
+            let output = Binding::ArenaSlot {
+                slot: *out,
+                binding_index: 0,
+            };
+            // A partitioned attention writes its partials, a merge reads them into the output.
+            let (written, partials) = match parts {
+                1 => (output, None),
+                _ => (
+                    Binding::Scratch { binding_index: 8 },
+                    Some(4 * bucket_m * mla.heads().get() * parts * tiling.partial.get()),
+                ),
+            };
+            let attend = LoweredCommand {
                 kernel: KernelId::MlaAttend,
                 library: "mla",
                 function: pick_specialized_symbol(
@@ -5882,26 +5909,14 @@ fn lower_one(
                     "mla_attend_bf16",
                     p.act_dtype(),
                 ),
-                constants: super::kernel_constants::MlaConstants {
-                    mla: *mla,
-                    cache: Some(mla_cache(p, attention_blocks_per_chunk(chunked))?),
-                    heads_per_tg: Some(served),
-                }
-                .into_baked(),
+                constants: constants(),
                 dispatch: DispatchShape {
-                    threadgroups: (eff_m, mla.heads().get() / served.get(), 1),
-                    threads_per_threadgroup: (1024, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        set_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    }),
+                    threadgroups: (eff_m, mla.heads().get() / tiling.heads_per_tg.get(), parts),
+                    threads_per_threadgroup: (32 * tiling.simdgroups.get(), 1, 1),
+                    m_scaling,
                 },
                 bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out,
-                        binding_index: 0,
-                    },
+                    written,
                     Binding::ArenaSlot {
                         slot: *q_latent,
                         binding_index: 1,
@@ -5916,7 +5931,28 @@ fn lower_one(
                     runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
                     runtime(RuntimeBindingKind::CuSeqlensQ, 7),
                 ]),
-            }
+            };
+            let Some(bytes) = partials else {
+                return dispatched(vec![attend]);
+            };
+            *splitk_scratch_bytes = (*splitk_scratch_bytes).max(bytes);
+            let merge = LoweredCommand {
+                kernel: KernelId::MlaAttendMerge,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_attend_merge_f16",
+                    "mla_attend_merge_bf16",
+                    p.act_dtype(),
+                ),
+                constants: constants(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, mla.heads().get(), 1),
+                    threads_per_threadgroup: (tiling.merge_threads.get(), 1, 1),
+                    m_scaling,
+                },
+                bindings: baked(vec![output, Binding::Scratch { binding_index: 1 }]),
+            };
+            return dispatched(vec![attend, merge]);
         }
         I::GatedDeltaNet(
             Slot(qkv_slot),
@@ -6953,22 +6989,60 @@ fn mla_cache(
     })
 }
 
-/// The query heads one MLA attention threadgroup serves: the largest divisor of the heads up to
-/// [`MLA_HEADS_PER_TG`], so each threadgroup reads every cached row once for all of them.
-fn mla_heads_per_tg(mla: crate::tape::step::Mla) -> super::ids::NumQHeads {
+/// How an MLA attention spreads over threadgroups: each serves the largest divisor of the heads
+/// up to [`MLA_HEADS_PER_TG`], over as many simdgroups (up to 32, a power of two) as merge their
+/// latent partials in [`MLA_MERGE_BYTES`] of threadgroup memory. A decode-shaped bucket (up to
+/// [`crate::op_abi::METAL_VERIFY_ROWS`] rows, each a whole context) splits each sequence's cached
+/// rows into [`MLA_DECODE_PARTS`] partitions, whose partials — each its softmax max and sum, then
+/// its latent lanes, f32 — a merge combines; a prefill-shaped one has rows enough to fill the GPU
+/// unsplit.
+fn mla_attend_tiling(
+    mla: crate::tape::step::Mla,
+    bucket_m: u32,
+) -> super::kernel_constants::MlaAttendTiling {
     let heads = mla.heads().get();
     let served = (1..=MLA_HEADS_PER_TG.min(heads))
         .rev()
         .find(|d| heads.is_multiple_of(*d))
         .unwrap_or(1);
-    super::ids::NumQHeads(served)
+    let lanes = 4 * mla.latent().get();
+    let simdgroups = (0..=5)
+        .rev()
+        .map(|p| 1u32 << p)
+        .find(|sg| sg * lanes <= MLA_MERGE_BYTES)
+        .unwrap_or(1);
+    let parts = match bucket_m <= crate::op_abi::METAL_VERIFY_ROWS {
+        true => MLA_DECODE_PARTS,
+        false => 1,
+    };
+    super::kernel_constants::MlaAttendTiling {
+        heads_per_tg: super::ids::NumQHeads(served),
+        simdgroups: super::ids::SimdgroupCount(simdgroups),
+        parts: super::ids::KvPartitions(parts),
+        partial: super::ids::PartialStride(mla.latent().get() + 2),
+        merge_threads: super::ids::ThreadCount(MLA_MERGE_THREADS),
+    }
 }
 
-/// The most query heads an MLA attention threadgroup serves: each holds its query and output
-/// lanes of a cached row in registers.
-const MLA_HEADS_PER_TG: u32 = 4;
+/// The partitions a decode-shaped bucket's MLA attention splits each sequence's cached rows into.
+/// Hand-tuned: measured on GLM-4.7-Flash on an M3 Pro (1024-token decode: 8 partitions 53.1
+/// tok/s, 16 51.8, 32 49.1).
+const MLA_DECODE_PARTS: u32 = 8;
 
-/// A per-head matmul threadgroup's simdgroups, and the output rows each computes.
+/// The threads of an MLA merge threadgroup: one head's latent lanes, several a thread.
+const MLA_MERGE_THREADS: u32 = 256;
+
+/// The most query heads an MLA attention threadgroup serves. Hand-tuned: a head's query and
+/// output lanes of a cached row are a thread's registers, and more than one spills them (measured
+/// on GLM-4.7-Flash on an M3 Pro, 1024-token decode: 1 head 51.8 tok/s, 2 46.8, 4 42.7, at 16
+/// partitions).
+const MLA_HEADS_PER_TG: u32 = 1;
+
+/// The threadgroup memory an MLA attention's merge holds its simdgroups' latent partials in.
+const MLA_MERGE_BYTES: u32 = 16 * 1024;
+
+/// A per-head matmul threadgroup's simdgroups, and the output rows each computes. Hand-tuned, the
+/// MLX `qmv` family's shape (`quantized_qmv.metal`).
 const HEAD_MATMUL_SIMDGROUPS: u32 = 8;
 const HEAD_MATMUL_ROWS_PER_SG: u32 = 4;
 
@@ -7017,8 +7091,8 @@ fn lower_head_matmul(
             k: hm.k,
             n_head: super::ids::NDim(n / heads),
             in_stride: hm.in_stride,
-            simdgroups: super::ids::RowStride(HEAD_MATMUL_SIMDGROUPS),
-            rows_per_simdgroup: super::ids::RowStride(HEAD_MATMUL_ROWS_PER_SG),
+            simdgroups: super::ids::SimdgroupCount(HEAD_MATMUL_SIMDGROUPS),
+            rows_per_simdgroup: super::ids::RowsPerSimdgroup(HEAD_MATMUL_ROWS_PER_SG),
             affine,
         }
         .into_baked(),
