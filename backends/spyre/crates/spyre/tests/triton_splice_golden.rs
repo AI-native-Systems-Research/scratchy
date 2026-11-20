@@ -3448,14 +3448,18 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         (src(3), vd.clone(), vec![b, kv_width]),
         (u64::from(mask_tid), mask, mask_shape),
     ];
-    // The pools: every sequence's cached rows laid into ITS pages (`pool_of_rows`), page by page.
-    let page_elems = step.nkvh as usize * slots * hd;
+    // The pools: every sequence's cached rows laid into ITS pages (`pool_of_rows`), page by page at
+    // the unit stride the one law states (`kv_unit_elems` — each plane's pool carries the whole
+    // unit per page, its own half staged by `pool_of_rows`, the other plane's the zeros), which is
+    // the stride `batch_sources`' folded ids read (`x · unit_rows + a`).
+    let unit_elems =
+        scratchy_triton_splice::kv_unit_elems(step.nkvh, hd as u32, step.page_slots) as usize;
     for (i, cache) in [(4usize, &kc), (5, &vc)] {
-        let mut pool = vec![0.0f32; step.pages as usize * page_elems];
+        let mut pool = vec![0.0f32; step.pages as usize * unit_elems];
         for (sq, (&c, bl)) in contexts.iter().zip(&blocks).enumerate() {
             let rows = pool_of_rows(&step, hd, bl, &cache[sq], c).unwrap();
             for &p in &bl[..c.div_ceil(slots)] {
-                let r = p as usize * page_elems..(p as usize + 1) * page_elems;
+                let r = p as usize * unit_elems..(p as usize + 1) * unit_elems;
                 pool[r.clone()].copy_from_slice(&rows[r]);
             }
         }
