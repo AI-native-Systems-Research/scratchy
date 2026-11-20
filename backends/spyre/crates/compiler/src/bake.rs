@@ -1703,6 +1703,7 @@ fn layout_tokens(
         segment_bytes,
         weight_bank_bytes,
         kv_bank_bytes,
+        kv_bank_unit_bytes,
         weight_tail,
         places,
         kernel_weights,
@@ -1722,6 +1723,9 @@ fn layout_tokens(
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let kvbanks = kv_bank_bytes
+        .iter()
+        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+    let kvbankunits = kv_bank_unit_bytes
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places_interner.ident(places);
@@ -1782,6 +1786,7 @@ fn layout_tokens(
             segment_bytes: [#(#segs),*],
             weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
             kv_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#kvbanks),*]),
+            kv_bank_unit_bytes: ::std::borrow::Cow::Borrowed(&[#(#kvbankunits),*]),
             weight_tail: #tail,
             places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),

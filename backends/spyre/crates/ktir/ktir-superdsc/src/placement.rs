@@ -263,6 +263,13 @@ pub struct BundleLayout {
     /// and skipped from the serialization then, so those bundles' fingerprints do not carry it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kv_bank_bytes: Vec<u64>,
+    /// ⭐ EACH KV BANK'S UNIT BYTES — one page's bytes in that bank, bank 0 first (one entry per
+    /// bank, so one longer than [`Self::kv_bank_bytes`]). A bank holds ONE declaration's pools
+    /// (a pairing more than one is refused at expansion), so this is the one fact the run-time
+    /// funding needs: the worker allocates bank `b` at `(pages funded + the null page) ×
+    /// kv_bank_unit_bytes[b]`. Empty for a bundle that places no per-layer pools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kv_bank_unit_bytes: Vec<u64>,
     /// ⭐ WHICH KV BANK EACH PER-LAYER POOL TABLE'S LAYERS LIVE IN — keyed by the table's layer-0
     /// tid (the key every per-layer table is owned by), one bank per iteration: the one statement
     /// both the placements and the launch table read. The tables of one class share one list.

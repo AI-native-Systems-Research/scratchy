@@ -767,6 +767,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No KV banks: this layout places nothing in the KV segment (every operand above is an
         // Activation or Logits placement), so no layer block owns a region.
         kv_bank_bytes: Vec::new(),
+        kv_bank_unit_bytes: Vec::new(),
         kv_block_banks: Default::default(),
         // No spilled tail, for the same reason: every parameter is its own region.
         weight_tail: WeightTail::InPlace,

@@ -1489,8 +1489,11 @@ impl SpyreWorker {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
-                let pool_bound_bytes = code.layout.kv_pool_bytes();
-                let pool_stride_bytes = pool_bound_bytes / u64::from(step.pages).max(1);
+                // ⭐ THE PAGE'S PRICE, STRAIGHT OFF THE LAYOUT — the sum of every bank's unit
+                // bytes (`kv_block_bytes`), the one number the engine divides the budget by. No
+                // consumer re-derives it (the bound's bytes over the bound's pages was a second
+                // statement of the same price).
+                let pool_stride_bytes = code.layout.kv_block_bytes();
                 // ⭐ THE CONTEXT THIS RUN SERVES — the MODEL'S context as the bake states it (the
                 // step's `context`, the AttnDecode's `valid_len`), never the pool's capacity: the
                 // pool may hold more pages than any one request may attend, and the mint proved it

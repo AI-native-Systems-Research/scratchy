@@ -999,10 +999,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let t = &ir.tensors[tid as usize];
         nbytes(tid) / u64::from(t.rows) / u64::from(t.cols)
     };
-    let (kv_bank_bytes, kv_block_banks) = if cfg!(feature = "spyre-lower") {
+    let (kv_bank_bytes, kv_bank_unit_bytes, kv_block_banks) = if cfg!(feature = "spyre-lower") {
         place_kv_pools(kv_states, per_layer_ext, &width_of, &mut seg_bytes, &mut placements)?
     } else {
-        (Vec::new(), Default::default())
+        (Vec::new(), Vec::new(), Default::default())
     };
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
@@ -1630,6 +1630,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         segment_bytes: seg_bytes,
         weight_bank_bytes,
         kv_bank_bytes,
+        kv_bank_unit_bytes,
         kv_block_banks,
         weight_tail,
         kernel_weights: std::collections::BTreeMap::new(),
@@ -2021,7 +2022,7 @@ fn place_kv_pools(
     width_of: &impl Fn(u32) -> u64,
     seg_bytes: &mut [u64; 7],
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-) -> Result<(Vec<u64>, PoolTableBanks), SuperDscError> {
+) -> Result<(Vec<u64>, Vec<u64>, PoolTableBanks), SuperDscError> {
     use scratchy_subtile::handoff::KvStateDecl;
     let kv_seg = SegRole::Kv.segment();
     // ⭐⭐ THE SPAN UNITS ARE THE ADDRESSING BOUND, NOT THE FUNDED POOL —
@@ -2031,6 +2032,12 @@ fn place_kv_pools(
     // the pages it funds); the PLACEMENT states the bound, so no view of the pool declares past
     // its region. A bank whose bound bytes exceed the segment (a class pairing more than one
     // declaration) is refused at expansion — a build failure, never a runtime shortfall.
+    // ⭐ AND ONE DECLARATION PER BANK — the law the run-time funding consumes: a bank's funded
+    // extent is `(pages funded + the null page) × the declaration's unit bytes`, a fact of ONE
+    // declaration, so a bank pairing two has no one unit bytes to fund at and is refused by name
+    // (the region law above refuses every realistic pairing; this names the law where the door
+    // reads it). `bank_unit_bytes` below records each bank's declaration's unit bytes, bank 0
+    // first, as [`bundle::BundleLayout::kv_bank_unit_bytes`] states.
     let span_units = |decl: &KvStateDecl, w: u64| {
         u64::from(scratchy_triton_splice::units_max(decl.unit_bytes(w)))
     };
@@ -2058,6 +2065,9 @@ fn place_kv_pools(
         );
     };
     let mut bank_bytes: Vec<u64> = Vec::new();
+    // Each bank's declaration's unit bytes, BANK 0 FIRST — one entry per bank the pool places,
+    // so `kv_bank_unit_bytes.len() == kv_bank_bytes.len() + 1` whenever pools exist.
+    let mut bank_unit_bytes: Vec<u64> = Vec::new();
     let mut table_banks: PoolTableBanks = Default::default();
     for class in per_layer_ext {
         let tables: Vec<(u32, &Vec<u32>)> = class
@@ -2113,6 +2123,14 @@ fn place_kv_pools(
             );
             block += span_units(decl, w) * decl.unit_bytes(w);
         }
+        if paired.len() > 1 {
+            return Err(SuperDscError(format!(
+                "a class pairs {} KV declarations into one bank — one declaration per bank is \
+                 the law the run-time funding consumes (a bank's funded extent is \
+                 `(pages + the null page) × its declaration's unit bytes`). Split the class.",
+                paired.len()
+            )));
+        }
         if block > region_bytes {
             return Err(SuperDscError(format!(
                 "the KV pools' addressing bound packs {block} B in one layer's bank and a \
@@ -2127,6 +2145,11 @@ fn place_kv_pools(
             .map(|j| KvBank::of_placement((bank_bytes.len() + j) as u32))
             .collect();
         bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
+        // The class's ONE declaration's unit bytes, one entry per bank — bank 0's entry is the
+        // FIRST bank this pool places (the list is empty until now), so the order stays
+        // bank 0 first.
+        let class_unit_bytes = paired[0].0.unit_bytes(width_of(paired[0].1[0].0));
+        bank_unit_bytes.extend(std::iter::repeat_n(class_unit_bytes, banks.len()));
         for ((decl, plane_tables), offs) in paired.iter().zip(&intra) {
             for (&(t0, tids), &off) in plane_tables.iter().zip(offs) {
                 // ⭐ THE FAMILY'S KEY NAMES THE PLANE — the table's layer-0 tid is the
@@ -2155,10 +2178,27 @@ fn place_kv_pools(
     // declaration one unit stride wide, so an unrolled bundle's pools are as unit-major as a
     // rolled one's. A declaration's planes straddle the classes only together: both are
     // per-layer externals of the same layer, so both file in the same class or neither does.
+    // ⭐ AND THE ONE-DECLARATION-PER-BANK LAW HOLDS HERE TOO: bank 0 holds the tail's ONE
+    // declaration or a class's block, never both (and never two tail declarations) — the same
+    // funding law, refused by name where the door reads it.
     let mut tail = bank_bytes[0];
+    let mut tail_decls = 0u32;
     for d in kv_states {
         if d.planes().iter().any(|p| owned.contains(&(p.source() as u32))) {
             continue;
+        }
+        tail_decls += 1;
+        if tail_decls > 1 || !bank_unit_bytes.is_empty() {
+            return Err(SuperDscError(format!(
+                "bank 0 of the KV segment would hold {} declaration(s) beside a class's \
+                 per-layer block — one declaration per bank is the law the run-time funding \
+                 consumes. Split the class or the tail.",
+                if bank_unit_bytes.is_empty() {
+                    tail_decls
+                } else {
+                    tail_decls + 1
+                }
+            )));
         }
         let w = width_of(d.planes()[0].source() as u32);
         let su = span_units(d, w);
@@ -2171,6 +2211,8 @@ fn place_kv_pools(
             );
         }
         tail += su * d.unit_bytes(w);
+        // Bank 0 is the tail's alone here: its entry is the tail declaration's unit bytes.
+        bank_unit_bytes.push(d.unit_bytes(w));
     }
     if tail > region_bytes {
         return Err(SuperDscError(format!(
@@ -2181,7 +2223,7 @@ fn place_kv_pools(
     }
     bank_bytes[0] = tail;
     seg_bytes[kv_seg] = bank_bytes[0];
-    Ok((bank_bytes.split_off(1), table_banks))
+    Ok((bank_bytes.split_off(1), bank_unit_bytes, table_banks))
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -6770,6 +6812,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         segment_bytes,
         weight_bank_bytes,
         kv_bank_bytes,
+        // Each bank's unit bytes — the one fact the run-time funding reads (the door allocates
+        // each bank at `(pages funded + the null page) × its unit bytes`).
+        kv_bank_unit_bytes,
         // Read by the launch table (`lower_subtile_tape_to_ktir`), which carries each layer's bank
         // as its own column; the placements below already name every pool's bank.
         kv_block_banks: _,
@@ -6918,6 +6963,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         segment_bytes,
         weight_bank_bytes: std::borrow::Cow::Owned(weight_bank_bytes.clone()),
         kv_bank_bytes: std::borrow::Cow::Owned(kv_bank_bytes.clone()),
+        kv_bank_unit_bytes: std::borrow::Cow::Owned(kv_bank_unit_bytes.clone()),
         weight_tail: *weight_tail,
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(
@@ -11048,7 +11094,7 @@ mod kv_pool_placement_tests {
         let (layers, pool) = (4u32, 3 * 1024u64);
         let per_layer_ext = one_class(layers);
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let (extra, banks) = place_kv_pools(
+        let (extra, unit_bytes, banks) = place_kv_pools(
             &[one_state(pool)],
             &per_layer_ext,
             &|_| 1,
@@ -11067,6 +11113,13 @@ mod kv_pool_placement_tests {
             "one bank per further layer"
         );
         let per_layer_banks: Vec<KvBank> = (0..layers).map(KvBank::of_placement).collect();
+        // ⭐ ONE DECLARATION PER BANK, ONE ENTRY PER BANK, BANK 0 FIRST — the run-time funding's
+        // fact: each layer's bank funds at `(pages + the null page) × 2·pool` unit bytes.
+        assert_eq!(
+            unit_bytes,
+            vec![2 * pool; layers as usize],
+            "each bank's unit bytes, bank 0 first"
+        );
         assert_eq!(
             banks,
             [(1000, per_layer_banks.clone()), (2000, per_layer_banks)]
@@ -11107,7 +11160,7 @@ mod kv_pool_placement_tests {
         )
         .expect("one page is a whole number of pages")];
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let (extra, _) = place_kv_pools(
+        let (extra, unit_bytes, _) = place_kv_pools(
             &states,
             &per_layer_ext,
             &|_| 1,
@@ -11124,6 +11177,8 @@ mod kv_pool_placement_tests {
         assert_eq!(v.size, bank - pool, "V spans it less its plane offset");
         assert_eq!(seg_bytes[SegRole::Kv.segment()], bank);
         assert!(extra.is_empty(), "no class, no further banks");
+        // The tail state's bank 0 is its alone, so its entry is its own unit bytes.
+        assert_eq!(unit_bytes, vec![2 * pool], "bank 0 is the tail's alone");
     }
 
     /// ⭐ A BANK PAST ITS SEGMENT IS REFUSED AT EXPANSION — a class's block already fills bank 0
@@ -11157,8 +11212,9 @@ mod kv_pool_placement_tests {
             panic!("bank 0 past the segment's bound must be refused");
         };
         assert!(
-            e.to_string().contains("exceed one device region"),
-            "the refusal names the segment law: {e}"
+            e.to_string().contains("one declaration per bank"),
+            "the refusal names the funding law (a class's block fills bank 0 at the bound, so \
+             the tail's declaration cannot join it): {e}"
         );
     }
 }

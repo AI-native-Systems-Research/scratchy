@@ -255,6 +255,15 @@ pub struct BundleLayout<'a> {
     /// their own device allocation, so the pool holds the model's whole context however its total
     /// compares to a region. Empty for a bundle that places no per-layer pools.
     pub kv_bank_bytes: Cow<'a, [u64]>,
+    /// ⭐ EACH KV BANK'S UNIT BYTES — one page's bytes in that bank, bank 0 first (so bank `b`'s
+    /// entry is `kv_bank_unit_bytes[b]`, and the list is one longer than [`Self::kv_bank_bytes`]).
+    /// A bank holds ONE declaration's pools at unit stride (a class pairing more than one is
+    /// refused at expansion), so this is the one fact the run-time funding needs: the worker
+    /// allocates bank `b` at `(pages funded + the null page) × kv_bank_unit_bytes[b]`, and the
+    /// engine's per-block cost ([`Self::kv_block_bytes`]) is the sum over banks. The entries are
+    /// the BOUND's own unit bytes — the funded count is never stated here. Empty for a bundle
+    /// that places no per-layer pools.
+    pub kv_bank_unit_bytes: Cow<'a, [u64]>,
     /// ⭐ WHERE THE NON-PER-LAYER WEIGHT TAIL LIVES — the bake's verdict, not the runtime's inference.
     /// [`WeightTail::Spilled`] is the work list every borrowing session's tail copy reads; see
     /// [`WeightTail`] for why this is a field.
@@ -359,6 +368,14 @@ impl<'a> BundleLayout<'a> {
     pub fn kv_pool_bytes(&self) -> u64 {
         self.segment_bytes[ktir_superdsc::placement::SegRole::Kv.segment()]
             + self.kv_bank_bytes.iter().sum::<u64>()
+    }
+
+    /// ⭐ ONE SCHEDULER BLOCK'S BYTES — the sum of every bank's unit bytes
+    /// ([`Self::kv_bank_unit_bytes`]): one page id costs its unit in EVERY layer's bank, so a
+    /// block's device cost is that sum. The one number the engine divides the KV budget by,
+    /// stated here so no consumer re-derives it.
+    pub fn kv_block_bytes(&self) -> u64 {
+        self.kv_bank_unit_bytes.iter().sum()
     }
 
     /// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this SHIPPED layout's packed size for
