@@ -2142,7 +2142,7 @@ def scaling(engine):
 # What a dataset cell keeps: the serving metrics, then what a task measures.
 TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "request_rate", "timed_answers",
                     "start_times", "ttfts_ms", "e2els_ms", "prompt_tokens", "tpots_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
-                    "accuracy", "empty_answers", "thinking_answers", "capped_answers",
+                    "accuracy", "empty_answers", "capped_answers",
                     # Task by task, where the dataset names its tasks: so engines can be compared
                     # on the same tasks, and accuracy read by MuSiQue's hops.
                     "task_ids", "task_groups", "task_right", "accuracy_by_group", "task_share"]

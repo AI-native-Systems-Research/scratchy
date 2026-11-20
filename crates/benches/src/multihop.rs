@@ -101,7 +101,6 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
         &q.documents,
         &q.question,
         std::slice::from_ref(&q.answer),
-        crate::workloads::Rule::OneAnswer,
         max_tokens,
     )
 }
@@ -163,17 +162,13 @@ fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate response against expected answer.
-///
-/// Returns 1.0 if the expected answer is found as a substring or if
-/// token F1 >= 0.5 (many answers are short entities and the model may
-/// add surrounding context). Returns 0.0 otherwise.
+/// 1.0 where the response names the expected answer word for word ([`crate::scoring::gives_any`]), else 0.0.
 fn evaluate(response: &str, expected: &str, debug: bool) -> f64 {
     if debug {
         eprintln!("  expected: {expected}");
         eprintln!("  response: {response}");
     }
-    if crate::scoring::contains_or_f1(response, expected) {
+    if crate::scoring::gives_any(response, &[expected]) {
         1.0
     } else {
         0.0
@@ -538,11 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_f1_threshold() {
+    fn evaluate_wants_every_word() {
         assert!(
             (evaluate("12 June 1516 was the date", "12 June 1516", false) - 1.0).abs()
                 < f64::EPSILON
         );
+        assert!(evaluate("June 1516", "12 June 1516", false).abs() < f64::EPSILON);
     }
 
     #[test]

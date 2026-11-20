@@ -192,7 +192,6 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
         &docs,
         &q.question,
         &answers,
-        crate::workloads::Rule::AnyAnswer,
         max_tokens,
     );
     t.label = Some(crate::workloads::TaskLabel {
@@ -210,11 +209,7 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate response against expected answer and aliases.
-///
-/// Returns 1.0 if any of the following match:
-/// - The expected answer (or any alias) is a substring of the response
-/// - Token F1 >= 0.5 against any acceptable answer
+/// 1.0 where the response names the expected answer or one of its aliases word for word ([`crate::scoring::gives_any`]), else 0.0.
 fn evaluate(response: &str, expected: &str, aliases: &[String], debug: bool) -> f64 {
     if debug {
         eprintln!("  expected: {expected}");
@@ -226,7 +221,7 @@ fn evaluate(response: &str, expected: &str, aliases: &[String], debug: bool) -> 
     let all: Vec<&str> = std::iter::once(expected)
         .chain(aliases.iter().map(String::as_str))
         .collect();
-    if crate::scoring::any_contains_or_f1(response, &all) {
+    if crate::scoring::gives_any(response, &all) {
         1.0
     } else {
         0.0
@@ -635,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_f1_threshold() {
+    fn evaluate_ignores_punctuation() {
         assert!(
             (evaluate(
                 "Denver Colorado is the city",
