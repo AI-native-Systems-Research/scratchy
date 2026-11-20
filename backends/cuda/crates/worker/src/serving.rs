@@ -291,7 +291,7 @@ impl CudaServingWorker {
             None => self.table.clear(),
         }
         let tapes = model.entry.tapes;
-        let bucket_ms: Vec<u32> = tapes.iter().map(|t| t.bucket_m.get()).collect();
+        let bucket_ms: Vec<u32> = tapes.iter().map(|t| t.bucket_m().get()).collect();
         let (bucket, bucket_m) = choose_bucket(&bucket_ms, n).map_err(exec)?;
         let tape = &tapes[bucket];
         fill_inputs(
@@ -449,11 +449,11 @@ impl Worker for CudaServingWorker {
         );
         let kv = entry.tapes.iter().find_map(|t| t.kv);
         let row_elems = (entry.tapes.iter())
-            .map(|t| (t.result.bytes / u64::from(t.bucket_m.max(BucketM(1)))) as usize / 2)
+            .map(|t| (t.result.bytes / u64::from(t.bucket_m().max(BucketM(1)))) as usize / 2)
             .max()
             .unwrap_or(0);
         let rows = (entry.tapes.iter())
-            .map(|t| t.bucket_m.get() as usize)
+            .map(|t| t.bucket_m().get() as usize)
             .max();
         let rows = rows.unwrap_or(0);
         self.ids.reserve(rows);
@@ -592,7 +592,7 @@ impl Worker for CudaServingWorker {
     /// The prefill buckets' largest: no step may run more tokens than one forward holds.
     fn prefill_bucket_max_m(&self) -> Option<u32> {
         let model = self.model.as_ref()?;
-        model.entry.tapes.iter().map(|t| t.bucket_m.get()).max()
+        model.entry.tapes.iter().map(|t| t.bucket_m().get()).max()
     }
 
     /// One block table of tokens: what the attention kernels address for a sequence.

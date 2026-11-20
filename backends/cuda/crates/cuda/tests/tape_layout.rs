@@ -106,9 +106,8 @@ fn each_static_is_what_its_canonical_lowers_to() {
 }
 
 fn gemm_steps(tape: &CudaTape) -> Vec<GemmBf16> {
-    tape.steps
-        .iter()
-        .map(|s| match *s {
+    tape.steps()
+        .map(|s| match s {
             CudaStep::Gemm(g) => g,
             other => panic!("a GEMM chain holds only GEMMs, got {other:?}"),
         })
@@ -399,7 +398,7 @@ fn the_mlp_numbers() {
         CudaStep::GateUpAct(gu),
         CudaStep::Gemm(down),
         CudaStep::Add(y),
-    ] = *MLP_M256.steps
+    ] = MLP_M256.steps().collect::<Vec<_>>()[..]
     else {
         panic!("the MLP's steps are norm, gate/up and silu_mul in one launch (#1049), gemm, add");
     };
@@ -422,7 +421,7 @@ fn the_mlp_numbers() {
 fn no_mlp_step_touches_the_absorbed_silus_colour() {
     for tape in [&MLP_M128, &MLP_M256] {
         let s = tape.arena.colour_offsets[4];
-        for (k, step) in tape.steps.iter().enumerate() {
+        for (k, step) in tape.steps().enumerate() {
             let e = step.extents().expect("an MLP step's bytes fit u64");
             for span in e.reads.iter().flatten().chain([&e.writes]) {
                 assert_ne!(span.offset.0, s, "step {k} touches colour 4: {step:?}");
@@ -686,7 +685,7 @@ fn the_attention_gate_numbers() {
         CudaStep::GateApply(ga),
         CudaStep::Gemm(o),
         CudaStep::Add(y),
-    ] = *ATTN_GATE_M256.steps
+    ] = ATTN_GATE_M256.steps().collect::<Vec<_>>()[..]
     else {
         panic!("the steps are norm, gemm, gate split, norm, rope, gate apply, gemm, add");
     };
@@ -1066,7 +1065,7 @@ fn the_attention_layer_numbers() {
         CudaStep::GateApply(ga),
         CudaStep::Gemm(o),
         CudaStep::Add(y),
-    ] = *t.steps
+    ] = t.steps().collect::<Vec<_>>()[..]
     else {
         panic!("the steps are the layer's eleven launches, in order");
     };
@@ -2944,9 +2943,9 @@ fn vnorm_shape(l: &LoweredDecode, facts: LoweringFacts) -> (u32, u32) {
         rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     let c = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("the v_norm lowers: {e}"));
-    match static_tape(&c).steps {
+    match static_tape(&c).steps().collect::<Vec<_>>()[..] {
         [CudaStep::RmsNormUnit(n)] => (n.rows.get(), n.cols.get()),
-        other => panic!("one RmsNormUnit step: {other:?}"),
+        ref other => panic!("one RmsNormUnit step: {other:?}"),
     }
 }
 

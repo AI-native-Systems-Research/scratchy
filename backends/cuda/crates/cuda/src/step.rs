@@ -2,10 +2,12 @@
 //! CUDA's step: one or two kernel launches of a lowered tape, the counterpart of metal's
 //! `MetalStep`.
 
+use core::fmt::Debug;
 /// Re-exported so a static tape names it beside the steps that carry it
 /// (`scratchy_target_cuda::step::GainConvention`).
 pub use scratchy_ir::model_facts::RopePairing;
 pub use scratchy_subtile::subtile_ir::GainConvention;
+
 use serde::Serialize;
 
 /// The constants the kernels share ([`crate::kernel_consts`]), under the paths they always had.
@@ -179,7 +181,8 @@ impl RopeTheta {
 /// player matches it exhaustively, so a new variant does not compile until the player launches
 /// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum CudaStep {
+#[serde(bound = "")]
+pub enum CudaStep<B: BucketKind = OneRow> {
     /// The token-embedding row gather, the forward's first step when its input is token ids
     /// (`kernels/embed_bf16.cu`): metal's `MetalStep::Embed`. Not lowered from an op of the
     /// shared tape: it fills the embedded hidden, colour 0, which the tape's first ops read.
@@ -194,7 +197,7 @@ pub enum CudaStep {
     /// The bf16 GEMV, a one-row GEMM, lowered from `SubOp::MatmulTile` of a one-row bucket whose
     /// `n` the narrow GEMM does not take (`kernels/gemv_bf16.cu`): the operands of [`Self::Gemm`]
     /// with `m = 1`, another kernel. The lowering's `MatmulTile` arm chooses it at expansion.
-    Gemv(GemvBf16),
+    Gemv(B::OneRow<GemvBf16>),
     /// The bf16 RMSNorm, lowered from `SubOp::RmsNorm` (`kernels/rms_norm_bf16.cu`).
     RmsNorm(RmsNormBf16),
     /// The bf16 elementwise add, lowered from `Elementwise(Add)` (`kernels/add_bf16.cu`).
@@ -219,7 +222,7 @@ pub enum CudaStep {
     /// One query row's grouped-query attention over the paged KV cache, lowered from
     /// `SubOp::AttnDecode` when the bucket has one row (`kernels/attn_decode_fp8kv.cu`): the
     /// operands of [`Self::AttnPrefill`] with `rows = 1`, another kernel.
-    AttnDecode(AttnDecodeBf16),
+    AttnDecode(B::OneRow<AttnDecodeBf16>),
     /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
     /// `kernels/gdn_gating.cu`, `kernels/gdn_chunk_scan.cu` (FP8 S8 F6a: the scan 64 tokens at a
@@ -360,7 +363,7 @@ pub enum CudaStep {
     GemmNarrowFp8(GemmNarrowFp8),
     /// [`Self::Gemv`] over an fp8 weight: `a` is the bf16 row, which the GEMV quantizes in its
     /// prologue (`kernels/gemv_fp8.cu`).
-    GemvFp8(GemvFp8),
+    GemvFp8(B::OneRow<GemvFp8>),
     /// [`Self::GemmGroup`] over fp8 weights, as [`Self::GemmFp8`] each.
     GemmGroupFp8(GemmGroupFp8),
     /// [`Self::GemmNarrowGroup`] over fp8 weights (the 27B's `in_proj_a` + `in_proj_b`), as
@@ -372,7 +375,7 @@ pub enum CudaStep {
     /// shapes [`gemv_tc_takes`] takes: `a` is the quant scratch, the one e4m3 row the step before
     /// wrote and its scale after it, as [`Self::GemmFp8`]'s; `c = bf16((a·Bᵀ) · w_scale · a_scale)`
     /// (with the residual's `with_residual` when it has one), WGMMA's fp8 accumulation.
-    GemvTcFp8(GemvTcFp8),
+    GemvTcFp8(B::OneRow<GemvTcFp8>),
     /// [`Self::GemvGroupFp8`] on the tensor cores, each member as [`Self::GemvTcFp8`].
     GemvGroupTcFp8(GemvGroupTcFp8),
     /// [`Self::GateUpAct`] of one row on the tensor cores: the gate and the up as B8's f32
@@ -390,9 +393,195 @@ pub enum CudaStep {
     /// one launch (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`): `y` as N3's norm computes it, then
     /// its e4m3 row and scale at `q`, the quant scratch's first slot, `quant_rows_fp8` of `y` bit
     /// for bit.
-    RmsNormQuantFp8(RmsNormQuantFp8),
+    RmsNormQuantFp8(B::OneRow<RmsNormQuantFp8>),
     /// [`Self::AddRmsNorm`] of one row and the quantization of its `y`, as [`Self::RmsNormQuantFp8`].
-    AddRmsNormQuantFp8(AddRmsNormQuantFp8),
+    AddRmsNormQuantFp8(B::OneRow<AddRmsNormQuantFp8>),
+}
+
+/// What a tape's bucket holds, as a type: [`OneRow`] for a one-row bucket, whose steps take every
+/// kind; [`ManyRows`] for a bucket of more rows, whose [`CudaStep`] has no one-row kind (the GEMVs,
+/// the decode attention, the norm with its quantization): their payloads are [`Never`].
+pub trait BucketKind: Copy + Debug + PartialEq + Eq {
+    /// A one-row kind's payload: `T` in a one-row bucket, [`Never`] in any other.
+    type OneRow<T: Copy + Debug + PartialEq + Eq + Serialize>: Copy
+        + Debug
+        + PartialEq
+        + Eq
+        + Serialize;
+}
+
+/// A one-row bucket's [`BucketKind`]: every step kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OneRow {}
+
+/// A bucket of more than one row's [`BucketKind`]: no one-row kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManyRows {}
+
+impl BucketKind for OneRow {
+    type OneRow<T: Copy + Debug + PartialEq + Eq + Serialize> = T;
+}
+
+impl BucketKind for ManyRows {
+    type OneRow<T: Copy + Debug + PartialEq + Eq + Serialize> = Never<T>;
+}
+
+/// A payload no value has: a one-row kind's in a bucket of more rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Never<T> {
+    #[doc(hidden)]
+    Never(core::convert::Infallible, core::marker::PhantomData<T>),
+}
+
+impl<T> Never<T> {
+    /// Any value: there is no `Never` to call it on.
+    pub const fn never<U>(self) -> U {
+        match self {
+            Self::Never(x, _) => match x {},
+        }
+    }
+}
+
+impl<T> Serialize for Never<T> {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Never(x, _) => match x {},
+        }
+    }
+}
+
+impl CudaStep<ManyRows> {
+    /// The step as a one-row bucket's would hold it: the same step, every kind of it one a
+    /// bucket of more rows holds.
+    pub const fn widen(self) -> CudaStep {
+        match self {
+            Self::Embed(x) => CudaStep::Embed(x),
+            Self::Gemm(x) => CudaStep::Gemm(x),
+            Self::GemmNarrow(x) => CudaStep::GemmNarrow(x),
+            Self::Gemv(n) => n.never(),
+            Self::RmsNorm(x) => CudaStep::RmsNorm(x),
+            Self::Add(x) => CudaStep::Add(x),
+            Self::SiluMul(x) => CudaStep::SiluMul(x),
+            Self::Rope(x) => CudaStep::Rope(x),
+            Self::GateSplit(x) => CudaStep::GateSplit(x),
+            Self::GateApply(x) => CudaStep::GateApply(x),
+            Self::RopeAppend(x) => CudaStep::RopeAppend(x),
+            Self::AttnPrefill(x) => CudaStep::AttnPrefill(x),
+            Self::AttnDecode(n) => n.never(),
+            Self::GatedDeltaNet(x) => CudaStep::GatedDeltaNet(x),
+            Self::RouterLogits(x) => CudaStep::RouterLogits(x),
+            Self::MoeRoute(x) => CudaStep::MoeRoute(x),
+            Self::ExpertSort(x) => CudaStep::ExpertSort(x),
+            Self::ExpertSortFp8(x) => CudaStep::ExpertSortFp8(x),
+            Self::ExpertActQuant(x) => CudaStep::ExpertActQuant(x),
+            Self::ExpertGateUpGemmFp8(x) => CudaStep::ExpertGateUpGemmFp8(x),
+            Self::ExpertGemm(x) => CudaStep::ExpertGemm(x),
+            Self::ExpertGemmFp8(x) => CudaStep::ExpertGemmFp8(x),
+            Self::ExpertGemv(x) => CudaStep::ExpertGemv(x),
+            Self::ExpertGemvFp8(x) => CudaStep::ExpertGemvFp8(x),
+            Self::ExpertCombine(x) => CudaStep::ExpertCombine(x),
+            Self::GateScale(x) => CudaStep::GateScale(x),
+            Self::Scale(x) => CudaStep::Scale(x),
+            Self::RmsNormUnit(x) => CudaStep::RmsNormUnit(x),
+            Self::GeluMul(x) => CudaStep::GeluMul(x),
+            Self::LayerScale(x) => CudaStep::LayerScale(x),
+            Self::SoftCap(x) => CudaStep::SoftCap(x),
+            Self::GatherLastRow(x) => CudaStep::GatherLastRow(x),
+            Self::RouterNorm(x) => CudaStep::RouterNorm(x),
+            Self::GemmCol64(x) => CudaStep::GemmCol64(x),
+            Self::GemmGroup(x) => CudaStep::GemmGroup(x),
+            Self::GemmNarrowGroup(x) => CudaStep::GemmNarrowGroup(x),
+            Self::GemvGroup(x) => CudaStep::GemvGroup(x),
+            Self::AddRmsNorm(x) => CudaStep::AddRmsNorm(x),
+            Self::NormAdd(x) => CudaStep::NormAdd(x),
+            Self::GateUpAct(x) => CudaStep::GateUpAct(x),
+            Self::ExpertGateUpAct(x) => CudaStep::ExpertGateUpAct(x),
+            Self::ExpertGateUpActFp8(x) => CudaStep::ExpertGateUpActFp8(x),
+            Self::GdnDecode(x) => CudaStep::GdnDecode(x),
+            Self::QuantRowsFp8(x) => CudaStep::QuantRowsFp8(x),
+            Self::GemmFp8(x) => CudaStep::GemmFp8(x),
+            Self::GemmCol64Fp8(x) => CudaStep::GemmCol64Fp8(x),
+            Self::GemmNarrowFp8(x) => CudaStep::GemmNarrowFp8(x),
+            Self::GemvFp8(n) => n.never(),
+            Self::GemmGroupFp8(x) => CudaStep::GemmGroupFp8(x),
+            Self::GemmNarrowGroupFp8(x) => CudaStep::GemmNarrowGroupFp8(x),
+            Self::GemvGroupFp8(x) => CudaStep::GemvGroupFp8(x),
+            Self::GemvTcFp8(n) => n.never(),
+            Self::GemvGroupTcFp8(x) => CudaStep::GemvGroupTcFp8(x),
+            Self::GateUpTcFp8(x) => CudaStep::GateUpTcFp8(x),
+            Self::ExpertGemvTcFp8(x) => CudaStep::ExpertGemvTcFp8(x),
+            Self::ExpertGateUpTcFp8(x) => CudaStep::ExpertGateUpTcFp8(x),
+            Self::RmsNormQuantFp8(n) => n.never(),
+            Self::AddRmsNormQuantFp8(n) => n.never(),
+        }
+    }
+}
+
+impl CudaStep {
+    /// The step as a bucket of more rows holds it; `None` for a one-row kind, which no such
+    /// bucket holds.
+    pub const fn narrow(self) -> Option<CudaStep<ManyRows>> {
+        match self {
+            Self::Embed(x) => Some(CudaStep::Embed(x)),
+            Self::Gemm(x) => Some(CudaStep::Gemm(x)),
+            Self::GemmNarrow(x) => Some(CudaStep::GemmNarrow(x)),
+            Self::Gemv(_) => None,
+            Self::RmsNorm(x) => Some(CudaStep::RmsNorm(x)),
+            Self::Add(x) => Some(CudaStep::Add(x)),
+            Self::SiluMul(x) => Some(CudaStep::SiluMul(x)),
+            Self::Rope(x) => Some(CudaStep::Rope(x)),
+            Self::GateSplit(x) => Some(CudaStep::GateSplit(x)),
+            Self::GateApply(x) => Some(CudaStep::GateApply(x)),
+            Self::RopeAppend(x) => Some(CudaStep::RopeAppend(x)),
+            Self::AttnPrefill(x) => Some(CudaStep::AttnPrefill(x)),
+            Self::AttnDecode(_) => None,
+            Self::GatedDeltaNet(x) => Some(CudaStep::GatedDeltaNet(x)),
+            Self::RouterLogits(x) => Some(CudaStep::RouterLogits(x)),
+            Self::MoeRoute(x) => Some(CudaStep::MoeRoute(x)),
+            Self::ExpertSort(x) => Some(CudaStep::ExpertSort(x)),
+            Self::ExpertSortFp8(x) => Some(CudaStep::ExpertSortFp8(x)),
+            Self::ExpertActQuant(x) => Some(CudaStep::ExpertActQuant(x)),
+            Self::ExpertGateUpGemmFp8(x) => Some(CudaStep::ExpertGateUpGemmFp8(x)),
+            Self::ExpertGemm(x) => Some(CudaStep::ExpertGemm(x)),
+            Self::ExpertGemmFp8(x) => Some(CudaStep::ExpertGemmFp8(x)),
+            Self::ExpertGemv(x) => Some(CudaStep::ExpertGemv(x)),
+            Self::ExpertGemvFp8(x) => Some(CudaStep::ExpertGemvFp8(x)),
+            Self::ExpertCombine(x) => Some(CudaStep::ExpertCombine(x)),
+            Self::GateScale(x) => Some(CudaStep::GateScale(x)),
+            Self::Scale(x) => Some(CudaStep::Scale(x)),
+            Self::RmsNormUnit(x) => Some(CudaStep::RmsNormUnit(x)),
+            Self::GeluMul(x) => Some(CudaStep::GeluMul(x)),
+            Self::LayerScale(x) => Some(CudaStep::LayerScale(x)),
+            Self::SoftCap(x) => Some(CudaStep::SoftCap(x)),
+            Self::GatherLastRow(x) => Some(CudaStep::GatherLastRow(x)),
+            Self::RouterNorm(x) => Some(CudaStep::RouterNorm(x)),
+            Self::GemmCol64(x) => Some(CudaStep::GemmCol64(x)),
+            Self::GemmGroup(x) => Some(CudaStep::GemmGroup(x)),
+            Self::GemmNarrowGroup(x) => Some(CudaStep::GemmNarrowGroup(x)),
+            Self::GemvGroup(x) => Some(CudaStep::GemvGroup(x)),
+            Self::AddRmsNorm(x) => Some(CudaStep::AddRmsNorm(x)),
+            Self::NormAdd(x) => Some(CudaStep::NormAdd(x)),
+            Self::GateUpAct(x) => Some(CudaStep::GateUpAct(x)),
+            Self::ExpertGateUpAct(x) => Some(CudaStep::ExpertGateUpAct(x)),
+            Self::ExpertGateUpActFp8(x) => Some(CudaStep::ExpertGateUpActFp8(x)),
+            Self::GdnDecode(x) => Some(CudaStep::GdnDecode(x)),
+            Self::QuantRowsFp8(x) => Some(CudaStep::QuantRowsFp8(x)),
+            Self::GemmFp8(x) => Some(CudaStep::GemmFp8(x)),
+            Self::GemmCol64Fp8(x) => Some(CudaStep::GemmCol64Fp8(x)),
+            Self::GemmNarrowFp8(x) => Some(CudaStep::GemmNarrowFp8(x)),
+            Self::GemvFp8(_) => None,
+            Self::GemmGroupFp8(x) => Some(CudaStep::GemmGroupFp8(x)),
+            Self::GemmNarrowGroupFp8(x) => Some(CudaStep::GemmNarrowGroupFp8(x)),
+            Self::GemvGroupFp8(x) => Some(CudaStep::GemvGroupFp8(x)),
+            Self::GemvTcFp8(_) => None,
+            Self::GemvGroupTcFp8(x) => Some(CudaStep::GemvGroupTcFp8(x)),
+            Self::GateUpTcFp8(x) => Some(CudaStep::GateUpTcFp8(x)),
+            Self::ExpertGemvTcFp8(x) => Some(CudaStep::ExpertGemvTcFp8(x)),
+            Self::ExpertGateUpTcFp8(x) => Some(CudaStep::ExpertGateUpTcFp8(x)),
+            Self::RmsNormQuantFp8(_) => None,
+            Self::AddRmsNormQuantFp8(_) => None,
+        }
+    }
 }
 
 /// An [`RmsNormBf16`] of one row: its operands, no `rows`. What the norm-quant fold makes where

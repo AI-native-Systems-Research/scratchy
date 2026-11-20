@@ -21,7 +21,7 @@ use scratchy_target_cuda::step::{
     CudaStep, GateUpActBf16, GateUpProj,
     MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
-use scratchy_target_cuda::tape::{
+use scratchy_target_cuda::tape::{TapeSteps, 
     ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, TapeError, overlap,
 };
 use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
@@ -66,14 +66,14 @@ fn capture() -> TargetModelInput {
 /// The lowered tape of bucket `m`, looked up by its `bucket_m`, never by position.
 fn tape_of(m: u32) -> &'static CudaTape {
     (CUDA_TAPES.iter())
-        .find(|t| t.bucket_m == BucketM(m))
+        .find(|t| t.bucket_m() == BucketM(m))
         .unwrap_or_else(|| panic!("no m={m} tape"))
 }
 
 /// One tape's steps, by kind.
 fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
     let mut h = BTreeMap::new();
-    for step in tape.steps {
+    for step in tape.steps() {
         let kind = match step {
             CudaStep::Embed(_) => "Embed",
             CudaStep::Gemm(_) => "Gemm",
@@ -139,8 +139,8 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
 
 /// Every quant write of `tape`, with its position.
 fn quants(tape: &CudaTape) -> Vec<(usize, QuantRowsFp8)> {
-    (tape.steps.iter().enumerate())
-        .filter_map(|(i, s)| match *s {
+    (tape.steps().enumerate())
+        .filter_map(|(i, s)| match s {
             CudaStep::QuantRowsFp8(q) => Some((i, q)),
             _ => None,
         })
@@ -153,7 +153,7 @@ fn every_emitted_tape_is_what_cuda_lowers_from_the_same_canonical() {
     let model = lower_model(&input).unwrap_or_else(|e| panic!("lower_model: {e}"));
     assert_eq!(model.tapes.len(), CUDA_TAPES.len(), "tapes");
     for (tape, lowered) in CUDA_TAPES.iter().zip(&model.tapes) {
-        let name = format!("{} m={}", variant(), tape.bucket_m);
+        let name = format!("{} m={}", variant(), tape.bucket_m());
         chains::assert_tape_is(&name, tape, lowered);
     }
     assert_eq!(CUDA_WEIGHTS, model.weights.as_slice(), "CUDA_WEIGHTS");
@@ -161,11 +161,11 @@ fn every_emitted_tape_is_what_cuda_lowers_from_the_same_canonical() {
 
 #[test]
 fn the_tapes_are_the_decode_and_prefill_buckets_and_validate() {
-    let ms: Vec<u32> = CUDA_TAPES.iter().map(|t| t.bucket_m.get()).collect();
+    let ms: Vec<u32> = CUDA_TAPES.iter().map(|t| t.bucket_m().get()).collect();
     assert_eq!(ms, TAPE_BUCKETS, "CUDA_TAPES' buckets");
     for tape in CUDA_TAPES {
         tape.validate()
-            .unwrap_or_else(|e| panic!("m={}: {e}", tape.bucket_m));
+            .unwrap_or_else(|e| panic!("m={}: {e}", tape.bucket_m()));
     }
     let left: Vec<u32> = CUDA_UNLOWERED.iter().map(|&(m, _)| m).collect();
     assert_eq!(left, [2, 4, 8, 16, 32, 64], "CUDA_UNLOWERED's buckets");
@@ -180,20 +180,20 @@ fn the_tapes_are_the_decode_and_prefill_buckets_and_validate() {
 #[test]
 fn every_tape_has_the_fp8_steps() {
     for tape in CUDA_TAPES {
-        let m = tape.bucket_m;
+        let m = tape.bucket_m();
         let want: BTreeMap<&str, usize> = match m {
             BucketM(1) => DECODE_STEPS.iter().copied().collect(),
             _ => PREFILL_STEPS.iter().copied().collect(),
         };
         assert_eq!(histogram(tape), want, "m={m}: step histogram");
-        let quantized = (tape.steps.iter())
+        let quantized = (tape.steps())
             .filter(|s| s.quantized_input().is_some())
             .count();
         assert_eq!(quantized, if m == BucketM(1) { DECODE_QUANT_READERS } else { QUANT_READERS }, "m={m}");
-        for (i, s) in tape.steps.iter().enumerate() {
+        for (i, s) in tape.steps().enumerate() {
             // Every gate/up pair of these checkpoints is quantized; a tensor-core one folds the
             // CUDA-core one-row gate/up's kernel.
-            let fp8_kind = match *s {
+            let fp8_kind = match s {
                 CudaStep::GateUpAct(GateUpActBf16 { proj, .. }) => Some(match m {
                     BucketM(1) => matches!(proj, GateUpProj::GemvFp8 { .. }),
                     _ => matches!(proj, GateUpProj::GemmFp8 { .. } | GateUpProj::GemmCol64Fp8 { .. }),
@@ -205,7 +205,7 @@ fn every_tape_has_the_fp8_steps() {
             if let Some(want) = fp8_kind {
                 assert!(want, "m={m} step {i}: {s:?}");
             }
-            let expert = match *s {
+            let expert = match s {
                 CudaStep::ExpertGemm(g) => Some(g.moe_weight()),
                 CudaStep::ExpertGemmFp8(g) => Some(g.moe_weight()),
                 CudaStep::ExpertGemv(g) => Some(g.gemv.moe_weight()),
@@ -240,7 +240,7 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
         let mut cols = std::collections::BTreeSet::new();
         let mut most = 0;
         for &(i, q) in &qs {
-            let reader = tape.steps.get(i + 1).and_then(CudaStep::quantized_input);
+            let reader = tape.step(i + 1).and_then(|s| s.quantized_input());
             assert_eq!(
                 reader,
                 Some((q.q, q.rows.get(), q.cols.get())),
@@ -263,7 +263,7 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
         // Per slot, the last write, and whether a step wrote its bf16 rows since (a step reads,
         // then writes): a quant write's, or an act + quantize's (FP8 S8 P1, the expert down's).
         let mut live: Vec<(QuantRowsFp8, bool)> = Vec::new();
-        for (i, s) in tape.steps.iter().enumerate() {
+        for (i, s) in tape.steps().enumerate() {
             if let Some(read) = s.quantized_input() {
                 assert!(
                     live.iter().any(|&(q, stale)| !stale && (q.q, q.rows.get(), q.cols.get()) == read),
@@ -292,7 +292,7 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
         assert!(at.is_multiple_of(CUDA_ARENA_ALIGN), "m={m}: aligned");
         // The quant scratch ends the arena: its last slot's end (the act + quantize's, after the
         // quant writes' slot, when the tape has one).
-        let end = (tape.steps.iter().filter_map(CudaStep::quant_write))
+        let end = (tape.steps().filter_map(|s| s.quant_write()))
             .map(|q| q.q.0 + q.bytes().expect("fits").next_multiple_of(CUDA_ARENA_ALIGN))
             .max()
             .unwrap_or(at + bytes.next_multiple_of(CUDA_ARENA_ALIGN));
@@ -307,16 +307,16 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
 fn the_quant_scratch_liveness_check_holds_and_bites() {
     for &(m, ..) in &QUANT_SCRATCH {
         let tape = tape_of(m);
-        assert_eq!(quant_chain(tape.steps), Ok(()), "m={m}");
+        assert_eq!(quant_chain(&tape.steps().collect::<Vec<_>>()), Ok(()), "m={m}");
         let (i, q) = quants(tape)[QUANTS / 2];
-        let mut dropped = tape.steps.to_vec();
+        let mut dropped = tape.steps().collect::<Vec<_>>();
         dropped.remove(i);
         assert_eq!(
             quant_chain(&dropped),
             Err(QuantChainError::Unquantized { step: i }),
             "m={m}: write {i} dropped"
         );
-        let mut doubled = tape.steps.to_vec();
+        let mut doubled = tape.steps().collect::<Vec<_>>();
         doubled.insert(i, CudaStep::QuantRowsFp8(q));
         assert_eq!(
             quant_chain(&doubled),
@@ -328,7 +328,7 @@ fn the_quant_scratch_liveness_check_holds_and_bites() {
             ("doubled", doubled, QuantChainError::Overwritten { step: i }),
         ] {
             let bad = CudaTape {
-                steps: Box::leak(steps.into_boxed_slice()),
+                steps: TapeSteps::leaked(tape.bucket_m(), &steps).expect("the bucket's kinds"),
                 ..*tape
             };
             assert_eq!(
@@ -347,9 +347,9 @@ fn the_quant_scratch_liveness_check_holds_and_bites() {
 #[test]
 fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
     let tape = tape_of(1);
-    assert_eq!(quant_chain(tape.steps), Ok(()), "m=1");
-    for (i, s) in tape.steps.iter().enumerate() {
-        match *s {
+    assert_eq!(quant_chain(&tape.steps().collect::<Vec<_>>()), Ok(()), "m=1");
+    for (i, s) in tape.steps().enumerate() {
+        match s {
             CudaStep::QuantRowsFp8(q) => assert_eq!(q.rows, Rows(1), "m=1 step {i}: one row"),
             CudaStep::GemvFp8(g) => {
                 assert!(!gemv_tc_takes([g.n.get(), 0, 0], g.k.get(), 1), "m=1 step {i}: {g:?}")
@@ -368,7 +368,7 @@ fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
             _ => {}
         }
         if let (false, Some(w)) = (matches!(s, CudaStep::QuantRowsFp8(_)), s.quant_write()) {
-            let down = tape.steps.get(i + 1).and_then(CudaStep::quantized_input);
+            let down = tape.step(i + 1).and_then(|s| s.quantized_input());
             assert_eq!(down, Some((w.q, w.rows.get(), w.cols.get())), "m=1 step {i}: its down reads it");
         }
     }
@@ -413,7 +413,7 @@ fn the_weight_table_has_the_fp8_entries() {
                 bytes == 0,
                 entry.is_none(),
                 "m={} weight {ix}: {bytes} bytes, entry {entry:?}",
-                tape.bucket_m
+                tape.bucket_m()
             );
         }
     }
@@ -513,7 +513,7 @@ fn the_model_is_registered_under_its_fp8_stem() {
 #[test]
 fn only_the_decode_tape_runs_the_greedy_argmax() {
     let got: Vec<(u32, Option<u32>)> = (CUDA_TAPES.iter())
-        .map(|t| (t.bucket_m.get(), t.greedy.map(|g| g.width.get())))
+        .map(|t| (t.bucket_m().get(), t.greedy.map(|g| g.width.get())))
         .collect();
     let want: Vec<(u32, Option<u32>)> = (TAPE_BUCKETS.iter())
         .map(|&m| (m, (m == 1).then_some(GREEDY_WIDTH)))

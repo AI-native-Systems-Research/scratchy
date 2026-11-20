@@ -14,10 +14,10 @@ use scratchy_subtile::fixtures::{front_end_lowered, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
-use scratchy_target_cuda::step::{BucketM, KDim, NDim, Rows};
+use scratchy_target_cuda::step::{BucketKind, BucketM, KDim, NDim, Rows};
 use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, TapeSteps, WeightIx,
 };
 use scratchy_target_cuda_compiler::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, LoweringFacts, SharedExpertOwner,
@@ -139,7 +139,7 @@ pub fn assert_tape_is_lowered_with(
 ) {
     let at = CanonicalAt {
         stem: name,
-        m: u64::from(tape.bucket_m),
+        m: u64::from(tape.bucket_m()),
         rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     let lowered =
@@ -150,7 +150,6 @@ pub fn assert_tape_is_lowered_with(
 /// Panic unless `tape` is, field by field, `lowered`.
 pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
     let CudaTape {
-        bucket_m,
         arena:
             ArenaLayout {
                 colour_bytes,
@@ -160,7 +159,8 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         input,
         result,
         weight_bytes,
-        steps,
+        // Compared below, as the tape reads them.
+        steps: _,
         rotary,
         kv,
         gdn,
@@ -186,14 +186,18 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         gemv_scratch: lowered_gemv_scratch,
         greedy: lowered_greedy,
     } = lowered;
-    assert_eq!(bucket_m, BucketM(*lowered_m), "{name}: bucket_m");
+    assert_eq!(tape.bucket_m(), BucketM(*lowered_m), "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
     assert_eq!(colour_offsets, lowered_offsets, "{name}: offsets");
     assert_eq!(total_bytes, *lowered_total, "{name}: total");
     assert_eq!(input, *lowered_input, "{name}: input");
     assert_eq!(result, *lowered_result, "{name}: result");
     assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
-    assert_eq!(steps, lowered_steps, "{name}: steps");
+    assert_eq!(
+        tape.steps().collect::<Vec<_>>(),
+        *lowered_steps,
+        "{name}: steps"
+    );
     assert_eq!(rotary, *lowered_rotary, "{name}: rotary");
     assert_eq!(rotary_local, *lowered_rotary_local, "{name}: rotary_local");
     assert_eq!(gemv_scratch, *lowered_gemv_scratch, "{name}: gemv_scratch");
@@ -301,7 +305,7 @@ pub fn three_gemm() -> LoweredDecode {
     with_hidden(chain_input(256, HIDDEN, &[1024, 512, 1024]))
 }
 
-const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
+const fn gemm<B: BucketKind>(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep<B> {
     CudaStep::Gemm(GemmBf16 {
         a: ArenaOffset(a),
         b: WeightIx(b),
@@ -321,7 +325,6 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
 
 /// [`two_gemm`]`(128)`: colours x, y1, y2.
 pub static TWO_GEMM_M128: CudaTape = CudaTape {
-    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[131072, 262144, 131072],
         colour_offsets: &[0, 131072, 393216],
@@ -330,10 +333,13 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 131072)),
     result: span(393216, 131072),
     weight_bytes: &[0, 1048576, 1048576],
-    steps: &[
-        gemm(0, 1, 131072, 128, 1024, 512),
-        gemm(131072, 2, 393216, 128, 512, 1024),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(128),
+        steps: &[
+            gemm(0, 1, 131072, 128, 1024, 512),
+            gemm(131072, 2, 393216, 128, 512, 1024),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: None,
@@ -345,7 +351,6 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
 pub static TWO_GEMM_M256: CudaTape = CudaTape {
-    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[262144, 524288, 262144],
         colour_offsets: &[0, 262144, 786432],
@@ -354,10 +359,13 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 262144)),
     result: span(786432, 262144),
     weight_bytes: &[0, 1048576, 1048576],
-    steps: &[
-        gemm(0, 1, 262144, 256, 1024, 512),
-        gemm(262144, 2, 786432, 256, 512, 1024),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(256),
+        steps: &[
+            gemm(0, 1, 262144, 256, 1024, 512),
+            gemm(262144, 2, 786432, 256, 512, 1024),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: None,
@@ -370,7 +378,6 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
 /// two-GEMM one. `y3` is the result.
 pub static THREE_GEMM_M256: CudaTape = CudaTape {
-    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[262144, 524288, 262144],
         colour_offsets: &[0, 262144, 786432],
@@ -379,11 +386,14 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 262144)),
     result: span(262144, 524288),
     weight_bytes: &[0, 1048576, 1048576, 1048576],
-    steps: &[
-        gemm(0, 1, 262144, 256, 1024, 512),
-        gemm(262144, 2, 786432, 256, 512, 1024),
-        gemm(786432, 3, 262144, 256, 1024, 512),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(256),
+        steps: &[
+            gemm(0, 1, 262144, 256, 1024, 512),
+            gemm(262144, 2, 786432, 256, 512, 1024),
+            gemm(786432, 3, 262144, 256, 1024, 512),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: None,

@@ -36,15 +36,15 @@ use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GatedDeltaNetBf16, GdnLayout, GdnPrefillBf16, GemmBf16, GemmGroupBf16,
-    GroupMember, NormKernel, RmsNormBf16, gdn_bundle, gdn_conv_dim, gdn_scratch,
+    AddBf16, BucketKind, CudaStep, GatedDeltaNetBf16, GdnLayout, GdnPrefillBf16, GemmBf16,
+    GemmGroupBf16, GroupMember, NormKernel, RmsNormBf16, gdn_bundle, gdn_conv_dim, gdn_scratch,
 };
 use scratchy_target_cuda::step::{
     BucketM, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, KDim, LayerId, NDim, Rows,
 };
 use scratchy_target_cuda::step::{GemmNarrowGroupBf16, MatmulGroup};
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, TapeInput, TapeSteps, WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -174,7 +174,7 @@ const fn group(a: u64, m: u32, members: [(u32, u64, u32); 2]) -> MatmulGroup {
     }
 }
 
-const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
+const fn norm<B: BucketKind>(x: u64, y: u64, rows: u32) -> CudaStep<B> {
     CudaStep::RmsNorm(RmsNormBf16 {
         x: ArenaOffset(x),
         gain: WeightIx(1),
@@ -187,7 +187,7 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
+const fn add<B: BucketKind>(a: u64, b: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::Add(AddBf16 {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
@@ -287,7 +287,6 @@ const GDN_LAYER_WEIGHT_BYTES: &[u64] = &[
 /// 256-byte slot) at 3416064, the scratch (4210688 bytes: `conv_out` 3145728, `g` 8192, `beta`
 /// 8192, `o` 1048576) at 3416320. Arena 7627008.
 pub static GDN_LAYER_M128: CudaTape = CudaTape {
-    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[262144, 262144, 1572864, 524288, 4096, 4096, 524288, 262144],
         colour_offsets: &[
@@ -298,27 +297,30 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 262144)),
     result: span(3153920, 262144),
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 262144, 128),
-        CudaStep::GemmGroup(GemmGroupBf16::of(group(
-            262144,
-            128,
-            [(2, 524288, CONV_DIM), (3, 2097152, VALUE_DIM)],
-        ))),
-        CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(group(
-            262144,
-            128,
-            [(4, 2621440, NV), (5, 2625536, NV)],
-        ))),
-        CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
-            (524288, 2097152, 2621440, 2625536),
-            2629632,
-            (3416064, 3416320),
-            128,
-        ))),
-        CudaStep::Gemm(gemm(2629632, 7, 262144, (128, H, VALUE_DIM))),
-        add(262144, 0, 3153920, 128),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(128),
+        steps: &[
+            norm(0, 262144, 128),
+            CudaStep::GemmGroup(GemmGroupBf16::of(group(
+                262144,
+                128,
+                [(2, 524288, CONV_DIM), (3, 2097152, VALUE_DIM)],
+            ))),
+            CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(group(
+                262144,
+                128,
+                [(4, 2621440, NV), (5, 2625536, NV)],
+            ))),
+            CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
+                (524288, 2097152, 2621440, 2625536),
+                2629632,
+                (3416064, 3416320),
+                128,
+            ))),
+            CudaStep::Gemm(gemm(2629632, 7, 262144, (128, H, VALUE_DIM))),
+            add(262144, 0, 3153920, 128),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: gdn_tape(3416064, (3416320, 4210688), 128),
@@ -333,7 +335,6 @@ pub static GDN_LAYER_M128: CudaTape = CudaTape {
 /// at 6832128. The GDN sequence at 6832128, the scratch (8421376 bytes: 6291456, 16384, 16384,
 /// 2097152) at 6832384. Arena 15253760.
 pub static GDN_LAYER_M256: CudaTape = CudaTape {
-    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[
             524288, 524288, 3145728, 1048576, 8192, 8192, 1048576, 524288,
@@ -346,27 +347,30 @@ pub static GDN_LAYER_M256: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 524288)),
     result: span(6307840, 524288),
     weight_bytes: GDN_LAYER_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 524288, 256),
-        CudaStep::GemmGroup(GemmGroupBf16::of(group(
-            524288,
-            256,
-            [(2, 1048576, CONV_DIM), (3, 4194304, VALUE_DIM)],
-        ))),
-        CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(group(
-            524288,
-            256,
-            [(4, 5242880, NV), (5, 5251072, NV)],
-        ))),
-        CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
-            (1048576, 4194304, 5242880, 5251072),
-            5259264,
-            (6832128, 6832384),
-            256,
-        ))),
-        CudaStep::Gemm(gemm(5259264, 7, 524288, (256, H, VALUE_DIM))),
-        add(524288, 0, 6307840, 256),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(256),
+        steps: &[
+            norm(0, 524288, 256),
+            CudaStep::GemmGroup(GemmGroupBf16::of(group(
+                524288,
+                256,
+                [(2, 1048576, CONV_DIM), (3, 4194304, VALUE_DIM)],
+            ))),
+            CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(group(
+                524288,
+                256,
+                [(4, 5242880, NV), (5, 5251072, NV)],
+            ))),
+            CudaStep::GatedDeltaNet(GdnPrefillBf16::of(gdn_step(
+                (1048576, 4194304, 5242880, 5251072),
+                5259264,
+                (6832128, 6832384),
+                256,
+            ))),
+            CudaStep::Gemm(gemm(5259264, 7, 524288, (256, H, VALUE_DIM))),
+            add(524288, 0, 6307840, 256),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: gdn_tape(6832128, (6832384, 8421376), 256),

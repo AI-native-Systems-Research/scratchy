@@ -33,8 +33,8 @@
 //! and the sequence.
 
 use scratchy_target_cuda::step::{
-    BlockSize, BucketM, Cols, FreqDim, KDim, LayerId, MaxBlocksPerSeq, NDim, NumKvHeads, NumQHeads,
-    RotDim, Rows,
+    BlockSize, BucketKind, BucketM, Cols, FreqDim, KDim, LayerId, MaxBlocksPerSeq, NDim,
+    NumKvHeads, NumQHeads, RotDim, Rows,
 };
 use std::num::NonZeroU32;
 
@@ -53,7 +53,7 @@ use scratchy_target_cuda::step::{
 };
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvClass, KvTape, RotaryTable, TapeInput,
-    WeightIx,
+    TapeSteps, WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -209,7 +209,7 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
     }
 }
 
-const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
+const fn gemm<B: BucketKind>(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep<B> {
     CudaStep::Gemm(GemmBf16 {
         a: ArenaOffset(a),
         b: WeightIx(b),
@@ -231,7 +231,7 @@ const fn member((b, c, n): (u32, u64, u32)) -> GroupMember {
 
 /// The q, k and v projections of `n` (#1049's grouped GEMM): `Wq` into `qg`, `Wk` into `k`, `Wv`
 /// into `v`.
-const fn qkv(n: u64, (qg, k, v): (u64, u64, u64), m: u32) -> CudaStep {
+const fn qkv<B: BucketKind>(n: u64, (qg, k, v): (u64, u64, u64), m: u32) -> CudaStep<B> {
     CudaStep::GemmGroup(GemmGroupBf16 {
         a: ArenaOffset(n),
         m: Rows(m),
@@ -242,7 +242,7 @@ const fn qkv(n: u64, (qg, k, v): (u64, u64, u64), m: u32) -> CudaStep {
     })
 }
 
-const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
+const fn norm<B: BucketKind>(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep<B> {
     CudaStep::RmsNorm(RmsNormBf16 {
         x: ArenaOffset(x),
         gain: WeightIx(gain),
@@ -255,7 +255,7 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
     })
 }
 
-const fn gate_split(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep {
+const fn gate_split<B: BucketKind>(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep<B> {
     CudaStep::GateSplit(GateSplitBf16 {
         qg: ArenaOffset(qg),
         q: ArenaOffset(q),
@@ -266,7 +266,7 @@ const fn gate_split(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
+const fn rope<B: BucketKind>(x: u64, table: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::Rope(RopeBf16 {
         x: ArenaOffset(x),
         table: ArenaOffset(table),
@@ -279,13 +279,13 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn rope_append(
+const fn rope_append<B: BucketKind>(
     (k, v): (u64, u64),
     table: u64,
     slot_mapping: u64,
     k_out: u64,
     rows: u32,
-) -> CudaStep {
+) -> CudaStep<B> {
     CudaStep::RopeAppend(RopeAppendBf16 {
         k: ArenaOffset(k),
         v: ArenaOffset(v),
@@ -303,7 +303,13 @@ const fn rope_append(
     })
 }
 
-const fn attn(q: u64, block_table: u64, sequence: u64, out: u64, rows: u32) -> CudaStep {
+const fn attn<B: BucketKind>(
+    q: u64,
+    block_table: u64,
+    sequence: u64,
+    out: u64,
+    rows: u32,
+) -> CudaStep<B> {
     CudaStep::AttnPrefill(AttnPrefillBf16 {
         q: ArenaOffset(q),
         block_table: ArenaOffset(block_table),
@@ -319,7 +325,7 @@ const fn attn(q: u64, block_table: u64, sequence: u64, out: u64, rows: u32) -> C
     })
 }
 
-const fn gate_apply(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep {
+const fn gate_apply<B: BucketKind>(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::GateApply(GateApplyBf16 {
         attn: ArenaOffset(attn),
         gate: ArenaOffset(gate),
@@ -329,7 +335,7 @@ const fn gate_apply(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
+const fn add<B: BucketKind>(a: u64, b: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::Add(AddBf16 {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
@@ -379,7 +385,6 @@ const ATTN_LAYER_WEIGHT_BYTES: &[u64] = &[
 /// slot) are fixed. Colours end at 4849664; the table at 4849664, the block table at 4866048, the
 /// slot mapping at 4866560, the sequence at 4867072.
 pub static ATTN_LAYER_M128: CudaTape = CudaTape {
-    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[
             262144, 262144, 1048576, 131072, 131072, 524288, 524288, 131072, 524288, 524288,
@@ -394,19 +399,22 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 262144)),
     result: span(4063232, 262144),
     weight_bytes: ATTN_LAYER_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 1, 262144, 128, H),
-        qkv(262144, (524288, 1572864, 1703936), 128),
-        gate_split(524288, 1835008, 4325376, 128),
-        norm(1835008, 3, 2359296, 1024, HD),
-        norm(1572864, 5, 2883584, 256, HD),
-        rope(2359296, 4849664, 3014656, 128),
-        rope_append((2883584, 1703936), 4849664, 4866560, 1572864, 128),
-        attn(3014656, 4866048, 4867072, 3538944, 128),
-        gate_apply(3538944, 4325376, 3014656, 128),
-        gemm(3014656, 13, 262144, 128, H, Q),
-        add(262144, 0, 4063232, 128),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(128),
+        steps: &[
+            norm(0, 1, 262144, 128, H),
+            qkv(262144, (524288, 1572864, 1703936), 128),
+            gate_split(524288, 1835008, 4325376, 128),
+            norm(1835008, 3, 2359296, 1024, HD),
+            norm(1572864, 5, 2883584, 256, HD),
+            rope(2359296, 4849664, 3014656, 128),
+            rope_append((2883584, 1703936), 4849664, 4866560, 1572864, 128),
+            attn(3014656, 4866048, 4867072, 3538944, 128),
+            gate_apply(3538944, 4325376, 3014656, 128),
+            gemm(3014656, 13, 262144, 128, H, Q),
+            add(262144, 0, 4063232, 128),
+        ],
+    },
     rotary: rotary(4849664, 16384),
     kv: kv(4866048, (4866560, 512), 4867072),
     gdn: None,
@@ -422,7 +430,6 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
 /// 9699328, the block table (512) at 9732096, the slot mapping (1024) at 9732608, the sequence (8,
 /// in a 256-byte slot) at 9733632.
 pub static ATTN_LAYER_M256: CudaTape = CudaTape {
-    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[
             524288, 524288, 2097152, 262144, 262144, 1048576, 1048576, 262144, 1048576, 1048576,
@@ -437,19 +444,22 @@ pub static ATTN_LAYER_M256: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 524288)),
     result: span(8126464, 524288),
     weight_bytes: ATTN_LAYER_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 1, 524288, 256, H),
-        qkv(524288, (1048576, 3145728, 3407872), 256),
-        gate_split(1048576, 3670016, 8650752, 256),
-        norm(3670016, 3, 4718592, 2048, HD),
-        norm(3145728, 5, 5767168, 512, HD),
-        rope(4718592, 9699328, 6029312, 256),
-        rope_append((5767168, 3407872), 9699328, 9732608, 3145728, 256),
-        attn(6029312, 9732096, 9733632, 7077888, 256),
-        gate_apply(7077888, 8650752, 6029312, 256),
-        gemm(6029312, 13, 524288, 256, H, Q),
-        add(524288, 0, 8126464, 256),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(256),
+        steps: &[
+            norm(0, 1, 524288, 256, H),
+            qkv(524288, (1048576, 3145728, 3407872), 256),
+            gate_split(1048576, 3670016, 8650752, 256),
+            norm(3670016, 3, 4718592, 2048, HD),
+            norm(3145728, 5, 5767168, 512, HD),
+            rope(4718592, 9699328, 6029312, 256),
+            rope_append((5767168, 3407872), 9699328, 9732608, 3145728, 256),
+            attn(6029312, 9732096, 9733632, 7077888, 256),
+            gate_apply(7077888, 8650752, 6029312, 256),
+            gemm(6029312, 13, 524288, 256, H, Q),
+            add(524288, 0, 8126464, 256),
+        ],
+    },
     rotary: rotary(9699328, 32768),
     kv: kv(9732096, (9732608, 1024), 9733632),
     gdn: None,

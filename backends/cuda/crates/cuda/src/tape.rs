@@ -24,7 +24,7 @@ use crate::step::{
     Rows, SiluMulBf16, TileRows, TopK, VocabSize, gdn_conv_dim, quant_chain, sort_index_regions,
 };
 use crate::step::{
-    ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8, ExpertGemvTcFp8, ExpertSortFp8,
+    ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8, ExpertGemvTcFp8, ExpertSortFp8, ManyRows,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -468,11 +468,103 @@ impl GreedyArgmax {
     }
 }
 
+/// A tape's steps, by its bucket: a one-row bucket's (its `M` 1) take every kind, a bucket of more
+/// rows' no one-row kind ([`ManyRows`]). So a one-row kind is in a one-row bucket by its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TapeSteps {
+    OneRow(&'static [CudaStep]),
+    Rows {
+        bucket_m: BucketM,
+        steps: &'static [CudaStep<ManyRows>],
+    },
+}
+
+impl TapeSteps {
+    /// `steps` as a bucket of `bucket_m` rows holds them, leaked to `'static` (a tape's steps are
+    /// static data: the emitter's, and a test's); `None` when a bucket of more than one row is
+    /// given a one-row kind.
+    pub fn leaked(bucket_m: BucketM, steps: &[CudaStep]) -> Option<Self> {
+        if bucket_m == BucketM(1) {
+            return Some(Self::OneRow(Box::leak(steps.to_vec().into_boxed_slice())));
+        }
+        let rows: Option<Vec<CudaStep<ManyRows>>> = steps.iter().map(|s| s.narrow()).collect();
+        Some(Self::Rows {
+            bucket_m,
+            steps: Box::leak(rows?.into_boxed_slice()),
+        })
+    }
+
+    /// The bucket's token count `M`.
+    pub const fn bucket_m(self) -> BucketM {
+        match self {
+            Self::OneRow(_) => BucketM(1),
+            Self::Rows { bucket_m, .. } => bucket_m,
+        }
+    }
+
+    pub const fn len(self) -> usize {
+        match self {
+            Self::OneRow(s) => s.len(),
+            Self::Rows { steps, .. } => steps.len(),
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Step `i` as a one-row bucket's would hold it ([`CudaStep::widen`]); `None` past the last.
+    pub const fn get(self, i: usize) -> Option<CudaStep> {
+        if i >= self.len() {
+            return None;
+        }
+        match self {
+            Self::OneRow(s) => Some(s[i]),
+            Self::Rows { steps, .. } => Some(steps[i].widen()),
+        }
+    }
+}
+
+/// A tape's steps in launch order, each as [`TapeSteps::get`] gives it.
+#[derive(Clone, Debug)]
+pub struct Steps {
+    steps: TapeSteps,
+    front: usize,
+    back: usize,
+}
+
+impl Iterator for Steps {
+    type Item = CudaStep;
+
+    fn next(&mut self) -> Option<CudaStep> {
+        if self.front == self.back {
+            return None;
+        }
+        self.front += 1;
+        self.steps.get(self.front - 1)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.back - self.front;
+        (n, Some(n))
+    }
+}
+
+impl DoubleEndedIterator for Steps {
+    fn next_back(&mut self) -> Option<CudaStep> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        self.steps.get(self.back)
+    }
+}
+
+impl ExactSizeIterator for Steps {}
+
 /// One bucket's forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CudaTape {
-    /// The token count `M` the tape is compiled for.
-    pub bucket_m: BucketM,
     pub arena: ArenaLayout,
     /// What the forward uploads: the embedded hidden (colour 0), or the token ids its first step
     /// embeds into colour 0.
@@ -483,8 +575,8 @@ pub struct CudaTape {
     /// GDN layer's packed f32 bundle, the embedding table at the embedded hidden's index); 0 for a
     /// source no step reads as a weight.
     pub weight_bytes: &'static [u64],
-    /// One step per launch, in launch order.
-    pub steps: &'static [CudaStep],
+    /// One step per launch, in launch order, and the token count `M` the tape is compiled for.
+    pub steps: TapeSteps,
     /// The rotary table the forward fills, when a step reads one; `None` for a tape with no rope.
     /// It is the `Cos { local: false }` table: a uniform model's only one, Gemma's global layers'.
     pub rotary: Option<RotaryTable>,
@@ -690,9 +782,6 @@ pub enum TapeError {
     /// tape's `kv_heads` and `head_dim`, a head dim or window off the rules, a layer without a
     /// class or naming one the tape lacks; or a local rotary table without a global one.
     KvClasses,
-    /// The `step`-th step is a one-row kernel's (a GEMV or the decode attention) and its rows are
-    /// `rows`, not 1, or the tape's bucket is not one row.
-    OneRowStep { step: usize, rows: u32 },
     /// The GEMV scratch is missing, present with no split step, of other bytes than the largest
     /// split step writes (`want`), misaligned, past the arena, or over a region.
     GemvScratch {
@@ -1019,11 +1108,6 @@ impl std::fmt::Display for TapeError {
                 "the GEMV scratch is {span:?}; its split steps write {want} bytes, aligned to \
                  {CUDA_ARENA_ALIGN} inside the {total}-byte arena, over no other region"
             ),
-            Self::OneRowStep { step, rows } => write!(
-                f,
-                "step {step} is a one-row kernel's (the GEMV or the decode attention) at \
-                 {rows} rows, or in a bucket of more than one row"
-            ),
             Self::RotaryMismatch { step, table, tape } => match tape {
                 Some(t) => write!(
                     f,
@@ -1167,6 +1251,25 @@ impl std::fmt::Display for TapeError {
 impl std::error::Error for TapeError {}
 
 impl CudaTape {
+    /// The token count `M` the tape is compiled for.
+    pub const fn bucket_m(&self) -> BucketM {
+        self.steps.bucket_m()
+    }
+
+    /// The steps in launch order, each as a one-row bucket's would hold it.
+    pub fn steps(&self) -> Steps {
+        Steps {
+            steps: self.steps,
+            front: 0,
+            back: self.steps.len(),
+        }
+    }
+
+    /// Step `i`; `None` past the last.
+    pub const fn step(&self, i: usize) -> Option<CudaStep> {
+        self.steps.get(i)
+    }
+
     /// Check that playing this tape stays inside its arena, its declared weights and its KV pool.
     ///
     /// Every colour is aligned and inside `total_bytes`, and so are the input and result spans,
@@ -1230,14 +1333,14 @@ impl CudaTape {
             // The forward fills exactly `bucket_m · rot_dim` bf16 into the span, in rows of
             // `rot_dim/2` cos and `rot_dim/2` sin.
             let rows_bytes =
-                (u64::from(self.bucket_m) * u64::from(t.rot_dim)).checked_mul(CUDA_ACT_BYTES);
+                (u64::from(self.bucket_m()) * u64::from(t.rot_dim)).checked_mul(CUDA_ACT_BYTES);
             if t.rot_dim == RotDim(0)
                 || t.rot_dim.get() % 2 != 0
                 || rows_bytes != Some(t.span.bytes)
             {
                 return Err(TapeError::RotaryShape {
                     span: t.span,
-                    bucket_m: self.bucket_m.get(),
+                    bucket_m: self.bucket_m().get(),
                     rot_dim: t.rot_dim.get(),
                 });
             }
@@ -1256,7 +1359,8 @@ impl CudaTape {
         let moe = self.moe_regions(total, &regions)?;
         let gemv = self.gemv_region(total, &regions, moe)?;
         let quant = self.quant_region(total, &regions, [moe, gemv])?;
-        for (step, whole) in self.steps.iter().enumerate() {
+        for (step, whole) in self.steps().enumerate() {
+            let whole = &whole;
             self.check_group(step, whole)?;
             for s in whole.parts().iter().flatten() {
                 self.check_step(step, s, (total, &regions), (scratch, moe, gemv))?;
@@ -1264,7 +1368,7 @@ impl CudaTape {
             }
         }
         // Last, so a tape refused for any other fact names that one first.
-        let want = GreedyArgmax::of(self.bucket_m.get(), self.result);
+        let want = GreedyArgmax::of(self.bucket_m().get(), self.result);
         if self.greedy != want {
             return Err(TapeError::Greedy {
                 got: self.greedy,
@@ -1404,41 +1508,41 @@ impl CudaTape {
     /// embed reading it, with its rows and vocabulary; no other step embeds, and a tape whose
     /// input is the embedded hidden has no embed.
     fn check_embed(&self) -> Result<(), TapeError> {
-        let embeds =
-            (self.steps.iter().enumerate()).filter(|(_, s)| matches!(s, CudaStep::Embed(_)));
+        let embeds = (self.steps().enumerate()).filter(|(_, s)| matches!(s, CudaStep::Embed(_)));
         match self.input {
             TapeInput::Hidden(_) => match embeds.map(|(step, _)| step).next() {
                 Some(step) => Err(TapeError::EmbedMisplaced { step }),
                 None => Ok(()),
             },
             TapeInput::TokenIds { span, vocab } => {
-                let want = u64::from(self.bucket_m) * TOKEN_ID_BYTES;
+                let want = u64::from(self.bucket_m()) * TOKEN_ID_BYTES;
                 if !span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN)
                     || span.bytes != want
                     || vocab == VocabSize(0)
                 {
                     return Err(TapeError::TokenIdsShape {
                         span,
-                        bucket_m: self.bucket_m.get(),
+                        bucket_m: self.bucket_m().get(),
                         vocab: vocab.get(),
                     });
                 }
                 if let Some((step, _)) = embeds.clone().find(|&(step, _)| step > 0) {
                     return Err(TapeError::EmbedMisplaced { step });
                 }
-                let Some(&CudaStep::Embed(EmbedBf16 {
+                let Some(CudaStep::Embed(EmbedBf16 {
                     tokens,
                     out,
                     rows,
                     hidden,
                     vocab: embed_vocab,
                     ..
-                })) = self.steps.first()
+                })) = self.steps().next()
                 else {
                     let first = (!self.steps.is_empty()).then_some(0);
                     return Err(TapeError::EmbedMissing { first });
                 };
-                if (tokens, rows, embed_vocab) != (span.offset, Rows(self.bucket_m.get()), vocab) {
+                if (tokens, rows, embed_vocab) != (span.offset, Rows(self.bucket_m().get()), vocab)
+                {
                     return Err(TapeError::EmbedInput { step: 0 });
                 }
                 // The embed fills colour 0 and nothing else: its offset, and its bytes exactly.
@@ -1548,7 +1652,7 @@ impl CudaTape {
             (
                 Region::SlotMapping,
                 kv.slot_mapping,
-                u64::from(self.bucket_m) * KV_ENTRY_BYTES,
+                u64::from(self.bucket_m()) * KV_ENTRY_BYTES,
             ),
             (Region::Sequence, kv.sequence, 2 * KV_ENTRY_BYTES),
         ] {
@@ -1698,7 +1802,6 @@ impl CudaTape {
                 window,
                 ..
             }, .. }) => {
-                self.one_row(step, s)?;
                 let kv = self.kv;
                 let table = ArenaSpan {
                     offset: block_table,
@@ -1778,16 +1881,17 @@ impl CudaTape {
                 }
                 Ok(())
             }
+            // One row, in a one-row bucket, by their types (`TapeSteps`).
             CudaStep::Gemv(_)
             | CudaStep::GemvFp8(_)
             | CudaStep::GemvTcFp8(_)
             | CudaStep::RmsNormQuantFp8(_)
-            | CudaStep::AddRmsNormQuantFp8(_) => self.one_row(step, s),
+            | CudaStep::AddRmsNormQuantFp8(_) => Ok(()),
             // Gemma's router norm writes the scratch's router-norm region, whole.
             CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
                 Some(moe)
                     if Some(y) == moe.router_norm.map(|r| r.offset)
-                        && (rows, cols) == (Rows(self.bucket_m.get()), Cols(moe.hidden.get())) =>
+                        && (rows, cols) == (Rows(self.bucket_m().get()), Cols(moe.hidden.get())) =>
                 {
                     Ok(())
                 }
@@ -1875,10 +1979,10 @@ impl CudaTape {
         let Some(moe) = self.moe else {
             return Ok(None);
         };
-        let sorted = self.bucket_m.get().checked_mul(moe.top_k.get())
+        let sorted = self.bucket_m().get().checked_mul(moe.top_k.get())
             >= Some(crate::op_abi::CUDA_SORTED_PAIRS);
         let tiles = moe_tiles_at(
-            self.bucket_m.get(),
+            self.bucket_m().get(),
             moe.experts.get(),
             moe.top_k.get(),
             moe.tile_rows.get(),
@@ -1892,7 +1996,7 @@ impl CudaTape {
         );
         // The tile rows are the bank's (FP8 S8 P3(a)): an fp8 bank's 64 when a step is one of its
         // expert steps, else 128.
-        let fp8 = self.steps.iter().any(|s| {
+        let fp8 = self.steps().any(|s| {
             matches!(
                 s,
                 CudaStep::ExpertSortFp8(_)
@@ -1915,10 +2019,10 @@ impl CudaTape {
             return Err(TapeError::MoeGeometry);
         }
         let mut want =
-            moe_region_bytes_at(self.bucket_m.get(), geometry, sorted, moe.tile_rows.get())
+            moe_region_bytes_at(self.bucket_m().get(), geometry, sorted, moe.tile_rows.get())
                 .ok_or(TapeError::MoeGeometry)?;
         if moe.router_norm.is_some() {
-            let bytes = u64::from(self.bucket_m) * u64::from(moe.hidden) * CUDA_ACT_BYTES;
+            let bytes = u64::from(self.bucket_m()) * u64::from(moe.hidden) * CUDA_ACT_BYTES;
             want.push(bytes);
         }
         let mut next = 0u64;
@@ -1954,7 +2058,7 @@ impl CudaTape {
         moe: Option<ArenaSpan>,
     ) -> Result<Option<ArenaSpan>, TapeError> {
         let mut want = 0u64;
-        for (step, s) in self.steps.iter().enumerate() {
+        for (step, s) in self.steps().enumerate() {
             let need = s.gemv_scratch().ok_or(TapeError::StepOverflow { step })?;
             want = want.max(need);
         }
@@ -1988,11 +2092,12 @@ impl CudaTape {
         regions: &[(Region, ArenaSpan)],
         scratches: [Option<ArenaSpan>; 2],
     ) -> Result<Option<ArenaSpan>, TapeError> {
-        quant_chain(self.steps).map_err(|error| TapeError::QuantChain { error })?;
+        let steps: Vec<CudaStep> = self.steps().collect();
+        quant_chain(&steps).map_err(|error| TapeError::QuantChain { error })?;
         // Its two slots (`quant_chain`): every write's span at its slot's `q`, the second slot
         // after the first; the scratch is both.
         let mut slots: [Option<ArenaSpan>; 2] = [None, None];
-        for (step, s) in self.steps.iter().enumerate() {
+        for (step, s) in self.steps().enumerate() {
             let Some(q) = s.quant_write() else {
                 continue;
             };
@@ -2175,7 +2280,7 @@ impl CudaTape {
     fn check_moe_step(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let geometry = TapeError::MoeStepGeometry { step };
         let moe = self.moe.ok_or(geometry)?;
-        let rows = moe.expert_rows(self.bucket_m.get());
+        let rows = moe.expert_rows(self.bucket_m().get());
         let want = |region: Region, at: ArenaOffset, tape: ArenaSpan| {
             if at == tape.offset {
                 Ok(())
@@ -2203,7 +2308,8 @@ impl CudaTape {
                 inter,
                 ..
             }) => {
-                if m != Rows(self.bucket_m.get()) || !same(experts.get(), hidden.get(), inter.get())
+                if m != Rows(self.bucket_m().get())
+                    || !same(experts.get(), hidden.get(), inter.get())
                 {
                     return Err(geometry);
                 }
@@ -2218,7 +2324,7 @@ impl CudaTape {
                 top_k,
                 ..
             }) => {
-                if (m, experts, top_k) != (Rows(self.bucket_m.get()), moe.experts, moe.top_k) {
+                if (m, experts, top_k) != (Rows(self.bucket_m().get()), moe.experts, moe.top_k) {
                     return Err(geometry);
                 }
                 want(Region::MoeLogits, logits, moe.logits)?;
@@ -2258,7 +2364,7 @@ impl CudaTape {
                 let sort = moe.sort.ok_or(geometry)?;
                 if (m, experts, top_k, hidden, max_tiles)
                     != (
-                        Rows(self.bucket_m.get()),
+                        Rows(self.bucket_m().get()),
                         moe.experts,
                         moe.top_k,
                         moe.hidden,
@@ -2308,10 +2414,10 @@ impl CudaTape {
                 let (input, output) = moe.projection_regions(proj, Some(sort.rows));
                 // An fp8 bank's GEMM reads the quant scratch (`quant_region`), which the last
                 // quant write before it filled from the projection's input rows.
-                let last = (self.steps[..step].iter().rev()).find_map(CudaStep::quant_write);
+                let last = (self.steps().take(step).rev()).find_map(|p| p.quant_write());
                 // An fp8 bank's gate and up read the e4m3 sorted rows (FP8 S8 P1), a bf16 bank's
                 // the bf16 ones: the last sort before it is of that form.
-                let sort_fp8 = (self.steps[..step].iter().rev()).find_map(|p| match p {
+                let sort_fp8 = (self.steps().take(step).rev()).find_map(|p| match p {
                     CudaStep::ExpertSort(_) => Some(false),
                     CudaStep::ExpertSortFp8(_) => Some(true),
                     _ => None,
@@ -2368,7 +2474,7 @@ impl CudaTape {
                 ..
             }) => {
                 if moe.sort.is_some()
-                    || (m, top_k) != (Rows(self.bucket_m.get()), moe.top_k)
+                    || (m, top_k) != (Rows(self.bucket_m().get()), moe.top_k)
                     || !same(experts.get(), hidden.get(), inter.get())
                 {
                     return Err(geometry);
@@ -2396,7 +2502,7 @@ impl CudaTape {
                 },
             ) => {
                 if moe.sort.is_some()
-                    || (m, top_k) != (Rows(self.bucket_m.get()), moe.top_k)
+                    || (m, top_k) != (Rows(self.bucket_m().get()), moe.top_k)
                     || !same(experts.get(), hidden.get(), inter.get())
                 {
                     return Err(geometry);
@@ -2410,7 +2516,7 @@ impl CudaTape {
             CudaStep::ExpertGateUpTcFp8(t) => {
                 let g = t.gate;
                 if moe.sort.is_some()
-                    || (g.m, g.top_k) != (Rows(self.bucket_m.get()), moe.top_k)
+                    || (g.m, g.top_k) != (Rows(self.bucket_m().get()), moe.top_k)
                     || !same(g.experts.get(), g.hidden.get(), g.inter.get())
                 {
                     return Err(geometry);
@@ -2447,7 +2553,12 @@ impl CudaTape {
                 ..
             }) => {
                 if (m, top_k, hidden, down_rows)
-                    != (Rows(self.bucket_m.get()), moe.top_k, moe.hidden, Rows(rows))
+                    != (
+                        Rows(self.bucket_m().get()),
+                        moe.top_k,
+                        moe.hidden,
+                        Rows(rows),
+                    )
                 {
                     return Err(geometry);
                 }
@@ -2460,27 +2571,6 @@ impl CudaTape {
                 }
             }
             _ => Ok(()),
-        }
-    }
-
-    /// A one-row kernel's step (the GEMV, the decode attention, the norm with its quantization) is
-    /// one row, in a one-row bucket: those kernels index no row past the first. Any other step
-    /// passes.
-    fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
-        // Each is one row by its type; its bucket must be one row too.
-        let one_row = matches!(
-            *s,
-            CudaStep::Gemv(_)
-                | CudaStep::GemvFp8(_)
-                | CudaStep::GemvTcFp8(_)
-                | CudaStep::AttnDecode(_)
-                | CudaStep::RmsNormQuantFp8(_)
-                | CudaStep::AddRmsNormQuantFp8(_)
-        );
-        if !one_row || self.bucket_m == BucketM(1) {
-            Ok(())
-        } else {
-            Err(TapeError::OneRowStep { step, rows: 1 })
         }
     }
 }
@@ -2542,7 +2632,7 @@ mod tests {
     ///
     /// Colours: 0 `x` [256, 512] at 0, 1 `y` [256, 1024] at 262144, 2 `n` [256, 1024] at 786432.
     /// Weights: 1 `W1` [1024, 512], 2 `g` [1024].
-    const GOOD_STEPS: &[CudaStep] = &[
+    const GOOD_STEPS: &[CudaStep<ManyRows>] = &[
         CudaStep::Gemm(GemmBf16 {
             a: ArenaOffset(0),
             b: WeightIx(1),
@@ -2564,7 +2654,6 @@ mod tests {
     ];
 
     const GOOD: CudaTape = CudaTape {
-        bucket_m: BucketM(256),
         arena: ArenaLayout {
             colour_bytes: &[262144, 524288, 524288],
             colour_offsets: &[0, 262144, 786432],
@@ -2573,7 +2662,10 @@ mod tests {
         input: TapeInput::Hidden(span(0, 262144)),
         result: span(786432, 524288),
         weight_bytes: &[0, 1048576, 2048],
-        steps: GOOD_STEPS,
+        steps: TapeSteps::Rows {
+            bucket_m: BucketM(256),
+            steps: GOOD_STEPS,
+        },
         rotary: None,
         kv: None,
         gdn: None,
@@ -2583,10 +2675,15 @@ mod tests {
         greedy: None,
     };
 
+    /// [`GOOD_STEPS`] as a tape's steps read.
+    fn good_steps() -> Vec<CudaStep> {
+        GOOD_STEPS.iter().map(|s| s.widen()).collect()
+    }
+
     /// `GOOD` with its steps replaced by `step` alone.
     fn with_step(step: CudaStep) -> CudaTape {
         CudaTape {
-            steps: Box::leak(Box::new([step])),
+            steps: TapeSteps::leaked(GOOD.bucket_m(), &[step]).expect("a bucket\'s kinds"),
             ..GOOD
         }
     }
@@ -2634,7 +2731,7 @@ mod tests {
                 vocab: VocabSize(VOCAB),
             },
             weight_bytes: &[102400, 1048576, 2048],
-            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            steps: TapeSteps::leaked(GOOD.bucket_m(), steps).expect("a bucket's kinds"),
             ..GOOD
         }
     }
@@ -2647,7 +2744,7 @@ mod tests {
 
     #[test]
     fn a_token_id_tape_validates() {
-        assert_eq!(embedded(GOOD_STEPS).validate(), Ok(()));
+        assert_eq!(embedded(&good_steps()).validate(), Ok(()));
         let e = embed_step(TOKENS, 256, VOCAB)
             .extents()
             .expect("the embed's extents");
@@ -2671,7 +2768,7 @@ mod tests {
     #[test]
     fn a_token_id_tape_starts_with_its_embed() {
         assert_eq!(
-            token_tape(GOOD_STEPS).validate(),
+            token_tape(&good_steps()).validate(),
             Err(TapeError::EmbedMissing { first: Some(0) })
         );
         assert_eq!(
@@ -2688,7 +2785,7 @@ mod tests {
             Err(TapeError::EmbedMisplaced { step: 0 })
         );
         let mut steps = vec![embed_step(TOKENS, 256, VOCAB)];
-        steps.extend_from_slice(GOOD_STEPS);
+        steps.extend(good_steps());
         steps.push(embed_step(TOKENS, 256, VOCAB));
         assert_eq!(
             token_tape(&steps).validate(),
@@ -2729,7 +2826,7 @@ mod tests {
                     span: input_span,
                     vocab: VocabSize(vocab),
                 },
-                ..embedded(GOOD_STEPS)
+                ..embedded(&good_steps())
             };
             assert_eq!(
                 t.validate(),
@@ -2762,7 +2859,7 @@ mod tests {
     fn an_embed_table_declared_short_is_refused() {
         let t = CudaTape {
             weight_bytes: &[102400 - 2, 1048576, 2048],
-            ..embedded(GOOD_STEPS)
+            ..embedded(&good_steps())
         };
         assert_eq!(
             t.validate(),
@@ -3126,7 +3223,8 @@ mod tests {
     #[test]
     fn a_rope_reads_its_table() {
         let t = CudaTape {
-            steps: Box::leak(Box::new([rope(TABLE_AT)])),
+            steps: TapeSteps::leaked(GOOD.bucket_m(), &[rope(TABLE_AT)])
+                .expect("a bucket\'s kinds"),
             ..with_rotary(TABLE_AT, TABLE)
         };
         assert_eq!(t.validate(), Ok(()));
@@ -3145,7 +3243,8 @@ mod tests {
     #[test]
     fn rotary_mismatch() {
         let t = CudaTape {
-            steps: Box::leak(Box::new([rope(TABLE_AT - 256)])),
+            steps: TapeSteps::leaked(GOOD.bucket_m(), &[rope(TABLE_AT - 256)])
+                .expect("a bucket\'s kinds"),
             ..with_rotary(TABLE_AT, TABLE)
         };
         assert_eq!(
@@ -3238,7 +3337,7 @@ mod tests {
                 total_bytes: KV_TOTAL,
                 ..GOOD.arena
             },
-            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            steps: TapeSteps::leaked(GOOD.bucket_m(), steps).expect("a bucket's kinds"),
             rotary: Some(RotaryTable {
                 span: span(KV_ROTARY, TABLE),
                 rot_dim: RotDim(64),
@@ -3565,7 +3664,6 @@ mod tests {
     /// The GDN tape of `gdn` and `steps`.
     fn gdn_tape(gdn: Option<GdnTape>, steps: &[CudaStep]) -> CudaTape {
         CudaTape {
-            bucket_m: BucketM(64),
             arena: ArenaLayout {
                 colour_bytes: &[36864, 4096, 128, 128, 4096],
                 colour_offsets: &[0, 36864, 40960, 41216, 41472],
@@ -3574,7 +3672,7 @@ mod tests {
             input: TapeInput::Hidden(span(0, 36864)),
             result: span(41472, 4096),
             weight_bytes: &[0, GDN_BUNDLE_BYTES],
-            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            steps: TapeSteps::leaked(BucketM(64), steps).expect("a bucket's kinds"),
             rotary: None,
             kv: None,
             gdn,
@@ -3997,7 +4095,6 @@ mod tests {
                 tape: None,
             },
             TapeError::KvStepGeometry { step: 1 },
-            TapeError::OneRowStep { step: 1, rows: 2 },
             TapeError::RotaryMismatch {
                 step: 1,
                 table: ArenaOffset(256),
@@ -4110,7 +4207,6 @@ mod tests {
                 | TapeError::KvRegionMismatch { .. }
                 | TapeError::KvStepGeometry { .. }
                 | TapeError::KvClasses
-                | TapeError::OneRowStep { .. }
                 | TapeError::RotaryMismatch { .. }
                 | TapeError::WriteOverRegion { .. }
                 | TapeError::GdnRegionOutside { .. }
@@ -4198,7 +4294,6 @@ mod tests {
     /// `x [1, 512] → GEMV (N = 1024) → y [1, 1024]`, the one-row tape: colours 0 `x` at 0 and 1
     /// `y` at 1024 (256-aligned), weight 1 `W [1024, 512]`.
     const ONE_ROW: CudaTape = CudaTape {
-        bucket_m: BucketM(1),
         arena: ArenaLayout {
             colour_bytes: &[1024, 2048],
             colour_offsets: &[0, 1024],
@@ -4207,13 +4302,13 @@ mod tests {
         input: TapeInput::Hidden(span(0, 1024)),
         result: span(1024, 2048),
         weight_bytes: &[0, 1048576],
-        steps: &[CudaStep::Gemv(GemvBf16::of(Matvec {
+        steps: TapeSteps::OneRow(&[CudaStep::Gemv(GemvBf16::of(Matvec {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(1024),
             n: NDim(1024),
             k: KDim(512),
-        }))],
+        }))]),
         rotary: None,
         kv: None,
         gdn: None,
@@ -4232,7 +4327,6 @@ mod tests {
     #[test]
     fn a_gemv_off_the_launchers_vector_passes_validate() {
         let t = CudaTape {
-            bucket_m: BucketM(1),
             arena: ArenaLayout {
                 colour_bytes: &[4096],
                 colour_offsets: &[0],
@@ -4241,15 +4335,17 @@ mod tests {
             input: TapeInput::Hidden(span(0, 4096)),
             result: span(0, 2),
             weight_bytes: &[64],
-            steps: &const {
-                [CudaStep::Gemv(GemvBf16::of(Matvec {
-                    a: ArenaOffset(0),
-                    b: WeightIx(0),
-                    c: ArenaOffset(1024),
-                    n: NDim(8),
-                    k: KDim(4),
-                }))]
-            },
+            steps: TapeSteps::OneRow(
+                &const {
+                    [CudaStep::Gemv(GemvBf16::of(Matvec {
+                        a: ArenaOffset(0),
+                        b: WeightIx(0),
+                        c: ArenaOffset(1024),
+                        n: NDim(8),
+                        k: KDim(4),
+                    }))]
+                },
+            ),
             rotary: None,
             kv: None,
             gdn: None,
@@ -4261,23 +4357,14 @@ mod tests {
         assert_eq!(t.validate(), Ok(()));
     }
 
-    /// A one-row GEMV tape validates; one in a bucket of more than one row is refused: the kernel
-    /// reads one row of `a` (a GEMV of more rows has no payload).
+    /// A one-row GEMV tape validates (a GEMV in a bucket of more rows has no step type).
     #[test]
     fn a_gemv_is_one_row_of_a_one_row_bucket() {
         assert_eq!(ONE_ROW.validate(), Ok(()));
-        let bucket = CudaTape {
-            bucket_m: BucketM(2),
-            ..ONE_ROW
-        };
-        assert_eq!(
-            bucket.validate(),
-            Err(TapeError::OneRowStep { step: 0, rows: 1 })
-        );
     }
 
-    /// A decode attention is one row of a one-row bucket, and reads the KV regions the prefill
-    /// attention reads.
+    /// A decode attention reads the KV regions the prefill attention reads (it is one row, in a
+    /// one-row bucket, by its types).
     #[test]
     fn a_decode_attention_is_one_row_of_a_one_row_bucket() {
         let decode = |kv_heads| match attn(KV_TABLE, KV_SEQ, kv_heads) {
@@ -4298,27 +4385,6 @@ mod tests {
             ),
             _ => unreachable!("an attention"),
         };
-        // `kv_tape` is a 256-row bucket: a one-row decode in it is refused for the bucket. (The
-        // whole one-row qwen3.5 tape validates: `cuda_tapes`.)
-        // Each with the split scratch its decode's partials need (W6b), at the arena's end, as the
-        // canonical places it.
-        let with_scratch = |t: CudaTape| {
-            let want = (crate::step::attn_decode_scratch_bytes(2, 256))
-                .expect("the partials")
-                .1;
-            CudaTape {
-                gemv_scratch: Some(span(t.arena.total_bytes, want)),
-                arena: ArenaLayout {
-                    total_bytes: t.arena.total_bytes + want,
-                    ..t.arena
-                },
-                ..t
-            }
-        };
-        assert_eq!(
-            with_scratch(kv_tape(KV, &[decode(2)])).validate(),
-            Err(TapeError::OneRowStep { step: 0, rows: 1 })
-        );
         let e = decode(2).extents().expect("the decode's extents");
         assert_eq!(e.kv, Some((0, KvUse::Read)));
         assert_eq!(e.reads[1], Some(span(KV_TABLE, 512)), "the block table");
@@ -4364,7 +4430,6 @@ mod tests {
 
     fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {
         CudaTape {
-            bucket_m: BucketM(1),
             arena: ArenaLayout {
                 colour_bytes: &[128, 128],
                 colour_offsets: &[0, 256],
@@ -4373,7 +4438,7 @@ mod tests {
             input: TapeInput::Hidden(span(0, 128)),
             result: span(256, 128),
             weight_bytes: &[],
-            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            steps: TapeSteps::OneRow(Box::leak(steps.to_vec().into_boxed_slice())),
             rotary: None,
             kv: None,
             gdn: None,
@@ -4713,7 +4778,7 @@ mod tests {
         };
         let two = CudaTape {
             rotary_local: Some(local(at)),
-            steps: Box::leak(Box::new([rope(at)])),
+            steps: TapeSteps::leaked(GOOD.bucket_m(), &[rope(at)]).expect("a bucket\'s kinds"),
             ..grown(with_rotary(TABLE_AT, TABLE))
         };
         assert_eq!(two.validate(), Ok(()));
@@ -4724,7 +4789,7 @@ mod tests {
         assert_eq!(alone.validate(), Err(TapeError::KvClasses));
         let over = CudaTape {
             rotary_local: Some(local(TABLE_AT)),
-            steps: &[],
+            steps: TapeSteps::leaked(GOOD.bucket_m(), &[]).expect("a bucket's kinds"),
             ..two
         };
         assert_eq!(
@@ -4736,7 +4801,7 @@ mod tests {
         );
         let outside = CudaTape {
             rotary_local: Some(local(ROTARY_TOTAL + TABLE)),
-            steps: &[],
+            steps: TapeSteps::leaked(GOOD.bucket_m(), &[]).expect("a bucket's kinds"),
             ..two
         };
         assert!(

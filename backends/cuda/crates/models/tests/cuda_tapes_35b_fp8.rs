@@ -111,7 +111,7 @@ const HEADERS: &str = "fp8_headers_qwen3.6-35b-a3b.json";
 /// (FP8 S8 T2): no quant write between the two, so the one write serves both, in every MoE layer.
 #[test]
 fn the_shared_gate_up_reuses_the_routed_quant_write() {
-    let steps = tape_of(1).steps;
+    let steps: Vec<CudaStep> = tape_of(1).steps().collect();
     let mut layers = 0;
     for (i, s) in steps.iter().enumerate() {
         let CudaStep::ExpertGateUpTcFp8(_) = s else {

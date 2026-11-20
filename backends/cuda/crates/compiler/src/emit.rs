@@ -56,7 +56,9 @@ use scratchy_target_cuda::step::{
     GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvTcFp8, LayerScaleBf16, MoeRouteBf16,
     MoeWeight, NormAddBf16, RmsNormBf16, RouteProgram, RouterLogitsBf16, gdn_conv_dim,
 };
-use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
+use scratchy_target_cuda::tape::{
+    ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, TapeSteps, WeightIx,
+};
 use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
@@ -74,6 +76,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
             path: "::scratchy_target_cuda::tape",
             types: &[
                 "CudaTape",
+                "TapeSteps",
                 "ArenaLayout",
                 "ArenaSpan",
                 "ArenaOffset",
@@ -1083,8 +1086,11 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         gemv_scratch,
         greedy,
     } = c;
+    // A bucket of more rows holds no one-row kind: the lowering picks one at one row only, so the
+    // expansion stops here, at compile time, were it ever to.
+    let steps = TapeSteps::leaked(BucketM(*bucket_m), steps)
+        .expect("a one-row kind lowers at one row only");
     CudaTape {
-        bucket_m: BucketM(*bucket_m),
         arena: ArenaLayout {
             colour_bytes: baked(colour_bytes),
             colour_offsets: baked(colour_offsets),
@@ -1093,7 +1099,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         input: *input,
         result: *result,
         weight_bytes: baked(weight_bytes),
-        steps: baked(steps),
+        steps,
         rotary: *rotary,
         rotary_local: *rotary_local,
         kv: kv.as_ref().map(

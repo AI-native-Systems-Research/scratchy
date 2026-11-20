@@ -17,11 +17,12 @@ use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
 use scratchy_target_cuda::step::{
-    AddBf16, CudaStep, GateUpActBf16, GateUpProj, GatedOp, GemmBf16, NormKernel, RmsNormBf16,
+    AddBf16, BucketKind, CudaStep, GateUpActBf16, GateUpProj, GatedOp, GemmBf16, NormKernel,
+    RmsNormBf16,
 };
 use scratchy_target_cuda::step::{BucketM, Cols, KDim, NDim, Rows};
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, TapeSteps, WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -98,7 +99,7 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
     }
 }
 
-const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
+const fn gemm<B: BucketKind>(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep<B> {
     CudaStep::Gemm(GemmBf16 {
         a: ArenaOffset(a),
         b: WeightIx(b),
@@ -109,7 +110,7 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
     })
 }
 
-const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
+const fn norm<B: BucketKind>(x: u64, y: u64, rows: u32) -> CudaStep<B> {
     CudaStep::RmsNorm(RmsNormBf16 {
         x: ArenaOffset(x),
         gain: WeightIx(1),
@@ -124,7 +125,12 @@ const fn norm(x: u64, y: u64, rows: u32) -> CudaStep {
 
 /// The gate and up GEMMs of `n` (into the colours `gate` and `up`) and `silu(gate) · up` into
 /// `out`, as one launch.
-const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaStep {
+const fn gate_up<B: BucketKind>(
+    n: u64,
+    (gate, up): (u64, u64),
+    out: u64,
+    rows: u32,
+) -> CudaStep<B> {
     CudaStep::GateUpAct(GateUpActBf16 {
         proj: GateUpProj::Gemm {
             gate: GemmBf16 {
@@ -149,7 +155,7 @@ const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaSte
     })
 }
 
-const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
+const fn add<B: BucketKind>(a: u64, b: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::Add(AddBf16 {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
@@ -164,7 +170,6 @@ const MLP_WEIGHT_BYTES: &[u64] = &[0, 2048, 7340032, 7340032, 7340032];
 
 /// [`mlp`]`(128)`: every offset of [`MLP_M256`], halved.
 pub static MLP_M128: CudaTape = CudaTape {
-    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[262144, 262144, 917504, 917504, 917504, 917504, 262144],
         colour_offsets: &[0, 262144, 524288, 1441792, 2359296, 3276800, 4194304],
@@ -173,12 +178,15 @@ pub static MLP_M128: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 262144)),
     result: span(4194304, 262144),
     weight_bytes: MLP_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 262144, 128),
-        gate_up(262144, (524288, 1441792), 3276800, 128),
-        gemm(3276800, 4, 262144, 128, H, I),
-        add(262144, 0, 4194304, 128),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(128),
+        steps: &[
+            norm(0, 262144, 128),
+            gate_up(262144, (524288, 1441792), 3276800, 128),
+            gemm(3276800, 4, 262144, 128, H, I),
+            add(262144, 0, 4194304, 128),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: None,
@@ -191,7 +199,6 @@ pub static MLP_M128: CudaTape = CudaTape {
 /// [`mlp`]`(256)`: `x` 0, `n` 524288, `gate` 1048576, `up` 2883584, `s` 4718592 (unused),
 /// `a` 6553600, `y` 8388608; `d` over `n` at 524288.
 pub static MLP_M256: CudaTape = CudaTape {
-    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[524288, 524288, 1835008, 1835008, 1835008, 1835008, 524288],
         colour_offsets: &[0, 524288, 1048576, 2883584, 4718592, 6553600, 8388608],
@@ -200,12 +207,15 @@ pub static MLP_M256: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 524288)),
     result: span(8388608, 524288),
     weight_bytes: MLP_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 524288, 256),
-        gate_up(524288, (1048576, 2883584), 6553600, 256),
-        gemm(6553600, 4, 524288, 256, H, I),
-        add(524288, 0, 8388608, 256),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(256),
+        steps: &[
+            norm(0, 524288, 256),
+            gate_up(524288, (1048576, 2883584), 6553600, 256),
+            gemm(6553600, 4, 524288, 256, H, I),
+            add(524288, 0, 8388608, 256),
+        ],
+    },
     rotary: None,
     kv: None,
     gdn: None,

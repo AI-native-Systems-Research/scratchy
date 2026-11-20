@@ -18,7 +18,7 @@
 //! Colours: 0 `x`, 1 `n` (then `o`), 2 `qg`, 3 `q` (and the view `qh`), 4 `qn` (and the view
 //! `qf`), 5 `qr`, 6 `ga`, 7 `y`, 8 the gate. The rotary table follows the colours.
 
-use scratchy_target_cuda::step::{BucketM, Cols, FreqDim, KDim, NDim, RotDim, Rows};
+use scratchy_target_cuda::step::{BucketKind, BucketM, Cols, FreqDim, KDim, NDim, RotDim, Rows};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
@@ -31,7 +31,7 @@ use scratchy_target_cuda::step::{
     RopePairing,
 };
 use scratchy_target_cuda::tape::{
-    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, RotaryTable, TapeInput, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, RotaryTable, TapeInput, TapeSteps, WeightIx,
 };
 
 use super::chains::with_hidden;
@@ -133,7 +133,7 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
     }
 }
 
-const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
+const fn gemm<B: BucketKind>(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep<B> {
     CudaStep::Gemm(GemmBf16 {
         a: ArenaOffset(a),
         b: WeightIx(b),
@@ -144,7 +144,7 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
     })
 }
 
-const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
+const fn norm<B: BucketKind>(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep<B> {
     CudaStep::RmsNorm(RmsNormBf16 {
         x: ArenaOffset(x),
         gain: WeightIx(gain),
@@ -157,7 +157,7 @@ const fn norm(x: u64, gain: u32, y: u64, rows: u32, cols: u32) -> CudaStep {
     })
 }
 
-const fn gate_split(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep {
+const fn gate_split<B: BucketKind>(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep<B> {
     CudaStep::GateSplit(GateSplitBf16 {
         qg: ArenaOffset(qg),
         q: ArenaOffset(q),
@@ -168,7 +168,7 @@ const fn gate_split(qg: u64, q: u64, gate: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
+const fn rope<B: BucketKind>(x: u64, table: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::Rope(RopeBf16 {
         x: ArenaOffset(x),
         table: ArenaOffset(table),
@@ -181,7 +181,7 @@ const fn rope(x: u64, table: u64, out: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn gate_apply(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep {
+const fn gate_apply<B: BucketKind>(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::GateApply(GateApplyBf16 {
         attn: ArenaOffset(attn),
         gate: ArenaOffset(gate),
@@ -191,7 +191,7 @@ const fn gate_apply(attn: u64, gate: u64, out: u64, rows: u32) -> CudaStep {
     })
 }
 
-const fn add(a: u64, b: u64, out: u64, rows: u32) -> CudaStep {
+const fn add<B: BucketKind>(a: u64, b: u64, out: u64, rows: u32) -> CudaStep<B> {
     CudaStep::Add(AddBf16 {
         a: ArenaOffset(a),
         b: ArenaOffset(b),
@@ -217,7 +217,6 @@ const ATTN_GATE_WEIGHT_BYTES: &[u64] = &[0, 2048, 8388608, 512, 0, 0, 4194304];
 /// [`attn_gate`]`(128)`: every offset of [`ATTN_GATE_M256`] halved, and the per-head norm's rows
 /// with them.
 pub static ATTN_GATE_M128: CudaTape = CudaTape {
-    bucket_m: BucketM(128),
     arena: ArenaLayout {
         colour_bytes: &[
             262144, 262144, 1048576, 524288, 524288, 524288, 524288, 262144, 524288,
@@ -230,16 +229,19 @@ pub static ATTN_GATE_M128: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 262144)),
     result: span(3670016, 262144),
     weight_bytes: ATTN_GATE_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 1, 262144, 128, H),
-        gemm(262144, 2, 524288, 128, 2 * Q, H),
-        gate_split(524288, 1572864, 3932160, 128),
-        norm(1572864, 3, 2097152, 1024, HD),
-        rope(2097152, 4456448, 2621440, 128),
-        gate_apply(2621440, 3932160, 3145728, 128),
-        gemm(3145728, 6, 262144, 128, H, Q),
-        add(262144, 0, 3670016, 128),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(128),
+        steps: &[
+            norm(0, 1, 262144, 128, H),
+            gemm(262144, 2, 524288, 128, 2 * Q, H),
+            gate_split(524288, 1572864, 3932160, 128),
+            norm(1572864, 3, 2097152, 1024, HD),
+            rope(2097152, 4456448, 2621440, 128),
+            gate_apply(2621440, 3932160, 3145728, 128),
+            gemm(3145728, 6, 262144, 128, H, Q),
+            add(262144, 0, 3670016, 128),
+        ],
+    },
     rotary: rotary(4456448, 16384),
     kv: None,
     gdn: None,
@@ -252,7 +254,6 @@ pub static ATTN_GATE_M128: CudaTape = CudaTape {
 /// [`attn_gate`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
 /// `qr` 5242880, `ga` 6291456, `y` 7340032, the gate 7864320; the rotary table at 8912896.
 pub static ATTN_GATE_M256: CudaTape = CudaTape {
-    bucket_m: BucketM(256),
     arena: ArenaLayout {
         colour_bytes: &[
             524288, 524288, 2097152, 1048576, 1048576, 1048576, 1048576, 524288, 1048576,
@@ -265,16 +266,19 @@ pub static ATTN_GATE_M256: CudaTape = CudaTape {
     input: TapeInput::Hidden(span(0, 524288)),
     result: span(7340032, 524288),
     weight_bytes: ATTN_GATE_WEIGHT_BYTES,
-    steps: &[
-        norm(0, 1, 524288, 256, H),
-        gemm(524288, 2, 1048576, 256, 2 * Q, H),
-        gate_split(1048576, 3145728, 7864320, 256),
-        norm(3145728, 3, 4194304, 2048, HD),
-        rope(4194304, 8912896, 5242880, 256),
-        gate_apply(5242880, 7864320, 6291456, 256),
-        gemm(6291456, 6, 524288, 256, H, Q),
-        add(524288, 0, 7340032, 256),
-    ],
+    steps: TapeSteps::Rows {
+        bucket_m: BucketM(256),
+        steps: &[
+            norm(0, 1, 524288, 256, H),
+            gemm(524288, 2, 1048576, 256, 2 * Q, H),
+            gate_split(1048576, 3145728, 7864320, 256),
+            norm(3145728, 3, 4194304, 2048, HD),
+            rope(4194304, 8912896, 5242880, 256),
+            gate_apply(5242880, 7864320, 6291456, 256),
+            gemm(6291456, 6, 524288, 256, H, Q),
+            add(524288, 0, 7340032, 256),
+        ],
+    },
     rotary: rotary(8912896, 32768),
     kv: None,
     gdn: None,

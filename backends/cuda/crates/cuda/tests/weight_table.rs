@@ -12,14 +12,15 @@
 //! `router.proj` kept bf16) staged exactly, and a dtype the entry does not take refused naming the
 //! tensor and both dtypes.
 
-use scratchy_target_cuda::step::BucketM;
 use std::path::Path;
 
 use half::bf16;
 use safetensors::tensor::{Dtype, TensorView};
 use scratchy_target_cuda::step::expert_bank;
 use scratchy_target_cuda::step::{fp8_moe_layout, fp8_weight, gdn_bundle, moe_bundle};
-use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput};
+use scratchy_target_cuda::tape::{
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput, TapeSteps,
+};
 use scratchy_target_cuda::weights::{
     CudaWeight, HostStaging, LoadError, check, open_checkpoint, stage,
 };
@@ -142,7 +143,6 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         bytes: 0,
     };
     CudaTape {
-        bucket_m: BucketM(1),
         arena: ArenaLayout {
             colour_bytes: &[],
             colour_offsets: &[],
@@ -151,7 +151,7 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         input: TapeInput::Hidden(span),
         result: span,
         weight_bytes,
-        steps: &[],
+        steps: TapeSteps::OneRow(&[]),
         rotary: None,
         kv: None,
         gdn: None,

@@ -641,6 +641,8 @@ fn tape_header(stem: &str, t: &CudaTape) -> Value {
     let mut v = serde_json::to_value(t).expect("the tape serializes");
     let m: &mut Map<String, Value> = v.as_object_mut().expect("a tape is an object");
     m.remove("steps");
+    // The bucket's `M`, the tape's own field until its steps carried it.
+    m.insert("bucket_m".into(), json!(t.bucket_m()));
     // The GDN scratch's stored regions are what `validate` derived from the header's own geometry
     // at 99c60d50: checked against that derivation, not printed.
     if let Some(g) = t.gdn {
@@ -651,7 +653,7 @@ fn tape_header(stem: &str, t: &CudaTape) -> Value {
             g.head_v.get(),
         );
         let conv_dim = gdn_conv_dim(nk, hk, nv, hv).expect("the tape's GDN conv fits");
-        let want = gdn_scratch(t.bucket_m.get(), conv_dim, nv, nv * hv);
+        let want = gdn_scratch(t.bucket_m().get(), conv_dim, nv, nv * hv);
         assert_eq!(Some(g.scratch_layout), want, "the tape's GDN scratch");
         (m.get_mut("gdn").and_then(Value::as_object_mut))
             .expect("a GDN tape is an object")
@@ -677,14 +679,14 @@ fn model_files(e: &CudaModelEntry) -> Vec<(String, String)> {
     let mut files = Vec::new();
     for t in e.tapes {
         let mut text = line(&tape_header(e.stem, t));
-        for (i, s) in t.steps.iter().enumerate() {
-            let mut rec = step_record(s);
+        for (i, s) in t.steps().enumerate() {
+            let mut rec = step_record(&s);
             rec.as_object_mut()
                 .expect("a step record is an object")
                 .insert("step".into(), json!(i));
             text.push_str(&line(&rec));
         }
-        files.push((format!("m{}.jsonl", t.bucket_m), text));
+        files.push((format!("m{}.jsonl", t.bucket_m()), text));
     }
     let weights: String = (e.weights.iter().enumerate())
         .map(|(ix, w)| {
@@ -692,7 +694,7 @@ fn model_files(e: &CudaModelEntry) -> Vec<(String, String)> {
         })
         .collect();
     files.push(("weights.jsonl".into(), weights));
-    let buckets: Vec<u32> = e.tapes.iter().map(|t| t.bucket_m.get()).collect();
+    let buckets: Vec<u32> = e.tapes.iter().map(|t| t.bucket_m().get()).collect();
     files.push((
         "entry.json".into(),
         line(&json!({"stem": e.stem, "buckets": buckets, "weights": e.weights.len()})),

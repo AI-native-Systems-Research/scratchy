@@ -877,7 +877,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 let buffer = DeviceBuffer::alloc(device, bytes).map_err(WorkerError::Cuda)?;
                 let slots = (tapes.iter())
                     .filter(|t| t.kv.is_some())
-                    .map(|t| t.bucket_m);
+                    .map(|t| t.bucket_m());
                 Some(KvPool {
                     buffer,
                     layout,
@@ -916,7 +916,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         };
         let graphs = (tapes.iter().enumerate())
             .map(|(bucket, tape)| {
-                if tape.steps.iter().any(|s| not_launched(s).is_some()) {
+                if tape.steps().any(|s| not_launched(&s).is_some()) {
                     return Ok(None);
                 }
                 Self::capture(
@@ -1164,8 +1164,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             bucket,
             buckets: self.tapes.len(),
         })?;
-        if let Some((step, op)) = (tape.steps.iter().enumerate())
-            .find_map(|(step, s)| not_launched(s).map(|op| (step, op)))
+        if let Some((step, op)) =
+            (tape.steps().enumerate()).find_map(|(step, s)| not_launched(&s).map(|op| (step, op)))
         {
             return Err(ForwardError::NotLaunched { step, op });
         }
@@ -1216,17 +1216,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             Out::Token(_) => {
                 if tape.greedy.is_none() {
                     return Err(ForwardError::NoGreedy {
-                        bucket_m: tape.bucket_m.get(),
+                        bucket_m: tape.bucket_m().get(),
                         result_bytes: tape.result.bytes,
                     });
                 }
             }
             Out::Row(row, buf) => {
-                let rows = u64::from(tape.bucket_m);
+                let rows = u64::from(tape.bucket_m());
                 if u64::from(*row) >= rows || !tape.result.bytes.is_multiple_of(rows) {
                     return Err(ForwardError::ResultRow {
                         row: *row,
-                        bucket_m: tape.bucket_m.get(),
+                        bucket_m: tape.bucket_m().get(),
                         result_bytes: tape.result.bytes,
                     });
                 }
@@ -1239,7 +1239,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 }
             }
         }
-        let expected = tape.rotary.map_or(0, |_| tape.bucket_m.get() as usize);
+        let expected = tape.rotary.map_or(0, |_| tape.bucket_m().get() as usize);
         if positions.len() != expected {
             return Err(ForwardError::Positions {
                 expected,
@@ -1267,7 +1267,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let gdn_sequence = match (tape.gdn, gdn) {
             (Some(gdn_tape), Some(seq)) => {
                 let pool = self.gdn.as_mut().expect("`new` made a pool for a GDN tape");
-                let bucket_m = tape.bucket_m;
+                let bucket_m = tape.bucket_m();
                 if seq.q_len == 0 || seq.q_len > bucket_m.get() {
                     return Err(ForwardError::GdnQueryLength {
                         q_len: seq.q_len,
@@ -1296,7 +1296,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (Some((kv_tape, data)), Some(pool)) => Some(KvUpload {
                 tape: *kv_tape,
                 block_table: &pool.block_table_host,
-                slot_mapping: &pool.slot_mapping_host[..tape.bucket_m.get() as usize],
+                slot_mapping: &pool.slot_mapping_host[..tape.bucket_m().get() as usize],
                 sequence: *data,
             }),
             _ => None,
@@ -1524,7 +1524,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // is live. A KV step's layer is one of the tape's (`validate`), so of the pool's (`new`
         // checked every KV tape has the pool's geometry), and every block a kernel touches is one
         // `forward` checked is inside the pool.
-        for (step, s) in tape.steps.iter().enumerate() {
+        for (step, s) in tape.steps().enumerate() {
+            let s = &s;
             let launched = 'launch: {
                 match *s {
                     CudaStep::GemvFp8(GemvFp8 {
@@ -3796,7 +3797,7 @@ fn fill_sequence(
         prefix_len,
         q_len,
     } = *seq;
-    let bucket_m = tape.bucket_m;
+    let bucket_m = tape.bucket_m();
     if q_len == 0 || q_len > bucket_m.get() {
         return Err(ForwardError::KvQueryLength {
             q_len,
