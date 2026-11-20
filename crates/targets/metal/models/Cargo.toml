@@ -56,4 +56,6 @@ serde_json = { workspace = true }
 # and the row hash (config parse and the hybrid KV layout: scratchy-core-config above).
 hf-hub-downloader = { workspace = true }
 sha2 = "0.11"
+# tests/tape_hashes.rs: the golden every target's tape-hash test is held to.
+scratchy-golden-hash = { path = "../../../testing/golden-hash" }
 tokenizers = { workspace = true }
