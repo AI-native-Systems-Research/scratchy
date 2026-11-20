@@ -121,6 +121,12 @@ fn adopt_from_owner(
             )
         })?;
     }
+    // ⭐ AND THE FUNDED POOL'S EXTRA BANKS. The pool is funded inside `load_model`, before any
+    // rung builds, so bank 0 arrives through the `SEG_KV` alias above (the owner's
+    // `seg_addr[SEG_KV]` IS the funded region) while the banks past it — `kv_bank_addr`, no
+    // segment of the borrower's own — need this door. Pairwise per rank, exactly as
+    // [`SuperDscSession::fund_kv_pool`] allocated them.
+    borrower.adopt_funded_kv(owner);
     Ok(())
 }
 
@@ -1356,6 +1362,13 @@ impl SpyreWorker {
         // ENGINE sizes the scheduler's block allocator off the SAME number the pool was cut from.
         #[allow(unused_mut, unused_assignments)]
         let mut kv_budget_bytes_v: Option<u64> = None;
+        // ⭐ THE POOL'S FUNDED PAGE COUNT — minted beside `kv_budget_bytes_v` by the census
+        // (the budget ÷ the page stride, clamped to the programs' addressing bound), spent by
+        // the funding call inside this same load (the owner session funds its regions at it
+        // BEFORE any ladder rung builds), and carried to `Loaded` so
+        // `kv_cache_num_blocks_override` hands the engine exactly the pool that exists.
+        #[allow(unused_mut, unused_assignments)]
+        let mut funded_pages_o: Option<u64> = None;
         // The context the sized pool will actually serve (tokens) — the ONE context law's answer
         // (`resolve_served_context`) over the declaration and what the budget funds, decided in
         // the SuperDsc branch below where budget, page stride and launch rows first meet, and
@@ -1483,8 +1496,8 @@ impl SpyreWorker {
                 // stride is the one number both share — the bound's bytes over the bound's pages
                 // IS the page's bytes — so the engine can divide the funded budget by it. Nothing
                 // allocates the bound: the OWNER session allocates each layer's region at the
-                // funded page count (in `initialize_cache`, after every session is built), and
-                // every other session aliases it.
+                // funded page count (inside `load_model`, right after its own prepare and
+                // before any rung builds), and every other session aliases it.
                 let step = wirings.decode.paged.ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
@@ -1734,43 +1747,105 @@ impl SpyreWorker {
                         anchor_live_bytes / (1024 * 1024),
                     );
                 }
+                // ⛔⛔⛔ AND THE LADDER'S RUNGS, charged as the static bytes their own bundles
+                // state — the pre-fragmentation law, restored. The rungs' device halves
+                // allocate AFTER the pool is funded (the funding site below takes clean
+                // regions first, inside `load_model`), so the budget must already hold their
+                // bytes or the rungs land on memory the pool spent. Charged exactly as the
+                // old `ladder_rung_bytes` census stated it: every rung bundle's NON-RESIDENT
+                // segments (all but the weight home the rung aliases and the KV pool it
+                // adopts) — the prefill rungs past the anchor's own (whose live segments
+                // `anchor_live_bytes` already charged once), every decode batch rung, and the
+                // prefix-capable rungs. The spilled tails are NOT re-charged here:
+                // `tail_bytes × borrowers` above already counted every borrowing session's
+                // copy, this ladder included.
+                let ladder_rung_bytes: u64 = {
+                    let weight = scratchy_target_spyre_card::superdsc_exec::SEG_WEIGHT.get();
+                    let kv = scratchy_target_spyre_card::superdsc_exec::SEG_KV.get();
+                    let non_resident =
+                        |lay: &scratchy_target_spyre::bundle_code::BundleLayout<'static>| {
+                            lay.segment_bytes
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| *i != weight && *i != kv)
+                                .map(|(_, b)| *b)
+                                .sum::<u64>()
+                        };
+                    let anchor_rung_m = g0
+                        .prefill_rungs
+                        .iter()
+                        .filter(|(rm, _)| *rm > 1)
+                        .min_by_key(|(rm, _)| *rm)
+                        .map(|(rm, _)| *rm);
+                    g0.prefill_rungs
+                        .iter()
+                        .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
+                        .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
+                        .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
+                        .map(|rc| non_resident(&rc.layout))
+                        .sum::<u64>()
+                        + g0.decode_rungs
+                            .iter()
+                            .filter(|(rn, _, _, _)| rn.get() > 1)
+                            .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
+                            .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
+                            .map(|rc| non_resident(&rc.layout))
+                            .sum::<u64>()
+                        + g0
+                            .prefill_prefix
+                            .iter()
+                            .filter(|(pmq, _, sent)| *pmq > 1 && !sent.is_empty())
+                            .filter_map(|(_, _, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
+                            .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
+                            .map(|rc| non_resident(&rc.layout))
+                            .sum::<u64>()
+                };
                 // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
                 // of its seven equal regions for PROGRAM memory, so a tensor allocation is served
                 // from six. See `CardMemory::tensor_capacity`.
                 let funded =
                     (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization) as u64;
-                if non_kv_bytes > funded {
+                if non_kv_bytes + ladder_rung_bytes + pool_stride_bytes > funded {
                     return Err(werr(format!(
                         "the Spyre card's {} MB of tensor memory × --gpu-memory-utilization {:.2} funds \
-                         {} MB, but this model's sessions reserve {} MB of non-KV residency. Raise \
-                         --gpu-memory-utilization, or use a smaller model.",
+                         {} MB, but this model's sessions reserve {} MB of non-KV residency plus \
+                         {} MB of ladder rungs. Raise --gpu-memory-utilization, or use a smaller \
+                         model.",
                         card_bytes.tensor_capacity() / (1024 * 1024),
                         self.gpu_memory_utilization,
                         funded / (1024 * 1024),
                         non_kv_bytes / (1024 * 1024),
+                        ladder_rung_bytes / (1024 * 1024),
                     )));
                 }
                 // ⭐ THE KV BUDGET IS THE REMAINDER MINUS THE NULL PAGE — what the funded tensor
-                // capacity holds beyond the non-KV residency the census just charged, less one
-                // page's bytes: funding allocates `(pages + the null page) × unit bytes` per
-                // bank, so a budget the engine may divide into N whole pages must already have
-                // page 0's bytes spent. Carried to `Loaded`, so `determine_available_memory`
-                // hands the engine this one number and `compute_kv_blocks` divides it by the
-                // page stride (capped at the programs' addressing bound,
-                // `PagedStep::host_blocks`) — the ENGINE owns the funded page count, and
-                // `initialize_cache` allocates each layer's pool region at it.
-                let kv_budget_bytes = funded - non_kv_bytes - pool_stride_bytes;
-                kv_budget_bytes_v = Some(kv_budget_bytes);
+                // capacity holds beyond the non-KV residency and the ladder's rungs the census
+                // just charged, less one page's bytes: funding allocates `(pages + the null
+                // page) × unit bytes` per bank, so a budget divided into N whole pages must
+                // already have page 0's bytes spent. THE POOL IS FUNDED AT THIS COUNT, inside
+                // `load_model` right after the decode owner's prepare and before any
+                // ladder/prefix/decode-rung session builds its device half, so the pool's banks
+                // take clean regions first. `determine_available_memory` then hands the engine
+                // EXACTLY the funded bytes (`pages × stride`) and
+                // `kv_cache_num_blocks_override` the funded pages, so the engine's own
+                // division lands on the count already funded and `initialize_cache` has
+                // nothing left to do.
+                let kv_budget_bytes = funded - non_kv_bytes - ladder_rung_bytes - pool_stride_bytes;
+                let funded_pages =
+                    (kv_budget_bytes / pool_stride_bytes.max(1)).min(step.host_blocks() as u64);
+                funded_pages_o = Some(funded_pages);
+                kv_budget_bytes_v = Some(funded_pages * pool_stride_bytes);
                 pool_stride_bytes_v = Some(pool_stride_bytes);
                 info!(
-                    "superdsc paged: KV pool funded at {} MB of the {} MB remainder ({} page(s) of \
-                     {} slot(s) at {} KB/page), addressing bound {} page(s); serving \
-                     {served_context_v} — page 0 kept for padded rows' writes",
+                    "superdsc paged: KV pool to fund at {} MB of the {} MB remainder ({} page(s) of \
+                     {} slot(s) at {} KB/page, ladder rungs charged {} MB), addressing bound {} \
+                     page(s); serving {served_context_v} — page 0 kept for padded rows' writes",
                     kv_budget_bytes / (1024 * 1024),
                     funded / (1024 * 1024),
-                    kv_budget_bytes / pool_stride_bytes.max(1),
+                    funded_pages,
                     step.page_slots,
                     pool_stride_bytes / 1024,
+                    ladder_rung_bytes / (1024 * 1024),
                     step.host_blocks(),
                 );
                 // What the DECODE bake placed — one call, and its own refusal.
@@ -2497,6 +2572,32 @@ impl SpyreWorker {
                      kv_dim {kv_dim}, num_blocks {num_blocks}, pmask reserves {:?} column(s))",
                     ss.pmask_slots,
                 );
+                // ⭐ FUND THE KV POOL HERE — inside `load_model`, right after the decode owner's
+                // prepare and BEFORE any ladder/prefix/decode-rung session builds its device
+                // half. The pool's banks are the largest allocations the load makes, and a
+                // flex-rs tensor allocation is served from ONE region, never spanning: funded
+                // at the engine's `initialize_cache` door — after ~16 rung sessions had each
+                // taken their own regions — the last bank deterministically met a card whose
+                // free bytes were sufficient in aggregate and unallocatable in any one region
+                // (measured 2026-11-20, 8b fp16 at gmu 1.0: 1,900,019,712 B asked, six
+                // regions' aggregate free larger, every single region smaller). Funded here,
+                // the pool takes clean regions first and the rungs — charged ahead of it by
+                // the census's `ladder_rung_bytes` — fit after it. The count is the census's
+                // own (budget ÷ stride, clamped at the addressing bound); the engine's
+                // `initialize_cache` door does nothing more, and every rung built below
+                // adopts the funded regions through `adopt_from_owner`.
+                let funded_pages = funded_pages_o
+                    .expect("the census minted the funded page count before any session built");
+                ss.fund_kv_pool(funded_pages).map_err(|e| {
+                    werr(format!(
+                        "funding the KV pool at {funded_pages} page(s) inside load_model: {e}"
+                    ))
+                })?;
+                info!(
+                    "[spyre-worker] KV pool funded at {funded_pages} page(s) — every layer's bank \
+                     allocated at (pages + the null page) × unit bytes and zero-filled BEFORE the \
+                     ladder's rungs build; the rungs adopt the owner's regions"
+                );
                 // ── SHARE seg2 (the resident KV) between the PREFILL and DECODE sessions ──
                 // Both bundles place seg2 identically by construction (kc/vc at nqh·hd·cap·2, the
                 // resident kct at nkvh·hd·cap·2 — no term depends on the query-row count m), so
@@ -3066,6 +3167,7 @@ impl SpyreWorker {
             prefill,
             batched_prefill,
             kv_budget_bytes: kv_budget_bytes_v,
+            funded_pages: funded_pages_o,
             pool_stride_bytes: {
                 #[cfg(feature = "spyre-hw")]
                 let stride = pool_stride_bytes_v;

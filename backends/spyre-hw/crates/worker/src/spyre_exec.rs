@@ -103,29 +103,19 @@ impl Worker for SpyreWorker {
         num_gpu_blocks: usize,
         _num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
-        // ⭐ THE ENGINE'S DIVISION, SPENT HERE — and nowhere else. The engine divided its budget
-        // (`determine_available_memory`, the census's funded-remainder) by the bundle's page
-        // stride and held the count to the programs' addressing bound; this door is where that
-        // count becomes device regions: every layer's pool bank at `(pages + the null page) ×
-        // its unit bytes`, zero-filled, on every card, with every ladder rung adopting the
-        // owner's regions. The engine's own order — init_cache before the serving loop — is
-        // the contract, as it is for every backend.
-        #[cfg(feature = "spyre-hw")]
-        {
-            let Some(loaded) = self.model.as_mut() else {
-                return Err(werr("initialize_cache: no model is loaded"));
-            };
-            match &mut loaded.session {
-                SendnnSession::SuperDsc(sb) => sb.fund_kv_pool(num_gpu_blocks as u64)?,
-            }
-            tracing::info!(
-                "[spyre-worker] KV pool funded at {num_gpu_blocks} page(s) — every layer's bank \
-                 allocated at (pages + the null page) × unit bytes and zero-filled; the ladder's \
-                 rungs adopted the owner's regions"
-            );
-        }
-        #[cfg(not(feature = "spyre-hw"))]
-        let _ = num_gpu_blocks;
+        // ⭐ NOTHING LEFT TO DO — the pool was funded inside `load_model`, right after the
+        // decode owner's prepare and before any ladder rung built, so its banks took clean
+        // regions first (the fragmentation that killed the last bank when this door funded
+        // is unconstructable now). The engine's count is the count already funded by
+        // construction: `determine_available_memory` returns exactly the funded bytes
+        // (`pages × stride`) and `kv_cache_num_blocks_override` the funded pages, so the
+        // engine's own division lands on the pool that exists. The engine's order —
+        // init_cache before the serving loop — is still the contract, as it is for every
+        // backend; this door just witnesses it.
+        tracing::info!(
+            "[spyre-worker] KV pool already funded at load: the engine's {num_gpu_blocks} \
+             block(s) is the count every layer's bank was allocated at"
+        );
         Ok(())
     }
 
@@ -159,9 +149,15 @@ impl Worker for SpyreWorker {
     }
 
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has —
-    /// every page but the null page a padded row writes (`paged_step::page_of_block`). The pool is the
-    /// bake's: every bundle places it, at the decode wiring's `PagedStep::pages`.
+    /// every page but the null page a padded row writes (`paged_step::page_of_block`). On the card
+    /// this is the count `load_model` itself FUNDED ([`Loaded::funded_pages`], the census budget ÷
+    /// the stride, already clamped to the bake's addressing bound): the pool that exists is the
+    /// pool that was funded, before any ladder rung built. The emulator's is still the bake's
+    /// placing (`PagedStep::host_blocks`), which its host-RAM allowance always reaches.
     fn kv_cache_num_blocks_override(&self) -> Option<usize> {
+        if let Some(pages) = self.model.as_ref().and_then(|m| m.funded_pages) {
+            return Some(pages as usize);
+        }
         self.model
             .as_ref()
             .and_then(|m| m.decode.first())

@@ -521,12 +521,13 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         self.each(|e| e.prepare()).map(drop)
     }
 
-    /// ⭐ FUND THE POOL — the engine's `initialize_cache` door. The engine computed `pages`
-    /// itself (its budget divided by the bundle's page stride, capped at the programs' addressing
-    /// bound); this session's ranks are each their card's owner, so each funds its own card's
-    /// regions at `(pages + the null page) × unit bytes` per bank and every borrower rung adopts
-    /// them ([`Self::adopt_funded_kv`]) right after. The engine's own order — init_cache
-    /// before the serving loop — is the contract, as it is for every backend.
+    /// ⭐ FUND THE POOL — called inside `load_model`, right after this (owner) session's
+    /// prepare and before any ladder rung builds, so the pool's banks take clean regions
+    /// first. `pages` is the loader's census answer (its budget divided by the page stride,
+    /// capped at the programs' addressing bound); this session's ranks are each their card's
+    /// owner, so each funds its own card's regions at `(pages + the null page) × unit bytes`
+    /// per bank, and every borrower rung adopts them ([`Self::adopt_funded_kv`]) as it is
+    /// built, through `adopt_from_owner`.
     pub fn fund_kv_pool(&mut self, pages: u64) -> Result<()> {
         self.each_parallel("FundKv", |e| e.fund_kv_pool(pages)).map(drop)
     }

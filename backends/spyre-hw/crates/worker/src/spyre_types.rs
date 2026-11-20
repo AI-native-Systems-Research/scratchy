@@ -187,6 +187,14 @@ pub(crate) struct Loaded {
     ///
     /// `None` on the emulator.
     pub(crate) pool_stride_bytes: Option<u64>,
+    /// ⭐ THE POOL'S FUNDED PAGE COUNT — the pages `load_model` itself funded (the census
+    /// budget ÷ [`Self::pool_stride_bytes`], clamped to the programs' addressing bound),
+    /// BEFORE any ladder rung built. The engine's `kv_cache_num_blocks_override` hands the
+    /// scheduler exactly this count: the pool that exists is the pool that was funded, so
+    /// the block allocator can never hand out a page past it.
+    ///
+    /// `None` on the emulator, which funds no device pool.
+    pub(crate) funded_pages: Option<u64>,
     /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the `--max-model-len` declared (else the model's
     /// own limit), which the pool the bake placed must hold: a declaration past the pool is refused at
     /// load, never clamped. `usize::MAX` on the emulator (no cap).

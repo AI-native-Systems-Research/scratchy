@@ -274,12 +274,6 @@ impl PrefixLadder {
         self.0.is_empty()
     }
 
-    /// The built rungs, mutably — the funding walk's adoption
-    /// ([`SuperDscBundle::fund_kv_pool`]) is the one reader.
-    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, PrefixRungBuilt> {
-        self.0.iter_mut()
-    }
-
     /// The baked (width, seqs) pairs, ascending.
     pub(crate) fn pairs(&self) -> Vec<(usize, usize)> {
         self.0.iter().map(|r| (r.width, r.seqs)).collect()
@@ -358,36 +352,12 @@ impl PrefixLadder {
 }
 
 impl SuperDscBundle {
-    /// ⭐ FUND THE POOL — the engine's `initialize_cache` door. The decode session is the
-    /// pool's owner on every card; it funds each rank's regions at `(pages + the null page) ×
-    /// unit bytes` per bank, and EVERY other session this bundle holds — the prefill ladder
-    /// (anchor and rungs, each a borrower of the pool), the decode batch rungs, the
-    /// prefix-capable rungs — adopts the owner's funded regions on its own card, pairwise per
-    /// rank. The engine's own order (init_cache before the serving loop) is the contract.
-    pub(crate) fn fund_kv_pool(
-        &mut self,
-        pages: u64,
-    ) -> scratchy_serving_worker::error::ExecutorResult<()> {
-        self.decode
-            .fund_kv_pool(pages)
-            .map_err(|e| crate::spyre_worker::werr_chain("fund the KV pool", &e))?;
-        let SuperDscBundle {
-            decode,
-            prefill_rungs,
-            decode_rungs,
-            prefill_prefix,
-        } = self;
-        for (_, rung) in prefill_rungs.iter_mut() {
-            rung.adopt_funded_kv(decode);
-        }
-        for rung in decode_rungs.iter_mut() {
-            rung.sess.adopt_funded_kv(decode);
-        }
-        for rung in prefill_prefix.iter_mut() {
-            rung.sess.adopt_funded_kv(decode);
-        }
-        Ok(())
-    }
+    // ⭐ THE POOL IS FUNDED AT LOAD, NOT HERE. The owner session funds its regions inside
+    // `load_model` — right after its own prepare, before any rung builds, so the pool's banks
+    // take clean regions first — and every rung adopts the funded regions as it is built
+    // (`adopt_from_owner`, which carries [`SuperDscSession::adopt_funded_kv`] beside its
+    // segment aliases). The engine's `initialize_cache` door witnesses the engine's order
+    // and does nothing more.
 
     /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1
     /// rung IS the owner session, by the loader's `rn <= 1 → continue`), else the index of the
