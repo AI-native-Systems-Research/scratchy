@@ -29,10 +29,17 @@ import triton.language as tl
 @triton.jit
 def reshape_and_cache_head_major_kernel(key, value, k_rows, v_rows, row_index,  #
                                         T: tl.constexpr, NUM_KV_HEADS: tl.constexpr,  #
-                                        HEAD_SIZE: tl.constexpr, NUM_ROWS: tl.constexpr):
-    k_dst = tl.make_tensor_descriptor(k_rows, shape=[NUM_ROWS, HEAD_SIZE], strides=[HEAD_SIZE, 1],
+                                        HEAD_SIZE: tl.constexpr,  #
+                                        K_ROWS: tl.constexpr, V_ROWS: tl.constexpr):
+    # ⭐ THE POOL IS UNIT-MAJOR, AND THE KERNEL RESTATES NO GEOMETRY. One growth unit (a page) holds
+    # BOTH planes — K then V — and the two planes share ONE index (the row a head's slot names),
+    # so each plane's offset rides in its own BASE and each descriptor declares exactly the rows
+    # its addressing reaches from that base: K's the span, V's the span minus the plane's own
+    # offset rows (both bound by the splice, one statement: the layout) — no view declares past
+    # its region.
+    k_dst = tl.make_tensor_descriptor(k_rows, shape=[K_ROWS, HEAD_SIZE], strides=[HEAD_SIZE, 1],
                                       block_shape=[1, HEAD_SIZE])
-    v_dst = tl.make_tensor_descriptor(v_rows, shape=[NUM_ROWS, HEAD_SIZE], strides=[HEAD_SIZE, 1],
+    v_dst = tl.make_tensor_descriptor(v_rows, shape=[V_ROWS, HEAD_SIZE], strides=[HEAD_SIZE, 1],
                                       block_shape=[1, HEAD_SIZE])
     if T >= 8:
         # key[:, h]: the [T, head_size] column block of head h.

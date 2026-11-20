@@ -61,7 +61,11 @@ fn spec(file: &str, kernel: &str, pointers: &[(&str, &str)], ce: &[(&str, i128)]
     }
 }
 
-fn kv_write_spec(t: i128, nkvh: i128, hd: i128, num_rows: i128) -> KernelSpec {
+/// The write kernel's spec at `pages` pages: each plane's descriptor declares exactly the rows
+/// its addressing reaches from its own base — K's the span `2 · pages · nkvh · block`, V's that
+/// minus the plane's own offset rows `nkvh · block` (`kv_unit_elems`' law, spelled by this
+/// fixture's adapter).
+fn kv_write_spec(t: i128, nkvh: i128, hd: i128, block: i128, pages: i128) -> KernelSpec {
     spec(
         "reshape_and_cache_head_major.py",
         "reshape_and_cache_head_major_kernel",
@@ -76,7 +80,14 @@ fn kv_write_spec(t: i128, nkvh: i128, hd: i128, num_rows: i128) -> KernelSpec {
             ("T", t),
             ("NUM_KV_HEADS", nkvh),
             ("HEAD_SIZE", hd),
-            ("NUM_ROWS", num_rows),
+            (
+                "K_ROWS",
+                2 * pages * nkvh * block,
+            ),
+            (
+                "V_ROWS",
+                2 * pages * nkvh * block - nkvh * block,
+            ),
         ],
     )
 }
@@ -117,6 +128,11 @@ fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
         ("NUM_BLOCKS", s.num_blocks),
     ];
     let (src, file, kernel) = if decode {
+        // The folded cache's row extents: one unit holds both planes, so a page is `2 · nkvh`
+        // folded rows — K declares that span, V (based at the plane offset) the span minus its
+        // own `nkvh` offset rows (`kv_unit_elems`' law, spelled by this fixture's adapter).
+        ce.push(("KV_ROWS", 2 * s.num_kv_heads * s.num_pages));
+        ce.push(("V_ROWS", 2 * s.num_kv_heads * s.num_pages - s.num_kv_heads));
         (
             DECODE,
             "page_attn_head_major_decode.py",
@@ -124,6 +140,14 @@ fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
         )
     } else {
         ce.push(("PADDED_QUERY_LEN", s.padded_query_len));
+        // The unfolded cache: a row PER PAGE (the loads sit at `[page, 0]`), each page a
+        // `PAGE_STRIDE` of elements apart — one unit holds both planes, so the extent is the page
+        // count and the law rides in the stride.
+        ce.push(("KV_ROWS", s.num_pages));
+        ce.push((
+            "PAGE_STRIDE",
+            2 * s.num_kv_heads * s.block_size * s.head_size,
+        ));
         (
             PREFILL,
             "page_attn_head_major_prefill.py",
@@ -152,7 +176,8 @@ fn count(f: &IRFunction, kind: OpKind) -> usize {
 #[test]
 fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
     // A prompt chunk's write: one scatter per kv head per cache (their per-head `index_copy_`).
-    let w = lower(KV_WRITE, &kv_write_spec(32, 8, 64, 8 * 8 * 64));
+    // `K_ROWS`/`V_ROWS` are the pool's row extents — both planes (8 pages of 8 heads · 64 slots).
+    let w = lower(KV_WRITE, &kv_write_spec(32, 8, 64, 64, 8));
     assert_eq!(
         count(&w, OpKind::KtdpConstructIndirectAccessTile),
         2 * 8,
@@ -160,7 +185,7 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
     );
     // A decode step's one token is under Triton's scatter floor of 8 rows: each row is its own
     // store at the row its head's index names — still an indirect tile, one per (head, cache).
-    let w1 = lower(KV_WRITE, &kv_write_spec(1, 8, 64, 8 * 8 * 64));
+    let w1 = lower(KV_WRITE, &kv_write_spec(1, 8, 64, 64, 8));
     assert_eq!(
         count(&w1, OpKind::KtdpConstructIndirectAccessTile),
         2 * 8,
@@ -399,6 +424,38 @@ fn i32_arg(words: &[i32], shape: Vec<usize>) -> Arg {
     }
 }
 
+/// ⭐ THE UNIT-MAJOR POOL ADAPTER. The pools this fixture stages are spyre-inference's DENSE
+/// per-plane caches — one plane's `R` rows per page, packed. Our pool is unit-major: one growth
+/// unit (a page) holds BOTH planes, so the reference's dense row `d` sits at `page(d) · 2R +
+/// d % R` of the span — `kv_unit_elems`' law, spelled here because this crate stands apart from
+/// the splice on purpose. `R` is each frame's own rows per page: the write frame's
+/// `nkvh · block`, the folded decode frame's `nkvh`, the prefill frame's `1`, the batched
+/// frame's `ROWS_PER_PAGE`.
+fn unit_row(rpp: usize, d: usize) -> usize {
+    (d / rpp) * 2 * rpp + d % rpp
+}
+
+/// The dense pool `dense` (`row_width` elements per row) on the unit-major span: every dense row
+/// moved to its unit's rows, the other plane's rows zero.
+fn interleave_pool(dense: &[f64], rpp: usize, row_width: usize) -> Vec<f64> {
+    let dense_rows = dense.len() / row_width;
+    let mut out = vec![0.0; dense_rows * 2 * row_width];
+    for d in 0..dense_rows {
+        let to = unit_row(rpp, d);
+        out[to * row_width..(to + 1) * row_width]
+            .copy_from_slice(&dense[d * row_width..(d + 1) * row_width]);
+    }
+    out
+}
+
+/// The span pool `ours` back on the reference's dense form, for the byte-exact comparison.
+fn deinterleave_pool(ours: &[f64], rpp: usize, row_width: usize) -> Vec<f64> {
+    let dense_rows = ours.len() / row_width / 2;
+    (0..dense_rows)
+        .flat_map(|d| ours[unit_row(rpp, d) * row_width..][..row_width].to_vec())
+        .collect()
+}
+
 /// The step's attention, on the emulator, over pools `kp`/`vp` with page table `pt` — the kernel
 /// spyre-inference dispatches at this query width, on their operands.
 fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
@@ -421,15 +478,21 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
     let row_index: Vec<i32> = (0..mq as i32).collect();
     let mut bound = vec![s.arg("q", q_shape.clone()), i32_arg(&row_index, vec![rows])];
     if mq == 1 {
-        // The folded cache `[pages * kv, block, D]`, and `kv_row_pool` `[pages, kv, 1]`.
-        let folded = vec![(pages * nkvh) as usize, (block * hd) as usize];
+        // The folded cache's SPAN `[pages · 2 · kv, block, D]` — one unit holds both planes — and
+        // `kv_row_pool` `[pages, kv, 1]` naming `page · 2 · kv + kv`, the index tables' law.
+        let folded = vec![(pages * 2 * nkvh) as usize, (block * hd) as usize];
         bound.push(f16_arg(kp, folded.clone()));
         bound.push(f16_arg(vp, folded));
         bound.push(pt);
-        let pool: Vec<i32> = (0..(pages * nkvh) as i32).collect();
+        let (p_max, kv_max) = (pages as i32, nkvh as i32);
+        let pool: Vec<i32> = (0..p_max)
+            .flat_map(move |p| (0..kv_max).map(move |kv| p * 2 * kv_max + kv))
+            .collect();
         bound.push(i32_arg(&pool, vec![pages as usize, nkvh as usize]));
     } else {
-        let unfolded = vec![pages as usize, (nkvh * block * hd) as usize];
+        // The unfolded cache's SPAN `[2 · pages, kv · block · D]`: page p's plane at row `2 · p`,
+        // the other plane's row between (`PAGE_STRIDE`'s law).
+        let unfolded = vec![(2 * pages) as usize, (nkvh * block * hd) as usize];
         bound.push(f16_arg(kp, unfolded.clone()));
         bound.push(f16_arg(vp, unfolded));
         bound.push(pt);
@@ -446,14 +509,19 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
 fn the_step_matches_spyre_inference(config: &str) {
     let s = Step::load(config);
     let (mq, nkvh, hd) = (s.mq(), s.geom("NKVH"), s.geom("HD"));
-    let pool_rows = s.geom("NUM_PAGES") * nkvh * s.geom("BLOCK");
+    let (block, pages) = (s.geom("BLOCK"), s.geom("NUM_PAGES"));
+    // The write frame's rows per page, and the pool's row SPAN (both planes — `kv_unit_elems`'
+    // law at this geometry, spelled by this fixture's adapter above).
+    let rpp = (nkvh * block) as usize;
+    let span_rows = (pages * nkvh * block * 2) as usize;
 
     // THE WRITE — exact: a scatter moves bits.
-    let w = lower(KV_WRITE, &kv_write_spec(mq, nkvh, hd, pool_rows));
+    let w = lower(KV_WRITE, &kv_write_spec(mq, nkvh, hd, block, pages));
     let (t, kvh) = (mq as usize, nkvh as usize);
-    let pool = vec![pool_rows as usize, hd as usize];
+    let pool = vec![span_rows, hd as usize];
     // `kv_write_index`'s one `[T]` index per kv head, one after another: the recording holds the
-    // same rows `(token, head)`-major.
+    // same rows `(token, head)`-major — DENSE rows, re-based to the unit-major span
+    // (`row + page(row) · rpp`, the adapter's law).
     let (raw, _, _) = s.file("write_rows");
     let token_major: Vec<i32> = raw
         .as_chunks::<4>()
@@ -461,29 +529,35 @@ fn the_step_matches_spyre_inference(config: &str) {
         .iter()
         .map(|w| i32::from_le_bytes(*w))
         .collect();
+    let rpp_i = rpp as i32;
     let per_head: Vec<i32> = (0..kvh)
         .flat_map(|h| (0..t).map(move |tok| (h, tok)))
-        .map(|(h, tok)| token_major[tok * kvh + h])
+        .map(|(h, tok)| token_major[tok * kvh + h] + rpp_i * (token_major[tok * kvh + h] / rpp_i))
         .collect();
     let kv_shape = vec![t, (nkvh * hd) as usize];
+    // The pre-write pools, staged on the span: the reference's dense caches re-laid unit-major.
+    let (pre_k, pre_v) = (
+        interleave_pool(&s.values("kp_pre"), rpp, hd as usize),
+        interleave_pool(&s.values("vp_pre"), rpp, hd as usize),
+    );
     let after = run(
         &w,
         vec![
             s.arg("k_new", kv_shape.clone()),
             s.arg("v_new", kv_shape),
-            s.arg("kp_pre", pool.clone()),
-            s.arg("vp_pre", pool),
+            f16_arg(&pre_k, pool.clone()),
+            f16_arg(&pre_v, pool),
             i32_arg(&per_head, vec![t * kvh]),
         ],
     );
     let (kp, vp) = (after[2].clone(), after[3].clone());
     let (want_k, want_v) = (s.values("kp_post"), s.values("vp_post"));
     assert!(
-        kp == want_k,
+        deinterleave_pool(&kp, rpp, hd as usize) == want_k,
         "{config}: the K pool after the scatter is not spyre-inference's"
     );
     assert!(
-        vp == want_v,
+        deinterleave_pool(&vp, rpp, hd as usize) == want_v,
         "{config}: the V pool after the scatter is not spyre-inference's"
     );
     // The write's own control: the step's write CHANGES the pools, so a scatter that wrote
@@ -529,12 +603,7 @@ fn the_step_matches_spyre_inference(config: &str) {
     }
     // CONTROL 2 — the attention reads what the scatter wrote: over the PRE-write pools it must
     // miss, because this step's own keys are absent.
-    let stale = attend(
-        &s,
-        &s.values("kp_pre"),
-        &s.values("vp_pre"),
-        page_table(&s, 0),
-    );
+    let stale = attend(&s, &pre_k, &pre_v, page_table(&s, 0));
     let miss = max_abs(&stale, &exact);
     println!("{config}: attending the pre-write pools misses by {miss:.3e}");
     assert!(
@@ -623,6 +692,11 @@ impl Batch {
                 ("HEAD_SIZE", hd),
                 ("NUM_PAGES", pages),
                 ("ROWS_PER_PAGE", self.rows_per_page),
+                // The cache's row extents in this frame: one unit holds both planes, so a page is
+                // `2 · ROWS_PER_PAGE` rows — K declares that span, V (based at the plane offset)
+                // the span minus its own `ROWS_PER_PAGE` offset rows.
+                ("KV_ROWS", 2 * pages * self.rows_per_page),
+                ("V_ROWS", 2 * pages * self.rows_per_page - self.rows_per_page),
             ],
         );
         k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
@@ -634,15 +708,23 @@ impl Batch {
         let (rows, width) = (self.seqs as usize, (nqh * hd) as usize);
         let e = self.entries() as usize;
         let index_rows = e * self.rows_per_page as usize;
-        let page = vec![pages as usize, (nkvh * block * hd) as usize];
+        // The caches, staged on the span: the reference's dense `[pages, kv · block · D]` re-laid
+        // unit-major (`ROWS_PER_PAGE` rows per page, the other plane's rows between).
+        let rpp = self.rows_per_page as usize;
+        let row_elems = (nkvh * block * hd / self.rows_per_page) as usize;
+        let span = vec![(pages * 2 * self.rows_per_page) as usize, row_elems];
+        // The page ids, likewise: the recording holds `page · per + a`; ours hold
+        // `page · 2 · per + a` (one unit holds both planes).
+        let per = self.rows_per_page as i32;
+        let ids: Vec<i32> = page_ids.iter().map(|&p| p + per * (p / per)).collect();
         let out = run(
             &f,
             vec![
                 s.arg("q", vec![rows, width]),
                 i32_arg(rep_row_ids, vec![index_rows]),
-                s.arg("kp", page.clone()),
-                s.arg("vp", page),
-                i32_arg(page_ids, vec![self.num_chunks as usize * index_rows]),
+                f16_arg(&interleave_pool(&s.values("kp"), rpp, row_elems), span.clone()),
+                f16_arg(&interleave_pool(&s.values("vp"), rpp, row_elems), span),
+                i32_arg(&ids, vec![self.num_chunks as usize * index_rows]),
                 self.mask_rows(e, nkvh as usize, block as usize),
                 f16_arg(&vec![0.0; rows * width], vec![rows, width]),
             ],

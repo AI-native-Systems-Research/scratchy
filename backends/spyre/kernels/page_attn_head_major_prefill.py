@@ -43,6 +43,7 @@ def page_attn_head_major_prefill_kernel(query, query_row_index, k_pages, v_pages
                                         BLOCK_SIZE: tl.constexpr, NUM_PAGES: tl.constexpr,  #
                                         NUM_BLOCKS: tl.constexpr,
                                         PADDED_QUERY_LEN: tl.constexpr,  #
+                                        KV_ROWS: tl.constexpr, PAGE_STRIDE: tl.constexpr,  #
                                         SCALE: tl.constexpr):
     NUM_QUERIES_PER_KV: tl.constexpr = NUM_HEADS // NUM_KV_HEADS
     INT32_ELEMS_PER_STICK: tl.constexpr = 32
@@ -74,13 +75,19 @@ def page_attn_head_major_prefill_kernel(query, query_row_index, k_pages, v_pages
     q = tl.reshape(tl.trans(tl.reshape(q_rows, [P, NUM_HEADS, HEAD_SIZE]), (1, 0, 2)),
                    [NUM_KV_HEADS, G * P, HEAD_SIZE])
 
-    k_unfolded = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES,
+    # ⭐ THE POOL IS UNIT-MAJOR, AND THE KERNEL RESTATES NO GEOMETRY. One growth unit (a page) holds
+    # BOTH planes — K then V — so a plane's page `p` sits at `p · PAGE_STRIDE` elements from its own
+    # base, and the base itself is the plane's offset inside the unit (bound by the splice, one
+    # statement: the layout). This frame addresses a row PER PAGE (the loads sit at `[page, 0]`), so
+    # `KV_ROWS` — the descriptor's row extent — is the page count; the unit law rides in
+    # `PAGE_STRIDE`, never in the rows.
+    k_unfolded = tl.make_tensor_descriptor(k_pages, shape=[KV_ROWS,
                                                            NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE],
-                                           strides=[NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE, 1],
+                                           strides=[PAGE_STRIDE, 1],
                                            block_shape=[1, NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE])
-    v_unfolded = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES,
+    v_unfolded = tl.make_tensor_descriptor(v_pages, shape=[KV_ROWS,
                                                            NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE],
-                                           strides=[NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE, 1],
+                                           strides=[PAGE_STRIDE, 1],
                                            block_shape=[1, NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE])
     masks = tl.make_tensor_descriptor(mask_stack, shape=[NUM_BLOCKS * P, BLOCK_SIZE],
                                       strides=[BLOCK_SIZE, 1], block_shape=[P, BLOCK_SIZE])

@@ -633,7 +633,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("T", Val::Int(20)),
                     ("NUM_KV_HEADS", Val::Int(8)),
                     ("HEAD_SIZE", Val::Int(64)),
-                    ("NUM_ROWS", Val::Int(4 * 8 * 64)),
+                    // The pool's row extents, unit-major (the splice door `kv_unit_elems` /
+                    // `kv_span_rows` / `kv_offset_plane_rows` states the law; this fixture
+                    // spells it): K the span `2 · pages · nkvh · block`, V that minus its own
+                    // offset rows `nkvh · block`.
+                    ("K_ROWS", Val::Int(2 * 4 * 8 * 64)),
+                    ("V_ROWS", Val::Int(2 * 4 * 8 * 64 - 8 * 64)),
                 ],
             ),
             vec![1],
@@ -666,6 +671,11 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("NUM_PAGES", Val::Int(4)),
                     ("NUM_BLOCKS", Val::Int(1)),
                     ("PADDED_QUERY_LEN", Val::Int(20)),
+                    // The pool, unit-major (the splice door's law, spelled by this fixture):
+                    // the prefill frame addresses a row per page, the unit stride carrying the
+                    // law — `PAGE_STRIDE` is one unit, both planes.
+                    ("KV_ROWS", Val::Int(4)),
+                    ("PAGE_STRIDE", Val::Int(2 * 8 * 64 * 64)),
                     ("SCALE", Val::Float(0.125)),
                 ],
             ),

@@ -41,7 +41,7 @@ Where Triton spells a torch op differently, the spelling is Triton's and the op 
 ONE FORM IS OURS, NOT THEIRS. Triton's gather takes at least 8 indices, and a chunk of their own
 `blocks_per_chunk` (`batched_decode_chunking`) can hold fewer entries, whose whole pages Triton
 cannot gather. Such a chunk gathers each page's kv heads as the folded cache's rows
-(`ROWS_PER_PAGE = num_kv_heads`: `page * kv + a`, the per-sequence decode kernel's `kv_row_pool`
+(`ROWS_PER_PAGE = num_kv_heads`: `page * 2 * kv + a`, the per-sequence decode kernel's `kv_row_pool`
 form), its query rows folded alike (`row * kv + a` of the query read `[num_tokens * kv, group *
 head_size]`): `rep_row_ids` `[entries * kv]` and `chunk_page_ids` `[num_chunks, entries * kv]`,
 entry `e`'s kv head `a` at `e * kv + a`. Their batched kernel never folds — its docstring: "folding
@@ -65,6 +65,7 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
                                      NUM_QUERIES_PER_KV: tl.constexpr,  #
                                      BLOCK_SIZE: tl.constexpr, HEAD_SIZE: tl.constexpr,  #
                                      NUM_PAGES: tl.constexpr, ROWS_PER_PAGE: tl.constexpr,  #
+                                     KV_ROWS: tl.constexpr, V_ROWS: tl.constexpr,  #
                                      SCALE: tl.constexpr):
     B: tl.constexpr = NUM_SEQS
     J: tl.constexpr = BLOCKS_PER_CHUNK
@@ -84,10 +85,17 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
     # rep_row_ids `[entries * P]`: entry e's row r at e * P + r, holding rep * P + r.
     rep_desc = tl.make_tensor_descriptor(rep_row_ids, shape=[ROWS], strides=[1],
                                          block_shape=[ROWS])
-    # The cache `[num_pages * P, page / P]`: page p's row r is row p * P + r.
-    k_rows = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * P, PAGE // P],
+    # ⭐ THE POOL IS UNIT-MAJOR, AND THE KERNEL RESTATES NO GEOMETRY. One growth unit (a page) holds
+    # BOTH planes — K then V — so the row a gather entry names (`page · 2·P + r`, the index tables'
+    # law) already carries the interleave, the row stride stays the frame's own width, and each
+    # plane's BASE is its offset inside the unit (bound by the splice, one statement: the layout).
+    # Each descriptor declares exactly the rows its addressing reaches from its own base:
+    # `KV_ROWS` the K plane's span, `V_ROWS` the V plane's span minus its own offset rows — no
+    # view declares past its region. `NUM_PAGES` is the scheduler's page count, a different fact
+    # the cache descriptors never state as an extent.
+    k_rows = tl.make_tensor_descriptor(k_pages, shape=[KV_ROWS, PAGE // P],
                                        strides=[PAGE // P, 1], block_shape=[1, PAGE // P])
-    v_rows = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * P, PAGE // P],
+    v_rows = tl.make_tensor_descriptor(v_pages, shape=[V_ROWS, PAGE // P],
                                        strides=[PAGE // P, 1], block_shape=[1, PAGE // P])
     # chunk_page_ids `[num_chunks, entries * P]`, contiguous: chunk c's rows are the ROWS at c * ROWS.
     ids_desc = tl.make_tensor_descriptor(chunk_page_ids, shape=[NUM_CHUNKS * ROWS], strides=[1],

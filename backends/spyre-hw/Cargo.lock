@@ -2930,6 +2930,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "flex-rs",
  "libc",
  "scratchy-cli",
  "scratchy-models",

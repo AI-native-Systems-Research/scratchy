@@ -37,7 +37,9 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
                                        NUM_TOKENS: tl.constexpr, NUM_HEADS: tl.constexpr,  #
                                        NUM_KV_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,  #
                                        BLOCK_SIZE: tl.constexpr, NUM_PAGES: tl.constexpr,  #
-                                       NUM_BLOCKS: tl.constexpr, SCALE: tl.constexpr):
+                                       NUM_BLOCKS: tl.constexpr, KV_ROWS: tl.constexpr,  #
+                                       V_ROWS: tl.constexpr,  #
+                                       SCALE: tl.constexpr):
     NUM_QUERIES_PER_KV: tl.constexpr = NUM_HEADS // NUM_KV_HEADS
     INT32_ELEMS_PER_STICK: tl.constexpr = 32
     q_rows = tl.make_tensor_descriptor(query, shape=[NUM_TOKENS, NUM_HEADS * HEAD_SIZE],
@@ -46,21 +48,26 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
     out_rows = tl.make_tensor_descriptor(out, shape=[NUM_TOKENS, NUM_HEADS * HEAD_SIZE],
                                          strides=[NUM_HEADS * HEAD_SIZE, 1],
                                          block_shape=[1, NUM_HEADS * HEAD_SIZE])
-    k_folded = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                         BLOCK_SIZE * HEAD_SIZE],
+    # ⭐ THE POOL IS UNIT-MAJOR, AND THE KERNEL RESTATES NO GEOMETRY. One growth unit (a page) holds
+    # BOTH planes — K then V — so the folded row a gather entry names (`page · 2·num_kv_heads + kv`,
+    # `kv_row_pool`'s law) already carries the interleave, the row stride stays the folded row's own
+    # width, and each plane's BASE is its offset inside the unit (bound by the splice, one statement:
+    # the layout). Each descriptor declares exactly the rows its addressing reaches from its own
+    # base: `KV_ROWS` the K plane's span, `V_ROWS` the V plane's span minus its own offset rows —
+    # no view declares past its region. `NUM_PAGES` stays the scheduler's page count, a different
+    # fact the cache descriptors never state as an extent.
+    k_folded = tl.make_tensor_descriptor(k_pages, shape=[KV_ROWS, BLOCK_SIZE * HEAD_SIZE],
                                          strides=[BLOCK_SIZE * HEAD_SIZE, 1],
                                          block_shape=[1, BLOCK_SIZE * HEAD_SIZE])
-    v_folded = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                         BLOCK_SIZE * HEAD_SIZE],
+    v_folded = tl.make_tensor_descriptor(v_pages, shape=[V_ROWS, BLOCK_SIZE * HEAD_SIZE],
                                          strides=[BLOCK_SIZE * HEAD_SIZE, 1],
                                          block_shape=[1, BLOCK_SIZE * HEAD_SIZE])
-    # Under the gather floor: num_kv_heads consecutive rows of the folded cache.
-    k_tiles = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                        BLOCK_SIZE * HEAD_SIZE],
+    # Under the gather floor: num_kv_heads consecutive rows of the folded cache — consecutive
+    # within one unit by `kv_row_pool`'s law, so the tile at the first still reads one page's plane.
+    k_tiles = tl.make_tensor_descriptor(k_pages, shape=[KV_ROWS, BLOCK_SIZE * HEAD_SIZE],
                                         strides=[BLOCK_SIZE * HEAD_SIZE, 1],
                                         block_shape=[NUM_KV_HEADS, BLOCK_SIZE * HEAD_SIZE])
-    v_tiles = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                        BLOCK_SIZE * HEAD_SIZE],
+    v_tiles = tl.make_tensor_descriptor(v_pages, shape=[V_ROWS, BLOCK_SIZE * HEAD_SIZE],
                                         strides=[BLOCK_SIZE * HEAD_SIZE, 1],
                                         block_shape=[NUM_KV_HEADS, BLOCK_SIZE * HEAD_SIZE])
     # kv_row_pool `[num_pages, num_kv_heads, 1]`, contiguous: page p's slab is the num_kv_heads
@@ -89,7 +96,8 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
             v_page = tl.reshape(v_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
         else:
             # Under the gather floor. The rows `kv_row_pool[page]` names ascend by one
-            # (`page * num_kv_heads + kv`), so they are the num_kv_heads-row tile at the first.
+            # (`page * 2 * num_kv_heads + kv` — one unit's plane, consecutive), so they are the
+            # num_kv_heads-row tile at the first.
             first = tl.min(kv_rows, 0)
             k_page = tl.reshape(k_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
             v_page = tl.reshape(v_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
