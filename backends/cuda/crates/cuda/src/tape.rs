@@ -13,16 +13,15 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    ARGMAX_CHUNK, ARGMAX_MAX_VOCAB, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AddRmsNormBf16,
-    AddRmsNormQuantFp8, AttnDecodeBf16, AttnPrefillBf16, AttnWindow, BlockSize, BucketM,
-    CUDA_KV_BLOCK_SIZE, Cols, ConvKernel, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, FreqDim,
-    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GdnScratch,
-    HeadDim, HiddenSize, IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, NumExperts,
-    NumKvHeads, QuantChainError, RmsNormBf16, RmsNormQuantFp8, RopeAppendBf16, RopeBf16, RopeTheta,
-    RotDim, RouterLogitsBf16, Rows, SiluMulBf16, TileRows, TopK, VocabSize, gdn_conv_dim,
-    quant_chain, sort_index_regions,
+    ARGMAX_CHUNK, ARGMAX_MAX_VOCAB, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnDecodeBf16,
+    AttnPrefillBf16, AttnRowBf16, AttnWindow, BlockSize, BucketM, CUDA_KV_BLOCK_SIZE, Cols,
+    ConvKernel, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
+    ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, FreqDim, GDN_CONV_KERNEL_RANGE,
+    GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16,
+    GatherLastRowBf16, GdnHeadDim, GdnHeads, GdnPrefillBf16, GdnScratch, HeadDim, HiddenSize,
+    IntermediateSize, MaxBlocksPerSeq, MaxTiles, MoeRouteBf16, NumExperts, NumKvHeads,
+    QuantChainError, RmsNormBf16, RopeAppendBf16, RopeBf16, RopeTheta, RotDim, RouterLogitsBf16,
+    Rows, SiluMulBf16, TileRows, TopK, VocabSize, gdn_conv_dim, quant_chain, sort_index_regions,
 };
 use crate::step::{
     ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8, ExpertGemvTcFp8, ExpertSortFp8,
@@ -1690,7 +1689,7 @@ impl CudaTape {
                 window,
                 ..
             })
-            | CudaStep::AttnDecode(AttnDecodeBf16 { attn: AttnPrefillBf16 {
+            | CudaStep::AttnDecode(AttnDecodeBf16 { attn: AttnRowBf16 {
                 block_table,
                 sequence,
                 layer,
@@ -2468,26 +2467,20 @@ impl CudaTape {
     /// one row, in a one-row bucket: those kernels index no row past the first. Any other step
     /// passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
-        let rows = match *s {
-            CudaStep::Gemv(_) | CudaStep::GemvFp8(_) | CudaStep::GemvTcFp8(_) => Rows(1),
-            CudaStep::AttnDecode(AttnDecodeBf16 {
-                attn: AttnPrefillBf16 { rows, .. },
-                ..
-            }) => rows,
-            CudaStep::RmsNormQuantFp8(RmsNormQuantFp8 { norm, .. })
-            | CudaStep::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
-                fold: AddRmsNormBf16 { norm, .. },
-                ..
-            }) => norm.rows,
-            _ => return Ok(()),
-        };
-        if rows == Rows(1) && self.bucket_m == BucketM(1) {
+        // Each is one row by its type; its bucket must be one row too.
+        let one_row = matches!(
+            *s,
+            CudaStep::Gemv(_)
+                | CudaStep::GemvFp8(_)
+                | CudaStep::GemvTcFp8(_)
+                | CudaStep::AttnDecode(_)
+                | CudaStep::RmsNormQuantFp8(_)
+                | CudaStep::AddRmsNormQuantFp8(_)
+        );
+        if !one_row || self.bucket_m == BucketM(1) {
             Ok(())
         } else {
-            Err(TapeError::OneRowStep {
-                step,
-                rows: rows.get(),
-            })
+            Err(TapeError::OneRowStep { step, rows: 1 })
         }
     }
 }
@@ -4287,15 +4280,26 @@ mod tests {
     /// attention reads.
     #[test]
     fn a_decode_attention_is_one_row_of_a_one_row_bucket() {
-        let decode = |rows, kv_heads| match attn(KV_TABLE, KV_SEQ, kv_heads) {
+        let decode = |kv_heads| match attn(KV_TABLE, KV_SEQ, kv_heads) {
             CudaStep::AttnPrefill(a) => CudaStep::AttnDecode(
-                AttnDecodeBf16::of(AttnPrefillBf16 { rows, ..a })
-                    .expect("a head dim with a decode kernel"),
+                AttnDecodeBf16::of(AttnRowBf16 {
+                    q: a.q,
+                    block_table: a.block_table,
+                    sequence: a.sequence,
+                    out: a.out,
+                    layer: a.layer,
+                    q_heads: a.q_heads,
+                    kv_heads: a.kv_heads,
+                    head_dim: a.head_dim,
+                    scale: a.scale,
+                    window: a.window,
+                })
+                .expect("a head dim with a decode kernel"),
             ),
             _ => unreachable!("an attention"),
         };
-        // `kv_tape` is a 256-row bucket: a one-row decode in it is refused for the bucket, a
-        // 256-row one for its rows. (The whole one-row qwen3.5 tape validates: `cuda_tapes`.)
+        // `kv_tape` is a 256-row bucket: a one-row decode in it is refused for the bucket. (The
+        // whole one-row qwen3.5 tape validates: `cuda_tapes`.)
         // Each with the split scratch its decode's partials need (W6b), at the arena's end, as the
         // canonical places it.
         let with_scratch = |t: CudaTape| {
@@ -4312,14 +4316,10 @@ mod tests {
             }
         };
         assert_eq!(
-            with_scratch(kv_tape(KV, &[decode(Rows(1), 2)])).validate(),
+            with_scratch(kv_tape(KV, &[decode(2)])).validate(),
             Err(TapeError::OneRowStep { step: 0, rows: 1 })
         );
-        assert_eq!(
-            with_scratch(kv_tape(KV, &[decode(Rows(256), 2)])).validate(),
-            Err(TapeError::OneRowStep { step: 0, rows: 256 })
-        );
-        let e = decode(Rows(1), 2).extents().expect("the decode's extents");
+        let e = decode(2).extents().expect("the decode's extents");
         assert_eq!(e.kv, Some((0, KvUse::Read)));
         assert_eq!(e.reads[1], Some(span(KV_TABLE, 512)), "the block table");
         assert_eq!(e.reads[2], Some(span(KV_SEQ, 8)), "the sequence");

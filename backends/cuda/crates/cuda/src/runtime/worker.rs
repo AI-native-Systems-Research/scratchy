@@ -43,14 +43,15 @@ use crate::pool::{BlockId, GdnPoolConfig, KvPoolConfig, SlotId};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnDecodeBf16,
-    AttnDecodeSplit, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16,
-    ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
-    GateSplitBf16, GateUpProj, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GdnPrefillBf16,
-    GdnScan, GemmBf16, GemvBf16, GemvSplit, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
-    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, QuantRowsFp8,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight,
+    AttnDecodeSplit, AttnPrefillBf16, AttnRowBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
+    ExpertGateUpActBf16, ExpertGateUpGemmFp8, ExpertGateUpGemvBf16, ExpertGateUpTcFp8,
+    ExpertGemmBf16, ExpertGemvBf16, ExpertGemvSplitBf16, ExpertProjection, ExpertSortBf16,
+    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpProj, GateUpTcFp8, GatedDeltaNetBf16,
+    GatherLastRowBf16, GdnPrefillBf16, GdnScan, GemmBf16, GemvBf16, GemvSplit, GroupMember,
+    LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16,
+    NormKernel, PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
+    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout,
+    fp8_weight,
 };
 use crate::step::{
     AttnWindow, BucketM, Cols, GdnLayout, GemmCol64Bf16, GemmCol64Fp8, GemmFp8, GemmGroupFp8,
@@ -2398,7 +2399,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::RmsNormQuantFp8(t) => {
                         let quant = Some(t.q);
                         Self::norm_row(
-                            t.norm,
+                            t.norm.norm(),
                             (NORM_ROW_FORM_NORM, t.norm.x, None, None),
                             quant,
                             slot,
@@ -2413,7 +2414,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             Some(t.fold.b),
                             Some(t.fold.sum),
                         );
-                        Self::norm_row(t.fold.norm, add, Some(t.q), slot, weights, stream)
+                        Self::norm_row(t.fold.norm.norm(), add, Some(t.q), slot, weights, stream)
                     }
                     CudaStep::Add(AddBf16 {
                         a,
@@ -2653,7 +2654,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     }
                     CudaStep::AttnDecode(AttnDecodeBf16 {
                         attn:
-                            attn @ AttnPrefillBf16 {
+                            attn @ AttnRowBf16 {
                                 q,
                                 block_table,
                                 sequence,

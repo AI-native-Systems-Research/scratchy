@@ -395,10 +395,61 @@ pub enum CudaStep {
     AddRmsNormQuantFp8(AddRmsNormQuantFp8),
 }
 
-/// [`CudaStep::RmsNormQuantFp8`]: the norm, and where its quantization goes.
+/// An [`RmsNormBf16`] of one row: its operands, no `rows`. What the norm-quant fold makes where
+/// it folds a one-row norm (`fold_norm_quants`), and the one-row norm kernels' operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct NormRowBf16 {
+    pub x: ArenaOffset,
+    pub gain: WeightIx,
+    pub y: ArenaOffset,
+    pub cols: Cols,
+    pub eps: RmsNormEps,
+    #[serde(serialize_with = "serialize_gain_convention")]
+    pub convention: GainConvention,
+    pub kernel: NormKernel,
+}
+
+impl NormRowBf16 {
+    /// The norm it computes, at its one row.
+    pub const fn norm(&self) -> RmsNormBf16 {
+        RmsNormBf16 {
+            x: self.x,
+            gain: self.gain,
+            y: self.y,
+            rows: Rows(1),
+            cols: self.cols,
+            eps: self.eps,
+            convention: self.convention,
+            kernel: self.kernel,
+        }
+    }
+}
+
+/// An [`AddRmsNormBf16`] of one row: the add's operands and the [`NormRowBf16`] of their sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AddNormRowBf16 {
+    pub a: ArenaOffset,
+    pub b: ArenaOffset,
+    pub sum: ArenaOffset,
+    pub norm: NormRowBf16,
+}
+
+impl AddNormRowBf16 {
+    /// The add-norm it computes, at its one row.
+    pub const fn fold(&self) -> AddRmsNormBf16 {
+        AddRmsNormBf16 {
+            a: self.a,
+            b: self.b,
+            sum: self.sum,
+            norm: self.norm.norm(),
+        }
+    }
+}
+
+/// [`CudaStep::RmsNormQuantFp8`]: the one-row norm, and where its quantization goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RmsNormQuantFp8 {
-    pub norm: RmsNormBf16,
+    pub norm: NormRowBf16,
     pub q: ArenaOffset,
 }
 
@@ -408,16 +459,16 @@ impl RmsNormQuantFp8 {
         QuantRowsFp8 {
             x: self.norm.y,
             q: self.q,
-            rows: self.norm.rows,
+            rows: Rows(1),
             cols: self.norm.cols,
         }
     }
 }
 
-/// [`CudaStep::AddRmsNormQuantFp8`]: the add-norm, and where its quantization goes.
+/// [`CudaStep::AddRmsNormQuantFp8`]: the one-row add-norm, and where its quantization goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AddRmsNormQuantFp8 {
-    pub fold: AddRmsNormBf16,
+    pub fold: AddNormRowBf16,
     pub q: ArenaOffset,
 }
 
@@ -1816,9 +1867,44 @@ pub struct AttnDecodeSplit {
 /// the split scratch its partials take at that split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct AttnDecodeBf16 {
-    pub attn: AttnPrefillBf16,
+    pub attn: AttnRowBf16,
     pub split: AttnDecodeSplit,
     pub scratch: AttnDecodeScratch,
+}
+
+/// An [`AttnPrefillBf16`] of one query row: its operands, no `rows`. What the attention's lowering
+/// makes where a one-row bucket picks the decode attention, and its operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AttnRowBf16 {
+    pub q: ArenaOffset,
+    pub block_table: ArenaOffset,
+    pub sequence: ArenaOffset,
+    pub out: ArenaOffset,
+    pub layer: LayerId,
+    pub q_heads: NumQHeads,
+    pub kv_heads: NumKvHeads,
+    pub head_dim: HeadDim,
+    pub scale: AttnScale,
+    pub window: Option<AttnWindow>,
+}
+
+impl AttnRowBf16 {
+    /// The attention it computes, at its one row.
+    pub const fn prefill(&self) -> AttnPrefillBf16 {
+        AttnPrefillBf16 {
+            q: self.q,
+            block_table: self.block_table,
+            sequence: self.sequence,
+            out: self.out,
+            layer: self.layer,
+            rows: Rows(1),
+            q_heads: self.q_heads,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+            window: self.window,
+        }
+    }
 }
 
 /// Where a decode attention's split partials lie in the tape's split scratch
@@ -1834,7 +1920,7 @@ pub struct AttnDecodeScratch {
 impl AttnDecodeBf16 {
     /// `attn` at its head dim's split and that split's scratch; `None` at a head dim with no decode
     /// kernel, or when the scratch overflows `u64`.
-    pub const fn of(attn: AttnPrefillBf16) -> Option<Self> {
+    pub const fn of(attn: AttnRowBf16) -> Option<Self> {
         let Some(split) = attn_decode_split_at(attn.head_dim.get()) else {
             return None;
         };
@@ -3694,8 +3780,8 @@ impl CudaStep {
                 })
             }
             // The norm's; its quantization is its second part's ([`Self::parts`]).
-            Self::RmsNormQuantFp8(t) => Self::RmsNorm(t.norm).extents(),
-            Self::AddRmsNormQuantFp8(t) => Self::AddRmsNorm(t.fold).extents(),
+            Self::RmsNormQuantFp8(t) => Self::RmsNorm(t.norm.norm()).extents(),
+            Self::AddRmsNormQuantFp8(t) => Self::AddRmsNorm(t.fold.fold()).extents(),
             // The norm's gain and both inputs; the sum, then the norm.
             Self::AddRmsNorm(f) => {
                 let RmsNormBf16 {
@@ -3886,21 +3972,6 @@ impl CudaStep {
                 q_heads,
                 head_dim,
                 ..
-            })
-            | Self::AttnDecode(AttnDecodeBf16 {
-                attn:
-                    AttnPrefillBf16 {
-                        q,
-                        block_table,
-                        sequence,
-                        out,
-                        layer,
-                        rows,
-                        q_heads,
-                        head_dim,
-                        ..
-                    },
-                ..
             }) => {
                 let Some(cols) = q_heads.get().checked_mul(head_dim.get()) else {
                     return None;
@@ -3923,6 +3994,8 @@ impl CudaStep {
                     in_place: false,
                 })
             }
+            // The prefill attention's at its one row.
+            Self::AttnDecode(d) => Self::AttnPrefill(d.attn.prefill()).extents(),
             // The GDN step's reads and its output; no scratch (`kernels/gdn_decode.cu`).
             Self::GdnDecode(g) => {
                 let Some(e) = Self::GatedDeltaNet(GdnPrefillBf16::of(g)).extents() else {
@@ -4399,13 +4472,13 @@ impl CudaStep {
                 ..
             })
             | Self::RmsNormQuantFp8(RmsNormQuantFp8 {
-                norm: RmsNormBf16 { gain, .. },
+                norm: NormRowBf16 { gain, .. },
                 ..
             })
             | Self::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
                 fold:
-                    AddRmsNormBf16 {
-                        norm: RmsNormBf16 { gain, .. },
+                    AddNormRowBf16 {
+                        norm: NormRowBf16 { gain, .. },
                         ..
                     },
                 ..

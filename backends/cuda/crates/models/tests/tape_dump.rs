@@ -419,12 +419,12 @@ fn step_record(s: &CudaStep) -> Value {
         ),
         CudaStep::RmsNormQuantFp8(t) => (
             "rms_norm_quant_row",
-            json!({"norm": norm(&t.norm), "q": off(t.q)}),
+            json!({"norm": norm(&t.norm.norm()), "q": off(t.q)}),
             Value::Null,
         ),
         CudaStep::AddRmsNormQuantFp8(t) => (
             "rms_norm_quant_row (with the add)",
-            json!({"fold": add_norm(&t.fold), "q": off(t.q)}),
+            json!({"fold": add_norm(&t.fold.fold()), "q": off(t.q)}),
             Value::Null,
         ),
         CudaStep::RmsNormUnit(n) => (
@@ -492,7 +492,7 @@ fn step_record(s: &CudaStep) -> Value {
                     at,
                     "the split scratch"
                 );
-                attn(&a.attn)
+                attn(&a.attn.prefill())
             },
             json!({"attn_decode_split": [a.split.splits, a.split.min_tiles]}),
         ),

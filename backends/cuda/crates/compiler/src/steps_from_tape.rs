@@ -9,6 +9,7 @@
 //! (E0004) as it does in the colour rule. Each opcode issue moves exactly one variant out of the
 //! refusing arm into an arm of its own.
 
+use scratchy_target_cuda::step::AttnRowBf16;
 use scratchy_target_cuda::step::{
     AttnWindow, Cols, ConvDim, ConvKernel, GdnHeadDim, GdnHeads, GdnLayout, HeadDim, HiddenSize,
     KDim, LayerId, NDim, NTile, NumExperts, NumKvHeads, NumQHeads, RotDim, Rows, TopK, VocabSize,
@@ -1498,7 +1499,20 @@ fn attention_step(
     match rows {
         // A decode bucket's attention at its head dim's split over keys (W6b).
         1 => {
-            AttnDecodeBf16::of(attn)
+            // The one row the decode attention computes.
+            let row = AttnRowBf16 {
+                q: attn.q,
+                block_table: attn.block_table,
+                sequence: attn.sequence,
+                out: attn.out,
+                layer: attn.layer,
+                q_heads: attn.q_heads,
+                kv_heads: attn.kv_heads,
+                head_dim: attn.head_dim,
+                scale: attn.scale,
+                window: attn.window,
+            };
+            AttnDecodeBf16::of(row)
                 .map(CudaStep::AttnDecode)
                 .ok_or(CanonicalRefusal::AttnShape {
                     step,

@@ -19,6 +19,7 @@
 //!
 //! [`steps_from_tape`]: crate::steps_from_tape
 
+use scratchy_target_cuda::step::{AddNormRowBf16, NormRowBf16};
 use scratchy_target_cuda::step::{
     AttnWindow, Cols, FreqDim, HeadDim, HiddenSize, IntermediateSize, MaxTiles, NDim, NumExperts,
     NumKvHeads, RotDim, Rows, TileRows, TopK, VocabSize,
@@ -2029,6 +2030,19 @@ pub(crate) fn fold_expert_gate_up(steps: Vec<CudaStep>) -> Vec<CudaStep> {
     out
 }
 
+/// `n` as the one row it is: only the fold below calls it, where `norm_row_takes` held (one row).
+const fn norm_row(n: RmsNormBf16) -> NormRowBf16 {
+    NormRowBf16 {
+        x: n.x,
+        gain: n.gain,
+        y: n.y,
+        cols: n.cols,
+        eps: n.eps,
+        convention: n.convention,
+        kernel: n.kernel,
+    }
+}
+
 /// A one-row norm or add-norm whose `y` the next step quantizes, with that quant write folded in
 /// (FP8 S8 N3, [`norm_row_takes`]): one launch writes the norm and its quantization, one step
 /// fewer. Every other step is as it was; the quant scratch holds what it held, at the same step.
@@ -2040,12 +2054,23 @@ fn fold_norm_quants(steps: Vec<CudaStep>) -> Vec<CudaStep> {
     for s in steps {
         let fused = match (out.last(), s) {
             (Some(&CudaStep::RmsNorm(norm)), CudaStep::QuantRowsFp8(q)) if folds(norm, q) => {
-                CudaStep::RmsNormQuantFp8(RmsNormQuantFp8 { norm, q: q.q })
+                CudaStep::RmsNormQuantFp8(RmsNormQuantFp8 {
+                    norm: norm_row(norm),
+                    q: q.q,
+                })
             }
             (Some(&CudaStep::AddRmsNorm(fold)), CudaStep::QuantRowsFp8(q))
                 if folds(fold.norm, q) =>
             {
-                CudaStep::AddRmsNormQuantFp8(AddRmsNormQuantFp8 { fold, q: q.q })
+                CudaStep::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
+                    fold: AddNormRowBf16 {
+                        a: fold.a,
+                        b: fold.b,
+                        sum: fold.sum,
+                        norm: norm_row(fold.norm),
+                    },
+                    q: q.q,
+                })
             }
             _ => {
                 out.push(s);

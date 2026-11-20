@@ -1490,7 +1490,7 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     };
     assert_eq!(
         (
-            a.rows,
+            a.prefill().rows,
             a.q_heads,
             a.kv_heads,
             a.head_dim,
@@ -2675,13 +2675,16 @@ fn a_sliding_layer_lowers_with_its_class() {
             match *step {
                 CudaStep::Rope(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
                 CudaStep::RopeAppend(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
-                CudaStep::AttnPrefill(a) | CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => {
-                    assert_eq!(
-                        a.window,
-                        Some(scratchy_target_cuda::step::AttnWindow(1024)),
-                        "m={m}"
-                    )
-                }
+                CudaStep::AttnPrefill(a) => assert_eq!(
+                    a.window,
+                    Some(scratchy_target_cuda::step::AttnWindow(1024)),
+                    "m={m}"
+                ),
+                CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => assert_eq!(
+                    a.window,
+                    Some(scratchy_target_cuda::step::AttnWindow(1024)),
+                    "m={m}"
+                ),
                 _ => {}
             }
         }

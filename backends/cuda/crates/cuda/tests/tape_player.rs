@@ -59,6 +59,7 @@ use scratchy_target_cuda::runtime::{
     BlockId, CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input,
     KvHalf, KvPoolConfig, KvSequence, SlotId, WorkerError,
 };
+use scratchy_target_cuda::step::AttnRowBf16;
 use scratchy_target_cuda::step::MatmulKernel;
 use scratchy_target_cuda::step::Matvec;
 use scratchy_target_cuda::step::{
@@ -2828,7 +2829,7 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
         );
         pass &= ok && below == 0 && appended == 0 && finite;
     }
-    pass &= decode.rows == Rows(1)
+    pass &= decode.prefill().rows == Rows(1)
         && decode.scale == scratchy_target_cuda::step::AttnScale::new(0.0625);
     assert!(
         pass,
@@ -3789,7 +3790,7 @@ fn unwindowed(t: &CudaTape) -> CudaTape {
                 CudaStep::AttnPrefill(AttnPrefillBf16 { window: None, ..a })
             }
             CudaStep::AttnDecode(AttnDecodeBf16 { attn: a, .. }) => CudaStep::AttnDecode(
-                AttnDecodeBf16::of(AttnPrefillBf16 { window: None, ..a })
+                AttnDecodeBf16::of(AttnRowBf16 { window: None, ..a })
                     .expect("a head dim with a decode kernel"),
             ),
             s => s,
