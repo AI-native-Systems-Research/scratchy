@@ -24,7 +24,8 @@ pub struct Run {
     /// Models the runner left out on this machine, and why (memory).
     #[serde(default)]
     pub skipped_models: Option<Vec<Skipped>>,
-    /// The file it was read from, for the link to it.
+    /// The file it was read from, relative to the site's root: where it is published, and what its
+    /// runs table row links to.
     #[serde(skip)]
     pub file: PathBuf,
 }
