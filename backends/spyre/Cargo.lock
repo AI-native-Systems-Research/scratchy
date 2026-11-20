@@ -1632,6 +1632,7 @@ dependencies = [
  "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "serde_json",
 ]

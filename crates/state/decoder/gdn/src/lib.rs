@@ -5,6 +5,8 @@
 //! Mamba-2 runs on the same pool, so this crate serves both. It names no backend: the kernels, the
 //! lowering and the snapshot traffic stay in each target.
 
+pub mod layout;
 pub mod pool;
+pub mod slots;
 
 pub use pool::{GDN_CONV_AND_RECORD_DTYPE, GdnStatePool};

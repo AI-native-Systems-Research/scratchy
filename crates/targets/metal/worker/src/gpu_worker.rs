@@ -27,8 +27,8 @@ use scratchy_serving_scheduler::scheduler::output::{
 };
 use tracing::info;
 
-use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::VerifySeqs;
+use scratchy_state_decoder_gdn::slots::{GdnRow, GdnSlotAllocator};
 use scratchy_target_metal::dtype::DType as GpuDType;
 use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
 use scratchy_target_metal::kv_cache::KvCachePool;
@@ -668,7 +668,7 @@ fn draft_budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudg
 /// target's kernels keep no draft state).
 fn gdn_draft_lanes(
     verify_seqs: VerifySeqs,
-    cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
+    cfg: &scratchy_state_decoder_gdn::layout::GdnRuntimeConfig,
     max_num_seqs: usize,
 ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
     use scratchy_target_metal::gdn_state::DraftLanes;
@@ -1484,7 +1484,7 @@ impl MetalWorker {
     /// width: what its pool allocates and its budget reserves.
     fn gdn_lanes(
         &self,
-        cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
+        cfg: &scratchy_state_decoder_gdn::layout::GdnRuntimeConfig,
     ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
         gdn_draft_lanes(self.config.verify_seqs, cfg, self.max_num_seqs_resolved())
     }
