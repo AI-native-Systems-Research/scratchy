@@ -3601,10 +3601,11 @@ mod tests {
         let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURES);
         let history = site.root.join(super::HISTORY);
         std::fs::create_dir_all(&history).unwrap();
-        gzip(
-            &fixtures.join(replaced),
-            &history.join(format!("{replaced}.gz")),
-        );
+        std::fs::copy(
+            fixtures.join(format!("{replaced}.gz")),
+            history.join(format!("{replaced}.gz")),
+        )
+        .unwrap();
         let assets = crate::chrome::Published {
             styles: String::new(),
             favicon: String::new(),
