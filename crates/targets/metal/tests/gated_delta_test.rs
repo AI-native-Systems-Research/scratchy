@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Golden tests for the Gated-DeltaNet Metal kernels, validated against
-//! reference math that mirrors `scratchy_forward_compiler::cpu_golden::gdn_*` (the
-//! canonical oracle, itself pinned to transformers + mlx-lm). The reference
-//! is inlined here because `cpu_golden` lives in `scratchy-forward-compiler`, which
-//! `scratchy-target-metal` cannot depend on (wrong direction), and the
-//! `scratchy-forward-compiler` lib-test target is independently pre-broken.
+//! reference math: the canonical oracle `scratchy_target_metal::cpu_golden::gdn_*` (itself pinned
+//! to transformers + mlx-lm), which lives in `scratchy-state-decoder-gdn`. The conv1d, gating and
+//! gated-norm references are that oracle called directly. The scan reference stays inlined
+//! (`recurrent_ref`) because it also rounds its state through the pool's slot dtype at step
+//! boundaries, which the oracle does not.
 //!
 //! Each kernel is dispatched standalone via `SpecializedPipelineCache` +
 //! `get_or_build` (the same path production uses through
@@ -17,6 +17,9 @@ mod common;
 use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::{bake, baked_build};
+use scratchy_target_metal::cpu_golden::{
+    GatingInputs, gdn_causal_conv1d, gdn_gating, gdn_rms_norm_gated,
+};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
     CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots,
@@ -305,8 +308,8 @@ fn dispatch_scan(
     Some(read_f32(&o_buf, num_tokens * value_dim))
 }
 
-/// CPU reference mirroring `cpu_golden::gdn_causal_conv1d` (single fresh seq,
-/// zero left-pad, +SiLU). `weight` is `[conv_dim, kernel]`.
+/// `cpu_golden::gdn_causal_conv1d` for a single fresh seq (zero left-pad, +SiLU). `weight` is
+/// `[conv_dim, kernel]`.
 fn conv1d_ref(
     x: &[f32],
     weight: &[f32],
@@ -315,18 +318,7 @@ fn conv1d_ref(
     num_tokens: usize,
 ) -> Vec<f32> {
     let mut out = vec![0f32; num_tokens * conv_dim];
-    for t in 0..num_tokens {
-        for c in 0..conv_dim {
-            let mut acc = 0.0f32;
-            for j in 0..kernel {
-                let ti = t as isize - (kernel as isize - 1) + j as isize;
-                if ti >= 0 {
-                    acc += weight[c * kernel + j] * x[ti as usize * conv_dim + c];
-                }
-            }
-            out[t * conv_dim + c] = acc / (1.0 + (-acc).exp());
-        }
-    }
+    gdn_causal_conv1d(x, weight, &mut out, conv_dim, kernel, num_tokens, true);
     out
 }
 
@@ -349,17 +341,17 @@ fn gdn_gating_matches_reference() {
     let a_log = fill(nv);
     let dt_bias = fill(nv);
 
-    // Reference (mirrors cpu_golden::gdn_gating).
-    let softplus = |x: f32| if x <= 20.0 { x.exp().ln_1p() } else { x };
     let mut g_ref = vec![0f32; n];
     let mut beta_ref = vec![0f32; n];
-    for ti in 0..t {
-        for h in 0..nv {
-            let idx = ti * nv + h;
-            g_ref[idx] = -(a_log[h].exp()) * softplus(a[idx] + dt_bias[h]);
-            beta_ref[idx] = 1.0 / (1.0 + (-b[idx]).exp());
-        }
-    }
+    let gating = GatingInputs {
+        a: &a,
+        b: &b,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        num_heads: nv,
+        num_tokens: t,
+    };
+    gdn_gating(&gating, &mut g_ref, &mut beta_ref);
 
     let key = PipelineKey::new(
         "gdn_gating",
@@ -434,18 +426,8 @@ fn gdn_rms_norm_gated_matches_reference() {
     let z = fill(total_rows * d);
     let weight = fill(d);
 
-    // Reference (mirrors cpu_golden::gdn_rms_norm_gated).
     let mut out_ref = vec![0f32; total_rows * d];
-    for r in 0..total_rows {
-        let row = &x[r * d..][..d];
-        let var = row.iter().map(|&v| v * v).sum::<f32>() / d as f32;
-        let inv = 1.0 / (var + eps).sqrt();
-        for i in 0..d {
-            let zi = z[r * d + i];
-            let silu_z = zi / (1.0 + (-zi).exp());
-            out_ref[r * d + i] = row[i] * inv * weight[i] * silu_z;
-        }
-    }
+    gdn_rms_norm_gated(&x, &z, &weight, &mut out_ref, d, total_rows, eps);
 
     let key = PipelineKey::new(
         "gdn_rms_norm_gated",
