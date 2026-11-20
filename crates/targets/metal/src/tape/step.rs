@@ -408,11 +408,39 @@ pub struct HeadMatmul {
     pub output: Slot,
     pub layer: LayerId,
     pub heads: super::ids::NumQHeads,
-    /// A head's part of an input row: its `k` dotted lanes, then any it leaves.
-    pub in_stride: super::ids::RowStride,
-    pub k: KDim,
+    pub lanes: HeadLanes,
     pub n: NDim,
     pub weight: HeadWeight,
+}
+
+/// A head's part of a per-head matmul's input row: its `stride` lanes, the first `k` of them
+/// dotted. Minted only where `0 < k <= stride`, so a head's dot never reads its neighbour's lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadLanes {
+    k: KDim,
+    stride: super::ids::RowStride,
+}
+
+impl HeadLanes {
+    /// The lanes of each of `heads` equal parts of a `cols`-wide row, the first `k` dotted; `None`
+    /// unless the parts are equal and each holds its `k`.
+    pub const fn of(k: u32, cols: u32, heads: u32) -> Option<Self> {
+        match heads > 0 && cols.is_multiple_of(heads) && 0 < k && k <= cols / heads {
+            true => Some(Self {
+                k: KDim(k),
+                stride: super::ids::RowStride(cols / heads),
+            }),
+            false => None,
+        }
+    }
+
+    pub const fn k(self) -> KDim {
+        self.k
+    }
+
+    pub const fn stride(self) -> super::ids::RowStride {
+        self.stride
+    }
 }
 
 /// A captured layer's block of the rows a drafter reads: block `slot` of `slots`.

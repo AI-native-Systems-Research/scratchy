@@ -140,6 +140,13 @@ pub enum Refused {
     /// A collective: metal runs one rank, where tensor parallelism weaves none in, so a node
     /// here is a sharded forward handed to the metal tape — a wiring bug, never a missing kernel.
     Collective,
+    /// A per-head matmul whose `cols`-wide input row splits into no `heads` equal parts holding
+    /// its `k` dotted lanes each ([`scratchy_target_metal::tape::step::HeadLanes`]).
+    HeadLanes {
+        k: u32,
+        cols: u32,
+        heads: u32,
+    },
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -2440,13 +2447,22 @@ impl Recording<'_> {
                         return Err(self.no(i, Refused::Fp8Gemm));
                     }
                 };
+                let lanes = st::HeadLanes::of(k, in_cols, heads.get()).ok_or_else(|| {
+                    self.no(
+                        i,
+                        Refused::HeadLanes {
+                            k,
+                            cols: in_cols,
+                            heads: heads.get(),
+                        },
+                    )
+                })?;
                 let step = S::HeadMatmul(st::HeadMatmul {
                     input,
                     output: out,
                     layer: self.layer(e),
                     heads: scratchy_target_metal::tape::ids::NumQHeads(heads.get()),
-                    in_stride: scratchy_target_metal::tape::ids::RowStride(in_cols / heads.get()),
-                    k: st::KDim(k),
+                    lanes,
                     n: st::NDim(n),
                     weight,
                 });
