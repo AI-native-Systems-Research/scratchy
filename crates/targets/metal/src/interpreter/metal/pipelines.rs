@@ -580,6 +580,12 @@ mod tests {
                 | KernelId::GateSplit
                 | KernelId::GateScale
                 | KernelId::GatedDeltaNet
+                | KernelId::SliceCols
+                | KernelId::HeadMatmul
+                | KernelId::MlaRopeQ
+                | KernelId::MlaAppend
+                | KernelId::MlaAttend
+                | KernelId::MlaAttendMerge
                 | KernelId::CaptureRows
                 | KernelId::DraftConv
                 | KernelId::DraftAttentionQkv
@@ -789,6 +795,12 @@ mod tests {
             | KernelId::GateSplit
             | KernelId::GateScale
             | KernelId::GatedDeltaNet
+            | KernelId::SliceCols
+            | KernelId::HeadMatmul
+            | KernelId::MlaRopeQ
+            | KernelId::MlaAppend
+            | KernelId::MlaAttend
+            | KernelId::MlaAttendMerge
             | KernelId::CaptureRows
             | KernelId::DraftConv
             | KernelId::DraftAttentionQkv
