@@ -3182,7 +3182,6 @@ mod tests {
                     let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                     c.prompt_tokens = Some(vec![Some(3200); n]);
                     c.timed_answers = forced;
-                    c.thinking_answers = Some(0);
                     c.capped_answers = Some(0);
                     c.accuracy = Some(0.5);
                     c.task_right = Some((0..n).map(|k| Some(k % 2 == 0)).collect());
@@ -3236,25 +3235,15 @@ mod tests {
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("no energy on one side"));
         assert!(!html.contains("each cell&#39;s whole"));
-        // A cell the accuracy table does not score has no joules a correct answer: its square
-        // says why, as the table does, and names the side. Most of scratchy's answers cut off:
+        // A cell's answers cut off at the length limit, every one, are still its answers: its
+        // accuracy, and so its joules a correct answer, stand.
         shape(&mut runs, false, true);
         for c in runs[0].models[0].tasks.iter_mut().flatten() {
             c.capped_answers = c.completed;
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("scratchy: cut off: 8 of 8 answers hit the length limit"));
-        assert!(!html.contains("×1.80 vs oMLX"), "no square has a ratio");
-        // Most of oMLX's answered in reasoning:
-        shape(&mut runs, false, true);
-        for c in runs[0].models[0].tasks_omlx.iter_mut().flatten() {
-            c.thinking_answers = c.completed;
-        }
-        let machines = super::index(&runs);
-        let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("oMLX: answered in reasoning: 16 of 16"));
-        assert!(!html.contains("×1.80 vs oMLX"), "no square has a ratio");
+        assert!(html.contains("×1.80 vs oMLX"), "cut off, and still scored");
     }
 
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
@@ -3401,7 +3390,7 @@ mod tests {
         let m = &mut runs[0].models[0];
         let cell = |acc: f64, capped: u32| -> super::data::TaskCell {
             serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
-                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "completed": 400, "num_tasks": 400, "accuracy": acc,
                 "capped_answers": capped, "median_ttft_ms": 4000.0,
                 "accuracy_by_group": {"2": 0.3, "3": 0.2, "4": 0.1}}))
             .unwrap()
@@ -3418,15 +3407,12 @@ mod tests {
         assert!(html.contains("25% ±4.2"), "scratchy's, with its range");
         assert!(html.contains("2-hop 30%, 3-hop 20%, 4-hop 10%"));
         assert!(
-            html.contains("cut off: 331 of 400 answers hit the length limit"),
-            "oMLX's, held back"
+            html.contains("10% ±2.9"),
+            "oMLX's, 331 of its 400 answers cut off, shown all the same"
         );
         // Above the table, a plot: scratchy's dot over its range, oMLX's reason on its own line.
         assert!(html.contains("Each dot is an engine"), "the plot's note");
-        assert!(
-            html.contains("oMLX: 331 of 400 cut off"),
-            "a held-back mark says why, in short"
-        );
+        assert!(!html.contains("cut off:"), "no mark is held back");
         assert!(html.contains("left: 25.00%"), "scratchy's dot at its 25%");
         assert!(
             at("Each dot is an engine") < at("Table view"),
@@ -3893,7 +3879,7 @@ mod tests {
         let m = &mut runs[0].models[0];
         let cell = |acc: f64| -> super::data::TaskCell {
             serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
-                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "completed": 400, "num_tasks": 400, "accuracy": acc,
                 "capped_answers": 0, "median_ttft_ms": 4000.0}))
             .unwrap()
         };
@@ -3940,7 +3926,7 @@ mod tests {
         tasks.push(
             serde_json::from_value(serde_json::json!({
                 "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
-                "accuracy": 0.48, "thinking_answers": 0, "capped_answers": 0,
+                "accuracy": 0.48, "capped_answers": 0,
                 "median_ttft_ms": 4000.0,
             }))
             .unwrap(),
@@ -3970,7 +3956,7 @@ mod tests {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let cell: super::data::TaskCell = serde_json::from_value(serde_json::json!({
             "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
-            "accuracy": 0.48, "thinking_answers": 0, "capped_answers": 0,
+            "accuracy": 0.48, "capped_answers": 0,
             "median_ttft_ms": 4000.0, "median_e2el_ms": 7500.0, "mean_output_tokens": 23.0,
             "accuracy_by_group": {"2": 0.53, "3": 0.46, "4": 0.38},
         }))
@@ -4412,7 +4398,7 @@ mod tests {
             let id = |i: usize| format!("{}{i}", if other { "x" } else { "t" });
             serde_json::json!({"workload": "rag", "conc": 4, "load": "users",
                 "completed": n, "failed": 0, "num_tasks": n, "timed_answers": false,
-                "accuracy": 0.5, "capped_answers": 0, "thinking_answers": 0,
+                "accuracy": 0.5, "capped_answers": 0,
                 "task_share": share,
                 "task_ids": (0..n).map(id).collect::<Vec<_>>(),
                 "task_groups": (0..n).map(|i| 2 + (i % 3)).collect::<Vec<_>>(),
@@ -4509,7 +4495,6 @@ mod tests {
                     _ => 3,
                 };
                 c.timed_answers = false;
-                c.thinking_answers = Some(0);
                 c.task_share = Some(format!("{k}/3"));
                 c.accuracy = Some(base + 0.01 * f64::from(k));
                 c.num_tasks = Some(100);

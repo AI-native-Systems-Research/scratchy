@@ -1030,14 +1030,10 @@ fn summary_map(
                 if ours.timed_answers || theirs.timed_answers {
                     return Err("answers forced to a length, so not scored".into());
                 }
-                // A cell the accuracy table does not score, its answers mostly cut off or in
-                // reasoning without the other side's matching, has no joules a correct answer
+                // A cell the accuracy table shows no accuracy for has no joules a correct answer
                 // either: the side's reason, as there.
-                for (side, c, other) in [
-                    ("scratchy", *ours, Some(*theirs)),
-                    (rival.label(), *theirs, Some(*ours)),
-                ] {
-                    if tasks::accuracy(c, other).is_none() {
+                for (side, c) in [("scratchy", *ours), (rival.label(), *theirs)] {
+                    if tasks::accuracy(c).is_none() {
                         return Err(format!("{side}: {}", tasks::no_accuracy(c)));
                     }
                 }
@@ -1050,10 +1046,7 @@ fn summary_map(
                         buckets::joules_per_right_in(theirs, bs, b),
                     ),
                     // A run that kept no joules a request: each cell's whole, every bucket alike.
-                    _ => (
-                        tasks::per_right(ours, Some(theirs)),
-                        tasks::per_right(theirs, Some(ours)),
-                    ),
+                    _ => (tasks::per_right(ours), tasks::per_right(theirs)),
                 }
             }
         };
