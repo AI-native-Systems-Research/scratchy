@@ -2525,7 +2525,8 @@ pub fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::step::{GemvBf16, Matmul};
+    use crate::step::GemvBf16;
+    use crate::step::Matvec;
     use crate::step::{KDim, LayerId, NDim, NumQHeads};
     use scratchy_subtile::subtile_ir::GainConvention;
 
@@ -4213,11 +4214,10 @@ mod tests {
         input: TapeInput::Hidden(span(0, 1024)),
         result: span(1024, 2048),
         weight_bytes: &[0, 1048576],
-        steps: &[CudaStep::Gemv(GemvBf16::of(Matmul {
+        steps: &[CudaStep::Gemv(GemvBf16::of(Matvec {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(1024),
-            m: Rows(1),
             n: NDim(1024),
             k: KDim(512),
         }))],
@@ -4249,11 +4249,10 @@ mod tests {
             result: span(0, 2),
             weight_bytes: &[64],
             steps: &const {
-                [CudaStep::Gemv(GemvBf16::of(Matmul {
+                [CudaStep::Gemv(GemvBf16::of(Matvec {
                     a: ArenaOffset(0),
                     b: WeightIx(0),
                     c: ArenaOffset(1024),
-                    m: Rows(1),
                     n: NDim(8),
                     k: KDim(4),
                 }))]

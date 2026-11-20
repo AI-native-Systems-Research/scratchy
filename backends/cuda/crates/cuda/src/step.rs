@@ -961,8 +961,8 @@ pub struct NormAddBf16 {
     pub residual: ArenaOffset,
 }
 
-/// Which kernel a grouped GEMM groups (#1049): the step each member is on its own, and the
-/// grouped step of them.
+/// Which kernel a grouped GEMM groups (#1049): the step each member is on its own
+/// ([`CudaStep::member`]), and the grouped step of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupKind {
     Gemm,
@@ -972,34 +972,6 @@ pub enum GroupKind {
     GemmNarrowFp8,
     GemvFp8,
     GemvTcFp8,
-}
-
-impl GroupKind {
-    /// A member as the step it is on its own (a GEMV at its shape's split, [`GemvBf16::of`]).
-    pub const fn step(self, g: Matmul) -> CudaStep {
-        match self {
-            Self::Gemm => CudaStep::Gemm(GemmBf16::of(g)),
-            Self::GemmNarrow => CudaStep::GemmNarrow(GemmNarrowBf16::of(g)),
-            Self::Gemv => CudaStep::Gemv(GemvBf16::of(g)),
-            Self::GemmFp8 => CudaStep::GemmFp8(GemmFp8::of(g)),
-            Self::GemmNarrowFp8 => CudaStep::GemmNarrowFp8(GemmNarrowFp8::of(g)),
-            Self::GemvFp8 => CudaStep::GemvFp8(GemvFp8::of(g)),
-            Self::GemvTcFp8 => CudaStep::GemvTcFp8(GemvTcFp8::of(GemvFp8::of(g))),
-        }
-    }
-
-    /// The grouped step of `g` (a GEMV group at each member's split, [`GemvGroupBf16::of`]).
-    pub const fn grouped(self, g: MatmulGroup) -> CudaStep {
-        match self {
-            Self::Gemm => CudaStep::GemmGroup(GemmGroupBf16::of(g)),
-            Self::GemmNarrow => CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(g)),
-            Self::Gemv => CudaStep::GemvGroup(GemvGroupBf16::of(g)),
-            Self::GemmFp8 => CudaStep::GemmGroupFp8(GemmGroupFp8::of(g)),
-            Self::GemmNarrowFp8 => CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8::of(g)),
-            Self::GemvFp8 => CudaStep::GemvGroupFp8(GemvGroupFp8::of(g)),
-            Self::GemvTcFp8 => CudaStep::GemvGroupTcFp8(GemvGroupTcFp8::of(g)),
-        }
-    }
 }
 
 /// One weight of a grouped GEMM ([`MatmulGroup`]): `B [n, k]` and its output `C [m, n]`.
@@ -1042,6 +1014,17 @@ impl MatmulGroup {
             k: self.k,
         }
     }
+}
+
+/// Up to three [`Matvec`]s that share `a`, one row: what a `SiblingMatmuls` fold's lowering builds
+/// where its members are GEMVs, and every GEMV group payload's operands. It has no `m`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatvecGroup {
+    pub a: ArenaOffset,
+    pub k: KDim,
+    pub first: GroupMember,
+    pub second: GroupMember,
+    pub third: Option<GroupMember>,
 }
 
 /// One payload per grouped GEMM kernel of `m` rows, each the [`MatmulGroup`] it computes.
@@ -1109,9 +1092,8 @@ pub struct GemvGroupTcFp8 {
 }
 
 impl GemvGroupTcFp8 {
-    /// `g`, one row, on the tensor cores.
-    pub const fn of(g: MatmulGroup) -> Self {
-        assert!(g.m.get() == 1, "a GEMV group computes one row");
+    /// `g` on the tensor cores.
+    pub const fn of(g: MatvecGroup) -> Self {
         Self {
             a: g.a,
             k: g.k,
@@ -1240,6 +1222,18 @@ pub struct Matmul {
     pub k: KDim,
 }
 
+/// `c [1, n] = a [1, k] · B[n, k]ᵀ`, one row: what a matmul's lowering builds where it picks a
+/// GEMV (its one-row arm), and every GEMV payload's operands. It has no `m`: a GEMV is one row by
+/// its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Matvec {
+    pub a: ArenaOffset,
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub n: NDim,
+    pub k: KDim,
+}
+
 /// One payload per tiled GEMM kernel, each the [`Matmul`] it computes: `m` rows, no epilogue.
 macro_rules! gemm_payload {
     ($($(#[$doc:meta])* $name:ident;)*) => {$(
@@ -1325,16 +1319,9 @@ pub struct GemvTcFp8 {
     pub residual: Option<ArenaOffset>,
 }
 
-/// `g`'s one row: a GEMV's kernel rule chose it for one row only.
-const fn one_row(g: Matmul) -> Matmul {
-    assert!(g.m.get() == 1, "a GEMV computes one row");
-    g
-}
-
 impl GemvBf16 {
-    /// `g`, one row, at its shape's split (one pair), no residual.
-    pub const fn of(g: Matmul) -> Self {
-        let g = one_row(g);
+    /// `g` at its shape's split (one pair), no residual.
+    pub const fn of(g: Matvec) -> Self {
         Self {
             a: g.a,
             b: g.b,
@@ -1361,8 +1348,7 @@ impl GemvBf16 {
 
 impl GemvFp8 {
     /// As [`GemvBf16::of`].
-    pub const fn of(g: Matmul) -> Self {
-        let g = one_row(g);
+    pub const fn of(g: Matvec) -> Self {
         Self {
             a: g.a,
             b: g.b,
@@ -1536,9 +1522,8 @@ macro_rules! gemv_group_payload {
         }
 
         impl $name {
-            /// `g`, one row, at each member's split.
-            pub const fn of(g: MatmulGroup) -> Self {
-                assert!(g.m.get() == 1, "a GEMV group computes one row");
+            /// `g` at each member's split.
+            pub const fn of(g: MatvecGroup) -> Self {
                 Self {
                     a: g.a,
                     k: g.k,
@@ -1556,6 +1541,20 @@ macro_rules! gemv_group_payload {
                 MatmulGroup {
                     a: self.a,
                     m: Rows(1),
+                    k: self.k,
+                    first: self.first.member(),
+                    second: self.second.member(),
+                    third: match self.third {
+                        Some(t) => Some(t.member()),
+                        None => None,
+                    },
+                }
+            }
+
+            /// The group without its members' splits.
+            pub const fn matvecs(&self) -> MatvecGroup {
+                MatvecGroup {
+                    a: self.a,
                     k: self.k,
                     first: self.first.member(),
                     second: self.second.member(),
@@ -3079,6 +3078,60 @@ impl CudaStep {
         }
     }
 
+    /// A grouped step's member `i` as the step it is on its own: a multi-row group's as its kernel's
+    /// GEMM, a GEMV group's at its stored split; `None` past its members, or for every other step.
+    pub const fn member(&self, i: usize) -> Option<CudaStep> {
+        if i >= 3 {
+            return None;
+        }
+        macro_rules! rows {
+            ($g:expr, $step:ident, $payload:ident) => {{
+                let g = $g.group();
+                match g.members()[i] {
+                    Some(m) => Some(Self::$step($payload::of(g.member(m)))),
+                    None => None,
+                }
+            }};
+        }
+        macro_rules! row {
+            ($g:expr, $step:ident, $payload:ident) => {{
+                let g = $g;
+                match [Some(g.first), Some(g.second), g.third][i] {
+                    Some(m) => Some(Self::$step($payload {
+                        a: g.a,
+                        b: m.b,
+                        c: m.c,
+                        n: m.n,
+                        k: g.k,
+                        residual: None,
+                        split: m.split,
+                    })),
+                    None => None,
+                }
+            }};
+        }
+        match *self {
+            Self::GemmGroup(g) => rows!(g, Gemm, GemmBf16),
+            Self::GemmNarrowGroup(g) => rows!(g, GemmNarrow, GemmNarrowBf16),
+            Self::GemmGroupFp8(g) => rows!(g, GemmFp8, GemmFp8),
+            Self::GemmNarrowGroupFp8(g) => rows!(g, GemmNarrowFp8, GemmNarrowFp8),
+            Self::GemvGroup(g) => row!(g, Gemv, GemvBf16),
+            Self::GemvGroupFp8(g) => row!(g, GemvFp8, GemvFp8),
+            Self::GemvGroupTcFp8(g) => match [Some(g.first), Some(g.second), g.third][i] {
+                Some(m) => Some(Self::GemvTcFp8(GemvTcFp8 {
+                    a: g.a,
+                    b: m.b,
+                    c: m.c,
+                    n: m.n,
+                    k: g.k,
+                    residual: None,
+                })),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
     /// A grouped GEMM step's kind and group; `None` for every other step.
     pub const fn group(&self) -> Option<(GroupKind, MatmulGroup)> {
         match *self {
@@ -3235,8 +3288,8 @@ impl CudaStep {
     /// whose bits it writes, in order; every other step itself. `CudaTape::validate` checks each
     /// part as a step of its own, and a grouped step's members against each other.
     pub fn parts(&self) -> [Option<CudaStep>; 3] {
-        if let Some((kind, g)) = self.group() {
-            return g.members().map(|m| m.map(|m| kind.step(g.member(m))));
+        if self.group().is_some() {
+            return [self.member(0), self.member(1), self.member(2)];
         }
         // A gate/up step's GEMMs, each its own kernel step, then the activation over their
         // colours: what the chain it folds computes, each part checked as that step.
@@ -3360,8 +3413,8 @@ impl CudaStep {
     pub const fn extents(&self) -> Option<StepExtents> {
         match *self {
             Self::GemmGroup(_) | Self::GemmNarrowGroup(_) | Self::GemvGroup(_) => {
-                match self.group() {
-                    Some((_, g)) => Self::Gemm(GemmBf16::of(g.member(g.first))).extents(),
+                match self.member(0) {
+                    Some(first) => first.extents(),
                     None => None,
                 }
             }
@@ -3370,8 +3423,8 @@ impl CudaStep {
             Self::GemmGroupFp8(_)
             | Self::GemmNarrowGroupFp8(_)
             | Self::GemvGroupFp8(_)
-            | Self::GemvGroupTcFp8(_) => match self.group() {
-                Some((kind, g)) => kind.step(g.member(g.first)).extents(),
+            | Self::GemvGroupTcFp8(_) => match self.member(0) {
+                Some(first) => first.extents(),
                 None => None,
             },
             // The bf16 rows; the e4m3 rows and their scales, the quant scratch.

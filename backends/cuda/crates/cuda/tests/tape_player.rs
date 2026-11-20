@@ -59,8 +59,8 @@ use scratchy_target_cuda::runtime::{
     BlockId, CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input,
     KvHalf, KvPoolConfig, KvSequence, SlotId, WorkerError,
 };
-use scratchy_target_cuda::step::Matmul;
 use scratchy_target_cuda::step::MatmulKernel;
+use scratchy_target_cuda::step::Matvec;
 use scratchy_target_cuda::step::{
     AttnDecodeBf16, CudaStep, GemvBf16, RopeAppendBf16, gdn_bundle, gdn_scratch,
 };
@@ -4923,11 +4923,10 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
     static BAD: std::sync::OnceLock<[CudaTape; 1]> = std::sync::OnceLock::new();
     let tapes = BAD.get_or_init(|| {
         let mut t = whole_arena_tape(4096);
-        t.steps = Box::leak(Box::new([CudaStep::Gemv(GemvBf16::of(Matmul {
+        t.steps = Box::leak(Box::new([CudaStep::Gemv(GemvBf16::of(Matvec {
             a: ArenaOffset(0),
             b: WeightIx(0),
             c: ArenaOffset(1024),
-            m: Rows(1),
             n: NDim(8),
             k: KDim(4),
         }))]));

@@ -1743,7 +1743,7 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
         CudaStep::GemvGroupFp8(g) => {
             let third = g.third.map_or(0, |t| t.n.get());
             match gemv_tc_takes([g.first.n.get(), g.second.n.get(), third], g.k.get(), 1) {
-                true => CudaStep::GemvGroupTcFp8(GemvGroupTcFp8::of(g.group())),
+                true => CudaStep::GemvGroupTcFp8(GemvGroupTcFp8::of(g.matvecs())),
                 false => s,
             }
         }

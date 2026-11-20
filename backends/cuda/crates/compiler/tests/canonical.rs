@@ -9,7 +9,8 @@ use scratchy_subtile::fixtures::{
     rmsnorm_only_input, rope_rotate_only_input, silu_mul_only_input,
 };
 use scratchy_target_cuda::step::Cols;
-use scratchy_target_cuda::step::{GemmNarrowBf16, Matmul};
+use scratchy_target_cuda::step::GemmNarrowBf16;
+use scratchy_target_cuda::step::Matvec;
 use scratchy_target_cuda::step::{KDim, NDim, Rows};
 use std::num::NonZeroU32;
 
@@ -526,11 +527,10 @@ fn a_decode_gemm_lowers_to_the_gemv() {
     let c = lower_canonical(&gemm_m1(1024, 1024), FACTS, AT).expect("the one-row GEMM lowers");
     assert_eq!(
         c.steps,
-        [CudaStep::Gemv(GemvBf16::of(Matmul {
+        [CudaStep::Gemv(GemvBf16::of(Matvec {
             a: ArenaOffset(0),
             b: WeightIx(1),
             c: ArenaOffset(c.colour_offsets[1]),
-            m: Rows(1),
             n: NDim(1024),
             k: KDim(1024),
         }))]

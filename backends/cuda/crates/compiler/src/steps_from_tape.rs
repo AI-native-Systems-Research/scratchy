@@ -17,6 +17,10 @@ use scratchy_target_cuda::step::{
 use scratchy_target_cuda::step::{
     ExpertGateUpActFp8, ExpertGateUpGemvFp8, ExpertGemmFp8, ExpertGemvFp8, ExpertGemvSplitFp8,
 };
+use scratchy_target_cuda::step::{
+    GemmGroupBf16, GemmGroupFp8, GemmNarrowGroupBf16, GemmNarrowGroupFp8, GemvGroupBf16,
+    GemvGroupFp8, GemvGroupTcFp8,
+};
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::{AttnClass, HeadGeometry};
@@ -44,11 +48,11 @@ use scratchy_target_cuda::step::{
     GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpProj, GatedDeltaNetBf16,
     GatedOp, GatherLastRowBf16, GdnPrefillBf16, GemmBf16, GemmCol64Bf16, GemmCol64Fp8, GemmFp8,
     GemmNarrowBf16, GemmNarrowFp8, GemvBf16, GemvFp8, GemvSplit, GroupKind, GroupMember, HeadNorms,
-    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulGroup, MatmulKernel, MoeBank, MoeRouteBf16,
-    MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
-    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ,
-    RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS,
-    ScaleBf16, SiluMulBf16, SoftCapBf16,
+    LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, Matmul, MatmulGroup, MatmulKernel, Matvec, MatvecGroup,
+    MoeBank, MoeRouteBf16, MoeWeight, NormAddBf16, NormKernel, PairRows, RMS_NORM_BF16_COLS,
+    ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
+    RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS,
+    SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::step::{AttnScale, RmsNormEps, Scale, SoftCap};
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
@@ -780,14 +784,37 @@ fn sibling_matmuls(
     if third.len() > 1 {
         return Err(refused());
     }
-    Ok(kind.grouped(MatmulGroup {
+    let (lead, second, third) = (
+        member(&lowered[0]),
+        member(second),
+        third.first().map(member),
+    );
+    let rows = MatmulGroup {
         a: first.a,
         m: first.m,
         k: first.k,
-        first: member(&lowered[0]),
-        second: member(second),
-        third: third.first().map(member),
-    }))
+        first: lead,
+        second,
+        third,
+    };
+    // A GEMV kind's group is one row: each member's lowering picked the GEMV at one row, or the
+    // promotion above did.
+    let row = MatvecGroup {
+        a: first.a,
+        k: first.k,
+        first: lead,
+        second,
+        third,
+    };
+    Ok(match kind {
+        GroupKind::Gemm => CudaStep::GemmGroup(GemmGroupBf16::of(rows)),
+        GroupKind::GemmNarrow => CudaStep::GemmNarrowGroup(GemmNarrowGroupBf16::of(rows)),
+        GroupKind::Gemv => CudaStep::GemvGroup(GemvGroupBf16::of(row)),
+        GroupKind::GemmFp8 => CudaStep::GemmGroupFp8(GemmGroupFp8::of(rows)),
+        GroupKind::GemmNarrowFp8 => CudaStep::GemmNarrowGroupFp8(GemmNarrowGroupFp8::of(rows)),
+        GroupKind::GemvFp8 => CudaStep::GemvGroupFp8(GemvGroupFp8::of(row)),
+        GroupKind::GemvTcFp8 => CudaStep::GemvGroupTcFp8(GemvGroupTcFp8::of(row)),
+    })
 }
 
 /// `MatmulTile` as a bf16 GEMM `C[m, n] = A[m, k] · B[n, k]ᵀ`: the tiled GEMM when `n` is a
@@ -2616,6 +2643,18 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
     Ok(())
 }
 
+/// `g` as the one row its GEMV computes: only the selectors' one-row arms below call it, where
+/// `m == 1` picked the GEMV.
+const fn matvec(g: Matmul) -> Matvec {
+    Matvec {
+        a: g.a,
+        b: g.b,
+        c: g.c,
+        n: g.n,
+        k: g.k,
+    }
+}
+
 /// Which bf16 GEMM takes `(m, n, k)`, as the step constructor: an `n` of at most
 /// [`GEMM_NARROW_BF16_MAX_N`] that is not a multiple of the tile's goes to the narrow GEMM under
 /// its rule ([`gemm_narrow_shape`]) at every `m`, one row included, since its bits for a row do
@@ -2637,7 +2676,7 @@ fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, GemmSha
     }
     if m == 1 {
         gemv_shape(n, k)?;
-        return Ok(|g| CudaStep::Gemv(GemvBf16::of(g)));
+        return Ok(|g| CudaStep::Gemv(GemvBf16::of(matvec(g))));
     }
     gemm_shape(m, n, k)?;
     Ok(|g| CudaStep::Gemm(GemmBf16::of(g)))
@@ -2682,7 +2721,7 @@ fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(Matmul) -> CudaStep, Gem
         });
     }
     Ok(match (m, n) {
-        (1, _) => |g| CudaStep::GemvFp8(GemvFp8::of(g)),
+        (1, _) => |g| CudaStep::GemvFp8(GemvFp8::of(matvec(g))),
         _ if n.is_multiple_of(GEMM_BF16_TILE.1) => |g| CudaStep::GemmFp8(GemmFp8::of(g)),
         _ if n.is_multiple_of(GEMM_COL64_TILE.1) => |g| CudaStep::GemmCol64Fp8(GemmCol64Fp8::of(g)),
         _ if n < GEMM_COL64_TILE.1 && n.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) => {
