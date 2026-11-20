@@ -768,7 +768,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
       # backends/spyre and backends/spyre-hw are their own workspaces, so the root --all above
-      # never reaches them. The site, on its own branch, is format-checked by site-build.yml.
+      # never reaches them. The site, on its own branch, is format-checked by that branch's pages.yml.
       - run: cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
       # backends/spyre-hw is its own workspace too, but `cargo fmt` there resolves the
       # workspace's manifests and its flex-rs path dep reaches for the senlib-rs

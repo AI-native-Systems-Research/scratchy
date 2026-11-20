@@ -91,7 +91,7 @@ jobs:
 
       # The site build reads every field the page needs, so it is the check that the runs render.
       # The site lives on the site branch and reads main's docs and DSLs from the folder above it,
-      # so it goes at site/ in this main checkout, as site-build.yml lays it out. Its lint and
+      # so it goes at site/ in this main checkout, as the site branch's pages.yml lays it out. Its lint and
       # tests read only the renderer's own fixtures, which the runs do not touch: rendering is the
       # check, and the round's PR runs the whole build (pages.yml on the site branch).
       - if: steps.collect.outputs.commit == 'true'
