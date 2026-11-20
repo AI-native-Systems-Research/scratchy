@@ -455,6 +455,8 @@ fn run_loaded(
         weight_bank_bytes: std::borrow::Cow::Owned(Vec::new()),
         // No KV banks: a single kernel's layout places nothing in the KV segment.
         kv_bank_bytes: std::borrow::Cow::Owned(Vec::new()),
+        // And no pool to fund: no bank, no unit bytes — `kv_block_bytes` sums to zero.
+        kv_bank_unit_bytes: std::borrow::Cow::Owned(Vec::new()),
         // No weight tail to spill: a single-kernel bundle's parameters are one region each.
         weight_tail: scratchy_target_spyre::bundle_code::WeightTail::InPlace,
         places: std::borrow::Cow::Owned(places),
