@@ -6344,18 +6344,6 @@ fn lower_one(
             return lower_moe_step(p, block, *step, w, at, moe_scratch_bytes);
         }
 
-        // ── Qwen3.5 Gated-DeltaNet: conv1d → gating → scan → gated-RMSNorm ──
-        //
-        // One coarse op lowers to FOUR compute commands that pass f32
-        // intermediates through the bucket's `moe_scratch` (reused as
-        // generic op-scratch). The final `core` lands in the model-dtype
-        // arena `out_slot` (read by the out_proj gemm). Persistent
-        // conv/ssm state binds from `GdnStatePool` via Runtime bindings
-        // (the KV-cache pattern); per-forward slot indices + is_fresh
-        // come from the worker. `lower` supplies barrier_before=true for
-        // commands 1.. (intra-instruction RAW on conv_out/g/beta/o +
-        // the in-place state rings), so each stage sees the prior one's
-        // writes. Math is the golden-tested cpu_golden recurrence.
         // ── Multi-head latent attention, its column window and its per-head matmul ──
         I::SliceCols(Slot(input), Slot(out), offset, in_width, width) => {
             let n = eff_m * width.get();
@@ -6579,6 +6567,18 @@ fn lower_one(
             };
             return dispatched(vec![attend, merge]);
         }
+        // ── Qwen3.5 Gated-DeltaNet: conv1d → gating → scan → gated-RMSNorm ──
+        //
+        // One coarse op lowers to FOUR compute commands that pass f32
+        // intermediates through the bucket's `moe_scratch` (reused as
+        // generic op-scratch). The final `core` lands in the model-dtype
+        // arena `out_slot` (read by the out_proj gemm). Persistent
+        // conv/ssm state binds from `GdnStatePool` via Runtime bindings
+        // (the KV-cache pattern); per-forward slot indices + is_fresh
+        // come from the worker. `lower` supplies barrier_before=true for
+        // commands 1.. (intra-instruction RAW on conv_out/g/beta/o +
+        // the in-place state rings), so each stage sees the prior one's
+        // writes. Math is the golden-tested cpu_golden recurrence.
         I::GatedDeltaNet(
             Slot(qkv_slot),
             Slot(z_slot),
@@ -7754,9 +7754,9 @@ fn lower_head_matmul(
         function,
         constants: super::kernel_constants::HeadMatmulConstants {
             heads: super::ids::NumQHeads(heads),
-            k: hm.k,
+            k: hm.lanes.k(),
             n_head: super::ids::NDim(n / heads),
-            in_stride: hm.in_stride,
+            in_stride: hm.lanes.stride(),
             simdgroups: super::ids::SimdgroupCount(HEAD_MATMUL_SIMDGROUPS),
             rows_per_simdgroup: super::ids::RowsPerSimdgroup(HEAD_MATMUL_ROWS_PER_SG),
             affine,
