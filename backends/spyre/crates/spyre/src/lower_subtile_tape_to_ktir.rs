@@ -1788,8 +1788,16 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     // (the program's own view strides), read here so the wiring's staged page
                     // ids and the emitted gather descriptors cannot disagree about the layout
                     // they address.
+                    // ⭐ A WALKING program states its page gathers in the walk's body, which only
+                    // [`loop_fold::flatten`] — the same statement the whole-function door lowers —
+                    // states inline: the scale is read off that FLAT node, the one form both doors
+                    // share. A program with no walk flattens to itself, so every dense program
+                    // reads identically.
+                    let flat = ktir_superdsc::emit::loop_fold::flatten(&k)
+                        .map_err(|e| SuperDscError(e.message))?;
+                    let flat_k = flat.as_ref().map(|f| &f.node).unwrap_or(&k);
                     let scale = ktir_superdsc::emit::whole_function::page_index_scale(
-                        &k,
+                        flat_k,
                         scratchy_triton_splice::PagedStepTids::RESERVED.page_table,
                     )
                     .map_err(|e| SuperDscError(e.message))?;
