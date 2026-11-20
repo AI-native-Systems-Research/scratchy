@@ -117,7 +117,7 @@ impl Worker for SpyreWorker {
             let funded = match &mut loaded.session {
                 SendnnSession::SuperDsc(sb) => sb.fund_kv_pool(num_gpu_blocks as u64)?,
             };
-            info!(
+            tracing::info!(
                 "[spyre-worker] KV pool funded at {num_gpu_blocks} page(s) — every layer's bank \
                  allocated at (pages + the null page) × unit bytes and zero-filled; the ladder's \
                  rungs adopted the owner's regions"
@@ -463,6 +463,9 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
+                // Hoisted above the session borrow: the token is read once, before
+                // `sb` holds the model.
+                let funded = model.funded()?;
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
                 let picks = superdsc_forward_packed(
@@ -471,7 +474,7 @@ impl Worker for SpyreWorker {
                     rung,
                     group,
                     input_batch,
-                    model.funded()?,
+                    &funded,
                 )?;
                 for (t, pick) in group.iter().zip(picks) {
                     order.push(t.id.clone());
@@ -630,6 +633,8 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
+                // The token rides beside the shared facts, above the session borrow.
+                let funded = model.funded()?;
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let DecodeSeat { seqs, sess } = sb.decode_seat(ri);
                 tracing::debug!(
@@ -712,7 +717,7 @@ impl Worker for SpyreWorker {
                         want_logits: LogitsWanted::PerRequestDeferred,
                         laws: SeatLaws::Batch { draws: &draws },
                     },
-                    model.funded()?,
+                    &funded,
                 )? {
                     BatchOut::Deferred(sub) => sub,
                     BatchOut::Done(_) => {

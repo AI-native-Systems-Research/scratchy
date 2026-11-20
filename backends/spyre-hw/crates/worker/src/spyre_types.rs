@@ -344,9 +344,11 @@ impl Loaded {
     pub(crate) fn funded(
         &self,
     ) -> scratchy_serving_worker::error::ExecutorResult<
-        &scratchy_target_spyre_card::superdsc_exec::Funded,
+        scratchy_target_spyre_card::superdsc_exec::Funded,
     > {
-        self.funded.as_ref().ok_or_else(|| {
+        // The token is `Copy` and carries no borrow: a launch holds it beside the
+        // mutable session borrow without overlapping it.
+        self.funded.ok_or_else(|| {
             crate::spyre_worker::werr(
                 "the KV pool was never funded — initialize_cache must run before any forward",
             )

@@ -166,6 +166,11 @@ pub(crate) fn run_request_step(
         hidden: model.hidden,
         vocab: model.vocab,
     };
+    // ⭐ THE POOL'S FUNDING, read once up front: the card's launch doors below take the
+    // token (the one runtime edge is `Loaded::funded`; everything under it is compile-gated),
+    // and it is `Copy`, so it rides beside the mutable session borrow without holding one.
+    #[cfg(feature = "spyre-hw")]
+    let funded = model.funded()?;
     // A decode step runs on the smallest rung that reaches the last position this step reaches,
     // so a short context walks the pages it fills rather than the whole pool. A prompt runs its
     // chunks on the prefill rungs (each chunk on the smallest that reaches it, below); `b` is the
@@ -247,6 +252,8 @@ pub(crate) fn run_request_step(
             &mut model.session,
             b,
             model.batched_prefill.as_ref(),
+            #[cfg(feature = "spyre-hw")]
+            &funded,
             Chunk {
                 state: req,
                 id,
@@ -276,17 +283,13 @@ pub(crate) fn run_request_step(
         // logits, no host argmax, anywhere: the idx stick is the only answer that
         // comes back.
         let db = select_decode(&model.decode, start + n);
-        // The card's launch doors take the pool's funding token — the one
-        // runtime edge is `Loaded::funded`, everything below it is compile-gated.
-        #[cfg(feature = "spyre-hw")]
-        let funded = model.funded()?;
         match forward_chunk(
             &sh,
             &mut model.session,
             db,
             model.batched_prefill.as_ref(),
             #[cfg(feature = "spyre-hw")]
-            funded,
+            &funded,
             Chunk {
                 state: req,
                 id,

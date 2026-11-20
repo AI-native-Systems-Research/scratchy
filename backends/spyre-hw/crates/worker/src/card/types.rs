@@ -367,7 +367,9 @@ impl SuperDscBundle {
     pub(crate) fn fund_kv_pool(
         &mut self,
         pages: u64,
-    ) -> ExecutorResult<scratchy_target_spyre_card::superdsc_exec::Funded> {
+    ) -> scratchy_serving_worker::error::ExecutorResult<
+        scratchy_target_spyre_card::superdsc_exec::Funded,
+    > {
         let funded = self
             .decode
             .fund_kv_pool(pages)
