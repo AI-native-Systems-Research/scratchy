@@ -1375,6 +1375,7 @@ impl SpyreWorker {
         // at its width; the rung wave below consumes the SAME picks (borrowers marked before
         // prepare, arenas shared after it), so the charge and the sharing are one statement.
         // `None` on the emulator, which builds no wave.
+        #[cfg(feature = "spyre-hw")]
         #[allow(unused_mut, unused_assignments)]
         let mut family_arenas_o: Option<
             Vec<(
@@ -2757,14 +2758,14 @@ impl SpyreWorker {
                 // host half allocates nothing. This wave reorders WHO ALLOCATES FIRST; it does not
                 // serialize startup, and the aliasing after it is unchanged.
                 let _t_wave = std::time::Instant::now();
-                let ladder_built = match ladder_join.join() {
+                let mut ladder_built = match ladder_join.join() {
                     Ok(v) => v,
                     // A panicked fan-out thread re-panics HERE with its own payload —
                     // the original message and location, not a replacement string.
                     Err(p) => std::panic::resume_unwind(p),
                 };
                 let _t_ladder_join = _t_wave.elapsed();
-                let (prefix_jobs, prefix_built_sessions) = match prefix_join.join() {
+                let (prefix_jobs, mut prefix_built_sessions) = match prefix_join.join() {
                     Ok(v) => v,
                     Err(p) => std::panic::resume_unwind(p),
                 };
@@ -2812,7 +2813,7 @@ impl SpyreWorker {
                         }
                     }
                 }
-                let (ladder_prepared, prefix_prepared, decode_prepared) =
+                let (mut ladder_prepared, mut prefix_prepared, decode_prepared) =
                     std::thread::scope(|scope| {
                         fn joined<R>(hs: Vec<std::thread::ScopedJoinHandle<'_, R>>) -> Vec<R> {
                             hs.into_iter()
