@@ -1,36 +1,82 @@
 name: Pages
 
-# The only workflow that deploys the site. It runs main's site build (site-build.yml on main, which
-# states the build once): it checks out main at the root and this branch at site/, lints, tests,
-# renders, and deploys. It runs on a push to this branch, and main starts it (a workflow_dispatch on
-# this branch) when what the site renders from main changes.
+# The site's one build, and the only workflow that deploys it. The site lives on this branch; it
+# renders files from main (docs/, CONTRIBUTING.md, the DSLs), which it reads from the folder above
+# its own. So this checks out main's head at the root and this branch at site/, then checks
+# formatting, lints, tests and renders the site, and deploys it.
+#
+# It runs on a push to this branch, and main's pages.yml starts it (a dispatch on this branch) when
+# a docs or DSL change merges. A pull request to this branch, or the metal round bot's dispatch on
+# its own branch made from this one, only builds.
 on:
   push:
     branches: [site]
-  # A pull request to this branch (a data PR, a page change) builds the site and checks its links
-  # without deploying.
   pull_request:
     branches: [site]
-  # Started on this branch by main's pages.yml, which deploys; and on a metal round's branch by its
-  # bot (metal-round.yml on main), which only builds: only this branch deploys.
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# One deploy at a time; let an in-flight run finish rather than cancelling it. Anything but this branch (a pull request, or a dispatch on a metal round's branch)
-# only builds, in a group of its own superseded by its next run, so it never queues behind or
-# cancels a deploy.
+# One deploy at a time; let an in-flight run finish rather than cancelling it. Anything but this
+# branch (a pull request, or a dispatch on a metal round's branch) only builds, in a group of its
+# own superseded by its next run, so it never queues behind or cancels a deploy.
 concurrency:
   group: ${{ github.ref == 'refs/heads/site' && github.event_name != 'pull_request' && 'pages' || format('pages-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/site' || github.event_name == 'pull_request' }}
 
 jobs:
-  site:
-    uses: AI-native-Systems-Research/scratchy/.github/workflows/site-build.yml@main
-    with:
-      main_ref: main
-      site_ref: ${{ github.sha }}
-      deploy: ${{ github.ref == 'refs/heads/site' && github.event_name != 'pull_request' }}
+  build:
+    # Forks don't have Pages enabled, so configure-pages would fail there.
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: AI-native-Systems-Research/scratchy
+          ref: main
+
+      - uses: actions/checkout@v7
+        with:
+          path: site
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: site
+
+      # The site crate is its own workspace, so the repo-wide gates in main's rust.yml never see
+      # it: format-check, lint and test it here. --locked: this branch's Cargo.lock is the build's.
+      - name: Format, lint and test the site renderer
+        run: |
+          cargo fmt --manifest-path site/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path site/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path site/Cargo.toml
+
+      - name: Build site
+        run: cargo run --locked --release --manifest-path site/Cargo.toml
+
+      - if: github.ref == 'refs/heads/site' && github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6
+
+      - if: github.ref == 'refs/heads/site' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/_site
+
+  deploy:
+    if: github.ref == 'refs/heads/site' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

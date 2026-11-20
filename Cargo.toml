@@ -7,9 +7,9 @@ publish = false
 description = "Renders the GitHub Pages site into _site at build time."
 
 # The site branch's own workspace, never a member of main's: it is checked out
-# at site/ in a main checkout and built by main's .github/workflows/site-build.yml
-# (called from each branch's .github/workflows/pages.yml), so main's
-# workspace-wide clippy gates never compile a web framework.
+# at site/ in a main checkout and built by this branch's
+# .github/workflows/pages.yml, so main's workspace-wide clippy gates never
+# compile a web framework.
 [workspace]
 
 [dependencies]
