@@ -2014,11 +2014,10 @@ fn task_metrics(
             .filter_map(|(r, t)| right(r, t))
             .collect::<Vec<_>>(),
     );
-    // Answers that carry reasoning: a model's that reasons whatever `enable_thinking` says, or one
-    // whose `enable_thinking: false` did not reach the template (a span query has no template
-    // kwargs). Their accuracy and tokens count the thinking too, so they are not like for like
-    // with a plain answer.
-    let thought = ok.iter().filter(|(r, _)| carries_reasoning(r)).count();
+    // Answers the server sent reasoning with: a model's that reasons whatever `enable_thinking`
+    // says, or one whose `enable_thinking: false` did not reach the template. Their accuracy and
+    // tokens count the thinking too, so they are not like for like with a plain answer.
+    let thought = ok.iter().filter(|(r, _)| r.reasoned).count();
     let capped = ok.iter().filter(|(r, t)| capped(r, t)).count();
     let cached: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
@@ -2157,30 +2156,6 @@ fn add_task_requests(
             })
             .collect::<Vec<_>>()
     );
-}
-
-/// Whether an answer carries reasoning: the server sent some of it as reasoning, in a field of its
-/// own, or its text opens as a thought where nothing marked it as one.
-fn carries_reasoning(r: &RequestResult) -> bool {
-    r.reasoned || opens_as_thought(&r.generated_text)
-}
-
-/// Whether text no field marked as reasoning opens as reasoning rather than the answer: a think
-/// tag or channel header, where a server passes the model's raw output on (mlx_lm.server), or the
-/// openings the matrix's reasoning models write when thinking reaches them as plain text ("We
-/// need to...", "Okay, let's see"), as span queries do.
-fn opens_as_thought(text: &str) -> bool {
-    let t = text.trim_start();
-    [
-        "<think>",
-        "<|channel|>analysis",
-        "We need to",
-        "Okay, let's",
-        "Okay, so",
-        "Let me ",
-    ]
-    .iter()
-    .any(|p| t.starts_with(p))
 }
 
 fn print_task_summary(dataset: &str, j: &serde_json::Value) {
@@ -2765,15 +2740,17 @@ mod tests {
         assert_eq!(j["empty_answers"], 0);
         assert_eq!(j["thinking_answers"], 0);
         assert_eq!(j["capped_answers"], 0);
-        let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
-        let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        // Reasoning is what the server sent as reasoning, whatever its words.
+        let mut thought = answered("We need find the capital. Paris.", 9, None);
+        thought.reasoned = true;
+        let j = task_metrics(&[thought], &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert_eq!(j["thinking_answers"], 1);
-        // gpt-oss's thinking, sent as reasoning, carries it whatever its words: its terser
-        // openings ("We need find...", "We need answer:...") match no opening the text rule knows.
-        let mut terse = answered("We need find the capital. Paris.", 9, None);
-        terse.reasoned = true;
-        let j = task_metrics(&[terse], &tasks[..1], tokenizer, 1.0, "musique", 7);
-        assert_eq!(j["thinking_answers"], 1);
+        let plain = vec![answered("We need to answer: what is the capital?", 9, None)];
+        let j = task_metrics(&plain, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(
+            j["thinking_answers"], 0,
+            "an answer is an answer, whatever its words"
+        );
         let no_usage = vec![answered("Paris", 1, None)];
         let j = task_metrics(&no_usage, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert!(j["mean_cached_tokens"].is_null(), "no count is not zero");
