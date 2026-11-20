@@ -1609,6 +1609,7 @@ pub fn storage_format_for_weight(
             || node.op == OpKind::Moe
             || node.op == OpKind::GemmaMoe
             || node.op == OpKind::GptOssMoe
+            || node.op == OpKind::HeadMatmul
             || (affine_method && node.op == OpKind::Embed);
         if !consumer {
             continue;

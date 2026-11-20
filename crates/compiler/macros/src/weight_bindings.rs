@@ -221,6 +221,8 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
             // tape carries on the gemm itself.
             GemmWeight::Affine { .. } => WeightKind::Linear,
         },
+        // A per-head matmul's blocks load as one linear, every head's rows in order.
+        L::HeadMatmul { .. } => WeightKind::Linear,
         L::RmsNorm { .. } | L::RmsNormUnit { .. } => WeightKind::RmsNorm,
         L::EmbeddingGather { .. } => WeightKind::Embedding,
         L::GatedDeltaNet | L::Mamba2 { .. } => WeightKind::GatedDeltaNet,

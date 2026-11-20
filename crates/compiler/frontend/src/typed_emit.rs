@@ -30,15 +30,19 @@ use crate::weights_manifest::WeightsManifest;
 
 /// The bounds the op signatures in `typed_shapes` name themselves, beside those a `weights.json`
 /// declares. Config vocabulary, shared by every arch.
-pub const SIGNATURE_BOUNDS: [&str; 11] = [
+pub const SIGNATURE_BOUNDS: [&str; 15] = [
     "backbone_hidden_size",
     "global_head_dim",
     "head_dim",
     "hidden_size",
+    "kv_lora_rank",
     "num_attention_heads",
     "num_global_key_value_heads",
     "num_key_value_heads",
     "num_tokens",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "v_head_dim",
     "vision_embed_dim",
     "vision_in_features",
     "vision_rope_half_dim",

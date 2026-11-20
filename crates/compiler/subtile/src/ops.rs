@@ -186,6 +186,21 @@ macro_rules! for_each_subop {
                 rows = [in0], gemm_w = [none], tp = [whole];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none],
                 tp = [rowwise];
+            // Multi-head latent attention. Its cache is runtime-ambient per layer, as a GDN's
+            // state: no operand. The per-head matmul's weight is staged by its own path, not as
+            // a gemm's.
+            SliceCols [SubOp::SliceCols { .. }] arity = (|n| n == 1), cols = [field cols],
+                rows = [in0], gemm_w = [none], tp = [whole];
+            MlaRopeQ [SubOp::MlaRopeQ { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
+                gemm_w = [none], tp = [whole];
+            // `[latent, k_pe]`: the output is the rotated key.
+            MlaAppend [SubOp::MlaAppend { .. }] arity = (|n| n == 2), cols = [in1], rows = [in0],
+                gemm_w = [none], tp = [whole];
+            HeadMatmul [SubOp::HeadMatmul { .. }] arity = (|n| n == 2), cols = [field n],
+                rows = [in0], gemm_w = [none], tp = [whole];
+            // `[q_latent, q, k_pe]`: the output is as wide as the latent queries.
+            MlaAttend [SubOp::MlaAttend { .. }] arity = (|n| n == 3), cols = [in0], rows = [in0],
+                gemm_w = [none], tp = [whole];
             // Inserted by `tensor_parallel::shard` alone — never stated by a front end.
             AllReduce [SubOp::AllReduce] arity = (|n| n == 1), cols = [in0], rows = [in0],
                 gemm_w = [none], tp = [collective];
