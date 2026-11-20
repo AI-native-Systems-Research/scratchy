@@ -1,8 +1,10 @@
 name: Pages
 
-# Main's runs of the site build (site-build.yml, which states the build once). The site and its data
-# live on the site branch, which runs the same build from its own pages.yml; main runs it when what
-# the site renders from main changes.
+# Main never deploys the site. The site and its data live on the site branch, and only the site
+# branch's own pages.yml deploys, so the github-pages environment needs only that branch. When what
+# the site renders from main changes (docs, CONTRIBUTING.md, the DSLs, these workflows), main asks
+# the site branch to rebuild and deploy, and every pull request to main builds the site against the
+# site branch's head without deploying. The build itself is stated once, in site-build.yml.
 on:
   push:
     branches: [main]
@@ -17,24 +19,41 @@ on:
   # can break it.
   pull_request:
     branches: [main]
+  # A manual run on main asks the site branch to rebuild and deploy, as a push does.
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# One deploy at a time, shared with the site branch's Pages runs; let an in-flight run finish rather
-# than cancelling it. Anything but main (a pull request, or a dispatch elsewhere) only builds, in a
-# group of its own superseded by its next run, so it never queues behind or cancels a deploy.
+# A pull request's build is superseded by its next push. Deploys queue on the site branch's side,
+# where its own pages.yml holds the one deploy group.
 concurrency:
-  group: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'pages' || format('pages-{0}', github.ref) }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || github.event_name == 'pull_request' }}
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A push or a manual run on main: start the site branch's Pages run, which builds main's new head
+  # with the site branch and deploys it.
+  redeploy:
+    if: ${{ github.event_name != 'pull_request' && !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref site
+
+  # A pull request: build only. The reusable workflow's deploy job is skipped, but a caller must
+  # still grant the permissions that job declares.
   site:
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     uses: ./.github/workflows/site-build.yml
     with:
       main_ref: ${{ github.sha }}
       site_ref: site
-      deploy: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+      deploy: false
