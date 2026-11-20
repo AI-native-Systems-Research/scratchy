@@ -3,7 +3,8 @@ name = "scratchy-core-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared types, errors, logging, and metrics for vLLM Rust port"
+repository.workspace = true
+description = "Shared types, errors, logging, and metrics for scratchy"
 
 [features]
 default = []

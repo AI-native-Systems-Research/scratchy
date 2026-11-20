@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
-name = "hf-hub-downloader"
+name = "scratchy-hf-hub-downloader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Minimal HuggingFace Hub downloader: parallel ranged fetch into the standard HF cache layout"
+
+# Published as scratchy-hf-hub-downloader, so the name on crates.io carries the scratchy prefix;
+# the library keeps its name, so code still says `hf_hub_downloader`.
+[lib]
+name = "hf_hub_downloader"
 
 # Every dependency here is one we already compile, every one is on a
 # maintained release line, and there are no dev-dependencies at all. That is

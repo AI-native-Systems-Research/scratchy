@@ -3,6 +3,7 @@ name = "scratchy-quantizations"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Shared quantization preset definitions + GGUF (llama.cpp) format support. Presets live in `presets/`; GGUF format-level code in the `gguf` module."
 # `build.rs` publishes the enabled presets to every direct dependent's build script, as
 # `DEP_SCRATCHY_QUANTIZATIONS_PRESETS`.
@@ -71,8 +72,8 @@ mlx = [
 ]
 
 [dependencies]
-scratchy-core-model = { path = "../../core/model" }
-scratchy-tensors = { path = "../../tensors" }
+scratchy-core-model = { workspace = true }
+scratchy-tensors = { workspace = true }
 anyhow = { workspace = true }
 half = { workspace = true }
 rayon = { workspace = true }

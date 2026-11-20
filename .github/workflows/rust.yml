@@ -127,6 +127,14 @@ jobs:
         run: cargo clippy -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
 
+      # The separation-of-concerns guard: outside the target homes (crates/targets/ and
+      # backends/, `TARGET_HOMES` in the test), no crate gates on a target's cfg, has a feature
+      # named for one, or depends on one, and every crate named for a target lives under its
+      # home's <target>/. It reads source and `cargo metadata`, so it builds nothing but
+      # scratchy-tensors.
+      - name: Target-neutrality guard
+        run: cargo test -p scratchy-tensors --test cfg_neutrality
+
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
       # backend, no hardware. Featureless, these are the same crate builds the
@@ -134,6 +142,13 @@ jobs:
       - name: Multi-node control plane tests (no backend feature)
         run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
           --lib -- tcp_store multinode
+
+      # The crates a release publishes to crates.io (every root member without
+      # `publish = false`) still package: each depends only on versioned crates
+      # in that set or on crates.io. A dry run without verification, so it builds
+      # nothing; the release workflow's publish verifies each build.
+      - name: The published crates package
+        run: cargo publish --workspace --dry-run --no-verify
 
       # The scheduler is backend-neutral — its tests need no hardware, and no
       # other step runs them (deps of `-p` test steps don't run transitively,

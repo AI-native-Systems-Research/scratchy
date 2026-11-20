@@ -1209,20 +1209,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "hf-hub-downloader"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "hex",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror",
- "ureq",
-]
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2639,10 +2625,10 @@ name = "scratchy-core-model"
 version = "0.1.0"
 dependencies = [
  "fs2",
- "hf-hub-downloader",
  "indicatif",
  "inventory",
  "scratchy-core-common",
+ "scratchy-hf-hub-downloader",
  "serde",
  "serde_json",
  "thiserror",
@@ -2691,6 +2677,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-hf-hub-downloader"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "scratchy-ir"
 version = "0.1.0"
 dependencies = [
@@ -2732,11 +2732,11 @@ dependencies = [
 name = "scratchy-models-build"
 version = "0.1.0"
 dependencies = [
- "hf-hub-downloader",
  "proc-macro2",
  "rayon",
  "scratchy-core-model",
  "scratchy-forward-compiler-macro",
+ "scratchy-hf-hub-downloader",
  "serde_json",
 ]
 

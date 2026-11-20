@@ -3,6 +3,7 @@ name = "scratchy-target-metal-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "`scr`: the scratchy CLI on Apple silicon — the common CLI core's commands, served through the metal worker"
 
 [features]

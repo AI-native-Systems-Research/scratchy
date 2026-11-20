@@ -3,11 +3,12 @@ name = "scratchy-ir"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Backend-neutral universal interpreter instruction set for scratchy: the closed `Instruction` enum + the per-arch `WeightAccessors` dispatch trait. No backend — names only the neutral tensor/layer type defs the accessors return."
 
 [dependencies]
-scratchy-tensors = { path = "../../tensors" }
+scratchy-tensors = { workspace = true }
 # The tensor-parallel world, as the type a rank's share of the attention is taken for.
-scratchy-tp-world = { path = "../../core/tp-world" }
-scratchy-layers = { path = "../../layers" }
-scratchy-quantizations = { path = "../../models/quantization" }   # AffineQuantEmbedding in WeightAccessors::affine_quant_embedding_at
+scratchy-tp-world = { workspace = true }
+scratchy-layers = { workspace = true }
+scratchy-quantizations = { workspace = true }   # AffineQuantEmbedding in WeightAccessors::affine_quant_embedding_at

@@ -3,6 +3,7 @@ name = "scratchy-target-metal-compiler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Metal's compile-time lowering and emission: the target emitter the shared pipeline calls, SubtileTape -> metal step tape + static tape"
 
 # A COMPILE-TIME crate: the build script of metal's models crate runs it, and it never links into
@@ -12,15 +13,15 @@ description = "Metal's compile-time lowering and emission: the target emitter th
 # The shared pipeline this crate's emitter plugs into (`target::TargetEmitter`), and the passes the
 # emission reads (`to_wavefront`, `codegen`, `weight_bindings`, ...).
 scratchy-forward-compiler-macro = { path = "../../../compiler/macros" }
-scratchy-forward-compiler-frontend = { path = "../../../compiler/frontend" }
+scratchy-forward-compiler-frontend = { workspace = true }
 # The facts the emission states (`KvCodec`, `LentWeight`).
-scratchy-forward-compiler = { path = "../../../compiler" }
-scratchy-subtile = { path = "../../../compiler/subtile" }
+scratchy-forward-compiler = { workspace = true }
+scratchy-subtile = { workspace = true }
 scratchy-target-metal = { path = ".." }
-scratchy-ir = { path = "../../../compiler/ir" }
+scratchy-ir = { workspace = true }
 # `typed::unsigned_path`: the bake states a GEMM's numbers as types. Already in the graph (through
 # scratchy-target-metal).
-scratchy-tensors = { path = "../../../tensors" }
+scratchy-tensors = { workspace = true }
 
 syn = { version = "3", features = ["full"] }
 quote = "1"

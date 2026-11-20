@@ -3,7 +3,8 @@ name = "scratchy-serving-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
+repository.workspace = true
+description = "scratchy's serving front end: OpenAI- and Anthropic-compatible HTTP API (axum), chat templates, tokenization, and tool-call and reasoning parsing"
 
 [features]
 default = []

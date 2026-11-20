@@ -3,6 +3,7 @@ name = "scratchy-vision"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Scratchy vision-tower host glue (rope tables, varlen cu_seqlens, patch flatten, K-pad, trace dump)."
 
 [features]
@@ -12,6 +13,6 @@ description = "Scratchy vision-tower host glue (rope tables, varlen cu_seqlens, 
 default = []
 
 [dependencies]
-scratchy-core-common = { path = "../../core/common" }
+scratchy-core-common = { workspace = true }
 half = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

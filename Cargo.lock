@@ -1326,20 +1326,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "hf-hub-downloader"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "hex",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror",
- "ureq",
-]
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3046,11 +3032,11 @@ name = "scratchy-core-model"
 version = "0.1.0"
 dependencies = [
  "fs2",
- "hf-hub-downloader",
  "indicatif",
  "inventory",
  "safetensors",
  "scratchy-core-common",
+ "scratchy-hf-hub-downloader",
  "serde",
  "serde_json",
  "tempfile",
@@ -3088,9 +3074,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "hf-hub-downloader",
  "inventory",
  "scratchy-core-config",
+ "scratchy-hf-hub-downloader",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-tensors",
@@ -3126,6 +3112,20 @@ dependencies = [
  "syn 3.0.10",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "scratchy-hf-hub-downloader"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror",
+ "ureq",
 ]
 
 [[package]]
@@ -3170,11 +3170,11 @@ dependencies = [
 name = "scratchy-models-build"
 version = "0.1.0"
 dependencies = [
- "hf-hub-downloader",
  "proc-macro2",
  "rayon",
  "scratchy-core-model",
  "scratchy-forward-compiler-macro",
+ "scratchy-hf-hub-downloader",
  "serde_json",
 ]
 
@@ -3401,7 +3401,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
- "hf-hub-downloader",
  "objc2-metal",
  "proc-macro2",
  "scratchy-core-common",
@@ -3409,6 +3408,7 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
+ "scratchy-hf-hub-downloader",
  "scratchy-layers",
  "scratchy-models",
  "scratchy-models-build",
@@ -3454,6 +3454,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "serde_json",
  "typenum",
 ]
 

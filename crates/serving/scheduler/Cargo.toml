@@ -3,7 +3,8 @@ name = "scratchy-serving-scheduler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Scheduler, KV cache management, and block allocation for vLLM Rust port"
+repository.workspace = true
+description = "Scheduler, KV cache management, and block allocation for scratchy"
 
 [dependencies]
 scratchy-core-common = { workspace = true }

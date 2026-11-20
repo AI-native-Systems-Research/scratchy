@@ -1,0 +1,103 @@
+name: Release (crates.io)
+
+# Publishing a GitHub Release publishes the core crates to crates.io: every
+# member of the root workspace without `publish = false`, which is the serving
+# and compiler crates and the core crates they depend on. The target crates
+# (metal, and spyre's own workspaces) are not published. `cargo publish
+# --workspace` uploads them in dependency order and verifies that each builds
+# from its own package first.
+#
+# The release tag must be `v` plus the workspace version (`[workspace.package]
+# version` and the internal rows of `[workspace.dependencies]` in Cargo.toml),
+# so bump that version before cutting a release.
+#
+# A crate whose version is already on crates.io is left out of the publish, so
+# re-running a release that stopped part-way publishes only what is missing,
+# and re-running one that finished publishes nothing. crates.io limits how many
+# NEW crates one account publishes: a burst of 5, then one every 10 minutes.
+# The first release is more new crates than that, so either raise the limit
+# first (below) or expect to re-run it, at least 10 minutes apart, until every
+# crate is up.
+#
+# workflow_dispatch runs the same publish as a dry run, uploading nothing.
+#
+# Before the first release:
+#   CARGO_REGISTRY_TOKEN  a repo secret (Settings → Secrets and variables →
+#                         Actions): a crates.io API token with the publish-new
+#                         and publish-update scopes, from an owner of the crates
+#   the new-crate limit   ask help@crates.io to raise the publishing account's
+#                         new-crate limit to at least the number of crates this
+#                         publishes (`publish != false` members), so the first
+#                         release publishes them in one run
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-crates:
+    name: crates.io (core crates)
+    runs-on: ubuntu-latest
+    # Every action is pinned to a commit: this job publishes to crates.io for good, and an action
+    # that runs before the publish can change what it builds. No build cache either, for the same
+    # reason: a cache another ref wrote would go into what is published, and a release is rare.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
+        with:
+          toolchain: stable
+
+      - name: Check the tag names the workspace version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "scratchy-core-common") | .version')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::release tag $TAG is not v$version, the workspace version"
+            exit 1
+          fi
+
+      # Each crate whose version is already on crates.io is left out: cargo refuses to publish a
+      # version that is up, before it uploads anything, so a release that stopped part-way (the
+      # new-crate limit, a network error) could not be finished by a re-run. The crates left out
+      # are the ones the rest depend on from crates.io.
+      - name: Leave out the crates already on crates.io
+        id: published
+        run: |
+          set -euo pipefail
+          exclude="" remaining=0
+          while read -r name version; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -A "scratchy-release (https://github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/${name}/${version}")"
+            case "$code" in
+              200) echo "already on crates.io: ${name}@${version}"; exclude="${exclude} --exclude ${name}" ;;
+              404) remaining=$((remaining + 1)) ;;
+              *) echo "::error::crates.io answered ${code} for ${name}@${version}"; exit 1 ;;
+            esac
+          done < <(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.publish != []) | "\(.name) \(.version)"')
+          echo "to publish: ${remaining}"
+          echo "exclude=${exclude}" >> "$GITHUB_OUTPUT"
+          echo "remaining=${remaining}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        if: steps.published.outputs.remaining != '0'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # `a && b || c` is an if-else only while `b` is truthy, and '' is not: the empty
+          # value has to be the fallback, or a release would dry-run too.
+          DRY_RUN: ${{ github.event_name != 'release' && '--dry-run' || '' }}
+          EXCLUDE: ${{ steps.published.outputs.exclude }}
+        # Both are word lists: unquoted, each word is one argument.
+        run: cargo publish --workspace --locked $DRY_RUN $EXCLUDE

@@ -3,6 +3,8 @@ name = "scratchy-forward-compiler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Runtime support for the code scratchy's #[forward] compiler emits: the ForwardCtx a forward pass takes, and the Instruction rows of its tape"
 
 [features]
 default = []
@@ -21,10 +23,10 @@ probe = ["dep:hf-hub-downloader", "dep:clap", "dep:ureq", "dep:serde"]
 # target feature and no target dependency — each target crate depends on this one and extends it.
 [dependencies]
 # Backend-neutral tensor core.
-scratchy-tensors = { path = "../tensors" }
+scratchy-tensors = { workspace = true }
 # The cfg-free `Instruction` enum + `WeightAccessors` trait live here so
 # the forward pipeline and every target share one neutral definition.
-scratchy-ir = { path = "ir" }
+scratchy-ir = { workspace = true }
 # `LayerKvGeometry`: a compiled model states each layer's KV geometry (`kv_layer_geometry`) in the
 # type the KV pool layout and the scheduler take.
 scratchy-core-config = { workspace = true }
@@ -34,11 +36,11 @@ scratchy-core-config = { workspace = true }
 # the fn-pointers themselves stay allocator-erased via
 # `scratchy_tensors::GpuWeightsHandle`. Acyclic — scratchy-layers deps only
 # tensors + quantizations + core-model, none of which dep this crate.
-scratchy-layers = { path = "../layers" }
+scratchy-layers = { workspace = true }
 # `scratchy-vision` (backend-neutral vision host glue) supplies
 # `MmMetadata` for the dispatcher's `ScratchyMmRegistration`. Optional and
 # pulled in by the `vision` feature; the crate itself is backend-dep-free.
-scratchy-vision = { path = "../models/vision", optional = true }
+scratchy-vision = { workspace = true, optional = true }
 anyhow = { workspace = true }
 inventory = { workspace = true }
 # Optional deps used only by the `probe-weights` bin under the

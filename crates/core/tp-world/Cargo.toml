@@ -3,6 +3,7 @@ name = "scratchy-tp-world"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "The tensor-parallel world as a type: `TpWorld<N>` and its ranks. No dependencies, no features."
 
 [lib]

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! HTTP serving layer for vLLM Rust port.
+//! scratchy's serving front end.
 //!
-//! Provides an OpenAI-compatible HTTP API server using axum, with endpoints
-//! for chat completions, text completions, model listing, health checks,
-//! and version information.
+//! An OpenAI- and Anthropic-compatible HTTP API server using axum (the `serve`
+//! feature): chat and text completions, responses, messages, embeddings, model
+//! listing, tokenize and detokenize, health checks and version information. It
+//! also holds what every request path shares: chat templates, tokenization, and
+//! tool-call and reasoning parsing.
 //!
 //! Port of: `vllm/entrypoints/openai/` (subset)
 
