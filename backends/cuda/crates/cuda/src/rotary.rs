@@ -14,20 +14,23 @@
 //! from its own position; for text all three positions are the token's, so every band gets the
 //! same angle and the table is this plain one. Image positions (`[3, M]`) are not built here.
 //!
-//! ⛔ NOT SHARED, AND SAID SO. This duplicates metal's table math, which cannot be called from here:
-//! the metal crate links `objc2`. One builder in a shared crate is a follow-up.
+//! The angles are the shared builder's (`scratchy_layers::rotary::rotary_table_rows`, which metal's
+//! per-token table reads too); the bf16 row layout is CUDA's.
 //!
 //! Pure Rust with no toolchain, so its tests run in CI with no GPU.
 
 use half::bf16;
+use scratchy_layers::rotary::RopeFreqDim;
+use scratchy_tensors::{HeadDim, RopeTheta, RotDim};
 
-/// `rope_theta`'s inverse frequency for pair `i` of a table whose exponent's denominator is
-/// `freq_dim` (the rotated width, or a proportional class's head dim).
-fn inv_freq(i: usize, freq_dim: u32, theta: f64) -> f64 {
-    1.0 / theta.powf(2.0 * i as f64 / f64::from(freq_dim))
+/// The shared `rope_inv_freq`: what the tests' references read.
+#[cfg(test)]
+fn inv_freq(i: usize, freq_dim: RopeFreqDim, theta: f64) -> f64 {
+    scratchy_layers::rotary::rope_inv_freq(i, freq_dim, RopeTheta::new(theta))
 }
 
-/// `v` rounded f64 → f32 → bf16 (both round to nearest even), as its bits.
+/// `v` rounded f64 → f32 → bf16 (both round to nearest even), as its bits: the tests' references.
+#[cfg(test)]
 fn to_bf16(v: f64) -> u16 {
     bf16::from_f32(v as f32).to_bits()
 }
@@ -76,14 +79,26 @@ pub fn fill_rotary_rows_with_freq_dim(
         positions.len() * width,
         "the table holds one rot_dim-wide row per position"
     );
-    for (row, &p) in out.chunks_exact_mut(width).zip(positions) {
-        let (cos, sin) = row.split_at_mut(half);
-        for (i, (c, s)) in cos.iter_mut().zip(sin).enumerate() {
-            let angle = f64::from(p) * inv_freq(i, freq_dim, theta);
-            *c = to_bf16(angle.cos());
-            *s = to_bf16(angle.sin());
-        }
-    }
+    // The tape states the denominator as a number: the rotated width, or, above it (the tape
+    // refuses below), a proportional class's head width.
+    let rot = RotDim::new(rot_dim);
+    let freq = if freq_dim == rot_dim {
+        RopeFreqDim::Rot(rot)
+    } else {
+        RopeFreqDim::Head(HeadDim::new(freq_dim))
+    };
+    // The shared builder's f32 `cos` and `sin`, each rounded to bf16 (nearest even).
+    scratchy_layers::rotary::rotary_table_rows(
+        positions.len(),
+        rot,
+        freq,
+        RopeTheta::new(theta),
+        |t, _| positions[t],
+        |t, i, c, s| {
+            out[t * width + i] = bf16::from_f32(c).to_bits();
+            out[t * width + half + i] = bf16::from_f32(s).to_bits();
+        },
+    );
 }
 
 #[cfg(test)]
@@ -101,7 +116,7 @@ mod tests {
     /// The f64 `cos` and `sin` of the f64 angles of `p`'s row.
     fn exact(p: u32, rot_dim: u32) -> Vec<f64> {
         let angles: Vec<f64> = (0..rot_dim as usize / 2)
-            .map(|i| f64::from(p) * inv_freq(i, rot_dim, THETA))
+            .map(|i| f64::from(p) * inv_freq(i, RopeFreqDim::Rot(RotDim::new(rot_dim)), THETA))
             .collect();
         (angles.iter().map(|a| a.cos()))
             .chain(angles.iter().map(|a| a.sin()))
@@ -184,7 +199,7 @@ mod tests {
         let real = rotary_rows(&[1000], R, THETA);
         let wrong: Vec<u16> = {
             let angles: Vec<f64> = (0..R as usize / 2)
-                .map(|i| 1000.0 * inv_freq(i, 256, THETA))
+                .map(|i| 1000.0 * inv_freq(i, RopeFreqDim::Head(HeadDim::new(256)), THETA))
                 .collect();
             (angles.iter().map(|a| to_bf16(a.cos())))
                 .chain(angles.iter().map(|a| to_bf16(a.sin())))
@@ -208,7 +223,9 @@ mod tests {
         assert!(rest.is_empty(), "the table is whole rows");
         for (row, &p) in rows.iter().zip(&positions) {
             let angles: Vec<f64> = (0..R256 as usize / 2)
-                .map(|i| f64::from(p) * inv_freq(i, R256, THETA_LOCAL))
+                .map(|i| {
+                    f64::from(p) * inv_freq(i, RopeFreqDim::Rot(RotDim::new(R256)), THETA_LOCAL)
+                })
                 .collect();
             let exact = (angles.iter().map(|a| a.cos())).chain(angles.iter().map(|a| a.sin()));
             let missed = (row.iter().zip(exact))

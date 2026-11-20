@@ -35,8 +35,9 @@ half = { workspace = true }
 serde = { workspace = true }
 # The weight loader (`weights`, `runtime::load_weights`) reads the checkpoint through the shared
 # safetensors reader, `GpuWeights` (one reader, and the VL name aliases), for its host-side reads
-# only; `scratchy-tensors` holds the `DeviceAllocator` trait its stub allocator implements, and
-# `anyhow` that trait's error type. All three are plain Rust, with no backend code.
+# only; `scratchy-tensors` holds the `DeviceAllocator` trait its stub allocator implements and the
+# rotary facts the shared rotary builder takes, and `anyhow` that trait's error type. All three
+# are plain Rust, with no backend code.
 scratchy-layers = { path = "../../../../crates/layers" }
 scratchy-tensors = { path = "../../../../crates/tensors" }
 anyhow = { workspace = true }
