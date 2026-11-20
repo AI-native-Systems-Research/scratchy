@@ -1813,16 +1813,19 @@ fn plan_field_load(
                             accessor.name,
                         )
                     });
-                    if shape.len() != 2 {
-                        panic!(
+                    // `[K, N]`, or a per-head matmul's `[heads, K, N]` blocks: K is the
+                    // second-to-last dim either way.
+                    let k_dim = match shape.as_slice() {
+                        [k, _] | [_, k, _] => k,
+                        _ => panic!(
                             "accessor `{}`: Affine source weight `{dotted}` has shape len {} \
-                             (expected 2 for a matmul)",
+                             (expected 2 for a matmul, or 3 for a per-head matmul's blocks)",
                             accessor.name,
                             shape.len(),
-                        );
-                    }
-                    let in_f = crate::shape::eval_closed_dim(&shape[0], &model.bounds)
-                        .unwrap_or_else(|| {
+                        ),
+                    };
+                    let in_f =
+                        crate::shape::eval_closed_dim(k_dim, &model.bounds).unwrap_or_else(|| {
                             panic!(
                                 "accessor `{}`: can't resolve in_features for `{dotted}`",
                                 accessor.name,
@@ -4336,7 +4339,7 @@ impl ModelDims {
                 // Every kind, by name: a new `WeightKind` is a compile error here, not a panic in
                 // someone's build.
                 match first.kind {
-                    // Held by the shape handles below (`W1`, `W2`, `Q2`).
+                    // Held by the shape handles below (`W1`, `W2`, `Q2`, `Q3`).
                     WeightKind::Linear
                     // An fp8 per-channel linear (`Fp8AnyLinear`): `[in, out]` with no affine codes,
                     // so the dense rank-2 handle (`W2`) holds it.
@@ -4398,6 +4401,12 @@ impl ModelDims {
                             let (k, n) = (dim(k)?, dim(n)?);
                             let (b, g) = (format_ident!("B{bits}"), format_ident!("G{group}"));
                             Some(quote!(#w::Q2<#k, #n, #w::#b, #w::#g, #layer>))
+                        }
+                        // A per-head matmul's blocks, held as one linear of their rows.
+                        ([h, k, n], Some((bits, group))) if first.kind == WeightKind::Linear => {
+                            let (h, k, n) = (dim(h)?, dim(k)?, dim(n)?);
+                            let (b, g) = (format_ident!("B{bits}"), format_ident!("G{group}"));
+                            Some(quote!(#w::Q3<#h, #k, #n, #w::#b, #w::#g, #layer>))
                         }
                         _ => None,
                     })
@@ -7863,27 +7872,9 @@ pub(crate) fn fill_canonical_params(
         .get("final_logit_softcapping")
         .copied()
         .unwrap_or(0.0) as f32;
-    // MLA scale: 1/sqrt(qk_head_dim) with YaRN mscale_all_dim
-    // correction. Mirrors MlaAttentionImpl's previous bake.
-    let mla_attn_scale: f32 = if qk_head_dim > 0 {
-        let base = 1.0_f32 / (qk_head_dim as f32).sqrt();
-        match &model.rope_scaling {
-            Some(crate::config::RopeScaling::Yarn {
-                factor,
-                mscale_all_dim: Some(mscale_all_dim),
-                ..
-            }) => {
-                let mm = if *factor <= 1.0 {
-                    1.0_f64
-                } else {
-                    0.1 * mscale_all_dim * factor.ln() + 1.0
-                };
-                base * (mm * mm) as f32
-            }
-            _ => base,
-        }
-    } else {
-        0.0
+    let mla_attn_scale: f32 = match qk_head_dim {
+        0 => 0.0,
+        _ => mla_attn_scale(model),
     };
 
     // Vision-only bodies (the `#[vision_forward]` crates — qwen2-vl,
@@ -8245,6 +8236,29 @@ pub(crate) fn fill_canonical_params(
             const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
         },
     )
+}
+
+/// A multi-head latent attention's softmax scale: `1/sqrt(qk_nope_head_dim + qk_rope_head_dim)`,
+/// with YaRN's `mscale_all_dim` correction squared in when its factor scales.
+pub(crate) fn mla_attn_scale(model: &ModelParams) -> f32 {
+    let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
+    let qk_head_dim = bound("qk_nope_head_dim") + bound("qk_rope_head_dim");
+    let base = 1.0_f32 / (qk_head_dim as f32).sqrt();
+    match &model.rope_scaling {
+        Some(crate::config::RopeScaling::Yarn {
+            factor,
+            mscale_all_dim: Some(mscale_all_dim),
+            ..
+        }) => {
+            let mm = if *factor <= 1.0 {
+                1.0_f64
+            } else {
+                0.1 * mscale_all_dim * factor.ln() + 1.0
+            };
+            base * (mm * mm) as f32
+        }
+        _ => base,
+    }
 }
 
 /// A canonical's `CanonicalParams` impl: its `facts` serialized as `FACTS`, and `mla_consts`.

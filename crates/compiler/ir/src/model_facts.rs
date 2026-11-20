@@ -79,6 +79,8 @@ positive! {
     PoolKernel(u32),
     /// The input width of a vision tower's patch embedding.
     InFeatures(usize),
+    /// A multi-head latent attention's compressed latent width (`kv_lora_rank`).
+    LatentRank(u32),
 }
 
 /// One head's width. Deliberately outside `positive!`: its storage IS the non-zero its
@@ -819,6 +821,88 @@ impl Gdn {
     /// The convolution's channels.
     pub const fn conv_dim(self) -> ConvDim {
         self.conv_dim
+    }
+}
+
+/// A multi-head latent attention's geometry: `heads` query heads, each a `nope`-wide part and a
+/// `rope`-wide rotated part, over one cached row per token of a `latent`-wide compressed latent
+/// then a `rope`-wide shared key; each head's attended latent decompresses to `value` lanes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mla {
+    heads: QueryHeads,
+    latent: LatentRank,
+    nope: HeadDim,
+    rope: RotDim,
+    value: HeadDim,
+    scale: AttnScale,
+}
+
+// Its scale is finite (`AttnScale`'s law), so equality is reflexive.
+impl Eq for Mla {}
+
+impl Mla {
+    /// The geometry, refused when the rope part has an odd lane (rotation pairs lanes) or the
+    /// cached row an odd width (the paged pool holds it as its K and V halves).
+    pub const fn new(
+        heads: QueryHeads,
+        latent: LatentRank,
+        nope: HeadDim,
+        rope: RotDim,
+        value: HeadDim,
+        scale: AttnScale,
+    ) -> Self {
+        assert!(
+            rope.get().is_multiple_of(2),
+            "Mla: the rope part pairs its lanes"
+        );
+        assert!(
+            (latent.get() + rope.get()).is_multiple_of(2),
+            "Mla: the cached row splits into the pool's K and V halves"
+        );
+        Self {
+            heads,
+            latent,
+            nope,
+            rope,
+            value,
+            scale,
+        }
+    }
+    /// The query heads.
+    pub const fn heads(self) -> QueryHeads {
+        self.heads
+    }
+    /// The compressed latent's width.
+    pub const fn latent(self) -> LatentRank {
+        self.latent
+    }
+    /// A query head's un-rotated part.
+    pub const fn nope(self) -> HeadDim {
+        self.nope
+    }
+    /// A query head's rotated part, and the shared key's width.
+    pub const fn rope(self) -> RotDim {
+        self.rope
+    }
+    /// A head's value width.
+    pub const fn value(self) -> HeadDim {
+        self.value
+    }
+    /// The softmax scale.
+    pub const fn scale(self) -> AttnScale {
+        self.scale
+    }
+    /// One query head's width: its un-rotated then its rotated part.
+    pub const fn q_head(self) -> u32 {
+        self.nope.get() + self.rope.get()
+    }
+    /// One cached row's width: the latent then the rotated shared key.
+    pub const fn row(self) -> u32 {
+        self.latent.get() + self.rope.get()
+    }
+    /// The half of a cached row the paged pool's K (then V) rows hold.
+    pub const fn half_row(self) -> u32 {
+        self.row() / 2
     }
 }
 

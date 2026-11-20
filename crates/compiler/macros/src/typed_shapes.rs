@@ -245,6 +245,12 @@ impl<K: DimType, N: DimType> Traced for W2<K, N> {
     }
 }
 
+impl<E: DimType, K: DimType, N: DimType> Traced for W3<E, K, N> {
+    fn shape() -> Vec<Dim> {
+        vec![E::dim(), K::dim(), N::dim()]
+    }
+}
+
 /// A tuple of traced values, bound to as many locals.
 pub trait TracedTuple<const N: usize> {
     /// Each element's shape, in order.
@@ -412,6 +418,7 @@ pub mod ops {
     use super::HiddenSize;
     use super::{Act, Add, BlockTable, CuSeqlens, Div, KvCache, Lit, MaxSeqlen, Mul, PhantomData};
     use super::{ExpertBank, ExpertBiases, Experts, GdnMixer, LatentExperts, MambaMixer};
+    use super::{KvLoraRank, NumAttentionHeads, QkNopeHeadDim, QkRopeHeadDim};
     use super::{Rotary, RowIndex, Scalar, Tokens, W1, W2, W3};
     use super::{RoutedAt, ScaledRouter, Swiglu};
 
@@ -824,6 +831,54 @@ pub mod ops {
         _zxbcdt: Act<T, Add<C, Add<Di, Nh>>>,
         _mamba: MambaMixer<C, Di, Nh>,
     ) -> Act<T, Di> {
+        Act(PhantomData)
+    }
+
+    /// `mla_split(kv_a: [T, Lr + Rd]) -> ([T, Lr], [T, Rd])`: a multi-head latent attention's
+    /// compressed projection, its latent (`kv_lora_rank`) then the one rope key every head shares
+    /// (`qk_rope_head_dim`).
+    pub fn mla_split<T>(
+        _kv_a: Act<T, Add<KvLoraRank, QkRopeHeadDim>>,
+    ) -> (Act<T, KvLoraRank>, Act<T, QkRopeHeadDim>) {
+        (Act(PhantomData), Act(PhantomData))
+    }
+
+    /// `mla_append(q, kv_latent, k_pe, positions, rotary, kv_cache) -> (q, kv_latent, k_pe)`:
+    /// multi-head latent attention's cache write. Each head of `q` is a no-rope part (`Nd`) then a
+    /// rope part (`Rd`), which it rotates; the shared rope key is rotated and the token's latent
+    /// row (`kv_latent`, then the rotated key) is written to the layer's cache.
+    pub fn mla_append<T>(
+        q: Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
+        kv_latent: Act<T, KvLoraRank>,
+        k_pe: Act<T, QkRopeHeadDim>,
+        _positions: Tokens<T>,
+        _rotary: Rotary,
+        _kv_cache: KvCache,
+    ) -> (
+        Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
+        Act<T, KvLoraRank>,
+        Act<T, QkRopeHeadDim>,
+    ) {
+        (q, kv_latent, k_pe)
+    }
+
+    /// `mla_attention(q_latent, q, k_pe, kv_cache, block_table) -> [T, H · Lr]`: absorbed
+    /// multi-head latent attention over the cache [`mla_append`] wrote. `q_latent` is each head's
+    /// latent query (a [`head_matmul`] through `embed_q`), `q` the rotated query its rope parts
+    /// are read from, `k_pe` the cache writer's output; out, each head's attended latent.
+    pub fn mla_attention<T>(
+        _q_latent: Act<T, Mul<NumAttentionHeads, KvLoraRank>>,
+        _q: Act<T, Mul<NumAttentionHeads, Add<QkNopeHeadDim, QkRopeHeadDim>>>,
+        _k_pe: Act<T, QkRopeHeadDim>,
+        _kv_cache: KvCache,
+        _block_table: BlockTable,
+    ) -> Act<T, Mul<NumAttentionHeads, KvLoraRank>> {
+        Act(PhantomData)
+    }
+
+    /// `head_matmul(x: [T, H · S], w: [H, K, N]) -> [T, H · N]`: a matmul per head, each of the
+    /// weight's `H` blocks times the first `K` of its head's `S` lanes of `x`.
+    pub fn head_matmul<T, H, S, K, N>(_x: Act<T, Mul<H, S>>, _w: W3<H, K, N>) -> Act<T, Mul<H, N>> {
         Act(PhantomData)
     }
 

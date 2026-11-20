@@ -522,6 +522,88 @@ fn sliding_window_bound(
     )
 }
 
+/// The model's multi-head latent attention geometry, from its (rank-local) bounds and its
+/// config's softmax scale.
+pub(crate) fn mla_geometry(
+    bounds: &BTreeMap<String, u64>,
+    model: &ModelParams,
+) -> Result<scratchy_ir::model_facts::Mla, BridgeError> {
+    use scratchy_ir::model_facts as mf;
+    let bound = |key: &'static str| {
+        (bounds.get(key).copied())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+            .ok_or(BridgeError::MissingBound { key })
+    };
+    Ok(mf::Mla::new(
+        mf::QueryHeads::new(bound("num_attention_heads")?),
+        mf::LatentRank::new(bound("kv_lora_rank")?),
+        mf::HeadDim::new(bound("qk_nope_head_dim")?),
+        mf::RotDim::new(bound("qk_rope_head_dim")?),
+        mf::HeadDim::new(bound("v_head_dim")?),
+        mf::AttnScale::new(crate::codegen::mla_attn_scale(model)),
+    ))
+}
+
+/// A per-head matmul's heads and each block's depth: its weight's `[heads, k, n_head]` shape.
+fn head_blocks(
+    tile: TileId,
+    node: &FufNode,
+    bounds: &BTreeMap<String, u64>,
+    inferred: &Inferred,
+) -> Result<(u32, u32), BridgeError> {
+    let unresolved = BridgeError::UnresolvedShape {
+        tile,
+        what: "head_matmul weight blocks",
+    };
+    let Some(FufInput::Weight { id, .. }) = node.inputs.get(1) else {
+        return Err(BridgeError::MalformedOp {
+            tile,
+            op: node.op,
+            detail: "head_matmul's second input is not a weight",
+        });
+    };
+    let shape = (inferred.weights.get(&crate::classified::WeightId(id.0))).ok_or(unresolved)?;
+    match eval_shape_with(shape, bounds).as_deref() {
+        Some(&[heads, k, _]) => Ok((heads as u32, k as u32)),
+        _ => Err(BridgeError::UnresolvedShape {
+            tile,
+            what: "head_matmul weight blocks",
+        }),
+    }
+}
+
+/// The storage scheme of the per-head weight at `node`'s input `idx`, its blocks `k` rows deep:
+/// dense, or MLX-affine with groups that tile `k`.
+fn head_weight(
+    tile: TileId,
+    node: &FufNode,
+    idx: usize,
+    k: u32,
+) -> Result<GemmWeight, BridgeError> {
+    match node.inputs.get(idx) {
+        Some(FufInput::Weight { storage, .. }) => match storage {
+            StorageFormat::Dense => Ok(GemmWeight::Dense),
+            StorageFormat::Affine { bits, group_size } => AffineInt4::mint(*bits, *group_size, k)
+                .map(|affine| GemmWeight::Affine { affine })
+                .ok_or(BridgeError::UnsupportedWeight {
+                    tile,
+                    detail: "per-head affine weight: bits unsupported, or group_size does not \
+                             tile k",
+                }),
+            _ => Err(BridgeError::UnsupportedWeight {
+                tile,
+                detail: "per-head weight: only dense and MLX-affine storage are lowered",
+            }),
+        },
+        _ => Err(BridgeError::MalformedOp {
+            tile,
+            op: node.op,
+            detail: "per-head matmul weight is not a weight input",
+        }),
+    }
+}
+
 /// Pull the kv-cache extern's layer index out of an attention /
 /// rope_append input list. Returns the first `Extern{KvCache, Some(i)}`.
 fn kv_cache_index(node: &FufNode) -> Option<u64> {
@@ -1526,6 +1608,95 @@ pub fn lower_decode_to_wavefront(
                 let shared = bx.input_at(tile, 1)?;
                 let g = bx.input_at(tile, 2)?;
                 let idx = bx.push_op(SubOp::GateScale, vec![routed, shared, g]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // mla_split(kv_a) → (kv_latent, k_pe): two column windows of the compressed
+            // projection, the latent then the shared rope key.
+            OpKind::MlaSplit => {
+                let x = bx.input_at(tile, 0)?;
+                let latent = bx.out_cols(tile, 0, "mla_split latent cols")?;
+                let rope = bx.out_cols(tile, 1, "mla_split k_pe cols")?;
+                let a = bx.push_op(
+                    SubOp::SliceCols {
+                        offset: 0,
+                        cols: latent,
+                    },
+                    vec![x],
+                );
+                let b = bx.push_op(
+                    SubOp::SliceCols {
+                        offset: latent,
+                        cols: rope,
+                    },
+                    vec![x],
+                );
+                bx.produced.insert((tile.0, 0), Producer::Op(a));
+                bx.produced.insert((tile.0, 1), Producer::Op(b));
+            }
+            // mla_append(q, kv_latent, k_pe, positions, rotary, kv_cache[layer]) →
+            // (q', kv_latent, k_pe'): the query's rotation, and the cache writer that rotates the
+            // shared key and writes the token's latent row. The latent passes through, aliasing
+            // its producer, as rope_append's V does.
+            OpKind::MlaAppend => {
+                let mla = mla_geometry(&bx.bounds, bx.model)?;
+                let q = bx.input_at(tile, 0)?;
+                let latent_inp = node.inputs.get(1).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "mla_append missing kv_latent input",
+                })?;
+                let latent = bx.resolve(tile, latent_inp)?;
+                let k_pe = bx.input_at(tile, 2)?;
+                let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "mla_append missing kv_cache extern index",
+                })? as u32;
+                let qi = bx.push_op(SubOp::MlaRopeQ { mla }, vec![q]);
+                let ki = bx.push_op(SubOp::MlaAppend { mla, layer }, vec![latent, k_pe]);
+                bx.produced.insert((tile.0, 0), Producer::Op(qi));
+                bx.produced.insert(
+                    (tile.0, 1),
+                    match latent {
+                        InputRef::Op(j) => Producer::Op(j),
+                        InputRef::Ext(e) => Producer::Ext(e),
+                    },
+                );
+                bx.produced.insert((tile.0, 2), Producer::Op(ki));
+            }
+            // mla_attention(q_latent, q', k_pe', kv_cache[layer], block_table): the attention over
+            // the layer's cached latent rows; the block table reaches it through that layer's
+            // cache, not as an operand.
+            OpKind::MlaAttention => {
+                let mla = mla_geometry(&bx.bounds, bx.model)?;
+                let q_latent = bx.input_at(tile, 0)?;
+                let q = bx.input_at(tile, 1)?;
+                let k_pe = bx.input_at(tile, 2)?;
+                let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "mla_attention missing kv_cache extern index",
+                })? as u32;
+                let idx = bx.push_op(SubOp::MlaAttend { mla, layer }, vec![q_latent, q, k_pe]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // head_matmul(x, w): a matmul per head, each of the weight's `[heads, k, n_head]`
+            // blocks times the first `k` lanes of its head's part of `x`.
+            OpKind::HeadMatmul => {
+                let x = bx.input_at(tile, 0)?;
+                let w = bx.input_at(tile, 1)?;
+                let (heads, k) = head_blocks(tile, node, &bx.bounds, bx.inferred)?;
+                let n = bx.out_cols(tile, 0, "head_matmul cols")?;
+                let weight = head_weight(tile, node, 1, k)?;
+                let op = SubOp::HeadMatmul {
+                    heads: scratchy_ir::model_facts::QueryHeads::new(heads),
+                    k,
+                    n,
+                    weight,
+                };
+                let idx = bx.push_op(op, vec![x, w]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

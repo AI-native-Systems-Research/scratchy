@@ -297,6 +297,18 @@ pub enum KernelId {
     /// Qwen3.5 / Qwen3-Next Gated-DeltaNet linear-attention core. Maps to
     /// the `gated_delta_*` kernels in `gated_delta.metallib`.
     GatedDeltaNet,
+    /// Each row's column window (`slice_cols_<dtype>`, `slice_cols.metal`).
+    SliceCols,
+    /// A matmul per head (`head_qmv_<dtype>_s_<scale>` / `head_mv_<dtype>`,
+    /// `head_matmul.metal`).
+    HeadMatmul,
+    /// Multi-head latent attention's query rotation (`mla_rope_q_<dtype>`, `mla.metal`).
+    MlaRopeQ,
+    /// Multi-head latent attention's cache write (`mla_append_<dtype>`, `mla.metal`).
+    MlaAppend,
+    /// Multi-head latent attention's absorbed attention over the cache
+    /// (`mla_attend_<dtype>`, `mla.metal`).
+    MlaAttend,
     /// Sum-along-axis-0 reduce for the `[split_k, M, N]` intermediate
     /// `AffineQmmTSplitK` produces. Maps to
     /// `splitk_reduce_sum_<dtype>` in `quantized_splitk_reduce.metallib`.
@@ -658,7 +670,14 @@ impl KernelId {
             | Self::DraftSelectTop16
             | Self::DraftSelectEdges
             | Self::DraftSelectWalk
-            | Self::DraftVerifyRows => SeqScope::AllRows,
+            | Self::DraftVerifyRows
+            // Each row is a token of its own sequence: the attention reads its sequence's rows
+            // through `cu_seqlens_q`.
+            | Self::SliceCols
+            | Self::HeadMatmul
+            | Self::MlaRopeQ
+            | Self::MlaAppend
+            | Self::MlaAttend => SeqScope::AllRows,
         }
     }
 }

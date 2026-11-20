@@ -306,15 +306,25 @@ impl MetalAffineQuantOps for AffineQuantLinear {
         bits: u32,
         expected_in_features: u32,
     ) -> Result<Self> {
-        let weight = weights.take(&format!("{prefix}.weight"))?;
+        // A per-head matmul's blocks (`[heads, out, packed]`, MLX's `MultiLinear`) load as one
+        // linear of every head's rows in order: an affine group runs along K, so each row
+        // dequantizes from its own codes, scale and bias wherever it sits.
+        let rows = |t: GpuTensor| match t.ndim() {
+            3 => {
+                let (banks, out, cols) = (t.dim(0), t.dim(1), t.dim(2));
+                t.reshape(&[banks * out, cols])
+            }
+            _ => t,
+        };
+        let weight = rows(weights.take(&format!("{prefix}.weight"))?);
         // The qmv / qmm_t / qvm / qmm_n kernels read scales and biases as
         // the model's `SCALE_DTYPE` and cast to `T_act` in-register. Here the
         // weight stays packed: in_features is recovered from the packed width
         // via the ceil(K*bits/32) law (exact when K is a multiple of
         // group_size; the round-trip check rejects a checkpoint quantized at
         // a different width than this build's preset).
-        let scales = take_affine_scales(weights, format!("{prefix}.scales"))?;
-        let affine_biases = take_affine_scales(weights, format!("{prefix}.biases"))?;
+        let scales = rows(take_affine_scales(weights, format!("{prefix}.scales"))?);
+        let affine_biases = rows(take_affine_scales(weights, format!("{prefix}.biases"))?);
         let bias_name = format!("{prefix}.bias");
         let linear_bias = if weights.contains(&bias_name) {
             Some(weights.take(&bias_name)?)

@@ -371,6 +371,40 @@ impl<K: Dim, N, B, G: Tiles<K>, L> std::ops::Deref for Q2<K, N, B, G, L> {
     }
 }
 
+/// A per-head MLX-affine weight `[H, K, N]` — `H` blocks of `[K, N]`, a matmul per head — its
+/// codes `B` bits wide in groups of `G`, held as `L`, one linear of every block's rows in order:
+/// `[K, H · N]`. Its groups tile its inner dim ([`Tiles`]), as [`Q2`]'s do.
+///
+/// ```compile_fail,E0277
+/// # use scratchy_tensors::typed::{B4, G64, Q3};
+/// # use scratchy_tensors::typed::typenum::{U20, U200, U512};
+/// let _: Option<Q3<U20, U200, U512, B4, G64, ()>> = None;
+/// ```
+#[repr(transparent)]
+pub struct Q3<H, K: Dim, N, B, G: Tiles<K>, L> {
+    layer: L,
+    shape: PhantomData<fn() -> (H, K, N)>,
+    codes: PhantomData<fn() -> (B, G)>,
+}
+
+/// As the one linear it is held as: `[K, H · N]`.
+impl<H: Dim, K: Dim, N: Dim, B: Bits, G: Tiles<K>, L> QShape2 for Q3<H, K, N, B, G, L>
+where
+    Mul<H, N>: Dim,
+{
+    type K = K;
+    type N = Mul<H, N>;
+    type Bits = B;
+    type Group = G;
+}
+
+impl<H, K: Dim, N, B, G: Tiles<K>, L> std::ops::Deref for Q3<H, K, N, B, G, L> {
+    type Target = L;
+    fn deref(&self) -> &L {
+        &self.layer
+    }
+}
+
 /// A device layer's MLX-affine codes, `(bits, group)`; `None` for a layer of other storage.
 pub trait AffineCodes {
     fn affine_codes(&self) -> Option<(u32, u32)>;
@@ -764,6 +798,32 @@ impl<K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> Shaped<L
 
 impl<K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> Mint<L>
     for Q2<K, N, B, G, L>
+{
+    fn mint(layer: L, tensor: &str) -> anyhow::Result<Self> {
+        Self::check(std::slice::from_ref(&layer), tensor, false)?;
+        Ok(Self::wrap(Checked(layer)))
+    }
+}
+
+impl<H: Dim, K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> Shaped<L>
+    for Q3<H, K, N, B, G, L>
+{
+    fn check(layers: &[L], tensor: &str, layered: bool) -> anyhow::Result<()> {
+        check_layers(layers, [K::N, H::N * N::N], tensor, layered)?;
+        check_codes(layers, (B::N, G::N), tensor, layered)
+    }
+
+    fn wrap(Checked(layer): Checked<L>) -> Self {
+        Self {
+            layer,
+            shape: PhantomData,
+            codes: PhantomData,
+        }
+    }
+}
+
+impl<H: Dim, K: Dim, N: Dim, B: Bits, G: Tiles<K>, L: Extents<2> + AffineCodes> Mint<L>
+    for Q3<H, K, N, B, G, L>
 {
     fn mint(layer: L, tensor: &str) -> anyhow::Result<Self> {
         Self::check(std::slice::from_ref(&layer), tensor, false)?;

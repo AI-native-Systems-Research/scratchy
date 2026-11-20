@@ -38,7 +38,7 @@
 
 #![allow(dead_code)]
 
-use scratchy_ir::model_facts::{Attention, HeadDim};
+use scratchy_ir::model_facts::{Attention, HeadDim, Mla, QueryHeads};
 use std::marker::PhantomData;
 
 // ── Identifiers & geometry ─────────────────────────────────────────
@@ -856,7 +856,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::RopeAppend { layer, .. }
             | SubOp::KvAppend { layer, .. }
             | SubOp::DraftAttention { layer, .. }
-            | SubOp::DraftContextKv { layer, .. } => Some(*layer),
+            | SubOp::DraftContextKv { layer, .. }
+            | SubOp::MlaAppend { layer, .. }
+            | SubOp::MlaAttend { layer, .. } => Some(*layer),
             _ => None,
         }
     }
@@ -961,6 +963,24 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 k,
             } => (pad_vocab, table_rows, k).hash(h),
             SubOp::Mamba2 { inner } => inner.hash(h),
+            SubOp::SliceCols { offset, cols } => (offset, cols).hash(h),
+            // `layer` is per-layer identity, not class; the geometry is the class.
+            SubOp::MlaRopeQ { mla }
+            | SubOp::MlaAppend { mla, .. }
+            | SubOp::MlaAttend { mla, .. } => mla_class_key(mla, h),
+            SubOp::HeadMatmul {
+                heads,
+                k,
+                n,
+                weight,
+            } => {
+                (heads.get(), k, n).hash(h);
+                std::mem::discriminant(weight).hash(h);
+                if let crate::lower::GemmWeight::Affine { affine } = weight {
+                    affine.bits().get().hash(h);
+                    affine.group().get().hash(h);
+                }
+            }
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
             SubOp::RouteSigmoidBias { router } => router.hash(h),
@@ -1073,6 +1093,20 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             }
         }
     }
+}
+
+/// A multi-head latent attention op's class: its geometry's numbers.
+fn mla_class_key(mla: &Mla, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    (
+        mla.heads().get(),
+        mla.latent().get(),
+        mla.nope().get(),
+        mla.rope().get(),
+        mla.value().get(),
+        mla.scale().get().to_bits(),
+    )
+        .hash(h);
 }
 
 /// Which stage of a DFlash2 drafter's dynamic convolution a [`SubOp::DraftConv`] runs (Splash
@@ -1489,6 +1523,38 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     Mamba2 { inner: u32 },
     /// Row mean: `out[m, 1] = mean(x, axis = -1)`. `inputs` = `[x]`.
     Mean,
+
+    // ── Multi-head latent attention (`mla_split`, `mla_append`, `mla_attention`) ──────────
+    /// A column window of each row: `out[t] = x[t][offset .. offset + cols]`. `inputs` = `[x]`.
+    /// `mla_split`'s latent and shared rope key, each a window of the compressed projection.
+    SliceCols { offset: u32, cols: u32 },
+    /// MLA's query rotation: each of `mla.heads()` query heads rotates its rope part (the
+    /// `mla.rope()` lanes after its `mla.nope()` un-rotated ones) at its row's position, lanes
+    /// `(2i, 2i + 1)` paired. `inputs` = `[q]`; the output is `q`, rotated. The positions are the
+    /// forward's, so there is no host reference.
+    MlaRopeQ { mla: Mla },
+    /// MLA's cache write at `layer`: the shared rope key rotated as [`Self::MlaRopeQ`] rotates a
+    /// head, and the token's row `[latent | rotated key]` written to the layer's paged cache.
+    /// `inputs` = `[latent, k_pe]`; the output is the rotated key. The cache is the layer's own,
+    /// runtime-ambient, so there is no host reference.
+    MlaAppend { mla: Mla, layer: u32 },
+    /// A matmul per head: head `h` of `x` (the first `k` of its `x.cols / heads` lanes) times
+    /// weight block `h` (`[k, n / heads]`), into head `h`'s `n / heads` output lanes. `inputs` =
+    /// `[x, W]`, `W` the `[heads, k, n / heads]` blocks; `n` is the whole output width. MLA's
+    /// query absorption (`embed_q`) and value decompression (`unembed_out`).
+    HeadMatmul {
+        heads: QueryHeads,
+        k: u32,
+        n: u32,
+        weight: crate::lower::GemmWeight,
+    },
+    /// MLA's absorbed attention over `layer`'s cache: each head's latent query and rotated rope
+    /// part scored against every cached row up to its position, scaled by `mla.scale()`, the
+    /// softmax-weighted latents out. `inputs` = `[q_latent, q, k_pe]`: the `[T, heads · latent]`
+    /// latent queries, the rotated query its rope parts are read from, and the cache writer's
+    /// output; the output is `[T, heads · latent]`. The cache is runtime-ambient, so there is no
+    /// host reference.
+    MlaAttend { mla: Mla, layer: u32 },
 
     // ── Collectives: what tensor parallelism weaves in ──────────────
     //
@@ -3974,6 +4040,38 @@ pub fn eval_node<F: RopeForm>(
              single node's output is not a function of its operands alone",
             node.op.name()
         ),
+        SubOp::SliceCols { offset, .. } => {
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            let (xr, xc) = (xr as usize, xc as usize);
+            let (offset, cols) = (offset as usize, out_cols as usize);
+            (0..xr)
+                .flat_map(|r| x[r * xc + offset..r * xc + offset + cols].iter().copied())
+                .collect()
+        }
+        SubOp::HeadMatmul { heads, k, .. } => {
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            let (w, _, wc) = gather(&node.inputs[1], graph, bufs);
+            let (xr, xc, wc) = (xr as usize, xc as usize, wc as usize);
+            let (heads, k, out_cols) = (heads.get() as usize, k as usize, out_cols as usize);
+            let (stride, n_head) = (xc / heads, out_cols / heads);
+            let mut out = vec![0.0f32; xr * out_cols];
+            for r in 0..xr {
+                for hd in 0..heads {
+                    for j in 0..n_head {
+                        out[r * out_cols + hd * n_head + j] = (0..k)
+                            .map(|i| x[r * xc + hd * stride + i] * w[(hd * k + i) * wc + j])
+                            .sum();
+                    }
+                }
+            }
+            out
+        }
+        SubOp::MlaRopeQ { .. } | SubOp::MlaAppend { .. } | SubOp::MlaAttend { .. } => panic!(
+            "{} has no host reference: its rotation reads the forward's positions and its cache \
+             is runtime-ambient per layer, so a node's output is not a function of its operands \
+             alone",
+            node.op.name()
+        ),
         SubOp::DraftAttention { .. }
         | SubOp::DraftContextKv { .. }
         | SubOp::DraftWindowStore
@@ -4653,6 +4751,21 @@ pub fn lower_region(
             SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
             SubOp::Mamba2 { inner } => SubOp::Mamba2 { inner },
             SubOp::Mean => SubOp::Mean,
+            SubOp::SliceCols { offset, cols } => SubOp::SliceCols { offset, cols },
+            SubOp::MlaRopeQ { mla } => SubOp::MlaRopeQ { mla },
+            SubOp::MlaAppend { mla, layer } => SubOp::MlaAppend { mla, layer },
+            SubOp::HeadMatmul {
+                heads,
+                k,
+                n,
+                weight,
+            } => SubOp::HeadMatmul {
+                heads,
+                k,
+                n,
+                weight,
+            },
+            SubOp::MlaAttend { mla, layer } => SubOp::MlaAttend { mla, layer },
             SubOp::AllReduce => SubOp::AllReduce,
             SubOp::AllGather { cols } => SubOp::AllGather { cols },
             SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },

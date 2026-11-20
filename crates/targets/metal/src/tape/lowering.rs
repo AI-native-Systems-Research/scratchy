@@ -6356,6 +6356,189 @@ fn lower_one(
         // commands 1.. (intra-instruction RAW on conv_out/g/beta/o +
         // the in-place state rings), so each stage sees the prior one's
         // writes. Math is the golden-tested cpu_golden recurrence.
+        // ── Multi-head latent attention, its column window and its per-head matmul ──
+        I::SliceCols(Slot(input), Slot(out), offset, in_width, width) => {
+            let n = eff_m * width.get();
+            LoweredCommand {
+                kernel: KernelId::SliceCols,
+                library: "slice_cols",
+                function: pick_specialized_symbol(
+                    "slice_cols_f16",
+                    "slice_cols_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::SliceColsConstants {
+                    in_cols: *in_width,
+                    offset: *offset,
+                    cols: *width,
+                    elements: super::ids::ElementCount(n),
+                }
+                .into_baked(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *input,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 1,
+                    },
+                ]),
+            }
+        }
+        I::HeadMatmul(hm) => lower_head_matmul(p, hm, w, eff_m, bucket_m, layer_offset)?,
+        I::MlaRopeQ(Slot(q), Slot(out), mla) => {
+            let q_head = mla.q_head();
+            LoweredCommand {
+                kernel: KernelId::MlaRopeQ,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_rope_q_f16",
+                    "mla_rope_q_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: None,
+                    heads_per_tg: None,
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, mla.heads().get(), 1),
+                    threads_per_threadgroup: (q_head.next_power_of_two().max(32), 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *q,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 1,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::Positions,
+                        binding_index: 2,
+                    },
+                    mla_cos_sin(w, 3)?,
+                ]),
+            }
+        }
+        I::MlaAppend(Slot(latent), Slot(k_pe), Slot(out), LayerId(layer), mla) => {
+            let kv_layer = super::ids::LayerId(*layer + layer_offset);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            LoweredCommand {
+                kernel: KernelId::MlaAppend,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_append_f16",
+                    "mla_append_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: Some(mla_cache(p, crate::BLOCKS_PER_CHUNK)?),
+                    heads_per_tg: None,
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, 1, 1),
+                    threads_per_threadgroup: (mla.row().next_power_of_two().max(32), 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *latent,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *k_pe,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 2,
+                    },
+                    runtime(RuntimeBindingKind::Positions, 3),
+                    mla_cos_sin(w, 4)?,
+                    runtime(RuntimeBindingKind::SlotMapping { layer: kv_layer }, 5),
+                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 6),
+                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 7),
+                ]),
+            }
+        }
+        I::MlaAttend(Slot(q_latent), Slot(q), Slot(out), LayerId(layer), mla) => {
+            let kv_layer = super::ids::LayerId(*layer + layer_offset);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            let served = mla_heads_per_tg(*mla);
+            LoweredCommand {
+                kernel: KernelId::MlaAttend,
+                library: "mla",
+                function: pick_specialized_symbol(
+                    "mla_attend_f16",
+                    "mla_attend_bf16",
+                    p.act_dtype(),
+                ),
+                constants: super::kernel_constants::MlaConstants {
+                    mla: *mla,
+                    cache: Some(mla_cache(p, attention_blocks_per_chunk(chunked))?),
+                    heads_per_tg: Some(served),
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, mla.heads().get() / served.get(), 1),
+                    threads_per_threadgroup: (1024, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        set_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    Binding::ArenaSlot {
+                        slot: *out,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q_latent,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q,
+                        binding_index: 2,
+                    },
+                    runtime(RuntimeBindingKind::SeqUsedK, 3),
+                    runtime(RuntimeBindingKind::BlockTable { layer: kv_layer }, 4),
+                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 5),
+                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 7),
+                ]),
+            }
+        }
         I::GatedDeltaNet(
             Slot(qkv_slot),
             Slot(z_slot),
@@ -7371,6 +7554,123 @@ fn route_draft_commit(step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCom
             GatedCommand { command, gate }
         })
         .collect()
+}
+
+/// The rotary table an MLA rope reads, at `binding_index`: its row's site's cos/sin.
+fn mla_cos_sin(w: RowSources<'_>, binding_index: u8) -> Result<Binding, LoweringError> {
+    let ix = w.of(WeightKind::CosSin, 0)?;
+    Ok(source(ix, WeightTensor::Weight, LayerId(0), binding_index))
+}
+
+/// The paged cache an MLA kernel addresses: the model's KV page, in chunks of `blocks_per_chunk`
+/// blocks (0: one base).
+fn mla_cache(
+    p: &ModelFacts,
+    blocks_per_chunk: u32,
+) -> Result<super::kernel_constants::MlaCacheConstants, LoweringError> {
+    Ok(super::kernel_constants::MlaCacheConstants {
+        block_size: super::ids::BlockSize(base(p)?.page().get()),
+        blocks_per_chunk: super::ids::BlocksPerChunk(blocks_per_chunk),
+    })
+}
+
+/// The query heads one MLA attention threadgroup serves: the largest divisor of the heads up to
+/// [`MLA_HEADS_PER_TG`], so each threadgroup reads every cached row once for all of them.
+fn mla_heads_per_tg(mla: crate::tape::step::Mla) -> super::ids::NumQHeads {
+    let heads = mla.heads().get();
+    let served = (1..=MLA_HEADS_PER_TG.min(heads))
+        .rev()
+        .find(|d| heads.is_multiple_of(*d))
+        .unwrap_or(1);
+    super::ids::NumQHeads(served)
+}
+
+/// The most query heads an MLA attention threadgroup serves: each holds its query and output
+/// lanes of a cached row in registers.
+const MLA_HEADS_PER_TG: u32 = 4;
+
+/// A per-head matmul threadgroup's simdgroups, and the output rows each computes.
+const HEAD_MATMUL_SIMDGROUPS: u32 = 8;
+const HEAD_MATMUL_ROWS_PER_SG: u32 = 4;
+
+/// A per-head matmul's command: the affine kernel over packed blocks, or the dense one.
+fn lower_head_matmul(
+    p: &ModelFacts,
+    hm: &crate::tape::step::HeadMatmul,
+    w: RowSources<'_>,
+    eff_m: u32,
+    bucket_m: u32,
+    layer_offset: u32,
+) -> Result<LoweredCommand, LoweringError> {
+    use crate::tape::step::HeadWeight;
+    let layer = super::ids::LayerId(hm.layer.0 + layer_offset);
+    let ix = w.of(WeightKind::Linear, 0)?;
+    let heads = hm.heads.get();
+    let n = hm.n.get();
+    let (function, affine, mut bindings) = match hm.weight {
+        HeadWeight::Affine { group_size, bits } => (
+            head_qmv_static_name(p.act_dtype(), scale_dtype_for(p)),
+            Some((group_size, bits)),
+            affine_weight_bindings(ix, layer).to_vec(),
+        ),
+        HeadWeight::Dense => (
+            pick_specialized_symbol("head_mv_f16", "head_mv_bf16", p.act_dtype()),
+            None,
+            vec![source(ix, WeightTensor::Weight, layer, 0)],
+        ),
+    };
+    bindings.extend([
+        Binding::ArenaSlot {
+            slot: hm.input.0,
+            binding_index: 3,
+        },
+        Binding::ArenaSlot {
+            slot: hm.output.0,
+            binding_index: 4,
+        },
+    ]);
+    Ok(LoweredCommand {
+        kernel: KernelId::HeadMatmul,
+        library: "head_matmul",
+        function,
+        constants: super::kernel_constants::HeadMatmulConstants {
+            heads: super::ids::NumQHeads(heads),
+            k: hm.k,
+            n_head: super::ids::NDim(n / heads),
+            in_stride: hm.in_stride,
+            simdgroups: super::ids::RowStride(HEAD_MATMUL_SIMDGROUPS),
+            rows_per_simdgroup: super::ids::RowStride(HEAD_MATMUL_ROWS_PER_SG),
+            affine,
+        }
+        .into_baked(),
+        dispatch: DispatchShape {
+            threadgroups: (
+                eff_m,
+                n.div_ceil(HEAD_MATMUL_SIMDGROUPS * HEAD_MATMUL_ROWS_PER_SG),
+                1,
+            ),
+            threads_per_threadgroup: (32, HEAD_MATMUL_SIMDGROUPS, 1),
+            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                set_axis: None,
+                axis: crate::tape::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(bucket_m),
+            }),
+        },
+        bindings: baked(bindings),
+    })
+}
+
+/// `head_qmv_<act>_s_<scale>`.
+fn head_qmv_static_name(act: MetalDtype, scale: ScaleDtype) -> &'static str {
+    match (act, scale) {
+        (MetalDtype::F16, ScaleDtype::F16) => "head_qmv_f16_s_f16",
+        (MetalDtype::F16, ScaleDtype::Bf16) => "head_qmv_f16_s_bf16",
+        (MetalDtype::Bf16, ScaleDtype::F16) => "head_qmv_bf16_s_f16",
+        (MetalDtype::Bf16, ScaleDtype::Bf16) => "head_qmv_bf16_s_bf16",
+        (MetalDtype::Int4, _) => {
+            panic!("metal lowering: Int4 dtype not yet wired through kernel symbol picker")
+        }
+    }
 }
 
 /// Pick the f16-or-bf16 specialization for a kernel that follows the

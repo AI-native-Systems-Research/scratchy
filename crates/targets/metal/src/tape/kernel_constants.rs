@@ -1333,6 +1333,103 @@ impl From<SiluMulConstants> for Vec<ConstantValue> {
     }
 }
 
+// ── Multi-head latent attention, its column window and its per-head matmul ─────
+
+/// `KernelId::SliceCols` (`slice_cols_<dtype>`, `slice_cols.metal`).
+pub struct SliceColsConstants {
+    pub in_cols: ActivationWidth,
+    pub offset: crate::tape::step::ColOffset,
+    pub cols: ActivationWidth,
+    pub elements: ElementCount,
+}
+
+impl From<SliceColsConstants> for Vec<ConstantValue> {
+    fn from(c: SliceColsConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.in_cols.get()),
+            ConstantValue::uint(ConstSlot(1), c.offset.0),
+            ConstantValue::uint(ConstSlot(2), c.cols.get()),
+            ConstantValue::uint(ConstSlot(3), c.elements.get()),
+        ]
+    }
+}
+
+/// `KernelId::HeadMatmul` (`head_qmv_*` / `head_mv_*`, `head_matmul.metal`): the heads, the
+/// lanes each row dots, a head's output lanes and input part, and an affine weight's group and
+/// code width (slots 4 / 5, set for the affine kernels alone).
+pub struct HeadMatmulConstants {
+    pub heads: NumQHeads,
+    pub k: KDim,
+    pub n_head: NDim,
+    pub in_stride: RowStride,
+    /// A threadgroup's simdgroups (slot 6) and the output rows each computes (slot 7).
+    pub simdgroups: RowStride,
+    pub rows_per_simdgroup: RowStride,
+    pub affine: Option<(
+        crate::tape::ids::AffineGroupSize,
+        crate::tape::ids::AffineBits,
+    )>,
+}
+
+impl From<HeadMatmulConstants> for Vec<ConstantValue> {
+    fn from(c: HeadMatmulConstants) -> Self {
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), c.heads.get()),
+            ConstantValue::uint(ConstSlot(1), c.k.get()),
+            ConstantValue::uint(ConstSlot(2), c.n_head.get()),
+            ConstantValue::uint(ConstSlot(3), c.in_stride.get()),
+            ConstantValue::uint(ConstSlot(6), c.simdgroups.get()),
+            ConstantValue::uint(ConstSlot(7), c.rows_per_simdgroup.get()),
+        ];
+        if let Some((group, bits)) = c.affine {
+            v.push(ConstantValue::uint(ConstSlot(4), group.get()));
+            v.push(ConstantValue::uint(ConstSlot(5), bits.get()));
+        }
+        v
+    }
+}
+
+/// The paged cache an MLA kernel reads or writes: its block's rows, and the chunks it is held in
+/// (`mla.metal` slots 4 to 6; slot 5, the block table's stride, is the tape's KV cap rung).
+pub struct MlaCacheConstants {
+    pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
+}
+
+/// `KernelId::MlaRopeQ` / `MlaAppend` / `MlaAttend` (`mla.metal`): the geometry (slots 0 to 3),
+/// the cache (4 to 6, the writer's and the attention's), the softmax scale (7) and the query
+/// heads an attention threadgroup serves (8), the attention's alone.
+pub struct MlaConstants {
+    pub mla: crate::tape::step::Mla,
+    pub cache: Option<MlaCacheConstants>,
+    pub heads_per_tg: Option<NumQHeads>,
+}
+
+impl From<MlaConstants> for Vec<ConstantValue> {
+    fn from(c: MlaConstants) -> Self {
+        let m = c.mla;
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), m.heads().get()),
+            ConstantValue::uint(ConstSlot(1), m.latent().get()),
+            ConstantValue::uint(ConstSlot(2), m.nope().get()),
+            ConstantValue::uint(ConstSlot(3), m.rope().get()),
+        ];
+        if let Some(cache) = c.cache {
+            v.push(ConstantValue::uint(ConstSlot(4), cache.block_size.get()));
+            v.push(ConstantValue::kv_cap(ConstSlot(5)));
+            v.push(ConstantValue::uint(
+                ConstSlot(6),
+                cache.blocks_per_chunk.get(),
+            ));
+        }
+        if let Some(heads) = c.heads_per_tg {
+            v.push(ConstantValue::float(ConstSlot(7), m.scale().get()));
+            v.push(ConstantValue::uint(ConstSlot(8), heads.get()));
+        }
+        v
+    }
+}
+
 // ── GateApply / GateSplit (Qwen3.5 attention output gate) ─────────
 
 /// `KernelId::GateApply` (`gate_apply.metal::gate_apply_<dtype>`).

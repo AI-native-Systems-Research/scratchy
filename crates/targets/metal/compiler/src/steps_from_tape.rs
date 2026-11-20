@@ -2413,6 +2413,74 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
+            // Multi-head latent attention: its cache is the layer's paged KV — the writer's rows a
+            // KV write, the attention's a KV read, so the barrier walk orders the two and the
+            // cache play keeps the writer.
+            L::SliceCols { offset, cols } => {
+                let (input, out) = (self.read(i, 0)?, out()?);
+                let in_width = self.width(self.step_arg(i, 0)?);
+                let step = S::SliceCols(
+                    input,
+                    out,
+                    st::ColOffset(offset),
+                    in_width,
+                    st::ActivationWidth::of_cols(cols),
+                );
+                em(step, &[input], &[out], Vec::new())
+            }
+            L::MlaRopeQ { mla } => {
+                let (q, out) = (self.read(i, 0)?, out()?);
+                em(S::MlaRopeQ(q, out, mla), &[q], &[out], vec![self.rotary(i)])
+            }
+            L::MlaAppend { mla, layer } => {
+                let (latent, k_pe, out) = (self.read(i, 0)?, self.read(i, 1)?, out()?);
+                let layer = LayerId(layer);
+                let step = S::MlaAppend(latent, k_pe, out, layer, mla);
+                let mut e = em(step, &[latent, k_pe], &[out], vec![self.rotary(i)]);
+                e.sig.kv_w = Some(layer);
+                e
+            }
+            L::HeadMatmul {
+                heads,
+                k,
+                n,
+                weight,
+            } => {
+                let (input, out) = (self.read(i, 0)?, out()?);
+                let in_cols = self.width(self.step_arg(i, 0)?).get();
+                let e = self.weight_of(i)?;
+                let weight = match weight {
+                    GemmWeight::Dense => st::HeadWeight::Dense,
+                    GemmWeight::Affine { affine } => {
+                        let (group_size, bits) =
+                            self.affine(i, affine.group().get(), affine.bits().get())?;
+                        st::HeadWeight::Affine { group_size, bits }
+                    }
+                    GemmWeight::Fp8Dynamic => {
+                        return Err(self.no(i, Refused::Fp8Gemm));
+                    }
+                };
+                let step = S::HeadMatmul(st::HeadMatmul {
+                    input,
+                    output: out,
+                    layer: self.layer(e),
+                    heads: scratchy_target_metal::tape::ids::NumQHeads(heads.get()),
+                    in_stride: scratchy_target_metal::tape::ids::RowStride(in_cols / heads.get()),
+                    k: st::KDim(k),
+                    n: st::NDim(n),
+                    weight,
+                });
+                em(step, &[input], &[out], self.site(i, WeightKind::Linear, e)?)
+            }
+            L::MlaAttend { mla, layer } => {
+                let out = out()?;
+                let (q_latent, q, k_pe) = (self.read(i, 0)?, self.read(i, 1)?, self.read(i, 2)?);
+                let layer = LayerId(layer);
+                let step = S::MlaAttend(q_latent, q, out, layer, mla);
+                let mut e = em(step, &[q_latent, q, k_pe], &[out], Vec::new());
+                e.sig.kv_r = Some(layer);
+                e
+            }
             L::GatedDeltaNet => {
                 let out = out()?;
                 let ins = [
