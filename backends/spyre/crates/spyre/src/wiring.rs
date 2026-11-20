@@ -25,6 +25,7 @@ use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, row_footprint_
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
+use ktir_superdsc::sdsc_abstract::SchedulerBlockTokens;
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
 
@@ -694,6 +695,24 @@ pub struct PagedStep {
     pub extent: QueryExtent,
 }
 
+/// ⭐ THE ROW POOL'S PAGE — the bytes one page of `kv_row_pool` holds on the card: the run of
+/// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) int32
+/// words the decode walk's chained index copies per page. The ONE spelling of the per-page
+/// bytes both the pool's placement ([`PagedStep::card_kv_row_pool_bytes`]) and the session's
+/// residency ([`crate::pool_pages`]) read.
+pub const KV_ROW_POOL_PAGE_BYTES: u64 =
+    ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4;
+
+/// ⭐ THE POOL'S PAGE — the bytes one page of a KV pool at `cols` columns holds on the card:
+/// the scheduler's own block ([`SchedulerBlockTokens::REFERENCE`] slots) of rows, each at the
+/// fp16 row footprint ([`row_footprint_bytes`]) every pool placement is sized at. The ONE
+/// statement both the layout's pool sizing and the session's per-page residency
+/// ([`crate::pool_pages`]) read — a pool's bytes are its pages times this, never its rows
+/// times the footprint re-derived.
+pub fn pool_page_bytes(cols: u32) -> u64 {
+    u64::from(SchedulerBlockTokens::REFERENCE.get()) * row_footprint_bytes(cols, Df::Fp16)
+}
+
 impl PagedStep {
     /// The blocks the scheduler may hand out — every page but the null page
     /// ([`crate::paged_step::page_of_block`]).
@@ -756,10 +775,10 @@ impl PagedStep {
     }
 
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
-    /// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) int32
-    /// words, the run the decode walk's chained index copies per page.
+    /// [`KV_ROW_POOL_PAGE_BYTES`] int32 bytes — the run the decode walk's chained index
+    /// copies per page — the pool's pages at the one page law.
     pub const fn card_kv_row_pool_bytes(self) -> u64 {
-        self.pages as u64 * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4
+        self.pages as u64 * KV_ROW_POOL_PAGE_BYTES
     }
 
     /// The int32 zero stick on the card: one run of

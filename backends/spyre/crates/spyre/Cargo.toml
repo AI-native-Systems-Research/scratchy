@@ -72,6 +72,9 @@ scratchy-layers = { path = "../../../../crates/layers" }
 # Neutral leaf — the affine/nvfp4 quant layer TYPES the macro's `Weights` struct
 # names (`AffineQuantEmbedding`, `AffineQuantLinear`, `Nvfp4Linear`).
 scratchy-quantizations = { path = "../../../../crates/models/quantization" }
+# The serving step's own memory laws — `blocks_within` and
+# `DEFAULT_GPU_MEMORY_UTILIZATION`, the pool-pages budget's inputs (`pool_pages`).
+scratchy-core-config = { path = "../../../../crates/core/config" }
 half = { workspace = true }
 # The weight store's mmap backing — the alias path's keepalive (`HostBytes::View`
 # holds the `Arc<Mmap>` the bytes are viewed through). Same workspace version

@@ -1778,6 +1778,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "scratchy-core-config",
  "scratchy-forward-compiler",
  "scratchy-ir",
  "scratchy-layers",

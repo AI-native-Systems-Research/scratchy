@@ -17,9 +17,9 @@ pub mod spans;
 
 // Re-export top-level types for convenience.
 pub use cache::{
-    CacheConfig, CacheDType, HybridKvLayout, KVCacheConfig, KVCacheGroupSpec, KVCacheSpec,
-    KVCacheSpecType, KVCacheTensor, LayerKvGeometry, MambaCacheMode, PrefixCachingHashAlgo,
-    blocks_within, compact_kv_layer_to_tensor, compute_hybrid_kv_layout,
+    CacheConfig, CacheDType, DEFAULT_GPU_MEMORY_UTILIZATION, HybridKvLayout, KVCacheConfig,
+    KVCacheGroupSpec, KVCacheSpec, KVCacheSpecType, KVCacheTensor, LayerKvGeometry, MambaCacheMode,
+    PrefixCachingHashAlgo, blocks_within, compact_kv_layer_to_tensor, compute_hybrid_kv_layout,
 };
 pub use scheduler::{RunnerType, SchedulerConfig, SchedulerPolicy};
 pub use spans::SpansConfig;
