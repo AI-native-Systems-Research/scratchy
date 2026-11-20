@@ -183,15 +183,32 @@ fn main() {
     // function's ops rather than reading its parameter list as one op's operands. That is the door a
     // whole-kernel producer needs, so it is how a multi-matmul kernel gets driven.
     if std::env::var("KTIR_WHOLE").as_deref() == Ok("1") {
-        let layout = match triton_ktir_superdsc::layout::for_node(&node) {
+        let mut layout = match triton_ktir_superdsc::layout::for_node(&node) {
             Ok(l) => l,
             Err(e) => refused!(e.stage, e.message),
         };
-        // A paged kernel's cache is allocated row-outermost, as the production dump allocates it.
-        if matches!(program, Program::PagedAttn | Program::PagedKvWrite)
-            && let Err(e) = triton_ktir_superdsc::layout::allocate_paged_cache(&node, &layout)
-        {
-            refused!("cache", e);
+        // A paged kernel's cache is allocated row-outermost, as the production dump allocates it —
+        // at the bytes the DRIVER stages each plane at (`CACHE_BYTES`, the launcher's own funded
+        // pool; the views state only the addressing bound, which no run funds).
+        if matches!(program, Program::PagedAttn | Program::PagedKvWrite) {
+            let plane_bytes = match std::env::var("CACHE_BYTES")
+                .map_err(|e| e.to_string())
+                .and_then(|v| v.parse::<u64>().map_err(|e| e.to_string()))
+            {
+                Ok(b) => [b, b],
+                Err(e) => refused!(
+                    "cache",
+                    format!(
+                        "a paged kernel's cache planes are allocated at CACHE_BYTES (the bytes \
+                         the driver stages each plane at); got {e:?}"
+                    )
+                ),
+            };
+            if let Err(e) =
+                triton_ktir_superdsc::layout::allocate_paged_cache(&node, &mut layout, plane_bytes)
+            {
+                refused!("cache", e);
+            }
         }
         match triton_ktir_superdsc::emit_whole::<ktir_superdsc::collective::TpWorld<1>>(
             &node,

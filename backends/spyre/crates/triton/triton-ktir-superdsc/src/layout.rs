@@ -109,17 +109,65 @@ const PAGED_CACHE_PARAMS: [usize; 2] = [2, 3];
 /// cache a paged kernel reads or writes is allocated row-outermost (`head_major_kv_layout`,
 /// [`ktir_superdsc::placement::BundleLayout::allocate_row_outermost`]). A model bundle's cache is
 /// allocated where the bake places it (`compute_bundle_layout`).
-pub fn allocate_paged_cache(node: &KtirNode, layout: &BundleLayout) -> Result<(), String> {
-    for i in PAGED_CACHE_PARAMS {
-        let Some(b) = node.bindings.get(i) else {
+///
+/// ⭐⭐⭐ AND THE PLACEMENT IS THE CALLER'S OWN ALLOCATION, NOT THE VIEW'S. [`for_regions`] places
+/// each cache plane as a ZERO-BYTE stub — the cache views state the addressing bound (the most one
+/// pool region may hold, a whole segment a plane), and the bytes a run actually funds are the
+/// caller's choice at run time, which no program states. This grows the stubs to `plane_bytes` —
+/// the bytes the CALLER allocates each cache plane at, its own funded pool (`[K, V]`) — re-packing
+/// each at the TOP of its stub's segment so a funded plane can never overlap a neighbour, and
+/// refusing a growth past the segment ceiling by name. An emission against an unallocated cache
+/// is refused by the footprint guard ("exceeds its placement footprint 0B"), never silently
+/// addressed through a stub.
+pub fn allocate_paged_cache(
+    node: &KtirNode,
+    layout: &mut BundleLayout,
+    plane_bytes: [u64; 2],
+) -> Result<(), String> {
+    for (i, &bytes) in PAGED_CACHE_PARAMS.iter().zip(plane_bytes.iter()) {
+        let Some(b) = node.bindings.get(*i) else {
             return Err(format!(
                 "{}: a paged kernel binds {} buffers, so no cache at parameter {i}",
                 node.func.name,
                 node.bindings.len()
             ));
         };
+        let tid = b.get();
+        let Some(stub) = layout.placements.get(&tid).copied() else {
+            return Err(format!(
+                "{}: t{tid} is the cache at parameter {i} but this bundle never placed it",
+                node.func.name
+            ));
+        };
+        // Re-pack at the segment's high-water: the stub held ZERO bytes at its own offset, and
+        // growing it in place would run into whatever was packed after it. Appending at the top
+        // is overlap-free by construction — the same granule arithmetic `for_regions`'s [`pack`]
+        // advances by, so the overlap proof needs no second run.
+        let offset = layout.segment_bytes[stub.segment];
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: stub.role,
+                segment: stub.segment,
+                bank: 0,
+                offset,
+                size: bytes,
+            },
+        );
+        layout.segment_bytes[stub.segment] = align128(offset + bytes).max(offset + GRANULE);
+        if layout.segment_bytes[stub.segment] > SEGMENT_SIZE {
+            return Err(format!(
+                "{}: the cache plane t{tid} is allocated at {bytes} B and seg{} then packs {} B, \
+                 past the {SEGMENT_SIZE} B a segment is (`SEGMENT_SIZE`, which is also the \
+                 addressing stride) — the funded pool does not fit one HBM region.",
+                node.func.name,
+                stub.segment,
+                layout.segment_bytes[stub.segment],
+            ));
+        }
         layout
-            .allocate_row_outermost(b.get())
+            .allocate_row_outermost(tid)
             .map_err(|e| format!("{}: {}", node.func.name, e.0))?;
     }
     Ok(())
@@ -304,6 +352,35 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // CHOOSES the segment again ([`pack`] takes only the role), so a downstream worker deriving a
     // binding region from `role.segment()` reads the same segment the placement states.
     for reg in r.iter() {
+        // ⭐⭐⭐ THE PAGED CACHE'S PLACEMENT IS ITS ALLOCATION'S, NOT ITS VIEW'S. The paged kernels'
+        // cache views state the ADDRESSING BOUND — the most one pool region may hold, which is a
+        // whole 16 GiB segment a plane — so placing them at their view extents would demand more
+        // segments than the program has; and the bytes a run actually funds are the caller's
+        // choice at run time, which no program states. So the one-kernel layout places each cache
+        // plane as a ZERO-BYTE stub, at its own role and segment (minting its id and its source
+        // count like every parameter), and [`allocate_paged_cache`] grows it — to the bytes the
+        // caller allocates, re-packed at the top of the segment — when the caller allocates the
+        // cache. An emission against an unallocated cache is refused by the footprint guard
+        // ("exceeds its placement footprint 0B"), never silently addressed through a stub.
+        if matches!(node.program, Program::PagedAttn | Program::PagedKvWrite)
+            && PAGED_CACHE_PARAMS
+                .iter()
+                .any(|i| node.bindings.get(*i).is_some_and(|b| b.get() == reg.tid))
+        {
+            pack(
+                name,
+                reg.tid,
+                if reg.is_out {
+                    SegRole::Logits
+                } else {
+                    SegRole::Activation
+                },
+                0,
+                &mut placements,
+                &mut segment_bytes,
+            )?;
+            continue;
+        }
         // SIZE IS THE TENSOR'S TRUE FOOTPRINT, VIA THEIR OWN FUNCTION. `synth_footprint_bytes`
         // pads the inner (stick) axis up to the dtype's stick-elem multiple and multiplies the
         // rest — the same rule `materialized_bytes` measures an access against on the other side of

@@ -1000,7 +1000,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         nbytes(tid) / u64::from(t.rows) / u64::from(t.cols)
     };
     let (kv_bank_bytes, kv_block_banks) = if cfg!(feature = "spyre-lower") {
-        place_kv_pools(kv_states, per_layer_ext, &width_of, &mut seg_bytes, &mut placements)
+        place_kv_pools(kv_states, per_layer_ext, &width_of, &mut seg_bytes, &mut placements)?
     } else {
         (Vec::new(), Default::default())
     };
@@ -2021,9 +2021,21 @@ fn place_kv_pools(
     width_of: &impl Fn(u32) -> u64,
     seg_bytes: &mut [u64; 7],
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-) -> (Vec<u64>, PoolTableBanks) {
+) -> Result<(Vec<u64>, PoolTableBanks), SuperDscError> {
     use scratchy_subtile::handoff::KvStateDecl;
     let kv_seg = SegRole::Kv.segment();
+    // ⭐⭐ THE SPAN UNITS ARE THE ADDRESSING BOUND, NOT THE FUNDED POOL —
+    // [`scratchy_triton_splice::units_max`] of the declaration's unit bytes: the most one layer's
+    // bank may hold, the same constant the kernels' cache descriptors declare. The bytes a run
+    // actually funds are the worker's choice at run time (the card allocates each layer's bank at
+    // the pages it funds); the PLACEMENT states the bound, so no view of the pool declares past
+    // its region. A bank whose bound bytes exceed the segment (a class pairing more than one
+    // declaration) is refused at expansion — a build failure, never a runtime shortfall.
+    let span_units = |decl: &KvStateDecl, w: u64| {
+        u64::from(scratchy_triton_splice::units_max(decl.unit_bytes(w)))
+    };
+    use ktir_core::ddl_binds::DeviceGen;
+    let region_bytes = <ktir_core::ddl_binds::Baked as DeviceGen>::MAX_SEGMENT_BYTES;
     // ⭐ THE DECLARATIONS ARE THE PAIRING — each plane tid names its declaration (and its place
     // in it) directly; the pool set is exactly the declarations' planes.
     let mut plane_of: std::collections::BTreeMap<u32, (&KvStateDecl, usize)> = Default::default();
@@ -2099,7 +2111,15 @@ fn place_kv_pools(
                     .map(|i| block + decl.plane_offset_bytes(i, w))
                     .collect(),
             );
-            block += decl.units() * decl.unit_bytes(w);
+            block += span_units(decl, w) * decl.unit_bytes(w);
+        }
+        if block > region_bytes {
+            return Err(SuperDscError(format!(
+                "the KV pools' addressing bound packs {block} B in one layer's bank and a \
+                 segment is {region_bytes} B — a class pairing more than one KV declaration \
+                 cannot hold both pools' bounds in one device region. Split the class or \
+                 shrink a declaration."
+            )));
         }
         let banks: Vec<KvBank> = (0..paired.first()
             .map(|(_, ts)| ts.first().map(|t| t.1.len()).unwrap_or(0))
@@ -2115,9 +2135,10 @@ fn place_kv_pools(
                 // baked body serves every layer, so the per-layer tid never re-derives which
                 // plane it is.
                 let (_, plane) = plane_of[&t0];
+                let su = span_units(decl, width_of(t0));
                 for (&tid, &bank) in tids.iter().zip(&banks) {
                     let w = width_of(tid);
-                    place(tid, bank, off, decl.plane_span_bytes(plane, w));
+                    place(tid, bank, off, decl.plane_span_bytes_at(su, plane, w));
                 }
                 table_banks.insert(t0, banks.clone());
             }
@@ -2140,19 +2161,27 @@ fn place_kv_pools(
             continue;
         }
         let w = width_of(d.planes()[0].source() as u32);
+        let su = span_units(d, w);
         for (i, p) in d.planes().iter().enumerate() {
             place(
                 p.source() as u32,
                 KvBank::BASE,
                 tail + d.plane_offset_bytes(i, w),
-                d.plane_span_bytes(i, w),
+                d.plane_span_bytes_at(su, i, w),
             );
         }
-        tail += d.units() * d.unit_bytes(w);
+        tail += su * d.unit_bytes(w);
+    }
+    if tail > region_bytes {
+        return Err(SuperDscError(format!(
+            "bank 0 of the KV segment packs {tail} B at the pools' addressing bound and a \
+             segment is {region_bytes} B — the per-layer block and the unowned tail together \
+             exceed one device region. Split the class or shrink a declaration."
+        )));
     }
     bank_bytes[0] = tail;
     seg_bytes[kv_seg] = bank_bytes[0];
-    (bank_bytes.split_off(1), table_banks)
+    Ok((bank_bytes.split_off(1), table_banks))
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -11010,9 +11039,10 @@ mod kv_pool_placement_tests {
     /// ⭐ EVERY LAYER OWNS ITS REGION: each launch block is its own bank, every bank holds the
     /// same intra-block (plane) offsets (one baked body serves every layer), and bank 0's bytes are
     /// the segment's own. The unit is ONE page of both planes — K at the unit's base, V at
-    /// `+per_unit` — so K's placement spans the whole interleaved bank (`2·pool`) and V's that
-    /// minus its own plane offset (the byte form of the descriptor law: an offset-based plane
-    /// declares the span less its offset rows).
+    /// `+per_unit` — and every span is the ADDRESSING BOUND's ([`scratchy_triton_splice::units_max`]
+    /// of the declaration's unit bytes — the most one bank may hold), so K's placement spans the
+    /// whole interleaved bank and V's that less its own plane offset (the byte form of the
+    /// descriptor law: an offset-based plane declares the span less its offset rows).
     #[test]
     fn every_layer_owns_its_region_at_the_same_offsets() {
         let (layers, pool) = (4u32, 3 * 1024u64);
@@ -11024,12 +11054,16 @@ mod kv_pool_placement_tests {
             &|_| 1,
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the bound-sized pools place");
+        // The bound, at the fixture's own width: `units_max` of `2·pool` unit bytes.
+        let su = u64::from(scratchy_triton_splice::units_max(2 * pool));
+        let bank = su * 2 * pool;
         let kv = SegRole::Kv.segment();
-        assert_eq!(seg_bytes[kv], 2 * pool, "bank 0 holds one layer's K and V");
+        assert_eq!(seg_bytes[kv], bank, "bank 0 holds one layer's K and V");
         assert_eq!(
             extra,
-            vec![2 * pool; layers as usize - 1],
+            vec![bank; layers as usize - 1],
             "one bank per further layer"
         );
         let per_layer_banks: Vec<KvBank> = (0..layers).map(KvBank::of_placement).collect();
@@ -11044,10 +11078,10 @@ mod kv_pool_placement_tests {
             let (k, val) = (placements[&(1000 + v)], placements[&(2000 + v)]);
             assert_eq!((k.bank, k.offset), (v, 0), "layer {v}'s K");
             assert_eq!((val.bank, val.offset), (v, pool), "layer {v}'s V");
-            assert_eq!(k.size, 2 * pool, "layer {v}'s K placement spans the bank");
+            assert_eq!(k.size, bank, "layer {v}'s K placement spans the bank");
             assert_eq!(
                 val.size,
-                2 * pool - pool,
+                bank - pool,
                 "layer {v}'s V placement spans the bank less its plane offset"
             );
         }
@@ -11055,9 +11089,48 @@ mod kv_pool_placement_tests {
 
     /// A state no per-layer table names sits in bank 0, after that bank's block — where the
     /// unshifted prefix and suffix launches read it — unit-major like every other state: its K
-    /// at the tail, its V at `+per_unit`, the state one span wide.
+    /// at the tail, its V at `+per_unit`, each plane one BOUND span wide. Stated with NO class
+    /// owning anything, so bank 0 is the tail state's alone (a class's block already fills the
+    /// bank at the bound — the refusal test below).
     #[test]
     fn a_state_no_layer_owns_sits_in_bank_0_after_its_block() {
+        let pool = 1024u64;
+        let per_layer_ext: Vec<std::collections::BTreeMap<u32, Vec<u32>>> = Vec::new();
+        let page = std::num::NonZeroU32::new(128).expect("128 != 0");
+        let states = vec![scratchy_subtile::handoff::KvStateDecl::new(
+            vec![
+                scratchy_subtile::handoff::KvStatePlane::new(9000, pool),
+                scratchy_subtile::handoff::KvStatePlane::new(9100, pool),
+            ],
+            page,
+            page.get(),
+        )
+        .expect("one page is a whole number of pages")];
+        let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
+        let (extra, _) = place_kv_pools(
+            &states,
+            &per_layer_ext,
+            &|_| 1,
+            &mut seg_bytes,
+            &mut placements,
+        )
+        .expect("a lone tail state places at the bound");
+        let su = u64::from(scratchy_triton_splice::units_max(2 * pool));
+        let bank = su * 2 * pool;
+        let (k, v) = (placements[&9000], placements[&9100]);
+        assert_eq!((k.bank, k.offset), (0, 0));
+        assert_eq!((v.bank, v.offset), (0, pool), "V rides its unit");
+        assert_eq!(k.size, bank, "K spans the bank at the bound");
+        assert_eq!(v.size, bank - pool, "V spans it less its plane offset");
+        assert_eq!(seg_bytes[SegRole::Kv.segment()], bank);
+        assert!(extra.is_empty(), "no class, no further banks");
+    }
+
+    /// ⭐ A BANK PAST ITS SEGMENT IS REFUSED AT EXPANSION — a class's block already fills bank 0
+    /// at the bound, so an unowned tail state on top of it exceeds the segment and the placement
+    /// refuses by name: a build failure, never a runtime shortfall.
+    #[test]
+    fn a_bank_past_its_segment_is_refused_at_expansion() {
         let (layers, pool) = (3u32, 1024u64);
         let per_layer_ext = one_class(layers);
         let mut states = vec![one_state(pool)];
@@ -11074,21 +11147,18 @@ mod kv_pool_placement_tests {
             .expect("one page is a whole number of pages"),
         );
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let (extra, _) = place_kv_pools(
+        let Err(e) = place_kv_pools(
             &states,
             &per_layer_ext,
             &|_| 1,
             &mut seg_bytes,
             &mut placements,
-        );
-        let (k, v) = (placements[&9000], placements[&9100]);
-        assert_eq!((k.bank, k.offset), (0, 2 * pool));
-        assert_eq!((v.bank, v.offset), (0, 2 * pool + pool), "V rides its unit");
-        assert_eq!(seg_bytes[SegRole::Kv.segment()], 4 * pool);
-        assert_eq!(
-            extra,
-            vec![2 * pool; layers as usize - 1],
-            "the other banks are unchanged"
+        ) else {
+            panic!("bank 0 past the segment's bound must be refused");
+        };
+        assert!(
+            e.to_string().contains("exceed one device region"),
+            "the refusal names the segment law: {e}"
         );
     }
 }

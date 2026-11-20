@@ -426,7 +426,18 @@ impl KvStateDecl {
 
     /// A PLANE'S EXTENT from its own base, in elems — the whole bank minus its offset.
     pub fn plane_span_elems(&self, plane: usize) -> u64 {
-        self.units() * self.unit_elems() - self.plane_offset_elems(plane)
+        self.plane_span_elems_at(self.units(), plane)
+    }
+
+    /// ⭐ THE SPAN LAW AT AN ARBITRARY UNIT COUNT of this same declaration —
+    /// `units · unit − offset`, the ONE statement ([`Self::plane_span_elems`]'s
+    /// own law), stated once and read at any unit count a placement or a kernel
+    /// descriptor declares FOR THIS DECLARATION: the declaration's own units at
+    /// its mint, and the addressing bound (`units_max`, the most units one
+    /// device region may hold) where the compiled programs state the pool's
+    /// span without baking the pages a particular run funds.
+    pub fn plane_span_elems_at(&self, units: u64, plane: usize) -> u64 {
+        units * self.unit_elems() - self.plane_offset_elems(plane)
     }
 
     /// UNIT BYTES at one elems→bytes width — the sum over planes, the ONE statement.
@@ -441,7 +452,13 @@ impl KvStateDecl {
 
     /// A PLANE'S EXTENT from its own base, in bytes.
     pub fn plane_span_bytes(&self, plane: usize, width: u64) -> u64 {
-        self.plane_span_elems(plane) * width
+        self.plane_span_bytes_at(self.units(), plane, width)
+    }
+
+    /// The span law's byte form at an arbitrary unit count — see
+    /// [`Self::plane_span_elems_at`].
+    pub fn plane_span_bytes_at(&self, units: u64, plane: usize, width: u64) -> u64 {
+        self.plane_span_elems_at(units, plane) * width
     }
 
     /// The declaration as ONE TP RANK holds it: `cols[plane]` is that plane's source's

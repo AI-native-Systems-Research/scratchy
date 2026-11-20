@@ -663,7 +663,11 @@ pub struct PagedStep {
     pub chunk_masks: u32,
     /// The int32 zero stick staged beside `kv_row_pool` ([`Self::card_int32_zero_bytes`]).
     pub int32_zero: u32,
-    /// Pages in each layer's pools — the scheduler's block count.
+    /// ⭐ THE POOL'S ADDRESSING BOUND, IN PAGES — [`scratchy_triton_splice::units_max`] of the
+    /// declaration's unit bytes: the most one layer's pool region may hold, a compile-time
+    /// constant of the generation and the declaration. NEVER the pages a particular run funds:
+    /// the worker picks those at run time (up to this bound minus the null page), and
+    /// [`Self::host_blocks`] — the scheduler's block count — is the bound's own answer.
     pub pages: u32,
     /// ⭐ THE STATE UNIT, IN ELEMENTS — the declaration's own Σ of the planes' per-unit elems
     /// ([`scratchy_subtile::handoff::KvStateDecl::unit_elems`]), minted with the state's tensors

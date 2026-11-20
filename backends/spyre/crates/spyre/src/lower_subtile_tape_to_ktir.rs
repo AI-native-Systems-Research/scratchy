@@ -1630,14 +1630,22 @@ pub fn paged_step_of_ir<F: RopeForm>(
                 n.output.tensor.index()
             ))
         })?;
-        // ⭐ THE POOL'S FACTS OFF THE DECLARATION — its page count is the declared units and its
-        // unit the declared Σ of the planes' per-unit elems ([`KvStateDecl`]), whole by the
-        // mint's own construction; no tensor shape is read back and no whole-pages law is
-        // restated here. A pool no declaration names is refused by name (a bake bug).
+        // ⭐ THE POOL'S FACTS OFF THE DECLARATION — its unit the declared Σ of the planes'
+        // per-unit elems ([`KvStateDecl`]), whole by the mint's own construction; no tensor
+        // shape is read back and no whole-pages law is restated here. A pool no declaration
+        // names is refused by name (a bake bug). The PAGE COUNT is the addressing bound
+        // ([`scratchy_triton_splice::units_max`] — the most one pool region may hold, a
+        // compile-time constant of the generation and the declaration), NEVER the pages a
+        // particular run funds: the worker picks those at run time, up to this bound minus the
+        // null page.
         let decl = scratchy_triton_splice::decl_of_pool(kv_states, cache)
             .map_err(SuperDscError)?;
+        let unit_bytes =
+            decl.unit_bytes(u64::from(
+                ktir_superdsc::superdsc_opspec::Df::Fp16.word_length(),
+            ));
         let (pages, unit_elems, mq) = (
-            decl.units() as u32,
+            scratchy_triton_splice::units_max(unit_bytes),
             decl.unit_elems() as u32,
             n.output.region.rows.len,
         );

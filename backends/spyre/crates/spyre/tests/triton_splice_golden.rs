@@ -2388,7 +2388,7 @@ const ATTN_SHAPES: &[AttnShape] = &[
 /// this step (`= decode_position + 1`). For a rope-appended cache the prefix segment is
 /// `valid_len - 1` rows (the new row arrives through the separate new-k/new-v segments); for a
 /// pre-populated cache the whole region is valid.
-
+///
 /// One attention node (plus its RopeAppend producer when the shape wants one) as a
 /// `lower_region`-bound `SubtileIR` — the ONLY construction that can mint the Tiled stage's
 /// `KvCacheLayout`/`KvCacheProducer`/`SoftmaxStateId` witnesses, because their constructors are
@@ -2699,10 +2699,14 @@ fn the_paged_attention_splices_with_its_contract() {
         // promotes to straight-line code). At a head two sticks wide the decode's pages are permuted
         // per kv head and its output row back, and the prefill's query and output are relaid
         // head-major and back, its page gathered in pieces.
-        let layout = triton_ktir_superdsc::layout::for_node(k)
+        let mut layout = triton_ktir_superdsc::layout::for_node(k)
             .unwrap_or_else(|e| panic!("{at}: layout: {e:?}"));
-        scratchy_triton_splice::allocate_paged_cache(k, &layout)
-            .unwrap_or_else(|e| panic!("{at}: {e}"));
+        scratchy_triton_splice::allocate_paged_cache(
+            k,
+            &mut layout,
+            scratchy_triton_splice::funded_cache_plane_bytes(&kv_decls_of(s)[0]),
+        )
+        .unwrap_or_else(|e| panic!("{at}: {e}"));
         let mut sym = 0i64;
         let ops = door_lower(k, &mut sym, Some(&layout), None)
             .unwrap_or_else(|e| panic!("{at}: the walk lowers: {}", e.message));

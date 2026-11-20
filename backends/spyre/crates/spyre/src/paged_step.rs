@@ -1756,7 +1756,7 @@ mod tests {
         // The per-request regions: the walk's 4 pages, NOT the pool's 16 — the one law this
         // test exists for.
         assert_eq!(size(s.page_table), 4 * s.card_walk_step());
-        assert_eq!(size(s.mask), (4 * 1 * 4 * 2) as u64);
+        assert_eq!(size(s.mask), (4 * 4 * 2) as u64);
         // The pool-indexed static: the pool's own 16 pages.
         let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64;
         assert_eq!(size(s.kv_row_pool), 16 * run * 4);
