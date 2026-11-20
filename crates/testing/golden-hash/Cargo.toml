@@ -1,0 +1,13 @@
+[package]
+name = "scratchy-golden-hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Test support: a build's per-model hashes held to a checked-in golden, which the test regenerates, never a hand"
+
+[lib]
+
+# A dev-dependency of every target's golden-hash test (Metal's `tape_hashes`, CUDA's
+# `tape_dump`): the one golden format and its regeneration rule. What a model's hash covers is
+# each test's own.
+[dependencies]

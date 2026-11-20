@@ -5,6 +5,7 @@ members = [
     "crates/core/common",
     "crates/core/config",
     "crates/core/tp-world",
+    "crates/testing/golden-hash",
     "crates/serving/scheduler",
     "crates/serving/engine",
     "crates/serving/api",
