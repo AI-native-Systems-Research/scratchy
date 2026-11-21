@@ -7,20 +7,22 @@
 Each team member posts a clean quick run of scripts/bench_metal_matrix.sh as a
 comment on the open round issue (the metal-bench skill, step 7). Once every Mac
 in MACHINES has one, .github/workflows/metal-round.yml opens a PR to the site
-branch that adds the newest run per Mac, gzipped, to its data/metal, in one
-commit, and closes the issue; an admin merges the PR.
+branch that adds the newest run per Mac, gzipped, to its Mac's folder in
+data/metal, in one commit that moves nothing, and closes the issue; an admin
+merges the PR.
 
   metal_round.py check RUN.json
       Whether the run can go in a round; exits 1 with the reason if not.
   metal_round.py collect --comments C.json --out-dir D [--main-ref REF]
       Read the issue's comments (gh api .../comments, a JSON array), write the
-      newest accepted run per Mac to D, gzipped, under the site's file name, and
-      print a JSON summary: the status comment's body, the rejections to reply
-      to, and whether the round is complete.
+      newest accepted run per Mac to D, gzipped, under the site's path for it
+      (<machine>/<stamp>-<sha8>.json.gz), and print a JSON summary: the status
+      comment's body, the rejections to reply to, and whether the round is
+      complete.
   metal_round.py commit-input --branch B --head SHA --repo OWNER/NAME --dir D FILE...
-      The GraphQL request that adds the files to data/metal on branch B, a
-      branch from the site branch, as one commit (createCommitOnBranch, which
-      GitHub signs).
+      The GraphQL request that adds the files (paths in D, which are their
+      paths under data/metal) to data/metal on branch B, a branch from the site
+      branch, as one commit (createCommitOnBranch, which GitHub signs).
 
 Standard library only.
 """
@@ -30,6 +32,7 @@ import base64
 import binascii
 import gzip
 import json
+import os
 import re
 import subprocess
 import sys
@@ -57,7 +60,7 @@ PACKED = re.compile(r"```json\+gzip\+base64[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.S
 UTC = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 SHA = re.compile(r"[0-9a-f]{40}")
 
-# Where the site branch keeps the runs its Metal page reads.
+# Where the site branch keeps the runs its Metal page reads: a folder a Mac, every run of it.
 SITE_DATA = "data/metal"
 
 
@@ -121,17 +124,27 @@ def problem(run, is_on_main, posted=None):
     return None
 
 
+def machine(run):
+    """The run's Mac as a slug of its chip, apple-m3-pro: its folder on the site branch."""
+    return re.sub(r"[^a-z0-9-]", "", run["machine"]["chip"].lower().replace(" ", "-"))
+
+
+def when_sha(run):
+    """The run's <stamp>-<sha8>: when it started, and its commit."""
+    utc = run["generated_utc"]
+    return f"{utc[:10]}T{utc[11:19].replace(':', '')}Z-{run['repo']['sha'][:8]}"
+
+
 def stamp(run):
     """The bench script's file name for a run: <chip-slug>-<stamp>-<sha8>.json."""
-    slug = re.sub(r"[^a-z0-9-]", "", run["machine"]["chip"].lower().replace(" ", "-"))
-    utc = run["generated_utc"]
-    return f"{slug}-{utc[:10]}T{utc[11:19].replace(':', '')}Z-{run['repo']['sha'][:8]}.json"
+    return f"{machine(run)}-{when_sha(run)}.json"
 
 
 def site_file(run):
-    """A run's file name and gzipped bytes, as the site branch stores it."""
+    """A run's path under data/metal, <machine>/<stamp>-<sha8>.json.gz, and its gzipped bytes,
+    as the site branch stores it."""
     text = json.dumps(run, indent=2) + "\n"
-    return f"{stamp(run)}.gz", gzip.compress(text.encode(), compresslevel=9, mtime=0)
+    return f"{machine(run)}/{when_sha(run)}.json.gz", gzip.compress(text.encode(), compresslevel=9, mtime=0)
 
 
 def runs_in(body):
@@ -268,6 +281,7 @@ def main(argv=None):
     for chip in MACHINES:
         if chip in newest:
             name, packed = site_file(newest[chip][0])
+            os.makedirs(os.path.dirname(f"{a.out_dir}/{name}"), exist_ok=True)
             with open(f"{a.out_dir}/{name}", "wb") as f:
                 f.write(packed)
             files.append(name)

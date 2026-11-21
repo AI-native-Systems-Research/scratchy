@@ -597,8 +597,9 @@ chip="$(sysctl -n machdep.cpu.brand_string)"
 slug="$(echo "${chip}" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9-]//g')"
 : "${OUT_DIR:="${ROOT}/bench_results/metal_matrix"}"
 RAW="${OUT_DIR}/${slug}"
-# Named <machine>-<start time>-<sha8>.json (gzipped when copied to the site
-# branch), so two runs of one commit never collide. One timestamp feeds both
+# Named <machine>-<start time>-<sha8>.json, so two runs of one commit never
+# collide. On the site branch it goes, gzipped, in its Mac's folder:
+# data/metal/<machine>/<start time>-<sha8>.json.gz. One timestamp feeds both
 # the name and generated_utc.
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 stamp="${STARTED_UTC//:/}"

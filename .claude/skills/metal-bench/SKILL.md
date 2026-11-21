@@ -327,7 +327,7 @@ The runs are on the repo's `site` branch, gzipped; read them from there:
 ```bash
 up=$(git remote -v | awk '/AI-native-Systems-Research\/scratchy(\.git)? \(fetch\)/ {print $1; exit}')
 git fetch -q "$up" site
-sha=$(git ls-tree --name-only "$up/site" data/metal/ | grep '\.json\.gz$' | while read -r p; do git show "$up/site:$p" | gunzip | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["generated_utc"], d["repo"]["sha"])'; done | sort | tail -1 | cut -d' ' -f2)
+sha=$(git ls-tree -r --name-only "$up/site" data/metal/ | grep '\.json\.gz$' | while read -r p; do git show "$up/site:$p" | gunzip | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["generated_utc"], d["repo"]["sha"])'; done | sort | tail -1 | cut -d' ' -f2)
 git worktree add /tmp/scratchy-known-good "$sha"
 (cd /tmp/scratchy-known-good && if [ -d crates/targets/metal/cli ]; then
    cargo build --release -p scratchy-target-metal-cli --features <features>
@@ -477,35 +477,35 @@ block says `site/ is a plain folder`, stop: show the user `ls -A site`, ask
 them to check that it holds only `target/` and `_site/`, and once they have
 removed it (`rm -rf site`), run the block again.
 
-The site shows each chip's two newest runs, as current and previous, and
-computes the ▲/▼ change badges from them. Add the new run, gzipped
-(`gzip -9 -n`: no name or time in the header, so the same gzip makes the
-same bytes from the same run, though another tool may not; the site refuses
-a plain `.json` in `data/`), keep the run before it as the previous one, and move
-anything older to `data/metal/history/`, which the page's Over time section
-reads. Copy first, and move only once the copy has worked: a run that has the
-same name is not overwritten, and in that case nothing should be moved.
+The site keeps every run of a Mac in that Mac's folder, `data/metal/<machine>/`,
+named `<stamp>-<sha8>.json.gz`. The page shows each chip's two newest runs, by
+when they ran, as current and previous, and computes the ▲/▼ change badges from
+them; its Over time section reads every run. Add the new run, gzipped
+(`gzip -9 -n`: no name or time in the header, so the same gzip makes the same
+bytes from the same run, though another tool may not; the site refuses a plain
+`.json` in `data/`), to its Mac's folder. Nothing else moves: a run that has the
+same name is not overwritten.
 
 ```bash
 m=$(basename "$f" | sed -E 's/-[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{6}Z)?-[0-9a-f]{8}\.json$//')   # e.g. apple-m3-pro
-g="data/metal/$(basename "$f").gz"
+g="data/metal/$m/$(basename "$f" | sed "s/^$m-//").gz"   # data/metal/<machine>/<stamp>-<sha8>.json.gz
+mkdir -p "site/data/metal/$m"
 if [ ! -e "site/$g" ] && gzip -9 -n -c "$f" > "site/$g" && git -C site add "$g"; then
-  ls site/data/metal/"$m"-*.json.gz | sort | sed '$d' | sed '$d' | sed 's|^site/||' \
-    | xargs -r -I{} git -C site mv {} data/metal/history/   # keep the newest two; the rest to history/
+  echo "added $g"
 else
-  echo "$(basename "$g") is already in the site's data/metal; nothing copied or moved"
+  echo "$g is already in the site's data/metal; nothing copied"
 fi
 ```
 
 If it says the file is already there, show the user both files and let them
 decide which one to keep.
 
-Don't delete a run: move it. The one exception is a Mac retired from the
-round, whose runs can be removed with `git rm`.
+Don't delete a run. The one exception is a Mac retired from the round, whose
+runs can be removed with `git rm`.
 
-**Done when:** `ls site/data/metal/$m-*` lists at most two files, the
-newest one is `$(basename "$f").gz`, and `git -C site status --short data/metal`
-shows the new run as added and any older one as renamed into `history/`.
+**Done when:** `ls site/data/metal/$m/` lists `$(basename "$g")` as its newest
+file, and `git -C site status --short data/metal` shows the new run as added
+and nothing else.
 
 ## 6. Preview
 

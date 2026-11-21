@@ -98,6 +98,10 @@ class Check(unittest.TestCase):
         self.assertEqual(metal_round.stamp(run()),
                          "apple-m3-pro-2026-10-21T102354Z-aa000000.json")
 
+    def test_on_the_site_it_goes_in_its_macs_folder(self):
+        name, _ = metal_round.site_file(run())
+        self.assertEqual(name, "apple-m3-pro/2026-10-21T102354Z-aa000000.json.gz")
+
 
 class Collect(unittest.TestCase):
     def test_the_newest_run_per_mac_counts_by_when_it_ran(self):
@@ -175,7 +179,8 @@ class Collect(unittest.TestCase):
 
 
 class Commit(unittest.TestCase):
-    """A finished round's runs go to the site branch's data/metal, gzipped."""
+    """A finished round's runs go to their Macs' folders in the site branch's data/metal, gzipped,
+    and nothing is moved."""
 
     def collect_into(self, out_dir):
         cs = [comment(i, run(chip=c)) for i, c in enumerate(metal_round.MACHINES)]
@@ -190,7 +195,7 @@ class Commit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             summary = self.collect_into(d)
             self.assertTrue(summary["complete"])
-            self.assertIn("apple-m3-pro-2026-10-21T102354Z-aa000000.json.gz", summary["files"])
+            self.assertIn("apple-m3-pro/2026-10-21T102354Z-aa000000.json.gz", summary["files"])
             for name in summary["files"]:
                 self.assertTrue(name.endswith(".json.gz"), name)
                 with open(f"{d}/{name}", "rb") as f:
@@ -202,9 +207,13 @@ class Commit(unittest.TestCase):
             summary = self.collect_into(d)
             a = argparse.Namespace(repo="o/r", branch="metal-round/1", head="abc", dir=d,
                                    headline="h", files=summary["files"])
-            adds = metal_round.commit_input(a)["variables"]["input"]["fileChanges"]["additions"]
+            changes = metal_round.commit_input(a)["variables"]["input"]["fileChanges"]
+        self.assertEqual(set(changes), {"additions"}, "the commit adds, and moves or deletes nothing")
+        adds = changes["additions"]
         self.assertEqual([x["path"] for x in adds],
                          [f"data/metal/{n}" for n in summary["files"]])
+        self.assertIn("data/metal/apple-m5/2026-10-21T102354Z-aa000000.json.gz",
+                      [x["path"] for x in adds])
         back = json.loads(gzip.decompress(base64.b64decode(adds[0]["contents"])))
         self.assertEqual(back, run(chip=metal_round.MACHINES[0]))
 
