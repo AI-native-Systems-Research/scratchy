@@ -152,6 +152,31 @@ fn reroot_crate(ts: TokenStream, mod_name: &str, shared: &[&str]) -> TokenStream
     out.into_iter().collect()
 }
 
+/// Whether an emission names the path `scratchy_models::gdn`: the recurrent state's re-export,
+/// which the emitted `ScratchyWeights::gdn_runtime_config` of an arch running a recurrent mixer
+/// names.
+fn names_gdn_state(ts: &TokenStream) -> bool {
+    let tts: Vec<TokenTree> = ts.clone().into_iter().collect();
+    tts.windows(4).any(|w| match w {
+        [
+            TokenTree::Ident(krate),
+            TokenTree::Punct(c1),
+            TokenTree::Punct(c2),
+            TokenTree::Ident(module),
+        ] => {
+            krate == "scratchy_models"
+                && c1.as_char() == ':'
+                && c1.spacing() == Spacing::Joint
+                && c2.as_char() == ':'
+                && module == "gdn"
+        }
+        _ => false,
+    }) || tts.iter().any(|tt| match tt {
+        TokenTree::Group(g) => names_gdn_state(&g.stream()),
+        _ => false,
+    })
+}
+
 /// The quant presets enabled for one arch: its `quantizations.json` ∩ the enabled presets.
 fn enabled_quants(qpath: &Path, enabled_presets: &HashSet<&str>) -> Vec<String> {
     // Only watch the file if it EXISTS. `rerun-if-changed` on a missing path
@@ -259,6 +284,15 @@ fn emit_arch(
     for variant in compiled_variants(&tokens, mod_name) {
         println!("cargo::rustc-cfg=compiled_model=\"{variant}\"");
     }
+    // A recurrent mixer's emitted state config names `::scratchy_models::gdn`, which exists only
+    // under scratchy-models' `gdn`: refuse the build here, by the arch's name, rather than let
+    // rustc fail inside the emitted dispatcher.
+    assert!(
+        build.metadata.features.iter().any(|f| f == "GDN") || !names_gdn_state(&tokens),
+        "arch `{mod_name}` runs a recurrent mixer (`gated_delta_net` or `mamba2`), whose state \
+         config the emitted code names as `::scratchy_models::gdn`: its `arch-*` feature on \
+         scratchy-models must turn on `gdn`"
+    );
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name, build.emitter.shared_root_modules());
     let found = ((build.inspect)(&tokens).into_iter())

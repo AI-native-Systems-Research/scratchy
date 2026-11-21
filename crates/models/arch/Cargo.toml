@@ -26,7 +26,8 @@ default = []
 
 # Per-arch gates. `arch-<name>` selects the arch: a target's models build emits
 # it as `pub mod <name>`. Vision arches also pull their shared text decoder and
-# state `vision`. (The models build scans dsl/*.py.)
+# state `vision`. An arch whose carrier runs a recurrent mixer (`gated_delta_net`
+# or `mamba2`) turns on `gdn`. (The models build scans dsl/*.py.)
 arch-commandr = []
 arch-gemma2 = []
 arch-gemma3 = []
@@ -40,17 +41,17 @@ arch-locateanything = ["arch-qwen2", "vision"]
 arch-mistral = []
 arch-mixtral = []
 arch-modernbert = []
-arch-nemotron-h = []
-arch-nemotron-h-latent = []
-arch-nemotron-h-mtp = []
+arch-nemotron-h = ["gdn"]
+arch-nemotron-h-latent = ["gdn"]
+arch-nemotron-h-mtp = ["gdn"]
 arch-phi3 = []
 arch-qwen2 = []
 arch-qwen2-5-vl = ["arch-qwen2", "vision"]
 arch-qwen2-moe = []
 arch-qwen2-vl = ["arch-qwen2", "vision"]
 arch-qwen3 = []
-arch-qwen3-5 = []
-arch-qwen3-5-moe = []
+arch-qwen3-5 = ["gdn"]
+arch-qwen3-5-moe = ["gdn"]
 arch-qwen3-5-mtp = []
 arch-qwen3-5-dense-mtp = []
 arch-gemma4-assistant = []
@@ -62,6 +63,13 @@ arch-qwen3-moe = []
 # does): published with the rest of the scope, so a target's models crate
 # knows its build needs the vision towers' runtime.
 vision = []
+
+# The scope selects an arch with a recurrent (conv + ssm) state: Gated DeltaNet or Mamba-2, which
+# share one state pool, slot allocator and runtime config (`scratchy-state-decoder-gdn`). Every
+# such `arch-<name>` turns it on, so naming a model is enough. The emitted state config names
+# the crate through this crate's `gdn` re-export (`src/lib.rs`), which exists only under this
+# feature: an arch that runs the mixer without it fails to build its models crate.
+gdn = ["dep:scratchy-state-decoder-gdn"]
 
 all-arches = [
     "arch-commandr",
@@ -720,6 +728,8 @@ hf-completions = ["dep:ureq", "dep:scratchy-forward-compiler-macro"]
 # The quant presets the scope names: its build script publishes them as `links` metadata, which
 # cargo hands to this crate's build script, a direct dependent (`DEP_SCRATCHY_QUANTIZATIONS_PRESETS`).
 scratchy-quantizations = { workspace = true }
+# The recurrent state's runtime types, re-exported as `gdn` for the emitted code (`gdn` above).
+scratchy-state-decoder-gdn = { workspace = true, optional = true }
 
 [build-dependencies]
 # The scope's metadata (`ScopeMetadata`), and the selected arches the registry resolves.
@@ -737,3 +747,7 @@ rayon = { workspace = true }
 # `hf-completions`, so a build without that feature links no HTTP client into
 # the build script at all and cannot reach the network even by accident.
 ureq = { workspace = true, optional = true }
+
+[dev-dependencies]
+# tests/gdn_feature.rs reads this crate's features from `cargo metadata`.
+serde_json = { workspace = true }

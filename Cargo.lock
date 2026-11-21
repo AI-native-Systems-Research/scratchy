@@ -3165,6 +3165,7 @@ dependencies = [
  "scratchy-forward-compiler-macro",
  "scratchy-models-build",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "serde_json",
  "ureq",
 ]

@@ -1209,7 +1209,7 @@ pub fn compile_carrier(
                     fn gdn_runtime_config(
                         &self,
                     ) -> ::core::option::Option<
-                        ::scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
+                        ::scratchy_models::gdn::layout::GdnRuntimeConfig,
                     > {
                         match self {
                             #(#arms)*

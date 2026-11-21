@@ -5,6 +5,12 @@
 //! models crate reads it back and compiles that selection with the target's emitter
 //! (`scratchy_models_build`). This crate compiles no model itself.
 
+/// The recurrent (conv + ssm) state an arch running Gated DeltaNet or Mamba-2 keeps: its pool,
+/// layout, slot allocator and runtime config. A scope selecting such an arch turns on `gdn`, and
+/// the emitted `ScratchyWeights::gdn_runtime_config` names its config through this path.
+#[cfg(feature = "gdn")]
+pub use scratchy_state_decoder_gdn as gdn;
+
 // Real HF org/repo ids resolved once against huggingface.co at BUILD time
 // (`hf_registry_build.rs`), scoped to exactly the architectures this binary
 // was compiled to run. `scr model names` completes from this — no runtime
