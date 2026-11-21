@@ -22,7 +22,7 @@ use scratchy_serving_engine::spec_decode::{
     DraftBudget, DraftModelProposerConfig, MtpProposerConfig, NgramProposerConfig, ProposerConfig,
 };
 use scratchy_serving_worker::uniproc::UniProcExecutor;
-use scratchy_serving_worker::worker::Worker;
+use scratchy_serving_worker::worker::{SequenceState, Worker};
 use tracing::info;
 
 use crate::chat_template::ChatTemplate;
@@ -1152,33 +1152,6 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-/// Whether an architecture is recurrent / hybrid — it keeps a sequential
-/// conv/ssm (Mamba-style) or Gated-DeltaNet state that cannot be reconstructed
-/// from a cached KV prefix. A prefix-cache hit on one is only correct where a
-/// snapshot of that state is restored with it (a hit would otherwise feed only
-/// the new tokens, leaving the recurrent state computed over the wrong span), so
-/// prefix caching is off for these models unless the worker keeps snapshots —
-/// see [`effective_prefix_caching`]. Mirrors vLLM's hybrid/SSM handling.
-/// Detected by HF `architectures` string since the marker is per-layer.
-fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
-    architectures.iter().any(|a| {
-        let a = a.as_str();
-        // Gated-DeltaNet hybrids (Qwen3.5 / Qwen3.6 / Qwen3-Next).
-        a.contains("Qwen3_5")
-            || a.contains("Qwen3_6")
-            || a.contains("Qwen3Next")
-            // Mamba / SSM families (Nemotron-H: Mamba-2 + attention + MoE).
-            || a.contains("Mamba")
-            || a.contains("NemotronH")
-            || a.contains("Jamba")
-            || a.contains("FalconH")
-            || a.contains("RecurrentGemma")
-            || a.contains("Zamba")
-            || a.contains("Lfm2")
-            || a.contains("GraniteMoeHybrid")
-    })
-}
-
 /// Prefix caching as requested AND as the backend can honour it at all
 /// (`WorkerFactory::supports_prefix_caching`) — what the worker is created with,
 /// so it reserves recurrent-state snapshots only for an engine that will use them.
@@ -1188,8 +1161,8 @@ fn requested_prefix_caching(config: &VllmConfig) -> bool {
 
 /// ⭐ THE ONE RULE FOR WHETHER THE ENGINE SERVES CACHED PREFIXES, at every `EngineCoreConfig` site.
 ///
-/// `requested` is [`requested_prefix_caching`]; a recurrent-hybrid model (see
-/// [`is_recurrent_hybrid_arch`]) additionally needs a worker that keeps `snapshots` of its
+/// `requested` is [`requested_prefix_caching`]; a recurrent-hybrid model (one whose worker reports
+/// [`SequenceState::KvAndRecurrent`]) additionally needs a worker that keeps `snapshots` of its
 /// recurrent state, because a hit that restores no state runs the model over the wrong span.
 fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: bool) -> bool {
     requested && (!recurrent_hybrid || snapshots)
@@ -1197,15 +1170,17 @@ fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: 
 
 /// ⭐ WHETHER THE ENGINE SERVES CACHED PREFIXES, as EVERY entry point decides it (#435): asked for,
 /// honoured by the backend ([`requested_prefix_caching`]), and, for a recurrent hybrid
-/// ([`is_recurrent_hybrid_arch`]), with `snapshots` of its recurrent state that a hit resumes
+/// ([`SequenceState::KvAndRecurrent`], as the worker's compiled model states it), with
+/// `snapshots` of its recurrent state that a hit resumes
 /// from ([`effective_prefix_caching`]). `snapshots` is what the engine's executor reports
 /// (`Executor::snapshot_budget`): an executor that forwards none keeps a hybrid's caching off.
 fn prefix_caching(
     config: &VllmConfig,
     architectures: &[String],
+    sequence_state: SequenceState,
     worker_snapshots: Option<scratchy_serving_scheduler::scheduler::SnapshotBudget>,
 ) -> bool {
-    let hybrid = is_recurrent_hybrid_arch(architectures);
+    let hybrid = sequence_state == SequenceState::KvAndRecurrent;
     let requested = requested_prefix_caching(config);
     if hybrid && requested {
         if let Some(budget) = worker_snapshots {
@@ -1342,7 +1317,7 @@ fn resolve_max_num_seqs(
                     device_budget_bytes: None,
                     allocated_bytes: 0,
                     peak_activation_bytes: 0,
-                    gdn_per_slot_bytes: None,
+                    recurrent_per_slot_bytes: None,
                     sampler_bytes_per_row: 0,
                 },
                 is_offline,
@@ -1468,6 +1443,8 @@ fn initialize_core(
     // And the snapshots of the model's recurrent state it can keep, which decide whether a
     // recurrent-hybrid model may be prefix cached at all.
     let worker_snapshots = worker.snapshot_budget();
+    // And what its model keeps for a sequence: a recurrent state beside the KV decides that too.
+    let sequence_state = worker.sequence_state();
     // And whether it scores a prompt's rows for `prompt_logprobs`: the scheduler takes no
     // prefix-cache hit for such a request, and the API refuses the field without it.
     let scores_prompts = worker.scores_prompts();
@@ -1519,9 +1496,14 @@ fn initialize_core(
     // (garbage output). A hit on one is correct only where a SNAPSHOT of that
     // state is restored with it, so caching stays off for these models unless
     // the worker keeps snapshots (`Worker::snapshot_budget`) — see
-    // `effective_prefix_caching`. (Per-layer linear-attention is the marker;
-    // detect by arch string.)
-    let enable_prefix_caching = prefix_caching(config, &hf_config.architectures, worker_snapshots);
+    // `effective_prefix_caching`. The worker's compiled model states whether it
+    // keeps one (`Worker::sequence_state`).
+    let enable_prefix_caching = prefix_caching(
+        config,
+        &hf_config.architectures,
+        sequence_state,
+        worker_snapshots,
+    );
 
     // Device-specific `max_num_batched_tokens` default — no flat constant on any
     // backend. On backends that prune a compiled prefill-bucket ladder
@@ -2256,8 +2238,8 @@ mod tests {
         );
     }
 
-    /// The decision every entry point makes (#435), from the config, the model's architectures
-    /// and the snapshots the engine's executor reports. An executor that forwards none (the
+    /// The decision every entry point makes (#435), from the config, what the worker's model
+    /// keeps for a sequence and the snapshots the engine's executor reports. An executor that forwards none (the
     /// multi-GPU ones) keeps a recurrent hybrid's caching off; an attention-only model is cached
     /// as asked.
     #[test]
@@ -2266,6 +2248,7 @@ mod tests {
         let config = VllmConfig::default();
         let hybrid = ["Qwen3_5ForConditionalGeneration".to_string()];
         let llama = ["LlamaForCausalLM".to_string()];
+        let (kv, recurrent) = (SequenceState::Kv, SequenceState::KvAndRecurrent);
         let snapshots = scratchy_serving_scheduler::scheduler::SnapshotBudget {
             kv_block_bytes: 1,
             kv_granule_blocks: std::num::NonZeroUsize::MIN,
@@ -2275,22 +2258,25 @@ mod tests {
         };
         assert!(config.enable_prefix_caching, "on by default");
         assert!(
-            prefix_caching(&config, &llama, None),
+            prefix_caching(&config, &llama, kv, None),
             "attention-only: as asked"
         );
         assert!(
-            !prefix_caching(&config, &hybrid, None),
+            !prefix_caching(&config, &hybrid, recurrent, None),
             "a hybrid without snapshots"
         );
         assert!(
-            prefix_caching(&config, &hybrid, Some(snapshots)),
+            prefix_caching(&config, &hybrid, recurrent, Some(snapshots)),
             "with them"
         );
         let off = VllmConfig {
             enable_prefix_caching: false,
             ..config.clone()
         };
-        assert!(!prefix_caching(&off, &llama, None), "--no-prefix-caching");
+        assert!(
+            !prefix_caching(&off, &llama, kv, None),
+            "--no-prefix-caching"
+        );
     }
 
     #[test]
@@ -2299,16 +2285,6 @@ mod tests {
             extract_model_name("meta-llama/Llama-3.2-1B"),
             "meta-llama/Llama-3.2-1B"
         );
-    }
-
-    /// Nemotron-H's Mamba-2 layers carry conv/ssm state no cached KV prefix
-    /// restores, so its architecture string turns prefix caching off.
-    #[test]
-    fn test_nemotron_h_is_a_recurrent_hybrid() {
-        for arch in ["NemotronHForCausalLM", "Qwen3_5MoeForConditionalGeneration"] {
-            assert!(is_recurrent_hybrid_arch(&[arch.to_string()]), "{arch}");
-        }
-        assert!(!is_recurrent_hybrid_arch(&["LlamaForCausalLM".to_string()]));
     }
 
     /// The mlx-community Nemotron-3 checkpoints' stop ids: `config.json` says

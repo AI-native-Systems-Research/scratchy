@@ -1164,7 +1164,7 @@ pub fn compile_carrier(
     let arch_dispatch_ts = if mode.emit_arch_dispatch {
         let arch_ident = Ident::new(&arch_name, name_span);
         // Hybrid (Gated-DeltaNet) arches: the per-arch
-        // `ScratchyWeights::gdn_runtime_config` override the worker reads
+        // `ScratchyWeights::recurrent_state` override the worker reads
         // to size + allocate the GDN state pool. Empty for non-hybrid
         // arches (they keep the trait default `None`). Per-variant arms
         // dispatch on the matched `Weights::Variant(_)` so each variant
@@ -1173,22 +1173,22 @@ pub fn compile_carrier(
         // 9b: 24 layers vs 32, different conv_dim). Across workload
         // buckets within one variant the FUF op graph is identical so
         // we read it off the first bucket per variant.
-        // Per-variant `gdn_runtime_config` arms — each `Weights::Variant(_)`
+        // Per-variant `recurrent_state` arms — each `Weights::Variant(_)`
         // returns its own (conv_dim, num_v_heads, linear_layers) literal or
         // None for non-hybrid variants. Load-bearing for arches with
         // multiple sizes (Qwen3.5 0.8b vs 9b: 24 vs 32 layers, different
         // conv_dim). Workload-bucket dups collapse via `mod_name` dedup;
         // FUF op graph is bucket-invariant for the GDN predicate.
-        let gdn_runtime_config_tokens = {
+        let recurrent_state_tokens = {
             let mut per_variant: std::collections::BTreeMap<
                 String,
                 Option<proc_macro2::TokenStream>,
             > = std::collections::BTreeMap::new();
             for sm in &solved {
                 let key = sm.mod_name.clone();
-                per_variant.entry(key).or_insert_with(|| {
-                    codegen::emit_gdn_runtime_config_arm_body(&sm.fuf, sm.model)
-                });
+                per_variant
+                    .entry(key)
+                    .or_insert_with(|| codegen::emit_recurrent_state_arm_body(&sm.fuf, sm.model));
             }
             if per_variant.values().all(|v| v.is_none()) {
                 proc_macro2::TokenStream::new()
@@ -1206,10 +1206,10 @@ pub fn compile_carrier(
                     })
                     .collect();
                 quote! {
-                    fn gdn_runtime_config(
+                    fn recurrent_state(
                         &self,
                     ) -> ::core::option::Option<
-                        ::scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
+                        ::scratchy_models::gdn::layout::GdnRuntimeConfig,
                     > {
                         match self {
                             #(#arms)*
@@ -1220,7 +1220,7 @@ pub fn compile_carrier(
         };
         // Per-variant `kv_layer_geometry` arms — Some(vec![..]) for an arch with
         // sliding-window layers, None elsewhere.
-        // Same per-variant dedup mechanics as gdn_runtime_config above.
+        // Same per-variant dedup mechanics as recurrent_state above.
         let kv_layer_geometry_tokens = {
             let mut per_variant: std::collections::BTreeMap<
                 String,
@@ -1521,8 +1521,8 @@ pub fn compile_carrier(
                 }
             }
         };
-        let gdn_runtime_config_tokens = quote! {
-            #gdn_runtime_config_tokens
+        let recurrent_state_tokens = quote! {
+            #recurrent_state_tokens
             #kv_layer_geometry_tokens
             #spec_drafts_tokens
             #rope_on_read_tokens
@@ -1545,7 +1545,7 @@ pub fn compile_carrier(
             &hf_arches,
             &arch_dispatch_arms,
             gguf_spec.as_ref(),
-            gdn_runtime_config_tokens,
+            recurrent_state_tokens,
             head_registration,
             emitter,
         )
@@ -1658,7 +1658,7 @@ fn emit_arch_dispatcher(
     arms: &[DispatchArm],
     // The arch's `quantizations.json` GGUF spec (`config::load_gguf_spec`).
     gguf_spec: Option<&config::GgufSpec>,
-    gdn_runtime_config_tokens: proc_macro2::TokenStream,
+    recurrent_state_tokens: proc_macro2::TokenStream,
     head_registration: proc_macro2::TokenStream,
     emitter: &dyn target::TargetEmitter,
 ) -> syn::Result<proc_macro2::TokenStream> {
@@ -1899,7 +1899,7 @@ fn emit_arch_dispatcher(
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
 
-            #gdn_runtime_config_tokens
+            #recurrent_state_tokens
         }
 
         #target_loaded_model

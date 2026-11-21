@@ -54,7 +54,7 @@ pub struct MaxNumSeqsFacts {
     pub peak_activation_bytes: usize,
     /// The GDN state pool's cost of ONE slot (`reserve_bytes(_, 1, ..)` —
     /// the reservation is linear in `num_slots`). `None` = non-hybrid arch.
-    pub gdn_per_slot_bytes: Option<usize>,
+    pub recurrent_per_slot_bytes: Option<usize>,
     /// The sampler arena's cost per row — the resolver sizes the arena it
     /// itself triggers (`n·(vocab + 2·max_hist)·4` plus the sliced buffers'
     /// terms). 0 when the backend keeps no per-row sampler arena.
@@ -79,7 +79,7 @@ impl MaxNumSeqsFacts {
             return usize::MAX;
         };
         let per_row = self
-            .gdn_per_slot_bytes
+            .recurrent_per_slot_bytes
             .unwrap_or(0)
             .saturating_add(self.sampler_bytes_per_row);
         let fixed = self
@@ -258,7 +258,7 @@ pub fn select_prefill_bucket(
 /// deterministic across calls within a run, so the same `req_id` always
 /// maps to the same slot for its whole lifetime; collisions among the
 /// few hundred concurrently-live ids are astronomically unlikely.
-pub fn gdn_slot_key(req_id: &str) -> u64 {
+pub fn recurrent_slot_key(req_id: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     req_id.hash(&mut h);
@@ -283,7 +283,7 @@ mod max_num_seqs_default_tests {
             device_budget_bytes: Some(24 * GIB),
             allocated_bytes: 4 * GIB,
             peak_activation_bytes: 512 * MIB,
-            gdn_per_slot_bytes: Some(19 * MIB),
+            recurrent_per_slot_bytes: Some(19 * MIB),
             sampler_bytes_per_row: 8 * MIB,
         };
         over(&mut f);
@@ -296,7 +296,7 @@ mod max_num_seqs_default_tests {
     /// floor, fits inside the budget — i.e. a default never trips the OOM
     /// guard it is sized against.
     fn kv_left(f: &MaxNumSeqsFacts, width: usize) -> i64 {
-        let per_row = f.gdn_per_slot_bytes.unwrap_or(0) + f.sampler_bytes_per_row;
+        let per_row = f.recurrent_per_slot_bytes.unwrap_or(0) + f.sampler_bytes_per_row;
         let fixed = f.allocated_bytes + f.peak_activation_bytes + MaxNumSeqsFacts::REDUNDANCY_BYTES;
         f.device_budget_bytes.unwrap_or(0) as i64 - fixed as i64 - (per_row * width) as i64
     }
@@ -362,7 +362,7 @@ mod max_num_seqs_default_tests {
             f.device_budget_bytes = Some(5 * GIB);
             f.allocated_bytes = 2 * GIB;
             f.peak_activation_bytes = 300 * MIB;
-            f.gdn_per_slot_bytes = Some(61 * MIB);
+            f.recurrent_per_slot_bytes = Some(61 * MIB);
             f.sampler_bytes_per_row = 0;
         });
         let w = resolve_default_max_num_seqs(&f, false);
@@ -384,7 +384,7 @@ mod max_num_seqs_default_tests {
                 f.device_budget_bytes = Some(6 * GIB);
                 f.allocated_bytes = 2 * GIB;
                 f.peak_activation_bytes = 300 * MIB;
-                f.gdn_per_slot_bytes = None;
+                f.recurrent_per_slot_bytes = None;
                 f.sampler_bytes_per_row = sampler_row;
             })
         };
@@ -406,7 +406,7 @@ mod max_num_seqs_default_tests {
             &roomy(|f| {
                 f.device_budget_bytes = Some(64 * GIB);
                 f.allocated_bytes = 4 * GIB;
-                f.gdn_per_slot_bytes = Some(61 * MIB);
+                f.recurrent_per_slot_bytes = Some(61 * MIB);
             }),
             false,
         );

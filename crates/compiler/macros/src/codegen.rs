@@ -8317,7 +8317,7 @@ impl RecurrentDims {
 /// Emit a per-variant arm body — the `GdnRuntimeConfig` literal for one
 /// specialization. Returns `None` if the variant has no recurrent mixer
 /// (`OpKind::GatedDeltaNet` / `OpKind::Mamba2`) — caller emits a `None` arm.
-pub fn emit_gdn_runtime_config_arm_body(
+pub fn emit_recurrent_state_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
@@ -8361,7 +8361,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     let bits = linear.iter().copied();
     Some(quote! {
         ::core::option::Option::Some(
-            ::scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig {
+            ::scratchy_models::gdn::layout::GdnRuntimeConfig {
                 conv_dim: #conv_dim,
                 conv_kernel: #conv_kernel,
                 num_k_heads: #num_k_heads,

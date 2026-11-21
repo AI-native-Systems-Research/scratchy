@@ -47,8 +47,8 @@ pub trait ScratchyWeights: Send + Sync {
     /// allocation. The proc-macro emits a per-arch override returning
     /// `Some(_)` for arches whose forward body contains a `gated_delta_net`
     /// op; the default (non-hybrid arches) returns `None`, so no GDN state
-    /// pool is allocated and the `gdn_state` ForwardCtx field stays `None`.
-    fn gdn_runtime_config(&self) -> Option<crate::gdn_state_layout::GdnRuntimeConfig> {
+    /// pool is allocated and the `recurrent_state` ForwardCtx field stays `None`.
+    fn recurrent_state(&self) -> Option<crate::gdn_state_layout::GdnRuntimeConfig> {
         None
     }
 

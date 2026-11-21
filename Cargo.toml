@@ -18,6 +18,7 @@ members = [
     "crates/targets/metal/e2e",
     "crates/tensors",
     "crates/layers",
+    "crates/state/decoder/gdn",
     "crates/compiler/ir",
     "crates/models/arch",
     "crates/models/build",
@@ -206,6 +207,7 @@ scratchy-serving-transport = { version = "0.1.0", path = "crates/serving/transpo
 scratchy-tensors = { version = "0.1.0", path = "crates/tensors" }
 scratchy-tp-world = { version = "0.1.0", path = "crates/core/tp-world" }
 scratchy-layers = { version = "0.1.0", path = "crates/layers" }
+scratchy-state-decoder-gdn = { version = "0.1.0", path = "crates/state/decoder/gdn" }
 scratchy-ir = { version = "0.1.0", path = "crates/compiler/ir" }
 scratchy-forward-compiler-frontend = { version = "0.1.0", path = "crates/compiler/frontend" }
 scratchy-subtile = { version = "0.1.0", path = "crates/compiler/subtile" }
