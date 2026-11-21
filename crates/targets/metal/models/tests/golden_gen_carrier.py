@@ -485,11 +485,16 @@ BUNDLE_LEAVES = {
     ],
     # GDN linear_attn (GatedDeltaNetLayer) — gated_delta_net input 4.
     # conv1d is [conv_dim, 1, 4] on disk; the singleton dim drops at use.
+    # The gated norm's gain is one value head wide, shared by every head
+    # (HF `Qwen3_5RMSNormGated(head_v_dim)`), and takes that module's ones
+    # init, jittered so a per-element weight index shows: the generic 0.02
+    # randn would scale the mixer's whole output down about 50x.
     "linear_attn": [
         ("conv1d", lambda b: [b["gdn_conv_dim"], 1, 4]),
         ("a_log", lambda b: [b["linear_num_value_heads"]]),
         ("dt_bias", lambda b: [b["linear_num_value_heads"]]),
-        ("norm", lambda b: [b["gdn_value_dim"]]),
+        ("norm", lambda b: ([b["linear_value_head_dim"]],
+                            lambda shape: 1.0 + 0.1 * torch.randn(*shape))),
     ],
     # Nemotron-H MoE (mlx-lm `NemotronHMoE`: `MoEGate` + `SwitchMLP` with
     # ReLU2) → the ungated SharedFusedMoELayer bank: the dense router `gate`
@@ -1399,10 +1404,14 @@ def gated_delta_net(qkv, z, a, b, layer_w):
                 u = gt * (float(vs_[vd]) - sk)
                 sh[vd] += u * kn
                 o[ti, h * hv + vd] = float(sh[vd] @ qn)
-    # 5. gated RMSNorm: rmsnorm(x) * w * silu(z)
-    var = o.pow(2).mean(-1, keepdim=True)
-    xn = o * torch.rsqrt(var + 1e-6)
-    return xn * layer_w.norm * torch.nn.functional.silu(z)
+    # 5. gated RMSNorm per value head (HF `Qwen3_5GatedDeltaNet`: the norm
+    #    runs over `core_attn_out.reshape(-1, head_v_dim)` at the config's
+    #    `rms_norm_eps`): rmsnorm(o_h) * w * silu(z_h), one gain for every head
+    oh = o.view(t, nv, hv)
+    var = oh.pow(2).mean(-1, keepdim=True)
+    xn = oh * torch.rsqrt(var + STATE["rms_eps"])
+    gated = xn * layer_w.norm * torch.nn.functional.silu(z.view(t, nv, hv))
+    return gated.reshape(t, value_dim)
 
 
 # ── Mamba-2 (mlx-lm nemotron_h.py `NemotronHMamba2Mixer` + ssm.py) ──
@@ -2721,6 +2730,12 @@ def main():
     # derive the bank from the carrier), so the marker the synthesis keys the bank by is restored
     # here, from the carrier's own call.
     for key in re.findall(r"\bmoe_block\([^,]+,\s*([A-Za-z_][A-Za-z_0-9.]*)\[", carrier):
+        manifest.setdefault(key, ["hidden_size"])
+    # The recurrent mixers' bundles likewise: `gated_delta_net(.., <key>[layer])` and
+    # `mamba2(.., <key>[layer])` take theirs as the last argument.
+    for key in re.findall(
+            r"\b(?:gated_delta_net|mamba2)\([^()]*,\s*([A-Za-z_][A-Za-z_0-9.]*)\[[^\]]*\]\s*\)",
+            carrier):
         manifest.setdefault(key, ["hidden_size"])
 
     # ── STATE the shims read ──
