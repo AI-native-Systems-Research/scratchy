@@ -46,7 +46,7 @@ pub struct GdnStateLayout {
 /// carries the per-layer dims + the per-global-layer linear-attention mask. The
 /// `num_slots` (= `max_num_seqs`) is supplied by the worker, not the model.
 ///
-/// The proc-macro emits a per-arch `ScratchyWeights::gdn_runtime_config`
+/// The proc-macro emits a per-arch `ScratchyWeights::recurrent_state`
 /// override returning `Some(_)` for arches whose forward body contains a
 /// `gated_delta_net` op; non-hybrid arches use the trait default (`None`).
 #[derive(Clone, Debug, PartialEq, Eq)]

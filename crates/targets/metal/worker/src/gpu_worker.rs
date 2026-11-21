@@ -51,7 +51,7 @@ use scratchy_serving_worker::error::{ExecutorError, ExecutorResult};
 use scratchy_serving_worker::input_batch::InputBatch;
 #[cfg(feature = "vision")]
 use scratchy_serving_worker::input_batch::PreparedInputs;
-use scratchy_serving_worker::worker::Worker;
+use scratchy_serving_worker::worker::{SequenceState, Worker};
 use scratchy_serving_worker::worker_factory::Draft;
 
 // ---------------------------------------------------------------------------
@@ -117,19 +117,19 @@ pub struct MetalWorker {
     kv_cache: Option<KvCachePool>,
     /// Gated-DeltaNet recurrent-state pool for hybrid arches (Qwen3.5 /
     /// Qwen3-Next). `Some(_)` only when the loaded model's
-    /// `gdn_runtime_config()` is `Some` (built in `initialize_cache`).
+    /// `recurrent_state()` is `Some` (built in `initialize_cache`).
     /// The non-paged sibling of `kv_cache`: the metal forward binds its
     /// per-linear-layer conv/ssm buffers into the runtime through
-    /// `ForwardCtx::gdn_state`.
+    /// `ForwardCtx::recurrent_state`.
     gdn_state: Option<GdnStatePool<scratchy_target_metal::PoolMem>>,
     /// Per-request GDN state-slot allocator (one slot per concurrently
     /// resident sequence, recycled on finish — the "degeneration after
     /// N requests" guard). `Some` iff the model is hybrid; drives the
-    /// per-step `gdn_state_indices` / `gdn_is_fresh` the forward reads.
+    /// per-step `recurrent_state_indices` / `recurrent_is_fresh` the forward reads.
     gdn_slot_allocator: Option<GdnSlotAllocator>,
     /// Per-step GDN scratch: each batched sequence's state record (`GdnSeqSlots::words`) and
     /// step code, built in `execute_model` in cu_seqlens order and consumed by the metal
-    /// `forward_argmax_blocking` to populate `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`.
+    /// `forward_argmax_blocking` to populate `ForwardCtx::{recurrent_state_indices, recurrent_is_fresh}`.
     /// `None` between steps / for non-hybrid arches.
     gdn_pending: Option<(Vec<i32>, Vec<u32>)>,
     /// How many recurrent-state snapshot slots the prefix cache can address: past the live ones in
@@ -944,11 +944,11 @@ struct MetalBudget {
 // MetalWorker constructor + `Worker` impl
 // ---------------------------------------------------------------------------
 
-// `gdn_slot_key` and the shared unset-`--max-num-seqs` resolver are
+// `recurrent_slot_key` and the shared unset-`--max-num-seqs` resolver are
 // backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
 // every worker) and are re-exported here.
 use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
-pub use scratchy_serving_engine::gpu_budget::{gdn_slot_key, resolve_default_max_num_seqs};
+pub use scratchy_serving_engine::gpu_budget::{recurrent_slot_key, resolve_default_max_num_seqs};
 
 impl MetalWorker {
     pub fn new(config: WorkerCreateConfig) -> Self {
@@ -1131,7 +1131,7 @@ impl MetalWorker {
     }
 
     /// ⭐⭐⭐ THE UNSET `--max-num-seqs` ANSWER — called at the END of `load_model`,
-    /// after weights are resident and `model.gdn_runtime_config()` is answerable, and BEFORE every
+    /// after weights are resident and `model.recurrent_state()` is answerable, and BEFORE every
     /// consumer of the width (the sampler arena below, the GDN state pool + slot allocator in
     /// `initialize_cache`, the spec-decode chain bounds).
     ///
@@ -1176,7 +1176,7 @@ impl MetalWorker {
                 // target crate).
                 // A slot's GDN state, and its draft lanes: under a head's gate fixed bytes (twice
                 // the gate, whatever the width), when every sequence drafts a lane a slot.
-                let gdn = model.gdn_runtime_config();
+                let gdn = model.recurrent_state();
                 let gdn_bytes = |slots, lanes| {
                     gdn.as_ref().map_or(0, |cfg| {
                         GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
@@ -1259,7 +1259,7 @@ impl MetalWorker {
                     device_budget_bytes: budget,
                     allocated_bytes: allocated + draft_rows * sampler_row + gdn_lanes,
                     peak_activation_bytes: peak,
-                    gdn_per_slot_bytes: gdn_per_slot,
+                    recurrent_per_slot_bytes: gdn_per_slot,
                     sampler_bytes_per_row: sampler_row,
                 };
                 resolve_default_max_num_seqs(&facts, false)
@@ -2336,7 +2336,11 @@ impl MetalWorker {
             self.input_batch
                 .resolve_rows(&spec.req_id, &tokens, spec.rows);
             if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
-                alloc.verified(gdn_slot_key(&spec.req_id), tokens.len() - 1, spec.rows - 1);
+                alloc.verified(
+                    recurrent_slot_key(&spec.req_id),
+                    tokens.len() - 1,
+                    spec.rows - 1,
+                );
             }
             return Ok(());
         }
@@ -2766,7 +2770,7 @@ impl MetalWorker {
             let drafts = input.spec_token_ids.len();
             let mut row = GdnRow {
                 refused: self.input_batch.refused(req_id),
-                ..GdnRow::new(gdn_slot_key(req_id), drafts, before)
+                ..GdnRow::new(recurrent_slot_key(req_id), drafts, before)
             };
             if row.refused {
                 rows.push(row);
@@ -3080,7 +3084,7 @@ impl MetalWorker {
     /// recurrent state, prefix caching or a device; refused on a device that maps no sparse tiles.
     fn snapshot_slot(&self) -> ExecutorResult<Option<(usize, std::num::NonZeroUsize)>> {
         let Some(cfg) = (self.model.as_ref())
-            .and_then(|m| m.gdn_runtime_config())
+            .and_then(|m| m.recurrent_state())
             .filter(|_| self.config.enable_prefix_caching)
         else {
             return Ok(None);
@@ -3587,9 +3591,9 @@ fn metal_chain_dispatch(
         vision_window_index: None,
         vision_reverse_indices: None,
         vision_position_ids: None,
-        gdn_state: None,
-        gdn_state_indices: None,
-        gdn_is_fresh: None,
+        recurrent_state: None,
+        recurrent_state_indices: None,
+        recurrent_is_fresh: None,
         draft_ring: None,
         draft: None,
         sampled_rows: None,
@@ -4087,7 +4091,7 @@ impl MetalWorker {
 
         // Upload the per-step GDN slot ids / fresh flags into shared
         // (host-readable) buffers. The macro-emitted metal forward reads
-        // them back off `ctx.gdn_state_indices` / `gdn_is_fresh` as host
+        // them back off `ctx.recurrent_state_indices` / `recurrent_is_fresh` as host
         // slices for `ForwardInputs`, then `write_runtime_inputs` copies
         // them into the runtime buffers the kernels bind. i32 and u32
         // share the 4-byte layout `alloc_shared_u32_buf` writes. The
@@ -4220,9 +4224,9 @@ impl MetalWorker {
             vision_window_index: None,
             vision_reverse_indices: None,
             vision_position_ids: None,
-            gdn_state: gdn_state_ref,
-            gdn_state_indices: view_gdn_indices,
-            gdn_is_fresh: view_gdn_is_fresh,
+            recurrent_state: gdn_state_ref,
+            recurrent_state_indices: view_gdn_indices,
+            recurrent_is_fresh: view_gdn_is_fresh,
             draft_ring: None,
             draft: None,
             sampled_rows: view_sampled_rows,
@@ -5880,9 +5884,9 @@ fn head_ctx<'c>(
         vision_window_index: None,
         vision_reverse_indices: None,
         vision_position_ids: None,
-        gdn_state: None,
-        gdn_state_indices: None,
-        gdn_is_fresh: None,
+        recurrent_state: None,
+        recurrent_state_indices: None,
+        recurrent_is_fresh: None,
         draft_ring: None,
         draft: None,
         sampled_rows: req.sampled_rows.map(|r| view(r, &[r.len()])),
@@ -6419,6 +6423,13 @@ impl Worker for MetalWorker {
             .as_ref()
             .and(self.shared_kv.as_ref())
             .map(|s| s.budget)
+    }
+
+    fn sequence_state(&self) -> SequenceState {
+        match self.model.as_ref().and_then(|m| m.recurrent_state()) {
+            Some(_) => SequenceState::KvAndRecurrent,
+            None => SequenceState::Kv,
+        }
     }
 
     fn scores_prompts(&self) -> bool {
@@ -7144,14 +7155,14 @@ impl Worker for MetalWorker {
 
         // Gated-DeltaNet (Qwen3.5 / Qwen3-Next) recurrent-state pool —
         // the non-paged sibling of the KV cache. Only hybrid arches
-        // report a `gdn_runtime_config` (macro-emitted from the unrolled
+        // report a `recurrent_state` (macro-emitted from the unrolled
         // IR's per-layer GDN dispatch); every other arch leaves
         // `self.gdn_state` / `self.gdn_slot_allocator` `None`. One
         // recurrent-state slot per concurrently-resident sequence
         // (`max_num_seqs`), matching the scheduler's `max_num_running_reqs`
         // so the slot allocator never exhausts — and past them, the prefix
         // cache's snapshot slots (`determine_available_memory`).
-        if let Some(gdn_cfg) = model.gdn_runtime_config() {
+        if let Some(gdn_cfg) = model.recurrent_state() {
             let live = self.max_num_seqs_resolved();
             let num_layers = model.num_hidden_layers() as usize;
             let lanes = self.gdn_lanes(&gdn_cfg);
@@ -7343,7 +7354,7 @@ impl Worker for MetalWorker {
         let gdn_reserve = self
             .model
             .as_ref()
-            .and_then(|m| m.gdn_runtime_config())
+            .and_then(|m| m.recurrent_state())
             .map(|cfg| {
                 scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
@@ -7702,7 +7713,7 @@ impl Worker for MetalWorker {
             // request to claim it is flagged fresh so it zero-inits
             // rather than continuing from a finished sequence's state.
             if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
-                alloc.release(gdn_slot_key(req_id));
+                alloc.release(recurrent_slot_key(req_id));
             }
             // Its DFlash2 ring slot, which the next request to take it overwrites from its first
             // position on.
@@ -7717,7 +7728,7 @@ impl Worker for MetalWorker {
             &scheduler_output.preempted_req_ids,
         ) {
             for req_id in preempted {
-                alloc.release(gdn_slot_key(req_id));
+                alloc.release(recurrent_slot_key(req_id));
                 self.kv_cached_through.remove(req_id);
             }
         }
@@ -8232,8 +8243,8 @@ impl Worker for MetalWorker {
 
         // GDN per-step state records + step codes (hybrid arches only), one per batched
         // sequence in the SAME order as `cu_seqlens_q` / `req_ids_in_order`. The metal
-        // `forward_argmax_blocking` uploads these into `ForwardCtx::{gdn_state_indices,
-        // gdn_is_fresh}`. A request's FIRST forward (including a recycled slot's new owner)
+        // `forward_argmax_blocking` uploads these into `ForwardCtx::{recurrent_state_indices,
+        // recurrent_is_fresh}`. A request's FIRST forward (including a recycled slot's new owner)
         // starts from zero instead of a finished sequence's stale data (the degeneration
         // guard); a verify step checkpoints its drafts; a prefix-cache hit's scan starts from
         // its snapshot, and a scan passing a save point stores its state there.
@@ -8368,7 +8379,7 @@ impl Worker for MetalWorker {
                 // A hybrid target keeps a drafting sequence's verify rows in a draft lane, held
                 // from here through the step that replays them.
                 let mut holds_draft_state = |r: &str| match self.gdn_slot_allocator.as_mut() {
-                    Some(alloc) => alloc.hold_lane(gdn_slot_key(r)),
+                    Some(alloc) => alloc.hold_lane(recurrent_slot_key(r)),
                     None => true,
                 };
                 drafter.passes(
@@ -8977,9 +8988,9 @@ impl Worker for MetalWorker {
                             vision_window_index: None,
                             vision_reverse_indices: None,
                             vision_position_ids: None,
-                            gdn_state: None,
-                            gdn_state_indices: None,
-                            gdn_is_fresh: None,
+                            recurrent_state: None,
+                            recurrent_state_indices: None,
+                            recurrent_is_fresh: None,
                             draft_ring: None,
                             draft: None,
                             sampled_rows: None,
@@ -9406,7 +9417,7 @@ impl Worker for MetalWorker {
                 };
                 if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
                     alloc.verified(
-                        gdn_slot_key(req_id),
+                        recurrent_slot_key(req_id),
                         num_accepted_drafts,
                         req_slice.spec_token_ids.len(),
                     );

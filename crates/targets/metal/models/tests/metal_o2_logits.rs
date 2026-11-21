@@ -377,7 +377,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     residency.commit();
     kv.fill_chunk_tables(|m| m.gpu_address());
 
-    let gdn = model.gdn_runtime_config().map(|cfg| {
+    let gdn = model.recurrent_state().map(|cfg| {
         unsafe {
             GdnStatePool::new(
                 layers,
@@ -533,12 +533,12 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         vision_window_index: None,
         vision_reverse_indices: None,
         vision_position_ids: None,
-        gdn_state: l.gdn.as_ref(),
-        gdn_state_indices: l
+        recurrent_state: l.gdn.as_ref(),
+        recurrent_state_indices: l
             .gdn
             .as_ref()
             .map(|_| view(&s.gdn_indices, &[s.gdn_indices.len()], DType::I32)),
-        gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
+        recurrent_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
         draft_ring: None,
         draft: None,
         sampled_rows: Some(view(&s.sampled_rows, &[1], u32t)),

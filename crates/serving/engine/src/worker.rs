@@ -20,6 +20,15 @@ use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
 use crate::error::ExecutorResult;
 
+/// What a model keeps for each sequence it serves ([`Worker::sequence_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SequenceState {
+    /// Its KV cache only, which a cached prefix restores.
+    Kv,
+    /// A recurrent (conv + ssm) state beside its KV: a Gated DeltaNet or Mamba-2 hybrid.
+    KvAndRecurrent,
+}
+
 // ---------------------------------------------------------------------------
 // Worker trait
 // ---------------------------------------------------------------------------
@@ -233,6 +242,15 @@ pub trait Worker: Send {
     /// snapshots has.
     fn snapshot_budget(&self) -> Option<SnapshotBudget> {
         None
+    }
+
+    /// What this worker's model keeps for a sequence, as its compiled model states it: a Gated
+    /// DeltaNet or Mamba-2 hybrid keeps a recurrent (conv + ssm) state beside its KV, which a
+    /// cached KV prefix cannot rebuild, so a prefix hit on it is correct only where a snapshot of
+    /// that state ([`Self::snapshot_budget`]) is restored with it. Known at `load_model` time.
+    /// [`SequenceState::Kv`] (the default): every model without one.
+    fn sequence_state(&self) -> SequenceState {
+        SequenceState::Kv
     }
 
     /// Every layer's KV geometry for a model with sliding-window layers — whether each slides

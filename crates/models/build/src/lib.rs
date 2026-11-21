@@ -153,7 +153,7 @@ fn reroot_crate(ts: TokenStream, mod_name: &str, shared: &[&str]) -> TokenStream
 }
 
 /// Whether an emission names the path `scratchy_models::gdn`: the recurrent state's re-export,
-/// which the emitted `ScratchyWeights::gdn_runtime_config` of an arch running a recurrent mixer
+/// which the emitted `ScratchyWeights::recurrent_state` of an arch running a recurrent mixer
 /// names.
 fn names_gdn_state(ts: &TokenStream) -> bool {
     let tts: Vec<TokenTree> = ts.clone().into_iter().collect();

@@ -7,7 +7,7 @@
 
 /// The recurrent (conv + ssm) state an arch running Gated DeltaNet or Mamba-2 keeps: its pool,
 /// layout, slot allocator and runtime config. A scope selecting such an arch turns on `gdn`, and
-/// the emitted `ScratchyWeights::gdn_runtime_config` names its config through this path.
+/// the emitted `ScratchyWeights::recurrent_state` names its config through this path.
 #[cfg(feature = "gdn")]
 pub use scratchy_state_decoder_gdn as gdn;
 
