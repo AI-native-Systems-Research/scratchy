@@ -538,6 +538,7 @@ fn prefill_steel_case<T: Store>(
     symbol: &'static str,
     threads: usize,
     bq: usize,
+    tile: &[ConstantValue],
 ) {
     let Some(di) = detect_device() else {
         eprintln!("{name}: no Metal device, skipped");
@@ -564,6 +565,7 @@ fn prefill_steel_case<T: Store>(
     consts[6] = ConstantValue::uint(6, 128);
     consts.push(ConstantValue::uint(99, 0)); // DEBUG_MODE (steel reads slot 99)
     consts.push(ConstantValue::uint(21, 1)); // ATTN_SINKS
+    consts.extend_from_slice(tile);
     let key = PipelineKey::new(library, symbol, consts);
     let pipeline = baked_build(&cache, &key).expect("steel pipeline");
 
@@ -744,6 +746,7 @@ fn steel_paged_sinks_f16() {
         "attention_steel_paged_f16_bq32_bk16_bd64_wm4_wn1_bs16",
         128,
         32,
+        &[],
     );
 }
 
@@ -762,8 +765,7 @@ fn nax_paged_sinks_f16() {
         );
         return;
     }
-    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", 64, 16)
-        .expect("a hd-64 NAX instantiation");
+    let nax = scratchy_target_metal::steel_paged::NaxTile::of(64, 16).expect("a hd-64 NAX tile");
     prefill_steel_case::<f16>(
         "nax paged sinks f16",
         Case {
@@ -774,8 +776,9 @@ fn nax_paged_sinks_f16() {
             window: 0,
         },
         "attention_steel_nax_paged",
-        nax.symbol,
-        nax.threads as usize,
-        nax.bq as usize,
+        nax.symbol("f16"),
+        nax.threads() as usize,
+        nax.bq() as usize,
+        &nax.constants(),
     );
 }

@@ -26,148 +26,170 @@ pub mod steel_paged {
         "/steel_paged_kernels_generated.rs"
     ));
 
-    /// The NAX (matrix-accelerator) paged attention instantiated for a (dtype, head_dim, page
-    /// size), in `attention_steel_nax_paged.metal`; `None` sends the dispatcher to the simdgroup
-    /// `steel_paged_symbol` / SDPA path. Warps are WM Q-row blocks × WN head-dim slices, four
-    /// blocks a threadgroup (BQ 64): head_dims 64 / 128 one warp a block, 256 two, 512 four over
-    /// 32-token pages (Gemma 4's global layers); 256 and 512 on `attention_nax_paged_wide`, whose
-    /// Q @ K^T / P @ V are whole-page `matmul2d`s.
-    pub fn nax_paged_kernel(
-        dtype_tag: &str,
-        head_dim: u32,
-        block_size: u32,
-    ) -> Option<NaxPagedKernel> {
-        let at = |symbol, threads, bq| {
-            Some(NaxPagedKernel {
-                symbol,
-                threads,
-                bq,
-            })
-        };
-        match (dtype_tag, head_dim, block_size) {
-            ("f16", 64, 16) => at(
-                "attention_steel_nax_paged_f16_bq64_bk32_bd64_wm4_wn1_bs16",
-                128,
-                64,
-            ),
-            ("bf16", 64, 16) => at(
-                "attention_steel_nax_paged_bf16_bq64_bk32_bd64_wm4_wn1_bs16",
-                128,
-                64,
-            ),
-            ("f16", 128, 16) => at(
-                "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
-                128,
-                64,
-            ),
-            ("bf16", 128, 16) => at(
-                "attention_steel_nax_paged_bf16_bq64_bk32_bd128_wm4_wn1_bs16",
-                128,
-                64,
-            ),
-            ("f16", 256, 16) => at(
-                "attention_steel_nax_paged_f16_bq64_bk32_bd256_wm4_wn2_bs16",
-                256,
-                64,
-            ),
-            ("bf16", 256, 16) => at(
-                "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16",
-                256,
-                64,
-            ),
-            ("f16", 512, 32) => at(
-                "attention_steel_nax_paged_f16_bq64_bk32_bd512_wm4_wn4_bs32",
-                512,
-                64,
-            ),
-            ("bf16", 512, 32) => at(
-                "attention_steel_nax_paged_bf16_bq64_bk32_bd512_wm4_wn4_bs32",
-                512,
-                64,
-            ),
-            _ => None,
-        }
-    }
+    /// The head dims one warp of the NAX paged attention holds of O: eight 16-dim NAX fragments.
+    /// A hand-picked constant (measured on a base M5: head_dim 256 at two warps a Q-row block,
+    /// 512 at four).
+    pub const NAX_WARP_HEAD_DIMS: u32 = 128;
 
-    /// An instantiation of the NAX paged attention: its symbol, the threads its warps make
-    /// (`WM × WN × 32`), and the Q rows a threadgroup takes (`BQ`, its grid's x tile).
+    /// The NAX (matrix-accelerator) paged attention's tile at a head dim and page
+    /// (`attention_steel_nax_paged.metal`): four warps along a 64-row Q block, each a 16-row NAX
+    /// fragment, two 16-key fragments of keys a step, and the head dims in slices of at most
+    /// [`NAX_WARP_HEAD_DIMS`] a warp. One slice runs `attention_nax_paged`, which takes one
+    /// fragment a page (16-token pages); several run `attention_nax_paged_wide` over whole-page
+    /// `matmul2d`s, a step whole K-tiles of whole pages.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct NaxPagedKernel {
-        pub symbol: &'static str,
-        pub threads: u32,
-        pub bq: u32,
+    pub struct NaxTile {
+        bq: u32,
+        bk: u32,
+        wm: u32,
+        wn: u32,
     }
 
-    /// The simdgroup (pre-NAX) WIDE paged attention instantiated for a (dtype, head_dim, page
-    /// size), in `attention_steel_wide_paged.metal` — the steel port of `attention_nax_paged_wide`
-    /// (WN head-dim-slice warps a 16-row Q block, S exchanged once a step, Q/K/V fragments straight
-    /// from device) for head_dims one warp's whole-head O cannot hold on GPUs without the matrix
-    /// accelerator: head_dim 512 over 32-token pages (Gemma 4's global layers on M1-M4). `None`
-    /// sends the dispatcher to the unfused / SDPA path.
-    pub fn steel_wide_paged_kernel(
-        dtype_tag: &str,
-        head_dim: u32,
-        block_size: u32,
-    ) -> Option<NaxPagedKernel> {
-        let at = |symbol, threads, bq| {
-            Some(NaxPagedKernel {
-                symbol,
-                threads,
-                bq,
-            })
-        };
-        match (dtype_tag, head_dim, block_size) {
-            ("f16", 512, 32) => at(
-                "attention_steel_wide_paged_f16_bq32_bk32_bd512_wm2_wn8_bs32",
-                512,
-                32,
-            ),
-            ("bf16", 512, 32) => at(
-                "attention_steel_wide_paged_bf16_bq32_bk32_bd512_wm2_wn8_bs32",
-                512,
-                32,
-            ),
-            _ => None,
+    impl NaxTile {
+        /// The NAX fragment edge: rows, columns, keys of one fragment.
+        const FRAGMENT: u32 = 16;
+
+        /// The tile at `head_dim` over `block_size`-token pages; `None` where neither kernel takes
+        /// the shape (a head dim not of whole fragments a slice, or a page the kernel's steps do
+        /// not tile).
+        pub fn of(head_dim: u32, block_size: u32) -> Option<Self> {
+            let f = Self::FRAGMENT;
+            let wn = head_dim.div_ceil(NAX_WARP_HEAD_DIMS).max(1);
+            let tile = Self {
+                bq: 4 * f,
+                bk: 2 * f,
+                wm: 4,
+                wn,
+            };
+            let slices = head_dim.is_multiple_of(f * wn);
+            let pages = match wn {
+                1 => block_size == f,
+                _ => block_size.is_multiple_of(f) && (wn * block_size).is_multiple_of(tile.bk),
+            };
+            (slices && pages).then_some(tile)
+        }
+
+        /// The kernel's symbol at `dtype_tag`.
+        pub fn symbol(self, dtype_tag: &str) -> &'static str {
+            match (self.wn, dtype_tag) {
+                (1, "bf16") => "attention_nax_paged_bf16",
+                (1, _) => "attention_nax_paged_f16",
+                (_, "bf16") => "attention_nax_paged_wide_bf16",
+                (_, _) => "attention_nax_paged_wide_f16",
+            }
+        }
+
+        /// The rope-once kernel's symbol at `dtype_tag` (its head dim and page the bake's).
+        pub fn rope_once_symbol(dtype_tag: &str) -> &'static str {
+            match dtype_tag {
+                "bf16" => "rope_once_nax_bf16",
+                _ => "rope_once_nax_f16",
+            }
+        }
+
+        /// The threads its warps make.
+        pub fn threads(self) -> u32 {
+            self.wm * self.wn * 32
+        }
+
+        /// The Q rows a threadgroup takes: its grid's x tile.
+        pub fn bq(self) -> u32 {
+            self.bq
+        }
+
+        /// The tile's constants (`NAXP_TILE_*`, slots 30..=33).
+        pub fn constants(self) -> [crate::specialized_pipeline_cache::ConstantValue; 4] {
+            use crate::specialized_pipeline_cache::ConstantValue as C;
+            [
+                C::uint(30, self.bq),
+                C::uint(31, self.bk),
+                C::uint(32, self.wm),
+                C::uint(33, self.wn),
+            ]
         }
     }
 
-    /// MSL symbol for the spans rope-once kernel at the WIDE steel kernel's page size
-    /// (`rope_once_steel` at bs32, from `attention_steel_wide_paged.metal`). The
-    /// `rope_once_steel_symbol` rows are bs16 (the classic kernel's 16-token pages); the
-    /// wide kernel runs on 32-token pages, so its rope twin is instantiated separately at
-    /// the same (dtype, head_dim, page) combos as `steel_wide_paged_kernel`.
-    pub fn rope_once_steel_wide_symbol(
-        dtype_tag: &str,
-        head_dim: u32,
-        block_size: u32,
-    ) -> Option<&'static str> {
-        match (dtype_tag, head_dim, block_size) {
-            ("f16", 512, 32) => Some("rope_once_steel_f16_bd512_bs32"),
-            ("bf16", 512, 32) => Some("rope_once_steel_bf16_bd512_bs32"),
-            _ => None,
-        }
+    /// The head dims one warp of the simdgroup wide paged attention holds of O. A hand-picked
+    /// constant, measured on an M1 Max at head_dim 512 (m 4096, 8 query heads over 2): eight
+    /// slices of 64 ran 1.64 TFLOP/s against four's 1.30 and sixteen's 1.54 — every doubling of
+    /// the slices halves a warp's V/Q fragment loads a key (loads, not the MMA, bound the kernel)
+    /// and doubles the slice-duplicated softmax.
+    pub const STEEL_WIDE_WARP_HEAD_DIMS: u32 = 64;
+
+    /// The most head dims one warp of the classic simdgroup paged attention holds of O whole
+    /// (`attention_steel_paged`): its widest instantiation. A wider head takes the wide kernel.
+    pub const STEEL_WARP_O_HEAD_DIMS: u32 = 256;
+
+    /// The simdgroup (pre-NAX) wide paged attention's tile at a head dim and page
+    /// (`attention_steel_wide_paged.metal`): two 16-row Q blocks a threadgroup, the head dims in
+    /// slices of [`STEEL_WIDE_WARP_HEAD_DIMS`] a warp, a step one page group (at most 32 keys) a
+    /// warp. It takes the head dims one warp's whole-head O cannot hold (past
+    /// [`STEEL_WARP_O_HEAD_DIMS`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SteelWideTile {
+        bq: u32,
+        bk: u32,
+        wm: u32,
+        wn: u32,
     }
 
-    /// MSL symbol for the spans rope-once kernel (`rope_once_nax`), which
-    /// ropes a request's K ONCE into the dense scratch so the NAX attention
-    /// reads pre-roped K with no per-tile rotation. Lives in the same
-    /// `attention_steel_nax_paged` library and is instantiated at the same
-    /// (dtype, head_dim, page size) combos as `nax_paged_kernel`.
-    pub fn rope_once_nax_symbol(
-        dtype_tag: &str,
-        head_dim: u32,
-        block_size: u32,
-    ) -> Option<&'static str> {
-        match (dtype_tag, head_dim, block_size) {
-            ("f16", 64, 16) => Some("rope_once_nax_f16_bd64_bs16"),
-            ("bf16", 64, 16) => Some("rope_once_nax_bf16_bd64_bs16"),
-            ("f16", 128, 16) => Some("rope_once_nax_f16_bd128_bs16"),
-            ("bf16", 128, 16) => Some("rope_once_nax_bf16_bd128_bs16"),
-            ("f16", 256, 16) => Some("rope_once_nax_f16_bd256_bs16"),
-            ("bf16", 256, 16) => Some("rope_once_nax_bf16_bd256_bs16"),
-            ("f16", 512, 32) => Some("rope_once_nax_f16_bd512_bs32"),
-            ("bf16", 512, 32) => Some("rope_once_nax_bf16_bd512_bs32"),
-            _ => None,
+    impl SteelWideTile {
+        /// The simdgroup MMA fragment edge.
+        const FRAGMENT: u32 = 8;
+
+        /// The tile at `head_dim` over `block_size`-token pages; `None` where the kernel does not
+        /// take the shape (a head the classic kernel holds whole, a head dim not of whole
+        /// fragments a slice, or a page its page groups do not tile).
+        pub fn of(head_dim: u32, block_size: u32) -> Option<Self> {
+            let wn = head_dim / STEEL_WIDE_WARP_HEAD_DIMS;
+            let group = block_size.min(32);
+            let tile = Self {
+                bq: 2 * 16,
+                bk: group,
+                wm: 2,
+                wn,
+            };
+            let slices =
+                head_dim > STEEL_WARP_O_HEAD_DIMS && head_dim.is_multiple_of(Self::FRAGMENT * wn);
+            let pages = group.is_multiple_of(Self::FRAGMENT) && block_size.is_multiple_of(group);
+            (slices && pages).then_some(tile)
+        }
+
+        /// The kernel's symbol at `dtype_tag`.
+        pub fn symbol(dtype_tag: &str) -> &'static str {
+            match dtype_tag {
+                "bf16" => "attention_steel_wide_paged_bf16",
+                _ => "attention_steel_wide_paged_f16",
+            }
+        }
+
+        /// The rope-once kernel's symbol at `dtype_tag` (its head dim and page the bake's).
+        pub fn rope_once_symbol(dtype_tag: &str) -> &'static str {
+            match dtype_tag {
+                "bf16" => "rope_once_steel_wide_bf16",
+                _ => "rope_once_steel_wide_f16",
+            }
+        }
+
+        /// The threads its warps make.
+        pub fn threads(self) -> u32 {
+            self.wm * self.wn * 32
+        }
+
+        /// The Q rows a threadgroup takes: its grid's x tile.
+        pub fn bq(self) -> u32 {
+            self.bq
+        }
+
+        /// The tile's constants (`STEEL_TILE_*`, slots 30..=33).
+        pub fn constants(self) -> [crate::specialized_pipeline_cache::ConstantValue; 4] {
+            use crate::specialized_pipeline_cache::ConstantValue as C;
+            [
+                C::uint(30, self.bq),
+                C::uint(31, self.bk),
+                C::uint(32, self.wm),
+                C::uint(33, self.wn),
+            ]
         }
     }
 

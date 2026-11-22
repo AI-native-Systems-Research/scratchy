@@ -96,7 +96,17 @@ fn split_verify_attention_matches_the_plain_tile() {
             )
             .expect(sym)
         };
-        let plain = nax("attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16");
+        let tile = scratchy_target_metal::steel_paged::NaxTile::of(HD as u32, BS as u32)
+            .expect("NAX bd256");
+        let plain = baked_build(
+            &cache,
+            &PipelineKey::new(
+                "attention_steel_nax_paged",
+                tile.symbol("bf16"),
+                [consts.clone(), tile.constants().to_vec()].concat(),
+            ),
+        )
+        .expect("the plain tile");
         let split =
             nax("attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4");
         let pack = nax("attention_verify_pack_q_bf16_bd256");

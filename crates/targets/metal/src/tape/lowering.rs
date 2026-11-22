@@ -4945,11 +4945,9 @@ fn lower_one(
                 _ => "f16",
             };
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
-            let nax_kernel = if is_nax {
-                crate::steel_paged::nax_paged_kernel(steel_dtype_tag, head_dim, block_size)
-            } else {
-                None
-            };
+            let nax_kernel = is_nax
+                .then(|| crate::steel_paged::NaxTile::of(head_dim, block_size))
+                .flatten();
             // The simdgroup WIDE paged kernel — the pre-NAX steel port of the
             // NAX wide kernel (WN head-dim-slice warps, S exchanged once a
             // step) — takes the head_dims the classic steel kernel cannot
@@ -4957,8 +4955,7 @@ fn lower_one(
             // 32-token pages, Gemma 4's global layers on M1-M4. Unconditional
             // lookup: on M5+ the NAX kernel above keeps the class (`use_nax`
             // prefers it); earlier GPUs run this one.
-            let steel_wide_kernel =
-                crate::steel_paged::steel_wide_paged_kernel(steel_dtype_tag, head_dim, block_size);
+            let steel_wide_kernel = crate::steel_paged::SteelWideTile::of(head_dim, block_size);
             // The fused NAX or wide-steel kernel takes the hd512 global class
             // where it has an instantiation.
             #[allow(clippy::overly_complex_bool_expr)]
@@ -5267,7 +5264,7 @@ fn lower_one(
             // Spans rope-on-read, the class's. All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, !sliding);
             // The simdgroup steel kernel's Q rows a threadgroup; a NAX instantiation carries its own
-            // (`NaxPagedKernel::bq`).
+            // (`NaxTile::bq`).
             const BQ_STEEL: u32 = 32;
             // Steel attention paged needs an instantiation in
             // `attention_steel_paged.metal` for the model's HEAD_DIM
@@ -5320,9 +5317,9 @@ fn lower_one(
             // 512-thread grid (its BQ is 32, the classic's).
             let use_steel_wide = use_steel && !use_nax && steel_wide_kernel.is_some();
             let bq_steel = match nax_kernel.filter(|_| use_nax) {
-                Some(nax) => nax.bq,
+                Some(nax) => nax.bq(),
                 None => match steel_wide_kernel.filter(|_| use_steel_wide) {
-                    Some(wide) => wide.bq,
+                    Some(wide) => wide.bq(),
                     None => BQ_STEEL,
                 },
             };
@@ -5482,9 +5479,17 @@ fn lower_one(
                 // (pre-NAX hd512). Falls back to the simdgroup
                 // `attention_steel_paged` symbol otherwise.
                 let (library, function, threads) = match nax_kernel.filter(|_| use_nax) {
-                    Some(nax) => ("attention_steel_nax_paged", nax.symbol, nax.threads),
+                    Some(nax) => (
+                        "attention_steel_nax_paged",
+                        nax.symbol(steel_dtype_tag),
+                        nax.threads(),
+                    ),
                     None => match steel_wide_kernel.filter(|_| use_steel_wide) {
-                        Some(wide) => ("attention_steel_wide_paged", wide.symbol, wide.threads),
+                        Some(wide) => (
+                            "attention_steel_wide_paged",
+                            crate::steel_paged::SteelWideTile::symbol(steel_dtype_tag),
+                            wide.threads(),
+                        ),
                         None => (
                             "attention_steel_paged",
                             steel_symbol.expect("steel_symbol is Some when use_steel is true"),
@@ -5492,11 +5497,22 @@ fn lower_one(
                         ),
                     },
                 };
+                // The NAX or wide kernel's tile reaches it as constants (slots 30..=33).
+                let tile = match nax_kernel.filter(|_| use_nax) {
+                    Some(nax) => Some(nax.constants()),
+                    None => steel_wide_kernel
+                        .filter(|_| use_steel_wide)
+                        .map(|wide| wide.constants()),
+                };
+                let with_tile = |c: super::kernel_constants::AttentionPrefillPagedConstants| {
+                    let c: Vec<ConstantValue> = c.into();
+                    baked(c.into_iter().chain(tile.into_iter().flatten()).collect())
+                };
                 let attn_cmd = LoweredCommand {
                     kernel: KernelId::AttentionPrefillSdpaPaged,
                     library,
                     function,
-                    constants: constants.into_baked(),
+                    constants: with_tile(constants),
                     dispatch: steel_paged_dispatch(q_heads, bucket_m, bq_steel, threads),
                     bindings: bindings.into_baked(),
                 };
@@ -5516,25 +5532,13 @@ fn lower_one(
                         (
                             KernelId::RopeOnceNax,
                             "attention_steel_nax_paged",
-                            crate::steel_paged::rope_once_nax_symbol(
-                                steel_dtype_tag,
-                                head_dim,
-                                block_size,
-                            )
-                            .expect("rope_once_nax_symbol is Some when use_nax is true"),
+                            crate::steel_paged::NaxTile::rope_once_symbol(steel_dtype_tag),
                         )
                     } else if use_steel_wide {
                         (
                             KernelId::RopeOnceSteel,
                             "attention_steel_wide_paged",
-                            crate::steel_paged::rope_once_steel_wide_symbol(
-                                steel_dtype_tag,
-                                head_dim,
-                                block_size,
-                            )
-                            .expect(
-                                "rope_once_steel_wide_symbol is Some when use_steel_wide is true",
-                            ),
+                            crate::steel_paged::SteelWideTile::rope_once_symbol(steel_dtype_tag),
                         )
                     } else {
                         (
@@ -5585,7 +5589,7 @@ fn lower_one(
                         .into_baked(),
                     };
                     let plain = LoweredCommand {
-                        constants: plain_constants.into_baked(),
+                        constants: with_tile(plain_constants),
                         bindings: bindings_for(false, false).into_baked(),
                         ..attn_cmd
                     };
@@ -11330,26 +11334,39 @@ mod tests {
         );
     }
 
-    /// The NAX paged attention is instantiated for the pages it reads: 16-token pages at head_dims
-    /// 64 / 128 / 256, 32-token pages at 512 (Gemma 4's global layers); a cache of other pages
-    /// gets none of its instantiations.
+    /// The NAX paged attention's tile law: four warps along a 64-row Q block, two 16-key
+    /// fragments a step, the head dims in slices of `NAX_WARP_HEAD_DIMS` a warp — one slice the
+    /// narrow kernel, which takes one fragment a page (16-token pages), several the wide one.
     #[test]
-    fn nax_paged_attention_takes_only_its_instantiated_pages() {
-        use crate::steel_paged::nax_paged_kernel;
-        for head_dim in [64, 128, 256] {
-            assert!(
-                nax_paged_kernel("bf16", head_dim, 16).is_some(),
-                "{head_dim}"
+    fn the_nax_tile_follows_the_head_dim_and_page() {
+        use crate::steel_paged::NaxTile;
+        let tile = |hd, bs| NaxTile::of(hd, bs).map(|t| (t.symbol("bf16"), t.threads(), t.bq()));
+        for hd in [64, 128] {
+            assert_eq!(
+                tile(hd, 16),
+                Some(("attention_nax_paged_bf16", 128, 64)),
+                "{hd}"
             );
-            assert!(
-                nax_paged_kernel("bf16", head_dim, 32).is_none(),
-                "{head_dim}"
-            );
+            assert_eq!(tile(hd, 32), None, "{hd}: one fragment a page");
         }
-        assert!(nax_paged_kernel("bf16", 512, 16).is_none());
-        let wide = |hd, bs| nax_paged_kernel("f16", hd, bs).map(|k| (k.threads, k.bq));
-        assert_eq!(wide(256, 16), Some((256, 64)));
-        assert_eq!(wide(512, 32), Some((512, 64)));
+        assert_eq!(
+            tile(256, 16),
+            Some(("attention_nax_paged_wide_bf16", 256, 64))
+        );
+        assert_eq!(
+            tile(512, 32),
+            Some(("attention_nax_paged_wide_bf16", 512, 64))
+        );
+        let c = NaxTile::of(512, 32).map(NaxTile::constants);
+        assert_eq!(
+            c,
+            Some([
+                ConstantValue::uint(30, 64),
+                ConstantValue::uint(31, 32),
+                ConstantValue::uint(32, 4),
+                ConstantValue::uint(33, 4),
+            ])
+        );
     }
 
     /// The sliding class's paged prefill lowers through the global class's arm with its own
@@ -11392,7 +11409,7 @@ mod tests {
             ),
             (
                 "attention_steel_nax_paged",
-                "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16",
+                "attention_nax_paged_wide_bf16",
                 (256, 1, 1)
             )
         );
@@ -12965,12 +12982,9 @@ mod tests {
                 "{codec:?}"
             );
             assert_eq!(own[0].library, "attention_steel_wide_paged");
-            assert_eq!(own[0].function, "rope_once_steel_bf16_bd512_bs32");
+            assert_eq!(own[0].function, "rope_once_steel_wide_bf16");
             assert_eq!(own[1].library, "attention_steel_wide_paged");
-            assert_eq!(
-                own[1].function,
-                "attention_steel_wide_paged_bf16_bq32_bk32_bd512_wm2_wn8_bs32"
-            );
+            assert_eq!(own[1].function, "attention_steel_wide_paged_bf16");
             assert_eq!(own[1].dispatch.threads_per_threadgroup, (512, 1, 1));
             assert_eq!(own[1].dispatch.threadgroups.0, 2, "bucket_m 64 / BQ 32");
             assert!(own.iter().all(|c| c.seq_scope() == SeqScope::RowZero));
@@ -12992,31 +13006,15 @@ mod tests {
         }
     }
 
-    /// head_dim 512 over pages the wide kernel is NOT instantiated for (16)
-    /// keeps the unfused attention fallback: its kernels read sequence 0 only,
-    /// on single-sequence steps, and on the rest a paged attention re-roping
-    /// span blocks as it reads: gqa_shared at a GQA ratio it takes, sdpa-paged
-    /// otherwise. Neither needs a rope-once pair or scratch.
+    /// head_dim 512 over 16-token pages takes the wide kernel too: its tile law covers every page
+    /// of whole key groups, so no head dim past the classic kernel's falls back to the unfused
+    /// attention — dense or int8, whatever the GQA ratio.
     #[test]
-    fn hd512_unfused_prefill_runs_only_for_one_sequence() {
-        use crate::tape::lowered::RuntimeGate::{
-            OnlyIfOneSequence, UnlessDecodeStep, UnlessOneSequence,
-        };
-        use crate::tape::lowered::SeqScope;
-        for ((codec, step_gate), (kv_heads, per_row)) in [
-            (KvCodec::Dense, None),
-            (KvCodec::Int8, Some(UnlessDecodeStep)),
-        ]
-        .into_iter()
-        .flat_map(|c| {
-            [
-                (2, "attention_prefill_sdpa_gqa_shared_bf16_specialized"),
-                (16, "attention_prefill_sdpa_v2_paged_bf16_specialized"),
-            ]
-            .map(|h| (c, h))
-        }) {
-            let one = RuntimeGate::and(step_gate, &[OnlyIfOneSequence]);
-            let rest = RuntimeGate::and(step_gate, &[UnlessOneSequence]);
+    fn hd512_prefill_takes_the_wide_kernel_at_any_page() {
+        for (codec, kv_heads) in [KvCodec::Dense, KvCodec::Int8]
+            .into_iter()
+            .flat_map(|c| [2, 16].map(|h| (c, h)))
+        {
             let p = with(
                 with_attention(
                     tp(),
@@ -13029,27 +13027,22 @@ mod tests {
             );
             let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
             let writer = kv_writer(0, Causal, LLAMA_KV);
-            // A dense model's tape carries the layer as written; a coded one's, as the codec
-            // pass expands it.
             let rows = match codec {
                 KvCodec::Dense => plain(&[writer, attention]),
                 KvCodec::Int8 => coded(writer, attention),
             };
             let tape = lower_int8(&p, rows, 64);
-            let gated = |g: RuntimeGate| {
-                tape.commands
+            let commands: Vec<_> = tape.commands.iter().map(|c| c.lowered()).collect();
+            assert!(
+                commands
                     .iter()
-                    .filter(move |c| c.gate == Some(g))
-                    .map(|c| c.lowered())
-            };
-            assert!(gated(one).any(|c| c.kernel == KernelId::AttnGatherKRope));
-            assert!(gated(one).all(|c| c.seq_scope() == SeqScope::RowZero));
-            assert_eq!(
-                gated(rest).map(|c| c.function).collect::<Vec<_>>(),
-                [per_row],
+                    .all(|c| c.kernel != KernelId::AttnGatherKRope),
                 "{codec}: {kv_heads} kv heads"
             );
-            assert_eq!(tape.roped_k_scratch_bytes, 0);
+            assert!(
+                (commands.iter()).any(|c| c.function == "attention_steel_wide_paged_bf16"),
+                "{codec}: {kv_heads} kv heads"
+            );
         }
     }
 

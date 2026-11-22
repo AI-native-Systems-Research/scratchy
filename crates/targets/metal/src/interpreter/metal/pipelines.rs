@@ -511,10 +511,10 @@ mod tests {
                 "attention_prefill_sdpa_v2_paged_bf16_specialized",
             ),
             (KernelId::RopeOnceNax, MetalDtype::F16) => {
-                ("attention_steel_nax_paged", "rope_once_nax_f16_bd128_bs16")
+                ("attention_steel_nax_paged", "rope_once_nax_f16")
             }
             (KernelId::RopeOnceNax, MetalDtype::Bf16) => {
-                ("attention_steel_nax_paged", "rope_once_nax_bf16_bd128_bs16")
+                ("attention_steel_nax_paged", "rope_once_nax_bf16")
             }
             // Production dispatch keys on cmd.library/function (baked at
             // lowering with the live head dim); this synthetic-helper arm
