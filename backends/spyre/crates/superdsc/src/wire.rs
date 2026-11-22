@@ -6,13 +6,29 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-/// `{"factor_": n, "label_": "core"}`.
+/// `{"factor_": n, "label_": "core"}`. dxp's schema requires every fold factor `>= 1`, so the
+/// factor is a nonzero count by type.
 #[derive(Clone, Debug, Serialize)]
 pub struct Prop {
     #[serde(rename = "factor_")]
-    pub factor: i64,
+    pub factor: std::num::NonZeroU64,
     #[serde(rename = "label_")]
     pub label: &'static str,
+}
+
+impl Prop {
+    /// A fold of `factor` along `label`.
+    ///
+    /// # Panics
+    /// When `factor` is 0: a fold spans at least one of what it folds, and a zero names a lowering
+    /// that miscounted it (dxp's schema refuses the descriptor: `factor_ … Must be >= 1`).
+    pub fn new(factor: u64, label: &'static str) -> Prop {
+        Prop {
+            factor: std::num::NonZeroU64::new(factor)
+                .unwrap_or_else(|| panic!("a `{label}` fold of zero — a fold spans at least one")),
+            label,
+        }
+    }
 }
 
 /// One fold function.

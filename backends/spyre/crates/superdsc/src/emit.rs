@@ -136,6 +136,14 @@ impl Proj<'_> {
         }
     }
 
+    /// Whether the operand holds one position along space axis `i` (of `extent` in the space): the
+    /// space's own extent is one, or the operand's view axis is one position the stick's padding
+    /// widened — every position of it reads that one element.
+    fn one_position(&self, i: usize, extent: u64) -> bool {
+        extent == 1
+            || matches!(self.at[i], Some(At::View(j)) if self.operand.view.axes[j].extent == Extent::ONE)
+    }
+
     /// Element distance between consecutive sticks along space axis `i`, when it is held in stick
     /// columns.
     fn columns(&self, i: usize) -> Option<u64> {
@@ -590,7 +598,7 @@ fn op<G: DeviceGen>(
             let lanes = index.format.lanes::<G>().get();
             let n = axes[*g].extent as i64;
             let affine = |alpha: i64| wire::Func::Affine { alpha, beta: 0 };
-            let prop = |factor: i64, label| wire::Prop { factor, label };
+            let prop = |factor: u64, label| wire::Prop::new(factor, label);
             let coord = wire::Coord {
                 spatial: 3,
                 temporal: 0,
@@ -608,8 +616,9 @@ fn op<G: DeviceGen>(
                         prop(1, "core_fold"),
                         prop(1, "corelet_fold"),
                         prop(1, "row_fold"),
-                        prop(0, "elem_arr_1"),
-                        prop(lanes as i64, "elem_arr_0"),
+                        // The sticks the `n` indices span — every stick dimension's own law.
+                        prop((n as u64).div_ceil(lanes), "elem_arr_1"),
+                        prop(lanes, "elem_arr_0"),
                     ],
                     data: None,
                 },
@@ -685,11 +694,8 @@ fn op<G: DeviceGen>(
             stick_size: vec![t.format.lanes::<G>().get()],
         });
     }
-    let core_prop = |n: u64| wire::Prop {
-        factor: n as i64,
-        label: "core",
-    };
-    let one = |label| wire::Prop { factor: 1, label };
+    let core_prop = |n: u64| wire::Prop::new(n, "core");
+    let one = |label| wire::Prop::new(1, label);
     let schedule: Vec<wire::Allocate> = tensors
         .iter()
         .enumerate()
@@ -768,7 +774,9 @@ fn op<G: DeviceGen>(
     if node.func.accumulates() {
         inputs.push(format!("Tensor{out_idx}-idx{out_idx}"));
     }
-    let compute_format = node.inputs.first().map_or(node.output.format, |o| o.format);
+    let compute_format = node
+        .func
+        .compute_format(node.inputs.first().map_or(node.output.format, |o| o.format));
     let space_of = |name, ext: &[u64]| wire::Space {
         name,
         dims: axes
@@ -904,7 +912,7 @@ fn tensor<G: DeviceGen>(
                     });
                 }
             }
-        } else if p.indexed != Some(axis) && (stride == 0 || ax.extent == 1) {
+        } else if p.indexed != Some(axis) && (stride == 0 || p.one_position(axis, ax.extent)) {
             Entry {
                 axis,
                 scale: -1,
@@ -988,7 +996,7 @@ fn tensor<G: DeviceGen>(
         let ns = if tiled { split[e.axis] } else { 1 };
         let size = if tiled { per_core[e.axis] } else { 1 } as i64;
         let affine = |alpha: i64| wire::Func::Affine { alpha, beta: 0 };
-        let prop = |factor: i64, label| wire::Prop { factor, label };
+        let prop = |factor: u64, label| wire::Prop::new(factor, label);
         let c = if e.axis != p.stick {
             wire::Coord {
                 spatial: 3,
@@ -998,10 +1006,10 @@ fn tensor<G: DeviceGen>(
                 folds: wire::Folds {
                     dim_prop_func: vec![affine(size), affine(0), affine(0), affine(1)],
                     dim_prop_attr: vec![
-                        prop(ns as i64, "core_fold"),
+                        prop(ns, "core_fold"),
                         prop(1, "corelet_fold"),
                         prop(1, "row_fold"),
-                        prop(size, "elem_arr_0"),
+                        prop(size as u64, "elem_arr_0"),
                     ],
                     data: None,
                 },
@@ -1023,18 +1031,18 @@ fn tensor<G: DeviceGen>(
                         affine(if red { 0 } else { 1 }),
                     ],
                     dim_prop_attr: vec![
-                        prop(ns as i64, "core_fold"),
+                        prop(ns, "core_fold"),
                         prop(1, "corelet_fold"),
                         prop(1, "row_fold"),
                         prop(
                             if red {
                                 1
                             } else {
-                                (size as u64).div_ceil(lanes) as i64
+                                (size as u64).div_ceil(lanes)
                             },
                             "elem_arr_1",
                         ),
-                        prop(l, "elem_arr_0"),
+                        prop(lanes, "elem_arr_0"),
                     ],
                     data: None,
                 },
@@ -1050,7 +1058,7 @@ fn tensor<G: DeviceGen>(
         };
         let outer_aligned = (0..axes.len()).all(|i| {
             i == p.stick
-                || axes[i].extent == 1
+                || p.one_position(i, axes[i].extent)
                 || p.stride(i).is_none_or(|s| s.is_multiple_of(lanes))
         });
         if !o.view.offset.get().is_multiple_of(lanes) || !outer_aligned {
