@@ -351,9 +351,10 @@ pub enum MetalStep {
     Mamba2(Slot, Slot, LayerId),
     /// One step of a MoE block.
     Moe(MoeBlock, MoeStep),
-    /// `(operand, layer)`: the layer's cached `operand` rows staged out of its int8 store into the
-    /// dense scratch the layer's attention reads. Its site is the writer's.
-    KvStage(KvOperand, LayerId),
+    /// `(operand, layer, class)`: the layer's cached `operand` rows staged out of its int8 store
+    /// into the dense scratch its attention of `class` reads, at the class's geometry. Its site is
+    /// the writer's.
+    KvStage(KvOperand, LayerId, AttnMask),
     /// `(q, out, layer, pairing, class)`: the decode attention of `class`, read straight off the
     /// int8 store into `out`. Its site is the writer's.
     AttnPackedKv(Slot, Slot, LayerId, RopeFormTag, AttnMask),

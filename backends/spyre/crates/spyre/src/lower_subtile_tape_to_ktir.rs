@@ -988,7 +988,6 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         }
         SubOp::KvEncode { .. }
         | SubOp::KvStage { .. }
-        | SubOp::RotateRows { .. }
         | SubOp::AttnPackedKv
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter

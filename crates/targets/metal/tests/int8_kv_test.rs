@@ -299,7 +299,6 @@ fn decode_run(
     // `reps` calls in one command buffer, each after the last (a decode step's order).
     let mut batch = scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch::begin(&device)?;
     let binds: Vec<(&Buffer, usize)> = bufs.iter().enumerate().map(|(i, b)| (*b, i)).collect();
-    let t = std::time::Instant::now();
     for _ in 0..reps {
         batch.encode(
             &split,
@@ -312,8 +311,125 @@ fn decode_run(
         );
         batch.barrier();
     }
+    // Timed from the commit: an MTL4 command buffer runs once committed, so the encoding is not.
+    let t = std::time::Instant::now();
     batch.commit(true);
     (reps > 0).then(|| t.elapsed().as_secs_f64() / reps as f64)
+}
+
+/// The dense one-pass decode (`attention_via_cache_v2`) over a bf16 pool of `kv_len` keys, the
+/// seconds a call takes over `reps` calls: its heads a threadgroup the largest divisor of the
+/// group whose lanes fit its 32 simdgroups, as the lowering bakes them.
+fn dense_decode_time(
+    num_q: usize,
+    num_kv: usize,
+    d: usize,
+    kv_len: usize,
+    window: Option<usize>,
+    reps: usize,
+) -> Option<f64> {
+    let di = detect_device()?;
+    let device = di.device.clone();
+    let group = num_q / num_kv;
+    let heads = (1..=group)
+        .filter(|h| group.is_multiple_of(*h) && h * d / 32 <= 32)
+        .max()
+        .unwrap_or(1);
+    let max_blocks = kv_len.div_ceil(BLOCK_SIZE);
+    let constants = vec![
+        ConstantValue::uint(0, d as u32),
+        ConstantValue::uint(1, num_q as u32),
+        ConstantValue::uint(2, num_kv as u32),
+        ConstantValue::float(3, 1.0 / (d as f32).sqrt()),
+        ConstantValue::uint(4, BLOCK_SIZE as u32),
+        ConstantValue::uint(5, max_blocks as u32),
+        ConstantValue::uint(6, 0),
+        ConstantValue::int(7, window.map_or(0, |w| w as i32)),
+        ConstantValue::uint(16, heads as u32),
+    ];
+    let attention = pipeline(
+        &device,
+        "attention",
+        "attention_via_cache_v2_bf16_specialized",
+        constants,
+    );
+    let pool_elems = max_blocks * num_kv * BLOCK_SIZE * d;
+    let k = buf_bf16(&device, &pseudo(11, pool_elems, 1.0));
+    let v = buf_bf16(&device, &pseudo(13, pool_elems, 1.0));
+    let k_table = buf_bytes(&device, bytes_of(&[k.gpuAddress()]));
+    let v_table = buf_bytes(&device, bytes_of(&[v.gpuAddress()]));
+    let q = buf_bf16(&device, &pseudo(3, num_q * d, 2.0));
+    let out = buf_bytes(&device, &vec![0u8; num_q * d * 2]);
+    let seq_used = buf_bytes(&device, bytes_of(&[kv_len as u32]));
+    let table: Vec<u32> = (0..max_blocks as u32).collect();
+    let block_table = buf_bytes(&device, bytes_of(&table));
+    let slot_mapping = buf_bytes(&device, bytes_of(&[u32::MAX]));
+    let unread = buf_bytes(&device, &[0u8; 64]);
+    let mut bufs: Vec<&Buffer> = vec![&unread; 14];
+    bufs[0] = &out;
+    bufs[1] = &q;
+    bufs[2] = &seq_used;
+    bufs[3] = &block_table;
+    bufs[4] = &k_table;
+    bufs[5] = &v_table;
+    bufs[13] = &slot_mapping;
+    let binds: Vec<(&Buffer, usize)> = bufs.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+    let resident = [&k, &v];
+    let mut batch = scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch::begin(&device)?;
+    for _ in 0..reps {
+        batch.encode(
+            &attention,
+            &binds,
+            &[],
+            &[],
+            &resident,
+            size(1, num_q / heads, 1),
+            size(1024, 1, 1),
+        );
+        batch.barrier();
+    }
+    // Timed from the commit: an MTL4 command buffer runs once committed, so the encoding is not.
+    let t = std::time::Instant::now();
+    batch.commit(true);
+    Some(t.elapsed().as_secs_f64() / reps as f64)
+}
+
+/// The dense one-pass decode against the int8 decode (its split pass at the law's key group and
+/// the lowering's splits — `ATTN_SPLIT_KEYS` keys each, at most 16 — the combine not counted),
+/// µs a call (GPU time: from the commit) at each real model's geometry and context, interleaved rounds. A probe,
+/// not a gate: `--ignored --nocapture`.
+#[test]
+#[ignore = "a timing probe: --ignored --nocapture"]
+fn dense_vs_int8_decode_timings() {
+    let shapes: [(usize, usize, usize, Option<usize>, usize); 8] = [
+        (16, 8, 256, Some(1024), 8192),
+        (16, 8, 256, None, 1024),
+        (64, 8, 64, Some(128), 8192),
+        (64, 8, 64, None, 128),
+        (16, 2, 512, None, 8192),
+        (16, 2, 256, None, 8192),
+        (32, 2, 128, None, 8192),
+        (64, 8, 64, None, 8192),
+    ];
+    for (nq, nkv, d, window, len) in shapes {
+        let keys = window.unwrap_or(len);
+        let splits = keys.div_ceil(1024).clamp(1, 16);
+        let sg = scratchy_target_metal::kv_int8::decode_key_group(d as u32);
+        let (mut dense, mut int8) = (Vec::new(), Vec::new());
+        for _ in 0..5 {
+            dense.extend(dense_decode_time(nq, nkv, d, len, window, 50));
+            int8.extend(decode_run(nq, nkv, d, len, splits, window, Some((sg, 50))));
+        }
+        let median = |t: &mut Vec<f64>| {
+            t.sort_by(f64::total_cmp);
+            t[t.len() / 2] * 1e6
+        };
+        eprintln!(
+            "decode {nq}q/{nkv}kv d{d} {len} keys window {window:?}: dense {:.1} us, int8 {:.1} us ({splits} splits)",
+            median(&mut dense),
+            median(&mut int8)
+        );
+    }
 }
 
 /// The decode's key-group width, timed: an 8192-key context (16 query heads over 2, eight splits)

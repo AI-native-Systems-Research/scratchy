@@ -1929,16 +1929,12 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                         .unzip();
                     (keys, values, pool.windows().buffer().clone())
                 });
-                // Int8: captured (Copy) so the 'static factory closure can provision
-                // the int8 store + scratch per worker for a model whose `KV_CODEC` is
-                // int8. UNIFORM arches (num_kv_groups == 1): every layer is "global",
-                // coded at the base geometry. HYBRID/SWA arches (gemma4: num_kv_groups
-                // > 1) code ONLY the GLOBAL (full-context, group 0) layers at the
-                // GLOBAL geometry; the sliding layers stay fp16.
-                // `is_global[L]` = (group_of(L) == 0): group 0 is always the
-                // full-context group (see `compute_hybrid_kv_layout`); uniform →
-                // all-zero map → all-true. A recurrent hybrid's layers that hold
-                // no KV (`FACTS.kv_layers()`) get no store.
+                // Int8: captured so the 'static factory closure can provision the int8
+                // store + scratch per worker for a model whose `KV_CODEC` is int8. Every
+                // KV layer is coded at its class's geometry: group 0 is the full-context
+                // class (`compute_hybrid_kv_layout`; a uniform model's every layer), any
+                // other group a sliding one. A recurrent hybrid's layers that hold no KV
+                // (`FACTS.kv_layers()`) get no store.
                 let __int8_nb = ctx.kv_cache.num_blocks;
                 let __int8_kv_layers = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
                     .kv_layers()
@@ -1948,13 +1944,23 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 let __global = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
                     .attention()
                     .map(|a| a.global());
-                let __int8_is_global: ::std::vec::Vec<bool> = ctx
-                    .kv_cache
-                    .layer_to_group_u32()
-                    .iter()
-                    .zip(0u32..)
-                    .map(|(&g, l)| g == 0 && __int8_kv_layers.is_none_or(|kv| kv.contains(&l)))
-                    .collect();
+                let __int8_layers: ::std::vec::Vec<
+                    ::std::option::Option<::scratchy_forward_compiler::model_facts::HeadGeometry>,
+                > = {
+                    let __attention = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
+                        .attention();
+                    ctx.kv_cache
+                        .layer_to_group_u32()
+                        .iter()
+                        .zip(0u32..)
+                        .map(|(&g, l)| {
+                            let a = __attention.filter(|_| {
+                                __int8_kv_layers.is_none_or(|kv| kv.contains(&l))
+                            })?;
+                            Some(if g == 0 { a.global() } else { a.base() })
+                        })
+                        .collect()
+                };
                 // The stores register with the device's allocator, whose KV growth maps them.
                 let __int8_allocator = device.allocator.clone();
                 // A step's block tables: a row per sequence, at most the serving batch (every
@@ -1976,11 +1982,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                             )
                             .expect("newBufferWithLength_options returned nil")
                         };
-                        // Provision at the GLOBAL geometry: uniform arches have
-                        // GLOBAL_* == base, so this is identical to the base-geometry
-                        // call (every layer global). gemma4 provisions GLOBAL-sized
-                        // codes/scales/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
-                        // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
+                        // Every KV layer's codes and scales at its class's geometry, and one
+                        // scratch of the widest (`build_int8_provision`).
                         let __int8_prov = (<Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC
                             .is_int8())
                         .then(|| {
@@ -1991,16 +1994,11 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                                      its target's, which shares it",
                                 );
                             }
-                            let global = __global
-                                .expect("ModelFacts::new: an int8 KV codec is an attention's");
                             ::scratchy_target_metal::kv_int8::build_int8_provision(
                                 &__int8_allocator,
                                 ::scratchy_target_metal::kv_int8::Int8Pool {
-                                    is_global: &__int8_is_global,
+                                    layers: &__int8_layers,
                                     num_blocks: __int8_nb,
-                                    block_size: global.page().get() as usize,
-                                    num_kv_heads: global.kv_heads().get() as usize,
-                                    head_dim: global.head_dim().get() as usize,
                                     blocks_per_chunk: ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
                                 },
                                 host.kv_scratch.as_ref(),
@@ -2031,17 +2029,14 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                                 .map(|_| alloc(__bt_rows * __bt_stride * 4))
                                 .collect(),
                             layer_to_group: kv_layer_to_group.clone(),
-                            // Int8: when provisioned, the GLOBAL (group-0) layers' KV
-                            // points at the one fp16 scratch (the writers and the
-                            // per-layer staging fill it); SLIDING layers keep the
-                            // normal fp16 pool. For uniform arches every layer is
-                            // global → all scratch. Dense, every layer uses the fp16
-                            // pool.
+                            // Int8: when provisioned, every coded layer's KV points at
+                            // the one fp16 scratch (the writers and the per-layer
+                            // staging fill it). Dense, every layer uses the fp16 pool.
                             kv_cache_k: __int8_prov
                                 .as_ref()
                                 .map(|p| {
                                     (0..num_layers)
-                                        .map(|l| if __int8_is_global[l] {
+                                        .map(|l| if __int8_layers[l].is_some() {
                                             p.scratch.k_table.clone()
                                         } else {
                                             kv_k[l].clone()
@@ -2053,7 +2048,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                                 .as_ref()
                                 .map(|p| {
                                     (0..num_layers)
-                                        .map(|l| if __int8_is_global[l] {
+                                        .map(|l| if __int8_layers[l].is_some() {
                                             p.scratch.v_table.clone()
                                         } else {
                                             kv_v[l].clone()

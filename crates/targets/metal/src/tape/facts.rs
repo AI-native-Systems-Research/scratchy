@@ -5,6 +5,7 @@
 //! [`LoweringError::ModelLacks`] naming it, never a zero read in its place.
 
 use super::lowered::{Lacked, LoweringError};
+use super::step::AttnMask;
 use scratchy_ir::model_facts::{
     Attention, AttnClass, AttnWindow, Drafter, Gdn, HeadGeometry, IntermediateSize, KvRope,
     ModelFacts, SoftCap, Target, Vision, VocabSize,
@@ -88,6 +89,15 @@ pub(crate) fn rope_on_read(p: &ModelFacts) -> Result<bool, LoweringError> {
 /// The attention class a layer of `class` reads.
 pub(crate) fn class(p: &ModelFacts, class: AttnClass) -> Result<HeadGeometry, LoweringError> {
     attention(p).map(|a| a.class(class))
+}
+
+/// The attention class a layer masked `mask` reads: a sliding window's, or the full class's.
+pub(crate) fn masked(p: &ModelFacts, mask: AttnMask) -> Result<HeadGeometry, LoweringError> {
+    let of = match mask {
+        AttnMask::Causal => AttnClass::Full,
+        AttnMask::SlidingWindow { .. } => AttnClass::Sliding,
+    };
+    class(p, of)
 }
 
 /// Whether the global class's rope pairs across the head's halves (Gemma 4's proportional rope).

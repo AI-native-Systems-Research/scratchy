@@ -24,7 +24,7 @@ use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::SampleRowsFacts;
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBundle, ExpertProj, KvOperand, OpStage, RopeForm, RouterBundle, SubOp,
+    EwKind, ExpertBundle, ExpertProj, KvOperand, OpStage, RopeForm, RouterBundle, SubOp,
 };
 
 use crate::tape::lowered::{RuntimeGate, WeightTensor};
@@ -211,8 +211,8 @@ pub const METAL_SAMPLE_ROWS: SampleRowsFacts = SampleRowsFacts {
 
 // ── The KV codec (int8) ─────────────────────────────────────────────
 
-/// Metal's KV codec, int8 (`scratchy_layers::kv_int8`): every layer coded on a uniform arch, the
-/// global class on a hybrid one. A writer's K and V are encoded as it writes them; a decode
+/// Metal's KV codec, int8 (`scratchy_layers::kv_int8`): every layer coded, each at its class's
+/// geometry. A writer's K and V are encoded as it writes them; a decode
 /// attention yields to its int8 twin, any other reads the layer's cached K/V staged into the dense
 /// scratch off decode steps.
 pub const METAL_KV_CODEC: KvCodecFacts = {
@@ -222,7 +222,6 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
     }
     const TWIN: Guarded<After> = g(After::PackedTwin, CodecDecode);
     KvCodecFacts {
-        coded_class: AttnMask::Causal,
         after_writer: &[g(KvOperand::K, Codec), g(KvOperand::V, Codec)],
         decode: CodecAround {
             before: &[],

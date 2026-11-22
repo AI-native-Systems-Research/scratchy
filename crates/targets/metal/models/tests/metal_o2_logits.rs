@@ -484,10 +484,9 @@ fn view<'a, T>(v: &'a [T], shape: &[usize], dtype: DType) -> TensorView<'a> {
 
 /// Run one step; return the terminal slot's `[n, width]` bytes (bf16/f16 raw) and `width`.
 fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) {
-    // the int8 stores hold group 0's blocks: map them through the step's last, as
+    // the int8 stores hold every group's blocks: map them through the step's last, as
     // `MetalWorker::grow_metal_kv_to_cover` does before every forward.
-    let reach = s.block_tables[0]
-        .iter()
+    let reach = (s.block_tables.iter().flatten())
         .max()
         .map_or(1, |&b| b as usize + 1);
     let registry = l.gpu.allocator.sparse_kv.lock();

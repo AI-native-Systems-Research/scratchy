@@ -148,9 +148,8 @@ pub enum HybridKvStores {
     /// Every group's blocks are pages of one shared pool. The default.
     #[default]
     Shared,
-    /// The global (full-attention) group's KV lives in a store of its own — an int8 store,
-    /// mapped through the global group's highest block — and the sliding groups' in the shared pool,
-    /// mapped through theirs.
+    /// The global (full-attention) group's KV lives in a store of its own, mapped through the global
+    /// group's highest block, and the sliding groups' in stores mapped through theirs.
     GlobalApart,
 }
 

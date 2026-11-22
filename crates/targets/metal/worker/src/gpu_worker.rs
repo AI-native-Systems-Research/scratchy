@@ -759,47 +759,41 @@ fn hybrid_kv_layout(
     )
 }
 
-/// A uniform model built with int8 KV: its KV lives in int8 codes and the fp16 pool is a
-/// one-chunk seed (`initialize_cache`). A hybrid model's int8 global layers keep their codes
-/// BESIDE its fp16 pool, which the sliding layers read ([`target_block_bytes`] charges both).
-fn uniform_int8(
-    model: &dyn scratchy_target_metal::MetalWeights,
-    block_size: scratchy_core_common::KvBlockTokens,
-) -> bool {
-    model.kv_codec().is_int8() && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
+/// A model built with int8 KV: its every layer's KV lives in int8 codes and the fp16 pool is a
+/// one-chunk seed (`initialize_cache`).
+fn int8_kv(model: &dyn scratchy_target_metal::MetalWeights) -> bool {
+    model.kv_codec().is_int8()
 }
 
-/// Bytes one block of the TARGET pool costs: a hybrid model's page in each of
-/// its group-shared tensors plus, built with int8 KV, the global layers'
-/// codes, scales and scratch; a uniform int8 model's codes, scales and
-/// scratch; every other model's dense rows.
+/// Bytes one block of the TARGET pool costs: built with int8 KV, every layer's codes and
+/// scales at its class's geometry and the scratch of the widest; otherwise a hybrid model's
+/// page in each of its group-shared tensors, every other model's dense rows.
 fn target_block_bytes(
     model: &dyn scratchy_target_metal::MetalWeights,
     block_size: scratchy_core_common::KvBlockTokens,
 ) -> usize {
     if let Some(layout) = hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES) {
-        let shared_pages = layout.page_size_bytes * layout.group_size;
-        let codec = model.kv_codec();
-        if !codec.is_int8() {
-            return shared_pages;
+        if !model.kv_codec().is_int8() {
+            return layout.page_size_bytes * layout.group_size;
         }
-        // What `build_int8_provision` allocates per block: the GLOBAL group's
-        // (group 0) layers at the global geometry, `full_block_size` tokens each.
+        // What `build_int8_provision` allocates per block: each layer's codes and scales at its
+        // class's geometry — the full class's `full_block_size` tokens, a sliding one's
+        // `block_size` — and one layer's scratch of the widest.
         let geometry = model.kv_layer_geometry().unwrap_or_default();
-        let global = (geometry.iter()).find(|g| !g.is_sliding);
-        let (kv_heads, head_dim) = global.map_or((0, 0), |g| (g.num_kv_heads, g.head_size));
-        let num_global = layout.layer_to_group.iter().filter(|&&g| g == 0).count();
-        return shared_pages
-            + layout.full_block_size()
-                * scratchy_target_metal::kv_int8::kv_bytes_per_token(
-                    codec,
-                    num_global,
-                    kv_heads,
-                    head_dim,
-                    METAL_KV_ELEM_BYTES,
-                );
+        let bytes = |g: &scratchy_core_config::LayerKvGeometry| {
+            let tokens = match g.is_sliding {
+                true => block_size.get(),
+                false => layout.full_block_size(),
+            };
+            scratchy_target_metal::kv_int8::Int8BlockBytes::of(tokens, g.num_kv_heads, g.head_size)
+        };
+        let stores: usize = (geometry.iter().map(bytes))
+            .map(|b| 2 * (b.codes + b.scales))
+            .sum();
+        let scratch = geometry.iter().map(|g| bytes(g).scratch).max().unwrap_or(0);
+        return stores + 2 * scratch;
     }
-    if uniform_int8(model, block_size) {
+    if int8_kv(model) {
         block_size.get().saturating_mul(pool_bytes_per_token(
             model,
             model.kv_codec(),
@@ -1653,12 +1647,11 @@ impl MetalWorker {
     /// Where the draft's int8 KV stages ([`DraftScratch`]): a head whose KV geometry is its
     /// int8 target's stages through the target's scratch, as `build_int8_provision` places it.
     fn draft_scratch(&self) -> DraftScratch {
-        let bs = self.config.block_size;
         let lends = match (self.model.as_deref(), self.draft_model.as_deref()) {
             (Some(target), Some(draft)) => {
                 self.draft_is_head()
-                    && uniform_int8(target, bs)
-                    && uniform_int8(draft, bs)
+                    && int8_kv(target)
+                    && int8_kv(draft)
                     && target.num_key_value_heads() == draft.num_key_value_heads()
                     && target.head_dim() == draft.head_dim()
             }
@@ -2945,8 +2938,8 @@ impl MetalWorker {
     /// allocator's shared residency set so attention reads don't race
     /// the Apple pager.
     /// Reactive KV (2b): map the KV stores through every block the step names before a forward
-    /// derefs them — int8's through group 0's (`max_full_block`), the chunked fp16 pool's
-    /// through every group's (`max_block`) — mapped, wired and zeroed where they must be by
+    /// derefs them — int8's through every group's, the chunked fp16 pool's through the groups it
+    /// holds (`max_block`) — mapped, wired and zeroed where they must be by
     /// `SparseStores::grow_to`: on Apple Silicon a GPU read of un-wired device memory does not
     /// raise a recoverable fault, it hangs the command buffer past the watchdog (a reboot).
     fn grow_metal_kv_to_cover(
@@ -2965,41 +2958,29 @@ impl MetalWorker {
                 ExecutorError::WorkerExecution(format!("{what} grow to block {block}: {e}"))
             }
         };
-        // int8's stores hold group 0's blocks (`build_int8_provision`), as the scheduler
-        // numbers them (a span block's table entry carries `UNROTATED_BLOCK_BIT`; its ID here
-        // does not).
+        // int8's stores hold every group's blocks (`build_int8_provision`), each as the scheduler
+        // numbers its own: mapped through the highest any names (a span block's table entry
+        // carries `UNROTATED_BLOCK_BIT`; its ID here does not).
         // A budget shared with the snapshots maps the granules the scheduler names, before the step
         // (`apply_shared_memory`), and none past them.
         let shared = self.shared_kv.is_some();
         let registry = device.allocator.sparse_kv.lock();
         let reached = match shared {
             true => Ok(false),
-            false => (registry.expect("sparse KV registry")).reach(max_full_block + 1, mapper),
+            false => (registry.expect("sparse KV registry"))
+                .reach(max_block.max(max_full_block) + 1, mapper),
         };
-        if reached.map_err(refused("int8 KV", max_full_block))? {
+        if reached.map_err(refused("int8 KV", max_block.max(max_full_block)))? {
             info!(
-                "ScratchyWorker(metal): int8 KV mapped through block {max_full_block} in \
-                 {:.1} ms",
+                "ScratchyWorker(metal): int8 KV mapped through block {} in {:.1} ms",
+                max_block.max(max_full_block),
                 t_grow.elapsed().as_secs_f64() * 1e3,
             );
         }
-        // int8 on a UNIFORM model never reads the fp16 KV pool (every layer
-        // uses the packed store + the one-layer fp16 scratch, both provisioned by
-        // the RuntimeFactory). Skipping growth keeps the pool at its 1-chunk seed
-        // — THE memory win: per-layer fp16 KV is replaced by the ~4.7x smaller
-        // packed store + a single reused scratch.
-        //
-        // 🛑 BUT a HYBRID SWA model (gemma4) only int8-codes its GLOBAL
-        // layers; its FP16 SLIDING layers DO read the fp16 pool. Skipping growth
-        // there leaves chunks past the 1-chunk seed un-committed, so once a sliding
-        // group's blocks cross BLOCKS_PER_CHUNK (128) the sliding K-write/read hits
-        // a stale chunk-address-table entry → KV corruption (garbage past ~384
-        // tokens for gemma4-12b, where total blocks = 8 + 5·ceil(tok/16) ≥ 128).
-        // Uniform int8 keeps a single-chunk pool that's never read here, so
-        // skip growth there; hybrid SWA must grow its fp16 sliding tensors. Gate
-        // on `kv_is_hybrid` (the same discriminator `max_chunks` uses) — NOT
-        // `kv_full_block_size`, which is nonzero on uniform too.
-        if self.model.as_ref().is_some_and(|m| m.kv_codec().is_int8()) && !self.kv_is_hybrid {
+        // An int8 model never reads the fp16 KV pool: every layer reads its int8 store and the
+        // one-layer fp16 scratch, both provisioned by the RuntimeFactory. The pool stays at its
+        // one-chunk seed.
+        if self.model.as_ref().is_some_and(|m| int8_kv(m.as_ref())) {
             return Ok(());
         }
         let (Some(kv), Some(stores)) = (self.kv_cache.as_mut(), self.target_kv_stores.as_mut())
@@ -3128,13 +3109,13 @@ impl MetalWorker {
             let b = scratchy_target_metal::kv_int8::Int8BlockBytes::of(bs.get(), heads, head_dim);
             vec![b.codes, b.scales, b.scratch]
         };
-        let dense_target = !uniform_int8(model, bs);
+        let dense_target = !int8_kv(model);
         let mut store_bytes: Vec<usize> = match dense_target {
             true => target_layout.iter().map(|&(bytes, _)| bytes).collect(),
             false => int8_stores(model),
         };
         let draft = (self.draft_model.as_deref()).filter(|_| self.draft_keeps_kv());
-        let dense_draft = draft.is_some_and(|d| !uniform_int8(d, bs));
+        let dense_draft = draft.is_some_and(|d| !int8_kv(d));
         let draft_block = match draft {
             Some(d) => {
                 store_bytes.extend(match dense_draft {
@@ -3236,7 +3217,7 @@ impl MetalWorker {
 
         // A int8 draft's dense rows are never read (its KV binds the int8 scratch), so
         // its pool is a one-chunk seed, as the target's (`initialize_cache`).
-        let draft_chunks = if uniform_int8(model.as_ref(), self.config.block_size) {
+        let draft_chunks = if int8_kv(model.as_ref()) {
             1
         } else {
             num_chunks_total_draft
@@ -6457,7 +6438,7 @@ impl Worker for MetalWorker {
         // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
         // engine's every-layer row would overcount.
         let model = self.model.as_deref()?;
-        (uniform_int8(model, block)
+        (int8_kv(model)
             || hybrid_kv_layout(model, block, METAL_KV_ELEM_BYTES).is_some()
             || model.kv_cache_layers().is_some())
         .then(|| target_block_bytes(model, block))
@@ -6972,20 +6953,10 @@ impl Worker for MetalWorker {
             (None, Some(v)) => v[slot / 2] * elem_bytes,
             _ => per_block_elems * elem_bytes,
         };
-        // UNIFORM int8: the fp16 pool is never read (tape ops use the
-        // packed store + scratch) and never grown, so reserve only ONE chunk
-        // instead of the full num_chunks_total. That drops the per-layer fp16
-        // VA reservation (~13 GB) to a seed — the packed store (~4.7x smaller)
-        // is the canonical cache.
-        // 🛑 HYBRID SWA (gemma4): only the GLOBAL layers are int8-coded; the
-        // FP16 SLIDING layers DO read this (shared) pool and grow it past the
-        // seed once their blocks cross a chunk boundary (BLOCKS_PER_CHUNK=128,
-        // ~384 tokens for gemma4-12b). A 1-chunk seed makes grow_to_cover fail
-        // (all chunks committed) → the sliding KV in chunk 1+ reads a stale
-        // chunk-address-table entry → garbage. So the hybrid path needs the
-        // full capacity; a chunk's pages are only mapped when the pool grows
-        // into it, so the SWA win (global packed + sliding fp16-windowed) holds.
-        let max_chunks = if kv_codec.is_int8() && hybrid_layout.is_none() {
+        // int8: the fp16 pool is never read (every layer's attention reads its int8 store and the
+        // one-layer scratch) and never grown, so it reserves ONE chunk, not num_chunks_total: the
+        // int8 stores are the canonical cache.
+        let max_chunks = if kv_codec.is_int8() {
             1
         } else {
             num_chunks_total
@@ -7450,7 +7421,7 @@ impl Worker for MetalWorker {
         let int8_seed = [self.model.as_deref(), draft_pool]
             .into_iter()
             .flatten()
-            .filter(|m| uniform_int8(*m, self.config.block_size))
+            .filter(|m| int8_kv(*m))
             .map(|m| {
                 scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
                     * kv_per_block_bytes(m, self.config.block_size.get())
@@ -9683,11 +9654,11 @@ impl Worker for MetalWorker {
         self.mtp_drafter.is_some() && self.select_rows_kernel.is_some()
     }
 
-    /// An int8 KV cache holds a hybrid model's global layers in stores of their own: codes,
-    /// scales and an fp16 scratch, bound at each global layer's `kv_cache_k/v` and mapped through group 0's
-    /// blocks (`build_int8_provision`). The shared pool then backs the sliding layers alone — unless a
-    /// head reading its target's KV is not int8 itself, and so reads the target's global layer
-    /// from the shared pool at group 0's blocks (a coded one binds its target's stores).
+    /// An int8 KV cache holds every layer in stores of its own, each mapped through the blocks its
+    /// group names (`build_int8_provision`): the global group numbers its blocks apart from the
+    /// sliding groups — unless a head reading its target's KV is not int8 itself, and so reads the
+    /// target's global layer from the shared pool at group 0's blocks (a coded one binds its
+    /// target's stores).
     fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
         let coded = |m: &dyn scratchy_target_metal::MetalWeights| m.kv_codec().is_int8();
         let target_coded = self.model.as_deref().is_some_and(coded);

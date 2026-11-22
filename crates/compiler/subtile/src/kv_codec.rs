@@ -2,12 +2,11 @@
 //! THE KV CODEC'S STEPS, INSERTED FROM A TARGET'S DECLARED FACTS.
 //!
 //! A target that stores its KV cache compressed runs extra steps around every KV writer and every
-//! attention of a coded class: the writer's new K and V are encoded into a packed store, and the
+//! attention: the writer's new K and V are encoded into a packed store, and the
 //! attention either reads that store directly (its packed twin) or reads it staged back into a
 //! dense cache. WHICH steps, in WHICH
-//! order, under WHICH runtime guard, and which classes and head dims are coded, are the target's
-//! facts ([`KvCodecFacts`]); inserting them is this one pass over the front end's op list. A
-//! target without a codec never calls it.
+//! order and under WHICH runtime guard are the target's facts ([`KvCodecFacts`]); inserting them
+//! is this one pass over the front end's op list. A target without a codec never calls it.
 //!
 //! The inserted ops are expansion ops (`expansion_ops!`): a writer and its encodes are one
 //! expansion, an attention and the steps around it another, so a target fences each as one. Every
@@ -17,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::handoff::{Expansion, ExpansionId, LoweredDecode};
 use crate::lower::{ArchOp, InputRef, LoweringInput, OpDesc, kv_operand_bias};
-use crate::subtile_ir::{AttnMask, KvOperand, SubOp};
+use crate::subtile_ir::{KvOperand, SubOp};
 
 /// When a codec step runs: a runtime condition the target's worker evaluates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -101,9 +100,6 @@ pub struct CodecAround {
 
 /// A target's KV codec, as data.
 pub struct KvCodecFacts {
-    /// The one class coded, on every arch. A layer of another class (a sliding window) keeps its
-    /// KV dense, in a group of its own in the KV pool (`compute_hybrid_kv_layout`).
-    pub coded_class: AttnMask,
     /// After each coded KV writer — whether or not an attention reads its cache.
     pub after_writer: &'static [Guarded<KvOperand>],
     /// Around each coded attention of a decode form (one query row per sequence) ...
@@ -167,13 +163,13 @@ pub fn expand_kv_codec(
     facts: &KvCodecFacts,
 ) -> Result<LoweredDecode, KvCodecError> {
     let ops = &l.input.ops;
-    let coded = |class: AttnMask| class == facts.coded_class;
-    // A body with no op of the coded class (a vision tower, a recurrent-only body) comes back as
+    // A body with no KV writer or attention (a vision tower, a recurrent-only body) comes back as
     // it was.
-    let codes = ops.iter().any(|od| match od.op {
-        SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } => coded(attn),
-        SubOp::AttnDecode { mask, .. } => coded(mask),
-        _ => false,
+    let codes = ops.iter().any(|od| {
+        matches!(
+            od.op,
+            SubOp::RopeAppend { .. } | SubOp::KvAppend { .. } | SubOp::AttnDecode { .. }
+        )
     });
     if !codes {
         return Ok(l.clone());
@@ -192,10 +188,8 @@ pub fn expand_kv_codec(
     };
     for (i, od) in ops.iter().enumerate() {
         match od.op {
-            SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } if coded(attn) => {
-                x.writer(i, facts)?
-            }
-            SubOp::AttnDecode { mask, .. } if coded(mask) => {
+            SubOp::RopeAppend { .. } | SubOp::KvAppend { .. } => x.writer(i, facts)?,
+            SubOp::AttnDecode { .. } => {
                 let around = if od.m == 1 {
                     &facts.decode
                 } else {
@@ -465,7 +459,7 @@ mod tests {
         one_layer_input_shaped,
     };
     use crate::lower::GemmWeight;
-    use crate::subtile_ir::{EwKind, SourceShape};
+    use crate::subtile_ir::{AttnMask, EwKind, SourceShape};
     use CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
 
     /// The one-layer fixture (llama-shaped, head dim `hd`) with every op `m` rows.
@@ -487,7 +481,6 @@ mod tests {
     /// attention twinned onto them; off decode steps its K and V stage for the attention.
     #[test]
     fn an_unrotated_writer_encodes_its_cache_halves_alone() {
-        use crate::subtile_ir::AttnMask;
         use scratchy_ir::model_facts::HeadDim;
         let attention = one_layer_attention(256, 64, 64);
         let unrotated = |m: u32| {
@@ -669,10 +662,10 @@ mod tests {
         assert_eq!(x.input.ops.len(), l.input.ops.len() + 2);
     }
 
-    /// Two attention classes of different head dims (a hybrid arch): only the declared class is
-    /// coded — its writer and its attention; the other class's are left as they were.
+    /// Two attention classes of different head dims (a hybrid arch): both are coded — each
+    /// writer and each attention, at its own class.
     #[test]
-    fn a_hybrid_arch_codes_its_declared_class_only() {
+    fn a_hybrid_arch_codes_every_class() {
         let mut l = layer(64, 1);
         let mut second = one_layer_input_shaped(512, 128, 512, 128);
         let (s0, o0) = (l.input.sources.len(), l.input.ops.len());
@@ -700,13 +693,21 @@ mod tests {
         let l = lowered(l.input);
         let x = expand_kv_codec(&l, &FACTS).expect("expands");
         let count = |name| x.input.ops.iter().filter(|od| od.op.name() == name).count();
-        assert_eq!((count("KvEncode"), count("AttnPackedKv")), (2, 1));
+        assert_eq!((count("KvEncode"), count("AttnPackedKv")), (4, 2));
         let coded = x.input.ops.iter().zip(&x.op_expansion);
-        for (od, e) in coded.filter(|(_, e)| e.is_some()) {
-            if let SubOp::RopeAppend { attn, .. } | SubOp::AttnDecode { mask: attn, .. } = od.op {
-                assert_eq!(attn, AttnMask::Causal, "{e:?}");
-            }
-        }
+        let classes: Vec<AttnMask> = (coded.filter(|(_, e)| e.is_some()))
+            .filter_map(|(od, _)| match od.op {
+                SubOp::AttnDecode { mask, .. } => Some(mask),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(classes.len(), 2);
+        assert!(classes.contains(&AttnMask::Causal));
+        assert!(
+            classes
+                .iter()
+                .any(|c| matches!(c, AttnMask::SlidingWindow { .. }))
+        );
     }
 
     /// `od` inserted at `at`, every reference to a later op moved with it.

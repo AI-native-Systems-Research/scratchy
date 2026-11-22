@@ -410,6 +410,14 @@ kernel void kv_stage(
     }
     const uint q_start = cu_seqlens_q[seq];
     const uint prefix_len = kv_len - (cu_seqlens_q[seq + 1] - q_start);
+    // A sliding window: the step's first query reads keys from `prefix_len - window + 1` on, and
+    // every later one past them, so the blocks before stay unstaged.
+    const uint first_key = (ATTN_WINDOW > 0 && prefix_len >= uint(ATTN_WINDOW))
+                               ? prefix_len - uint(ATTN_WINDOW) + 1u
+                               : 0u;
+    if ((logical_block + 1u) * block_size <= first_key) {
+        return;
+    }
     const uint physical_block =
         block_table[seq * ATTN_MAX_BLOCKS_PER_SEQ + logical_block] & 0x7FFFFFFFu;
     const uint chunk = (ATTN_BLOCKS_PER_CHUNK == 0u) ? 0u : physical_block / ATTN_BLOCKS_PER_CHUNK;

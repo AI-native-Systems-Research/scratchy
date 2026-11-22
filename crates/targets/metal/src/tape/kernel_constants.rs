@@ -435,6 +435,8 @@ pub struct KvStageConstants {
     pub num_kv_heads: NumKvHeads,
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
+    /// The layer's sliding window (`ATTN_WINDOW`, slot 7): 0 for a full-attention layer.
+    pub window: AttnWindow,
 }
 
 impl From<KvStageConstants> for Vec<ConstantValue> {
@@ -445,6 +447,7 @@ impl From<KvStageConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
+            ConstantValue::int(ConstSlot(7), c.window.get()),
             ConstantValue::uint(AttentionViaCacheConstants::INT8, 1),
         ]
     }

@@ -732,7 +732,6 @@ pub fn gemm_m1_only_input() -> LoweringInput {
 
 /// A codec shaped like the int8 one.
 pub const INT8_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
-    coded_class: AttnMask::Causal,
     after_writer: &[
         Guarded {
             step: KvOperand::K,

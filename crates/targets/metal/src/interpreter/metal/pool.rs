@@ -2282,13 +2282,12 @@ fn write_runtime_inputs(
             Padding::Zero,
         )?;
     }
-    // The int8 stores hold group 0's blocks, mapped as the pool grows: a block past them is
+    // The int8 stores hold every group's blocks, mapped as the pool grows: a block past them is
     // un-wired, and a GPU read of that hangs past the watchdog rather than faulting.
     if let Some(int8) = &runtime.int8 {
         let mapped = int8.mapped.load(std::sync::atomic::Ordering::Relaxed);
-        let group0 = inputs.block_tables.first().map_or(&[][..], |t| *t);
-        let named = group0
-            .iter()
+        let named = (inputs.block_tables.iter())
+            .flat_map(|t| t.iter())
             .map(|&b| b & !crate::UNROTATED_BLOCK_BIT)
             .max();
         if let Some(block) = named.filter(|&b| b as usize >= mapped) {

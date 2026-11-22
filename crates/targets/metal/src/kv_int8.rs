@@ -8,27 +8,33 @@
 use objc2_metal::MTLDevice;
 pub use scratchy_layers::kv_int8::{Int8BlockBytes, kv_bytes_per_token, scratch_bytes_per_token};
 
+use scratchy_ir::model_facts::HeadGeometry;
+
 use crate::argmax::Buffer;
 use crate::interpreter::metal::runtime::{Int8KvBuffers, KvScratch};
 
-/// The KV pool an int8 provision serves, at its GLOBAL (full-context) geometry.
+/// What one block of a layer of `class` takes in each store.
+fn block_bytes(class: &HeadGeometry) -> Int8BlockBytes {
+    Int8BlockBytes::of(
+        class.page().get() as usize,
+        class.kv_heads().get() as usize,
+        class.head_dim().get() as usize,
+    )
+}
+
+/// The KV pool an int8 provision serves: each layer's attention class (`None` for a layer that
+/// holds no KV), the pool's blocks and their chunking.
 #[derive(Clone, Copy)]
 pub struct Int8Pool<'a> {
-    pub is_global: &'a [bool],
+    pub layers: &'a [Option<HeadGeometry>],
     pub num_blocks: usize,
-    pub block_size: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
     pub blocks_per_chunk: usize,
 }
 
-/// Build the int8 provisioning for one worker at the GLOBAL (full-context) geometry.
-/// `num_blocks` is the shared KV pool capacity (the int8 store is the canonical cache of that
-/// size); the scratch is ONE layer's fp16 (`num_blocks` blocks) reused across the global layers.
-///
-/// `is_global[L]` flags whether layer L is in the GLOBAL group (group 0). Only global layers get a
-/// real store; sliding layers get a tiny placeholder buffer that the tape never binds (the KV codec
-/// pass codes only the global KV writers). Uniform arches pass all-true.
+/// Build the int8 provisioning for one worker: each KV layer's codes and scales at its class's
+/// geometry, over the pool's `num_blocks` blocks (each class numbers its own), and the scratch
+/// prefill attention reads them staged into — one layer's fp16 rows of the widest class's block,
+/// reused by every layer. A layer that holds no KV gets a 16-byte placeholder the tape never binds.
 ///
 /// `hosted` is the scratch of the pool whose arena this one runs in (a head's target's,
 /// [`crate::interpreter::metal::HostArena::kv_scratch`]): of this geometry, the provision stages
@@ -39,45 +45,43 @@ pub fn build_int8_provision(
     hosted: Option<&KvScratch>,
 ) -> Int8KvBuffers {
     let Int8Pool {
-        is_global,
+        layers,
         num_blocks,
-        block_size,
-        num_kv_heads,
-        head_dim,
         blocks_per_chunk,
     } = pool;
     use objc2_metal::{MTLBuffer, MTLResourceOptions};
     let device = allocator.device();
-    let num_layers = is_global.len();
-    let n_global = is_global.iter().filter(|&&g| g).count();
+    let coded: Vec<HeadGeometry> = layers.iter().flatten().copied().collect();
     tracing::info!(
-        "int8 KV: head_dim={head_dim}, num_kv_heads={num_kv_heads}, block_size={block_size}, \
-         {num_blocks} blocks, {n_global}/{num_layers} global layers coded"
+        "int8 KV: {num_blocks} blocks, {}/{} layers coded",
+        coded.len(),
+        layers.len()
     );
 
-    // Per-layer codes + scales (canonical cache), at the GLOBAL geometry, then the per-worker fp16
-    // scratch: one layer (num_blocks blocks), reused across all global layers. All are
-    // placement-sparse, mapped as group 0's blocks are reached (`SparseRegistry`). The SCALES read
-    // zero until written: decode reads every key of the active context, and a block the step's
-    // scheduler handed out but no writer reached yet decodes to 0. So does the scratch: the paged
-    // attention can stage blocks just past the active context. Codes need no zeroing (a garbage
-    // code times scale 0 is 0).
-    let bytes = Int8BlockBytes::of(block_size, num_kv_heads, head_dim);
-    let (codes, scales, scratch) = (
-        (bytes.codes, false),
-        (bytes.scales, true),
-        (bytes.scratch, true),
-    );
+    // Per-layer codes + scales (the canonical cache), then the per-worker fp16 scratch. All are
+    // placement-sparse, mapped as the pool's blocks are reached (`SparseRegistry`). The SCALES
+    // read zero until written: decode reads every key of the active context, and a block the
+    // step's scheduler handed out but no writer reached yet decodes to 0. So does the scratch: the
+    // paged attention can stage blocks just past the active context. Codes need no zeroing (a
+    // garbage code times scale 0 is 0).
+    let scratch_block = coded
+        .iter()
+        .map(|l| block_bytes(l).scratch)
+        .max()
+        .unwrap_or(0);
     // A hosted scratch of this geometry is staged through, and none of this pool's own is laid
     // out: its stores are its host's, mapped as far as the same blocks are reached.
-    let chunk_bytes = blocks_per_chunk * scratch.0;
-    let scratch_bytes = num_blocks * scratch.0;
+    let chunk_bytes = blocks_per_chunk * scratch_block;
+    let scratch_bytes = num_blocks * scratch_block;
     let hosted = hosted.filter(|s| s.bytes == scratch_bytes && s.chunk_bytes == chunk_bytes);
     let own_scratch = if hosted.is_some() { 0 } else { 2 };
-    let layout: Vec<(usize, bool)> = [codes, codes, scales, scales]
-        .into_iter()
-        .flat_map(|store| std::iter::repeat_n(store, n_global))
-        .chain(std::iter::repeat_n(scratch, own_scratch))
+    let codes = |l: &HeadGeometry| (block_bytes(l).codes, false);
+    let scales = |l: &HeadGeometry| (block_bytes(l).scales, true);
+    let layout: Vec<(usize, bool)> = (coded.iter().map(codes))
+        .chain(coded.iter().map(codes))
+        .chain(coded.iter().map(scales))
+        .chain(coded.iter().map(scales))
+        .chain(std::iter::repeat_n((scratch_block, true), own_scratch))
         .collect();
     let stores = crate::sparse_kv::SparseStores::new(
         device,
@@ -87,18 +91,18 @@ pub fn build_int8_provision(
         &layout,
     );
     let stores = stores.expect("int8 KV stores");
-    // The KvCodesK{layer} binding is layer-indexed, so a global layer L's store must sit at index
-    // L; sliding layers (is_global[L]==false) get a 16-byte placeholder that the tape never binds.
+    // The KvCodesK{layer} binding is layer-indexed, so layer L's store sits at index L; a layer
+    // that holds no KV gets a 16-byte placeholder that the tape never binds.
     let mut next = (0..layout.len()).map(|i| stores.buffer(i));
     let mut by_layer = || -> Vec<Buffer> {
         let shared = MTLResourceOptions::StorageModeShared;
-        let mut one = |&g: &bool| match g {
-            true => next.next().expect("a store per global layer"),
-            false => device
+        let mut one = |l: &Option<HeadGeometry>| match l {
+            Some(_) => next.next().expect("a store per coded layer"),
+            None => device
                 .newBufferWithLength_options(16, shared)
                 .expect("int8 KV placeholder"),
         };
-        is_global.iter().map(&mut one).collect()
+        layers.iter().map(&mut one).collect()
     };
     let (codes_k, codes_v, scales_k, scales_v) = (by_layer(), by_layer(), by_layer(), by_layer());
     // Contiguous scratch data + a chunk-table of gpuAddresses at chunk offsets (the kernels

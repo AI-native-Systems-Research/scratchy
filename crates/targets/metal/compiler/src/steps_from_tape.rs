@@ -2232,8 +2232,8 @@ impl Recording<'_> {
             }
             // The KV codec: each step's operands are its writer's, its site the writer's.
             L::KvStage { operand } => {
-                let (layer, _, _, sites) = self.codec_operand(i, 0)?;
-                let mut e = em(S::KvStage(operand, layer), &[], &[], sites);
+                let (layer, _, class, sites) = self.codec_operand(i, 0)?;
+                let mut e = em(S::KvStage(operand, layer, class), &[], &[], sites);
                 // The layer's packed store in, the staging buffer out.
                 e.sig.kv_r = Some(layer);
                 e.sig.codec_staging = Access::Write;

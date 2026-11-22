@@ -18,7 +18,7 @@
 
 use crate::tape::facts::{
     attention, base, class, drafter, final_softcap, gdn, global, intermediate, kernel_drafts,
-    kernel_window, proportional, q_heads, rope_on_read, target, vision, vocab,
+    kernel_window, masked, proportional, q_heads, rope_on_read, target, vision, vocab,
 };
 use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::{QSize, RowStride, SourceIx};
@@ -713,9 +713,10 @@ fn kv_stage_command(
     p: &ModelFacts,
     layer: u32,
     operand: KvOperand,
+    mask: AttnMask,
     bucket_m: u32,
 ) -> Result<LoweredCommand, LoweringError> {
-    let global = global(p)?;
+    let global = masked(p, mask)?;
     Ok(LoweredCommand {
         kernel: KernelId::KvStage,
         library: "attention",
@@ -725,6 +726,10 @@ fn kv_stage_command(
             num_kv_heads: super::ids::NumKvHeads(global.kv_heads().get()),
             block_size: super::ids::BlockSize(global.page().get()),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
+            window: super::ids::AttnWindow(match mask {
+                AttnMask::Causal => 0,
+                AttnMask::SlidingWindow { window } => window.get() as i32,
+            }),
         }
         .into_baked(),
         // A simdgroup a row of the block.
@@ -754,8 +759,7 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
 
 /// A KV writer's folded-in int8 encode ([`KvWrite::PoolAndPacked`]): the layer's int8 store, as
 /// the writer's constant and the bindings it adds from 16 (`kv_writer.h`'s
-/// `KV_WRITER_INT8_BUFFERS`). `None` for a writer that writes the pool alone. The coded layers are
-/// the GLOBAL class (every layer on uniform arches).
+/// `KV_WRITER_INT8_BUFFERS`). `None` for a writer that writes the pool alone.
 fn kv_writer_codec(
     write: KvWrite,
     layer: LayerId,
@@ -1410,7 +1414,7 @@ fn route_gdn(
 
 /// The keys of the rung's KV cap one threadgroup of `attention_decode_gqa_int8` takes: a
 /// hand-picked constant.
-const ATTN_SPLIT_KEYS: u32 = 1024;
+const ATTN_SPLIT_KEYS: u32 = 256;
 
 /// At most this many threadgroups a KV head's keys spread over: a hand-picked constant.
 const ATTN_MAX_SPLITS: u32 = 16;
@@ -1419,9 +1423,14 @@ const ATTN_MAX_SPLITS: u32 = 16;
 /// a threadgroup takes the largest divisor of the GQA group that fits them.
 const DECODE_FRAGMENT_ROWS: u32 = 8;
 
-/// The threadgroups a KV head's keys spread over at the KV cap rung `block_cap`.
-fn decode_splits(p: &ModelFacts, block_cap: u32) -> Result<u32, LoweringError> {
-    let keys = block_cap.saturating_mul(global(p)?.page().get());
+/// The threadgroups a KV head's keys spread over at the KV cap rung `block_cap`: the keys a query
+/// of a layer masked `mask` reads at most — the rung's, within its window.
+fn decode_splits(p: &ModelFacts, mask: AttnMask, block_cap: u32) -> Result<u32, LoweringError> {
+    let cap = block_cap.saturating_mul(masked(p, mask)?.page().get());
+    let keys = match mask {
+        AttnMask::Causal => cap,
+        AttnMask::SlidingWindow { window } => cap.min(window.get()),
+    };
     Ok(keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS))
 }
 
@@ -1438,18 +1447,19 @@ fn int8_decode_commands(
     p: &ModelFacts,
     dense: &LoweredCommand,
     layer: u32,
+    mask: AttnMask,
     sinks: Option<SourceIx>,
     block_cap: u32,
     index: usize,
 ) -> Result<[LoweredCommand; 2], LoweringError> {
     use super::kernel_constants::AttentionViaCacheConstants as C;
-    let (global, q_heads) = (global(p)?, q_heads(p)?);
-    let hd = global.head_dim().get();
-    let group = global.gqa().get();
+    let (class, q_heads) = (masked(p, mask)?, q_heads(p)?);
+    let hd = class.head_dim().get();
+    let group = class.gqa().get();
     let rows = (1..=group.min(DECODE_FRAGMENT_ROWS))
         .filter(|r| group.is_multiple_of(*r))
         .fold(1, |_, r| r);
-    let splits = decode_splits(p, block_cap)?;
+    let splits = decode_splits(p, mask, block_cap)?;
     let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.act_dtype());
     let (heads, sinks_const) = (C::HEADS.0, C::SINKS.0);
@@ -1531,6 +1541,15 @@ fn int8_decode_commands(
     Ok([attention, combine])
 }
 
+/// The class of the int8 decode `step` runs, alone or running its KV writer.
+fn packed_mask(step: &MetalStep) -> Option<AttnMask> {
+    match step {
+        MetalStep::AttnPackedKv(.., mask) => Some(*mask),
+        MetalStep::RopedAttention(fold) => packed_mask(&fold.attention),
+        _ => None,
+    }
+}
+
 /// The int8 decode split's partials the row's commands write ([`int8_decode_commands`]): a row's
 /// bytes, and the steps it runs on as its gate — the command's, or else `row_gate`, the row's —
 /// admits them ([`LoweredMetalTape::scratch_bytes`]): gated to decode steps, a row a sequence, the
@@ -1538,6 +1557,7 @@ fn int8_decode_commands(
 /// every step, so it holds every row's.
 fn record_decode_partials(
     p: &ModelFacts,
+    step: &MetalStep,
     cmds: &[GatedCommand],
     at: &BakePoint<'_>,
     row_gate: Option<RuntimeGate>,
@@ -1550,9 +1570,12 @@ fn record_decode_partials(
     let Some(c) = cmds.iter().find(split) else {
         return Ok(());
     };
-    let (global, q_heads) = (global(p)?, q_heads(p)?);
-    let splits = decode_splits(p, at.block_cap)?;
-    let row_bytes = q_heads * splits * (global.head_dim().get() + 2) * 4;
+    let Some(mask) = packed_mask(step) else {
+        return Ok(());
+    };
+    let (class, q_heads) = (masked(p, mask)?, q_heads(p)?);
+    let splits = decode_splits(p, mask, at.block_cap)?;
+    let row_bytes = q_heads * splits * (class.head_dim().get() + 2) * 4;
     let steps = SplitSteps::of(c.gate.or(row_gate));
     *partials = partials.max(DecodePartials { row_bytes, steps });
     Ok(())
@@ -1891,7 +1914,7 @@ fn lower(
                 )?;
                 let cmds = route_gdn(p, step, cmds, bucket_m)?;
                 let cmds = route_draft_commit(step, cmds);
-                record_decode_partials(p, &cmds, at, *gate, &mut decode_partials)?;
+                record_decode_partials(p, step, &cmds, at, *gate, &mut decode_partials)?;
                 let (cmds, rows) =
                     sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes)?;
                 logits_rows = writes_logits(logits_rows, rows);
@@ -5666,11 +5689,12 @@ fn lower_one(
         }
 
         // ── The KV codec (int8): its row's guard gates every command ──
-        I::KvStage(operand, layer) => {
+        I::KvStage(operand, layer, mask) => {
             return dispatched([kv_stage_command(
                 p,
                 layer.get() + layer_offset,
                 *operand,
+                *mask,
                 bucket_m,
             )?]);
         }
@@ -5707,6 +5731,7 @@ fn lower_one(
                 p,
                 dense,
                 layer,
+                *class,
                 w.sinks(),
                 block_cap,
                 w.index,
@@ -9556,7 +9581,7 @@ mod tests {
         let around = if decode { codec.decode } else { codec.prefill };
         for g in around.before {
             let step = match g.step {
-                Before::Stage(operand) => S::KvStage(operand, layer),
+                Before::Stage(operand) => S::KvStage(operand, layer, class),
             };
             rows.extend(gated(step, g.guard));
         }
@@ -10566,7 +10591,7 @@ mod tests {
                 ..
             }
         )));
-        let lowered = int8_decode_commands(&int8_consts(), &dense, 0, None, 128, 7);
+        let lowered = int8_decode_commands(&int8_consts(), &dense, 0, Causal, None, 128, 7);
         assert!(matches!(
             lowered,
             Err(LoweringError::SplitPartialsSlotTaken {
@@ -10686,9 +10711,9 @@ mod tests {
             &tape.commands.get(3).lowered(),
         );
         let dense = &tape.commands.get(1).lowered();
-        // 128 blocks of 16 keys: two threadgroups of `ATTN_SPLIT_KEYS`.
+        // 128 blocks of 16 keys: eight threadgroups of `ATTN_SPLIT_KEYS`.
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
-        assert_eq!(splits, 2);
+        assert_eq!(splits, 8);
         assert_eq!(
             (
                 gqa.function,
@@ -10881,7 +10906,7 @@ mod tests {
             &tape.commands.get(3).lowered(),
         );
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
-        assert_eq!(splits, 2);
+        assert_eq!(splits, 8);
         assert_eq!(gqa.dispatch.threadgroups, (1, 4, splits));
         assert_eq!(gqa.dispatch.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(combine.dispatch.threadgroups, (1, a(&p).q_heads().get(), 1));
@@ -11159,13 +11184,13 @@ mod tests {
         assert!(!has_trio(&lower(64, None)));
     }
 
-    /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass
-    /// expands the declared class only (`kv_codec`'s
-    /// `a_hybrid_arch_codes_its_declared_class_only`): the global layer's rows lower
-    /// to its writer, encoding its rows, and the int8 commands around its
-    /// attention, while the sliding layer's rows stay plain fp16.
+    /// A hybrid arch (gemma-4) codes every layer, each at its class's geometry: the global
+    /// layer's and the sliding layer's rows each lower to their writer, encoding their rows, and
+    /// the int8 commands around their attention. The sliding layer's decode reads its own class
+    /// (head_dim 64 over 4 KV heads, its window) and spreads the keys of its window, not the
+    /// rung's.
     #[test]
-    fn hybrid_int8_compresses_global_layers_only() {
+    fn hybrid_int8_codes_every_layer() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         let p = with_attention(
             int8_consts(),
@@ -11180,55 +11205,58 @@ mod tests {
         let sliding = attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved);
         let rows = [
             coded(global_writer.clone(), global),
-            plain(&[sliding_writer.clone(), sliding]),
+            coded(sliding_writer.clone(), sliding),
         ];
         let decode = lower_int8(&p, rows.concat(), 1);
-        let want = [
+        let layer = [
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
             (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
             (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
-            (KernelId::RopeAppend, None),
-            (KernelId::AttentionViaCache, None),
         ];
-        assert_eq!(gated_steps(&decode), want);
+        assert_eq!(gated_steps(&decode), [layer, layer].concat());
+        let sliding_split = decode.commands.get(6).lowered();
+        let constant = |k: u16| {
+            (sliding_split.constants.iter())
+                .find(|c| c.index == k)
+                .copied()
+        };
+        assert_eq!(constant(0), Some(ConstantValue::uint(0, 64)));
+        assert_eq!(constant(2), Some(ConstantValue::uint(2, 4)));
+        assert_eq!(constant(7), Some(ConstantValue::int(7, 1024)));
+        let window_splits = 1024u32.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
+        assert_eq!(sliding_split.dispatch.threadgroups.2, window_splits);
 
         let global_attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
         let sliding_attention = attention(MetalStep::SlidingAttentionPrefillPaged, 1, NeoX);
-        // A sliding layer lowers as it would in a dense model; alone in a tape
-        // it compresses nothing, which an int8 model's tape may not do.
-        let dense = with(p, |x| x.kv_codec = KvCodec::Dense);
-        let fp16 = |i: MetalStep| gated_steps(&lower_int8(&dense, plain(&[i]), 64));
-        // An int8 attention compresses its layer's writer's operands, so
-        // its own commands are read off a tape that has the writer.
-        let own = |i: MetalStep| {
-            own_attention_steps(&lower_int8(&p, coded(global_writer.clone(), i), 64))
+        // An int8 attention compresses its layer's writer's operands, so its own commands are
+        // read off a tape that has the writer.
+        let own = |w: &MetalStep, i: MetalStep| {
+            own_attention_steps(&lower_int8(&p, coded(w.clone(), i), 64))
         };
         let prefill = lower_int8(
             &p,
             [
                 coded(global_writer.clone(), global_attention.clone()),
-                plain(&[sliding_writer, sliding_attention.clone()]),
+                coded(sliding_writer.clone(), sliding_attention.clone()),
             ]
             .concat(),
             64,
         );
+        let decoded = [
+            (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
+            (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
+        ];
         let mut want = vec![(KernelId::RopeAppend, None)];
         want.extend(int8_attention_steps(
-            &own(global_attention),
-            &[
-                (
-                    KernelId::AttentionDecodeInt8,
-                    Some(RuntimeGate::OnlyIfDecodeStep),
-                ),
-                (
-                    KernelId::AttentionDecodeCombine,
-                    Some(RuntimeGate::OnlyIfDecodeStep),
-                ),
-            ],
+            &own(&global_writer, global_attention),
+            &decoded,
         ));
         want.push((KernelId::RopeAppend, None));
-        want.extend(fp16(sliding_attention));
+        want.extend(int8_attention_steps(
+            &own(&sliding_writer, sliding_attention),
+            &decoded,
+        ));
         assert_eq!(gated_steps(&prefill), want);
     }
 
