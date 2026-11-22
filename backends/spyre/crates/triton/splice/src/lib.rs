@@ -1361,7 +1361,7 @@ fn lower_prefill_lm_head_fold<
 
     let a = &node.inputs[0];
     let (mq, hidden) = (a.region.rows.len, a.region.cols.len);
-    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's lmlast arm checks
+    let stk = scratchy_spyre_bundle::rung::FP16_LANES; // the tail copies whole fp16 sticks
     if hidden % stk != 0 {
         return Err(format!(
             "triton splice: matmul_s{} (prefill lm-head tail): hidden={hidden} is not a whole \
@@ -1680,7 +1680,7 @@ impl BatchChunking {
 
     /// One stick of fp16 lanes — a gathered row of the folded cache or the folded query is whole
     /// sticks of it, or the gather has no addressing for it.
-    pub const STICK: u32 = 64;
+    pub const STICK: u32 = scratchy_spyre_bundle::rung::FP16_LANES;
 
     /// The fold's page-side law, stated rather than relied on: the cut is `kv_heads · 2^i` rows a
     /// page with `2^i < GATHER_FLOOR`, so a page's share is `page_slots · head_size / 2^i`, whole
@@ -1721,6 +1721,15 @@ impl BatchChunking {
     /// A walk past [`Self::MAX_CHUNKS`] chunks takes more block slots a chunk, but never as many
     /// pages a chunk as the `pages`-page pool holds (spyre-inference's eligibility: a gather of the
     /// whole pool faults their device, torch-spyre#4033) — past that it takes more chunks.
+    ///
+    /// Nor more pages a chunk than one access reaches ([`DeviceGen::MUTABLE_REACH_BYTES`]): a
+    /// chunk's pages land as one fp16 gather, and a gather runs on one core as one access, so a
+    /// chunk whose landed pages pass the reach is one dxp refuses ("EAR overflow detected";
+    /// gemma-4-12b's 32-sequence decode landed 1024 pages of 512 KiB a chunk, twice the reach) — it
+    /// takes more chunks instead, past [`Self::MAX_CHUNKS`] if it must. The gather floor's few pages
+    /// stay under the reach at any page a model has.
+    ///
+    /// [`DeviceGen::MUTABLE_REACH_BYTES`]: ktir_core::ddl_binds::DeviceGen::MUTABLE_REACH_BYTES
     pub const fn of(
         seqs: u32,
         blocks: u32,
@@ -1772,6 +1781,24 @@ impl BatchChunking {
         } else {
             blocks_per_chunk
         };
+        let landed = SchedulerBlockTokens::REFERENCE.get() as u64
+            * (if nkvh < 1 { 1 } else { nkvh }) as u64
+            * head_size as u64
+            * Df::Fp16.word_bytes()
+            * seqs as u64;
+        let reach =
+            <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MUTABLE_REACH_BYTES
+                / landed;
+        let blocks_per_chunk = if (blocks_per_chunk as u64) > reach {
+            reach as u32
+        } else {
+            blocks_per_chunk
+        };
+        let blocks_per_chunk = if blocks_per_chunk < floor {
+            floor
+        } else {
+            blocks_per_chunk
+        };
         BatchChunking {
             seqs,
             blocks_per_chunk,
@@ -1789,6 +1816,47 @@ impl BatchChunking {
     /// and of `rep_row_ids`.
     pub const fn index_rows(self) -> u32 {
         self.entries() * self.rows_per_page
+    }
+}
+
+#[cfg(test)]
+mod chunking {
+    use super::{BatchChunking, SchedulerBlockTokens};
+    use ktir_core::ddl_binds::{Baked, DeviceGen};
+
+    /// Every chunk lands within one access's reach and the chunks still cover the walk, at every
+    /// batch width, at head dims and kv heads past any model's, up to a 4096-block walk.
+    #[test]
+    fn a_chunk_lands_within_one_access_and_the_chunks_cover_the_walk() {
+        for seqs in 1..=32u32 {
+            for (nkvh, hd) in [
+                (1u32, 64u32),
+                (8, 64),
+                (8, 128),
+                (8, 256),
+                (1, 512),
+                (8, 512),
+                (16, 512),
+            ] {
+                for blocks in [1u32, 7, 64, 1024, 2048, 4096] {
+                    let c = BatchChunking::of(seqs, blocks, 8192, nkvh, 32 * hd, hd);
+                    let landed = u64::from(c.entries())
+                        * u64::from(SchedulerBlockTokens::REFERENCE.get() * nkvh * hd)
+                        * 2;
+                    assert!(
+                        landed <= <Baked as DeviceGen>::MUTABLE_REACH_BYTES,
+                        "{seqs} seqs, {nkvh}x{hd}, {blocks} blocks: {c:?} lands {landed} B"
+                    );
+                    assert!(
+                        c.blocks_per_chunk * c.num_chunks >= blocks,
+                        "{c:?} over {blocks}"
+                    );
+                }
+            }
+        }
+        // The decode batch dxp refused: 32 sequences of 512 KiB pages over a 2048-block walk.
+        let c = BatchChunking::of(32, 2048, 8192, 8, 16 * 256, 256);
+        assert_eq!((c.blocks_per_chunk, c.num_chunks), (16, 128));
     }
 }
 
@@ -2809,9 +2877,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // value the descriptor reads is the f16 image either way.
             ce("EPS", Val::Float(f64::from(*eps)))?;
             // `1.0 / D_MODEL` folded on the host, exactly as the fixture's own
-            // `constexprs()` helper does — one multiply instead of a divide, and NOT a
-            // registry scale (the consumer binds `1/cols` at the reserved
-            // `RMS_INVCOLS_TID`, never through `scalarmul_scales`).
+            // `constexprs()` helper does — one multiply instead of a divide.
             ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
         }
         // ⭐ THE (1 + w) FORM'S OWN SPEC — the same signature and constants as the Scale
@@ -3213,14 +3279,13 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                     node.output.tensor.index()
                 ));
             }
-            let stk: u32 = 64; // Fp16::ELEMS_PER_STICK — the door's own stick law
+            let stk = scratchy_spyre_bundle::rung::FP16_LANES; // the walk copies whole fp16 sticks
             if c_in % stk != 0 || c_out % stk != 0 {
                 return Err(format!(
                     "triton splice: reshape t{}: a {c_in}- or {c_out}-wide side is not a whole \
                      {stk}-fp16 stick — a device tensor is stick-blocked, so flat elements \
                      {stk}q..{stk}q+{stk} are one `[1, {stk}]` tile of each side only when both \
-                     column extents are whole sticks (the door's own law, stated here so the \
-                     walk's `// {stk}` arithmetic is well-formed)",
+                     column extents are whole sticks (the kernel's walk steps `// {stk}`)",
                     node.output.tensor.index()
                 ));
             }

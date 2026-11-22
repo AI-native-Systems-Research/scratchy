@@ -378,6 +378,14 @@ pub trait DeviceGen {
     /// counts in, and (by the device's own stick law) the width of every
     /// format's stick: elems per stick = `FLIT_BYTES / element size`.
     const FLIT_BYTES: u64;
+    /// The width, in bits, of an L3 load or store unit's mutable address register (EAR): the
+    /// part of a tensor access's address that changes as the access walks the tensor.
+    const EAR_BITS: u32;
+    /// The bytes one tensor access can walk from its base: `2^EAR_BITS` sticks
+    /// (`MutableAddrSplitting.cpp:673-680` scales the register by the stick). dxp refuses an
+    /// access that walks past it ("EAR overflow detected", `MutableAddrSplitting.cpp:808`), so a
+    /// tensor no larger than this is always addressable by one access.
+    const MUTABLE_REACH_BYTES: u64 = (1u64 << Self::EAR_BITS) * Self::FLIT_BYTES;
     /// The bytes one core's share of an elementwise op may carry before another core pays for
     /// itself. A descriptor's fixed cost grows with the cores it is spread over while its byte cost
     /// is flat for a few KiB a core, so a free elementwise division spends one core per this many of
@@ -761,6 +769,11 @@ impl DeviceGen for Gen1 {
     /// twelve of its rows, packed int2/int4 included).
     const FLIT_BYTES: u64 = 128;
 
+    /// EAR = 21 bits: the vendor `SenSystemDef`'s `regInfoPerUnit[L3LU][EAR]` and
+    /// `regInfoPerUnit[L3SU][EAR]`, both `bitSize = 21` (sys-arch-spec/sysdef.cpp:313, :336) — a
+    /// reach of 2^21 sticks, 256 MiB.
+    const EAR_BITS: u32 = 21;
+
     /// BYTES_PER_CORE = 3 KiB: measured on the card (2026-11-08, the cycle counter over 200 launches
     /// of 32 chained descriptors, pinned). A `[1, 2048]` add costs 0.51 µs a descriptor on 4–8 cores
     /// against 0.80 µs on 32, flat from 1 to 8 cores; 32 cores win from 24–32 KiB of output up (6%
@@ -842,6 +855,21 @@ pub fn admits<G: DeviceGen>(op: DeviceOp, df: DdlDf) -> bool {
 /// row to guess at — the array states one row per op by construction.
 pub fn output_arrangement<G: DeviceGen>(op: DeviceOp) -> ElementArrangement {
     row::<G>(op).arrangement
+}
+
+/// Stage f32 words in the baked generation's `dl16tofp32` lane order: logical lane `i` of each
+/// 64-word block lands at [`DeviceGen::DL16TOFP32_PERMUTATION`]`[i]` (a trailing partial block is
+/// left as is).
+pub fn dl16tofp32_stagger(words: &[f32]) -> Vec<f32> {
+    let mut out = words.to_vec();
+    let (blocks, _) = out.as_chunks_mut::<64>();
+    for block in blocks {
+        let logical = *block;
+        for (i, word) in logical.iter().enumerate() {
+            block[<Baked as DeviceGen>::DL16TOFP32_PERMUTATION[i] as usize] = *word;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -962,19 +990,4 @@ mod tests {
             assert_eq!(output_arrangement::<Gen1>(op), ElementArrangement::Standard);
         }
     }
-}
-
-/// Stage f32 words in the baked generation's `dl16tofp32` lane order: logical lane `i` of each
-/// 64-word block lands at [`DeviceGen::DL16TOFP32_PERMUTATION`]`[i]` (a trailing partial block is
-/// left as is).
-pub fn dl16tofp32_stagger(words: &[f32]) -> Vec<f32> {
-    let mut out = words.to_vec();
-    let (blocks, _) = out.as_chunks_mut::<64>();
-    for block in blocks {
-        let logical = *block;
-        for (i, word) in logical.iter().enumerate() {
-            block[<Baked as DeviceGen>::DL16TOFP32_PERMUTATION[i] as usize] = *word;
-        }
-    }
-    out
 }
