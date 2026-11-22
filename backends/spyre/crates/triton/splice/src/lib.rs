@@ -4717,18 +4717,25 @@ mod production_ktir_dump {
         let params = node.func.arguments.len();
         let planned = spyre_superdsc::plan::<G>(&node.func, &vec![None; params])
             .map_err(|e| format!("{name}: {e:?}"))?;
-        let addresses: Vec<u64> = (0..params as u64).map(|p| (p + 1) << 28).collect();
-        let consts: Vec<(spyre_superdsc::graph::ConstStick, u64)> = planned
+        let addresses: Vec<spyre_superdsc::DevAddr> = (0..params as u64)
+            .map(|p| spyre_superdsc::DevAddr::new((p + 1) << 28))
+            .collect();
+        let consts: Vec<(spyre_superdsc::graph::ConstStick, spyre_superdsc::DevAddr)> = planned
             .graph
             .consts
             .iter()
             .enumerate()
-            .map(|(i, c)| (*c, (params as u64 + 1) << 28 | (i as u64 * 128)))
+            .map(|(i, c)| {
+                (
+                    *c,
+                    spyre_superdsc::DevAddr::new((params as u64 + 1) << 28 | (i as u64 * 128)),
+                )
+            })
             .collect();
         let bindings = spyre_superdsc::Bindings {
             params: &addresses,
             consts: &consts,
-            scratch: Some((params as u64 + 2) << 28),
+            scratch: Some(spyre_superdsc::DevAddr::new((params as u64 + 2) << 28)),
         };
         let ops = planned
             .emit::<G>(&bindings)

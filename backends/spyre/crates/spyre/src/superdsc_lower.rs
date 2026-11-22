@@ -15,7 +15,7 @@ use spyre_superdsc::format::DataFormat;
 use spyre_superdsc::graph::ConstStick;
 use spyre_superdsc::opfunc::OpFunc;
 use spyre_superdsc::wire::Sdsc;
-use spyre_superdsc::{Held, Planned, Residency};
+use spyre_superdsc::{DevAddr, Held, Planned, Residency};
 
 use crate::placement::{BundleLayout, RetileDescriptor, SegRole, TensorPlacement, align128};
 
@@ -273,19 +273,20 @@ pub fn rooms<T: Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
 pub fn lower_op<T: Tp>(e: &EmittedOp<T>, layout: &BundleLayout) -> Result<Descriptors, String> {
     let k = &e.ktir;
     let planned = plan(layout, k)?;
-    let params: Vec<u64> = tids(k)
+    let params: Vec<DevAddr> = tids(k)
         .map(|t| {
             layout
                 .address(t)
+                .map(DevAddr::new)
                 .ok_or_else(|| format!("{}: t{t} has no placement", e.op_name))
         })
         .collect::<Result<_, _>>()?;
-    let consts: Vec<(ConstStick, u64)> = layout
+    let consts: Vec<(ConstStick, DevAddr)> = layout
         .stick_consts
         .iter()
-        .filter_map(|(t, c)| Some((*c, layout.address(*t)?)))
+        .filter_map(|(t, c)| Some((*c, DevAddr::new(layout.address(*t)?))))
         .collect();
-    let scratch = layout.address(SCRATCH_TID);
+    let scratch = layout.address(SCRATCH_TID).map(DevAddr::new);
     let bindings = spyre_superdsc::Bindings {
         params: &params,
         consts: &consts,

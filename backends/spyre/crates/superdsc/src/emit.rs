@@ -18,15 +18,34 @@ use crate::graph::{ConstStick, Graph, Node, Operand, Store};
 use crate::opfunc::{Family, OpFunc};
 use crate::wire;
 
+/// A byte address in device memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DevAddr(u64);
+
+impl DevAddr {
+    pub const fn new(byte: u64) -> DevAddr {
+        DevAddr(byte)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The address `bytes` past this one.
+    pub const fn add_bytes(self, bytes: u64) -> DevAddr {
+        DevAddr(self.0 + bytes)
+    }
+}
+
 /// Where the function's storage lives on the device.
 #[derive(Clone, Debug)]
 pub struct Bindings<'a> {
-    /// Byte address of each parameter's buffer, by parameter.
-    pub params: &'a [u64],
-    /// Byte address of each constant's stick, by constant.
-    pub consts: &'a [(ConstStick, u64)],
-    /// Byte address of the region the intermediates are packed into, if one is placed.
-    pub scratch: Option<u64>,
+    /// Each parameter's buffer, by parameter.
+    pub params: &'a [DevAddr],
+    /// Each constant's stick, by constant.
+    pub consts: &'a [(ConstStick, DevAddr)],
+    /// The region the intermediates are packed into, if one is placed.
+    pub scratch: Option<DevAddr>,
 }
 
 /// What a graph needs placed: the scratch its intermediates take, packed from the scratch base in
@@ -239,7 +258,7 @@ pub fn emit<G: DeviceGen>(
     footprint: &Footprint,
     bindings: &Bindings<'_>,
 ) -> Result<Vec<(OpFunc, wire::Sdsc)>, EmitError> {
-    let base = |s: Store| -> Result<u64, EmitError> {
+    let base = |s: Store| -> Result<DevAddr, EmitError> {
         match s {
             Store::Param(p) => bindings
                 .params
@@ -248,7 +267,7 @@ pub fn emit<G: DeviceGen>(
                 .ok_or(EmitError::Unbound { param: p }),
             Store::Local(l) => bindings
                 .scratch
-                .map(|s| s + footprint.locals[l])
+                .map(|s| s.add_bytes(footprint.locals[l]))
                 .ok_or(EmitError::Unscratched { local: l }),
             Store::Const(c) => g
                 .consts
@@ -520,7 +539,7 @@ fn op<G: DeviceGen>(
     ni: usize,
     node: &Node,
     plan: &Plan,
-    base: &dyn Fn(Store) -> Result<u64, EmitError>,
+    base: &dyn Fn(Store) -> Result<DevAddr, EmitError>,
 ) -> Result<wire::Sdsc, EmitError> {
     let family = node.func.family();
     let mut operands: Vec<&Operand> = node.inputs.iter().collect();
@@ -591,7 +610,9 @@ fn op<G: DeviceGen>(
                     data: None,
                 },
             };
-            let addr = base(index.store)? + index.view.offset * index.format.word_bytes();
+            let addr = base(index.store)?
+                .add_bytes(index.view.offset * index.format.word_bytes())
+                .get();
             // The value's indexed axis holds one row per index. Rows one stick apart are the rows of
             // a stick array, the rest of which are a gap; a whole multi-stick row per index is the
             // value's outermost block, past which there is nothing.
@@ -839,7 +860,7 @@ fn tensor<G: DeviceGen>(
     (ni, oi): (usize, usize),
     p: &Proj<'_>,
     d: &Division<'_>,
-    base: &dyn Fn(Store) -> Result<u64, EmitError>,
+    base: &dyn Fn(Store) -> Result<DevAddr, EmitError>,
 ) -> Result<Tensor, EmitError> {
     let Division {
         axes,
@@ -1058,7 +1079,7 @@ fn tensor<G: DeviceGen>(
                 .filter(|e| e.scale == 1)
                 .map(|e| p.distance(e.axis, s[e.axis] * per_core[e.axis]))
                 .sum();
-            origin + (o.view.offset + elems) * word
+            origin.add_bytes((o.view.offset + elems) * word).get()
         })
         .collect();
     Ok(Tensor {

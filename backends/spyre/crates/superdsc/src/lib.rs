@@ -24,7 +24,7 @@ pub mod wire;
 use ktir_core::ddl_binds::DeviceGen;
 use ktir_core::ir::IRFunction;
 
-pub use emit::{Bindings, EmitError, Footprint};
+pub use emit::{Bindings, DevAddr, EmitError, Footprint};
 pub use layout::Residency;
 pub use lift::{Held, LiftError, ParamLayout};
 

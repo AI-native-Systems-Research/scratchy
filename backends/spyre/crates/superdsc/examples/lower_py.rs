@@ -84,8 +84,8 @@ fn main() {
         println!("args {:?} grid {:?}", f.arguments, f.grid);
         dump(f.operations, 0);
     }
-    let params: Vec<u64> = (0..f.arguments.len() as u64)
-        .map(|i| 0x4_0000_0000 + i * 0x4000_0000)
+    let params: Vec<spyre_superdsc::DevAddr> = (0..f.arguments.len() as u64)
+        .map(|i| spyre_superdsc::DevAddr::new(0x4_0000_0000 + i * 0x4000_0000))
         .collect();
     let residency: Vec<spyre_superdsc::Residency> = (0..f.arguments.len())
         .map(|p| {
@@ -138,16 +138,21 @@ fn main() {
             )
         );
     }
-    let placed: Vec<(spyre_superdsc::graph::ConstStick, u64)> = g
+    let placed: Vec<(spyre_superdsc::graph::ConstStick, spyre_superdsc::DevAddr)> = g
         .consts
         .iter()
         .enumerate()
-        .map(|(i, c)| (*c, 0x2000_0000 + i as u64 * 128))
+        .map(|(i, c)| {
+            (
+                *c,
+                spyre_superdsc::DevAddr::new(0x2000_0000 + i as u64 * 128),
+            )
+        })
         .collect();
     let b = spyre_superdsc::Bindings {
         params: &params,
         consts: &placed,
-        scratch: Some(0x1000_0000),
+        scratch: Some(spyre_superdsc::DevAddr::new(0x1000_0000)),
     };
     let fp = spyre_superdsc::emit::footprint::<Baked>(&g);
     match spyre_superdsc::emit::emit::<Baked>(&g, &fp, &b) {
