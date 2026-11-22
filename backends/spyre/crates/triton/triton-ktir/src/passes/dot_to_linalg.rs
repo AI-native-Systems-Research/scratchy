@@ -173,7 +173,7 @@ pub fn run(module: &mut Module) -> Result<()> {
         // emulator's own `batch_matmul` runs exactly this form. It rides `OpKind::Other`
         // precisely as `to_ktir`'s `convert_trans` mints `Other("linalg.transpose")`: a
         // MINTED op, not a censused one, so no rank-2 machinery (`plan_corelets`'s shape
-        // recovery, the standalone single-program door's tag requirement) can match it by
+        // recovery) can match it by
         // accident -- the handoff's `Other` arm names `KOpKind::LinalgBatchMatmul`, and the
         // whole-function walk is where a batch matmul lowers.
         //
@@ -185,9 +185,8 @@ pub fn run(module: &mut Module) -> Result<()> {
         // `tt.trans` on a rank-3 operand is NOT FOLDED: it stays the op it is, and
         // `to_ktir`'s `convert_trans` lowers it to a real `linalg.transpose`, whose result
         // the batch matmul reads in the standard orientation (spyre-inference's
-        // `torch.matmul(q, k_page.permute(0, 2, 1))`). The fp8 widening is refused: the
-        // W8A8 door is the rank-2 standalone contract's own, and no batched form of it is
-        // stated.
+        // `torch.matmul(q, k_page.permute(0, 2, 1))`). The fp8 widening is refused: the fp8
+        // contract is the rank-2 one, and no batched form of it is stated.
         if batched {
             let (da, db, dd) = (
                 da.expect("batched implies rank-3 dims"),
@@ -736,29 +735,17 @@ fn verify_canonical_matmul_kernel(
     Ok(())
 }
 
-/// ⭐ THE fp8 W8A8 WHOLE-KERNEL CONTRACT (review P1.0, the fp8 arm).
+/// ⭐ THE fp8 WHOLE-KERNEL CONTRACT (review P1.0, the fp8 arm).
 ///
-/// The lowering this admits is `ktir-superdsc`'s arity-3 `matmul_oriented` door: A, W_fp8
-/// and w_scale read from the node's FULL parameter list, with the device quantizing the
-/// activation and applying BOTH dequant scales (`a_scale[m] · w_scale[n]`) whatever the
-/// kernel says. That door never inspects the compute ops -- so THIS verifier is the only
-/// thing that makes the kernel's spelled `* w_scale` binding rather than decorative: it
-/// requires the dot's result to feed EXACTLY one `arith.mulf` whose other operand is the
-/// w_scale LOAD (through at most a `tt.broadcast` -- the `[1, N]` row sprayed over the m
-/// product rows, which is the `In::mb` the device's dequant states), and THAT mulf's result
-/// to be the store's source.
+/// A, W_fp8 and w_scale are read from the node's FULL parameter list, and the KTIR→SuperDSC
+/// lowering lowers the program as spelled — so the spelled `* w_scale` IS the dequant. This
+/// verifier requires the dot's result to feed EXACTLY one `arith.mulf` whose other operand is
+/// the w_scale LOAD (through at most a `tt.broadcast` — the `[1, N]` row sprayed over the m
+/// product rows), and THAT mulf's result to be the store's source: a kernel that forgot the
+/// multiply, or multiplied by something else, computes a different function than the
+/// checkpoint's, and is refused here by name rather than baked.
 ///
-/// ⛔ WHY THE mulf MUST BE SPELLED, on the record. The per-`Program` door is
-/// op-blind (`emit_regions` reads only the region list and the B orientation), so a kernel
-/// that forgot the multiply would still lower, still run, and still get the door's dequant --
-/// computing the right function from a program that states a different one. It would also be
-/// refused at the handoff for an unrelated reason (an unloaded `desc_ws` is DCE'd and
-/// `every_parameter_states_its_width` red-stops on the hole), which is luck, not design.
-/// This check replaces the luck: the epilogue the door assumes and the epilogue the kernel
-/// spells are pinned together HERE.
-///
-/// The counts follow the f16 verifier's discipline -- the emitter is a shape-keyed TEMPLATE
-/// that would silently drop anything it does not model, so exactly
+/// The counts follow the f16 verifier's discipline — exactly
 /// `{1 tt.dot, 3 tt.descriptor_load, 1 arith.mulf, 1 tt.descriptor_store}` is admitted and
 /// every deviation is refused by name.
 fn verify_canonical_fp8_matmul_kernel(
@@ -813,10 +800,8 @@ fn verify_canonical_fp8_matmul_kernel(
     let (w_r, w_c) = desc_shape2(index, b_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
 
-    // ⛔ THE WEIGHT VIEW IS `[N, K]` AND THE KERNEL'S BLOCK IS THE WHOLE TILE. The fp8 door
-    // reads W through `rb(&w_name, ...)` with extents it never checks on ITS side -- the
-    // `w_k != k` guard in the f16 arm is what catches a mis-framed weight, and this is its
-    // fp8 twin: the descriptor must state the checkpoint's `[out, in]` with `K` the second
+    // ⛔ THE WEIGHT VIEW IS `[N, K]` AND THE KERNEL'S BLOCK IS THE WHOLE TILE. The `w_k != k`
+    // guard in the f16 arm is what catches a mis-framed weight, and this is its fp8 twin: the descriptor must state the checkpoint's `[out, in]` with `K` the second
     // extent, and the block must cover it (single-tile contraction, `BLOCK_K == K`).
     if w_r != bn || w_c != k {
         return Err(refuse(format!(
@@ -890,8 +875,7 @@ fn verify_canonical_fp8_matmul_kernel(
         return Err(refuse(format!(
             "fp8 kernel is not exactly {{1 tt.dot, 3 tt.descriptor_load, 1 arith.mulf, 1 \
              tt.descriptor_store}} (got dot={n_dot} load={n_load} mulf={n_mulf} \
-             store={n_store}); the W8A8 door assumes the spelled dequant, so anything else \
-             would be silently reinterpreted",
+             store={n_store}); the fp8 contract is exactly the spelled dequant",
         )));
     }
     if n_bcast > 1 {
@@ -940,13 +924,13 @@ fn verify_canonical_fp8_matmul_kernel(
     check_desc_c(index, c_desc, m, bn, bm, bn)?;
 
     // ⭐⭐⭐ POSITIONAL BINDING: A=arg0, W=arg1, ws=arg2, C=arg3. The emitted DFIR binds
-    // buffers positionally, and the fp8 door reads the THIRD input as the scale -- so a
-    // swapped ws/C would silently dequant by the output and store into the scale row.
+    // buffers positionally, and the THIRD input is the scale -- so a swapped ws/C would
+    // silently dequant by the output and store into the scale row.
     // Both are f16 pointers, so nothing type-checks the difference; only position does.
     let args: Vec<Ssa> = func.regions[0].args.iter().map(|(v, _)| *v).collect();
     if args.len() != 4 {
         return Err(refuse(format!(
-            "fp8 kernel takes {} arguments; the W8A8 door binds FOUR positionally (A, W_fp8, \
+            "fp8 kernel takes {} arguments; the splice binds FOUR positionally (A, W_fp8, \
              w_scale, output) and a trailing hole or extra pointer would renumber every \
              buffer after it",
             args.len()
@@ -961,8 +945,7 @@ fn verify_canonical_fp8_matmul_kernel(
     }
 
     // ⭐ THE SCALE LOAD: the third descriptor_load, over arg2, shaped [1, N]. Its window is
-    // the whole row (the door reads the buffer as `[1, n]`, byte-identical to the loaded
-    // `[1, n]`). Identified by the VALUE IT DEFINES (`a` and `b_load` are those loads'
+    // the whole row (`[1, n]`). Identified by the VALUE IT DEFINES (`a` and `b_load` are those loads'
     // results), not by pointer: `def_of` and `ops_deep` borrow the same ops through
     // different paths.
     let ws_ld = all
@@ -976,7 +959,7 @@ fn verify_canonical_fp8_matmul_kernel(
     let ws_desc = descriptor_of(index, &ws_ld.operands)?;
     if base(ws_desc) != Some(args[2]) {
         return Err(refuse(
-            "the scale load does not read arg2; the W8A8 door binds w_scale as the THIRD \
+            "the scale load does not read arg2; the splice binds w_scale as the THIRD \
              buffer, positionally",
         ));
     }
@@ -990,7 +973,7 @@ fn verify_canonical_fp8_matmul_kernel(
     }
     if base(c_desc) != Some(args[3]) {
         return Err(refuse(
-            "the output store does not read arg3; the W8A8 door binds the output as the \
+            "the output store does not read arg3; the splice binds the output as the \
              FOURTH buffer, positionally",
         ));
     }
@@ -1038,7 +1021,7 @@ fn verify_canonical_fp8_matmul_kernel(
     // ⭐⭐⭐ THE mulf CHAIN: `mulf(dot_or_bcast(dot), bcast_or_load(ws))` -- either operand
     // order, at most one broadcast on the scale side. The mulf's OTHER operand must be the
     // dot's result (possibly through the same broadcast); anything else is a kernel
-    // computing a different function than the door lowers.
+    // computing a different function than the checkpoint's.
     let mulf = all
         .iter()
         .find(|o| o.kind == OpKind::ArithMulf)
@@ -1069,10 +1052,9 @@ fn verify_canonical_fp8_matmul_kernel(
         let scale_ok_m = through_bcast(m0) == ws_res;
         if !(dot_ok_m && scale_ok_m) {
             return Err(refuse(
-                "the arith.mulf does not multiply the dot result by the w_scale load -- the \
-                 W8A8 door applies that dequant whatever the kernel says, so a kernel \
-                 spelling a different epilogue is computing a different function and is \
-                 refused rather than reinterpreted",
+                "the arith.mulf does not multiply the dot result by the w_scale load -- a \
+                 kernel spelling a different epilogue computes a different function than the \
+                 checkpoint's",
             ));
         }
     }
@@ -1087,9 +1069,8 @@ fn verify_canonical_fp8_matmul_kernel(
     }
     if store.operands.last() != Some(&mulf_res) {
         return Err(refuse(
-            "the descriptor_store source is not the scale-multiply result (the W8A8 door \
-             dequantizes into the output, so storing anything else would silently discard \
-             it)",
+            "the descriptor_store source is not the scale-multiply result (storing anything \
+             else would discard the dequant)",
         ));
     }
     // No other compute reads the mulf or the dot's result.
