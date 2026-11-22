@@ -4718,7 +4718,7 @@ mod production_ktir_dump {
         let bindings = spyre_superdsc::Bindings {
             params: &addresses,
             consts: &consts,
-            scratch: (params as u64 + 2) << 28,
+            scratch: Some((params as u64 + 2) << 28),
         };
         let ops = planned
             .emit::<G>(&bindings)

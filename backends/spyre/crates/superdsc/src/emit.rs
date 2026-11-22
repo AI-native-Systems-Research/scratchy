@@ -25,8 +25,8 @@ pub struct Bindings<'a> {
     pub params: &'a [u64],
     /// Byte address of each constant's stick, by constant.
     pub consts: &'a [(ConstStick, u64)],
-    /// Byte address of the region the intermediates are packed into.
-    pub scratch: u64,
+    /// Byte address of the region the intermediates are packed into, if one is placed.
+    pub scratch: Option<u64>,
 }
 
 /// What a graph needs placed: the scratch its intermediates take, packed from the scratch base in
@@ -51,6 +51,8 @@ pub enum EmitError {
     Unbound { param: usize },
     /// A constant the bindings give no stick.
     Unplaced { constant: usize },
+    /// An intermediate with no scratch region placed to hold it.
+    Unscratched { local: usize },
     /// An operand held in a format dxp binds the op over none of ([`OpFunc::binds`]).
     Format {
         node: usize,
@@ -244,7 +246,10 @@ pub fn emit<G: DeviceGen>(
                 .get(p)
                 .copied()
                 .ok_or(EmitError::Unbound { param: p }),
-            Store::Local(l) => Ok(bindings.scratch + footprint.locals[l]),
+            Store::Local(l) => bindings
+                .scratch
+                .map(|s| s + footprint.locals[l])
+                .ok_or(EmitError::Unscratched { local: l }),
             Store::Const(c) => g
                 .consts
                 .get(c)

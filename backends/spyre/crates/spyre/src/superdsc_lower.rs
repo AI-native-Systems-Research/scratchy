@@ -285,7 +285,7 @@ pub fn lower_op<T: Tp>(e: &EmittedOp<T>, layout: &BundleLayout) -> Result<Descri
         .iter()
         .filter_map(|(t, c)| Some((*c, layout.address(*t)?)))
         .collect();
-    let scratch = layout.address(SCRATCH_TID).unwrap_or(0);
+    let scratch = layout.address(SCRATCH_TID);
     let bindings = spyre_superdsc::Bindings {
         params: &params,
         consts: &consts,

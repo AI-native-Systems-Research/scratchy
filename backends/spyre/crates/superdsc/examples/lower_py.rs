@@ -147,7 +147,7 @@ fn main() {
     let b = spyre_superdsc::Bindings {
         params: &params,
         consts: &placed,
-        scratch: 0x1000_0000,
+        scratch: Some(0x1000_0000),
     };
     let fp = spyre_superdsc::emit::footprint::<Baked>(&g);
     match spyre_superdsc::emit::emit::<Baked>(&g, &fp, &b) {
