@@ -912,6 +912,15 @@ fn tensor<G: DeviceGen>(
                     });
                 }
             }
+        } else if p.indexed != Some(axis) && ax.extent == 1 && stride != 0 {
+            // A dimension of one position the operand has: iterated once, outermost, its size
+            // dxp's own — never marked broadcast, which a convert's template drops (deeptools
+            // 2.1.0 refuses `quantization_double_pad.ddl`'s loop over it).
+            Entry {
+                axis,
+                scale: 1,
+                key: u64::MAX - 1,
+            }
         } else if p.indexed != Some(axis) && (stride == 0 || p.one_position(axis, ax.extent)) {
             Entry {
                 axis,
@@ -955,7 +964,13 @@ fn tensor<G: DeviceGen>(
     let mut max_dims = Vec::with_capacity(entries.len());
     for e in &entries {
         if e.key >= u64::MAX - 1 {
-            max_dims.push(1);
+            // A dimension of one position the operand has is sized by dxp; a broadcast or an
+            // indexed row is one.
+            max_dims.push(if e.scale == 1 && p.indexed != Some(e.axis) {
+                -1
+            } else {
+                1
+            });
             continue;
         }
         let pos = real.iter().position(|r| r.axis == e.axis).unwrap_or(0);
