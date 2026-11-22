@@ -1205,11 +1205,11 @@ mod rope_from_the_fixture {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-//  THE 7-SEGMENT WALL, GONE — a 14-parameter function is not a 14-segment demand.
+//  NO 7-SEGMENT WALL — a 14-parameter function is not a 14-segment demand.
 //
 //  This is the test for [`layout::for_regions`]'s packing, and it does not depend on any door past
-//  the layout: `decoder_layer_one_flat` used to be refused at `layout` for wanting 14 of 7 HBM
-//  segments, which put the whole decoder block behind an arithmetic of ours rather than a limit of
+//  the layout: refusing `decoder_layer_one_flat` at `layout` for wanting 14 of 7 HBM
+//  segments would put the whole decoder block behind an arithmetic of ours rather than a limit of
 //  the device's (`wire::SEGMENT_OFFSETS` states its 7 PER OP — per emitted descriptor's operand
 //  list, three or four tensors here).
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1287,10 +1287,9 @@ mod decoder_from_the_fixture {
     fn fourteen_parameters_pack_into_two_segments_without_overlapping() {
         let node = decoder_layer_one_flat();
         let l = layout::for_node(&node).expect("14 parameters must not be a refusal");
-        // ONE PLACEMENT PER PARAMETER **PLUS ONE PER REGISTRY SCALE**, and the second half is new:
-        // this used to be a bare `== 14` because a decoder's `scalarmul_scales` was EMPTY — `scales_for`
+        // ONE PLACEMENT PER PARAMETER **PLUS ONE PER REGISTRY SCALE**, not a bare `== 14`: `scales_for`
         // is keyed on the stated `Program` and returns nothing for `Matmul`, which is what a
-        // whole-kernel bake states. The whole-function door now populates the registry from the
+        // whole-kernel bake states, but the whole-function door populates the registry from the
         // program's own shape (its epsilons and its genuine scalar multipliers, NOT the rmsnorm
         // divisors), and each of those needs a placement or `resolve_seg_base` panics on it. So the
         // invariant is stated as the two parts it has, and the PARAMETER half is checked by tid rather

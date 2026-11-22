@@ -80,7 +80,7 @@ impl DType {
             // ⭐ MLIR's OWN BUILTIN SPELLING, not the `fp8` placeholder name. Every other entry
             // here is the MLIR type keyword, and this one has to be too: it is printed straight
             // into a view's element type, and IBM's own MLIR writes `memref<2x64x4x1xf8E4M3FN>`
-            // (`~/tmp/dt/dcc/test/PT/fp8-bmm.mlir:1022`). `tensor<..xfp8>` names no builtin type.
+            // (deeptools, `dcc/test/PT/fp8-bmm.mlir:1022`). `tensor<..xfp8>` names no builtin type.
             DType::Fp8E4m3 => "f8E4M3FN",
         }
     }

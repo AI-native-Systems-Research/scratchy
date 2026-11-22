@@ -560,9 +560,9 @@ pub fn fuse_program<'a>(
     // Pointer args the fused function still needs (sources, results, and any
     // intermediate edge we could not forward), keyed by tensor id.
     let mut needed_args: Vec<(u64, Ssa)> = Vec::new();
-    // ⭐ ONE VALUE PER TENSOR. The fused function's pointer argument for a tensor used to be the
-    // NAME `%t{id}_ptr`, so every node had to spell the same identity the same way. It is minted
-    // once here and aliased into each node's space instead.
+    // ⭐ ONE VALUE PER TENSOR. The fused function's pointer argument for a tensor is not a
+    // NAME like `%t{id}_ptr`, which every node would have to spell the same way. It is minted
+    // once here and aliased into each node's space.
     let mut canon_arg: HashMap<u64, Ssa> = HashMap::new();
     let mut rename = Renamer::default();
     let mut have_arg: HashSet<u64> = HashSet::new();
@@ -1019,8 +1019,8 @@ fn base_map_is_identity(tile_op: &Operation<'_>) -> bool {
 /// Mints the fused function's SSA values.
 ///
 /// Fusing N nodes into one body puts N independently-numbered value spaces in one scope, so each
-/// node's values need fresh identities. That used to be a NAME PREFIX (`%l` -> `%n0_l`), which is
-/// why an unrenamed declaration could still parse and then fail to resolve at run time. Minting an
+/// node's values need fresh identities. A NAME PREFIX (`%l` -> `%n0_l`) would let an unrenamed
+/// declaration still parse and then fail to resolve at run time. Minting an
 /// id per `(node, value)` pair makes the collision impossible instead of detectable.
 #[derive(Default)]
 struct Renamer {

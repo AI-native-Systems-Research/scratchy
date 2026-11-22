@@ -89,7 +89,7 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
-//  ⛔ THE ENTRY UNIT ABOVE IS SUPERSEDED — the tests below use the pool's OWN geometry
+//  ⛔ THE ENTRY UNIT ABOVE IS SYNTHETIC — the tests below use the pool's OWN geometry
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 //
 // `KV_STRIDE = 4096` above is a SYNTHETIC number: at nkvh=8/hd=64 a real layer-page is
@@ -126,11 +126,11 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
 /// ⛔⛔⛔ THE TABLE IS A **FLAT ARRAY OVER THE COPY'S OWN `mb` ROWS**, ONE PASS-BLOCK PER FOLD PASS —
 /// and the row order is `GatherScratch::row_of`'s, request-MINOR.
 ///
-/// ## What changed and why the old layout does not transfer
-/// This asserted "one 32-entry stick per launch row", which was right for the MATMUL as the gathered
-/// operand: its index dims were the value's two pinned axes `["out","mb"] = [256, 8]`, paged on `out`, so
-/// `mb` was a second index axis and dxp rounded the inner paged extent up to a whole 32-entry stick per
-/// row. The gather now lives on the KERNEL-less copy (deeptools refuses one on an op with a `KERNEL`,
+/// ## Why the per-row-stick layout does not transfer
+/// "One 32-entry stick per launch row" is right for the MATMUL as the gathered
+/// operand: its index dims are the value's two pinned axes `["out","mb"] = [256, 8]`, paged on `out`, so
+/// `mb` is a second index axis and dxp rounds the inner paged extent up to a whole 32-entry stick per
+/// row. The gather is on the KERNEL-less copy (deeptools refuses one on an op with a `KERNEL`,
 /// measured twice on the card), whose gather dim is `mb` with NO second pinned axis — the index is rank-1
 /// and `dsc2.cpp:4001-4008`'s product has a single factor. There is no per-row stick to pad to, because
 /// the ROW *is* the entry.

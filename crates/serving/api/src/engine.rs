@@ -84,16 +84,16 @@ fn validate_n(n: u32, params: &SamplingParams) -> ServeResult<usize> {
 
 /// A REQUEST'S DETOKENIZER, SHARED RATHER THAN MOVED.
 ///
-/// ⛔ It used to be MOVED OUT of the request state for the parallel phase and put back afterwards,
-/// across a RELEASED LOCK — so for the whole of that phase every request in the batch was publicly
-/// reachable with `detokenizer == None`, and any waiter that took the lock in that window with
-/// `finish_reason` already set removed the state and fell back to `placeholder_text`. That is the
-/// `<token_37769><token_3919>…` output: the token ids were always CORRECT, only the text was lost.
-/// Worse, if the state was already gone, phase 3's put-back found nothing and DROPPED the
-/// detokenizer for good, so that request could never produce text again.
+/// ⛔ MOVING IT OUT of the request state for the parallel phase and putting it back afterwards,
+/// across a RELEASED LOCK, leaves every request in the batch publicly reachable with
+/// `detokenizer == None` for the whole of that phase, and any waiter that takes the lock in that
+/// window with `finish_reason` already set removes the state and falls back to `placeholder_text`.
+/// That is the `<token_37769><token_3919>…` output: the token ids are CORRECT, only the text is lost.
+/// Worse, if the state is already gone, phase 3's put-back finds nothing and DROPS the
+/// detokenizer for good, so that request can never produce text again.
 ///
 /// Shared behind an `Arc`, there is no window and no put-back: phase 1 clones the handle, phase 2
-/// mutates through it, and nothing can empty the field. `None` now means exactly one thing — the
+/// mutates through it, and nothing can empty the field. `None` means exactly one thing — the
 /// engine has no tokenizer, a static property fixed at load — so `placeholder_text` is unreachable
 /// for any request submitted with one. That is the guard: "detokenizer temporarily absent" stops
 /// being a representable state rather than being checked for.

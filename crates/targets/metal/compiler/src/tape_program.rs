@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE SHARED TAPE METAL LOWERS FROM, RE-ROLLED — in the target's own crate.
 //!
-//! ⛔ THIS USED TO LIVE IN `compiler/macros/codegen.rs`. It is metal codegen: it names
+//! ⛔ THIS DOES NOT LIVE IN `compiler/macros/codegen.rs`. It is metal codegen: it names
 //! `scratchy_target_metal::from_tape` in every line. A `#[cfg(feature = "metal")]` island in the
 //! shared compiler crate compiles only when that feature is on, which is how target code rots
 //! there unnoticed.

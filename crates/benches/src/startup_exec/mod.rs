@@ -1736,8 +1736,8 @@ mod tests {
     /// Typos are rejected at argument-parse time, by the type.
     ///
     /// The point of enumerating these rather than taking strings: a misspelled
-    /// `--backend` used to be accepted and silently fall through to scratchy's
-    /// banner rules, so an mlx-lm run would stop its clock on the `==========`
+    /// `--backend` taken as a string is accepted and silently falls through to
+    /// scratchy's banner rules, so an mlx-lm run would stop its clock on the `==========`
     /// separator and report an impossibly fast TTFT with no error at all.
     #[test]
     fn typos_are_rejected_by_the_types_not_discovered_at_runtime() {

@@ -355,7 +355,7 @@ pub(crate) fn execute_segmented(
                 let mut call_args: Vec<(Ssa, Arg)> = Vec::new();
                 let mut want: Vec<(Ssa, u64)> = Vec::new();
                 // The arg -> tensor mapping travels WITH the segment (`fs.args`); it
-                // used to be recovered by parsing the argument's `%t<id>_ptr` name.
+                // is not recovered by parsing the argument's `%t<id>_ptr` name.
                 for &(arg, tid) in &fs.args {
                     let (data, dtype, shape) = if fs.inputs.contains(&tid) {
                         // Boundary input: must already be resident.

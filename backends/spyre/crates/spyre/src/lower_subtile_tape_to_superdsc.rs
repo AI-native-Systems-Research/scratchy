@@ -33,16 +33,15 @@
 pub use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 // Re-exports: external crates reference these matmul-family functions directly through this
 // module's path (`scratchy-forward-compiler-macro`'s codegen: `superdsc::assemble_matmul`;
-// `scratchy-sdsc`'s emit.rs: `mono::assemble_matmul_split`) — keep those paths resolving after
-// the matmul family's real home moved to `ir::bridge::tiled_op_sdsc_op::matmul`.
+// `scratchy-sdsc`'s emit.rs: `mono::assemble_matmul_split`) — keep those paths resolving to the
+// matmul family's real home, `ir::bridge::tiled_op_sdsc_op::matmul`.
 //
-// `assemble_matmul_seeded` / `assemble_matmul_off` moved from the private `use` above to this
-// `pub use` (2026-07-28): tests/element_torchspyre_parity.rs calls both through this module path,
-// so a private import made that ENTIRE test target fail to compile with E0603 — it has not built
-// since 57dfac42 (07-26), silently killing 6 tests. One of them,
+// `assemble_matmul_seeded` / `assemble_matmul_off` are in this `pub use`, not the private `use`
+// above: tests/element_torchspyre_parity.rs calls both through this module path, so a private
+// import makes that ENTIRE test target fail to compile with E0603, silently killing 6 tests. One of them,
 // `per_core_start_derives_from_spyre_layout`, is the ONLY thing that pins mb-split per-core start
 // bytes against torch-spyre, i.e. exactly the machinery under suspicion for the composite-m
-// garble. Nothing caught it because CI never builds this crate with `--features superdsc`.
+// garble. Nothing catches it because CI never builds this crate with `--features superdsc`.
 pub use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_matmul, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_split,
 };
@@ -103,7 +102,7 @@ pub use ktir_superdsc::work::{
 // the measured pedigree of 4204.
 pub use ktir_superdsc::sdsc_abstract::DxGroupCeiling;
 
-// ── EMIT-TIME CONSTANTS THAT USED TO BE ENVIRONMENT READS ───────────────────
+// ── EMIT-TIME CONSTANTS, NOT ENVIRONMENT READS ──────────────────────────────
 //
 // ⛔⛔⛔ THE EMITTER MUST NOT READ THE SHELL. `#[forward]` compiles
 // `(config.json, math DSL)` into an artifact. An `env::var` in here makes it
@@ -208,14 +207,14 @@ pub use ktir_superdsc::placement::{
     BundleLayout, KvBank, RetileDescriptor, SegRole, SynthAlloc, TensorPlacement,
     WEIGHT_SPILL_SEGS, WeightTail, align128, syn, synth_footprint_bytes,
 };
-// ⭐⭐⭐ AND THE EMITTER ITSELF NOW LIVES IN `ktir_superdsc::emit` — `emit_sdsc`/`emit_sdsc_tiled`, the
+// ⭐⭐⭐ AND THE EMITTER ITSELF LIVES IN `ktir_superdsc::emit` — `emit_sdsc`/`emit_sdsc_tiled`, the
 // whole `assemble_*` family, `pw1`/`pw2`, `ArgBinding`/`EmittedOp`, `bmm_site` and the SFP constant
 // table. What is left in THIS file is the half that reads a `SubtileIR`: `compute_bundle_layout`
 // (liveness → a `BundleLayout`), `audit_layout_addresses`, `bake_layout`, the tape walk, the group
 // classifier and the bake queue.
 //
-// ⚠️ A PRIVATE `use`, NOT A `pub use`. Every other caller in the tree was RE-POINTED at
-// `ktir_superdsc::emit::…` rather than kept resolving through here — a re-export would have hidden
+// ⚠️ A PRIVATE `use`, NOT A `pub use`. Every other caller in the tree names
+// `ktir_superdsc::emit::…` directly rather than resolving through here — a re-export would hide
 // which of them still believe the emitter is in this crate. (`ActiveCap` above is the one exception,
 // and only because its call sites are tokens the `#[forward]` macro emits.)
 use ktir_superdsc::emit::EmittedOp;
@@ -1356,8 +1355,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 
     // ── RMSNorm Newton const [1,stick] ── If the tape has any RmsNorm, place `RMS_HALF_TID` in seg0
     // (ACTIVATION, re-bound per step like ATTN_SCALE — a seg1 weight would only be H2D'd at prepare).
-    // The worker binds 0.5 (EXACT in fp16); the rmsnorm derives 1.0/1.5/−1.0 on-card from it. The old
-    // RMS_SEED_TID seed-floor placement was REMOVED: the amax-normalized reciprocal seed never
+    // The worker binds 0.5 (EXACT in fp16); the rmsnorm derives 1.0/1.5/−1.0 on-card from it. There
+    // is NO seed-floor placement (an RMS_SEED_TID): the amax-normalized reciprocal seed never
     // underflows, so no floor const is needed. See [`RMS_HALF_TID`].
     if ir
         .nodes
@@ -7793,10 +7792,10 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
 // from `scr chat` via the AoT bake — never a hand CLI.
 // ───────────────────────────────────────────────────────────────────────────
 
-// `SuperDscError` now lives in the shared leaf module [`ktir_superdsc::superdsc_error`]
+// `SuperDscError` lives in the shared leaf module [`ktir_superdsc::superdsc_error`]
 // so the typed core (`superdsc_opspec::WorkPlan::time_tile_for_lx`) and this wire
 // module raise the SAME build-time error without a module cycle. Re-exported here
-// so every existing `superdsc::SuperDscError` path keeps resolving.
+// so every `superdsc::SuperDscError` path resolves.
 pub use ktir_superdsc::superdsc_error::SuperDscError;
 
 // ⛔ `ds_name` IS GONE, AND ITS ABSENCE IS THE ONE-PATH INVARIANT MADE VISIBLE. It was the stable
@@ -8286,8 +8285,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     for e in ops {
         // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
         // some producer arm lowered a `SubtileNode` straight to SuperDSC, which is the `*_sdsc`
-        // side-path class. There used to be a pass-through here for exactly one such arm
-        // (`lower_sumreduce_node`); that arm is deleted, so the pass-through is a refusal now — the
+        // side-path class. So there is no pass-through here, only a refusal — the
         // only way to SuperDSC is through a KTIR program.
         if e.op.is_some() {
             return Err(SuperDscError(format!(
@@ -8386,16 +8384,15 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         }
     }
 
-    // ⛔⛔⛔ main's POST-LOWERING ALIASING GUARD, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
+    // ⛔⛔⛔ THE POST-LOWERING ALIASING GUARD, AT THE GRAIN WHERE THE DESCRIPTORS EXIST.
     //
-    // It is `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and it (with three dxp-shape
-    // guards since made unwritable by the wire types) went SILENT
-    // when the lowering moved here: they read `EmittedOp::op` and `EmittedOp::time`, which main's walk
-    // had already filled by the time they ran. On this path the ops reaching `emit_bundle_inner` carry
-    // a KTIR program and NOTHING ELSE — `EmittedOp::bare` sets `op: None` and `time: 1` — so the
-    // aliasing check's `e.time > 1` was false for every op in every bundle, and the three dxp guards
-    // had no `dscs_` to walk at all. A guard that cannot fire is not a guard; `sdsc_ops` below is the
-    // list main's guards were written against.
+    // It is `lower_graph_to_superdsc`/`emit_bundle_inner`'s own check, and it is SILENT inside
+    // `emit_bundle_inner` (as are three dxp-shape guards, which the wire types make unwritable): it
+    // reads `EmittedOp::op` and `EmittedOp::time`, and on this path the ops reaching `emit_bundle_inner`
+    // carry a KTIR program and NOTHING ELSE — `EmittedOp::bare` sets `op: None` and `time: 1` — so the
+    // aliasing check's `e.time > 1` is false for every op in every bundle, and the dxp guards have
+    // no `dscs_` to walk at all. A guard that cannot fire is not a guard; `sdsc_ops` below is the
+    // list the guard is written against.
     {
         let _pc = crate::pc::Pc::start("guards");
         if let Some(e) = sdsc_ops.iter().find(|e| e.time > 1 && tiled_trips_alias(e)) {
@@ -8777,9 +8774,9 @@ mod tests {
         );
     }
 
-    /// ⭐⭐⭐ AN INDEX PAST ITS REGION IS A REFUSAL, NOT AN ALIAS. Every reserved tid used to be
-    /// raw `u32` subtraction from a base — `SCALARMUL_SCALE_BASE - idx`, unchecked — so the 100th
-    /// scale silently took `ksplit_block_tid(0)`'s slot. Two tensors, one tid, one placement: the
+    /// ⭐⭐⭐ AN INDEX PAST ITS REGION IS A REFUSAL, NOT AN ALIAS. A reserved tid as raw `u32`
+    /// subtraction from a base — `SCALARMUL_SCALE_BASE - idx`, unchecked — lets the 100th
+    /// scale silently take `ksplit_block_tid(0)`'s slot. Two tensors, one tid, one placement: the
     /// second producer overwrites the first's bytes and the first's consumer reads them. On a
     /// device with no stack to attach to that is wrong output or a hang, reported by nothing.
     #[test]
@@ -8850,10 +8847,10 @@ mod tests {
     /// weight's own contraction width, unpadded — and stages 49155 columns into a placement sized
     /// for 51200. The executor catches it as
     /// `host size 201338880 B != prod(device_size)*word_length (209715200 B)`, which is exactly
-    /// `2048 * 49155 * 2` against `2048 * 51200 * 2`. That is a real failure this repo shipped:
-    /// the staged `[rows, cols]` pair moved from a JSON manifest (which recorded the LOGICAL
-    /// `[k, n]`) to `BoundWeight::staged_shape` (which returned the ON-DISK `[n, k]`) under the
-    /// same field names, so every downstream use read `n` where it meant `k`.
+    /// `2048 * 49155 * 2` against `2048 * 51200 * 2`. That is a real failure: a JSON manifest
+    /// recording the LOGICAL `[k, n]` and `BoundWeight::staged_shape` returning the ON-DISK `[n, k]`
+    /// share the staged `[rows, cols]` field names, so a use written against one and fed the
+    /// other reads `n` where it means `k`.
     #[test]
     fn the_output_axis_is_what_gets_padded_and_swapping_k_and_n_is_silent() {
         const N: u32 = 49155; // granite vocab
@@ -10821,13 +10818,13 @@ mod tests {
     /// ⭐⭐ THE CARD P0 OF 2026-10-20, AS A TEST — two whole-function nodes in ONE bundle, and
     /// every intermediate mint must stay above every placement in it.
     ///
-    /// The mint used to be seeded per NODE off that node's own bindings. Node A below
-    /// (bindings `t0, t1, t4`) therefore minted from `t5` — node B's output, a real placement —
+    /// A mint seeded per NODE off that node's own bindings collides: node A below
+    /// (bindings `t0, t1, t4`) would mint from `t5` — node B's output, a real placement —
     /// and on the card, granite-2b fp16 refused at `load_model` with "1310 placements collapse
     /// to 1214 distinct ids — t454 … t549 appear more than once" (96 silent aliases per rope
-    /// program, each landing on another node's placement exactly as node A's first mint lands
-    /// on `t5` here). The bundle-unique cursor (`BundleLayout::take_inter_tid`) mints strictly
-    /// above every placement instead, and this is the two-node shape that made the per-node
+    /// program, each landing on another node's placement exactly as node A's first mint would
+    /// land on `t5` here). The bundle-unique cursor (`BundleLayout::take_inter_tid`) mints strictly
+    /// above every placement instead, and this is the two-node shape that makes a per-node
     /// seed collide.
     ///
     /// ⛔ FAILS WITHOUT THE FIX BY CONSTRUCTION: node A's first mint lands on `t5` — a real

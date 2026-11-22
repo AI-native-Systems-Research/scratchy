@@ -2,15 +2,14 @@
 //! THE SuperDSC EMITTER — the typed op family ([`OpSpec`]/[`TensorArg`]) lowered into the wire
 //! [`SdscOp`], plus every `assemble_*` entry point the assemblers and the lowering call.
 //!
-//! ⭐ THE CONSUMER HALF OF THE PROVEN EMITTER, WITHOUT ITS PRODUCER HALF. Two contiguous ranges of
-//! the on-card-proven `lower_subtile_tape_to_superdsc` moved here verbatim: `pointwise_iter_space`
+//! ⭐ THE CONSUMER HALF OF THE PROVEN EMITTER, WITHOUT ITS PRODUCER HALF. Two contiguous ranges
+//! here are the on-card-proven `lower_subtile_tape_to_superdsc` code verbatim: `pointwise_iter_space`
 //! through `op_func_from_str` (the pointwise/restickify/transpose assemblers, [`ArgBinding`],
 //! [`EmittedOp`], [`emit_sdsc`]/[`emit_sdsc_tiled`], `resolve_seg_base`, [`pw1`]/[`pw2`]) and
 //! [`bmm_site`] through [`check_pointwise_cols`] (the SFP constant table and the SEN169 encoder).
-//! What stayed with the producer is what BUILDS a plan from a graph — `compute_bundle_layout`,
-//! `audit_layout_addresses`, `bake_layout`, the tape walk and the bake queue — which is the seam the
-//! whole extraction turns on. Line citations to `ibm/main` throughout are the port's provenance and
-//! stay.
+//! What the producer keeps is what BUILDS a plan from a graph — `compute_bundle_layout`,
+//! `audit_layout_addresses`, `bake_layout`, the tape walk and the bake queue — which is the seam
+//! between the two halves. Line citations to `ibm/main` throughout are the port's provenance.
 //!
 //! ⛔ [`bmm_site::TapeLoweringSite::witness`] IS `pub(in crate::emit)`, AND THAT IS WHY THIS IS A
 //! DIRECTORY MODULE. Its doc has always claimed "the attention emitter cannot mint one"; while the
@@ -538,7 +537,7 @@ pub fn pointwise_iter_space(rows: u32, cols: u32) -> IterSpace {
 // scales, divide once, emit once.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Thin wrapper — the ONE implementation now lives in
+/// Thin wrapper — the ONE implementation lives in
 /// [`crate::ir::island::tile_op::pointwise_lx_resident_generic`] (`TileOp`'s dispatch target for
 /// `TileOpKind::PointwiseOrReduce`), Kani-proven equal to this formula at every symbolic extent. Kept
 /// as a free function so the 6 existing `time_tile_for_lx(|p,opt| pointwise_lx_resident(…), …)` call
@@ -3672,7 +3671,7 @@ pub fn emit_sdsc(
     // PROBE PROVED SCHEDULABLE: the TOKEN-PLANE form (entries on `mb`, one position each, no second
     // pin — the prefill-m>1 per-expert batched matmul).
     //
-    // ## The original refusal, and what superseded it
+    // ## The refusal the card reports, and how the token-plane form escapes it
     // MEASURED ON THE CARD (pod nickm-7db9667cdd-z2jc6, granite-3.1-2b fp8), with the gather on the
     // prefix score leg's Kᵗ operand. Two bakes, two refusals, bracketing the cause:
     //   index memOrg_ = hbm + lx  ->  sbf-ddc: DtException: Expect a valid allocate node.
@@ -3684,7 +3683,7 @@ pub fn emit_sdsc(
     // to each STAGED operand and never to an index — an index is read into the IBR, not staged — so
     // no `memOrg_` satisfies both. That measurement is real, and it is also NOT the whole story.
     //
-    // ⭐ THE 2026-10-09 PROBE (`/tmp/prefill-m1-probe-report.md`) ROOT-CAUSED AND ESCAPED IT:
+    // ⭐ THE 2026-10-09 PROBE ROOT-CAUSED AND ESCAPED IT:
     // `calculateFlopPerByte` runs only inside CHUNK-PARAM EXPLORATION (`addChunkDataStage → … →
     // findBestParamsForArithmeticIntensity`, gated on `isReuse` at `:1550`), and demands — via
     // `getLdsL3TransferNodes` (`:1779`) — TRANSFER USERS on the index's HBM alloc. Those users are
@@ -5442,14 +5441,14 @@ pub fn assemble_pointwise_seeded<T: crate::collective::Tp>(
 /// output override). Used to transpose the prefill chunk's new-K `[mq,hd]→[hd,mq]`
 /// for the new-token `Q·Kᵀ` score block (decode mq=1 skips it — a free reinterpret).
 ///
-/// ⛔⛔⛔ BOTH EXTENTS ARE STICK WITNESSES, AND `mb` USED TO BE UNCHECKED. `out` is the INPUT's stick,
-/// and it has always been routed through [`StickExtent`]. `mb` is the OTHER half of the OUTPUT's stick
+/// ⛔⛔⛔ BOTH EXTENTS ARE STICK WITNESSES, `mb` AS MUCH AS `out`. `out` is the INPUT's stick,
+/// routed through [`StickExtent`]. `mb` is the OTHER half of the OUTPUT's stick
 /// — `emit_sdsc` overrides that role to the 8×8 inter-slice block `["out","mb"]`/`[8,8]`, so `mb` is a
-/// stick extent of the output exactly as `out` is of the input, and it was the one extent this builder
-/// accepted at any value. That is the omission the deleted generic op walk fell through: a
+/// stick extent of the output exactly as `out` is of the input, and an unchecked `mb` is accepted at
+/// any value. A generic op walk falls through exactly that omission: a
 /// `linalg.transpose` of a per-step `[1, 64]` key is `mb = 1`, whose stick extent is 1, which the dxp
-/// scheduler refuses (`L3DlOpsScheduler:1040`) — and the on-card ReStickify that was asked for that
-/// shape anyway wrote the second Kᵀ stick wrong and garbled decode past 64 tokens. So `mb` is a
+/// scheduler refuses (`L3DlOpsScheduler:1040`) — and an on-card ReStickify asked for that
+/// shape anyway writes the second Kᵀ stick wrong and garbles decode past 64 tokens. So `mb` is a
 /// witness too, and a sub-stick transpose is a `cargo` `Err` rather than a shape the card sees.
 ///
 /// ⚖️ 64, THOUGH THE `[8,8]` BLOCK ALONE WOULD ADMIT ANY MULTIPLE OF 8 — RECORDED, NOT APPLIED. The
@@ -5951,8 +5950,8 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔⛔⛔ THE ROW EXTENT IS A STICK EXTENT TOO, AND IT USED TO BE UNCHECKED — so the ONE shape
-    /// whose on-card failure is on this project's record, the per-step `[1, 64]` key, was accepted by
+    /// ⛔⛔⛔ THE ROW EXTENT IS A STICK EXTENT TOO, AND IT IS CHECKED — so the ONE shape
+    /// whose on-card failure is on this project's record, the per-step `[1, 64]` key, is refused by
     /// this builder. The control is the same transpose with its rows padded up.
     #[test]
     fn the_historically_fatal_1x64_shape_is_refused_and_a_padded_one_still_succeeds() {
@@ -6163,8 +6162,8 @@ mod transpose_tests {
     /// trips a builder law would abort the build with a bare panic instead of a producer-reportable
     /// error; the door calls the fallible form for exactly that reason.
     ///
-    /// ⚖️ THE LAW BEING TRIPPED CHANGED WITH THE REROUTE, AND THAT IS WHY THIS SHAPE DID. It used to be
-    /// `transpose_opspec`'s 8×8 core-division guard, reached at `mb = 64` (per-core mb 2). The door now
+    /// ⚖️ THE LAW BEING TRIPPED IS NOT `transpose_opspec`'s 8×8 CORE-DIVISION GUARD (reached at
+    /// `mb = 64`, per-core mb 2), AND THAT IS WHY THIS IS THE SHAPE. The door
     /// emits a `ReStickifyOpHBM`, which has no block law — `[64, 128]` is one of the shapes the reroute
     /// exists to make lower — so the remaining builder law is the LX budget: a restickify carries
     /// `time_tile: None` (its output stick IS the whole `y` extent, so there is no stick dim left to
@@ -6184,10 +6183,10 @@ mod transpose_tests {
         );
     }
 
-    /// ⭐ THE CONTROL FOR THE SHAPE THE REROUTE EXISTS FOR. `[64, 128]` used to be refused by the 8×8
-    /// core-division guard (per-core mb 2) and is exactly the class `decoder_layer_one_flat` needs; it
-    /// now emits, with the one-dim stick. Without this the test above would read as "big shapes are
-    /// refused" and would not record that the small one was UNBLOCKED.
+    /// ⭐ THE CONTROL FOR THE SHAPE THE REROUTE EXISTS FOR. `[64, 128]` is what the 8×8
+    /// core-division guard refuses (per-core mb 2) and is exactly the class `decoder_layer_one_flat`
+    /// needs; the door emits it, with the one-dim stick. Without this the test above would read as "big
+    /// shapes are refused" and would not record that the small one LOWERS.
     #[test]
     fn the_shape_the_block_division_used_to_refuse_now_lowers() {
         let ops = lower_transpose(&transpose_program((64, 128), (128, 64)))
@@ -6264,12 +6263,11 @@ mod transpose_stick_law {
     use super::*;
 
     /// NO `(mb, out)` in `0..=512²` that is not a pair of whole 64-element sticks is EVER accepted —
-    /// and (since the division became the fixture-measured law) EVERY whole-stick pair IS.
+    /// and (the division being the fixture-measured law) EVERY whole-stick pair IS.
     ///
-    /// ⭐ BOTH DIRECTIONS, NOW. The converse used to be FALSE — `distribute_cores` split `mb` alone,
-    /// so most whole-stick pairs were refused by the core-division guard (the history
-    /// [`transpose_opspec`] records) — and this sweep deliberately skipped them rather than assert
-    /// our own division as truth. [`transpose_core_split`] makes acceptance a property of the SHAPE
+    /// ⭐ BOTH DIRECTIONS. The converse is FALSE under a `distribute_cores` that splits `mb` alone —
+    /// most whole-stick pairs fail the core-division guard there (see [`transpose_opspec`]) — and a
+    /// sweep would have to skip them rather than assert that division as truth. [`transpose_core_split`] makes acceptance a property of the SHAPE
     /// (a whole-stick pair always has a whole-block division, `(1, 1)` at worst), so the sweep
     /// asserts it: acceptance is exactly the stick law, nothing narrower. The whole-block invariant
     /// on the accepted side is stated separately, over the builder's output, by

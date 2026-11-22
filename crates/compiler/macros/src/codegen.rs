@@ -6686,10 +6686,10 @@ fn emit_layered_load_body(
 /// Non-layered bases get the same signature for caller uniformity;
 /// the body returns `&self.<base>` and ignores the layer arg.
 ///
-/// Compresses what used to be a 40-arm `match layer` per accessor
-/// into a single slice index — the 578-line `impl Weights { … }`
-/// block on commandr collapses to ~50 lines, and llama's 28k-line
-/// equivalent collapses by the same proportion.
+/// A single slice index per accessor, not a 40-arm `match layer`:
+/// the `impl Weights { … }` block on commandr is ~50 lines rather
+/// than 578, and llama's (28k lines as a `match`) shrinks by the
+/// same proportion.
 ///
 /// Returns an `impl Weights { ... }` block. Empty (zero accessors)
 /// is fine — the impl block is then elided entirely.
@@ -9894,8 +9894,8 @@ mod fingerprint_tests {
 
     /// Gemma-4-MoE's router is 8-bit while the rest of the checkpoint is 4-bit.
     /// That width must come from the arch's DECLARED override, so the loader and
-    /// the fingerprint read one value — it used to be hardcoded inside both
-    /// backends' `Gemma4RouterOps::load`, leaving the compiled bit map silently
+    /// the fingerprint read one value — hardcoding it inside both backends'
+    /// `Gemma4RouterOps::load` leaves the compiled bit map silently
     /// disagreeing with the tensor the loader reads.
     #[test]
     fn the_gemma4_moe_router_width_comes_from_the_declared_override() {
@@ -10238,8 +10238,8 @@ mod fingerprint_tests {
 
     /// `affine_tensors_of` must report the width THE LOAD CALL GETS, so the
     /// fingerprint cannot assert something the loader won't do. The MoE arm's
-    /// gate is the #202 role; the Gemma router is the one that used to be
-    /// hardcoded.
+    /// router gate carries `gate_bits`, not the expert width; the Gemma router's
+    /// width comes from the declared override, never a hardcoded value.
     #[test]
     fn affine_tensors_of_reports_the_width_the_load_call_receives() {
         let moe = FieldLoad::SharedFusedMoe {

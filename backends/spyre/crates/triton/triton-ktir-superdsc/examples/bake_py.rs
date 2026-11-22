@@ -3,7 +3,7 @@
 //! THE WHOLE CHAIN, FROM TRITON SOURCE: `.py` -> ttir -> KTIR -> SuperDSC -> a dxp input dir.
 //!
 //! ```bash
-//! cargo run --offline --example bake_py -- rmsnorm_granite /tmp/out
+//! cargo run --offline --example bake_py -- rmsnorm_granite <out-dir>
 //! ```
 //!
 //! # WHY THIS EXISTS WHEN `bake` ALREADY DID
@@ -29,10 +29,10 @@ use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 use triton_frontend::{codegen, opt};
 
-// ⭐ THE CASE TABLE MOVED TO `triton_ktir_superdsc::cases`, so `triton-numeric`'s emulator check
-// reads the SAME statement of what a configuration is. It used to live here, and a second
+// ⭐ THE CASE TABLE LIVES IN `triton_ktir_superdsc::cases`, so `triton-numeric`'s emulator check
+// reads the SAME statement of what a configuration is. A second
 // statement of `rope_q32`'s grid in another consumer is exactly the defect recorded in that
-// module. Nothing about the configurations changed in the move.
+// module.
 use triton_ktir_superdsc::cases;
 
 fn main() {
@@ -169,14 +169,13 @@ fn main() {
         }
     }
 
-    // ⛔ ATTENTION HAS NO MODEL-GEOMETRY ARM HERE, ON PURPOSE. There used to be a `KTIR_ATTN=1`
-    // door that recognised `Program::Attn` and slotted in `attn_at::<NQH, NKVH, HD>`'s fragment
-    // assembly (scratchy's prebuilt attention lowering) selected by constexpr-geometry match.
-    // That is pattern matching, not lowering: it substitutes a hand-rolled implementation for the
-    // given Triton code. Removed. Attention goes through the whole-function door below
+    // ⛔ ATTENTION HAS NO MODEL-GEOMETRY ARM HERE, ON PURPOSE. A `KTIR_ATTN=1` door that
+    // recognised `Program::Attn` and slotted in `attn_at::<NQH, NKVH, HD>`'s fragment
+    // assembly (scratchy's prebuilt attention lowering) selected by constexpr-geometry match
+    // would be pattern matching, not lowering: it substitutes a hand-rolled implementation for the
+    // given Triton code. Attention goes through the whole-function door below
     // (`KTIR_WHOLE=1`) like every other kernel — its ops, from the compiled fixture, one at a
-    // time. (The old comment claiming the whole door "computes the wrong numbers on card" was
-    // wrong — that defect was host staging, fixed by `attn_card_stage.py`'s layout law; the
+    // time. (The whole door does NOT compute the wrong numbers on card — that defect was host staging, fixed by `attn_card_stage.py`'s layout law; the
     // per-trip math was verified by stage read-backs.)
 
     // KTIR_WHOLE=1 takes the whole-function door instead of the per-`Program` one: it walks the

@@ -1384,10 +1384,10 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // ── The rest of the arch vocabulary ────────────────────────────
     //
     // ⭐ THESE EXIST SO THE SHARED FRONT END CAN EXPRESS EVERY ARCH, NOT SO EVERY TARGET CAN RUN
-    // THEM. Each used to be a `panic!("has no SubOp form on this pipeline yet")` in
-    // `lower_region`, which meant an arch using one had no SubtileIR at all and therefore no
-    // tape — so a target consuming the tape simply could not compile that arch, whatever its
-    // kernels could do. Representing the op moves the "can this run here?" question to the ONE
+    // THEM. Without a SubOp form, each is a `panic!("has no SubOp form on this pipeline yet")`
+    // in `lower_region`, so an arch using one has no SubtileIR at all and therefore no tape — and
+    // a target consuming the tape simply cannot compile that arch, whatever its kernels can do.
+    // Representing the op moves the "can this run here?" question to the ONE
     // place that can answer it: the target's opcode lowering.
     /// `cap · tanh(x / cap)` — Gemma's logit/attention soft cap.
     ///
@@ -4383,7 +4383,7 @@ pub fn head_blocks(
 /// carry `PhantomData<F>`, so a SubtileIR<NeoX> cannot hold an
 /// Interleaved-form rope node).
 ///
-/// Each node performs its source op — the SAME [`SubOp`], moved from the [`Arch`] stage to the
+/// Each node performs its source op — the SAME [`SubOp`], carried from the [`Arch`] stage to the
 /// [`Tiled`] one: the KV-cache witnesses are bound here and nothing else about the op changes.
 pub fn lower_region(
     input: &crate::lower::LoweringInput,

@@ -697,10 +697,9 @@ impl<T: ktir_superdsc::collective::Tp> LaunchGroup<'_, T> {
     /// ⭐⭐⭐⭐⭐ WHERE THIS PROGRAM SITS INSIDE ITS OWN ALLOCATION AND HOW BIG THAT ALLOCATION IS — ONE
     /// value, minted from [`Self::job_bin_ptr`] alone.
     ///
-    /// 🛑 **IT WAS THE SAME SUBTRACTION, WRITTEN TWICE, WITH TWO DIFFERENT FAILURE BEHAVIOURS.** The
-    /// allocation path spelled `job_bin_ptr.checked_sub(prog_offset_base())` and refused an underflow;
-    /// the launch spelled `job_bin_ptr - prog_offset_base()` bare, two hundred lines away, which wraps
-    /// in release and panics in debug. Both are "the prologue dxp reserved", and the device starts
+    /// 🛑 **ONE SUBTRACTION, NOT TWO WITH DIFFERENT FAILURE BEHAVIOURS.** Spelled at the allocation
+    /// path as `job_bin_ptr.checked_sub(prog_offset_base())` it refuses an underflow; spelled bare at
+    /// the launch as `job_bin_ptr - prog_offset_base()` it wraps in release and panics in debug. Both are "the prologue dxp reserved", and the device starts
     /// executing where the image was uploaded only because they agree.
     ///
     /// ⛔ THIS IS THE QUANTITY DXP DECLARES TWICE. `ComputeOnDevice.job_bin_ptr` and
@@ -712,7 +711,7 @@ impl<T: ktir_superdsc::collective::Tp> LaunchGroup<'_, T> {
     /// only because the offset and the bootstrap were two derivations rather than one value.
     ///
     /// `None` when `job_bin_ptr` is below the program segment's base — an address that names no offset
-    /// at all, which used to be a refusal on one path and a wrap on the other.
+    /// at all, and the same answer on every path, never a refusal on one and a wrap on another.
     pub fn prog_image(&self, prog_base: u64) -> Option<ProgImage> {
         Some(ProgImage {
             head: self.job_bin_ptr.checked_sub(prog_base)?,
@@ -1059,8 +1058,8 @@ mod tests {
 
     /// ⭐ RUNG SELECTION ASKS THE SWEEP EXTENT ITS OWN QUESTION, and the batch width cannot answer it.
     ///
-    /// The two axes of the rung grid are both counts and both used to be bare `u32` in lists that have
-    /// both been called `decode_rungs`, so `rung.0 >= live` compiled against either — and selecting a
+    /// The two axes of the rung grid are both counts; as bare `u32` in lists both called
+    /// `decode_rungs`, `rung.0 >= live` would compile against either — and selecting a
     /// body baked for a 64-column sweep because four requests are live is a wrong ANSWER with no fault.
     ///
     /// ⛔ THE COMPILE-TIME HALF OF THIS GUARD CANNOT BE ASSERTED HERE, WHICH IS THE POINT: there is no
