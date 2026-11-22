@@ -113,6 +113,11 @@ compiles none). The macOS `all` run is the full-scope case —
 expect it to be slow (every config, every arch) and RAM-heavy; that's expected
 CI-scale cost, not a regression.
 
+The **purity** job runs the purity skill's rules as rustc lints (`lints/scratchy-purity`, by
+dylint): `scripts/purity.sh --scope all` runs every scope this host builds, and `--file <path>`
+the package that owns one file. The Claude Code hooks in `.claude/settings.json` run it at every
+edit and at session end. A finding is the verdict: fix the code, never opt the site out.
+
 Reproduce the **x86_64** linux-workspace gate in a container (Apple Silicon
 runs it amd64-emulated — slow but faithful; a native aarch64 run is faster but
 not the CI arch):
