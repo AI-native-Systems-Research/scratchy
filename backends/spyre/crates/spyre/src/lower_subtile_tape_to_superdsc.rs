@@ -2169,8 +2169,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
         scalarmul_folds.iter().any(|(fold_id, _, _)| *fold_id == id)
     };
-    // ⭐⭐ THE FOLD'S READER HALF — the alias the card door's layout states and the bundle's
-    // programs bind directly (the consumer rewrite in `lower_one_node`): a reader of the
+    // ⭐⭐ THE FOLD'S READER HALF — the alias the bundle's programs bind directly (the consumer rewrite in `lower_one_node`): a reader of the
     // folded node's output reads the PRODUCER'S bytes. Skipping the folded node alone leaves
     // its output buffer at the zero-init, and every comparison at the fold's consumers
     // diverges by exactly the folded term — a golden that models the bundle's bug as its
@@ -2276,9 +2275,8 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // the golden and the bundle agree at the GRID's precision instead of at a guessed
     // floor. The program computes `o[m,n] = (Σ_k a[m,k] · e4m3(w[n,k])) · ws[n]` — the
     // fp8 kernel's own law (`matmul_fp8.py`: the widened code read, the F32
-    // wider-accumulate dot, the spelled `p * ws` epilogue; the emulator executes
-    // exactly that — the CARD's per-token activation quantize is a door chain the
-    // program never states, so the model needs no activation half). The probe stages
+    // wider-accumulate dot, the spelled `p * ws` epilogue, which every executor runs as
+    // spelled — no activation quantize). The probe stages
     // the codes as `e4m3(synth · FP8_SYNTH_SCALE)` and the ws row as
     // `f16(fold / FP8_SYNTH_SCALE)`, so the model is two round trips — the payload
     // through the e4m3 grid, the ws through f16 — and the FOLD rides the same mulf the

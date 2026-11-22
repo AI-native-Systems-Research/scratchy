@@ -1027,8 +1027,7 @@ mod tests {
         return_type: None,
     };
     // The kind is inert at these two consts (ordering fixtures over EMPTY functions — no ops, so
-    // the enum's own "only program with no compute op at all" class); the field's readers are the
-    // door discriminators, and no fixture here is a door.
+    // the enum's own "only program with no compute op at all" class).
     const PROGS_A: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_A,
         program: Program::LmLast,
