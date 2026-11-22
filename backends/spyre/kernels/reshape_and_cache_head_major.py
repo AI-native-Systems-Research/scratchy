@@ -96,6 +96,21 @@ def reshape_and_cache_head_major_fp8_kernel(key, value, k_rows, v_rows, row_inde
             k_dst.scatter(_to_fp8(k_src.load([0, h * HEAD_SIZE])), idx, 0)
             # v_rows.index_copy_(0, idx, value[:, h])
             v_dst.scatter(_to_fp8(v_src.load([0, h * HEAD_SIZE])), idx, 0)
+    elif (T == 1) & (NUM_KV_HEADS >= 8):
+        # One token: its kv heads' rows narrowed together, `[NUM_KV_HEADS, HEAD_SIZE]` — a one-row
+        # narrow is a shape the device's fp8 conversion does not take — and scattered through the
+        # heads' indices, which at one token are consecutive.
+        k_all = tl.make_tensor_descriptor(key, shape=[NUM_KV_HEADS, HEAD_SIZE],
+                                          strides=[HEAD_SIZE, 1],
+                                          block_shape=[NUM_KV_HEADS, HEAD_SIZE])
+        v_all = tl.make_tensor_descriptor(value, shape=[NUM_KV_HEADS, HEAD_SIZE],
+                                          strides=[HEAD_SIZE, 1],
+                                          block_shape=[NUM_KV_HEADS, HEAD_SIZE])
+        heads = tl.make_tensor_descriptor(row_index, shape=[NUM_KV_HEADS], strides=[1],
+                                          block_shape=[NUM_KV_HEADS])
+        idx = heads.load([0])
+        k_dst.scatter(_to_fp8(k_all.load([0, 0])), idx, 0)
+        v_dst.scatter(_to_fp8(v_all.load([0, 0])), idx, 0)
     else:
         k_src = tl.make_tensor_descriptor(key, shape=[T, NUM_KV_HEADS * HEAD_SIZE],
                                           strides=[NUM_KV_HEADS * HEAD_SIZE, 1],

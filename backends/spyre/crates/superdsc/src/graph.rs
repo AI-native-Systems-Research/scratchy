@@ -58,7 +58,7 @@ pub struct Node {
 
 /// A constant an op reads: one value, every lane of its stick. The value is stated in f32 (an
 /// integer constant exactly so); the stick holds it in `format`, which the stager converts it to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct ConstStick {
     pub format: DataFormat,
     /// The value's f32 bits.

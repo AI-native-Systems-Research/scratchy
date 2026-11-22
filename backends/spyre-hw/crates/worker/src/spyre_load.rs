@@ -187,9 +187,6 @@ pub(crate) struct Parsed {
     pub(crate) layers: Vec<LayerWiring>,
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) output_ids: Vec<usize>,
-    /// See [`crate::spyre_types::BundleMeta::scalarmul_scales`].
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) scalarmul_scales: &'static [f32],
 }
 
 /// Parse one embedded [`KtirBundleData`]: manifest + runtime source ids +
@@ -253,8 +250,6 @@ pub(crate) fn wiring_to_parsed(
         kv_dim: w.geometry.kv_dim as usize,
         vocab: w.geometry.vocab as usize,
         layers,
-        #[cfg(not(feature = "spyre-hw"))]
-        scalarmul_scales: w.scalarmul_scales,
         // The tensor the host reads back after a pass: the result. The KV stays on the device — each
         // layer's write scatters it into the pools its attention gathers from.
         #[cfg(not(feature = "spyre-hw"))]
@@ -1164,45 +1159,8 @@ impl SpyreWorker {
         );
         #[cfg(not(feature = "spyre-hw"))]
         let weights = stage_bound_weights(&bound, &wirings.decode, Some(gw.allocator_mut()))?;
-        // ⭐ THE LOAD CONSTS RIDE IN WITH THE WEIGHTS. The minted draw's twenty staged tables
-        // (and the chained head's decompose tables) are sources the bake states once at load —
-        // `Wiring::load_consts` — staged here at their TRUE dtypes exactly as the numeric gate
-        // stages them (`LoadConst::build`, the memref-faithful form). Without them the draw reads
-        // zero ramps and zero widen tables and answers token 0, every step. Both bundles mint the
-        // draw at the same tids with the same tables; a tid two bundles state DIFFERENTLY cannot
-        // live in one resident session, so it refuses rather than keep either.
         #[cfg(not(feature = "spyre-hw"))]
         let weights = {
-            let mut weights = weights;
-            let mut staged: std::collections::HashMap<u32, Vec<u8>> =
-                std::collections::HashMap::new();
-            let consts = wirings
-                .decode
-                .load_consts
-                .iter()
-                .chain(wirings.prefill.iter().flat_map(|p| p.load_consts.iter()));
-            for &(tid, kind) in consts {
-                // The emulator serves one card: no rank's block, the whole table.
-                let (bytes, dt, shape) =
-                    kind.build::<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>(None);
-                match staged.get(&tid) {
-                    Some(prev) if *prev != bytes => {
-                        return Err(werr(format!(
-                            "load const t{tid} is stated differently by the decode and prefill \
-                             bundles — one resident session holds one value per tensor id"
-                        )));
-                    }
-                    Some(_) => {}
-                    None => {
-                        staged.insert(tid, bytes.clone());
-                        weights.push((tid as usize, HostBytes::Owned(bytes), dt, shape.to_vec()));
-                    }
-                }
-            }
-            tracing::info!(
-                "[weights] staged {} load const(s) for the session",
-                staged.len()
-            );
             // ⭐ THE KV POOLS ARE NEVER STAGED. Every layer's K and V pool is a resident tensor the
             // device writes (the paged KV write's scatter) and reads (the page walk's gathers) from
             // step to step, and a step reads only rows its own request wrote — the mask stack keeps
@@ -1402,12 +1360,6 @@ impl SpyreWorker {
                     layers: p.layers,
                     #[cfg(not(feature = "spyre-hw"))]
                     output_ids: p.output_ids,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    scalarmul_scales: p.scalarmul_scales,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    phase: wiring.phase,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    sample_seat: wiring.sample_seat,
                     #[cfg(feature = "spyre-hw")]
                     wiring,
                 }
@@ -2349,7 +2301,7 @@ impl SpyreWorker {
                 // derived.
                 struct DecodeRungJob {
                     rn: usize,
-                    rung_width: ktir_superdsc::sdsc_abstract::RungWidth,
+                    rung_width: scratchy_spyre_bundle::rung::RungWidth,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                     rung_consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
                     logits: LogitsGeom,
@@ -2373,7 +2325,7 @@ impl SpyreWorker {
                     // The manifest's `RungSeqs` IS a baked row count — this is the one boundary where
                     // it becomes the launch-width vocabulary everything below runs on.
                     let Some(rung_width) =
-                        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
+                        scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(rung_n.get())
                     else {
                         continue;
                     };

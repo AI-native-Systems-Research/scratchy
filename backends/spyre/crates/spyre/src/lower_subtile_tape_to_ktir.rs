@@ -7,20 +7,17 @@
 //!
 //! ⭐ ONE NODE, ONE PROGRAM. Each [`SubtileNode`] becomes one KTIR `func` — inputs loaded from HBM,
 //! output stored back — carried on an [`EmittedOp`] as `ktir`. Both consumers read that SAME value:
-//! `-Fspyre-emu` interprets it, `-Fspyre-hw` lowers it through
-//! [`crate::ktir_superdsc_door`].
+//! `-Fspyre-emu` interprets it, `-Fspyre-hw` lowers it through [`crate::superdsc_lower`].
 //!
 //! ⛔ NOTHING HERE EMITS A SuperDSC DESCRIPTOR. That is the consumer's half, in its own file, and a
 //! node lowered straight to SuperDSC from here would be a second path to the same format.
 //!
-//! [`EmittedOp`]: crate::lower_subtile_tape_to_superdsc::EmittedOp
+//! [`EmittedOp`]: scratchy_triton_splice::EmittedOp
 
 use crate::lower_subtile_tape_to_superdsc::*;
-use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::ktir_node::ActiveCap;
-use ktir_superdsc::sdsc_abstract::QueryExtent;
-use ktir_superdsc::superdsc_opspec::{DataFormat, DeviceTileLayout};
-use scratchy_subtile::subtile_ir::chain_slab_entries;
+use scratchy_triton_splice::EmittedOp;
+use scratchy_spyre_bundle::program::ActiveCap;
+use scratchy_spyre_bundle::rung::QueryExtent;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
@@ -42,7 +39,7 @@ fn host_glue_kind<F: RopeForm>(op: &SubOp<F>) -> &'static str {
 /// [`lower_graph_to_ktir`] walk and the RE-ROLLED tape-driven walk so the
 /// per-op `match` lives exactly once (the reroll just changes WHICH nodes are
 /// walked + how many times the body runs, not how each op lowers).
-pub(crate) enum NodeLowering<T: ktir_superdsc::collective::Tp> {
+pub(crate) enum NodeLowering<T: scratchy_spyre_bundle::collective::Tp> {
     Ops(Vec<EmittedOp<T>>),
     /// An op kind not yet lowerable (collected into the hard-error worklist).
     Unhandled(String),
@@ -363,259 +360,6 @@ pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(Subtile
     folds
 }
 
-/// The bundle's [`crate::ktir_superdsc_door::BundleAttnParams`] — `None` for a graph with no
-/// attention node. The row kind is the one fact no program states (see the field).
-pub(crate) fn attn_bundle_params<F: RopeForm>(
-    ir: &SubtileIR<F>,
-    rows_are_requests: bool,
-) -> Option<crate::ktir_superdsc_door::BundleAttnParams> {
-    ir.nodes
-        .iter()
-        .any(|n| matches!(n.op, SubOp::AttnDecode { .. }))
-        .then_some(crate::ktir_superdsc_door::BundleAttnParams { rows_are_requests })
-}
-
-// ════════════════════════════════════════════════════════════════════════════════════
-//  THE CHAINED HEAD'S HAND-MINTED PROGRAMS (#603)
-// ════════════════════════════════════════════════════════════════════════════════════
-//
-// ⭐⭐⭐ NO TRITON KERNEL, SO NO SPLICE — the chained head's pair is the `Transpose`
-// precedent class the other way round: a computed-value op whose body the DOOR assembles
-// (`lk::embed_row_gather`'s three legs; `lk::chain_stage`'s three one-entry table
-// gathers), so the producer's whole job is to state the DOOR-SHAPED SKELETON the door's
-// `regions()` walk reads — one `ktdp.construct_memory_view` per parameter (the TENSOR's
-// own extent), one `ktdp.construct_access_tile` over it (the NODE's own region: a slice
-// reaches the door as a stated window and the door's whole-view law refuses it BY NAME,
-// never silently widened), one load and one store through the output's tile. The
-// persistent s/l writes are GATHER DESTINATIONS the door names — no store states them,
-// which is exactly the KV-pool law (a placement the device owns, written by the body's
-// own ops, not by the program's output).
-
-/// One door-shaped KTIR skeleton for a chained-head node: the node's operands (inputs in
-/// order, the output LAST) as parameters, each with its view and its window, one load off
-/// the first input's tile and one store through the output's tile. The program kind and
-/// its payload are the caller's; the shapes are the graph's own.
-fn chain_skeleton<F: RopeForm>(
-    stem: &str,
-    node: &SubtileNode<F>,
-    ir: &SubtileIR<F>,
-    program: ktir_superdsc::ktir_node::Program,
-) -> Result<ktir_superdsc::ktir_node::KtirNode, String> {
-    use ktir_core::arena::Arena;
-    use ktir_core::attrkey::AttrKey;
-    use ktir_core::ir::{Attr, Operation, Ssa};
-    use ktir_core::irtype::IrType;
-    use ktir_core::opkind::OpKind;
-
-    let a: &'static Arena = Arena::global();
-    // The operand list: the node's inputs, then the output — the splice's own
-    // `default_bindings` law, so the door's `regions()` and the placement census read
-    // the same order every other producer states.
-    let mut operands: Vec<scratchy_subtile::subtile_ir::TensorRegion> = node.inputs.clone();
-    operands.push(node.output);
-    let n = operands.len();
-    // ⭐ THE VIEW STATES THE TENSOR, THE TILE STATES THE REGION — the buffer extent is
-    // the tensor's own `[rows, cols]`, the window is the node's region of it, so a
-    // sliced operand arrives at the door as a stated window (refused there by name)
-    // and a whole one as `(0, 0)` over the full extent.
-    let extent = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
-        let s = ir.tensors[tr.tensor.index()];
-        (
-            (s.rows as i64, s.cols as i64),
-            (
-                tr.region.rows.start as i64,
-                tr.region.cols.start as i64,
-                tr.region.rows.len as i64,
-                tr.region.cols.len as i64,
-            ),
-        )
-    };
-    let mut ops: Vec<Operation<'static>> = Vec::with_capacity(3 * n + 3);
-    let mut fresh = 0u32;
-    let mut ssa = || {
-        fresh += 1;
-        Ssa(fresh + n as u32)
-    };
-    let shape_of = |op: Operation<'static>, rows: i64, cols: i64| {
-        op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![rows, cols])))
-    };
-    // One tile per operand, in operand order — the load reads the FIRST input's
-    // tile and the store writes the output's (the LAST) tile. No Option legs:
-    // the operand list is nonempty by construction (both callers check the
-    // mint's arity — three inputs plus the output — before minting).
-    let mut tiles = Vec::with_capacity(n);
-    for (i, tr) in operands.iter().enumerate() {
-        let p = Ssa(i as u32);
-        let ((rows, cols), (r0, c0, rlen, clen)) = extent(tr);
-        let v = ssa();
-        ops.push(shape_of(
-            Operation::new(a, Some(v), OpKind::KtdpConstructMemoryView, &[p]),
-            rows,
-            cols,
-        ));
-        // The tile's corner operands are CONSTANTS the door's `index_constants` walk
-        // reads — one pair per operand, minted even when both are zero, so the window
-        // is always STATED and never fallen back to the whole-view default.
-        let rc = ssa();
-        ops.push(
-            Operation::new(a, Some(rc), OpKind::ArithConstant, &[]).with_attr(
-                a,
-                AttrKey::Value,
-                Attr::Int(r0),
-            ),
-        );
-        let cc = ssa();
-        ops.push(
-            Operation::new(a, Some(cc), OpKind::ArithConstant, &[]).with_attr(
-                a,
-                AttrKey::Value,
-                Attr::Int(c0),
-            ),
-        );
-        let t = ssa();
-        ops.push(shape_of(
-            Operation::new(a, Some(t), OpKind::KtdpConstructAccessTile, &[v, rc, cc]),
-            rlen,
-            clen,
-        ));
-        tiles.push(t);
-    }
-    let first_tile = tiles[0];
-    let last_tile = tiles[tiles.len() - 1];
-    let val = ssa();
-    ops.push(Operation::new(
-        a,
-        Some(val),
-        OpKind::KtdpLoad,
-        &[first_tile],
-    ));
-    ops.push(Operation::new(
-        a,
-        None,
-        OpKind::KtdpStore,
-        &[val, last_tile],
-    ));
-    let bindings = operands
-        .iter()
-        .map(|tr| ktir_superdsc::ktir_node::BufferId::new(tr.tensor.index() as u32))
-        .collect();
-    Ok(ktir_superdsc::ktir_node::KtirNode {
-        func: ktir_core::ir::IRFunction {
-            name: a.str(format!("{stem}_s{}", node.id.index())),
-            arguments: a.args(
-                (0..n)
-                    .map(|i| (Ssa(i as u32), IrType::Index))
-                    .collect::<Vec<_>>(),
-            ),
-            operations: a.ops(ops),
-            grid: (1, 1, 1),
-            return_type: None,
-        },
-        program,
-        bindings,
-        mask: None,
-        node_out_tid: None,
-        answer_rows: None,
-        minted: Default::default(),
-        lx_plan: Default::default(),
-    })
-}
-
-/// The gathered row's program — `Program::EmbedRowGather { k }`, `[s_stick, l_stick, weight]`
-/// in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
-/// ONE SPELLING'S spyre-side call: this node carries no k of its own (the ChainStage's
-/// payload does), so the emitter asks [`chain_slab_entries`] at THIS node's own `hidden`
-/// — the same pure fn the mint stated, called on the same hidden, the ruled third site.
-fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
-    node: &SubtileNode<F>,
-    ir: &SubtileIR<F>,
-    hidden: u32,
-) -> Result<EmittedOp<T>, String> {
-    if node.inputs.len() != 3 {
-        return Err(format!(
-            "embed_row_gather t{}: {} input(s) — the mint's shape is exactly three (the \
-             s stick, the l stick, the tied weight)",
-            node.output.tensor.index() as u32,
-            node.inputs.len()
-        ));
-    }
-    // `entries`, not `k` — the skeleton's own result binding is `k` (the
-    // KtirNode, the door's node-as-`k` idiom); a same-named entry count here
-    // would shadow it.
-    let entries = chain_slab_entries(u64::from(hidden)) as u32;
-    let k = chain_skeleton(
-        "embed_row_gather",
-        node,
-        ir,
-        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries },
-    )?;
-    Ok(ktir_only(k))
-}
-
-/// The pick decompose's program — `Program::ChainStage { pad_vocab, table_rows, k, hidden }`,
-/// `[pick, s_stick, l_stick, s_tab, l_tab]` in and the fresh s-value stick out, hand-minted
-/// over the node's own regions. The two tables are ORDINARY TENSOR OPERANDS — the argmax
-/// nine's own idiom — staged once at load through [`crate::wiring::LoadConst::ChainStageTable`],
-/// never synths. `pad_vocab`, `table_rows`, and `k` arrive as PARAMETERS, paired at
-/// construction in the caller's own `SubOp::ChainStage` arm — the match that
-/// dispatches the node is the match that reads its payload, so no second dispatch exists
-/// here, and the door's extent check reads the stated `table_rows` rather than re-deriving
-/// it from `pad_vocab` in a second crate. `k` is the mint's own stated entry count, read
-/// from the same payload — never a derivation here. `hidden` is read off the PAIRED
-/// gather's own `hidden` payload — the same single statement `load_consts_of_ir` stages
-/// the `ChainStageTable`s from — never a second derivation: the mint splices the pair
-/// together, so the find cannot miss.
-fn chain_stage_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
-    node: &SubtileNode<F>,
-    ir: &SubtileIR<F>,
-    pad_vocab: u32,
-    table_rows: u32,
-    k: u32,
-) -> Result<EmittedOp<T>, String> {
-    if node.inputs.len() != 5 {
-        return Err(format!(
-            "chain_stage t{}: {} input(s) — the mint's shape is exactly five (the pick \
-             stick, the persistent s stick, the persistent l stick, the two decompose \
-             tables)",
-            node.output.tensor.index() as u32,
-            node.inputs.len()
-        ));
-    }
-    let hidden = ir
-        .nodes
-        .iter()
-        .find_map(|n| match n.op {
-            SubOp::EmbedRowGather { hidden, .. } => Some(hidden),
-            _ => None,
-        })
-        .expect(
-            "chain_stage_emitted: a ChainStage with no EmbedRowGather — the mint splices \
-             the pair together, so a stage with no gather is a graph the mint never made",
-        );
-    let k = chain_skeleton(
-        "chain_stage",
-        node,
-        ir,
-        ktir_superdsc::ktir_node::Program::ChainStage {
-            pad_vocab,
-            table_rows,
-            k,
-            hidden,
-        },
-    )?;
-    Ok(ktir_only(k))
-}
-
-/// One [`EmittedOp`] carrying ONLY its KTIR program — the splice's own `bare` law: the
-/// door is the body, so the producer states the program and nothing else.
-fn ktir_only<T: ktir_superdsc::collective::Tp>(
-    k: ktir_superdsc::ktir_node::KtirNode,
-) -> EmittedOp<T> {
-    let mut e = EmittedOp::bare(k.func.name.to_string());
-    e.ktir = Some(k);
-    e
-}
-
 /// ⭐ WHAT A COLLECTIVE'S SENDS MOVE — this rank's operand `x` as ONE fragment. A send is not a
 /// program: it is an F-send control block (device p2p RDMA, flex-rs
 /// `scheduler::build_rdma_send_cb`) the CB pipeline issues, once per peer, ahead of the consume's
@@ -628,11 +372,11 @@ fn ktir_only<T: ktir_superdsc::collective::Tp>(
 /// one, and each send is a run of messages when it passes the cap. An operand with more rows than a
 /// block is refused by name.
 ///
-/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
-fn send_fragment<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+/// [`TpConsume`]: scratchy_spyre_bundle::collective::TpConsume
+fn send_fragment<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
-    kind: ktir_superdsc::collective::CollectiveKind,
-) -> Result<ktir_superdsc::collective::Fragment, NodeLowering<T>> {
+    kind: scratchy_spyre_bundle::collective::CollectiveKind,
+) -> Result<scratchy_spyre_bundle::collective::Fragment, NodeLowering<T>> {
     let x = node.inputs[0];
     let (rows, cols) = (x.region.rows.len, x.region.cols.len);
     match crate::tp_plan::consume_fragments::<T>(rows, cols).as_deref() {
@@ -652,18 +396,18 @@ fn send_fragment<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// forward's own order (how many collectives precede it in `ir`), so consecutive collectives land
 /// in alternate cuts. The same index on every rank and in every bundle that carries the node.
 ///
-/// [`WindowCut::of_collective`]: ktir_superdsc::collective::WindowCut::of_collective
+/// [`WindowCut::of_collective`]: scratchy_spyre_bundle::collective::WindowCut::of_collective
 fn window_cut<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-) -> ktir_superdsc::collective::WindowCut {
+) -> scratchy_spyre_bundle::collective::WindowCut {
     let k = ir
         .nodes
         .iter()
         .take_while(|n| n.id != node.id)
         .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
         .count();
-    ktir_superdsc::collective::WindowCut::of_collective(k)
+    scratchy_spyre_bundle::collective::WindowCut::of_collective(k)
 }
 
 /// The `[rows, cols]` region of `tensor` starting at its first byte — how a consume reads a
@@ -693,13 +437,13 @@ fn whole_block(
 /// `tensor_parallel::eval_collective`). All of one rank's adds carry ONE [`TpConsume`] that plays
 /// at that rank, so they fuse into its consume group behind its sends and waits.
 ///
-/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
-fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+/// [`TpConsume`]: scratchy_spyre_bundle::collective::TpConsume
+fn all_reduce_consumes<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> NodeLowering<T> {
-    use ktir_superdsc::collective::{CollectiveKind, Rank, TpConsume, ranks};
+    use scratchy_spyre_bundle::collective::{CollectiveKind, Rank, TpConsume, ranks};
     use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
     let x = node.inputs[0];
     let rows = x.region.rows.len;
@@ -727,7 +471,7 @@ fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     for me in ranks::<T>() {
         let consume = TpConsume {
             kind: CollectiveKind::AllReduce,
-            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            operand: scratchy_spyre_bundle::place::PlaceId::Act(x.tensor.index() as u32),
             fragment: f,
             plays_at: me,
             cut,
@@ -759,9 +503,7 @@ fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             // One name per (rank, add): they share the node's id, and a launch's name is its
             // program's identity.
             let name = format!("tpreduce_s{}_r{}_a{k}", node.id.index(), me.get());
-            if let Some(kt) = e.ktir.as_mut() {
-                kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
-            }
+            e.ktir.func.name = ktir_core::arena::Arena::global().str(name.clone());
             e.op_name = name;
             e.tp_consume = Some(consume);
             ops.push(e);
@@ -780,13 +522,13 @@ fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// ⛔ ONE FRAGMENT. A block copy moves a WHOLE source, and a window block holds one fragment —
 /// `WINDOW_ROWS` rows of the block, which every block a bundle hands a gather fits.
 ///
-/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
-fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+/// [`TpConsume`]: scratchy_spyre_bundle::collective::TpConsume
+fn all_gather_consumes<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     cols: u32,
 ) -> NodeLowering<T> {
-    use ktir_superdsc::collective::{CollectiveKind, STICK_ELEMS, TpConsume, World, ranks};
+    use scratchy_spyre_bundle::collective::{CollectiveKind, STICK_ELEMS, TpConsume, World, ranks};
     use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
     let x = node.inputs[0];
     let (rows, lc) = (x.region.rows.len, x.region.cols.len);
@@ -827,7 +569,7 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     for me in ranks::<T>() {
         let consume = TpConsume {
             kind: CollectiveKind::AllGather,
-            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            operand: scratchy_spyre_bundle::place::PlaceId::Act(x.tensor.index() as u32),
             fragment,
             plays_at: me,
             cut,
@@ -869,7 +611,7 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// that grain. KTIR does not: a node's whole computation is one `func`, with its inputs loaded from
 /// HBM and its output stored back, and the work division stated INSIDE it as the grid and its
 /// loops. So this walk yields one [`EmittedOp`] per node, carrying that program.
-pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+pub(crate) fn lower_one_node<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     // Sweep KV extent for AttnDecode (paged-attn ladder rung); FULL ⇒ full cap. See main's
@@ -999,31 +741,10 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::DraftContextKv { .. }
         | SubOp::DraftWindowStore
         | SubOp::DraftWindowLoad
-        | SubOp::DraftSelect => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
-        // ⭐ THE CHAINED HEAD'S PAIR — HAND-MINTED KTIR, never spliced: these are the
-        // `Transpose` precedent class (a computed-value op whose body the DOOR
-        // assembles), so the producer's whole statement is the door-shaped skeleton
-        // (`chain_skeleton`) plus the program kind. The door bodies are
-        // `lk::embed_row_gather` (the three legs) and `lk::chain_stage` (the three
-        // one-entry table gathers); the splice's registry routes these kinds back here
-        // BY NAME, so a node reaching it is a routing change, not a missing kernel.
-        // `replaces` is metadata for the wiring's chain fact — the ktir
-        // Program payload stays k-only (the stamp reads the SubOp fact).
-        SubOp::EmbedRowGather { hidden, .. } => match embed_row_gather_emitted(node, ir, *hidden) {
-            Ok(e) => Ops(vec![e]),
-            Err(reason) => Unhandled(reason),
-        },
-        // The payload's three u32s copy out of the borrowed op (the match is on
-        // `&node.op`, so the bindings are references) — the pair-at-construction
-        // call states all three, dereferenced at the call.
-        SubOp::ChainStage {
-            pad_vocab,
-            table_rows,
-            k,
-        } => match chain_stage_emitted(node, ir, *pad_vocab, *table_rows, *k) {
-            Ok(e) => Ops(vec![e]),
-            Err(reason) => Unhandled(reason),
-        },
+        | SubOp::DraftSelect
+        | SubOp::Sample { .. }
+        | SubOp::EmbedRowGather { .. }
+        | SubOp::ChainStage { .. } => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ── THE 2a KINDS — every one through `lower_all`: the TanhSoftCap logits fold
         // and the head-norm sandwich's three seats (Reshape split / norm middle /
         // Reshape flatten) are `lower_all`'s interceptions, and every other node of
@@ -1072,20 +793,6 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         SubOp::Elementwise(_) | SubOp::SiluMul => {
             match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
-                Err(reason) => Unhandled(reason),
-            }
-        }
-        // ⭐ THE TOKEN DRAW — one kernel, spliced like every other: the row, its
-        // noise and temperature (per-step operands the RUNTIME binds, never load
-        // constants), the nine vocab-derived tables, the [1, 64] idx stick out.
-        // The tables are tape sources the expansion stages at load (functions of
-        // the vocab alone); the splice binds them positionally, exactly as it
-        // binds silumul's gate and up. `lower_all`, not `lower`: a prefill rung's
-        // draw reads the FOLDED tail's answer rows (the `[S, vocab]` window the
-        // mint states on the node), which is `lower_all`'s machinery.
-        SubOp::Sample { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
-                Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
@@ -1197,14 +904,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// The PRODUCER half over a whole UNROLLED graph: one KTIR program per node, plus the bundle layout
 /// every one of them resolves its addresses through.
 ///
-/// ⛔⛔⛔ THIS USED TO BE CALLED `lower_graph_to_superdsc`, AND KEEPING THAT NAME THROUGH THE SPLIT IS
-/// WHAT WENT WRONG. It is `ibm/main`'s function, text unchanged — but main's `lower_one_node` returned
-/// SuperDSC descriptors and this one returns KTIR programs, so the body silently stopped producing what
-/// its name, its doc and its own worklist error (`"{} SuperDSC op(s) emitted ok"`) all still claim. A
-/// caller that asked it for descriptors got `EmittedOp::bare` — `op: None`, `time: 1` — and every
-/// question it then asked of them ("how many descriptors?", "is this op tiled?") was answered about a
-/// program instead. The WHOLE lowering is [`lower_graph_to_superdsc`] below; this is its first half.
-pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+pub fn lower_graph_to_ktir<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     // Swept KV extent for the decode attention (paged-attn ladder rung); FULL ⇒ full cap (byte-identical).
@@ -1272,70 +972,6 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     Ok((ops, bundle_layout))
 }
 
-/// SubtileIR → KTIR → SuperDSC for a whole UNROLLED graph — [`lower_graph_to_ktir`] followed by the
-/// ONE KTIR → SuperDSC lowering over each program it built. These are the descriptors main's
-/// `lower_graph_to_superdsc` returned: the same builders, in node order, threading the same two
-/// bundle-scoped accumulators main's single walk threaded.
-///
-/// ⛔ THE TWO ACCUMULATORS BELONG TO THE CONSUMER NOW, WHICH IS WHY THEY ARE MINTED HERE AND NOT
-/// UPSTREAM. main incremented the negative-symbol-id counter and inserted into the fp8
-/// activation-quantize dedup set as it built each DESCRIPTOR, so both are per-bundle facts of the
-/// descriptor pass — the producer's copies are threaded but never written (main's
-/// `lower_matmul_node`'s `_quantized`). `ktir_groups_via_superdsc` mints them at exactly this grain for exactly this reason.
-pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
-    ir: &SubtileIR<F>,
-    weight_ids: &std::collections::HashSet<u32>,
-    active_cap: ActiveCap,
-    rows_are_requests: bool,
-    query_rows: QueryExtent,
-) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
-    let (programs, mut bundle_layout) =
-        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows)?;
-    // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
-    // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
-    let attn_params = attn_bundle_params(ir, rows_are_requests);
-    let mut sym_id_base: i64 = 0;
-    let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
-    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(programs.len());
-    for e in &programs {
-        if e.ktir.is_none() {
-            return Err(SuperDscError(format!(
-                "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
-                 program computes something else",
-                e.op_name
-            )));
-        }
-        // ⭐ `lower_op`, not `lower`: a collective's consume carries its `tp_consume` from the
-        // emitted op onto every SuperDSC op its program lowers to.
-        ops.extend(
-            crate::ktir_superdsc_door::lower_op(
-                e,
-                &mut sym_id_base,
-                Some(&bundle_layout),
-                attn_params,
-                &mut fp8_quantized,
-            )
-            .map_err(|err| {
-                SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
-            })?,
-        );
-    }
-    // (The former negative-symbol-id disjointness guard is GONE: the concrete-unroll
-    // Synthetic intermediates were assigned seg3 offsets ABOVE the colored
-    // intermediates during the walk; grow the Intermediate segment's byte count to
-    // cover them so the executor allocates a seg3 region large enough (task #55/#56).
-    //
-    // ⛔ AFTER THE CONSUMER PASS, NOT AFTER THE PRODUCER'S. `BundleLayout::synth` is called by
-    // the door's descriptor builders — `assemble_rmsnorm` / `matmul_fp8` / `lmlast` — so at the
-    // end of `lower_graph_to_ktir` nothing has been declared yet and this grew seg3 by zero. That is
-    // the same ordering fact the re-rolled walk pays for with its explicit declare pass.
-    let seg3 = SegRole::Intermediate.segment();
-    let synth_high = bundle_layout.synth.borrow().high_water();
-    if synth_high > bundle_layout.segment_bytes[seg3] {
-        bundle_layout.segment_bytes[seg3] = synth_high;
-    }
-    Ok((ops, bundle_layout))
-}
 /// WHAT A LAUNCH BINDS: for every program, which SubtileIR tensor each of its parameters points
 /// at, plus the graph-level facts the worker needs to place those tensors — how many are sources,
 /// which one is the result, every tensor's shape, and the id of the runtime attention mask if the
@@ -1369,22 +1005,6 @@ pub struct BundleWiring {
     pub attn_mask: Option<u32>,
     /// The paged step's sources and pool — see [`crate::wiring::PagedStep`].
     pub paged: Option<crate::wiring::PagedStep>,
-    /// EVERY compile-time scalar the programs read, in registry order: entry `i` is the value the
-    /// worker must bind at [`scalarmul_scale_tid`]`(i)` — the model's own multipliers and RMSNorm
-    /// epsilons, exactly the set and exactly the order `subtile→superdsc` registers.
-    ///
-    /// ⛔ NOTHING IS SEEDED INTO IT AND NOTHING EXTRA IS PUSHED. The index IS the device tid, so an
-    /// added entry moves every constant after it. Two algebraic identities were once seeded at the
-    /// front for this construction's `linalg.*` `outs` seeds, and the mean-of-squares divisor was
-    /// pushed beside each epsilon; both are gone — the seeds are immediates, and `1/cols` is bound at
-    /// the reserved `RMS_INVCOLS_TID` the way the proven path binds it.
-    ///
-    /// ⛔ CARRIED HERE BECAUSE A CONSTANT A DESCRIPTOR READS IS A BOUND TENSOR. `dxp_standalone`
-    /// has no immediate operand, so the programs read these off reserved tids that
-    /// appear in `func.arguments` like any other buffer — which means BOTH consumers of this KTIR
-    /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
-    /// own source binding. This is the one list they read, so they cannot disagree about it.
-    pub scalarmul_scales: Vec<f32>,
     /// The weight folds this graph admits: `(tensor id, multiplier)` for each matmul weight the
     /// worker must scale at load instead of the tape applying the multiplier at runtime —
     /// EITHER a `ScalarMul` fold ([`scalar_mul_weight_folds`], whose refusal set — sliced reads,
@@ -1399,44 +1019,6 @@ pub struct BundleWiring {
     /// double-applies the scale. (An attention-scale fold's node is NOT host-routed — it still
     /// runs, at the scale 1.0 the same arm rewrote it to.)
     pub weight_scale_folds: Vec<(u32, f32)>,
-    /// ⭐ THE KERNEL-TABLE CLASS SETS — this graph's DISTINCT rope head dims (`rope_class_hds`)
-    /// and attention head dims (`attn_class_hds`), sorted descending, published off the
-    /// `BundleLayout` registry this walk threads: the ONE-source law `scalarmul_scales` states
-    /// above, applied to the class sets. The door resolves a rope program's class index off the
-    /// LAYOUT's list (`BundleLayout::rope_class_hds`, the registry mechanism
-    /// `scalarmul_scales` established), so the worker's load-time table binds must be THAT list
-    /// and not a second derivation free to disagree — the runtime's
-    /// `Wiring::verify_class_placements` cross-checks exactly this against the baked placements.
-    /// Index `i` ↔ `rope_p_class_tid(i)` / `identity_class_tid(i)`; class 0 is the widest and
-    /// keeps the pre-class sentinel tid, so a uniform model's binds are byte-identical.
-    /// `attn_class_hds` is EMPTY on this ladder — `AttnDecode` is refused by name and the door
-    /// mints per-program geometry — but the field is carried anyway: the worker's
-    /// `synthetic_constants` builds each class's identity table off it, and a door that lands
-    /// attention classes states its set here the day it lands (the registry row already exists).
-    pub rope_class_hds: Vec<u32>,
-    pub attn_class_hds: Vec<u32>,
-    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer this
-    /// graph's own producer minted below the `SourceBinding` layer, derived by
-    /// [`load_consts_of_ir`] (the one derivation; the bake's numeric gate reads
-    /// the same list). The worker stages each entry ONCE at load through the
-    /// kind's builder — the rope tables' own law. The tables carry no
-    /// `SourceBinding`; this list is the worker's only naming of them.
-    pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
-    /// ⭐ THE SAMPLER'S PER-STEP SEAT — `Some` exactly when the graph carries
-    /// the minted `Sample` node, derived by [`sample_seat_of_ir`] (the one
-    /// derivation, the mint's own facts). Names the sources the draw reads
-    /// FRESH EVERY DECODE STEP, as a NAMED CLASS — the source gate counts them
-    /// as filled only when bound THIS step, never a held default (the class's
-    /// own law, on [`crate::wiring::SampleSeat`]).
-    pub sample_seat: Option<crate::wiring::SampleSeat>,
-    /// ⭐ THE CHAINED HEAD'S STICK FACT — [`crate::wiring::ChainFact::Chained`]
-    /// iff the mint spliced the EmbedRowGather/ChainStage pair into this
-    /// graph, naming the two persistent stick sources (derived by
-    /// [`chain_of_ir`], the one derivation). The worker's seed binds these
-    /// ids — staged per step in the per-step path (idempotent with the
-    /// device's own ChainStage writes) and once per block in the block
-    /// path; `Unchained` is every graph the mint did not touch.
-    pub chain: crate::wiring::ChainFact,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -1444,23 +1026,6 @@ pub struct NodeArgs {
     pub args: Vec<usize>,
 }
 
-/// ⭐ THE WIRING'S REGISTRIES — the layout facts [`graph_wiring`] rebuilds as pure functions of
-/// `ir`, in the wiring's own shapes. ⛔ NO `Default`, and the literal in `graph_wiring` is
-/// EXHAUSTIVE: a registry added to this struct (or to [`BundleWiring`]) is a MISSING FIELD at
-/// the one construction site — a build error, not a silent empty list on the card. This is
-/// the class #299's registry rewrite of `graph_wiring` dropped: `weight_copies` stayed on
-/// `BundleLayout::default()` while the placement pass kept minting it, so every head-major
-/// copy was placed-but-never-staged and the m=1 fp8 o matmul read never-written windows
-/// (`Fr4 (oon`, granite-3.1-8b fp8, card-only). Before that rewrite the wiring ran the whole
-/// placement pass for these five fields — a throwaway budget pass that refused models the
-/// re-rolled bake had accepted (the 26b MoE panic that motivated the rewrite) — so the
-/// registries stand alone here, exhaustively built.
-pub(crate) struct WiringRegistries {
-    pub scalarmul_scales: Vec<f32>,
-    pub weight_scale_folds: Vec<(u32, f32)>,
-    pub rope_class_hds: Vec<u32>,
-    pub attn_class_hds: Vec<u32>,
-}
 /// ⭐ THE HOST PAIR FOR A GEMM WEIGHT IS THE UNION OF ITS MATMUL CONSUMERS' VIEW REGIONS
 /// — never the tensor's STATED shape. The pair is what the host STAGES: the wiring's
 /// static `tensor_shapes` and the JSON tensors manifest are emitted from it (codegen's
@@ -1590,7 +1155,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_spyre_bundle::rung::QueryExtent,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
@@ -1634,11 +1199,9 @@ pub fn paged_step_of_ir<F: RopeForm>(
             page_table: tids.page_table,
             write_rows: tids.write_rows,
             query_rows: tids.query_rows,
-            kv_row_pool: tids.kv_row_pool,
             rep_rows: tids.rep_rows,
             chunk_pages: tids.chunk_pages,
             chunk_masks: tids.chunk_masks,
-            int32_zero: tids.int32_zero,
             pages,
             page_slots: slots,
             rows: mq,
@@ -1667,691 +1230,54 @@ pub fn paged_step_of_ir<F: RopeForm>(
 ///
 /// The pairings do not depend on the rung, so the arms lower at `ActiveCap::FULL`; `active_cap` is the
 /// rung the bundle is baked at, read for the one fact that does — the paged step's walk.
-///
-/// ⛔ THE LAYOUT IS NOT OPTIONAL, even though the pairing does not depend on placement. It is also
-/// the REGISTRY the lowering writes constants into — the door registers its attention
-/// scale in `BundleLayout.scalarmul_scales` and refuses without one ("registry desync") — so a
-/// wiring pass that threads `None` does not get placement-independent answers, it gets no answers.
-pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+pub fn graph_wiring<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
-    weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
-    // The graph's query extents, minted by the bake — threaded to the registry and node walks
-    // below, never re-derived from graph rows: a walk that minted its own pair would agree
-    // with the graph yet state the wrong per-request width the day a packed prefill arrives.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_spyre_bundle::rung::QueryExtent,
 ) -> Result<BundleWiring, SuperDscError> {
-    // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
-    // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
-    // here would be a THROWAWAY (the shipped layout is the re-rolled bake's), and it is the
-    // CARD's budget pass: it refuses a weight segment past one 16 GiB region with no layer
-    // classes to bank on — MEASURED on the old ladder, the 26b MoE under the fp8 preset wired
-    // fine through the banked re-rolled bake and then panicked HERE on a layout nobody reads.
-    // Every registry is a pure function of `ir.nodes` (the same helpers the placement pass
-    // itself fills from), so that is what [`WiringRegistries`] builds — exhaustively, so a
-    // registry added later is a missing field at the literal, not a silent `Default` on the
-    // card.
-    let _ = weight_ids;
-    let registries = WiringRegistries {
-        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry::<T, F>(
-            ir, paged_rows, query_rows,
-        )?,
-        // Same rule as the placement pass's own field: the fold list the worker applies to
-        // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
-        // fact and does not ship).
-        weight_scale_folds: weight_scale_folds(ir)
-            .into_iter()
-            .map(|(_, tid, scale)| (tid, scale))
-            .collect(),
-        // ⭐ THE CLASS REGISTRIES, here too — the door resolves a rope/attn program's P/identity
-        // class through these, and this pass lowers through the door. Same shared helper, same
-        // tape, so the wiring's answer and the placement pass's cannot disagree.
-        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
-            ir.nodes
-                .iter()
-                .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
-        ),
-        attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
-            |n| match &n.op {
-                SubOp::AttnDecode {
-                    mask, attention, ..
-                } => Some(attention.class(mask.class()).head_dim().get()),
-                _ => None,
-            },
-        )),
-    };
-    // ⭐ EVERY NODE IS LOWERED ON ITS OWN, so they are lowered IN PARALLEL and folded IN ORDER. Each
-    // node's arm is a pure function of the node and the graph (the kernel memos it reaches are
-    // process-wide, so a kernel two layers share still compiles once), and this walk is over the
-    // UNROLLED graph: on granite-2b it was two thirds of the models build script, serially, for one
-    // fact per program — its bindings — and one per mask. The fold below sees the results in node
-    // order, so the first error and the mask check read exactly as the serial walk did.
-    // One program's binding order, the `(mask tid, capacity)` it reads when it reads one, and
-    // the ARRANGEMENT FACTS its propagation marked — the staggered parameters this program's
-    // consumers must stage already permuted (empty for every program with no staggered
-    // convert; a decoder layer contributes nothing).
-    type WiredProgram = (
-        NodeArgs,
-        Option<(u32, u32)>,
-        Vec<(u32, ktir_superdsc::element_arrangement::ElementArrangement)>,
-    );
-    let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
+    let batch = paged_rows == scratchy_triton_splice::PagedRows::Batch;
+    let per_node: Vec<Result<Vec<NodeArgs>, SuperDscError>> = {
         use rayon::prelude::*;
         ir.nodes
             .par_iter()
             .map(|node| {
-                // ⭐ THE SAME ARM THE PRODUCER PASS TAKES (`paged_rows`, handed in by the bake) — the
-                // one-derivation law. This walk was hardcoded `rows_are_requests = false` from before
-                // the extent pair existed, so it lowered a decode batch's attention through the
-                // SEQUENCE arm while the emitted program took the batch's: the wiring's `NodeArgs`
-                // named the prefill spelling of the step tables for a program that reads the batch's,
-                // and the prefill arm's window family (a packed rung's one-op-per-window unroll)
-                // refused a symbolic batch's 96-request pair outright. The wiring's programs and the
-                // shipped ones must come from ONE lowering of each node.
-                let ops = match lower_one_node::<T, F>(
-                    node,
-                    ir,
-                    ActiveCap::FULL,
-                    paged_rows == scratchy_triton_splice::PagedRows::Batch,
-                    query_rows,
-                ) {
+                let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, batch, query_rows)
+                {
                     NodeLowering::Ops(v) => v,
-                    // A host-routed op runs off the device, so it has no program and binds nothing. It
-                    // still occupies a position in the node order, so it contributes an empty entry.
                     NodeLowering::HostRouted(_) => Vec::new(),
                     NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
                 };
-                let mut out = Vec::with_capacity(ops.len());
-                for e in ops {
-                    let Some(k) = e.ktir else { continue };
-                    // ⭐ THE ARRANGEMENT PROPAGATION, run on the SAME lowered program the bake
-                    // emits — the one derivation, so the wiring's marked parameters and the
-                    // emitted descriptors cannot disagree about which buffers carry the
-                    // stagger. Refused here (a build error naming the program) rather than
-                    // staged wrong on the card.
-                    let staggered = ktir_superdsc::emit::whole_function::staggered_sources::<
-                        ktir_core::ddl_binds::Baked,
-                    >(&k)
-                    .map_err(|e| SuperDscError(e.message))?
+                Ok(ops
                     .into_iter()
-                    .collect::<Vec<_>>();
-                    let mask = match k.mask {
-                        // ⭐ THE CAPACITY IS THE K POOL's: the paged walk's parameters are `[q, out,
-                        // k pool, v pool, page table, mask]`, and the K pool is the layer's K cache
-                        // tensor, whose rows are the pool's token slots.
-                        Some(mid) => {
-                            if !k.bindings.contains(&mid) {
-                                return Err(SuperDscError(format!(
-                                    "the mask buffer t{mid} is not among this program's parameters \
-                                     — the attention bound a mask its own program never declares"
-                                )));
-                            }
-                            let pool = k
-                                .bindings
-                                .get(2)
-                                .map(|b| b.get() as usize)
-                                .filter(|&t| t < ir.tensors.len())
-                                .ok_or_else(|| {
-                                    SuperDscError(format!(
-                                        "the attention binding mask t{mid} binds no K pool at \
-                                         position 2 — the paged walk's order is q, out, k pool, \
-                                         v pool, page table, mask"
-                                    ))
-                                })?;
-                            Some((mid.get(), ir.tensors[pool].rows))
-                        }
-                        None => None,
-                    };
-                    out.push((
-                        NodeArgs {
-                            args: k.bindings.iter().map(|b| b.get() as usize).collect(),
-                        },
-                        mask,
-                        staggered,
-                    ));
-                }
-                Ok(out)
+                    .map(|e| NodeArgs {
+                        args: e.ktir.bindings.iter().map(|b| b.get() as usize).collect(),
+                    })
+                    .collect())
             })
             .collect()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
-    // ⭐ THE MASK FAMILY, not one mask: a packed rung's attention is spliced once per
-    // window and window r's program binds its OWN mask stack (`paged_window_tid(r, ·)`),
-    // so the walk collects every `(tid, capacity)` the programs bound — one per window at
-    // most, all over the one K pool — and the check below names the family the rung's
-    // own windows state. A solo rung's family is the single sentinel it always bound.
-    let mut masks: Vec<(u32, u32)> = Vec::new();
-    // ⭐ THE MERGED ARRANGEMENT FACTS — every parameter any program's propagation marked, in
-    // node order, merged BEFORE the load-const list and the seat are derived so those two
-    // derivations state the arrangement the bake actually emits (the one-derivation law).
-    let mut staggered: std::collections::BTreeMap<
-        u32,
-        ktir_superdsc::element_arrangement::ElementArrangement,
-    > = Default::default();
     for lowered in per_node {
-        for (args, m, marks) in lowered? {
-            if let Some(m) = m {
-                if let Some(&(_, prev_cap)) = masks.iter().find(|&&(_, c)| c != m.1) {
-                    return Err(SuperDscError(format!(
-                        "the attention masks must share one prefix capacity (one K pool), but \
-                         {prev_cap} and {} were both emitted",
-                        m.1
-                    )));
-                }
-                if !masks.contains(&m) {
-                    masks.push(m);
-                }
-            }
-            staggered.extend(marks);
-            nodes.push(args);
-        }
+        nodes.extend(lowered?);
     }
-    // ⭐ THE HOST PAIRS, NOT THE STATED SHAPES: every gemm weight's entry is the
-    // union of its matmul consumers' view regions (the widen keeps the tied embed
-    // weight's STATED cols at the pad while the host stages the real vocab region).
-    let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
     let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows)?;
-    let attn_mask = match (masks.first().copied(), paged) {
-        (Some((_, cap)), Some(p)) => {
-            // The step's three sources are RESERVED tids (their shapes are the paged step's own
-            // statement, not entries of this tid-indexed list).
-            // ⭐ THE MASK IS THE ARM'S OWN FAMILY: the batched kernel reads the step's per-chunk
-            // masks (`tids.chunk_masks`), one table for its one window; the sequence kernels
-            // read window r's own mask stack (`paged_window_tid(r, mask)` — window 0 IS the
-            // step's sentinel `tids.mask`), one per window of the rung's pair. The programs
-            // must have bound EXACTLY that family: a missing window's mask is staged by
-            // nothing, a tid outside the family is a mask staged onto another table.
-            let batch = paged_rows == scratchy_triton_splice::PagedRows::Batch;
-            let windows = if batch {
-                1
-            } else {
-                query_rows.requests().get()
-            };
-            let expected: std::collections::BTreeSet<u32> = if batch {
-                std::iter::once(p.chunk_masks).collect()
-            } else {
-                (0..windows)
-                    .map(|r| ktir_superdsc::reserved_tids::paged_window_tid(r, 2))
-                    .collect()
-            };
-            let bound: std::collections::BTreeSet<u32> =
-                masks.iter().map(|&(tid, _)| tid).collect();
-            if bound != expected {
-                let show = |s: &std::collections::BTreeSet<u32>| {
-                    s.iter()
-                        .map(|t| format!("t{t}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                return Err(SuperDscError(format!(
-                    "the attention binds its masks at [{}] but the paged step's {} window(s) \
-                     name [{}] — the step's sources have one family of ids",
-                    show(&bound),
-                    windows,
-                    show(&expected)
-                )));
-            }
-            if cap as usize != p.capacity() {
-                return Err(SuperDscError(format!(
-                    "the attention's K pool holds {cap} slots but the paged step states {} — one \
-                     pool, two capacities",
-                    p.capacity()
-                )));
-            }
-            // Window 0's tid, the family's first — proven bound above; the family past
-            // window 0 is `paged_window_tid`'s own law, stated once in reserved_tids.
-            Some(if batch { p.chunk_masks } else { p.mask })
-        }
-        (None, None) => None,
-        (masks, paged) => {
-            return Err(SuperDscError(format!(
-                "the attention programs bind masks {masks:?} while the graph's paged step is \
-                 {paged:?} — the two are one statement of one attention"
-            )));
-        }
-    };
-    // ⭐ THE LOAD-CONST LIST AND THE SEAT, derived with the merged arrangement facts in hand —
-    // the one derivations, so the wiring's ids, arrangements and the layout's placements cannot
-    // disagree (the `weight_copies` one-mint law).
-    let load_consts = load_consts_of_ir(ir, &staggered)?;
-    let sample_seat = sample_seat_of_ir(ir)?;
-    // ⭐ THE CHAIN FACT, off the same minted nodes — after `load_consts` so
-    // the one-node law's error propagates before the first-wins read.
-    let chain = chain_of_ir(ir);
-    // ⛔ EVERY MARKED PARAMETER HAS A STAGER. The arrangement rides exactly one staging
-    // channel here — the load-const builders (pure in the arrangement) — and the seat's
-    // per-step staging (the seed quadruple and the inverse temperature) binds fresh words
-    // with NO arrangement of its own, so a propagation mark on any parameter other than a
-    // load-const table (a weight, an activation, another kernel's source, or one of the
-    // seat's own per-step tids) is a staggered buffer nothing can stage: a build error
-    // naming the tid, never a silently standard-staged operand read permuted on the card.
-    {
-        let staged: std::collections::BTreeSet<u32> =
-            load_consts.iter().map(|&(tid, _)| tid).collect();
-        for &tid in staggered.keys() {
-            if !staged.contains(&tid) {
-                return Err(SuperDscError(format!(
-                    "the arrangement propagation marked t{tid} — a parameter outside the \
-                     sampler's own staged set (the load-const tables; the seat's per-step \
-                     staging carries no arrangement). No stager carries an arrangement for \
-                     it, so it would be staged standard and read permuted; keep the stagger \
-                     inside the sampler's pointwise island"
-                )));
-            }
-        }
-    }
     Ok(BundleWiring {
         nodes,
         num_sources: ir.num_sources,
         result_tensor: ir.result.index() as u32,
         result_dtype: result_dtype_of_ir(ir)?,
-        tensor_shapes,
-        attn_mask,
+        tensor_shapes: tensor_shapes_of_ir(ir)?,
+        // The attention reads its mask stack at the paged step's own tid.
+        attn_mask: paged.map(|p| if batch { p.chunk_masks } else { p.mask }),
         paged,
-        scalarmul_scales: registries.scalarmul_scales,
-        weight_scale_folds: registries.weight_scale_folds,
-        // The class sets, off the SAME registries the two lists above come from — the
-        // registry the door resolves class indices against, so the worker's table binds and
-        // the emitter's class tids agree by construction (see the field's doc).
-        rope_class_hds: registries.rope_class_hds,
-        attn_class_hds: registries.attn_class_hds,
-        load_consts,
-        // ⭐ THE PER-STEP SEAT, off the same minted node the load-const list
-        // reads — the one derivation, so the wiring's seat and the mint's
-        // facts cannot disagree (the `weight_copies` one-mint law).
-        sample_seat,
-        // ⭐ THE CHAIN FACT, off the same minted nodes the load-const list
-        // reads — the one derivation, so the wiring's seeds and the mint's
-        // facts cannot disagree (the `weight_copies` one-mint law).
-        chain,
+        weight_scale_folds: weight_scale_folds(ir)
+            .into_iter()
+            .map(|(_, tid, scale)| (tid, scale))
+            .collect(),
     })
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
-/// ⭐⭐⭐ THE LOAD-TIME CONSTANTS A GRAPH CARRIES — `(tid, kind)` for every
-/// resident buffer the graph's own producer minted below the `SourceBinding`
-/// layer. THE ONE DERIVATION: [`graph_wiring`](self)'s registry and the bake's
-/// numeric gate both read this list, so the wiring's ids and the gate's staged
-/// bytes cannot disagree (the `weight_copies` one-mint law).
-///
-/// This fn is the PRODUCER'S TRANSLATION POINT — the one place a minted op
-/// states its host contract as generic [`LoadConst`] kinds. Everything
-/// downstream of it is op-blind: the kinds name shared builders
-/// ([`crate::wiring::LoadConst::build`]), the consumers iterate the list, and
-/// a second spliced kernel with staged tables adds its arm HERE and rides the
-/// same list with zero new wiring surface.
-///
-/// A second minted node of one kind is a build error, not a last-write-wins:
-/// two scans would stage two sticks and the worker could read either.
-pub fn load_consts_of_ir<F: RopeForm>(
-    ir: &SubtileIR<F>,
-    staggered: &std::collections::BTreeMap<
-        u32,
-        ktir_superdsc::element_arrangement::ElementArrangement,
-    >,
-) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
-    // ⭐ THE SAMPLER'S MINT — the twenty operand tables (built by the shared
-    // `sample_staged_tables` derivation the kind names; the ten UNIFORM tables
-    // stage at the rung's own `[rows, 1]` — the seed words' own class — and the
-    // per-lane tables are functions of the vocab alone; `padoff` is the pad
-    // law's offset row, which the kernel adds
-    // to the score LAST, after its two roundings — the row's own pad bytes are
-    // never its contract). The node's FIRST FIVE seats after the row — the
-    // seed quadruple's four `[rows, 1]` word tables and the temperature
-    // reciprocal — are PER-STEP operands the runtime binds every decode step;
-    // they are deliberately NOT in this list (a load-time constant staged
-    // over them would freeze one draw's seed into every step).
-    let mut mints = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::Sample { .. }));
-    let sample: Vec<_> = match (mints.next(), mints.next()) {
-        (None, _) => Vec::new(),
-        (Some(_), Some(_)) => {
-            return Err(SuperDscError(
-                "two Sample nodes in one graph — the mint appends exactly one to a rung; a second \
-                 means two mints ran over one graph"
-                    .to_string(),
-            ));
-        }
-        (Some(node), None) => {
-            let SubOp::Sample { vocab, rows } = node.op else {
-                unreachable!("the filter matched a Sample")
-            };
-            assert_eq!(
-                node.inputs.len(),
-                26,
-                "the Sample node's arity is the registry's own row (logits + the four seed word \
-                 tables + inv_t + twenty tables)"
-            );
-            node.inputs[6..]
-                .iter()
-                .enumerate()
-                .map(|(i, tr)| {
-                    (
-                        tr.tensor.index() as u32,
-                        crate::wiring::LoadConst::SampleTable {
-                            vocab,
-                            // The rung's own row count — the mint's own fact, so
-                            // the ten uniform tables bake as [rows, 1] (the seed
-                            // words' own class) and the worker writes nothing for
-                            // them. The per-lane tables ignore it.
-                            rows,
-                            operand: (i + 1) as u8,
-                            // The bake's own arrangement fact: a table the sampler's staggered
-                            // pointwise island reads lane-for-lane is staged ALREADY permuted —
-                            // `build()` is pure in it, so the worker decides nothing.
-                            arrangement: staggered
-                                .get(&(tr.tensor.index() as u32))
-                                .copied()
-                                .unwrap_or(
-                                ktir_superdsc::element_arrangement::ElementArrangement::Standard,
-                            ),
-                        },
-                    )
-                })
-                .collect()
-        }
-    };
-    // ⭐ THE CHAINED HEAD'S PAIR — the two decompose tables the mint spliced
-    // past the pick and the sticks (inputs 3 and 4 of the ChainStage node,
-    // operands 1 and 2 of the kind), staged ONCE at load exactly like the
-    // sampler's nine. A second ChainStage is a build error, not a
-    // last-write-wins — the same one-node law the Sample arm states.
-    let mut stages = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::ChainStage { .. }));
-    let chain: Vec<(u32, crate::wiring::LoadConst)> = match (stages.next(), stages.next()) {
-        (None, _) => Vec::new(),
-        (Some(_), Some(_)) => {
-            return Err(SuperDscError(
-                "two ChainStage nodes in one graph — the mint splices exactly one pair into a \
-                 rung; a second means two mints ran over one graph"
-                    .to_string(),
-            ));
-        }
-        (Some(node), None) => {
-            let SubOp::ChainStage { pad_vocab, k, .. } = node.op else {
-                unreachable!("the filter matched a ChainStage")
-            };
-            assert_eq!(
-                node.inputs.len(),
-                5,
-                "the ChainStage node's arity is the registry's own row (pick + two sticks + \
-                 two tables)"
-            );
-            // The graph's own hidden, read from the gather the mint spliced
-            // beside this stage — the same one statement `chain_of_ir` reads
-            // below, so the tables' `hidden` and the wiring's can never
-            // disagree about the graph's width.
-            let (hidden, block) = ir
-                .nodes
-                .iter()
-                .find_map(|n| match n.op {
-                    SubOp::EmbedRowGather { hidden, .. } => Some((hidden, chain_block_cols(n, ir))),
-                    _ => None,
-                })
-                .expect(
-                    "load_consts_of_ir: a ChainStage with no EmbedRowGather — the mint splices \
-                     the pair together, so a stage with no gather is a graph the mint never made",
-                );
-            node.inputs[3..5]
-                .iter()
-                .enumerate()
-                .map(|(i, tr)| {
-                    (
-                        tr.tensor.index() as u32,
-                        crate::wiring::LoadConst::ChainStageTable {
-                            pad_vocab,
-                            k,
-                            hidden,
-                            block,
-                            operand: (i + 1) as u8,
-                        },
-                    )
-                })
-                .collect()
-        }
-    };
-    let mut consts = sample;
-    consts.extend(chain);
-    Ok(consts)
-}
-
-/// ⭐ THE CHAINED HEAD'S STICK FACT — the two persistent `[1, CHAIN_IDX_BLOCK]`
-/// SENUINT32 sources the ChainStage WRITES each step and the EmbedRowGather
-/// READS the next, read off the minted node's own inputs (inputs 1 and 2,
-/// past the pick), plus the node's own stated entry count `k` (the seeds'
-/// lane-pattern modulus), the gather's own stated `hidden` (the l seed's LANE
-/// RAMP modulus — `64·(i mod (hidden/64)) + l`), and the gather's own stated
-/// `replaces` (the row the chain replaced — the stamp's resident excuse and
-/// the binding check's truth read the SAME id the mint stated) — all read
-/// from the SAME payload the mint stated, never re-derived here. THE ONE
-/// DERIVATION: the wiring's seed and the mint's reference answer the same
-/// ids, the same k, the same hidden, and the same replaced row, so the
-/// host's one-time stick write, the device's per-step rewrite, and the
-/// stamp's excuse cannot disagree about where the state lives, how it is
-/// patterned, or which row lost its host filler. `Unchained` is every graph
-/// the mint did not touch — the pre-mint behavior, byte-identical.
-///
-/// Call after [`load_consts_of_ir`]: that fn's one-node law errors on a second
-/// ChainStage, so this first-wins read is never asked to break a tie.
-pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
-    // The two minted nodes each state their half of the fact — the stage's
-    // inputs name the sticks and the entry count, the gather's payload names
-    // the hidden, the row it replaced — and both halves are the mint's own
-    // statements, read here once, never re-derived.
-    let Some((stage, k)) = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::ChainStage { k, .. } => Some((n, *k)),
-        _ => None,
-    }) else {
-        // No stage, no mint — the graph's own state, spelled by name.
-        return crate::wiring::ChainFact::Unchained;
-    };
-    let (hidden, replaces, block) = ir
-        .nodes
-        .iter()
-        .find_map(|n| match &n.op {
-            SubOp::EmbedRowGather { hidden, replaces } => {
-                Some((*hidden, *replaces, chain_block_cols(n, ir)))
-            }
-            _ => None,
-        })
-        .expect(
-            "chain_of_ir: a ChainStage with no EmbedRowGather — the mint splices the pair \
-             together, so a stage with no gather is a graph the mint never made",
-        );
-    crate::wiring::ChainFact::Chained {
-        chain: crate::wiring::ChainWiring {
-            s_src: stage.inputs[1].tensor.index() as u32,
-            l_src: stage.inputs[2].tensor.index() as u32,
-            k,
-            hidden,
-            replaces: replaces.index() as u32,
-            block,
-        },
-    }
-}
-
-/// The table columns a chained head's gather reads — its matrix operand's stated width: the
-/// widened table's pad at a world of one, one rank's vocabulary block when the projection is
-/// split (`mint_embed_chain`'s `block`). Read off the gather the mint spliced, never re-derived.
-fn chain_block_cols<F: RopeForm>(gather: &SubtileNode<F>, ir: &SubtileIR<F>) -> u32 {
-    ir.shape(gather.inputs[2].tensor).cols
-}
-
-/// ⭐ THE ARRANGEMENT FACTS OFF THE MINTED `Sample` NODE ALONE — the gate-side
-/// twin of the merged map [`graph_wiring`] collects from its own walk. The
-/// two agree BY CONSTRUCTION on every graph that builds: `graph_wiring`
-/// REFUSES a mark on any parameter outside the sampler's own staged set (the
-/// load-const tables — the only stagers that carry an
-/// arrangement), so a graph that wires has NO mark outside the Sample node,
-/// and lowering that one node here states the same map the wiring baked. The
-/// bake's numeric gate calls this so its staged bytes are the worker's bytes.
-///
-/// ⛔ ONLY THE SAMPLE NODE IS LOWERED, deliberately: the gate runs per bundle
-/// during the bake, and re-lowering the whole graph per gate run would double
-/// the build's expensive half. The kernel memo is process-wide, so the
-/// sample kernel itself compiles once.
-pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
-    ir: &SubtileIR<F>,
-    // The graph's query extents, minted by the bake — threaded to the node walk, never
-    // re-derived from graph rows (see [`graph_wiring`]'s own parameter note).
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
-) -> Result<
-    std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
-    SuperDscError,
-> {
-    let mut out = std::collections::BTreeMap::new();
-    for node in ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::Sample { .. }))
-    {
-        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows) {
-            NodeLowering::Ops(v) => v,
-            NodeLowering::HostRouted(_) => continue,
-            NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
-        };
-        for e in ops {
-            let Some(k) = e.ktir else { continue };
-            out.extend(
-                ktir_superdsc::emit::whole_function::staggered_sources::<ktir_core::ddl_binds::Baked>(&k)
-                    .map_err(|e| SuperDscError(e.message))?,
-            );
-        }
-    }
-    Ok(out)
-}
-
-/// ⭐⭐⭐ THE SAMPLER'S PER-STEP SEAT — the mint's own facts for the two
-/// sources the token draw reads FRESH EVERY DECODE STEP, read off the minted
-/// `Sample` node the same way [`load_consts_of_ir`] reads its tables: THE ONE
-/// DERIVATION, so the wiring's seat and the mint cannot disagree (the
-/// `weight_copies` one-mint law). Everything downstream is op-blind: the class
-/// ([`crate::wiring::SampleSeat`]) names the contract, and the consumers —
-/// the expansion's source-completeness gate and the worker's per-step bind —
-/// read the class, never the node.
-///
-/// ⛔ THE SEAT IS A CLASS APART FROM EVERY OTHER SOURCE. A weight stages once
-/// at load; a load-const stages once at load; an activation is bound before
-/// the launch that reads it. The seed words and inv_t go STALE the moment a
-/// step completes — the seed's step word is the step's own freshness — so the
-/// gate counts them as filled ONLY when bound THIS STEP, and a decode launch
-/// without a fresh bind of EVERY SEAT OPERAND refuses loudly (the PrefixMask
-/// precedent), never a held default: a held seed row is a held TOKEN.
-///
-/// ⭐ EACH SEED WORD TABLE'S ROW STRIDE is the placement's own law, not a
-/// restatement: `seed_row_words` = `row_footprint_bytes(1, SenUint32) / 4` —
-/// the same pub derivation the placement's reservation calls (a `[rows, 1]`
-/// i32 table reserves like every u32 tensor, 32-element sticks, one stick per
-/// row), so the worker's per-row write and the placement's per-row
-/// reservation can never drift. The word of row `r` in table `k` lands at
-/// that table's word `r · seed_row_words` — the STICK HEAD the Col operand
-/// mode reads (the int-bcast leg's measured law). The emulator is
-/// memref-faithful (each table packed `rows × 1` words); the card seat writes
-/// each word at its own table's stick head, the reservation's own stride.
-/// ⭐⭐ THE GATE ALONE (`seed_words[3]`, the quadruple's fourth word) reserves
-/// the CONVERT's device sweep instead — `gate_row_words` = 64 words, the β
-/// ruling's own stride ([`crate::wiring::SampleSeat::gate_row_words`]) —
-/// because its chain crosses the i32→f32 convert and the sweep, not the
-/// one-stick footprint, is what the placement must hold.
-///
-/// A second minted node is the same build error the load-const list states —
-/// two mints ran over one graph — never last-write-wins.
-pub fn sample_seat_of_ir<F: RopeForm>(
-    ir: &SubtileIR<F>,
-) -> Result<Option<crate::wiring::SampleSeat>, SuperDscError> {
-    let mut mints = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::Sample { .. }));
-    match (mints.next(), mints.next()) {
-        (None, _) => Ok(None),
-        (Some(_), Some(_)) => Err(SuperDscError(
-            "two Sample nodes in one graph — the mint appends exactly one to a rung; a second \
-             means two mints ran over one graph"
-                .to_string(),
-        )),
-        (Some(node), None) => {
-            let SubOp::Sample { vocab, rows } = node.op else {
-                unreachable!("the filter matched a Sample")
-            };
-            assert_eq!(
-                node.inputs.len(),
-                26,
-                "the Sample node's arity is the registry's own row (logits + four seed word \
-                 tables + inv_t + twenty tables)"
-            );
-            // ⭐ FOUR SEED WORD TABLES, each `[rows, 1]` i32 — the auditor's
-            // wall-4 ruling (a), the row word dropped from the key by the P3
-            // localization ruling (2026-10-27): the hash is request-owned
-            // alone, so a request draws the same noise in any row. The Col
-            // operand mode that broadcasts a
-            // per-row word reads the STICK HEAD ALONE (the int-bcast card
-            // leg's measured law: a word at stick word k would be mis-read as
-            // word 0), so the cornered `[1, 1]`-window-of-`[rows, 5]`
-            // spelling the fold first carried is unpronounceable — every word
-            // rides its own one-stick-per-row table, `invt`'s own class,
-            // loaded corner-free at `[pid, 0]`.
-            let mut seed_words = [0u32; 4];
-            for (k, tid) in seed_words.iter_mut().enumerate() {
-                let word_tid = node.inputs[1 + k].tensor;
-                let word_shape = ir.tensors[word_tid.index()];
-                assert_eq!(
-                    word_shape.cols,
-                    1,
-                    "the seed word table t{} is {} wide, not the one word of its own \
-                     `[rows, 1]` class — the mint and the seat disagree on the seed's shape",
-                    word_tid.index(),
-                    word_shape.cols
-                );
-                *tid = word_tid.index() as u32;
-            }
-            // THE ONE LAW, shared with the placement's reservation: each word
-            // table is a `[rows, 1]` SenUint32 tensor, and its row stride is
-            // the footprint's own width. `u32` cast is lossless (the footprint
-            // is 32 words at every admitted shape — a whole 32-element stick).
-            let seed_row_words = (row_footprint_bytes(1, Df::SenUint32) / 4) as u32;
-            // ⭐⭐⭐ THE GATE'S OWN STRIDE — the β ruling (front-b-noise, auditor
-            // 2026-10-27): the quadruple's fourth table (inputs[4]) crosses the
-            // i32→f32 convert, so its reservation is the convert's own device
-            // sweep — `DeviceWidth::for_convert(1)` = 64 words, TWO u32 sticks
-            // per row — against the other three's one. The SAME one decision the
-            // layout's `nbytes` reserves and the door sweeps, stated here on the
-            // seat so the worker's staging and the placement cannot drift.
-            let gate_row_words = DeviceWidth::for_convert(1).get();
-            // ⭐ THE IDX STICK'S OWN ROW SIZE — the readback's typed byte law.
-            // The mint re-points the rung's result at the Sample node's own
-            // output, the `[rows, SAMPLE_BLOCK]` SenUint32 idx stick, and the
-            // readback reads that stick's own PLACED ROW: one u32 word per
-            // element, so the seat states the placed width itself in words —
-            // the worker's readback size and its per-row addressing both read
-            // this one fact, never a recomputed `64 · 4`. (NOT
-            // `row_footprint_bytes`: the footprint's occupancy pad is a
-            // WEIGHT-STREAMING reservation — the readback reads the placed
-            // row, never the pad, so the two deliberately differ.)
-            let idx_row_words = ir.tensors[node.output.tensor.index()].cols;
-            Ok(Some(crate::wiring::SampleSeat {
-                seed_words,
-                invt: node.inputs[5].tensor.index() as u32,
-                rows,
-                // inputs[0] is the LOGITS row — kept placed by the mint while
-                // the RESULT is re-pointed at the idx stick (the struct's own
-                // doc): the tid the worker reads the launch's logits through.
-                row: node.inputs[0].tensor.index() as u32,
-                vocab,
-                pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
-                seed_row_words,
-                gate_row_words,
-                idx_row_words,
-            }))
-        }
-    }
-}
-
 /// ⭐ THE RESULT'S OWN DTYPE, from the RESULT PRODUCER'S OWN KERNEL SIGNATURE —
 /// the same `operand_dfs` authority the placement widths already read (the
 /// registry's operand-order contract zips the kernel's buffer parameters with
@@ -2384,16 +1310,13 @@ pub fn result_dtype_of_ir<F: RopeForm>(
             )
         })
         .and_then(|(_, df)| match df {
-            ktir_superdsc::superdsc_opspec::Df::Fp16 => Ok(scratchy_tensors::DType::F16),
-            ktir_superdsc::superdsc_opspec::Df::Bf16 => Ok(scratchy_tensors::DType::BF16),
-            ktir_superdsc::superdsc_opspec::Df::Fp32 => Ok(scratchy_tensors::DType::F32),
-            ktir_superdsc::superdsc_opspec::Df::Fp8 => Ok(scratchy_tensors::DType::Fp8E4m3),
-            // The door's own mapping law states an i32 buffer as SenUint32; the
-            // consumer reads raw LE int32 words either way.
-            ktir_superdsc::superdsc_opspec::Df::SenUint32 => Ok(scratchy_tensors::DType::I32),
-            ktir_superdsc::superdsc_opspec::Df::SenInt8 => Err(SuperDscError(
-                "the result's kernel states an int8 output, which no consumer reads back \
-                 today — state a dtype the readback knows (f16, bf16, f32, fp8, i32)"
+            spyre_superdsc::format::DataFormat::Fp16 => Ok(scratchy_tensors::DType::F16),
+            spyre_superdsc::format::DataFormat::Fp32 => Ok(scratchy_tensors::DType::F32),
+            spyre_superdsc::format::DataFormat::Fp8 => Ok(scratchy_tensors::DType::Fp8E4m3),
+            spyre_superdsc::format::DataFormat::UInt32 => Ok(scratchy_tensors::DType::I32),
+            spyre_superdsc::format::DataFormat::Int64 => Err(SuperDscError(
+                "the result's kernel states an int64 output, which no consumer reads back — \
+                 state a dtype the readback knows (f16, f32, fp8, i32)"
                     .to_string(),
             )),
         })
@@ -2434,7 +1357,7 @@ pub fn node_output_on_f16_stick<F: RopeForm>(
             node.op
         )
     };
-    matches!(df, ktir_superdsc::superdsc_opspec::Df::Fp16)
+    matches!(df, spyre_superdsc::format::DataFormat::Fp16)
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -2444,7 +1367,7 @@ pub fn node_output_on_f16_stick<F: RopeForm>(
 /// `lower_one_node`); post-loop Computes → `suffix`. Collects the per-layer tid map
 /// (`Compute::per_layer_out` for outputs + `ComputeInput::External::per_layer` for
 /// weights) for the executor's per-iteration address advance.
-pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+pub fn lower_subtile_tape_to_ktir<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     tape: &scratchy_subtile::subtile_tape::SubtileTape,
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -2459,11 +1382,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let _pc = crate::pc::Pc::start("producer");
-    // ⭐ THE GEMM WEIGHTS' HOST PAIRS — the union of each weight's matmul consumers'
-    // view regions, computed ONCE here: the wiring's `tensor_shapes` and the
-    // three-width-laws check's worker law both read this map, so the host pair
-    // cannot drift between them (see [`gemm_weight_host_pairs`]' law).
-    let host_pairs = gemm_weight_host_pairs(ir)?;
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
     // so the matmul splitter would not need the fact in its signature. That made the kind ambient: no
@@ -2659,8 +1577,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // body→suffix seam must thread hidden_out → suffix_in at runtime (else the suffix
     // reads an unwritten slot = 0 → rmsnorm(0)=inf → garbage logits).
     let mut first_suffix_node: Option<u32> = None;
-    // Matmul KERNEL weights (layer-0 tid, in=k, out=n) for the device re-tile manifest.
-    let mut kernel0: Vec<(u32, u32, u32)> = Vec::new();
     // The CURRENT body's first/last Compute node, reset at each OpenLoop and folded into that
     // body's hidden tids at its CloseLoop.
     let mut cur_first: Option<u32> = None;
@@ -2717,103 +1633,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                 ..
             } => {
                 let n = &ir.nodes[node.index()];
-                // ⛔⛔⛔ THE GEMM-WEIGHT MANIFEST GATE — EXHAUSTIVE BY CONSTRUCTION (W29).
-                //
-                // The classification comes from the REGISTRY (`SubOp::gemm_weight_input` — one
-                // row per op, a new gemm kind is a compile error until it answers), and this
-                // collection is EXHAUSTIVE OVER IT: every op that carries a gemm weight must
-                // land in one of the named arms below, and one that does not REFUSES THE BAKE.
-                //
-                // WHY REFUSE, AND WHY HERE: the three arms below were held together only by the
-                // "every weight crosses the m=1 util floor" assumption, and the router broke
-                // that silently. `RouterLogits`' `[E,hidden]` projection was EXCLUDED from the
-                // kernel-weight manifest, so the shim's `None` arm staged the checkpoint's
-                // row-major bytes VERBATIM into the stick-tiled slot the gemm addresses: the
-                // 26b card computed `A @ perm(W)` — right ranking form, wrong experts
-                // ([113,122,28,0,…] vs host [102,79,114,92,…]) → junk (root-caused + on-card
-                // 2026-10-13). The same exclusion class had already fired once before as the
-                // fp8 arity gap (arity-2-only collection → flat-staged fp8 weights → scrambled
-                // `scr chat`, 2026-07-16). A THIRD kind would fire the same way and nothing
-                // downstream would say so — the emulator reads a weight through the program's
-                // row-major transpose-B `indexing_maps`, not through the card's per-core stick
-                // addressing, so a staging-layout defect is numerically INVISIBLE to every emu
-                // suite. THE BLIND SPOT THIS GATE COVERS: the bake-time numeric-equivalence
-                // gate runs the EMULATOR build, and the emulator never executes hardware
-                // staging — so the numeric gate cannot see staging defects at all. This gate
-                // (exhaustiveness + the width-law agreement below) is the coverage for exactly
-                // that hole: it refuses at BAKE, from the bake's own data, before any card or
-                // emulator runs.
-                //
-                // Collect matmul KERNEL weights for the device re-tile manifest: w =
-                // inputs[1] is [k,n]=[in,out] row-major; the PT array needs the device
-                // tile layout [out/64, in, 64]. in=A.cols (k), out=output.cols (n).
-                // Arity-3 fp8 W8A8 matmuls MUST be collected here too: their weight (inputs[1]; inputs[2] is
-                // w_scale) needs the 1-byte packed RetileDescriptor from the `fp8_weight_tids` branch below.
-                // in_k/out derive identically (inputs[0].cols=k, output.cols=n); the
-                // KSPLIT branch (out>16384) never fires for fp8 projs.
-                match n.op.gemm_weight_input() {
-                    // kernel0-collected: the dense gemms — W = inputs[1].
-                    Some(1)
-                        if matches!(n.op, SubOp::MatmulTile { .. })
-                            && (n.inputs.len() == 2 || n.inputs.len() == 3) =>
-                    {
-                        kernel0.push((
-                            n.inputs[1].tensor.index() as u32,
-                            n.inputs[0].region.cols.len,
-                            // DEVICE out extent via the TYPE-SAFE `DeviceWidth` — the SAME rule as the
-                            // worker's weight zero-pad and the slot reservation, so the RetileDescriptor
-                            // device_size, the per-core address, and the staged buffer agree by
-                            // construction (granite lm_head 49159→49664).
-                            //
-                            // ⭐ `for_pointwise` — the UNCONDITIONAL bump — NOT `for_output(m,·)`: the
-                            // staged buffer is ONE per model (the worker binds it once; each bucket's
-                            // session stages or borrows it), so its width must be m-INDEPENDENT, and the
-                            // slot reservation already sizes every gemm weight at this same unconditional
-                            // bump (`bump_sticks_to_splittable` on the cols, lower_subtile_tape_to_superdsc).
-                            // For any weight crossing the util floor at m=1 — every dense weight — the two
-                            // laws are IDENTICAL at every bucket (both bump), so those manifests are
-                            // byte-identical to before.
-                            DeviceWidth::for_pointwise(n.output.region.cols.len).get(),
-                        ));
-                        // KSPLIT fp32-merge (lm_head first-test, n>16384): the split weight ALSO needs B
-                        // block-weight descriptors `[KB,N]` under reserved tids `ksplit_block_tid(b)`, matching
-                        // the emit branch's block matmuls. Same gate + condition. The kernel0 descriptor loop
-                        // below builds each as `[dev_out/64, KB, 64]` (in=KB) — exactly the block matmul's read
-                        // (`ksplit_block_weight_kslice_offset_matches_read`). Worker gathers the K-slice bytes.
-                    }
-                    // The router's gemm has no per-op card path — the MoE lowers only
-                    // from `kernels/moe.py` through KTIR; the worklist below refuses
-                    // the op itself, nothing to collect.
-                    Some(1) if matches!(n.op, SubOp::RouterLogits { .. }) => {}
-                    // Bank-staged no longer: the gathered expert gemm has no per-op
-                    // card path (the MoE lowers only from `kernels/moe.py` through
-                    // KTIR); the worklist below refuses the op itself, nothing to
-                    // collect.
-                    Some(2) if matches!(n.op, SubOp::ExpertMatmul { .. }) => {}
-                    // Carries a gemm weight but has no SuperDSC kernel — the worklist below
-                    // refuses the op itself; nothing to collect.
-                    Some(2) if matches!(n.op, SubOp::AllRowsMatmul) => {}
-                    // ⛔ A GEMM WEIGHT OUTSIDE THE COLLECTED SET — the router-defect class,
-                    // refused at bake. A gemm whose weight never lands in the kernel0 manifest
-                    // is staged by the shim's `None` arm (verbatim bytes into a stick-tiled
-                    // slot): right ranking form, wrong elements, junk on the card, green on
-                    // every emulator.
-                    Some(pos) => {
-                        let msg = format!(
-                            "reroll-superdsc: op {} (t{}) carries a GEMM WEIGHT at input \
-                             {pos} but the kernel-weight manifest does not collect its kind — \
-                             its weight would be staged VERBATIM into a stick-tiled slot (the \
-                             26b router-defect class: `A @ perm(W)`, junk on the card, invisible \
-                             to the emulator). Add the kind to the kernel0 collection or give it \
-                             its own staging arm in `SubOp::gemm_weight_input`",
-                            n.op.name(),
-                            n.output.tensor.index()
-                        );
-                        eprintln!("[spyre-gemm-weights] REFUSING TO BAKE: {msg}");
-                        return Err(SuperDscError(msg));
-                    }
-                    None => {}
-                }
                 if seg >= 1 && seg <= loops.len() {
                     let bi = seg - 1;
                     let iters = bodies[bi].iters;
@@ -2849,30 +1668,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                                 .entry(tensor.index() as u32)
                                 .or_insert_with(|| pl.iter().map(|t| t.index() as u32).collect());
                         }
-                    }
-                    // RESIDENT kct per-layer registration (kill-the-restickify residency): the score reads a
-                    // per-layer RESIDENT Kᵀ kernel `kct_resident_tid(k_id)`. It's neither an External nor a node
-                    // output, so the loops above never add it — insert it manually: map each layer's
-                    // K-cache source tid k_Lv → kct_resident_tid(k_Lv), keyed under the layer-0 kct tid.
-                    // REQUIRED so the launch-table guard validates kct's per-layer offset matches k/v — the
-                    // executor shifts seg2 by the launch's kv_off for every op, so a kct packed out of step
-                    // with k/v would SILENTLY read the wrong layer (runtime-errors-need-compile-
-                    // time-checks). per_layer[k_id] was just inserted by the External loop above.
-                    if let SubOp::AttnDecode { layout: kv, .. } = &n.op
-                        && iters > 1
-                        && let Some(k_layers) =
-                            per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
-                        && k_layers.len() as u32 == iters
-                    {
-                        let kct_tids: Vec<u32> = k_layers
-                            .iter()
-                            .map(|&k_lv| kct_resident_tid(k_lv))
-                            .collect();
-                        body_representatives[bi]
-                            .push(kct_resident_tid(kv.cache_tensor().index() as u32));
-                        per_layer
-                            .entry(kct_resident_tid(kv.cache_tensor().index() as u32))
-                            .or_insert(kct_tids);
                     }
                     // ⭐ THE CLASS'S LAYER IDS, from its OWN rope table: the body's RopeAppend node
                     // (the KV writer — "a layer is named by its KV writer") carries `per_layer_out`
@@ -2973,272 +1768,26 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     }
     let launches: Vec<(u8, u32)> = order.iter().map(|&(b, i, _)| (b, i)).collect();
     let launch_layer: Vec<u32> = order.iter().map(|&(_, _, l)| l).collect();
-    // ⛔⛔⛔ THE SHARED PLAN IS COMPLETED HERE, BEFORE ANY BUNDLE CAN SNAPSHOT IT.
-    //
-    // MEASURED, granite-3.1-2b on the card: main's decode bundle places rmsnorm scratch for tids
-    // {448, 458, 1128}; ours placed {448, 458}. t1128 is the FINAL `model.norm` — the lm-head tail,
-    // which lives in the SUFFIX bundle. Every other placement and every segment but seg0 was
-    // byte-identical to main; seg0 was short by exactly one rmsnorm's five scratch buffers
-    // (Sq16 4096 + Xn 4096 + Mean/Meps/Rinv 128 each = 8576 B at m=1, and 67 sticks × (3n − 2) across
-    // the whole ladder).
-    //
-    // WHY, and it is an ORDERING fact, not a lowering one. `subtile→superdsc` declares a synthetic
-    // intermediate during the TAPE WALK — main's `lower_rmsnorm_node` calls `assemble_rmsnorm`, which
-    // calls `BundleLayout::synth`, for prefix, body AND suffix nodes alike — so its layout is complete
-    // before the first `emit_bundle`. On this path the producer emits only a KTIR program, and
-    // `assemble_rmsnorm` runs LATER, in the consumer (`ktir_groups_via_superdsc`), once per bundle.
-    // `emit_bundle` then does `layout.map(bake_layout)` right after lowering ITS OWN ops, and codegen
-    // emits prefix → body → suffix. So the BODY's snapshot — which is the layout the RUNTIME loads,
-    // sizes its segments from and resolves every address through — held the prefix's and the body's
-    // synths and none of the suffix's.
-    //
-    // The suffix's descriptors were built against the suffix's own later, complete snapshot, so they
-    // address seg0 past the extent the runtime allocated from the body's. That is a DMA to an address
-    // with no IOMMU translation behind it on the very first forward (the suffix runs in every one),
-    // which the card answers with a response block carrying `status=Error`, reported as
-    // `scheduler rejected submission` and then a bare `predict: sync rc=-1` naming no operand. It is
-    // also why a descriptor-footprint audit beside the emitter was silent: at the moment the suffix's
-    // ops were checked, the suffix's own snapshot did contain them.
-    //
-    // ⭐ THIS DECLARES, IT DOES NOT EMIT. `BundleLayout::synth_bytes` is first-one-wins, so running
-    // the consumer over prefix → body → suffix here fixes every synthetic's offset in the SAME order
-    // the tape walk would have, and the real pass in `ktir_groups_via_superdsc` finds each one already
-    // declared and resolves the identical address. The symbol counter and the fp8-quantize set are
-    // throwaways because only the layout is wanted; the descriptors are dropped.
-    // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
-    // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
-    let attn_params = attn_bundle_params(ir, rows_are_requests);
-    // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
-    // declared them in, so every synthetic's first-one-wins offset is fixed identically.
-    let pools = crate::lower_subtile_tape_to_superdsc::kv_pool_tids(ir);
-    let body_op_lists: Vec<&Vec<EmittedOp<T>>> = bodies.iter().map(|b| &b.ops).collect();
-    for ops in std::iter::once(&prefix)
-        .chain(body_op_lists.iter().copied())
-        .chain(std::iter::once(&suffix))
-    {
-        let mut declare_syms: i64 = 0;
-        // The declaring pass mints what the real one will, so it threads the same per-bundle set.
-        let mut declare_fp8 = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
-        for e in ops.iter() {
-            let Some(k) = e.ktir.as_ref() else { continue };
-            // An emulator bake leaves the KV cache to the emulator — the KTIR's own buffers
-            // ([`crate::lower_subtile_tape_to_superdsc::kv_pool_tids`], placed on a card bake
-            // only) — so a program binding it has no card plan to declare into there. A card
-            // bake declares every program.
-            if !cfg!(feature = "spyre-lower") && k.bindings.iter().any(|b| pools.contains(&b.get()))
-            {
-                continue;
-            }
-            crate::ktir_superdsc_door::lower::<T>(
-                k,
-                &mut declare_syms,
-                Some(&bundle_layout),
-                attn_params,
-                &mut declare_fp8,
-            )
-            .map_err(|err| {
-                SuperDscError(format!(
-                    "{}: declaring the shared plan's synthetics: {}",
-                    e.op_name, err.message
-                ))
-            })?;
-        }
-    }
-    // Device re-tile manifest: each matmul kernel weight (layer 0) + its per-layer
-    // copies → a RetileDescriptor built SOLELY from the DeviceTileLayout witness (the
-    // SAME source per_core_addr uses for the stride), so the shim's host re-tile and the
-    // on-card per-core address cannot diverge. KERNEL layout = [in,out] sticked on out.
-    // fp8 W8A8 weights (`input[1]` of an arity-3 MatmulTile) stage 1-byte / 128-elem stick (SEN143_FP8);
-    // dense weights stay fp16 2-byte / 64-stick. The shim reads `word_length` from this descriptor to
-    // size the H2D re-tile, so an fp8 weight MUST carry the fp8 descriptor or it is staged as 2-byte.
-    let fp8_weight_tids: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-        .map(|n| n.inputs[1].tensor.index() as u32)
-        .collect();
-    for (w_tid, in_k, out_n) in &kernel0 {
-        let desc = if fp8_weight_tids.contains(w_tid) {
-            // fp8 W8A8 weight = the AIU matmulfp8 PACKED tile. Each 128-byte stick holds 64 N-cols each
-            // carrying its 2 K-bytes BYTE-ADJACENT — the matmulfp8 in-fold (gen_fp8_kernel_in_fold) reads the
-            // 2-pack as "2 fp8 per fp16-width slot, CONTIGUOUS". Device order (outer→inner):
-            // [N/64 n-sticks, K/2 k-pairs, 64 n-inner, 2 k-inner]; device[n_stick][k_outer][n_in][k_inner] =
-            // host[64·n_stick + 2N·k_outer + n_in + N·k_inner] = weight[2·k_outer+k_inner][64·n_stick+n_in].
-            // The [.,.,2,64] order (2 K-rows as two separate 64-N blocks) and a FLAT 128-stick layout BOTH
-            // scramble the weights → garbage; only this [.,.,64,2] order runs coherent (on-card 2026-07-16,
-            // `scr chat` → "Paris"). (K even + N%64==0 hold for every granite fp8 proj.)
-            // ⭐ THE fp8 K-PAD (`work::fp8_k_pad`) — the whole-stick law, ONE authority: the
-            // activation quantize's tail, the worker's staged rebuild, the placement's reserved
-            // rows, and this packed retile's K all take the SAME pad. A dense fp8 weight whose k
-            // is not a whole 128-elem stick (gemma-4-26b's dense GeGLU DOWN: k=2112 = 16.5
-            // sticks) widens to 2176 — the extra 64 K-rows are ZERO on the host, real staged
-            // bytes, inert to the contraction. Without the pad the retile enumerates n·k elements
-            // against the worker's n·k_pad staged rebuild, and the matmul's k_pad-wide tile read
-            // overruns the staged buffer. A no-op at every 128-aligned k (granite, g8b, g12b —
-            // byte-identical staging).
-            let k = fp8_k_pad(*in_k) as u64;
-            let n = *out_n as u64;
-            if !k.is_multiple_of(2) || !n.is_multiple_of(64) {
-                return Err(SuperDscError(format!(
-                    "fp8 W8A8 weight t{w_tid}: packed tile needs K({k})%2==0 and N({n})%64==0"
-                )));
-            }
-            RetileDescriptor {
-                device_size: vec![n / 64, k / 2, 64, 2],
-                // DISK ORDER, like the fp16 tile below. The worker no longer transposes, so this map
-                // reads the `[out, in]` buffer safetensors stores. Converting it is mechanical: a term
-                // that stepped an IN index by `x` was `x*n` against `[in, out]` and becomes `x*1`; a
-                // term that stepped an OUT index by `y` was `y*1` and becomes `y*k`. So
-                // `[64, 2n, 1, n]` → `[64k, 2, k, 1]`, which resolves `host[o*k + i]` for every
-                // coordinate (checked exhaustively against the transposed map's `host[i*n + o]`).
-                //
-                // MISSING THIS BRANCH is what made granite-3.1-8b emit garbage: it is fp8, so its
-                // GEMM weights come through here and not the fp16 path, and they were still being read
-                // as though something had transposed them.
-                stride_map: vec![64 * k, 2, k, 1],
-                stick_size: Fp8::ELEMS_PER_STICK,
-                word_length: Fp8::WORD_LENGTH,
-            }
-        } else {
-            let tile = DeviceTileLayout::<Fp16>::new(
-                &["in", "out"],
-                "out",
-                &[*in_k as u64, *out_n as u64],
-            )?;
-            RetileDescriptor {
-                device_size: tile.device_size(),
-                // DISK ORDER: the worker binds a GEMM weight in the `[out, in]` orientation
-                // safetensors stores it, so the re-tile reads it there rather than from a transposed
-                // copy. Same elements, one fewer pass over the model at load.
-                stride_map: tile.stride_map_disk_order(),
-                stick_size: Fp16::ELEMS_PER_STICK,
-                word_length: Fp16::WORD_LENGTH,
-            }
-        };
-        // ⛔⛔⛔ THE THREE WIDTH LAWS, HELD EQUAL AT BAKE (the staging-consistency guard, W29).
-        //
-        // For every gemm weight the manifest declares — the entry AND each of its per-layer
-        // copies — three independent laws must name the SAME device width, and each is computed
-        // here from the bake's own data:
-        //   1. THE MANIFEST'S: `out_n`, the width this loop declares in the RetileDescriptor
-        //      (`DeviceWidth::for_pointwise` over the gemm's output cols, at the collection).
-        //   2. THE WORKER'S: `DeviceWidth::for_pointwise` over the weight TENSOR's own cols —
-        //      the law `spyre_load.rs`'s N-pad applies to the same source (the wiring's
-        //      `[rows, cols]` pair is generated from these shapes). A gemm whose output region
-        //      names a different width than the weight tensor it reads (a sliced output, a
-        //      manifest/wiring shape desync) stages a buffer the manifest's tile does not
-        //      cover — the shim's `prod(device_size)` byte check would fire at LOAD, on the
-        //      card, after the build said yes.
-        //   3. THE SLOT RESERVATION'S: the bytes this bake placed for the tensor
-        //      (`compute_bundle_layout`'s `rows · bump(cols) · word_length`) must COVER
-        //      the manifest's `prod(device_size) · word_length` — at least, not exactly:
-        //      the reservation pads the weight's innermost stick dim to the DEVICE's
-        //      whole-stick footprint (fp8 is a 128-elem stick — the 26b's dense gate/up
-        //      at n=2112 = 16.5 sticks reserves 2176 cols), and over-reservation is the
-        //      documented safe direction (the retile's staging guard reads the WORKER's
-        //      bytes; `lower_subtile_tape_to_superdsc`'s own fp8 K-pad comment). UNDER-
-        //      reservation is what aliases — the t35 class the fp8 K-pad rows law fixed
-        //      (access 6,127,616 B vs placement 5,947,392 B). The K the manifest contracts
-        //      (fp8 weights take `fp8_k_pad`, the same whole-stick law the reservation's rows
-        //      take) times the same width. They were held together only by the "every weight
-        //      crosses the m=1 util floor" assumption, which the router broke silently: its
-        //      slot was reserved at the pointwise floor (512) while the excluded manifest
-        //      staged the checkpoint's 128-wide bytes verbatim — over-addressed the slot by
-        //      the retile, wrong experts, junk. The check is pure compile-time arithmetic on
-        //      the bake's own placements and descriptors; it needs no emulator run (and the
-        //      emulator could not witness it — see the gate at the collection above).
-        {
-            let wl = desc.word_length as u64;
-            // ⛔ THE DESYNC GUARD — the collection pushes only MatmulTile-consumed
-            // primaries, and the map's key set is exactly that same set (the two walks
-            // share one gate), so a primary missing from the map is a two-walk
-            // disagreement, refused by name. Per-layer copies never reach this refusal:
-            // they enter through the `tids` chain below and are never at any node's
-            // inputs, so no copy tid can be in the map.
-            if !host_pairs.contains_key(w_tid) {
-                return Err(SuperDscError(format!(
-                    "reroll-superdsc: gemm weight t{w_tid} was collected from a MatmulTile \
-                     but the host-pair walk finds no consumer for it — the collection and \
-                     the walk disagree, and the host pair law has no region to read"
-                )));
-            }
-            let manifest_bytes = desc.device_size.iter().product::<u64>() * wl;
-            let mut tids = std::iter::once(*w_tid)
-                .chain(per_layer.get(w_tid).into_iter().flatten().copied())
-                .collect::<Vec<u32>>();
-            tids.sort_unstable();
-            tids.dedup();
-            for t in tids {
-                // The op that reads this weight, by name — the refusal's own provenance.
-                let op_name = match ir
-                    .nodes
-                    .iter()
-                    .find(|n| n.inputs.len() > 1 && n.inputs[1].tensor.index() as u32 == t)
-                {
-                    Some(n) => n.op.name(),
-                    None => "gemm",
-                };
-                // ⭐ THE WORKER'S LAW READS THE HOST PAIR — the union of the matmul
-                // consumers' view regions (the same one map the wiring's `tensor_shapes`
-                // states) — never the tensor's stated cols: the widen states the pad
-                // extent for the placement and the gather while the host stages the
-                // region. A per-layer copy has no MatmulTile of its own in the rolled
-                // graph, so it deliberately misses the map and keeps its stated pair.
-                let worker_w = DeviceWidth::for_pointwise(
-                    host_pairs
-                        .get(&t)
-                        .map(|&(_, cols)| cols)
-                        .unwrap_or(ir.tensors[t as usize].cols),
-                )
-                .get();
-                let slot = bundle_layout.placements.get(&t);
-                let slot_desc = match slot {
-                    Some(p) => format!("{} bytes (expected at least {manifest_bytes})", p.size),
-                    None => "NO PLACEMENT".to_string(),
-                };
-                let refuse = |what: &str| -> SuperDscError {
-                    let msg = format!(
-                        "reroll-superdsc: gemm weight t{t} of {op_name}: the staging width \
-                         laws disagree — {what}. The manifest declares {out_n}, the worker's \
-                         N-pad law says {worker_w}, the slot reservation holds {slot_desc}. A \
-                         divergence stages a buffer the device tile does not cover (or \
-                         under-covers): the router-defect class, wrong elements on the card, \
-                         invisible to the emulator. All three laws must be \
-                         `DeviceWidth::for_pointwise` over the same logical width, and the \
-                         reservation must hold at least prod(device_size)·word_length bytes"
-                    );
-                    eprintln!("[spyre-gemm-weights] REFUSING TO BAKE: {msg}");
-                    SuperDscError(msg)
-                };
-                if worker_w != *out_n {
-                    return Err(refuse(
-                        "the gemm's output width and the weight tensor's own cols disagree",
-                    ));
-                }
-                match slot {
-                    None => {
-                        return Err(refuse("the bake reserved no placement for the weight"));
-                    }
-                    Some(p) if p.size < manifest_bytes => {
-                        return Err(refuse(
-                            "the placement under-reserves the manifest's tile (aliases the next placement)",
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-        bundle_layout.kernel_weights.insert(*w_tid, desc.clone());
-        if let Some(layers) = per_layer.get(w_tid) {
-            for &t in layers {
-                bundle_layout.kernel_weights.insert(t, desc.clone());
-            }
-        }
-    }
-    let seg3 = SegRole::Intermediate.segment();
-    let synth_high = bundle_layout.synth.borrow().high_water();
-    if synth_high > bundle_layout.segment_bytes[seg3] {
-        bundle_layout.segment_bytes[seg3] = synth_high;
+    // ⭐ THE RUNG'S PLAN IS COMPLETED HERE, BEFORE ANY BUNDLE CAN SNAPSHOT IT: every program of
+    // the rung (prefix, every body, suffix) is planned against the one layout, which then places
+    // what the plans need — each staged weight's held layout, the constant sticks, and the scratch
+    // every program's intermediates are packed into. The runtime loads ONE bundle's layout for a
+    // session and launches every sibling against it, so a sibling's needs placed only in its own
+    // snapshot would be addressed past the session's allocation.
+    if cfg!(feature = "spyre-lower") {
+        let all = prefix
+            .iter()
+            .chain(bodies.iter().flat_map(|b| b.ops.iter()))
+            .chain(suffix.iter());
+        crate::superdsc_lower::place_rung(all, &mut bundle_layout).map_err(SuperDscError)?;
+        // A body's per-layer weights are its layer-0 weight's copies: each is staged in the same
+        // held layout, by the same walk.
+        let copies: Vec<(u32, RetileDescriptor)> = per_layer
+            .iter()
+            .filter_map(|(t, layers)| Some((bundle_layout.kernel_weights.get(t)?.clone(), layers)))
+            .flat_map(|(k, layers)| layers.iter().map(move |&l| (l, k.clone())))
+            .collect();
+        bundle_layout.kernel_weights.extend(copies);
     }
     // ─────────────────────────────────────────────────────────────────────────────────────────
     //  ⭐ THE LAUNCH TABLE — one `(w_bank, w_off, kv_off)` per layer, GENERATED from the
@@ -3442,15 +1991,13 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     if launches.len() > 1 {
         let per_layer_tids: std::collections::HashSet<u32> =
             per_layer.values().flatten().copied().collect();
-        let body_reads: std::collections::HashSet<&str> = bodies
+        let body_reads: std::collections::HashSet<u32> = bodies
             .iter()
             .flat_map(|b| b.ops.iter())
-            .flat_map(|e| e.arg_bindings.iter().map(|a| a.buffer.as_str()))
+            .flat_map(|e| e.ktir.bindings.iter().map(|b| b.get()))
             .collect();
         if let Some(p) = bundle_layout.placements.values().find(|p| {
-            p.segment == kv_seg
-                && !per_layer_tids.contains(&p.tid)
-                && body_reads.contains(ktir_superdsc::place::act_name(p.tid).as_str())
+            p.segment == kv_seg && !per_layer_tids.contains(&p.tid) && body_reads.contains(&p.tid)
         }) {
             return Err(SuperDscError(format!(
                 "reroll-superdsc: a layer's body reads t{}, which is placed in the KV segment \
@@ -3509,41 +2056,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         .and_then(|nid| ir.nodes[nid as usize].inputs.first())
         .map(|r| r.tensor.index() as u32)
         .unwrap_or(u32::MAX);
-    // ── DISCOVERY dump (SCRATCHY_SUPERDSC_SEGDUMP) ── which segment/tensor drives the
-    //    footprint. Emit runs at cargo-build (AoT bake), so this lands in the build log.
-    if std::env::var_os("SCRATCHY_SUPERDSC_SEGDUMP").is_some() {
-        let sb = &bundle_layout.segment_bytes;
-        let tot: u64 = sb.iter().sum();
-        eprintln!(
-            "[SEGDUMP] layers={total_layers} total={:.3}GB segs(GB)=[{}]",
-            tot as f64 / 1e9,
-            sb.iter()
-                .map(|b| format!("{:.3}", *b as f64 / 1e9))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        let mut pls: Vec<(&u32, &TensorPlacement)> = bundle_layout.placements.iter().collect();
-        pls.sort_by_key(|(_, p)| std::cmp::Reverse(p.size));
-        for (tid, p) in pls.into_iter().take(15) {
-            eprintln!(
-                "[SEGDUMP]   t{tid} seg{} role={:?} size={:.4}GB ({} B)",
-                p.segment,
-                p.role,
-                p.size as f64 / 1e9,
-                p.size,
-            );
-        }
-        let syn = bundle_layout.synth.borrow();
-        let mut szs: Vec<(&str, u64)> = syn.iter().map(|(name, _, size)| (name, size)).collect();
-        szs.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
-        for (name, s) in szs.into_iter().take(10) {
-            eprintln!(
-                "[SEGDUMP]   synth {name} size={:.4}GB ({} B)",
-                s as f64 / 1e9,
-                s
-            );
-        }
-    }
     let kv_request_stride = bundle_layout.kv_request_stride_bytes;
     Ok(RolledSuperDsc {
         prefix,
@@ -3558,7 +2070,6 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         suffix_weight_bank,
         kv_request_stride,
         suffix_in_tid,
-        attn_params,
     })
 }
 

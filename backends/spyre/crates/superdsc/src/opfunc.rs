@@ -107,6 +107,12 @@ pub enum Axis {
 }
 
 impl OpFunc {
+    /// Whether this op converts its operand's element format — its two sides hold different
+    /// sticks, and dxp's conversion templates bind them by role.
+    pub const fn converts(self) -> bool {
+        matches!(self, OpFunc::Widen | OpFunc::Narrow | OpFunc::Fp8ToFp16 | OpFunc::Fp16ToFp8)
+    }
+
     /// The `opFuncName` dxp reads.
     pub const fn wire(self) -> &'static str {
         match self {

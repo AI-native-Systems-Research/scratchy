@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: Apache-2.0
+//! OPERAND IDENTITY — what a lowered operand IS, and the one site that spells it.
+//!
+//! ⛔ THIS IS THE LOWERING'S OWN VOCABULARY, WHICH IS WHY IT IS HERE AND NOT IN THE BUNDLE. Every
+//! [`SynthRole`] names an intermediate *this lowering invents* (rope's `rot`/`xc`/`rs`, the online
+//! softmax's `newkt`/`bmax`/`corr`, the fp8 activation quantizer's `fq_*`). A third-party KTIR
+//! producer does not supply them and cannot: they exist only because a node decomposes into
+//! several device ops. So the vocabulary travels with the decomposition: a consumer's bake crate,
+//! which needs a placement for each one, re-exports these two types from here rather than declaring
+//! its own, so the bake and the lowering cannot drift.
+//!
+//! ⭐ AND IT IS THE NAMING DOOR the extraction needed. `superdsc` references an operand by NAME, so
+//! something must render one; [`PlaceId`]'s [`Display`](std::fmt::Display) is that one site, and
+//! `syn` is the one call to it. Nothing parses the rendering back — the identity is the value.
+
+use std::fmt;
+
+/// What a synthetic intermediate IS — the role it plays for the tensor it derives from.
+///
+/// ⛔ THESE ARE NOT NAME SUFFIXES. Every one of these was a `format!("{out}_rot")`-style
+/// string built at one site and matched at another, which is a join on a spelling. The role
+/// is a fact about the lowering, so it is a value; the spelling exists only in [`Display`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SynthRole {
+    // ── rope ──
+    Rot,
+    Xc,
+    Rs,
+    // ── ffn ──
+    Silu,
+    // ── attention scratch ──
+    Qs,
+    KRep,
+    VRep,
+    NewKRep,
+    NewVRep,
+    NewKScaled,
+    // ── fp8 activation quantization ──
+    FqAbsX,
+    FqAfp8,
+    FqAmax,
+    FqAmaxFl,
+    FqAscale,
+    FqChi,
+    FqCl,
+    FqInvS,
+    FqSc,
+    FqDqA,
+    FqMm,
+    FqRaw,
+    /// ⭐ ONE amax PARTIAL SLOT — the `[m, 64]` max a SINGLE time-slice of the wide reduce produced,
+    /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
+    /// of partials is the reduce's own time-tile count, known only at bake.
+    FqAmaxP(u32),
+    /// ⭐ ONE SEEDED-REDUCE PARTIAL SLOT — the `[rows, stick]` result a SINGLE time-slice of a
+    /// long reduce produced, before the per-kind combine folds them into the reduce's own accum.
+    /// Indexed (like [`Self::FqAmaxP`]) because the number of partials is the reduce's own
+    /// time-tile count, known only at bake. Minted by the ONE long-reduce split body
+    /// (`reduce::assemble_reduce_split`), under the reduce's own place — never per caller.
+    ReducePartial(u32),
+    // ── rmsnorm scratch ──
+    Sq16,
+    Mean,
+    Meps,
+    /// The GAINLESS rmsnorm's `1/√(mean+eps)` — an HBM synthetic (`assemble_rmsnorm_unit`). The
+    /// gained form's reciprocal root is an op-local LX pin, [`OpLocalRole`], not this.
+    Rinv,
+    Xn,
+    /// ⭐ THE `(1 + w)` GAIN ROW — `gamma + GAIN_OFFSET`, the OnePlusScale
+    /// convention's applied gain as ONE `[1, cols]` (plain) / `[1, d]` (windowed)
+    /// buffer the door fills with a single `add` ahead of the gain multiply. The
+    /// stored gamma row itself is never rewritten — the checkpoint's value rides
+    /// untouched, the offset is applied on the fly, the same formula the program
+    /// states.
+    Gw,
+    /// ⭐ ONE HEAD'S reduced-scalar block of the FUSED per-head norm sandwich
+    /// (`WindowedRmsNorm`) — the `[m, stick]` mean / mean+eps / reciprocal of head `h`
+    /// alone, at offset ZERO of its own buffer. Indexed (like [`Self::FqAmaxP`]) because
+    /// the head count is the sandwich's own, known only at bake; and PER-HEAD rather
+    /// than one `[H·m, stick]` buffer with offsets because a reduce's accum must sit at
+    /// a whole-block shift of its own slab for the stick-major rank-2 path (the fp8
+    /// amax-partial precedent) — a shared buffer's `h·m·stick` offsets are not
+    /// block-aligned at the reduce's `[m, D]` block, and the flat rank-3 fallback would
+    /// then read the stick-major `sq16` write scrambled. Three roles, one law.
+    HeadMean(u32),
+    HeadMeps(u32),
+    HeadRinv(u32),
+    // ── tanh softcap scratch ──
+    /// `tanh(x/cap)` — the divided half of `cap·tanh(x/cap)`, one `[rows, cols]`
+    /// buffer reused as its own tanh's destination.
+    Tanhc,
+    // ⛔ THE MoE ROLES ARE GONE — the row-softmax, expert-combine, route-argsort and
+    // expert-matmul scratches (RMax..XDqA) existed only for the hand-written per-op
+    // MoE card lowering, which is deleted: the MoE lowers only from `kernels/moe.py`
+    // through KTIR.
+    // ── the HARDWARE GATHER's contiguous destinations ──
+    //
+    // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
+    // whose rows have no uniform per-request pitch BY LAW (`PagedKvPool::addr` — "a request is a set of
+    // SLOTS, never a coordinate the device computes with"), so a `y = request` matmul over the pool
+    // cannot exist. A gathered COPY lands each (kv head, slot window, request) block at a pitch THIS
+    // compiler chose, and the score/value matmuls then read that at the stride dxp derives.
+    //
+    // ⛔ TWO ROLES, NOT ONE INDEXED ROLE: the Kᵗ plane and the V plane are read by different legs with
+    // different kernel shapes (`[hd, slots]` vs `[slots, hd]`) and are copied by two ops, so one shared
+    // buffer would have the value leg reading the score leg's blocks.
+    GatherKt,
+    GatherV,
+    // ── the SPLIT-KV CHUNK's wide buffers (`ChunkScratch`) ──
+    //
+    // `[nkvh][gqa][chunk slots]`: each kv head owns a WHOLE `[gqa, slots]` RowBlocked block, never a row
+    // slice of a taller multi-stick buffer (see `ChunkScratch::rows_corner` for the card measurement that
+    // forbids the slice).
+    ChunkSc,
+    ChunkESub,
+    ChunkExp,
+    // The one-request decode's query re-laid group-major above one slab (`QGroupBlock`):
+    // `[nkvh][gqa, hd]`, each kv head's group a whole block of its own.
+    ChunkQGroup,
+    // One-stick partial reductions of a chunk whose row max / denominator is cut into parts (`[rows, 64]`,
+    // like the online-softmax state), combined part after part. INDEXED: a prompt chunk's denominator
+    // holds one partial per probability part.
+    ChunkRed(u32),
+    // ── the CHUNK-FORMED causal new-token block's wide buffers (`NewBlockForm::Chunk`) — the same
+    //    `[nkvh][gqa·mq][mq_pad]` whole-block law as the chunk's ──
+    NewChunkSc,
+    NewChunkESub,
+    NewChunkExp,
+    // ── flash-attention online-softmax state ──
+    NewKt,
+    Sc,
+    BMax,
+    NewM,
+    Corr,
+    CorrSubT,
+    ExpB,
+    ESubT,
+    BSum,
+    OTmp,
+    LTmp,
+    RunM,
+    RunL,
+    RunO,
+    // ── K-split / down-projection blocking ──
+    Blk(u32),
+    Acc(u32),
+    LBlk(u32),
+    LAcc(u32),
+    // ── the split-KV chunk's LX-resident Kᵗ and V, one core-local tensor per (part, kv head)
+    //    (`ChunkScratch::lx_form`): a core-local pin holds one slice at one address, so parts and kv heads
+    //    cannot share one tensor at offsets ──
+    GatherKtLx(u32),
+    GatherVLx(u32),
+    // ── the chained head (#603) ──
+    //
+    // ⭐ THE PER-STEP SLABS `Program::ChainStage` / `Program::EmbedRowGather` lower
+    // through. The decompose's two u32 tables are NOT synths — they are ordinary
+    // graph sources the mint inserts (the argmax nine's own idiom), staged once at
+    // load through the load-const registry; the placements here are only the
+    // gather/transpose scratch, sized at expansion as arena activations.
+    /// The `[width·hidden, 64]` copy of the batch's picked 64-column slabs of the
+    /// (tied) embedding matrix — `EmbedRowGather`'s leg-1 destination, one request's
+    /// `[hidden, 64]` block per row at element base `row·hidden·64` (request-major;
+    /// at width 1 this IS the single `[hidden, 64]` slab).
+    ChainSlab,
+    /// ⭐ THE TRANSPOSED SLABS, `[width·(64+1), hidden]` — request r's rows `64r..64r+64`
+    /// are `EmbedRowGather`'s leg-2 transpose of r's [`ChainSlab`] block, and ROW `64r+64`
+    /// IS r's SENTINEL'S RESERVED ZERO ROW: never written by any op, staged zero once at
+    /// prepare (the synthetic-constants law), so the lane-64 sentinel pick (`l_tab`'s
+    /// past-`pad_vocab` mapping) reads a ZERO ROW, never past the placement. The one-row
+    /// cost per request — `hidden · 2 B` — is the price of keeping an already-broken chat
+    /// off the device bus (the loud `idx >= vocab` refusal at the readback still fires;
+    /// this row only keeps the bus quiet while it does).
+    ChainSlabT,
+    /// ⭐⭐ THE REQUEST-MAJOR ROWS, `[width·row_entries, 64]` — `EmbedRowGather`'s leg-3
+    /// destination at width > 1, ONE STICK WIDE (the KV fold's own card-proven dest class:
+    /// `cols == one stick`, where the gather's row-major-over-entries write and the
+    /// RowBlocked handle coincide), request r's picked row at sticks
+    /// `[r·row_entries, (r+1)·row_entries)`. This is NOT the body's operand: the emission
+    /// reads the m>1 residual stream STICK-MAJOR (`spyre_forward.rs:228-235`), so leg 4 —
+    /// a pointwise-identity relayout, a Flat `[width, hidden]` read of THIS scratch into
+    /// the RowBlocked `[width, hidden]` activation — exists exactly when
+    /// `sdsc_abstract::row_major_is_stick_major(width, hidden)` is FALSE (a derived layout
+    /// fact, never a width branch; `embed_row_relayout_proofs` is the Kani record). ELIDED
+    /// entirely at the coincidence — width 1 keeps the tip's exact `[1, hidden]` dest and
+    /// this role is never minted.
+    ChainRow,
+}
+
+impl fmt::Display for SynthRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rot => f.write_str("rot"),
+            Self::Xc => f.write_str("xc"),
+            Self::Rs => f.write_str("rs"),
+            Self::Silu => f.write_str("silu"),
+            Self::Qs => f.write_str("qs"),
+            Self::KRep => f.write_str("krep"),
+            Self::VRep => f.write_str("vrep"),
+            Self::NewKRep => f.write_str("newkrep"),
+            Self::NewVRep => f.write_str("newvrep"),
+            Self::NewKScaled => f.write_str("newkscaled"),
+            Self::FqAbsX => f.write_str("fq_absx"),
+            Self::FqAfp8 => f.write_str("fq_afp8"),
+            Self::FqAmax => f.write_str("fq_amax"),
+            Self::FqAmaxFl => f.write_str("fq_amaxfl"),
+            Self::FqAscale => f.write_str("fq_ascale"),
+            Self::FqChi => f.write_str("fq_chi"),
+            Self::FqCl => f.write_str("fq_cl"),
+            Self::FqInvS => f.write_str("fq_invs"),
+            Self::FqSc => f.write_str("fq_sc"),
+            Self::FqDqA => f.write_str("fq_dqa"),
+            Self::FqMm => f.write_str("fq_mm"),
+            Self::FqRaw => f.write_str("fq_raw"),
+            Self::FqAmaxP(j) => write!(f, "fq_amaxp{j}"),
+            Self::ReducePartial(j) => write!(f, "redp{j}"),
+            Self::Sq16 => f.write_str("sq16"),
+            Self::Mean => f.write_str("mean"),
+            Self::Meps => f.write_str("meps"),
+            Self::Rinv => f.write_str("rinv"),
+            Self::Xn => f.write_str("xn"),
+            Self::Gw => f.write_str("gw"),
+            Self::HeadMean(h) => write!(f, "hmean{h}"),
+            Self::HeadMeps(h) => write!(f, "hmeps{h}"),
+            Self::HeadRinv(h) => write!(f, "hrinv{h}"),
+            Self::Tanhc => f.write_str("tanhc"),
+            Self::GatherKt => f.write_str("gkt"),
+            Self::GatherV => f.write_str("gv"),
+            Self::ChunkSc => f.write_str("csc"),
+            Self::ChunkESub => f.write_str("cesub"),
+            Self::ChunkExp => f.write_str("cexp"),
+            Self::ChunkQGroup => f.write_str("cqg"),
+            Self::ChunkRed(i) => write!(f, "cred{i}"),
+            Self::NewChunkSc => f.write_str("ncsc"),
+            Self::NewChunkESub => f.write_str("ncesub"),
+            Self::NewChunkExp => f.write_str("ncexp"),
+            Self::NewKt => f.write_str("newkt"),
+            Self::Sc => f.write_str("sc"),
+            Self::BMax => f.write_str("bmax"),
+            Self::NewM => f.write_str("newm"),
+            Self::Corr => f.write_str("corr"),
+            Self::CorrSubT => f.write_str("corrsubt"),
+            Self::ExpB => f.write_str("expb"),
+            Self::ESubT => f.write_str("esubt"),
+            Self::BSum => f.write_str("bsum"),
+            Self::OTmp => f.write_str("otmp"),
+            Self::LTmp => f.write_str("ltmp"),
+            Self::RunM => f.write_str("m"),
+            Self::RunL => f.write_str("l"),
+            Self::RunO => f.write_str("o"),
+            Self::Blk(i) => write!(f, "blk{i}"),
+            Self::Acc(i) => write!(f, "acc{i}"),
+            Self::LBlk(i) => write!(f, "lblk{i}"),
+            Self::LAcc(i) => write!(f, "lacc{i}"),
+            Self::GatherKtLx(i) => write!(f, "gktlx{i}"),
+            Self::GatherVLx(h) => write!(f, "gvlx{h}"),
+            Self::ChainSlab => f.write_str("cslab"),
+            Self::ChainSlabT => f.write_str("cslabt"),
+            Self::ChainRow => f.write_str("crow"),
+        }
+    }
+}
+
+/// A placed tensor's IDENTITY — the join key between what the bake placed and what the host binds.
+///
+/// ⛔ THIS REPLACES `t{tid}`. The old form carried `name: Cow<str>` *and* `tid: Option<u32>`: the
+/// name was `format!("t{tid}")` for a real tensor, so one field was a rendering of the other, and
+/// every bind was a string round-trip through a spelling both ends had to agree on by convention.
+/// Nothing ever PARSED it back — the string existed only to be a map key — so the key is now the
+/// number it was always standing in for.
+///
+/// [`Synth`] keeps a place here because a synthetic occupies segment space and the alias-equality
+/// check must see it; it is never bound, which is why it needs no separate tid.
+///
+/// [`Synth`]: Self::Synth
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlaceId {
+    /// A buffer the CALLER numbered — the only kind the host ever binds.
+    ///
+    /// The number is the caller's, carried in on
+    /// [`KtirNode::bindings`](crate::ktir_node::KtirNode::bindings) as a
+    /// [`BufferId`](crate::ktir_node::BufferId); this crate only names it and looks it up in the
+    /// caller's [`BundleLayout`](crate::placement::BundleLayout). Whatever the number MEANS to the
+    /// producer — a graph tensor index, a Triton buffer slot — is a fact of that side of the door and
+    /// not of this type.
+    Act(u32),
+    /// An intermediate the lowering invented, derived from `of`. Device-internal.
+    Synth { of: u32, role: SynthRole },
+    /// An OP-LOCAL LX pin, derived from `of` — scratch written by one op and read by the next inside
+    /// one program, sharing its class's slot. Declared, slotted and spelled ONLY by its pair
+    /// ([`crate::emit::lx_op_local_pair`]): every layout constructor takes a [`SynthId`], which has
+    /// no variant for it.
+    OpLocal { of: u32, role: OpLocalRole },
+}
+
+/// The role of an op-local LX pin ([`PlaceId::OpLocal`]) — one named constant per pin kind, with no
+/// public constructor beside them:
+///
+/// ```compile_fail,E0603
+/// let _ = scratchy_spyre_bundle::place::OpLocalRole(scratchy_spyre_bundle::place::OpLocalKind::Rinv);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpLocalRole(OpLocalKind);
+
+/// Which op-local pin an [`OpLocalRole`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OpLocalKind {
+    /// The gained rmsnorm's `1/√(E[x²]+eps)`, read back at its E[x²] lane by the normalising
+    /// multiply.
+    Rinv,
+}
+
+impl OpLocalRole {
+    /// The gained rmsnorm's reciprocal root. Public so generated code can NAME a baked op-local
+    /// identity; an op-local [`PlaceId`] still reaches a layout only through its pair, because no
+    /// layout constructor takes a [`PlaceId`] ([`SynthId`] has no op-local variant).
+    pub const RINV: OpLocalRole = OpLocalRole(OpLocalKind::Rinv);
+
+    /// Which pin this is.
+    pub fn kind(self) -> OpLocalKind {
+        self.0
+    }
+}
+
+impl fmt::Display for OpLocalRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            OpLocalKind::Rinv => f.write_str("rinv"),
+        }
+    }
+}
+
+impl PlaceId {
+    /// The caller-numbered buffer this names, or that it derives from.
+    pub fn tid(self) -> u32 {
+        match self {
+            Self::Act(t) | Self::Synth { of: t, .. } | Self::OpLocal { of: t, .. } => t,
+        }
+    }
+    /// Is this a tensor the host may bind? False for a device-internal synthetic.
+    pub fn is_bindable(self) -> bool {
+        matches!(self, Self::Act(_))
+    }
+    /// The id the host binds under, or `None` for a device-internal synthetic.
+    pub fn bindable(self) -> Option<u32> {
+        match self {
+            Self::Act(t) => Some(t),
+            Self::Synth { .. } | Self::OpLocal { .. } => None,
+        }
+    }
+    /// Derive a synthetic from this tensor — as the [`SynthId`] a layout constructor takes.
+    pub fn synth(self, role: SynthRole) -> SynthId {
+        SynthId::Synth {
+            of: self.tid(),
+            role,
+        }
+    }
+}
+
+/// A placed id a LAYOUT CONSTRUCTOR takes ([`crate::placement::BundleLayout::synth`] and its
+/// siblings, [`crate::placement::syn`]) — a caller-numbered buffer or a synthetic. It has no op-local
+/// variant, so an op-local pin cannot be declared, slotted or spelled through any of them: its one
+/// door is [`crate::emit::lx_op_local_pair`]. Every way INTO it ([`SynthId::Act`], `From<u32>`,
+/// [`PlaceId::synth`], [`SynthId::synth`]) produces one of these two variants by its type; there is
+/// no conversion from a [`PlaceId`].
+///
+/// ```compile_fail,E0599
+/// let _ = scratchy_spyre_bundle::place::SynthId::OpLocal { of: 7, role: todo!() };
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SynthId {
+    /// [`PlaceId::Act`].
+    Act(u32),
+    /// [`PlaceId::Synth`].
+    Synth { of: u32, role: SynthRole },
+}
+
+impl SynthId {
+    /// The [`PlaceId`] it names — never [`PlaceId::OpLocal`].
+    pub fn place(self) -> PlaceId {
+        match self {
+            Self::Act(t) => PlaceId::Act(t),
+            Self::Synth { of, role } => PlaceId::Synth { of, role },
+        }
+    }
+
+    /// The caller-numbered buffer this names, or that it derives from.
+    pub fn tid(self) -> u32 {
+        self.place().tid()
+    }
+
+    /// Derive a synthetic from this tensor ([`PlaceId::synth`]).
+    pub fn synth(self, role: SynthRole) -> SynthId {
+        SynthId::Synth {
+            of: self.tid(),
+            role,
+        }
+    }
+}
+
+impl From<u32> for SynthId {
+    /// A caller-numbered buffer, `t{tid}`.
+    fn from(tid: u32) -> SynthId {
+        SynthId::Act(tid)
+    }
+}
+
+impl fmt::Display for SynthId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.place().fmt(f)
+    }
+}
+
+impl fmt::Display for PlaceId {
+    /// THE ONE SPELLING SITE. For diagnostics and the emitted program's own operand references;
+    /// nothing parses this back, so it is a rendering, not an encoding.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Act(t) => write!(f, "t{t}"),
+            Self::Synth { of, role } => write!(f, "t{of}_{role}"),
+            Self::OpLocal { of, role } => write!(f, "t{of}_{role}"),
+        }
+    }
+}
+
+/// The emitted PROGRAM's operand spelling for tensor `tid`.
+///
+/// ⛔ THIS IS A RENDERING, NOT AN IDENTITY. The identity is
+/// [`PlaceId`], and that is what the bake and the host now join on —
+/// nothing parses this string back. It survives only because a SuperDSC op
+/// references its operands by name, so the emitted program needs a spelling;
+/// [`PlaceId`]'s `Display` is where that spelling is decided, and this
+/// is the one call to it.
+#[inline]
+pub fn act_name(tid: u32) -> String {
+    PlaceId::Act(tid).to_string()
+}

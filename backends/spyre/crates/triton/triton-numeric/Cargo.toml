@@ -14,10 +14,9 @@
 # matches. Every claim in this paragraph has a file:line in `src/lib.rs`; that is exactly the right
 # instrument for the bug class this tree has, and the wrong one for a fidelity claim.
 #
-# ⛔ SEPARATE FROM `triton-ktir` AND `triton-ktir-superdsc` ON PURPOSE. `triton-ktir`'s default
-# feature set is dependency-free and `cargo test --offline` on the pod is its gate; `ktir-superdsc`'s
-# manifest states "⛔ NEVER `ktir-emulator`". The emulator edge lives here, where nothing in the
-# lowering path can acquire it.
+# ⛔ SEPARATE FROM `triton-ktir` ON PURPOSE. `triton-ktir`'s default feature set is
+# dependency-free and `cargo test --offline` on the pod is its gate. The emulator edge lives here,
+# where nothing in the lowering path can acquire it.
 [package]
 name = "triton-numeric"
 description = "the nine Granite configurations, EXECUTED: .py -> ttir -> KTIR -> emulator -> vs torch"
@@ -34,9 +33,6 @@ publish = false
 triton-frontend = { path = "../triton-frontend" }
 # LEG 2 -- ttir value to our KTIR value, then `passes::to_ktir_emit::lower` to THEIR `IRFunction`.
 triton-ktir = { path = "../triton-ktir" }
-# THE FOURTEEN CONFIGURATIONS, stated once. `cases::case(name)` is the same table `examples/bake_py`
-# drives, so "what is `rope_q32`?" has one answer in this repo and not two.
-triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
 # LEG 3 -- the executor. Re-hosted: scratchy's own `ktir-emulator`, in-tree.
 #
 # `default-features = false` drops `optimizer`, which gates `resident`/`segmented`/`program` --
@@ -47,8 +43,7 @@ ktir-core = { path = "../../ktir/ktir-core" }
 # THE REFERENCE DATA'S PROVENANCE IS A JSON FILE. `test/numeric/<config>/meta.json` records the
 # shapes, dtypes, seed, fixture function names and torch version behind every checked-in `.bin`, so
 # the bytes' origin is in the tree rather than in a commit message. Hand-rolling a reader for it is
-# how the `constantInfo_` class of bug gets written; `ktir-superdsc` and `triton-ktir-superdsc`
-# already declare this edge and the pod's cache holds it (see ../vendor/PROVENANCE.md).
+# how the `constantInfo_` class of bug gets written.
 serde_json = "1"
 
 [features]

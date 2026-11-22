@@ -140,69 +140,8 @@ pub(crate) fn forward_chunk(
     let mut dynamic: Vec<(u64, Vec<f32>, Vec<usize>)> = {
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
-        // ⭐ THE CHAIN REPLACES THE EMBED ROW PUSH here too — a chained wiring's
-        // gather reads the two persistent sticks, so the host's contribution is
-        // their seed: the LAST REAL token's decompose (the token this forward
-        // feeds — the same value the card path's ChainSeed steps state, and
-        // idempotent with the device's own ChainStage writes for the same
-        // reason: step t feeds the token step t-1 picked). ⭐ THE WORDS RIDE AS
-        // THEIR VALUES, not their bits: the gather's eval arm reads them as
-        // numbers (`s_stick[..] as usize / k`, `l_stick[..] as usize`) and so do
-        // the emulator's doors, which write the same sticks numerically at the
-        // model dtype. The words the gather reads are f16-exact: the s stick's
-        // lane 0 is `k·s` (granite-3.1-2b: k = 4, s ≤ 768 — a multiple of 4
-        // below 4096) and the l stick's word 0 is `l < 64`. A `f32::from_bits`
-        // word is a denormal the f16 channel flushes to zero, which seeded every
-        // decode step with token 0's row.
-        match b.phase {
-            scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
-                // ⭐ THE SEEDS ARE PER-REQUEST-ROW AT THE FORWARD'S OWN WIDTH —
-                // the ONE per-row spelling (`chain_s_seed` / `chain_l_seed`,
-                // the same fns the card path's ChainSeed tape arm calls): row i
-                // carries ITS OWN token's decompose, pad rows repeat the last
-                // real token's (the same clamp the embed fill above uses,
-                // idempotent with the device's own ChainStage writes). The s
-                // seed is `[rows, lanes]` — one whole pattern stick per row —
-                // and the l seed is `[rows·l_sticks, lanes]`, row i's ramp
-                // sticks then row i+1's, the placement shape the mint states.
-                // At `rows == 1` both pushes are the solo spelling
-                // byte-for-byte.
-                let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
-                let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
-                let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
-                // The emulator plays a world of one: the whole table.
-                let block = scratchy_subtile::subtile_ir::ChainBlock::whole(chain.block);
-                let s_words =
-                    scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows, block);
-                let l_words =
-                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows, block);
-                dynamic.push((
-                    chain.s_src as u64,
-                    s_words.iter().map(|&w| w as f32).collect(),
-                    vec![rows, lanes],
-                ));
-                dynamic.push((
-                    chain.l_src as u64,
-                    l_words.iter().map(|&w| w as f32).collect(),
-                    vec![rows * l_sticks, lanes],
-                ));
-            }
-            scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => {
-                // The embedding is this chunk's rows of the hidden state.
-                dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
-            }
-        }
-        // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. The programs read each
-        // model constant (a ScalarMul multiplier, an RMSNorm epsilon or divisor) and the algebraic
-        // identities `0`/`1` from a bound `[1,1]` tile rather than a KTIR immediate, so that ONE
-        // program serves both consumers: `dxp_standalone` has no immediate operand, and an
-        // `arith.constant` the card cannot read is not a constant the card has. They are ordinary
-        // `func.arguments` here, so leaving one unbound is a zero, and a zero in this position is
-        // silent — `x/(1+e)` becomes `x/e` and every scaled residual vanishes.
-        for (i, v) in b.scalarmul_scales.iter().enumerate() {
-            let tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::scalarmul_scale_tid(i);
-            dynamic.push((u64::from(tid), vec![*v], vec![1, 1]));
-        }
+        // The embedding is this chunk's rows of the hidden state.
+        dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
         // Each rope table is tiled to the width its consumer reads, from THE
         // SOURCE'S OWN CLASS's rows. `classes` is cos-then-sin, so a sin
         // source's class index is offset past the cos sources.
@@ -249,114 +188,39 @@ pub(crate) fn forward_chunk(
             .map_err(|e| werr(format!("paged step: {e}")))?;
         let (mask_tid, mask, mask_shape) = srcs.mask;
         dynamic.push((u64::from(mask_tid), mask, mask_shape));
-        // ⭐ ASK FOR THE ROWS THIS FORWARD WROTE, NOT THE WHOLE RESIDENT TENSOR. Decode and prefill
-        // share one session, so every tensor is resident at the WIDEST program's row count: a
-        // one-row decode step had its outputs decoded at the prefill's `m`. The result is the one
-        // readback — `vocab` of the logits row, or, for a rung that draws (its result re-pointed at
-        // the idx stick, `[rows, W]` at the seat's minted width), the whole stick (`0`).
-        let result_elems = if b.sample_seat.is_some() { 0 } else { vocab };
-        let wanted: std::collections::HashMap<u64, usize> =
-            std::iter::once((b.result_id as u64, result_elems)).collect();
-        let outputs: Vec<(u64, usize)> = b
-            .output_ids
-            .iter()
-            .map(|id| (*id as u64, wanted.get(&(*id as u64)).copied().unwrap_or(0)))
-            .collect();
-        // ⭐ THE MINTED DRAW'S SEAT, STAGED FRESH EVERY STEP. The bake mints the token draw into
-        // this rung (`Wiring::sample_seat`), and its five operands go stale the moment a step
-        // completes — the step word IS the step's freshness, a held one is a held token. One law
-        // per seat row, by the card's own prompt law: row `r` runs this request's draw at
-        // `start + min(r, n - 1)`, a pad row clamped to the last real position (at decode `n = 1`
-        // and the one row sits at `start`). The words are `seat_words`' — the one statement of the
-        // law both tiers lay out — packed `[rows, 1]` at the views' own dtypes (i32 words, f32
-        // inv_t), the memref-faithful layout the bake's numeric gate stages them in; the f16
-        // channel `run_step` takes would encode them into half the bytes their views span.
-        if let Some(seat) = b.sample_seat {
-            let rows = seat.rows as usize;
-            let draw = req.draw;
-            let words: Vec<([i32; 4], f32)> = (0..rows)
-                .map(|r| {
-                    seat_words(&RowLaw {
-                        draw: draw.as_ref(),
-                        step: (start + r.min(n - 1)) as u32,
-                    })
-                })
-                .collect();
-            let mut typed: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = seat
-                .seed_words
-                .iter()
-                .enumerate()
-                .map(|(k, &tid)| {
-                    (
-                        tid as usize,
-                        words.iter().flat_map(|(w, _)| w[k].to_le_bytes()).collect(),
-                        scratchy_tensors::DType::I32,
-                        vec![rows, 1],
-                    )
-                })
-                .collect();
-            typed.push((
-                seat.invt as usize,
-                words
-                    .iter()
-                    .flat_map(|(_, inv_t)| inv_t.to_le_bytes())
-                    .collect(),
-                scratchy_tensors::DType::F32,
-                vec![rows, 1],
-            ));
-            session
-                .set_typed_sources(typed)
-                .map_err(|e| werr(format!("sampler seat: {e}")))?;
-        }
+        // The result is the one readback, whole: the answer rows' logits, the host draws from.
+        let outputs: Vec<(u64, usize)> = b.output_ids.iter().map(|id| (*id as u64, 0)).collect();
         let out = session
             .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
         tokens.set_tokens_in_pool(id, start + n);
-        // ⭐⭐⭐ ONE LOGITS ROW, AT ROW 0 — because that is what the bundle COMPUTES.
-        //
-        // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s
-        // `is_prefill_lm_head_tail` arm folds it to the m=1 tail it really is
-        // (main's `lower_prefill_lm_head_at_m1`): the activation is sliced to the LAST prompt row
-        // and the output is narrowed to row 0. Only that
-        // row's logits are ever read, and computing all `mq` rows of a 128k-column output would be
-        // `mq`× the work for one row of answer.
-        //
-        // ⛔ SO `(0..n)` WAS A CLAIM THE BUNDLE NEVER MADE. Rows 1..n are never written, and the
-        // caller takes the LAST of what it gets (`next_back()`), so a prompt chunk with n > 1
-        // sampled an unwritten row — zeros — and generation continued from a token the model never
-        // chose. It coincided with row 0 only at n == 1, which is why decode looked correct and a
-        // prompt that fit ONE chunk looked correct. MEASURED: the result tensor comes back with
-        // ~one row of `vocab` nonzeros and every argmax below `vocab`, i.e. in row 0.
-        //
-        // ⭐ THE PICK IS THE MINTED SAMPLER'S, READ BACK LIKE THE CARD'S. The bake mints the draw
-        // into this rung and re-points its result at the idx stick — one word per seat row at lane
-        // 0, every lane equal (the store is a whole stick per row) — so no host argmax runs: the
-        // emulator's readback is memref-faithful, row `r`'s lane 0 is element `r·width`, and each
-        // word passes the same token law the card's decode applies (`token_of_idx_word`). The
-        // caller consumes the LAST row's pick, the folded tail's: the last real token's forward.
-        match b.sample_seat {
-            Some(seat) => {
-                let idx = out.get(&(b.result_id as u64)).ok_or_else(|| {
-                    werr(format!(
-                        "the minted draw's idx stick t{} came back unread",
-                        b.result_id
-                    ))
-                })?;
-                let rows = seat.rows as usize;
-                let width = idx.len() / rows.max(1);
-                tracing::debug!(
-                    "EMU_PICK t{} rows={rows} width={width} words={:?} seat={:?}",
-                    b.result_id,
-                    &idx[..idx.len().min(8)],
-                    seat
-                );
-                let picks = (0..rows)
-                    .map(|r| token_of_idx_word(r, idx[r * width] as i32, seat.vocab as usize))
-                    .collect::<ExecutorResult<Vec<u32>>>()?;
-                Ok(ChunkOut::Tokens(picks))
-            }
-            None => Ok(ChunkOut::Prompt),
-        }
+        // ⭐ THE ANSWER ROWS ARE THE RESULT'S FIRST ROWS: a prompt chunk's lm-head tail is folded to
+        // its requests' last rows (request `r`'s logits at row `r`), a decode batch's rows are its
+        // sequences'. The host draws each row's token under the request's own law; the caller
+        // consumes the last row's, the last real token's forward.
+        let logits = out.get(&(b.result_id as u64)).ok_or_else(|| {
+            werr(format!("the logits t{} came back unread", b.result_id))
+        })?;
+        let answers = match b.paged.map(|p| p.paged_rows) {
+            Some(scratchy_target_spyre::paged_step::PagedRows::Batch) => n,
+            _ => b.paged.map_or(1, |p| p.extent.requests().get() as usize),
+        };
+        let picks = logits
+            .chunks(vocab)
+            .take(answers)
+            .enumerate()
+            .map(|(r, row)| {
+                draw_token(
+                    r,
+                    row,
+                    &RowLaw {
+                        draw: req.draw.as_ref(),
+                        step: (start + n - 1) as u32,
+                    },
+                )
+            })
+            .collect::<ExecutorResult<Vec<u32>>>()?;
+        Ok(ChunkOut::Tokens(picks))
     }
 }
 

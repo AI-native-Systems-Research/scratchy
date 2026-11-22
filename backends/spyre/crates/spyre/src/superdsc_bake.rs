@@ -53,12 +53,12 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::lower_subtile_tape_to_superdsc::SdscOp;
+use spyre_superdsc::wire::Sdsc;
 use scratchy_spyre_bundle::correction;
 // The dxp-group descriptor ceiling — ONE const, owned by the leaf crate beside the window-chunk
 // split that targets it (re-exported from `lower_subtile_tape_to_superdsc` under this same name
 // for the emission's own paths). See its doc in `sdsc_abstract` for 4204's measured pedigree.
-use ktir_superdsc::sdsc_abstract::DxGroupCeiling;
+use scratchy_spyre_bundle::rung::DxGroupCeiling;
 
 use crate::dxp_cache::{DxpCache, DxpIdentity, GroupDigest};
 
@@ -1091,13 +1091,13 @@ impl ChunkExplore {
     /// admits on (`primaryDsInfo_` carries a `KERNEL` and the op names an indirect-access index) —
     /// because that is what dxp sees. A kernel-less gather (the vendor's `identity` copy, whose roles
     /// are `{OUTPUT, KERNEL_IDX}`) is not this shape and schedules with the explorer on.
-    pub fn of_group<'a>(trips: impl IntoIterator<Item = &'a SdscOp>) -> ChunkExplore {
-        let gathers_a_kernel = |op: &SdscOp| {
-            op.dscs_.iter().flat_map(|m| m.values()).any(|d| {
-                d.primaryDsInfo_.contains_key("KERNEL")
-                    && d.computeOp_
+    pub fn of_group<'a>(trips: impl IntoIterator<Item = &'a Sdsc>) -> ChunkExplore {
+        let gathers_a_kernel = |op: &Sdsc| {
+            op.dscs.iter().flat_map(|m| m.values()).any(|d| {
+                d.primary_ds_info.contains_key("KERNEL")
+                    && d.compute_op
                         .iter()
-                        .any(|c| !c.indirectAccessIndexLabeledDs.is_empty())
+                        .any(|c| !c.indirect_access_index_labeled_ds.is_empty())
             })
         };
         if trips.into_iter().any(gathers_a_kernel) {

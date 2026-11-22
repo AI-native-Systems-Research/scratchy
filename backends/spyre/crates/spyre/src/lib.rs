@@ -28,7 +28,6 @@ pub mod dxp_cache;
 /// arithmetic, lifted out of C++. No SDK dependency and no feature gate — it is arithmetic, so it
 /// builds and is tested on any host, including one with no Spyre toolchain.
 pub mod fold_plan;
-pub mod ir;
 /// THE MODEL-GEOMETRY DOOR — all that is left of KTIR → SuperDSC on this side, and it is NOT the
 /// lowering. `lower()`'s name-keyed dispatch (our naming convention, so ours to read), the two arms
 /// that monomorphise a model's head geometry — whose match arms `scratchy-subtile`'s `build.rs`
@@ -41,27 +40,17 @@ pub mod ir;
 /// here. It does not, and none of what is here can move: an arm set generated from the consumer's
 /// configs cannot live in a leaf crate, and it cannot arrive as data either, because the point is that
 /// the values become `const` parameters.
-pub mod ktir_superdsc_door;
+pub mod placement;
+pub mod superdsc_lower;
 /// SubtileIR → KTIR: the producer half. One KTIR program per node, and no descriptors.
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;
-mod op_abi;
 // ⚠️ TEMPORARY bake-time instrumentation — strip with its call sites before landing.
 mod pc;
 pub mod superdsc_bake;
 /// Spyre's half of tensor parallelism: the world and split granule the shared analysis takes as
 /// input, and the ring schedule its collectives run as.
 pub mod tp_plan;
-/// Path shims kept from `scratchy-subtile`'s lib so the moved lowering
-/// keeps its existing `crate::…` references: the modules themselves
-/// live under `ir::island` / `ir::bridge`.
-pub mod tile_op {
-    pub use crate::ir::island::tile_op::*;
-    pub use crate::ir::island::tiled_op::TiledOp;
-}
-pub mod subtile_tape_to_tile_ir {
-    pub use crate::ir::bridge::subtile_tape_tile_op::*;
-}
 /// THE FORWARD TAPE — one decode step as ordered steps rather than a function
 /// body: which host kernels run, what each fills, and where the single device
 /// launch sits. The LAUNCHER is the worker's (it owns the session).

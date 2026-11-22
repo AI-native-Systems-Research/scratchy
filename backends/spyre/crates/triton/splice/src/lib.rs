@@ -91,12 +91,34 @@
 //! view is fp8 and whose bindings are arity-3; fp8-ness is recognized from the weight
 //! view's `is_fp8`, cross-checked against arity, exactly as the builder's program is.
 
+pub mod compile;
+
+/// One node's program as the splice mints it: its name in the bake log, its KTIR, and the
+/// collective consume it belongs to — set by the caller that plans the collective.
+#[derive(Clone)]
+pub struct EmittedOp<T: scratchy_spyre_bundle::collective::Tp> {
+    pub op_name: String,
+    pub ktir: KtirNode,
+    pub tp_consume: Option<scratchy_spyre_bundle::collective::TpConsume<T>>,
+}
+
+impl<T: scratchy_spyre_bundle::collective::Tp> EmittedOp<T> {
+    /// A program outside any collective.
+    pub fn new(op_name: String, ktir: KtirNode) -> EmittedOp<T> {
+        EmittedOp {
+            op_name,
+            ktir,
+            tp_consume: None,
+        }
+    }
+}
+
 use std::collections::HashMap;
 
 use ktir_core::arena::Arena;
-use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
-use ktir_superdsc::superdsc_opspec::Df;
+use ktir_core::program::{Elementwise, Program};
+use scratchy_spyre_bundle::program::{BufferId, KtirNode};
+use spyre_superdsc::format::DataFormat as Df;
 use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::subtile_ir::{
     AttnScaleSite, EwKind, GainConvention, SubOp, SubtileIR, SubtileNode,
@@ -105,7 +127,7 @@ use scratchy_subtile::subtile_ir::{
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
-use triton_ktir_superdsc::CompiledKernel;
+use crate::compile::CompiledKernel;
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -398,18 +420,6 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "reshape_fwd",
             program: Program::Reshape,
         },
-        // ⭐ THE TOKEN DRAW — the whole vocab scan as ONE kernel per request
-        // row: the row, its per-row noise block and temperature reciprocals,
-        // the nine staged tables (functions of the vocab alone, host-staged at
-        // load — the seventh is the pad law's offset row), and the `[rows,
-        // 64]` i32 idx stick out. The vocab and the row count ride the node
-        // (never a model name); every constexpr below derives from them.
-        SubOp::Sample { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../../kernels/sample_fwd.py"),
-            file: "sample_fwd.py",
-            entry: "sample_fwd",
-            program: Program::Sample,
-        },
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
         // match is the gate: these kinds have their own arms there (attention's
@@ -456,7 +466,9 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // they are ordinary members of the "not a spliced kind" class: reaching
         // the splice means the routing changed, not that a kernel is missing.
         | SubOp::EmbedRowGather { .. }
-        | SubOp::ChainStage { .. } => TritonKernelRow::Refused(
+        | SubOp::ChainStage { .. }
+        // The decode reads its logits back and the host samples them.
+        | SubOp::Sample { .. } => TritonKernelRow::Refused(
             "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
@@ -491,7 +503,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
 ///
 /// ⭐ ONE NODE MAY LOWER TO MORE THAN ONE OP, and only the splice knows which kinds:
 /// [`lower_all`] is the entry the walk calls, and it routes every one-op kind here.
-pub fn lower<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn lower<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     // Whether this bundle's rows are separate requests (the lm-head fold's own fact).
@@ -520,46 +532,18 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> bool {
-    // ⭐ THE MINTED DRAW STATES THE TAIL'S PRODUCT. A graph the sampler minted
-    // re-points its result at the idx stick and pads the tail's storage width,
-    // so the original width conjunct (the node's output region width equals the
-    // result tensor's cols) can no longer see the tail. The draw restates it:
-    // the lm-head's OWN full output width N equals the vocab the draw serves,
-    // and an elementwise tail node's region width equals that vocab — the same
-    // "this node is vocab-wide like the result" statement, read off the ops'
-    // own fields, immune to the re-point and the padding. A graph without a
-    // draw keeps the original conjunct verbatim. One predicate, read by every
-    // caller — the `lower_all` rewrite, the one-op routing echo, and the
-    // bake-time numeric gate — so all three state the SAME fold. (The width
-    // alone was never sufficient — the gemma-4 q-projection collision is what
-    // the feeds-walk conjunct below kills — and that protection is unchanged.)
-    let draw = ir
-        .nodes
-        .iter()
-        .find(|n| matches!(n.op, SubOp::Sample { .. }));
-    // ⭐ A SPLIT HEAD IS THE TAIL'S PRODUCT TOO. A vocabulary projection split across ranks is one
-    // rank's block (`n` < vocab), and it reaches the draw through the all-gather that restores the
-    // whole vocabulary — the same product, gathered.
-    let feeds_the_tail_product = match (&draw, &node.op) {
-        (Some(sample), SubOp::MatmulTile { n, .. }) => match &sample.op {
-            SubOp::Sample { vocab, .. } => {
-                *n == *vocab || gathers_to_width(ir, node.output.tensor, *vocab)
-            }
-            _ => false,
-        },
-        (Some(sample), _) => match &sample.op {
-            SubOp::Sample { vocab, .. } => node.output.region.cols.len == *vocab,
-            _ => false,
-        },
-        (None, _) => {
-            let result_cols = ir.tensors[ir.result.index()].cols;
-            node.output.region.cols.len == result_cols
-        }
-    };
-    // A projection's rows are its ACTIVATION's: a folded tail that gathers is declared one row from
-    // the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a whole
-    // one-row tensor), while the prompt rows it folds over are still `mq`. Every other tail op, and
-    // every projection of a tail that does not gather, has the same rows in and out.
+    // ⭐ THE TAIL'S PRODUCT IS THE RESULT'S WIDTH — the node's output region is as wide as the
+    // result, or (a vocabulary projection split across ranks, one rank's block) it reaches the
+    // result through the all-gather that restores the whole vocabulary. One predicate, read by
+    // every caller — the `lower_all` rewrite and the one-op routing echo — so both state the SAME
+    // fold. (The width alone was never sufficient — the gemma-4 q-projection collision is what the
+    // feeds-walk conjunct below kills.)
+    let result_cols = ir.tensors[ir.result.index()].cols;
+    let feeds_the_tail_product = node.output.region.cols.len == result_cols
+        || matches!(node.op, SubOp::MatmulTile { .. })
+            && gathers_to_width(ir, node.output.tensor, result_cols);
+    // A projection's rows are its ACTIVATION's: every tail op has the same rows in and out, and a
+    // projection's are the prompt rows it folds over.
     let rows = match &node.op {
         SubOp::MatmulTile { .. } => node.inputs.first().map_or(0, |a| a.region.rows.len),
         _ => node.output.region.rows.len,
@@ -603,7 +587,7 @@ fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=S matmul — main's
 /// `lower_prefill_lm_head_at_m1` shape, stated at the rung's own request count
 /// (exactly m=1 there, byte-identical).
-pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn lower_all<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -612,7 +596,7 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     // [`AnswerRows`] from the pair and refuses a mint that does not describe the graph
     // being lowered. Every other interception ignores it, exactly as the decode and batch
     // arms of `lower_attn` read the graph's rows and never the pair's split.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_spyre_bundle::rung::QueryExtent,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
     // program is emitted; the flatten-back (tail) and the middle (norm) self-identify
@@ -723,7 +707,7 @@ fn node_at_tail_rows<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// rung, including the empty windows a launch seated fewer requests leaves (their
 /// logits rows are pads, never read); the readback takes the live count off the
 /// launch's own slot list.
-fn tail_requests(query_rows: ktir_superdsc::sdsc_abstract::QueryExtent) -> u32 {
+fn tail_requests(query_rows: scratchy_spyre_bundle::rung::QueryExtent) -> u32 {
     query_rows.requests().get()
 }
 
@@ -941,7 +925,7 @@ fn is_sandwich_flatten<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// gamma row (gained form only) and the flatten's OUTPUT — the same
 /// synthetic-node-and-mint shape the prefill lm-head fold uses for `lmlast.py`.
 fn lower_sandwich_node<
-    T: ktir_superdsc::collective::Tp,
+    T: scratchy_spyre_bundle::collective::Tp,
     F: scratchy_subtile::subtile_ir::RopeForm,
 >(
     sandwich: &HeadNormSandwich<'_, F>,
@@ -1035,8 +1019,7 @@ fn lower_sandwich_node<
     // `mint` already named the node `rmsnorm_s{split.id}` (the program stem + the
     // split's id, main's own naming law for the fused form).
     let name = k.func.name.to_string();
-    let mut e = EmittedOp::bare(name);
-    e.ktir = Some(k);
+    let e = EmittedOp::new(name, k);
     Ok(vec![e])
 }
 
@@ -1066,11 +1049,6 @@ pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F
             | SubOp::RmsNormUnit { .. }
             | SubOp::TanhSoftCap { .. }
             | SubOp::ScalarWeightMul
-            // ⭐ THE DRAW IS ROW-LOCAL IN THE TAIL'S OWN SENSE: it reads one
-            // row region of its input (the fold's product) and writes the idx
-            // stick — no row mixing — so a minted graph's feeds-walk traverses
-            // it from the tail to the re-pointed result.
-            | SubOp::Sample { .. }
             // ⭐ AN ALL-GATHER IS ROW-LOCAL: row `r` of its output is row `r` of every rank's
             // block, side by side — a split vocabulary projection's tail passes through it.
             | SubOp::AllGather { .. }
@@ -1123,7 +1101,7 @@ pub fn tensor_feeds_result_through_row_local_ops<F: scratchy_subtile::subtile_ir
     any_reader
 }
 
-fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+fn lower_one<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -1235,7 +1213,7 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // the draw binds (the per-row pair, the nine tables, the idx stick) is
         // whole at corner 0.
         let states_neither_corner =
-            matches!(&node.op, SubOp::TanhSoftCap { .. } | SubOp::Sample { .. });
+            matches!(&node.op, SubOp::TanhSoftCap { .. });
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
                 tr.region.rows.start == 0 && tr.region.cols.start == 0
@@ -1318,20 +1296,6 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
-        // ⭐ THE SAMPLER'S ARITY IS 26: the logits row, its per-row seed
-        // quadruple's FOUR `[rows, 1]` word tables and its per-row temperature
-        // reciprocals, then the twenty staged tables (two decreasing ramps,
-        // two increasing index tables, two widen tables, the pad law's offset
-        // row, the two-level ramp's group pair, then the noise section's own
-        // eleven — the four i32 hash/fold constants, the lane table, the
-        // fold's five f32 constants, the fp16 clamp) — every kernel parameter
-        // but the output is a tape operand, per the splice's own positional
-        // law. (Four word tables, not one `[rows, 4]` table: the Col operand
-        // mode addresses the stick head alone — the int-bcast leg's measured
-        // law — so each word rides its own corner-free table, the auditor's
-        // wall-4 ruling (a); the row word is GONE from the key — the P3
-        // localization ruling, 2026-10-27, request-owned noise alone.)
-        SubOp::Sample { .. } => 26,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -1353,8 +1317,7 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
     let m = compile_kernel(src, &spec, &grid(node, ir)?)?;
     let k = mint(node, &m, program, default_bindings(node))?;
     let name = format!("{}_s{}", program_stem(node, program), node.id.index());
-    let mut e = EmittedOp::bare(name);
-    e.ktir = Some(k);
+    let e = EmittedOp::new(name, k);
     Ok(e)
 }
 
@@ -1396,12 +1359,12 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 /// is a PAD row's: the copy is harmless, and the row is never read (the readback
 /// takes `rows().take(live)` with the live count off the launch's own slot list).
 fn lower_prefill_lm_head_fold<
-    T: ktir_superdsc::collective::Tp,
+    T: scratchy_spyre_bundle::collective::Tp,
     F: scratchy_subtile::subtile_ir::RopeForm,
 >(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_spyre_bundle::rung::QueryExtent,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     use scratchy_subtile::subtile_ir::Region as SubRegion;
 
@@ -1432,13 +1395,13 @@ fn lower_prefill_lm_head_fold<
             query_rows.requests().get(),
         ));
     }
-    let answers = ktir_superdsc::sdsc_abstract::AnswerRows::of_extent(query_rows);
+    let answers = scratchy_spyre_bundle::rung::AnswerRows::of_extent(query_rows);
     let (w, s) = (
         query_rows.per_request().get(),
         u32::try_from(answers.count())
             .map_err(|_| "triton splice: the rung's request capacity overflows u32".to_string())?,
     );
-    let last_hidden = ktir_superdsc::reserved_tids::LAST_HIDDEN_TID;
+    let last_hidden = scratchy_spyre_bundle::reserved_tids::LAST_HIDDEN_TID;
     // The bake-log proof the fold fired: every prefill rung's bake names its
     // own LAST_HIDDEN extraction — the op, the rows it takes, and the staging
     // it lands in. A rung whose bake lacks this line folded nothing. The count
@@ -1450,7 +1413,7 @@ fn lower_prefill_lm_head_fold<
         node.id.index(),
         s,
         w,
-        ktir_superdsc::sdsc_abstract::selector_lastrow_col(w as usize) as u32,
+        scratchy_spyre_bundle::rung::selector_lastrow_col(w as usize) as u32,
         mq,
         hidden,
         last_hidden
@@ -1508,17 +1471,9 @@ fn lower_prefill_lm_head_fold<
         &lmlast_program,
         default_bindings(&extraction_node),
     )?;
-    // The KtirNode's own fields: `node_out_tid` names the TAIL'S output (the door
-    // names its copies `lmlast{j}_o{tid}` after it), and `answer_rows` states the rows
-    // themselves — the ONE statement the door's `S · hidden/64` copies take each
-    // request's row from, never re-derived from the view extents. The name is the
-    // builder's `lmlast_s{id}` law.
-    k.node_out_tid = Some(BufferId::new(node.output.tensor.index() as u32));
-    k.answer_rows = Some(answers);
     let xname = format!("lmlast_s{}", node.id.index());
     k.func.name = Arena::global().str(xname.clone());
-    let mut extract = EmittedOp::bare(xname);
-    extract.ktir = Some(k);
+    let extract = EmittedOp::new(xname, k);
 
     // ── Half 2: the SAME node at m=S, reading the staging's whole [S, hidden] ──
     let mut at_ms = node.clone();
@@ -1552,7 +1507,7 @@ fn lower_prefill_lm_head_fold<
 /// off + C_SRC)` of a `dst_cols`-wide tensor: one spliced `blockcopy.py` program named `name`.
 /// `node` is the collective the copy realizes — its id and op key the program like every other.
 pub fn lower_block_copy<
-    T: ktir_superdsc::collective::Tp,
+    T: scratchy_spyre_bundle::collective::Tp,
     F: scratchy_subtile::subtile_ir::RopeForm,
 >(
     node: &SubtileNode<F>,
@@ -1561,27 +1516,10 @@ pub fn lower_block_copy<
     dst_cols: u32,
     name: &str,
 ) -> Result<EmittedOp<T>, String> {
-    use ktir_superdsc::superdsc_opspec::{Fp16, StickExtent};
     let rows = src.region.rows.len;
-    // ⭐ THE WHOLE-STICK LAW, STATED ONCE: both widths are `StickExtent`s and the column is a
-    // `ColWindow`, each refusing a sub-stick value at its own constructor, so the kernel and the
-    // door are handed whole sticks and restate no check of their own.
-    let whole = |what: &str, r: Result<u32, String>| {
-        r.map_err(|e| format!("triton splice: {name}: the block copy's {what}: {e}"))
-    };
-    let c_src = whole(
-        "source width",
-        StickExtent::<Fp16>::new(src.region.cols.len).map(|s| s.elems()),
-    )?;
-    let c_dst = whole(
-        "destination width",
-        StickExtent::<Fp16>::new(dst_cols).map(|s| s.elems()),
-    )?;
-    let off = whole(
-        "destination column",
-        ktir_superdsc::addr::col_window_of(rows, c_dst, dst.region.cols.start, Df::Fp16)
-            .map(|w| w.column()),
-    )?;
+    let c_src = src.region.cols.len;
+    let c_dst = dst_cols;
+    let off = dst.region.cols.start;
     let (src_py, file, whole_entry) = match blockcopy_row() {
         TritonKernelRow::Spliced {
             src, file, entry, ..
@@ -1600,11 +1538,7 @@ pub fn lower_block_copy<
     // `O(rows / BLOCK_M)` straight-line copies at any width (`blockcopy.py`'s own doc says why).
     // The row count is not a constexpr: the kernel states it as `N_BLOCKS · BLOCK_M (+ TAIL_H)`.
     // A copy with no tail takes the whole-block entry, which has no `TAIL_H` to state.
-    let (block_m, n_blocks, tail_h) = blocks_of(
-        rows,
-        c_src,
-        ktir_superdsc::superdsc_opspec::BLOCK_COPY_LIVE_TILES,
-    );
+    let (block_m, n_blocks, tail_h) = blocks_of(rows, c_src, BLOCK_COPY_LIVE_TILES);
     let tail = std::num::NonZeroU32::new(tail_h);
     let mut stated = vec![
         ("C_SRC", c_src),
@@ -1639,8 +1573,7 @@ pub fn lower_block_copy<
     };
     let mut k = mint(&copy, &module, &Program::BlockCopy, default_bindings(&copy))?;
     k.func.name = Arena::global().str(name.to_string());
-    let mut e = EmittedOp::bare(name.to_string());
-    e.ktir = Some(k);
+    let e = EmittedOp::new(name.to_string(), k);
     Ok(e)
 }
 
@@ -1692,7 +1625,7 @@ pub fn lower_block_copy<
 /// that one value. The pool's page ([`PagedKvPool::POOL_PAGE_SLOTS`], a
 /// [`PoolPageSlots`]) is a DIFFERENT quantity: before they were types, a plain integer
 /// accepted either. Integer boundaries call `.get()`.
-pub use ktir_superdsc::sdsc_abstract::{HeadWidth, PoolPageSlots, SchedulerBlockTokens};
+pub use scratchy_spyre_bundle::rung::{HeadWidth, PoolPageSlots, SchedulerBlockTokens};
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
@@ -1750,6 +1683,10 @@ impl BatchChunking {
     /// Triton's gather floor.
     pub const GATHER_FLOOR: u32 = 8;
 
+    /// The most chunks one walk is cut into ([`MAX_WALK_TRIPS`]): a 32-sequence batch over a
+    /// 2048-page pool is 64 chunks of 32 block slots, not 2048 chunks of one.
+    pub const MAX_CHUNKS: u32 = MAX_WALK_TRIPS;
+
     /// One stick of fp16 lanes — a gathered row of the folded cache or the folded query is whole
     /// sticks of it, or the gather has no addressing for it.
     pub const STICK: u32 = 64;
@@ -1789,9 +1726,14 @@ impl BatchChunking {
     /// reaches the floor, the widest whole-stick cut is taken and the block slots make up the rest
     /// as before — the law stays total. At `kv_heads` rows a page this is the kv-head fold exactly;
     /// its cut is a cut of the same bytes into finer equal rows.
+    ///
+    /// A walk past [`Self::MAX_CHUNKS`] chunks takes more block slots a chunk, but never as many
+    /// pages a chunk as the `pages`-page pool holds (spyre-inference's eligibility: a gather of the
+    /// whole pool faults their device, torch-spyre#4033) — past that it takes more chunks.
     pub const fn of(
         seqs: u32,
         blocks: u32,
+        pages: u32,
         nkvh: u32,
         q_width: u32,
         head_size: u32,
@@ -1826,7 +1768,15 @@ impl BatchChunking {
             1
         };
         let floor = Self::GATHER_FLOOR.div_ceil(seqs * rows_per_page);
+        let bounded = blocks.div_ceil(Self::MAX_CHUNKS);
+        let under_pool = if pages > seqs { (pages - 1) / seqs } else { 1 };
+        let bounded = if bounded < under_pool { bounded } else { under_pool };
         let blocks_per_chunk = if theirs < floor { floor } else { theirs };
+        let blocks_per_chunk = if blocks_per_chunk < bounded {
+            bounded
+        } else {
+            blocks_per_chunk
+        };
         BatchChunking {
             seqs,
             blocks_per_chunk,
@@ -1848,7 +1798,7 @@ impl BatchChunking {
 }
 
 /// ⭐⭐⭐ THE PAGED STEP'S HOST SOURCES — the buffers a paged forward's attention and KV write read
-/// besides the pools, at their RESERVED tids (`ktir_superdsc::reserved_tids::PAGED_STEP_BASE`): one
+/// besides the pools, at their RESERVED tids (`scratchy_spyre_bundle::reserved_tids::PAGED_STEP_BASE`): one
 /// session holds every bundle's programs, so a source numbered past ONE graph can be a real tensor of
 /// another, and the reserved region names the same ids for every bundle. The splice that binds them
 /// and the wiring that exposes them read them here. Each is spyre-inference's own operand.
@@ -1864,9 +1814,6 @@ pub struct PagedStepTids {
     pub write_rows: u32,
     /// `query_row_index` `[padded_query_len]` int32: the sequence's rows of the query.
     pub query_rows: u32,
-    /// `kv_row_pool` `[num_pages, num_kv_heads, 1]` int32: every page's folded-cache rows
-    /// `page * num_kv_heads + kv` (the decode kernel's).
-    pub kv_row_pool: u32,
     /// A decode batch's `rep_row_ids` `[entries · rows_per_page]` int32 ([`BatchChunking`]): entry
     /// `j · seqs + s`'s row `a` holds `row · rows_per_page + a` of sequence `s`'s query row.
     pub rep_rows: u32,
@@ -1877,22 +1824,17 @@ pub struct PagedStepTids {
     /// A decode batch's `mask_by_chunk` `[num_chunks, blocks_per_chunk, seqs, 1, 1, block_size]`:
     /// one row per block slot and sequence, broadcast over the kv heads in the kernel.
     pub chunk_masks: u32,
-    /// The decode step's int32 zero stick, staged beside `kv_row_pool`: the add identity the chained
-    /// index's run copy reads on the card.
-    pub int32_zero: u32,
 }
 
 impl PagedStepTids {
     pub const RESERVED: PagedStepTids = PagedStepTids {
-        mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
-        page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
-        write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
-        query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
-        kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
-        rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
-        chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
-        chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
-        int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
+        mask: scratchy_spyre_bundle::reserved_tids::PAGED_MASK_TID,
+        page_table: scratchy_spyre_bundle::reserved_tids::PAGED_PAGE_TABLE_TID,
+        write_rows: scratchy_spyre_bundle::reserved_tids::PAGED_WRITE_ROWS_TID,
+        query_rows: scratchy_spyre_bundle::reserved_tids::PAGED_QUERY_ROWS_TID,
+        rep_rows: scratchy_spyre_bundle::reserved_tids::PAGED_REP_ROWS_TID,
+        chunk_pages: scratchy_spyre_bundle::reserved_tids::PAGED_CHUNK_PAGES_TID,
+        chunk_masks: scratchy_spyre_bundle::reserved_tids::PAGED_CHUNK_MASKS_TID,
     };
 }
 
@@ -1903,8 +1845,45 @@ pub fn attn_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
         src: include_str!("../../../../kernels/page_attn_head_major_prefill.py"),
         file: "page_attn_head_major_prefill.py",
-        entry: "page_attn_head_major_prefill_kernel",
+        entry: KvPool::BUILD.entry(
+            "page_attn_head_major_prefill_kernel",
+            "page_attn_head_major_prefill_fp8_kernel",
+        ),
         program: Program::PagedAttn,
+    }
+}
+
+/// ⭐ THE KV POOL'S ELEMENT FORMAT — one per build (`kv-fp8`), the format every paged kernel writes
+/// and reads its pages in. The fp8 pool halves the cache: its writer narrows each row to E4M3, and
+/// every walk widens its pages back to f16 before their first use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPool {
+    Fp16,
+    Fp8,
+}
+
+impl KvPool {
+    /// This build's pool.
+    pub const BUILD: KvPool = if cfg!(feature = "kv-fp8") {
+        KvPool::Fp8
+    } else {
+        KvPool::Fp16
+    };
+
+    /// A paged kernel's entry for this pool: spyre-inference's own, or its fp8-pool twin.
+    pub const fn entry(self, fp16: &'static str, fp8: &'static str) -> &'static str {
+        match self {
+            KvPool::Fp16 => fp16,
+            KvPool::Fp8 => fp8,
+        }
+    }
+
+    /// The pool's pointer type in a paged kernel's signature.
+    pub const fn pointer(self) -> &'static str {
+        match self {
+            KvPool::Fp16 => "*fp16",
+            KvPool::Fp8 => "*fp8e4nv",
+        }
     }
 }
 
@@ -1914,7 +1893,7 @@ pub fn attn_decode_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
         src: include_str!("../../../../kernels/page_attn_head_major_decode.py"),
         file: "page_attn_head_major_decode.py",
-        entry: "page_attn_head_major_decode_kernel",
+        entry: KvPool::BUILD.entry("page_attn_head_major_decode_kernel", "page_attn_head_major_decode_fp8_kernel"),
         program: Program::PagedAttn,
     }
 }
@@ -1925,7 +1904,7 @@ pub fn batched_decode_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
         src: include_str!("../../../../kernels/batched_decode_head_major.py"),
         file: "batched_decode_head_major.py",
-        entry: "batched_decode_head_major_kernel",
+        entry: KvPool::BUILD.entry("batched_decode_head_major_kernel", "batched_decode_head_major_fp8_kernel"),
         program: Program::PagedAttn,
     }
 }
@@ -1937,7 +1916,7 @@ pub fn kv_write_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
         src: include_str!("../../../../kernels/reshape_and_cache_head_major.py"),
         file: "reshape_and_cache_head_major.py",
-        entry: "reshape_and_cache_head_major_kernel",
+        entry: KvPool::BUILD.entry("reshape_and_cache_head_major_kernel", "reshape_and_cache_head_major_fp8_kernel"),
         program: Program::PagedKvWrite,
     }
 }
@@ -1998,6 +1977,23 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// The most trips one page walk unrolls. Every trip is its own straight-line copy of the walk's
+/// body in the baked program, so a longer walk takes more pages a trip instead of more trips.
+pub const MAX_WALK_TRIPS: u32 = 64;
+
+/// ⭐ A PROMPT WALK'S PAGES A TRIP — one (spyre-inference's walk, page by page) while `walk` fits
+/// [`MAX_WALK_TRIPS`] trips, else the fewest that keeps it there: a power of two, and at least
+/// Triton's gather floor, since a trip's pages are one gather.
+pub fn trip_pages(walk: u32) -> u32 {
+    if walk <= MAX_WALK_TRIPS {
+        1
+    } else {
+        walk.div_ceil(MAX_WALK_TRIPS)
+            .next_power_of_two()
+            .max(BatchChunking::GATHER_FLOOR)
+    }
+}
+
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
 /// swept extent in pages. Every page of the pool at `ActiveCap::FULL` (a decode step's keys can sit
 /// anywhere below the capacity), and at `ActiveCap::NONE` (a prompt chunk baked with no resident
@@ -2008,15 +2004,17 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(pages: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
+pub fn walk_pages(pages: u32, mq: u32, active_cap: scratchy_spyre_bundle::program::ActiveCap) -> u32 {
     let swept = active_cap.resolve(
         pages * SchedulerBlockTokens::REFERENCE.get(),
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
+        scratchy_spyre_bundle::rung::POOL_STICK,
     );
     let walked = if swept == 0 { mq } else { swept };
-    walked
+    let walk = walked
         .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(pages)
+        .min(pages);
+    // Whole trips: the pages past the pool's own are page 0 under a fully masked tile.
+    walk.next_multiple_of(trip_pages(walk))
 }
 
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
@@ -2036,10 +2034,6 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     buckets
 }
 
-/// The KV cache's allocation in a one-kernel bundle — see
-/// [`triton_ktir_superdsc::layout::allocate_paged_cache`], where the one-kernel layout lives.
-pub use triton_ktir_superdsc::layout::allocate_paged_cache;
-
 /// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's rows (one sequence's:
 /// the decode kernel at one row, the prefill kernel past it; a decode batch's: the batched decode
 /// kernel) at its geometry and the rung's walk ([`walk_pages`]), and mint the `Program::PagedAttn`
@@ -2052,23 +2046,23 @@ pub use triton_ktir_superdsc::layout::allocate_paged_cache;
 /// (`NUM_TOKENS = w·S`, `PADDED_QUERY_LEN = w`, geometry, `SCALE`, `NUM_BLOCKS`) is identical
 /// across windows, so the module is one object and a window differs only in which buffers its
 /// `query_row_index`, `page_index_table` and `mask_stack` name — window `r`'s are
-/// [`ktir_superdsc::reserved_tids::paged_window_tid`], window 0's being the step's own sentinels
+/// [`scratchy_spyre_bundle::reserved_tids::paged_window_tid`], window 0's being the step's own sentinels
 /// (so a solo rung's family is the one op it has always baked, byte for byte). The windows are
 /// `S` ordinary ops over the graph's absolute rows — the outputs are disjoint by construction
 /// (window `r` scatters rows `r·w .. r·w+w` through its own query row index), the kvwrite stays
 /// the one whole-graph program, and nothing below the splice knows a window exists.
-pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn lower_attn<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     scale_site: AttnScaleSite,
-    active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    active_cap: scratchy_spyre_bundle::program::ActiveCap,
     // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, minted once at the bake and
     // never divided back out of the graph's rows. The PREFILL arm spends it as the kernel's two
     // extents (`NUM_TOKENS` = the graph's rows, `PADDED_QUERY_LEN` = one request's width) and as
     // the walk's extent; the DECODE and BATCH arms read the graph's rows exactly as they did
     // before (one row per request, so the pair's product IS the row count by construction). The
     // agreement check below refuses a mint that does not describe the graph being lowered.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_spyre_bundle::rung::QueryExtent,
     paged_rows: PagedRows,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     let batch = paged_rows == PagedRows::Batch;
@@ -2196,7 +2190,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // of at most `CORES · SchedulerBlockTokens::REFERENCE` positions, and the one config in scope that small
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
-        let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
+        let chunking = BatchChunking::of(mq, blocks, pages, nkvh, g.q_width(), g.head_dim().get());
         if chunking.entries() >= pages {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
@@ -2210,8 +2204,8 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         for (p, ty) in [
             ("query", "*fp16"),
             ("rep_row_ids", "*i32"),
-            ("k_pages", "*fp16"),
-            ("v_pages", "*fp16"),
+            ("k_pages", KvPool::BUILD.pointer()),
+            ("v_pages", KvPool::BUILD.pointer()),
             ("chunk_page_ids", "*i32"),
             ("mask_by_chunk", "*fp16"),
             ("out", "*fp16"),
@@ -2245,7 +2239,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             file: file.to_string(),
         };
         let module = compile_kernel(src, &spec, &[1])?;
-        let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
+        let positional = crate::compile::node_for_compiled(&module, program)
             .map_err(|e| format!("triton splice: node_for: {e}"))?;
         let k = rebind(
             positional,
@@ -2259,23 +2253,19 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
                 BufferId::new(tids.chunk_masks),
                 t(&node.output),
             ],
-            Some(BufferId::new(tids.chunk_masks)),
         )?;
-        let mut e = EmittedOp::bare(format!("attn_s{}", node.id.index()));
-        e.ktir = Some(k);
+        let e = EmittedOp::new(format!("attn_s{}", node.id.index()), k);
         return Ok(vec![e]);
     }
-    let mut pointers = vec![
+    let pointers = [
         ("query", "*fp16"),
         ("query_row_index", "*i32"),
-        ("k_pages", "*fp16"),
-        ("v_pages", "*fp16"),
+        ("k_pages", KvPool::BUILD.pointer()),
+        ("v_pages", KvPool::BUILD.pointer()),
         ("page_index_table", "*i32"),
+        ("mask_stack", "*fp16"),
+        ("out", "*fp16"),
     ];
-    if decode {
-        pointers.push(("kv_row_pool", "*i32"));
-    }
-    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
     for (p, ty) in pointers {
         signature.insert(
             p.to_string(),
@@ -2297,6 +2287,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // its padded query length is the rung's per-request width. At one request the two agree,
         // which is why one `mq` served until S > 1.
         sizes.push(("PADDED_QUERY_LEN", query_rows.per_request().get()));
+        sizes.push(("BLOCKS_PER_TRIP", trip_pages(blocks)));
     }
     for (k, v) in sizes {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -2311,7 +2302,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
+    let positional = crate::compile::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE WINDOW FAMILY — a prefill pair's capacity is how many one-sequence programs the one
     // compiled module is rebind to. Every OTHER arm is one window by its own pair: a batch's rows
@@ -2324,12 +2315,12 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         1
     } else {
         let s = query_rows.requests().get();
-        if s > ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
+        if s > scratchy_spyre_bundle::reserved_tids::PAGED_MAX_WINDOWS {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a packed prefill of {s} window(s) — the reserved \
                  tid space holds {} (PAGED_MAX_WINDOWS); the bake's packed table outgrew it",
                 node.output.tensor.index(),
-                ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS,
+                scratchy_spyre_bundle::reserved_tids::PAGED_MAX_WINDOWS,
             ));
         }
         s
@@ -2346,18 +2337,16 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let mut out = Vec::with_capacity(windows as usize);
     for r in 0..windows {
         let window =
-            |table: u32| BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, table));
-        let mut bindings = vec![
+            |table: u32| BufferId::new(scratchy_spyre_bundle::reserved_tids::paged_window_tid(r, table));
+        let bindings = vec![
             t(&node.inputs[0]),
             window(0),
             t(&node.inputs[1]),
             t(&node.inputs[2]),
             window(1),
+            window(2),
+            t(&node.output),
         ];
-        if decode {
-            bindings.push(BufferId::new(tids.kv_row_pool));
-        }
-        bindings.extend([window(2), t(&node.output)]);
         let name = if r == 0 {
             format!("attn_s{}", node.id.index())
         } else {
@@ -2378,14 +2367,8 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             },
             program,
             bindings,
-            mask: Some(window(2)),
-            node_out_tid: None,
-            answer_rows: None,
-            minted: Default::default(),
-            lx_plan: Default::default(),
         };
-        let mut e = EmittedOp::bare(name);
-        e.ktir = Some(k);
+        let e = EmittedOp::new(name, k);
         out.push(e);
     }
     Ok(out)
@@ -2396,7 +2379,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
 /// `Program::PagedKvWrite` node over their operands: `[key, value, k_rows, v_rows, row_index]`, where
 /// `key` is the RopeAppend's own output (the rotated K) and `value` its V input.
 pub fn lower_kv_write<
-    T: ktir_superdsc::collective::Tp,
+    T: scratchy_spyre_bundle::collective::Tp,
     F: scratchy_subtile::subtile_ir::RopeForm,
 >(
     node: &SubtileNode<F>,
@@ -2462,8 +2445,8 @@ pub fn lower_kv_write<
     for (p, ty) in [
         ("key", "*fp16"),
         ("value", "*fp16"),
-        ("k_rows", "*fp16"),
-        ("v_rows", "*fp16"),
+        ("k_rows", KvPool::BUILD.pointer()),
+        ("v_rows", KvPool::BUILD.pointer()),
         ("row_index", "*i32"),
     ] {
         signature.insert(
@@ -2490,7 +2473,7 @@ pub fn lower_kv_write<
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
+    let positional = crate::compile::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
@@ -2502,9 +2485,8 @@ pub fn lower_kv_write<
         BufferId::new(PagedStepTids::RESERVED.write_rows),
     ];
     let name = format!("kvwrite_s{}", node.id.index());
-    let k = rebind(positional, name.clone(), bindings, None)?;
-    let mut e = EmittedOp::bare(name);
-    e.ktir = Some(k);
+    let k = rebind(positional, name.clone(), bindings)?;
+    let e = EmittedOp::new(name, k);
     Ok(e)
 }
 
@@ -2514,7 +2496,6 @@ fn rebind(
     positional: KtirNode,
     name: String,
     bindings: Vec<BufferId>,
-    mask: Option<BufferId>,
 ) -> Result<KtirNode, String> {
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
@@ -2532,11 +2513,6 @@ fn rebind(
         },
         program,
         bindings,
-        mask,
-        node_out_tid: None,
-        answer_rows: None,
-        minted: Default::default(),
-        lx_plan: Default::default(),
     })
 }
 
@@ -2780,7 +2756,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // stays LOGICAL: its door arm returns early through
             // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
-            let n_dev = matmul_out_width(node, ir, m, *n, k);
+            let n_dev = stick_width(*n);
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(n_dev)))?;
@@ -2860,7 +2836,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // states `N_TOTAL = N`, `C_START = 0`.
             let (n_total, c_start) = window_of(node, ir)?;
             let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES);
+                blocks_of(m, c, SILU_MUL_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -2884,7 +2860,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             };
             let (n_total, c_start) = window_of(node, ir)?;
             let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, ktir_superdsc::superdsc_opspec::EW_SILU_LIVE_TILES);
+                blocks_of(m, c, EW_SILU_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -2913,7 +2889,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             };
             let (n_total, c_start) = window_of(node, ir)?;
             let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, ktir_superdsc::superdsc_opspec::EW_BINARY_LIVE_TILES);
+                blocks_of(m, c, EW_BINARY_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -2962,9 +2938,9 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // `for_output` width (the documented equality, for any matmul above the
             // util floor), so the widened view names the storage the placement
             // actually holds.
-            let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(c).get();
+            let c_dev = stick_width(c);
             let (block_m, n_blocks, tail_h) = blocks_of(m, c_dev, 3);
-            let n_total_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(n_total).get();
+            let n_total_dev = stick_width(n_total);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c_dev)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -3137,100 +3113,6 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_OUT", Val::Int(i128::from(c_out)))?;
             ce("N_STICKS", Val::Int(i128::from(elems_in / u64::from(stk))))?;
         }
-        (SubOp::Sample { vocab, rows }, "sample_fwd") => {
-            // The token draw's own facts, all derived from the node's vocab and
-            // row count — never a model name: PAD_V is the power-of-two padded
-            // row, STRICTLY above the vocab (the descriptor block's law and the
-            // sentinel's — a power-of-two vocab still needs pad lanes), ONE
-            // derivation shared with the host reference and the load-time table
-            // staging), NB its block count, BLOCK the stick (the two-level
-            // ramp's lane width and the output stick), B the row count this
-            // rung serves (the grid's own width). The signature states every
-            // kernel parameter's dtype: the fp16 row, the PER-ROW SEED WORD
-            // TABLES in i32 — four `[rows, 1]` tables, one per word of the
-            // quadruple (seed_lo, seed_hi, step, greedy_gate), each
-            // loaded corner-free at `[pid, 0]` (the Col operand mode reads
-            // the stick head alone — the int-bcast leg's measured law — so
-            // no word rides a windowed column; the auditor's wall-4 ruling
-            // (a); the row word is gone from the key — the P3 localization
-            // ruling, request-owned noise alone); the noise is computed on
-            // the card, no f32 noise staging
-            // rides — then the per-row temperature reciprocals in f32,
-            // the nine selection tables in f32 (the selection is f32 — a sum
-            // the f16 grid would round), the noise section's own tables — the
-            // hash multipliers and the wrap-fold's 2^8 in i32, the lane and the
-            // fold's five f32 constants, the FEST-domain clamp in fp16 — and
-            // the i32 output stick (the index-ingestion law).
-            let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(*vocab);
-            let nb = pad_v / scratchy_subtile::subtile_ir::SAMPLE_BLOCK;
-            signature.insert(
-                "logits_ptr".to_string(),
-                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-            );
-            for p in ["slo_ptr", "shi_ptr", "stp_ptr", "sgate_ptr"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
-                );
-            }
-            for p in [
-                "invt_ptr",
-                "bramp_ptr",
-                "lramp_ptr",
-                "binc_ptr",
-                "linc_ptr",
-                "ones_ptr",
-                "sixtyfour_ptr",
-                "padoff_ptr",
-                "gramp_ptr",
-                "ginc_ptr",
-            ] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
-                );
-            }
-            for p in ["hc1_ptr", "hc2_ptr", "hc3_ptr", "c256_ptr"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
-                );
-            }
-            for p in [
-                "lane_ptr",
-                "fm8_ptr",
-                "ftop_ptr",
-                "fzero_ptr",
-                "fhalf_ptr",
-                "fm22_ptr",
-            ] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
-                );
-            }
-            signature.insert(
-                "cmin_ptr".to_string(),
-                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-            );
-            signature.insert(
-                "idx_ptr".to_string(),
-                ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
-            );
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            ce("V", Val::Int(i128::from(*vocab)))?;
-            ce("PAD_V", Val::Int(i128::from(pad_v)))?;
-            ce("NB", Val::Int(i128::from(nb)))?;
-            ce(
-                "BLOCK",
-                Val::Int(i128::from(scratchy_subtile::subtile_ir::SAMPLE_BLOCK)),
-            )?;
-            ce("B", Val::Int(i128::from(*rows)))?;
-        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -3292,70 +3174,6 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((n_total, c_start))
 }
 
-/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=S
-/// tail states: the out descriptor names the OUTPUT TENSOR's row extent (`M_TOTAL`,
-/// the storage the layout reserved) while the store takes the `[M, N]` tile at row 0,
-/// and the activation names its own `[M, K]` window. A whole-region node answers
-/// `(out_rows, a_rows)` with `M_TOTAL = M`.
-///
-/// ⛔ THE ROW CORNER MUST BE 0 — the door's `base_addressed` refuses a nonzero row
-/// corner on both the activation and the output, and no matmul kernel in this family
-/// spells one. The fold's m=S tail is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage, so
-/// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
-/// silently mis-address.
-/// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.
-///
-/// The door's device width (`DeviceWidth::for_matmul`) may pad the output's stick count to fill
-/// the util floor, and the layout reserves the padded width. The program's output view must name
-/// what its readers read, because the program's views are row-major (the emulator runs them as
-/// stated): a reader that states the LOGICAL width over a buffer written at the padded one reads
-/// every row past the first at the wrong stride. So:
-/// - when EVERY reader is a family whose kernel states the logical width — RoPE, the attention,
-///   the norms, the elementwise and gated-activation families, a collective — the output is the
-///   logical width, stick-rounded;
-/// - otherwise the padded width stands: a pad-aware reader (the ScalarMul family, whose window IS
-///   `DeviceWidth::for_pointwise` — the logits scale over the padded lm head) or one this law does
-///   not name (the sampler's widened row) reads the storage the door pads.
-///
-/// The card is unchanged either way: the door re-derives its padded write from the stated width
-/// (`for_matmul` is idempotent at a padded width and pads the logical one alike), and a card
-/// activation is stick-major, so the leading sticks of a padded write are the logical tensor's
-/// bytes. MEASURED (the emulator gates): smollm2's one-rank prefill k/v (`[31, 192]`, 3 sticks)
-/// and granite's two-rank prefill k/v (`[31, 256]`, 4 sticks) were written at 512 and read at
-/// their logical widths — row 0 right, every later row at the wrong stride.
-fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
-    node: &SubtileNode<F>,
-    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
-    m: u32,
-    n: u32,
-    k: u32,
-) -> u32 {
-    let out = node.output.tensor;
-    let mut readers = ir
-        .nodes
-        .iter()
-        .filter(|r| r.inputs.iter().any(|i| i.tensor == out))
-        .peekable();
-    let logical_readers = readers.peek().is_some()
-        && readers.all(|r| {
-            matches!(
-                r.op,
-                SubOp::RopeRotate { .. }
-                    | SubOp::RopeAppend { .. }
-                    | SubOp::AttnDecode { .. }
-                    | SubOp::RmsNorm { .. }
-                    | SubOp::Elementwise(_)
-                    | SubOp::SiluMul
-                    | SubOp::AllReduce
-                    | SubOp::AllGather { .. }
-            )
-        });
-    if logical_readers {
-        n.next_multiple_of(ktir_superdsc::work::FP16_ELEMS_PER_STICK)
-    } else {
-        ktir_superdsc::work::DeviceWidth::for_matmul(m, n, k, false).get()
-    }
-}
 
 fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
@@ -3392,6 +3210,28 @@ fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((out_total, a_total.unwrap_or(a.region.rows.len)))
 }
 
+/// A row's storage width: whole fp16 sticks.
+fn stick_width(n: u32) -> u32 {
+    n.next_multiple_of(scratchy_spyre_bundle::rung::FP16_LANES)
+}
+
+/// The fp16 elements one program's live tiles may hold together: the scratchpad's capacity.
+const LIVE_ELEMS: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::LX_CAPACITY_BYTES / 2;
+
+/// The tiles an elementwise kernel holds live at once: silu's decomposition (`x`, its negation,
+/// the exponential, the one, the denominator, the result); a binary op's two operands and result;
+/// silu-mul's eight; a block copy's one.
+const EW_SILU_LIVE_TILES: u32 = 6;
+const EW_BINARY_LIVE_TILES: u32 = 3;
+const SILU_MUL_LIVE_TILES: u32 = 8;
+const BLOCK_COPY_LIVE_TILES: u32 = 1;
+
+/// How many rows of a `cols`-wide region keep `live` tiles inside [`LIVE_ELEMS`].
+fn rows_per_block(cols: u32, live: u32) -> u32 {
+    ((LIVE_ELEMS / u64::from(live.max(1)) / u64::from(cols.max(1))) as u32).max(1)
+}
+
 /// THE ROW-BLOCK CONSTANTS the pointwise kernels take — the builder's own blocking
 /// law, stated from the node's own region: `BLOCK_M` is the SHARED `rows_per_block`
 /// (`EW_LX_ELEMS / live / cols` — one function both paths read, so the builder's
@@ -3410,7 +3250,7 @@ fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// a wrong count here would block at a different height than the builder and diverge
 /// the door's windows.
 fn blocks_of(rows: u32, cols: u32, live: u32) -> (u32, u32, u32) {
-    let blk = ktir_superdsc::superdsc_opspec::rows_per_block(cols, live);
+    let blk = rows_per_block(cols, live);
     if blk >= rows {
         // The region FITS: one whole-region tile, the constants the one-tile form
         // always stated (and the builder's un-blocked arm still states).
@@ -3444,11 +3284,6 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => Ok(vec![1]),
-        // ⭐ ONE PROGRAM PER REQUEST ROW: the sampler's grid is the rung's
-        // own row count — 1 on the solo rung, the batched rung's baked width
-        // on every batch rung. Every per-row operand is a `[B, ·]` descriptor
-        // this program's own row indexes (`[pid, 0]`).
-        SubOp::Sample { rows, .. } => Ok(vec![i64::from(*rows)]),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -3481,7 +3316,7 @@ fn compile_kernel(src: &str, spec: &KernelSpec, grid: &[i64]) -> Result<Compiled
     /// [`CompiledKernel`] the doors take. The key is [`memo_key`]'s canonical `String`,
     /// so it needs no `Hash`/`Ord` on `ArgSpec`/`Val` and is deterministic in
     /// construction.
-    static CACHE: triton_ktir_superdsc::ModuleMemo = triton_ktir_superdsc::ModuleMemo::new();
+    static CACHE: crate::compile::ModuleMemo = crate::compile::ModuleMemo::new();
     CACHE.compile_under(memo_key(src, spec, grid), || {
         compile_kernel_uncached(src, spec, grid)
     })
@@ -3729,15 +3564,15 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
             // the placement census by its own skip law (`df != Df::Fp16`), so
             // completion changes no sizing.
             SubOp::EmbedRowGather { .. } if bindings.len() == 4 => vec![
-                (bindings[0].get(), Df::SenUint32),
-                (bindings[1].get(), Df::SenUint32),
+                (bindings[0].get(), Df::UInt32),
+                (bindings[1].get(), Df::UInt32),
                 (bindings[2].get(), Df::Fp16),
                 (bindings[3].get(), Df::Fp16),
             ],
             // `[pick, s_stick, l_stick, s_tab, l_tab, out]`: every operand is
             // a u32 stick or a u32 table — all SENUINT32.
             SubOp::ChainStage { .. } if bindings.len() == 6 => {
-                bindings.iter().map(|b| (b.get(), Df::SenUint32)).collect()
+                bindings.iter().map(|b| (b.get(), Df::UInt32)).collect()
             }
             // A chain node off the mint's arity — the operand-order contract
             // this function's own zip law states below.
@@ -3803,16 +3638,15 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// One stated pointer dtype → its device format — the door's own mapping law
-/// (F16→Fp16, BF16→Bf16, F32→Fp32, F8E4M3FN→Fp8, i32→SenUint32): a dtype with
+/// (F16→Fp16, F32→Fp32, F8E4M3FN→Fp8, i32→UInt32): a dtype with
 /// no device format is refused BY NAME.
 fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
     use triton_frontend::ttir::{FloatKind, Type};
     Ok(match t {
         Type::Float(FloatKind::F16) => Df::Fp16,
-        Type::Float(FloatKind::BF16) => Df::Bf16,
         Type::Float(FloatKind::F32) => Df::Fp32,
         Type::Float(FloatKind::F8E4M3FN) => Df::Fp8,
-        Type::Int(32, _) => Df::SenUint32,
+        Type::Int(32, _) => Df::UInt32,
         other => {
             return Err(format!(
                 "triton splice: parameter `{param}` states element type {other:?}, which has no \
@@ -3843,7 +3677,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     // KEYED by the compile's own memo key (riding inside the `CompiledKernel` the memo
     // minted), so a kernel spliced once per layer per rung lowers its handoff ONCE, not
     // once per node.
-    let positional = triton_ktir_superdsc::node_for_compiled(compiled, *program)
+    let positional = crate::compile::node_for_compiled(compiled, *program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key
     // follow the same law the builder path established — what the golden pins.
@@ -3866,11 +3700,6 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         func: ktir_core::ir::IRFunction { name, ..func },
         program,
         bindings,
-        mask: None,
-        node_out_tid: None,
-        answer_rows: None,
-        minted: Default::default(),
-        lx_plan: Default::default(),
     })
 }
 
@@ -3913,10 +3742,6 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
         Program::BlockCopy => "blockcopy",
-        // ⭐ THE SAMPLER'S OWN STEM — #813's argmax law: a spliced whole-function kernel
-        // keeps its own name (`argmax_s{id}`), never the generic `triton`, so a bake log
-        // names the draw's descriptors for what they are.
-        Program::Sample => "sample",
         _ => "triton",
     }
 }
@@ -3927,9 +3752,8 @@ mod production_ktir_dump {
     //! `LegalizeTypes` runs on EVERY kernel the ladder compiles, so a change that widens
     //! what stays f32 could move bytes in kernels that work today. This test dumps the
     //! post-`to_ktir` module text — `triton_ktir::text::print::print`, the deterministic
-    //! module printer — for EVERY production kernel in `backends/spyre/kernels/`
-    //! except `sample_fwd.py` (the sampler this proof guards), each at one representative
-    //! admitted geometry, into `<workspace>/target/spyre-ktir-dump/`.
+    //! module printer — for EVERY production kernel in `backends/spyre/kernels/`, each at one
+    //! representative admitted geometry, into `<workspace>/target/spyre-ktir-dump/`.
     //!
     //! The proof is the EXTERNAL DIFF, not this test: run once with the tree's
     //! `legalize_types.rs`, once with the pre-change file swapped in, and diff the two dump
@@ -3961,7 +3785,6 @@ mod production_ktir_dump {
     const MOE: &str = include_str!("../../../../kernels/moe.py");
     const MOE_PREFILL: &str = include_str!("../../../../kernels/moe_prefill.py");
     const RESHAPE: &str = include_str!("../../../../kernels/reshape.py");
-    const SAMPLE: &str = include_str!("../../../../kernels/sample_fwd.py");
     const RMSNORM: &str = include_str!("../../../../kernels/rmsnorm.py");
     const RMSNORMUNIT: &str = include_str!("../../../../kernels/rmsnormunit.py");
     const ROPE: &str = include_str!("../../../../kernels/rope.py");
@@ -3995,9 +3818,6 @@ mod production_ktir_dump {
         }
     }
 
-    use ktir_superdsc::superdsc_opspec::{
-        EW_BINARY_LIVE_TILES, EW_SILU_LIVE_TILES, SILU_MUL_LIVE_TILES,
-    };
 
     /// One entry per (kernel file, entry point) — the multi-entry files (`elementwise.py`,
     /// `rmsnorm.py`, `windowedrmsnorm.py`, `matmul.py`, `page_attn_head_major_*.py`) state every entry, so a
@@ -4055,7 +3875,7 @@ mod production_ktir_dump {
             ));
         }
         // ── matmul.py (Dense): N is the DEVICE width, the arm's own padding law. ──
-        let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(1, 2048, 2048, false).get();
+        let n_dev = stick_width(2048);
         v.push((
             "matmul_fwd",
             MATMUL,
@@ -4171,7 +3991,7 @@ mod production_ktir_dump {
         // ── scalarmul.py: the WINDOW is the device width — `for_pointwise` on both N and
         // N_TOTAL, the arm's own law. ──
         {
-            let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(2048).get();
+            let c_dev = stick_width(2048);
             let (_, n_blocks, tail_h) = blocks_of(1, c_dev, 3);
             v.push((
                 "scalarmul_fwd",
@@ -4365,19 +4185,22 @@ mod production_ktir_dump {
             // granite-3.1-8b's head dim: a kv-head slab is two sticks wide.
             ("paged_attn_decode_hd128", 1, 4, 4, 128),
             ("paged_attn_prefill_hd128", 64, 4, 4, 128),
+            // under Triton's 8-row gather floor: the rows read and written at the first row
+            // `query_row_index` names.
+            ("paged_attn_prefill_p7", 7, 1, 4, 64),
+            // a prompt chunk over granite-3.1-2b's whole pool, sixteen pages a trip
+            ("paged_attn_prefill_trips", 64, 1024, 1024, 64),
         ] {
             let decode = mq == 1;
-            let mut ptrs: Vec<(&str, &str)> = vec![
+            let ptrs: Vec<(&str, &str)> = vec![
                 ("query", "*fp16"),
                 ("query_row_index", "*i32"),
                 ("k_pages", "*fp16"),
                 ("v_pages", "*fp16"),
                 ("page_index_table", "*i32"),
+                ("mask_stack", "*fp16"),
+                ("out", "*fp16"),
             ];
-            if decode {
-                ptrs.push(("kv_row_pool", "*i32"));
-            }
-            ptrs.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
             let mut ces = vec![
                 ("NUM_TOKENS", Val::Int(mq)),
                 ("NUM_HEADS", Val::Int(32)),
@@ -4399,6 +4222,7 @@ mod production_ktir_dump {
                 )
             } else {
                 ces.push(("PADDED_QUERY_LEN", Val::Int(mq)));
+                ces.push(("BLOCKS_PER_TRIP", Val::Int(i128::from(trip_pages(blocks as u32)))));
                 (
                     PAGED_PREFILL,
                     "page_attn_head_major_prefill.py",
@@ -4423,7 +4247,7 @@ mod production_ktir_dump {
                 ("mask_stack", "*fp16"),
                 ("out", "*fp16"),
             ];
-            let blocks = walk_pages(4, 64, ktir_superdsc::ktir_node::ActiveCap::NONE);
+            let blocks = walk_pages(4, 64, scratchy_spyre_bundle::program::ActiveCap::NONE);
             let ces = vec![
                 ("NUM_TOKENS", Val::Int(128)),
                 ("NUM_HEADS", Val::Int(32)),
@@ -4436,6 +4260,7 @@ mod production_ktir_dump {
                 ("NUM_PAGES", Val::Int(4)),
                 ("NUM_BLOCKS", Val::Int(i128::from(blocks))),
                 ("PADDED_QUERY_LEN", Val::Int(64)),
+                ("BLOCKS_PER_TRIP", Val::Int(i128::from(trip_pages(blocks)))),
                 ("SCALE", Val::Float(0.125)),
             ];
             v.push((
@@ -4465,7 +4290,7 @@ mod production_ktir_dump {
             ("batched_decode_chunks_hd128", 4, 64, 128),
             ("batched_decode_one_slot_hd128", 32, 1, 128),
         ] {
-            let c = BatchChunking::of(seqs, walk, 8, 32 * hd as u32, hd as u32);
+            let c = BatchChunking::of(seqs, walk, 2048, 8, 32 * hd as u32, hd as u32);
             v.push((
                 name,
                 BATCHED_DECODE,
@@ -4605,66 +4430,6 @@ mod production_ktir_dump {
             ),
             vec![1],
         ));
-        // ── sample_fwd.py: the token draw at solo and batched grids — the sampler this
-        // proof guards, and the ONE kernel the grid-[B] fix is allowed to move. The
-        // spec mirrors the `SubOp::Sample` arm of `kernel_spec`'s registry row: the
-        // logits row, its per-row seed quadruple's four word tables and temperature
-        // reciprocal, the twenty staged tables (the nine of the selection cascade and
-        // the noise section's own eleven), and the `[B, 64]` idx stick out. ──
-        {
-            let sample_ptrs: &[(&str, &str)] = &[
-                ("logits_ptr", "*fp16"),
-                ("slo_ptr", "*i32"),
-                ("shi_ptr", "*i32"),
-                ("stp_ptr", "*i32"),
-                ("sgate_ptr", "*i32"),
-                ("invt_ptr", "*fp32"),
-                ("bramp_ptr", "*fp32"),
-                ("lramp_ptr", "*fp32"),
-                ("binc_ptr", "*fp32"),
-                ("linc_ptr", "*fp32"),
-                ("ones_ptr", "*fp32"),
-                ("sixtyfour_ptr", "*fp32"),
-                ("padoff_ptr", "*fp32"),
-                ("gramp_ptr", "*fp32"),
-                ("ginc_ptr", "*fp32"),
-                ("hc1_ptr", "*i32"),
-                ("hc2_ptr", "*i32"),
-                ("hc3_ptr", "*i32"),
-                ("c256_ptr", "*i32"),
-                ("lane_ptr", "*fp32"),
-                ("fm8_ptr", "*fp32"),
-                ("ftop_ptr", "*fp32"),
-                ("fzero_ptr", "*fp32"),
-                ("fhalf_ptr", "*fp32"),
-                ("fm22_ptr", "*fp32"),
-                ("cmin_ptr", "*fp16"),
-                ("idx_ptr", "*i32"),
-            ];
-            for (name, b, grid) in [
-                ("sample_fwd_b1", 1i128, vec![1i64]),
-                ("sample_fwd_b2", 2, vec![2]),
-                ("sample_fwd_b32", 32, vec![32]),
-            ] {
-                v.push((
-                    name,
-                    SAMPLE,
-                    spec(
-                        "sample_fwd.py",
-                        "sample_fwd",
-                        sample_ptrs,
-                        &[
-                            ("V", Val::Int(49155)),
-                            ("PAD_V", Val::Int(65536)),
-                            ("NB", Val::Int(1024)),
-                            ("BLOCK", Val::Int(64)),
-                            ("B", Val::Int(b)),
-                        ],
-                    ),
-                    grid,
-                ));
-            }
-        }
         v
     }
 
@@ -4693,7 +4458,7 @@ mod production_ktir_dump {
                 Program::WindowedRmsNorm { unit: false }
             }
             "windowedrmsnorm_unit_fwd" => Program::WindowedRmsNorm { unit: true },
-            "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
+            "rope_fwd" => Program::Rope,
             "paged_attn_decode"
             | "paged_attn_prefill"
             | "paged_attn_prefill_packed"
@@ -4701,6 +4466,8 @@ mod production_ktir_dump {
             | "paged_attn_prefill_walk"
             | "paged_attn_decode_hd128"
             | "paged_attn_prefill_hd128"
+            | "paged_attn_prefill_p7"
+            | "paged_attn_prefill_trips"
             | "batched_decode"
             | "batched_decode_chunks"
             | "batched_decode_pair"
@@ -4722,169 +4489,45 @@ mod production_ktir_dump {
         }
     }
 
-    /// The kernels whose SDSC this driver CANNOT emit, each for a stated reason — a
-    /// NAMED skip, never a silent one. Everything else must lower or the dump fails.
+    /// The kernels with no `Program` to mint them under: the MoE lowers only from `moe.py`
+    /// through KTIR, and no per-op row names a program for it.
     fn sdsc_skip_of(name: &str) -> Option<&'static str> {
         match name {
-            // The geometry const door: `rope_at::<HD>` monomorphises on head geometry the
-            // driver would have to state from the fixture's constexprs (`bake_py`'s rope
-            // arm). The KTIR-text leg still covers it.
-            "rope_fwd" => Some("the model-geometry const door (rope_at::<HD>)"),
-            // The paged step's card lowering is not ported: the door refuses both programs by
-            // name. The KTIR-text leg covers them.
-            // No `Program` variant exists and none is inventable here: the MoE lowers
-            // only from `kernels/moe.py` through KTIR, and no per-op row names a
-            // program for it. Stating one in a dump driver would be routing invented
-            // outside the registry.
-            "moe_fwd" | "moe_prefill_fwd" => Some("no Program variant — the MoE has no door row"),
+            "moe_fwd" | "moe_prefill_fwd" => Some("no Program variant — the MoE has no row"),
             _ => None,
         }
     }
 
-    /// One emitted op as STABLE TEXT for the byte-identity diff: `wire::SdscOp` derives
-    /// `Serialize` (the wire format's own serializer — deterministic maps, no Debug
-    /// float spelling), and every non-serializable field rides as its `Debug` string.
-    /// `ktir` is dropped on purpose: it is the program the op CARRIES, not bytes the
-    /// device consumes, and the `.ktir` file beside this one already pins it.
-    fn sdsc_line(
-        op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
-    ) -> String {
-        let mut obj = serde_json::Map::new();
-        obj.insert("op_name".into(), serde_json::json!(op.op_name));
-        obj.insert(
-            "op".into(),
-            match &op.op {
-                Some(o) => serde_json::to_value(o)
-                    .unwrap_or_else(|e| panic!("serialize {}: {e}", op.op_name)),
-                // `None` is the answer for a KTIR op, not an empty descriptor.
-                None => serde_json::Value::Null,
-            },
-        );
-        obj.insert(
-            "arg_bindings".into(),
-            serde_json::json!(format!("{:?}", op.arg_bindings)),
-        );
-        obj.insert("time".into(), serde_json::json!(op.time));
-        obj.insert(
-            "affine_strides".into(),
-            serde_json::json!(format!("{:?}", op.affine_strides)),
-        );
-        obj.insert("kv_page_fold".into(), serde_json::json!(op.kv_page_fold));
-        obj.insert("kv_gathered".into(), serde_json::json!(op.kv_gathered));
-        obj.insert("walk".into(), serde_json::json!(format!("{:?}", op.walk)));
-        serde_json::Value::Object(obj).to_string()
+    /// One emitted descriptor as stable text for the byte-identity diff.
+    fn sdsc_line(op: &(spyre_superdsc::opfunc::OpFunc, spyre_superdsc::wire::Sdsc)) -> String {
+        serde_json::json!({ "op": op.0.wire(), "sdsc": op.1 }).to_string()
     }
 
-    /// Emit one dumped kernel's SDSC through the SAME dispatch the production door
-    /// (`scratchy-target-spyre`'s `ktir_superdsc_door::lower`) states, arm for arm:
-    /// the pointwise kinds, the matmuls, the sampler and LmLast through
-    /// `whole_function::lower_function`; the leaf kinds through their own
-    /// `lower_ktir_to_superdsc` bodies; the column-window guard on exactly the kinds
-    /// the door wraps it around. This crate cannot call that door (the dependency runs
-    /// the other way — the target crate depends on the splice), so the arms are
-    /// mirrored here and the mirror is the dump's own cited limitation.
+    /// Lower one dumped kernel the way the bake does: every parameter device-resident, each at a
+    /// distinct address, every constant on a stick of its own.
     fn emit_sdsc(name: &str, node: &KtirNode) -> Result<Vec<String>, String> {
-        use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
-        use ktir_superdsc::emit::whole_function::lower_function;
-
-        let lk_name = node.func.name;
-        // A WALKING program's windows are its trip-0 windows (`loop_fold::flatten`), the reading
-        // the walk's own lowering takes.
-        let flat = ktir_superdsc::emit::loop_fold::flatten(node)
-            .map_err(|e| format!("{name}: flatten: {e:?}"))?;
-        let at_trip0 = flat.as_ref().map_or(node, |f| &f.node);
-        let regions = lk::regions(at_trip0).map_err(|e| format!("{name}: regions: {e:?}"))?;
-        let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
-            .map_err(|e| format!("{name}: layout: {e}"))?;
-        if matches!(program_of(name), Program::PagedAttn | Program::PagedKvWrite) {
-            allocate_paged_cache(node, &layout)?;
-        }
-        let windowed = |ops: Result<
-            Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
-            lk::Error,
-        >| {
-            let ops = ops.map_err(|e| format!("{name}: {e:?}"))?;
-            lk::column_windows_are_honoured(lk_name, &regions, &ops)
-                .map_err(|e| format!("{name}: {e:?}"))?;
-            Ok::<_, String>(ops)
+        type G = ktir_core::ddl_binds::Baked;
+        let params = node.func.arguments.len();
+        let planned = spyre_superdsc::plan::<G>(&node.func, &vec![None; params])
+            .map_err(|e| format!("{name}: {e:?}"))?;
+        let addresses: Vec<u64> = (0..params as u64).map(|p| (p + 1) << 28).collect();
+        let consts: Vec<(spyre_superdsc::graph::ConstStick, u64)> = planned
+            .graph
+            .consts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (*c, (params as u64 + 1) << 28 | (i as u64 * 128)))
+            .collect();
+        let bindings = spyre_superdsc::Bindings {
+            params: &addresses,
+            consts: &consts,
+            scratch: (params as u64 + 2) << 28,
         };
-        let mut sym = 0i64;
-        let ops = match program_of(name) {
-            // The door's walk, whatever the program computes: the body at trip 0, marked for the
-            // card's relaunch.
-            _ if flat.is_some() => Ok(ktir_superdsc::emit::whole_function::lower_walk(
-                node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .map_err(|e| format!("{name}: {e:?}"))?),
-            // The door's `windowed(...)`-wrapped whole-function kinds.
-            Program::Elementwise(_)
-            | Program::SiluMul
-            | Program::RmsNorm
-            | Program::ScalarMul
-            | Program::Sample
-            | Program::PagedAttn
-            | Program::PagedKvWrite => windowed(lower_function(
-                node,
-                Some(&layout),
-                &mut sym,
-                None,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )),
-            // The door's unwrapped whole-function kinds.
-            Program::Matmul | Program::LmLast => Ok(lower_function(
-                node,
-                Some(&layout),
-                &mut sym,
-                None,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .map_err(|e| format!("{name}: {e:?}"))?),
-            Program::RmsNormUnit => windowed(lk::rmsnorm_unit(
-                lk_name,
-                node,
-                &regions,
-                &mut sym,
-                Some(&layout),
-            )),
-            Program::TanhSoftCap => windowed(lk::tanhsoftcap(
-                lk_name,
-                node,
-                &regions,
-                &mut sym,
-                Some(&layout),
-            )),
-            Program::ScalarWeightMul => windowed(lk::scalarweightmul(
-                lk_name,
-                &regions,
-                &mut sym,
-                Some(&layout),
-            )),
-            Program::Reshape => Ok(lk::reshape(lk_name, &regions, &mut sym, Some(&layout))
-                .map_err(|e| format!("{name}: {e:?}"))?),
-            Program::WindowedRmsNorm { .. } => {
-                Ok(
-                    lk::windowed_rmsnorm(lk_name, node, &regions, &mut sym, Some(&layout))
-                        .map_err(|e| format!("{name}: {e:?}"))?,
-                )
-            }
-            // `program_of` states none of these and `sdsc_skip_of` names the ones that
-            // reach this far — a geometry-door or MoE name here means the two tables
-            // disagree, which is a defect in the driver, not a skip.
-            other => {
-                return Err(format!(
-                    "`{name}` states {other:?}, which the dump's door mirror has no arm for — \
-                     `sdsc_skip_of` must name it or `program_of` must not state it"
-                ));
-            }
-        }?;
+        let ops = planned
+            .emit::<G>(&bindings)
+            .map_err(|e| format!("{name}: {e:?}"))?;
         if ops.is_empty() {
-            return Err(format!(
-                "`{name}` emitted ZERO ops — a dump of nothing proves nothing (the \
-                 no-silent-skip law, applied to the SDSC leg)"
-            ));
+            return Err(format!("`{name}` emitted zero ops"));
         }
         Ok(ops.iter().map(sdsc_line).collect())
     }
@@ -4899,12 +4542,8 @@ mod production_ktir_dump {
     /// to regenerate: the byte-level proof stays the ignored driver's diff.
     #[test]
     fn every_production_kernel_lowers_or_is_refused_by_name() {
-        // (kernel, a substring its door refusal carries).
-        const EXPECTED_REFUSALS: &[(&str, &str)] = &[
-            ("lmlast_fwd_s1", "states no `node_out_tid`"),
-            ("lmlast_fwd_s2", "states no `node_out_tid`"),
-            ("lmlast_fwd_s3", "states no `node_out_tid`"),
-        ];
+        // (kernel, a substring its refusal carries).
+        const EXPECTED_REFUSALS: &[(&str, &str)] = &[];
         let mut refused: Vec<(&str, String)> = Vec::new();
         let mut skipped: Vec<&str> = Vec::new();
         for (name, src, spec, grid) in entries() {
@@ -4918,7 +4557,7 @@ mod production_ktir_dump {
                 skipped.push(name);
                 continue;
             }
-            let node = triton_ktir_superdsc::node_for(&module, program_of(name))
+            let node = crate::compile::node_for(&module, program_of(name))
                 .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
             match emit_sdsc(name, &node) {
                 Ok(lines) => assert!(!lines.is_empty(), "`{name}` emitted no ops"),
@@ -4929,7 +4568,7 @@ mod production_ktir_dump {
         let expected: Vec<&str> = EXPECTED_REFUSALS.iter().map(|(n, _)| *n).collect();
         assert_eq!(
             names, expected,
-            "the kernels the door refuses moved — refusals: {refused:#?}"
+            "the kernels the lowering refuses moved — refusals: {refused:#?}"
         );
         for ((name, reason), (_, why)) in refused.iter().zip(EXPECTED_REFUSALS) {
             assert!(
@@ -4940,7 +4579,7 @@ mod production_ktir_dump {
         skipped.sort_unstable();
         assert_eq!(
             skipped,
-            ["moe_fwd", "moe_prefill_fwd", "rope_fwd"],
+            ["moe_fwd", "moe_prefill_fwd"],
             "the named skips moved"
         );
     }
@@ -4980,7 +4619,7 @@ mod production_ktir_dump {
                     eprintln!("SDSC-SKIP {name}: {reason}");
                 }
                 None => {
-                    let node = triton_ktir_superdsc::node_for(&module, program_of(name))
+                    let node = crate::compile::node_for(&module, program_of(name))
                         .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
                     let sdsc_path = dir.join(format!("{name}.sdsc.jsonl"));
                     match emit_sdsc(name, &node) {
@@ -5014,1812 +4653,3 @@ mod production_ktir_dump {
     }
 }
 
-/// ⭐ THE PAGE WALK ON THE CARD — spyre-inference's page walk at granite-3.1-2b's own pool (2048 pages of
-/// [`SchedulerBlockTokens::REFERENCE`] slots, 32 query heads over 8 kv heads at head dim 64), through the card's walk lowering
-/// (`whole_function::lower_walk`): the loop becomes ONE body built at trip 0 that the card relaunches
-/// once per trip, and every fact of that relaunch is read off the program.
-#[cfg(test)]
-mod walk_on_the_card {
-    use super::*;
-    use ktir_superdsc::emit::loop_fold::{WalkTrips, flatten};
-
-    fn walk(mq: i128, blocks: i128) -> KtirNode {
-        walk_at(mq, blocks, 64)
-    }
-
-    /// [`walk`] at head dim `hd`.
-    fn walk_at(mq: i128, blocks: i128, hd: i128) -> KtirNode {
-        let decode = mq == 1;
-        let row = if decode {
-            attn_decode_row()
-        } else {
-            attn_row()
-        };
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = row
-        else {
-            panic!("the attention rows are spliced");
-        };
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for p in ["query", "k_pages", "v_pages", "mask_stack", "out"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
-        }
-        let mut ints = vec!["query_row_index", "page_index_table"];
-        if decode {
-            ints.push("kv_row_pool");
-        }
-        for p in ints {
-            signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
-        }
-        let mut sizes = vec![
-            ("NUM_TOKENS", mq),
-            ("NUM_HEADS", 32),
-            ("NUM_KV_HEADS", 8),
-            ("HEAD_SIZE", hd),
-            (
-                "BLOCK_SIZE",
-                i128::from(SchedulerBlockTokens::REFERENCE.get()),
-            ),
-            ("NUM_PAGES", 2048),
-            ("NUM_BLOCKS", blocks),
-        ];
-        if !decode {
-            sizes.push(("PADDED_QUERY_LEN", mq));
-        }
-        for (k, v) in sizes {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(v));
-        }
-        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(0.125));
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1]).expect("the walk compiles");
-        triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
-    }
-
-    /// ⭐ A PROMPT CHUNK UNDER TRITON'S SCATTER FLOOR WRITES ITS OUTPUT. Under 8 query rows the
-    /// prefill kernel stores its attention as the tile at the first row the index names
-    /// (`out_tile.store([first, 0], attn)`), not by a scatter; the lowering must still write `out`.
-    #[test]
-    fn a_short_prompt_chunk_writes_its_output() {
-        for (mq, blocks, hd) in [(7i128, 1i128, 64i128), (7, 4, 64), (3, 1, 128), (64, 1, 64)] {
-            let node = walk_at(mq, blocks, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("mq={mq} blocks={blocks} hd={hd}: {}", e.message));
-            let out = ktir_superdsc::place::act_name((node.bindings.len() - 1) as u32);
-            assert!(
-                ops.iter().any(|e| e
-                    .arg_bindings
-                    .iter()
-                    .any(|a| !a.is_input && a.buffer == out)),
-                "mq={mq} blocks={blocks} hd={hd}: some op writes the stored output {out}"
-            );
-        }
-    }
-
-    /// ⭐⭐ THE DECODE TRIP IN torch-spyre's FORM — its compiled program's, at head dim 64 and 128: one
-    /// kv head a core for every op of the trip, the page's Kᵀ re-laid by ONE all-heads restickify, the
-    /// scores and the value product each ONE all-heads contraction, and the kernels, the scores and
-    /// the probabilities all in each core's LX, beside the carried accumulator.
-    #[test]
-    fn the_decode_trip_runs_one_kv_head_a_core_in_lx() {
-        for hd in [64, 128] {
-            the_decode_trip_runs_one_kv_head_a_core_in_lx_at(hd);
-        }
-    }
-
-    fn the_decode_trip_runs_one_kv_head_a_core_in_lx_at(hd: i128) {
-        let node = walk_at(1, 4, hd);
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("the walk lowers: {}", e.message));
-        let named = |prefix: &str| -> Vec<
-            &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
-        > {
-            ops.iter()
-                .filter(|e| e.op_name.starts_with(prefix))
-                .collect()
-        };
-        let lx = |name: &str| layout.lx_core_local(name);
-        let bmms = named("bmm");
-        assert_eq!(
-            bmms.iter()
-                .map(|e| e.op_name.as_str())
-                .collect::<Vec<_>>()
-                .len(),
-            2,
-            "hd={hd}: the scores and the value product, one all-heads contraction each: {:?}",
-            bmms.iter().map(|e| &e.op_name).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            named("transpose").len(),
-            1,
-            "hd={hd}: one all-heads restickify"
-        );
-        for e in &bmms {
-            assert!(e.walk.is_some(), "hd={hd} {}: on every trip", e.op_name);
-            let [_, kernel, out] = e.arg_bindings.as_slice() else {
-                panic!("{}: activation, kernel, output", e.op_name);
-            };
-            assert!(
-                lx(&kernel.buffer),
-                "hd={hd} {}: its kernel in LX",
-                e.op_name
-            );
-            assert!(lx(&out.buffer), "hd={hd} {}: its product in LX", e.op_name);
-        }
-        // The trip's per-row columns — the scores' row max, the carried running max and the row
-        // sum — are in LX too: a reduction writes each core's rows one stick a row, and the ops
-        // reading them broadcast across the page read the same slice.
-        for prefix in ["max_o", "maximum_o", "sum_o"] {
-            let ops = named(prefix);
-            assert!(!ops.is_empty(), "hd={hd}: a {prefix} op");
-            for e in ops {
-                let out = e.arg_bindings.last().expect("an output");
-                assert!(
-                    e.walk.is_none() || lx(&out.buffer),
-                    "hd={hd} {}: its column in LX",
-                    e.op_name
-                );
-            }
-        }
-        // ⭐ AND EVERY VALUE THE TRIP COMPUTES, as the reference's trip keeps every one in LX: the mask
-        // add runs a stick plane at a time, and each plane of a core's rows sits in its own slice.
-        // Only the page's index run, gathered through the position table, is read from HBM.
-        for e in ops
-            .iter()
-            .filter(|e| e.walk.is_some() && !e.op_name.starts_with("gather_run"))
-        {
-            let out = e.arg_bindings.last().expect("an output");
-            assert!(
-                lx(&out.buffer),
-                "hd={hd} {}: writes t{} outside LX",
-                e.op_name,
-                out.buffer
-            );
-        }
-    }
-
-    /// ⭐ THE SCRATCHPAD PLAN ON THE DECODE WALK — torch-spyre's LX planning: the carried output
-    /// accumulator lives in each core's LX across the whole walk (seeded before it, accumulated by
-    /// every trip, divided after it).
-    #[test]
-    fn the_decode_walk_keeps_its_accumulator_in_lx() {
-        for hd in [64, 128] {
-            let node = walk_at(1, 4, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("hd {hd}: the walk lowers: {}", e.message));
-            let lx = |name: &str| layout.lx_core_local(name);
-            let div = ops
-                .iter()
-                .find(|e| e.op_name.starts_with("realdiv"))
-                .expect("the output's division");
-            let acc = div.arg_bindings[0].buffer.as_str();
-            assert!(lx(acc), "hd {hd}: the accumulator {acc} is core-local");
-            let touching: Vec<_> = ops
-                .iter()
-                .filter(|e| e.arg_bindings.iter().any(|a| a.buffer == acc))
-                .collect();
-            assert!(
-                touching
-                    .iter()
-                    .any(|e| e.walk.is_none() && e.op_name.starts_with("fill")),
-                "hd {hd}: {acc} is seeded before the walk"
-            );
-            assert!(
-                touching.iter().any(|e| e.walk.is_some()),
-                "hd {hd}: {acc} is accumulated on every trip"
-            );
-        }
-    }
-
-    /// `batched_decode_head_major` at granite's geometry over its 2048-page pool: `seqs` sequences
-    /// walking `walk` blocks, at the chunking a decode batch rung states.
-    fn batched_walk(seqs: u32, walk: u32) -> (KtirNode, BatchChunking) {
-        batched_walk_at(seqs, walk, 64)
-    }
-
-    /// [`batched_walk`] at head dim `hd`.
-    fn batched_walk_at(seqs: u32, walk: u32, hd: u32) -> (KtirNode, BatchChunking) {
-        batched_walk_heads(seqs, walk, hd, 8, 4)
-    }
-
-    /// [`batched_walk_at`] at `kv_heads` kv heads of `group` query heads each — a tensor-parallel
-    /// rank's share of the attention.
-    fn batched_walk_heads(
-        seqs: u32,
-        walk: u32,
-        hd: u32,
-        kv_heads: u32,
-        group: u32,
-    ) -> (KtirNode, BatchChunking) {
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = batched_decode_row()
-        else {
-            panic!("the batched decode row is spliced");
-        };
-        let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for p in ["query", "k_pages", "v_pages", "mask_by_chunk", "out"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
-        }
-        for p in ["rep_row_ids", "chunk_page_ids"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
-        }
-        for (k, v) in [
-            ("NUM_TOKENS", seqs),
-            ("NUM_SEQS", c.seqs),
-            ("BLOCKS_PER_CHUNK", c.blocks_per_chunk),
-            ("NUM_CHUNKS", c.num_chunks),
-            ("NUM_KV_HEADS", kv_heads),
-            ("NUM_QUERIES_PER_KV", group),
-            ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
-            ("HEAD_SIZE", hd),
-            ("NUM_PAGES", 2048),
-            ("ROWS_PER_PAGE", c.rows_per_page),
-        ] {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
-        }
-        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(0.125));
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1]).expect("the batched walk compiles");
-        let node =
-            triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints");
-        (node, c)
-    }
-
-    /// A decode batch's walk relaunches its chunk body once per chunk: its trips are the
-    /// chunks, and ONE trip moves the chunk's mask tile — `entries · kv heads` one-stick rows of the
-    /// stick-major stack — which is the one shift a relaunch applies (the chunk's page ids pitched
-    /// to it). The body is one contiguous run of descriptors, one launch group.
-    #[test]
-    fn a_decode_batch_relaunches_its_chunk_body_once_per_chunk() {
-        let (node, c) = batched_walk(4, 64);
-        assert_eq!(
-            (c.blocks_per_chunk, c.num_chunks),
-            (8, 8),
-            "4 sequences over 64 blocks"
-        );
-        let flat = flatten(&node)
-            .expect("the walk flattens")
-            .expect("a multi-chunk walk states its loop");
-        assert_eq!(flat.fold.trips, c.num_chunks);
-        assert_eq!(flat.fold.step_bytes, c.entries() * 128);
-        assert_eq!(
-            flat.fold.carried.len(),
-            3,
-            "each block slot's running max, sum and output"
-        );
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-            ktir_superdsc::collective::TpWorld<1>,
-        >(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("the batched walk lowers: {}", e.message));
-        let marked: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].walk.is_some()).collect();
-        let (first, last) = (marked[0], *marked.last().expect("a body"));
-        assert_eq!(
-            marked.len(),
-            last - first + 1,
-            "the body's descriptors are one contiguous run — one launch group"
-        );
-        for e in &ops[first..=last] {
-            assert_eq!(
-                e.walk,
-                Some(WalkTrips {
-                    trips: c.num_chunks,
-                    step_bytes: c.entries() * 128
-                }),
-                "{}",
-                e.op_name
-            );
-            assert!(e.kv_page_fold && e.kv_gathered, "{}", e.op_name);
-        }
-    }
-
-    /// ⭐ A DECODE BATCH LOWERS AT EVERY RUNG SHAPE THE BAKE ASKS FOR — two sequences to thirty-two,
-    /// one chunk to many, at head dim 64 and at 128 (granite-3.1-8b, its query rows split into head
-    /// rows of two sticks) — its body marked for the relaunch exactly when the walk loops. The widest
-    /// rung's one-page walk (32 sequences, one chunk of one block slot) is the one a bake used to skip.
-    #[test]
-    fn a_decode_batch_lowers_at_every_rung_shape() {
-        for hd in [64, 128] {
-            for (seqs, walk) in [
-                (1, 1),
-                (1, 64),
-                (1, 2048),
-                (2, 1),
-                (2, 64),
-                (32, 1),
-                (32, 64),
-                (4, 2048),
-            ] {
-                let at = format!("{seqs} sequences over {walk} blocks at head dim {hd}");
-                let (node, c) = batched_walk_at(seqs, walk, hd);
-                let layout = triton_ktir_superdsc::layout::for_node(&node)
-                    .unwrap_or_else(|e| panic!("{at}: {e:?}"));
-                allocate_paged_cache(&node, &layout).expect("the cache allocates");
-                let mut sym = 0i64;
-                let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                    ktir_superdsc::collective::TpWorld<1>,
-                >(
-                    &node,
-                    Some(&layout),
-                    &mut sym,
-                    &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-                )
-                .unwrap_or_else(|e| panic!("{at}: {}", e.message));
-                assert_eq!(
-                    ops.iter().any(|e| e.walk.is_some()),
-                    c.num_chunks > 1,
-                    "{at}"
-                );
-            }
-        }
-    }
-
-    /// ⭐ A DECODE BATCH LOWERS AT EVERY TENSOR-PARALLEL RANK'S SHARE of granite's 8 kv heads of 4
-    /// query heads — tp/2's 4 kv heads, tp/4's 2, tp/8's 1 — at both head dims and the rung shapes
-    /// a bake asks for: a rank's attention is the same kernel over fewer heads, and every world's
-    /// must reach the card.
-    #[test]
-    fn a_decode_batch_lowers_at_every_ranks_head_share() {
-        for kv_heads in [8u32, 4, 2, 1] {
-            for hd in [64, 128] {
-                for (seqs, walk) in [(1, 1), (1, 64), (1, 2048), (4, 64), (32, 1)] {
-                    let at = format!(
-                        "{kv_heads} kv heads, {seqs} sequences over {walk} blocks at hd {hd}"
-                    );
-                    let (node, _) = batched_walk_heads(seqs, walk, hd, kv_heads, 4);
-                    let layout = triton_ktir_superdsc::layout::for_node(&node)
-                        .unwrap_or_else(|e| panic!("{at}: {e:?}"));
-                    allocate_paged_cache(&node, &layout).expect("the cache allocates");
-                    let mut sym = 0i64;
-                    ktir_superdsc::emit::whole_function::lower_walk::<
-                        ktir_superdsc::collective::TpWorld<1>,
-                    >(
-                        &node,
-                        Some(&layout),
-                        &mut sym,
-                        &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-                    )
-                    .unwrap_or_else(|e| panic!("{at}: {}", e.message));
-                }
-            }
-        }
-    }
-
-    /// ⛔ `BatchChunking::of` IS TOTAL — `seqs` and `nkvh` both divide in it, so a zero would be a
-    /// panic inside a `const` evaluation at BAKE rather than a wrong answer a test could catch. No
-    /// producer passes zero (`ModelAttnGeometry::mint` refuses a zero kv-head count, a rung's rows
-    /// are its baked width), which is exactly why this is pinned: the invariant lives in the
-    /// callers today, so nothing but this test stops the function from dying if one ever slips.
-    #[test]
-    fn the_chunking_is_total_at_zero_counts() {
-        for (seqs, blocks, nkvh, q_width, head_size) in [
-            (0u32, 4u32, 8u32, 2048u32, 64u32),
-            (2, 4, 0, 2048, 64),
-            (0, 0, 0, 0, 0),
-            (1, 0, 8, 2048, 64),
-            (1, 1, 1, 0, 64),
-            (1, 1, 1, 256, 0),
-        ] {
-            let c = BatchChunking::of(seqs, blocks, nkvh, q_width, head_size);
-            assert!(
-                c.seqs >= 1 && c.blocks_per_chunk >= 1 && c.rows_per_page >= 1,
-                "of({seqs}, {blocks}, {nkvh}) = {c:?}"
-            );
-            // `entries` and `index_rows` multiply those, so they are non-zero too — the extents
-            // every caller sizes a placement and an index table by.
-            assert!(c.entries() >= 1 && c.index_rows() >= 1, "{c:?}");
-        }
-        // And the real geometries are untouched by the clamps.
-        assert_eq!(
-            BatchChunking::of(1, 128, 8, 2048, 64),
-            BatchChunking {
-                seqs: 1,
-                blocks_per_chunk: 32,
-                num_chunks: 4,
-                rows_per_page: 1
-            }
-        );
-        assert_eq!(
-            BatchChunking::of(2, 1, 8, 2048, 64).rows_per_page,
-            8,
-            "under the floor"
-        );
-    }
-
-    /// ⛔ A DECODE BATCH GATHERS EACH OF ITS PAGES WHOLE, ONE OP FOR ALL OF THEM — the whole-page
-    /// gather over its `J · B` entries, a page a core, never the pieces form. At 128-slot pages a
-    /// granite page is 128 KB (2b) or 256 KB (8b), past the one-stick sub-row copy's 64 KB entry, and
-    /// a batch's several entries went through it in pieces: the ids doubled, each half-page piece of
-    /// every entry landed in a scratch, then copied to the entry's pitch. Two concurrent requests
-    /// decoded garbage on the card from their first batched step (bisected: `b82250b17`, 64-slot
-    /// pages, coherent; the 128-slot page, which switched 2b onto the pieces, first bad).
-    ///
-    /// A chunk of fewer than 8 pages (two sequences' one block each) gathers its pages' kv heads, a
-    /// head a core — still each page whole, and spyre-inference's own one block slot.
-    #[test]
-    fn a_decode_batch_gathers_each_page_whole() {
-        for (seqs, walk, hd, rows_per_page) in [
-            (2u32, 1u32, 64u32, 8u32),
-            (2, 1, 128, 8),
-            (8, 1, 64, 1),
-            (4, 4, 128, 1),
-        ] {
-            let (node, c) = batched_walk_at(seqs, walk, hd);
-            assert_eq!(
-                (c.blocks_per_chunk, c.rows_per_page),
-                ((32 / seqs).min(walk), rows_per_page),
-                "B={seqs} walk={walk}: spyre-inference's block slots"
-            );
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
-            let at = format!("B={seqs} hd={hd}");
-            assert!(
-                ops.iter()
-                    .all(|e| !e.op_name.starts_with("pieces")
-                        && !e.op_name.starts_with("addi32toi32")),
-                "{at}: no piece copy and no scaled index"
-            );
-            // The query rows' gathers are named a stick column (`gather{c}_..`) or a run of rows.
-            let pages: Vec<_> = ops
-                .iter()
-                .filter(|e| e.op_name.starts_with("gather_o"))
-                .collect();
-            assert_eq!(
-                pages.len(),
-                2,
-                "{at}: one gather for the K pages, one for the V pages"
-            );
-            for e in pages {
-                let split = serde_json::to_value(e.op.as_ref().expect("a descriptor"))
-                    .expect("json")["numWkSlicesPerDim_"]
-                    .clone();
-                assert_eq!(
-                    split["mb"],
-                    c.index_rows(),
-                    "{at} {}: a page (or a page's kv head) a core over the chunk's {} index rows",
-                    e.op_name,
-                    c.index_rows()
-                );
-            }
-        }
-    }
-
-    /// ⭐⭐ A DECODE BATCH's CHUNK IN THE DECODE TRIP's FORM — the kernel spyre-inference serves every
-    /// decode with (`batched_decode_head_major`, one sequence included). A chunk's `J · B · KV` page
-    /// blocks are the trip's batch: its K and V pages each gathered in ONE op (a page a core), Kᵀ
-    /// laid by one all-blocks restickify, the scores and the value product each ONE contraction over
-    /// every block, and the softmax between them — as many consecutive blocks a core as divide over
-    /// the 32 (8 at 256 blocks). 22 ops a chunk, from ~800 one block at a time.
-    #[test]
-    fn a_decode_batch_chunk_runs_in_the_decode_trips_form() {
-        for hd in [64, 128] {
-            for seqs in [1, 4] {
-                let at = format!("{seqs} sequences over 128 blocks at head dim {hd}");
-                let (node, c) = batched_walk_at(seqs, 128, hd);
-                let blocks = c.index_rows() * 8 / c.rows_per_page;
-                let layout =
-                    triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-                allocate_paged_cache(&node, &layout).expect("the cache allocates");
-                let mut sym = 0i64;
-                let ops = ktir_superdsc::emit::whole_function::lower_walk(
-                    &node,
-                    Some(&layout),
-                    &mut sym,
-                    &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-                )
-                .unwrap_or_else(|e| panic!("{at}: {}", e.message));
-                let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).collect();
-                assert_eq!(body.len(), 22, "{at}: the chunk's ops");
-                let named = |prefix: &str| -> Vec<
-                    &&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
-                > {
-                    body.iter()
-                        .filter(|e| e.op_name.starts_with(prefix))
-                        .collect()
-                };
-                assert_eq!(
-                    named("gather").len(),
-                    2,
-                    "{at}: the K and the V pages, one op each"
-                );
-                let split =
-                    |e: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>| {
-                        serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json")
-                        ["numWkSlicesPerDim_"]
-                        .clone()
-                    };
-                let bmms = named("bmm");
-                assert_eq!(bmms.len(), 2, "{at}: the scores and the value product");
-                for e in bmms {
-                    assert_eq!(
-                        split(e)["x"],
-                        serde_json::json!(ktir_superdsc::work::core_split(blocks, 32)),
-                        "{at} {}: every block, over the cores",
-                        e.op_name
-                    );
-                }
-                assert_eq!(
-                    named("transpose").len(),
-                    1,
-                    "{at}: one all-blocks restickify"
-                );
-            }
-        }
-    }
-
-    /// ⭐ A DECODE BATCH'S CARRIED STATE LIVES IN LX — the running maximum, the running sum and the
-    /// output accumulator each core keeps across the walk, as torch-spyre's compiled walk keeps all
-    /// three. Every walk op that writes a carried value writes it core-locally.
-    #[test]
-    fn a_decode_batch_keeps_its_carried_state_in_lx() {
-        for (seqs, walk, hd) in [
-            (1u32, 128u32, 64u32),
-            (4, 128, 64),
-            (1, 128, 128),
-            (4, 64, 128),
-        ] {
-            let (node, _) = batched_walk_at(seqs, walk, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
-            let at = format!("B={seqs} walk={walk} hd={hd}");
-            // The walk's carried buffers: what a trip writes that a seed before the walk filled.
-            let filled: Vec<String> = ops
-                .iter()
-                .filter(|e| e.walk.is_none() && e.op_name.starts_with("fill_o"))
-                .filter_map(|e| e.arg_bindings.last().map(|a| a.buffer.clone()))
-                .collect();
-            let seeded: Vec<String> = filled
-                .into_iter()
-                .filter(|b| {
-                    ops.iter()
-                        .filter(|e| e.walk.is_some())
-                        .any(|e| e.arg_bindings.iter().any(|a| !a.is_input && a.buffer == *b))
-                })
-                .collect();
-            assert_eq!(
-                seeded.len(),
-                3,
-                "{at}: max, sum and output carried: {seeded:?}"
-            );
-            let spilled: Vec<String> = ops
-                .iter()
-                .filter(|e| e.walk.is_some())
-                .flat_map(|e| {
-                    e.arg_bindings
-                        .iter()
-                        .filter(|a| seeded.contains(&a.buffer))
-                        .filter(|a| !layout.lx_core_local(&a.buffer))
-                        .map(move |a| format!("{} {}", e.op_name, a.buffer))
-                })
-                .collect();
-            assert!(
-                spilled.is_empty(),
-                "{at}: carried state outside LX: {spilled:?}"
-            );
-        }
-    }
-
-    /// ⭐ THE LEADING-AXIS MAXIMUM FOLDS BY HALVING — `log₂ J` ops, not `J - 1`. A decode batch's
-    /// one-chunk arm shares one maximum across its `J` block slots (`torch.amax(..., dim=0)`), and
-    /// the card's reduce folds only along the stick, so the fold is a chain of combines; folding the
-    /// first half against the second makes that chain `log₂ J` levels of half the windows each — the
-    /// same elements, the same answer (`max` reassociates EXACTLY), 5 ops instead of 31 at `J = 32`.
-    ///
-    /// Counted against the `J = 1` lowering, where the fold is skipped entirely, so the kernel's own
-    /// non-fold maximums (its `finfo.min` clamp, its rescale) cancel out of both sides.
-    ///
-    /// ⛔ THE SUM FOLDS KEEP WALKING, and the last assertion says what lifts that rather than
-    /// blessing the walk: fp16 addition does not reassociate and nothing local executes these
-    /// descriptors, so a sum tree is an unverified re-rounding — and so is the walk, since which
-    /// order torch-spyre's compiled program sums in is not known here. The walk is the incumbent,
-    /// not the reference; only a card run holding a new order to spyre-inference's own output
-    /// settles it.
-    #[test]
-    fn the_leading_axis_maximum_folds_by_halving() {
-        for hd in [64, 128] {
-            for seqs in [1u32, 2] {
-                let count = |walk: u32, prefix: &str| -> u32 {
-                    let (node, _) = batched_walk_at(seqs, walk, hd);
-                    let layout =
-                        triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-                    allocate_paged_cache(&node, &layout).expect("the cache allocates");
-                    let mut sym = 0i64;
-                    let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                        ktir_superdsc::collective::TpWorld<1>,
-                    >(
-                        &node,
-                        Some(&layout),
-                        &mut sym,
-                        &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-                    )
-                    .unwrap_or_else(|e| panic!("B={seqs} walk={walk} hd={hd}: {}", e.message));
-                    ops.iter().filter(|e| e.op_name.starts_with(prefix)).count() as u32
-                };
-                // `J = 1`: no fold at all, so this is the kernel's own non-fold maximums.
-                let base = count(1, "maximum");
-                for slots in [4u32, 16, 32 / seqs] {
-                    let at = format!("B={seqs} J={slots} hd={hd}");
-                    let (_, c) = batched_walk_at(seqs, slots, hd);
-                    assert_eq!(
-                        (c.blocks_per_chunk, c.num_chunks),
-                        (slots, 1),
-                        "{at}: the one-chunk arm"
-                    );
-                    let levels = slots.trailing_zeros();
-                    assert_eq!(
-                        count(slots, "maximum") - base,
-                        levels,
-                        "{at}: the slot maximum folds in {levels} level(s), where the walk would \
-                         take {}",
-                        slots - 1
-                    );
-                    // ⛔ THE SUM FOLDS STILL WALK, AND NOT BECAUSE THE WALK IS THE FAITHFUL ORDER.
-                    // Two of them (the running sum and the carried output), one op a window, so at
-                    // least `2·(J-1)` adds survive. WHAT LIFTS THIS: a card run that holds a sum
-                    // tree to spyre-inference's own output. Until then a tree is an UNVERIFIED
-                    // re-rounding — fp16 addition does not reassociate and nothing but the card
-                    // executes these descriptors — and so is the walk: which order torch-spyre's
-                    // compiled program sums in is NOT known here (our `.scratch/torch_ref` capture
-                    // holds 6 of its 28 descriptors and the reductions are not among them). The walk
-                    // is the INCUMBENT, not the reference; this assertion pins "do not change the
-                    // summation order without card evidence", in either direction.
-                    assert!(
-                        count(slots, "add") >= 2 * (slots - 1),
-                        "{at}: the sum folds changed shape ({} adds for {slots} slots). Lift this \
-                         only with a card run holding the new order to spyre-inference's own \
-                         output — fp16 addition re-rounds and nothing local executes these \
-                         descriptors, so neither order is verified here",
-                        count(slots, "add")
-                    );
-                }
-            }
-        }
-    }
-
-    /// ⛔ A DECODE BATCH LAYS ITS PROBABILITIES OUT AS BLOCKS ONE RUN A CORE. At 128-slot pages a
-    /// probability row is two sticks, and the value contraction reads it as `J · B · KV` blocks of
-    /// `G` rows: one stick-run copy a plane, a run a block. Past 32 blocks one copy hands a core
-    /// several runs, stepped by the run's device-extent pitch, a stride no copy on the card has run
-    /// with; the runs go out 32 an op instead, so every core copies one run. Two sequences over four
-    /// blocks, or eight over one, are 64 blocks (two ops a plane); two over one gather a kv head a
-    /// core and read the probabilities with no relayout at all.
-    /// ⭐ A BATCH OF ONE WRITES ITS ATTENTION TO THE OUTPUT IT STORES. One sequence's attention at a
-    /// head two sticks wide (granite-3.1-8b) is one `[1, heads·128]` row read from the stick-major
-    /// `[kv·group, 128]` blocks, which the lowering lands row-major with one permute. That permute
-    /// went into a minted buffer and nothing stored the output parameter: on the card the output
-    /// projection read bytes no op had written ("Fraryning000…" from the second token at every
-    /// walk). So the permute's destination is the stored output itself, at every batch width and
-    /// both head dims.
-    #[test]
-    fn a_decode_batch_writes_its_attention_to_the_output_it_stores() {
-        for (seqs, walk, hd) in [
-            (1u32, 1u32, 128u32),
-            (1, 64, 128),
-            (1, 1, 64),
-            (2, 1, 128),
-            (2, 4, 64),
-        ] {
-            let (node, _) = batched_walk_at(seqs, walk, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
-            let at = format!("B={seqs} walk={walk} hd={hd}");
-            // `out` is the kernel's last parameter.
-            let out = ktir_superdsc::place::act_name((node.bindings.len() - 1) as u32);
-            assert!(
-                ops.iter().any(|e| e
-                    .arg_bindings
-                    .iter()
-                    .any(|a| !a.is_input && a.buffer == out)),
-                "{at}: some op writes the stored output {out}; writers: {:?}",
-                ops.iter()
-                    .filter(|e| e.op_name.starts_with("permute"))
-                    .map(|e| (
-                        e.op_name.clone(),
-                        e.arg_bindings
-                            .iter()
-                            .filter(|a| !a.is_input)
-                            .map(|a| a.buffer.clone())
-                            .collect::<Vec<_>>()
-                    ))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
-    /// ⭐ A DECODE BATCH'S QUERY TABLE IS RELAID FROM THE QUERY'S OWN FRAME. Folded under Triton's
-    /// gather floor, the kernel reads the `[tokens, heads·hd]` query as `[tokens·kv, heads·hd/kv]`
-    /// rows; stick-major on the card those are different bytes, and the producer wrote the query's
-    /// own. Card-measured (granite-3.1-2b, two short requests): the table permuted as if the bytes
-    /// were the view's (`[16, 256]`) equalled the query read in the wrong frame to the last bit, and
-    /// both replies decoded garbage. So the permute's rows are the query's own (two), and one row
-    /// is its elements in order already, so a batch of one permutes nothing.
-    #[test]
-    fn a_decode_batch_relays_its_query_from_the_querys_own_frame() {
-        for (seqs, walk, hd) in [(2u32, 1u32, 64u32), (1, 1, 64), (2, 4, 64), (2, 1, 128)] {
-            let (node, c) = batched_walk_at(seqs, walk, hd);
-            let mut layout =
-                triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            // Parameter 0 is the query; its producer wrote it `[tokens, heads · hd]`.
-            layout.frames.insert(0, [seqs, 32 * hd]);
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
-            let at = format!("B={seqs} walk={walk} hd={hd} rows/page={}", c.rows_per_page);
-            let reads_query =
-                |e: &&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>| {
-                    e.arg_bindings
-                        .iter()
-                        .any(|a| a.is_input && a.buffer == ktir_superdsc::place::act_name(0))
-                };
-            let permutes: Vec<_> = ops
-                .iter()
-                .filter(|e| e.op_name.starts_with("permute"))
-                .filter(reads_query)
-                .collect();
-            if seqs == 1 {
-                assert!(
-                    permutes.is_empty(),
-                    "{at}: one row is its own row-major table"
-                );
-                continue;
-            }
-            assert_eq!(permutes.len(), 1, "{at}: one relayout of the query");
-            let v =
-                serde_json::to_value(permutes[0].op.as_ref().expect("a descriptor")).expect("json");
-            let n = &v["dscs_"][0][&permutes[0].op_name]["N_"];
-            assert_eq!(
-                (n["mb_"].as_u64(), n["y_"].as_u64()),
-                (Some(u64::from(seqs)), Some(u64::from(32 * hd / 64))),
-                "{at} {}: the query's own rows and sticks",
-                permutes[0].op_name
-            );
-        }
-    }
-
-    #[test]
-    fn a_decode_batch_lays_its_probabilities_out_one_run_a_core() {
-        for (seqs, walk, hd) in [(2u32, 1u32, 64u32), (2, 4, 64), (8, 1, 64), (2, 4, 128)] {
-            let (node, c) = batched_walk_at(seqs, walk, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("the batch lowers: {}", e.message));
-            let at = format!("B={seqs} walk={walk} hd={hd}");
-            let copies: Vec<_> = ops
-                .iter()
-                .filter(|e| e.op_name.starts_with("heads"))
-                .collect();
-            // At head dim 64 the probabilities are the walk's only relayout (at 128 the query's
-            // two-stick rows go to blocks the same way, and ride the same law). A chunk gathered a
-            // kv head a core reads them as the decode trip does, with no relayout at all.
-            let blocks = c.entries() * 8;
-            if hd == 64 {
-                let want = match c.rows_per_page {
-                    1 => 2 * blocks.div_ceil(32),
-                    _ => 0,
-                };
-                assert_eq!(
-                    copies.len() as u32,
-                    want,
-                    "{at}: two planes, {blocks} runs 32 an op ({} rows a page)",
-                    c.rows_per_page
-                );
-            }
-            for e in copies {
-                let v = serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json");
-                let runs = v["dscs_"][0][&e.op_name]["N_"]["mb_"].clone();
-                assert!(
-                    runs.as_u64().is_some_and(|r| r <= 32),
-                    "{at} {}: {runs} runs",
-                    e.op_name
-                );
-                assert_eq!(
-                    v["numWkSlicesPerDim_"]["mb"], runs,
-                    "{at} {}: one run a core",
-                    e.op_name
-                );
-            }
-        }
-    }
-
-    /// One chunk is straight-line: no loop to relaunch, every descriptor once.
-    #[test]
-    fn a_one_chunk_decode_batch_is_straight_line() {
-        let (node, c) = batched_walk(4, 4);
-        assert_eq!(c.num_chunks, 1);
-        assert!(
-            flatten(&node).expect("the walk flattens").is_none(),
-            "a single chunk states no loop"
-        );
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-            ktir_superdsc::collective::TpWorld<1>,
-        >(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("the one-chunk batch lowers: {}", e.message));
-        assert!(ops.iter().all(|e| e.walk.is_none()));
-    }
-
-    /// The walk's trips are its blocks, and ONE trip moves the mask tile `[P, block]` — `P` stick rows
-    /// of the stick-major stack — and the page index table's row by the same card bytes, which is
-    /// the one shift a relaunch applies.
-    #[test]
-    fn the_walk_relaunches_its_body_once_per_block() {
-        for (mq, blocks) in [(1i128, 2048i128), (64, 4)] {
-            let node = walk(mq, blocks);
-            let flat = flatten(&node)
-                .expect("the walk flattens")
-                .expect("a multi-block walk states its loop");
-            assert_eq!(flat.fold.trips, blocks as u32, "mq={mq}");
-            assert_eq!(flat.fold.step_bytes, mq as u32 * 128, "mq={mq}");
-            assert_eq!(
-                flat.fold.carried.len(),
-                3,
-                "the running max, sum and output (mq={mq})"
-            );
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
-            let marked: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].walk.is_some()).collect();
-            let (first, last) = (marked[0], *marked.last().expect("a body"));
-            assert_eq!(
-                marked.len(),
-                last - first + 1,
-                "mq={mq}: the body's descriptors are one contiguous run — one launch group"
-            );
-            for e in &ops[first..=last] {
-                assert_eq!(
-                    e.walk,
-                    Some(WalkTrips {
-                        trips: blocks as u32,
-                        step_bytes: mq as u32 * 128
-                    }),
-                    "mq={mq}: {}",
-                    e.op_name
-                );
-                assert!(e.kv_page_fold && e.kv_gathered, "mq={mq}: {}", e.op_name);
-            }
-            // The carried buffers are seeded, and the body's constants filled, BEFORE the body (a
-            // relaunch shifts the segment the registry constants live in) — beside the query's own
-            // `index_select`, which spyre-inference runs before its walk, and a prompt's relayout of
-            // those rows query-row-major, the frame its trip runs in (one permute at a head one
-            // stick wide).
-            assert!(
-                ops[..first].iter().all(|e| ["fill", "gather", "permute"]
-                    .iter()
-                    .any(|p| e.op_name.starts_with(p))),
-                "mq={mq}: only fills, the query's gather and its relayout precede the body"
-            );
-            assert_eq!(
-                ops[..first]
-                    .iter()
-                    .filter(|e| e.op_name.starts_with("permute"))
-                    .count(),
-                usize::from(mq > 1),
-                "mq={mq}: a prompt's query rows are laid query-row-major once"
-            );
-            // The decode walk copies its `kv_row_pool` run against the int32 zero the host stages
-            // beside the pool, as it stages every int32 the attention reads — nothing makes it on
-            // the card.
-            let zero = ktir_superdsc::place::act_name(PagedStepTids::RESERVED.int32_zero);
-            assert_eq!(
-                ops[first..=last]
-                    .iter()
-                    .any(|e| e.arg_bindings.iter().any(|a| a.buffer == zero)),
-                mq == 1,
-                "mq={mq}: the body reads the host-staged int32 zero exactly when the walk chains \
-                 `kv_row_pool`"
-            );
-            assert!(
-                ops[..first].iter().any(|e| e.op_name.starts_with("gather")),
-                "mq={mq}: the query's rows are gathered through `query_row_index`"
-            );
-            assert!(
-                ops[last + 1..]
-                    .iter()
-                    .any(|e| e.op_name.starts_with("scatter")),
-                "mq={mq}: the output rows are scattered through `query_row_index`"
-            );
-            assert!(
-                ops[first..=last]
-                    .iter()
-                    .all(|e| !e.op_name.starts_with("fill") && !e.op_name.starts_with("scalarmul")),
-                "mq={mq}: the body reads no registry constant"
-            );
-            assert!(
-                ops[first..=last]
-                    .iter()
-                    .any(|e| e.op_name.starts_with("gather")),
-                "mq={mq}: the body gathers its pages"
-            );
-            assert!(
-                ops[last + 1..].iter().all(|e| e.walk.is_none()),
-                "mq={mq}: the epilogue runs once"
-            );
-        }
-    }
-
-    /// ⭐ A HEAD TWO STICKS WIDE (granite-3.1-8b's 128): each trip gathers its K page and its V page in
-    /// ONE op each, `[KV, BLOCK, 128]` one kv head a core, every head's row-major block landed
-    /// stick-major by the gather itself (torch-spyre's compiled page gather: value
-    /// `['out','x','mb','y']`, landing `['x','out','mb','y']`) — so nothing in the body re-lays a
-    /// page. The query row is permuted once into the stick-major `[KV·G, 128]` before the walk, and
-    /// the output back to its `[1, H·128]` row after it, which the scatter then writes.
-    #[test]
-    fn a_two_stick_head_gathers_each_kv_heads_page_stick_major() {
-        let node = walk_at(1, 4, 128);
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("the hd128 walk lowers: {}", e.message));
-        let pages: Vec<&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> =
-            ops.iter()
-                .filter(|e| e.op_name.starts_with("gather_o"))
-                .collect();
-        assert_eq!(pages.len(), 2, "the K page and the V page, one op each");
-        for e in pages {
-            assert!(e.walk.is_some(), "{}: on every trip", e.op_name);
-            let json = serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json");
-            let dsc = json["dscs_"][0]
-                .as_object()
-                .and_then(|m| m.values().next())
-                .expect("one dsc");
-            assert_eq!(
-                dsc["N_"],
-                serde_json::json!({"name_": "n", "mb_": 8, "y_": 1, "x_": SchedulerBlockTokens::REFERENCE.get(), "out_": 128}),
-                "{}: one [BLOCK, 128] block an entry — the one op's `blocks == 1` case",
-                e.op_name
-            );
-            assert_eq!(
-                json["numWkSlicesPerDim_"]["mb"], 8,
-                "{}: one kv head a core",
-                e.op_name
-            );
-            let orders: Vec<&serde_json::Value> = dsc["scheduleTree_"]
-                .as_array()
-                .expect("a tree")
-                .iter()
-                .filter(|n| n["nodeType_"] == "allocate")
-                .map(|n| &n["layoutDimOrder_"])
-                .collect();
-            assert_eq!(
-                orders,
-                [
-                    &serde_json::json!(["out", "x", "y", "mb"]),
-                    &serde_json::json!(["mb"]),
-                    &serde_json::json!(["x", "out", "y", "mb"]),
-                ],
-                "{}: the page read row-major through its index, landed stick-major — at one block \
-                 an entry the one op's orders, the same bytes the split form's spelled",
-                e.op_name
-            );
-        }
-        let permutes: Vec<&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> =
-            ops.iter()
-                .filter(|e| e.op_name.starts_with("permute"))
-                .collect();
-        assert_eq!(
-            permutes.len(),
-            2,
-            "the query row in, the output row out: {:?}",
-            permutes.iter().map(|e| &e.op_name).collect::<Vec<_>>()
-        );
-        assert!(
-            permutes.iter().all(|e| e.walk.is_none()),
-            "nothing in the body re-lays a page"
-        );
-        assert!(
-            ops.iter().any(|e| e.op_name.starts_with("scatter")),
-            "the output row is scattered to its query row"
-        );
-    }
-
-    /// ⭐ A PREFILL TRIP'S PAGE-GATHER LANDING IS HBM, NOT LX — the placement fact the one
-    /// `index_select` gather's "no LX law bounds a whole-page entry's size" rests on (the deleted
-    /// 64 KiB sub-row bound's territory), shown in the emitted bundle rather than stated: every
-    /// in-body page-gather op's destination is a SYNTHETIC of the Intermediate segment
-    /// (`BundleLayout::synth`, its footprint reserved there), pinned NOWHERE in the scratchpad —
-    /// neither core-locally nor op-locally (`lx_core_local`/`lx_op_local`). An entry's size is
-    /// bounded by HBM, so no compose-around is owed for a page the pool holds.
-    ///
-    /// The DECODE trip is a separate front: its whole body — page gathers included — the
-    /// scratchpad plan pins in LX beside the compute, and the plan's own window guard is the
-    /// build-time bound that trip answers to; this test does not speak for it.
-    #[test]
-    fn a_prefill_trips_page_gather_lands_in_hbm_not_lx() {
-        for (mq, blocks, hd) in [(128i128, 4i128, 64i128), (128, 4, 128), (512, 4, 64)] {
-            let node = walk_at(mq, blocks, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message));
-            // The ONE gather's in-body ops — `gather_o{tid}` / `gather{chunk}_o{tid}` with the
-            // trip's walk flag — not the head-major staging path's `gather{c}_{i}_o{tid}` copies
-            // and not the query row's gather before the body, both separate fronts.
-            let one_gather = |name: &str| {
-                let Some(rest) = name.strip_prefix("gather") else {
-                    return false;
-                };
-                let Some((mid, _tid)) = rest.split_once("_o") else {
-                    return false;
-                };
-                mid.is_empty() || mid.chars().all(|c| c.is_ascii_digit())
-            };
-            let gathers: Vec<
-                &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
-            > = ops
-                .iter()
-                .filter(|e| one_gather(&e.op_name) && e.walk.is_some())
-                .collect();
-            assert!(
-                !gathers.is_empty(),
-                "mq={mq} hd={hd}: the trip gathers its pages"
-            );
-            for e in gathers {
-                let dsts: Vec<&str> = e
-                    .arg_bindings
-                    .iter()
-                    .filter(|a| !a.is_input)
-                    .map(|a| a.buffer.as_str())
-                    .collect();
-                assert_eq!(dsts.len(), 1, "mq={mq} hd={hd}: {}: one landing", e.op_name);
-                let dst = dsts[0];
-                assert!(
-                    !layout.lx_core_local(dst) && !layout.lx_op_local(dst),
-                    "mq={mq} hd={hd}: {}: the landing {dst} is pinned in the LX scratchpad",
-                    e.op_name
-                );
-                let synth = layout.synth.borrow();
-                let footprint = synth.size(dst).unwrap_or_else(|| {
-                    panic!(
-                        "mq={mq} hd={hd}: {}: the landing {dst} is no HBM synthetic of the \
-                         Intermediate segment",
-                        e.op_name
-                    )
-                });
-                let page_bytes =
-                    u64::from(SchedulerBlockTokens::REFERENCE.get()) * u64::from(hd as u32) * 2;
-                assert!(
-                    footprint >= page_bytes,
-                    "mq={mq} hd={hd}: {}: the landing {dst} reserves {footprint} B, less than the \
-                     {page_bytes} B one page holds",
-                    e.op_name
-                );
-            }
-        }
-    }
-
-    /// ⭐ A PROMPT CHUNK'S ROWS MOVE IN ONE OP EACH. torch-spyre's compiled prefill gathers all 512
-    /// of a chunk's query rows in one op (`sdsc_0`), each core reading its own stick of the row
-    /// index, and scatters the output the same way (`sdsc_26`). The query and the output are
-    /// stick-major here, and no index entry names a stick-major row whole, so each is laid row-major
-    /// around its one gather or scatter — never one op a stick column.
-    #[test]
-    fn a_prompt_chunks_rows_move_in_one_op_each() {
-        // A chunk of rows no split of the cores reads a stick of the index each (55: past one stick,
-        // and no core count divides it into runs within a stick) moves in one op a run of whole
-        // sticks and one for the rest.
-        for (mq, hd, runs) in [(64, 64, 1), (512, 64, 1), (64, 128, 1), (55, 64, 2)] {
-            let node = walk_at(mq, 4, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-                ktir_superdsc::collective::TpWorld<1>,
-            >(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("mq={mq}: the prompt walk lowers: {}", e.message));
-            let outside = |prefix: &str| {
-                ops.iter()
-                    .filter(|e| e.walk.is_none() && e.op_name.starts_with(prefix))
-                    .count()
-            };
-            assert_eq!(outside("gather"), runs, "mq={mq} hd={hd}: the query rows");
-            assert_eq!(outside("scatter"), runs, "mq={mq} hd={hd}: the output rows");
-        }
-    }
-
-    /// ⭐ A WALK LOWERED TWICE INTO ONE LAYOUT LOWERS THE SAME BOTH TIMES. A card bake lowers each
-    /// program once to declare the bundle's synthetics and again for real, into the same layout; the
-    /// second lowering takes the first's tensors and scratchpad plan, so it neither mints a second
-    /// set of buffers nor plans its LX around the first's pins (which left the real pass of a
-    /// 128-row prompt walk only the window the declaring pass had not taken).
-    #[test]
-    fn a_walk_lowered_twice_into_one_layout_lowers_the_same() {
-        for (mq, hd) in [(1, 64), (128, 64), (128, 128)] {
-            let node = walk_at(mq, 4, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let lower = || {
-                let mut sym = 0i64;
-                ktir_superdsc::emit::whole_function::lower_walk(
-                    &node,
-                    Some(&layout),
-                    &mut sym,
-                    &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-                )
-                .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message))
-            };
-            let shape = |ops: &[ktir_superdsc::emit::EmittedOp<
-                ktir_superdsc::collective::TpWorld<1>,
-            >]|
-             -> Vec<(String, Vec<(String, u32)>)> {
-                ops.iter()
-                    .map(|e| {
-                        (
-                            e.op_name.clone(),
-                            e.arg_bindings
-                                .iter()
-                                .map(|a| (a.buffer.clone(), a.offset_elems))
-                                .collect(),
-                        )
-                    })
-                    .collect()
-            };
-            let declaring = shape(&lower());
-            let window = layout.lx_window_bytes();
-            let real = shape(&lower());
-            assert_eq!(
-                real, declaring,
-                "mq={mq} hd={hd}: the real pass lowers as the declaring pass did"
-            );
-            assert_eq!(
-                layout.lx_window_bytes(),
-                window,
-                "mq={mq} hd={hd}: and pins nothing more"
-            );
-        }
-    }
-
-    /// ⭐ A WALK'S TRIPS UNROLLED INTO ONE LAUNCH, as dxp unrolls torch-spyre's walk. Four trips of a
-    /// 23-op body fit a 128-descriptor launch group: the body four times over, relaunched once, copy `t`
-    /// reading the activation segment (the step's page-table row and mask tile) `t` steps further in
-    /// and every other address where the bake placed it.
-    #[test]
-    fn a_walks_trips_unroll_into_one_launch() {
-        use ktir_superdsc::emit::loop_fold::{WalkTrips, unroll_walk};
-        let addrs = |e: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>| -> Vec<u64> {
-            let v = serde_json::to_value(e.op.as_ref().expect("a descriptor")).expect("json");
-            let mut out = Vec::new();
-            for m in v["dscs_"].as_array().expect("dscs") {
-                for dsc in m.as_object().expect("a map").values() {
-                    for n in dsc["scheduleTree_"].as_array().expect("a tree") {
-                        if n["nodeType_"] == "allocate" && n["component_"] == "hbm" {
-                            for a in n["startAddressCoreCorelet_"]["data_"]
-                                .as_object()
-                                .expect("addresses")
-                                .values()
-                            {
-                                out.push(
-                                    a.as_str().expect("an address").parse().expect("a number"),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            out
-        };
-        let segment = 0x4_0000_0000u64;
-        let activation = 3 * segment..4 * segment;
-        for mq in [1, 128] {
-            let node = walk_at(mq, 4, 64);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
-            let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).cloned().collect();
-            let walk = body[0].walk.expect("a walk");
-            assert_eq!(walk.trips, 4, "mq={mq}: four pages, four trips");
-            let unrolled = unroll_walk(ops.clone(), 128);
-            let copies: Vec<_> = unrolled.iter().filter(|e| e.walk.is_some()).collect();
-            assert_eq!(
-                copies.len(),
-                4 * body.len(),
-                "mq={mq}: the body four times over"
-            );
-            assert_eq!(
-                unrolled.len() - copies.len(),
-                ops.len() - body.len(),
-                "mq={mq}: and nothing else repeated"
-            );
-            for c in &copies {
-                assert_eq!(
-                    c.walk,
-                    Some(WalkTrips {
-                        trips: 1,
-                        step_bytes: 4 * walk.step_bytes
-                    }),
-                    "mq={mq} {}: one launch of four steps",
-                    c.op_name
-                );
-            }
-            let mut stepped = 0;
-            for (i, c) in copies.iter().enumerate() {
-                let (t, e) = (i / body.len(), &body[i % body.len()]);
-                for (a0, at) in addrs(e).into_iter().zip(addrs(c)) {
-                    let expect = if activation.contains(&a0) {
-                        stepped += 1;
-                        a0 + t as u64 * u64::from(walk.step_bytes)
-                    } else {
-                        a0
-                    };
-                    assert_eq!(at, expect, "mq={mq} trip {t} {}", c.op_name);
-                }
-            }
-            assert!(stepped > 0, "mq={mq}: the body reads the step's tables");
-        }
-    }
-
-    /// ⭐⭐ THE PROMPT TRIP IN torch-spyre's FORM — its compiled prefill's: the query rows split across
-    /// the cores, each core holding whole query rows of every head (row `p·32 + h`), the scores and
-    /// the value product each ONE contraction over every query head against the kv head's block
-    /// expanded once per query head of its group (read by every core at one start, from HBM), the
-    /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
-    /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
-    /// with the rows: 23 at either head dim, each page gathered in one op (the reference's trip is
-    /// 21). At 512 rows every value still fits, because a pin is held
-    /// for its value's lifetime rather than the walk's (torch-spyre's placement), so values the trip
-    /// is done with hand their bytes to the next.
-    #[test]
-    fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
-        for (mq, hd, trip) in [(128, 64, 23), (512, 64, 23), (128, 128, 23), (512, 128, 23)] {
-            let blocks = 4;
-            let node = walk_at(mq, blocks, hd);
-            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-            allocate_paged_cache(&node, &layout).expect("the cache allocates");
-            let mut sym = 0i64;
-            let ops = ktir_superdsc::emit::whole_function::lower_walk(
-                &node,
-                Some(&layout),
-                &mut sym,
-                &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-            )
-            .unwrap_or_else(|e| panic!("mq={mq} hd={hd}: the walk lowers: {}", e.message));
-            let lx = |name: &str| layout.lx_core_local(name);
-            let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).collect();
-            assert_eq!(body.len(), trip, "mq={mq} hd={hd}: the trip's ops");
-            let named = |prefix: &str| -> Vec<
-                &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
-            > {
-                body.iter()
-                    .copied()
-                    .filter(|e| e.op_name.starts_with(prefix))
-                    .collect()
-            };
-            let expanded: Vec<&str> = named("expand")
-                .iter()
-                .map(|e| {
-                    e.arg_bindings
-                        .last()
-                        .expect("the expansion")
-                        .buffer
-                        .as_str()
-                })
-                .collect();
-            let bmms = named("bmm");
-            assert_eq!(
-                (expanded.len(), bmms.len()),
-                (2, 2),
-                "mq={mq} hd={hd}: one expansion and one contraction for the scores and for the \
-                 value product"
-            );
-            for (e, kernel) in bmms.iter().zip(&expanded) {
-                let [a, k, out] = e.arg_bindings.as_slice() else {
-                    panic!("{}: activation, kernel, output", e.op_name);
-                };
-                assert_eq!(
-                    k.buffer, *kernel,
-                    "mq={mq} hd={hd} {}: the expanded block",
-                    e.op_name
-                );
-                assert!(
-                    !lx(&k.buffer),
-                    "mq={mq} hd={hd} {}: its kernel read from HBM at one start",
-                    e.op_name
-                );
-                assert!(
-                    lx(&a.buffer) && lx(&out.buffer),
-                    "mq={mq} hd={hd} {}: its rows in each core's LX",
-                    e.op_name
-                );
-                let split = serde_json::to_value(e.op.as_ref().expect("a descriptor"))
-                    .expect("json")["numWkSlicesPerDim_"]
-                    .clone();
-                assert_eq!(
-                    split["mb"], 32,
-                    "mq={mq} hd={hd} {}: the query rows split across 32 cores",
-                    e.op_name
-                );
-            }
-            // The mask, `[P, SchedulerBlockTokens::REFERENCE]` of the stick-major stack of `blocks` tiles: one add a
-            // stick plane, each reading that plane of the mask.
-            let adds: Vec<_> = (0..SchedulerBlockTokens::REFERENCE.get() / 64)
-                .map(|c| {
-                    let e = named(&format!("add{c}_o"));
-                    assert_eq!(e.len(), 1, "mq={mq} hd={hd}: plane {c}'s mask add");
-                    e[0]
-                })
-                .collect();
-            for (c, e) in adds.iter().enumerate() {
-                let mask = &e.arg_bindings[1];
-                assert_eq!(
-                    mask.offset_elems,
-                    c as u32 * blocks as u32 * mq as u32 * 64,
-                    "mq={mq} hd={hd} {}: the mask's plane {c}",
-                    e.op_name
-                );
-                assert!(
-                    lx(&e.arg_bindings[0].buffer) && lx(&e.arg_bindings[2].buffer),
-                    "mq={mq} hd={hd} {}: the scores' plane in LX",
-                    e.op_name
-                );
-            }
-            // Every value the trip computes from the scores on is in LX, beside the carried state.
-            for prefix in [
-                "multiply_o",
-                "add_o",
-                "max_o",
-                "sub_o",
-                "maximum_o",
-                "neg_o",
-                "exp_o",
-                "sum_o",
-            ] {
-                let chain = named(prefix);
-                assert!(!chain.is_empty(), "mq={mq} hd={hd}: a {prefix} op");
-                for e in chain {
-                    let out = e.arg_bindings.last().expect("an output");
-                    assert!(
-                        lx(&out.buffer),
-                        "mq={mq} hd={hd} {}: writes {} outside LX",
-                        e.op_name,
-                        out.buffer
-                    );
-                }
-            }
-        }
-    }
-
-    /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE, in torch-spyre's prompt trip. The query rows are
-    /// laid query-row-major before the walk — the table laid row-major, its rows gathered there, each
-    /// head's row laid stick-major into `[64·32, 128]`, row `p·32 + h`: two whole-tensor permutes —
-    /// and the output back after it (each head's row laid row-major, scattered into the output laid
-    /// row-major and back: three), so each contraction is ONE op over every query head, its kernel the kv
-    /// head's block expanded once per query head of its group, and nothing re-lays a head on a trip.
-    /// Each page (8 kv heads × [`SchedulerBlockTokens::REFERENCE`] slots × 128, 256 KB) is gathered in ONE op, as the
-    /// reference's compiled prefill gathers it (`sdsc_4` / `sdsc_5`): its one entry the page, every kv
-    /// head's block landed stick-major — no pieces, no scaled page id, no permute on the trip.
-    #[test]
-    fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_each_page_in_one_op() {
-        let node = walk_at(64, 4, 128);
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-            ktir_superdsc::collective::TpWorld<1>,
-        >(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("the hd128 prompt walk lowers: {}", e.message));
-        let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
-        let last_body = ops.iter().rposition(|e| e.walk.is_some()).expect("a body");
-        let named = |prefix: &str| -> Vec<usize> {
-            (0..ops.len())
-                .filter(|&i| ops[i].op_name.starts_with(prefix))
-                .collect()
-        };
-        let stick = 64u32;
-        assert_eq!(
-            SchedulerBlockTokens::REFERENCE.get() / stick,
-            2,
-            "a page two sticks wide, as the head is"
-        );
-        assert!(
-            named("heads").is_empty(),
-            "no head is copied into a block of its own"
-        );
-        // The whole-tensor relayouts: the query's two before the walk, the output's three after it.
-        let relays = named("permute_o");
-        assert_eq!(
-            relays.iter().map(|&i| i < first_body).collect::<Vec<_>>(),
-            [true, true, false, false, false],
-            "the query's two permutes precede the walk, the output's three follow it"
-        );
-        for &i in &relays {
-            let e = &ops[i];
-            assert!(
-                e.walk.is_none() && (i < first_body || i > last_body),
-                "{}: once, outside the trip",
-                e.op_name
-            );
-            assert!(
-                e.arg_bindings.iter().all(|x| x.offset_elems == 0),
-                "{}: a whole-tensor relayout",
-                e.op_name
-            );
-        }
-        // Each contraction is one op on every trip, its kernel an expansion the trip lays.
-        let expanded: Vec<&str> = named("expand")
-            .into_iter()
-            .map(|i| {
-                assert!(ops[i].walk.is_some(), "{}: on the trip", ops[i].op_name);
-                ops[i]
-                    .arg_bindings
-                    .iter()
-                    .find(|x| !x.is_input)
-                    .expect("the expansion")
-                    .buffer
-                    .as_str()
-            })
-            .collect();
-        let bmms = named("bmm");
-        assert_eq!(
-            (expanded.len(), bmms.len()),
-            (2, 2),
-            "the scores and the value product: one expansion and one contraction each"
-        );
-        for (&i, kernel) in bmms.iter().zip(&expanded) {
-            let e = &ops[i];
-            assert!(e.walk.is_some(), "{}: on the trip", e.op_name);
-            assert_eq!(
-                e.arg_bindings[1].buffer, *kernel,
-                "{}: its kernel is the expanded block",
-                e.op_name
-            );
-        }
-        let pages: Vec<usize> = named("gather_o")
-            .into_iter()
-            .filter(|&i| ops[i].walk.is_some())
-            .collect();
-        assert_eq!(pages.len(), 2, "the K page and the V page, one op each");
-        for &i in &pages {
-            let e = &ops[i];
-            let split = serde_json::to_value(e.op.as_ref().expect("a descriptor"))
-                .expect("json")["numWkSlicesPerDim_"]
-                .clone();
-            assert_eq!(
-                split,
-                serde_json::json!({"mb": 1, "y": 1, "x": 1, "out": 1}),
-                "{}: the whole page on one core, as the reference's",
-                e.op_name
-            );
-        }
-        for e in ops.iter().filter(|e| e.walk.is_some()) {
-            assert!(
-                !e.op_name.starts_with("addi32toi32") && !e.op_name.starts_with("permute"),
-                "{}: nothing scales a page id or re-lays a page on the trip",
-                e.op_name
-            );
-        }
-    }
-
-    /// ⛔ A PAGE IN BLOCKS IS READ ONLY AS BLOCKS. Read `[KV, BLOCK, 128]`, a page lands as its kv
-    /// heads' stick-major blocks one after another — the frame a batched transpose and a batched
-    /// contraction's kernel take a block of at its base, and not the flat frame any other op reads.
-    /// An elementwise op over two such pages is refused by name, not lowered at the flat frame's
-    /// addresses — and so is a shape op naming one in any frame.
-    #[test]
-    fn an_elementwise_read_of_a_page_in_blocks_is_refused() {
-        // (what the program stores, the refusal's own words)
-        for (stored, says) in [
-            (
-                "tl.reshape(k + v, [4 * 64, 128])",
-                "only a batched transpose's input or a batched contraction's kernel reads",
-            ),
-            (
-                "tl.reshape(k, [4 * 64, 128]) + tl.reshape(v, [4 * 64, 128])",
-                "every frame a shape op names is the flat frame's",
-            ),
-        ] {
-            refused_over_pages_in_blocks(stored, says);
-        }
-    }
-
-    fn refused_over_pages_in_blocks(stored: &str, says: &str) {
-        const SRC: &str = r#"
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
-    k_desc = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES, 4 * 64 * 128],
-                                       strides=[4 * 64 * 128, 1], block_shape=[1, 4 * 64 * 128])
-    v_desc = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES, 4 * 64 * 128],
-                                       strides=[4 * 64 * 128, 1], block_shape=[1, 4 * 64 * 128])
-    rows = tl.make_tensor_descriptor(out, shape=[4 * 64, 128], strides=[128, 1],
-                                     block_shape=[4 * 64, 128])
-    k = tl.reshape(k_desc.load([tl.load(k_index), 0]), [4, 64, 128])
-    v = tl.reshape(v_desc.load([tl.load(v_index), 0]), [4, 64, 128])
-    rows.store([0, 0], STORED)
-"#;
-        let src = SRC.replace("STORED", stored);
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for (p, ty) in [
-            ("k_index", "*i32"),
-            ("v_index", "*i32"),
-            ("k_pages", "*fp16"),
-            ("v_pages", "*fp16"),
-            ("out", "*fp16"),
-        ] {
-            signature.insert(p.to_string(), ArgSpec::parse(ty).expect("spec"));
-        }
-        signature.insert("NUM_PAGES".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("NUM_PAGES".to_string(), Val::Int(4));
-        let spec = KernelSpec {
-            kernel: "two_pages".to_string(),
-            signature,
-            constexprs,
-            file: "two_pages.py".to_string(),
-        };
-        let module = compile_kernel(&src, &spec, &[1]).expect("the kernel compiles");
-        let node =
-            triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the program mints");
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the program places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let Err(e) = ktir_superdsc::emit::whole_function::lower_function::<
-            ktir_superdsc::collective::TpWorld<1>,
-        >(
-            &node,
-            Some(&layout),
-            &mut sym,
-            None,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        ) else {
-            panic!("{stored}: an add over two pages in blocks lowered");
-        };
-        assert!(e.message.contains(says), "{stored}: {}", e.message);
-    }
-
-    /// A one-block walk states no loop — the front end promotes a one-trip `scf.for` to its body —
-    /// and lowers as the straight-line program it is, nothing marked for a relaunch.
-    #[test]
-    fn a_one_block_walk_is_straight_line() {
-        let node = walk(1, 1);
-        assert!(flatten(&node).expect("flattens").is_none());
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        let ops = ktir_superdsc::emit::whole_function::lower_walk::<
-            ktir_superdsc::collective::TpWorld<1>,
-        >(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("the one-block walk lowers: {}", e.message));
-        assert!(!ops.is_empty() && ops.iter().all(|e| e.walk.is_none()));
-    }
-
-    /// `reshape_and_cache_head_major` writing `t` tokens of `nkvh` kv heads at head dim `hd` into a
-    /// four-page-per-head pool, through the card's lowering against its one-kernel layout.
-    fn kv_write_ops(
-        t: i128,
-        nkvh: i128,
-        hd: i128,
-    ) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = kv_write_row()
-        else {
-            panic!("the KV write row is spliced");
-        };
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for p in ["key", "value", "k_rows", "v_rows"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
-        }
-        signature.insert(
-            "row_index".to_string(),
-            ArgSpec::parse("*i32").expect("spec"),
-        );
-        for (k, v) in [
-            ("T", t),
-            ("NUM_KV_HEADS", nkvh),
-            ("HEAD_SIZE", hd),
-            (
-                "NUM_ROWS",
-                4 * nkvh * i128::from(SchedulerBlockTokens::REFERENCE.get()),
-            ),
-        ] {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(v));
-        }
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1]).expect("the write compiles");
-        let node = triton_ktir_superdsc::node_for(&module, Program::PagedKvWrite)
-            .expect("the write mints");
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
-        let mut sym = 0i64;
-        ktir_superdsc::emit::whole_function::lower_walk(
-            &node,
-            Some(&layout),
-            &mut sym,
-            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
-        )
-        .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {}", e.message))
-    }
-
-    /// ⭐ A HEAD TWO STICKS WIDE IS WRITTEN WHOLE, one index entry per row. The pool is row-outermost,
-    /// so a row's two sticks are one entry there; a prompt chunk's rows are first relaid row-major,
-    /// one stick permute per kv head of K and of V, and a decode step's one row per head already is.
-    /// At head dim 64 nothing is relaid.
-    #[test]
-    fn a_two_stick_head_is_scattered_one_row_per_entry() {
-        let count =
-            |ops: &[ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
-             prefix: &str| {
-                ops.iter().filter(|e| e.op_name.starts_with(prefix)).count()
-            };
-        for (t, hd, permutes) in [(1, 64, 0), (96, 64, 0), (1, 128, 0), (96, 128, 2 * 8)] {
-            let ops = kv_write_ops(t, 8, hd);
-            assert_eq!(
-                count(&ops, "scatter_rows"),
-                permutes,
-                "t={t} hd={hd}: one relayout per kv head of K and of V, and only at two sticks"
-            );
-            // `t · 8` rows each for K and for V, one op serving every core a stick of 32 index
-            // entries: one op for the whole write at t=96 (768 entries, 24 cores).
-            let runs = ktir_superdsc::emit::lower_ktir_to_superdsc::index_runs(t as u32 * 8);
-            assert_eq!(runs.len(), 1, "t={t}: {runs:?}");
-            assert_eq!(count(&ops, "scatter_run"), 2 * runs.len(), "t={t} hd={hd}");
-            assert_eq!(
-                ops.len(),
-                count(&ops, "scatter_"),
-                "t={t} hd={hd}: nothing else"
-            );
-        }
-        // Below the scatter floor (two kv heads, one store per row) the rows coalesce the same way.
-        let rows = kv_write_ops(1, 2, 128);
-        assert_eq!(rows.len(), 2, "one scatter each for K and V: {:?}", {
-            rows.iter().map(|e| e.op_name.clone()).collect::<Vec<_>>()
-        });
-    }
-}

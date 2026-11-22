@@ -29,14 +29,15 @@ pub struct Bindings<'a> {
     pub scratch: u64,
 }
 
-/// A lowered function: its descriptors in launch order, the scratch its intermediates take, and
-/// the bytes each parameter's buffer must hold (every element any descriptor reaches, padding
-/// included).
-#[derive(Clone, Debug)]
-pub struct Lowered {
-    pub ops: Vec<(OpFunc, wire::Sdsc)>,
+/// What a graph needs placed: the scratch its intermediates take, packed from the scratch base in
+/// local order, and the bytes each parameter's buffer must hold — every element any descriptor
+/// reaches, padding included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Footprint {
     pub scratch_bytes: u64,
     pub room: Vec<u64>,
+    /// Each intermediate's byte offset from the scratch base.
+    locals: Vec<u64>,
 }
 
 /// Why an op has no descriptor.
@@ -156,30 +157,65 @@ impl Plan {
     }
 }
 
-/// Lower `g` against `bindings` for generation `G`.
-pub fn emit<G: DeviceGen>(g: &Graph, bindings: &Bindings<'_>) -> Result<Lowered, EmitError> {
-    let plans: Vec<Plan> = g.nodes.iter().map(plan::<G>).collect();
-    // Each intermediate holds every element any op reaches in it, and each parameter's buffer
-    // must hold the same.
+/// The storage `g`'s descriptors reach on generation `G`.
+pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
     let mut elements: Vec<u64> = g.locals.iter().map(|l| l.elements).collect();
     let mut room: Vec<u64> = vec![0; g.params.len()];
-    for (node, p) in g.nodes.iter().zip(&plans) {
+    // Each intermediate's live range: from the first op that touches it to the last.
+    let mut live: Vec<Option<(usize, usize)>> = vec![None; g.locals.len()];
+    for (ni, node) in g.nodes.iter().enumerate() {
+        let p = plan::<G>(node);
         for oi in 0..=node.inputs.len() {
             let o = if oi < node.inputs.len() { &node.inputs[oi] } else { &node.output };
             let end = p.end(node, oi);
             match o.store {
-                Store::Local(l) => elements[l] = elements[l].max(end),
+                Store::Local(l) => {
+                    elements[l] = elements[l].max(end);
+                    live[l] = Some(live[l].map_or((ni, ni), |(a, _)| (a, ni)));
+                }
                 Store::Param(q) => room[q] = room[q].max(end * o.format.word_bytes()),
                 Store::Const(_) => {}
             }
         }
     }
-    let mut local_at = Vec::with_capacity(g.locals.len());
-    let mut scratch = 0u64;
-    for (l, e) in g.locals.iter().zip(&elements) {
-        local_at.push(bindings.scratch + scratch);
-        scratch += (e * l.format.word_bytes()).next_multiple_of(G::FLIT_BYTES);
+    // Packed by live range: an intermediate takes the lowest bytes no intermediate live beside it
+    // holds, so one dead before another is born shares its bytes.
+    let bytes: Vec<u64> = g
+        .locals
+        .iter()
+        .zip(&elements)
+        .map(|(l, e)| (e * l.format.word_bytes()).next_multiple_of(G::FLIT_BYTES))
+        .collect();
+    let mut order: Vec<usize> = (0..g.locals.len()).collect();
+    order.sort_by_key(|&l| (live[l].map_or(usize::MAX, |r| r.0), l));
+    let mut locals = vec![0u64; g.locals.len()];
+    let mut placed: Vec<(u64, u64, usize)> = Vec::new();
+    let mut scratch_bytes = 0u64;
+    for l in order {
+        let Some((first, last)) = live[l] else { continue };
+        placed.retain(|&(_, _, end)| end >= first);
+        let mut taken: Vec<(u64, u64)> = placed.iter().map(|&(a, b, _)| (a, b)).collect();
+        taken.sort_unstable();
+        let mut at = 0u64;
+        for (a, b) in taken {
+            if at + bytes[l] <= a {
+                break;
+            }
+            at = at.max(b);
+        }
+        locals[l] = at;
+        placed.push((at, at + bytes[l], last));
+        scratch_bytes = scratch_bytes.max(at + bytes[l]);
     }
+    Footprint { scratch_bytes, room, locals }
+}
+
+/// `g`'s descriptors in launch order, against `bindings`, for generation `G`.
+pub fn emit<G: DeviceGen>(
+    g: &Graph,
+    footprint: &Footprint,
+    bindings: &Bindings<'_>,
+) -> Result<Vec<(OpFunc, wire::Sdsc)>, EmitError> {
     let base = |s: Store| -> Result<u64, EmitError> {
         match s {
             Store::Param(p) => bindings
@@ -187,7 +223,7 @@ pub fn emit<G: DeviceGen>(g: &Graph, bindings: &Bindings<'_>) -> Result<Lowered,
                 .get(p)
                 .copied()
                 .ok_or(EmitError::Unbound { param: p }),
-            Store::Local(l) => Ok(local_at[l]),
+            Store::Local(l) => Ok(bindings.scratch + footprint.locals[l]),
             Store::Const(c) => g
                 .consts
                 .get(c)
@@ -196,15 +232,11 @@ pub fn emit<G: DeviceGen>(g: &Graph, bindings: &Bindings<'_>) -> Result<Lowered,
                 .ok_or(EmitError::Unplaced { constant: c }),
         }
     };
-    let mut ops = Vec::with_capacity(g.nodes.len());
-    for (ni, (node, p)) in g.nodes.iter().zip(&plans).enumerate() {
-        ops.push((node.func, op::<G>(ni, node, p, &base)?));
-    }
-    Ok(Lowered {
-        ops,
-        scratch_bytes: scratch,
-        room,
-    })
+    g.nodes
+        .iter()
+        .enumerate()
+        .map(|(ni, node)| Ok((node.func, op::<G>(ni, node, &plan::<G>(node), &base)?)))
+        .collect()
 }
 
 /// For each parameter some op reads on a unit stride: the widest padded extent any op's division
@@ -234,16 +266,26 @@ pub fn staged_widths<G: DeviceGen>(g: &Graph) -> Vec<Option<u64>> {
     out
 }
 
+/// One operand's position along each space axis, and its stick axis.
+type Projection = (Vec<Option<At>>, usize);
+
 /// The space, labels, division and operand projections of `node`.
 fn plan<G: DeviceGen>(node: &Node) -> Plan {
     let family = node.func.family();
-    let lanes = node.output.format.lanes::<G>();
+    // A conversion computes on whole sticks of its wider side: a core's slab of the narrower one is
+    // then whole sticks too.
+    let lanes = node
+        .inputs
+        .iter()
+        .filter(|_| node.func.converts())
+        .map(|o| o.format.lanes::<G>())
+        .fold(node.output.format.lanes::<G>(), u64::max);
     let mut space: Vec<u64> = node.space.clone();
     let rank = space.len();
     let mut operands: Vec<&Operand> = node.inputs.iter().collect();
     operands.push(&node.output);
     // Each operand's strides along the space, and the space axis that is the op's stick.
-    let (projs, stick_axis, labels): (Vec<(Vec<Option<At>>, usize)>, usize, Vec<Dim>) = match family {
+    let (projs, stick_axis, labels): (Vec<Projection>, usize, Vec<Dim>) = match family {
         Family::Contraction => {
             let nb = rank - 3;
             let (m, n, k) = (nb, nb + 1, nb + 2);
@@ -370,23 +412,20 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
             .collect()
     };
     let mut split = divide(&cuttable(&space), budget);
-    // A contraction whose stick count factors badly divides badly: pad it by up to an eighth to
-    // the count that divides across the most cores. The padding is lanes every operand holds as
-    // its own.
+    // A contraction whose stick count factors badly divides badly: a prime count of output sticks
+    // splits across one core. Such an axis is padded by up to an eighth to the count that splits
+    // across the most cores — judged on the stick axis alone, so a weight's padding is the same at
+    // every row count that reads it. The padding is lanes every operand's buffer holds.
     if family == Family::Contraction {
         let units = space[stick_axis] / lanes;
-        let mut best = (split.iter().product::<u64>(), units, split.clone());
-        for u in units + 1..=units + units / 8 {
-            let mut padded = space.clone();
-            padded[stick_axis] = u * lanes;
-            let s = divide(&cuttable(&padded), budget);
-            let c: u64 = s.iter().product();
-            if c > best.0 {
-                best = (c, u, s);
-            }
+        let splits = |u: u64| (1..=budget.min(u)).rev().find(|d| u.is_multiple_of(*d)).unwrap_or(1);
+        if splits(units) < budget.min(units) / 2 {
+            let best = (units..=units + units / 8)
+                .max_by_key(|&u| (splits(u), std::cmp::Reverse(u)))
+                .unwrap_or(units);
+            space[stick_axis] = best * lanes;
+            split = divide(&cuttable(&space), budget);
         }
-        space[stick_axis] = best.1 * lanes;
-        split = best.2;
     }
     let axes: Vec<SAxis> = space
         .iter()
@@ -471,12 +510,22 @@ fn op<G: DeviceGen>(
                 },
             };
             let addr = base(index.store)? + index.view.offset * index.format.word_bytes();
-            // The value's indexed axis holds one row per index; the rest of its rows are a gap.
+            // The value's indexed axis holds one row per index. Rows one stick apart are the rows of
+            // a stick array, the rest of which are a gap; a whole multi-stick row per index is the
+            // value's outermost block, past which there is nothing.
+            let one_stick = plan.proj(node, *vi).stride(*g) == Some(operands[*vi].format.lanes::<G>());
             let vt = &mut tensors[*vi];
+            if !one_stick {
+                // dxp sizes a whole row's own dims itself; it is told only that each index names
+                // one row.
+                vt.max_dims.iter_mut().for_each(|m| *m = -1);
+            }
             if let Some(k) = vt.order.iter().position(|d| *d == axes[*g].dim) {
                 vt.max_dims[k] = 1;
             }
-            vt.back_gap = Some((axes[*g].dim, gather.rows.saturating_sub(1)));
+            if one_stick {
+                vt.back_gap = Some((axes[*g].dim, gather.rows.saturating_sub(1)));
+            }
             tensors.push(Tensor {
                 format: index.format,
                 order: vec![axes[*g].dim],
@@ -498,7 +547,8 @@ fn op<G: DeviceGen>(
     };
     // Where the op's own inputs and result sit in the operand list.
     let first = usize::from(index_at.is_some());
-    // ── the layout labels: one per distinct (order, stick), the contraction's by role
+    let out_idx = first + n_in;
+    // ── the layout labels: one per distinct (order, stick), a contraction's and a conversion's by role
     let mut labels_of: Vec<&'static str> = Vec::with_capacity(tensors.len());
     let mut primary: BTreeMap<&'static str, wire::LayoutInfo> = BTreeMap::new();
     let mut seen: Vec<(Vec<Dim>, Dim, u64, &'static str)> = Vec::new();
@@ -509,6 +559,8 @@ fn op<G: DeviceGen>(
             "KERNEL_IDX"
         } else if family == Family::Contraction {
             ROLES[ti]
+        } else if node.func.converts() {
+            if ti < out_idx { "INPUT" } else { "OUTPUT" }
         } else if let Some((_, _, _, l)) = seen
             .iter()
             .find(|(o, s, w, _)| *o == t.order && *s == t.stick && *w == t.format.lanes::<G>())
@@ -595,7 +647,6 @@ fn op<G: DeviceGen>(
             },
         })
         .collect();
-    let out_idx = first + n_in;
     let mut inputs: Vec<String> = (first..first + n_in).map(|i| format!("Tensor{i}-idx{i}")).collect();
     if node.func.accumulates() {
         inputs.push(format!("Tensor{out_idx}-idx{out_idx}"));
@@ -615,8 +666,8 @@ fn op<G: DeviceGen>(
         data_stage_param: BTreeMap::from([(
             "0",
             wire::Stage {
-                ss: space_of("core", &per_core),
-                el: space_of("core", &per_core),
+                ss: space_of("core", per_core),
+                el: space_of("core", per_core),
             },
         )]),
         primary_ds_info: primary,
@@ -690,27 +741,26 @@ fn tensor<G: DeviceGen>(
     #[derive(Clone, Copy)]
     struct Entry {
         axis: usize,
-        stride: u64,
         scale: i64,
         key: u64,
     }
     let mut entries: Vec<Entry> = Vec::new();
-    for axis in 0..axes.len() {
+    for (axis, ax) in axes.iter().enumerate() {
         let Some(stride) = p.stride(axis) else { continue };
         let e = if axis == p.stick {
             match stride {
                 // The stick's index advances a stick at a time — or a whole stick column.
-                1 => Entry { axis, stride, scale: 1, key: p.columns(axis).unwrap_or(lanes) },
-                0 => Entry { axis, stride, scale: -2, key: 0 },
+                1 => Entry { axis, scale: 1, key: p.columns(axis).unwrap_or(lanes) },
+                0 => Entry { axis, scale: -2, key: 0 },
                 _ => return Err(EmitError::Stick { node: ni, operand: oi }),
             }
-        } else if p.indexed != Some(axis) && (stride == 0 || axes[axis].extent == 1) {
-            Entry { axis, stride: 0, scale: -1, key: u64::MAX }
+        } else if p.indexed != Some(axis) && (stride == 0 || ax.extent == 1) {
+            Entry { axis, scale: -1, key: u64::MAX }
         } else if stride == 0 {
             // The indexed axis of an operand holding one row: outermost, one row.
-            Entry { axis, stride: 0, scale: 1, key: u64::MAX - 1 }
+            Entry { axis, scale: 1, key: u64::MAX - 1 }
         } else {
-            Entry { axis, stride, scale: 1, key: stride }
+            Entry { axis, scale: 1, key: stride }
         };
         entries.push(e);
     }
@@ -810,8 +860,8 @@ fn tensor<G: DeviceGen>(
             _ => axes[p.stick].extent,
         };
         let outer_aligned = (0..axes.len())
-            .all(|i| i == p.stick || axes[i].extent == 1 || p.stride(i).is_none_or(|s| s % lanes == 0));
-        if o.view.offset % lanes != 0 || !outer_aligned {
+            .all(|i| i == p.stick || axes[i].extent == 1 || p.stride(i).is_none_or(|s| s.is_multiple_of(lanes)));
+        if !o.view.offset.is_multiple_of(lanes) || !outer_aligned {
             return Err(EmitError::Nesting { node: ni, operand: oi });
         }
         if logical % lanes != 0 && logical != axes[p.stick].extent {

@@ -12,18 +12,23 @@ publish = false
 # through it unconditionally — the target crate gains a hook, not a second copy of
 # the lowering.
 
+[features]
+# THE BUILD'S KV POOL (`KvPool::BUILD`): fp8 E4M3 pages, written narrowed and read widened by every
+# paged kernel's fp8-pool twin.
+kv-fp8 = []
+
 [dependencies]
 scratchy-subtile = { path = "../../../../../crates/compiler/subtile" }
 scratchy-ir = { path = "../../../../../crates/compiler/ir" }
 ktir-core = { path = "../../ktir/ktir-core" }
-ktir-superdsc = { path = "../../ktir/ktir-superdsc" }
+scratchy-spyre-bundle = { path = "../../bundle" }
+spyre-superdsc = { package = "scratchy-spyre-superdsc", path = "../../superdsc" }
 # ⭐ THE RUST LADDER, from this workspace's own re-host. `codegen::compile` parses `.py`
 # kernels with the OWNED parser (`triton-frontend/src/py/parser.rs`), which the splice
 # does at expansion time. The ladder is dependency-free offline
 # (backends/spyre/crates/triton/PROVENANCE.md, copy rule 2) — no crates.io package regardless.
 triton-frontend = { path = "../triton-frontend" }
 triton-ktir = { path = "../triton-ktir" }
-triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
 
 [dev-dependencies]
 # The byte-identity dump's per-op stable text: `wire::SdscOp` derives `Serialize`,

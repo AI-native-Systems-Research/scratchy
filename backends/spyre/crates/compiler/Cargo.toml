@@ -9,6 +9,8 @@ description = "Spyre's compile-time emission: the per-model bundle bake (Subtile
 default = []
 # THE CARD'S LOWERING, with no device compile: every rung a card bakes, lowered through the card's
 # path and refused where it does not lower, and no device image. What CI runs for a card's ladder.
+# THE BUILD'S KV POOL: fp8 E4M3 pages (`scratchy_triton_splice::KvPool`).
+kv-fp8 = ["scratchy-target-spyre/kv-fp8"]
 spyre-lower = ["scratchy-target-spyre/spyre-lower"]
 # A CARD. The device image is compiled from the KTIR at bake time, so this build has a device
 # compiler to drain; the emulator build has nothing to compile and nothing to wait for.
@@ -39,9 +41,8 @@ ktir-core = { path = "../ktir/ktir-core" }
 # emu prefill-width derivation reads the count from beside the program it describes.
 scratchy-triton-splice = { path = "../triton/splice" }
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
-# The SuperDSC device facts the bake states its ladders and budgets in (`sdsc_abstract`,
-# `superdsc_opspec`).
-ktir-superdsc = { path = "../ktir/ktir-superdsc" }
+# The rung's extents and the bundle contract the bake states its ladders in.
+scratchy-spyre-bundle = { path = "../bundle" }
 scratchy-ir = { path = "../../../../crates/compiler/ir" }
 scratchy-tp-world = { path = "../../../../crates/core/tp-world" }
 proc-macro2 = "1"

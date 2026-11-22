@@ -90,23 +90,23 @@ struct AttnShape {
     block_size: i128,
     num_pages: i128,
     num_blocks: i128,
+    /// The prefill walk's pages a trip — 1 for spyre-inference's own walk.
+    blocks_per_trip: i128,
 }
 
 /// The kernel a sequence's step runs — spyre-inference's dispatch: the decode kernel at one query
 /// row, the prefill kernel past it.
 fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
     let decode = s.padded_query_len == 1;
-    let mut pointers = vec![
+    let pointers = [
         ("query", "*fp16"),
         ("query_row_index", "*i32"),
         ("k_pages", "*fp16"),
         ("v_pages", "*fp16"),
         ("page_index_table", "*i32"),
+        ("mask_stack", "*fp16"),
+        ("out", "*fp16"),
     ];
-    if decode {
-        pointers.push(("kv_row_pool", "*i32"));
-    }
-    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
     let mut ce = vec![
         ("NUM_TOKENS", s.padded_query_len),
         ("NUM_HEADS", s.num_heads),
@@ -124,6 +124,7 @@ fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
         )
     } else {
         ce.push(("PADDED_QUERY_LEN", s.padded_query_len));
+        ce.push(("BLOCKS_PER_TRIP", s.blocks_per_trip));
         (
             PREFILL,
             "page_attn_head_major_prefill.py",
@@ -174,6 +175,7 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
         block_size: 64,
         num_pages: 8,
         num_blocks: 3,
+        blocks_per_trip: 1,
     };
     let (src, k) = attn_kernel(&decode);
     let a = lower(src, &k);
@@ -402,8 +404,23 @@ fn i32_arg(words: &[i32], shape: Vec<usize>) -> Arg {
 /// The step's attention, on the emulator, over pools `kp`/`vp` with page table `pt` — the kernel
 /// spyre-inference dispatches at this query width, on their operands.
 fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
+    let (rows, block) = (s.mq() as usize, s.geom("BLOCK") as usize);
+    // `[num_blocks, padded_query_len, block_size]`, as recorded.
+    let mask = s.arg("mask", vec![s.num_blocks() as usize * rows, block]);
+    attend_walk(s, kp, vp, (pt, mask), (s.num_blocks(), 1))
+}
+
+/// [`attend`] over a walk of `num_blocks` blocks taken `blocks_per_trip` pages a trip, with its own
+/// page table and mask stack.
+fn attend_walk(
+    s: &Step,
+    kp: &[f64],
+    vp: &[f64],
+    (pt, mask): (Arg, Arg),
+    (num_blocks, blocks_per_trip): (i128, i128),
+) -> Vec<f64> {
     let (mq, nqh, nkvh, hd) = (s.mq(), s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
-    let (block, pages, nb) = (s.geom("BLOCK"), s.geom("NUM_PAGES"), s.num_blocks());
+    let (block, pages) = (s.geom("BLOCK"), s.geom("NUM_PAGES"));
     let shape = AttnShape {
         padded_query_len: mq,
         num_heads: nqh,
@@ -411,7 +428,8 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
         head_size: hd,
         block_size: block,
         num_pages: pages,
-        num_blocks: nb,
+        num_blocks,
+        blocks_per_trip,
     };
     let (src, k) = attn_kernel(&shape);
     let f = lower(src, &k);
@@ -419,24 +437,17 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
     let q_shape = vec![rows, width];
     // The batch is this one sequence: its rows are the query's rows, in order.
     let row_index: Vec<i32> = (0..mq as i32).collect();
-    let mut bound = vec![s.arg("q", q_shape.clone()), i32_arg(&row_index, vec![rows])];
-    if mq == 1 {
-        // The folded cache `[pages * kv, block, D]`, and `kv_row_pool` `[pages, kv, 1]`.
-        let folded = vec![(pages * nkvh) as usize, (block * hd) as usize];
-        bound.push(f16_arg(kp, folded.clone()));
-        bound.push(f16_arg(vp, folded));
-        bound.push(pt);
-        let pool: Vec<i32> = (0..(pages * nkvh) as i32).collect();
-        bound.push(i32_arg(&pool, vec![pages as usize, nkvh as usize]));
-    } else {
-        let unfolded = vec![pages as usize, (nkvh * block * hd) as usize];
-        bound.push(f16_arg(kp, unfolded.clone()));
-        bound.push(f16_arg(vp, unfolded));
-        bound.push(pt);
-    }
-    // `[num_blocks, padded_query_len, block_size]`, as recorded.
-    bound.push(s.arg("mask", vec![nb as usize * rows, block as usize]));
-    bound.push(f16_arg(&vec![0.0; rows * width], q_shape));
+    // The unfolded cache `[pages, kv · block · D]`: one row per page.
+    let unfolded = vec![pages as usize, (nkvh * block * hd) as usize];
+    let bound = vec![
+        s.arg("q", q_shape.clone()),
+        i32_arg(&row_index, vec![rows]),
+        f16_arg(kp, unfolded.clone()),
+        f16_arg(vp, unfolded),
+        pt,
+        mask,
+        f16_arg(&vec![0.0; rows * width], q_shape),
+    ];
     let out = run(&f, bound);
     out.last().expect("the out operand").clone()
 }
@@ -563,6 +574,90 @@ fn a_prompt_chunk_over_a_cached_prefix_matches_spyre_inference() {
 #[test]
 fn a_first_prompt_chunk_matches_spyre_inference() {
     the_step_matches_spyre_inference("paged_attn_prefill_first");
+}
+
+/// ⭐ OUR TRIP WALK — the prefill kernel taking eight pages a trip (`BLOCKS_PER_TRIP`, the form a
+/// walk past `MAX_WALK_TRIPS` trips bakes) answers what its walk page by page answers (held to
+/// spyre-inference's own kernels above): one prompt chunk of eight rows after a cached prefix of
+/// fifteen pages, its sixteen pages scattered over the pool. The page ids ride one word a block in
+/// the trip form, one int32 stick a block in theirs.
+#[test]
+fn a_walk_of_eight_pages_a_trip_is_the_walk_page_by_page() {
+    const TRIP: usize = 8;
+    let (p, nqh, nkvh, hd, block, pages) = (8usize, 4usize, 2usize, 64usize, 64usize, 16usize);
+    let walk = pages;
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut noise = |n: usize| -> Vec<f64> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 2001) as f64 / 1000.0 - 1.0
+            })
+            .collect()
+    };
+    let q = noise(p * nqh * hd);
+    let page_elems = nkvh * block * hd;
+    let (kp, vp) = (noise(pages * page_elems), noise(pages * page_elems));
+    // Block b of the walk sits on page (5·b + 3) mod 16: every page once, none in order.
+    let page_of = |b: usize| ((5 * b + 3) % pages) as i32;
+    // The chunk's rows sit at positions 960.. after the prefix; a key past a row's position is
+    // masked.
+    let start = (walk - 1) * block;
+    let mask: Vec<f64> = (0..walk)
+        .flat_map(|b| {
+            (0..p).flat_map(move |r| {
+                (0..block).map(move |c| if b * block + c <= start + r { 0.0 } else { -65504.0 })
+            })
+        })
+        .collect();
+    let run_walk = |trip: usize, table: Arg| -> Vec<f64> {
+        let shape = AttnShape {
+            padded_query_len: p as i128,
+            num_heads: nqh as i128,
+            num_kv_heads: nkvh as i128,
+            head_size: hd as i128,
+            block_size: block as i128,
+            num_pages: pages as i128,
+            num_blocks: walk as i128,
+            blocks_per_trip: trip as i128,
+        };
+        let (src, k) = attn_kernel(&shape);
+        let f = lower(src, &k);
+        let rows: Vec<i32> = (0..p as i32).collect();
+        let bound = vec![
+            f16_arg(&q, vec![p, nqh * hd]),
+            i32_arg(&rows, vec![p]),
+            f16_arg(&kp, vec![pages, page_elems]),
+            f16_arg(&vp, vec![pages, page_elems]),
+            table,
+            f16_arg(&mask, vec![walk * p, block]),
+            f16_arg(&vec![0.0; p * nqh * hd], vec![p, nqh * hd]),
+        ];
+        run(&f, bound).last().expect("the out operand").clone()
+    };
+    let stick = 32;
+    let mut sticks = vec![0i32; walk * stick];
+    for b in 0..walk {
+        sticks[b * stick] = page_of(b);
+    }
+    let words: Vec<i32> = (0..walk).map(page_of).collect();
+    let page_by_page = run_walk(1, i32_arg(&sticks, vec![walk, stick]));
+    let by_trips = run_walk(TRIP, i32_arg(&words, vec![walk]));
+    let err = max_abs(&by_trips, &page_by_page);
+    // Both walks round every softmax step to f16; they differ only in where the running maximum
+    // is taken.
+    let gate = 2e-3;
+    println!("trip walk vs page walk: {err:.3e}, gate {gate:.3e}");
+    assert!(err < gate, "eight pages a trip answers {err:.3e} apart from page by page");
+    // The control: the trip walk over its pages read in another order must miss.
+    let shifted: Vec<i32> = (0..walk).map(|b| page_of((b + 1) % walk)).collect();
+    let miss = max_abs(&run_walk(TRIP, i32_arg(&shifted, vec![walk])), &page_by_page);
+    assert!(
+        miss > CONTROL_MARGIN * gate,
+        "the trip walk over shifted pages still matches ({miss:.3e})"
+    );
 }
 
 /// ⭐ SEVERAL SEQUENCES' DECODE IN ONE LAUNCH — `batched_decode_head_major_kernel` over the pools

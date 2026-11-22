@@ -405,6 +405,11 @@ pub struct Gen1;
 /// one-line change in one place, not a grep.
 pub type Baked = Gen1;
 
+/// The live-set budget a fused segment of programs is planned against: seven eighths of the baked
+/// generation's per-core LX, the eighth left for a node's transient temporaries. Without it a whole
+/// transformer MLP fuses into one segment and overflows LX at larger token counts (llama, m = 32).
+pub const LX_FUSION_BUDGET_BYTES: u64 = <Baked as DeviceGen>::LX_CAPACITY_BYTES * 7 / 8;
+
 impl DeviceGen for Gen1 {
     /// GEN1'S TABLE. Every row cites the gen1 vendor templates (read on the
     /// card pod, 2026-11-07) and line; an op gen1 does not bind is a row
@@ -961,4 +966,19 @@ mod tests {
             assert_eq!(output_arrangement::<Gen1>(op), ElementArrangement::Standard);
         }
     }
+}
+
+/// Stage f32 words in the baked generation's `dl16tofp32` lane order: logical lane `i` of each
+/// 64-word block lands at [`DeviceGen::DL16TOFP32_PERMUTATION`]`[i]` (a trailing partial block is
+/// left as is).
+pub fn dl16tofp32_stagger(words: &[f32]) -> Vec<f32> {
+    let mut out = words.to_vec();
+    let (blocks, _) = out.as_chunks_mut::<64>();
+    for block in blocks {
+        let logical = *block;
+        for (i, word) in logical.iter().enumerate() {
+            block[<Baked as DeviceGen>::DL16TOFP32_PERMUTATION[i] as usize] = *word;
+        }
+    }
+    out
 }

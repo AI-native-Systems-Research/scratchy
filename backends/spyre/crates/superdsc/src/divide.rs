@@ -13,7 +13,7 @@ pub struct Cuttable {
 /// with the most units left per core.
 pub fn divide(axes: &[Cuttable], cores: u64) -> Vec<u64> {
     fn divisors(n: u64, cap: u64) -> Vec<u64> {
-        (1..=n.min(cap)).filter(|d| n % d == 0).collect()
+        (1..=n.min(cap)).filter(|&d| n.is_multiple_of(d)).collect()
     }
     fn search(axes: &[Cuttable], cores: u64, at: usize, split: &mut Vec<u64>, best: &mut (u64, u64, Vec<u64>)) {
         if at == axes.len() {

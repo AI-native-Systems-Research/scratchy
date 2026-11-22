@@ -21,4 +21,5 @@ pub mod ir;
 pub mod irtype;
 pub mod memref;
 pub mod opkind;
+pub mod program;
 pub mod tile;

@@ -18,10 +18,8 @@ members = [
     "crates/ktir/ktir-core",
     "crates/ktir/ktir-emulator",
     "crates/ktir/ktir-optimizer",
-    # KTIR -> SuperDSC as a leaf: the typed SuperDSC IR, with no scratchy dependency, so a
-    # third-party KTIR producer can consume the lowering.
-    "crates/ktir/ktir-superdsc",
-    # KTIR -> SuperDSC: the lowering of one KTIR function to the descriptors dxp compiles.
+    # KTIR -> SuperDSC: the lowering of one KTIR function to the descriptors dxp compiles, a leaf
+    # with no scratchy dependency, so a third-party KTIR producer can consume it.
     "crates/superdsc",
     # The Triton front end, re-hosted from triton-spyre (see crates/triton/PROVENANCE.md):
     # Triton.py -> TTIR -> KTIR, pure Rust, so kernels are authored in Triton and compiled at
@@ -29,7 +27,6 @@ members = [
     "crates/triton/triton-frontend",
     "crates/triton/triton-ktir",
     "crates/triton/triton-numeric",
-    "crates/triton/triton-ktir-superdsc",
     # The splice: a SubtileTape node whose KTIR comes from a Triton kernel, not the Rust builder.
     # A leaf between the tape types and the ladder, so scratchy-target-spyre hooks it in without a
     # second copy of the lowering.

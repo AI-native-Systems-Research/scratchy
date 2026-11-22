@@ -61,19 +61,24 @@ def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
              HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
              Y_TOTAL: tl.constexpr, R_START: tl.constexpr):
     tl.static_assert(HALF + HALF == HEAD_DIM)
-    # ⭐ THE LOOP RUNS OVER THE SHORTER AXIS — positions or heads — so the program holds
-    # `min(MQ, H)` bodies and stops growing with the chunk. The trip count is constexpr either
-    # way, so `to_ktir` unrolls it into a straight-line program.
+    # ⭐ THE LOOP RUNS OVER THE HEADS whenever there are several positions, so the program holds
+    # `H` bodies and stops growing with the chunk. The trip count is constexpr either way, so
+    # `to_ktir` unrolls it into a straight-line program.
     #
     # ⛔ IT WAS ALWAYS THE POSITION LOOP, AND THAT GREW WITH THE CHUNK: one body per position, so a
     # 512-row prompt chunk's q rope was 512 bodies, every one walked by every pass of the lowering.
     #
+    # ⛔ AND SEVERAL POSITIONS TAKE THE HEAD LOOP EVEN WHEN THE HEADS OUTNUMBER THEM. A position's
+    # `[H, HALF]` window starts `H` rows past the last, inside a stick whenever `H` is not a whole
+    # number of sticks, and a descriptor addresses whole sticks only; a head's `[MQ, HALF]` window
+    # always starts at row 0. The program holds `H` bodies there, at most the model's head count.
+    #
     # Nested constexpr ifs, not `and`: the parser refuses a Python `BoolOp` in a @triton.jit kernel.
     # One head (H == 1) always takes the position loop: the door tells the forms apart by the view's
     # width, and at one head both views are one head dim wide. A ROW-WINDOWED rope (`R_START > 0`,
-    # the per-row form — one row, so never `MQ > H`) keeps the position loop too: its window rides
+    # the per-row form — one row) keeps the position loop too: its window rides
     # the tall view's tile corner, which the per-head form's whole-plane view does not state.
-    if MQ > H:
+    if MQ > 1:
         if H > 1:
             if R_START == 0:
                 _rope_per_head(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF)

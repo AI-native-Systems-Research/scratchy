@@ -34,7 +34,7 @@ use crate::ir::{Attr, IRFunction, Operation, Scalar, Ssa};
 use crate::irtype::IrType;
 use crate::opkind::OpKind;
 use ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec};
-use ktir_superdsc::ktir_node::Program;
+use ktir_core::program::Program;
 use std::collections::{HashMap, HashSet};
 
 /// One tensor argument of an example kernel: the function arg name (no `%`), the
@@ -201,7 +201,7 @@ impl ResidentRunner {
                 // field's only reader and no example function is a door, so the value
                 // changes nothing here; a mint-stated kind rides LaunchProgram ->
                 // build_spec on the production path.
-                program: Program::Elementwise(ktir_superdsc::ktir_node::Elementwise::Add),
+                program: Program::Elementwise(ktir_core::program::Elementwise::Add),
                 bindings,
             }],
             sources,

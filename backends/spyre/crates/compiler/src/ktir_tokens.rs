@@ -409,36 +409,12 @@ fn program_kind_tokens(
         Program::Reshape => quote! { __KProgram::Reshape },
         Program::ScalarMul => quote! { __KProgram::ScalarMul },
         Program::Matmul => quote! { __KProgram::Matmul },
-        Program::Sample => quote! { __KProgram::Sample },
         Program::LmLast => quote! { __KProgram::LmLast },
         Program::BlockCopy => quote! { __KProgram::BlockCopy },
         Program::Rope => quote! { __KProgram::Rope },
         Program::PagedAttn => quote! { __KProgram::PagedAttn },
         Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
         Program::Transpose => quote! { __KProgram::Transpose },
-        Program::EmbedRowGather { k } => {
-            let k = proc_macro2::Literal::u32_unsuffixed(*k);
-            quote! { __KProgram::EmbedRowGather { k: #k } }
-        }
-        Program::ChainStage {
-            pad_vocab,
-            table_rows,
-            k,
-            hidden,
-        } => {
-            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(*pad_vocab);
-            let table_rows = proc_macro2::Literal::u32_unsuffixed(*table_rows);
-            let k = proc_macro2::Literal::u32_unsuffixed(*k);
-            let hidden = proc_macro2::Literal::u32_unsuffixed(*hidden);
-            quote! {
-                __KProgram::ChainStage {
-                    pad_vocab: #pad_vocab,
-                    table_rows: #table_rows,
-                    k: #k,
-                    hidden: #hidden,
-                }
-            }
-        }
         Program::WindowedRmsNorm { unit } => {
             quote! { __KProgram::WindowedRmsNorm { unit: #unit } }
         }
@@ -455,23 +431,11 @@ pub fn program_tokens(
         let (s, id) = (ssa(*s), place_id_tokens(*id));
         quote! { (#s, #id) }
     });
-    // ⭐ THE PIN WINDOW THIS PROGRAM RUNS UNDER — the bundle layout's own `lx_window_fits`
-    // budget, carried as `Some(bytes)` exactly as the bake stamped it. `None` (no window was
-    // ever proven) round-trips as `None`: the resident fused path refuses it at load, and the
-    // refusal must survive the bake → inventory → worker trip.
-    let lxpw = match p.lx_pin_window_bytes {
-        Some(b) => {
-            let lit = proc_macro2::Literal::u64_unsuffixed(b);
-            quote! { ::core::option::Option::Some(#lit) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
     quote! {
         __KProg {
             func: #func,
             program: #prog,
             args: __KCow(&[#(#binds),*]),
-            lx_pin_window_bytes: #lxpw,
         }
     }
 }

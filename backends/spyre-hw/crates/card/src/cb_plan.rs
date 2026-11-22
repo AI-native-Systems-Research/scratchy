@@ -118,7 +118,7 @@ impl LaunchSite {
 /// One (op, request, relaunch)'s launch: the request's tables and the walk's body shift for
 /// relaunch `rep` on the launch row's static shifts, the resolved bases, the program and its
 /// bootstrap.
-pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
+pub(crate) fn launch_site<T: scratchy_spyre_bundle::collective::Tp>(
     ops: &Ops<T>,
     oi: usize,
     request: u32,
@@ -205,7 +205,7 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
 /// that plays it. Minted only at bind (`superdsc_exec::bind_ops`), for the consumes the session
 /// plays.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BoundCollective<T: ktir_superdsc::collective::Tp> {
+pub(crate) struct BoundCollective<T: scratchy_spyre_bundle::collective::Tp> {
     pub(crate) send: TpSend<T>,
     pub(crate) me: Rank<T>,
 }
@@ -213,7 +213,7 @@ pub(crate) struct BoundCollective<T: ktir_superdsc::collective::Tp> {
 /// What [`site_cbs`] reads off a group: its launch order, its consume (the bundle's), and the
 /// session's binding of it.
 #[derive(Clone, Copy)]
-pub(crate) struct SiteTp<T: ktir_superdsc::collective::Tp> {
+pub(crate) struct SiteTp<T: scratchy_spyre_bundle::collective::Tp> {
     pub(crate) index: usize,
     pub(crate) consume: Option<TpConsume<T>>,
     pub(crate) bound: Option<BoundCollective<T>>,
@@ -230,7 +230,7 @@ pub(crate) struct SiteTp<T: ktir_superdsc::collective::Tp> {
 /// end is this rank's block, which is the same block on every peer (the layout is card-symmetric),
 /// so one landing address serves every send; the destination is the peer's base-address-table
 /// entry, its rank.
-pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
+pub(crate) fn site_cbs<T: scratchy_spyre_bundle::collective::Tp>(
     tp: SiteTp<T>,
     launch: BatchedCompute,
 ) -> Result<Vec<BatchedCb>> {
@@ -328,7 +328,7 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
 
 /// The base-address-table entry a send to `to` names: the peer's rank, the entry
 /// `runtime::link_peers` installs that card's region-2 address at on every other card.
-pub(crate) fn base_addr_entry<T: ktir_superdsc::collective::Tp>(to: Rank<T>) -> u8 {
+pub(crate) fn base_addr_entry<T: scratchy_spyre_bundle::collective::Tp>(to: Rank<T>) -> u8 {
     // A rank is below `collective::MAX_WORLD`, far below a byte.
     to.get() as u8
 }
@@ -342,7 +342,7 @@ pub(crate) fn base_addr_entry<T: ktir_superdsc::collective::Tp>(to: Rank<T>) -> 
 /// order cannot drift — only addressing can, and the gate catches that. Returns the
 /// items and the walk's host fence: set whenever the call launches anything, since
 /// every launch fences.
-pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
+pub(crate) fn walk_items<T: scratchy_spyre_bundle::collective::Tp>(
     ops: &Ops<T>,
     tables: &SegTables<'_>,
     where_: &LaunchWhere,
@@ -383,7 +383,7 @@ impl WalkCanvas {
     /// staged by [`walk_items`] and rendered by the same door the submit path
     /// renders through. A non-empty ops list stages at least one launch, so a
     /// canvas from this door is never empty.
-    pub(crate) fn of_walk<T: ktir_superdsc::collective::Tp>(
+    pub(crate) fn of_walk<T: scratchy_spyre_bundle::collective::Tp>(
         ops: &Ops<T>,
         tables: &SegTables<'_>,
         where_: &LaunchWhere,

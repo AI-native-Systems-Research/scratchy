@@ -24,16 +24,13 @@ inventory = { workspace = true }
 # `#[forward]` — so this crate names the same types the lowering built. Dependency-free, and no
 # feature gates it: a bundle IS its KTIR on every target.
 ktir-core = { path = "../ktir/ktir-core" }
-# ⭐ THE OPERAND IDENTITY (`PlaceId`/`SynthRole`), re-exported from this crate's root. A leaf BELOW
-# this one — no scratchy dependency, no features — so it does not breach the "depend on nothing
-# either end owns" rule above: the lowering that MINTS a synthetic and the bake that PLACES it now
-# name one declaration instead of two.
-ktir-superdsc = { path = "../ktir/ktir-superdsc" }
 # dxp's `spyrecode.json` is the ONE input to this crate that is not ours — it is the DeepTools
 # compiler's output, parsed here ONCE at build time so nothing downstream ever sees JSON.
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+scratchy-tp-world = { path = "../../../../crates/core/tp-world" }
+half = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

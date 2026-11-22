@@ -26,7 +26,7 @@ use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, IRModule, Operation, Ssa};
 use ktir_core::irtype::IrType;
 use ktir_core::opkind::OpKind;
-use ktir_superdsc::ktir_node::Program;
+use ktir_core::program::Program;
 use std::collections::{HashMap, HashSet};
 
 /// One function argument's binding to a logical tensor and its direction.
@@ -283,27 +283,6 @@ pub fn plan_segments_budgeted<'a>(
     lx_budget: usize,
     tensor_bytes: &HashMap<u64, usize>,
 ) -> Result<Vec<Segment<'a>>, String> {
-    // Per-node DOOR classification (the chained head, #603). A door node's KTIR
-    // body is a STRUCTURAL SKELETON minted for the card-side door assembly — a
-    // load of the first operand's view and a store to the last — not door
-    // semantics, so executing it op by op inside a fused function computes a
-    // copy, not the door. Isolated as its own `Segment::Native` (the same law
-    // so the resident executor can substitute the host door, keyed on the
-    // node's CARRIED `program` kind — the mint's one statement of the fact,
-    // never the func name (the spelling this crate retired). NO opt-out: the
-    // door's decomposed path is the missing-Strides refusal, not an oracle, so
-    // there is nothing sound to fall back to.
-    let door: Vec<bool> = spec
-        .nodes
-        .iter()
-        .map(|n| {
-            matches!(
-                n.program,
-                Program::EmbedRowGather { .. } | Program::ChainStage { .. }
-            )
-        })
-        .collect();
-
     // For widening segment-local sources/results: which node indices produce /
     // consume each tensor, across the WHOLE program.
     let mut produced_at: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -329,17 +308,9 @@ pub fn plan_segments_budgeted<'a>(
     let mut segments: Vec<Segment> = Vec::new();
     let mut i = 0;
     while i < spec.nodes.len() {
-        if door[i] {
-            segments.push(Segment::Native(spec.nodes[i].clone()));
-            i += 1;
-            continue;
-        }
-        // Maximal run [start, j) of consecutive non-door nodes.
+        // The run [start, j) of the remaining nodes.
         let start = i;
-        let mut j = i;
-        while j < spec.nodes.len() && !door[j] {
-            j += 1;
-        }
+        let j = spec.nodes.len();
         // Split the maximal run into sub-runs that each fit the LX live-set
         // budget (the whole run, unsplit, when lx_budget is usize::MAX), each
         // becoming its own fused segment.
@@ -1165,7 +1136,7 @@ mod tests {
     use ktir_core::attrkey::AttrKey;
     use ktir_core::dtypes::DType;
     use ktir_core::ir::Attr;
-    use ktir_superdsc::ktir_node::Elementwise;
+    use ktir_core::program::Elementwise;
 
     /// Build a node function: load whole tensor from `%in`, "compute" (identity
     /// copy via `math.exp`), store whole to `%out`. `whole` toggles whether the
@@ -1550,38 +1521,6 @@ mod tests {
             sources: HashSet::from([1]),
             results: HashSet::from([4]),
         }
-    }
-
-    #[test]
-    fn plan_isolates_door_into_native_segment_by_carried_kind() {
-        // A door node is isolated by its CARRIED kind, never by its body: the
-        // middle node's body is a plain copy (fused-eligible on its own), and the
-        // `Program::ChainStage` payload alone puts it
-        // Native — the mint's one typed statement is the discriminator.
-        let (fa, a_in, a_out) = copy_node("a", 16, true);
-        let (fb, b_in, b_out) = copy_node("b", 16, true);
-        let (fc, c_in, c_out) = copy_node("c", 16, true);
-        let m = module(vec![fa, fb, fc]);
-        let mut spec = three_node_spec(a_in, a_out, b_in, b_out, c_in, c_out);
-        // The door tests' own toy payload (emit's chain_stage_tests consts).
-        spec.nodes[1].program = Program::ChainStage {
-            pad_vocab: 4096,
-            table_rows: 8257,
-            k: 1,
-            hidden: 128,
-        };
-        let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
-        assert_eq!(
-            segs.len(),
-            3,
-            "the door breaks the run: [fused a], [native door], [fused c]"
-        );
-        match &segs[1] {
-            Segment::Native(n) => assert_eq!(n.func, "b", "the door node stays native"),
-            _ => panic!("expected the door in a native segment, never fused"),
-        }
-        assert!(matches!(segs[0], Segment::Fused(_)), "node a fused");
-        assert!(matches!(segs[2], Segment::Fused(_)), "node c fused");
     }
 
     #[test]

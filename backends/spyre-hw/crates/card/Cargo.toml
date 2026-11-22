@@ -27,7 +27,6 @@ scratchy-target-spyre = { path = "../../../spyre/crates/spyre", features = ["spy
 # compiles in through the workspace's red patch.
 flex-rs = { workspace = true }
 scratchy-spyre-bundle = { path = "../../../spyre/crates/bundle" }
-ktir-superdsc = { path = "../../../spyre/crates/ktir/ktir-superdsc" }
 scratchy-tensors = { path = "../../../../crates/tensors" }
 libc = { workspace = true }
 half = { workspace = true }

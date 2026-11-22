@@ -17,6 +17,8 @@ spyre-hw = ["dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre-hw", "de
 # differs is the device underneath. Forwards into the models crate so the bake-time
 # numeric gate runs on every emu build (see scratchy-target-spyre-compiler's `spyre-emu`).
 spyre-emu = ["scratchy-target-spyre/spyre-emu", "scratchy-target-spyre-models/spyre-emu"]
+# THE BUILD'S KV POOL: fp8 E4M3 pages.
+kv-fp8 = ["scratchy-target-spyre/kv-fp8", "scratchy-target-spyre-models/kv-fp8"]
 # A W-RANK TENSOR-PARALLEL WORLD: the bake shards every model W ways (scratchy-target-spyre-models/tp-<W>) and
 # this worker runs every rank in one process, one card each, linked by device p2p RDMA. A build that
 # names no world serves one card. Reached from the CLI as `tp/<W>`.
@@ -48,9 +50,7 @@ scratchy-target-spyre-models = { path = "../../../spyre/crates/models" }
 # Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
 # staged weight width == the emitted device width by construction.
 scratchy-subtile = { path = "../../../../crates/compiler/subtile" }
-# The SuperDSC device facts (`sdsc_abstract`, `superdsc_opspec`): the laws the staging and the
-# session setters mint their values through.
-ktir-superdsc = { path = "../../../spyre/crates/ktir/ktir-superdsc" }
+scratchy-spyre-bundle = { path = "../../../spyre/crates/bundle" }
 # Spyre rides the neutral seam directly: GpuWeights from scratchy-layers, DType from
 # scratchy-tensors.
 scratchy-layers = { path = "../../../../crates/layers" }

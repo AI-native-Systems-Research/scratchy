@@ -9,8 +9,6 @@
 //! (each line's cumulative micros vs the bundle index). Rows are Relaxed atomics —
 //! the bake is rayon-fanned, so every counter must be thread-safe.
 
-use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -88,54 +86,3 @@ pub fn count(name: &str, n: u64) {
     }
 }
 
-/// The mint class for an op name — coarse buckets, enough to attribute the door's cost.
-pub fn mint_class(op_name: &str) -> &'static str {
-    if op_name.starts_with("attn") {
-        "mint_attn"
-    } else if op_name.starts_with("rope") {
-        "mint_rope"
-    } else if op_name.contains("rms") {
-        "mint_rms"
-    } else if op_name.starts_with("matmul") || op_name.starts_with("lmlast") {
-        "mint_matmul"
-    } else if op_name.starts_with("route") {
-        "mint_route"
-    } else if op_name.starts_with("expert") {
-        "mint_expert"
-    } else {
-        "mint_ew"
-    }
-}
-
-/// One line per bundle: identity plus the cumulative table (`name:µs/calls/items`).
-pub fn bundle_line(fp: &str, ops: usize, dsc: usize, staged_bytes: u64) {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut line = String::with_capacity(640);
-    line.push_str(&format!(
-        "PC fp={fp} ops={ops} dsc={dsc} staged={staged_bytes}"
-    ));
-    for r in &ROWS {
-        let ns = r.nanos.load(Ordering::Relaxed);
-        let calls = r.calls.load(Ordering::Relaxed);
-        let items = r.items.load(Ordering::Relaxed);
-        if ns == 0 && calls == 0 && items == 0 {
-            continue;
-        }
-        line.push_str(&format!(" {}:{}", r.name, ns / 1000));
-        if calls > 0 {
-            line.push_str(&format!("/{calls}"));
-        }
-        if items > 0 {
-            line.push_str(&format!("/{items}"));
-        }
-    }
-    line.push('\n');
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/bt-passcounters.log")
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
-}

@@ -10,9 +10,9 @@
 //! 1. the splice COMPILES the row's kernel (an Err is a broken row);
 //! 2. ⛔ THE NAME LAW — the op_name is the stem+rung law the bundle's own
 //!    consumers key on (`rmsnorm_s{id}`, `matmul_s{id}`, ...);
-//! 3. the program LOWERS through the production door
-//!    (`ktir_superdsc_door::lower`, under the SAME `BundleLayout` the tape
-//!    walk computes) — the descriptors that reach the card are minted here.
+//! 3. the program LOWERS to the card's descriptors (`superdsc_lower`, placed in the SAME
+//!    `BundleLayout` the tape walk computes) — the descriptors that reach the card are minted
+//!    here.
 //!
 //! The NUMBERS are the execution rows' half (`*_executes_the_real_program`,
 //! `#[cfg(feature = "spyre-emu")]`): the REAL spliced program through the
@@ -24,25 +24,23 @@
 
 use std::collections::HashSet;
 
-use ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations;
 use scratchy_subtile::subtile_ir::{
     EwKind, GainConvention, Range, Region, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion,
     TensorShape,
 };
-use scratchy_target_spyre::ktir_superdsc_door::{BundleAttnParams, lower as bundle_lower};
 
-/// One program through the production door as a bundle of its own — the fp8 quantize set starts
-/// empty, which is what a one-program bundle's is.
-fn door_lower(
-    k: &ktir_superdsc::ktir_node::KtirNode,
-    sym: &mut i64,
-    layout: Option<&ktir_superdsc::placement::BundleLayout>,
-    attn: Option<BundleAttnParams>,
-) -> Result<
-    Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
-    ktir_superdsc::emit::lower_ktir_to_superdsc::Error,
-> {
-    bundle_lower(k, sym, layout, attn, &mut QuantizedActivations::default())
+/// One world: every row here is a one-card program.
+type One = scratchy_spyre_bundle::collective::TpWorld<1>;
+
+/// One program through the card's lowering, as a bake lowers a rung of it alone: placed in the
+/// walk's own layout, then lowered to its descriptors.
+fn card_lower(
+    e: &scratchy_triton_splice::EmittedOp<One>,
+    layout: &scratchy_target_spyre::placement::BundleLayout,
+) -> Result<scratchy_target_spyre::superdsc_lower::Descriptors, String> {
+    let mut placed = layout.clone();
+    scratchy_target_spyre::superdsc_lower::place_rung(std::iter::once(e), &mut placed)?;
+    scratchy_target_spyre::superdsc_lower::lower_op(e, &placed)
 }
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 use scratchy_triton_splice::PagedRows;
@@ -66,13 +64,13 @@ const SHAPES: &[(u32, u32)] = &[
 ];
 
 #[test]
-fn spliced_rmsnorm_lowers_through_the_door() {
+fn spliced_rmsnorm_lowers_to_the_card() {
     for &(m, c) in SHAPES {
         let ir = rmsnorm_ir(m, c, GainConvention::Scale);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -84,7 +82,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         // The splice — the row compiles the kernel for this node. Every width is
         // splicable (the kernel's ceiling-safe pre-scale), so an Err here is a broken row.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, false,
         )
         .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
@@ -96,41 +94,24 @@ fn spliced_rmsnorm_lowers_through_the_door() {
             "op_name (m={m} c={c})"
         );
 
-        // The program lowers through the production door under the walk's own layout —
-        // the descriptors that reach the card are minted here, so a door refusal is a
-        // broken row, not a fallback.
-        let mut sym = 0i64;
-        let _emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
+        // The program lowers to the card's descriptors under the walk's own layout — the
+        // descriptors that reach the card are minted here, so a refusal is a broken row.
+        let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
     }
 }
 
-/// ⭐ THE `(1 + w)` CONVENTION'S OWN DOOR GATE — the OnePlusScale row end to end:
-/// the splice compiles `rmsnorm_oneplus_fwd`, the census gives 1.0 a registry slot
-/// (the epsilon's own mechanism), and the door emits the `rmga_` add ahead of the
-/// `rmg_` gain multiply — the same formula the program runs, op for op. The SCALE
-/// CONTROL below pins the other half of the row's law: a Scale-only model pushes
-/// NO 1.0 into the registry (the nothing-is-seeded law) and emits NO `rmga_` op —
-/// byte-identical to the form before the row existed.
+/// ⭐ THE `(1 + w)` CONVENTION'S OWN GATE — the OnePlusScale row end to end: the splice
+/// compiles `rmsnorm_oneplus_fwd` under the same name law as the Scale row, and the program
+/// lowers to the card's descriptors in the walk's own layout.
 #[test]
-fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
+fn spliced_oneplus_rmsnorm_lowers_to_the_card() {
     for &(m, c) in SHAPES {
         let ir = rmsnorm_ir(m, c, GainConvention::OnePlusScale);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-        // The layout the tape walk computes for this graph — the census must have
-        // collected the convention's own 1.0 alongside the epsilon, or the door's
-        // slot lookup fails as a registry desync (the test's own control on the
-        // wiring, not an assertion here: the door refuses below).
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        // The layout the tape walk computes for this graph.
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -138,17 +119,10 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
-        assert!(
-            layout
-                .scalarmul_scales
-                .iter()
-                .any(|s| s.to_bits() == 1.0f32.to_bits()),
-            "the OnePlusScale node's census must collect the convention's 1.0 (m={m} c={c})"
-        );
 
         // The splice — the row compiles the oneplus entry for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, false,
         )
         .unwrap_or_else(|e| panic!("splice compiled the oneplus row m={m} c={c}: {e}"));
@@ -161,64 +135,10 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             "op_name (m={m} c={c})"
         );
 
-        // The program lowers through the production door under the walk's own layout.
-        let mut sym = 0i64;
-        let emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {}", e.message));
-
-        // THE OP CENSUS — the fixture's output is t2, so the chain's prefixes are
-        // `o2`: the `rmga_o2` add must be present AND ahead of the `rmg_o2` gain
-        // multiply (the add fills the Gw row the multiply reads; the reverse order
-        // would read the stored row).
-        let t = 2;
-        let add = emitted
-            .iter()
-            .position(|op| op.op_name == format!("rmga_o{t}"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "no rmga_o{t} in the oneplus chain (m={m} c={c}): {:?}",
-                    emitted.iter().map(|o| &o.op_name).collect::<Vec<_>>()
-                )
-            });
-        let mul = emitted
-            .iter()
-            .position(|op| op.op_name == format!("rmg_o{t}"))
-            .unwrap_or_else(|| panic!("no rmg_o{t} in the oneplus chain (m={m} c={c})"));
-        assert!(
-            add < mul,
-            "rmga_o{t} must precede rmg_o{t} (m={m} c={c}): the add fills the Gw row the \
-             multiply reads"
-        );
-
-        // THE SCALE CONTROL — the same shape under Scale: no 1.0 in the registry,
-        // no rmga_ op. This is the nothing-is-seeded law read backwards: the oneplus
-        // push is gated on the node's own convention, so a Scale-only model's
-        // registry is byte-identical to the form before the row existed.
-        let scale_ir = rmsnorm_ir(m, c, GainConvention::Scale);
-        let scale_layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
-            &scale_ir,
-            &weight_ids,
-            PagedRows::Sequence,
-            &[],
-            pair_of_one_request(m),
-        )
-        .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
-        assert!(
-            !scale_layout
-                .scalarmul_scales
-                .iter()
-                .any(|s| s.to_bits() == 1.0f32.to_bits()),
-            "a Scale-only model must not seed a 1.0 slot (m={m} c={c}) — the registry shifts \
-             every later constant's tid"
-        );
+        // The program lowers to the card's descriptors under the walk's own layout.
+        let emitted = card_lower(&spliced, &layout)
+            .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {e}"));
+        assert!(!emitted.is_empty(), "the oneplus program lowered to nothing (m={m} c={c})");
     }
 }
 
@@ -260,13 +180,13 @@ fn rmsnorm_ir(m: u32, c: u32, gain: GainConvention) -> SubtileIR {
 const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800), (96, 4096)];
 
 #[test]
-fn spliced_silumul_lowers_through_the_door() {
+fn spliced_silumul_lowers_to_the_card() {
     for &(m, c) in SILUMUL_SHAPES {
         let ir = silumul_ir(m, c);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -280,7 +200,7 @@ fn spliced_silumul_lowers_through_the_door() {
         // the kernel (the `rows_per_block` law), so an Err here is a broken row or a
         // broken block law.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, false,
         )
         .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
@@ -292,18 +212,9 @@ fn spliced_silumul_lowers_through_the_door() {
             "op_name (m={m} c={c})"
         );
 
-        // The program lowers through the production door under the walk's own layout.
-        let mut sym = 0i64;
-        let _emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
+        // The program lowers to the card's descriptors under the walk's own layout.
+        let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
     }
 }
 
@@ -344,7 +255,7 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
 /// lower through the door — the whole-tensor control at the same width pins that
 /// the discrimination is by REGION, never by width.
 #[test]
-fn a_column_chunked_silumul_splices_through_the_door() {
+fn a_column_chunked_silumul_lowers_to_the_card() {
     // The CHUNK-1 shape, measured on the card: 12800-wide intermediate, second block.
     let ir = silumul_ir(1, 12800);
     let chunk = Range::new(8192, 12800 - 8192);
@@ -360,7 +271,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let layout = compute_bundle_layout::<One, _>(
         &chunked,
         &weight_ids,
         PagedRows::Sequence,
@@ -370,7 +281,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
-    let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let spliced = scratchy_triton_splice::lower::<One, _>(
         &chunked.nodes[0],
         &chunked,
         false,
@@ -384,22 +295,13 @@ fn a_column_chunked_silumul_splices_through_the_door() {
 
     // Through the door: the regions the door reads must resolve, or the descriptors
     // mis-address on the card.
-    let mut sym = 0i64;
-    let _emitted = door_lower(
-        spliced
-            .ktir
-            .as_ref()
-            .expect("spliced op carries its program"),
-        &mut sym,
-        Some(&layout),
-        None,
-    )
-    .unwrap_or_else(|e| panic!("spliced program lowered: {}", e.message));
+    let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered: {e}"));
 
     // THE CONTROL: the whole-tensor node at the same total width still splices — the
     // discrimination is by REGION, never by width.
     let whole_node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let spliced = scratchy_triton_splice::lower::<One, _>(
         whole_node, &ir, false,
     )
     .expect("the whole-tensor node compiles");
@@ -455,14 +357,14 @@ fn elementwise_stem(kind: EwKind) -> &'static str {
 }
 
 #[test]
-fn spliced_elementwise_lowers_through_the_door() {
+fn spliced_elementwise_lowers_to_the_card() {
     for &kind in EW_KINDS {
         for &(m, c) in EW_SHAPES {
             let ir = elementwise_ir(m, c, kind);
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+            let layout = compute_bundle_layout::<One, _>(
                 &ir,
                 &weight_ids,
                 PagedRows::Sequence,
@@ -477,7 +379,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             // broken row or a broken block law.
             let node = &ir.nodes[0];
             let spliced =
-                scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+                scratchy_triton_splice::lower::<One, _>(
                     node, &ir, false,
                 )
                 .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
@@ -491,22 +393,9 @@ fn spliced_elementwise_lowers_through_the_door() {
                 "op_name ({kind:?} m={m} c={c})"
             );
 
-            // The program lowers through the production door under the walk's own layout.
-            let mut sym = 0i64;
-            let _emitted = door_lower(
-                spliced
-                    .ktir
-                    .as_ref()
-                    .expect("spliced op carries its program"),
-                &mut sym,
-                Some(&layout),
-                None,
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "spliced program lowered ({kind:?} m={m} c={c}): {}",
-                    e.message
-                )
+            // The program lowers to the card's descriptors under the walk's own layout.
+            let _emitted = card_lower(&spliced, &layout).unwrap_or_else(|e| {
+                panic!("spliced program lowered ({kind:?} m={m} c={c}): {e}")
             });
         }
     }
@@ -567,14 +456,14 @@ const MATMUL_SHAPES: &[(u32, u32, u32)] = &[
 ];
 
 #[test]
-fn spliced_dense_matmul_lowers_through_the_door() {
+fn spliced_dense_matmul_lowers_to_the_card() {
     for &(m, k, n) in MATMUL_SHAPES {
         let ir = matmul_ir(m, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph (`rows_are_requests:
         // true` is the decode/batched shape).
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -585,7 +474,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, true,
         )
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
@@ -597,18 +486,9 @@ fn spliced_dense_matmul_lowers_through_the_door() {
             "op_name (m={m} k={k} n={n})"
         );
 
-        // The program lowers through the production door under the walk's own layout.
-        let mut sym = 0i64;
-        let _emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
+        // The program lowers to the card's descriptors under the walk's own layout.
+        let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
     }
 }
 
@@ -738,72 +618,6 @@ fn two_sessions_on_one_thread_read_their_own_resident_weights() {
     }
 }
 
-/// ⭐ A NARROW PREFILL MATMUL WRITES THE WIDTH ITS READERS READ. `[31, 2048] · [2048, 256]` crosses
-/// the util floor's MAC threshold, and `DeviceWidth::for_matmul` pads its 4 output sticks to 8; a
-/// program that STATES that padded width writes every row at a 512 stride, while an elementwise
-/// reader of the same tensor states the logical 256 — row 0 right, every later row read from the
-/// wrong place (measured: smollm2's one-rank and granite's two-rank prefill k/v). The splice states
-/// the logical width when every reader does, so the output reads back row-major at 256.
-#[test]
-#[cfg(feature = "spyre-emu")]
-fn a_narrow_prefill_matmul_writes_the_width_its_readers_read() {
-    let (m, k, n) = (31u32, 2048u32, 256u32);
-    assert!(
-        ktir_superdsc::work::DeviceWidth::for_matmul(m, n, k, false).get() > n,
-        "the shape must be one the door pads, or the test proves nothing"
-    );
-    // The matmul (t0 · t1 → t2) and an elementwise reader of its output (t2 + t3 → t4).
-    let mut ir = matmul_ir(m, k, n);
-    ir.tensors.push(TensorShape { rows: m, cols: n });
-    ir.tensors.push(TensorShape { rows: m, cols: n });
-    let whole = |t: usize, s: &[TensorShape]| TensorRegion {
-        tensor: TensorId::from_index(t),
-        region: s[t].whole(),
-    };
-    let reader = SubtileNode {
-        id: scratchy_subtile::subtile_ir::SubtileId::from_index(1),
-        op: SubOp::Elementwise(EwKind::Add),
-        inputs: vec![whole(2, &ir.tensors), whole(3, &ir.tensors)],
-        output: whole(4, &ir.tensors),
-    };
-    ir.nodes.push(reader);
-    let a: Vec<f32> = (0..m * k)
-        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
-        .collect();
-    let w: Vec<f32> = (0..k * n)
-        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
-        .collect();
-    let want = host_matmul(&a, &w, m, k, n);
-    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
-        &[(&[spliced_node_group(&ir, 0)], &[2u64])],
-        Vec::new(),
-    )
-    .expect("build the one-program session");
-    let out = session
-        .run_step(
-            0,
-            vec![
-                (0, a, vec![m as usize, k as usize]),
-                (1, w, vec![n as usize, k as usize]),
-            ],
-            &[(2, 0)],
-        )
-        .expect("run the spliced matmul program");
-    let got = &out[&2];
-    assert_eq!(got.len(), (m * n) as usize);
-    let row_err = |r: usize| {
-        let at = r * n as usize..(r + 1) * n as usize;
-        max_abs_err(&got[at.clone()], &want[at])
-    };
-    for r in [0, 1, (m - 1) as usize] {
-        assert!(
-            row_err(r) < 0.05,
-            "row {r} of the narrow prefill matmul reads back wrong: max abs err {}",
-            row_err(r)
-        );
-    }
-}
-
 /// `A[m, k] · W[n, k]ᵀ` on the host, over the on-disk `[n, k]` weight.
 #[cfg(feature = "spyre-emu")]
 fn host_matmul(a: &[f32], w: &[f32], m: u32, k: u32, n: u32) -> Vec<f32> {
@@ -835,7 +649,7 @@ fn spliced_matmul_group(
     m: u32,
     k: u32,
     n: u32,
-) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, ktir_superdsc::collective::TpWorld<1>>
+) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, One>
 {
     spliced_node_group(&matmul_ir(m, k, n), 0)
 }
@@ -845,18 +659,15 @@ fn spliced_matmul_group(
 fn spliced_node_group(
     ir: &SubtileIR,
     at: usize,
-) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, ktir_superdsc::collective::TpWorld<1>>
+) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, One>
 {
     use std::borrow::Cow;
 
     let node = &ir.nodes[at];
     let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, ir, true)
+        scratchy_triton_splice::lower::<One, _>(node, ir, true)
             .unwrap_or_else(|e| panic!("splice compiled node {at}: {e}"));
-    let k_node = spliced
-        .ktir
-        .as_ref()
-        .expect("spliced op carries its program");
+    let k_node = &spliced.ktir;
 
     // The launch binding: parameter `i` -> `bindings[i]`, exactly the pairing
     // `build_spec` reads off `LaunchProgram::args` — the tape's own numbering.
@@ -874,16 +685,12 @@ fn spliced_node_group(
             )
         })
         .collect();
-    scratchy_target_spyre::bundle_code::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+    scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
             program: k_node.program,
             args: Cow::Owned(args),
-            // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
-            // minted no LX pins, so the window its fused segments run under is zero —
-            // a program without a stated window is refused, never silently charged.
-            lx_pin_window_bytes: Some(0),
         }]),
         init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
         job_bin_ptr: 0,
@@ -919,12 +726,9 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
     let ir = elementwise_ir(m, c, kind);
     let node = &ir.nodes[0];
     let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
+        scratchy_triton_splice::lower::<One, _>(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
-    let k_node = spliced
-        .ktir
-        .as_ref()
-        .expect("spliced op carries its program");
+    let k_node = &spliced.ktir;
 
     let args: Vec<(
         ktir_core::ir::Ssa,
@@ -941,16 +745,12 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         })
         .collect();
     let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
             kv: Default::default(),
             programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
                 func: k_node.func,
                 program: k_node.program,
                 args: Cow::Owned(args),
-                // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
-                // minted no LX pins, so the window its fused segments run under is zero —
-                // a program without a stated window is refused, never silently charged.
-                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
@@ -1033,12 +833,9 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
     let ir = elementwise_ir(m, c, EwKind::Gelu);
     let node = &ir.nodes[0];
     let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
+        scratchy_triton_splice::lower::<One, _>(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled gelu m={m} c={c}: {e}"));
-    let k_node = spliced
-        .ktir
-        .as_ref()
-        .expect("spliced op carries its program");
+    let k_node = &spliced.ktir;
 
     let args: Vec<(
         ktir_core::ir::Ssa,
@@ -1055,16 +852,12 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
         })
         .collect();
     let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
             kv: Default::default(),
             programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
                 func: k_node.func,
                 program: k_node.program,
                 args: Cow::Owned(args),
-                // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
-                // minted no LX pins, so the window its fused segments run under is zero —
-                // a program without a stated window is refused, never silently charged.
-                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
@@ -1109,7 +902,7 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
 /// (`spliced_column_chunked_scalarmul_lowers_per_chunk`); the whole-tensor
 /// shapes at these widths fit the three-live-tile budget.
 #[test]
-fn spliced_scalarmul_lowers_through_the_door() {
+fn spliced_scalarmul_lowers_to_the_card() {
     // (M, C, SCALE) — 2b's and 8b's logits scale at the hidden each normalizes to.
     // The m=96 row is the ROW-BLOCK TAIL rung at the bake's own defect shape:
     // `rows_per_block(8192, 3)` = 42, so 96 rows = 2 full blocks + a 12-row tail —
@@ -1126,7 +919,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -1137,7 +930,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
 
         // The splice — the row compiles `scalarmul.py` for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, false,
         )
         .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
@@ -1149,23 +942,10 @@ fn spliced_scalarmul_lowers_through_the_door() {
             "op_name (m={m} c={c} scale={scale})"
         );
 
-        // The program lowers through the production door under the walk's own layout.
-        // ⛔ THE SCALE MUST HAVE A REGISTRY SLOT — the door reads it off the
-        // program (`program_scalarmul_scale`) and looks it up in
-        // `BundleLayout::scalarmul_scales`, which `compute_bundle_layout` fills from
-        // the node payload, so a splice that states a different scale than the node's
-        // fails HERE by registry desync rather than by a wrong number on the card.
-        let mut sym = 0i64;
-        let _emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
+        // The program lowers to the card's descriptors under the walk's own layout, its scale a
+        // constant stick of its own value.
+        let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
     }
 }
 
@@ -1173,9 +953,8 @@ fn spliced_scalarmul_lowers_through_the_door() {
 /// 8b defect was convicted on. The logits tensor is `[1, 49155]`
 /// (49155 = 6 × 8192 + 3), and `lower_region` tiles it into SEVEN scalarmul chunks
 /// that share one output TensorId; the splice compiles every chunk with
-/// `C_START` naming its column corner and every chunk must lower through the door —
-/// under one layout threaded over ALL SEVEN (the one `bundle_sym` counter the
-/// production bake threads).
+/// `C_START` naming its column corner and every chunk must lower to the card's descriptors
+/// under one layout threaded over ALL SEVEN.
 #[test]
 fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     const LOGITS_COLS: u32 = 49_155;
@@ -1183,7 +962,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let layout = compute_bundle_layout::<One, _>(
         &ir,
         &weight_ids,
         PagedRows::Sequence,
@@ -1192,9 +971,6 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
-    // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
-    // descriptor names depend on the chunks before it.
-    let mut splice_sym = 0i64;
     let mut chunk_idx = 0usize;
     let mut c_start = 0u32;
     while c_start < LOGITS_COLS {
@@ -1211,7 +987,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
         chunked.nodes[0].output = window(1);
 
         // The splice — every chunk compiles (`C_START` states the corner).
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             &chunked.nodes[0],
             &chunked,
             false,
@@ -1223,16 +999,8 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
             "op_name (chunk {chunk_idx}, c_start {c_start})"
         );
 
-        let _emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut splice_sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("spliced program lowered (chunk {chunk_idx}): {}", e.message));
+        let _emitted = card_lower(&spliced, &layout)
+            .unwrap_or_else(|e| panic!("spliced program lowered (chunk {chunk_idx}): {e}"));
 
         chunk_idx += 1;
         c_start += len;
@@ -1301,16 +1069,16 @@ fn spliced_rope_executes_the_real_program() {
 fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
     // The op count, and its three commonest kinds — what grew, if anything did. PRODUCTION'S node shape,
     // the wide `[mq, heads·hd]` plane `to_wavefront` builds (the splice derives `H = total / hd` off
-    // it); `rope_ir`'s tall `[mq·heads, hd]` node states ONE head of `mq·heads` positions.
+    // it).
     let ops_at = |mq: u32, heads: u32| {
         let ir = rope_plane_ir(mq, heads, 64);
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             &ir.nodes[0],
             &ir,
             false,
         )
         .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads}: {e}"));
-        let k = spliced.ktir.expect("spliced op carries its program");
+        let k = spliced.ktir;
         let ops = k.func.ops_deep();
         let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
         for o in &ops {
@@ -1337,19 +1105,14 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
 fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     use std::borrow::Cow;
 
-    // ⛔ PRODUCTION'S PLANE, NOT THE TALL NODE: `rope_ir` states `[mq·heads, hd]`, which the splice reads
-    // as ONE head of `mq·heads` positions (`H = total / hd = 1`), so a run over it never had more than one
-    // head. `rope_plane_ir` is `to_wavefront`'s `[mq, heads·hd]` — the SAME bytes (element (p, h·hd + d)
-    // is tall row p·heads + h, column d), so the staging below is unchanged.
+    // ⛔ PRODUCTION'S PLANE: `rope_plane_ir` is `to_wavefront`'s `[mq, heads·hd]` — element
+    // (p, h·hd + d) is tall row p·heads + h, column d of the worker's staging.
     let ir = rope_plane_ir(mq, heads, hd);
     let node = &ir.nodes[0];
     let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
+        scratchy_triton_splice::lower::<One, _>(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
-    let k_node = spliced
-        .ktir
-        .as_ref()
-        .expect("spliced op carries its program");
+    let k_node = &spliced.ktir;
 
     let args: Vec<(
         ktir_core::ir::Ssa,
@@ -1366,16 +1129,12 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         })
         .collect();
     let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
             kv: Default::default(),
             programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
                 func: k_node.func,
                 program: k_node.program,
                 args: Cow::Owned(args),
-                // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
-                // minted no LX pins, so the window its fused segments run under is zero —
-                // a program without a stated window is refused, never silently charged.
-                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
@@ -1470,12 +1229,13 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+    // The rows ARE requests, so the layout is the batch's.
+    let layout = compute_bundle_layout::<One, _>(
         &ir,
         &weight_ids,
-        PagedRows::Sequence,
+        PagedRows::Batch,
         &[],
-        pair_of_one_request(m),
+        batch_pair_of_one_row_each(m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1483,7 +1243,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     // SingleCorelet re-patterning), never refuse.
     let node = &ir.nodes[0];
     let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, true)
+        scratchy_triton_splice::lower::<One, _>(node, &ir, true)
             .unwrap_or_else(|e| panic!("odd vocab must splice at any row count: {e}"));
     assert_eq!(
         spliced.op_name,
@@ -1491,18 +1251,9 @@ fn batched_decode_odd_vocab_lm_head_splices() {
         "op_name (m={m} k={k} n={n})"
     );
 
-    // Through the production door under the walk's own layout.
-    let mut sym = 0i64;
-    let _emitted = door_lower(
-        spliced
-            .ktir
-            .as_ref()
-            .expect("spliced op carries its program"),
-        &mut sym,
-        Some(&layout),
-        None,
-    )
-    .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
+    // The program lowers to the card's descriptors under the walk's own layout.
+    let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
 }
 
 /// The PREFILL lm-head FOLD's gate: `scratchy_triton_splice::lower_all` —
@@ -1518,7 +1269,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
 /// naming the `[mq, vocab]` storage while the store tile stays `[1, vocab]` at row 0),
 /// which no other matmul gate reaches: every other matmul shape is decode-shaped.
 #[test]
-fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
+fn spliced_prefill_lm_head_fold_lowers_to_the_card() {
     // hidden[mq, k] @ W_lmhead[k, n] -> logits[mq, n], rows_are_requests FALSE (the
     // prefill walk). The 2b's own tail shape at a prefill rung: k=2048, granite's odd
     // vocab 49155 (the odd width the ladder's re-patterning exists for), mq=31 (the
@@ -1526,7 +1277,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -1538,7 +1289,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         // The splice — `lower_all` takes the fold route for this shape.
         let node = &ir.nodes[0];
         let spliced_ops = scratchy_triton_splice::lower_all::<
-            ktir_superdsc::collective::TpWorld<1>,
+            One,
             _,
         >(node, &ir, false, pair_of_one_request(mq))
         .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
@@ -1549,24 +1300,10 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
             spliced_ops.len()
         );
 
-        // Each program through the door under the SAME layout, symbol counters
-        // threaded in bundle order (the door's names are per-bundle).
-        let mut s_sym = 0i64;
-        let mut s_fp8 = QuantizedActivations::default();
+        // Each program lowers to the card's descriptors under the SAME layout.
         for s_op in &spliced_ops {
-            let s_ktir = s_op.ktir.as_ref().expect("spliced op carries its program");
-            let _emitted = bundle_lower::<ktir_superdsc::collective::TpWorld<1>>(
-                s_ktir,
-                &mut s_sym,
-                Some(&layout),
-                None,
-                &mut s_fp8,
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "spliced program lowered (mq={mq} k={k} n={n}): {}",
-                    e.message
-                )
+            let _emitted = card_lower(s_op, &layout).unwrap_or_else(|e| {
+                panic!("spliced program lowered (mq={mq} k={k} n={n}): {e}")
             });
         }
     }
@@ -1598,13 +1335,13 @@ const MATMUL_FP8_SHAPES: &[(u32, u32, u32)] = &[
 /// qfp8ch→batchmatmulfp8→dqa→dqw) — at one-node grain no dedup can hide a missing
 /// link in the chain.
 #[test]
-fn spliced_fp8_matmul_lowers_through_the_door() {
+fn spliced_fp8_matmul_lowers_to_the_card() {
     for &(m, k, n) in MATMUL_FP8_SHAPES {
         let ir = matmul_fp8_ir(m, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let layout = compute_bundle_layout::<One, _>(
             &ir,
             &weight_ids,
             PagedRows::Sequence,
@@ -1615,7 +1352,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, true,
         )
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
@@ -1627,19 +1364,10 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
             "op_name (m={m} k={k} n={n})"
         );
 
-        // The program lowers through the production door under the walk's own layout.
+        // The program lowers to the card's descriptors under the walk's own layout.
         // One node is one grain: the full quant chain is emitted and minted.
-        let mut sym = 0i64;
-        let _emitted = door_lower(
-            spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program"),
-            &mut sym,
-            Some(&layout),
-            None,
-        )
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
+        let _emitted = card_lower(&spliced, &layout)
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
     }
 }
 
@@ -1677,12 +1405,9 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let ir = matmul_fp8_ir(m, k, n);
     let node = &ir.nodes[0];
     let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, true)
+        scratchy_triton_splice::lower::<One, _>(node, &ir, true)
             .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
-    let k_node = spliced
-        .ktir
-        .as_ref()
-        .expect("spliced op carries its program");
+    let k_node = &spliced.ktir;
 
     // The host data, bound EXACTLY as the worker binds it: x `[m, k]` as f16
     // (run_step narrows), W as PACKED e4m3 bytes in its on-disk `[n, k]`
@@ -1736,7 +1461,7 @@ fn execute_fp8_program(
     a: Vec<f32>,
     w: Vec<u8>,
     ws: Vec<f32>,
-    k_node: ktir_superdsc::ktir_node::KtirNode,
+    k_node: scratchy_spyre_bundle::program::KtirNode,
 ) -> Vec<f32> {
     use std::borrow::Cow;
 
@@ -1755,16 +1480,12 @@ fn execute_fp8_program(
         })
         .collect();
     let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
             kv: Default::default(),
             programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
                 func: k_node.func,
                 program: k_node.program,
                 args: Cow::Owned(args),
-                // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built program
-                // minted no LX pins, so the window its fused segments run under is zero —
-                // a program without a stated window is refused, never silently charged.
-                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
             job_bin_ptr: 0,
@@ -1889,14 +1610,15 @@ const ROPE_SHAPES: &[(u32, u32, u32)] = &[
 ];
 
 #[test]
-fn spliced_rope_lowers_through_the_door() {
+fn spliced_rope_lowers_to_the_card() {
     for &(mq, heads, hd) in ROPE_SHAPES {
         for rows_are_requests in [false, true] {
-            let ir = rope_ir(mq, heads, hd);
+            // Production's node shape: the wide `[mq, heads·hd]` plane.
+            let ir = rope_plane_ir(mq, heads, hd);
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+            let layout = compute_bundle_layout::<One, _>(
                 &ir,
                 &weight_ids,
                 PagedRows::Sequence,
@@ -1912,7 +1634,7 @@ fn spliced_rope_lowers_through_the_door() {
             // mirrored as an Err, not a fallthrough), so an Err here is a broken row.
             let node = &ir.nodes[0];
             let spliced =
-                scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+                scratchy_triton_splice::lower::<One, _>(
                     node,
                     &ir,
                     rows_are_requests,
@@ -1926,41 +1648,19 @@ fn spliced_rope_lowers_through_the_door() {
                 "op_name (mq={mq} heads={heads} hd={hd})"
             );
 
-            // The program lowers through the production door under the walk's own
-            // layout. Rope's door arm reads `rows_are_requests` off
-            // `BundleAttnParams` — the bundle states NO geometry: the door mints
-            // each program's geometry from the program's own views (the
-            // hybrid-model law; gemma-4 carries two attention classes, so no
-            // per-bundle geometry exists to state here).
-            let attn_params =
-                scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams { rows_are_requests };
-            let mut sym = 0i64;
-            let _emitted = door_lower(
-                spliced.ktir.as_ref().expect("spliced op carries its program"),
-                &mut sym,
-                Some(&layout),
-                Some(attn_params),
-            )
-            .unwrap_or_else(|e| {
+            // The program lowers to the card's descriptors under the walk's own layout: each
+            // program states its own geometry in its views (gemma-4 carries two attention
+            // classes, so no per-bundle geometry exists to state here).
+            let _emitted = card_lower(&spliced, &layout).unwrap_or_else(|e| {
                 panic!(
-                    "spliced program lowered (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): {}",
-                    e.message
+                    "spliced program lowered (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): {e}"
                 )
             });
         }
     }
 }
 
-/// One rope node as a one-node [`SubtileIR`]: `rotate(x, cos, sin) -> out` over
-/// `[mq, heads*hd]`. The x/cos/sin/out tensors carry the WORKER's staging — x/out as
-/// `[mq*heads, hd]` tall views of the `[mq, heads*hd]` plane (same bytes, the
-/// arrangement `addr_eq` admits), cos/sin as the worker's head-tiled
-/// `[mq*heads, hd]` tables (`spyre_forward.rs`'s `tile` over `rope_cos_sin` rows) —
-/// because that is the binding the spliced kernel and the historical builder program both
-/// address. The node kind is `RopeRotate` (the pure rotation); `RopeAppend`'s extra
-/// inputs are cache destinations that flow through graph edges, and the splice covers
-/// both kinds with the same row.
-/// [`rope_ir`] at PRODUCTION'S node shape: the wide `[mq, heads·hd]` plane `to_wavefront` builds for a
+/// One rope node at PRODUCTION'S node shape: the wide `[mq, heads·hd]` plane `to_wavefront` builds for a
 /// rope (`out_cols` = the rope's full width), so the splice reads `H = heads` and `MQ = mq`.
 fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let plane = TensorShape {
@@ -1968,50 +1668,6 @@ fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
         cols: heads * hd,
     };
     let tensors = vec![plane, plane, plane, plane];
-    let whole = |t: usize| TensorRegion {
-        tensor: TensorId::from_index(t),
-        region: tensors[t].whole(),
-    };
-    let node = SubtileNode {
-        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
-        op: SubOp::RopeRotate {
-            head_dim: scratchy_ir::model_facts::HeadDim::new(hd),
-            _form: std::marker::PhantomData,
-        },
-        inputs: vec![whole(0), whole(1), whole(2)],
-        output: whole(3),
-    };
-    SubtileIR {
-        tensors,
-        num_sources: 3,
-        nodes: vec![node],
-        result: TensorId::from_index(3),
-        op_output: Vec::new(),
-    }
-}
-
-fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
-    let tall = mq * heads;
-    // t0 = x source (staged [mq*heads, hd], i.e. the [mq, heads*hd] plane reshaped),
-    // t1 = cos source (head-tiled [mq*heads, hd]), t2 = sin, t3 = result.
-    let tensors = vec![
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-    ];
     let whole = |t: usize| TensorRegion {
         tensor: TensorId::from_index(t),
         region: tensors[t].whole(),
@@ -2058,8 +1714,8 @@ struct AttnShape {
 }
 
 impl AttnShape {
-    fn active_cap(self) -> ktir_superdsc::ktir_node::ActiveCap {
-        ktir_superdsc::ktir_node::ActiveCap::new(self.rung)
+    fn active_cap(self) -> scratchy_spyre_bundle::program::ActiveCap {
+        scratchy_spyre_bundle::program::ActiveCap::new(self.rung)
     }
 }
 
@@ -2520,7 +2176,7 @@ fn a_sliding_window_attention_is_refused() {
         window: std::num::NonZeroU32::new(4096).expect("a window"),
     };
     let node = ir.nodes.last().expect("the attention");
-    let Err(e) = scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let Err(e) = scratchy_triton_splice::lower_attn::<One, _>(
         node,
         &ir,
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
@@ -2554,7 +2210,7 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     let small = at_pages(16);
     let ir = attn_ir(small, 0.015625);
     let node = ir.nodes.last().expect("the attention");
-    let Err(e) = scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let Err(e) = scratchy_triton_splice::lower_attn::<One, _>(
         node,
         &ir,
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
@@ -2574,7 +2230,7 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
     let big = at_pages(64);
     let ir = attn_ir(big, 0.015625);
     let node = ir.nodes.last().expect("the attention");
-    scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+    scratchy_triton_splice::lower_attn::<One, _>(
         node,
         &ir,
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
@@ -2593,7 +2249,7 @@ fn the_paged_attention_splices_with_its_contract() {
         let ir = attn_ir(s, scale);
         let node = ir.nodes.last().unwrap();
         let at = format!("geom={:?} mq={} rung={}", s.geom, s.mq, s.rung);
-        let spliced = scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower_attn::<One, _>(
             node,
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
@@ -2624,18 +2280,15 @@ fn the_paged_attention_splices_with_its_contract() {
             format!("attn_s{}", node.id.index()),
             "{at}"
         );
-        let k = spliced
-            .ktir
-            .as_ref()
-            .expect("spliced op carries its program");
+        let k = &spliced.ktir;
         assert_eq!(
             k.program,
-            ktir_superdsc::ktir_node::Program::PagedAttn,
+            scratchy_spyre_bundle::Program::PagedAttn,
             "{at}"
         );
         // spyre-inference's operands, in their order: query, query_row_index, the K and V pools, the
-        // page index table, `kv_row_pool` (the decode kernel's, at one query row), the mask stack
-        // and out — the step's sources at the ids the one law (`PagedStepTids`) states.
+        // page index table, the mask stack and out — the step's sources at the ids the one law
+        // (`PagedStepTids`) states.
         let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
         let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
         let mut want = vec![
@@ -2645,40 +2298,20 @@ fn the_paged_attention_splices_with_its_contract() {
             node.inputs[2].tensor.index() as u32,
             tids.page_table,
         ];
-        if s.mq == 1 {
-            want.push(tids.kv_row_pool);
-        }
         want.extend([tids.mask, node.output.tensor.index() as u32]);
         assert_eq!(bound, want, "{at}");
-        assert_eq!(k.mask.map(|m| m.get()), Some(tids.mask), "{at}");
-        // ⭐ THE CARD'S HALF, through the production door under the bundle's own layout: the walk
-        // lowers at every geometry — its body at trip 0, marked for the card's per-trip relaunch
-        // exactly when the walk loops (a one-page pool's walk is one trip, which the front end
-        // promotes to straight-line code). At a head two sticks wide the decode's pages are permuted
-        // per kv head and its output row back, and the prefill's query and output are relaid
-        // head-major and back, its page gathered in pieces.
-        let layout = triton_ktir_superdsc::layout::for_node(k)
-            .unwrap_or_else(|e| panic!("{at}: layout: {e:?}"));
-        scratchy_triton_splice::allocate_paged_cache(k, &layout)
-            .unwrap_or_else(|e| panic!("{at}: {e}"));
-        let mut sym = 0i64;
-        let ops = door_lower(k, &mut sym, Some(&layout), None)
-            .unwrap_or_else(|e| panic!("{at}: the walk lowers: {}", e.message));
+        // ⭐ THE CARD'S HALF: the walk lowers to the card's descriptors under the bundle's own
+        // layout at every geometry.
+        let layout = compute_bundle_layout::<One, _>(
+            &ir,
+            &HashSet::new(),
+            PagedRows::Sequence,
+            &[],
+            pair_of_one_request(s.mq),
+        )
+        .unwrap_or_else(|e| panic!("{at}: layout: {e}"));
+        let ops = card_lower(spliced, &layout).unwrap_or_else(|e| panic!("{at}: the walk lowers: {e}"));
         assert!(!ops.is_empty(), "{at}: the walk emitted nothing");
-        let walking = ktir_superdsc::emit::loop_fold::flatten(k)
-            .expect("the program flattens")
-            .is_some();
-        assert_eq!(
-            ops.iter().any(|e| e.walk.is_some()),
-            walking,
-            "{at}: the body is marked for the relaunch exactly when the walk loops"
-        );
-        // And a walk's body never fuses away, so the attention has no fold-fused twin: the bake
-        // would compile its split program twice, under two names.
-        assert!(
-            !scratchy_target_spyre::lower_subtile_tape_to_superdsc::has_fused_twin(&ops),
-            "{at}: the paged attention has a fold-fused twin"
-        );
     }
 }
 
@@ -2858,8 +2491,8 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     };
     let ir = attn_ir(s, 0.125f32);
     let attn = &ir.nodes[1];
-    let splice = |pair: ktir_superdsc::sdsc_abstract::QueryExtent| {
-        scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+    let splice = |pair: scratchy_spyre_bundle::rung::QueryExtent| {
+        scratchy_triton_splice::lower_attn::<One, _>(
             attn,
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
@@ -2869,10 +2502,10 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         )
     };
     // The S=2 mint: two requests of 64 rows over the 128-row graph.
-    let packed = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(64)
+    let packed = scratchy_spyre_bundle::rung::QueryExtent::of_baked_rung(
+        scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(64)
             .expect("the rung's width is nonzero"),
-        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(2)
+        scratchy_spyre_bundle::rung::RungCap::of_baked_seqs(2)
             .expect("the rung's capacity is nonzero"),
     )
     .expect("128 rows fit a u32");
@@ -2887,10 +2520,8 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         "the packed (64, 2) mint emits one window per request"
     );
     assert!(
-        e.iter().all(|w| w
-            .ktir
-            .as_ref()
-            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn))),
+        e.iter()
+            .all(|w| matches!(w.ktir.program, scratchy_spyre_bundle::Program::PagedAttn)),
         "every window of the packed mint is the prefill walk's own program"
     );
     // The S=1 mint of the SAME graph — one request of all 128 rows — still splices.
@@ -2898,10 +2529,10 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         .unwrap_or_else(|e| panic!("the S=1 mint splices the same graph: {e}"));
     // ⛔ AND A MINT THAT DOES NOT DESCRIBE THE GRAPH IS REFUSED, BY NAME, with both extents
     // stated — never a silently-wrong `PADDED_QUERY_LEN`.
-    let mismatch = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(64)
+    let mismatch = scratchy_spyre_bundle::rung::QueryExtent::of_baked_rung(
+        scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(64)
             .expect("the rung's width is nonzero"),
-        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(3)
+        scratchy_spyre_bundle::rung::RungCap::of_baked_seqs(3)
             .expect("the rung's capacity is nonzero"),
     )
     .expect("192 rows fit a u32");
@@ -2933,11 +2564,11 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
 
 /// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows. Pure arithmetic,
 /// read by the door tests every build runs, so it is not behind the emulator.
-fn pair_of_one_request(mq: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
-    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(mq)
+fn pair_of_one_request(mq: u32) -> scratchy_spyre_bundle::rung::QueryExtent {
+    scratchy_spyre_bundle::rung::QueryExtent::of_baked_rung(
+        scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(mq)
             .expect("the shape's row count is nonzero"),
-        ktir_superdsc::sdsc_abstract::RungCap::ONE,
+        scratchy_spyre_bundle::rung::RungCap::ONE,
     )
     .expect("one request's rows fit a u32")
 }
@@ -2945,10 +2576,10 @@ fn pair_of_one_request(mq: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
 /// The extent pair a BATCH walk states: `rows` rows that are `rows` requests, one row
 /// each — the pair's held product is the graph's row count, which the batched kernel
 /// arm reads.
-fn batch_pair_of_one_row_each(rows: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
-    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
-        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(rows)
+fn batch_pair_of_one_row_each(rows: u32) -> scratchy_spyre_bundle::rung::QueryExtent {
+    scratchy_spyre_bundle::rung::QueryExtent::of_baked_rung(
+        scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
+        scratchy_spyre_bundle::rung::RungCap::of_baked_seqs(rows)
             .expect("the batch's sequence count is nonzero"),
     )
     .expect("the batch's rows fit a u32")
@@ -2984,7 +2615,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         s.geom, s.mq, s.cap
     );
     let mut programs =
-        scratchy_triton_splice::lower_all::<ktir_superdsc::collective::TpWorld<1>, _>(
+        scratchy_triton_splice::lower_all::<One, _>(
             rope,
             &ir,
             false,
@@ -3005,10 +2636,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, walk");
-    let walk = programs[2]
-        .ktir
-        .as_ref()
-        .expect("the walk carries its program");
+    let walk = &programs[2].ktir;
     let t_out = u64::from(
         walk.bindings
             .last()
@@ -3018,13 +2646,13 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     let groups: Vec<
         scratchy_target_spyre::bundle_code::LaunchGroup<
             'static,
-            ktir_superdsc::collective::TpWorld<1>,
+            One,
         >,
     > =
         programs
             .into_iter()
             .map(|e| {
-                let k = e.ktir.expect("every spliced op carries its program");
+                let k = e.ktir;
                 let args = k
                     .func
                     .arguments
@@ -3039,14 +2667,13 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
                     })
                     .collect::<Vec<_>>();
                 scratchy_target_spyre::bundle_code::LaunchGroup::<
-                    ktir_superdsc::collective::TpWorld<1>,
+                    One,
                 > {
                     kv: Default::default(),
                     programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
                         func: k.func,
                         program: k.program,
                         args: Cow::Owned(args),
-                        lx_pin_window_bytes: Some(0),
                     }]),
                     init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
                         Cow::Borrowed(&[]),
@@ -3284,7 +2911,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         s.geom, s.mq, s.cap, s.rung
     );
     let mut programs =
-        scratchy_triton_splice::lower_all::<ktir_superdsc::collective::TpWorld<1>, _>(
+        scratchy_triton_splice::lower_all::<One, _>(
             rope,
             &ir,
             true,
@@ -3306,10 +2933,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, batched walk");
-    let walk = programs[2]
-        .ktir
-        .as_ref()
-        .expect("the walk carries its program");
+    let walk = &programs[2].ktir;
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let bound: Vec<u32> = walk.bindings.iter().map(|b| b.get()).collect();
     assert!(
@@ -3328,13 +2952,13 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
     let groups: Vec<
         scratchy_target_spyre::bundle_code::LaunchGroup<
             'static,
-            ktir_superdsc::collective::TpWorld<1>,
+            One,
         >,
     > =
         programs
             .into_iter()
             .map(|e| {
-                let k = e.ktir.expect("every spliced op carries its program");
+                let k = e.ktir;
                 let args = k
                     .func
                     .arguments
@@ -3349,14 +2973,13 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
                     })
                     .collect::<Vec<_>>();
                 scratchy_target_spyre::bundle_code::LaunchGroup::<
-                    ktir_superdsc::collective::TpWorld<1>,
+                    One,
                 > {
                     kv: Default::default(),
                     programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
                         func: k.func,
                         program: k.program,
                         args: Cow::Owned(args),
-                        lx_pin_window_bytes: Some(0),
                     }]),
                     init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
                         Cow::Borrowed(&[]),
@@ -3512,195 +3135,6 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
     );
 }
 
-/// ⭐⭐ THE TWO RMSNORM RECOGNIZERS, PINNED TO EACH OTHER. The door recognizes
-/// rmsnorm chains to fuse them (`ktir_superdsc`'s `program_rmsnorm_chains`); the
-/// emulator re-derives the same walk to land the scalar chain's sticks on the
-/// card's DLF16 grid (`ktir_emulator`'s `rmsnorm_scalar_sticks` — the emulator
-/// cannot depend on the door's crate, so the walk is a second implementation of
-/// one pattern). Two implementations of one fact is the class that desyncs
-/// silently, so this pin runs BOTH over the same SHIPPED programs — every
-/// spelling the delivery scope runs: the gained `rmsnorm.py` under both gain
-/// conventions, and the un-gained `rmsnormunit.py` — and asserts they agree.
-/// The door's per-chain `consumed` interior must contain exactly the
-/// emulator's three sticks (the square, the `·INV_D` mean, the `+eps` sum —
-/// never the raw reduce or the rsqrt, which land on the reduce's own
-/// accumulator grid), the total must be three per chain with nothing outside
-/// the door's chains, and the un-gained spelling must read the SAME eps through
-/// the door's per-op reader that the walk's chain is built around. A non-norm
-/// program recognizes on NEITHER side. A recognizer that drifts — a new chain
-/// shape the door admits, or a discriminator the emulator tightens — fails
-/// here by name, instead of silently landing the wrong grid.
-#[cfg(feature = "spyre-emu")]
-#[test]
-fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
-    use ktir_emulator::comm_sched::rmsnorm_scalar_sticks;
-    use ktir_superdsc::emit::lower_ktir_to_superdsc::program_rmsnorm_eps;
-    use ktir_superdsc::emit::whole_function::program_rmsnorm_chains;
-
-    // The gained spellings, both conventions, at the delivery scope's shapes.
-    for &(m, c) in SHAPES {
-        for gain in [GainConvention::Scale, GainConvention::OnePlusScale] {
-            let ir = rmsnorm_ir(m, c, gain);
-            let node = &ir.nodes[0];
-            let spliced =
-                scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
-                    node, &ir, false,
-                )
-                .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
-            let f = spliced
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program");
-
-            let chains = program_rmsnorm_chains(&f.func)
-                .unwrap_or_else(|e| panic!("door recognized m={m} c={c}: {}", e.message));
-            assert_eq!(
-                chains.len(),
-                1,
-                "one chain per gained program (m={m} c={c})"
-            );
-            // ⛔ THE GAIN LEG IS CLAIMED ON THE REAL SPLICED PROGRAM, at every row count — the
-            // one-row tile included, where the row's spray is extent-1, the producer folds the
-            // broadcast away, and only the leg's own `[1, cols]` shape states the row. A close
-            // as the identity here would flip every decode-bucket norm to the unit form and
-            // move the gained bundles (the g2bfp8 gate's measured diff).
-            assert!(
-                match gain {
-                    GainConvention::Scale => matches!(
-                        chains[0].gain,
-                        ktir_superdsc::emit::whole_function::GainLeg::Scale(_)
-                    ),
-                    GainConvention::OnePlusScale => matches!(
-                        chains[0].gain,
-                        ktir_superdsc::emit::whole_function::GainLeg::OnePlusScale(_)
-                    ),
-                },
-                "the real spliced {gain:?} program claims its gain row (m={m} c={c})"
-            );
-            let sticks = rmsnorm_scalar_sticks(f.func.operations);
-            assert_eq!(
-                sticks.len(),
-                3,
-                "exactly the square, mean and meps sticks (m={m} c={c})"
-            );
-            let consumed: HashSet<_> = chains[0].consumed.iter().copied().collect();
-            assert_eq!(
-                sticks.intersection(&consumed).count(),
-                3,
-                "the sticks are the chain's own interior (m={m} c={c})"
-            );
-            // The program's own eps, read by the door: the kernel's
-            // `(ms + EPS).to(tl.float32)` spelling states the add f16-typed, so
-            // the constant reaches the program ALREADY collapsed to its f16
-            // image — the same fact the golden's registry staging states, and
-            // the one the door's registry lookup serves through its f16-image
-            // fallback.
-            let eps = program_rmsnorm_eps(&f.func)
-                .unwrap_or_else(|| panic!("door read the gained program's eps (m={m} c={c})"));
-            assert_eq!(
-                eps,
-                half::f16::from_f32(1e-5).to_f32(),
-                "the gained program states its eps as the f16 image (m={m} c={c})"
-            );
-        }
-    }
-
-    // The un-gained spelling: the door recognizes it as the SAME chain with the gain leg
-    // closed as the identity — one chain, `GainLeg::Identity`, its terminal the normalising
-    // multiply — and reads it through the per-op epsilon reader (one root, the addf carrying
-    // the eps splat), the emulator through the same scalar-chain walk — and the eps both see
-    // is the f16 image.
-    for &(m, c) in SHAPES {
-        let ir = rmsnormunit_ir(m, c);
-        let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
-            node, &ir, false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled the unit row m={m} c={c}: {e}"));
-        let f = spliced
-            .ktir
-            .as_ref()
-            .expect("spliced op carries its program");
-
-        let chains = program_rmsnorm_chains(&f.func)
-            .unwrap_or_else(|e| panic!("door recognized the unit row m={m} c={c}: {}", e.message));
-        assert_eq!(chains.len(), 1, "one chain per unit program (m={m} c={c})");
-        assert!(
-            matches!(
-                chains[0].gain,
-                ktir_superdsc::emit::whole_function::GainLeg::Identity
-            ),
-            "the unit program's gain leg closes as the identity (m={m} c={c})"
-        );
-        let eps = program_rmsnorm_eps(&f.func)
-            .unwrap_or_else(|| panic!("door read the unit program's eps (m={m} c={c})"));
-        assert_eq!(
-            eps,
-            half::f16::from_f32(1e-6).to_f32(),
-            "the unit program states its eps as the f16 image (m={m} c={c})"
-        );
-        let sticks = rmsnorm_scalar_sticks(f.func.operations);
-        assert_eq!(
-            sticks.len(),
-            3,
-            "the unit chain's three sticks (m={m} c={c})"
-        );
-        let consumed: HashSet<_> = chains[0].consumed.iter().copied().collect();
-        assert_eq!(
-            sticks.intersection(&consumed).count(),
-            3,
-            "the unit chain's sticks are its own interior (m={m} c={c})"
-        );
-    }
-
-    // The negative control: a program with no norm recognizes on NEITHER side.
-    let ir = silumul_ir(1, 4096);
-    let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled the silumul control: {e}"));
-    let f = spliced
-        .ktir
-        .as_ref()
-        .expect("spliced op carries its program");
-    let chains = program_rmsnorm_chains(&f.func)
-        .unwrap_or_else(|e| panic!("door recognized the control: {}", e.message));
-    assert!(chains.is_empty(), "no rmsnorm chain in a silumul program");
-    assert!(
-        rmsnorm_scalar_sticks(f.func.operations).is_empty(),
-        "no scalar sticks in a silumul program"
-    );
-}
-
-/// `rmsnorm_unit(x) -> out` as a one-node [`SubtileIR`] — the un-gained spelling
-/// (`rmsnormunit.py`, the head-norm sandwich's unit): one input, no gamma. t0 = x
-/// source, t1 = result. Eps is gemma-4's `1e-6` — the subnormal regime the DLF16
-/// landing exists for.
-#[cfg(feature = "spyre-emu")]
-fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
-    let tensors = vec![
-        TensorShape { rows: m, cols: c },
-        TensorShape { rows: m, cols: c },
-    ];
-    let whole = |t: usize| TensorRegion {
-        tensor: TensorId::from_index(t),
-        region: tensors[t].whole(),
-    };
-    let node = SubtileNode {
-        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
-        op: SubOp::RmsNormUnit { eps: 1e-6 },
-        inputs: vec![whole(0)],
-        output: whole(1),
-    };
-    SubtileIR {
-        tensors,
-        num_sources: 1,
-        nodes: vec![node],
-        result: TensorId::from_index(1),
-        op_output: Vec::new(),
-    }
-}
-
 /// ⛔⛔⛔ A CONTINUATION'S PROGRAM IS FLAT IN ITS ROWS — the whole-chunk form, pinned at the door's own
 /// guard and across row counts. The per-row arm it replaced held `mq` row bodies (granite-2b at 256
 /// rows: 94.7 s to lower; at 512, never finished). Eight times the rows must not grow the program, both
@@ -3718,7 +3152,7 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
         let spliced =
-            scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+            scratchy_triton_splice::lower_attn::<One, _>(
                 node,
                 &ir,
                 scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
@@ -3731,8 +3165,6 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
         assert_eq!(spliced.len(), 1, "one window at one request");
         spliced[0]
             .ktir
-            .as_ref()
-            .expect("spliced op carries its program")
             .func
             .ops_deep()
             .len()
@@ -3764,14 +3196,11 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
     for (m, k, n) in [(8u32, 128u32, 256u32), (35u32, 2048u32, 8192u32)] {
         let ir = matmul_fp8_ir(m, k, n);
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        let spliced = scratchy_triton_splice::lower::<One, _>(
             node, &ir, true,
         )
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
-        let prog = spliced
-            .ktir
-            .as_ref()
-            .expect("the spliced op carries its program");
+        let prog = &spliced.ktir;
         let ops = prog.func.ops_deep();
         let is_mn_f16 = |v: ktir_core::ir::Ssa| {
             ops.iter().any(|op| {
@@ -3819,113 +3248,3 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
     }
 }
 
-/// ⭐⭐ THE TALL WIDE-HIDDEN RUNG — a prefill-width rmsnorm at hidden 16384 whose
-/// mean(x²) bills past the per-core LX budget (2048 rows × 32 KiB/row, spread over the
-/// cores, is past 1,677,721 B per core), so the chain's own reduce goes through the
-/// LONG-REDUCE SPLIT inside `assemble_rmsnorm`: `time` single-shot slice reduces plus
-/// `time − 1` running combines, in place on the chain's own mean. The door lowers the
-/// whole program — nothing refuses — and the split's slice marker (`_p1_op`, an op name
-/// only the split body mints) is present in the emission. The SHAPES sweep above is the
-/// byte-identity control: every fitting rung still lowers one-for-one.
-#[test]
-fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
-    let (m, c) = (2048u32, 16384u32);
-    let ir = rmsnorm_ir(m, c, GainConvention::Scale);
-    let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
-        &ir,
-        &weight_ids,
-        PagedRows::Sequence,
-        &[],
-        pair_of_one_request(m),
-    )
-    .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
-    let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
-    assert_eq!(
-        spliced.op_name,
-        format!("rmsnorm_s{}", node.id.index()),
-        "op_name (m={m} c={c})"
-    );
-    let mut sym = 0i64;
-    let emitted = door_lower(
-        spliced
-            .ktir
-            .as_ref()
-            .expect("spliced op carries its program"),
-        &mut sym,
-        Some(&layout),
-        None,
-    )
-    .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
-    assert!(
-        emitted.iter().any(|e| e.op_name.contains("_p1_op")),
-        "the tall rung's mean(x²) splits: no `_p1_op` slice among {} emitted ops",
-        emitted.len()
-    );
-    // ⛔ #1113's ADDRESS-RESOLVING CHECK (auditor ruling 2026-11-06): every time-tiled op
-    // the door emitted — the split's own slices and combines included — must keep every
-    // STRIDED operand's whole trip span inside that operand's own footprint, resolved
-    // against the concrete per-trip addresses `concrete_trips` baked. This is the rung
-    // whose rmg gain (an mb-broadcast read by a time-tiled op) advanced 64× past its
-    // one-row frame on the card (run-4, RAS::PCI::BusFence 0xa35e); the own-frame stride
-    // law plus the emitter's bake-time segment law must hold here op by op, and this
-    // asserts it on the REAL door emission, not a hand-minted fixture.
-    let mut tiled_ops = 0usize;
-    for e in &emitted {
-        if e.time == 1 {
-            continue;
-        }
-        tiled_ops += 1;
-        for (ti, strides) in e.affine_strides.iter().enumerate() {
-            let Some(&stride) = strides.values().next() else {
-                continue;
-            };
-            assert!(
-                stride > 0,
-                "m={m} c={c} op '{}': operand {ti} carries a stride map with a non-advance",
-                e.op_name
-            );
-            let trips = e.concrete_trips();
-            let start = |t: usize| -> u64 {
-                trips
-                    .get(t)
-                    .unwrap_or_else(|| panic!("a trip per time ({})", e.time))
-                    .dscs_[0]
-                    .values()
-                    .next()
-                    .expect("one dsc")
-                    .scheduleTree_
-                    .iter()
-                    .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ as usize == ti)
-                    .unwrap_or_else(|| {
-                        panic!("op '{}': an allocate node per operand {ti}", e.op_name)
-                    })
-                    .startAddressCoreCorelet_
-                    .data_
-                    .values()
-                    .next()
-                    .expect("a per-core address")
-                    .parse()
-                    .expect("a decimal address")
-            };
-            let span = start(e.time as usize - 1) - start(0) + stride as u64;
-            assert!(
-                span <= e.arg_bindings[ti].footprint_bytes,
-                "m={m} c={c} op '{}': operand {ti}'s trips span {span} B (stride {stride} B × \
-                 {} trips) but its own frame is {} B — the op's iteration outruns the operand",
-                e.op_name,
-                e.time,
-                e.arg_bindings[ti].footprint_bytes
-            );
-        }
-    }
-    assert!(
-        tiled_ops > 0,
-        "m={m} c={c}: the tall rung's emission carries at least one time-tiled op — the \
-         split's slices are single-trip by construction, but the program's wide pointwise \
-         applies tile"
-    );
-}

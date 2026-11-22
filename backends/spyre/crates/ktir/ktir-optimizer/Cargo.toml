@@ -33,9 +33,3 @@ path = "src/lib.rs"
 version = "0.1.0"
 path = "../ktir-core"
 
-# ⭐ THE `Program` KIND, for `NodeSpec`'s carried field — the planner's door
-# isolation keys on the mint's one typed statement of what a node computes.
-# A leaf beside ktir-core (serde/serde_json/half only below it), so no cycle.
-[dependencies.ktir-superdsc]
-version = "0.1.0"
-path = "../ktir-superdsc"

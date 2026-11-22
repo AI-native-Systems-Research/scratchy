@@ -880,7 +880,7 @@ pub fn decode_f64(bytes: &[u8], n: usize, dtype: DType) -> Result<Vec<f64>> {
 /// Every configuration that HAS checked-in data, so a sweep can report the rest as MISSING rather
 /// than silently covering fewer than it names.
 pub fn present() -> Vec<String> {
-    triton_ktir_superdsc::cases::ALL
+    crate::cases::ALL
         .iter()
         .filter(|c| dir(c).join("meta.json").is_file())
         .map(|c| c.to_string())

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE NOUNS — what a loaded Spyre model IS.
 //!
-//! `BundleMeta` (one baked bundle: its wiring, its `BakeFacts`, its capacity), `Loaded` (the
+//! `BundleMeta` (one baked bundle: its wiring and its capacity), `Loaded` (the
 //! sessions and the rung ladders), `ReqState` (one request's draw), and the smaller value types the
 //! launch path passes around.
 //!
@@ -71,35 +71,7 @@ pub(crate) struct BundleMeta {
     /// writes it into the pools and reads it there.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) output_ids: Vec<usize>,
-    /// Every compile-time scalar this bundle's KTIR reads, in registry order — entry `i` is bound at
-    /// `scalarmul_scale_tid(i)` as a `[1,1]` tile.
-    ///
-    /// ⛔ THE EMULATOR MUST BIND THESE OR THE OUTPUT IS SILENTLY WRONG. The programs read
-    /// a model constant (a scale, an RMSNorm epsilon or divisor) and the algebraic identities
-    /// `0`/`1` off reserved tids rather than baking them as KTIR immediates, because
-    /// `dxp_standalone` has no immediate operand and the card path needs a real address. Those tids
-    /// are ordinary `func.arguments` of the program the emulator runs too, so an unbound one is a
-    /// zero — which turns `x/(1+e)` into `x/e` and every scaled residual into nothing. The card
-    /// binds the same list through `wiring::constant_steps`; this is the emulator's copy of it.
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) scalarmul_scales: &'static [f32],
-    /// ⭐ THE WIRING'S OWN PHASE — decode's chained head vs prefill — projected
-    /// from `Wiring::phase` at load (`phase: wiring.phase`, never a second
-    /// derivation), so the emulator forward's chain-seed staging decides off
-    /// the same fact the tape's `ForwardShape` carries. On `Decode` the
-    /// per-step embed-row push is REPLACED by the sticks' seed; on `Prefill`
-    /// the host pushes the row. Emulator-only: the card path reads the phase
-    /// straight off its own `wiring` field below.
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) phase: scratchy_target_spyre::forward_tape::ForwardPhase,
-    /// ⭐ THE MINTED SAMPLER'S SEAT — the wiring's own (`Wiring::sample_seat`), projected at load
-    /// like `phase` above (never a second derivation). `Some` on every rung the bake minted the
-    /// draw into: the emulator forward stages this seat's law every step and reads the pick back
-    /// through the re-pointed result. Emulator-only: the card path reads it straight off its own
-    /// `wiring` field.
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) sample_seat: Option<scratchy_target_spyre::wiring::SampleSeat>,
-    /// ⭐ THE GENERATED scratchy_target_spyre::wiring::IRING THIS BUNDLE scratchy_target_spyre::wiring::AS BAKED scratchy_target_spyre::wiring::ITH. Everything above it is a copy taken
+    /// ⭐ THE GENERATED WIRING THIS BUNDLE WAS BAKED WITH. Everything above it is a copy taken
     /// out of this static on the way through `Parsed`; the forward tape is read straight off it
     /// (`Wiring::forward_shape`) so the shape a forward plays cannot be a second opinion about
     /// what the bake decided.

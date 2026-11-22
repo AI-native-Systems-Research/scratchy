@@ -87,15 +87,16 @@ fn main() {
         .map(|(i, c)| (*c, 0x2000_0000 + i as u64 * 128))
         .collect();
     let b = spyre_superdsc::Bindings { params: &params, consts: &placed, scratch: 0x1000_0000 };
-    match spyre_superdsc::emit::emit::<Baked>(&g, &b) {
-        Ok(l) => {
-            let files = spyre_superdsc::emit::group_files(&l.ops).expect("render");
+    let fp = spyre_superdsc::emit::footprint::<Baked>(&g);
+    match spyre_superdsc::emit::emit::<Baked>(&g, &fp, &b) {
+        Ok(ops) => {
+            let files = spyre_superdsc::emit::group_files(&ops).expect("render");
             let _ = std::fs::remove_dir_all(out);
             std::fs::create_dir_all(out).expect("mkdir");
             for (name, body) in files {
                 std::fs::write(std::path::Path::new(out).join(name), body).expect("write");
             }
-            println!("LOWERED {} ops, scratch {} B, consts {:?}", l.ops.len(), l.scratch_bytes, g.consts);
+            println!("LOWERED {} ops, scratch {} B, consts {:?}", ops.len(), fp.scratch_bytes, g.consts);
         }
         Err(e) => {
             println!("REFUSED {e:?}");

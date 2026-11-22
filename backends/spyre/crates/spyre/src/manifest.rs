@@ -14,10 +14,6 @@ use std::path::Path;
 /// be a second way to spell the same count — which is exactly how the two axes became interchangeable.
 pub use crate::bundle_code::{RungSeqs, SweptCols};
 
-/// One decode batch rung's OWN staged constants — `(tid, kind)` at the rung's
-/// own `rows` (see [`SengraphBundleGroup::decode_rungs`]).
-pub type RungLoadConsts = &'static [(u32, crate::wiring::LoadConst)];
-
 /// The registry sentinel naming a baked sibling bundle — `"SUPERDSC_BUNDLE:<fingerprint>"`.
 ///
 /// ⛔ A NEWTYPE AND NOT A `&str` because every other string in this manifest is also a `&'static str`
@@ -253,14 +249,7 @@ pub struct SengraphBundleGroup {
     /// placement depends on the row count.
     ///
     /// EMPTY ⇒ no ladder; the worker decodes one request per forward, as it always did.
-    ///
-    /// ⭐ EACH RUNG CARRIES ITS OWN `load_consts` — the kinds staged into THAT
-    /// rung's session at the rung's own `rows`, never the single-request
-    /// wiring's list: the ten uniform `[rows, 1]` tables stage each row's word
-    /// at its stick head, so a rows=1 kind's bytes leave every row past 0
-    /// reading ZERO on a wider rung (Finding 1, 2026-10-27). The worker
-    /// refuses at load if a rung's kind rows ≠ the rung's rows.
-    pub decode_rungs: &'static [(RungSeqs, SweptCols, BundleSentinel, RungLoadConsts)],
+    pub decode_rungs: &'static [(RungSeqs, SweptCols, BundleSentinel)],
     /// PREFIX-CAPABLE PREFILL LADDER `[(width, seqs, sentinel)]`, ascending — the bundles baked with a
     /// full resident-prefix sweep, for chunks with `start > 0`. EMPTY ⇒ none baked.
     ///
@@ -379,7 +368,7 @@ pub fn attn_causal_mask_fill(mq: usize) -> Vec<f32> {
     let mut m = vec![0.0f32; mq * mq];
     for r in 0..mq {
         for c in 0..mq {
-            if !ktir_superdsc::sdsc_abstract::prefill_causal_col_valid(c, r) {
+            if !scratchy_spyre_bundle::rung::prefill_causal_col_valid(c, r) {
                 m[r * mq + c] = -1.0e38;
             }
         }

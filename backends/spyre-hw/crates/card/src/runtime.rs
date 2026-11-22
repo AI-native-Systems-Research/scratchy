@@ -85,7 +85,7 @@ use flex_rs::util::Status;
 /// submitter, capacity source, IOMMU mapper, scheduler, context) borrows the card with the same
 /// `'a`, so one card has one owner and the compiler — not a refcount — checks that nothing
 /// outlives it.
-pub struct CardRuntime<'a, T: ktir_superdsc::collective::Tp> {
+pub struct CardRuntime<'a, T: scratchy_spyre_bundle::collective::Tp> {
     card: &'a flex_rs::card::Card,
     /// ⭐ THE CPUS THIS CARD'S HOST THREADS RUN ON — its NUMA node's, read from sysfs at open
     /// (`flex_rs::numa`). Its response worker, its rank's submit thread and its bring-up thread
@@ -99,7 +99,7 @@ pub struct CardRuntime<'a, T: ktir_superdsc::collective::Tp> {
     link: std::sync::OnceLock<PeerLink<T>>,
 }
 
-impl<'a, T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<'a, T> {
+impl<'a, T: scratchy_spyre_bundle::collective::Tp> fmt::Debug for CardRuntime<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardRuntime")
             .field("pci", &self.card.pci())
@@ -109,7 +109,7 @@ impl<'a, T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<'a, T> {
     }
 }
 
-impl<'a, T: ktir_superdsc::collective::Tp> CardRuntime<'a, T> {
+impl<'a, T: scratchy_spyre_bundle::collective::Tp> CardRuntime<'a, T> {
     /// Build one card's runtime over a card its owner already opened ([`WorldCards::open_cards`])
     /// — the card BORROWED for `'a`, its capacity read from the card.
     ///
@@ -500,14 +500,14 @@ impl std::error::Error for HwError {}
 /// ⭐ DISTINCT BY CONSTRUCTION: [`Self::claim`] is the only constructor and refuses a repeated
 /// address, so no two ranks hold one card and nothing downstream checks it again.
 #[derive(Debug)]
-pub struct WorldCards<T: ktir_superdsc::collective::Tp>(PerRank<T, WorldCard<T>>);
+pub struct WorldCards<T: scratchy_spyre_bundle::collective::Tp>(PerRank<T, WorldCard<T>>);
 
 /// One rank's card of a [`WorldCards`] — only a claim mints one, so a card opened as a rank's is a
 /// card its world claimed.
 #[derive(Debug)]
-pub struct WorldCard<T: ktir_superdsc::collective::Tp>(EnumeratedCard, std::marker::PhantomData<T>);
+pub struct WorldCard<T: scratchy_spyre_bundle::collective::Tp>(EnumeratedCard, std::marker::PhantomData<T>);
 
-impl<T: ktir_superdsc::collective::Tp> WorldCard<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> WorldCard<T> {
     /// The claimed card's PCIe address.
     pub fn pci(&self) -> &str {
         self.0.pci()
@@ -540,7 +540,7 @@ impl fmt::Display for ClaimRefusal {
 
 impl std::error::Error for ClaimRefusal {}
 
-impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> WorldCards<T> {
     /// Claim world `T`'s cards from `table`: rank `r` is the table's `r`-th card.
     ///
     /// # Errors
@@ -745,7 +745,7 @@ pub type SpanBuild<T> = (
 ///    hosting thread's send fails — the send itself DROPS the runtimes, so their completion
 ///    threads exit — and the park below it returns immediately (the release sender died with
 ///    the handle). No deadlock, no stranded thread.
-pub struct ServeSpan<T: ktir_superdsc::collective::Tp> {
+pub struct ServeSpan<T: scratchy_spyre_bundle::collective::Tp> {
     /// The hosting thread's release signal — `send(())` ends the park, the scope closes, the
     /// completion threads join. `None` only inside [`Drop`], which takes it.
     release: Option<std::sync::mpsc::Sender<()>>,
@@ -758,7 +758,7 @@ pub struct ServeSpan<T: ktir_superdsc::collective::Tp> {
     runtimes: Option<&'static PerRank<T, CardRuntime<'static, T>>>,
 }
 
-impl<T: ktir_superdsc::collective::Tp> ServeSpan<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> ServeSpan<T> {
     /// Adopt the leaked runtimes this span hosts — the one mint, called once by the owner that
     /// leaked them. Their completion threads are stopped at [`Drop`], before the span releases.
     pub fn adopt(&mut self, runtimes: &'static PerRank<T, CardRuntime<'static, T>>) {
@@ -766,7 +766,7 @@ impl<T: ktir_superdsc::collective::Tp> ServeSpan<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Drop for ServeSpan<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> Drop for ServeSpan<T> {
     fn drop(&mut self) {
         // The join law: stop every card's completion thread BEFORE the hosting thread is
         // released, so the scope's join drains already-stopping threads.
@@ -986,7 +986,7 @@ impl<'a> Stream<'a> {
     /// are user-owned and order through their own submissions; the hazard tracker's conservative
     /// Compute address sets would cross-edge concurrent sessions sharing resident weights into
     /// full serialization. Delegates to [`Self::create_with`].
-    pub fn create<T: ktir_superdsc::collective::Tp>(
+    pub fn create<T: scratchy_spyre_bundle::collective::Tp>(
         card: &CardRuntime<'a, T>,
     ) -> Result<Stream<'a>, HwError> {
         Self::create_with(
@@ -1005,7 +1005,7 @@ impl<'a> Stream<'a> {
     /// direction). This is the shape for concurrent pipelines over shared device memory —
     /// `OP_ORDERING` streams whose cross-stream ordering the tracker carries instead of a
     /// host-side lock; see `examples/hazard_concurrency.rs`, the #546 concurrency leg.
-    pub fn create_with<T: ktir_superdsc::collective::Tp>(
+    pub fn create_with<T: scratchy_spyre_bundle::collective::Tp>(
         card: &CardRuntime<'a, T>,
         priority: RuntimeStreamPriority,
         mode: RuntimeStreamMode,
@@ -1777,7 +1777,7 @@ pub struct DevAddr(Arc<CompositeAddress>);
 impl DevAddr {
     /// Allocate `nbytes` of device memory of the given [`MemoryType`]. The region is never freed
     /// (see the struct doc); this handle describes it.
-    pub fn alloc<T: ktir_superdsc::collective::Tp>(
+    pub fn alloc<T: scratchy_spyre_bundle::collective::Tp>(
         card: &CardRuntime<'_, T>,
         nbytes: ByteSize,
         kind: MemoryType,
@@ -1885,7 +1885,7 @@ impl DevAddr {
 /// Why a sharded world's cards could not be linked. Each is a load refusal: a topology without
 /// device p2p RDMA is refused, never served over the host.
 #[derive(Debug)]
-pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
+pub enum AttachRefusal<T: scratchy_spyre_bundle::collective::Tp> {
     /// A card is already linked, as another rank or for another window.
     AlreadyLinked {
         card: String,
@@ -1909,7 +1909,7 @@ pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
     Xseg(String),
 }
 
-impl<T: ktir_superdsc::collective::Tp> fmt::Display for AttachRefusal<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> fmt::Display for AttachRefusal<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyLinked {
@@ -1936,7 +1936,7 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Display for AttachRefusal<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> std::error::Error for AttachRefusal<T> {}
+impl<T: scratchy_spyre_bundle::collective::Tp> std::error::Error for AttachRefusal<T> {}
 
 /// ⭐ ONE CARD'S P2P LINK — tensor parallelism's one load-time fact per card: which rank the card
 /// runs as and where its peer's sends land. Minted only by [`link_peers`], which installs every
@@ -1950,7 +1950,7 @@ impl<T: ktir_superdsc::collective::Tp> std::error::Error for AttachRefusal<T> {}
 /// window the link programmed — [`crate::superdsc_exec::Executor::load`] refuses a bundle whose
 /// window is elsewhere.
 #[derive(Debug)]
-pub struct PeerLink<T: ktir_superdsc::collective::Tp> {
+pub struct PeerLink<T: scratchy_spyre_bundle::collective::Tp> {
     me: Rank<T>,
     window: RecvWindow<T>,
     /// The window's first byte as the ALLOCATOR placed it on this card — set once, by
@@ -1958,7 +1958,7 @@ pub struct PeerLink<T: ktir_superdsc::collective::Tp> {
     landing: std::sync::OnceLock<u64>,
 }
 
-impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> PeerLink<T> {
     /// The rank this card runs as.
     pub fn identity(&self) -> Rank<T> {
         self.me
@@ -1991,7 +1991,7 @@ impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
 ///
 /// # Errors
 /// [`AttachRefusal`], by name.
-pub fn link_peers<T: ktir_superdsc::collective::Tp>(
+pub fn link_peers<T: scratchy_spyre_bundle::collective::Tp>(
     cards: &PerRank<T, CardRuntime<'_, T>>,
     window: RecvWindow<T>,
 ) -> Result<(), AttachRefusal<T>> {
@@ -2059,7 +2059,7 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
 /// # Errors
 /// [`AttachRefusal`]: an unlinked card, a slot past the allocation, a second pointing at another
 /// address, or a word that will not compose or program.
-pub fn point_landing_slots<T: ktir_superdsc::collective::Tp>(
+pub fn point_landing_slots<T: scratchy_spyre_bundle::collective::Tp>(
     card: &CardRuntime<'_, T>,
     window_region: &DevAddr,
 ) -> Result<(), AttachRefusal<T>> {
@@ -2143,7 +2143,7 @@ impl std::error::Error for WindowsApart {}
 ///
 /// # Errors
 /// [`WindowsApart`], naming every rank's landing.
-pub fn refuse_if_windows_apart<T: ktir_superdsc::collective::Tp>(
+pub fn refuse_if_windows_apart<T: scratchy_spyre_bundle::collective::Tp>(
     cards: &PerRank<T, CardRuntime<'_, T>>,
 ) -> Result<u64, WindowsApart> {
     let landings: Vec<Option<u64>> = cards

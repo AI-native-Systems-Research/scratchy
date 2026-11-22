@@ -41,6 +41,21 @@ pub mod correction;
 /// window, the sids and the send → wait → consume ring — see [`collective`].
 pub mod collective;
 
+/// The operand identity: what a placement is keyed by.
+pub mod place;
+
+/// The KTIR programs a bake carries, and the buffers they bind.
+pub mod program;
+
+/// The tensor ids the runtime fills by role.
+pub mod reserved_tids;
+
+/// The rung's extents and the paged KV pool's shape.
+pub mod rung;
+
+/// The device segments a layout places into.
+pub mod segments;
+
 /// Re-exported so the `inventory::submit!` the macro emits into each arch crate resolves through the
 /// same path as the types it submits — the arch crate need not depend on `inventory` itself.
 pub use inventory;
@@ -140,25 +155,12 @@ pub const NUM_SEGMENTS: usize =
 pub const MAX_SEGMENT_BYTES: u64 =
     <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MAX_SEGMENT_BYTES;
 
-/// WHAT A LAUNCH'S PROGRAM COMPUTES, and the pointwise kinds it names — re-exported for the same
-/// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter
-/// (`ktir_tokens`) renders it through THIS crate's path into the generated source, and the macro
-/// crate depends on the target crate, never on `ktir-superdsc` directly.
-pub use ktir_superdsc::ktir_node::{Elementwise, Program};
-/// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
-/// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
-/// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that
-/// invents the intermediate rather than to the bake that places it.
-///
-/// ⚠️ THIS CRATE'S HEADER SAYS IT MAY "DEPEND ON NOTHING EITHER END OWNS", AND THIS IS A DEPENDENCY.
-/// `ktir-superdsc` is neither end: it is a leaf BELOW all three crates that header names, with no
-/// scratchy dependency of its own, and all three still reach these types through this crate.
-/// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
-/// not name.
-pub use ktir_superdsc::place::{OpLocalKind, OpLocalRole, PlaceId, SynthId, SynthRole};
-/// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
-/// same reason as [`PlaceId`]: both ends read the one type.
-pub use ktir_superdsc::placement::{KvBank, WeightTail};
+/// What a launch's program computes — [`LaunchProgram::program`] carries the kind.
+pub use ktir_core::program::{Elementwise, Program};
+/// The operand identity a placement is keyed by.
+pub use place::{OpLocalKind, OpLocalRole, PlaceId, SynthId, SynthRole};
+/// The segments a layout places into, and the weight tail's verdict.
+pub use segments::{KvBank, SegRole, WeightTail};
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,6 +236,59 @@ pub enum WalkArm<'a> {
     PerElement,
 }
 
+/// A constant a descriptor reads as a whole stick: the stager writes `value` into every lane of
+/// the one stick placed under `id`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StickConst {
+    pub id: PlaceId,
+    pub format: StickFormat,
+    /// The value, as an `f32`'s bits.
+    pub value: u32,
+}
+
+/// The element format of a [`StickConst`]'s lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickFormat {
+    /// IEEE half on the host, the device's 16-bit float once staged.
+    Fp16,
+    Fp32,
+    Fp8,
+    UInt32,
+}
+
+impl StickConst {
+    /// The stick's host bytes: the value in every lane of one `stick_bytes`-byte stick, in the
+    /// format's host encoding.
+    pub fn host_bytes(&self, stick_bytes: usize) -> Vec<u8> {
+        let v = f32::from_bits(self.value);
+        let lane: Vec<u8> = match self.format {
+            StickFormat::Fp16 => half::f16::from_f32(v).to_le_bytes().to_vec(),
+            StickFormat::Fp32 => v.to_le_bytes().to_vec(),
+            StickFormat::Fp8 => vec![fp8_e4m3(v)],
+            StickFormat::UInt32 => (v as u32).to_le_bytes().to_vec(),
+        };
+        lane.iter().copied().cycle().take(stick_bytes).collect()
+    }
+}
+
+/// `v` rounded to E4M3 (saturating at ±448, no infinities).
+fn fp8_e4m3(v: f32) -> u8 {
+    let sign = if v.is_sign_negative() { 0x80 } else { 0 };
+    let a = v.abs().min(448.0);
+    if a < f32::from_bits(0x3A80_0000) / 2.0 {
+        return sign;
+    }
+    // Subnormals step 2^-9 below 2^-6; normals carry 3 mantissa bits.
+    if a < 2f32.powi(-6) {
+        let m = (a / 2f32.powi(-9)).round() as u8;
+        return sign | m.min(7);
+    }
+    let e = a.log2().floor() as i32;
+    let m = ((a / 2f32.powi(e) - 1.0) * 8.0).round() as i32;
+    let (e, m) = if m == 8 { (e + 1, 0) } else { (e, m) };
+    sign | (((e + 7) as u8) << 3) | (m as u8 & 7)
+}
+
 /// The whole-bundle memory plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BundleLayout<'a> {
@@ -263,10 +318,8 @@ pub struct BundleLayout<'a> {
     pub places: Cow<'a, [Placement]>,
     /// The matmul kernel weights that must be staged tiled.
     pub kernel_weights: Cow<'a, [KernelWeight<'a>]>,
-    /// Distinct ScalarMul scale VALUES, in a stable order. Index `i` ↔ the reserved const tid
-    /// `scalarmul_scale_tid(i)`, which the worker binds as a `[1,1]` const so the on-device
-    /// pointwise `mul` gets its real multiplier (unbound = 0 = wrong output).
-    pub scalarmul_scales: Cow<'a, [f32]>,
+    /// The constants the descriptors read as whole sticks, each staged once at load.
+    pub stick_consts: Cow<'a, [StickConst]>,
     /// ⭐ THE SCALARMUL WEIGHT FOLDS — `(weight tensor id, multiplier)`: the compile-time
     /// multipliers that commuted into their matmul's weight and so never became device ops.
     /// The worker multiplies each listed weight's STAGED fp16 bytes by its multiplier at load
@@ -275,30 +328,6 @@ pub struct BundleLayout<'a> {
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,
-    /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — the top-down footprint-class slots the
-    /// emitter placed below [`LX_PIN_END`]. The HOST's term of the one window budget
-    /// (`lx_window_fits`): `chunk_gather_index_table` refuses a chunk whose core-local pins plus
-    /// THIS number leave the frontend window, so the host budgets against the same pins the bake
-    /// did. The pin PLACEMENTS stay emit-only (they live in the compiled sdsc allocates); this is
-    /// the SUM, which is all the budget asks. Every bundle of one rung carries the same number —
-    /// the slot map is the rung layout's, shared by prefix, bodies and suffix alike.
-    pub lx_op_local_bytes: u64,
-    /// ⭐ THE CHUNK FORM'S PROBABILITY-PART LX PINS, in bytes — the `cesub` (and a prompt chunk's
-    /// `cexp`) per-core slices the emission pins beside its gathers. The HOST's SECOND core-local
-    /// term of the same window budget: the bake's `lx_form` admission summed it beside the gather
-    /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
-    /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
-    pub lx_prob_pin_bytes: u64,
-    /// ⭐ THE WHOLE PIN WINDOW, in bytes — core-local pins + op-local slot classes, the exact
-    /// budget the bake's own `lx_window_fits` guard proved for this bundle's layout. Stamped from
-    /// the placement layout's own two terms (one accessor, no recomputation) so the EMULATOR's
-    /// resident fused path can charge the same window per segment: the card holds exactly these
-    /// pins for a fused segment's run and nothing else (its intermediates are HBM synth regions),
-    /// so the emulator's LX guard and the bake's guard prove one budget. Each of this bundle's
-    /// `LaunchProgram`s carries the same number beside its func. `None` when no placement layout
-    /// was computed for this bundle — no window was ever proven, and the resident fused path
-    /// REFUSES such a program at load rather than charging nothing silently.
-    pub lx_pin_window_bytes: Option<u64>,
     /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
     /// forward, and the runtime's completeness check walks exactly that range. Stamped by the
     /// bake (the same `ir.num_sources` the placement pass packed from) because the count is
@@ -357,7 +386,7 @@ impl<'a> BundleLayout<'a> {
     /// ⭐ THE KV POOL'S BYTES: bank 0 ([`Self::segment_bytes`] at `SegRole::Kv`) plus every extra
     /// bank ([`Self::kv_bank_bytes`]).
     pub fn kv_pool_bytes(&self) -> u64 {
-        self.segment_bytes[ktir_superdsc::placement::SegRole::Kv.segment()]
+        self.segment_bytes[segments::SegRole::Kv.segment()]
             + self.kv_bank_bytes.iter().sum::<u64>()
     }
 
@@ -373,7 +402,7 @@ impl<'a> BundleLayout<'a> {
     /// forbids a field-for-field conversion between them.
     pub fn weight_seg_record(&self) -> (u64, Vec<u64>) {
         (
-            self.segment_bytes[ktir_superdsc::placement::SegRole::Weight.segment()],
+            self.segment_bytes[segments::SegRole::Weight.segment()],
             self.weight_bank_bytes.to_vec(),
         )
     }
@@ -386,7 +415,7 @@ impl<'a> BundleLayout<'a> {
 /// How a launch group relaunches and what its segment bases read: a walk's body, a gathered read, or a
 /// collective's consume.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KvShifts<T: ktir_superdsc::collective::Tp> {
+pub struct KvShifts<T: collective::Tp> {
     /// This is a walk's body group: the runtime relaunches it [`Walk::trips`] times.
     pub page_fold: bool,
     /// ⭐ This group reads the pool through the GATHER — each page came from the index the host stages
@@ -417,7 +446,7 @@ pub struct Walk {
     pub step_bytes: u32,
 }
 
-impl<T: ktir_superdsc::collective::Tp> KvShifts<T> {
+impl<T: collective::Tp> KvShifts<T> {
     /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
     /// `(layer_shift, layer_bank)`.
     ///
@@ -454,21 +483,10 @@ pub struct LaunchProgram<'a> {
     /// construction), so a consumer that dispatches on the kind reads a TYPE, never a name.
     /// Pure carry: the hw runtime never reads it — `into_code`'s hw arm serializes no
     /// `programs` — so it changes no emitted byte.
-    pub program: ktir_superdsc::ktir_node::Program,
+    pub program: Program,
     /// Parameter -> the tensor it carries, in parameter order. Carried from the construction that
     /// minted the parameter, never re-derived from a name.
     pub args: Cow<'a, [(ktir_core::ir::Ssa, PlaceId)]>,
-    /// ⭐ THE LX PIN WINDOW THIS PROGRAM RUNS UNDER — its bundle layout's own
-    /// `lx_window_fits` budget (core-local pins + op-local slot classes), stamped at the
-    /// construction that minted the program from that layout. The resident fused path's
-    /// ONLY LX charge (auditor ruling 2026-10-27): the card holds these pins and nothing
-    /// else for the run — intermediates are HBM — so the emulator charges this per
-    /// segment and never the tiles. Read from the bundle, never inferred from shape.
-    /// `None` = no window was ever proven for this program (minted without a placement
-    /// layout): the resident fused path REFUSES a `None` at load, naming the program —
-    /// a missing window must not pass the LX guard as a silent zero. A hand-built
-    /// program states its window explicitly, or it does not run.
-    pub lx_pin_window_bytes: Option<u64>,
 }
 
 /// ⭐ THE BUILD'S WHOLE IMAGE SET, AS ITS BINARY HOLDS IT — one blob of zstd frames, one dictionary
@@ -602,7 +620,7 @@ impl std::fmt::Debug for BakedImage<'_> {
 /// edit; it was an env read until the two values were measured to give DIFFERENT OUTPUT at width 8.
 // NOT `Eq`: a group carries its PROGRAMS, and a program carries float constants.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct LaunchGroup<'a, T: ktir_superdsc::collective::Tp> {
+pub struct LaunchGroup<'a, T: collective::Tp> {
     /// What the launch shifts this program's segment bases by.
     pub kv: KvShifts<T>,
     /// ⭐⭐⭐ THE PROGRAMS THIS LAUNCH RUNS, IN ORDER — the group's KTIR, constructed by the lowering
@@ -629,7 +647,7 @@ pub struct LaunchGroup<'a, T: ktir_superdsc::collective::Tp> {
     pub correction: Cow<'a, [u8]>,
 }
 
-impl<T: ktir_superdsc::collective::Tp> LaunchGroup<'_, T> {
+impl<T: collective::Tp> LaunchGroup<'_, T> {
     /// ⭐⭐⭐⭐⭐ WHERE THIS PROGRAM SITS INSIDE ITS OWN ALLOCATION AND HOW BIG THAT ALLOCATION IS — ONE
     /// value, minted from [`Self::job_bin_ptr`] alone.
     ///
@@ -878,7 +896,7 @@ impl<'a> RerollMeta<'a> {
 /// ONE baked SuperDSC bundle: its memory plan, its launch index, its compiled device programs, and
 /// — when it is a re-rolled body — the layer-loop parameters and the siblings that complete it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct BundleCode<'a, T: ktir_superdsc::collective::Tp> {
+pub struct BundleCode<'a, T: collective::Tp> {
     /// Content fingerprint — this bundle's identity, and how a sibling names it.
     pub fp: Cow<'a, str>,
     /// The memory plan every launch addresses through.
@@ -1015,17 +1033,13 @@ mod tests {
     // door discriminators, and no fixture here is a door.
     const PROGS_A: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_A,
-        program: ktir_superdsc::ktir_node::Program::LmLast,
+        program: Program::LmLast,
         args: Cow::Borrowed(&[]),
-        // Stated EXPLICITLY (auditor ruling 2026-10-27): a hand-built const program
-        // mints no LX pins, so its window is zero — stated, not defaulted.
-        lx_pin_window_bytes: Some(0),
     }];
     const PROGS_B: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_B,
-        program: ktir_superdsc::ktir_node::Program::LmLast,
+        program: Program::LmLast,
         args: Cow::Borrowed(&[]),
-        lx_pin_window_bytes: Some(0),
     }];
 
     #[test]
@@ -1034,7 +1048,7 @@ mod tests {
             fp: Cow::Borrowed("fp"),
             layout: BundleLayout::default(),
             groups: Cow::Borrowed(&[
-                LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+                LaunchGroup::<collective::TpWorld<1>> {
                     kv: KvShifts::default(),
                     programs: Cow::Borrowed(PROGS_A),
                     init_binary: BakedImage::Raw(Cow::Borrowed(&[1, 2, 3])),

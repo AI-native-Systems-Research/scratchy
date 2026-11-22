@@ -32,7 +32,8 @@ use crate::dtypes::DType;
 use crate::env::ConvertModel;
 use crate::ir::{Attr, IRFunction, Operation, Ssa};
 use crate::opkind::{Dialect, OpKind};
-use ktir_superdsc::element_arrangement::DL16TOFP32_PERMUTATION;
+const DL16TOFP32_PERMUTATION: [u8; 64] =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::DL16TOFP32_PERMUTATION;
 
 // =========================================================================
 // Matmul acceleration tier — the GPU analogue of the BLAS auto-select.

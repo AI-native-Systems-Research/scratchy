@@ -193,15 +193,7 @@ impl HBMSimulator {
     }
 }
 
-/// LX live-set budget for fused-segment planning: the ONE const, read from
-/// ktir-superdsc beside the LX capacity it derives from
-/// ([`ktir_superdsc::superdsc_opspec::LX_FUSION_BUDGET_BYTES`], 7/8 of the 2 MB
-/// per-core LX — headroom for a node's transient temporaries). Passed to
-/// `ktir_optimizer::fusion::plan_segments_budgeted` so a fused segment's
-/// co-resident `[m, *]` intermediates never overflow LX (without it, a whole
-/// transformer MLP fuses into one segment and overflows at larger token counts —
-/// llama m=32). 2 MB matches `LXScratchpad::new(.., 2)` below.
-pub use ktir_superdsc::superdsc_opspec::LX_FUSION_BUDGET_BYTES;
+pub use ktir_core::ddl_binds::LX_FUSION_BUDGET_BYTES;
 
 /// The effective LX fusion budget — [`LX_FUSION_BUDGET_BYTES`] unless overridden
 /// by `KTIR_LX_FUSION_BUDGET` (bytes). The override lets a host with a different

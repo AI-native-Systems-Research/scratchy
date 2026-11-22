@@ -138,6 +138,55 @@ fn indexable(v: &View, axis: usize, lanes: u64) -> bool {
     v.axes[axis].stride == lanes && one_column
 }
 
+/// Is `v` read through an index along `axis` one whole row per index — the indexed axis outermost,
+/// every other axis densely inside it, the unit-stride axis whole sticks? dxp addresses such a row
+/// as one block per index, however many sticks it holds: a page of the KV pool gathers in place.
+fn row_indexable(v: &View, axis: usize, lanes: u64) -> bool {
+    if v.tile.is_some() {
+        return false;
+    }
+    let mut rest: Vec<crate::view::Axis> = v
+        .axes
+        .iter()
+        .enumerate()
+        .filter(|&(i, a)| i != axis && a.extent > 1)
+        .map(|(_, a)| *a)
+        .collect();
+    rest.sort_by_key(|a| a.stride);
+    let mut unit = 1u64;
+    for (k, a) in rest.iter().enumerate() {
+        if a.stride != unit {
+            return false;
+        }
+        unit *= if k == 0 { a.extent.next_multiple_of(lanes) } else { a.extent };
+    }
+    unit > lanes && v.axes[axis].stride == unit
+}
+
+/// `v` with its unit-stride axis `s` split into its sticks and their lanes — `[…, R·lanes, …]` read
+/// as `[…, R, lanes, …]` — a row of several sticks as dxp's indirect access walks it.
+fn split_sticks(v: &View, s: usize, lanes: u64) -> View {
+    let mut out = v.clone();
+    let a = out.axes[s];
+    out.axes[s] = crate::view::Axis { extent: lanes, stride: a.stride };
+    out.axes.insert(s, crate::view::Axis { extent: a.extent / lanes, stride: a.stride * lanes });
+    out
+}
+
+/// `shape` row-major, its innermost axis whole sticks: the rows a row gather lands or reads.
+fn row_view(shape: &[u64], lanes: u64) -> View {
+    let mut held = shape.to_vec();
+    if let Some(l) = held.last_mut() {
+        *l = l.next_multiple_of(lanes);
+    }
+    let physical = View::row_major(0, &held);
+    let mut v = View::row_major(0, shape);
+    for (a, p) in v.axes.iter_mut().zip(&physical.axes) {
+        a.stride = p.stride;
+    }
+    v
+}
+
 /// `shape` held with `axis` directly outside the stick's lanes and the stick axis `stick` in
 /// columns pitched past all `rows` of it.
 fn indexable_view(shape: &[u64], axis: usize, stick: usize, lanes: u64) -> View {
@@ -184,10 +233,17 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
             i += 1;
             continue;
         };
+        // A whole row per index reads (or lands) in place; the other side of the copy holds its
+        // rows contiguous, one per index.
+        let rows = row_indexable(&operand.view, axis, lanes);
         // The other side of the copy is held the same way, rows one per index.
         let other = if is_input { g.nodes[i].output.clone() } else { g.nodes[i].inputs[0].clone() };
         let other_shape = other.view.shape();
-        let other_held = indexable_view(&other_shape, axis, stick, lanes);
+        let other_held = if rows {
+            row_view(&other_shape, lanes)
+        } else {
+            indexable_view(&other_shape, axis, stick, lanes)
+        };
         if other.view != other_held {
             g.locals.push(Local {
                 elements: other_held.end(),
@@ -213,6 +269,28 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
                 g.nodes.insert(i, copy);
                 i += 1;
             }
+        }
+        if rows {
+            // A row of several sticks: its sticks are one more axis of the copy, its lanes the
+            // stick — on both sides, so the index walks whole rows of whole sticks.
+            let s_extent = operand.view.axes[stick].extent;
+            if s_extent > lanes && s_extent.is_multiple_of(lanes) {
+                let node = &mut g.nodes[i];
+                let split_axis = |o: &mut Operand| {
+                    o.view = split_sticks(&o.view, stick, lanes);
+                    if let Some(gt) = o.gather.as_mut()
+                        && gt.axis > stick
+                    {
+                        gt.axis += 1;
+                    }
+                };
+                split_axis(&mut node.inputs[0]);
+                split_axis(&mut node.output);
+                node.space[stick] = lanes;
+                node.space.insert(stick, s_extent / lanes);
+            }
+            i += 1;
+            continue;
         }
         if indexable(&operand.view, axis, lanes) {
             i += 1;
@@ -279,8 +357,8 @@ fn starts_inside_a_stick(o: &Operand, lanes: u64) -> Option<usize> {
         .axes
         .iter()
         .enumerate()
-        .all(|(i, a)| i == s || a.extent == 1 || a.stride % lanes == 0);
-    (o.view.tile.is_none() && outer_aligned && o.view.offset % lanes != 0).then_some(s)
+        .all(|(i, a)| i == s || a.extent == 1 || a.stride.is_multiple_of(lanes));
+    (o.view.tile.is_none() && outer_aligned && !o.view.offset.is_multiple_of(lanes)).then_some(s)
 }
 
 /// The parameters some op reads or writes in a window that starts inside a stick: each is worked

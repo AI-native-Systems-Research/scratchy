@@ -797,7 +797,7 @@ fn timers() -> std::sync::MutexGuard<'static, Timers> {
 /// orphaned the matmul in the fused bundle). A group that carries an address shift — a KV slot write,
 /// a Kᵀ slab restickify, a page fold — is a singleton at ANY group size, because the shift is applied
 /// once to the whole group.
-pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
+pub(crate) struct OpProg<T: scratchy_spyre_bundle::collective::Tp> {
     /// The launch: its address shifts and the compiled program they apply to.
     pub(crate) code: &'static bundle::LaunchGroup<'static, T>,
     /// The bundle this launch belongs to, and its position in that bundle's launch order — together,
@@ -835,13 +835,13 @@ pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
 /// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step
 /// windows (`shifted`, built per layer per launch) must keep dying as owned values — at ~120
 /// per forward a leaked descriptor each grows without bound.
-impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> Drop for OpProg<T> {
     fn drop(&mut self) {
         std::mem::forget(self.addr.take());
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, '_, T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> Drop for Executor<'_, '_, T> {
     fn drop(&mut self) {
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
@@ -849,7 +849,7 @@ impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, '_, T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> OpProg<T> {
     /// Pair one launch-index entry with the program it names. `per_request` is the bundle's own
     /// verdict — whether ANY of its groups walks — stamped here at load onto every group of the
     /// bundle alike (see `fold_plan`'s request law); it is never baked, so no record states it.
@@ -1095,10 +1095,10 @@ const STAGE_THREAD_BYTES: usize = 16 << 20;
 /// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
 /// this step). See [`Executor::keyed`].
 ///
-/// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
+/// [`CausalKey`]: scratchy_spyre_bundle::rung::CausalKey
 #[derive(Clone, Copy, Debug)]
 struct Keyed {
-    key: ktir_superdsc::sdsc_abstract::CausalKey,
+    key: scratchy_spyre_bundle::rung::CausalKey,
     fresh: bool,
 }
 
@@ -1183,7 +1183,7 @@ struct Rolled {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One resident SuperDSC session: program + weights + KV resident on-card.
-pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
+pub struct Executor<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
     code: &'static bundle::BundleCode<'static, T>,
@@ -1327,7 +1327,7 @@ pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     raw_ids: BTreeSet<bundle::PlaceId>,
     /// ⭐ ACTIVATIONS STAGED BY KEY — the key their bytes are a function of, and whether this
     /// step re-bound them. Today exactly one: the new-block causal mask
-    /// ([`ktir_superdsc::sdsc_abstract::CausalKey`]).
+    /// ([`scratchy_spyre_bundle::rung::CausalKey`]).
     ///
     /// A keyed bind is written to the shadow and uploaded in the step that binds it, and NOT
     /// re-uploaded by a step that does not: segment 3, where every activation lives, is written by
@@ -1499,7 +1499,7 @@ struct ForwardHalf {
 
 /// WHICH RANK A SESSION RUNS AS — the bundle's world and its card's link, agreed at load.
 #[derive(Clone, Copy, Debug)]
-pub enum RankSeat<T: ktir_superdsc::collective::Tp> {
+pub enum RankSeat<T: scratchy_spyre_bundle::collective::Tp> {
     /// A world of one: the bundle places no receive window and the card linked no peer.
     Alone,
     /// One rank of a sharded world: the bundle's window is the one whose slots the card's link
@@ -1509,7 +1509,7 @@ pub enum RankSeat<T: ktir_superdsc::collective::Tp> {
 
 /// Why a bundle cannot run in this process's world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SeatRefusal<T: ktir_superdsc::collective::Tp> {
+pub enum SeatRefusal<T: scratchy_spyre_bundle::collective::Tp> {
     /// The bundle was baked for a sharded world, and its card linked no peer to send to.
     Unlinked,
     /// The card runs one rank of a sharded world, and the bundle was baked for a world of one.
@@ -1524,7 +1524,7 @@ pub enum SeatRefusal<T: ktir_superdsc::collective::Tp> {
     Misplaced(bundle::collective::SendUnplaced),
 }
 
-impl<T: ktir_superdsc::collective::Tp> std::fmt::Display for SeatRefusal<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> std::fmt::Display for SeatRefusal<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unlinked => write!(
@@ -1549,9 +1549,9 @@ impl<T: ktir_superdsc::collective::Tp> std::fmt::Display for SeatRefusal<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> std::error::Error for SeatRefusal<T> {}
+impl<T: scratchy_spyre_bundle::collective::Tp> std::error::Error for SeatRefusal<T> {}
 
-impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
+impl<T: scratchy_spyre_bundle::collective::Tp> RankSeat<T> {
     /// The seat a session over `code` takes on a card holding `link`.
     ///
     /// # Errors
@@ -1599,7 +1599,7 @@ impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
     }
 }
 
-impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
+impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1626,7 +1626,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // submit only after it returns, so an instrument that synchronizes between ops waits on a
         // send never issued (measured: a 280 s stream timeout). Those instruments are a one-card
         // tool; a sharded session refuses them at load, by name, rather than hang.
-        if <T as ktir_superdsc::collective::World>::SHARDED {
+        if <T as scratchy_spyre_bundle::collective::World>::SHARDED {
             let d = Diag::get();
             let drains = [
                 ("SCRATCHY_SDSC_PEROP_SYNC", d.perop_sync),
@@ -2140,11 +2140,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// device are a function of — or `None` when `id` was never bound keyed. A launch whose key
     /// equals this binds nothing for `id`.
     ///
-    /// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
+    /// [`CausalKey`]: scratchy_spyre_bundle::rung::CausalKey
     pub fn keyed_holds(
         &self,
         id: bundle::PlaceId,
-    ) -> Option<ktir_superdsc::sdsc_abstract::CausalKey> {
+    ) -> Option<scratchy_spyre_bundle::rung::CausalKey> {
         self.keyed.get(&id).map(|k| k.key)
     }
 
@@ -2155,7 +2155,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     pub fn bind_input_keyed(
         &mut self,
         id: bundle::PlaceId,
-        key: ktir_superdsc::sdsc_abstract::CausalKey,
+        key: scratchy_spyre_bundle::rung::CausalKey,
         bytes: Vec<u8>,
     ) -> Result<()> {
         if !self.prepared {
@@ -2186,7 +2186,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     pub fn stage_keyed(
         &mut self,
         id: bundle::PlaceId,
-        key: ktir_superdsc::sdsc_abstract::CausalKey,
+        key: scratchy_spyre_bundle::rung::CausalKey,
         bytes: Vec<u8>,
     ) -> Result<u64> {
         let placed = self
@@ -2330,78 +2330,19 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         Ok(())
     }
 
-    /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
-    /// [`load_consts`](scratchy_target_spyre::wiring::Wiring::load_consts) list, bound ONCE at
-    /// load, before prepare (each is a function of the graph alone, so
-    /// re-binding per step would re-upload constants). Must be called before
-    /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
-    ///
-    /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
-    /// dtype, never off the op that minted it: a resident fp32 constant's LE
-    /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
-    /// [`Self::bind_const_fp32`]), and i32 rides the SAME verbatim channel
-    /// (`Df::SenUint32` shares IEEE_FP32's 4-byte/32-stick geometry, so the
-    /// LE words ARE the device encoding — the hash constants' own width),
-    /// while everything else rides the weight channel's IEEE→SEN convert
-    /// ([`Self::bind_weight`]), bit-exact for every value a staged table
-    /// states. An entry whose tid is a graph OUTPUT simply binds that
-    /// output's initial bytes into its own placement — the ops that
-    /// overwrite it per step do so over these bytes, exactly as the card
-    /// behaves.
-    ///
-    /// ⭐ THE BYTES ARE THE CARD FORM ([`LoadConst::card_bytes`]): the ten
-    /// UNIFORM `[rows, 1]` tables spread to each row's stick head — the seat's
-    /// own law — and every other table is verbatim. The emulator's gate legs
-    /// stage the dense value form instead; the two memory models are each
-    /// leg's own stated law, one value derivation.
-    ///
-    /// ⛔ AND A UNIFORM COL TABLE MUST EXACTLY FILL ITS PLACEMENT. The general
-    /// over-bind law permits a short bind (a placement's zero tail is a valid
-    /// constant image), but a `[rows, 1]` table short of its placement means
-    /// the KIND'S rows and the RUNG'S placement rows disagree — some row's
-    /// stick head was never staged and reads ZERO (Finding 1: a rows=1 kind
-    /// staged into a rows=N rung left every row past 0 with a zero hash
-    /// multiplier). Refuse it by name, both directions, never serve it.
-    pub fn bind_load_consts(
-        &mut self,
-        consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
-    ) -> Result<()> {
-        if self.prepared {
-            bail!(
-                "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
-                 staged once at load"
-            );
-        }
-        for &(tid, kind) in consts {
-            // The chain's decompose tables are this rank's vocabulary block's (`chain_block`).
-            let (bytes, dt, _shape) = kind.card_bytes(self.session());
-            let id = bundle::PlaceId::Act(tid);
-            if kind.is_uniform_col() {
-                let placed = self.places.get(&id).map(|p| p.size);
-                match placed {
-                    Some(size) if bytes.len() as u64 != size => bail!(
-                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table stages {} B \
-                         against its own {} B placement — the kind's rows and the rung's \
-                         placement rows disagree, and the short side's rows read ZERO at their \
-                         stick heads (Finding 1). REFUSING",
-                        bytes.len(),
-                        size
-                    ),
-                    None => bail!(
-                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table has NO placement \
-                         in this bundle — the layout did not place the const the wiring stages. \
-                         REFUSING"
-                    ),
-                    _ => {}
+    /// ⭐ STAGE THE BUNDLE'S CONSTANTS — every stick the lowering placed a constant value in
+    /// ([`bundle::StickConst`]), bound ONCE, before prepare: each is one stick of its value in every
+    /// lane. An fp16 stick rides the weight channel's IEEE→SEN convert ([`Self::bind_weight`]); every
+    /// other format's host bytes ARE the device's and ride the verbatim channel
+    /// ([`Self::bind_const_fp32`]).
+    pub fn bind_stick_consts(&mut self, consts: &[bundle::StickConst]) -> Result<()> {
+        for c in consts {
+            let bytes = c.host_bytes(bundle::collective::STICK_BYTES as usize);
+            match c.format {
+                bundle::StickFormat::Fp16 => self.bind_weight(c.id, HostBytes::Owned(bytes)),
+                bundle::StickFormat::Fp32 | bundle::StickFormat::Fp8 | bundle::StickFormat::UInt32 => {
+                    self.bind_const_fp32(c.id, bytes)?
                 }
-            }
-            if matches!(
-                dt,
-                scratchy_tensors::DType::F32 | scratchy_tensors::DType::I32
-            ) {
-                self.bind_const_fp32(id, bytes)?;
-            } else {
-                self.bind_weight(id, HostBytes::Owned(bytes));
             }
         }
         Ok(())
@@ -3544,12 +3485,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             swept: self.body_swept(sel),
             gathers: scratchy_target_spyre::wiring::GathersKv::of_launch_groups([gathers_any]),
             folds: folds_any,
-            // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
-            // rung carries the same number, so the body's own artifact is as good a seat as any.
-            lx_op_local_bytes: self.code.layout.lx_op_local_bytes,
-            // The chunk form's probability-part pins, the same layout's recorded term — the
-            // admission summed it beside the gathers, so the host's read must carry it too.
-            lx_prob_pin_bytes: self.code.layout.lx_prob_pin_bytes,
         })
     }
 
@@ -4728,7 +4663,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // sends, and a peer submits only after this rank returns: a drain here waits on a send that
         // cannot have been issued yet, and the stream times out (measured: 280 s, every phase-timed
         // tp/2 prefill). The phase split of a sharded step is the finish side's alone.
-        let sharded = <T as ktir_superdsc::collective::World>::SHARDED;
+        let sharded = <T as scratchy_spyre_bundle::collective::World>::SHARDED;
         if d.phase_time && !sharded {
             let _ = self.stream_ref()?.synchronize();
         }
@@ -6394,7 +6329,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
         );
         let slots = (self.places.get(&nm)?.size / 2) as usize;
-        let per_page = ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
+        let per_page = scratchy_spyre_bundle::rung::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
     }
 }
@@ -6498,8 +6433,6 @@ pub struct StepBody {
     swept: Option<SweptCols>,
     gathers: scratchy_target_spyre::wiring::GathersKv,
     folds: bool,
-    lx_op_local_bytes: u64,
-    lx_prob_pin_bytes: u64,
 }
 
 impl StepBody {
@@ -6528,24 +6461,6 @@ impl StepBody {
     pub const fn chunk(self) -> bool {
         self.gathers.get() && !self.folds
     }
-
-    /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked
-    /// layout (`bundle::BundleLayout::lx_op_local_bytes`), the host's term of the one
-    /// `lx_window_fits` budget. The host's chunk-table arm threads this into
-    /// `chunk_gather_index_table`, so the host refuses exactly the chunks the bake's `lx_form`
-    /// witness refused — neither arm budgets against another rung's pins.
-    pub const fn lx_op_local_bytes(self) -> u64 {
-        self.lx_op_local_bytes
-    }
-
-    /// ⭐ THE CHUNK FORM'S PROBABILITY-PART LX PINS, in bytes — read off the selected body's own
-    /// baked layout (`bundle::BundleLayout::lx_prob_pin_bytes`), the host's SECOND core-local
-    /// term of the same budget: the bake's `lx_form` admission summed it beside the gather pins,
-    /// and the host's chunk-table arm threads it in beside [`Self::lx_op_local_bytes`], so the
-    /// host refuses exactly what the bake refused.
-    pub const fn lx_prob_pin_bytes(self) -> u64 {
-        self.lx_prob_pin_bytes
-    }
 }
 
 /// This bundle's launches that the session running as `session` plays, in launch order — every
@@ -6557,7 +6472,7 @@ impl StepBody {
 /// program the bundle does not carry. What can fail is the WORLD: a consume bound by a session of
 /// a world of one, or a rank-selected consume baked for another world, is a bundle the session was
 /// never meant to run.
-fn bind_ops<T: ktir_superdsc::collective::Tp>(
+fn bind_ops<T: scratchy_spyre_bundle::collective::Tp>(
     code: &'static bundle::BundleCode<'static, T>,
     session: Option<bundle::collective::Rank<T>>,
 ) -> Result<Ops<T>> {
@@ -6921,7 +6836,7 @@ mod tests {
     /// new key re-binds it.
     #[test]
     fn a_keyed_bind_goes_out_once_and_an_unkeyed_one_every_step() {
-        use ktir_superdsc::sdsc_abstract::{CausalKey, RungWidth};
+        use scratchy_spyre_bundle::rung::{CausalKey, RungWidth};
         let key =
             CausalKey::chunk(RungWidth::of_baked_rows(512).expect("a width"), 512).expect("a key");
         let (mask, rope) = (bundle::PlaceId::Act(7), bundle::PlaceId::Act(8));

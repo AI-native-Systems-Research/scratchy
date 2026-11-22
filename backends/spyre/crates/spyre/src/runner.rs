@@ -192,7 +192,7 @@ impl SpyreSession {
     /// `program.rs:12-14` calls "the slow parity-oracle path", where "the GPU offloads, gated on a
     /// single-core grid, never fire" — is not reachable from outside the emulator crate.
     #[allow(clippy::type_complexity)]
-    pub fn new_multi<T: ktir_superdsc::collective::Tp>(
+    pub fn new_multi<T: scratchy_spyre_bundle::collective::Tp>(
         programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
         weights: Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>,
     ) -> Result<Self> {
@@ -211,7 +211,7 @@ impl SpyreSession {
     /// statement of the tensor's extent (the same authority the bundle
     /// layout reserves from). The floor is a MAX: it can only raise an
     /// allocation, never shrink one the views already sized.
-    pub fn new_multi_floored<T: ktir_superdsc::collective::Tp>(
+    pub fn new_multi_floored<T: scratchy_spyre_bundle::collective::Tp>(
         programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
         weights: Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>,
         shape_floor: &std::collections::HashMap<u64, usize>,
@@ -219,34 +219,15 @@ impl SpyreSession {
         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
             Vec::with_capacity(programs.len());
         let mut specs: Vec<ProgramSpec> = Vec::with_capacity(programs.len());
-        // ⭐ THE PIN WINDOW, PER PROGRAM — read off the bundle's own LaunchPrograms
-        // (stamped at their mint from the placement layout's `lx_window_bytes()`),
-        // with the agreement guard: every launch flattened into ONE session program
-        // must state the SAME window, because one program runs ONE bundle's budget.
-        // A program whose launches state none (`None`) passes through as `None` and
-        // the resident refuses it at load, naming it — never a silent zero.
-        let mut pin_windows: Vec<Option<u64>> = Vec::with_capacity(programs.len());
-        for (pi, (groups, results)) in programs.iter().enumerate() {
+        // The lowering pins no scratchpad bytes of its own: every program's pin window is empty.
+        let pin_windows: Vec<Option<u64>> = vec![Some(0); programs.len()];
+        for (groups, results) in programs.iter() {
             // A group IS a launch, and its programs run in order; the groups run in order too, so
             // the whole program is that sequence flattened.
             let progs: Vec<bundle::LaunchProgram<'static>> = groups
                 .iter()
                 .flat_map(|g| g.programs.iter().cloned())
                 .collect();
-            let mut window: Option<u64> = None;
-            for (li, p) in progs.iter().enumerate() {
-                if li == 0 {
-                    window = p.lx_pin_window_bytes;
-                } else if window != p.lx_pin_window_bytes {
-                    return Err(anyhow!(
-                        "session program {pi} mixes launches with different LX pin windows \
-                         ({window:?} vs {:?}) — one program runs ONE bundle's window, so the \
-                         launches it flattens must all come from that bundle",
-                        p.lx_pin_window_bytes
-                    ));
-                }
-            }
-            pin_windows.push(window);
             funcs.push(progs.iter().map(|p| p.func).collect());
             specs.push(build_spec(&progs, results));
         }
@@ -537,14 +518,14 @@ mod tests {
             grid: (1, 1, 1),
             return_type: None,
         };
-        let group = bundle::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
+        let group = bundle::LaunchGroup::<scratchy_spyre_bundle::collective::TpWorld<1>> {
             kv: Default::default(),
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
                 func,
                 // The fixture's body is an ArithAddf of two [1, 4] rows — the kind its own ops
                 // state (the KtirNode test precedent: body-derived, never a guess).
-                program: ktir_superdsc::ktir_node::Program::Elementwise(
-                    ktir_superdsc::ktir_node::Elementwise::Add,
+                program: ktir_core::program::Program::Elementwise(
+                    ktir_core::program::Elementwise::Add,
                 ),
                 args: std::borrow::Cow::Owned(vec![
                     (scores_p, bundle::PlaceId::Act(SCORES as u32)),
@@ -553,7 +534,6 @@ mod tests {
                 ]),
                 // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built
                 // fixture program mints no LX pins, so its window is zero.
-                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: bundle::BakedImage::Raw(std::borrow::Cow::Borrowed(&[])),
             job_bin_ptr: 0,

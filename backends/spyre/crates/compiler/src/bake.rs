@@ -189,14 +189,9 @@ fn superdsc_rotary_kind(
     }
 }
 
-/// One decode batch rung as a bake commits it: its request count, its swept extent, its body
-/// fingerprint and its own staged constants.
-type DecodeRungEntry = (
-    u32,
-    u32,
-    String,
-    Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
-);
+/// One decode batch rung as a bake commits it: its request count, its swept extent and its body
+/// fingerprint.
+type DecodeRungEntry = (u32, u32, String);
 
 /// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
 /// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
@@ -254,12 +249,12 @@ fn ladder_lits(
     };
     let decode = {
         let mut rungs = decode_rungs.to_vec();
-        rungs.sort_by_key(|(n, _, _, _)| *n);
-        rungs.dedup_by_key(|(n, _, _, _)| *n);
+        rungs.sort_by_key(|(n, _, _)| *n);
+        rungs.dedup_by_key(|(n, _, _)| *n);
         if rungs.len() > 1 {
             rungs
                 .iter()
-                .map(|(n, swept, fp, consts)| {
+                .map(|(n, swept, fp)| {
                     // ⛔ `RungSeqs`, NOT a bare u32: the decode ladder is keyed by `decode_rows` (the
                     // BATCH WIDTH), while the sibling `sk_bucket_rungs` list is keyed by `active_cap`
                     // (the SWEEP EXTENT). Both were `(u32, String)`, and the worker selects over this
@@ -268,21 +263,11 @@ fn ladder_lits(
                     let n = proc_macro2::Literal::u32_unsuffixed(*n);
                     let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
                     let sfp = sentinel(fp);
-                    // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's session, never
-                    // the single-request wiring's list: the ten uniform `[rows, 1]` tables' stick
-                    // heads are per-width (Finding 1's compounding half). Rendered by the ONE
-                    // load-const renderer the wiring static itself uses, so the spellings cannot
-                    // drift.
-                    let consts = consts
-                        .iter()
-                        .map(load_const_entry_tokens)
-                        .collect::<Vec<_>>();
                     quote! {
                         (
                             ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
                             ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
                             ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
-                            &[#(#consts),*],
                         )
                     }
                 })
@@ -292,72 +277,6 @@ fn ladder_lits(
         }
     };
     (prefill, decode, prefix)
-}
-
-/// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
-/// shared by the wiring static (`emit_superdsc_wiring`) and every decode
-/// batch rung's OWN consts in the manifest (`decode_rung_lits`), so the two
-/// can never disagree about how a kind is spelled.
-fn load_const_entry_tokens(
-    entry: &(u32, scratchy_target_spyre::wiring::LoadConst),
-) -> proc_macro2::TokenStream {
-    let &(tid, ref kind) = entry;
-    let tid = proc_macro2::Literal::u32_unsuffixed(tid);
-    let kind = match *kind {
-        scratchy_target_spyre::wiring::LoadConst::SampleTable {
-            vocab,
-            rows,
-            operand,
-            arrangement,
-        } => {
-            let vocab = proc_macro2::Literal::u32_unsuffixed(vocab);
-            let rows = proc_macro2::Literal::u32_unsuffixed(rows);
-            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
-            let arrangement = match arrangement {
-                scratchy_target_spyre::wiring::ElementArrangement::Standard => {
-                    quote! {
-                        ::scratchy_target_spyre::wiring::ElementArrangement::Standard
-                    }
-                }
-                scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
-                    quote! {
-                        ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
-                    }
-                }
-            };
-            quote! {
-                ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
-                    vocab: #vocab,
-                    rows: #rows,
-                    operand: #operand,
-                    arrangement: #arrangement,
-                }
-            }
-        }
-        scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
-            pad_vocab,
-            k,
-            hidden,
-            block,
-            operand,
-        } => {
-            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
-            let k = proc_macro2::Literal::u32_unsuffixed(k);
-            let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
-            let block = proc_macro2::Literal::u32_unsuffixed(block);
-            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
-            quote! {
-                ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
-                    pad_vocab: #pad_vocab,
-                    k: #k,
-                    hidden: #hidden,
-                    block: #block,
-                    operand: #operand,
-                }
-            }
-        }
-    };
-    quote! { (#tid, #kind) }
 }
 
 fn emit_superdsc_wiring(
@@ -586,130 +505,9 @@ fn emit_superdsc_wiring(
         }
 
         // ── every caller-filled source is covered by exactly one filler ──
-        // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
-        // five tids (the seed quadruple's four word tables and inv_t) are minted
-        // below the `LoweredDecode` binding layer (the mint's own law), so they
-        // carry no `SourceBinding`, and the CLASS declares their filler: the
-        // worker binds every one FRESH EVERY DECODE STEP, and the runtime launch
-        // gate refuses a decode without a fresh bind of all of them — the
-        // PrefixMask precedent, never a held default, because a held seed row is
-        // a held TOKEN. This block is the class's declaration at the expansion
-        // gate (the loop below counts the seat's tids as covered BY CLASS); the
-        // per-step enforcement is the runtime gate's own arm. Everything else
-        // about the seat is typed here, where the wiring is in hand:
-        if let Some(seat) = &gk.sample_seat {
-            let mut seat_tids: Vec<(String, u32)> = seat
-                .seed_words
-                .iter()
-                .enumerate()
-                .map(|(k, &tid)| (format!("seed word {k}"), tid))
-                .collect();
-            seat_tids.push(("invt".to_string(), seat.invt));
-            for (name, tid) in seat_tids {
-                if tid >= gk.num_sources {
-                    fail.push(format!(
-                        "the sample seat's {name} source t{tid} is not inside `num_sources` \
-                         ({}) — nothing can ever bind it",
-                        gk.num_sources
-                    ));
-                }
-                if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
-                    fail.push(format!(
-                        "the sample seat's {name} source t{tid} is ALSO a load-time const — a \
-                         tensor cannot both stage once at load and be the step's own freshness"
-                    ));
-                }
-            }
-            let seat_all: std::collections::HashSet<u32> =
-                seat.seed_words.iter().copied().chain([seat.invt]).collect();
-            if seat_all.len() != 1 + seat.seed_words.len() {
-                fail.push(
-                    "the sample seat names one tid twice — the mint mints one source per seat \
-                     operand, so a shared tid means two mints disagree"
-                        .to_string(),
-                );
-            }
-            if !matches!(
-                gk.result_dtype,
-                scratchy_target_spyre::DType::I32 | scratchy_target_spyre::DType::U32
-            ) {
-                fail.push(format!(
-                    "the rung carries the sample seat but its result dtype is {:?}, not an \
-                     index — the mint re-points the result to the idx stick, so a non-integer \
-                     result means the wiring and the mint disagree",
-                    gk.result_dtype
-                ));
-            }
-        }
-        // ⭐ THE CHAINED HEAD'S STICKS — the seat's own class law, stated for the
-        // chain: the two persistent `[1, CHAIN_IDX_BLOCK]` u32 sources are minted
-        // below the `LoweredDecode` binding layer, so they carry no
-        // `SourceBinding`, and the CLASS declares their filler — the tape's
-        // ChainSeed steps bind both (the s stick's lane pattern, the l stick's
-        // ramp), fresh every step, idempotent with the device's own ChainStage
-        // writes. The two decompose TABLES ride `load_consts` like the sampler's
-        // nine (staged once at load) and need no class of their own.
-        let chain_sticks: Option<(u32, u32)> = match &gk.chain {
-            scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
-                for (name, tid) in [("s", chain.s_src), ("l", chain.l_src)] {
-                    if tid >= gk.num_sources {
-                        fail.push(format!(
-                            "the chain's {name} stick t{tid} is not inside `num_sources` ({}) — \
-                             nothing can ever bind it",
-                            gk.num_sources
-                        ));
-                    }
-                    if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
-                        fail.push(format!(
-                            "the chain's {name} stick t{tid} is ALSO a load-time const — the \
-                             sticks are per-step state the device rewrites, never load-staged"
-                        ));
-                    }
-                }
-                if chain.s_src == chain.l_src {
-                    fail.push(
-                        "the chain names one tid as both the s and the l stick — the mint mints \
-                         two sources, so a shared tid means two mints disagree"
-                            .to_string(),
-                    );
-                }
-                Some((chain.s_src, chain.l_src))
-            }
-            scratchy_target_spyre::wiring::ChainFact::Unchained => None,
-        };
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings().get(id as usize) else {
-                // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
-                // binding layer, so it carries NO `SourceBinding`: the wiring's
-                // `load_consts` list names it (BY MEMBERSHIP in the generic
-                // list, never by the op that minted it), and the worker stages
-                // its bytes once at load through the kind's builder — the rope
-                // tables' own law. This arm is that list's declaration; every
-                // other binding-less source is still the
-                // hang-or-silent-wrong refusal below.
-                if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
-                    continue;
-                }
-                // ⭐ THE SEAT'S OWN ARM — the per-step class the block above declares:
-                // covered BY CLASS (the worker's fresh-every-step bind), which is why
-                // this is a `continue` and not a refusal. The loud refusal lives at the
-                // RUNTIME gate, per launch, where "this step" is a fact — an expansion
-                // cannot know it.
-                if let Some(seat) = &gk.sample_seat
-                    && (seat.seed_words.contains(&id) || seat.invt == id)
-                {
-                    continue;
-                }
-                // ⭐ THE CHAIN'S OWN ARM — the per-step class the block above
-                // declares: covered BY CLASS (the tape's ChainSeed steps bind
-                // both sticks every step), which is why this is a `continue`
-                // and not a refusal.
-                if let Some((s_src, l_src)) = chain_sticks
-                    && (s_src == id || l_src == id)
-                {
-                    continue;
-                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -720,17 +518,6 @@ fn emit_superdsc_wiring(
                 // The generated weight loader binds these once, before prepare.
                 SB::Weight { .. } | SB::WeightScale { .. } | SB::BundleTensor { .. } => {}
                 SB::EmbeddedHidden => {
-                    // ⭐ THE CHAIN'S RESIDENT EXCUSE — the replaced row's host
-                    // filler is gone (the tape's ChainSeed steps replaced the
-                    // embed-row push), but the row is not unbound: the device's
-                    // own EmbedRowGather writes it every step. The chain names
-                    // the replaced id at the mint; this gate reads the same
-                    // statement, never a re-derivation.
-                    if let scratchy_target_spyre::wiring::ChainFact::Chained { chain } = &gk.chain
-                        && id == chain.replaces
-                    {
-                        continue;
-                    }
                     embeds += 1;
                     if id != embed_src {
                         fail.push(format!(
@@ -747,10 +534,7 @@ fn emit_superdsc_wiring(
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
             }
         }
-        // A chained decode carries its EmbeddedHidden row as DEVICE-WRITTEN
-        // (excused above), so the tape-side count is legitimately zero there.
-        let embed_floor = if chain_sticks.is_some() { 0 } else { 1 };
-        if embeds < embed_floor {
+        if embeds < 1 {
             fail.push(format!(
                 "{embeds} EmbeddedHidden sources; the tape gathers exactly one row"
             ));
@@ -880,9 +664,8 @@ fn emit_superdsc_wiring(
     let paged = match gk.paged {
         Some(p) => {
             let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
-            let (q, kvp) = (u32l(p.query_rows), u32l(p.kv_row_pool));
+            let q = u32l(p.query_rows);
             let (rr, cp, cm) = (u32l(p.rep_rows), u32l(p.chunk_pages), u32l(p.chunk_masks));
-            let zero = u32l(p.int32_zero);
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             let (q_width, head_size) = (u32l(p.q_width), u32l(p.head_size));
@@ -931,8 +714,8 @@ fn emit_superdsc_wiring(
             };
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
-                    mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
-                    rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm, int32_zero: #zero,
+                    mask: #m, page_table: #t, write_rows: #w, query_rows: #q,
+                    rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm,
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
                     head_size: #head_size, walk: #walk,
                     paged_rows: #paged_rows,
@@ -943,43 +726,6 @@ fn emit_superdsc_wiring(
         None => quote! { ::core::option::Option::None },
     };
 
-    // ⭐ THE KERNEL-TABLE CLASS SETS, FROM THE BAKE — NOT THE TABLES THEMSELVES. The tables are
-    // pure functions of each class's head dim, but baking them as literals was the gemma-4 defect
-    // in two ways at once: the literals were staged at the BASE `head_dim` while the placement
-    // pass sized the tids at the MAX over the tape's classes (a `[64,64]` table in a `[128,128]`
-    // placement — the wide class's rope rotated pairs at half=32 and its GQA krep read slab 1 as
-    // zeros, dump-proven), and a hybrid's widest class is `hd = 512`, whose 512² table is 262,144
-    // f32 literals for one field — the expansion-cost rule broken at its most expensive.
-    //
-    // So the bake carries the class HEAD DIMS (the same lists `gk` derived from the same `ir` the
-    // placement pass read — one source of truth), and the worker's `synthetic_constants` builds
-    // each class's table at load through the SAME shared helpers the emission used
-    // (`stage_kernel_table` + `rope_p_entry`), with `Wiring::verify_class_placements`
-    // cross-checking the sets against the baked placements. Class 0 of each set is the widest and
-    // keeps the pre-class sentinel tid, so a uniform model's binds are byte-identical.
-    let rope_class_hds: Vec<proc_macro2::Literal> = gk
-        .rope_class_hds
-        .iter()
-        .map(|v| proc_macro2::Literal::u32_unsuffixed(*v))
-        .collect();
-    let attn_class_hds: Vec<proc_macro2::Literal> = gk
-        .attn_class_hds
-        .iter()
-        .map(|v| proc_macro2::Literal::u32_unsuffixed(*v))
-        .collect();
-    // `1/hidden` over one stick — the mq>1 sum-based amax pre-scale.
-    let rms_invcols_lits: Vec<proc_macro2::Literal> = {
-        let inv = 1.0f32 / (b("hidden_size").max(1) as f32);
-        (0..64)
-            .map(|_| proc_macro2::Literal::f32_suffixed(inv))
-            .collect()
-    };
-    // ⭐ EVERY COMPILE-TIME SCALAR THE KTIR READS, from the bake's own registry — not recomputed
-    // here from the config. The programs bake the INDEX into themselves, so the list
-    // the worker binds has to be the same list, in the same order, that the lowering indexed.
-    // ⭐ AS BITS: the registry holds the page walk's `-inf` seed, which no float literal spells.
-    let scalarmul_scale_lits: Vec<proc_macro2::TokenStream> =
-        gk.scalarmul_scales.iter().map(|v| f32_bits(*v)).collect();
     // The ScalarMul weight folds, straight off the bake's recognition — the worker scales these
     // staged weights at load, so the list it reads has to be the one the lowering recognized.
     let weight_scale_fold_lits: Vec<proc_macro2::TokenStream> = gk
@@ -992,129 +738,6 @@ fn emit_superdsc_wiring(
         })
         .collect();
 
-    // The VALUE, not a `static` — the caller composes decode + prefill into one
-    // `Wirings` const, because a bundle's tensor ids are per-PROGRAM and the
-    // prefill program has its own.
-    // ⭐ THE DENSE fp8 K-PADS — same rule, same tape, as the retile's own `fp8_k_pad` (the
-    // worker rebuilds the on-disk `[n, k]` buffer's inner axis to `k_pad` so the staged bytes
-    // match the packed retile). Computed HERE off `gk`/`lwd.input.ops` because the macro is
-    // where the wiring literal is rendered; the orientation (which axis is k) comes from the
-    // CONSUMING op, the same evidence the retile uses.
-    let fp8_k_pads: Vec<(u32, u32)> = {
-        use scratchy_subtile::lower::InputRef;
-        use scratchy_subtile::subtile_ir::SubOp;
-        let mut pads: Vec<(u32, u32)> = Vec::new();
-        for od in &lwd.input.ops {
-            let SubOp::MatmulTile { .. } = od.op else {
-                continue;
-            };
-            if od.inputs.len() != 3 {
-                continue;
-            }
-            let Some(InputRef::Ext(e)) = od.inputs.get(1) else {
-                continue;
-            };
-            let Some(&(rows, _cols)) = gk.tensor_shapes.get(*e) else {
-                continue;
-            };
-            let k_pad = scratchy_target_spyre::lower_subtile_tape_to_superdsc::fp8_k_pad(rows);
-            if k_pad > rows {
-                pads.push((*e as u32, k_pad));
-            }
-        }
-        pads.sort();
-        pads.dedup();
-        pads
-    };
-    let fp8_k_pad_toks = fp8_k_pads
-        .iter()
-        .map(|&(id, k)| {
-            let (id, k) = (u32l(id), u32l(k));
-            quote! { (#id, #k) }
-        })
-        .collect::<Vec<_>>();
-    // ⭐ THE LOAD-TIME CONSTANTS — straight off the bake's own one derivation
-    // (`load_consts_of_ir`, the same list the numeric gate stages), never
-    // recomputed here: each entry is `(tid, kind)` and the KIND names the
-    // shared builder that makes the bytes, so the worker and the gate stage
-    // identical bytes by construction. The sampler's TWENTY staged tables
-    // ride this list (the selection's f32, the noise section's i32/f32/fp16
-    // — each entry's own dtype); its four seed word tables and inv_t do NOT —
-    // they are per-step seats the worker binds fresh every decode, and a
-    // load-time constant staged over them would freeze one draw's seed into
-    // every step.
-    let load_const_toks = gk
-        .load_consts
-        .iter()
-        .map(load_const_entry_tokens)
-        .collect::<Vec<_>>();
-    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
-    // token draw binds FRESH EVERY DECODE STEP (the seed quadruple's four
-    // `[rows, 1]` word tables and inv_t), straight off the bake's one
-    // derivation (`sample_seat_of_ir`, the mint's own facts), never
-    // recomputed here. `None` on every rung that mints no draw; `Some` names
-    // the seed word and inv_t tids the worker must bind before EVERY decode
-    // launch — the class the source gate counts as filled only when bound
-    // THIS step.
-    let sample_seat_tok = match &gk.sample_seat {
-        Some(seat) => {
-            let seed_words = seat.seed_words.iter().map(|&t| u32l(t)).collect::<Vec<_>>();
-            let invt = u32l(seat.invt);
-            let rows = u32l(seat.rows);
-            let row = u32l(seat.row);
-            let vocab = u32l(seat.vocab);
-            let pad_vocab = u32l(seat.pad_vocab);
-            let seed_row_words = u32l(seat.seed_row_words);
-            let gate_row_words = u32l(seat.gate_row_words);
-            let idx_row_words = u32l(seat.idx_row_words);
-            quote! {
-                ::core::option::Option::Some(
-                    ::scratchy_target_spyre::wiring::SampleSeat {
-                        seed_words: [#(#seed_words),*],
-                        invt: #invt,
-                        rows: #rows,
-                        row: #row,
-                        vocab: #vocab,
-                        pad_vocab: #pad_vocab,
-                        seed_row_words: #seed_row_words,
-                        gate_row_words: #gate_row_words,
-                        idx_row_words: #idx_row_words,
-                    }
-                )
-            }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-    // ⭐ THE FORWARD'S OWN PHASE — a projection of the wiring's own chain
-    // fact, never a second derivation: a rung the mint chained is a DECODE
-    // rung (the mint runs on decode slots only, and it refuses — panics — a
-    // decode slot it cannot chain), so `Chained` ⇒ `Decode { chain }` and
-    // `Unchained` ⇒ `Prefill`, byte-identical to the pre-mint behavior.
-    let phase_tok = match &gk.chain {
-        scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
-            let s_src = u32l(chain.s_src);
-            let l_src = u32l(chain.l_src);
-            let k = u32l(chain.k);
-            let hidden = u32l(chain.hidden);
-            let replaces = u32l(chain.replaces);
-            let block = u32l(chain.block);
-            quote! {
-                ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
-                    chain: ::scratchy_target_spyre::wiring::ChainWiring {
-                        s_src: #s_src,
-                        l_src: #l_src,
-                        k: #k,
-                        hidden: #hidden,
-                        replaces: #replaces,
-                        block: #block,
-                    },
-                }
-            }
-        }
-        scratchy_target_spyre::wiring::ChainFact::Unchained => {
-            quote! { ::scratchy_target_spyre::forward_tape::ForwardPhase::Prefill }
-        }
-    };
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
@@ -1137,15 +760,7 @@ fn emit_superdsc_wiring(
                 nqh: #nqh,
                 rope_theta_bits: #theta_bits,
             },
-            rope_class_hds: &[#(#rope_class_hds),*],
-            attn_class_hds: &[#(#attn_class_hds),*],
-            rms_invcols: &[#(#rms_invcols_lits),*],
-            scalarmul_scales: &[#(#scalarmul_scale_lits),*],
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
-            fp8_k_pads: &[#(#fp8_k_pad_toks),*],
-            load_consts: &[#(#load_const_toks),*],
-            sample_seat: #sample_seat_tok,
-            phase: #phase_tok,
         }
     }
 }
@@ -1687,12 +1302,9 @@ fn layout_tokens(
         weight_tail,
         places,
         kernel_weights,
-        scalarmul_scales,
+        stick_consts,
         weight_scale_folds,
         kv_request_stride_bytes,
-        lx_op_local_bytes,
-        lx_prob_pin_bytes,
-        lx_pin_window_bytes,
         num_sources,
         resident_source_tids,
     } = l;
@@ -1707,9 +1319,33 @@ fn layout_tokens(
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places_interner.ident(places);
     let kws = kernel_weights.iter().map(kernel_weight_tokens);
-    // The exact value, as its BITS — these are the granite ScalarMul multipliers (a rounded one is a
-    // quietly wrong model) and the page walk's `-inf` seed (which no float literal spells).
-    let scales = scalarmul_scales.iter().map(|s| f32_bits(*s));
+    // Each constant stick's value as its BITS: a rounded constant is a quietly wrong model, and the
+    // attention mask's `-inf` is a value no float literal spells.
+    let consts = stick_consts.iter().map(|c| {
+        let id = place_id_tokens(&c.id);
+        let value = proc_macro2::Literal::u32_unsuffixed(c.value);
+        let format = match c.format {
+            scratchy_target_spyre::bundle_code::StickFormat::Fp16 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StickFormat::Fp16 }
+            }
+            scratchy_target_spyre::bundle_code::StickFormat::Fp32 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StickFormat::Fp32 }
+            }
+            scratchy_target_spyre::bundle_code::StickFormat::Fp8 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StickFormat::Fp8 }
+            }
+            scratchy_target_spyre::bundle_code::StickFormat::UInt32 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StickFormat::UInt32 }
+            }
+        };
+        quote! {
+            ::scratchy_target_spyre::bundle_code::StickConst {
+                id: #id,
+                format: #format,
+                value: #value,
+            }
+        }
+    });
     // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
     let folds = weight_scale_folds.iter().map(|(tid, scale)| {
         let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
@@ -1717,24 +1353,6 @@ fn layout_tokens(
         quote! { (#tid, #scale) }
     });
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
-    // The rung's op-local LX pin slots — the host's term of the one `lx_window_fits` budget. The
-    // pin PLACEMENTS stay emit-only (compiled sdsc allocates); the SUM is baked here so the host
-    // budgets against the same pins the bake did. Same number for every bundle of the rung.
-    let lxol = proc_macro2::Literal::u64_unsuffixed(*lx_op_local_bytes);
-    // The chunk form's probability-part pins — the host's SECOND core-local term of the same
-    // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
-    // chunk form mints none.
-    let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
-    // ⭐ THE WHOLE PIN WINDOW — core-local pins + op-local slot classes, the budget the bake's
-    // `lx_window_fits` guard proved. Carried as an Option: `None` is "no window was ever proven",
-    // which the resident fused path refuses at load rather than charging a silent zero.
-    let lxpw = match lx_pin_window_bytes {
-        Some(b) => {
-            let lit = proc_macro2::Literal::u64_unsuffixed(*b);
-            quote! { ::core::option::Option::Some(#lit) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
     // The graph's own wiring facts — the source count and the resident ids, so every session
     // reads them off the bundle it runs rather than off another graph's wiring (the mint's
     // renumbering makes the two differ; see the layout field's own doc).
@@ -1766,12 +1384,9 @@ fn layout_tokens(
             weight_tail: #tail,
             places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
-            scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
+            stick_consts: ::std::borrow::Cow::Borrowed(&[#(#consts),*]),
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
             kv_request_stride_bytes: #krs,
-            lx_op_local_bytes: #lxol,
-            lx_prob_pin_bytes: #lxpp,
-            lx_pin_window_bytes: #lxpw,
             num_sources: #nsrc,
             resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
         }
@@ -1918,13 +1533,6 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
             correction: ::std::borrow::Cow::Borrowed(&[#(#corr),*]),
         }
     }
-}
-
-/// An `f32` as the expression of its exact BITS — `f32::from_bits(0x…)`, a const expression that
-/// spells every value, the infinities included, which `Literal::f32_*` refuses.
-fn f32_bits(v: f32) -> proc_macro2::TokenStream {
-    let bits = proc_macro2::Literal::u32_unsuffixed(v.to_bits());
-    quote! { f32::from_bits(#bits) }
 }
 
 /// ⭐ THE EMISSION'S ONE IMAGE TABLE — the interner for device images, as [`PlacesInterner`] is for
@@ -2266,7 +1874,7 @@ const SUB_BLOCKED_PREFILL_CEILING: u32 = 128;
 // build that has the pool (`spyre`: its `sdsc_abstract` is the Spyre target's).
 const _: () = assert!(
     PREFILL_RUNGS[PREFILL_RUNGS.len() - 1] as usize
-        == ktir_superdsc::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS,
+        == scratchy_spyre_bundle::rung::PagedKvPool::PREFILL_CHUNK_SLOTS,
     "PagedKvPool::PREFILL_CHUNK_SLOTS must equal the PREFILL_RUNGS ceiling — the pool's \
      WRITE_SLACK is derived from it, and a padded chunk write that overruns by more than the \
      slack corrupts the next kv head's keys"
@@ -2281,7 +1889,7 @@ const _: () = assert!(
 // every rung positive.
 const _: () = assert!(
     {
-        use ktir_superdsc::sdsc_abstract::PagedKvPool;
+        use scratchy_spyre_bundle::rung::PagedKvPool;
         let page = PagedKvPool::POOL_PAGE_SLOTS.get();
         let mut ok = true;
         let mut i = 0;
@@ -2349,8 +1957,6 @@ const _: () = assert!(
 // collision-free cap binds first); dense-only models → 31 (no fp8 gemm
 // constrains). Pinned by `emu_prefill_lx_width_pins_the_gemma4_rungs`.
 
-// Gated on `spyre`, with the one-home budget it reads: `ktir_superdsc::superdsc_opspec`
-// is re-exported only under `spyre`, and the fn's one caller is the spyre bake block.
 fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 {
     use scratchy_forward_compiler_macro::shape::eval_closed_dim;
     // The result tail: the LAST tile nothing consumes — the bridge's own law
@@ -2421,7 +2027,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         let w = prefix_len.min(r);
         if fp8_ns.iter().all(|&n| {
             scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n)
-                <= u128::from(ktir_superdsc::superdsc_opspec::LX_FUSION_BUDGET_BYTES)
+                <= u128::from(ktir_core::ddl_binds::LX_FUSION_BUDGET_BYTES)
         }) {
             return w;
         }
@@ -2438,7 +2044,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         model.source_stem,
         scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n),
         w,
-        u128::from(ktir_superdsc::superdsc_opspec::LX_FUSION_BUDGET_BYTES),
+        u128::from(ktir_core::ddl_binds::LX_FUSION_BUDGET_BYTES),
         scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES,
     );
 }
@@ -2752,17 +2358,6 @@ pub(crate) fn dump_wavefront_mega(
         // `lower_subtile_tape_to_superdsc::weight_segment_parity` — the build-time half
         // of the runtime's `alias_seg` size guard, so the next bundle skew is a BUILD
         // error, never a card-load refusal.
-        // ⭐ THE REGISTRY LEDGER — every bake's scalar registry, by phase, beside the registry of
-        // the wiring that phase's launches bind (`registry_bound`: decode, prefill). The worker binds
-        // ONE wiring per phase for every bundle of it (a prompt chunk's rung, a decode batch rung),
-        // so a bundle placing a different registry reads its constants by the wrong index. Judged
-        // once, after the last bake.
-        let registry_ledger: std::cell::RefCell<Vec<(bool, String, Vec<f32>)>> =
-            std::cell::RefCell::new(Vec::new());
-        /// `(decode, prefill)`: the registry each phase's bound wiring places.
-        type PhaseRegistries = (Option<Vec<f32>>, Option<Vec<f32>>);
-        let registry_bound: std::cell::RefCell<PhaseRegistries> =
-            std::cell::RefCell::new((None, None));
         let weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>> =
             std::cell::RefCell::new(Vec::new());
         // ⭐ THE STATE ONE TENSOR-PARALLEL WORLD'S BAKES COMMIT INTO. Every cell above is the
@@ -2842,16 +2437,10 @@ pub(crate) fn dump_wavefront_mega(
                 fp: String,
             },
             PrefillFp(String),
-            // ⭐ THE RUNG'S OWN KINDS ride the effect: the decode batch rung's
-            // load_consts at ITS OWN `rows`, from THIS bake's wiring (`gk`) —
-            // the one derivation, carried to the manifest so the worker never
-            // stages the single-request wiring's rows=1 kinds into a wider
-            // rung (Finding 1's compounding half).
             DecodeRung {
                 rows: u32,
                 cap: u32,
                 fp: String,
-                consts: Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
             },
             DecodeFp(String),
             FoldCensus {
@@ -2875,12 +2464,6 @@ pub(crate) fn dump_wavefront_mega(
                 base: String,
                 bank0: u64,
                 banks: Vec<u64>,
-            },
-            // ⭐ THIS BAKE'S SCALAR REGISTRY, by phase — the registry ledger's entry.
-            Registry {
-                prefill: bool,
-                base: String,
-                scales: Vec<f32>,
             },
         }
         /// What one bake returns: its sengraph json and launch groups.
@@ -2965,9 +2548,9 @@ pub(crate) fn dump_wavefront_mega(
                     (None, None) => (1u32, decode_rows),
                 };
                 let query_rows = (|| {
-                    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-                        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(per_request)?,
-                        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(requests)?,
+                    scratchy_spyre_bundle::rung::QueryExtent::of_baked_rung(
+                        scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(per_request)?,
+                        scratchy_spyre_bundle::rung::RungCap::of_baked_seqs(requests)?,
                     )
                 })()
                 .unwrap_or_else(|| {
@@ -2997,147 +2580,7 @@ pub(crate) fn dump_wavefront_mega(
                 // (slower, never wrong).
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
-                let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
-                // ⭐⭐⭐ THE CHAINED HEAD'S WIDENING PASS — ABOVE every mint, tie-gated
-                // at the model: the tied embed weight's STATED cols widen to the pick's
-                // pad (`sample_pad_vocab`), so the gather's stride-`pad` walk and the
-                // decompose's clamp boundary are ONE width by construction. It must run
-                // BEFORE the mints — both passes walk the result tail back to the
-                // lm-head, and after the draw the result IS the idx stick, a tail the
-                // widen walk cannot read. Non-admitting tails return None and touch
-                // nothing; every admitting bundle of a tied model reserves the same
-                // widened bytes (the weight-segment parity ledger's law).
-                let tied = tie_word_embeddings(model);
-                let widen = if tied {
-                    scratchy_subtile::subtile_ir::widen_tied_embed_weight(&mut krg)
-                } else {
-                    None
-                };
-                if let Some(w) = &widen {
-                    eprintln!(
-                        "[spyre-superdsc] {base}: the tied embed weight widened — vocab {} \
-                         (stated cols {}), reservation grown, FLOPs untouched (the matmul's \
-                         region stays 0..vocab)",
-                        w.vocab, w.pad_vocab
-                    );
-                }
-                // ⭐⭐⭐ THE TOKEN DRAW'S MINT — EVERY rung this closure bakes: the
-                // solo m=1 bake, every emulator cap bucket, every batch-ladder rung,
-                // AND every prefill rung (the general mint — no prefill-specific
-                // copy, no `one_request` gate, no lm-head admission walk here: #813
-                // minted only the one-request rung whose lm-head admitted, and what
-                // survived that front is the LAW, not the gate — a rung without the
-                // draw is a rung whose answer must still come back as logits for a
-                // host argmax, which is exactly the readback this front deletes).
-                // The splice is the kernel's ONLY entry — the mint appends the node,
-                // its per-row per-step seat (the seed quadruple's four word tables,
-                // inv_t) and its twenty staged-table
-                // sources to the graph, and everything downstream (the splice's row,
-                // the door's whole-function walk, the placement pass, the wiring's
-                // sampler facts) is the same machinery every other Triton kernel
-                // takes. The mint's own tail walk IS the admission: a graph whose
-                // result tail is not the lm-head chain it knows PANICS at expansion —
-                // a build error naming the op, never a silent fall back to the host
-                // readback. A prefill rung's result is the FOLDED lm-head rows (the
-                // emitter folds the tail to the requests' last baked rows): its
-                // prompt-final chunk's picks are the idx stick, read back exactly
-                // like decode's; a middle chunk's suffix never runs, so its draw
-                // is never taken.
-                {
-                    let mint = scratchy_subtile::subtile_ir::mint_sample(
-                        &mut krg,
-                        if is_prefill {
-                            // The Folded draw serves the rung's OWN request
-                            // capacity — the same extent pair's `RungCap` the
-                            // attention and the lm-head fold read (one mint,
-                            // never a division of the graph's rows): the fold
-                            // writes S logits rows and the draw serves exactly
-                            // them.
-                            scratchy_subtile::subtile_ir::SampleRows::Folded {
-                                requests: query_rows.requests().nonzero(),
-                            }
-                        } else {
-                            scratchy_subtile::subtile_ir::SampleRows::All
-                        },
-                    );
-                    eprintln!(
-                        "[spyre-superdsc] {base}: the token draw minted — vocab {} (padded row \
-                         {}), rows {}, the per-row seat (seed words t{}..t{}, inv_t t{}) + \
-                         twenty staged tables appended, and the rung's RESULT re-pointed to the \
-                         idx stick (the row stays placed and readable by tid){}",
-                        mint.vocab,
-                        mint.pad_vocab,
-                        mint.rows,
-                        mint.seed_words[0].index(),
-                        mint.seed_words[3].index(),
-                        mint.invt.index(),
-                        if is_prefill { " (prefill rung)" } else { "" },
-                    );
-                    // ⭐⭐⭐ THE CHAINED HEAD'S MINT (#603) — the second splice onto the
-                    // same DECODE rung (prefill keeps the host-staged embed rows — its
-                    // input row is prompt tokens the host owns, never a device pick):
-                    // the EmbedRowGather at the entry (every whole-tensor consumer of
-                    // the embed row re-pointed onto its output), the ChainStage at the
-                    // tail (the pick decomposed into the persistent s/l sticks through
-                    // the two staged tables), the four-source insert below the
-                    // SourceBinding layer. THE PICK IS THE DRAW'S OWN OUTPUT — the
-                    // by-kind find the A-seam refused on: `mint_sample` re-pointed the
-                    // rung's result to the idx stick, so `krg.result` IS the device
-                    // pick, and the vocab the tables decompose over is the mint's own
-                    // emitted vocab. GATED ADDITIONALLY ON THE TIE (the gather's matrix
-                    // operand is the lm-head's weight source, the embedding matrix IFF
-                    // the model ties): an untied decode rung REFUSES here — the chained
-                    // head is the only decode path, and there is no host-pick arm to
-                    // fall to. Every width mints (the solo rung, every batch-ladder
-                    // rung, the symbolic CB batch alike): the chain is the decode path,
-                    // not a wide-batch extra.
-                    // ⛔ A PARTIAL ROW IS A CHAIN'S, AND A PREFILL HAS NO CHAIN. A source the
-                    // analysis cut as a gathered row's partial sum is filled by the chain's
-                    // per-rank gather; a prefill rung stages its rows whole from the host, so the
-                    // all-reduce would sum the prompt's rows once per rank.
-                    if is_prefill
-                        && let Some(e) = shards.and_then(|s| {
-                            s.iter().position(|c| {
-                                *c == scratchy_subtile::tensor_parallel::SourceShard::Partial
-                            })
-                        })
-                    {
-                        panic!(
-                            "[spyre-tp] {base}: source t{e} is a gathered row's partial sum, but a \
-                             prefill rung mints no chained head to gather it — the forward was \
-                             sharded with a decode's row gather"
-                        );
-                    }
-                    if !is_prefill {
-                        if !tied {
-                            panic!(
-                                "[spyre-superdsc] {base}: the decode rung's chained head \
-                                 requires a tied embedding head — this model does not tie \
-                                 word embeddings. The chained head is the only decode path \
-                                 (there is no host-pick arm to fall to); the untied \
-                                 admission is not implemented."
-                            );
-                        }
-                        let embed_row = lwd.embed_row().index();
-                        let pick = krg.result;
-                        let chain = scratchy_subtile::subtile_ir::mint_embed_chain(
-                            &mut krg,
-                            scratchy_subtile::subtile_ir::TensorId::from_index(embed_row),
-                            pick,
-                            mint.vocab,
-                        );
-                        eprintln!(
-                            "[spyre-superdsc] {base}: the chained head minted — the embed row \
-                             gather spliced over source t{embed_row} (hidden {}, vocab {}), the \
-                             persistent s/l sticks at t{}/t{}, the two decompose tables staged \
-                             once at load, and the pick decomposed into the sticks at the tail",
-                            chain.hidden,
-                            chain.vocab,
-                            chain.s_stick.index(),
-                            chain.l_stick.index()
-                        );
-                    }
-                }
+                let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
                     return ((String::new(), Vec::new()), fx);
@@ -3196,15 +2639,8 @@ pub(crate) fn dump_wavefront_mega(
                 // ⭐ THE WIRING COMES OFF THE LOWERING THAT EMITS THE PROGRAMS. Its parameter
                 // pairings are the ones the bundle's launches bind, so there is one lowering and
                 // the wiring cannot describe a different program than the one that ships.
-                // ⭐ HOISTED ABOVE THE REROLL BAKE: the decode batch rung's effect (pushed inside
-                // that bake) carries THIS bake's own `load_consts` — the kinds at the rung's own
-                // `rows`, never the single-request wiring's (Finding 1's compounding half) — so
-                // the derivation must exist before the push. `krg` is minted and validated above
-                // and only ever borrowed below, so computing the wiring here is the same value at
-                // an earlier point, nothing more.
                 let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring::<$W, _>(
                     &krg,
-                    &weight_ids,
                     active_cap,
                     scratchy_target_spyre::paged_step::PagedRows::of_requests(rows_are_requests),
                     query_rows,
@@ -3214,51 +2650,6 @@ pub(crate) fn dump_wavefront_mega(
                 };
                 if sendnn_superdsc && seq_sym.is_none() {
                     use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
-                    // ── GATE-1 de-risk: when `SCRATCHY_SUPERDSC_GATE1=1`, also drop a
-                    //    SINGLE self-contained matmul bundle (no dangling tensor refs)
-                    //    so a pod `sendnn` build's dxp-bake can prove dxp INGESTS
-                    //    scratchy's emitted SuperDSC (encoding + build.rs arm + init.txt
-                    //    end-to-end) BEFORE the full decode bundle is complete. Content-
-                    //    keyed write → idempotent across emit_bundle calls.
-                    if std::env::var("SCRATCHY_SUPERDSC_GATE1").as_deref() == Ok("1") {
-                        // SMALL LX-fitting matmul (64×64×64, batch 1): per-core tile
-                        // (kernel ~8KB) is well under the LX scratchpad, so it compiles
-                        // WITHOUT the frontend coarse-tile (time-tiling) pass — isolating
-                        // "is the typed emitter's format dxp-valid?" from "does it tile
-                        // large tiles?" (the latter = the coarse_tile port, next).
-                        use ktir_superdsc::sdsc_abstract::{
-                            KernelTag, RowBlockedTag, StickLayout, Stk,
-                        };
-                        // Typed matmul operands (compile-time addressing): activation/output RowBlocked, weight Kernel.
-                        let g1_a =
-                            Stk::<RowBlockedTag>::new("g1_a", StickLayout::row_blocked(64, 64))
-                                .unwrap();
-                        let g1_w = Stk::<KernelTag>::kernel(64, 64, "g1_w");
-                        let g1_o =
-                            Stk::<RowBlockedTag>::new("g1_o", StickLayout::row_blocked(64, 64))
-                                .unwrap();
-                        let g1 = superdsc::assemble_matmul(
-                            "gate1_mm", 64, 64, 64, 1, &g1_a, &g1_w, &g1_o, None,
-                        );
-                        // A hand-authored matmul, so there is no attention node for the four
-                        // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match g1.map_err(|e| e.to_string()).and_then(|g1| {
-                            superdsc::emit_bundle::<$W>(
-                                &[g1],
-                                None,
-                                superdsc::FoldGrouping::Split,
-                                None,
-                                dump,
-                            )
-                            .map_err(|e| e.to_string())
-                        }) {
-                            Ok(fp) => eprintln!(
-                                "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
-                                 dxp compiles it inline"
-                            ),
-                            Err(e) => eprintln!("[spyre-superdsc] GATE-1 bundle emit failed: {e}"),
-                        }
-                    }
                     // RE-ROLL the layer loop (the 40-min-compile fix): instead of lowering
                     // the 30×-UNROLLED `krg` to one 2047-op bundle (dxp super-linear → 40 min),
                     // re-roll the tape (mirror the tk_tape path, codegen ~8807) and lower the
@@ -3359,13 +2750,10 @@ pub(crate) fn dump_wavefront_mega(
                                     // wants it.
                                     let unrolled = superdsc::unroll_layers::<$W>(&rolled);
                                     let card = cfg!(feature = "spyre-lower");
-                                    let unrolled_params = rolled.attn_params;
                                     let pre = if card {
                                         superdsc::emit_bundle::<$W>(
                                             &rolled.prefix,
                                             Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Split,
-                                            rolled.attn_params,
                                             dump,
                                         )
                                     } else {
@@ -3396,12 +2784,6 @@ pub(crate) fn dump_wavefront_mega(
                                         let r = superdsc::emit_bundle::<$W>(
                                             if card { &b.ops } else { &unrolled },
                                             Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Split,
-                                            if card {
-                                                rolled.attn_params
-                                            } else {
-                                                unrolled_params
-                                            },
                                             dump,
                                         );
                                         match r {
@@ -3417,61 +2799,8 @@ pub(crate) fn dump_wavefront_mega(
                                     }
                                     let bod: Result<String, std::io::Error> =
                                         Ok(body_fps.first().cloned().unwrap_or_default());
-                                    // The SAME body, with the per-page fold fused back into the
-                                    // surrounding work instead of standing alone. Splitting the fold
-                                    // costs one extra launch per layer (measured: 5 groups vs the
-                                    // baseline's 4 = 40 more launches per token on a launch-bound path),
-                                    // and that is only worth paying when the fold is actually
-                                    // re-launched. The runtime picks this one whenever the context fits
-                                    // a single page, which is the case that has to stay at the
-                                    // baseline's cost.
-                                    // ⭐ THE TWIN IS A LAUNCH-*GROUPING* VARIANT, SO IT IS THE CARD'S.
-                                    // Off-card `ktir_groups` takes `_fold` and never reads it — one
-                                    // launch group per op, always — so an emulator twin is a
-                                    // byte-identical copy of its split under a different name, and its
-                                    // only reader (`superdsc_exec::select_body_paged`) is
-                                    // `spyre-hw`-gated. Same rule as the prefix/suffix below: bake it
-                                    // where it is read.
-                                    // One fold-fused twin PER CLASS, same order as the bodies. An
-                                    // emit failure is logged and left `none()` — silent at runtime
-                                    // only in the sense the selector documented: it falls through
-                                    // to the split body, one launch per layer dearer.
-                                    // ⛔ AND ONLY WHERE THERE IS A FOLD TO FUSE
-                                    // (`superdsc::has_fused_twin`). A body with none — every paged
-                                    // step's, whose walk is never fused away — has a "twin" that is
-                                    // its split program again under a second name: a second dxp
-                                    // compile and a second copy in the card image, for every rung.
                                     let bodies_fused: Vec<superdsc::bundle::SiblingFp<'static>> =
-                                        if card {
-                                            rolled
-                                                .bodies
-                                                .iter()
-                                                .map(|b| {
-                                                    if !superdsc::has_fused_twin::<$W>(&b.ops) {
-                                                        return superdsc::bundle::SiblingFp::none();
-                                                    }
-                                                    superdsc::emit_bundle::<$W>(
-                                                        &b.ops,
-                                                        Some(&rolled.layout),
-                                                        superdsc::FoldGrouping::Fused,
-                                                        rolled.attn_params,
-                                                        dump,
-                                                    )
-                                                    .map(superdsc::bundle::SiblingFp::from)
-                                                    .unwrap_or_else(|e| {
-                                                        panic!(
-                                                            "[spyre-superdsc] {base}: fold-fused \
-                                                             body twin does not emit: {e}"
-                                                        )
-                                                    })
-                                                })
-                                                .collect()
-                                        } else {
-                                            vec![
-                                                superdsc::bundle::SiblingFp::none();
-                                                rolled.bodies.len()
-                                            ]
-                                        };
+                                        vec![superdsc::bundle::SiblingFp::none(); rolled.bodies.len()];
                                     // ⭐ THE SUFFIX IS ITS OWN BUNDLE ON THE CARD. Rolling the body
                                     // means the lm-head tail can no longer ride inside it: the body is
                                     // ONE layer now, run `iters` times. The emulator keeps the single
@@ -3480,8 +2809,6 @@ pub(crate) fn dump_wavefront_mega(
                                         superdsc::emit_bundle::<$W>(
                                             &rolled.suffix,
                                             Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Split,
-                                            rolled.attn_params,
                                             dump,
                                         )
                                     } else {
@@ -3549,28 +2876,16 @@ pub(crate) fn dump_wavefront_mega(
                                                     bodies_fused.clone(),
                                                 ),
                                             }];
-                                            // ⛔ WHAT EACH BAKED RUNG SERVES PAST ITS OWN SWEEP, beside
-                                            // `decode_rungs` and pushed exactly where it is — read off
-                                            // the EMITTED bundle's launch groups, the `page_fold` the
-                                            // runtime loads (the program it was emitted from carries no
-                                            // fold flag: the attention expands inside `emit_bundle`).
-                                            // Proven below.
-                                            let folds_of = |fp: &str| {
-                                                superdsc::emitted_bundle_folds::<$W>(fp).unwrap_or_else(|| {
-                                                    panic!(
-                                                        "[spyre-superdsc] {base}: ladder body {fp} was named but never emitted"
-                                                    )
-                                                })
-                                            };
+                                            // What each baked rung serves past its own sweep: no body
+                                            // re-launches per resident page, so a rung serves exactly its
+                                            // own sweep.
                                             let mut rung_reach: Vec<(
                                                 superdsc::bundle::SweptCols,
                                                 scratchy_target_spyre::fold_plan::RungReach,
                                             )> = vec![(
                                                 decode_rungs[0].active_cap,
                                                 scratchy_target_spyre::fold_plan::RungReach {
-                                                    // EVERY class body: a rung serves any length only
-                                                    // if each of its classes' attentions folds.
-                                                    folds: body_fps.iter().all(|fp| folds_of(fp)),
+                                                    folds: false,
                                                     fused_twin: decode_rungs[0]
                                                         .bodies_fused
                                                         .iter()
@@ -3648,7 +2963,6 @@ pub(crate) fn dump_wavefront_mega(
                                                             } else {
                                                                 superdsc::unroll_layers::<$W>(&rr)
                                                             };
-                                                            let rung_params = rr.attn_params;
                                                             // ONE FP per body class; a failed body emit
                                                             // leaves the rung unbaked — the runtime falls
                                                             // back to the next rung up.
@@ -3668,61 +2982,11 @@ pub(crate) fn dump_wavefront_mega(
                                                                         &rung_unrolled
                                                                     },
                                                                     Some(&rr.layout),
-                                                                    superdsc::FoldGrouping::Split,
-                                                                    // THIS rung's own params — `rr` was
-                                                                    // lowered at `rung`, so its swept
-                                                                    // extent is `rung`'s and not the
-                                                                    // ceiling bundle's.
-                                                                    if card {
-                                                                        rr.attn_params
-                                                                    } else {
-                                                                        rung_params
-                                                                    },
                                                                     dump,
                                                                 ) {
                                                                     Ok(rfp) => {
                                                                         rfps.push(rfp);
-                                                                        // The rung's fold-fused
-                                                                        // twin too: the rung bounds
-                                                                        // the sweep, this bounds the
-                                                                        // launch count, and a short
-                                                                        // context needs BOTH. ON THE
-                                                                        // CARD, for the ceiling twin's
-                                                                        // reason above — and here it
-                                                                        // also keeps the twin's NAME
-                                                                        // lawful. `bundle_fp` says a
-                                                                        // twin is `<split fp>f`, so it
-                                                                        // must hash the ops the split
-                                                                        // hashed; off-card the split
-                                                                        // is `&rung_unrolled` while
-                                                                        // this is `&b.ops`, so the
-                                                                        // "twin" was named after a
-                                                                        // bundle nothing else emitted. And
-                                                                        // only where there is a fold to fuse,
-                                                                        // as for the ceiling's.
-                                                                        rfused.push(if card
-                                                                            && superdsc::has_fused_twin::<$W>(&b.ops)
-                                                                        {
-                                                                        superdsc::emit_bundle::<$W>(
-                                                                            &b.ops,
-                                                                            Some(&rr.layout),
-                                                                            superdsc::FoldGrouping::Fused,
-                                                                            rr.attn_params,
-                                                                            dump,
-                                                                        )
-                                                                        .map(
-                                                                            superdsc::bundle::SiblingFp::from,
-                                                                        )
-                                                                        .unwrap_or_else(|e| {
-                                                                            panic!(
-                                                                                "[spyre-superdsc] {base}: rung {} \
-                                                                                 fused twin does not emit: {e}",
-                                                                                rung.get()
-                                                                            )
-                                                                        })
-                                                                    } else {
-                                                                        superdsc::bundle::SiblingFp::none()
-                                                                    });
+                                                                        rfused.push(superdsc::bundle::SiblingFp::none());
                                                                     }
                                                                     Err(e) => panic!(
                                                                         "[spyre-superdsc] {base}: ladder rung {} body \
@@ -3736,9 +3000,6 @@ pub(crate) fn dump_wavefront_mega(
                                                              active_cap={} baked",
                                                                 rung.get()
                                                             );
-                                                            let rung_folds = rfps
-                                                                .iter()
-                                                                .all(|fp| folds_of(fp));
                                                             let rec = superdsc::bundle::LadderRung {
                                                                 active_cap: superdsc::bundle::SweptCols::new(rung_swept),
                                                                 bodies: rung_fps(&rfps),
@@ -3754,7 +3015,7 @@ pub(crate) fn dump_wavefront_mega(
                                                                 (
                                                                     superdsc::bundle::SweptCols::new(rung_swept),
                                                                     scratchy_target_spyre::fold_plan::RungReach {
-                                                                        folds: rung_folds,
+                                                                        folds: false,
                                                                         fused_twin,
                                                                     },
                                                                 ),
@@ -4077,20 +3338,6 @@ pub(crate) fn dump_wavefront_mega(
                                                     query_rows,
                                                     shards,
                                                 };
-                                                // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
-                                                // from its emitted layout, so the twin's minted
-                                                // programs carry the SAME `lx_window_fits` budget
-                                                // the bake proved (auditor ruling 2026-10-27). A
-                                                // missing entry or an unstated window here is a
-                                                // defect the gate names, not a zero it charges.
-                                                let lx_pin_window = superdsc::emitted_lx_pin_window_bytes::<$W>(&bfp).unwrap_or_else(|| {
-                                                    panic!(
-                                                        "[spyre-superdsc] {base}: bundle {bfp} has \
-                                                         no emitted layout stating its LX pin window \
-                                                         — the twin cannot mint programs without the \
-                                                         budget the bake proved"
-                                                    )
-                                                });
                                                 let run_gate =
                                                     |prefill: Option<&superdsc::PrefillGate>| {
                                                         // The twin's own groups, fresh from the
@@ -4100,7 +3347,6 @@ pub(crate) fn dump_wavefront_mega(
                                                         // exactly the classes under test.
                                                         let twin = superdsc::covering_twin_groups::<$W>(
                                                             &rolled,
-                                                            Some(lx_pin_window),
                                                         )
                                                         .unwrap_or_else(|e| {
                                                             panic!(
@@ -4231,13 +3477,6 @@ pub(crate) fn dump_wavefront_mega(
                                                     rows: decode_rows,
                                                     cap,
                                                     fp: bfp.clone(),
-                                                    // THIS rung's own kinds — the wiring `gk`
-                                                    // derived from THIS bake's `krg`, whose
-                                                    // mint ran at `decode_rows`. Not the
-                                                    // single-request wiring's list: the ten
-                                                    // uniform `[rows, 1]` tables stage at the
-                                                    // rung's own rows.
-                                                    consts: gk.load_consts.clone(),
                                                 });
                                             }
                                             // The one-request bundle stays THE decode bundle for
@@ -4387,13 +3626,6 @@ pub(crate) fn dump_wavefront_mega(
                     } else {
                         None
                     };
-                    fx.push(BakeEffect::Registry {
-                        prefill: is_prefill,
-                        base: format!(
-                            "{base} (prefill_mq={prefill_mq:?}, rows={decode_rows}, sweep={active_cap:?})"
-                        ),
-                        scales: gk.scalarmul_scales.clone(),
-                    });
                     fx.push(BakeEffect::Wiring {
                         slot,
                         gk: Box::new(gk),
@@ -4429,15 +3661,10 @@ pub(crate) fn dump_wavefront_mega(
                         }
                     }
                     BakeEffect::PrefillFp(fp) => *world.prefill_fp.borrow_mut() = Some(fp),
-                    BakeEffect::DecodeRung {
-                        rows,
-                        cap,
-                        fp,
-                        consts,
-                    } => {
+                    BakeEffect::DecodeRung { rows, cap, fp } => {
                         let mut r = world.decode_rungs.borrow_mut();
-                        if !r.iter().any(|(n, _, _, _)| *n == rows) {
-                            r.push((rows, cap, fp, consts));
+                        if !r.iter().any(|(n, _, _)| *n == rows) {
+                            r.push((rows, cap, fp));
                         }
                     }
                     BakeEffect::DecodeFp(fp) => *world.fp.borrow_mut() = Some(fp),
@@ -4478,15 +3705,12 @@ pub(crate) fn dump_wavefront_mega(
                     } => {
                         let w = emit_superdsc_wiring(&gk, lwd, model, decode_position);
                         let mut s = world.wiring.borrow_mut();
-                        let mut bound = registry_bound.borrow_mut();
                         match slot {
                             Some(WiringSlot::Prefill) => {
                                 s.prefill = Some(w);
-                                bound.1 = Some(gk.scalarmul_scales.clone());
                             }
                             Some(WiringSlot::Decode) => {
                                 s.decode = Some(w);
-                                bound.0 = Some(gk.scalarmul_scales.clone());
                             }
                             // ⭐ THE PAIR'S CELL, JOINED — a second bake of the same pair must be
                             // the SAME wiring (the pair names one graph), never a silent
@@ -4523,11 +3747,6 @@ pub(crate) fn dump_wavefront_mega(
                             .borrow_mut()
                             .push((base, bank0, banks));
                     }
-                    BakeEffect::Registry {
-                        prefill,
-                        base,
-                        scales,
-                    } => registry_ledger.borrow_mut().push((prefill, base, scales)),
                 }
             }
         };
@@ -4729,7 +3948,7 @@ pub(crate) fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
-            for seqs in ktir_superdsc::sdsc_abstract::PagedKvPool::BATCH_RUNGS
+            for seqs in scratchy_spyre_bundle::rung::PagedKvPool::BATCH_RUNGS
                 .into_iter()
                 .rev()
             {
@@ -4814,15 +4033,15 @@ pub(crate) fn dump_wavefront_mega(
 
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
         // ERROR that names the model and its head_dim (the config's, typed at load).
-        let prefill_head_width = ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+        let prefill_head_width = scratchy_spyre_bundle::rung::HeadWidth::of_whole_sticks_at_bake(
             u64::from(model.text.head_dim.get()),
             &model.name,
         );
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
-                || ktir_superdsc::sdsc_abstract::NewBlockForm::of(r, prefill_head_width, false)
-                    == ktir_superdsc::sdsc_abstract::NewBlockForm::Chunk
+                || scratchy_spyre_bundle::rung::NewBlockForm::of(r, prefill_head_width, false)
+                    == scratchy_spyre_bundle::rung::NewBlockForm::Chunk
         };
         let admitted_ceiling = PREFILL_RUNGS
             .into_iter()
@@ -5192,9 +4411,9 @@ pub(crate) fn dump_wavefront_mega(
                 .iter()
                 .map(|(m, _)| *m)
                 .collect();
-            let window = ktir_superdsc::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
+            let window = scratchy_spyre_bundle::rung::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
             if let Err(e) =
-                ktir_superdsc::sdsc_abstract::PagedKvPool::prefill_ladder_reaches_the_window(
+                scratchy_spyre_bundle::rung::PagedKvPool::prefill_ladder_reaches_the_window(
                     rung_admitted(window),
                     prefill_m,
                     &baked,
@@ -5226,7 +4445,7 @@ pub(crate) fn dump_wavefront_mega(
                 .iter()
                 .map(|(m, _)| *m)
                 .collect();
-            let asked = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
+            let asked = scratchy_spyre_bundle::rung::PagedKvPool::prefix_rungs(&baked);
             for &m in &asked {
                 match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
                     fuf,
@@ -5300,7 +4519,7 @@ pub(crate) fn dump_wavefront_mega(
             // attention spliced s times at window-local tables (the U1 unroll). The rung's
             // graph is the PRODUCT's (w·s rows, lowered here), its per-request width stated
             // by the pair, not divided back out of the rows.
-            for &(w, s) in &ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked) {
+            for &(w, s) in &scratchy_spyre_bundle::rung::PagedKvPool::packed_prefix_rungs(&baked) {
                 match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     inferred,
@@ -5391,7 +4610,7 @@ pub(crate) fn dump_wavefront_mega(
             // serialized solo chunks, the 878.7 ms this exists to kill. All checked against
             // what BAKED, not the widths asked for, both directions.
             let packed_asked =
-                ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked);
+                scratchy_spyre_bundle::rung::PagedKvPool::packed_prefix_rungs(&baked);
             let worlds: &[(&str, &WorldBake)] = if tp_sources.is_some() {
                 &[
                     ("one-rank world", &one_rank),
@@ -5415,14 +4634,14 @@ pub(crate) fn dump_wavefront_mega(
                     .map(|&(w, _, _)| w)
                     .collect();
                 if let Err(e) =
-                    ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
+                    scratchy_spyre_bundle::rung::PagedKvPool::prefix_ladder_tops_the_ladder(
                         &widths, &prefix,
                     )
                 {
                     panic!("[spyre-superdsc] {stem} ({label}): {e}");
                 }
                 if let Err(e) =
-                    ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
+                    scratchy_spyre_bundle::rung::PagedKvPool::prefix_ladder_bakes_every_rung(
                         &asked,
                         &prefix,
                         &[],
@@ -5481,37 +4700,6 @@ pub(crate) fn dump_wavefront_mega(
         ) {
             panic!("[spyre-superdsc] {stem} (tp={TP_WORLD}): {e}");
         }
-        // ⛔⛔ AND EVERY BUNDLE OF A PHASE PLACES THE REGISTRY ITS PHASE'S WIRING BINDS — the emulator
-        // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own
-        // session's placed registry, `SuperDscSession::bake_facts`, so its rungs may differ: a decode
-        // batch rung's carries the batched kernel's clamp.)
-        if !cfg!(feature = "spyre-lower") {
-            let (decode_bound, prefill_bound) = &*registry_bound.borrow();
-            let wrong: Vec<String> = registry_ledger
-                .borrow()
-                .iter()
-                .filter_map(|(prefill, base, scales)| {
-                    let bound = if *prefill {
-                        prefill_bound
-                    } else {
-                        decode_bound
-                    };
-                    bound
-                        .as_ref()
-                        .filter(|b| *b != scales)
-                        .map(|b| format!("{base}: places {scales:?}, its wiring binds {b:?}"))
-                })
-                .collect();
-            if !wrong.is_empty() {
-                panic!(
-                    "[spyre-superdsc] {stem}: {} bundle(s) place a scalar registry other than the \
-                     one their phase's wiring binds, so their constants are read by the wrong index:\n{}",
-                    wrong.len(),
-                    wrong.join("\n")
-                );
-            }
-        }
-
         // ── CB decode sengraph (the baked `--target sendnn` decode graph). The
         //    offline_decoder decode isengraph must carry a BATCH symbol on its K/Q
         //    data — the DEM reads batchSym from the PagedAttnStore KEY input

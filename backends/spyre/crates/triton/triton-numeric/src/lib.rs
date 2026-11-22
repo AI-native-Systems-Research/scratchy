@@ -64,6 +64,7 @@
 //! 3. **REPORT `max|err|` AND THE BOUND**, never "passes". [`Comparison`] carries both.
 
 pub mod bounds;
+pub mod cases;
 pub mod data;
 pub mod mutants;
 
@@ -74,11 +75,9 @@ use triton_frontend::codegen::KernelSpec;
 use triton_frontend::target::Target;
 use triton_frontend::{codegen, opt};
 use triton_ktir::ir::PartitionClone;
-use triton_ktir_superdsc::cases;
 
-/// What went wrong, and at which leg. Same shape as `triton_ktir_superdsc::Refusal`, and for the
-/// same reason: a driver tabulating `REFUSED <stage> <message>` shows a stage-less failure as a
-/// blank row, which is how a footprint mismatch went unread once already.
+/// What went wrong, and at which leg: a driver tabulating `REFUSED <stage> <message>` shows a
+/// stage-less failure as a blank row, which is how a footprint mismatch went unread once already.
 #[derive(Debug, Clone)]
 pub struct Refusal {
     pub stage: &'static str,
@@ -119,10 +118,8 @@ pub struct Lowered {
 
 /// `.py` SOURCE to their `IRFunction`. Every leg is a value; nothing reads a golden.
 pub fn lower(config: &str) -> Result<Lowered> {
-    // The door kind is ignored on PURPOSE here: this is the numeric ladder (`.py` → TTIR → KTIR
-    // → executor), which stops above the SuperDSC door. A `None` door row (a kernel stated in
-    // generic ops whose descriptor lowering is the open rung) runs this far and no further.
-    let (spec, grid, _door) = cases::case(config).ok_or_else(|| {
+    // The numeric ladder: `.py` → TTIR → KTIR → executor.
+    let (spec, grid) = cases::case(config).ok_or_else(|| {
         refuse(
             "case",
             format!("`{config}` is not one of: {}", cases::ALL.join(" ")),

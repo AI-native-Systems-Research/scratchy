@@ -44,7 +44,7 @@ use flex_rs::stream::{RuntimeStreamMode, RuntimeStreamPriority};
 use scratchy_target_spyre_card::runtime::{CardRuntime as AnyCard, DevAddr};
 
 /// A one-card probe: the card's runtime is a world of one's.
-type CardRuntime<'a> = AnyCard<'a, ktir_superdsc::collective::TpWorld<1>>;
+type CardRuntime<'a> = AnyCard<'a, scratchy_spyre_bundle::collective::TpWorld<1>>;
 
 /// One page-multiple megabyte per slot: the aligned stride equals the
 /// request, so the capacity arithmetic in the assertions below is exact.
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
     let table = scratchy_target_spyre_card::runtime::CardTable::enumerate()
         .map_err(|e| anyhow!("Spyre card table: {e}"))?;
     let world = scratchy_target_spyre_card::runtime::WorldCards::<
-        ktir_superdsc::collective::TpWorld<1>,
+        scratchy_spyre_bundle::collective::TpWorld<1>,
     >::claim(&table)
     .map_err(|e| anyhow!("{e}"))?;
     let cards = scratchy_target_spyre_card::runtime::WorldCards::join_opens(world.open_cards())

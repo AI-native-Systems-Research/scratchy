@@ -24,7 +24,7 @@ pub mod wire;
 use ktir_core::ddl_binds::DeviceGen;
 use ktir_core::ir::IRFunction;
 
-pub use emit::{Bindings, EmitError, Lowered};
+pub use emit::{Bindings, EmitError, Footprint};
 pub use layout::Residency;
 pub use lift::{Held, LiftError, ParamLayout};
 
@@ -35,14 +35,25 @@ pub enum Error {
     Emit(EmitError),
 }
 
-/// A lowered function: its ops, and how each parameter's buffer must be held.
+/// A function ready to place: its graph, how each parameter's buffer is held, and the storage its
+/// descriptors reach.
 #[derive(Clone, Debug)]
-pub struct Lowering {
+pub struct Planned {
     pub graph: graph::Graph,
     /// For each parameter, the layout its buffer is held in (`None`: as its view states). Only a
     /// [`Residency::Staged`] parameter is ever re-laid-out — its stager writes it so.
     pub layouts: Vec<ParamLayout>,
-    pub lowered: Lowered,
+    pub footprint: Footprint,
+}
+
+impl Planned {
+    /// The descriptors, in launch order, against `bindings`.
+    pub fn emit<G: DeviceGen>(
+        &self,
+        bindings: &Bindings<'_>,
+    ) -> Result<Vec<(opfunc::OpFunc, wire::Sdsc)>, Error> {
+        emit::emit::<G>(&self.graph, &self.footprint, bindings).map_err(Error::Emit)
+    }
 }
 
 /// The layouts `f`'s staged parameters must be held in: each re-laid-out so every op reads it on
@@ -59,12 +70,8 @@ pub fn layouts<G: DeviceGen>(f: &IRFunction<'_>, residency: &[Residency]) -> Res
     Ok(held)
 }
 
-/// Lower `f` against `bindings`, each parameter's buffer held as `layouts` states, for generation `G`.
-pub fn lower<G: DeviceGen>(
-    f: &IRFunction<'_>,
-    layouts: &[ParamLayout],
-    bindings: &Bindings<'_>,
-) -> Result<Lowering, Error> {
+/// Plan `f` for generation `G`, each parameter's buffer held as `layouts` states.
+pub fn plan<G: DeviceGen>(f: &IRFunction<'_>, layouts: &[ParamLayout]) -> Result<Planned, Error> {
     let natural = lift::lift::<G>(f, layouts).map_err(Error::Lift)?;
     let relocated = layout::misaligned::<G>(&natural);
     let mut graph = if relocated.is_empty() {
@@ -74,6 +81,6 @@ pub fn lower<G: DeviceGen>(
     };
     layout::restick::<G>(&mut graph);
     layout::index_inner::<G>(&mut graph);
-    let lowered = emit::emit::<G>(&graph, bindings).map_err(Error::Emit)?;
-    Ok(Lowering { graph, layouts: layouts.to_vec(), lowered })
+    let footprint = emit::footprint::<G>(&graph);
+    Ok(Planned { graph, layouts: layouts.to_vec(), footprint })
 }

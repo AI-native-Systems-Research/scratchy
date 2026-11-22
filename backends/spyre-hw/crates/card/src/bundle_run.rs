@@ -279,7 +279,7 @@ impl Payload {
 /// ⛔ SHORT IS LEGITIMATE for a raw bind where it is not for an fp16 one, so this does NOT demand the
 /// exact size the arms below do — `place_raw`'s own doc records the activations that bind less than
 /// their placement on purpose (a pmask's one broadcast row, the index table's one pass block).
-fn bind_raw<T: ktir_superdsc::collective::Tp>(
+fn bind_raw<T: scratchy_spyre_bundle::collective::Tp>(
     exec: &mut crate::superdsc_exec::Executor<'_, '_, T>,
     tid: u32,
     bytes: Vec<u8>,
@@ -287,7 +287,7 @@ fn bind_raw<T: ktir_superdsc::collective::Tp>(
     want: u64,
 ) -> Result<()> {
     let n = bytes.len();
-    let Some(rb) = exec.place_raw(ktir_superdsc::place::PlaceId::Act(tid), bytes) else {
+    let Some(rb) = exec.place_raw(scratchy_spyre_bundle::place::PlaceId::Act(tid), bytes) else {
         bail!(
             "--input t{tid}={how} raw:t{tid}: {n} B cannot be bound verbatim into a {want} B \
              placement. A raw payload must be a whole number of 4-byte entries — a partial trailing \
@@ -306,10 +306,10 @@ fn bind_raw<T: ktir_superdsc::collective::Tp>(
 // (`RESERVED_TID_FLOOR`, the one spelling). They are bound as weights (staged once)
 // rather than declared as per-run sources, because the executor's source model is the
 // contiguous id range `0..n`.
-use ktir_superdsc::reserved_tids::RESERVED_TID_FLOOR;
+use scratchy_spyre_bundle::reserved_tids::RESERVED_TID_FLOOR;
 
 /// One bundle off disk runs on one card: a world of one.
-type Alone = ktir_superdsc::collective::TpWorld<1>;
+type Alone = scratchy_spyre_bundle::collective::TpWorld<1>;
 
 pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     // One kernel on one card: a world of one's card, the first senlib enumerates.
@@ -432,7 +432,7 @@ fn run_loaded(
         .places
         .iter()
         .map(|p| scratchy_target_spyre::bundle_code::Placement {
-            id: ktir_superdsc::place::PlaceId::Act(p.tid),
+            id: scratchy_spyre_bundle::place::PlaceId::Act(p.tid),
             segment: p.segment,
             bank: p.bank,
             offset: p.offset,
@@ -818,7 +818,7 @@ fn run_loaded(
             None => bytes,
         };
         exec.bind_weight(
-            ktir_superdsc::place::PlaceId::Act(*tid),
+            scratchy_spyre_bundle::place::PlaceId::Act(*tid),
             scratchy_target_spyre::allocator::HostBytes::Owned(bytes),
         );
     }
@@ -914,7 +914,7 @@ fn run_loaded(
             Some((rows, cols)) => restick(&bytes, rows, cols, true),
             None => bytes,
         };
-        exec.bind_input(ktir_superdsc::place::PlaceId::Act(*tid), bytes);
+        exec.bind_input(scratchy_spyre_bundle::place::PlaceId::Act(*tid), bytes);
     }
 
     // ⛔ BEFORE `prepare`, AND NOT OPTIONAL EVEN WITH NO WEIGHTS. `stage_weights` is where the HOST
@@ -1004,7 +1004,7 @@ fn run_loaded(
             .find(|q| q.tid == *tid)
             .ok_or_else(|| anyhow!("--output t{tid}: no such tensor in placements.json"))?;
         let bytes = exec.read_tensor(
-            ktir_superdsc::place::PlaceId::Act(*tid),
+            scratchy_spyre_bundle::place::PlaceId::Act(*tid),
             (p.size / 2) as usize,
         )?;
         let bytes = match layout_of(*tid, p.size, "output")? {

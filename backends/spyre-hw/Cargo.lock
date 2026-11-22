@@ -976,15 +976,6 @@ dependencies = [
 [[package]]
 name = "flex-rs"
 version = "0.1.0"
-dependencies = [
- "libc",
- "rustix",
- "senlib-boot",
- "senlib-chip",
- "senlib-host",
- "senlib-rs",
- "tracing",
-]
 
 [[package]]
 name = "fluent-uri"
@@ -1544,7 +1535,6 @@ dependencies = [
  "cblas-sys",
  "ktir-core",
  "ktir-optimizer",
- "ktir-superdsc",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -1555,18 +1545,6 @@ name = "ktir-optimizer"
 version = "0.1.0"
 dependencies = [
  "ktir-core",
- "ktir-superdsc",
-]
-
-[[package]]
-name = "ktir-superdsc"
-version = "0.1.0"
-dependencies = [
- "half",
- "ktir-core",
- "scratchy-tp-world",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1652,12 +1630,6 @@ checksum = "28d0a00925a9f930d679b6789b721e3a7f9ed110f41b86d2497caa780c3a070a"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -2461,19 +2433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags",
- "errno",
- "libc",
- "linux-raw-sys",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "rustls"
 version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2642,6 +2601,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "inventory",
+ "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-tensors",
@@ -2858,9 +2818,20 @@ name = "scratchy-spyre-bundle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "inventory",
  "ktir-core",
- "ktir-superdsc",
+ "scratchy-tp-world",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "scratchy-spyre-superdsc"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "ktir-core",
  "serde",
  "serde_json",
 ]
@@ -2885,7 +2856,6 @@ dependencies = [
  "inventory",
  "ktir-core",
  "ktir-emulator",
- "ktir-superdsc",
  "libc",
  "memmap2",
  "rayon",
@@ -2894,14 +2864,15 @@ dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-spyre-bundle",
+ "scratchy-spyre-superdsc",
  "scratchy-subtile",
  "scratchy-tensors",
+ "scratchy-tp-world",
  "scratchy-triton-splice",
  "serde",
  "serde_json",
  "sha2",
  "tracing",
- "triton-ktir-superdsc",
 ]
 
 [[package]]
@@ -2911,7 +2882,6 @@ dependencies = [
  "anyhow",
  "flex-rs",
  "half",
- "ktir-superdsc",
  "libc",
  "scratchy-spyre-bundle",
  "scratchy-target-spyre",
@@ -2930,6 +2900,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "flex-rs",
  "libc",
  "scratchy-cli",
  "scratchy-models",
@@ -2946,13 +2917,13 @@ name = "scratchy-target-spyre-compiler"
 version = "0.1.0"
 dependencies = [
  "ktir-core",
- "ktir-superdsc",
  "proc-macro2",
  "quote",
  "rayon",
  "scratchy-forward-compiler-frontend",
  "scratchy-forward-compiler-macro",
  "scratchy-ir",
+ "scratchy-spyre-bundle",
  "scratchy-subtile",
  "scratchy-target-spyre",
  "scratchy-tp-world",
@@ -2986,7 +2957,6 @@ dependencies = [
  "anyhow",
  "half",
  "inventory",
- "ktir-superdsc",
  "rayon",
  "safetensors",
  "scratchy-builder-spyre",
@@ -2997,6 +2967,7 @@ dependencies = [
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
  "scratchy-serving-worker",
+ "scratchy-spyre-bundle",
  "scratchy-subtile",
  "scratchy-target-spyre",
  "scratchy-target-spyre-card",
@@ -3031,12 +3002,12 @@ name = "scratchy-triton-splice"
 version = "0.1.0"
 dependencies = [
  "ktir-core",
- "ktir-superdsc",
  "scratchy-ir",
+ "scratchy-spyre-bundle",
+ "scratchy-spyre-superdsc",
  "scratchy-subtile",
  "triton-frontend",
  "triton-ktir",
- "triton-ktir-superdsc",
 ]
 
 [[package]]
@@ -3044,51 +3015,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "senlib-boot"
-version = "0.1.0"
-dependencies = [
- "log",
- "senlib-chip",
- "senlib-host",
- "senlib-rs",
- "senlib-rs-export-controlled",
-]
-
-[[package]]
-name = "senlib-chip"
-version = "0.1.0"
-dependencies = [
- "libc",
- "senlib-errata",
- "senlib-host",
-]
-
-[[package]]
-name = "senlib-errata"
-version = "0.1.0"
-
-[[package]]
-name = "senlib-host"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "senlib-rs"
-version = "0.1.0"
-dependencies = [
- "libc",
- "senlib-chip",
- "senlib-errata",
- "senlib-host",
-]
-
-[[package]]
-name = "senlib-rs-export-controlled"
-version = "0.1.0"
 
 [[package]]
 name = "seq-macro"
@@ -3768,17 +3694,6 @@ version = "0.1.0"
 dependencies = [
  "ktir-core",
  "triton-frontend",
-]
-
-[[package]]
-name = "triton-ktir-superdsc"
-version = "0.1.0"
-dependencies = [
- "ktir-core",
- "ktir-superdsc",
- "serde_json",
- "triton-frontend",
- "triton-ktir",
 ]
 
 [[package]]

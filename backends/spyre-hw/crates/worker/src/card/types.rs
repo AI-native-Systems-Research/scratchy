@@ -34,7 +34,7 @@ pub(crate) type Cards = scratchy_target_spyre::bundle_code::collective::PerRank<
 ///  * `width` is the PADDED placement width, not the model's vocab. The emitter pads the vocab axis
 ///    to a whole number of sticks per core — granite's 49155 is placed as 51200 — so a row spans
 ///    `width` elements of which only the leading `vocab` are real.
-///  * A row is NOT contiguous. [`ktir_superdsc::sdsc_abstract::StickLayout::dev_off`] places
+///  * A row is NOT contiguous. [`scratchy_spyre_bundle::rung::StickLayout::dev_off`] places
 ///    element `(r, c)` at `(c/64)·(rows·64) + r·64 + (c%64)`: the vocab axis is cut into 64-wide
 ///    blocks and all `rows` rows of a block sit together.
 ///
@@ -54,7 +54,7 @@ impl LogitsGeom {
     /// it would read neighbouring placements.
     pub(crate) fn from_placement(
         size_bytes: u64,
-        rung: ktir_superdsc::sdsc_abstract::RungWidth,
+        rung: scratchy_spyre_bundle::rung::RungWidth,
         vocab: usize,
     ) -> Option<LogitsGeom> {
         let elems = (size_bytes / 2) as usize;
@@ -85,7 +85,7 @@ impl LogitsGeom {
 pub(crate) struct DecodeRung {
     /// The row count this rung's bundle was BAKED at — every launch on it binds exactly this many
     /// rows, live or padding, and every mask/fold/logits extent below derives from it.
-    pub(crate) seqs: ktir_superdsc::sdsc_abstract::RungWidth,
+    pub(crate) seqs: scratchy_spyre_bundle::rung::RungWidth,
     /// The rung's own session, aliasing the owner's weights and KV pool. Which body of its walk
     /// ladder a step runs is the session's own answer (`SuperDscSession::step_body`), and the step
     /// the host stages is that body's (`PagedStep::on_body`).
@@ -114,7 +114,7 @@ pub(crate) enum RungId {
 /// was chosen. The fields are exactly `DecodeRung`'s, so the launch reads one shape and
 /// never re-derives an owner fact it could get wrong — `seqs` is `1` on the owner.
 pub(crate) struct DecodeSeat<'a> {
-    pub(crate) seqs: ktir_superdsc::sdsc_abstract::RungWidth,
+    pub(crate) seqs: scratchy_spyre_bundle::rung::RungWidth,
     pub(crate) sess: &'a mut SuperDscSession,
 }
 
@@ -363,7 +363,7 @@ impl SuperDscBundle {
     /// The live count is the only input: live request `i` runs in slot `i`, whatever its pages.
     pub(crate) fn decode_rung_for(
         &self,
-        live: ktir_superdsc::sdsc_abstract::LiveRows,
+        live: scratchy_spyre_bundle::rung::LiveRows,
     ) -> Option<RungId> {
         if live.get() <= 1 {
             // The owner ALWAYS exists — it is the session every rung aliases — so the W=1
@@ -383,7 +383,7 @@ impl SuperDscBundle {
         match id {
             RungId::Owner => DecodeSeat {
                 // The owner is the m=1 bake; 1 is a baked width by `RungWidth`'s own law.
-                seqs: ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
+                seqs: scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(1)
                     .expect("1 is a baked width"),
                 sess: &mut self.decode,
             },

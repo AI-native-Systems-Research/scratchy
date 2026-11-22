@@ -626,7 +626,7 @@ fn extf(
         Value::Tile(t) => {
             let data = t.as_f32().to_vec();
             let data = if env.convert_model.widen_staggers(Some(t.dtype), to) {
-                ktir_superdsc::element_arrangement::dl16tofp32_stagger(&data)
+                ktir_core::ddl_binds::dl16tofp32_stagger(&data)
             } else {
                 data
             };

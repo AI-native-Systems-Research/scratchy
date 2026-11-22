@@ -16,7 +16,7 @@ use ktir_core::opkind::OpKind;
 use crate::format::DataFormat;
 use crate::graph::{ConstStick, Gather, Graph, Local, Node, Operand, Store};
 use crate::opfunc::{Axis as RAxis, Combine, Compare, OpFunc};
-use crate::view::{View, ViewError};
+use crate::view::{Axis, View, ViewError};
 
 /// Why a function did not lift.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,11 +44,15 @@ enum Val {
     /// An access tile read or written through an index tensor: `base` is the view with the indexed
     /// axis one row per index, `shape` the tile's own shape.
     Indirect { base: Operand, gather: Gather, shape: Vec<u64> },
+    /// An access tile at a row offset read from memory: its rows along `axis`, each one row
+    /// read or written through the offset.
+    Rows { axis: usize, rows: Vec<(Operand, Gather)>, shape: Vec<u64> },
     /// An index the function reads from memory: `index[0] · scale + add`.
     Dyn { index: Operand, scale: u64, add: u64 },
     Tensor(Operand),
     Splat { value: f64, format: DataFormat, shape: Vec<u64> },
-    Empty { format: DataFormat, shape: Vec<u64> },
+    /// An uninitialized tensor: what a destination-passing op writes into.
+    Empty,
     Tuple(Vec<Val>),
 }
 
@@ -195,6 +199,26 @@ impl<G: DeviceGen> Cx<'_, G> {
             })
     }
 
+    /// An access tile's `coordinate_order` when it is not the identity: result axis `i` is
+    /// memory axis `order[i]`.
+    fn coordinate_order(op: &Operation<'_>) -> Result<Option<Vec<usize>>, LiftError> {
+        let Some(Attr::AffineMap(m)) = op.attr(AttrKey::CoordinateOrder) else {
+            return Ok(None);
+        };
+        let order = m
+            .exprs
+            .iter()
+            .map(|e| match e {
+                ktir_core::affine::AffineExpr::Dim(d) => Ok(*d),
+                _ => Err(LiftError::Malformed {
+                    op: op.op_type,
+                    what: "a coordinate order permutes the tile's axes",
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((order.iter().enumerate().any(|(i, &d)| i != d)).then_some(order))
+    }
+
     fn const_stick(&mut self, format: DataFormat, value: f64) -> usize {
         let key = ConstStick {
             format,
@@ -266,7 +290,14 @@ impl<G: DeviceGen> Cx<'_, G> {
         let numel: u64 = shape.iter().product();
         // The innermost axis is held in whole sticks: a partial stick pads to the stick.
         let padded = |v: View| -> View {
-            let Some(inner) = v.axes.iter().position(|a| a.stride == 1) else { return v };
+            let Some(inner) = v
+                .axes
+                .iter()
+                .position(|a| a.stride == 1 && a.extent > 1)
+                .or_else(|| v.axes.iter().position(|a| a.stride == 1))
+            else {
+                return v;
+            };
             let pitch = v.axes[inner].extent.next_multiple_of(lanes);
             let mut out = v.clone();
             for (i, a) in v.axes.iter().enumerate() {
@@ -280,7 +311,10 @@ impl<G: DeviceGen> Cx<'_, G> {
             padded(match like {
                 Some(l) if l.axes.len() == s.len() && l.axes.iter().any(|a| a.stride == 1) => {
                     let mut order: Vec<usize> = (0..s.len()).collect();
-                    order.sort_by_key(|&a| (std::cmp::Reverse(l.axes[a].stride), a));
+                    // An axis `like` repeats along (stride 0) holds nothing of its own: outermost.
+                    order.sort_by_key(|&a| {
+                        (l.axes[a].stride != 0, std::cmp::Reverse(l.axes[a].stride), a)
+                    });
                     let held: Vec<u64> = order.iter().map(|&a| s[a]).collect();
                     let physical = View::row_major(0, &held);
                     let mut v = View::row_major(0, s);
@@ -334,11 +368,14 @@ impl<G: DeviceGen> Cx<'_, G> {
             .iter()
             .filter(|o| o.view.axes.iter().any(|a| a.stride != 0))
             .collect();
-        // The result holds one value per stick only when every input it reads does and none of
-        // them repeats along an axis — a broadcast along the stick materializes as whole sticks.
+        // The result holds one value per stick when every input it reads does: a per-stick input
+        // repeated along an outer axis reads the same stick at every position of it. Repeated
+        // along the innermost axis it is a broadcast INTO a stick, which materializes as whole
+        // sticks.
         let per_stick = !dense.is_empty()
             && dense.iter().all(|o| {
-                Self::per_stick(o) && o.view.axes.iter().all(|a| a.stride != 0 || a.extent == 1)
+                Self::per_stick(o)
+                    && o.view.axes.last().is_none_or(|a| a.stride != 0 || a.extent == 1)
             });
         let like = dense
             .iter()
@@ -402,7 +439,9 @@ impl<G: DeviceGen> Cx<'_, G> {
             .filter(|&(i, _)| i != axis)
             .map(|(_, &e)| e)
             .collect();
-        let result = self.local(&out_shape, format, stick);
+        // A stick reduction leaves one value per stick, and so does any reduction of an input
+        // that already holds one.
+        let result = self.local(&out_shape, format, stick || Self::per_stick(&input));
         let mut out = result.clone();
         out.view.axes.insert(
             axis,
@@ -504,8 +543,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         // `outs` accumulates: a non-zero accumulator adds in after the contraction.
         let acc = self.get(op.operands[2])?;
         let value = match acc {
-            Val::Splat { value, .. } if value == 0.0 => product,
-            Val::Empty { .. } => product,
+            Val::Splat { value: 0.0, .. } | Val::Empty => product,
             acc => {
                 let rhs = self.operand(op, &acc, &out_shape, format)?;
                 let o = self.local(&out_shape, format, false);
@@ -595,6 +633,39 @@ impl<G: DeviceGen> Cx<'_, G> {
             },
             shape: shape.to_vec(),
         })
+    }
+
+    /// An access tile whose corner along axis `a` is a row read from memory, `index + add`: its
+    /// `e` rows, row `k` the one-row block the index names of the axis from `add + k` on.
+    fn row_tiles(
+        &mut self,
+        op: &Operation<'_>,
+        (store, view, format): (Store, &View, DataFormat),
+        (corner, shape): (&[u64], &[u64]),
+        (a, index, add): (usize, Operand, u64),
+    ) -> Result<Val, LiftError> {
+        let mut one = shape.to_vec();
+        one[a] = 1;
+        let mut rows = Vec::with_capacity(shape[a] as usize);
+        for k in 0..shape[a] {
+            let mut at = vec![0u64; view.axes.len()];
+            at[a] = add + k;
+            let mut extents: Vec<u64> = view.axes.iter().map(|x| x.extent).collect();
+            extents[a] = extents[a]
+                .checked_sub(add + k)
+                .filter(|&n| n > 0)
+                .ok_or(LiftError::DynamicIndex { op: op.op_type })?;
+            let from = view
+                .window(&at, &extents)
+                .map_err(|error| LiftError::View { op: op.op_type, error })?;
+            let Val::Indirect { base, gather, .. } =
+                self.block_tile(op, (store, &from, format), (corner, &one), (a, index.clone(), 1, 0))?
+            else {
+                return Err(LiftError::Malformed { op: op.op_type, what: "a row of a tile" });
+            };
+            rows.push((base, gather));
+        }
+        Ok(Val::Rows { axis: a, rows, shape: shape.to_vec() })
     }
 
     /// `ktdp.construct_indirect_access_tile`: along each `indirect` dimension the row is the index
@@ -739,6 +810,27 @@ impl<G: DeviceGen> Cx<'_, G> {
                 });
                 return Ok(());
             }
+            Val::Rows { axis, rows, shape } => {
+                // Each row of the value, written to the row the offset names.
+                let format = rows.first().map(|(b, _)| b.format).ok_or(LiftError::Malformed {
+                    op: op.op_type,
+                    what: "a tile has rows",
+                })?;
+                let input = self.operand(op, &value, &shape, format)?;
+                for (k, (base, gather)) in rows.into_iter().enumerate() {
+                    let space = base.view.shape();
+                    let row = Self::row_of(&input.view, axis, k as u64, &space)
+                        .map_err(|error| LiftError::View { op: op.op_type, error })?;
+                    self.note_param(base.store, base.format);
+                    self.graph.nodes.push(Node {
+                        func: OpFunc::Identity,
+                        space,
+                        inputs: vec![Operand { view: row, ..input.clone() }],
+                        output: Operand { gather: Some(gather), ..base },
+                    });
+                }
+                return Ok(());
+            }
             _ => {
                 return Err(LiftError::Malformed {
                     op: op.op_type,
@@ -761,6 +853,15 @@ impl<G: DeviceGen> Cx<'_, G> {
             },
         });
         Ok(())
+    }
+
+    /// Row `k` of `v` along `axis`, seen as `space`.
+    fn row_of(v: &View, axis: usize, k: u64, space: &[u64]) -> Result<View, ViewError> {
+        let mut at = vec![0u64; v.axes.len()];
+        at[axis] = k;
+        let mut one = v.shape();
+        one[axis] = 1;
+        v.window(&at, &one)?.reshape(space)
     }
 
     fn note_param(&mut self, store: Store, format: DataFormat) {
@@ -906,7 +1007,22 @@ impl<G: DeviceGen> Cx<'_, G> {
                 let Val::Mem { store, view, format } = self.get(op.operands[0])? else {
                     return Err(malformed("an access tile windows a memory view"));
                 };
-                let shape = Self::shape(op)?;
+                // A tile read in another order states its shape in that order: the window is the
+                // memory-order block, read permuted.
+                let order = Self::coordinate_order(op)?;
+                let shape = {
+                    let stated = Self::shape(op)?;
+                    match &order {
+                        Some(o) => {
+                            let mut block = vec![0u64; stated.len()];
+                            for (i, &a) in o.iter().enumerate() {
+                                block[a] = stated[i];
+                            }
+                            block
+                        }
+                        None => stated,
+                    }
+                };
                 let mut corner = Vec::with_capacity(op.operands.len() - 1);
                 let mut dynamic = None;
                 for (a, &s) in op.operands[1..].iter().enumerate() {
@@ -919,15 +1035,22 @@ impl<G: DeviceGen> Cx<'_, G> {
                         _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                     }
                 }
-                let v = match dynamic {
-                    None => Val::Mem {
-                        store,
-                        view: view
+                let v = match (dynamic, order) {
+                    (None, order) => {
+                        let window = view
                             .window(&corner, &shape)
-                            .map_err(|error| LiftError::View { op: op.op_type, error })?,
-                        format,
-                    },
-                    Some((a, index, scale, add)) => self.block_tile(op, (store, &view, format), (&corner, &shape), (a, index, scale, add))?,
+                            .map_err(|error| LiftError::View { op: op.op_type, error })?;
+                        let view = match order {
+                            Some(o) => window.permute(&o).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                            None => window,
+                        };
+                        Val::Mem { store, view, format }
+                    }
+                    (Some(_), Some(_)) => return Err(LiftError::DynamicIndex { op: op.op_type }),
+                    (Some((a, index, 1, add)), None) if shape[a] > 1 => {
+                        self.row_tiles(op, (store, &view, format), (&corner, &shape), (a, index, add))?
+                    }
+                    (Some((a, index, scale, add)), None) => self.block_tile(op, (store, &view, format), (&corner, &shape), (a, index, scale, add))?,
                 };
                 self.bind(op, v);
             }
@@ -967,23 +1090,45 @@ impl<G: DeviceGen> Cx<'_, G> {
                         let view = out.view.reshape(&shape).map_err(|error| LiftError::View { op: op.op_type, error })?;
                         Val::Tensor(Operand { view, ..out })
                     }
+                    Val::Rows { axis, rows, shape } => {
+                        // Each row the offset names, copied into its row of one tile.
+                        let format = rows.first().map(|(b, _)| b.format).ok_or(malformed("a tile has rows"))?;
+                        let out = self.local(&shape, format, false);
+                        for (k, (base, gather)) in rows.into_iter().enumerate() {
+                            let value = Operand { gather: Some(gather), ..base };
+                            let space = value.view.shape();
+                            let row = Self::row_of(&out.view, axis, k as u64, &space)
+                                .map_err(|error| LiftError::View { op: op.op_type, error })?;
+                            self.graph.nodes.push(Node {
+                                func: OpFunc::Identity,
+                                space,
+                                inputs: vec![value],
+                                output: Operand { view: row, ..out.clone() },
+                            });
+                        }
+                        Val::Tensor(out)
+                    }
                     _ => return Err(malformed("ktdp.load reads an access tile")),
                 };
                 self.bind(op, v);
             }
             K::KtdpStore => self.store(op)?,
             K::TensorSplat => {
-                let value = match self.get(op.operands[0])? {
-                    Val::Float(f) => f,
-                    Val::Int(i) => i as f64,
+                let shape = Self::shape(op)?;
+                let v = match self.get(op.operands[0])? {
+                    Val::Float(value) => Val::Splat { value, format: Self::format(op)?, shape },
+                    Val::Int(i) => Val::Splat { value: i as f64, format: Self::format(op)?, shape },
+                    // A value read from memory repeats its one element over every axis.
+                    Val::Tensor(o) | Val::Dyn { index: o, scale: 1, add: 0 } if o.view.numel() == 1 => {
+                        let axes = shape.iter().map(|&extent| Axis { extent, stride: 0 }).collect();
+                        Val::Tensor(Operand { view: View { offset: o.view.offset, axes, tile: None }, ..o })
+                    }
                     _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                 };
-                let v = Val::Splat { value, format: Self::format(op)?, shape: Self::shape(op)? };
                 self.bind(op, v);
             }
             K::TensorEmpty => {
-                let v = Val::Empty { format: Self::format(op)?, shape: Self::shape(op)? };
-                self.bind(op, v);
+                self.bind(op, Val::Empty);
             }
             K::LinalgFill => {
                 let value = match self.get(op.operands[0])? {

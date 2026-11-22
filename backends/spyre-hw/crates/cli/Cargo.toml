@@ -31,6 +31,8 @@ spyre-hw = [
 ]
 # THE EMULATOR — a sibling of the card, not its absence.
 spyre-emu = ["scratchy-target-spyre-worker/spyre-emu"]
+# THE BUILD'S KV POOL: fp8 E4M3 pages.
+kv-fp8 = ["scratchy-target-spyre-worker/kv-fp8"]
 # THE ZERO-ALLOC PROOF INSTRUMENT: registers flex-rs's `CensusAllocator` as this
 # binary's global allocator (main.rs) and turns on the serving loop's census
 # window (the worker's and card crate's features of the same name). Run a serve

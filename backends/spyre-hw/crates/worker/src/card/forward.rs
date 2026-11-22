@@ -202,7 +202,7 @@ pub(crate) struct SamplerLaws<'a> {
     // ONLY where the card cannot have: a request's first step on a rung session, a churned seat, a
     // rung switch. `SeedSource::OnCard` is that statement — a stable seating — and binds nothing.
     // A prompt chunk's rows are the prompt's own tokens, always `Host`.
-    pub(crate) seeds: ktir_superdsc::sdsc_abstract::SeedSource<'a>,
+    pub(crate) seeds: scratchy_spyre_bundle::rung::SeedSource<'a>,
     pub(crate) want_logits: LogitsWanted,
     // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the suffix's sampler picks
     // for, staged before anything runs. A middle prompt chunk's suffix never runs, so the value it
@@ -227,7 +227,7 @@ pub(crate) fn run_card_launch(
     sh: &Shared<'_>,
     pf: &mut SuperDscSession,
     b: &BundleMeta,
-    width: ktir_superdsc::sdsc_abstract::RungWidth,
+    width: scratchy_spyre_bundle::rung::RungWidth,
     sampler: SamplerLaws<'_>,
 ) -> ExecutorResult<BatchOut> {
     let SamplerLaws {
@@ -313,7 +313,7 @@ pub(crate) fn run_card_launch(
     // `OnCard` launch binds none: its seeds are the card's own ChainStage writes, which only a
     // decode-phase bundle's tape reads.
     let tokens: Vec<usize> = match seeds {
-        ktir_superdsc::sdsc_abstract::SeedSource::Host(t) => {
+        scratchy_spyre_bundle::rung::SeedSource::Host(t) => {
             if t.len() != live {
                 return Err(werr(format!(
                     "card launch: {} seed token(s) for {live} live row(s) — one per live row",
@@ -322,7 +322,7 @@ pub(crate) fn run_card_launch(
             }
             (0..mq).map(|r| t[rows_in.live_of(r)]).collect()
         }
-        ktir_superdsc::sdsc_abstract::SeedSource::OnCard => {
+        scratchy_spyre_bundle::rung::SeedSource::OnCard => {
             if matches!(
                 b.wiring.phase,
                 scratchy_target_spyre::forward_tape::ForwardPhase::Prefill
@@ -344,7 +344,7 @@ pub(crate) fn run_card_launch(
     // The stick-padded row count the constants' tables are laid at — whole
     // fp16 sticks, the pool's own `POOL_STICK` (the emitter's own pad law),
     // never a literal 64.
-    let stick = ktir_superdsc::sdsc_abstract::POOL_STICK as usize;
+    let stick = scratchy_spyre_bundle::rung::POOL_STICK as usize;
     let mq_pad = mq.div_ceil(stick) * stick;
     if h % stick != 0 {
         return Err(werr(format!(
@@ -374,8 +374,8 @@ pub(crate) fn run_card_launch(
         // an `OnCard` launch passes `None` and the launcher's ChainSeed steps stage nothing. A
         // prompt chunk's tape has no ChainSeed step, so `Some` there is inert.
         chain_seeds: match seeds {
-            ktir_superdsc::sdsc_abstract::SeedSource::Host(_) => Some(&tokens[..]),
-            ktir_superdsc::sdsc_abstract::SeedSource::OnCard => None,
+            scratchy_spyre_bundle::rung::SeedSource::Host(_) => Some(&tokens[..]),
+            scratchy_spyre_bundle::rung::SeedSource::OnCard => None,
         },
         positions: &positions,
         consts: &consts,
@@ -1116,7 +1116,7 @@ fn log_decode_top2(
     tid: u32,
 ) {
     const FP16_ELEMS_PER_STICK: usize =
-        <ktir_superdsc::superdsc_opspec::Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        scratchy_spyre_bundle::rung::FP16_LANES
             as usize;
     for r in 0..rows {
         // Top AND second — the margin a pick won by is the fact that decides
@@ -1124,7 +1124,7 @@ fn log_decode_top2(
         let mut best = (0usize, f32::NEG_INFINITY);
         let mut second = f32::NEG_INFINITY;
         for j in 0..vocab {
-            let e = ktir_superdsc::sdsc_abstract::dev_off_stk(
+            let e = scratchy_spyre_bundle::rung::dev_off_stk(
                 &[rows, pad_vocab],
                 1,
                 &[r, j],
@@ -1315,7 +1315,7 @@ fn log_seat_readback(
     };
     let pad_v = seat.pad_vocab as usize;
     let vocab = seat.vocab as usize;
-    let stk = <ktir_superdsc::superdsc_opspec::Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+    let stk = scratchy_spyre_bundle::rung::FP16_LANES
         as usize;
     let mut argmax: Vec<(usize, u32, f32, f32)> = Vec::with_capacity(report.len());
     match session.read_tensor_raw(
@@ -1332,7 +1332,7 @@ fn log_seat_readback(
                 let mut second = f32::NEG_INFINITY;
                 for j in 0..vocab {
                     let e =
-                        ktir_superdsc::sdsc_abstract::dev_off_stk(&[rows, pad_v], 1, &[r, j], stk);
+                        scratchy_spyre_bundle::rung::dev_off_stk(&[rows, pad_v], 1, &[r, j], stk);
                     let o = e * 2;
                     if let Some(v) = b.get(o..o + 2) {
                         let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
@@ -1471,7 +1471,7 @@ pub(crate) fn superdsc_forward_chunk(
             .collect::<ExecutorResult<Vec<usize>>>()?;
         let last = pos + real == end;
         let finishes = last && end >= tokens.prompt_len(id);
-        let rung = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(width as u32)
+        let rung = scratchy_spyre_bundle::rung::RungWidth::of_baked_rows(width as u32)
             .ok_or_else(|| werr("superdsc prefill: the selected rung has zero rows".to_string()))?;
         let out = run_card_launch(
             LaunchRows::Sequence {
@@ -1488,7 +1488,7 @@ pub(crate) fn superdsc_forward_chunk(
             pmeta,
             rung,
             SamplerLaws {
-                seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&chunk_toks),
+                seeds: scratchy_spyre_bundle::rung::SeedSource::Host(&chunk_toks),
                 want_logits: if finishes {
                     LogitsWanted::LastRow
                 } else {
@@ -1576,7 +1576,7 @@ pub(crate) fn superdsc_forward_packed(
     // take request `r`'s tokens ([`LaunchRows::live_of`]'s window law).
     let seeds: Vec<usize> = tails.iter().flat_map(|t| t.toks.iter().copied()).collect();
     let draws: Vec<Option<&SampledDraw>> = tails.iter().map(|t| t.draw.as_ref()).collect();
-    let width = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows((w * s) as u32)
+    let width = scratchy_spyre_bundle::rung::RungWidth::of_baked_rows((w * s) as u32)
         .ok_or_else(|| werr("the packed rung bakes zero rows".to_string()))?;
     let picked = match run_card_launch(
         LaunchRows::Packed {
@@ -1588,7 +1588,7 @@ pub(crate) fn superdsc_forward_packed(
         meta,
         width,
         SamplerLaws {
-            seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&seeds),
+            seeds: scratchy_spyre_bundle::rung::SeedSource::Host(&seeds),
             want_logits: LogitsWanted::LastRow,
             laws: SeatLaws::Packed { draws: &draws },
         },

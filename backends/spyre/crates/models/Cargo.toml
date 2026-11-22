@@ -25,6 +25,8 @@ superdsc-dump = []
 # cargo does not unify its dependencies' features with the binary's — so the runtime's
 # `scratchy-target-spyre` is named here too, or its `Build` stays a world of one while the bake
 # shards for `N`. The baked code asserts the two agree (`SUPERDSC_TP`).
+# THE BUILD'S KV POOL: fp8 E4M3 pages, in the bake and in the runtime's copy alike.
+kv-fp8 = ["scratchy-target-spyre-compiler/kv-fp8", "scratchy-target-spyre/kv-fp8"]
 tp-2 = ["scratchy-target-spyre-compiler/tp-2", "scratchy-target-spyre/tp-2"]
 tp-4 = ["scratchy-target-spyre-compiler/tp-4", "scratchy-target-spyre/tp-4"]
 tp-8 = ["scratchy-target-spyre-compiler/tp-8", "scratchy-target-spyre/tp-8"]
