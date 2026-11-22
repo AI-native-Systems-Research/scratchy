@@ -26,13 +26,6 @@ kernels):
   `INV_D = 1/D` folded on the host).
 * GRID: `[1]`.
 
-THE DOOR'S OWN FACTS (`ktir_superdsc::windowed_rmsnorm`): `m =` the output's
-rows, `full =` the output view's `v_cols`, `D =` the FIRST access tile's width
-(one head's window), `heads = full / D` — so the descriptors state the FULL
-`[M, HEADS·D]` storage with a `[M, D]` block at each head's column corner. A
-nonzero GAIN OFFSET is stated to the door the same way the epsilon is: the
-program's gamma leg adds it over the load, and the door resolves the value's
-`[1,1]` registry slot and emits the add ahead of the gain multiply.
 """
 
 import triton

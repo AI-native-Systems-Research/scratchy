@@ -4,13 +4,7 @@ logit softcap.
 
 BODY PROVENANCE: main's `KtirFunc::tanhsoftcap` — the splatted cap feeds ONE
 `arith.divf`, the tanh runs on the quotient, and the SAME splat multiplies the
-tanh's result back up: `splat(cap) → divf → tanh → mulf`. The cap reaching the
-program as ONE splat feeding the divide and ONE feeding the multiply is not
-stylistic — the consumer's `program_tanhsoftcap_cap` reads the cap OFF THE
-PROGRAM (every `math.tanh` root's feeding `arith.divf` must carry exactly one
-`splat(constant)` operand, and every root must agree), so folding either use
-away, or spelling the cap a second way, would desync the program from the cap
-the door reads.
+tanh's result back up: `splat(cap) → divf → tanh → mulf`.
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
 
@@ -22,10 +16,6 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   refuses `cap <= 0`).
 * GRID: `[1]`.
 
-THE DOOR'S OWN FACTS (`ktir_superdsc::tanhsoftcap`): `cols = out.c_len` — the
-FIRST access tile's width — through `check_pointwise_cols`, so every block
-states the region's full width and the door pads the device width itself,
-exactly as it does for the builder's logical one.
 
 ⛔ THE TANH ISLAND, FORCED AND THEN COLLAPSED — `tl.tanh` is
 `@_check_dtype(["fp32", "fp64"])` in `python/triton/language/math.py` (the same
@@ -43,8 +33,7 @@ while decode (m=1) never does. `N_BLOCKS` full `[BLOCK_M, N]` tiles
 (BLOCK_M = the builder's own `rows_per_block(cols, 3)`) plus a `[TAIL_H, N]`
 tail tile when the region does not divide evenly. The trip count is constexpr,
 so `to_ktir` unrolls it and the spliced program is straight-line with one
-constant-corner tile per block — the door folds those through `Region::r_cover`
-and ONE descriptor spans all of them.
+constant-corner tile per block.
 """
 
 import triton

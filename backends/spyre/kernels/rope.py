@@ -11,16 +11,13 @@ which, written per half (x1 = x[..., :d//2], x2 = x[..., d//2:]), is
     out1 = x1 * cos - x2 * sin
     out2 = x2 * cos + x1 * sin
 
-THE SPLICE'S CONTRACT — the door (`ktir_superdsc_door::rope`) derives the node's facts
-from the program's own views and access tiles, so the kernel states them:
+THE SPLICE'S CONTRACT — the kernel states the node's facts in its own views and access tiles:
 
 * the x/out descriptors are `[MQ * H, HEAD_DIM]` — the WORKER's staging. Main's
   `KtirFunc::rope` views x as `[rows*heads, hd]` over the same bytes, so the view extents
   agree.
-* ONE ACCESS TILE PER POSITION, `[H, HALF]` — the door reads `heads` off the FIRST access
-  tile's row extent (`Region::r_len`) and `mq` as `v_rows / heads`, so a whole-tensor
-  tile would state `heads = MQ*H` and mis-derive everything. Main's builder program
-  takes exactly these tiles (main's `KtirFunc::rope`'s `tile(x_view, ri*heads, 0, heads, half)`).
+* ONE ACCESS TILE PER POSITION, `[H, HALF]`, the tiles main's builder program takes
+  (`KtirFunc::rope`'s `tile(x_view, ri*heads, 0, heads, half)`).
 * ONE WORK ITEM (grid `[1]`) with the position loop UNROLLED by the ladder
   (`to_ktir::unroll_constant_trip_loops`): constant-trip `tl.range(0, MQ, 1)`, each trip
   a copy of the per-position body. The spliced program is straight-line, like the
@@ -28,9 +25,7 @@ from the program's own views and access tiles, so the kernel states them:
 * cos/sin: the worker stages per-position head-tilled rows (`spyre_forward.rs`'s `tile`
   over `rope_cos_sin`), so element (p, h*hd+d) sits at `p*total + h*hd + d` — the
   `[MQ*H, HEAD_DIM]` head-replicated view, read at the position's OWN row base. The
-  fixture's `stage_table` (delta 8) is the same bytes; the door's "NOT THE COS VIEW"
-  trap does not bite here because `rope_at` derives its extents from `mq`/`total`, not
-  from the cos parameter's view.
+  fixture's `stage_table` (delta 8) is the same bytes.
 
 THE ROW ORDER, kept from the fixture (delta 7, measured): row = position * H + head,
 TOKEN-MAJOR, which is `addr_eq`'s same-bytes reshape of the worker's `[mq, heads*hd]`

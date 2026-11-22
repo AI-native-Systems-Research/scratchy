@@ -22,11 +22,6 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 * CONSTEXPRS: `M`, `N` — stated by the splice from the node's own region.
 * GRID: `[1]`.
 
-THE DOOR'S OWN FACTS (`ktir_superdsc::scalarweightmul`): it reads the operands'
-NAMES (the weight is the second, broadcast `In::scalar`-style), so the rung-3
-`[1, 1]` view is the weight's whole stated storage — the door's one-stick `rb`
-read, the card's lane-0 spray, and the emulator's splat (which takes the load
-tile's FIRST flat element) all read the one staged value.
 """
 
 import triton

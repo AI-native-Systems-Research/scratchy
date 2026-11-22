@@ -19,10 +19,6 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   on the host), exactly `rmsnorm.py`'s set minus the weight.
 * GRID: `[1]`.
 
-THE DOOR'S OWN FACTS (`ktir_superdsc::rmsnorm_unit`): `cols = out.c_len` and the
-epsilon off the program (`program_rmsnorm_eps`: ONE sqrt/rsqrt root feeding the
-addf that carries the eps splat), so the kernel states one whole-region
-`[M, D_MODEL]` tile at corner 0 and the chain the reader walks.
 """
 
 import triton
