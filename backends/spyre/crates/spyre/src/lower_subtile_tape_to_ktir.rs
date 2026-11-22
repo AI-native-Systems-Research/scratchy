@@ -742,6 +742,20 @@ pub(crate) fn lower_one_node<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
         | SubOp::DraftWindowStore
         | SubOp::DraftWindowLoad
         | SubOp::DraftSelect => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // ⭐ THE TOKEN DRAW — one kernel, spliced like every other: the logits rows, the per-row
+        // seat words and reciprocal temperature (per-step operands the runtime binds), the
+        // vocab-derived tables (tape sources staged at load), the idx stick out. `lower_all`: a
+        // prefill rung's draw reads the folded tail's answer rows, `lower_all`'s machinery.
+        //
+        // ⭐ THE CHAINED HEAD'S PAIR — spliced like the draw: the stage decomposes the device's
+        // pick into the next step's gather indices, and the gather reads the embedding row the pick
+        // names out of the tied table, so the step's token never leaves the card.
+        SubOp::Sample { .. } | SubOp::EmbedRowGather { .. } | SubOp::ChainStage { .. } => {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+                Ok(ops) => Ops(ops),
+                Err(reason) => Unhandled(reason),
+            }
+        }
         // ── THE 2a KINDS — every one through `lower_all`: the TanhSoftCap logits fold
         // and the head-norm sandwich's three seats (Reshape split / norm middle /
         // Reshape flatten) are `lower_all`'s interceptions, and every other node of
@@ -1016,6 +1030,16 @@ pub struct BundleWiring {
     /// double-applies the scale. (An attention-scale fold's node is NOT host-routed — it still
     /// runs, at the scale 1.0 the same arm rewrote it to.)
     pub weight_scale_folds: Vec<(u32, f32)>,
+    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer this graph's own
+    /// producer minted below the `SourceBinding` layer ([`load_consts_of_ir`], the one derivation
+    /// the numeric gate reads too). The worker stages each ONCE at load through the kind's builder.
+    pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
+    /// ⭐ THE SAMPLER'S PER-STEP SEAT — `Some` exactly when the graph carries the minted `Sample`
+    /// node ([`sample_seat_of_ir`]).
+    pub sample_seat: Option<crate::wiring::SampleSeat>,
+    /// ⭐ THE CHAINED HEAD'S STICK FACT — [`crate::wiring::ChainFact::Chained`] iff the mint
+    /// spliced the EmbedRowGather/ChainStage pair into this graph ([`chain_of_ir`]).
+    pub chain: crate::wiring::ChainFact,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -1276,9 +1300,210 @@ pub fn graph_wiring<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
             .collect(),
+        load_consts: load_consts_of_ir(ir)?,
+        sample_seat: sample_seat_of_ir(ir)?,
+        chain: chain_of_ir(ir)?,
     })
 }
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ THE SAMPLER'S PER-STEP SEAT, read off the minted `Sample` node alone — the one derivation
+/// ([`crate::wiring::SampleSeat`] names the contract; the expansion's source gate and the worker's
+/// per-step bind read the class, never the node). `None` on a graph the mint did not touch; a
+/// second minted node is a build error, never last-write-wins.
+pub fn sample_seat_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Option<crate::wiring::SampleSeat>, SuperDscError> {
+    let Some(node) = the_sample(ir)? else {
+        return Ok(None);
+    };
+    let SubOp::Sample { vocab, rows } = node.op else {
+        unreachable!("the_sample answers a Sample")
+    };
+    let seed_words: [u32; 4] = std::array::from_fn(|k| {
+        let word = node.inputs[1 + k].tensor;
+        assert_eq!(
+            ir.tensors[word.index()].cols,
+            1,
+            "the seed word table t{} is not one word per row — the mint and the seat disagree on \
+             the seed's shape",
+            word.index()
+        );
+        word.index() as u32
+    });
+    Ok(Some(crate::wiring::SampleSeat {
+        seed_words,
+        invt: node.inputs[5].tensor.index() as u32,
+        rows,
+        row: node.inputs[0].tensor.index() as u32,
+        vocab,
+        pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
+        // The idx stick is `[rows, SAMPLE_BLOCK]`, its rows dense at its own width.
+        idx_row_words: ir.tensors[node.output.tensor.index()].cols,
+    }))
+}
+
+/// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer the graph's own producer
+/// minted below the `SourceBinding` layer: the sampler's twenty tables (its node's inputs past the
+/// row, the four seed words and the temperature, which are per-step operands and never here) and
+/// the chained head's two decompose tables (its stage's inputs past the pick and the sticks). The
+/// one derivation the wiring, the placement's resident set and the numeric gate read.
+pub fn load_consts_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
+    let mut consts = Vec::new();
+    if let Some(node) = the_sample(ir)? {
+        let SubOp::Sample { vocab, rows } = node.op else {
+            unreachable!("the_sample answers a Sample")
+        };
+        let arrangements = sample_table_arrangements(node, ir)?;
+        for (tr, operand) in node.inputs[6..].iter().zip(1u8..) {
+            let tid = tr.tensor.index() as u32;
+            consts.push((
+                tid,
+                crate::wiring::LoadConst::SampleTable {
+                    vocab,
+                    rows,
+                    operand,
+                    arrangement: arrangements
+                        .get(&tid)
+                        .copied()
+                        .unwrap_or(crate::wiring::ElementArrangement::Standard),
+                },
+            ));
+        }
+    }
+    if let Some(ChainPair { stage, gather }) = the_chain(ir)? {
+        let SubOp::ChainStage { table_rows, .. } = stage.op else {
+            unreachable!("the_chain answers a ChainStage")
+        };
+        let block = ir.shape(gather.inputs[2].tensor).cols;
+        consts.extend(stage.inputs[3..5].iter().zip(1u8..).map(|(tr, operand)| {
+            (
+                tr.tensor.index() as u32,
+                crate::wiring::LoadConst::ChainStageTable {
+                    table_rows,
+                    block,
+                    operand,
+                },
+            )
+        }));
+    }
+    Ok(consts)
+}
+
+/// ⭐ THE CHAINED HEAD'S STICK FACT — the two persistent sources the `ChainStage` WRITES each step
+/// and the `EmbedRowGather` READS the next (the stage's inputs 1 and 2), the row the chain
+/// replaced (the gather's own `replaces`) and the table columns the gather reads (its matrix
+/// operand's stated width) — all the mint's own statements, read once. `Unchained` is every graph
+/// the mint did not touch.
+pub fn chain_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<crate::wiring::ChainFact, SuperDscError> {
+    let Some(ChainPair { stage, gather }) = the_chain(ir)? else {
+        return Ok(crate::wiring::ChainFact::Unchained);
+    };
+    let SubOp::EmbedRowGather { replaces, .. } = gather.op else {
+        unreachable!("the_chain answers an EmbedRowGather")
+    };
+    Ok(crate::wiring::ChainFact::Chained {
+        chain: crate::wiring::ChainWiring {
+            s_src: stage.inputs[1].tensor.index() as u32,
+            l_src: stage.inputs[2].tensor.index() as u32,
+            replaces: replaces.index() as u32,
+            block: ir.shape(gather.inputs[2].tensor).cols,
+        },
+    })
+}
+
+/// The chained head's two minted nodes.
+struct ChainPair<'g, F: RopeForm> {
+    stage: &'g SubtileNode<F>,
+    gather: &'g SubtileNode<F>,
+}
+
+/// The graph's minted chained-head pair: `None` when the mint did not run, an error when it ran
+/// twice or left one half.
+fn the_chain<F: RopeForm>(ir: &SubtileIR<F>) -> Result<Option<ChainPair<'_, F>>, SuperDscError> {
+    let of = |want: fn(&SubOp<F>) -> bool| -> Vec<&SubtileNode<F>> {
+        ir.nodes.iter().filter(|n| want(&n.op)).collect()
+    };
+    let stages = of(|o| matches!(o, SubOp::ChainStage { .. }));
+    let gathers = of(|o| matches!(o, SubOp::EmbedRowGather { .. }));
+    match (&stages[..], &gathers[..]) {
+        ([], []) => Ok(None),
+        ([stage], [gather]) => Ok(Some(ChainPair { stage, gather })),
+        _ => Err(SuperDscError(format!(
+            "{} ChainStage and {} EmbedRowGather nodes in one graph — the mint splices exactly \
+             one pair into a rung",
+            stages.len(),
+            gathers.len()
+        ))),
+    }
+}
+
+/// ⭐ THE ARRANGEMENT EACH OF THE DRAW'S TABLES IS STAGED IN — off the draw's own lowered program
+/// ([`spyre_superdsc::arrangement::staged_arrangements`], which reads the device-facts table's
+/// widen row): a table the program reads lane-for-lane beside a widened value is staged in the
+/// widen's lane order. The program is the splice's own for this node, planned with no layouts (the
+/// tables are activation-segment sources, held as their views state).
+fn sample_table_arrangements<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<std::collections::BTreeMap<u32, crate::wiring::ElementArrangement>, SuperDscError> {
+    let e = scratchy_triton_splice::lower::<scratchy_spyre_bundle::collective::TpWorld<1>, F>(
+        node, ir, false,
+    )
+    .map_err(SuperDscError)?;
+    let k = &e.ktir;
+    let planned = spyre_superdsc::plan::<ktir_core::ddl_binds::Baked>(
+        &k.func,
+        &vec![None; k.func.arguments.len()],
+    )
+    .map_err(|err| SuperDscError(format!("the draw's program: {err:?}")))?;
+    let tables: std::collections::HashSet<u32> = node.inputs[6..]
+        .iter()
+        .map(|tr| tr.tensor.index() as u32)
+        .collect();
+    let tids: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
+    let staged: Vec<bool> = tids.iter().map(|t| tables.contains(t)).collect();
+    let arrangements = spyre_superdsc::arrangement::staged_arrangements::<
+        ktir_core::ddl_binds::Baked,
+    >(&planned.graph, &staged)
+    .map_err(|err| {
+        SuperDscError(format!(
+            "the draw's program cannot hold one lane order per buffer: {err:?}"
+        ))
+    })?;
+    Ok(tids.into_iter().zip(arrangements).collect())
+}
+
+/// The graph's one minted `Sample` node: `None` when the mint did not run, an error when two did.
+fn the_sample<F: RopeForm>(ir: &SubtileIR<F>) -> Result<Option<&SubtileNode<F>>, SuperDscError> {
+    let mut mints = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::Sample { .. }));
+    match (mints.next(), mints.next()) {
+        (Some(_), Some(_)) => Err(SuperDscError(
+            "two Sample nodes in one graph — the mint appends exactly one to a rung; a second \
+             means two mints ran over one graph"
+                .to_string(),
+        )),
+        (node, _) => {
+            if let Some(n) = node {
+                assert_eq!(
+                    n.inputs.len(),
+                    26,
+                    "the Sample node's arity is the registry's own row (logits + four seed word \
+                     tables + inv_t + twenty tables)"
+                );
+            }
+            Ok(node)
+        }
+    }
+}
+
 /// ⭐ THE RESULT'S OWN DTYPE, from the RESULT PRODUCER'S OWN KERNEL SIGNATURE —
 /// the same `operand_dfs` authority the placement widths already read (the
 /// registry's operand-order contract zips the kernel's buffer parameters with
@@ -1314,7 +1539,8 @@ pub fn result_dtype_of_ir<F: RopeForm>(
             spyre_superdsc::format::DataFormat::Fp16 => Ok(scratchy_tensors::DType::F16),
             spyre_superdsc::format::DataFormat::Fp32 => Ok(scratchy_tensors::DType::F32),
             spyre_superdsc::format::DataFormat::Fp8 => Ok(scratchy_tensors::DType::Fp8E4m3),
-            spyre_superdsc::format::DataFormat::UInt32 => Ok(scratchy_tensors::DType::I32),
+            spyre_superdsc::format::DataFormat::UInt32
+            | spyre_superdsc::format::DataFormat::Int32 => Ok(scratchy_tensors::DType::I32),
             spyre_superdsc::format::DataFormat::Int64 => Err(SuperDscError(
                 "the result's kernel states an int64 output, which no consumer reads back — \
                  state a dtype the readback knows (f16, f32, fp8, i32)"

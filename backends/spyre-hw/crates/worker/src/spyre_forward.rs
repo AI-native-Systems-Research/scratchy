@@ -20,18 +20,22 @@ use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use scratchy_serving_worker::error::ExecutorResult;
 
-/// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the tokens the host drew from its answer rows' logits.
-/// One enum (not a bare `Vec`) because the shape is a fact of the step the caller must not be able
-/// to confuse with the model's other outs.
+/// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the tokens the card picked. One enum (not a bare `Vec`)
+/// because the shape is a fact of the step the caller must not be able to confuse with the
+/// model's other outs.
 pub(crate) enum ChunkOut {
-    /// A prompt-only forward: a mid-prompt chunk, whose answer row nobody reads.
+    /// A prompt-only forward: no launch in it picked, nothing to sample. The first generated token
+    /// is picked by the prompt-final chunk's own minted draw.
     Prompt,
-    /// One drawn token per answer row of the chunk, in row order.
+    /// TOKENS THE DEVICE PICKED, one per answer row, in row order — the minted sampler's idx stick,
+    /// read back raw: the only pick that exists, on the card and on the emulator alike. The shared
+    /// readers go through [`ChunkOut::minted_pick`], so no reader names the variant.
     Tokens(Vec<u32>),
 }
 
 impl ChunkOut {
-    /// The chunk's drawn tokens — `None` for a chunk that answered nothing.
+    /// ⭐ THE CHUNK'S OWN MINTED PICKS — the single door both shared pick readers go through.
+    /// `None` is every chunk that picked nothing (a mid-prompt chunk: its suffix never runs).
     pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
         match self {
             ChunkOut::Tokens(ts) => Some(ts),
@@ -40,10 +44,11 @@ impl ChunkOut {
     }
 }
 
-/// ⭐ ONE ROW'S DRAW LAW — what an answer row draws. `None` is the greedy law. `Some` is that row's
-/// request's draw, and the STEP SALT is the row's ABSOLUTE position — the one input that changes
-/// every launch of one generation, so the same seed draws afresh at every position instead of
-/// repeating one pick.
+/// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is the greedy law: the
+/// seed quadruple `(0, 0, 0, 0)` and `inv_t = 1.0`. `Some` is that row's request's draw, and the
+/// STEP SALT is the row's ABSOLUTE position — the one input that changes every launch of one
+/// generation, so the same seed draws different noise at every position instead of repeating one
+/// pick.
 pub(crate) struct RowLaw<'a> {
     pub(crate) draw: Option<&'a SampledDraw>,
     /// The row's absolute position — its request's own token count at this
@@ -51,59 +56,70 @@ pub(crate) struct RowLaw<'a> {
     pub(crate) step: u32,
 }
 
-/// ⭐ THE HOST DRAW — row `r`'s token from its logits under `law`: the first arg-max at the
-/// greedy law, else the Gumbel-max draw from `softmax(logits · inv_t)` — its noise a pure function
-/// of the request's seed, the row's step and the lane, so a seeded request replays and the same
-/// seed draws afresh at every position. A row with no logit but NaN answers nothing, and is refused
-/// by name rather than served a token the model never chose.
-pub(crate) fn draw_token(
-    r: usize,
-    logits: impl IntoIterator<Item = f32>,
-    law: &RowLaw<'_>,
-) -> ExecutorResult<u32> {
-    let score = |lane: usize, x: f32| -> f64 {
-        match law.draw {
-            None => f64::from(x),
-            Some(d) => f64::from(x) * f64::from(d.inv_t) + gumbel(d.seed, law.step, lane as u32),
-        }
-    };
-    logits
-        .into_iter()
-        .enumerate()
-        .filter(|(_, x)| !x.is_nan())
-        .map(|(lane, x)| (lane, score(lane, x)))
-        .fold(None, |best: Option<(usize, f64)>, (lane, s)| match best {
-            Some((_, b)) if b >= s => best,
-            _ => Some((lane, s)),
-        })
-        .map(|(lane, _)| lane as u32)
-        .ok_or_else(|| {
-            werr(format!(
-                "row {r}'s logits are NaN in every lane — no token to draw"
-            ))
-        })
+/// ⭐ ONE ROW'S SEAT WORDS — the seed quadruple `(seed_lo, seed_hi, step, gate)` and the inv_t this
+/// row's law stages, the ONE statement of the law both tiers lay out. Greedy is `(0, 0, 0, 0)` and
+/// 1.0 — the gate word's 0 IS the greedy law, `score = x·inv_t + g·0`. A sampled row is its
+/// request's seed split low/high, the row's step salt, the gate's 1 and the draw's own 1/T. ⭐ NO
+/// ROW WORD: the key is request-owned alone, identical in every row.
+pub(crate) fn seat_words(law: &RowLaw<'_>) -> ([i32; 4], f32) {
+    match law.draw {
+        Some(d) => (
+            [
+                d.seed as u32 as i32,
+                (d.seed >> 32) as u32 as i32,
+                law.step as i32,
+                1,
+            ],
+            d.inv_t,
+        ),
+        None => ([0; 4], 1.0),
+    }
 }
 
-/// The elements between two logits rows as the device holds them: the vocab in whole fp16
-/// sticks, the activation row law ([`scratchy_spyre_bundle::rung::row_pitch`]) the lm-head's
-/// output view states.
-pub(crate) fn logits_pitch(vocab: usize) -> usize {
-    scratchy_spyre_bundle::rung::row_pitch(
-        vocab as u64,
-        u64::from(scratchy_spyre_bundle::rung::FP16_LANES),
-    ) as usize
+/// The idx stick's word for row `r`, checked into a token — both tiers' readbacks end here. A
+/// negative word is not a token id, and one at or past `vocab` is the sampler's sentinel (the
+/// all-NaN row's answer), never a token.
+pub(crate) fn token_of_idx_word(r: usize, w: i32, vocab: usize) -> ExecutorResult<u32> {
+    let t = u32::try_from(w).map_err(|_| {
+        werr(format!(
+            "the token draw for row {r} is {w} — not a token id"
+        ))
+    })?;
+    if t as usize >= vocab {
+        let why = if t == scratchy_subtile::subtile_ir::sample_sentinel(vocab as u32) {
+            "the sampler's all-NaN sentinel: the logits row was NaN in every lane"
+        } else {
+            "not the all-NaN sentinel either, so no answer the sampler gives"
+        };
+        return Err(werr(format!(
+            "the token draw for row {r} is {t} >= vocab {vocab} — {why}. \
+             Refusing rather than serving a token that does not exist."
+        )));
+    }
+    Ok(t)
 }
 
-/// Gumbel noise `-ln(-ln u)` for `lane` of a row at `step` under `seed`, `u ∈ (0, 1)` the
-/// splitmix64 finalizer of the three.
-fn gumbel(seed: u64, step: u32, lane: u32) -> f64 {
-    let mut z =
-        seed ^ ((u64::from(step) << 32) | u64::from(lane)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    let u = ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-    -(-u.ln()).ln()
+/// The idx stick's decode law, shared by the sync readback and the deferred collect so the two
+/// cannot drift: row `r`'s pick is word `r · idx_row_words` of the stick — the kernel's own dense
+/// `[rows, idx_row_words]` view (`idx_row_words` is the seat's typed fact). A word at or past the
+/// vocab is refused ([`token_of_idx_word`]).
+// The `test` arm makes the fn exist under `spyre-emu`, which has no `spyre-hw`.
+#[cfg(any(test, feature = "spyre-hw"))]
+pub(crate) fn decode_idx_stick(
+    bytes: &[u8],
+    rows: usize,
+    idx_row_words: usize,
+    vocab: usize,
+) -> ExecutorResult<Vec<u32>> {
+    (0..rows)
+        .map(|r| {
+            let off = r * idx_row_words * 4;
+            let word = bytes
+                .get(off..off + 4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            token_of_idx_word(r, word.unwrap_or(-1), vocab)
+        })
+        .collect()
 }
 
 /// What a [`forward_chunk`] runs: one request's chunk, the tokens `toks` at absolute positions
@@ -179,13 +195,13 @@ pub(crate) fn run_request_step(
     let chunk_w = n.max(1);
     #[cfg(not(feature = "spyre-hw"))]
     let chunk_w = b.m_cap;
-    // ⭐ THE PROMPT'S LAST TOKEN RUNS THROUGH PREFILL. The prompt-final chunk's folded lm-head
-    // row is read back and the host draws the first generated token from it, as it draws a
-    // decode launch's. No decode launch runs a prompt step, so the last prompt position's KV is
-    // prefill-written. A generation step (n==1) prefills nothing and takes the DECODE launch
-    // below — every generated token past the first is drawn from the decode bundle's logits. A
-    // mid-prompt wave (start+n still inside the prompt) forwards every token it was given and
-    // draws nothing.
+    // ⭐ THE PROMPT'S LAST TOKEN RUNS THROUGH PREFILL. The prompt-final chunk's own minted sampler
+    // (every prefill rung carries the draw) picks the first generated token ON THE CARD from the
+    // folded lm-head row, and the idx stick is read back exactly like a decode launch's. No decode
+    // launch runs a prompt step, so the last prompt position's KV is prefill-written. A generation
+    // step (n==1) prefills nothing and takes the DECODE pick launch below — every generated token
+    // past the first is the decode bundle's own draw. A mid-prompt wave forwards every token it
+    // was given and picks nothing: its chunks' suffixes never run.
     let finishes = start + n >= tokens.prompt_len(id);
     let prefill_n = if finishes && n > 1 {
         n
@@ -258,10 +274,14 @@ pub(crate) fn run_request_step(
         return Ok(None);
     }
     let tok = if n > 1 {
-        // The prompt-final chunk's draw.
-        prompt_pick.ok_or_else(|| werr("the prompt-final chunk drew no token".to_string()))?
+        // The prompt-final chunk's on-card pick. A `None` here means the final chunk never asked
+        // for its draw — a wiring bug, never a silent skip.
+        prompt_pick.ok_or_else(|| {
+            werr("the prompt-final chunk picked no token — its minted draw never ran".to_string())
+        })?
     } else {
-        // THE DRAW — from the decode launch's logits.
+        // THE PICK — on the card, through the decode bundle's sampler: the idx stick is the only
+        // answer that comes back.
         let db = select_decode(&model.decode, start + n);
         match forward_chunk(
             &sh,
@@ -280,10 +300,10 @@ pub(crate) fn run_request_step(
         {
             Some(ts) => *ts
                 .last()
-                .ok_or_else(|| werr("the decode launch drew no token".to_string()))?,
+                .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?,
             None => {
                 return Err(werr(
-                    "the decode launch answered nothing — a decode row is always answered"
+                    "the pick step ran no decode launch's draw — a decode row is always answered"
                         .to_string(),
                 ));
             }
@@ -294,56 +314,45 @@ pub(crate) fn run_request_step(
 }
 
 #[cfg(test)]
-mod draw_tests {
-    use super::{RowLaw, draw_token};
-    use crate::spyre_types::SampledDraw;
+mod idx_stick_tests {
+    use super::decode_idx_stick;
+    use scratchy_subtile::subtile_ir::sample_sentinel;
 
-    /// The greedy law answers the FIRST arg-max, past NaN lanes; a row of NaN answers nothing.
-    #[test]
-    fn the_greedy_draw_is_the_first_arg_max() {
-        let greedy = RowLaw {
-            draw: None,
-            step: 7,
-        };
-        assert_eq!(
-            draw_token(0, [0.5, 2.0, f32::NAN, 2.0, -1.0], &greedy).unwrap(),
-            1
-        );
-        assert_eq!(draw_token(0, [f32::NAN, -3.0], &greedy).unwrap(), 1);
-        assert!(draw_token(0, [f32::NAN; 4], &greedy).is_err());
+    /// The idx stick's row width in these fixtures.
+    const ROW_WORDS: usize = 64;
+
+    /// An idx stick as the kernel writes it: row r's pick in every one of its `ROW_WORDS` words,
+    /// rows dense.
+    fn stick(picks: &[u32]) -> Vec<u8> {
+        picks
+            .iter()
+            .flat_map(|&p| std::iter::repeat_n(p as i32, ROW_WORDS))
+            .flat_map(i32::to_le_bytes)
+            .collect()
     }
 
-    /// A sampled draw replays under its seed and step, moves with the step, and follows the
-    /// logits: a lane far above the rest wins every draw, and lanes of equal logits are each
-    /// drawn about as often.
+    /// The readback passes real picks and refuses the sampler's all-NaN sentinel, at granite's
+    /// vocab, solo and on a batched row; any other word past the vocab refuses too.
     #[test]
-    fn a_sampled_draw_is_a_function_of_seed_step_and_logits() {
-        let d = SampledDraw {
-            seed: 0x1234_5678_9abc_def0,
-            inv_t: 1.0,
-        };
-        let law = |step| RowLaw {
-            draw: Some(&d),
-            step,
-        };
-        let flat = [0.0f32; 4];
-        let picks: Vec<u32> = (0..4000)
-            .map(|s| draw_token(0, flat.iter().copied(), &law(s)).unwrap())
-            .collect();
+    fn the_readback_refuses_the_all_nan_sentinel_and_passes_a_real_pick() {
+        let vocab = 49155u32;
+        let v = vocab as usize;
         assert_eq!(
-            picks,
-            (0..4000)
-                .map(|s| draw_token(0, flat.iter().copied(), &law(s)).unwrap())
-                .collect::<Vec<_>>()
+            decode_idx_stick(&stick(&[12358, 0]), 2, ROW_WORDS, v).expect("two real picks"),
+            vec![12358, 0]
         );
-        for lane in 0..4u32 {
-            let n = picks.iter().filter(|&&p| p == lane).count();
-            assert!(
-                (800..1200).contains(&n),
-                "lane {lane} drawn {n} of 4000 times"
-            );
+        for picks in [
+            vec![sample_sentinel(vocab)],
+            vec![12358, sample_sentinel(vocab)],
+        ] {
+            let err = decode_idx_stick(&stick(&picks), picks.len(), ROW_WORDS, v)
+                .expect_err("the sentinel is never a token");
+            assert!(err.to_string().contains("all-NaN sentinel:"), "{err}");
         }
-        let peaked = [0.0f32, 40.0, 0.0, 0.0];
-        assert!((0..200).all(|s| draw_token(0, peaked, &law(s)).unwrap() == 1));
+        let err = decode_idx_stick(&stick(&[vocab]), 1, ROW_WORDS, v).expect_err("past the vocab");
+        assert!(
+            err.to_string().contains("not the all-NaN sentinel"),
+            "{err}"
+        );
     }
 }

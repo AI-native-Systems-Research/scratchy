@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use quote::quote;
 use scratchy_forward_compiler_frontend::classified::{OpKind, Program, WeightId};
+use scratchy_forward_compiler_macro::codegen::tie_word_embeddings;
 use scratchy_forward_compiler_macro::config::ModelParams;
 use scratchy_forward_compiler_macro::fuf::{Fuf, FufInput, TileId};
 
@@ -108,6 +109,31 @@ fn bake_tape(
     })
 }
 
+/// ⭐ THE ROW A TIED DECODE STEP GATHERS — the `RowGather` the sharding analysis reads for a
+/// forward whose input row the chained head fills: a tied model's decode, its embedded-hidden
+/// source read on device out of the vocabulary projection's own table at the token the previous
+/// step drew. `mint_embed_chain` builds that gather on the lowered graph; the analysis needs only
+/// the fact, and places the row's all-reduce where it is first read whole when the table splits.
+/// A prefill forward's rows are the prompt's, staged whole by the host, and an untied model's
+/// decode does not chain: both state none. `decode` is the predicate the chain's mint runs under
+/// (a decode rung, never a prefill one), so the two cannot disagree about which bakes chain.
+fn chained_row_gathers(
+    lwd: &BakeTape,
+    model: &ModelParams,
+    decode: bool,
+) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
+    if !(decode && tie_word_embeddings(model)) {
+        return Vec::new();
+    }
+    match lwd.input.vocab_table() {
+        Some(table) => vec![scratchy_subtile::tensor_parallel::RowGather {
+            row: lwd.embed_row().index(),
+            table,
+        }],
+        None => Vec::new(),
+    }
+}
+
 // ── The rotary-class VALUE law, shared by the wiring's tokens and the gate ──
 // The wiring bakes `RotaryKind` TOKENS (`rot_kind` in `emit_superdsc_wiring`
 // re-spells this value); the bake-time numeric gate's prefill probe stages
@@ -163,9 +189,14 @@ fn superdsc_rotary_kind(
     }
 }
 
-/// One decode batch rung as a bake commits it: its request count, its swept extent and its body
-/// fingerprint.
-type DecodeRungEntry = (u32, u32, String);
+/// One decode batch rung as a bake commits it: its request count, its swept extent, its body
+/// fingerprint and its own staged constants.
+type DecodeRungEntry = (
+    u32,
+    u32,
+    String,
+    Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
+);
 
 /// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
 /// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
@@ -223,12 +254,12 @@ fn ladder_lits(
     };
     let decode = {
         let mut rungs = decode_rungs.to_vec();
-        rungs.sort_by_key(|(n, _, _)| *n);
-        rungs.dedup_by_key(|(n, _, _)| *n);
+        rungs.sort_by_key(|(n, _, _, _)| *n);
+        rungs.dedup_by_key(|(n, _, _, _)| *n);
         if rungs.len() > 1 {
             rungs
                 .iter()
-                .map(|(n, swept, fp)| {
+                .map(|(n, swept, fp, consts)| {
                     // ⛔ `RungSeqs`, NOT a bare u32: the decode ladder is keyed by `decode_rows` (the
                     // BATCH WIDTH), while the sibling `sk_bucket_rungs` list is keyed by `active_cap`
                     // (the SWEEP EXTENT). Both were `(u32, String)`, and the worker selects over this
@@ -237,11 +268,20 @@ fn ladder_lits(
                     let n = proc_macro2::Literal::u32_unsuffixed(*n);
                     let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
                     let sfp = sentinel(fp);
+                    // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's session, never
+                    // the single-request wiring's list: the uniform `[rows, 1]` tables are
+                    // per-width. Rendered by the ONE load-const renderer the wiring static itself
+                    // uses, so the spellings cannot drift.
+                    let consts = consts
+                        .iter()
+                        .map(load_const_entry_tokens)
+                        .collect::<Vec<_>>();
                     quote! {
                         (
                             ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
                             ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
                             ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
+                            &[#(#consts),*],
                         )
                     }
                 })
@@ -251,6 +291,61 @@ fn ladder_lits(
         }
     };
     (prefill, decode, prefix)
+}
+
+/// One load-const entry `(tid, kind)` as a token stream — the ONE renderer, shared by the wiring
+/// static (`emit_superdsc_wiring`) and every decode batch rung's OWN consts in the manifest
+/// (`ladder_lits`), so the two can never disagree about how a kind is spelled.
+fn load_const_entry_tokens(
+    entry: &(u32, scratchy_target_spyre::wiring::LoadConst),
+) -> proc_macro2::TokenStream {
+    let &(tid, ref kind) = entry;
+    let tid = proc_macro2::Literal::u32_unsuffixed(tid);
+    let kind = match *kind {
+        scratchy_target_spyre::wiring::LoadConst::SampleTable {
+            vocab,
+            rows,
+            operand,
+            arrangement,
+        } => {
+            let vocab = proc_macro2::Literal::u32_unsuffixed(vocab);
+            let rows = proc_macro2::Literal::u32_unsuffixed(rows);
+            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
+            let arrangement = match arrangement {
+                scratchy_target_spyre::wiring::ElementArrangement::Standard => {
+                    quote! { ::scratchy_target_spyre::wiring::ElementArrangement::Standard }
+                }
+                scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
+                    quote! { ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 }
+                }
+            };
+            quote! {
+                ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                    vocab: #vocab,
+                    rows: #rows,
+                    operand: #operand,
+                    arrangement: #arrangement,
+                }
+            }
+        }
+        scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+            table_rows,
+            block,
+            operand,
+        } => {
+            let table_rows = proc_macro2::Literal::u32_unsuffixed(table_rows);
+            let block = proc_macro2::Literal::u32_unsuffixed(block);
+            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
+            quote! {
+                ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+                    table_rows: #table_rows,
+                    block: #block,
+                    operand: #operand,
+                }
+            }
+        }
+    };
+    quote! { (#tid, #kind) }
 }
 
 fn emit_superdsc_wiring(
@@ -485,9 +580,115 @@ fn emit_superdsc_wiring(
         }
 
         // ── every caller-filled source is covered by exactly one filler ──
+        // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's five tids (the
+        // seed quadruple's four word tables and inv_t) are minted below the `LoweredDecode` binding
+        // layer, so they carry no `SourceBinding`, and the CLASS declares their filler: the worker
+        // binds every one FRESH EVERY STEP, and the runtime launch gate refuses a draw without a
+        // fresh bind of all of them — a held seed row is a held TOKEN. This block is the class's
+        // declaration at the expansion gate (the loop below counts the seat's tids as covered BY
+        // CLASS); everything else about the seat is typed here, where the wiring is in hand:
+        if let Some(seat) = &gk.sample_seat {
+            let mut seat_tids: Vec<(String, u32)> = seat
+                .seed_words
+                .iter()
+                .enumerate()
+                .map(|(k, &tid)| (format!("seed word {k}"), tid))
+                .collect();
+            seat_tids.push(("invt".to_string(), seat.invt));
+            for (name, tid) in seat_tids {
+                if tid >= gk.num_sources {
+                    fail.push(format!(
+                        "the sample seat's {name} source t{tid} is not inside `num_sources` \
+                         ({}) — nothing can ever bind it",
+                        gk.num_sources
+                    ));
+                }
+                if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
+                    fail.push(format!(
+                        "the sample seat's {name} source t{tid} is ALSO a load-time const — a \
+                         tensor cannot both stage once at load and be the step's own freshness"
+                    ));
+                }
+            }
+            let seat_all: std::collections::HashSet<u32> =
+                seat.seed_words.iter().copied().chain([seat.invt]).collect();
+            if seat_all.len() != 1 + seat.seed_words.len() {
+                fail.push(
+                    "the sample seat names one tid twice — the mint mints one source per seat \
+                     operand, so a shared tid means two mints disagree"
+                        .to_string(),
+                );
+            }
+            if !matches!(
+                gk.result_dtype,
+                scratchy_target_spyre::DType::I32 | scratchy_target_spyre::DType::U32
+            ) {
+                fail.push(format!(
+                    "the rung carries the sample seat but its result dtype is {:?}, not an \
+                     index — the mint re-points the result to the idx stick, so a non-integer \
+                     result means the wiring and the mint disagree",
+                    gk.result_dtype
+                ));
+            }
+        }
+        // ⭐ THE CHAINED HEAD'S STICKS — the seat's own class law, stated for the chain: the two
+        // persistent sources are minted below the `LoweredDecode` binding layer, so they carry no
+        // `SourceBinding`, and the CLASS declares their filler — the tape's ChainSeed steps bind
+        // both, idempotent with the device's own ChainStage writes. The two decompose TABLES ride
+        // `load_consts` and need no class of their own.
+        let chain_sticks: Option<(u32, u32)> = match &gk.chain {
+            scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
+                for (name, tid) in [("s", chain.s_src), ("l", chain.l_src)] {
+                    if tid >= gk.num_sources {
+                        fail.push(format!(
+                            "the chain's {name} stick t{tid} is not inside `num_sources` ({}) — \
+                             nothing can ever bind it",
+                            gk.num_sources
+                        ));
+                    }
+                    if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
+                        fail.push(format!(
+                            "the chain's {name} stick t{tid} is ALSO a load-time const — the \
+                             sticks are per-step state the device rewrites, never load-staged"
+                        ));
+                    }
+                }
+                if chain.s_src == chain.l_src {
+                    fail.push(
+                        "the chain names one tid as both the s and the l stick — the mint mints \
+                         two sources, so a shared tid means two mints disagree"
+                            .to_string(),
+                    );
+                }
+                Some((chain.s_src, chain.l_src))
+            }
+            scratchy_target_spyre::wiring::ChainFact::Unchained => None,
+        };
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings().get(id as usize) else {
+                // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode` binding layer, so it
+                // carries NO `SourceBinding`: the wiring's `load_consts` list names it (by
+                // membership in the generic list, never by the op that minted it), and the worker
+                // stages its bytes once at load through the kind's builder.
+                if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
+                    continue;
+                }
+                // ⭐ THE SEAT'S OWN ARM — covered BY CLASS (the worker's fresh-every-step bind);
+                // the loud refusal lives at the RUNTIME gate, per launch, where "this step" is a
+                // fact.
+                if let Some(seat) = &gk.sample_seat
+                    && (seat.seed_words.contains(&id) || seat.invt == id)
+                {
+                    continue;
+                }
+                // ⭐ THE CHAIN'S OWN ARM — covered BY CLASS (the tape's ChainSeed steps bind both
+                // sticks every step).
+                if let Some((s_src, l_src)) = chain_sticks
+                    && (s_src == id || l_src == id)
+                {
+                    continue;
+                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -498,6 +699,14 @@ fn emit_superdsc_wiring(
                 // The generated weight loader binds these once, before prepare.
                 SB::Weight { .. } | SB::WeightScale { .. } | SB::BundleTensor { .. } => {}
                 SB::EmbeddedHidden => {
+                    // ⭐ THE CHAIN'S RESIDENT EXCUSE — the replaced row's host filler is gone (the
+                    // tape's ChainSeed steps replaced the embed-row push): the device's own
+                    // EmbedRowGather writes its reader's row every step.
+                    if let scratchy_target_spyre::wiring::ChainFact::Chained { chain } = &gk.chain
+                        && id == chain.replaces
+                    {
+                        continue;
+                    }
                     embeds += 1;
                     if id != embed_src {
                         fail.push(format!(
@@ -514,7 +723,10 @@ fn emit_superdsc_wiring(
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
             }
         }
-        if embeds < 1 {
+        // A chained decode carries its EmbeddedHidden row as DEVICE-WRITTEN (excused above), so the
+        // tape-side count is legitimately zero there.
+        let embed_floor = if chain_sticks.is_some() { 0 } else { 1 };
+        if embeds < embed_floor {
             fail.push(format!(
                 "{embeds} EmbeddedHidden sources; the tape gathers exactly one row"
             ));
@@ -741,6 +953,64 @@ fn emit_superdsc_wiring(
             quote! { (#tid, #scale) }
         })
         .collect();
+    // ⭐ THE LOAD-TIME CONSTANTS — straight off the bake's own one derivation
+    // (`load_consts_of_ir`, the same list the numeric gate stages): each entry is `(tid, kind)`
+    // and the KIND names the shared builder that makes the bytes, so the worker and the gate stage
+    // identical bytes by construction. The sampler's four seed word tables and inv_t are NOT here
+    // — they are per-step seats the worker binds fresh every step.
+    let load_const_toks = gk
+        .load_consts
+        .iter()
+        .map(load_const_entry_tokens)
+        .collect::<Vec<_>>();
+    // ⭐ THE SAMPLER'S PER-STEP SEAT — straight off the bake's one derivation
+    // (`sample_seat_of_ir`, the mint's own facts). `None` on every rung that mints no draw.
+    let sample_seat_tok = match &gk.sample_seat {
+        Some(seat) => {
+            let seed_words = seat.seed_words.iter().map(|&t| u32l(t)).collect::<Vec<_>>();
+            let invt = u32l(seat.invt);
+            let rows = u32l(seat.rows);
+            let row = u32l(seat.row);
+            let vocab = u32l(seat.vocab);
+            let pad_vocab = u32l(seat.pad_vocab);
+            let idx_row_words = u32l(seat.idx_row_words);
+            quote! {
+                ::core::option::Option::Some(
+                    ::scratchy_target_spyre::wiring::SampleSeat {
+                        seed_words: [#(#seed_words),*],
+                        invt: #invt,
+                        rows: #rows,
+                        row: #row,
+                        vocab: #vocab,
+                        pad_vocab: #pad_vocab,
+                        idx_row_words: #idx_row_words,
+                    }
+                )
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    // ⭐ THE FORWARD'S OWN PHASE — a projection of the wiring's own chain fact, never a second
+    // derivation: `Chained` ⇒ `Decode { chain }`, `Unchained` ⇒ `Prefill`.
+    let phase_tok = match &gk.chain {
+        scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
+            let (s_src, l_src) = (u32l(chain.s_src), u32l(chain.l_src));
+            let (replaces, block) = (u32l(chain.replaces), u32l(chain.block));
+            quote! {
+                ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
+                    chain: ::scratchy_target_spyre::wiring::ChainWiring {
+                        s_src: #s_src,
+                        l_src: #l_src,
+                        replaces: #replaces,
+                        block: #block,
+                    },
+                }
+            }
+        }
+        scratchy_target_spyre::wiring::ChainFact::Unchained => {
+            quote! { ::scratchy_target_spyre::forward_tape::ForwardPhase::Prefill }
+        }
+    };
 
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
@@ -765,6 +1035,9 @@ fn emit_superdsc_wiring(
                 rope_theta_bits: #theta_bits,
             },
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
+            load_consts: &[#(#load_const_toks),*],
+            sample_seat: #sample_seat_tok,
+            phase: #phase_tok,
         }
     }
 }
@@ -2274,10 +2547,14 @@ pub(crate) fn dump_wavefront_mega(
                 fp: String,
             },
             PrefillFp(String),
+            // ⭐ THE RUNG'S OWN KINDS ride the effect: the decode batch rung's load_consts at ITS
+            // OWN `rows`, from THIS bake's wiring (`gk`), carried to the manifest so the worker
+            // never stages the single-request wiring's rows=1 kinds into a wider rung.
             DecodeRung {
                 rows: u32,
                 cap: u32,
                 fp: String,
+                consts: Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
             },
             DecodeFp(String),
             FoldCensus {
@@ -2417,7 +2694,147 @@ pub(crate) fn dump_wavefront_mega(
                 // (slower, never wrong).
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
-                let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                // ⭐⭐⭐ THE CHAINED HEAD'S WIDENING PASS — ABOVE every mint, tie-gated
+                // at the model: the tied embed weight's STATED cols widen to the pick's
+                // pad (`sample_pad_vocab`), so the gather's stride-`pad` walk and the
+                // decompose's clamp boundary are ONE width by construction. It must run
+                // BEFORE the mints — both passes walk the result tail back to the
+                // lm-head, and after the draw the result IS the idx stick, a tail the
+                // widen walk cannot read. Non-admitting tails return None and touch
+                // nothing; every admitting bundle of a tied model reserves the same
+                // widened bytes (the weight-segment parity ledger's law).
+                let tied = tie_word_embeddings(model);
+                let widen = if tied {
+                    scratchy_subtile::subtile_ir::widen_tied_embed_weight(&mut krg)
+                } else {
+                    None
+                };
+                if let Some(w) = &widen {
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the tied embed weight widened — vocab {} \
+                         (stated cols {}), reservation grown, FLOPs untouched (the matmul's \
+                         region stays 0..vocab)",
+                        w.vocab, w.pad_vocab
+                    );
+                }
+                // ⭐⭐⭐ THE TOKEN DRAW'S MINT — EVERY rung this closure bakes: the
+                // solo m=1 bake, every emulator cap bucket, every batch-ladder rung,
+                // AND every prefill rung (the general mint — no prefill-specific
+                // copy, no `one_request` gate, no lm-head admission walk here: #813
+                // minted only the one-request rung whose lm-head admitted, and what
+                // survived that front is the LAW, not the gate — a rung without the
+                // draw is a rung whose answer must still come back as logits for a
+                // host argmax, which is exactly the readback this front deletes).
+                // The splice is the kernel's ONLY entry — the mint appends the node,
+                // its per-row per-step seat (the seed quadruple's four word tables,
+                // inv_t) and its twenty staged-table
+                // sources to the graph, and everything downstream (the splice's row,
+                // the door's whole-function walk, the placement pass, the wiring's
+                // sampler facts) is the same machinery every other Triton kernel
+                // takes. The mint's own tail walk IS the admission: a graph whose
+                // result tail is not the lm-head chain it knows PANICS at expansion —
+                // a build error naming the op, never a silent fall back to the host
+                // readback. A prefill rung's result is the FOLDED lm-head rows (the
+                // emitter folds the tail to the requests' last baked rows): its
+                // prompt-final chunk's picks are the idx stick, read back exactly
+                // like decode's; a middle chunk's suffix never runs, so its draw
+                // is never taken.
+                {
+                    let mint = scratchy_subtile::subtile_ir::mint_sample(
+                        &mut krg,
+                        if is_prefill {
+                            // The Folded draw serves the rung's OWN request
+                            // capacity — the same extent pair's `RungCap` the
+                            // attention and the lm-head fold read (one mint,
+                            // never a division of the graph's rows): the fold
+                            // writes S logits rows and the draw serves exactly
+                            // them.
+                            scratchy_subtile::subtile_ir::SampleRows::Folded {
+                                requests: query_rows.requests().nonzero(),
+                            }
+                        } else {
+                            scratchy_subtile::subtile_ir::SampleRows::All
+                        },
+                    );
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the token draw minted — vocab {} (padded row \
+                         {}), rows {}, the per-row seat (seed words t{}..t{}, inv_t t{}) + \
+                         twenty staged tables appended, and the rung's RESULT re-pointed to the \
+                         idx stick (the row stays placed and readable by tid){}",
+                        mint.vocab,
+                        mint.pad_vocab,
+                        mint.rows,
+                        mint.seed_words[0].index(),
+                        mint.seed_words[3].index(),
+                        mint.invt.index(),
+                        if is_prefill { " (prefill rung)" } else { "" },
+                    );
+                    // ⭐⭐⭐ THE CHAINED HEAD'S MINT (#603) — the second splice onto the
+                    // same DECODE rung (prefill keeps the host-staged embed rows — its
+                    // input row is prompt tokens the host owns, never a device pick):
+                    // the EmbedRowGather at the entry (every whole-tensor consumer of
+                    // the embed row re-pointed onto its output), the ChainStage at the
+                    // tail (the pick decomposed into the persistent s/l sticks through
+                    // the two staged tables), the four-source insert below the
+                    // SourceBinding layer. THE PICK IS THE DRAW'S OWN OUTPUT — the
+                    // by-kind find the A-seam refused on: `mint_sample` re-pointed the
+                    // rung's result to the idx stick, so `krg.result` IS the device
+                    // pick, and the vocab the tables decompose over is the mint's own
+                    // emitted vocab. GATED ADDITIONALLY ON THE TIE (the gather's matrix
+                    // operand is the lm-head's weight source, the embedding matrix IFF
+                    // the model ties): an untied decode rung REFUSES here — the chained
+                    // head is the only decode path, and there is no host-pick arm to
+                    // fall to. Every width mints (the solo rung, every batch-ladder
+                    // rung, the symbolic CB batch alike): the chain is the decode path,
+                    // not a wide-batch extra.
+                    // ⛔ A PARTIAL ROW IS A CHAIN'S, AND A PREFILL HAS NO CHAIN. A source the
+                    // analysis cut as a gathered row's partial sum is filled by the chain's
+                    // per-rank gather; a prefill rung stages its rows whole from the host, so the
+                    // all-reduce would sum the prompt's rows once per rank.
+                    if is_prefill
+                        && let Some(e) = shards.and_then(|s| {
+                            s.iter().position(|c| {
+                                *c == scratchy_subtile::tensor_parallel::SourceShard::Partial
+                            })
+                        })
+                    {
+                        panic!(
+                            "[spyre-tp] {base}: source t{e} is a gathered row's partial sum, but a \
+                             prefill rung mints no chained head to gather it — the forward was \
+                             sharded with a decode's row gather"
+                        );
+                    }
+                    if !is_prefill {
+                        if !tied {
+                            panic!(
+                                "[spyre-superdsc] {base}: the decode rung's chained head \
+                                 requires a tied embedding head — this model does not tie \
+                                 word embeddings. The chained head is the only decode path \
+                                 (there is no host-pick arm to fall to); the untied \
+                                 admission is not implemented."
+                            );
+                        }
+                        let embed_row = lwd.embed_row().index();
+                        let pick = krg.result;
+                        let chain = scratchy_subtile::subtile_ir::mint_embed_chain(
+                            &mut krg,
+                            scratchy_subtile::subtile_ir::TensorId::from_index(embed_row),
+                            pick,
+                            mint.vocab,
+                        );
+                        eprintln!(
+                            "[spyre-superdsc] {base}: the chained head minted — the embed row \
+                             gather spliced over source t{embed_row} (hidden {}, vocab {}), the \
+                             persistent s/l sticks at t{}/t{}, the two decompose tables staged \
+                             once at load, and the pick decomposed into the sticks at the tail",
+                            chain.hidden,
+                            chain.vocab,
+                            chain.s_stick.index(),
+                            chain.l_stick.index()
+                        );
+                    }
+                }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
                     return ((String::new(), Vec::new()), fx);
@@ -3316,6 +3733,10 @@ pub(crate) fn dump_wavefront_mega(
                                                     rows: decode_rows,
                                                     cap,
                                                     fp: bfp.clone(),
+                                                    // THIS rung's own kinds — the wiring `gk`
+                                                    // derived from THIS bake's graph, whose mint
+                                                    // ran at `decode_rows`.
+                                                    consts: gk.load_consts.clone(),
                                                 });
                                             }
                                             // The one-request bundle stays THE decode bundle for
@@ -3500,10 +3921,15 @@ pub(crate) fn dump_wavefront_mega(
                         }
                     }
                     BakeEffect::PrefillFp(fp) => *world.prefill_fp.borrow_mut() = Some(fp),
-                    BakeEffect::DecodeRung { rows, cap, fp } => {
+                    BakeEffect::DecodeRung {
+                        rows,
+                        cap,
+                        fp,
+                        consts,
+                    } => {
                         let mut r = world.decode_rungs.borrow_mut();
-                        if !r.iter().any(|(n, _, _)| *n == rows) {
-                            r.push((rows, cap, fp));
+                        if !r.iter().any(|(n, _, _, _)| *n == rows) {
+                            r.push((rows, cap, fp, consts));
                         }
                     }
                     BakeEffect::DecodeFp(fp) => *world.fp.borrow_mut() = Some(fp),
@@ -3650,7 +4076,7 @@ pub(crate) fn dump_wavefront_mega(
         >(
                 &lowered,
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                &[],
+                &chained_row_gathers(&lowered, model, true),
             )
             .unwrap_or_else(|e| {
                 panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
@@ -3811,7 +4237,7 @@ pub(crate) fn dump_wavefront_mega(
                                 >(
                                     &lwd_b,
                                     scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                                    &[],
+                                    &chained_row_gathers(&lwd_b, model, true),
                                 )
                                 .unwrap_or_else(|e| {
                                     panic!(

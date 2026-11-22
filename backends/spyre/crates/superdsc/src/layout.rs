@@ -54,9 +54,14 @@ fn on_stick(o: &Operand, axis: usize) -> bool {
 }
 
 /// For each staged parameter: held so every op reads it on the stick it needs — innermost the
-/// axis a mismatched read needs, and in stick columns when a contraction reads it as its KERNEL.
-/// The analysis runs on the function as lifted with no re-layout.
-pub fn staged_layouts(g: &Graph, residency: &[Residency]) -> Vec<ParamLayout> {
+/// axis a mismatched read needs, and in stick columns when a contraction reads it as its KERNEL —
+/// and with its rows whole sticks apart when an op reads one element of it inside a stick (a
+/// per-row table read at its own row), so every row starts a stick. The analysis runs on the
+/// function as lifted with no re-layout.
+pub fn staged_layouts<G: ktir_core::ddl_binds::DeviceGen>(
+    g: &Graph,
+    residency: &[Residency],
+) -> Vec<ParamLayout> {
     let mut out: Vec<ParamLayout> = vec![None; g.params.len()];
     for node in &g.nodes {
         for oi in 0..=node.inputs.len() {
@@ -67,6 +72,18 @@ pub fn staged_layouts(g: &Graph, residency: &[Residency]) -> Vec<ParamLayout> {
             };
             let Store::Param(p) = o.store else { continue };
             if residency.get(p) != Some(&Residency::Staged) {
+                continue;
+            }
+            if out[p].is_none() && reads_one_element_inside_a_stick(o, o.format.lanes::<G>()) {
+                if let Some(mv) = g.param_views[p].first()
+                    && let Some(last) = mv.axes.last()
+                {
+                    out[p] = Some(Held {
+                        order: (0..mv.axes.len()).collect(),
+                        inner: last.extent,
+                        innermost: Innermost::Rows,
+                    });
+                }
                 continue;
             }
             let Some(axis) = required(node, oi) else {
@@ -98,6 +115,13 @@ pub fn staged_layouts(g: &Graph, residency: &[Residency]) -> Vec<ParamLayout> {
         }
     }
     out
+}
+
+/// Does `o` read one element at an offset inside a stick? A descriptor addresses whole sticks.
+fn reads_one_element_inside_a_stick(o: &Operand, lanes: Lanes) -> bool {
+    o.view.tile.is_none()
+        && o.view.axes.iter().all(|a| a.extent == Extent::ONE)
+        && !o.view.offset.get().is_multiple_of(lanes.get())
 }
 
 /// Copy every operand some op reads off its stick into an intermediate that holds it there.
@@ -396,6 +420,9 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
 /// Does `o`'s window start inside a stick along its unit-stride axis? A descriptor addresses whole
 /// sticks, so such a window is unreachable where it lies.
 fn starts_inside_a_stick(o: &Operand, lanes: Lanes) -> Option<usize> {
+    if reads_one_element_inside_a_stick(o, lanes) {
+        return Some(o.view.axes.len().saturating_sub(1));
+    }
     let s = o.view.axes.iter().position(|a| a.is_unit())?;
     let outer_aligned = o
         .view
@@ -422,4 +449,45 @@ pub fn misaligned<G: ktir_core::ddl_binds::DeviceGen>(g: &Graph) -> Vec<usize> {
         }
     }
     moved
+}
+
+/// Every copy of integer words made an integer add of zero: dxp binds `identity` over the float
+/// formats alone, and `x + 0` over 32-bit integer words is the same words. Runs on the finished
+/// graph, after every pass that inserts copies.
+pub fn integer_copies(g: &mut Graph) {
+    use crate::format::DataFormat;
+    use crate::graph::ConstStick;
+    let int = |f: DataFormat| matches!(f, DataFormat::UInt32 | DataFormat::Int32);
+    let zero = ConstStick {
+        format: DataFormat::UInt32,
+        bits: 0.0f32.to_bits(),
+    };
+    for i in 0..g.nodes.len() {
+        let n = &g.nodes[i];
+        if n.func != OpFunc::Identity
+            || n.inputs.len() != 1
+            || !int(n.inputs[0].format)
+            || !int(n.output.format)
+        {
+            continue;
+        }
+        let c = match g.consts.iter().position(|k| *k == zero) {
+            Some(c) => c,
+            None => {
+                g.consts.push(zero);
+                g.consts.len() - 1
+            }
+        };
+        let n = &mut g.nodes[i];
+        let space = n.space.clone();
+        n.func = OpFunc::AddI32;
+        n.inputs[0].format = DataFormat::UInt32;
+        n.output.format = DataFormat::UInt32;
+        n.inputs.push(Operand {
+            store: Store::Const(c),
+            view: View::of_memory(&space, &vec![Stride::BROADCAST; space.len()]),
+            format: DataFormat::UInt32,
+            gather: None,
+        });
+    }
 }

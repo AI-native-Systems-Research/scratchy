@@ -89,4 +89,12 @@ pub enum Program {
     WindowedRmsNorm {
         unit: bool,
     },
+    /// The token draw: one row of logits to the index it samples.
+    Sample,
+    /// The chained head's input rows: each request's token embedding read out of the tied
+    /// weight at the token the previous step drew.
+    EmbedRowGather,
+    /// The chained head's stage: each request's drawn token decomposed into the next step's
+    /// gather indices.
+    ChainStage,
 }

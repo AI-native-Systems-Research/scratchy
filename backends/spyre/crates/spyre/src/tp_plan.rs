@@ -619,7 +619,7 @@ mod tests {
                     .tensor
                     .index() as u32;
                 let at_partial = layout.address(partial).unwrap();
-                let natural = 2048 * spyre_superdsc::format::DataFormat::Fp16.word_bytes();
+                let natural = 2048 * spyre_superdsc::format::DataFormat::Fp16.word_bytes().get();
                 for me in ranks::<T>() {
                     let c = ops
                         .iter()

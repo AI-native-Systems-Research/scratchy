@@ -125,6 +125,14 @@ pub enum Refused {
     CodecUnanchored,
     /// A sample-rows step whose construct holds no matmul.
     NoSampledMatmul,
+    /// The minted token draw: a spliced device kernel metal never mints, so a
+    /// metal tape carries no Sample node by construction — one that does is a wiring bug named
+    /// here, not a missing lowering to write.
+    DeviceSampler,
+    /// A device-side chain mint's cross-step pair — metal's pick never left the host, so
+    /// there is no metal lowering to write; a node here is a wiring bug (a chain-minted
+    /// graph handed to the metal tape), never a missing kernel.
+    ChainedHead,
     /// A collective: metal runs one rank, where tensor parallelism weaves none in, so a node
     /// here is a sharded forward handed to the metal tape — a wiring bug, never a missing kernel.
     Collective,
@@ -2618,6 +2626,18 @@ impl Recording<'_> {
             }
             L::SumReduce { .. } | L::RmsNormReduce { .. } | L::RmsNormApply { .. } => {
                 return Err(self.no(i, Refused::TileLevel));
+            }
+            // The minted token draw is a device-sampler op; metal keeps the host pick. Reached
+            // only by a wiring bug (a minted graph handed to the metal tape), and the refusal
+            // names it as one instead of `todo!`-ing a lowering that must never exist.
+            L::Sample { .. } => {
+                return Err(self.no(i, Refused::DeviceSampler));
+            }
+            // The chained head's pair — a device-side chain mint's cross-step chain has no
+            // metal lowering to write (metal's pick never left the host), so a node here
+            // is the same wiring bug under the mint that constructs them.
+            L::EmbedRowGather { .. } | L::ChainStage { .. } => {
+                return Err(self.no(i, Refused::ChainedHead));
             }
             L::AllReduce | L::AllGather { .. } => {
                 return Err(self.no(i, Refused::Collective));

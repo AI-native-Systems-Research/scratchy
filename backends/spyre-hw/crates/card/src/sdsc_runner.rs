@@ -103,11 +103,15 @@ pub type RankWeights<T> = Option<PerRank<T, CardWeights>>;
 
 /// What a session binds before prepare — the private bundle of [`SuperDscSession::new_inner`]'s
 /// staged inputs.
-struct Staged<T: scratchy_spyre_bundle::collective::Tp> {
+struct Staged<'k, T: scratchy_spyre_bundle::collective::Tp> {
     /// The resident weights, moved in by the OWNER (the decode session) — one set per card, rank
     /// `r`'s its own shard — and empty for every borrower, which reads the owner's bytes through the
     /// alias.
     weights: RankWeights<T>,
+    /// The wiring's load-time constants — the staged tables a spliced kernel declares as sources,
+    /// bound once before prepare. Every session binds its own: they sit in its activation segment,
+    /// which no alias covers.
+    load_consts: &'k [(u32, scratchy_target_spyre::wiring::LoadConst)],
 }
 
 /// ⭐ EVERY RANK'S `f(r, its input)` AT ONCE — one scoped thread per rank, the results in rank
@@ -185,16 +189,28 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
     /// numbers. Only the spilled weight tail is an argument (a load-time copy
     /// decision the layout cannot make for the caller).
     ///
-    /// Every session binds its OWN bundle's constants (`BundleLayout::stick_consts`) once, before
-    /// prepare: they sit in the session's activation segment, which no alias covers.
+    /// Every session binds its OWN bundle's constants (`BundleLayout::stick_consts`) and its own
+    /// wiring's load-time tables (`load_consts`) once, before prepare: they sit in the session's
+    /// activation segment, which no alias covers.
     pub fn new(
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         weights: RankWeights<T>,
+        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
-        Self::new_inner(cards, code, dims, Staged { weights }, &[], spilled_tail)
+        Self::new_inner(
+            cards,
+            code,
+            dims,
+            Staged {
+                weights,
+                load_consts,
+            },
+            &[],
+            spilled_tail,
+        )
     }
 
     /// [`new`](Self::new) for a session whose WEIGHTS come from another session by alias — every
@@ -210,9 +226,11 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         borrowed: &[i64],
+        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
-        let mut sess = Self::build_borrowing(cards, code, dims, borrowed, spilled_tail)?;
+        let mut sess =
+            Self::build_borrowing(cards, code, dims, borrowed, load_consts, spilled_tail)?;
         sess.prepare()?;
         Ok(sess)
     }
@@ -226,13 +244,17 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         borrowed: &[i64],
+        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::build_inner(
             cards,
             code,
             dims,
-            Staged { weights: None },
+            Staged {
+                weights: None,
+                load_consts,
+            },
             borrowed,
             spilled_tail,
         )
@@ -250,13 +272,17 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
+        load_consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             cards,
             code,
             dims,
-            Staged { weights: None },
+            Staged {
+                weights: None,
+                load_consts,
+            },
             &[],
             spilled_tail,
         )
@@ -270,7 +296,7 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        staged: Staged<T>,
+        staged: Staged<'_, T>,
         borrowed: &[i64],
         spilled_tail: &[u32],
     ) -> Result<Self> {
@@ -289,7 +315,7 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        staged: Staged<T>,
+        staged: Staged<'_, T>,
         borrowed: &[i64],
         // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
         // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
@@ -304,7 +330,10 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
             kv_dim,
             num_blocks,
         } = dims;
-        let Staged { weights } = staged;
+        let Staged {
+            weights,
+            load_consts,
+        } = staged;
         // The owner binds rank r's weight set on card r; a borrower binds none on any.
         let weights: PerRank<T, CardWeights> = match weights {
             Some(w) => w,
@@ -380,7 +409,10 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
                 // same channel `stage_weights` converts and uploads — a constant this session never
                 // binds reads as ZEROS on card.
                 exec.bind_stick_consts(&code.layout.stick_consts)?;
-                let n_staged = n_bound + code.layout.stick_consts.len();
+                // ⭐ THE STAGED TABLES ride the same law: a table the session never binds reads as
+                // ZEROS on card, and the kernel composes its answer from zeros.
+                exec.bind_load_consts(load_consts)?;
+                let n_staged = n_bound + code.layout.stick_consts.len() + load_consts.len();
                 debug!(
                     "[timing] bind weights loop took {:.2}s",
                     t_bind.elapsed().as_secs_f64()
@@ -763,6 +795,15 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
             .sum())
     }
 
+    /// ⭐⭐⭐ THE ONCARD HAND-OFF — the sticks a stable decode seating leaves to the card's own
+    /// ChainStage writes. Ends the refill's re-send of a previous `Host` launch's seed bind
+    /// (see `Executor::hand_to_card`); a churned seating's re-bind re-inserts it.
+    pub fn hand_to_card(&mut self, id: scratchy_target_spyre::bundle_code::PlaceId) {
+        for e in self.ranks.values_mut() {
+            e.hand_to_card(id);
+        }
+    }
+
     /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE
     /// PIPELINED LOOP, which stages half a step at a time: it calls this with
     /// step `j+1`'s acts while the device still executes step `j` (the
@@ -780,6 +821,42 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
+        self.stage_step_acts_seeded(activations, activations_f16, activations_i32, &[])
+    }
+
+    /// [`Self::stage_step_acts`] plus the chained head's seeds — the one host input that is NOT
+    /// the same on every card: rank `r` binds the bytes of ITS OWN vocabulary block
+    /// ([`scratchy_target_spyre::forward_tape::ChainSeed::bytes`]), the block its staged tables were
+    /// built for, by the rank its executor plays as. The s stick's int32 words ride the verbatim
+    /// channel the index tables ride; the l stick's fp16 one-hot rides the ordinary fp16 bind.
+    pub fn stage_step_acts_seeded(
+        &mut self,
+        activations: &[scratchy_target_spyre::wiring::Bind],
+        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+        seeds: &[(
+            scratchy_target_spyre::bundle_code::PlaceId,
+            scratchy_target_spyre::forward_tape::ChainSeed,
+        )],
+    ) -> Result<()> {
+        for (id, seed) in seeds {
+            for e in self.ranks.values_mut() {
+                let bytes = seed.bytes(e.tp_identity());
+                if seed.is_s {
+                    let n = bytes.len();
+                    let bind = e.place_raw(*id, bytes).ok_or_else(|| {
+                        anyhow!(
+                            "bind: the chain seed '{id}' ({n} B) has no placement in this bundle \
+                             or does not fit the one it has — an unstaged stick gathers the wrong \
+                             row"
+                        )
+                    })?;
+                    e.bind_input_raw(bind);
+                } else {
+                    e.bind_input(*id, bytes);
+                }
+            }
+        }
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
         // preamble_h2d/compute/logits_d2h split. For batched prefill it converts ~300k f32

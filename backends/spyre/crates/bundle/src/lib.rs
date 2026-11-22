@@ -265,7 +265,8 @@ impl StickConst {
             StickFormat::Fp16 => half::f16::from_f32(v).to_le_bytes().to_vec(),
             StickFormat::Fp32 => v.to_le_bytes().to_vec(),
             StickFormat::Fp8 => vec![fp8_e4m3(v)],
-            StickFormat::UInt32 => (v as u32).to_le_bytes().to_vec(),
+            // An integer constant's word, its two's complement when negative.
+            StickFormat::UInt32 => ((v as i64) as u32).to_le_bytes().to_vec(),
         };
         lane.iter().copied().cycle().take(stick_bytes).collect()
     }

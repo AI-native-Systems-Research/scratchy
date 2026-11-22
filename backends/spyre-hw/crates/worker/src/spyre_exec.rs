@@ -181,10 +181,14 @@ impl Worker for SpyreWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        // ⭐ THE HOST DRAWS EVERY TOKEN: a decode step's launch reads `input_batch.token_at` — the
-        // previous step's pick — so every step in flight drains before a decoder launches.
+        // ⭐ #32 (c4b) — THE ENTRY-DRAIN IS GONE, AND THE SEED LAW IS WHY. The device writes the
+        // seeds itself (each step's ChainStage decomposes its pick into the persistent sticks), so
+        // a step on an UNCHANGED seating binds nothing and needs nothing drained: it submits while
+        // the previous step is still in flight — depth 2. A CHURNED seating (below, at the rung)
+        // still drains in-call, through the same pop the knock takes, because a re-seated row's
+        // seed is the previous step's pick and only the drain holds it.
         //
-        // ⛔ A DRAIN CAN OUTLIVE ITS REQUEST. A request that finishes by EOS on one step has the
+        // ⛔ AND A DRAIN CAN OUTLIVE ITS REQUEST. A request that finishes by EOS on one step has the
         // next step already in flight; the schedule after names it in `finished_req_ids`, so the
         // cleanup below drops it before that step is drained. The drain skips a gone request's
         // bookkeeping (`collect_rows`), and fills every step's cell whatever the collect did.
@@ -542,15 +546,47 @@ impl Worker for SpyreWorker {
                     ))
                 }
             };
+            // ⭐⭐⭐ #32 (c4b) — THE SEATING DISSOLVES whenever a decoder runs OUTSIDE the batched
+            // arm (`rung` is `None` with decoders live — the live count ran past the widest baked
+            // rung). The per-request path reads the token POOL (`token_at` = the previous pick), so
+            // the queue drains first; and the stored seating is DISCARDED, because a solo interlude
+            // advances a request's pick on another session while the rung's sticks still hold its
+            // pick from the last BATCHED step — a later batched step that compared equal against
+            // the stale seating would read a STALE seed, silently. A step with NO decoders (pure
+            // prefill) dissolves nothing.
             #[cfg(feature = "spyre-hw")]
-            if !decode_ids.is_empty() {
+            if rung.is_none() && !decode_ids.is_empty() {
+                self.seating = None;
                 while let Some(infl) = self.in_flight.pop_front() {
                     Self::drain_one(infl, model, requests, input_batch)?;
                 }
             }
             if let Some(ri) = rung {
-                // ⭐ STAGED AFTER ANY DRAIN: the drain above takes `&mut model` (the session it
-                // collects through), so the shared immutable facts ride below it.
+                // ⭐⭐⭐ #32 (c4b) — THE SEED LAW'S CHURN TEST, taken before the rung's session is
+                // borrowed (the drain needs `&mut model.session`). The seating is the rung plus
+                // which request sits in each launch slot, dense in `decode_ids` order; the pad set
+                // is decided by the same pair, so the pair IS the seating. IDENTICAL to the
+                // previous step's ⇒ the card's own ChainStage writes are every seat's seed and this
+                // step binds none — it submits with the previous step still in flight (depth 2).
+                // Any difference — a join, a leave, a rung switch — re-seats rows onto sticks
+                // holding the PREVIOUS occupant's pick (or none, on a fresh session), so those steps
+                // DRAIN FIRST and seed from the collected picks.
+                let seating_now: Vec<String> =
+                    decode_ids.iter().map(|(id, _)| id.clone()).collect();
+                let churned = match &self.seating {
+                    None => true,
+                    Some((last_rung, last_ids)) => {
+                        *last_rung != ri || last_ids.as_slice() != seating_now.as_slice()
+                    }
+                };
+                self.seating = Some((ri, seating_now));
+                if churned {
+                    while let Some(infl) = self.in_flight.pop_front() {
+                        Self::drain_one(infl, model, requests, input_batch)?;
+                    }
+                }
+                // ⭐ STAGED AFTER ANY DRAIN: the churn drain above takes `&mut model` (the session
+                // it collects through), so the shared immutable facts ride below it.
                 let sh = Shared {
                     embed_tokens: &model.embed_tokens,
                     hidden: model.hidden,
@@ -592,12 +628,16 @@ impl Worker for SpyreWorker {
                         .get(id)
                         .ok_or_else(|| werr(format!("unknown cached req {id}")))?;
                     draws.push(req.draw.as_ref());
-                    // The host drew the previous step's token, so the batch holds it.
-                    let tok = input_batch
-                        .token_at(id, *start)
-                        .ok_or_else(|| werr(format!("decode: req {id} has no token at {start}")))?
-                        as usize;
-                    toks.push(tok);
+                    // ⭐⭐⭐ THE TOKEN IS READ ONLY ON A CHURNED SEATING. A stable step's seeds are
+                    // the card's own ChainStage writes — `token_at` here would be the PREVIOUS
+                    // step's pick, uncollected. On churn the drain above has collected, so it
+                    // answers: a FRESH row's prompt-final token, or a continuing row's pick.
+                    if churned {
+                        let tok = input_batch.token_at(id, *start).ok_or_else(|| {
+                            werr(format!("decode: req {id} has no token at {start}"))
+                        })? as usize;
+                        toks.push(tok);
+                    }
                 }
                 let seqs_in: Vec<scratchy_target_spyre::paged_step::BatchSeq<'_>> = decode_ids
                     .iter()
@@ -612,9 +652,10 @@ impl Worker for SpyreWorker {
                 // Every decode rung is a decode batch (`batched_decode_head_major`), the W=1 seat
                 // one sequence of it: spyre-inference's sequence buckets start at 1.
                 let rows_in = LaunchRows::Batch { seqs: &seqs_in };
-                // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request; the answer
-                // rows' logits read is enqueued and comes back through the SAME collect door,
-                // where the host draws each row's token.
+                // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request and every row
+                // is sampled ON THE CARD by the rung's minted sampler; the idx stick's raw D2H is
+                // enqueued and comes back through the SAME collect door whether this schedule
+                // defers it to the drain or collects it right here.
                 let sub = match run_card_launch(
                     rows_in,
                     &sh,
@@ -624,7 +665,11 @@ impl Worker for SpyreWorker {
                     model.decode.last().expect("at least one decode bucket"),
                     seqs,
                     SamplerLaws {
-                        tokens: &toks,
+                        seeds: if churned {
+                            SeedSource::Host(&toks)
+                        } else {
+                            SeedSource::OnCard
+                        },
                         want_logits: LogitsWanted::PerRequestDeferred,
                         laws: SeatLaws::Batch { draws: &draws },
                     },

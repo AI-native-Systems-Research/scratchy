@@ -71,6 +71,17 @@ pub(crate) struct BundleMeta {
     /// writes it into the pools and reads it there.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) output_ids: Vec<usize>,
+    /// ⭐ THE WIRING'S OWN PHASE — decode's chained head vs prefill — projected from
+    /// `Wiring::phase` at load (never a second derivation), so the emulator forward's chain-seed
+    /// staging decides off the same fact the tape's `ForwardShape` carries. Emulator-only: the card
+    /// path reads it straight off its own `wiring`.
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) phase: scratchy_target_spyre::forward_tape::ForwardPhase,
+    /// ⭐ THE MINTED SAMPLER'S SEAT — the wiring's own (`Wiring::sample_seat`), projected at load
+    /// like `phase`. `Some` on every rung the bake minted the draw into: the emulator forward stages
+    /// this seat's law every step and reads the pick back through the re-pointed result.
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) sample_seat: Option<scratchy_target_spyre::wiring::SampleSeat>,
     /// ⭐ THE GENERATED WIRING THIS BUNDLE WAS BAKED WITH. Everything above it is a copy taken
     /// out of this static on the way through `Parsed`; the forward tape is read straight off it
     /// (`Wiring::forward_shape`) so the shape a forward plays cannot be a second opinion about
@@ -294,3 +305,15 @@ impl SampledDraw {
 
 #[cfg(feature = "spyre-hw")]
 pub(crate) use crate::card::types::*;
+
+/// ⭐ WHERE A DECODE LAUNCH'S CHAIN SEEDS COME FROM — the seed law. `Host(tokens)`: the host binds
+/// the sticks from these per-live-row tokens (a request's first step on a session, a churned or
+/// padded seating, a rung switch, every prompt chunk). `OnCard`: a stable seating, whose seeds are
+/// the previous step's own ChainStage writes on the card — the launch binds nothing, and so needs
+/// nothing drained before it submits.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SeedSource<'a> {
+    Host(&'a [usize]),
+    OnCard,
+}

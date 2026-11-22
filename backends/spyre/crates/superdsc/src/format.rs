@@ -18,8 +18,11 @@ pub enum DataFormat {
     Fp32,
     /// 8-bit E4M3 float (`SEN143_FP8`).
     Fp8,
-    /// A 32-bit unsigned word — every index tensor (page tables, row indices).
+    /// A 32-bit unsigned word — every index tensor (page tables, row indices), and the integer
+    /// ops' operands.
     UInt32,
+    /// A 32-bit signed integer (`IEEE_INT32`): an integer cast's integer side.
+    Int32,
     /// A 64-bit integer.
     Int64,
 }
@@ -37,11 +40,27 @@ impl DataFormat {
         }
     }
 
+    /// Whether two formats hold the same words — equal, or the two 32-bit integer readings of one
+    /// word.
+    pub const fn same_words(self, other: DataFormat) -> bool {
+        matches!(
+            (self, other),
+            (DataFormat::Fp16, DataFormat::Fp16)
+                | (DataFormat::Fp32, DataFormat::Fp32)
+                | (DataFormat::Fp8, DataFormat::Fp8)
+                | (DataFormat::Int64, DataFormat::Int64)
+                | (
+                    DataFormat::UInt32 | DataFormat::Int32,
+                    DataFormat::UInt32 | DataFormat::Int32
+                )
+        )
+    }
+
     /// Bytes per element.
     pub const fn word_bytes(self) -> Bytes {
         Bytes::new(match self {
             DataFormat::Fp16 => 2,
-            DataFormat::Fp32 | DataFormat::UInt32 => 4,
+            DataFormat::Fp32 | DataFormat::UInt32 | DataFormat::Int32 => 4,
             DataFormat::Fp8 => 1,
             DataFormat::Int64 => 8,
         })
@@ -59,6 +78,7 @@ impl DataFormat {
             DataFormat::Fp32 => "IEEE_FP32",
             DataFormat::Fp8 => "SEN143_FP8",
             DataFormat::UInt32 => "SENUINT32",
+            DataFormat::Int32 => "IEEE_INT32",
             DataFormat::Int64 => "IEEE_INT64",
         }
     }

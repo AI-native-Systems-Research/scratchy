@@ -94,6 +94,14 @@ pub enum OpFunc {
     Fp8ToFp16,
     /// fp16 → fp8: a format conversion, the value already in fp8's range.
     Fp16ToFp8,
+    /// i32 + i32, wrapping (`addi32toi32`).
+    AddI32,
+    /// i32 · i32, wrapping (`muli32toi32`).
+    MulI32,
+    /// i32 → fp32 (`int32tofp32`).
+    Int32ToFp32,
+    /// fp32 → i32, truncating (`fp32toint32`).
+    Fp32ToInt32,
     // ── reductions
     Reduce(Combine, Axis),
     // ── contractions
@@ -114,8 +122,25 @@ impl OpFunc {
     pub const fn converts(self) -> bool {
         matches!(
             self,
-            OpFunc::Widen | OpFunc::Narrow | OpFunc::Fp8ToFp16 | OpFunc::Fp16ToFp8
+            OpFunc::Widen
+                | OpFunc::Narrow
+                | OpFunc::Fp8ToFp16
+                | OpFunc::Fp16ToFp8
+                | OpFunc::Int32ToFp32
+                | OpFunc::Fp32ToInt32
         )
+    }
+
+    /// The format the op computes in — dxp's compute `dataFormat`. The integer ops and casts are
+    /// bound in fp32 mode over their integer tensors (`broadcast_ops.ddl:28,30`,
+    /// `unary_parallel.ddl:50,51`); every other op computes in its first operand's format.
+    pub const fn compute_format(self, first: DataFormat) -> DataFormat {
+        match self {
+            OpFunc::AddI32 | OpFunc::MulI32 | OpFunc::Int32ToFp32 | OpFunc::Fp32ToInt32 => {
+                DataFormat::Fp32
+            }
+            _ => first,
+        }
     }
 
     /// Whether dxp binds this op over values held in `format`. A copy binds the two float
@@ -161,6 +186,10 @@ impl OpFunc {
             OpFunc::Narrow => "fp32todl16",
             OpFunc::Fp8ToFp16 => "fp8todl16",
             OpFunc::Fp16ToFp8 => "qfp8ch",
+            OpFunc::AddI32 => "addi32toi32",
+            OpFunc::MulI32 => "muli32toi32",
+            OpFunc::Int32ToFp32 => "int32tofp32",
+            OpFunc::Fp32ToInt32 => "fp32toint32",
             OpFunc::Reduce(Combine::Sum, Axis::Stick) => "sum",
             OpFunc::Reduce(Combine::Max, Axis::Stick) => "max",
             OpFunc::Reduce(Combine::Min, Axis::Stick) => "min",

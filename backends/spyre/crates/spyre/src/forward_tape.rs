@@ -34,6 +34,47 @@ pub enum Staged {
     /// lose precision visibly — it would gather and scatter a DIFFERENT ROW'S KEYS and read as fluent
     /// text.
     I32(Vec<u8>),
+    /// ⭐ THE CHAINED HEAD'S SEED, PER RANK — the tokens and the stick it seeds, not yet its bytes.
+    /// Every other staged value is the same on every card of a sharded world (the forward is
+    /// SPMD); a seed is not, because each rank decomposes a token through ITS OWN vocabulary block
+    /// ([`crate::wiring::chain_block`]) — the block its staged tables were built for. The session
+    /// builds each rank's bytes at the bind ([`ChainSeed::bytes`]), by the rank's type.
+    ChainSeed(ChainSeed),
+}
+
+/// One stick's seed, before a rank is named — see [`Staged::ChainSeed`].
+#[derive(Clone, Debug)]
+pub struct ChainSeed {
+    pub chain: crate::wiring::ChainWiring,
+    /// The s stick (`true`) or the l stick.
+    pub is_s: bool,
+    /// One token per real row.
+    pub toks: Vec<u32>,
+    /// The launch's own row count; pad rows repeat the last real token.
+    pub rows: usize,
+}
+
+impl ChainSeed {
+    /// Rank `me`'s seed as the stick's device bytes — `None` for a session that plays no rank of a
+    /// sharded world: the s stick's slab words as int32, the l stick's lane one-hot as fp16 — the
+    /// dtypes the chain's kernels read them at, the same bytes the device's own stage writes.
+    pub fn bytes<T: crate::bundle_code::collective::World>(
+        &self,
+        me: Option<crate::bundle_code::collective::Rank<T>>,
+    ) -> Vec<u8> {
+        let block = crate::wiring::chain_block(self.chain.block, me);
+        if self.is_s {
+            scratchy_subtile::subtile_ir::chain_s_seed(&self.toks, self.rows, block)
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        } else {
+            scratchy_subtile::subtile_ir::chain_l_seed(&self.toks, self.rows, block)
+                .into_iter()
+                .flat_map(|w| half::f16::from_f32(w as f32).to_le_bytes())
+                .collect()
+        }
+    }
 }
 
 /// A forward's ARGUMENTS — the data its kernels compute FROM.
@@ -48,6 +89,13 @@ pub struct ForwardInputs<'a> {
     pub embed_tokens: &'a [f32],
     /// Token id per row.
     pub tokens: &'a [usize],
+    /// ⭐ THE CHAIN'S SEED DECISION — `Some(per-row token ids)` when this launch RE-SEEDS the
+    /// persistent sticks (a request's first step on a session, a churned or padded seat, a rung
+    /// switch), `None` when the card's own `ChainStage` writes are every seat's seed and the
+    /// launcher binds NOTHING. Mirrors [`Self::tokens`] on the decode phase: prefill's `EmbedRow`
+    /// reads `tokens`, decode's `ChainSeed` reads these, and neither phase's tape carries the
+    /// other's step.
+    pub chain_seeds: Option<&'a [usize]>,
     /// ABSOLUTE rotary position per row — a row's real position in ITS sequence, which for a
     /// decode batch is not its row index.
     pub positions: &'a [u32],
@@ -104,6 +152,50 @@ pub fn kernel_values(
                 )
             });
     }
+    // ⭐⭐⭐ THE CHAINED HEAD'S SEED — the decompose of the token this step feeds (the same law the
+    // staged tables and the mint's reference state). A ChainSeed step on a prefill forward, or a
+    // step naming a tensor the chain does not, is a refusal: the sticks are the gather's only
+    // index, and an unstaged or mis-staged one gathers the wrong row silently.
+    if let ForwardKernel::ChainSeed = step.kernel {
+        let ForwardPhase::Decode { chain } = shape.phase else {
+            return Err(
+                "ChainSeed step on a prefill forward — the sticks are the gather's only index, so \
+                 a step the phase does not back is a tape/wiring desync"
+                    .to_string(),
+            );
+        };
+        let toks = inp.chain_seeds.ok_or_else(|| {
+            "ChainSeed step on a forward whose seeds are the card's own — the launcher skips the \
+             bind when the card's stage seeds every seat, so reaching kernel_values with none is a \
+             tape/launcher desync"
+                .to_string()
+        })?;
+        if toks.is_empty() {
+            return Err(
+                "ChainSeed step on a forward with no token to seed from — the sticks are the \
+                 gather's only index, and an unstaged one gathers the wrong row silently"
+                    .to_string(),
+            );
+        }
+        let is_s = step.tensor == PlaceId::Act(chain.s_src);
+        if !is_s && step.tensor != PlaceId::Act(chain.l_src) {
+            return Err(format!(
+                "ChainSeed step on t{} — the chain names t{} (s) and t{} (l), and a seed landing \
+                 anywhere else is a stick the gather never reads",
+                step.tensor.tid(),
+                chain.s_src,
+                chain.l_src
+            ));
+        }
+        // Per request row at the launch's own width: row r its own token's decompose, pad rows
+        // the last real token's.
+        return Ok(Staged::ChainSeed(ChainSeed {
+            chain,
+            is_s,
+            toks: toks.iter().map(|&t| t as u32).collect(),
+            rows,
+        }));
+    }
     Ok(Staged::F32(std::borrow::Cow::Owned(match step.kernel {
         ForwardKernel::EmbedRow => {
             let mut emb = vec![0.0f32; rows * h];
@@ -144,6 +236,7 @@ pub fn kernel_values(
             col
         }
         ForwardKernel::Paged => unreachable!("served above, where its index words stay INTEGERS"),
+        ForwardKernel::ChainSeed => unreachable!("served above, where it stays a stick's bytes"),
         ForwardKernel::Decode => {
             return Err("Decode is a device step, not a host call".to_string());
         }
@@ -184,6 +277,13 @@ pub enum ForwardKernel {
     /// batch's replicated rows, chunk page ids and chunk masks instead). Present exactly when the
     /// bundle states a paged step ([`ForwardShape::paged`]).
     Paged,
+    /// ⭐⭐⭐ THE CHAINED HEAD'S SEED — the decompose of the token this step FEEDS, bound into one
+    /// of the two persistent sticks. Present only on a decode forward ([`ForwardPhase::Decode`]),
+    /// where it REPLACES the embed-row push: the device's own `EmbedRowGather` reads the row out of
+    /// the sticks. The seed is IDEMPOTENT with the device's own writes — step `t` feeds the token
+    /// step `t-1` picked, exactly what step `t-1`'s `ChainStage` wrote — so the first play (the
+    /// prompt's final token, which no stage has written yet) is the one that matters.
+    ChainSeed,
     /// The device program itself.
     Decode,
 }
@@ -221,6 +321,21 @@ pub struct ForwardShape {
     /// per table iff the bundle placed it. A projection of the wiring's own field, never a caller's
     /// opinion: a walk with no staged table gathers through zeros, i.e. page 0.
     pub paged: crate::wiring::ClassSteps,
+    /// ⭐⭐⭐ THE FORWARD'S OWN PHASE — which head the tape opens with, carried BY TYPE. DECODE opens
+    /// with the chained head's two [`ForwardKernel::ChainSeed`] steps, the chain wiring riding the
+    /// variant; PREFILL opens with the host's own embed-row gather ([`ForwardKernel::EmbedRow`]). A
+    /// projection of the wiring's phase, like every other field here.
+    pub phase: ForwardPhase,
+}
+
+/// The forward's phase — the head its tape opens with, BY TYPE. See [`ForwardShape::phase`].
+#[derive(Clone, Copy, Debug)]
+pub enum ForwardPhase {
+    /// DECODE — the chained head's own device gather: the host's one contribution is the sticks'
+    /// seed, and the chain names the sticks.
+    Decode { chain: crate::wiring::ChainWiring },
+    /// PREFILL — the host's own embed-row gather; there is no chain to carry.
+    Prefill,
 }
 
 impl ForwardShape {
@@ -228,11 +343,25 @@ impl ForwardShape {
     /// device program runs, then the logits come back.
     pub fn steps(&self) -> Vec<ForwardStep> {
         let mut v = Vec::new();
-        // The chunk's token rows, gathered on the host.
-        v.push(ForwardStep {
-            kernel: ForwardKernel::EmbedRow,
-            tensor: PlaceId::Act(self.embed_src),
-        });
+        match self.phase {
+            // ⭐ THE CHAIN REPLACES THE EMBED ROW PUSH — the device's own EmbedRowGather reads the
+            // row out of the persistent sticks, so the host's one contribution is their seed.
+            ForwardPhase::Decode { chain } => {
+                v.push(ForwardStep {
+                    kernel: ForwardKernel::ChainSeed,
+                    tensor: PlaceId::Act(chain.s_src),
+                });
+                v.push(ForwardStep {
+                    kernel: ForwardKernel::ChainSeed,
+                    tensor: PlaceId::Act(chain.l_src),
+                });
+            }
+            // ⭐ PREFILL'S OWN HEAD — the chunk's token rows, gathered on the host.
+            ForwardPhase::Prefill => v.push(ForwardStep {
+                kernel: ForwardKernel::EmbedRow,
+                tensor: PlaceId::Act(self.embed_src),
+            }),
+        }
         for (i, &(t, ..)) in self.cos_srcs.iter().enumerate() {
             v.push(ForwardStep {
                 kernel: ForwardKernel::Cos(i),
@@ -393,6 +522,7 @@ mod tests {
                 full: Some(STEP),
                 sliding: None,
             },
+            phase: ForwardPhase::Prefill,
         }
     }
 
@@ -402,6 +532,7 @@ mod tests {
             hidden: 64,
             embed_tokens: &[],
             tokens: &[],
+            chain_seeds: None,
             positions: &[],
             paged: card,
         }
@@ -634,6 +765,7 @@ mod tests {
                 hidden: 64,
                 embed_tokens: &[],
                 tokens: &[],
+                chain_seeds: None,
                 positions: &positions[..sh.rows],
                 paged: None,
             };

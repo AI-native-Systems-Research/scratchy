@@ -974,6 +974,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "openblas-src",
+ "scratchy-spyre-superdsc",
  "serde_json",
 ]
 

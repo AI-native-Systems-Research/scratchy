@@ -107,8 +107,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    spyre_superdsc::layout::restick::<Baked>(&mut g);
-    spyre_superdsc::layout::index_inner::<Baked>(&mut g);
+    let staged_flags: Vec<bool> = (0..g.params.len()).map(|p| staged.contains(&p)).collect();
+    println!(
+        "arrangements {:?}",
+        spyre_superdsc::arrangement::staged_arrangements::<Baked>(&g, &staged_flags)
+    );
+    if !rest.iter().any(|a| a == "lifted") {
+        spyre_superdsc::layout::restick::<Baked>(&mut g);
+        spyre_superdsc::layout::index_inner::<Baked>(&mut g);
+        spyre_superdsc::layout::integer_copies(&mut g);
+    }
     for (i, n) in g.nodes.iter().enumerate() {
         println!(
             "node {i}: {:?} space {:?} ins {:?} out {:?}",
@@ -123,7 +131,10 @@ fn main() {
                         .axes
                         .iter()
                         .map(|a| (a.extent, a.stride))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
+                    o.gather
+                        .as_ref()
+                        .map(|g| (g.axis, g.rows, g.index.store, g.index.view.offset))
                 ))
                 .collect::<Vec<_>>(),
             (

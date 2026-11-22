@@ -96,6 +96,10 @@ name = "port_dtypes"
 path = "tests/port_dtypes.rs"
 
 [[test]]
+name = "sampler_on_emulator"
+path = "tests/sampler_on_emulator.rs"
+
+[[test]]
 name = "port_indirect_access"
 path = "tests/port_indirect_access.rs"
 
@@ -160,6 +164,8 @@ default-features = false
 
 [dev-dependencies]
 serde_json = "1"
+# The sampler test stages its tables by the lowering's own stagger.
+spyre-superdsc = { package = "scratchy-spyre-superdsc", path = "../../superdsc" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cblas-sys = "0.3"

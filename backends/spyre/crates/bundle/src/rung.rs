@@ -164,6 +164,11 @@ impl RungCap {
     pub const fn count(self) -> usize {
         self.0.get() as usize
     }
+
+    /// The sequence count, never zero — the type the folded draw's request count is.
+    pub const fn nonzero(self) -> NonZeroU32 {
+        self.0
+    }
 }
 
 /// THE ATTENTION QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, never a division of the

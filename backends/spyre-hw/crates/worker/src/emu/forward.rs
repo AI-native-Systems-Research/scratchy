@@ -140,8 +140,49 @@ pub(crate) fn forward_chunk(
     let mut dynamic: Vec<(u64, Vec<f32>, Vec<usize>)> = {
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
-        // The embedding is this chunk's rows of the hidden state.
-        dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
+        // ⭐ THE CHAIN REPLACES THE EMBED ROW PUSH here too — a chained wiring's gather reads the
+        // two persistent sticks, so the host's contribution is their seed: each row's token's
+        // decompose (the token this forward feeds — the same bytes the card path's ChainSeed steps
+        // bind, idempotent with the device's own ChainStage writes), at the sticks' own dtypes.
+        match b.phase {
+            scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
+                let seed = |is_s| scratchy_target_spyre::forward_tape::ChainSeed {
+                    chain,
+                    is_s,
+                    toks: toks32.clone(),
+                    rows,
+                };
+                // The emulator plays a world of one: the whole table.
+                let world_of_one =
+                    None::<scratchy_target_spyre::bundle_code::collective::Rank<
+                        scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                    >>;
+                session
+                    .set_typed_sources(vec![
+                        (
+                            chain.s_src as usize,
+                            seed(true).bytes(world_of_one),
+                            scratchy_tensors::DType::I32,
+                            vec![
+                                rows,
+                                scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize,
+                            ],
+                        ),
+                        (
+                            chain.l_src as usize,
+                            seed(false).bytes(world_of_one),
+                            scratchy_tensors::DType::F16,
+                            vec![rows, scratchy_subtile::subtile_ir::SAMPLE_BLOCK as usize],
+                        ),
+                    ])
+                    .map_err(|e| werr(format!("chain seed: {e}")))?;
+            }
+            // The embedding is this chunk's rows of the hidden state.
+            scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => {
+                dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
+            }
+        }
         // Each rope table is tiled to the width its consumer reads, from THE
         // SOURCE'S OWN CLASS's rows. `classes` is cos-then-sin, so a sin
         // source's class index is offset past the cos sources.
@@ -158,7 +199,6 @@ pub(crate) fn forward_chunk(
         }
         dynamic
     };
-    let vocab = sh.vocab;
 
     // ⭐ THE PAGED STEP — the page table, the mask stack and the write rows, staged from the
     // request's blocks by `scratchy_target_spyre::paged_step` (the law the bake's numeric gate stages
@@ -166,8 +206,7 @@ pub(crate) fn forward_chunk(
     // staged: every layer's write scatters this step's K/V into them and its walk gathers from them,
     // on the device, step after step.
     {
-        let first = b
-            .paged
+        b.paged
             .first()
             .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
         let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
@@ -192,7 +231,48 @@ pub(crate) fn forward_chunk(
             let (mask_tid, mask, mask_shape) = srcs.mask;
             dynamic.push((u64::from(mask_tid), mask, mask_shape));
         }
-        // The result is the one readback, whole: the answer rows' logits, the host draws from.
+        // ⭐ THE MINTED DRAW'S SEAT, STAGED FRESH EVERY STEP — its five operands go stale the
+        // moment a step completes (the step word IS the step's freshness). One law per seat row,
+        // `seat_words`' — the one statement of the law both tiers lay out — packed `[rows, 1]` at
+        // the views' own dtypes (i32 words, f32 inv_t).
+        let seat = b.sample_seat.ok_or_else(|| {
+            werr(format!(
+                "bundle has no sampler seat (result t{}) — every bundle mints the draw",
+                b.result_id
+            ))
+        })?;
+        let seat_rows = seat.rows as usize;
+        let words: Vec<([i32; 4], f32)> = (0..seat_rows)
+            .map(|_| {
+                seat_words(&RowLaw {
+                    draw: req.draw.as_ref(),
+                    step: (start + n - 1) as u32,
+                })
+            })
+            .collect();
+        let mut typed: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = seat
+            .seed_words
+            .iter()
+            .enumerate()
+            .map(|(k, &tid)| {
+                (
+                    tid as usize,
+                    words.iter().flat_map(|(w, _)| w[k].to_le_bytes()).collect(),
+                    scratchy_tensors::DType::I32,
+                    vec![seat_rows, 1],
+                )
+            })
+            .collect();
+        typed.push((
+            seat.invt as usize,
+            words.iter().flat_map(|(_, t)| t.to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            vec![seat_rows, 1],
+        ));
+        session
+            .set_typed_sources(typed)
+            .map_err(|e| werr(format!("sampler seat: {e}")))?;
+        // The result is the one readback, whole: the idx stick the minted draw wrote.
         let outputs: Vec<(u64, usize)> = b.output_ids.iter().map(|id| (*id as u64, 0)).collect();
         let out = session
             .run_step(b.prog, dynamic, &outputs)
@@ -202,31 +282,20 @@ pub(crate) fn forward_chunk(
         if start + n < tokens.prompt_len(id) {
             return Ok(ChunkOut::Prompt);
         }
-        // ⭐ THE ANSWER ROWS ARE THE RESULT'S FIRST ROWS: a prompt chunk's lm-head tail is folded to
-        // its requests' last rows (request `r`'s logits at row `r`), a decode batch's rows are its
-        // sequences'. The host draws each row's token under the request's own law; the caller
-        // consumes the last row's, the last real token's forward.
-        let logits = out
+        // ⭐ THE PICK IS THE MINTED SAMPLER'S, READ BACK LIKE THE CARD'S. The bake re-points the
+        // result at the idx stick — one word per seat row, every lane equal — so no host argmax
+        // runs: row `r`'s pick is element `r · idx_row_words`, through the same token law the
+        // card's readback applies. The answer rows are the seat's rows: a prompt chunk's folded
+        // requests' last rows, a decode batch's sequences.
+        let idx = out
             .get(&(b.result_id as u64))
-            .ok_or_else(|| werr(format!("the logits t{} came back unread", b.result_id)))?;
-        let answers = match first.paged_rows {
-            scratchy_target_spyre::paged_step::PagedRows::Batch => n,
-            scratchy_target_spyre::paged_step::PagedRows::Sequence => {
-                first.extent.requests().get() as usize
-            }
-        };
-        let picks = logits
-            .chunks(crate::spyre_forward::logits_pitch(vocab))
-            .take(answers)
-            .enumerate()
-            .map(|(r, row)| {
-                draw_token(
+            .ok_or_else(|| werr(format!("the minted draw's idx stick t{} came back unread", b.result_id)))?;
+        let picks = (0..seat_rows)
+            .map(|r| {
+                token_of_idx_word(
                     r,
-                    row.iter().take(vocab).copied(),
-                    &RowLaw {
-                        draw: req.draw.as_ref(),
-                        step: (start + n - 1) as u32,
-                    },
+                    idx[r * seat.idx_row_words as usize] as i32,
+                    seat.vocab as usize,
                 )
             })
             .collect::<ExecutorResult<Vec<u32>>>()?;

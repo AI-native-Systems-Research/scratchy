@@ -371,6 +371,31 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "reshape_fwd",
             program: Program::Reshape,
         },
+        // ⭐ THE TOKEN DRAW — the whole vocab scan as ONE kernel per request row: the row, its
+        // per-row noise block and temperature reciprocals, the staged tables (functions of the
+        // vocab alone, host-staged at load), and the `[rows, 64]` i32 idx stick out. The vocab
+        // and the row count ride the node; every constexpr derives from them.
+        SubOp::Sample { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../../kernels/sample_fwd.py"),
+            file: "sample_fwd.py",
+            entry: "sample_fwd",
+            program: Program::Sample,
+        },
+        // ⭐ THE CHAINED HEAD'S PAIR — the drawn token never leaves the card: the stage decomposes
+        // each row's pick into the persistent s/l sticks through its staged tables, and the next
+        // step's gather reads the embedding row they name out of the tied weight.
+        SubOp::EmbedRowGather { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../../kernels/embed_row_gather.py"),
+            file: "embed_row_gather.py",
+            entry: "embed_row_gather_fwd",
+            program: Program::EmbedRowGather,
+        },
+        SubOp::ChainStage { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../../kernels/chain_stage.py"),
+            file: "chain_stage.py",
+            entry: "chain_stage_fwd",
+            program: Program::ChainStage,
+        },
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
         // match is the gate: these kinds have their own arms there, and a kind reaching
@@ -475,18 +500,35 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> bool {
-    // ⭐ THE TAIL'S PRODUCT IS THE RESULT'S WIDTH — the node's output region is as wide as the
-    // result, or (a vocabulary projection split across ranks, one rank's block) it reaches the
-    // result through the all-gather that restores the whole vocabulary. One predicate, read by
-    // every caller — the `lower_all` rewrite and the one-op routing echo — so both state the SAME
-    // fold. (The width alone was never sufficient — the gemma-4 q-projection collision is what the
-    // feeds-walk conjunct below kills.)
-    let result_cols = ir.tensors[ir.result.index()].cols;
-    let feeds_the_tail_product = node.output.region.cols.len == result_cols
-        || matches!(node.op, SubOp::MatmulTile { .. })
-            && gathers_to_width(ir, node.output.tensor, result_cols);
-    // A projection's rows are its ACTIVATION's: every tail op has the same rows in and out, and a
-    // projection's are the prompt rows it folds over.
+    // ⭐ THE TAIL'S PRODUCT IS VOCAB-WIDE. A graph the sampler minted re-points its result at the
+    // idx stick and pads the tail's storage width, so the draw states the width: the lm-head's own
+    // output width `n` equals the vocab the draw serves, and an elementwise tail node's region is
+    // that wide. A graph without a draw reads the result's own width. A vocabulary projection
+    // split across ranks (one rank's block) reaches it through the all-gather that restores the
+    // whole vocabulary. One predicate, read by every caller — the `lower_all` rewrite, the one-op
+    // routing echo and the bake's numeric gate — so all state the SAME fold. (The width alone was
+    // never sufficient — the gemma-4 q-projection collision is what the feeds-walk conjunct below
+    // kills.)
+    let draw = ir.nodes.iter().find_map(|n| match n.op {
+        SubOp::Sample { vocab, .. } => Some(vocab),
+        _ => None,
+    });
+    let feeds_the_tail_product = match (draw, &node.op) {
+        (Some(vocab), SubOp::MatmulTile { n, .. }) => {
+            *n == vocab || gathers_to_width(ir, node.output.tensor, vocab)
+        }
+        (Some(vocab), _) => node.output.region.cols.len == vocab,
+        (None, op) => {
+            let result_cols = ir.tensors[ir.result.index()].cols;
+            node.output.region.cols.len == result_cols
+                || matches!(op, SubOp::MatmulTile { .. })
+                    && gathers_to_width(ir, node.output.tensor, result_cols)
+        }
+    };
+    // A projection's rows are its ACTIVATION's: a folded tail that gathers is declared one row from
+    // the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a whole
+    // one-row tensor), while the prompt rows it folds over are still `mq`. Every other tail op has
+    // the same rows in and out.
     let rows = match &node.op {
         SubOp::MatmulTile { .. } => node.inputs.first().map_or(0, |a| a.region.rows.len),
         _ => node.output.region.rows.len,
@@ -507,7 +549,7 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
-/// epilogues — the path a split vocabulary projection takes to the logits.
+/// epilogues — the path a split vocabulary projection takes to the draw.
 fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     t: scratchy_subtile::subtile_ir::TensorId,
@@ -983,6 +1025,10 @@ pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F
             | SubOp::RmsNormUnit { .. }
             | SubOp::TanhSoftCap { .. }
             | SubOp::ScalarWeightMul
+            // ⭐ THE DRAW IS ROW-LOCAL IN THE TAIL'S OWN SENSE: it reads one row region of its
+            // input (the fold's product) and writes the idx stick — no row mixing — so a minted
+            // graph's feeds-walk traverses it from the tail to the re-pointed result.
+            | SubOp::Sample { .. }
             // ⭐ AN ALL-GATHER IS ROW-LOCAL: row `r` of its output is row `r` of every rank's
             // block, side by side — a split vocabulary projection's tail passes through it.
             | SubOp::AllGather { .. }
@@ -1135,7 +1181,13 @@ fn lower_one<
         // at m=S (the `[S, vocab]` prefix of the `[mq, vocab]` logits storage, a legal
         // prefix view), and the front end's chunker never tiles this op (its chunk set is
         // the elementwise/scalarmul/silumul family), so a column window never arises.
-        let states_neither_corner = matches!(&node.op, SubOp::TanhSoftCap { .. });
+        let states_neither_corner = matches!(
+            &node.op,
+            SubOp::TanhSoftCap { .. }
+                | SubOp::Sample { .. }
+                | SubOp::EmbedRowGather { .. }
+                | SubOp::ChainStage { .. }
+        );
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
                 tr.region.rows.start == 0 && tr.region.cols.start == 0
@@ -1214,6 +1266,17 @@ fn lower_one<
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
+        // ⭐ THE SAMPLER'S ARITY IS 26: the logits row, its per-row seed quadruple's four
+        // `[rows, 1]` word tables and its per-row temperature reciprocals, then the twenty staged
+        // tables (two decreasing ramps, two increasing index tables, two widen tables, the pad
+        // law's offset row, the two-level ramp's group pair, then the noise section's eleven —
+        // the four i32 hash/fold constants, the lane table, the fold's five f32 constants, the
+        // fp16 clamp) — every kernel parameter but the output is a tape operand.
+        SubOp::Sample { .. } => 26,
+        // The chained head's pair: `[s_stick, l_stick, weight]` and `[pick, s_stick, l_stick,
+        // s_tab, l_tab]`.
+        SubOp::EmbedRowGather { .. } => 3,
+        SubOp::ChainStage { .. } => 5,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -1922,20 +1985,20 @@ impl KvPool {
         KvPool::Fp16
     };
 
+    /// The pool's pointer type in a paged kernel's signature.
+    pub const fn pointer(self) -> &'static str {
+        match self {
+            KvPool::Fp16 => "*fp16",
+            KvPool::Fp8 => "*fp8e4nv",
+        }
+    }
+
     /// This pool's half of a paged kernel's pair — spyre-inference's own kernel, or its fp8-pool
     /// twin: the source, the file or the entry.
     pub const fn pick(self, fp16: &'static str, fp8: &'static str) -> &'static str {
         match self {
             KvPool::Fp16 => fp16,
             KvPool::Fp8 => fp8,
-        }
-    }
-
-    /// The pool's pointer type in a paged kernel's signature.
-    pub const fn pointer(self) -> &'static str {
-        match self {
-            KvPool::Fp16 => "*fp16",
-            KvPool::Fp8 => "*fp8e4nv",
         }
     }
 
@@ -3245,6 +3308,153 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_OUT", Val::Int(i128::from(c_out)))?;
             ce("N_STICKS", Val::Int(i128::from(elems_in / u64::from(stk))))?;
         }
+        (SubOp::Sample { vocab, rows }, "sample_fwd") => {
+            // The token draw's own facts, all derived from the node's vocab and
+            // row count — never a model name: PAD_V is the power-of-two padded
+            // row, STRICTLY above the vocab (the descriptor block's law and the
+            // sentinel's — a power-of-two vocab still needs pad lanes), ONE
+            // derivation shared with the host reference and the load-time table
+            // staging), NB its block count, BLOCK the stick (the two-level
+            // ramp's lane width and the output stick), B the row count this
+            // rung serves (the grid's own width). The signature states every
+            // kernel parameter's dtype: the fp16 row, the PER-ROW SEED WORD
+            // TABLES in i32 — four `[rows, 1]` tables, one per word of the
+            // quadruple (seed_lo, seed_hi, step, greedy_gate), each
+            // loaded corner-free at `[pid, 0]` (the Col operand mode reads
+            // the stick head alone — the int-bcast leg's measured law — so
+            // no word rides a windowed column; the auditor's wall-4 ruling
+            // (a); the row word is gone from the key — the P3 localization
+            // ruling, request-owned noise alone); the noise is computed on
+            // the card, no f32 noise staging
+            // rides — then the per-row temperature reciprocals in f32,
+            // the nine selection tables in f32 (the selection is f32 — a sum
+            // the f16 grid would round), the noise section's own tables — the
+            // hash multipliers and the wrap-fold's 2^8 in i32, the lane and the
+            // fold's five f32 constants, the FEST-domain clamp in fp16 — and
+            // the i32 output stick (the index-ingestion law).
+            let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(*vocab);
+            let nb = pad_v / scratchy_subtile::subtile_ir::SAMPLE_BLOCK;
+            signature.insert(
+                "logits_ptr".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+            for p in ["slo_ptr", "shi_ptr", "stp_ptr", "sgate_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in [
+                "invt_ptr",
+                "bramp_ptr",
+                "lramp_ptr",
+                "binc_ptr",
+                "linc_ptr",
+                "ones_ptr",
+                "sixtyfour_ptr",
+                "padoff_ptr",
+                "gramp_ptr",
+                "ginc_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in ["hc1_ptr", "hc2_ptr", "hc3_ptr", "c256_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in [
+                "lane_ptr",
+                "fm8_ptr",
+                "ftop_ptr",
+                "fzero_ptr",
+                "fhalf_ptr",
+                "fm22_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+                );
+            }
+            signature.insert(
+                "cmin_ptr".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+            signature.insert(
+                "idx_ptr".to_string(),
+                ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+            );
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("V", Val::Int(i128::from(*vocab)))?;
+            ce("PAD_V", Val::Int(i128::from(pad_v)))?;
+            ce("NB", Val::Int(i128::from(nb)))?;
+            ce(
+                "BLOCK",
+                Val::Int(i128::from(scratchy_subtile::subtile_ir::SAMPLE_BLOCK)),
+            )?;
+            ce("B", Val::Int(i128::from(*rows)))?;
+        }
+        (SubOp::EmbedRowGather { hidden, .. }, "embed_row_gather_fwd") => {
+            // The gathered row's facts, all read off the node: its hidden and request rows, the
+            // weight's stated columns (the widened pad, or one rank's block of it), the slab's
+            // lane count, and the s stick's row width.
+            let pad = ir.shape(node.inputs[2].tensor).cols;
+            for (p, t) in [
+                ("s_ptr", "*i32"),
+                ("l_ptr", "*fp16"),
+                ("w_ptr", "*fp16"),
+                ("out_ptr", "*fp16"),
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse(t).map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: u32| {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+            };
+            ce("HIDDEN", *hidden);
+            ce("PAD", pad);
+            ce("LANES", scratchy_subtile::subtile_ir::SAMPLE_BLOCK);
+            ce("IDX", scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK);
+            ce("B", m);
+        }
+        (SubOp::ChainStage { table_rows, .. }, "chain_stage_fwd") => {
+            // The stage's facts: the tables' extent the mint stated, the stick widths, the pick
+            // stick's row width (the sampler's idx stick), and the request rows.
+            let pick = ir.shape(node.inputs[0].tensor).cols;
+            for (p, t) in [
+                ("pick_ptr", "*i32"),
+                ("s_ptr", "*i32"),
+                ("l_ptr", "*fp16"),
+                ("s_tab_ptr", "*i32"),
+                ("l_tab_ptr", "*fp16"),
+                ("out_ptr", "*i32"),
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse(t).map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: u32| {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+            };
+            ce("TABLE_ROWS", *table_rows);
+            ce("IDX", scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK);
+            ce("LANES", scratchy_subtile::subtile_ir::SAMPLE_BLOCK);
+            ce("PICK", pick);
+            ce("B", m);
+        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -3410,6 +3620,12 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => Ok(vec![1]),
+        // ⭐ ONE PROGRAM PER REQUEST ROW: the sampler's grid is the rung's own row count — 1 on
+        // the solo rung, the batched rung's baked width on every batch rung. Every per-row
+        // operand is a `[B, ·]` descriptor this program's own row indexes (`[pid, 0]`).
+        SubOp::Sample { rows, .. } => Ok(vec![i64::from(*rows)]),
+        // The chained head's pair: one program walks the request rows.
+        SubOp::EmbedRowGather { .. } | SubOp::ChainStage { .. } => Ok(vec![1]),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -3815,6 +4031,9 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::PagedAttn => "pagedattn",
         Program::PagedKvWrite => "pagedkvwrite",
         Program::Transpose => "transpose",
+        Program::Sample => "sample",
+        Program::EmbedRowGather => "embedrow",
+        Program::ChainStage => "chainstage",
     }
 }
 
@@ -3865,6 +4084,9 @@ mod production_ktir_dump {
     const MOE: &str = include_str!("../../../../kernels/moe.py");
     const MOE_PREFILL: &str = include_str!("../../../../kernels/moe_prefill.py");
     const RESHAPE: &str = include_str!("../../../../kernels/reshape.py");
+    const SAMPLE: &str = include_str!("../../../../kernels/sample_fwd.py");
+    const EMBED_ROW_GATHER: &str = include_str!("../../../../kernels/embed_row_gather.py");
+    const CHAIN_STAGE: &str = include_str!("../../../../kernels/chain_stage.py");
     const RMSNORM: &str = include_str!("../../../../kernels/rmsnorm.py");
     const RMSNORMUNIT: &str = include_str!("../../../../kernels/rmsnormunit.py");
     const ROPE: &str = include_str!("../../../../kernels/rope.py");
@@ -4683,6 +4905,119 @@ mod production_ktir_dump {
             ),
             vec![1],
         ));
+        // ── sample_fwd.py: the token draw at solo and batched grids. The spec mirrors the `SubOp::Sample` arm of `kernel_spec`'s registry row: the
+        // logits row, its per-row seed quadruple's four word tables and temperature
+        // reciprocal, the twenty staged tables (the nine of the selection cascade and
+        // the noise section's own eleven), and the `[B, 64]` idx stick out. ──
+        {
+            let sample_ptrs: &[(&str, &str)] = &[
+                ("logits_ptr", "*fp16"),
+                ("slo_ptr", "*i32"),
+                ("shi_ptr", "*i32"),
+                ("stp_ptr", "*i32"),
+                ("sgate_ptr", "*i32"),
+                ("invt_ptr", "*fp32"),
+                ("bramp_ptr", "*fp32"),
+                ("lramp_ptr", "*fp32"),
+                ("binc_ptr", "*fp32"),
+                ("linc_ptr", "*fp32"),
+                ("ones_ptr", "*fp32"),
+                ("sixtyfour_ptr", "*fp32"),
+                ("padoff_ptr", "*fp32"),
+                ("gramp_ptr", "*fp32"),
+                ("ginc_ptr", "*fp32"),
+                ("hc1_ptr", "*i32"),
+                ("hc2_ptr", "*i32"),
+                ("hc3_ptr", "*i32"),
+                ("c256_ptr", "*i32"),
+                ("lane_ptr", "*fp32"),
+                ("fm8_ptr", "*fp32"),
+                ("ftop_ptr", "*fp32"),
+                ("fzero_ptr", "*fp32"),
+                ("fhalf_ptr", "*fp32"),
+                ("fm22_ptr", "*fp32"),
+                ("cmin_ptr", "*fp16"),
+                ("idx_ptr", "*i32"),
+            ];
+            for (name, b, grid) in [
+                ("sample_fwd_b1", 1i128, vec![1i64]),
+                ("sample_fwd_b2", 2, vec![2]),
+                ("sample_fwd_b32", 32, vec![32]),
+            ] {
+                v.push((
+                    name,
+                    SAMPLE,
+                    spec(
+                        "sample_fwd.py",
+                        "sample_fwd",
+                        sample_ptrs,
+                        &[
+                            ("V", Val::Int(49155)),
+                            ("PAD_V", Val::Int(65536)),
+                            ("NB", Val::Int(1024)),
+                            ("BLOCK", Val::Int(64)),
+                            ("B", Val::Int(b)),
+                        ],
+                    ),
+                    grid,
+                ));
+            }
+        }
+        // ── embed_row_gather.py / chain_stage.py: the chained head at granite's widened vocab,
+        // solo and batched — the specs mirror the registry rows' `kernel_spec` arms. ──
+        for (b, gather, stage) in [
+            (1i128, "embed_row_gather_b1", "chain_stage_b1"),
+            (2, "embed_row_gather_b2", "chain_stage_b2"),
+            (32, "embed_row_gather_b32", "chain_stage_b32"),
+        ] {
+            let grid = vec![1i64];
+            v.push((
+                gather,
+                EMBED_ROW_GATHER,
+                spec(
+                    "embed_row_gather.py",
+                    "embed_row_gather_fwd",
+                    &[
+                        ("s_ptr", "*i32"),
+                        ("l_ptr", "*fp16"),
+                        ("w_ptr", "*fp16"),
+                        ("out_ptr", "*fp16"),
+                    ],
+                    &[
+                        ("HIDDEN", Val::Int(2048)),
+                        ("PAD", Val::Int(65536)),
+                        ("LANES", Val::Int(64)),
+                        ("IDX", Val::Int(32)),
+                        ("B", Val::Int(b)),
+                    ],
+                ),
+                grid.clone(),
+            ));
+            v.push((
+                stage,
+                CHAIN_STAGE,
+                spec(
+                    "chain_stage.py",
+                    "chain_stage_fwd",
+                    &[
+                        ("pick_ptr", "*i32"),
+                        ("s_ptr", "*i32"),
+                        ("l_ptr", "*fp16"),
+                        ("s_tab_ptr", "*i32"),
+                        ("l_tab_ptr", "*fp16"),
+                        ("out_ptr", "*i32"),
+                    ],
+                    &[
+                        ("TABLE_ROWS", Val::Int(65536 + 4160 + 1)),
+                        ("IDX", Val::Int(32)),
+                        ("LANES", Val::Int(64)),
+                        ("PICK", Val::Int(64)),
+                        ("B", Val::Int(b)),
+                    ],
+                ),
+                grid,
+            ));
+        }
         v
     }
 
@@ -4711,6 +5046,11 @@ mod production_ktir_dump {
                 Program::WindowedRmsNorm { unit: false }
             }
             "windowedrmsnorm_unit_fwd" => Program::WindowedRmsNorm { unit: true },
+            "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
+            "embed_row_gather_b1" | "embed_row_gather_b2" | "embed_row_gather_b32" => {
+                Program::EmbedRowGather
+            }
+            "chain_stage_b1" | "chain_stage_b2" | "chain_stage_b32" => Program::ChainStage,
             "rope_fwd" => Program::Rope,
             "paged_attn_decode"
             | "paged_attn_prefill"

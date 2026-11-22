@@ -852,8 +852,24 @@ pub fn compute_bundle_layout<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
         seg_bytes[seg] = align128(off + size);
     }
 
+    // The resident sources: the prefix KV and the load-time constants (staged once at load, never
+    // by a step's binds).
     let mut resident_source_tids: Vec<u32> = prefix_kv_tids.iter().copied().collect();
+    resident_source_tids.extend(
+        crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir)?
+            .into_iter()
+            .map(|(tid, _)| tid),
+    );
+    // ⭐ THE CHAIN'S REPLACED ROW — the device's own EmbedRowGather writes its slot's reader
+    // every step, so the host has no filler for it: without the excuse the completeness gate
+    // refuses the launch.
+    if let crate::wiring::ChainFact::Chained { chain } =
+        crate::lower_subtile_tape_to_ktir::chain_of_ir(ir)?
+    {
+        resident_source_tids.push(chain.replaces);
+    }
     resident_source_tids.sort_unstable();
+    resident_source_tids.dedup();
     Ok(BundleLayout {
         placements,
         segment_bytes: seg_bytes,
@@ -2199,6 +2215,22 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // skipped below. The fold pre-scales the reference used to apply to
     // weight sources live in the bytes now (they were minted with them), so
     // there is nothing to pre-scale here.
+    // ⭐ THE SEAT UNDER THE GREEDY LAW ([`GREEDY_SEAT`], inv_t 1.0): the reference's draw is the
+    // plain first max (`g·0 = 0` exact). The emulator's f32 tiles cannot hold the bit-exact i32
+    // hash (products past 2^24 lose bits), so a noise-decided draw is not this gate's to check.
+    let staged_seat: std::collections::HashMap<u32, Vec<f32>> =
+        match crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir)
+            .expect("the golden's seat derivation — the graph is validated, one mint at most")
+        {
+            None => Default::default(),
+            Some(seat) => seat
+                .seed_words
+                .iter()
+                .zip(&GREEDY_SEAT)
+                .map(|(&tid, &w)| (tid, vec![w as f32; seat.rows as usize]))
+                .chain([(seat.invt, vec![1.0; seat.rows as usize])])
+                .collect(),
+        };
     let staged_weight = |id: usize| {
         weights.scale_rows.contains(&(id as u32)) || weights.bytes.iter().any(|(t, ..)| *t == id)
     };
@@ -2218,6 +2250,8 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             if staged_weight(id) || covering.is_some_and(|c| !c.contains(&(id as u64))) {
                 Vec::new()
             } else if let Some(v) = staged_rope.get(&(id as u32)) {
+                v.clone()
+            } else if let Some(v) = staged_seat.get(&(id as u32)) {
                 v.clone()
             } else {
                 let t = ir.tensors[id];
@@ -2990,6 +3024,10 @@ pub fn write_eval_golden<F: RopeForm>(
 /// one-rank gate stages it once; the sharded gate once per rank, with `seed` naming each source's
 /// synth stream — a rank's slice of a sharded source is its own, a replicated source the same on
 /// every rank.
+/// The gate's seed quadruple `(seed_lo, seed_hi, step, gate)`: the greedy law (gate word 0), at a
+/// small step salt every leg holds exactly.
+const GREEDY_SEAT: [i32; 4] = [0, 0, 7, 0];
+
 #[cfg(feature = "spyre-emu")]
 struct GateProbe {
     emu_weights: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)>,
@@ -3002,7 +3040,7 @@ struct GateProbe {
 }
 
 #[cfg(feature = "spyre-emu")]
-fn stage_gate_probe<F: RopeForm>(
+fn stage_gate_probe<T: crate::bundle_code::collective::World, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     covering: Option<&std::collections::HashSet<u64>>,
@@ -3012,6 +3050,9 @@ fn stage_gate_probe<F: RopeForm>(
     // gate message names; the probe reads `rung.active_cap` / `rung.query_rows`).
     rung: &GateRung<'_>,
     seed: &dyn Fn(u32) -> usize,
+    // The rank this probe stages — `None` for the one-rank gate. A chained head's decompose
+    // tables and seeds are this rank's vocabulary block (`LoadConst::build`).
+    me: Option<crate::bundle_code::collective::Rank<T>>,
 ) -> Result<GateProbe, String> {
     // ── Synth weights: staged ONCE for both legs — the emulator's resident
     //    bytes (moved into the session's HBM below) and the reference legs'
@@ -3026,8 +3067,77 @@ fn stage_gate_probe<F: RopeForm>(
         gemm,
         scale_rows,
     } = stage_synth_weights(ir, weight_ids, covering, seed);
+    // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged into the session
+    // exactly as the worker stages them at load: each entry's kind names the ONE builder
+    // (`LoadConst::build`) both legs call. ⛔ THE REFERENCE LEGS TAKE THEM THROUGH THE VIEW'S OWN
+    // `stage_load_consts`, NOT `bytes`: the clone crosses BEFORE the entries join the session's
+    // staging, because `materialize` substitutes a weight's bytes at every read.
+    let load_consts_of =
+        crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir).map_err(|e| e.0)?;
+    let mut load_const_tids: std::collections::HashSet<u32> =
+        load_consts_of.iter().map(|&(tid, _)| tid).collect();
     let weights_ref = emu_weights.clone();
-    let load_consts: Vec<BuiltConst> = Vec::new();
+    let mut load_consts: Vec<BuiltConst> = Vec::with_capacity(load_consts_of.len());
+    for &(tid, kind) in &load_consts_of {
+        let (bytes, dt, shape) = kind.build(me);
+        load_consts.push((tid, bytes.clone(), dt));
+        emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
+    }
+    // ⭐ THE CHAINED HEAD'S SEEDS — the persistent sticks as the worker seeds them
+    // (`forward_tape::ChainSeed`, this rank's block), one distinct in-vocabulary token per row,
+    // staged into the session and the reference legs' initial buffers alike: the gather reads them
+    // before any node writes them.
+    if let crate::wiring::ChainFact::Chained { chain } =
+        crate::lower_subtile_tape_to_ktir::chain_of_ir(ir).map_err(|e| e.0)?
+    {
+        let rows = ir.tensors[chain.s_src as usize].rows as usize;
+        let toks: Vec<u32> = (0..rows as u32).map(|r| 5 + 97 * r).collect();
+        for (is_s, tid, dt, cols) in [
+            (
+                true,
+                chain.s_src,
+                scratchy_tensors::DType::I32,
+                scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK,
+            ),
+            (
+                false,
+                chain.l_src,
+                scratchy_tensors::DType::F16,
+                scratchy_subtile::subtile_ir::SAMPLE_BLOCK,
+            ),
+        ] {
+            let bytes = crate::forward_tape::ChainSeed {
+                chain,
+                is_s,
+                toks: toks.clone(),
+                rows,
+            }
+            .bytes(me);
+            load_const_tids.insert(tid);
+            load_consts.push((tid, bytes.clone(), dt));
+            emu_weights.push((tid as usize, bytes, dt, vec![rows, cols as usize]));
+        }
+    }
+    // ⭐ THE SEAT, staged at the operands' TRUE dtypes under the golden's greedy law
+    // ([`GREEDY_SEAT`]): the four seed word tables as i32 words, the inv_t as f32, one per row.
+    let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir).map_err(|e| e.0)?;
+    if let Some(seat) = &sample_seat {
+        let rows = seat.rows as usize;
+        for (&tid, &word) in seat.seed_words.iter().zip(&GREEDY_SEAT) {
+            emu_weights.push((
+                tid as usize,
+                (0..rows).flat_map(|_| word.to_le_bytes()).collect(),
+                scratchy_tensors::DType::I32,
+                vec![rows, 1],
+            ));
+        }
+        emu_weights.push((
+            seat.invt as usize,
+            (0..rows).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            vec![rows, 1],
+        ));
+    }
     // ── The probe sources: synth at the IR shape, scales as ones, the mask
     //    keeping the prefix region's rows valid (the reference's own key set) ──
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
@@ -3120,7 +3230,11 @@ fn stage_gate_probe<F: RopeForm>(
         // part of the graph under test. The reserved-tid sources appended
         // below (the scalars, the mask) stay UNfiltered — the twin's programs
         // bind them exactly as the full bundle does.
-        if weight_ids.contains(&tid) || covering.is_some_and(|c| !c.contains(&(tid as u64))) {
+        if weight_ids.contains(&tid)
+            || load_const_tids.contains(&tid)
+            || sample_seat.is_some_and(|s| s.seed_words.contains(&tid) || s.invt == tid)
+            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
+        {
             continue;
         }
         let t = ir.tensors[tid as usize];
@@ -3560,7 +3674,15 @@ pub fn numeric_gate<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
         load_consts,
         staged_rope,
         sources,
-    } = stage_gate_probe::<F>(ir, weight_ids, covering, prefill, rung, &|tid| tid as usize)?;
+    } = stage_gate_probe::<crate::bundle_code::collective::TpWorld<1>, F>(
+        ir,
+        weight_ids,
+        covering,
+        prefill,
+        rung,
+        &|tid| tid as usize,
+        None,
+    )?;
     let view = StagedWeightView {
         bytes: &view_bytes,
         gemm: &gemm,
@@ -4249,13 +4371,14 @@ fn numeric_gate_sharded<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     };
     let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
     for me in &ranks {
-        probes.push(stage_gate_probe::<F>(
+        probes.push(stage_gate_probe::<T, F>(
             ir,
             weight_ids,
             covering,
             prefill,
             &probe_rung,
             &seed(me.get() as usize),
+            Some(*me),
         )?);
     }
     let golden_index = GoldenIndex::of(ir);
@@ -5791,6 +5914,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 spyre_superdsc::format::DataFormat::Fp32 => bundle::StickFormat::Fp32,
                 spyre_superdsc::format::DataFormat::Fp8 => bundle::StickFormat::Fp8,
                 spyre_superdsc::format::DataFormat::UInt32
+                | spyre_superdsc::format::DataFormat::Int32
                 | spyre_superdsc::format::DataFormat::Int64 => bundle::StickFormat::UInt32,
             },
             value: c.bits,

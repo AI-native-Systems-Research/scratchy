@@ -10,6 +10,7 @@
 //! What an op is on the device — its name, its unit, how its operands are sticked — is the
 //! [`opfunc`] table; the device's own facts are the generation's (`ktir_core::ddl_binds`).
 
+pub mod arrangement;
 pub mod dim;
 pub mod divide;
 pub mod emit;
@@ -64,7 +65,7 @@ pub fn layouts<G: DeviceGen>(
     residency: &[Residency],
 ) -> Result<Vec<ParamLayout>, Error> {
     let natural = lift::lift::<G>(f, &vec![None; f.arguments.len()]).map_err(Error::Lift)?;
-    let mut held = layout::staged_layouts(&natural, residency);
+    let mut held = layout::staged_layouts::<G>(&natural, residency);
     let relaid = lift::lift::<G>(f, &held).map_err(Error::Lift)?;
     for (p, width) in emit::staged_widths::<G>(&relaid).into_iter().enumerate() {
         if let (Some(Some(h)), Some(w)) = (held.get_mut(p), width) {
@@ -85,6 +86,7 @@ pub fn plan<G: DeviceGen>(f: &IRFunction<'_>, layouts: &[ParamLayout]) -> Result
     };
     layout::restick::<G>(&mut graph);
     layout::index_inner::<G>(&mut graph);
+    layout::integer_copies(&mut graph);
     let footprint = emit::footprint::<G>(&graph);
     Ok(Planned {
         graph,
