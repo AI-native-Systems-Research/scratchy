@@ -1541,8 +1541,9 @@ pub fn lower_block_copy<
 /// accepted either. Integer boundaries call `.get()`.
 pub use scratchy_spyre_bundle::rung::{HeadWidth, PoolPageSlots, SchedulerBlockTokens};
 
-/// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
-pub const INT32_STICK: u32 = 32;
+/// An int32 stick: the generation's stick bytes over int32's four (spyre-inference's
+/// `INT32_ELEMS_PER_STICK`).
+pub const INT32_STICK: u32 = Df::UInt32.lanes::<ktir_core::ddl_binds::Baked>() as u32;
 
 /// ⭐ WHAT A PAGED BUNDLE'S ROWS ARE — the fact spyre-inference's dispatch reads besides the query
 /// width: one sequence's query rows, or one decode row of each sequence of a batch
@@ -1592,8 +1593,9 @@ pub struct BatchChunking {
 }
 
 impl BatchChunking {
-    /// `spyre_attn_bucketer._SPYRE_CORE_COUNT`: the cores a chunk's entries are sized to.
-    pub const CORES: u32 = 32;
+    /// The cores a chunk's entries are sized to — the device's own (spyre-inference states the
+    /// same count as `spyre_attn_bucketer._SPYRE_CORE_COUNT`).
+    pub const CORES: u32 = <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES;
     /// Triton's gather floor.
     pub const GATHER_FLOOR: u32 = 8;
 
