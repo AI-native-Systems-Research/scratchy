@@ -5,8 +5,9 @@
 set -uo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 active=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("stop_hook_active", False))')
-if "${root}/scripts/purity.sh" --scope all; then
-    exit 0
-fi
+"${root}/scripts/purity.sh" --scope all
+rc=$?
+# Clean, or no cargo-dylint (exit 3, the runner has said how to install it; CI still enforces).
+(( rc == 0 || rc == 3 )) && exit 0
 [[ "${active}" == True ]] && exit 0
 exit 2

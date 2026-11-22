@@ -5,7 +5,7 @@ LL |     pub fn from_untyped(n: u32) -> Self {
    |            ^^^^^^^^^^^^
    |
    = help: delete it, and mint the value through the type's checking constructor
-   = note: `#[deny(p11_escape_hatch_constructor)]` on by default
+   = note: `#[forbid(p11_escape_hatch_constructor)]` on by default
 
 error: P11: `conflated_with_kv` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
   --> $DIR/p11_escape_hatch_constructor.rs:11:12
@@ -28,12 +28,16 @@ error: P11: `from_untyped` is an escape-hatch constructor; a checked type has on
    |
 LL |             pub fn from_untyped(n: u32) -> Self {
    |                    ^^^^^^^^^^^^
-...
-LL | stamp!(Rows);
-   | ------------ in this macro invocation
    |
    = help: delete it, and mint the value through the type's checking constructor
-   = note: this error originates in the macro `stamp` (in Nightly b$DIRlds, run with -Z macro-backtrace for more info)
 
-error: aborting due to 4 previous errors
+error: P11: `from_untyped` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_escape_hatch_constructor.rs:36:12
+   |
+LL |     pub fn from_untyped() {}
+   |            ^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+
+error: aborting due to 5 previous errors
 

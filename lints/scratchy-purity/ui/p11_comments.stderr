@@ -5,7 +5,7 @@ LL | //! Superseded by the typed table.
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = help: say what the code does now, or delete the comment
-   = note: `#[deny(p11_tombstone_comment)]` on by default
+   = note: `#[forbid(p11_tombstone_comment)]` on by default
 
 error: P11: this comment narrates history (`moved from`); comments describe the code as it is, in the present tense
   --> $DIR/p11_comments.rs:5:1
@@ -38,7 +38,7 @@ LL | // See `/tmp/report.md` for the numbers.
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = help: cite the in-tree source, or use a placeholder such as <out-dir> in a command example
-   = note: `#[deny(p11_tmp_path_comment)]` on by default
+   = note: `#[forbid(p11_tmp_path_comment)]` on by default
 
 error: P11: this comment cites a scratch path (`/tmp/`); a comment never points at scratch files
   --> $DIR/p11_comments.rs:17:1

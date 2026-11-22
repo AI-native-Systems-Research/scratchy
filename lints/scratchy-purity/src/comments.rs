@@ -139,6 +139,32 @@ pub fn toml_comments(text: &str) -> Vec<(usize, &str)> {
     found
 }
 
+/// The purity lints a manifest's `[lints]` or `[workspace.lints]` tables name: any level set
+/// there reaches rustc as a command-line level, the one opt-out `Forbid` can't refuse.
+pub fn lint_opt_outs(manifest: &str) -> Vec<String> {
+    let Ok(table) = manifest.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let purity = |name: &str| {
+        name.strip_prefix('p')
+            .and_then(|rest| rest.split_once('_'))
+            .is_some_and(|(rule, _)| !rule.is_empty() && rule.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let tables = [table.get("lints"), table.get("workspace").and_then(|w| w.get("lints"))];
+    let mut names: Vec<String> = tables
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .flat_map(|tools| tools.values())
+        .filter_map(toml::Value::as_table)
+        .flat_map(|lints| lints.keys())
+        .filter(|name| purity(name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +238,17 @@ mod tests {
         assert_eq!(toml_comments("u = 'a#b'\n# /tmp/x"), vec![(2, " /tmp/x")]);
         assert_eq!(toml_comments("v = \"q\\\"#\" # real"), vec![(1, " real")]);
         assert_eq!(toml_comments("# a — b\nw = \"—#\" # c — d"), vec![(1, " a — b"), (2, " c — d")]);
+    }
+
+    #[test]
+    fn a_lints_table_may_not_set_a_purity_lint() {
+        assert_eq!(lint_opt_outs("[lints.rust]\nunexpected_cfgs = \"warn\""), Vec::<String>::new());
+        assert_eq!(lint_opt_outs("[lints.rust]\np11_tombstone_comment = \"allow\""), ["p11_tombstone_comment"]);
+        assert_eq!(
+            lint_opt_outs("[workspace.lints.scratchy_purity]\np11_tmp_path_comment = { level = \"allow\" }"),
+            ["p11_tmp_path_comment"]
+        );
+        assert_eq!(lint_opt_outs("# p11_tombstone_comment = \"allow\""), Vec::<String>::new());
     }
 
     #[test]

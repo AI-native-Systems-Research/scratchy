@@ -14,7 +14,7 @@
 #   spyre-hw   backends/spyre-hw (a card host: a real ../senlib-rs checkout beside this tree)
 #   all        root, spyre, metal where macOS, spyre-hw where a card host
 #
-# Exit 0 when clean. Exit 1 with the findings on stderr, or when cargo-dylint is missing.
+# Exit 0 when clean, 1 with the findings on stderr, 3 when cargo-dylint is missing.
 # A --file outside every scanned package exits 0 with one line saying so.
 set -uo pipefail
 
@@ -23,7 +23,7 @@ DYLINT_VERSION=6.4.0
 METAL_CRATES=(scratchy-target-metal scratchy-target-metal-cli scratchy-target-metal-compiler
     scratchy-target-metal-models scratchy-target-metal-worker)
 ROOT_FEATURES=scratchy-models/granite-3.1-8b-instruct
-SPYRE_FEATURES=scratchy-models/granite-3.1-8b-instruct
+SPYRE_FEATURES=scratchy-models/granite-3.1-8b-instruct,scratchy-target-spyre-models/snt1p0
 # The card workspace's own alias for the models crate; it panics at build time with zero models.
 SPYRE_HW_FEATURES=model/granite-3.1-8b-instruct,snt1p0
 METAL_FEATURES=scratchy-models/qwen3-0.6b
@@ -33,7 +33,7 @@ say() { echo "scratchy-purity: $*" >&2; }
 
 if ! cargo dylint --version 2>/dev/null | grep -q "${DYLINT_VERSION}"; then
     say "cargo-dylint ${DYLINT_VERSION} is missing; run cargo install cargo-dylint dylint-link --version ${DYLINT_VERSION} --locked"
-    exit 1
+    exit 3
 fi
 
 macos() { [[ "$(uname -s)" == Darwin ]]; }
@@ -101,9 +101,11 @@ owning_manifest() { # path
     return 1
 }
 
-# The --features argument for one package: the scope's model, where the package selects models.
-features_for() { # manifest features
-    grep -q 'scratchy-models' "$1" && printf -- '--features\n%s\n' "$2"
+# The arguments that lint one package with a scope's model: the models crate is selected beside
+# it (the workspace member that has the `scratchy-models` dependency), so the feature resolves whatever the package names that dependency (some call it `model`),
+# and a package that reaches the models only through a dependency still builds one model.
+with_model() { # name models-package features
+    printf -- '-p\n%s\n-p\n%s\n--features\n%s\n' "$1" "$2" "$3"
 }
 
 file() { # path
@@ -113,6 +115,11 @@ file() { # path
         say "${path#"${ROOT}"/} is in no package; nothing to lint"; return 0
     fi
     name=$(sed -n '/^\[package\]/,/^\[/{s/^name *= *"\(.*\)"/\1/p;}' "${manifest}" | head -1)
+    # A file no dep-info lists yet (a new one) wouldn't make cargo re-run the lints: touching
+    # the manifest, which every package's dep-info does list, does.
+    if ! grep -rqlF --include='*.d' "${path}" "${ROOT}/target/dylint" 2>/dev/null; then
+        touch "${manifest}"
+    fi
     resolve_senlib
     ws=$(cargo locate-project --workspace --message-format plain --manifest-path "${manifest}" 2>/dev/null) || {
         say "${manifest#"${ROOT}"/} is in no workspace this runner lints; nothing to lint"; return 0
@@ -125,15 +132,15 @@ file() { # path
             for c in "${METAL_CRATES[@]}"; do
                 if [[ "${c}" == "${name}" ]]; then
                     macos || { say "${name} builds only on macOS; skipped"; return 0; }
-                    while IFS= read -r a; do feat+=("${a}"); done < <(features_for "${manifest}" "${METAL_FEATURES}")
-                    lint . -p "${name}" ${feat[@]+"${feat[@]}"}; return
+                    while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-models "${METAL_FEATURES}")
+                    lint . "${feat[@]}"; return
                 fi
             done
-            while IFS= read -r a; do feat+=("${a}"); done < <(features_for "${manifest}" "${ROOT_FEATURES}")
-            lint . -p "${name}" ${feat[@]+"${feat[@]}"} ;;
+            while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-models "${ROOT_FEATURES}")
+            lint . "${feat[@]}" ;;
         /backends/spyre)
-            while IFS= read -r a; do feat+=("${a}"); done < <(features_for "${manifest}" "${SPYRE_FEATURES}")
-            lint backends/spyre -p "${name}" ${feat[@]+"${feat[@]}"} ;;
+            while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-target-spyre-models "${SPYRE_FEATURES}")
+            lint backends/spyre "${feat[@]}" ;;
         # The card workspace's members need its model alias, so a file there lints the workspace.
         /backends/spyre-hw) scope spyre-hw ;;
         *) say "${manifest#"${ROOT}"/} is in no workspace this runner lints; nothing to lint"; return 0 ;;

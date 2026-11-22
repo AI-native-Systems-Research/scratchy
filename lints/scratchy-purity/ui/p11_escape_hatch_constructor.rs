@@ -30,6 +30,12 @@ macro_rules! stamp {
 pub struct Rows(u32);
 stamp!(Rows);
 
+// Flagged too: code no build compiles (a test helper, a disabled feature).
+#[cfg(any())]
+mod disabled {
+    pub fn from_untyped() {}
+}
+
 // Clean: other names, and calls to a flagged fn (only its definition is flagged).
 pub fn from_untypedness() {}
 pub fn untyped() {}

@@ -8,4 +8,7 @@ case "${path}" in
     *.rs|*Cargo.toml) ;;
     *) exit 0 ;;
 esac
-"${root}/scripts/purity.sh" --file "${path}" || exit 2
+"${root}/scripts/purity.sh" --file "${path}"
+rc=$?
+# Without cargo-dylint (exit 3) the runner has said how to install it; CI still enforces.
+(( rc == 0 || rc == 3 )) || exit 2
