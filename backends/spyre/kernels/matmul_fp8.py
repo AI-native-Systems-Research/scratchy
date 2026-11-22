@@ -19,17 +19,11 @@ kernel):
   `verify_canonical_fp8_matmul_kernel` refuses `BLOCK_K < K` and `BLOCK_N < N`).
 * GRID: `[1]`.
 
-WHAT THE DEVICE COMPUTES vs WHAT THE PROGRAM COMPUTES: the program spells the
-weight-side dequant (`p * ws`) and the emulator executes exactly that —
-`o[m, n] = Σ_k a[m,k] · e4m3(w[n,k]) · ws[n]` (the fp8 view widens on read).
-The CARD's W8A8 additionally quantizes the activation per token and applies
-`a_scale[m] · w_scale[n]`; that chain is emitted by the DOOR
-(`ktir_matmul_fp8::matmul_fp8_descriptors`, unchanged) from the weight view's
-`is_fp8` + arity-3 — downstream of both producers — and its cross-node dedup
-(the `quantized` set the door's caller threads, bundle-wide) is likewise the
-door's, not the splice's. The spelled `mulf` is therefore what the ladder's
-fp8 verifier REQUIRES of the kernel, so a kernel that forgot it is refused at
-compile time rather than silently reinterpreted.
+WHAT IT COMPUTES: the program spells the weight-side dequant (`p * ws`), and the
+KTIR→SuperDSC lowering lowers it as spelled —
+`o[m, n] = Σ_k a[m,k] · e4m3(w[n,k]) · ws[n]` (the fp8 view widens on read). The
+spelled `mulf` is what the ladder's fp8 verifier REQUIRES of the kernel, so a kernel
+that forgot it is refused at compile time rather than silently reinterpreted.
 
 THE ORIENTATION: same law as `matmul.py` — the weight descriptor is the
 checkpoint's own on-disk `[n, k]` buffer (fp8 bytes stay 1-byte verbatim on

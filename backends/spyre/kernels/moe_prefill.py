@@ -44,9 +44,7 @@ THE SPLICE'S OWN CONTRACT:
 * GRID: `[1]`.
 
 ⛔ EVERY LOOP IS `tl.static_range` (the ladder's law), and the expert sweep is the one that
-matters: E iterations of three fp8 gemms each. That is the bake cost this kernel brings, and
-whether the card door keeps it unrolled or rolls it into one expert body is the door's
-decision, measured, not this file's.
+matters: E iterations of three fp8 gemms each. That is the bake cost this kernel brings.
 """
 
 import triton

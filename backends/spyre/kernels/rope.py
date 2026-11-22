@@ -13,15 +13,11 @@ which, written per half (x1 = x[..., :d//2], x2 = x[..., d//2:]), is
 
 THE SPLICE'S CONTRACT — the kernel states the node's facts in its own views and access tiles:
 
-* the x/out descriptors are `[MQ * H, HEAD_DIM]` — the WORKER's staging. Main's
-  `KtirFunc::rope` views x as `[rows*heads, hd]` over the same bytes, so the view extents
-  agree.
-* ONE ACCESS TILE PER POSITION, `[H, HALF]`, the tiles main's builder program takes
-  (`KtirFunc::rope`'s `tile(x_view, ri*heads, 0, heads, half)`).
+* the x/out descriptors are `[MQ * H, HEAD_DIM]` — the WORKER's staging.
+* ONE ACCESS TILE PER POSITION, `[H, HALF]`.
 * ONE WORK ITEM (grid `[1]`) with the position loop UNROLLED by the ladder
   (`to_ktir::unroll_constant_trip_loops`): constant-trip `tl.range(0, MQ, 1)`, each trip
-  a copy of the per-position body. The spliced program is straight-line, like the
-  builder's.
+  a copy of the per-position body. The spliced program is straight-line.
 * cos/sin: the worker stages per-position head-tilled rows (`spyre_forward.rs`'s `tile`
   over `rope_cos_sin`), so element (p, h*hd+d) sits at `p*total + h*hd + d` — the
   `[MQ*H, HEAD_DIM]` head-replicated view, read at the position's OWN row base. The
@@ -69,8 +65,8 @@ def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
     # always starts at row 0. The program holds `H` bodies there, at most the model's head count.
     #
     # Nested constexpr ifs, not `and`: the parser refuses a Python `BoolOp` in a @triton.jit kernel.
-    # One head (H == 1) always takes the position loop: the door tells the forms apart by the view's
-    # width, and at one head both views are one head dim wide. A ROW-WINDOWED rope (`R_START > 0`,
+    # One head (H == 1) always takes the position loop: at one head both forms read the same
+    # one-head-wide view. A ROW-WINDOWED rope (`R_START > 0`,
     # the per-row form — one row) keeps the position loop too: its window rides
     # the tall view's tile corner, which the per-head form's whole-plane view does not state.
     if MQ > 1:
@@ -138,8 +134,7 @@ def _rope_per_head(desc_x, desc_cos, desc_sin, desc_o,
     # PER HEAD, over the plane as it is: `[MQ, H * HEAD_DIM]`, one `[MQ, HALF]` tile per head
     # half. Same bytes as the tall view (row p, column h*HEAD_DIM + d is tall row p*H + h,
     # column d), and the cos/sin tables are the same head-replicated bytes, so each head's
-    # tiles read its own angles. The door reads this form as `mq = v_rows`, `hd = 2 * c_len`,
-    # `heads = v_cols / hd` off x's view and first tile.
+    # tiles read its own angles.
     width = H * HEAD_DIM
     x_desc = tl.make_tensor_descriptor(desc_x, shape=[MQ, width], strides=[width, 1],
                                        block_shape=[MQ, HALF])

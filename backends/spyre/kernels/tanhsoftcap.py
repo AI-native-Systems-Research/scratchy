@@ -25,12 +25,12 @@ carries `math.tanh` on the f16 tile with no extf/truncf — the divf feeding the
 tanh DIRECTLY, which is the shape `program_tanhsoftcap_cap` requires. `tl.fdiv`,
 not `/`: `/` upcasts f16→f32 (the silumul delta-6 law).
 
-⭐ ROW BLOCKING, THE BUILDER'S OWN LAW (`lower_tanhsoftcap_node`): a whole
+⭐ ROW BLOCKING, THE SPLICE'S LAW (`blocks_of`): a whole
 `[rows, cols]` region whose three-tile live set (`rows × cols × 3`) exceeds the
 `EW_LX_ELEMS` budget is ROW-BLOCKED, not refused — the softcap spans the
 VOCAB-wide logits, wider than any activation, so prefill rungs exceed the budget
 while decode (m=1) never does. `N_BLOCKS` full `[BLOCK_M, N]` tiles
-(BLOCK_M = the builder's own `rows_per_block(cols, 3)`) plus a `[TAIL_H, N]`
+(BLOCK_M = the splice's `rows_per_block(cols, 3)`) plus a `[TAIL_H, N]`
 tail tile when the region does not divide evenly. The trip count is constexpr,
 so `to_ktir` unrolls it and the spliced program is straight-line with one
 constant-corner tile per block.

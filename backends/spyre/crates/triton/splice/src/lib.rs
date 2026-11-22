@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE SPLICE — where the tape's node and the kernel meet.
 //!
-//! The splice hands each node's [`scratchy_spyre_bundle::program::KtirNode`] to the one KTIR→SuperDSC
-//! lowering (`scratchy-spyre-superdsc`):
-//!
-//! * the TRITON LADDER (`triton-frontend` → TTIR → `triton-ktir` → KTIR), re-hosted at
-//!   `backends/spyre/crates/triton/` — a `.py` kernel compiled at `#[forward]` expansion time, in-process,
-//!   with no Python executing (the same discipline the torch carriers landed under #112).
-//!   This crate is the ONLY producer for the ops it covers: `lower_one_node` routes
-//!   every spliced kind here unconditionally, and there is no builder arm to fall
-//!   through to for them.
+//! Each tape node a Triton kernel covers is compiled here — `triton-frontend` → TTIR →
+//! `triton-ktir` → KTIR, at `#[forward]` expansion time, in-process, with no Python executing —
+//! and handed on as a [`scratchy_spyre_bundle::program::KtirNode`] to the one KTIR→SuperDSC
+//! lowering (`scratchy-spyre-superdsc`). This crate is the ONLY producer for the ops it covers.
 //!
 //! # WHAT THE TAPE STATES THAT A KERNEL CANNOT
 //!
@@ -19,18 +14,13 @@
 //! * **The operand binding.** The registry row declares the kernel's parameter order to be
 //!   the node's operand order — parameter `i` is `node.inputs[i]`'s tensor, and the last
 //!   parameter is the node's output. [`lower`] then re-states the adapter's positional
-//!   `BufferId`s with the tape's real tensor indices, because `regions()` resolves a
-//!   parameter's `Region.tid` — the operand name every descriptor addresses by, and the
-//!   slot `scalarmul_scales` is looked up through — from `bindings[i]`. A splice that
-//!   kept the positional ids would emit descriptors over buffers `t0/t1/t2` while the
-//!   tape's buffers are `t37/t41/t42`: well-formed, and wrong.
-//! * **The kind.** The row states the [`Program`] classification, the same value the
-//!   builder path's `finish_shaped` states. The standalone triton-spyre position had to
-//!   INFER this from the op soup; scratchy has the tape, so it STATES it, and the golden
-//!   pins the `op_name` this row's stem produces rather than trusting a classifier that
-//!   could mis-recognize.
+//!   `BufferId`s with the tape's real tensor indices, the operand names every descriptor
+//!   addresses by. A splice that kept the positional ids would emit descriptors over buffers
+//!   `t0/t1/t2` while the tape's buffers are `t37/t41/t42`: well-formed, and wrong.
+//! * **The kind.** The row states the [`Program`] classification, so nothing downstream
+//!   infers it from the op soup.
 //!
-//! # ⛔⭐ TOTALITY BY CONSTRUCTION — NO LOOKUP, NO FALLTHROUGH, NO REFUSAL
+//! # ⛔⭐ TOTALITY BY CONSTRUCTION — NO LOOKUP, NO FALLTHROUGH
 //!
 //! **We are a proc-macro compiler and everything is known at compile time.** The registry
 //! is not a lookup table an op kind can miss at runtime: it is a set of TOTAL per-family
@@ -44,52 +34,23 @@
 //! The members whose device realization does not exist yet are likewise DECLARED, never
 //! discovered at runtime:
 //!
-//! * **`GemmWeight::Affine`** — the wavefront lowering skips affine-quantized presets
-//!   before a tape is ever lowered (`codegen`'s `no superdsc bundle` gate), so no Affine
-//!   node reaches this crate on any build today. [`matmul_row`] still enumerates it:
+//! * **`GemmWeight::Affine`** — affine-quantized presets are skipped before a tape is ever
+//!   lowered, so no Affine node reaches this crate. [`matmul_row`] still enumerates it:
 //!   wiring one in is a compile error here until the kernel lands with the arm.
-//! * **`EwKind::QuickGelu` / `EwKind::GeluErf`** — the DDL has NO primitive for either
-//!   (the consumer's `elementwise_op_func` refuses them by name, and substituting
-//!   `"gelu"` would run a different function and report success). [`elementwise_row`]
-//!   enumerates them so the same law holds.
+//! * **`EwKind::QuickGelu` / `EwKind::GeluErf`** — the DDL has no primitive for either, and
+//!   substituting `gelu` would run a different function. [`elementwise_row`] enumerates
+//!   them so the same law holds.
 //!
-//! `GainConvention::OnePlusScale` WAS this list's third member and is a ROW now: the
-//! kernel states the `+1` as an addf over the loaded gain and the door states the same
-//! add against the offset's `[1,1]` registry const (the epsilon's own mechanism) —
-//! see [`rmsnorm_row`].
+//! # THE GATES
 //!
-//! # THE GATE, AND WHY IT IS AT THE DESCRIPTOR LEVEL
-//!
-//! The golden (`tests/triton_splice_golden.rs`) checks the splice's `EmittedOp`s: the
-//! `op_name` (the builder's naming law), the attention arm the shape took, and an
-//! emulator `max_abs` numeric comparison for the families the emulator runs (matmul,
-//! elementwise, gelu, rope, fp8 matmul). The builder that preceded the splice is
-//! DELETED — there is no byte-identity control anymore, and nothing in this crate
-//! should claim one. The strongest surviving gates are the numeric ones and the
-//! canonical card A/B per model/quant pair at the PR level.
+//! The golden (`tests/triton_splice_golden.rs`) checks the splice's `EmittedOp`s and, for the
+//! families the emulator runs, an emulator `max_abs` comparison; the bake's own emulator gate
+//! runs every rung's programs against a host reference.
 //!
 //! # ⛔ THE SHAPE WORK LIST, AS NAMED ERRORS
 //!
-//! The kernel families here state ONE whole-tensor tile at corner 0. A node whose shape
-//! needs more than that is refused LOUDLY, naming the kernel capability that must land.
-//! The historical items (windowed regions, LX row-blocking, the odd-N vocab matmul, the
-//! prefill lm-head fold) have all LANDED — their kernels state the corner (`C_START`),
-//! the row blocks, the device width, and the fold (`lmlast.py` + the m=S tail); what
-//! remains is whatever the current guards name, which is the honest work list.
-//!
-//! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
-//! against the door: `rope_at` derives every fact it needs (`mq`, `total`, `hd`) from the
-//! PROGRAM's own views and access tiles, and the one bundle fact (`rows_are_requests`)
-//! is re-read by the door off `BundleAttnParams` AFTER the splice returns. The kernel
-//! states the builder's own view extents (`[mq·heads, hd]`) and takes one `[heads, half]`
-//! access tile per position, which is what the door's first-tile read needs.
-//!
-//! fp8 `MatmulTile` — a row after all: the activation-quantize dedup (`quantized`) is
-//! threaded BUNDLE-WIDE by the door's callers, which run DOWNSTREAM of the splice: both
-//! producers' `EmittedOp`s flow through the SAME door call, and `matmul_fp8_descriptors`
-//! dedups there. The splice only has to mint a `Program::Matmul` `KtirNode` whose weight
-//! view is fp8 and whose bindings are arity-3; fp8-ness is recognized from the weight
-//! view's `is_fp8`, cross-checked against arity, exactly as the builder's program is.
+//! A node whose shape a kernel cannot state is refused at the bake, naming the kernel
+//! capability that must land; the current guards are the work list.
 
 pub mod compile;
 
@@ -161,9 +122,8 @@ pub enum TritonKernelRow {
 
 /// `SubOp::RmsNorm`'s two gain conventions — two entries of one kernel file. The
 /// Scale form multiplies by the loaded gain; the `(1 + w)` class (gemma) adds the
-/// offset over the load first, a constant the door resolves through the SAME
-/// `[1,1]` registry slot mechanism the epsilon uses (`program_gain_offset` reads
-/// it off the program; `compute_bundle_layout` collects `gain.offset()`).
+/// offset over the load first, a splat the lowering stages as a stick constant, as it
+/// stages the epsilon.
 pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
     match gain {
         GainConvention::Scale => TritonKernelRow::Spliced {
@@ -175,11 +135,8 @@ pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
         // ⭐ THE (1 + w) ROW — the offset is CARRIED, never folded into the weights
         // (folding would make the loaded gain disagree with the checkpoint, so every
         // consumer that re-reads it — dumps, the numeric reference, a second target —
-        // would see a different tensor). The kernel states the addf over the load;
-        // the door states the SAME add against the offset's registry const, so the
-        // descriptor computes the formula the program runs — the GPU target's own
-        // `ScalarOffsetRmsNorm` (whose kernel applies `weight + offset`) is the
-        // precedent shape.
+        // would see a different tensor). The kernel states the addf over the load, so
+        // the descriptor computes the formula the program runs.
         GainConvention::OnePlusScale => TritonKernelRow::Spliced {
             src: include_str!("../../../../kernels/rmsnorm.py"),
             file: "rmsnorm.py",
@@ -201,10 +158,9 @@ pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
             entry: "matmul_fwd",
             program: Program::Matmul,
         },
-        // THE fp8 W8A8 ROW — the delivery target (granite 8b fp8). Same
-        // `Program::Matmul` classification as dense: the DOOR discriminates fp8 from
-        // the weight view's `is_fp8` + arity-3 bindings, never from the program kind,
-        // so both rows reach the same `matmul` door arm. The kernel's spelled
+        // THE fp8 W8A8 ROW. Same `Program::Matmul` classification as dense: fp8-ness is
+        // the weight view's own format and the arity-3 bindings, never the program
+        // kind. The kernel's spelled
         // `* w_scale` epilogue is what the ladder's
         // `verify_canonical_fp8_matmul_kernel` requires.
         GemmWeight::Fp8Dynamic => TritonKernelRow::Spliced {
@@ -233,7 +189,7 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
     let ew_src = || include_str!("../../../../kernels/elementwise.py");
     match kind {
         // Add AND BiasAdd share `add_fwd` — both map to `Elementwise::Add` and the same
-        // `add_s{id}` name (the builder's own law).
+        // `add_s{id}` name.
         EwKind::Add | EwKind::BiasAdd => TritonKernelRow::Spliced {
             src: ew_src(),
             file: "elementwise.py",
@@ -271,8 +227,7 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
         },
         // ⛔ NO DDL PRIMITIVE, and substituting the nearest one is the bug: quick-gelu
         // is x·σ(1.702x), a DIFFERENT function from OpFunc::Gelu's tanh polynomial —
-        // emitting "gelu" for it would run the wrong model and report success (the
-        // consumer's own `elementwise_op_func` refusal names exactly this). A
+        // emitting "gelu" for it would run the wrong model and report success. A
         // realization must DECOMPOSE producer-side (its building blocks — sigmoid,
         // mul — ARE primitives), which is a kernel family of its own.
         EwKind::QuickGelu => TritonKernelRow::Refused(
@@ -349,8 +304,8 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             program: Program::ScalarMul,
         },
         // `RopeAppend` carries 6 inputs but only the first three are the rotation (V
-        // and the KV-cache destinations flow through GRAPH edges — the builder's own
-        // `lower_rope_node` reads `inputs[0..3]`), so the kernel consumes x/cos/sin/out
+        // and the KV-cache destinations flow through GRAPH edges), so the kernel
+        // consumes x/cos/sin/out
         // and the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../../kernels/rope.py"),
@@ -358,13 +313,9 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "rope_fwd",
             program: Program::Rope,
         },
-        // ATTENTION SPLICES — `lower_attn` is the entry: the kernel states the same
-        // three arms as constexpr-selected cases, and the door (`attn_operands`) reads
-        // every fact — the q/out views, the swept rung, the scale — off the program
-        // itself. This row exists so `row()` stays exhaustive; the walk never routes
-        // attention through `lower_one` (attention needs door-order bindings, the mask
-        // binding, and the dead-prefix view injection that no pure-Triton program can
-        // state).
+        // ATTENTION SPLICES — `lower_attn` is the entry (the paged step's tables and
+        // pools are bindings of their own). This row exists so `row()` stays
+        // exhaustive; the walk never routes attention through `lower_one`.
         SubOp::AttnDecode { .. } => attn_row(),
         // ⛔ THE MoE SUB-OPS ARE NOT SPLICED KINDS ANY MORE — the MoE lowers
         // only from `kernels/moe.py` through KTIR, and
@@ -422,9 +373,8 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         },
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
-        // match is the gate: these kinds have their own arms there (attention's
-        // const-generic geometry door, the host-routed rmsnorm pair, the by-name
-        // refusals), and a kind reaching THIS match means the routing changed — the
+        // match is the gate: these kinds have their own arms there, and a kind reaching
+        // THIS match means the routing changed — the
         // message names what must land, and no `_` arm can swallow it.
         SubOp::RmsNormReduce { .. }
         | SubOp::RmsNormApply { .. }
@@ -482,14 +432,14 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
 /// names for this node and hand back the [`EmittedOp`]: `EmittedOp::bare(name)` with
 /// `ktir` set.
 ///
-/// There is no `Ok(None)` and no builder to fall through to: every spliced kind either
+/// There is no `Ok(None)` and nothing to fall through to: every spliced kind either
 /// emits or the bake stops, loudly, naming the kernel capability that must land. The
 /// shape guards below are the work list — each one dies when its kernel states that
 /// shape, and the end state has none.
 ///
-/// The name is the builder's own law — `rmsnorm_s{node.id}` — so the spliced op's
-/// `op_name` and the emulator's function key follow the same naming law the builder
-/// path established. That is what the golden's `op_name` pins.
+/// The name is `rmsnorm_s{node.id}`-shaped, so the spliced op's `op_name` and the
+/// emulator's function key follow one naming law. That is what the golden's `op_name`
+/// pins.
 ///
 /// ⭐ ONE NODE MAY LOWER TO MORE THAN ONE OP, and only the splice knows which kinds:
 /// [`lower_all`] is the entry the walk calls, and it routes every one-op kind here.
@@ -557,7 +507,7 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
-/// epilogues — the path a split vocabulary projection takes to the draw.
+/// epilogues — the path a split vocabulary projection takes to the logits.
 fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     t: scratchy_subtile::subtile_ir::TensorId,
@@ -602,9 +552,8 @@ pub fn lower_all<
     // the byte-identical un-fused lowering (the ordinary reshape/norm rows below).
     // ⛔ THE MATCHER ACCEPTS GAINED (`Scale`/`OnePlusScale`) AND `RmsNormUnit`
     // MIDDLES. The two gained conventions are two ENTRIES of the same windowed
-    // body (`windowedrmsnorm_gained_fwd` / `windowedrmsnorm_oneplus_fwd`), and the
-    // door reads the oneplus form's offset off the program's own addf — the same
-    // law the plain rmsnorm row carries — so neither convention needs to stay
+    // body (`windowedrmsnorm_gained_fwd` / `windowedrmsnorm_oneplus_fwd`), the oneplus
+    // form's offset its program's own addf — so neither convention needs to stay
     // un-fused: the matcher is a pure function of the graph either way.
     if let SubOp::Reshape { .. } = &node.op {
         if is_sandwich_flatten(node, ir) {
@@ -715,9 +664,8 @@ fn tail_requests(query_rows: scratchy_spyre_bundle::rung::QueryExtent) -> u32 {
 //  ⛔ EVERY CHECK IS A REFUSAL BACK TO THE UN-FUSED PATH. Any extra consumer of the
 //  split's output (a skip connection reading the flat q), any op between norm and
 //  flatten, an in-place alias (split output == flatten output), a windowed region (the
-//  splice's own addition: the kernel addresses the TENSOR BASES where the builder's
-//  `load_region` honored a region's corner) — the matcher returns `None` and all three
-//  nodes lower exactly as they did before this existed, through their ordinary rows.
+//  kernel addresses the TENSOR BASES, so it cannot state a region's corner) — the matcher
+//  returns `None` and all three nodes lower through their ordinary rows.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The matched sandwich, carried from the split (the one position the fused program
@@ -730,8 +678,8 @@ struct HeadNormSandwich<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
     /// The flatten-back `Reshape{Times(1)}` node.
     flatten: &'a SubtileNode<F>,
     /// The per-head width `D` (the split's output columns). The head COUNT is not
-    /// carried: it is `full / D` of the split input's own extents, re-derived by the
-    /// spec and the door alike, so no second spelling can disagree.
+    /// carried: it is `full / D` of the split input's own extents, so no second spelling
+    /// can disagree.
     head_dim: u32,
     /// The norm's epsilon, read once here so the mint states one value.
     eps: f32,
@@ -784,9 +732,8 @@ fn producer_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 
 /// Match the sandwich AT THE SPLIT — the one position the fused program is emitted
 /// from. Both gained conventions and the unit form match: the gained forms are two
-/// entries of the same windowed body, and the door resolves the OnePlusScale form's
-/// offset off the program's own addf (the plain rmsnorm row's law), so the matcher
-/// stays a pure function of the graph for every convention.
+/// entries of the same windowed body, the OnePlusScale form's offset its program's own
+/// addf, so the matcher stays a pure function of the graph for every convention.
 fn sandwich_at_split<'a, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &'a SubtileNode<F>,
     ir: &'a SubtileIR<F>,
@@ -857,10 +804,9 @@ fn sandwich_at_split<'a, F: scratchy_subtile::subtile_ir::RopeForm>(
     {
         return None;
     }
-    // ⭐ THE SPLICE'S OWN LAW, the one the builder did not need: the kernel addresses
-    // the TENSOR BASES (its descriptors bind the split's source and the flatten's
-    // output directly), where the builder's `load_region` honored a region's corner.
-    // A windowed sandwich stays un-fused — the ordinary reshape + norm + reshape rows
+    // ⭐ THE KERNEL ADDRESSES THE TENSOR BASES (its descriptors bind the split's source
+    // and the flatten's output directly), so it cannot state a region's corner. A
+    // windowed sandwich stays un-fused — the ordinary reshape + norm + reshape rows
     // spell it.
     let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
         let s = &ir.tensors[tr.tensor.index()];
@@ -974,9 +920,8 @@ fn lower_sandwich_node<
     ce("EPS", Val::Float(f64::from(*eps)))?;
     ce("INV_D", Val::Float(1.0 / f64::from(*head_dim)))?;
     if *oneplus {
-        // The convention's own `offset()` (1.0), the same value the census
-        // collects and the door resolves — one constant, three readers, one
-        // value, the epsilon's law.
+        // The convention's own `offset()` (1.0), staged by the lowering as a stick
+        // constant like the epsilon.
         ce(
             "GAIN_OFFSET",
             Val::Float(f64::from(GainConvention::OnePlusScale.offset())),
@@ -1131,12 +1076,6 @@ fn lower_one<
     // matmul that feeds the result through rope lowers through here normally,
     // un-folded, every row kept).
     //
-    // ⭐ THE ODD VOCAB SPLICES. A decode lm_head at vocab 49155 (granite) has N odd,
-    //    and the ladder's `PlanCorelets` now re-patterns an odd N to `single_corelet`
-    //    (the same re-patterning the C++ itself made for `split` at one stick) — the
-    //    builder path has emitted exactly this matmul for this repo's whole life, so
-    //    the device runs it, and the two-corelet plan was a LADDER artifact, not a
-    //    device fact.
     if matches!(node.op, SubOp::MatmulTile { .. })
         && is_prefill_lm_head_tail(node, ir, rows_are_requests)
     {
@@ -1151,9 +1090,8 @@ fn lower_one<
     // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS A SHAPE ONLY A KERNEL THAT
     // STATES ITS CORNER CAN SPELL. The measured instance was the front end's COLUMN
     // CHUNKING of a wide pointwise op (`n_blocks(out_cols, nb)`; production `nb =
-    // 8192`): the builder's program states each chunk's access-tile corner
-    // (`load_region` honors `region.cols.start`), which the door turns into the
-    // operand's column offset. MEASURED, granite-3.1-8b fp8 on card: the 12800-wide
+    // 8192`): each chunk is a column window of one tensor, at its own corner.
+    // MEASURED, granite-3.1-8b fp8 on card: the 12800-wide
     // MLP intermediate is TWO chunks (0..8192, 8192..12800), and a kernel stating
     // corner 0 read and wrote the FIRST chunk's columns — fluent garbage out, on a
     // divergence the whole-region golden could not see because every fixture is
@@ -1163,9 +1101,7 @@ fn lower_one<
     // ⭐ THE POINTWISE FAMILY NOW SPELLS IT: `elementwise.py` / `silumul.py` /
     // `scalarmul.py` state `N_TOTAL` (the tensor's storage width, named by the
     // descriptor's shape/strides) and `C_START` (the region's column corner, named
-    // by the load/store offsets) — the same facts the builder's `load_region` /
-    // `store_region` state, so the door reads the SAME region off the spliced
-    // program. AND THE MATMUL FAMILY SPELLS ITS OWN ROW-0 WINDOW: `matmul.py` /
+    // by the load/store offsets). AND THE MATMUL FAMILY SPELLS ITS OWN ROW-0 WINDOW: `matmul.py` /
     // `matmul_fp8.py` state `M_TOTAL` (the output tensor's row extent) with the
     // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose activation
     // is the LAST_HIDDEN synthetic and whose output is the `[S, vocab]` prefix of
@@ -1193,17 +1129,12 @@ fn lower_one<
                     EwKind::Silu | EwKind::Gelu | EwKind::Add | EwKind::Mul | EwKind::Sub,
                 )
         );
-        // ⭐ THE TANH-SOFTCAP AND THE TOKEN DRAW STATE NEITHER CORNER — the softcap
-        // kernel's view IS the region (`[M, N]`, tiles from row 0 / column 0), so BOTH
-        // corners must be 0 while the extents are free: the prefill lm-head fold
-        // re-lowers the vocab-wide softcap at m=S (the `[S, vocab]`
-        // prefix of the `[mq, vocab]` logits storage, a legal prefix view), and the front end's chunker never tiles this
-        // op (its chunk set is the elementwise/scalarmul/silumul family), so a column
-        // window never arises. The draw's kernel is the same law: its view is the
-        // region — the minted prefill draw reads rows 0..S of the `[mq, pad_vocab]`
-        // storage (row 0 alone at S = 1), a legal prefix view — and every operand
-        // the draw binds (the per-row pair, the nine tables, the idx stick) is
-        // whole at corner 0.
+        // ⭐ THE TANH-SOFTCAP STATES NEITHER CORNER — the softcap kernel's view IS the
+        // region (`[M, N]`, tiles from row 0 / column 0), so BOTH corners must be 0 while
+        // the extents are free: the prefill lm-head fold re-lowers the vocab-wide softcap
+        // at m=S (the `[S, vocab]` prefix of the `[mq, vocab]` logits storage, a legal
+        // prefix view), and the front end's chunker never tiles this op (its chunk set is
+        // the elementwise/scalarmul/silumul family), so a column window never arises.
         let states_neither_corner = matches!(&node.op, SubOp::TanhSoftCap { .. });
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
@@ -1258,19 +1189,16 @@ fn lower_one<
         }
     }
 
-    // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
-    // the builder cannot disagree about it. The builder arm's own check is identical.
-    // ⭐ ROPE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: `lower_rope_node` reads only
+    // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind.
+    // ⭐ ROPE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: the rotation reads only
     // `inputs[0..3]` (x, cos, sin) — a `RopeAppend` carries 6 inputs but its V and
     // KV-cache destinations flow through GRAPH edges, not through the op — so the
-    // splice binds the same first three operands the builder's program does, and the
-    // check below is `>= 3` exactly as the builder's own `inputs.len() < 3` refusal is.
+    // splice binds the first three operands, and the check below is `>= 3`.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
         // ⭐ THE MATMUL'S ARITY IS THE WEIGHT SCHEME'S OWN: Dense is arity-2
-        // `[act, weight]`, Fp8Dynamic is arity-3 `[act, weight_fp8, weight_scale]`
-        // (the same routing `lower_matmul_node` does on `node.inputs.get(2)`). The
+        // `[act, weight]`, Fp8Dynamic is arity-3 `[act, weight_fp8, weight_scale]`. The
         // Affine scheme stays arity-2 (its scales/biases resolve from the SAME weight
         // source under tensor roles, not as separate IR operands).
         SubOp::MatmulTile { weight, .. } => match weight {
@@ -1282,8 +1210,7 @@ fn lower_one<
         SubOp::Elementwise(_) => 2,
         SubOp::ScalarMul { .. } => 1,
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
-        // ⭐ SCALAR-WEIGHT MUL IS ARITY-2 (`[act, weight]`, the builder's own
-        // binding). The MoE sub-ops have NO arity here any more: the registry
+        // ⭐ SCALAR-WEIGHT MUL IS ARITY-2 (`[act, weight]`). The MoE sub-ops have NO arity here any more: the registry
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
@@ -1312,8 +1239,8 @@ fn lower_one<
     Ok(e)
 }
 
-/// ⭐ THE PREFILL LM-HEAD FOLD — main's `lower_prefill_lm_head_at_m1` shape, with the
-/// Triton `lmlast.py` kernel as the extraction's body. The vocab-wide lm_head cannot
+/// ⭐ THE PREFILL LM-HEAD FOLD, with the Triton `lmlast.py` kernel as the extraction's
+/// body. The vocab-wide lm_head cannot
 /// run at m>1 (it time-tiles; per-row time-tiling is unimplemented), and only each
 /// request's LAST prompt token's logits are ever read, so the tail is TWO ops:
 ///
@@ -1322,11 +1249,7 @@ fn lower_one<
 ///    own extent pair) of the `[mq, hidden]` activation into the reserved `[S, hidden]`
 ///    `LAST_HIDDEN_TID` staging, one single-stick tile per `(request, stick-group)`
 ///    (the only representable form: the source buffer is stick-major, so a wider
-///    window over the row is not expressible). Its KtirNode carries `node_out_tid` =
-///    the tail's OWN output tid — the door's `lmlast` arm names its copies
-///    `lmlast{j}_o{tid}` after it, the same suffix the tail matmul's `matmul_o{tid}`
-///    uses, so the whole tail reads as one node's — and `answer_rows` = the rows
-///    themselves, the ONE statement the door's copies take each request's row from.
+///    window over the row is not expressible).
 /// 2. THE MATMUL — the SAME node at m=S, reading the staging's whole `[S, hidden]`
 ///    and writing the `[S, vocab]` prefix of the `[mq, vocab]` logits storage
 ///    (request r's logits row is row r), through the ordinary matmul row
@@ -2720,7 +2643,7 @@ fn rebind(positional: KtirNode, name: String, bindings: Vec<BufferId>) -> Result
 /// descriptor per operand plus the output), the constexprs (the node's facts as
 /// `tl.constexpr`s, the monomorphisation key), all in the case-table's own shape
 /// (`cases::spec`).
-/// The `rope_fwd` door's contract, stated from the node's own facts — the one body both rope
+/// The `rope_fwd` kernel's contract, stated from the node's own facts — the one body both rope
 /// ops' arms in `kernel_spec` run, each reading its head dim off its own fields: the rotate's
 /// own, the append's rope class off its attention.
 fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
@@ -2731,9 +2654,8 @@ fn rope_fwd<F: scratchy_subtile::subtile_ir::RopeForm>(
     hd: HeadWidth,
 ) -> Result<(), String> {
     // total = the output's declared width (`heads * hd`), heads = total / hd, mq = the
-    // output's rows — the same derivation `KtirFunc::rope`'s views state. The builder's own
-    // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here as an
-    // `Err`: the node is malformed, and no kernel can state it.
+    // output's rows. A `total` that is not a whole number of `hd`-wide heads is an `Err`:
+    // the node is malformed, and no kernel can state it.
     let out = &node.output;
     let total = out.region.cols.len;
     if !total.is_multiple_of(hd.get()) {
@@ -2865,27 +2787,19 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("M", Val::Int(i128::from(m)))?;
             ce("D_MODEL", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
-            // ⛔ THE EPSILON AND ITS RECIPROCAL ARE BIT-PINNED, AND THE DIRECTION
-            // MATTERS. The consumer's eps lookup (`scale_slot`) matches the registry by
-            // BITS, and the registry holds the tape's f32 eps. The Triton ladder's
-            // `LegalizeTypes` collapses the f32 island around `rsqrt` and
-            // `step_2b_island_constants` ROUNDS THE VALUE to f16 (`f.to_f16()`), so
-            // `1e-5f32` becomes `0.00001001358` in the program. The consumer's lookup therefore
-            // takes an f16-image fallback (builder-exact bits first, then the registry
-            // entry whose f16 image equals the program's eps), which is physically exact:
-            // the worker binds ONE fp16 per registry slot (`SCALE_BYTES = 2`), so the
-            // value the descriptor reads is the f16 image either way.
+            // The epsilon reaches the program as a splat the lowering stages as a stick
+            // constant. The Triton ladder collapses the f32 island around `rsqrt` and
+            // rounds the value to f16, so `1e-5f32` becomes `0.00001001358` in the
+            // program — the value the descriptor reads.
             ce("EPS", Val::Float(f64::from(*eps)))?;
             // `1.0 / D_MODEL` folded on the host, exactly as the fixture's own
             // `constexprs()` helper does — one multiply instead of a divide.
             ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
         }
         // ⭐ THE (1 + w) FORM'S OWN SPEC — the same signature and constants as the Scale
-        // arm, plus the offset itself. The value is the convention's own `offset()`
-        // (1.0; `GainConvention::from_offset` refuses every other value), and it is the
-        // SAME value `compute_bundle_layout` collects into `scalarmul_scales` and the
-        // door reads back off the program's splat — one constant, three readers, one
-        // value, the epsilon's law.
+        // arm, plus the offset itself: the convention's own `offset()` (1.0;
+        // `GainConvention::from_offset` refuses every other value), staged by the lowering
+        // as a stick constant like the epsilon.
         (
             SubOp::RmsNorm {
                 eps,
@@ -2936,22 +2850,13 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 constexprs.insert(k.to_string(), v);
                 Ok(())
             };
-            // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
-            // (one linalg.matmul, no K loop). `M_TOTAL` names the OUTPUT TENSOR's row
-            // extent (the storage the descriptor addresses) while the store takes the
-            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose
-            // output is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage.
-            // ⛔ `N` IS THE DEVICE WIDTH — the door's own padding law, stated here so
-            // the view/tile name the storage every consumer addresses: the card writes
-            // `n_dev` columns (`out_width_the_weight_holds`'s staged-weight contract),
-            // the layout reserves `n_dev` (`pointwise_width_the_output_holds`'s
-            // case-(b) proof), and a pointwise consumer on the same buffer (granite's
-            // logits scalarmul, whose chunk-6 window is `for_pointwise`-padded) needs
-            // the VIEW to hold the tile. `for_matmul` is IDEMPOTENT at a padded width
-            // and the weight-holds drop is the door's, applied to both paths — so this
-            // spelling and the builder's logical one reach the same emit. The fp8 arm
-            // stays LOGICAL: its door arm returns early through
-            // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
+            // ONE tile, the whole region (one linalg.matmul, no K loop). `M_TOTAL` names
+            // the OUTPUT TENSOR's row extent (the storage the descriptor addresses) while
+            // the store takes the `[M, N]` tile at row 0 — the prefill lm-head fold's m=S
+            // tail, whose output is the `[S, vocab]` prefix of the `[mq, vocab]` logits.
+            // ⛔ `N` IS THE DEVICE WIDTH — the activation row law (`rung::row_pitch`): the
+            // layout reserves rows of whole sticks and every consumer of the buffer reads
+            // them at that pitch, so the view and tile name the storage as it is held.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
             let n_dev = stick_width(*n);
             ce("M", Val::Int(i128::from(m)))?;
@@ -2973,8 +2878,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // checkpoint's own on-disk layout, 1 byte per element — the descriptor's
             // elem says fp8, the load widens on read), ws the [1, N] per-channel scale
             // row. K from A's own columns, n from the Linear's stated width — the same
-            // derivations the dense arm states, and the ones `KtirFunc::matmul_fp8`
-            // states for the builder path.
+            // derivations the dense arm states.
             let k = node.inputs[0].region.cols.len;
             signature.insert(
                 "desc_x".to_string(),
@@ -3024,13 +2928,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 constexprs.insert(k.to_string(), v);
                 Ok(())
             };
-            // The whole region, one tile: `BLOCK_M = M` rows and `BLOCK_N = N` columns,
-            // the same no-row-blocking law `KtirFunc::silu_mul` states for itself —
-            // PLUS the STORAGE the region windows: the descriptor names the TENSOR
-            // (`[M, N_TOTAL]`, strides `[N_TOTAL, 1]` — `KtirFunc::view`'s own shape
-            // read) and the load/store names the CORNER (`C_START`), exactly as the
-            // builder's `load_region`/`store_region` state it. A whole-region node
-            // states `N_TOTAL = N`, `C_START = 0`.
+            // The region in `[BLOCK_M, N]` row blocks — PLUS the STORAGE the region
+            // windows: the descriptor names the TENSOR (`[M, N_TOTAL]`, strides
+            // `[N_TOTAL, 1]`) and the load/store names the CORNER (`C_START`). A
+            // whole-region node states `N_TOTAL = N`, `C_START = 0`.
             let (n_total, c_start) = window_of(node, ir)?;
             let (block_m, n_blocks, tail_h) = blocks_of(m, c, SILU_MUL_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
@@ -3068,8 +2969,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         (SubOp::Elementwise(_), "add_fwd" | "mul_fwd" | "sub_fwd") => {
             // The kernel's own parameter spellings: desc_a, desc_b, desc_o for every
             // binary entry, then the constexprs M / N / BLOCK_M / BLOCK_N / N_TOTAL /
-            // C_START — the same whole-region single-tile law `lower_elementwise_node`
-            // states when the region fits, PLUS the storage-window facts (see
+            // C_START — the region in row blocks, PLUS the storage-window facts (see
             // `window_of`).
             for p in ["desc_a", "desc_b", "desc_o"] {
                 signature.insert(
@@ -3106,32 +3006,13 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             let (n_total, c_start) = window_of(node, ir)?;
-            // ⛔ THE WINDOW IS THE DEVICE WIDTH, NOT THE LOGICAL ONE — the door's own
-            // law for this family. `scalarmul_scaled` pads the window through
-            // `DeviceWidth::for_pointwise` (a ScalarMul on the padded logits must use
-            // the width its producer matmul emitted), and the Triton front end refuses
-            // a block whose last dim is under 16 bytes (`semantic.py:1863`), so
-            // granite's 3-wide logits tail chunk is not spellable at its logical
-            // width. Stating the DEVICE width clears that floor AND states the window
-            // the descriptor actually computes. `for_pointwise` is IDEMPOTENT (every
-            // branch of `bump_sticks_to_splittable` reproduces its input: a
-            // full-occupancy pad is 32-divisible and stays; an 8-stick pad is
-            // core-split ≥8 and stays), so the door re-derives the SAME width from
-            // this program as from the builder's logical one — including through the
-            // `pointwise_width_the_output_holds` cap, which sees identical `cols` on
-            // both paths. The other pointwise families (elementwise, silumul) state
-            // the LOGICAL width because their door arms do — `check_pointwise_cols`
-            // refuses a non-stick width rather than padding it.
-            // ⛔ AND SO IS `N_TOTAL` — the STORAGE is the device width too: the
-            // producer matmul wrote `for_matmul`-padded columns and the layout
-            // reserved exactly that (the weight-holds / output-holds proofs both rely
-            // on the pad being real), so a view at the logical width understates the
-            // buffer and a device-width TILE at the chunk corner leaves it — granite's
-            // chunk 6 (`[31, 512]` at 49152 of a 49159-wide view) is exactly that
-            // refusal. `for_pointwise` of the logical storage IS the producer's
-            // `for_output` width (the documented equality, for any matmul above the
-            // util floor), so the widened view names the storage the placement
-            // actually holds.
+            // ⛔ THE WINDOW IS THE DEVICE WIDTH, NOT THE LOGICAL ONE: a ScalarMul on
+            // the logits runs over the rows its producer matmul wrote, whole sticks wide
+            // (`rung::row_pitch`), and the Triton front end refuses a block whose last dim
+            // is under 16 bytes (`semantic.py:1863`), so a 3-wide logits tail chunk is not
+            // spellable at its logical width. ⛔ AND SO IS `N_TOTAL`: the storage is held
+            // at the device width, so a view at the logical width would understate the
+            // buffer and a device-width tile at the chunk corner would leave it.
             let c_dev = stick_width(c);
             let (block_m, n_blocks, tail_h) = blocks_of(m, c_dev, 3);
             let n_total_dev = stick_width(n_total);
@@ -3143,12 +3024,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_START", Val::Int(i128::from(c_start)))?;
             ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
             ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
-            // THE SCALE, from the node's own payload. The consumer reads it OFF THE
-            // PROGRAM (`program_scalarmul_scale`: one splat feeding every `arith.mulf`)
-            // and looks the value up in `BundleLayout::scalarmul_scales`, the registry
-            // the tape-side layout pass fills FROM THIS SAME PAYLOAD — so stating it
-            // here as the kernel's constexpr keeps the program and the registry slot in
-            // agreement by construction.
+            // THE SCALE, from the node's own payload: one splat feeding every
+            // `arith.mulf`, staged by the lowering as a stick constant.
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
         (SubOp::RopeRotate { head_dim, .. }, "rope_fwd") => {
@@ -3199,7 +3076,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                     node.output.tensor.index()
                 ));
             }
-            // ROW BLOCKING, the builder's own law: three live tiles (x, the tanh's
+            // ROW BLOCKING: three live tiles (x, the tanh's
             // operand, the result) over the VOCAB-wide logits, wider than any
             // activation — prefill rungs exceed the LX budget while decode (m=1)
             // never does.
@@ -3236,9 +3113,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         (SubOp::ScalarWeightMul, "scalarwmul_fwd") => {
             // desc_x, `w` (the `[1]` weight as a RUNTIME fp16 SCALAR — rung 3 of the
             // address-provenance ladder, `mul_scale.py`'s own shape), desc_o, then
-            // M / N — the logical width (the door's own `check_pointwise_cols` law for
-            // this family; the weight is read in the scalar broadcast mode and pads its
-            // own placement). ⛔ THE WEIGHT IS NOT A DESCRIPTOR: a `[1]`-region load
+            // M / N — the logical width (the weight is read in the scalar broadcast mode
+            // and pads its own placement). ⛔ THE WEIGHT IS NOT A DESCRIPTOR: a `[1]`-region load
             // would have to broadcast its `[1, 1]`-widened tile over `[M, N]`, an
             // all-unit source `to_ktir` refuses (it would need a rank-0 source), while
             // a rank-0 argument SPLATS — no broadcast anywhere — and the launch binds
@@ -3322,10 +3198,9 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// The STORAGE-WINDOW FACTS a pointwise kernel states: the tensor's full column
-/// extent (`N_TOTAL` — the descriptor's own shape/strides name the STORAGE, exactly
-/// as `KtirFunc::view` reads it from the graph) and the region's column corner
-/// (`C_START` — the load/store offsets name the WINDOW, exactly as the builder's
-/// `load_region`/`store_region` state it from `region.cols.start`).
+/// extent (`N_TOTAL` — the descriptor's own shape/strides name the STORAGE) and the
+/// region's column corner (`C_START`, `region.cols.start` — the load/store offsets name
+/// the WINDOW).
 ///
 /// ⛔ READ OFF THE OUTPUT'S TENSOR. The front end's chunking gives every operand of a
 /// chunked node the SAME column window (`lower_region` tiles all of a node's regions
@@ -3341,8 +3216,8 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     let out = &node.output;
     let n_total = ir.tensors[out.tensor.index()].cols;
     let (r, c_start) = (out.region.rows.start, out.region.cols.start);
-    // The operands must window the SAME slice of the SAME storage — the builder's
-    // own law (`load_region` per operand, one chunk per node).
+    // The operands must window the SAME slice of the SAME storage (one chunk per
+    // node).
     for tr in &node.inputs {
         // A SYNTHETIC BEYOND THE GRAPH (the tensor-parallel receive window) has no storage in the
         // graph: its storage IS its region, from its first byte — `matmul_window_of`'s law for the
@@ -3378,9 +3253,8 @@ fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     if out.region.rows.start != 0 || a.region.rows.start != 0 {
         return Err(format!(
             "triton splice: matmul t{} has a nonzero ROW corner (output row {}, activation \
-             row {}) — the door's `base_addressed` refuses a nonzero row corner on a matmul \
-             operand, and the kernels state row 0; the prefill lm-head fold is the row-0 \
-             window form",
+             row {}) — the matmul kernels state the activation's tile at row 0; the prefill \
+             lm-head fold is the row-0 window form",
             out.tensor.index(),
             out.region.rows.start,
             a.region.rows.start,
@@ -3427,13 +3301,9 @@ fn rows_per_block(cols: u32, live: u32) -> u32 {
     ((LIVE_ELEMS / u64::from(live.max(1)) / u64::from(cols.max(1))) as u32).max(1)
 }
 
-/// THE ROW-BLOCK CONSTANTS the pointwise kernels take — the builder's own blocking
-/// law, stated from the node's own region: `BLOCK_M` is the SHARED `rows_per_block`
-/// (`EW_LX_ELEMS / live / cols` — one function both paths read, so the builder's
-/// programs and the spliced ones cannot disagree about a block height and emit
-/// windows that overlap or leave a gap), `N_BLOCKS` full blocks follow, and `TAIL_H`
-/// is the shorter last tile when the region does not divide evenly (the builder's
-/// `h = blk.min(rows - off)`).
+/// THE ROW-BLOCK CONSTANTS the pointwise kernels take, stated from the node's own
+/// region: `BLOCK_M` is [`rows_per_block`], `N_BLOCKS` full blocks follow, and `TAIL_H`
+/// is the shorter last tile when the region does not divide evenly.
 ///
 /// A region that FITS the budget answers `(rows, 1, 0)` — ONE whole-region tile, the
 /// constants the one-tile form always implied, so nothing changes for decode (m=1)
@@ -3441,14 +3311,12 @@ fn rows_per_block(cols: u32, live: u32) -> u32 {
 ///
 /// ⛔ THE `live` COUNT IS THE FAMILY'S OWN — `EW_SILU_LIVE_TILES` /
 /// `EW_BINARY_LIVE_TILES` / `SILU_MUL_LIVE_TILES` / 3 for scalarmul — read by the
-/// CALLER, because it is the same fact the builder's own `by_row` condition reads and
-/// a wrong count here would block at a different height than the builder and diverge
-/// the door's windows.
+/// CALLER, because the live set is the kernel's own: a wrong count here would block
+/// at a height whose live tiles overflow LX.
 fn blocks_of(rows: u32, cols: u32, live: u32) -> (u32, u32, u32) {
     let blk = rows_per_block(cols, live);
     if blk >= rows {
-        // The region FITS: one whole-region tile, the constants the one-tile form
-        // always stated (and the builder's un-blocked arm still states).
+        // The region FITS: one whole-region tile.
         return (rows, 1, 0);
     }
     let n_blocks = rows / blk;
@@ -3456,8 +3324,8 @@ fn blocks_of(rows: u32, cols: u32, live: u32) -> (u32, u32, u32) {
     (blk, n_blocks, tail)
 }
 
-/// The launch grid. The builder's programs are `(gx, gy) = (1, 1)` for every pointwise
-/// kind; the kernel is compiled at the same grid the case table states (`vec![1]`).
+/// The launch grid: `[1]` for every kind — the kernel is compiled at the grid the case
+/// table states (`vec![1]`).
 fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     _ir: &SubtileIR<F>,
@@ -3470,7 +3338,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::ScalarMul { .. } => Ok(vec![1]),
         // ONE WORK ITEM: the position loop is a constant-trip `tl.range` inside the
         // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
-        // spliced program is straight-line like the builder's — no grid axis at all.
+        // spliced program is straight-line — no grid axis at all.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
         // The same one-work-item law: the row blocks are in-kernel tiles. The MoE
         // sub-ops have no grid row any more — the registry refuses them before the
@@ -3492,14 +3360,14 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// spec, grid) many times over: the prefill ladder's 21 rungs × 40 layers state one
 /// program per (kind, shape) cell, and the shape repeats across every layer of a rung —
 /// MEASURED before this cache, the 2b card bake spent ~100 minutes in the models build
-/// script, ~17 s per attention program alone (~26 programs in the golden's 442 s run),
-/// where main's direct-emission builder paid none of it. The compile is a pure function
+/// script, ~17 s per attention program alone (~26 programs in the golden's 442 s run).
+/// The compile is a pure function
 /// of (source, spec, grid) — the ladder is deterministic — so the second and later
 /// callers SHARE the first result (one `Arc`, no per-caller deep copy of the module
 /// tree: MEASURED on the tp/8 fp8 bake, 2026-11-11, the clone-on-hit was the memo's own
-/// second cost). No consumer mutates the module — `mint` and the attention doors only
-/// READ it (`node_for` takes `&Module`), and everything a node re-states (name,
-/// bindings, mask, `node_out_tid`) is a field of the MINTED NODE, not of the module.
+/// second cost). No consumer mutates the module — `mint` and the attention mints only
+/// READ it (`node_for` takes `&Module`), and everything a node re-states (its
+/// bindings) is a field of the MINTED NODE, not of the module.
 ///
 /// ⭐ THE KEY RIDES ALONG, INSIDE THE VALUE ([`CompiledKernel`]): the memo's own mint
 /// pairs the module with the key that produced it, and the mint hands the pair to
@@ -3508,7 +3376,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// motivated this memo).
 fn compile_kernel(src: &str, spec: &KernelSpec, grid: &[i64]) -> Result<CompiledKernel, String> {
     /// The module memo: one compile per key, and the ONLY mint of the paired
-    /// [`CompiledKernel`] the doors take. The key is [`memo_key`]'s canonical `String`,
+    /// [`CompiledKernel`] the mints take. The key is [`memo_key`]'s canonical `String`,
     /// so it needs no `Hash`/`Ord` on `ArgSpec`/`Val` and is deterministic in
     /// construction.
     static CACHE: crate::compile::ModuleMemo = crate::compile::ModuleMemo::new();
@@ -3708,10 +3576,10 @@ fn parse_py(src: &str) -> Result<std::sync::Arc<triton_frontend::py::ast::PyModu
 /// SIGNATURE's stated pointer dtype, the same statement the compile itself
 /// reads. `Ok(None)` for a kind that is not a `lower_one` kernel: a `Refused`
 /// row's formats are another producer's statement, and attention — a Spliced
-/// row that lowers through `lower_attn`'s door-order bindings — states its
-/// widths at the door (the per-parameter view dtype), not here.
+/// row that lowers through `lower_attn` — states its widths in its own operand
+/// views, not here.
 ///
-/// The device-format mapping is the door's own law: a stated dtype with no
+/// A stated dtype with no
 /// device format is refused BY NAME, because sizing it at some other format's
 /// bytes would turn the footprint guard into a rubber stamp for exactly the
 /// access it exists to catch. ⚠ AN `Err` HERE IS THE SEAT'S OWN REFUSAL — the
@@ -3724,9 +3592,8 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<Option<Vec<(u32, Df)>>, String> {
-    // Attention is a Spliced ROW but not a `lower_one` kernel (its door-order
-    // bindings and mask slot are `lower_attn`'s); its widths are the door's
-    // statement. This names the ROUTING, not a format.
+    // Attention is a Spliced ROW but not a `lower_one` kernel (its bindings are
+    // `lower_attn`'s). This names the ROUTING, not a format.
     if matches!(node.op, SubOp::AttnDecode { .. }) {
         return Ok(None);
     }
@@ -3780,7 +3647,7 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     ))
 }
 
-/// One stated pointer dtype → its device format — the door's own mapping law
+/// One stated pointer dtype → its device format
 /// (F16→Fp16, F32→Fp32, F8E4M3FN→Fp8, i32→UInt32): a dtype with
 /// no device format is refused BY NAME.
 fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
@@ -3801,15 +3668,14 @@ fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df,
     })
 }
 
-/// Mint the [`KtirNode`]: the adapter's `node_for` compilation, then RE-STATE the fields
-/// the tape owns — the name (the builder's naming law), the bindings (resolved by
-/// [`default_bindings`]: the tape's tensor indices, the output LAST), `mask` (none for
-/// rmsnorm), and `node_out_tid` (None — the program writes its own node's output).
+/// Mint the [`KtirNode`]: the adapter's `node_for` compilation, then RE-STATE the
+/// bindings the tape owns (resolved by [`default_bindings`]: the tape's tensor indices,
+/// the output LAST).
 ///
 /// ⛔ THE RE-STATE IS THE WHOLE POINT. `node_for` mints positional `BufferId`s
 /// (`0, 1, 2`); the tape's rmsnorm node reads `t37`/`t41` and writes `t42`. The
-/// bindings are ours to state, exactly as `KtirFunc::finish_shaped` states them, because
-/// only the splice knows which graph tensor each kernel parameter addresses.
+/// bindings are ours to state, because only the splice knows which graph tensor each
+/// kernel parameter addresses.
 fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     compiled: &CompiledKernel,
@@ -3822,8 +3688,8 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     // once per node.
     let positional = crate::compile::node_for_compiled(compiled, *program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
-    // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key
-    // follow the same law the builder path established — what the golden pins.
+    // ⭐ ONE NAMING LAW, so the op_name and the emulator's function key agree — what the
+    // golden pins.
     let name = Arena::global().str(format!(
         "{}_s{}",
         program_stem(node, program),
@@ -3846,10 +3712,9 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     })
 }
 
-/// The program stem the builder's naming law uses for this node (`rmsnorm_s{id}`,
-/// `add_s{id}`, …). ⛔ READ OFF THE NODE, NOT THE ROW: the elementwise rows carry the
-/// CONSUMER's kind (`Elementwise::Add`), and the builder's name comes from the
-/// PRODUCER's `EwKind` (`ew_kind_stem` — BiasAdd is named `add`, not `biasadd`). One
+/// The program stem of this node's name (`rmsnorm_s{id}`, `add_s{id}`, …). ⛔ READ OFF THE
+/// NODE, NOT THE ROW: the elementwise rows carry the CONSUMER's kind (`Elementwise::Add`),
+/// and the name comes from the PRODUCER's `EwKind` (`ew_kind_stem` — BiasAdd is named `add`, not `biasadd`). One
 /// row may therefore mint several stems; the node states which.
 fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
@@ -3862,15 +3727,12 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
             EwKind::Sub => "sub",
             EwKind::Silu => "silu",
             EwKind::Gelu => "gelu",
-            // ⛔ NO `_` ARM. A spliced elementwise kind has a row above; reaching here
-            // with a kind that has none is an unreachable — the same discipline the
-            // arity match holds.
-            other => unreachable!("elementwise kind {other:?} has no program stem"),
+            EwKind::QuickGelu => "quickgelu",
+            EwKind::GeluErf => "geluerf",
+            EwKind::Relu2 => "relu2",
         };
     }
-    // ⭐ THE 2a KINDS THAT SHARE ANOTHER FAMILY'S PROGRAM but keep their OWN builder
-    // names — read off the NODE, like the elementwise stems above, because the
-    // program match below would answer the shared family's name.
+    // ⛔ NO `_` ARM: a new program kind names its stem here or the build fails.
     match program {
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
@@ -3885,7 +3747,11 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
         Program::BlockCopy => "blockcopy",
-        _ => "triton",
+        Program::Elementwise(_) => "elementwise",
+        Program::LmLast => "lmlast",
+        Program::PagedAttn => "pagedattn",
+        Program::PagedKvWrite => "pagedkvwrite",
+        Program::Transpose => "transpose",
     }
 }
 
@@ -4049,8 +3915,7 @@ mod production_ktir_dump {
             ),
             vec![1],
         ));
-        // ── matmul_fp8.py: the arity-3 twin, LOGICAL widths (the arm's own early-return
-        // door is not pad-idempotent), one whole-region tile. ──
+        // ── matmul_fp8.py: the arity-3 twin, LOGICAL widths, one whole-region tile. ──
         v.push((
             "matmul_fp8_fwd",
             MATMUL_FP8,
@@ -4138,7 +4003,7 @@ mod production_ktir_dump {
             ),
             vec![1],
         ));
-        // ── scalarmul.py: the WINDOW is the device width — `for_pointwise` on both N and
+        // ── scalarmul.py: the WINDOW is the device width — whole sticks on both N and
         // N_TOTAL, the arm's own law. ──
         {
             let c_dev = stick_width(2048);
@@ -4866,10 +4731,10 @@ mod production_ktir_dump {
 
     /// ⭐ THE STRUCTURAL TWIN, RUN IN EVERY TEST PASS — the same driver over the same `entries()`,
     /// writing nothing and asserting the SHAPE of the result rather than its bytes. Every production
-    /// kernel compiles to a non-empty KTIR module; every one the door lowers emits at least one op;
-    /// and the kernels the door does NOT lower are exactly the two named tables — the skips
-    /// (`sdsc_skip_of`, kernels with no door row) and the refusals below (kernels whose door
-    /// refuses them by name, each with the substring its refusal must carry). A kernel that starts
+    /// kernel compiles to a non-empty KTIR module; every one the lowering takes emits at least one
+    /// op; and the kernels it does NOT lower are exactly the two named tables — the skips
+    /// (`sdsc_skip_of`) and the refusals below (kernels the lowering refuses by name, each with
+    /// the substring its refusal must carry). A kernel that starts
     /// refusing, stops refusing, or refuses for another reason fails here, by name, with no golden
     /// to regenerate: the byte-level proof stays the ignored driver's diff.
     #[test]
@@ -4941,9 +4806,8 @@ mod production_ktir_dump {
                 text.lines().count()
             );
 
-            // THE SDSC LEG — the emitted-descriptor half of the same proof: the grid-[B]
-            // fix changes `Region`/`windowed_region`/the mint, so the byte-identity bar
-            // applies to what the doors EMIT, not only to the module text. Same law:
+            // THE SDSC LEG — the emitted-descriptor half of the same proof: the byte-identity
+            // bar applies to what the lowering EMITS, not only to the module text. Same law:
             // the diff of two runs is the proof; a named skip (`sdsc_skip_of`) is the
             // only kernel without an `.sdsc.jsonl`, and every other kernel must lower.
             match sdsc_skip_of(name) {
@@ -4964,10 +4828,9 @@ mod production_ktir_dump {
                                 lines.len()
                             );
                         }
-                        // ⭐ A KERNEL THE DOOR REFUSES IS A NAMED SKIP, CARRIED AS DATA — the
-                        // driver mirrors what the production door lowers and NOTHING wider
-                        // (auditor ruling 2026-10-27: never fix the door to suit the driver).
-                        // The refusal is the door's own message, written as the kernel's one
+                        // ⭐ A KERNEL THE LOWERING REFUSES IS A NAMED SKIP, CARRIED AS DATA — the
+                        // driver mirrors what production lowers and NOTHING wider. The refusal
+                        // is the lowering's own message, written as the kernel's one
                         // `.sdsc.jsonl` line, so the before/after diff still sees it: a kernel
                         // that flips refused↔emitted, or whose refusal reason moves, is a diff.
                         Err(reason) => {

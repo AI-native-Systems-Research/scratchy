@@ -19,22 +19,20 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about these kern
   permute.
 * CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N`, `N_TOTAL`, `C_START`, `N_BLOCKS`,
   `TAIL_H` — stated by the splice from the node's own region (`M =` rows, `N =
-  BLOCK_N =` the region's width), the same whole-region single-tile law the builder
-  states when the region fits a core's LX, PLUS the STORAGE the region windows
+  BLOCK_N =` the region's width; one whole-region tile when the region fits a core's
+  LX), PLUS the STORAGE the region windows
   (`N_TOTAL =` the tensor's full width, `C_START =` the region's column corner). A
   whole-region node states `N_TOTAL = N`, `C_START = 0`. See `scalarmul.py`'s window
   law: the descriptor names the storage, the load names the window.
 * GRID: `[1]`.
 
-⭐ ROW BLOCKING, THE BUILDER'S OWN LAW (`lower_elementwise_node`): a whole
+⭐ ROW BLOCKING, THE SPLICE'S LAW (`blocks_of`): a whole
 `[rows, cols]` region whose live set (`rows × cols × live-tiles`) exceeds the
 `EW_LX_ELEMS` budget is ROW-BLOCKED, not refused — `N_BLOCKS` full `[BLOCK_M, N]`
-tiles (BLOCK_M = the builder's own `rows_per_block(cols, live)`) plus a `[TAIL_H, N]`
+tiles (BLOCK_M = the splice's `rows_per_block(cols, live)`) plus a `[TAIL_H, N]`
 tail tile when the region does not divide evenly. The trip count is constexpr, so
 `to_ktir` unrolls it and the spliced program is straight-line with one
-constant-corner tile per block — the door folds those through `Region::r_cover` and
-ONE descriptor spans all of them, exactly as it spans the builder's row-blocked
-program (`lower_elementwise_node_rows`).
+constant-corner tile per block, each a strided view the lift reads.
 """
 
 import triton
@@ -160,8 +158,8 @@ def silu_fwd(desc_x, desc_o,  #
     for blk in tl.range(0, N_BLOCKS, 1):
         offs_m = blk * BLOCK_M
         x = x_desc.load([offs_m, C_START])
-        # silu(x) = x / (1 + exp(-x)) — the same chain the builder's own arm writes
-        # (`negate → math.exp → splat 1 → addf → divf`) and `silumul.py` spells for the
+        # silu(x) = x / (1 + exp(-x)) — the chain `negate → math.exp → splat 1 → addf →
+        # divf`, which `silumul.py` spells for the
         # fused form: f16 in and out, the f32 island only around `exp` (the ladder's
         # LegalizeTypes collapses the widen/truncate), `tl.fdiv` not `/` (`/` upcasts
         # f16→f32).

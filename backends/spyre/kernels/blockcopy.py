@@ -5,17 +5,15 @@ rank's block (its own, or its peer's out of the receive window) landing at that 
 
 BODY PROVENANCE: `elementwise.py`'s row-blocked whole-width form — `N_BLOCKS` full `[BLOCK_M,
 C_SRC]` tiles plus, on the tail entry, a `[TAIL_H, C_SRC]` tail, each one load and one store — with the destination
-column shifted by `COL_OFF`. The door (`lower_ktir_to_superdsc::block_copy`) reads the block off
-the program's own first tiles (the source at its corner, the destination at `[0, COL_OFF]`) and
-the views' extents, and lowers the whole program to ONE identity over the run of stick columns,
-which stick-major layout makes contiguous at both ends.
+column shifted by `COL_OFF`. Each tile is a strided view of its buffer (the source at its corner,
+the destination at `[0, COL_OFF]`), which the KTIR→SuperDSC lift lowers to identities over the run
+of stick columns, contiguous at both ends in stick-major layout.
 
 ⛔ WHOLE-WIDTH ROW BLOCKS, NOT ONE COPY PER STICK. The per-stick walk (`R · C_SRC / 64` copies)
 unrolled into ~`12 · R · C_SRC / 64` KTIR ops — 196,616 for a `[512, 2048]` copy, 313 MB of
 build-script memory for that one program (MEASURED, crate-only, nickm5 2026-11-08) — and a bake
 mints one per (rank, gather, rung). The row blocks are the elementwise LX law's (`rows_per_block`),
-so the program is `O(R / BLOCK_M)` ops at any width (8 ops, 10 MB for the same copy), and the door
-emits the same one descriptor.
+so the program is `O(R / BLOCK_M)` ops at any width (8 ops, 10 MB for the same copy).
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
 
@@ -31,8 +29,8 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   kernel, and the kernel restates no stick law of its own.
 * GRID: `[1]`.
 
-⭐ THE TRIP COUNT IS CONSTEXPR, so `to_ktir` unrolls the walk into straight-line copies — the form
-the door's region walk requires, exactly as for `elementwise.py`.
+⭐ THE TRIP COUNT IS CONSTEXPR, so `to_ktir` unrolls the walk into straight-line copies, each tile
+at a constant corner — the form the lift reads, exactly as for `elementwise.py`.
 """
 
 import triton

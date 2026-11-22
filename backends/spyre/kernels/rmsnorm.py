@@ -3,10 +3,7 @@
 
 BODY PROVENANCE: `crates/targets/spyre/triton/test-fixtures/rmsnorm.py`'s `rmsnorm_fwd`, verbatim
 EXCEPT the ceiling-safe pre-scale below (the fixture keeps the card-validated body
-verbatim — it is the ladder's own test surface). The card's emission is unchanged by
-the delta: the door re-assembles the exx2 sequence from the program's regions,
-epsilon and gain offset, never from the mean's spelling (`program_rmsnorm_eps`'s own
-discriminator is "any spelling of the mean").
+verbatim — it is the ladder's own test surface).
 
 WHY THIS FILE EXISTS SEPARATELY from the fixture: the fixture is the LADDER's test
 surface (its `constexprs()`/`inputs()`/`reference()` helpers are test code); this is
@@ -62,20 +59,16 @@ The CARD was never affected by either band — its accumulator is DLF16, so
 Σx² ≈ 9.5e4 sits five orders inside range and small-row squares flush only
 below |x| = 2⁻¹⁵ (the model's smallest are ~3e-3). The ceiling and the crush
 existed ONLY in the emulator's old IEEE-f16 accumulator rounding, and that
-rounding is what the `codec::round_dlf16` law replaces. But the spliced KTIR
-program still must not state a computation that diverges from the builder's
-numerically — which is one more reason the plain form is the law: it is the
-body the card was validated on, verbatim.
+rounding is what the `codec::round_dlf16` law replaces. The plain form stays the
+law: it is the body the card was validated on, verbatim.
 
 THE `(1 + w)` CONVENTION (`rmsnorm_oneplus_fwd`, a SECOND ENTRY in this same file):
 the gemma class stores the gain zero-centred (`weight = gain − 1`, the HF
 convention), so the applied gain is the loaded row PLUS `GAIN_OFFSET`. The offset
-is stated as an `addf` over the load with a constant splat — the ONE shape the
-door's `program_gain_offset` reader accepts — and the door resolves the SAME
-value's `[1,1]` registry slot by bits, exactly the epsilon's law: the program
-states the constant, the descriptor adds the registry's copy of it. The Scale
-entry above states NO addf (the reader's `None`), which is why the conventions are
-two entries and not one entry with a flag — neither program carries an op its
+is stated as an `addf` over the load with a constant splat, which the lowering
+stages as a stick constant, exactly as it stages the epsilon. The Scale entry above
+states NO addf, which is why the conventions are two entries and not one entry
+with a flag — neither program carries an op its
 convention does not state, and the Scale program stays byte-identical to the form
 the card was validated on.
 """
@@ -148,8 +141,7 @@ def rmsnorm_oneplus_fwd(desc_x, desc_w, desc_o,  #
     # island-collapses to f16 (it feeds an addf with an f16 operand — LegalizeTypes'
     # own law), so the applied gain is f16(1 + w) and the trailing multiplies stay
     # f16 throughout. `GAIN_OFFSET` is 1.0 by the convention's definition
-    # (`GainConvention::from_offset` refuses every other value), and the door reads
-    # THIS splat's value back off the program to resolve its registry slot — the
-    # epsilon's law, one constant, two readers, one value.
+    # (`GainConvention::from_offset` refuses every other value); the lowering stages
+    # this splat as a stick constant, as it stages the epsilon.
     w = w_desc.load([0]) + GAIN_OFFSET
     o_desc.store([offs_m, 0], x * r[:, None] * w[None, :])

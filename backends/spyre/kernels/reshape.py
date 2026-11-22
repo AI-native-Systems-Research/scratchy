@@ -2,16 +2,13 @@
 """THE RESHAPE SPLICE'S KERNEL — the pure relayout `out = reshape(x)`: the same
 element sequence, different `[rows, cols]` extents.
 
-BODY PROVENANCE: main's `KtirFunc::reshape` lowered through the door's own
-decomposition — ONE `identity` COPY PER STICK, the `lmlast` mechanism. A device
-tensor is stick-blocked, and (because both column extents are 64-multiples —
-the door's own stick law) flat elements `64q..64q+64` are EXACTLY one `[1, 64]`
-tile of each side's own view: input row `q // (C_IN/64)` at column
+ONE `identity` COPY PER STICK, the `lmlast` mechanism. A device tensor is
+stick-blocked, and (because both column extents are 64-multiples) flat elements
+`64q..64q+64` are EXACTLY one `[1, 64]` tile of each side's own view: input row `q // (C_IN/64)` at column
 `(q % (C_IN/64))·64`, output row `q // (C_OUT/64)` at column
 `(q % (C_OUT/64))·64`. Walking the flat sequence a stick at a time is therefore
 the one form that is simultaneously (a) a legal load/store pair for the front
-end (every block fits its view), (b) a flat copy for the emulator, and (c) the
-same op count the door itself emits.
+end (every block fits its view), and (b) a flat copy on every executor.
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
 
@@ -25,15 +22,12 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 
 ⭐ THE TRIP COUNT IS CONSTEXPR, so `to_ktir` unrolls the stick loop and the
 spliced program is straight-line — one `[1, 64]` load/store pair per stick, all
-at top level, which is the straight-line form the door's region walk requires
-(an `scf.for`-borne window is refused there by name). The stick count is the
-buffer's own (`R·C/64`), the same count of identity legs the door emits, so the
-emulator's per-tile work and the card's per-op work agree on the cost shape.
+at top level, each tile at a constant corner. The stick count is the buffer's own
+(`R·C/64`).
 
-⛔ THE COLUMN EXTENTS MUST BE WHOLE 64-ELEMENT STICKS — the door's own law for
-both sides, re-stated here because the walk's coordinates assume it. A
-sub-stick width is a build `Err` at the door naming it; the splice's count law
-fires first for a malformed node.
+⛔ THE COLUMN EXTENTS MUST BE WHOLE 64-ELEMENT STICKS on both sides, because the
+walk's coordinates assume it; the splice refuses a sub-stick width by name at the
+bake.
 """
 
 import triton
@@ -46,15 +40,14 @@ def reshape_fwd(desc_src, desc_dst,  #
                 R_OUT: tl.constexpr, C_OUT: tl.constexpr,  #
                 N_STICKS: tl.constexpr,  #
                 ):
-    # Both sides at their TRUE extents — the door reads `v_rows`/`v_cols` off
-    # these views and derives its own stick walk from them.
+    # Both sides at their TRUE extents.
     src_desc = tl.make_tensor_descriptor(desc_src, shape=[R_IN, C_IN],
                                          strides=[C_IN, 1],
                                          block_shape=[1, 64])
     dst_desc = tl.make_tensor_descriptor(desc_dst, shape=[R_OUT, C_OUT],
                                          strides=[C_OUT, 1],
                                          block_shape=[1, 64])
-    # Sticks per row on each side (the extents are 64-multiples, the door's law).
+    # Sticks per row on each side (the extents are 64-multiples).
     IN_STICKS: tl.constexpr = C_IN // 64
     OUT_STICKS: tl.constexpr = C_OUT // 64
     # ONE SINGLE-STICK COPY PER FLAT STICK — the `lmlast` form. Each stick's

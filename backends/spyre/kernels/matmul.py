@@ -3,63 +3,33 @@
 
 BODY PROVENANCE: derived from `crates/targets/spyre/triton/test-fixtures/swiglu_mlp.py`'s projection
 structure (deltas 2/3/4 there) — one `tl.dot` over descriptor-loaded tiles, which is
-the form `spyre-dot-to-linalg` rewrites to `linalg.matmul` and the emitter's
-`Program::Matmul` door is built for. The fixture's OWN three-dot fused MLP is NOT this
-kernel: `SubOp::MatmulTile` is ONE projection, and the activation is its own node
-(`silumul.py`).
+the form `spyre-dot-to-linalg` rewrites to `linalg.matmul`. The fixture's OWN three-dot
+fused MLP is NOT this kernel: `SubOp::MatmulTile` is ONE projection, and the activation
+is its own node (`silumul.py`).
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
 
 * PARAMETERS, IN ORDER: `desc_a`, `desc_w`, `desc_o` — the node's operand order
   (activation, weight) then the output. The registry does not permute. ⛔ This row is
   DENSE-ONLY (arity 2): the fp8 arity-3 W8A8 form is its OWN row over
-  `matmul_fp8.py` (the activation-quantize dedup the old note here called a
-  bundle-level blocker lives in the DOOR, downstream of both producers — see
-  the splice module header).
+  `matmul_fp8.py`.
 * CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N`, `M_TOTAL` — stated by
   the splice from the node's own regions (`A is [M, K]`, the out tile is `[M, N]`,
-  all blocks the whole extents — ONE tile, the same whole-region law
-  main's `KtirFunc::matmul` states).
+  all blocks the whole extents — ONE tile).
 * GRID: `[1]`.
 
 THE ORIENTATION: the weight descriptor is the PRESENTED weight's own on-disk `[n, k]`
-buffer (the region the executor binds verbatim on the emulator path), and the `.T` is
-the single-dot canonical verifier's transposed form — `verify_canonical_matmul_kernel`
-admits `tt.trans` directly over the weight load, and `dot_to_linalg` folds that trans
-into the transpose-B `indexing_maps = [[0,2],[1,2],[0,1]]`: the EXACT maps scratchy's
-own `KtirFunc::matmul` from main states (it views the weight `view_shaped(w, n, k)` and carries
-the transposition in the maps). The two paths therefore not only emit byte-identical
-descriptors but also contract the same bytes the same way on EVERY executor, with no
-orientation seam between the door and the program.
+buffer (the region the executor binds verbatim), and the `.T` is the single-dot
+canonical verifier's transposed form — `verify_canonical_matmul_kernel` admits `tt.trans`
+directly over the weight load, and `dot_to_linalg` folds that trans into the transpose-B
+`indexing_maps = [[0,2],[1,2],[0,1]]`, so the weight is contracted in its on-disk
+orientation on every executor.
 
-⛔⛔ `N` IS THE **DEVICE** WIDTH, NOT THE LOGICAL ONE — the door's own padding law
-(`DeviceWidth::for_matmul`: a FLOP-heavy matmul's output stick count is bumped to
-≥8-splittable, so granite's 49155-wide lm_head is 49664 on device), and the splice
-states it as exactly that. Three facts make the device width the honest spelling:
-
-1. THE CARD WRITES IT. The emitted kernel MAC's over `[k, n_dev]` — the padded
-   columns are the door's own contract (`out_width_the_weight_holds`: the worker
-   zero-pads the staged weight to the same rule, so the pad is real).
-2. THE LAYOUT RESERVES IT. The logits placement is the device width (the door's
-   `pointwise_width_the_output_holds` case-(b) proof depends on exactly that), so a
-   view stating the logical width understates the buffer every consumer addresses.
-3. THE EMISSION IS PAD-IDEMPOTENT. `for_matmul(m, n_dev, k)` reproduces `n_dev`
-   (a bumped stick count is already ≥8-splittable), and the weight-holds drop is
-   applied by the door to BOTH paths — so a spliced tile at `n_dev` and a builder
-   tile at the logical `n` reach the SAME `assemble_matmul_*` call, byte-identical.
-
-⚠️ THE `SubOp::RouterLogits` ROW STATES THE LOGICAL `n` INSTEAD — the router's own
-consumers (argsort, gather) state logical `[m, e]` views, so a padded producer view
-would stride-disagree with them on the emulator path (the matmul writes stride
-`n_dev`, the consumers read stride `e` — measured as the prefill router e2e's
-row-0-only-correct divergence at m=64, where the `macs ≥ 2^20` bump pads e=128 to
-512). The door re-derives `n_dev` off the REGION for the card either way
-(`matmul_oriented`'s own law), so the descriptor is unchanged; the router family
-is simply all-logical, the same law moe.py's router chain states.
-
-The weight descriptor's shape is `[N, K]` at the same device width — the zero-padded
-staging the worker binds (the checkpoint's leading `n_logical` rows, then zero pad
-rows feeding only the output's don't-care pad columns).
+⛔⛔ `N` IS THE **DEVICE** WIDTH, NOT THE LOGICAL ONE — whole sticks (`rung::row_pitch`):
+the output's rows are held whole sticks wide, so a view stating the logical width would
+understate the buffer every consumer addresses. The weight descriptor's shape is `[N, K]`
+at the same device width — the zero-padded staging the worker binds (the checkpoint's
+leading `n_logical` rows, then zero pad rows feeding only the output's pad columns).
 """
 
 import triton

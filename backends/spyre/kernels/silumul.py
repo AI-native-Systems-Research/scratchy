@@ -3,9 +3,8 @@
 
 BODY PROVENANCE: derived from `crates/targets/spyre/triton/test-fixtures/swiglu_mlp.py`'s activation
 body (deltas 5/6/8 there) — the same four-op chain (`e = exp(-g)` → `s = g / (1+e)` →
-`h = s * u`) that fixture card-validated through this repo's KTIR→SuperDSC lowering,
-stated standalone over whole-region tiles the way the builder's own
-`KtirFunc::silu_mul` from main states them. It is NOT one tl.dot of that fixture: `SubOp::SiluMul` is the activation
+`h = s * u`) that fixture card-validated, stated standalone over row-blocked tiles. It
+is NOT one tl.dot of that fixture: `SubOp::SiluMul` is the activation
 alone, with the projections' matmuls their own nodes.
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
@@ -22,15 +21,14 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   columns 8192.. of that tensor, not its base.
 * GRID: `[1]`.
 
-⭐ ROW BLOCKING, THE BUILDER'S OWN LAW (main's `KtirFunc::silu_mul`): eight tiles are live
+⭐ ROW BLOCKING, THE SPLICE'S LAW (`blocks_of`): eight tiles are live
 here (gate, up, neg, exp, the splat, denom, silu, y), so a whole `[mq, intermediate]`
 region does not fit a core's LX at prefill — the widest live set in the model. The
-kernel takes `N_BLOCKS` full `[BLOCK_M, N]` tiles (BLOCK_M = the builder's own
+kernel takes `N_BLOCKS` full `[BLOCK_M, N]` tiles (BLOCK_M = the splice's
 `rows_per_block(cols, 8)`) plus a `[TAIL_H, N]` tail tile when the region does not
 divide evenly. The trip count is constexpr, so `to_ktir` unrolls it and the spliced
-program is straight-line with one constant-corner tile per block — the door folds
-those through `Region::r_cover` and ONE descriptor spans all of them, exactly as it
-spans the builder's row-blocked program. `swiglu_mlp.py`'s BLOCK_N=64 stick-width
+program is straight-line with one constant-corner tile per block, each a strided
+view the lift reads. `swiglu_mlp.py`'s BLOCK_N=64 stick-width
 note does NOT apply here: that is a `tl.dot` tile constraint, and this kernel has no
 `tl.dot`.
 """
@@ -57,7 +55,7 @@ def silumul_fwd(desc_g, desc_u, desc_o,  #
                                        block_shape=[BLOCK_M, BLOCK_N])
 
     # THE FULL BLOCKS — one `[BLOCK_M, N]` tile per trip, at the trip's own row
-    # corner. Unrolled by the ladder, so each corner is a constant the door reads.
+    # corner. Unrolled by `to_ktir`, so each corner is a constant.
     for blk in tl.range(0, N_BLOCKS, 1):
         offs_m = blk * BLOCK_M
         g = g_desc.load([offs_m, C_START])
@@ -66,8 +64,7 @@ def silumul_fwd(desc_g, desc_u, desc_o,  #
         # `tl.sigmoid` refuses an f16 tensor outright (swiglu delta 5, `math.exp` is
         # @_check_dtype(["fp32","fp64"])), and the ladder's LegalizeTypes collapses
         # the widen/truncate island this spells, so the emitted KTIR carries
-        # `math.exp` on an f16 tile with no extf/truncf — the exact four ops the
-        # builder emits.
+        # `math.exp` on an f16 tile with no extf/truncf.
         e = tl.exp((-g).to(tl.float32)).to(tl.float16)
         s = tl.fdiv(g, 1.0 + e)  # tl.fdiv, not `/`: `/` upcasts f16→f32 (swiglu delta 6)
         o_desc.store([offs_m, C_START], s * u)

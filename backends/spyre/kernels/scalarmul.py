@@ -18,48 +18,34 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   whole-region node states `N_TOTAL = N`, `C_START = 0` — the same constants the
   one-tile form implied. ⚠️ THE `SubOp::RouteScale` ROW STATES THE LOGICAL WIDTH
   instead — window AND storage — because the router's scores follow a GATHER that
-  writes the logical `[m, k]`, not a matmul that padded the columns; the door
-  re-derives its own device width off the region and caps it at the placement, so
-  the descriptor is the same either way (the splice's own law, in its
-  `kernel_spec` arm for the row).
+  writes the logical `[m, k]`, not a matmul that padded the columns.
 * GRID: `[1]`.
 
 ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE LOAD NAMES THE WINDOW — the front end's
 column chunking (`n_blocks(out_cols, nb)`, production `nb = 8192`) splits one wide
-pointwise op into chunks that share one output tensor, and the builder's own program
-states each chunk's access-tile corner (main's `KtirFunc::load_region` honors
-`region.cols.start`). The descriptor's shape/strides are therefore the TENSOR's
+pointwise op into chunks that share one output tensor, each at its own column corner
+(`region.cols.start`). The descriptor's shape/strides are therefore the TENSOR's
 (`[M, N_TOTAL]` / `[N_TOTAL, 1]`), never the chunk's, and the load/store corner is
 `C_START` — stating the chunk's width as the descriptor's would stride the store
 wrong (the 8b splice defect: chunk 1 of a 12800-wide intermediate read and wrote
 chunk 0's columns).
 
-⛔ THE WINDOW IS THE DEVICE WIDTH, NOT THE LOGICAL ONE — the door's own law for this
-family (`scalarmul_scaled` pads through `DeviceWidth::for_pointwise`, because a
-ScalarMul on the padded logits must use the width its producer matmul emitted), and
-the Triton front end refuses a block whose last dim is under 16 bytes, so granite's
-3-wide logits tail chunk is not spellable at its logical width. `for_pointwise` is
-IDEMPOTENT, so the door re-derives the same width from this program as from the
-builder's logical one.
+⛔ THE WINDOW IS THE DEVICE WIDTH, NOT THE LOGICAL ONE — a ScalarMul on the logits runs
+over the rows its producer matmul wrote, whole sticks wide (`rung::row_pitch`), and the
+Triton front end refuses a block whose last dim is under 16 bytes, so a 3-wide logits
+tail chunk is not spellable at its logical width.
 
-⛔ THE SCALE MUST REACH THE PROGRAM AS ONE SPLAT FEEDING ONE `arith.mulf` PER BLOCK —
-the consumer's `program_scalarmul_scale` reads the multiplier OFF THE PROGRAM (every
-`arith.mulf` in the body must multiply by the same splat) and then looks its value up
-in `BundleLayout::scalarmul_scales`, the registry the TAPE-side layout pass fills from
-the node's own `scale` payload. So `x * SCALE` — a constexpr multiply, lowered as
-`splat(SCALE)` then one `arith.mulf` per tile — is the shape the door requires;
-folding the multiply away, or spelling the scale a second way, would desync the
-program from the registry slot the descriptor reads.
+THE SCALE REACHES THE PROGRAM AS ONE SPLAT FEEDING ONE `arith.mulf` PER BLOCK —
+`x * SCALE`, a constexpr multiply lowered as `splat(SCALE)` then one `arith.mulf` per
+tile; the lowering stages the splat as a stick constant.
 
-⭐ ROW BLOCKING, THE BUILDER'S OWN LAW (`lower_scalarmul_node`'s `by_row`): a whole
+⭐ ROW BLOCKING, THE SPLICE'S LAW (`blocks_of`): a whole
 `[rows, cols]` region whose three-tile live set (`rows × cols × 3`) exceeds the
 `EW_LX_ELEMS` budget is ROW-BLOCKED, not refused — `N_BLOCKS` full `[BLOCK_M, N]`
-tiles (BLOCK_M = the builder's own `rows_per_block(cols, 3)`) plus a `[TAIL_H, N]`
+tiles (BLOCK_M = the splice's `rows_per_block(cols, 3)`) plus a `[TAIL_H, N]`
 tail tile when the region does not divide evenly. The trip count is constexpr, so
 `to_ktir` unrolls it and the spliced program is straight-line with one
-constant-corner tile per block — the door folds those through `Region::r_cover` and
-ONE descriptor spans all of them, exactly as it spans the builder's row-blocked
-program.
+constant-corner tile per block, each a strided view the lift reads.
 """
 
 import triton
