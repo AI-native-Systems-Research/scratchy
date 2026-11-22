@@ -64,24 +64,6 @@ impl HeadWidth {
         }
     }
 
-    /// The bake-time door over [`Self::try_whole_sticks`]: for the value the MODEL'S OWN BOUNDS
-    /// state (a `u64`), so the head_dim reaches this door as its own typed fact and the one
-    /// conversion — bounds to width — happens here, with a panic that NAMES the model and the
-    /// width. This is the one door the `#[forward]` bake reads; a model whose head_dim is not
-    /// whole sticks is a BUILD ERROR, not a runtime refusal.
-    pub fn of_whole_sticks_at_bake(hd: u64, model: &str) -> Self {
-        let hd = u32::try_from(hd).unwrap_or_else(|_| {
-            panic!("{model}: head_dim {hd} does not fit a u32, let alone a head width")
-        });
-        match Self::try_whole_sticks(hd) {
-            Some(w) => w,
-            None => panic!(
-                "{model}: head_dim {hd} is not a whole number of fp16 sticks ({POOL_STICK} lanes) \
-                 — a head that straddles a stick boundary has no emit form"
-            ),
-        }
-    }
-
     /// The width, in elements.
     pub const fn get(self) -> u32 {
         self.0.get()
@@ -97,13 +79,6 @@ impl HeadWidth {
     /// page types' own `as_usize`; no use site spells `as usize` on the raw value.
     pub const fn as_usize(self) -> usize {
         self.0.get() as usize
-    }
-
-    /// How many fp16 sticks one head spans — `hd / 64`, proven whole by construction. This is
-    /// the slab count every feature-axis stride multiplies by, and the `== 1` case is the
-    /// one-stick emit form's own predicate — askable by name instead of `hd == 64`.
-    pub const fn sticks(self) -> u32 {
-        self.0.get() / POOL_STICK
     }
 }
 
@@ -716,8 +691,8 @@ impl PagedKvPool {
     pub const PREFILL_WINDOW_PAGES: usize =
         Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::POOL_PAGE_SLOTS.as_usize());
 
-    /// ⛔⛔⛔ A CHUNK-FORM MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof,
-    /// panicked on by the macro.
+    /// ⛔⛔⛔ A MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof, panicked
+    /// on by the macro.
     ///
     /// `codegen`'s const assert ties [`PREFILL_CHUNK_SLOTS`](Self::PREFILL_CHUNK_SLOTS) to the ceiling of
     /// the CONST ladder, and the bake then lowers what it can of it: a rung that does not lower is
@@ -726,20 +701,17 @@ impl PagedKvPool {
     /// 512-row ladder baked to 256 behind a leftover resident-cache cap, loaded as `PREFILL ladder =
     /// [..., 192, 256]`, and every TTFT cell matched the 256-row build to the millisecond.
     ///
-    /// So the check is on what LOWERED. `chunk_form` says the model's causal block is chunk-formed at
-    /// the window's width (`NewBlockForm::of(PREFILL_CHUNK_SLOTS, hd, false) == Chunk`) — a model whose
-    /// block stays sub-blocked keeps its own shorter ladder by design. `baked` is every rung that
+    /// So the check is on what LOWERED. `baked` is every rung that
     /// lowered, `refused` every rung that did not and why, and `attempted` the ceiling the ladder was
     /// asked to reach. `Err` names the shortfall and each refusing rung's reason.
     pub fn prefill_ladder_reaches_the_window(
-        chunk_form: bool,
         attempted: u32,
         baked: &[u32],
         refused: &[(u32, String)],
     ) -> Result<(), String> {
         let window = Self::PREFILL_CHUNK_SLOTS as u32;
         let top = baked.iter().copied().max().unwrap_or(0);
-        if !chunk_form || top >= window {
+        if top >= window {
             return Ok(());
         }
         let why = if refused.is_empty() {
@@ -941,48 +913,6 @@ impl PagedKvPool {
     /// THE WIDEST BAKED RUNG, as a const — the requests a pool must be able to give pages each, known
     /// at bake, before any batch exists: `pool_pages = pages_per_row * WIDEST_BATCH_RUNG`.
     pub(crate) const WIDEST_BATCH_RUNG: u32 = Self::BATCH_RUNGS[Self::BATCH_RUNGS.len() - 1];
-}
-
-/// ⭐⭐⭐ THE FORM OF A LAUNCH'S CAUSAL NEW-TOKEN BLOCK — read by the bake to admit a prefill rung
-/// past the sub-blocked ceiling.
-///
-/// ⭐ WHY THERE ARE TWO. The block is `mq_pad` columns wide. Folded as `mq_pad / 64` stick-wide sub-blocks
-/// per QUERY HEAD, its op count grows with the chunk's width: granite-2b at 256 prompt rows spends about
-/// as much on it as halving the chunk count saves in weight streaming (MEASURED, one card: 10k TTFT 13.6 s
-/// at 128 rows against 13.0 s at 256, and ~1k got SLOWER, 0.90 → 0.94 s). As ONE block per KV HEAD over
-/// all `mq_pad` columns — the split-KV chunk's own form — it is a fixed handful of ops at any width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NewBlockForm {
-    /// Stick-wide sub-blocks folded per query head: decode, every batch, every prompt rung that is not a
-    /// whole number of sticks, and every head dim past [`NewBlockForm::CHUNK_MAX_SLABS`].
-    SubBlocks,
-    /// One block per chunk ROW BLOCK (a kv head at one feature slab, a query head above it) over all
-    /// `mq_pad` columns: a prompt chunk whose width is a whole number of sticks (so its new-V block is
-    /// exactly `mq_pad` rows and PV can contract it whole).
-    Chunk,
-}
-
-impl NewBlockForm {
-    /// ⭐ THE WIDEST HEAD DIM, IN FEATURE SLABS, THE CHUNK FORM IS BUILT AT: one slab (granite-2b) and two
-    /// (granite-8b) — the two whose per-row-block score and per-slab value forms the split-KV chunk runs
-    /// on card. A wider head dim (the gemma bakes' 256 and 512) keeps the sub-blocks byte for byte.
-    pub(crate) const CHUNK_MAX_SLABS: u32 = 2;
-
-    /// The form a launch of `mq` rows at head width `hd` takes; `rows_are_requests` is a decode batch.
-    /// Takes the typed [`HeadWidth`], so the whole-stick law is by construction and the slab count
-    /// is [`HeadWidth::sticks`], never re-divided here.
-    pub const fn of(mq: u32, hd: HeadWidth, rows_are_requests: bool) -> NewBlockForm {
-        if !rows_are_requests
-            && mq >= POOL_STICK
-            && mq.is_multiple_of(POOL_STICK)
-            && hd.sticks() >= 1
-            && hd.sticks() <= Self::CHUNK_MAX_SLABS
-        {
-            NewBlockForm::Chunk
-        } else {
-            NewBlockForm::SubBlocks
-        }
-    }
 }
 
 /// A request of a packed rung's windows — minted only by [`AnswerRows::rows`], never spelled
