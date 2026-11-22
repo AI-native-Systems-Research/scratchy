@@ -4262,7 +4262,7 @@ mod production_ktir_dump {
         // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 2048
         // pages — decoding over the whole of it and a prompt chunk walking four pages, so the card
         // compile is checked at the extents a bake states, not only at a toy pool.
-        for (name, mq, blocks, pages, hd, pool) in [
+        for (name, mq, blocks, pages, hd, pool, (heads, kvh)) in [
             (
                 "paged_attn_decode",
                 1i128,
@@ -4270,23 +4270,80 @@ mod production_ktir_dump {
                 4i128,
                 64i128,
                 KvPool::Fp16,
+                (32, 8),
             ),
-            ("paged_attn_prefill", 64, 1, 4, 64, KvPool::Fp16),
-            ("paged_attn_decode_pool", 1, 2048, 2048, 64, KvPool::Fp16),
-            ("paged_attn_prefill_walk", 64, 4, 2048, 64, KvPool::Fp16),
+            ("paged_attn_prefill", 64, 1, 4, 64, KvPool::Fp16, (32, 8)),
+            (
+                "paged_attn_decode_pool",
+                1,
+                2048,
+                2048,
+                64,
+                KvPool::Fp16,
+                (32, 8),
+            ),
+            (
+                "paged_attn_prefill_walk",
+                64,
+                4,
+                2048,
+                64,
+                KvPool::Fp16,
+                (32, 8),
+            ),
             // granite-3.1-8b's head dim: a kv-head slab is two sticks wide.
-            ("paged_attn_decode_hd128", 1, 4, 4, 128, KvPool::Fp16),
-            ("paged_attn_prefill_hd128", 64, 4, 4, 128, KvPool::Fp16),
+            (
+                "paged_attn_decode_hd128",
+                1,
+                4,
+                4,
+                128,
+                KvPool::Fp16,
+                (32, 8),
+            ),
+            (
+                "paged_attn_prefill_hd128",
+                64,
+                4,
+                4,
+                128,
+                KvPool::Fp16,
+                (32, 8),
+            ),
             // under Triton's 8-row gather floor: the rows read and written at the first row
             // `query_row_index` names.
-            ("paged_attn_prefill_p7", 7, 1, 4, 64, KvPool::Fp16),
+            ("paged_attn_prefill_p7", 7, 1, 4, 64, KvPool::Fp16, (32, 8)),
             // a prompt chunk over granite-3.1-2b's whole pool, sixteen pages a trip
-            ("paged_attn_prefill_trips", 64, 1024, 1024, 64, KvPool::Fp16),
+            (
+                "paged_attn_prefill_trips",
+                64,
+                1024,
+                1024,
+                64,
+                KvPool::Fp16,
+                (32, 8),
+            ),
             // the fp8 pool's twins, at the head dim whose fp8 row is whole sticks
-            ("paged_attn_decode_hd128_fp8", 1, 4, 4, 128, KvPool::Fp8),
-            ("paged_attn_prefill_hd128_fp8", 64, 4, 4, 128, KvPool::Fp8),
-            ("paged_attn_decode_fp8", 1, 4, 4, 64, KvPool::Fp8),
-            ("paged_attn_prefill_fp8", 64, 1, 4, 64, KvPool::Fp8),
+            (
+                "paged_attn_decode_hd128_fp8",
+                1,
+                4,
+                4,
+                128,
+                KvPool::Fp8,
+                (32, 8),
+            ),
+            (
+                "paged_attn_prefill_hd128_fp8",
+                64,
+                4,
+                4,
+                128,
+                KvPool::Fp8,
+                (32, 8),
+            ),
+            ("paged_attn_decode_fp8", 1, 4, 4, 64, KvPool::Fp8, (32, 8)),
+            ("paged_attn_prefill_fp8", 64, 1, 4, 64, KvPool::Fp8, (32, 8)),
             (
                 "paged_attn_prefill_trips_fp8",
                 64,
@@ -4294,6 +4351,54 @@ mod production_ktir_dump {
                 1024,
                 64,
                 KvPool::Fp8,
+                (32, 8),
+            ),
+            // gemma-4's two classes: the sliding layers' 8 kv heads of 256, the global layers' one
+            // kv head of 512, both under 16 query heads
+            (
+                "paged_attn_decode_g256",
+                1,
+                4,
+                4,
+                256,
+                KvPool::Fp16,
+                (16, 8),
+            ),
+            (
+                "paged_attn_decode_g512",
+                1,
+                4,
+                4,
+                512,
+                KvPool::Fp16,
+                (16, 1),
+            ),
+            (
+                "paged_attn_prefill_g512",
+                64,
+                4,
+                4,
+                512,
+                KvPool::Fp16,
+                (16, 1),
+            ),
+            (
+                "paged_attn_decode_g512_fp8",
+                1,
+                4,
+                4,
+                512,
+                KvPool::Fp8,
+                (16, 1),
+            ),
+            (
+                "paged_attn_prefill_g256_fp8",
+                64,
+                4,
+                4,
+                256,
+                KvPool::Fp8,
+                (16, 8),
             ),
         ] {
             let decode = mq == 1;
@@ -4308,8 +4413,8 @@ mod production_ktir_dump {
             ];
             let mut ces = vec![
                 ("NUM_TOKENS", Val::Int(mq)),
-                ("NUM_HEADS", Val::Int(32)),
-                ("NUM_KV_HEADS", Val::Int(8)),
+                ("NUM_HEADS", Val::Int(heads)),
+                ("NUM_KV_HEADS", Val::Int(kvh)),
                 ("HEAD_SIZE", Val::Int(hd)),
                 (
                     "BLOCK_SIZE",
@@ -4627,7 +4732,12 @@ mod production_ktir_dump {
             | "paged_attn_prefill_fp8"
             | "paged_attn_prefill_trips_fp8"
             | "batched_decode_fp8"
-            | "batched_decode_chunks_fp8" => Program::PagedAttn,
+            | "batched_decode_chunks_fp8"
+            | "paged_attn_decode_g256"
+            | "paged_attn_decode_g512"
+            | "paged_attn_prefill_g512"
+            | "paged_attn_decode_g512_fp8"
+            | "paged_attn_prefill_g256_fp8" => Program::PagedAttn,
             "paged_kv_write"
             | "paged_kv_write_rows"
             | "paged_kv_write_prompt"
