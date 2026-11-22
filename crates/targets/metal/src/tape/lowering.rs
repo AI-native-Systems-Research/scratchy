@@ -79,7 +79,7 @@ pub struct BakePoint<'a> {
     /// when the model has no rotary.
     pub rotary: Option<RotaryTables>,
     /// The KV cap rung: per-sequence block-table capacity, sizing the rope-once
-    /// `roped_k_scratch` and the hd512 unfused attention. The commands that read the block table
+    /// `roped_k_scratch`. The commands that read the block table
     /// take the rung's cap as a variant-bound constant ([`ConstantType::KvCap`]).
     ///
     /// [`ConstantType::KvCap`]: super::constants::ConstantType::KvCap
@@ -266,9 +266,6 @@ pub fn lower_with_rows(
         moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
         decode_partials: bb.decode_partials.max(lh.decode_partials),
         roped_k_scratch_bytes: bb.roped_k_scratch_bytes.max(lh.roped_k_scratch_bytes),
-        attn_unfused_scratch_bytes: bb
-            .attn_unfused_scratch_bytes
-            .max(lh.attn_unfused_scratch_bytes),
         // A tape without the sampled rows (a one-row bucket, an encoder) writes the logits — or
         // its terminal rows — at every row.
         logits_rows: writes_logits(bb_logits, lh_logits).unwrap_or(LogitsRows::Bucket),
@@ -864,8 +861,7 @@ fn roped_k_bytes(dims: [u32; 5], block_cap: u32) -> Result<u32, LoweringError> {
 }
 
 /// A command that computes batch row 0 only ([`SeqScope::RowZero`]: the
-/// rope-once pair, whose scratch holds one sequence's keys, and the hd512
-/// unfused attention) runs on single-sequence steps only. The step's per-row
+/// rope-once pair, whose scratch holds one sequence's keys) runs on single-sequence steps only. The step's per-row
 /// paged attentions serve steps with several sequences: one reading the
 /// cache's roped K as is takes the steps without unrotated span blocks, and
 /// one binding cos_sin, re-roping those blocks as it reads, takes the rest (or
@@ -1775,7 +1771,6 @@ fn lower(
     let mut moe_scratch_bytes: u32 = 0;
     let mut decode_partials = DecodePartials::default();
     let mut roped_k_scratch_bytes: u32 = 0;
-    let mut attn_unfused_scratch_bytes: u32 = 0;
     // What the sampled rows' steps write of the logits, and the slot they sit in; `None` until
     // one does.
     let mut logits_rows: Option<LogitsRows> = None;
@@ -1878,7 +1873,6 @@ fn lower(
                     &mut splitk_scratch_bytes,
                     &mut moe_scratch_bytes,
                     &mut roped_k_scratch_bytes,
-                    &mut attn_unfused_scratch_bytes,
                     block_cap,
                     profile,
                     class,
@@ -2057,7 +2051,6 @@ fn lower(
         moe_scratch_bytes,
         decode_partials,
         roped_k_scratch_bytes,
-        attn_unfused_scratch_bytes,
         logits_rows: logits_rows.unwrap_or(LogitsRows::Bucket),
     };
     Ok((tape, logits_rows, rows_cmds))
@@ -2538,7 +2531,6 @@ fn lower_one(
     splitk_scratch_bytes: &mut u32,
     moe_scratch_bytes: &mut u32,
     roped_k_scratch_bytes: &mut u32,
-    attn_unfused_scratch_bytes: &mut u32,
     // Runtime per-sequence block-table capacity (`KvCachePool::max_blocks_per_seq`).
     // Replaces `p.max_blocks_per_seq` at the `MaxBlocksPerSeq` function-constant
     // sites (block-table row stride + scratch bound) and the rope-once
@@ -2592,7 +2584,6 @@ fn lower_one(
                 splitk_scratch_bytes,
                 moe_scratch_bytes,
                 roped_k_scratch_bytes,
-                attn_unfused_scratch_bytes,
                 block_cap,
                 profile,
                 gen_class,
@@ -2620,7 +2611,6 @@ fn lower_one(
                     splitk_scratch_bytes,
                     moe_scratch_bytes,
                     roped_k_scratch_bytes,
-                    attn_unfused_scratch_bytes,
                     block_cap,
                     profile,
                     gen_class,
@@ -4898,48 +4888,6 @@ fn lower_one(
                     0,
                 )
             };
-            // ── hd512 UNFUSED attention (gemma4 GLOBAL class, head_dim 512) ──
-            // The fused gqa_shared kernel is O(T²) and slow for head_dim 512
-            // (it dominated 30k prefill). Replace it with mlx-style UNFUSED
-            // attention in bf16: q_convert → gather K/V → per-head
-            // (QKᵀ GEMM → causal softmax → PV GEMM) → o_convert. The two GEMMs
-            // run on the NAX matrix accelerator (M5+) or the simdgroup steel
-            // GEMM (pre-M5), chosen by `is_nax` — both far beat gqa_shared here.
-            // Typed dispatch: no env var, on by default for the hd512 class.
-            // 🛑 PR #79's hd512 unfused global attention is CORRECT for a single
-            // contiguous prefill but emits GARBAGE on a chunked-prefill
-            // CONTINUATION (num_computed_tokens>0 → lq != kv_len; the single-chunk
-            // case lq == kv_len is what masked the bug). Bisect-confirmed:
-            // gemma-4-12b at 3k is coherent at 2f6bc04d (global on gqa_shared) and
-            // emits token-0/empty at be0079d3 (this unfused path). AttentionPrefillPaged
-            // is the continuation path, so route hd512 global here to the correct
-            // gqa_shared/SDPA paged path below (still present after this branch).
-            // Re-enable once the lq!=kv_len defect in the unfused gather/QKᵀ/PV is
-            // fixed (dump Kdense/scores to localize).
-            // 🛑 COMPILE-TIME LOCK — flipping this to `true` FAILS THE BUILD.
-            // Re-enabling the hd512 unfused path for the continuation arm is a
-            // regression: it emits garbage on a chunked-prefill continuation
-            // (lq != kv_len) → gemma-4 empty output past one 2048-token chunk.
-            // To re-enable you MUST first fix the lq!=kv_len handling in the
-            // unfused gather/QKᵀ/PV kernels AND re-validate gemma-4-12b coherence
-            // at >2048 tokens, then update this lock with evidence.
-            // Re-enabled: both bugs that broke continuations are fixed — (1) the steel
-            // binding-order swap below, and (2) the (M,K,N) descriptor-order bug in
-            // gemm_t_nax_impl that silently halved the NAX contraction (metal_nax.h).
-            // Both are covered by tests/unfused_attn_compose_test.rs.
-            const HD512_UNFUSED_CONTINUATION_OK: bool = true;
-            const _: () = assert!(
-                HD512_UNFUSED_CONTINUATION_OK,
-                "hd512 unfused global attention is BROKEN on chunked-prefill \
-                 continuation (lq != kv_len -> garbage logits -> gemma-4 emits \
-                 token-0/empty past one 2048-token chunk). Do NOT re-enable for \
-                 AttentionPrefillPaged without fixing the unfused gather/QKt/PV \
-                 lq!=kv_len handling and re-validating gemma-4-12b at >2048 tokens. \
-                 Bisect: 2f6bc04d good, be0079d3 broken."
-            );
-            // The unfused kernels read sequence 0 only (`seq_used[0]`,
-            // `cu_seqlens_q[1] - cu_seqlens_q[0]`): they serve single-sequence
-            // steps, and the paged attention below the rest.
             let steel_dtype_tag: &str = match p.act_dtype() {
                 crate::tape::lowered::MetalDtype::Bf16 => "bf16",
                 _ => "f16",
@@ -4951,296 +4899,10 @@ fn lower_one(
             // The simdgroup WIDE paged kernel — the pre-NAX steel port of the
             // NAX wide kernel (WN head-dim-slice warps, S exchanged once a
             // step) — takes the head_dims the classic steel kernel cannot
-            // (one warp's whole-head O does not fit): head_dim 512 over
-            // 32-token pages, Gemma 4's global layers on M1-M4. Unconditional
-            // lookup: on M5+ the NAX kernel above keeps the class (`use_nax`
-            // prefers it); earlier GPUs run this one.
+            // (one warp's whole-head O does not fit; `SteelWideTile`): Gemma 4's
+            // global layers on M1-M4. Unconditional lookup: on M5+ the NAX kernel
+            // above keeps the class (`use_nax` prefers it); earlier GPUs run this one.
             let steel_wide_kernel = crate::steel_paged::SteelWideTile::of(head_dim, block_size);
-            // The fused NAX or wide-steel kernel takes the hd512 global class
-            // where it has an instantiation.
-            #[allow(clippy::overly_complex_bool_expr)]
-            let hd512_unfused = HD512_UNFUSED_CONTINUATION_OK
-                && !sliding
-                && head_dim > 256
-                && rope_on_read(p)?
-                && nax_kernel.is_none()
-                && steel_wide_kernel.is_none();
-            let unfused = if hd512_unfused {
-                use crate::specialized_pipeline_cache::ConstantValue as CV;
-                let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
-                let (rd, po, _on, _bind) = rope_on_read_params(p, !sliding);
-                let nh = q_heads(p)?;
-                let nkv = num_kv_heads.max(1);
-                let gqa = nh / nkv;
-                let hd = head_dim;
-                let bs = block_size;
-                let lq = bucket_m;
-                let too_large = || LoweringError::ScratchTooLarge {
-                    scratch: super::lowered::RungScratch::AttnUnfused,
-                    block_cap: super::ids::MaxBlocksPerSeq(block_cap),
-                };
-                let max_kv = block_cap.checked_mul(bs).ok_or_else(too_large)?;
-                let lid = super::ids::LayerId(*layer + layer_offset);
-                let rot = rd.map(|r| r.get()).unwrap_or(hd);
-                let pair = po.map(|p| p.get()).unwrap_or(0);
-                let e: u32 = 2; // bf16
-                // Each region at the scratch's end, 256-aligned; sized wide, and the whole
-                // scratch must fit the 32-bit offsets its kernels bind.
-                let mut end = 0u64;
-                let mut region = |dims: [u32; 3]| {
-                    let at = u32::try_from(end).map_err(|_| too_large())?;
-                    let bytes =
-                        (dims.iter()).try_fold(u64::from(e), |b, &d| b.checked_mul(d.into()));
-                    let next =
-                        bytes.and_then(|b| b.checked_add(end)?.checked_next_multiple_of(256));
-                    end = next.ok_or_else(too_large)?;
-                    Ok::<u32, LoweringError>(at)
-                };
-                let q_head_off = region([nh, lq, hd])?;
-                let kdense_off = region([nkv, max_kv, hd])?;
-                let vdense_off = region([nkv, hd, max_kv])?;
-                let scores_off = region([lq, max_kv, 1])?;
-                let out_head_off = region([nh, lq, hd])?;
-                let total = u32::try_from(end).map_err(|_| too_large())?;
-                *attn_unfused_scratch_bytes = (*attn_unfused_scratch_bytes).max(total);
-
-                let scr = |off: u32, bi: u8| Binding::AttnUnfusedScratch {
-                    offset: off,
-                    binding_index: bi,
-                };
-                let rt = |kind, bi: u8| Binding::Runtime {
-                    kind,
-                    binding_index: bi,
-                };
-                let table = w.table(!sliding)?;
-                let cossin = |bi: u8| source(table, WeightTensor::Weight, lid, bi);
-                let tg1 = |g: (u32, u32, u32)| DispatchShape {
-                    threadgroups: (g.0.div_ceil(64), g.1, g.2),
-                    threads_per_threadgroup: (64, 1, 1),
-                    m_scaling: None,
-                };
-                let tg_gemm = |n: u32, m: u32| DispatchShape {
-                    threadgroups: (n.div_ceil(64), m.div_ceil(64), 1),
-                    threads_per_threadgroup: (32, 2, 2),
-                    m_scaling: None,
-                };
-                // Steel simdgroup GEMM (pre-M5): blocked 32×32 output tile, 4
-                // simdgroups (128 threads) per threadgroup.
-                let tg_gemm_steel = |n: u32, m: u32| DispatchShape {
-                    threadgroups: (n.div_ceil(32), m.div_ceil(32), 1),
-                    threads_per_threadgroup: (128, 1, 1),
-                    m_scaling: None,
-                };
-
-                let mut cmds: Vec<LoweredCommand> = Vec::new();
-                // 1. Q [Lq,nh,hd] token-major → [nh,Lq,hd] head-major (bf16).
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::AttnQConvert,
-                    library: "attention_layout_convert",
-                    function: "q_convert_prod_bf16",
-                    constants: baked(vec![CV::uint(0, lq), CV::uint(1, nh), CV::uint(2, hd)]),
-                    dispatch: tg1((lq, nh, 1)),
-                    bindings: baked(vec![
-                        scr(q_head_off, 0),
-                        Binding::ArenaSlot {
-                            slot: *q_slot,
-                            binding_index: 1,
-                        },
-                    ]),
-                });
-                // 2. gather K (rope-on-read) → Kdense [nkv,max_kv,hd].
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::AttnGatherKRope,
-                    library: "attention_dense_gather",
-                    function: "gather_dense_kvmajor_rope_bf16",
-                    constants: baked(vec![
-                        CV::uint(0, hd),
-                        CV::uint(1, nkv),
-                        CV::uint(2, bs),
-                        CV::uint(3, crate::BLOCKS_PER_CHUNK),
-                        CV::uint(4, rot),
-                        CV::uint(5, pair),
-                        CV::uint(6, max_kv),
-                    ]),
-                    dispatch: tg1((max_kv, nkv, 1)),
-                    bindings: baked(vec![
-                        scr(kdense_off, 0),
-                        rt(RuntimeBindingKind::BlockTable { layer: lid }, 1),
-                        rt(RuntimeBindingKind::KvCacheK { layer: lid }, 2),
-                        rt(RuntimeBindingKind::SeqUsedK, 3),
-                        cossin(4),
-                    ]),
-                });
-                // 3. gather V (transposed copy) → Vdense_T [nkv,hd,max_kv].
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::AttnGatherVCopyT,
-                    library: "attention_dense_gather",
-                    function: "gather_dense_kvmajor_copyT_bf16",
-                    constants: baked(vec![
-                        CV::uint(0, hd),
-                        CV::uint(1, nkv),
-                        CV::uint(2, bs),
-                        CV::uint(3, crate::BLOCKS_PER_CHUNK),
-                        CV::uint(6, max_kv),
-                    ]),
-                    dispatch: tg1((max_kv, nkv, 1)),
-                    bindings: baked(vec![
-                        scr(vdense_off, 0),
-                        rt(RuntimeBindingKind::BlockTable { layer: lid }, 1),
-                        rt(RuntimeBindingKind::KvCacheV { layer: lid }, 2),
-                        rt(RuntimeBindingKind::SeqUsedK, 3),
-                    ]),
-                });
-                // 4. per head: QKᵀ (NAX GEMM, N=kv_len@seq_used) → softmax → PV.
-                for h in 0..nh {
-                    let kv = h / gqa;
-                    // QKᵀ: NAX matmul2d (M5+) or simdgroup steel (pre-M5). Both
-                    // C=A@B^T with N=kv_len read from seq_used at runtime.
-                    let (qk_lib, qk_fn, qk_consts, qk_disp) = if is_nax {
-                        (
-                            "quantized_qmm_nax",
-                            "gemm_nax_bf16_qk",
-                            vec![
-                                CV::int(0, hd as i32), // QMM_K = hd; N is live (seq_used)
-                                CV::int(2, lq as i32), // QMM_M = Lq
-                                // QK_SPAN_BLOCK_NAX = span_ids block size (== the
-                                // gather's `bs` = block_size), drives the
-                                // block-diagonal bound. MUST match span_ids layout.
-                                CV::uint(3, bs),
-                            ],
-                            tg_gemm(max_kv, lq),
-                        )
-                    } else {
-                        (
-                            "gemm",
-                            "gemm_bf16_qk",
-                            // GEMM_M=Lq, GEMM_K=hd; QK_SPAN_BLOCK = span_ids block
-                            // size (== the gather's `bs` = block_size).
-                            vec![CV::uint(0, lq), CV::uint(2, hd), CV::uint(3, bs)],
-                            tg_gemm_steel(max_kv, lq),
-                        )
-                    };
-                    // The NAX (gemm_nax_bf16_qk) and steel (gemm_bf16_qk) kernels use
-                    // OPPOSITE buffer conventions: NAX = [input(Q)@0, weight(K)@1,
-                    // output(scores)@2]; steel = [output(scores)@0, input(Q)@1,
-                    // weight(K)@2]. Bind per the kernel actually dispatched, else the
-                    // steel path writes scores into Q's slot and never fills out_head
-                    // → o_convert reads zero → garbage on every prefill.
-                    let q_b = scr(q_head_off + h * lq * hd * e, if is_nax { 0 } else { 1 });
-                    let k_b = scr(
-                        kdense_off + kv * max_kv * hd * e,
-                        if is_nax { 1 } else { 2 },
-                    );
-                    let s_b = scr(scores_off, if is_nax { 2 } else { 0 });
-                    cmds.push(LoweredCommand {
-                        kernel: KernelId::AttnGemmQk,
-                        library: qk_lib,
-                        function: qk_fn,
-                        constants: baked(qk_consts),
-                        dispatch: qk_disp,
-                        bindings: baked(vec![
-                            q_b,
-                            k_b,
-                            s_b,
-                            rt(RuntimeBindingKind::SeqUsedK, 3),
-                            rt(RuntimeBindingKind::SpanIds, 4),
-                            rt(RuntimeBindingKind::CuSeqlensQ, 5),
-                        ]),
-                    });
-                    cmds.push(LoweredCommand {
-                        kernel: KernelId::AttnCausalSoftmax,
-                        library: "attention_causal_softmax",
-                        function: "causal_softmax_prod_bf16",
-                        // SOFT_SPAN_BLOCK = span_ids block size (gather's `bs`).
-                        constants: baked(vec![
-                            CV::float(1, attention(p)?.scale().get()),
-                            CV::uint(3, bs),
-                        ]),
-                        // One 64-thread threadgroup per row (== the kernel's
-                        // SOFT_T): cooperative row max/sum, not one thread
-                        // streaming kv_len serially ×3 passes.
-                        dispatch: DispatchShape {
-                            threadgroups: (lq, 1, 1),
-                            threads_per_threadgroup: (64, 1, 1),
-                            m_scaling: None,
-                        },
-                        bindings: baked(vec![
-                            scr(scores_off, 0),
-                            rt(RuntimeBindingKind::SeqUsedK, 1),
-                            rt(RuntimeBindingKind::CuSeqlensQ, 2),
-                            rt(RuntimeBindingKind::SpanIds, 3),
-                        ]),
-                    });
-                    // PV: NAX matmul2d (M5+) or simdgroup steel (pre-M5). Both
-                    // C=A@B^T with K=kv_len read from seq_used at runtime.
-                    let (pv_lib, pv_fn, pv_consts, pv_disp) = if is_nax {
-                        (
-                            "quantized_qmm_nax",
-                            "gemm_nax_bf16_pv",
-                            vec![
-                                CV::int(1, hd as i32),     // QMM_N = hd; K is live (seq_used)
-                                CV::int(2, lq as i32),     // QMM_M = Lq
-                                CV::int(6, max_kv as i32), // NAX_PV_W_LD: V^T row stride
-                                // QK_SPAN_BLOCK_NAX: bounds the PV contraction to
-                                // the query-tile's span (== gather's `bs`).
-                                CV::uint(3, bs),
-                            ],
-                            tg_gemm(hd, lq),
-                        )
-                    } else {
-                        (
-                            "gemm",
-                            "gemm_bf16_pv",
-                            // GEMM_M=Lq, GEMM_N=hd, GEMM_PV_W_LD=max_kv (V^T row stride;
-                            // contraction kv_len read from seq_used).
-                            vec![CV::uint(0, lq), CV::uint(1, hd), CV::uint(4, max_kv)],
-                            tg_gemm_steel(hd, lq),
-                        )
-                    };
-                    // Same NAX-vs-steel buffer-order split as QKᵀ: NAX =
-                    // [input(probs)@0, weight(V)@1, output(out_head)@2]; steel =
-                    // [output(out_head)@0, input(probs)@1, weight(V)@2].
-                    let p_b = scr(scores_off, if is_nax { 0 } else { 1 });
-                    let v_b = scr(
-                        vdense_off + kv * hd * max_kv * e,
-                        if is_nax { 1 } else { 2 },
-                    );
-                    let o_b = scr(out_head_off + h * lq * hd * e, if is_nax { 2 } else { 0 });
-                    cmds.push(LoweredCommand {
-                        kernel: KernelId::AttnGemmPv,
-                        library: pv_lib,
-                        function: pv_fn,
-                        constants: baked(pv_consts),
-                        dispatch: pv_disp,
-                        bindings: baked(vec![
-                            p_b,
-                            v_b,
-                            o_b,
-                            rt(RuntimeBindingKind::SeqUsedK, 3),
-                            rt(RuntimeBindingKind::SpanIds, 4),
-                            rt(RuntimeBindingKind::CuSeqlensQ, 5),
-                        ]),
-                    });
-                }
-                // 5. O [nh,Lq,hd] head-major → [Lq,nh,hd] token-major into out_slot.
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::AttnOConvert,
-                    library: "attention_layout_convert",
-                    function: "o_convert_prod_bf16",
-                    constants: baked(vec![CV::uint(0, lq), CV::uint(1, nh), CV::uint(2, hd)]),
-                    dispatch: tg1((lq, nh, 1)),
-                    bindings: baked(vec![
-                        Binding::ArenaSlot {
-                            slot: *out_slot,
-                            binding_index: 0,
-                        },
-                        scr(out_head_off, 1),
-                    ]),
-                });
-                Some(cmds)
-            } else {
-                None
-            };
             // Steel-attention paged kernel — MLX FA-2 algorithm with
             // simdgroup_matrix MMAs (BQ=32, BK=16, BD=128, WM=4). Wins
             // big over the sdpa_vector port for prefill, but at small
@@ -5341,9 +5003,7 @@ fn lower_one(
             // and the attention reads pre-roped K (slot 7 = scratch, ATTN_K_SCRATCH
             // set) with no per-tile smem rotation. The gqa_shared twin of
             // nax_spans/steel_spans below.
-            // No rope-once pair where the unfused attention serves
-            // single-sequence steps.
-            let rope_once = rope_on_read(p)? && unfused.is_none();
+            let rope_once = rope_on_read(p)?;
             let gqa_shared_spans = use_gqa_shared && rope_once;
             let nax_spans = use_nax && rope_once;
             let steel_spans = use_steel && !use_nax && rope_once;
@@ -5464,7 +5124,7 @@ fn lower_one(
             // T=2930. Gated to gqa >= 8 so low-GQA arches keep the proven
             // sdpa_vector path. (`gqa` / `use_gqa_shared` / `gqa_shared_spans`
             // were computed above so `constants.k_scratch` could be set.)
-            let attention = if use_steel {
+            if use_steel {
                 // Symbol came from the codegen'd table above
                 // (`steel_symbol.is_some()` is the gate). Build the
                 // command directly instead of going through
@@ -5700,13 +5360,6 @@ fn lower_one(
                 attn_cmd
             } else {
                 sdpa_paged(constants, bindings)
-            };
-            match unfused {
-                Some(mut cmds) => {
-                    cmds.push(attention);
-                    return dispatched(cmds);
-                }
-                None => attention,
             }
         }
 
@@ -6048,7 +5701,6 @@ fn lower_one(
                 splitk_scratch_bytes,
                 moe_scratch_bytes,
                 roped_k_scratch_bytes,
-                attn_unfused_scratch_bytes,
                 block_cap,
                 profile,
                 gen_class,
@@ -13007,8 +12659,7 @@ mod tests {
     }
 
     /// head_dim 512 over 16-token pages takes the wide kernel too: its tile law covers every page
-    /// of whole key groups, so no head dim past the classic kernel's falls back to the unfused
-    /// attention — dense or int8, whatever the GQA ratio.
+    /// of whole key groups — dense or int8, whatever the GQA ratio.
     #[test]
     fn hd512_prefill_takes_the_wide_kernel_at_any_page() {
         for (codec, kv_heads) in [KvCodec::Dense, KvCodec::Int8]
@@ -13033,12 +12684,6 @@ mod tests {
             };
             let tape = lower_int8(&p, rows, 64);
             let commands: Vec<_> = tape.commands.iter().map(|c| c.lowered()).collect();
-            assert!(
-                commands
-                    .iter()
-                    .all(|c| c.kernel != KernelId::AttnGatherKRope),
-                "{codec}: {kv_heads} kv heads"
-            );
             assert!(
                 (commands.iter()).any(|c| c.function == "attention_steel_wide_paged_bf16"),
                 "{codec}: {kv_heads} kv heads"
@@ -13152,7 +12797,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13163,7 +12807,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             128,
             None,
             crate::tape::lowered::GenClass::M1,
@@ -13197,7 +12840,7 @@ mod tests {
 
     /// `step` lowered alone at `bucket_m` for a model of `p`. Pure-CPU.
     fn lower_alone(p: &ModelFacts, step: &MetalStep, bucket_m: u32) -> Vec<TapeCommand> {
-        let (mut scratch, mut moe, mut roped_k, mut unfused) = (0u32, 0u32, 0u32, 0u32);
+        let (mut scratch, mut moe, mut roped_k) = (0u32, 0u32, 0u32);
         lower_one(
             p,
             false,
@@ -13208,7 +12851,6 @@ mod tests {
             &mut scratch,
             &mut moe,
             &mut roped_k,
-            &mut unfused,
             128,
             None,
             crate::tape::lowered::GenClass::M1,
@@ -13244,7 +12886,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13255,7 +12896,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
@@ -13340,7 +12980,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13351,7 +12990,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
@@ -13398,7 +13036,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13409,7 +13046,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
@@ -13486,7 +13122,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13497,7 +13132,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
@@ -13566,7 +13200,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13577,7 +13210,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
@@ -13611,7 +13243,6 @@ mod tests {
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
-        let mut attn_unfused = 0u32;
         let cmds = lower_one(
             &tp(),
             /*chunked=*/ false,
@@ -13622,7 +13253,6 @@ mod tests {
             &mut scratch,
             &mut moe_scratch,
             &mut roped_k,
-            &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,

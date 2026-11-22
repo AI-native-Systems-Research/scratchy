@@ -627,17 +627,6 @@ mod tests {
             | KernelId::LoadRows
             | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
-            // hd512 unfused attention kernels carry their library/function +
-            // constants explicitly on the LoweredCommand (NAX vs steel chosen by
-            // is_nax), so they dispatch via `pipeline_for_command(cmd)` — not this
-            // synthetic (kernel, dtype) → name helper.
-            | KernelId::AttnGatherKRope
-            | KernelId::AttnGatherVCopyT
-            | KernelId::AttnQConvert
-            | KernelId::AttnOConvert
-            | KernelId::AttnCausalSoftmax
-            | KernelId::AttnGemmQk
-            | KernelId::AttnGemmPv
             | KernelId::AttentionDecodeInt8
             | KernelId::AttentionDecodeCombine
             | KernelId::AttentionVerifyPack
@@ -837,13 +826,6 @@ mod tests {
             | KernelId::LoadRows
             | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
-            | KernelId::AttnGatherKRope
-            | KernelId::AttnGatherVCopyT
-            | KernelId::AttnQConvert
-            | KernelId::AttnOConvert
-            | KernelId::AttnCausalSoftmax
-            | KernelId::AttnGemmQk
-            | KernelId::AttnGemmPv
             | KernelId::AttentionDecodeInt8
             | KernelId::AttentionDecodeCombine
             | KernelId::AttentionVerifyPack

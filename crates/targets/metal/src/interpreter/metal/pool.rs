@@ -2605,7 +2605,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
         }
@@ -3786,7 +3785,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
         };

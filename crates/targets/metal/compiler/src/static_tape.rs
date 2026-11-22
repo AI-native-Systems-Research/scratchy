@@ -1470,10 +1470,9 @@ pub fn bake_bucket_tapes(
             _ => (false, (input.steps, input.operands, input.arena)),
         };
         // The cap-sized scratch is the variant's; the rest of the tape is the body.
-        let (roped_k, attn_unfused) = (tape.roped_k_scratch_bytes, tape.attn_unfused_scratch_bytes);
+        let roped_k = tape.roped_k_scratch_bytes;
         let body = LoweredMetalTape {
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             ..tape
         };
         let body_ix = match seen.get(&(wide, body)).copied() {
@@ -1524,7 +1523,7 @@ pub fn bake_bucket_tapes(
         entries.push(quote! {
             __tl::ClassedTape::rung(
                 #ident, #class_toks, #addressing_toks, #cap_toks,
-                [#roped_k, #attn_unfused],
+                #roped_k,
             ),
         });
     }

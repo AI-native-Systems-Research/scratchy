@@ -111,28 +111,6 @@ pub enum KernelId {
     /// pair (`rope_once_gqa_shared_<dtype>_specialized`, in the `attention`
     /// library) covers any shape the gqa_shared kernel takes.
     RopeOnceGqaShared,
-    /// hd512 unfused attention (env `SCRATCHY_HD512_UNFUSED`): kv-head-major
-    /// gather of K (rope-on-read) into the attn-unfused scratch, STATIC row
-    /// stride (max_blocks*block_size) so per-head GEMM offsets are bakeable.
-    AttnGatherKRope,
-    /// hd512 unfused: kv-head-major TRANSPOSED gather of V → [kv, head_dim, kv_len]
-    /// so PV's `C = A @ B^T` gets B = V^T directly.
-    AttnGatherVCopyT,
-    /// hd512 unfused: Q `[total_q, nh, hd]` (token-major) → `[nh, Lq, hd]`
-    /// (head-major) bf16, so each head's QK^T A-operand is contiguous.
-    AttnQConvert,
-    /// hd512 unfused: O `[nh, Lq, hd]` (head-major) → `[total_q, nh, hd]`
-    /// (token-major) bf16 — the layout o_proj expects (same as gqa_shared).
-    AttnOConvert,
-    /// hd512 unfused: fused scale + chunked-prefill causal mask + row softmax
-    /// over scores `[Lq, kv_len]` (one head at a time), kv_len from seq_used.
-    AttnCausalSoftmax,
-    /// hd512 unfused: per-head QK^T via the plain bf16 NAX GEMM
-    /// (`gemm_nax_bf16_qk`); N = kv_len read from seq_used at runtime.
-    AttnGemmQk,
-    /// hd512 unfused: per-head PV via the plain bf16 NAX GEMM
-    /// (`gemm_nax_bf16_pv`); K = kv_len read from seq_used at runtime.
-    AttnGemmPv,
     /// Pure scalar broadcast multiply: `out = x * scale`.
     ScalarMul,
     /// Final logit softcapping: `out = cap * tanh(x / cap)` with the
@@ -542,12 +520,7 @@ impl KernelId {
         match self {
             Self::RopeOnceNax
             | Self::RopeOnceSteel
-            | Self::RopeOnceGqaShared
-            | Self::AttnGatherKRope
-            | Self::AttnGatherVCopyT
-            | Self::AttnCausalSoftmax
-            | Self::AttnGemmQk
-            | Self::AttnGemmPv => SeqScope::RowZero,
+            | Self::RopeOnceGqaShared => SeqScope::RowZero,
             Self::Embed
             | Self::RmsNorm
             | Self::RmsNormUnit
@@ -561,8 +534,6 @@ impl KernelId {
             | Self::KvAppend
             | Self::AttentionViaCache
             | Self::AttentionPrefillSdpaPaged
-            | Self::AttnQConvert
-            | Self::AttnOConvert
             | Self::ScalarMul
             | Self::TanhSoftCap
             | Self::Add
@@ -991,11 +962,6 @@ pub enum Binding {
     /// and its attention run serially per layer, and the scratch is
     /// overwritten each layer (the cache stays the persistent artifact).
     RopedKScratch { binding_index: u8 },
-    /// The worker's shared hd512-unfused-attention scratch buffer — sized to
-    /// `LoweredMetalTape::attn_unfused_scratch_bytes`. Packs the q_head /
-    /// Kdense / Vdense_T / scores / out_head regions at baked byte `offset`s
-    /// (one buffer, serial commands per layer; overwritten each layer).
-    AttnUnfusedScratch { offset: u32, binding_index: u8 },
     /// A bound sub-region of the worker's shared MoE scratch buffer
     /// (sized to
     /// `LoweredMetalTape::moe_scratch_bytes`). Each lowered MoE
@@ -2323,7 +2289,6 @@ impl Binding {
             | Self::Runtime { binding_index, .. }
             | Self::Scratch { binding_index }
             | Self::RopedKScratch { binding_index }
-            | Self::AttnUnfusedScratch { binding_index, .. }
             | Self::MoeScratch { binding_index, .. } => binding_index,
         }
     }
@@ -2350,10 +2315,6 @@ impl Binding {
             },
             Self::Scratch { .. } => Self::Scratch { binding_index },
             Self::RopedKScratch { .. } => Self::RopedKScratch { binding_index },
-            Self::AttnUnfusedScratch { offset, .. } => Self::AttnUnfusedScratch {
-                offset,
-                binding_index,
-            },
             Self::MoeScratch { byte_offset, .. } => Self::MoeScratch {
                 binding_index,
                 byte_offset,
@@ -2385,15 +2346,14 @@ impl Binding {
             Self::ArenaSlot { .. }
             | Self::Scratch { .. }
             | Self::RopedKScratch { .. }
-            | Self::AttnUnfusedScratch { .. }
             | Self::MoeScratch { .. } => self,
         }
     }
 
-    /// The rope-once and unfused-attention scratches hold one sequence's keys.
+    /// The rope-once scratch holds one sequence's keys.
     pub const fn seq_scope(self) -> SeqScope {
         match self {
-            Self::RopedKScratch { .. } | Self::AttnUnfusedScratch { .. } => SeqScope::RowZero,
+            Self::RopedKScratch { .. } => SeqScope::RowZero,
             Self::ArenaSlot { .. }
             | Self::Source { .. }
             | Self::Runtime { .. }
@@ -2442,12 +2402,10 @@ pub enum ScratchKind {
     Moe,
     /// The rope-once pre-roped K.
     RopedK,
-    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
-    AttnUnfused,
 }
 
 impl ScratchKind {
-    pub const ALL: [Self; 4] = [Self::SplitK, Self::Moe, Self::RopedK, Self::AttnUnfused];
+    pub const ALL: [Self; 3] = [Self::SplitK, Self::Moe, Self::RopedK];
 
     /// What a worker's buffer of this kind is called in an allocation failure.
     pub const fn what(self) -> &'static str {
@@ -2455,7 +2413,6 @@ impl ScratchKind {
             Self::SplitK => "splitk scratch",
             Self::Moe => "moe scratch",
             Self::RopedK => "roped-K scratch",
-            Self::AttnUnfused => "attn-unfused scratch",
         }
     }
 
@@ -2464,14 +2421,13 @@ impl ScratchKind {
             Self::SplitK => 0,
             Self::Moe => 1,
             Self::RopedK => 2,
-            Self::AttnUnfused => 3,
         }
     }
 }
 
 /// One `T` per [`ScratchKind`], indexed by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PerScratch<T>([T; 4]);
+pub struct PerScratch<T>([T; 3]);
 
 impl<T> PerScratch<T> {
     pub fn from_fn(mut f: impl FnMut(ScratchKind) -> T) -> Self {
@@ -2480,8 +2436,8 @@ impl<T> PerScratch<T> {
 
     /// [`Self::from_fn`] for a fallible `f`: the first kind's error.
     pub fn try_from_fn<E>(mut f: impl FnMut(ScratchKind) -> Result<T, E>) -> Result<Self, E> {
-        let [a, b, c, d] = ScratchKind::ALL.map(&mut f);
-        Ok(Self([a?, b?, c?, d?]))
+        let [a, b, c] = ScratchKind::ALL.map(&mut f);
+        Ok(Self([a?, b?, c?]))
     }
 
     pub fn map<U>(self, f: impl FnMut(T) -> U) -> PerScratch<U> {
@@ -2522,7 +2478,6 @@ impl LoweredMetalTape {
             ScratchKind::SplitK => self.splitk_scratch_bytes,
             ScratchKind::Moe => self.moe_scratch_bytes.max(partials),
             ScratchKind::RopedK => self.roped_k_scratch_bytes,
-            ScratchKind::AttnUnfused => self.attn_unfused_scratch_bytes,
         })
     }
 
@@ -2809,11 +2764,6 @@ pub struct LoweredMetalTape {
     /// Zero when no NAX spans prefill was lowered (the binding never
     /// appears and the worker skips the allocation).
     pub roped_k_scratch_bytes: u32,
-    /// Byte size of the shared hd512-unfused-attention scratch
-    /// (`Binding::AttnUnfusedScratch`). Max across layers of the packed
-    /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
-    /// hd512-unfused attention was lowered.
-    pub attn_unfused_scratch_bytes: u32,
     /// The rows of the logits buffer (the terminal slot) the tape's commands write: what the
     /// buffer holds beyond the rows a step samples ([`Self::logits_slot_rows`]).
     pub logits_rows: LogitsRows,
@@ -2985,8 +2935,6 @@ pub enum LoweringError {
 pub enum RungScratch {
     /// The rope-once pre-roped K.
     RopedK,
-    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
-    AttnUnfused,
 }
 
 impl std::fmt::Display for LoweringError {
@@ -3185,17 +3133,16 @@ pub struct ClassedTape {
 
 impl ClassedTape {
     /// The rung `(gen_class, addressing, cap)` of `body`, the tape its rungs share, with
-    /// the roped-K and unfused-attention scratch bytes its cap sizes.
+    /// the roped-K scratch bytes its cap sizes.
     pub const fn rung(
         body: LoweredMetalTape,
         gen_class: GenClass,
         addressing: KvAddressing,
         cap: MaxBlocksPerSeq,
-        [roped_k_scratch_bytes, attn_unfused_scratch_bytes]: [u32; 2],
+        roped_k_scratch_bytes: u32,
     ) -> Self {
         let tape = LoweredMetalTape {
             roped_k_scratch_bytes,
-            attn_unfused_scratch_bytes,
             ..body
         };
         Self {

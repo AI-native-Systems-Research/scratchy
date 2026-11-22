@@ -71,10 +71,6 @@ SCRATCHY_CONSTANT_OPTIONAL(int, QMM_N, 1);
 SCRATCHY_CONSTANT_OPTIONAL(int, QMM_M, 2);
 // The second tensor's N of a paired split-K GEMM (`affine_qmm_w4a8_splitk_pair`).
 SCRATCHY_CONSTANT_OPTIONAL(int, QMM_N2, 9);
-// Block-diagonal span attention (hd512 unfused QKᵀ): per-position span-label
-// granularity (== metal KV block size). 0 / unset → no bound (dense path
-// byte-identical).
-SCRATCHY_CONSTANT_OPTIONAL(uint, QK_SPAN_BLOCK_NAX, 3);
 // MoE grouped GEMM only: number of valid experts. Padded tiles whose
 // expert index == QMM_NUM_EXPERTS are trailing sentinels and skip.
 SCRATCHY_CONSTANT_OPTIONAL(int, QMM_NUM_EXPERTS, 4);
@@ -84,9 +80,6 @@ SCRATCHY_CONSTANT_OPTIONAL(int, QMM_NUM_EXPERTS, 4);
 // codes directly as signed int4 (q - 8) and fold the 8 into the bias.
 // Kernel entries branch on it once, into a loader instantiated for it.
 SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
-// The unfused attention PV's V^T row stride: the STATIC max_kv, sized from the
-// block capacity at load.
-SCRATCHY_CONSTANT_OPTIONAL(int, NAX_PV_W_LD, 6);
 // The fused act+quant (`affine_gather_w4a8_quant_<act>_*`) only: gpt-oss's grouped
 // bake — the pair's expert adds its gate and up LINEAR biases before the activation
 // ([E, 2·K], buffer(4)), the same switch `silu_mul.metal`'s `SILU_MUL_LINEAR_BIAS`
@@ -792,8 +785,8 @@ INST_NVFP4_QMM_T_NAX(bf16, bfloat, f16, half, 16, true, true)
 INST_NVFP4_QMM_T_NAX(bf16, bfloat, f16, half, 16, false, false)
 
 // ─────────────────────────────────────────────────────────────────
-// PLAIN bf16 NAX GEMM: y[M,N] = x[M,K] @ w[N,K]^T  (no quantization).
-// For the gemma4 hd512 unfused-attention QK^T / PV matmuls. Identical
+// PLAIN bf16 NAX GEMM: y[M,N] = x[M,K] @ w[N,K]^T  (no quantization), the
+// dense-linear GEMM's body (`gemm_nax_bf16_dense`). Identical
 // to qmm_t_nax_impl except the int4 QuantizedBlockLoader (dequant W ->
 // Ws) is replaced by a plain mlx::steel::BlockLoader (copy bf16 B ->
 // Ws). Same NAXTile MXU matmul + store. K/N/M ride QMM_K/N/M consts so
@@ -806,13 +799,9 @@ METAL_FUNC void gemm_t_nax_impl(
     device T*       y,    // [M, N]
     threadgroup T*  Ws,   // [BN, BK_padded]
     const int K, const int N, const int M,
-    const int w_ld,       // w (B) ROW stride; == K for dense/QKᵀ, but for PV the
-                          // V^T dense buffer has static stride max_kv while the
-                          // contraction K = kv_len — they MUST be decoupled.
+    const int w_ld,       // w (B) ROW stride
     uint simd_gid, uint simd_lid, uint3 tgid,
-    // Contraction loop bounds [k_lo, k_hi). For dense/QKᵀ this is [0, K] (full);
-    // for the block-diagonal PV it is [span_lo, causal] so the dropped band is
-    // never contracted (real FLOP cut). k_lo is BK-aligned (== span block size).
+    // Contraction loop bounds [k_lo, k_hi), BK-aligned.
     int k_lo, int k_hi)
 {
     constexpr int BM = 64;
@@ -893,25 +882,6 @@ METAL_FUNC void gemm_t_nax_impl(
     });
 }
 
-#if SCRATCHY_COMPILES(gemm_nax_bf16)
-[[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16(
-    const device bfloat* x   [[buffer(0)]],   // A [M, K]
-    const device bfloat* w   [[buffer(1)]],   // B [N, K]
-    device bfloat*       y   [[buffer(2)]],   // C [M, N] = A @ B^T
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]],
-    uint3 tgid     [[threadgroup_position_in_grid]])
-{
-    constexpr int BN = 64;
-    constexpr int BK = 64;
-    constexpr int BK_padded = BK + 16 / int(sizeof(bfloat));
-    threadgroup bfloat Ws[BN * BK_padded];
-    // dense: w row stride == contraction == QMM_K. Full contraction [0, QMM_K].
-    gemm_t_nax_impl<bfloat>(x, w, y, Ws, QMM_K, QMM_N, QMM_M, QMM_K, simd_gid, simd_lid, tgid,
-                            0, QMM_K);
-}
-#endif
-
 // The dense-linear GEMM (`KernelId::Gemm`) on the same body: behind the gemm
 // slot's binding contract — output(0), input(1), weight(2) — so the worker's
 // Gemm dispatch binds it like the simdgroup bodies. Picked from the rows the
@@ -936,97 +906,6 @@ METAL_FUNC void gemm_t_nax_impl(
 }
 #endif
 
-// Dynamic-kv_len GEMM wrappers for hd512 unfused attention. kv_len grows per
-// forward but the tape bakes dims, so the changing dim is read from
-// seq_used[0] at runtime (grid baked at the max; tiles with y_col>=N or the
-// K-loop past K early-return / stop). QK^T: N=kv_len. PV: K=kv_len.
-#if SCRATCHY_COMPILES(gemm_nax_bf16_qk)
-[[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16_qk(
-    const device bfloat* x        [[buffer(0)]],   // Q head [M=Lq, K=hd]
-    const device bfloat* w        [[buffer(1)]],   // K dense [N=kv_len, K=hd]
-    device bfloat*       y        [[buffer(2)]],   // scores [M=Lq, N=kv_len]
-    const device uint*   seq_used     [[buffer(3)]],   // [1] kv_len
-    const device uint*   span_ids     [[buffer(4)]],   // per-block span label; 0 = no span
-    const device uint*   cu_seqlens_q [[buffer(5)]],   // new-query span (ACTUAL, not bucket)
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]],
-    uint3 tgid     [[threadgroup_position_in_grid]])
-{
-    constexpr int BM = 64;
-    constexpr int BN = 64;
-    constexpr int BK = 64;
-    constexpr int BK_padded = BK + 16 / int(sizeof(bfloat));
-    // Block-diagonal span bound: a span-uniform query-tile attends only its own
-    // span's keys [span_lo, causal]. Skip both bands before the contraction
-    // (real FLOP cut). span_ids 0 / boundary-straddling tile → full causal range.
-    if (QK_SPAN_BLOCK_NAX != 0u) {
-        const uint N = uint(seq_used[0]);
-        const uint c_row = tgid.y * uint(BM);
-        const uint c_col = tgid.x * uint(BN);
-        // Causal offset from the ACTUAL new-query count (cu_seqlens), NOT QMM_M
-        // (the over-sized prefill bucket) — N - QMM_M underflows when bucket>kv_len.
-        const uint lq_actual = cu_seqlens_q[1] - cu_seqlens_q[0];
-        const uint causal_off = N - lq_actual;
-        const uint sf = span_ids[causal_off + c_row]; // per-TOKEN index
-        const uint sl = span_ids[causal_off + c_row + uint(BM) - 1u];
-        if (sf != 0u && sf == sl) {
-            if (c_col >= causal_off + c_row + uint(BM)) {
-                return;  // causal upper
-            }
-            const uint span_lo = sf - 1u; // label-1 IS the span's first TOKEN (exact)
-            if (c_col + uint(BN) <= span_lo) {
-                return;  // span lower
-            }
-        }
-    }
-    threadgroup bfloat Ws[BN * BK_padded];
-    // QK^T: N=kv_len dynamic; K dense (kdense) row stride == hd == QMM_K. The
-    // span bound is on the OUTPUT key-tile (above), not the hd contraction → full
-    // contraction [0, QMM_K].
-    gemm_t_nax_impl<bfloat>(x, w, y, Ws, QMM_K, int(seq_used[0]), QMM_M, QMM_K,
-                            simd_gid, simd_lid, tgid, 0, QMM_K);
-}
-#endif
-
-#if SCRATCHY_COMPILES(gemm_nax_bf16_pv)
-[[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16_pv(
-    const device bfloat* x        [[buffer(0)]],   // probs [M=Lq, K=kv_len]
-    const device bfloat* w        [[buffer(1)]],   // V^T dense [N=hd, rows strided by max_kv]
-    device bfloat*       y        [[buffer(2)]],   // out head [M=Lq, N=hd]
-    const device uint*   seq_used     [[buffer(3)]],   // [1] kv_len
-    const device uint*   span_ids     [[buffer(4)]],   // per-block span label; 0 = no span
-    const device uint*   cu_seqlens_q [[buffer(5)]],   // new-query span (ACTUAL, not bucket)
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]],
-    uint3 tgid     [[threadgroup_position_in_grid]])
-{
-    constexpr int BM = 64;
-    constexpr int BN = 64;
-    constexpr int BK = 64;
-    constexpr int BK_padded = BK + 16 / int(sizeof(bfloat));
-    const int K = int(seq_used[0]);  // contraction = kv_len
-    // Block-diagonal PV: bound the contraction to the query-tile's span
-    // [span_lo, causal] — the probs are zero outside it (the softmax span-lower
-    // zeroed them), so the dropped band is pure FLOP waste. Mirrors the QKᵀ bound.
-    int k_lo = 0, k_hi = K;
-    if (QK_SPAN_BLOCK_NAX != 0u) {
-        const uint c_row = tgid.y * uint(BM);  // query-tile (M dim)
-        const uint lq_actual = cu_seqlens_q[1] - cu_seqlens_q[0];
-        const uint causal_off = uint(K) - lq_actual;
-        const uint sf = span_ids[causal_off + c_row]; // per-TOKEN index
-        const uint sl = span_ids[causal_off + c_row + uint(BM) - 1u];
-        if (sf != 0u && sf == sl) {
-            k_lo = int(sf - 1u); // label-1 IS the span's first TOKEN (exact)
-            k_hi = int(min(uint(K), causal_off + c_row + uint(BM)));
-        }
-    }
-    threadgroup bfloat Ws[BN * BK_padded];
-    // PV: contraction K=kv_len (seq_used), but V^T dense rows are strided by the
-    // STATIC max_kv (= NAX_PV_W_LD, the gather's GDK_MAX_KV) — decoupled via w_ld.
-    gemm_t_nax_impl<bfloat>(x, w, y, Ws, K, QMM_N, QMM_M, NAX_PV_W_LD,
-                            simd_gid, simd_lid, tgid, k_lo, k_hi);
-}
-#endif
 
 // ─────────────────────────────────────────────────────────────────
 // Small-M (decode-batch) MLX-affine 4-bit GEMM on the matrix unit:

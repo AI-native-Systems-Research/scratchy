@@ -1226,12 +1226,9 @@ async fn test_metal_grammar_regex_digits_large_vocab() {
 
 /// REGRESSION GUARD — DO NOT DELETE, DO NOT SHORTEN THE PROMPT.
 ///
-/// gemma-4's global (head_dim 512) layers use the "unfused" attention path. On a
-/// chunked-prefill CONTINUATION (prompt longer than the 2048 chunk size → chunk 2+ has
-/// lq != kv_len), the bf16 NAX gemm's UNGUARDED contraction K-tail over-read pulled
-/// STALE dense-scratch (incl. NaN padding rows) into real outputs → garbage (empty /
-/// token-0) past one chunk. Fixed by zeroing the V^T K-tail (attention_dense_gather.metal)
-/// and the prefill-bucket padding rows (attention_causal_softmax.metal).
+/// gemma-4's global (head_dim 512) layers on a chunked-prefill CONTINUATION (prompt longer
+/// than the 2048 chunk size → chunk 2+ has lq != kv_len) once emitted garbage (empty /
+/// token-0) past one chunk: stale scratch rows read into real outputs.
 ///
 /// A SHORT prompt (single chunk) does NOT catch this — the scratch is fresh/zeroed on the
 /// first chunk; the bug only appears once a 2nd chunk REUSES the scratch. So this guard
@@ -1274,8 +1271,7 @@ async fn test_metal_gemma4_continuation_recall() {
     assert!(
         text.contains("BANANA7492"),
         "gemma-4 chunked-prefill CONTINUATION must recall the needle. Got {text:?} — the \
-         hd512 unfused continuation path regressed (NAX gemm K-tail over-read / padding-row \
-         zeroing). See attention_dense_gather.metal + attention_causal_softmax.metal.",
+         hd512 global continuation regressed.",
     );
 }
 

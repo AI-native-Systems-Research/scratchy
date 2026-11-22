@@ -1137,9 +1137,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 scratch[ScratchKind::RopedK]
                     .as_ref()
                     .map(Activation::buffer),
-                scratch[ScratchKind::AttnUnfused]
-                    .as_ref()
-                    .map(Activation::buffer),
                 pipelines,
                 sources,
                 runtime,
@@ -1540,14 +1537,7 @@ fn kernel_kind(id: StepKernel) -> KernelKind {
         | K::AttentionDecodeCombine
         | K::AttentionVerifyPack
         | K::AttentionVerifySplit
-        | K::AttentionPrefillSdpaPaged
-        | K::AttnGatherKRope
-        | K::AttnGatherVCopyT
-        | K::AttnQConvert
-        | K::AttnOConvert
-        | K::AttnCausalSoftmax
-        | K::AttnGemmQk
-        | K::AttnGemmPv => KernelKind::Attention,
+        | K::AttentionPrefillSdpaPaged => KernelKind::Attention,
         K::GatedDeltaNet => KernelKind::GatedDeltaNet,
         K::NormedGemv
         | K::AffineQmvQuad
@@ -1612,7 +1602,6 @@ fn bake_bucket<W: CanonicalParams>(
     splitk_scratch: Option<&Buffer>,
     moe_scratch: Option<&Buffer>,
     roped_k_scratch: Option<&Buffer>,
-    attn_unfused_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
     sources: &ResolvedSources,
     runtime: &RuntimeBindings,
@@ -1654,7 +1643,6 @@ fn bake_bucket<W: CanonicalParams>(
                     /*splitk_scratch=*/ None,
                     moe_scratch,
                     /*roped_k_scratch=*/ None,
-                    /*attn_unfused_scratch=*/ None,
                     sources,
                     runtime,
                 )?;
@@ -1701,7 +1689,6 @@ fn bake_bucket<W: CanonicalParams>(
                     splitk_scratch,
                     moe_scratch,
                     roped_k_scratch,
-                    attn_unfused_scratch,
                     sources,
                     runtime,
                 )?;
@@ -1869,7 +1856,6 @@ fn resolve_bindings(
     splitk_scratch: Option<&Buffer>,
     moe_scratch: Option<&Buffer>,
     roped_k_scratch: Option<&Buffer>,
-    attn_unfused_scratch: Option<&Buffer>,
     sources: &ResolvedSources,
     runtime: &RuntimeBindings,
 ) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
@@ -1923,16 +1909,6 @@ fn resolve_bindings(
                     command_index,
                 })?;
                 (scratch.clone(), 0u64, *binding_index as u64)
-            }
-            Binding::AttnUnfusedScratch {
-                offset,
-                binding_index,
-            } => {
-                let scratch = attn_unfused_scratch.ok_or(WorkerError::ScratchBufferMissing {
-                    bucket_index,
-                    command_index,
-                })?;
-                (scratch.clone(), *offset as u64, *binding_index as u64)
             }
             Binding::MoeScratch {
                 binding_index,
@@ -2610,7 +2586,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
@@ -2744,12 +2719,11 @@ mod tests {
         let own = PerScratch::from_fn(|kind| match kind {
             ScratchKind::SplitK => 10,
             ScratchKind::Moe => 90,
-            ScratchKind::AttnUnfused => 3,
             ScratchKind::RopedK => 0,
         });
         let grown = Hosting::scratch(own, &guest);
         let bytes: Vec<u64> = grown.iter().map(|(_, &b)| b).collect();
-        assert_eq!(bytes, [10, 90, 5, 3]);
+        assert_eq!(bytes, [10, 90, 5]);
     }
 
     /// Whatever a host's arena keeps and however many ranks its guest has, no guest rank takes a
@@ -3020,7 +2994,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
@@ -3091,7 +3064,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
@@ -3262,7 +3234,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
