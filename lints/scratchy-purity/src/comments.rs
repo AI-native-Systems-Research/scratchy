@@ -100,6 +100,45 @@ pub fn package_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The comments of a TOML document: each one's 1-based line and its text after the `#`.
+pub fn toml_comments(text: &str) -> Vec<(usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    // The string open at `i`: its closing delimiter, and whether `\\` escapes inside it.
+    let mut open: Option<(&str, bool)> = None;
+    let (mut i, mut line) = (0, 1);
+    while i < bytes.len() {
+        // Bytes, not str: `i` steps through multi-byte characters, and every delimiter is ASCII.
+        let rest = &bytes[i..];
+        match open {
+            Some((close, escapes)) => {
+                if escapes && bytes[i] == b'\\' {
+                    i += 1;
+                } else if rest.starts_with(close.as_bytes()) {
+                    i += close.len() - 1;
+                    open = None;
+                }
+            }
+            None => {
+                if let Some(delim) = ["\"\"\"", "'''", "\"", "'"].into_iter().find(|d| rest.starts_with(d.as_bytes())) {
+                    open = Some((delim, delim.starts_with('"')));
+                    i += delim.len() - 1;
+                } else if bytes[i] == b'#' {
+                    let end = rest.iter().position(|&b| b == b'\n').map_or(text.len(), |n| i + n);
+                    found.push((line, &text[i + 1..end]));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if bytes.get(i) == Some(&b'\n') {
+            line += 1;
+        }
+        i += 1;
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +202,16 @@ mod tests {
         let found: Vec<_> = package_files(&dir).iter().map(|p| p.strip_prefix(&dir).unwrap().to_path_buf()).collect();
         assert_eq!(found, ["build.rs", "src/lib.rs", "tests/t.rs"].map(PathBuf::from));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn toml_comments_skip_hashes_inside_strings() {
+        assert_eq!(toml_comments("a = \"x#y\" # moved from b"), vec![(1, " moved from b")]);
+        assert_eq!(toml_comments("s = '''\n# not\n'''"), vec![]);
+        assert_eq!(toml_comments("t = \"\"\"\n# not \\\" either\n\"\"\""), vec![]);
+        assert_eq!(toml_comments("u = 'a#b'\n# /tmp/x"), vec![(2, " /tmp/x")]);
+        assert_eq!(toml_comments("v = \"q\\\"#\" # real"), vec![(1, " real")]);
+        assert_eq!(toml_comments("# a — b\nw = \"—#\" # c — d"), vec![(1, " a — b"), (2, " c — d")]);
     }
 
     #[test]

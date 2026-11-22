@@ -99,20 +99,31 @@ fn file_comments(file: &rustc_span::SourceFile, found: &mut Vec<(rustc_span::Spa
     }
 }
 
+/// Whether this crate is its package's owner target, the one that checks the whole package.
+fn owns_package(sess: &rustc_session::Session, owner: &Option<std::path::PathBuf>, root: &Path) -> bool {
+    !sess.opts.test && owner.as_deref() == Some(root)
+}
+
+/// The crate root, relative to its package's manifest directory where it is under it.
+fn crate_root(sess: &rustc_session::Session, manifest_dir: &Path) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = cwd.join(sess.local_crate_source_file()?.local_path()?);
+    Some(root.strip_prefix(manifest_dir).map(Path::to_path_buf).unwrap_or(root))
+}
+
 /// The comments this crate checks. The package's owner target (`comments::owner_target`) reads
 /// every file of the package, compiled or not; a loose single-file crate reads the files it
 /// compiles; every other target of a package reads none, since its owner already did.
 fn checked_comments(cx: &EarlyContext<'_>, manifest_dir: &Path) -> Vec<(rustc_span::Span, String)> {
     let sess = cx.sess();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let Some(root) = sess.local_crate_source_file().and_then(|r| r.local_path().map(|p| cwd.join(p))) else {
+    let Some(root) = crate_root(sess, manifest_dir) else {
         return Vec::new();
     };
-    let root = root.strip_prefix(manifest_dir).map(Path::to_path_buf).unwrap_or(root);
     let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap_or_default();
     let owner = comments::owner_target(&manifest, |p| manifest_dir.join(p).exists());
     let mut found = Vec::new();
-    if !sess.opts.test && owner.as_deref() == Some(root.as_path()) {
+    if owns_package(sess, &owner, &root) {
         for path in comments::package_files(manifest_dir) {
             if let Ok(file) = sess.source_map().load_file(&path) {
                 file_comments(&file, &mut found);
@@ -137,12 +148,21 @@ fn escape_hatch(name: &str) -> bool {
 }
 
 impl EarlyLintPass for P11 {
-    fn check_crate(&mut self, cx: &EarlyContext<'_>, _: &rustc_ast::Crate) {
+    fn check_crate(&mut self, cx: &EarlyContext<'_>, krate: &rustc_ast::Crate) {
         let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") else {
             return;
         };
-        for (span, body) in checked_comments(cx, Path::new(&manifest_dir)) {
+        let manifest_dir = Path::new(&manifest_dir);
+        for (span, body) in checked_comments(cx, manifest_dir) {
             check_comment(cx, span, &body, "");
+        }
+        let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap_or_default();
+        let owner = comments::owner_target(&manifest, |p| manifest_dir.join(p).exists());
+        let owns = crate_root(cx.sess(), manifest_dir).is_some_and(|root| owns_package(cx.sess(), &owner, &root));
+        if owns {
+            for (line, body) in comments::toml_comments(&manifest) {
+                check_comment(cx, krate.spans.inner_span.shrink_to_lo(), body, &format!(" (Cargo.toml:{line})"));
+            }
         }
     }
 
