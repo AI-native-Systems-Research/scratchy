@@ -4,10 +4,12 @@
 #![warn(unused_extern_crates)]
 
 extern crate rustc_ast;
+extern crate rustc_lexer;
 extern crate rustc_lint;
 extern crate rustc_session;
 extern crate rustc_span;
 
+mod comments;
 mod p11;
 
 dylint_linting::dylint_library!();
