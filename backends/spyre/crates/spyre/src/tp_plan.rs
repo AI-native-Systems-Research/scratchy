@@ -140,7 +140,7 @@ mod tests {
         fn check<T: Tp>() {
             let b = tp_bake::<T>(&one_layer_input()).unwrap();
             assert_eq!(b.sharded.collectives.len(), 2, "world {}", T::RANKS);
-            let hidden_bytes = 2048 * spyre_superdsc::format::DataFormat::Fp16.word_bytes();
+            let hidden_bytes = 2048 * spyre_superdsc::format::DataFormat::Fp16.word_bytes().get();
             assert_eq!(
                 b.window_block.unwrap().get(),
                 hidden_bytes * u64::from(WINDOW_ROWS)

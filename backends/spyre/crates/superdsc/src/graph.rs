@@ -4,6 +4,7 @@
 
 use crate::format::DataFormat;
 use crate::opfunc::OpFunc;
+use crate::qty::{Elems, Extent};
 use crate::view::View;
 
 /// Where an operand's elements live.
@@ -36,7 +37,7 @@ pub struct Gather {
     /// The index tensor: a 1-D view, one entry per position of `axis`.
     pub index: Box<Operand>,
     /// Rows the indexed buffer holds along `axis`.
-    pub rows: u64,
+    pub rows: Extent,
 }
 
 /// One device op.
@@ -51,7 +52,7 @@ pub struct Gather {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub func: OpFunc,
-    pub space: Vec<u64>,
+    pub space: Vec<Extent>,
     pub inputs: Vec<Operand>,
     pub output: Operand,
 }
@@ -74,7 +75,7 @@ impl ConstStick {
 /// An intermediate's storage: `elements` of `format`, contiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Local {
-    pub elements: u64,
+    pub elements: Elems,
     pub format: DataFormat,
 }
 

@@ -440,10 +440,10 @@ pub fn compute_bundle_layout<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         let df = kernel_dfs.get(&tid).copied().unwrap_or(DataFormat::Fp16);
-        let lanes = df.lanes::<ktir_core::ddl_binds::Baked>();
+        let lanes = df.lanes::<ktir_core::ddl_binds::Baked>().get();
         let natural = u64::from(s.rows)
             * scratchy_spyre_bundle::rung::row_pitch(u64::from(s.cols), lanes)
-            * df.word_bytes();
+            * df.word_bytes().get();
         natural.max(room.get(&tid).copied().unwrap_or(0))
     };
     // ── Liveness: first def (output of node i) and last use (input of node j). A

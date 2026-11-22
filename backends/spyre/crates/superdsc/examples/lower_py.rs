@@ -166,7 +166,7 @@ fn main() {
             println!(
                 "LOWERED {} ops, scratch {} B, consts {:?}",
                 ops.len(),
-                fp.scratch_bytes,
+                fp.scratch_bytes.get(),
                 g.consts
             );
         }

@@ -9,9 +9,10 @@
 //! into an intermediate that holds the needed stick ([`restick`]).
 
 use crate::graph::{Graph, Local, Node, Operand, Store};
-use crate::lift::{Held, ParamLayout};
+use crate::lift::{Held, Innermost, ParamLayout};
 use crate::opfunc::{Family, OpFunc};
-use crate::view::View;
+use crate::qty::{Elems, Extent, Lanes, Stride};
+use crate::view::{Axis, Tile, View};
 
 /// Who writes a parameter's buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,12 +30,7 @@ pub fn required(node: &Node, oi: usize) -> Option<usize> {
     } else {
         &node.output
     };
-    let unit = |o: &Operand| {
-        o.view
-            .axes
-            .iter()
-            .position(|a| a.stride == 1 && a.extent > 1)
-    };
+    let unit = |o: &Operand| o.view.axes.iter().position(|a| a.is_unit());
     match (node.func, node.func.family()) {
         (OpFunc::Restick, _) => None,
         (_, Family::Contraction) => Some(operand.view.axes.len() - 1),
@@ -52,7 +48,9 @@ pub fn required(node: &Node, oi: usize) -> Option<usize> {
 /// Is `o` readable with `axis` as its stick?
 fn on_stick(o: &Operand, axis: usize) -> bool {
     let a = o.view.axes[axis];
-    a.stride == 1 || a.extent == 1 || (a.stride == 0 && o.gather.is_none())
+    a.stride == Stride::UNIT
+        || a.extent == Extent::ONE
+        || (a.stride == Stride::BROADCAST && o.gather.is_none())
 }
 
 /// For each staged parameter: held so every op reads it on the stick it needs — innermost the
@@ -91,7 +89,11 @@ pub fn staged_layouts(g: &Graph, residency: &[Residency]) -> Vec<ParamLayout> {
             out[p] = Some(Held {
                 order,
                 inner: mv.axes[a].extent,
-                columns: kernel,
+                innermost: if kernel {
+                    Innermost::Columns
+                } else {
+                    Innermost::Rows
+                },
             });
         }
     }
@@ -115,12 +117,12 @@ pub fn restick<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
             let mut order: Vec<usize> = (0..shape.len()).filter(|&a| a != axis).collect();
             order.sort_by_key(|&a| (std::cmp::Reverse(o.view.axes[a].stride), a));
             order.push(axis);
-            let mut held: Vec<u64> = order.iter().map(|&a| shape[a]).collect();
+            let mut held: Vec<Extent> = order.iter().map(|&a| shape[a]).collect();
             if let Some(l) = held.last_mut() {
-                *l = l.next_multiple_of(o.format.lanes::<G>());
+                *l = l.whole_sticks(o.format.lanes::<G>());
             }
-            let physical = View::row_major(0, &held);
-            let mut view = View::row_major(0, &shape);
+            let physical = View::row_major(Elems::ZERO, &held);
+            let mut view = View::row_major(Elems::ZERO, &shape);
             for (k, &a) in order.iter().enumerate() {
                 view.axes[a].stride = physical.axes[k].stride;
             }
@@ -153,69 +155,69 @@ pub fn restick<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
 /// The view an access through an index needs: the indexed axis one stick apart, directly outside
 /// the stick's lanes, and the stick's own columns pitched past every row — dxp converts an index
 /// to an address one stick per row.
-fn indexable(v: &View, axis: usize, lanes: u64) -> bool {
-    let stick = v.axes.iter().position(|a| a.stride == 1 && a.extent > 1);
-    let one_column =
-        stick.is_none_or(|s| v.axes[s].extent <= lanes || v.tile.is_some_and(|t| t.axis == s));
-    v.axes[axis].stride == lanes && one_column
+fn indexable(v: &View, axis: usize, lanes: Lanes) -> bool {
+    let stick = v.axes.iter().position(|a| a.is_unit());
+    let one_column = stick
+        .is_none_or(|s| v.axes[s].extent <= lanes.extent() || v.tile.is_some_and(|t| t.axis == s));
+    v.axes[axis].stride == Stride::of_lanes(lanes) && one_column
 }
 
 /// Is `v` read through an index along `axis` one whole row per index — the indexed axis outermost,
 /// every other axis densely inside it, the unit-stride axis whole sticks? dxp addresses such a row
 /// as one block per index, however many sticks it holds: a page of the KV pool gathers in place.
-fn row_indexable(v: &View, axis: usize, lanes: u64) -> bool {
+fn row_indexable(v: &View, axis: usize, lanes: Lanes) -> bool {
     if v.tile.is_some() {
         return false;
     }
-    let mut rest: Vec<crate::view::Axis> = v
+    let mut rest: Vec<Axis> = v
         .axes
         .iter()
         .enumerate()
-        .filter(|&(i, a)| i != axis && a.extent > 1)
+        .filter(|&(i, a)| i != axis && a.spreads())
         .map(|(_, a)| *a)
         .collect();
     rest.sort_by_key(|a| a.stride);
-    let mut unit = 1u64;
+    let mut unit = Stride::UNIT;
     for (k, a) in rest.iter().enumerate() {
         if a.stride != unit {
             return false;
         }
-        unit *= if k == 0 {
-            a.extent.next_multiple_of(lanes)
+        unit = unit.times(if k == 0 {
+            a.extent.whole_sticks(lanes)
         } else {
             a.extent
-        };
+        });
     }
-    unit > lanes && v.axes[axis].stride == unit
+    unit > Stride::of_lanes(lanes) && v.axes[axis].stride == unit
 }
 
 /// `v` with its unit-stride axis `s` split into its sticks and their lanes — `[…, R·lanes, …]` read
 /// as `[…, R, lanes, …]` — a row of several sticks as dxp's indirect access walks it.
-fn split_sticks(v: &View, s: usize, lanes: u64) -> View {
+fn split_sticks(v: &View, s: usize, lanes: Lanes) -> View {
     let mut out = v.clone();
     let a = out.axes[s];
-    out.axes[s] = crate::view::Axis {
-        extent: lanes,
+    out.axes[s] = Axis {
+        extent: lanes.extent(),
         stride: a.stride,
     };
     out.axes.insert(
         s,
-        crate::view::Axis {
-            extent: a.extent / lanes,
-            stride: a.stride * lanes,
+        Axis {
+            extent: a.extent.sticks(lanes),
+            stride: a.stride.times(lanes.extent()),
         },
     );
     out
 }
 
 /// `shape` row-major, its innermost axis whole sticks: the rows a row gather lands or reads.
-fn row_view(shape: &[u64], lanes: u64) -> View {
+fn row_view(shape: &[Extent], lanes: Lanes) -> View {
     let mut held = shape.to_vec();
     if let Some(l) = held.last_mut() {
-        *l = l.next_multiple_of(lanes);
+        *l = l.whole_sticks(lanes);
     }
-    let physical = View::row_major(0, &held);
-    let mut v = View::row_major(0, shape);
+    let physical = View::row_major(Elems::ZERO, &held);
+    let mut v = View::row_major(Elems::ZERO, shape);
     for (a, p) in v.axes.iter_mut().zip(&physical.axes) {
         a.stride = p.stride;
     }
@@ -224,21 +226,21 @@ fn row_view(shape: &[u64], lanes: u64) -> View {
 
 /// `shape` held with `axis` directly outside the stick's lanes and the stick axis `stick` in
 /// columns pitched past all `rows` of it.
-fn indexable_view(shape: &[u64], axis: usize, stick: usize, lanes: u64) -> View {
+fn indexable_view(shape: &[Extent], axis: usize, stick: usize, lanes: Lanes) -> View {
     let rows = shape[axis];
-    let cols = shape[stick].next_multiple_of(lanes);
-    let mut v = View::row_major(0, shape);
-    v.axes[axis].stride = lanes;
-    v.axes[stick].stride = 1;
-    let mut unit = rows * cols;
+    let cols = shape[stick].whole_sticks(lanes);
+    let mut v = View::row_major(Elems::ZERO, shape);
+    v.axes[axis].stride = Stride::of_lanes(lanes);
+    v.axes[stick].stride = Stride::UNIT;
+    let mut unit = Stride::UNIT.times(rows).times(cols);
     for a in (0..shape.len()).rev().filter(|&a| a != axis && a != stick) {
         v.axes[a].stride = unit;
-        unit *= shape[a];
+        unit = unit.times(shape[a]);
     }
-    v.tile = Some(crate::view::Tile {
+    v.tile = Some(Tile {
         axis: stick,
         lanes,
-        pitch: rows * lanes,
+        pitch: Stride::of_lanes(lanes).times(rows),
     });
     v
 }
@@ -264,12 +266,7 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
         };
         let lanes = operand.format.lanes::<G>();
         let axis = gather.axis;
-        let Some(stick) = operand
-            .view
-            .axes
-            .iter()
-            .position(|a| a.stride == 1 && a.extent > 1)
-        else {
+        let Some(stick) = operand.view.axes.iter().position(|a| a.is_unit()) else {
             i += 1;
             continue;
         };
@@ -322,7 +319,7 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
             // A row of several sticks: its sticks are one more axis of the copy, its lanes the
             // stick — on both sides, so the index walks whole rows of whole sticks.
             let s_extent = operand.view.axes[stick].extent;
-            if s_extent > lanes && s_extent.is_multiple_of(lanes) {
+            if s_extent > lanes.extent() && s_extent.is_whole_sticks(lanes) {
                 let node = &mut g.nodes[i];
                 let split_axis = |o: &mut Operand| {
                     o.view = split_sticks(&o.view, stick, lanes);
@@ -334,8 +331,8 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
                 };
                 split_axis(&mut node.inputs[0]);
                 split_axis(&mut node.output);
-                node.space[stick] = lanes;
-                node.space.insert(stick, s_extent / lanes);
+                node.space[stick] = lanes.extent();
+                node.space.insert(stick, s_extent.sticks(lanes));
             }
             i += 1;
             continue;
@@ -398,19 +395,16 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
 
 /// Does `o`'s window start inside a stick along its unit-stride axis? A descriptor addresses whole
 /// sticks, so such a window is unreachable where it lies.
-fn starts_inside_a_stick(o: &Operand, lanes: u64) -> Option<usize> {
-    let s = o
-        .view
-        .axes
-        .iter()
-        .position(|a| a.stride == 1 && a.extent > 1)?;
+fn starts_inside_a_stick(o: &Operand, lanes: Lanes) -> Option<usize> {
+    let s = o.view.axes.iter().position(|a| a.is_unit())?;
     let outer_aligned = o
         .view
         .axes
         .iter()
         .enumerate()
-        .all(|(i, a)| i == s || a.extent == 1 || a.stride.is_multiple_of(lanes));
-    (o.view.tile.is_none() && outer_aligned && !o.view.offset.is_multiple_of(lanes)).then_some(s)
+        .all(|(i, a)| i == s || a.extent == Extent::ONE || a.stride.is_whole_sticks(lanes));
+    (o.view.tile.is_none() && outer_aligned && !o.view.offset.get().is_multiple_of(lanes.get()))
+        .then_some(s)
 }
 
 /// The parameters some op reads or writes in a window that starts inside a stick: each is worked

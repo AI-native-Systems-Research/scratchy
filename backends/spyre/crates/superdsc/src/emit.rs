@@ -16,6 +16,7 @@ use crate::divide::{Cuttable, divide};
 use crate::format::DataFormat;
 use crate::graph::{ConstStick, Graph, Node, Operand, Store};
 use crate::opfunc::{Family, OpFunc};
+use crate::qty::{Bytes, Cores, Extent};
 use crate::wire;
 
 /// A byte address in device memory.
@@ -53,10 +54,10 @@ pub struct Bindings<'a> {
 /// reaches, padding included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Footprint {
-    pub scratch_bytes: u64,
-    pub room: Vec<u64>,
+    pub scratch_bytes: Bytes,
+    pub room: Vec<Bytes>,
     /// Each intermediate's byte offset from the scratch base.
-    locals: Vec<u64>,
+    locals: Vec<Bytes>,
 }
 
 /// Why an op has no descriptor.
@@ -120,7 +121,7 @@ impl Proj<'_> {
     /// Element stride along space axis `i` (0 for an axis the operand does not advance along).
     fn stride(&self, i: usize) -> Option<u64> {
         self.at[i].map(|a| match a {
-            At::View(j) => self.operand.view.axes[j].stride,
+            At::View(j) => self.operand.view.axes[j].stride.get(),
             At::Lanes => 1,
             At::Broadcast => 0,
         })
@@ -129,7 +130,7 @@ impl Proj<'_> {
     /// Element distance of position `c` along space axis `i`.
     fn distance(&self, i: usize, c: u64) -> u64 {
         match self.at[i] {
-            Some(At::View(j)) => self.operand.view.distance(j, c),
+            Some(At::View(j)) => self.operand.view.distance(j, Extent::new(c)).get(),
             Some(At::Lanes) => c,
             Some(At::Broadcast) | None => 0,
         }
@@ -139,7 +140,7 @@ impl Proj<'_> {
     /// columns.
     fn columns(&self, i: usize) -> Option<u64> {
         match (self.at[i], self.operand.view.tile) {
-            (Some(At::View(j)), Some(t)) if t.axis == j => Some(t.pitch),
+            (Some(At::View(j)), Some(t)) if t.axis == j => Some(t.pitch.get()),
             _ => None,
         }
     }
@@ -162,7 +163,7 @@ impl Plan {
     /// One past the last element operand `oi` reaches over the padded space.
     fn end(&self, node: &Node, oi: usize) -> u64 {
         let p = self.proj(node, oi);
-        p.operand.view.offset
+        p.operand.view.offset.get()
             + self
                 .axes
                 .iter()
@@ -191,7 +192,7 @@ impl Plan {
 
 /// The storage `g`'s descriptors reach on generation `G`.
 pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
-    let mut elements: Vec<u64> = g.locals.iter().map(|l| l.elements).collect();
+    let mut elements: Vec<u64> = g.locals.iter().map(|l| l.elements.get()).collect();
     let mut room: Vec<u64> = vec![0; g.params.len()];
     // Each intermediate's live range: from the first op that touches it to the last.
     let mut live: Vec<Option<(usize, usize)>> = vec![None; g.locals.len()];
@@ -209,7 +210,7 @@ pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
                     elements[l] = elements[l].max(end);
                     live[l] = Some(live[l].map_or((ni, ni), |(a, _)| (a, ni)));
                 }
-                Store::Param(q) => room[q] = room[q].max(end * o.format.word_bytes()),
+                Store::Param(q) => room[q] = room[q].max(end * o.format.word_bytes().get()),
                 Store::Const(_) => {}
             }
         }
@@ -220,7 +221,7 @@ pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
         .locals
         .iter()
         .zip(&elements)
-        .map(|(l, e)| (e * l.format.word_bytes()).next_multiple_of(G::FLIT_BYTES))
+        .map(|(l, e)| (e * l.format.word_bytes().get()).next_multiple_of(G::FLIT_BYTES))
         .collect();
     let mut order: Vec<usize> = (0..g.locals.len()).collect();
     order.sort_by_key(|&l| (live[l].map_or(usize::MAX, |r| r.0), l));
@@ -246,9 +247,9 @@ pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
         scratch_bytes = scratch_bytes.max(at + bytes[l]);
     }
     Footprint {
-        scratch_bytes,
-        room,
-        locals,
+        scratch_bytes: Bytes::new(scratch_bytes),
+        room: room.into_iter().map(Bytes::new).collect(),
+        locals: locals.into_iter().map(Bytes::new).collect(),
     }
 }
 
@@ -267,7 +268,7 @@ pub fn emit<G: DeviceGen>(
                 .ok_or(EmitError::Unbound { param: p }),
             Store::Local(l) => bindings
                 .scratch
-                .map(|s| s.add_bytes(footprint.locals[l]))
+                .map(|s| s.add_bytes(footprint.locals[l].get()))
                 .ok_or(EmitError::Unscratched { local: l }),
             Store::Const(c) => g
                 .consts
@@ -286,7 +287,7 @@ pub fn emit<G: DeviceGen>(
 
 /// For each parameter some op reads on a unit stride: the widest padded extent any op's division
 /// reaches along that stick, counted from the start of the buffer's row.
-pub fn staged_widths<G: DeviceGen>(g: &Graph) -> Vec<Option<u64>> {
+pub fn staged_widths<G: DeviceGen>(g: &Graph) -> Vec<Option<Extent>> {
     let mut out = vec![None; g.params.len()];
     for node in &g.nodes {
         let p = plan::<G>(node);
@@ -307,9 +308,10 @@ pub fn staged_widths<G: DeviceGen>(g: &Graph) -> Vec<Option<u64>> {
                 .filter_map(|i| pr.stride(i))
                 .filter(|&s| s > 1)
                 .min();
-            let in_row = pitch.map_or(o.view.offset, |pt| o.view.offset % pt);
-            let w = in_row + p.axes[pr.stick].extent;
-            out[q] = Some(out[q].map_or(w, |x: u64| x.max(w)));
+            let offset = o.view.offset.get();
+            let in_row = pitch.map_or(offset, |pt| offset % pt);
+            let w = Extent::new(in_row + p.axes[pr.stick].extent);
+            out[q] = Some(out[q].map_or(w, |x: Extent| x.max(w)));
         }
     }
     out
@@ -327,9 +329,9 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
         .inputs
         .iter()
         .filter(|_| node.func.converts())
-        .map(|o| o.format.lanes::<G>())
-        .fold(node.output.format.lanes::<G>(), u64::max);
-    let mut space: Vec<u64> = node.space.clone();
+        .map(|o| o.format.lanes::<G>().get())
+        .fold(node.output.format.lanes::<G>().get(), u64::max);
+    let mut space: Vec<u64> = node.space.iter().map(|e| e.get()).collect();
     let rank = space.len();
     let mut operands: Vec<&Operand> = node.inputs.iter().collect();
     operands.push(&node.output);
@@ -369,8 +371,8 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
                 .view
                 .axes
                 .iter()
-                .position(|a| a.stride == 1 && a.extent > 1)
-                .or_else(|| src.view.axes.iter().position(|a| a.stride == 1));
+                .position(|a| a.is_unit())
+                .or_else(|| src.view.axes.iter().position(|a| a.stride.get() == 1));
             let (stick, lanes_axis) = match unit {
                 Some(s) => (s, false),
                 // Every value sits on its own stick: the stick's lanes are an axis of their own.
@@ -402,11 +404,7 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
                         }));
                     }
                     // A restick reads each operand on its own stick.
-                    let own = o
-                        .view
-                        .axes
-                        .iter()
-                        .position(|a| a.stride == 1 && a.extent > 1);
+                    let own = o.view.axes.iter().position(|a| a.is_unit());
                     let stick = match (node.func, own) {
                         (OpFunc::Restick, Some(own)) => own,
                         _ => stick,
@@ -428,7 +426,7 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
             .view
             .axes
             .iter()
-            .position(|a| a.stride == 0 && a.extent > 1),
+            .position(|a| a.stride.get() == 0 && a.spreads()),
         Family::Pointwise => None,
     };
     // An access through an index tensor: the indexed axis stays whole on every core.
@@ -439,7 +437,7 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
     let reduced = reduced.or(gathered.map(|(_, a)| a));
     let bytes: u64 = operands
         .iter()
-        .map(|o| o.view.numel() * o.format.word_bytes())
+        .map(|o| o.view.numel().bytes(o.format.word_bytes()).get())
         .sum();
     // An access through an index tensor runs on one core: dxp converts its indices to addresses
     // on one (`GatherIndexConversion`'s `idx2addr`).
@@ -456,7 +454,7 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
         .zip(&operands)
         .filter(|((at, st), o)| {
             at.get(*st).copied().flatten().is_some_and(|a| match a {
-                At::View(j) => o.view.axes[j].stride == 1,
+                At::View(j) => o.view.axes[j].stride.get() == 1,
                 At::Lanes => true,
                 At::Broadcast => false,
             })
@@ -473,17 +471,23 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
             .iter()
             .enumerate()
             .map(|(i, &e)| Cuttable {
-                units: if Some(i) == reduced {
+                units: Extent::new(if Some(i) == reduced {
                     1
                 } else if sticks.contains(&i) {
                     if e % lanes == 0 { e / lanes } else { 1 }
                 } else {
                     e
-                },
+                }),
             })
             .collect()
     };
-    let mut split = divide(&cuttable(&space), budget);
+    let split_of = |space: &[u64]| -> Vec<u64> {
+        divide(&cuttable(space), Cores::new(budget))
+            .into_iter()
+            .map(Cores::get)
+            .collect()
+    };
+    let mut split = split_of(&space);
     // A contraction whose stick count factors badly divides badly: a prime count of output sticks
     // splits across one core. Such an axis is padded by up to an eighth to the count that splits
     // across the most cores — judged on the stick axis alone, so a weight's padding is the same at
@@ -501,7 +505,7 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
                 .max_by_key(|&u| (splits(u), std::cmp::Reverse(u)))
                 .unwrap_or(units);
             space[stick_axis] = best * lanes;
-            split = divide(&cuttable(&space), budget);
+            split = split_of(&space);
         }
     }
     let axes: Vec<SAxis> = space
@@ -583,7 +587,7 @@ fn op<G: DeviceGen>(
                 operand: *vi,
             })?;
             let index = &gather.index;
-            let lanes = index.format.lanes::<G>();
+            let lanes = index.format.lanes::<G>().get();
             let n = axes[*g].extent as i64;
             let affine = |alpha: i64| wire::Func::Affine { alpha, beta: 0 };
             let prop = |factor: i64, label| wire::Prop { factor, label };
@@ -611,13 +615,13 @@ fn op<G: DeviceGen>(
                 },
             };
             let addr = base(index.store)?
-                .add_bytes(index.view.offset * index.format.word_bytes())
+                .add_bytes(index.view.offset.bytes(index.format.word_bytes()).get())
                 .get();
             // The value's indexed axis holds one row per index. Rows one stick apart are the rows of
             // a stick array, the rest of which are a gap; a whole multi-stick row per index is the
             // value's outermost block, past which there is nothing.
             let one_stick =
-                plan.proj(node, *vi).stride(*g) == Some(operands[*vi].format.lanes::<G>());
+                plan.proj(node, *vi).stride(*g) == Some(operands[*vi].format.lanes::<G>().get());
             let vt = &mut tensors[*vi];
             if !one_stick {
                 // dxp sizes a whole row's own dims itself; it is told only that each index names
@@ -628,7 +632,7 @@ fn op<G: DeviceGen>(
                 vt.max_dims[k] = 1;
             }
             if one_stick {
-                vt.back_gap = Some((axes[*g].dim, gather.rows.saturating_sub(1)));
+                vt.back_gap = Some((axes[*g].dim, gather.rows.get().saturating_sub(1)));
             }
             tensors.push(Tensor {
                 format: index.format,
@@ -665,21 +669,20 @@ fn op<G: DeviceGen>(
             ROLES[ti]
         } else if node.func.converts() {
             if ti < out_idx { "INPUT" } else { "OUTPUT" }
-        } else if let Some((_, _, _, l)) = seen
-            .iter()
-            .find(|(o, s, w, _)| *o == t.order && *s == t.stick && *w == t.format.lanes::<G>())
-        {
+        } else if let Some((_, _, _, l)) = seen.iter().find(|(o, s, w, _)| {
+            *o == t.order && *s == t.stick && *w == t.format.lanes::<G>().get()
+        }) {
             l
         } else {
             let l = NAMES[seen.len().min(NAMES.len() - 1)];
-            seen.push((t.order.clone(), t.stick, t.format.lanes::<G>(), l));
+            seen.push((t.order.clone(), t.stick, t.format.lanes::<G>().get(), l));
             l
         };
         labels_of.push(label);
         primary.entry(label).or_insert_with(|| wire::LayoutInfo {
             layout_dim_order: t.order.iter().map(|d| d.wire()).collect(),
             stick_dim_order: vec![t.stick.wire()],
-            stick_size: vec![t.format.lanes::<G>()],
+            stick_size: vec![t.format.lanes::<G>().get()],
         });
     }
     let core_prop = |n: u64| wire::Prop {
@@ -749,7 +752,7 @@ fn op<G: DeviceGen>(
             ds_name: format!("Tensor{ti}"),
             ds_type: labels_of[ti],
             scale: t.scales.clone(),
-            word_length: t.format.word_bytes(),
+            word_length: t.format.word_bytes().get(),
             data_format: t.format.wire(),
             // An index tensor is read from HBM only: indices never stage through LX.
             mem_org: wire::MemOrg {
@@ -869,7 +872,7 @@ fn tensor<G: DeviceGen>(
         slices,
     } = *d;
     let o = p.operand;
-    let lanes = o.format.lanes::<G>();
+    let lanes = o.format.lanes::<G>().get();
     #[derive(Clone, Copy)]
     struct Entry {
         axis: usize,
@@ -1042,7 +1045,7 @@ fn tensor<G: DeviceGen>(
     // The window starts a stick, and a partial-stick window owns the rest of its last stick.
     if p.stride(p.stick) == Some(1) {
         let logical = match p.at[p.stick] {
-            Some(At::View(j)) => o.view.axes[j].extent,
+            Some(At::View(j)) => o.view.axes[j].extent.get(),
             _ => axes[p.stick].extent,
         };
         let outer_aligned = (0..axes.len()).all(|i| {
@@ -1050,7 +1053,7 @@ fn tensor<G: DeviceGen>(
                 || axes[i].extent == 1
                 || p.stride(i).is_none_or(|s| s.is_multiple_of(lanes))
         });
-        if !o.view.offset.is_multiple_of(lanes) || !outer_aligned {
+        if !o.view.offset.get().is_multiple_of(lanes) || !outer_aligned {
             return Err(EmitError::Nesting {
                 node: ni,
                 operand: oi,
@@ -1070,7 +1073,7 @@ fn tensor<G: DeviceGen>(
         }
     }
     let origin = base(o.store)?;
-    let word = o.format.word_bytes();
+    let word = o.format.word_bytes().get();
     let addrs = slices
         .iter()
         .map(|s| {
@@ -1079,7 +1082,7 @@ fn tensor<G: DeviceGen>(
                 .filter(|e| e.scale == 1)
                 .map(|e| p.distance(e.axis, s[e.axis] * per_core[e.axis]))
                 .sum();
-            origin.add_bytes((o.view.offset + elems) * word).get()
+            origin.add_bytes((o.view.offset.get() + elems) * word).get()
         })
         .collect();
     Ok(Tensor {

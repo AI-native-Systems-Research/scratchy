@@ -15,7 +15,7 @@ use spyre_superdsc::format::DataFormat;
 use spyre_superdsc::graph::ConstStick;
 use spyre_superdsc::opfunc::OpFunc;
 use spyre_superdsc::wire::Sdsc;
-use spyre_superdsc::{DevAddr, Held, Planned, Residency};
+use spyre_superdsc::{DevAddr, Held, Innermost, Planned, Residency};
 
 use crate::placement::{BundleLayout, RetileDescriptor, SegRole, TensorPlacement, align128};
 
@@ -84,19 +84,21 @@ pub fn place_rung<'a, T: Tp + 'a>(
         let k = &e.ktir;
         let p = plan(layout, k).map_err(|err| format!("{}: {err}", e.op_name))?;
         consts.extend(p.graph.consts.iter().copied());
-        scratch = scratch.max(p.footprint.scratch_bytes);
+        scratch = scratch.max(p.footprint.scratch_bytes.get());
         for (i, t) in tids(k).enumerate() {
             if let (true, Some(view), Some(format)) = (
                 layout.held.contains_key(&t),
                 p.graph.param_views[i].first(),
                 p.graph.params[i],
             ) {
-                layout.held_views.insert(t, (view.shape(), format));
+                layout
+                    .held_views
+                    .insert(t, (view.shape().iter().map(|e| e.get()).collect(), format));
             }
         }
-        for (t, room) in tids(k).zip(&p.footprint.room) {
+        for (t, room) in tids(k).zip(p.footprint.room.iter().map(|b| b.get())) {
             let size = layout.placements.get(&t).map_or(0, |p| p.size);
-            if *room > size {
+            if room > size {
                 return Err(format!(
                     "{}: t{t} is placed at {size} B but its descriptors reach {room} B",
                     e.op_name
@@ -190,23 +192,26 @@ fn retile_weights(layout: &mut BundleLayout) {
 /// The walk from a row-major host buffer of `shape` into `held`: per device axis, outermost first,
 /// its extent and the host stride it advances.
 pub fn retile(shape: &[u64], format: DataFormat, held: &Held) -> RetileDescriptor {
-    let lanes = format.lanes::<Baked>();
+    let lanes = format.lanes::<Baked>().get();
     let host = |a: usize| shape[a + 1..].iter().product::<u64>();
     let (outer, last) = held.order.split_at(held.order.len() - 1);
     let inner = last[0];
     let mut axes: Vec<(u64, u64)> = Vec::with_capacity(held.order.len() + 1);
-    if held.columns {
-        axes.push((shape[inner].div_ceil(lanes), host(inner) * lanes));
-        axes.extend(outer.iter().map(|&a| (shape[a], host(a))));
-        axes.push((lanes, host(inner)));
-    } else {
-        axes.extend(outer.iter().map(|&a| (shape[a], host(a))));
-        axes.push((shape[inner], host(inner)));
+    match held.innermost {
+        Innermost::Columns => {
+            axes.push((shape[inner].div_ceil(lanes), host(inner) * lanes));
+            axes.extend(outer.iter().map(|&a| (shape[a], host(a))));
+            axes.push((lanes, host(inner)));
+        }
+        Innermost::Rows => {
+            axes.extend(outer.iter().map(|&a| (shape[a], host(a))));
+            axes.push((shape[inner], host(inner)));
+        }
     }
     RetileDescriptor {
         axes,
         stick_size: lanes as u32,
-        word_length: format.word_bytes() as u32,
+        word_length: format.word_bytes().get() as u32,
     }
 }
 
@@ -256,7 +261,7 @@ pub fn rooms<T: Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
                 let Ok(p) = spyre_superdsc::plan::<Baked>(&k.func, &layouts) else {
                     continue;
                 };
-                out.extend(tids(k).zip(p.footprint.room.iter().copied()));
+                out.extend(tids(k).zip(p.footprint.room.iter().map(|b| b.get())));
             }
             out
         })

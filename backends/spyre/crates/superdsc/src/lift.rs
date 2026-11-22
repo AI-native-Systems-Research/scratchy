@@ -16,6 +16,7 @@ use ktir_core::opkind::OpKind;
 use crate::format::DataFormat;
 use crate::graph::{ConstStick, Gather, Graph, Local, Node, Operand, Store};
 use crate::opfunc::{Axis as RAxis, Combine, Compare, OpFunc};
+use crate::qty::{Elems, Extent, Stride};
 use crate::view::{Axis, View, ViewError};
 
 /// Why a function did not lift.
@@ -40,7 +41,7 @@ enum Val {
     /// A parameter's address, `offset` elements in.
     Param {
         param: usize,
-        offset: u64,
+        offset: Elems,
     },
     /// A memory view or an access tile over a store.
     Mem {
@@ -53,26 +54,26 @@ enum Val {
     Indirect {
         base: Operand,
         gather: Gather,
-        shape: Vec<u64>,
+        shape: Vec<Extent>,
     },
     /// An access tile at a row offset read from memory: its rows along `axis`, each one row
     /// read or written through the offset.
     Rows {
         axis: usize,
         rows: Vec<(Operand, Gather)>,
-        shape: Vec<u64>,
+        shape: Vec<Extent>,
     },
     /// An index the function reads from memory: `index[0] · scale + add`.
     Dyn {
         index: Operand,
-        scale: u64,
-        add: u64,
+        scale: Extent,
+        add: Extent,
     },
     Tensor(Operand),
     Splat {
         value: f64,
         format: DataFormat,
-        shape: Vec<u64>,
+        shape: Vec<Extent>,
     },
     /// An uninitialized tensor: what a destination-passing op writes into.
     Empty,
@@ -100,10 +101,18 @@ enum Contraction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held {
     pub order: Vec<usize>,
-    pub inner: u64,
-    /// The innermost axis held in stick columns (`[inner/lanes, rest…, lanes]`): the layout a
-    /// contraction's KERNEL is read in, each core's slice of columns contiguous.
-    pub columns: bool,
+    pub inner: Extent,
+    pub innermost: Innermost,
+}
+
+/// How a staged buffer holds its innermost axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Innermost {
+    /// Row-major, `inner` elements wide.
+    Rows,
+    /// In stick columns (`[inner/lanes, rest…, lanes]`): the layout a contraction's KERNEL is read
+    /// in, each core's slice of columns contiguous.
+    Columns,
 }
 
 /// A parameter's [`Held`] layout, or `None` for a buffer held as its view states.
@@ -142,7 +151,7 @@ pub fn lift_relocating<G: DeviceGen>(
                 *ssa,
                 Val::Param {
                     param: i,
-                    offset: 0,
+                    offset: Elems::ZERO,
                 },
             );
         }
@@ -194,7 +203,7 @@ pub fn lift_relocating<G: DeviceGen>(
 
 /// `operands` re-stated over `space`, a space their own differs from only in axes of one position.
 /// An operand read through an index keeps its space: its indexed axis is counted in it.
-fn over_space(operands: &[Operand], space: &[u64]) -> Option<Vec<Operand>> {
+fn over_space(operands: &[Operand], space: &[Extent]) -> Option<Vec<Operand>> {
     operands
         .iter()
         .map(|o| match &o.gather {
@@ -278,8 +287,12 @@ fn int_list<'a>(op: &Operation<'a>, key: AttrKey) -> Option<&'a [i64]> {
     }
 }
 
-fn u64s(v: &[i64]) -> Vec<u64> {
-    v.iter().map(|&x| x as u64).collect()
+fn extents(v: &[i64]) -> Vec<Extent> {
+    v.iter().map(|&x| Extent::new(x as u64)).collect()
+}
+
+fn strides(v: &[i64]) -> Vec<Stride> {
+    v.iter().map(|&x| Stride::new(x as u64)).collect()
 }
 
 impl<G: DeviceGen> Cx<'_, G> {
@@ -323,9 +336,9 @@ impl<G: DeviceGen> Cx<'_, G> {
         }
     }
 
-    fn shape(op: &Operation<'_>) -> Result<Vec<u64>, LiftError> {
+    fn shape(op: &Operation<'_>) -> Result<Vec<Extent>, LiftError> {
         int_list(op, AttrKey::Shape)
-            .map(u64s)
+            .map(extents)
             .ok_or(LiftError::Malformed {
                 op: op.op_type,
                 what: "a tensor op states its shape",
@@ -369,7 +382,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         &mut self,
         op: &Operation<'_>,
         v: &Val,
-        shape: &[u64],
+        shape: &[Extent],
         format: DataFormat,
     ) -> Result<Operand, LiftError> {
         match v {
@@ -384,7 +397,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                 let c = self.const_stick(*format, *value);
                 Ok(Operand {
                     store: Store::Const(c),
-                    view: View::of_memory(shape, &vec![0; shape.len()]),
+                    view: View::of_memory(shape, &vec![Stride::BROADCAST; shape.len()]),
                     format: *format,
                     gather: None,
                 })
@@ -393,7 +406,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                 let c = self.const_stick(format, *value);
                 Ok(Operand {
                     store: Store::Const(c),
-                    view: View::of_memory(shape, &vec![0; shape.len()]),
+                    view: View::of_memory(shape, &vec![Stride::BROADCAST; shape.len()]),
                     format,
                     gather: None,
                 })
@@ -402,7 +415,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                 let c = self.const_stick(format, *value as f64);
                 Ok(Operand {
                     store: Store::Const(c),
-                    view: View::of_memory(shape, &vec![0; shape.len()]),
+                    view: View::of_memory(shape, &vec![Stride::BROADCAST; shape.len()]),
                     format,
                     gather: None,
                 })
@@ -416,7 +429,7 @@ impl<G: DeviceGen> Cx<'_, G> {
 
     /// A fresh intermediate for a result of `shape`. A result whose dense inputs all hold one
     /// value per stick (a reduction's result and what is computed from it) is held the same way.
-    fn local(&mut self, shape: &[u64], format: DataFormat, holding: Holding) -> Operand {
+    fn local(&mut self, shape: &[Extent], format: DataFormat, holding: Holding) -> Operand {
         self.local_like(shape, format, holding, None)
     }
 
@@ -424,62 +437,66 @@ impl<G: DeviceGen> Cx<'_, G> {
     /// first), else row-major.
     fn local_like(
         &mut self,
-        shape: &[u64],
+        shape: &[Extent],
         format: DataFormat,
         holding: Holding,
         like: Option<&View>,
     ) -> Operand {
         let lanes = format.lanes::<G>();
-        let numel: u64 = shape.iter().product();
+        let numel = Extent::product(shape);
         // The innermost axis is held in whole sticks: a partial stick pads to the stick.
         let padded = |v: View| -> View {
             let Some(inner) = v
                 .axes
                 .iter()
-                .position(|a| a.stride == 1 && a.extent > 1)
-                .or_else(|| v.axes.iter().position(|a| a.stride == 1))
+                .position(|a| a.is_unit())
+                .or_else(|| v.axes.iter().position(|a| a.stride == Stride::UNIT))
             else {
                 return v;
             };
-            let pitch = v.axes[inner].extent.next_multiple_of(lanes);
+            let pitch = v.axes[inner].extent.whole_sticks(lanes);
             let mut out = v.clone();
             for (i, a) in v.axes.iter().enumerate() {
-                if i != inner && a.stride != 0 {
-                    out.axes[i].stride = a.stride / v.axes[inner].extent * pitch;
+                if i != inner && a.stride != Stride::BROADCAST {
+                    out.axes[i].stride =
+                        Stride::new(a.stride.get() / v.axes[inner].extent.get() * pitch.get());
                 }
             }
             out
         };
-        let ordered = |s: &[u64]| -> View {
+        let ordered = |s: &[Extent]| -> View {
             padded(match like {
-                Some(l) if l.axes.len() == s.len() && l.axes.iter().any(|a| a.stride == 1) => {
+                Some(l)
+                    if l.axes.len() == s.len()
+                        && l.axes.iter().any(|a| a.stride == Stride::UNIT) =>
+                {
                     let mut order: Vec<usize> = (0..s.len()).collect();
                     // An axis `like` repeats along (stride 0) holds nothing of its own: outermost.
                     order.sort_by_key(|&a| {
                         (
-                            l.axes[a].stride != 0,
+                            l.axes[a].stride != Stride::BROADCAST,
                             std::cmp::Reverse(l.axes[a].stride),
                             a,
                         )
                     });
-                    let held: Vec<u64> = order.iter().map(|&a| s[a]).collect();
-                    let physical = View::row_major(0, &held);
-                    let mut v = View::row_major(0, s);
+                    let held: Vec<Extent> = order.iter().map(|&a| s[a]).collect();
+                    let physical = View::row_major(Elems::ZERO, &held);
+                    let mut v = View::row_major(Elems::ZERO, s);
                     for (k, &a) in order.iter().enumerate() {
                         v.axes[a].stride = physical.axes[k].stride;
                     }
                     v
                 }
-                _ => View::row_major(0, s),
+                _ => View::row_major(Elems::ZERO, s),
             })
         };
         let (elements, view) = match holding {
             Holding::PerStick => {
-                let mut v = View::row_major(0, shape);
+                let mut v = View::row_major(Elems::ZERO, shape);
                 for a in &mut v.axes {
-                    a.stride *= lanes;
+                    a.stride = a.stride.times(lanes.extent());
                 }
-                (numel * lanes, v)
+                (Stride::of_lanes(lanes).span(numel), v)
             }
             Holding::Dense => {
                 let v = ordered(shape);
@@ -498,8 +515,11 @@ impl<G: DeviceGen> Cx<'_, G> {
     /// How `o` holds its values: one per stick when no axis is the lanes of a stick.
     fn holding(o: &Operand) -> Holding {
         if matches!(o.store, Store::Local(_) | Store::Param(_))
-            && o.view.axes.iter().all(|a| a.stride != 1 || a.extent == 1)
-            && o.view.axes.iter().any(|a| a.stride != 0)
+            && o.view
+                .axes
+                .iter()
+                .all(|a| a.stride != Stride::UNIT || a.extent == Extent::ONE)
+            && o.view.axes.iter().any(|a| a.stride != Stride::BROADCAST)
         {
             Holding::PerStick
         } else {
@@ -521,7 +541,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         }
         let dense: Vec<&Operand> = inputs
             .iter()
-            .filter(|o| o.view.axes.iter().any(|a| a.stride != 0))
+            .filter(|o| o.view.axes.iter().any(|a| a.stride != Stride::BROADCAST))
             .collect();
         // The result holds one value per stick when every input it reads does: a per-stick input
         // repeated along an outer axis reads the same stick at every position of it. Repeated
@@ -533,7 +553,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                     && o.view
                         .axes
                         .last()
-                        .is_none_or(|a| a.stride != 0 || a.extent == 1)
+                        .is_none_or(|a| a.stride != Stride::BROADCAST || a.extent == Extent::ONE)
             }) {
             Holding::PerStick
         } else {
@@ -541,7 +561,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         };
         let like = dense
             .iter()
-            .find(|o| o.view.axes.iter().any(|a| a.stride == 1 && a.extent > 1))
+            .find(|o| o.view.axes.iter().any(|a| a.is_unit()))
             .or(dense.first())
             .map(|o| o.view.clone());
         let output = self.local_like(&shape, format, holding, like.as_ref());
@@ -594,8 +614,8 @@ impl<G: DeviceGen> Cx<'_, G> {
             }
         };
         let space = input.view.shape();
-        let stick = input.view.axes[axis].stride == 1;
-        let out_shape: Vec<u64> = space
+        let stick = input.view.axes[axis].stride == Stride::UNIT;
+        let out_shape: Vec<Extent> = space
             .iter()
             .enumerate()
             .filter(|&(i, _)| i != axis)
@@ -610,13 +630,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         };
         let result = self.local(&out_shape, format, holding);
         let mut out = result.clone();
-        out.view.axes.insert(
-            axis,
-            crate::view::Axis {
-                extent: space[axis],
-                stride: 0,
-            },
-        );
+        out.view.axes.insert(axis, Axis::broadcast(space[axis]));
         let func = OpFunc::Reduce(combine, if stick { RAxis::Stick } else { RAxis::NonStick });
         self.graph.nodes.push(Node {
             func,
@@ -688,7 +702,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         };
         let (m, k) = (a.view.axes[rank - 2].extent, a.view.axes[rank - 1].extent);
         let n = b.view.axes[rank - 1].extent;
-        let batches: Vec<u64> = a.view.axes[..rank - 2].iter().map(|x| x.extent).collect();
+        let batches: Vec<Extent> = a.view.axes[..rank - 2].iter().map(|x| x.extent).collect();
         if (form == Contraction::Batched) != !batches.is_empty() {
             return Err(malformed("a batch matmul carries a batch axis"));
         }
@@ -784,12 +798,12 @@ impl<G: DeviceGen> Cx<'_, G> {
         &mut self,
         op: &Operation<'_>,
         (store, view, format): (Store, &View, DataFormat),
-        (corner, shape): (&[u64], &[u64]),
-        (a, index, scale, add): (usize, Operand, u64, u64),
+        (corner, shape): (&[Extent], &[Extent]),
+        (a, index, scale, add): (usize, Operand, Extent, Extent),
     ) -> Result<Val, LiftError> {
         let e = shape[a];
         let axis = view.axes[a];
-        if scale != e || add != 0 || axis.extent % e != 0 {
+        if scale != e || add != Extent::ZERO || !axis.extent.get().is_multiple_of(e.get()) {
             return Err(LiftError::DynamicIndex { op: op.op_type });
         }
         let mut base = view
@@ -803,13 +817,13 @@ impl<G: DeviceGen> Cx<'_, G> {
                 error,
             })?;
         // Axis `a` as (block, row in block): the index walks blocks.
-        base.axes[a] = crate::view::Axis {
-            extent: 1,
-            stride: axis.stride * e,
+        base.axes[a] = Axis {
+            extent: Extent::ONE,
+            stride: axis.stride.times(e),
         };
         base.axes.insert(
             a + 1,
-            crate::view::Axis {
+            Axis {
                 extent: e,
                 stride: axis.stride,
             },
@@ -830,7 +844,7 @@ impl<G: DeviceGen> Cx<'_, G> {
             gather: Gather {
                 axis: a,
                 index: Box::new(index),
-                rows: axis.extent / e,
+                rows: Extent::new(axis.extent.get() / e.get()),
             },
             shape: shape.to_vec(),
         })
@@ -842,19 +856,22 @@ impl<G: DeviceGen> Cx<'_, G> {
         &mut self,
         op: &Operation<'_>,
         (store, view, format): (Store, &View, DataFormat),
-        (corner, shape): (&[u64], &[u64]),
-        (a, index, add): (usize, Operand, u64),
+        (corner, shape): (&[Extent], &[Extent]),
+        (a, index, add): (usize, Operand, Extent),
     ) -> Result<Val, LiftError> {
         let mut one = shape.to_vec();
-        one[a] = 1;
-        let mut rows = Vec::with_capacity(shape[a] as usize);
-        for k in 0..shape[a] {
-            let mut at = vec![0u64; view.axes.len()];
-            at[a] = add + k;
-            let mut extents: Vec<u64> = view.axes.iter().map(|x| x.extent).collect();
+        one[a] = Extent::ONE;
+        let mut rows = Vec::with_capacity(shape[a].get() as usize);
+        for k in 0..shape[a].get() {
+            let row = Extent::new(add.get() + k);
+            let mut at = vec![Extent::ZERO; view.axes.len()];
+            at[a] = row;
+            let mut extents: Vec<Extent> = view.axes.iter().map(|x| x.extent).collect();
             extents[a] = extents[a]
-                .checked_sub(add + k)
+                .get()
+                .checked_sub(row.get())
                 .filter(|&n| n > 0)
+                .map(Extent::new)
                 .ok_or(LiftError::DynamicIndex { op: op.op_type })?;
             let from = view
                 .window(&at, &extents)
@@ -866,7 +883,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                 op,
                 (store, &from, format),
                 (corner, &one),
-                (a, index.clone(), 1, 0),
+                (a, index.clone(), Extent::ONE, Extent::ZERO),
             )?
             else {
                 return Err(LiftError::Malformed {
@@ -910,11 +927,11 @@ impl<G: DeviceGen> Cx<'_, G> {
             Some(Attr::Ssas(v)) => v.to_vec(),
             _ => return Err(malformed("an indirect tile states its offsets")),
         };
-        let mut corner = vec![0u64; shape.len()];
+        let mut corner = vec![Extent::ZERO; shape.len()];
         let mut indirect = None;
         for (d, kind) in kinds.iter().enumerate() {
             match *kind {
-                "direct_sub" => corner[d] = self.int(op, offsets[d])? as u64,
+                "direct_sub" => corner[d] = Extent::new(self.int(op, offsets[d])? as u64),
                 "indirect" if indirect.is_none() => {
                     let Val::Mem {
                         store: istore,
@@ -930,12 +947,12 @@ impl<G: DeviceGen> Cx<'_, G> {
                     let index = match self.get(offsets[d])? {
                         Val::Int(o) => Operand {
                             store: istore,
-                            view: iview.window(&[o as u64], &[n]).map_err(|error| {
-                                LiftError::View {
+                            view: iview.window(&[Extent::new(o as u64)], &[n]).map_err(
+                                |error| LiftError::View {
                                     op: op.op_type,
                                     error,
-                                }
-                            })?,
+                                },
+                            )?,
                             format: ifmt,
                             gather: None,
                         },
@@ -947,7 +964,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                             } = self.block_tile(
                                 op,
                                 (istore, &iview, ifmt),
-                                (&[0], &[n]),
+                                (&[Extent::ZERO], &[n]),
                                 (0, index, scale, add),
                             )?
                             else {
@@ -1020,18 +1037,18 @@ impl<G: DeviceGen> Cx<'_, G> {
         let shape = view.shape();
         let lanes = format.lanes::<G>();
         let t = (0..shape.len())
-            .filter(|&a| view.axes[a].stride != 1 && shape[a] > 1)
+            .filter(|&a| view.axes[a].stride != Stride::UNIT && shape[a].get() > 1)
             .max_by_key(|&a| view.axes[a].stride)
             .unwrap_or(0);
         let mut order: Vec<usize> = (0..shape.len()).filter(|&a| a != t).collect();
         order.sort_by_key(|&a| (std::cmp::Reverse(view.axes[a].stride), a));
         order.push(t);
-        let mut held: Vec<u64> = order.iter().map(|&a| shape[a]).collect();
+        let mut held: Vec<Extent> = order.iter().map(|&a| shape[a]).collect();
         if let Some(l) = held.last_mut() {
-            *l = l.next_multiple_of(lanes);
+            *l = l.whole_sticks(lanes);
         }
-        let physical = View::row_major(0, &held);
-        let mut lv = View::row_major(0, &shape);
+        let physical = View::row_major(Elems::ZERO, &held);
+        let mut lv = View::row_major(Elems::ZERO, &shape);
         for (k, &a) in order.iter().enumerate() {
             lv.axes[a].stride = physical.axes[k].stride;
         }
@@ -1108,12 +1125,10 @@ impl<G: DeviceGen> Cx<'_, G> {
                 let input = self.operand(op, &value, &shape, format)?;
                 for (k, (base, gather)) in rows.into_iter().enumerate() {
                     let space = base.view.shape();
-                    let row =
-                        Self::row_of(&input.view, axis, k as u64, &space).map_err(|error| {
-                            LiftError::View {
-                                op: op.op_type,
-                                error,
-                            }
+                    let row = Self::row_of(&input.view, axis, Extent::new(k as u64), &space)
+                        .map_err(|error| LiftError::View {
+                            op: op.op_type,
+                            error,
                         })?;
                     self.note_param(base.store, base.format);
                     self.graph.nodes.push(Node {
@@ -1156,11 +1171,11 @@ impl<G: DeviceGen> Cx<'_, G> {
     }
 
     /// Row `k` of `v` along `axis`, seen as `space`.
-    fn row_of(v: &View, axis: usize, k: u64, space: &[u64]) -> Result<View, ViewError> {
-        let mut at = vec![0u64; v.axes.len()];
+    fn row_of(v: &View, axis: usize, k: Extent, space: &[Extent]) -> Result<View, ViewError> {
+        let mut at = vec![Extent::ZERO; v.axes.len()];
         at[axis] = k;
         let mut one = v.shape();
-        one[axis] = 1;
+        one[axis] = Extent::ONE;
         v.window(&at, &one)?.reshape(space)
     }
 
@@ -1258,7 +1273,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                     {
                         Val::Param {
                             param,
-                            offset: offset + y as u64,
+                            offset: offset + Elems::new(y as u64),
                         }
                     }
                     (Val::Dyn { index, scale, add }, Val::Int(y))
@@ -1269,12 +1284,12 @@ impl<G: DeviceGen> Cx<'_, G> {
                             K::ArithAddi => Val::Dyn {
                                 index,
                                 scale,
-                                add: add + y as u64,
+                                add: Extent::new(add.get() + y as u64),
                             },
                             K::ArithMuli => Val::Dyn {
                                 index,
-                                scale: scale * y as u64,
-                                add: add * y as u64,
+                                scale: Extent::new(scale.get() * y as u64),
+                                add: Extent::new(add.get() * y as u64),
                             },
                             _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                         }
@@ -1285,16 +1300,18 @@ impl<G: DeviceGen> Cx<'_, G> {
             }
             K::KtdpConstructMemoryView => {
                 let shape = int_list(op, AttrKey::Shape)
-                    .map(u64s)
+                    .map(extents)
                     .ok_or(malformed("a view states its shape"))?;
                 // A view stating no strides is row-major over its shape.
-                let strides = int_list(op, AttrKey::Strides).map(u64s).unwrap_or_else(|| {
-                    View::row_major(0, &shape)
-                        .axes
-                        .iter()
-                        .map(|a| a.stride)
-                        .collect()
-                });
+                let strides = int_list(op, AttrKey::Strides)
+                    .map(strides)
+                    .unwrap_or_else(|| {
+                        View::row_major(Elems::ZERO, &shape)
+                            .axes
+                            .iter()
+                            .map(|a| a.stride)
+                            .collect()
+                    });
                 let format = Self::format(op)?;
                 let (param, offset) = match self.get(op.operands[0])? {
                     Val::Param { param, offset } => (param, offset),
@@ -1304,38 +1321,41 @@ impl<G: DeviceGen> Cx<'_, G> {
                 if let Some(Some(Held {
                     order,
                     inner,
-                    columns,
+                    innermost,
                 })) = self.layouts.get(param)
                 {
-                    if view != View::row_major(0, &shape) {
+                    if view != View::row_major(Elems::ZERO, &shape) {
                         return Err(malformed("a re-laid-out buffer's view is row-major"));
                     }
                     let lanes = format.lanes::<G>();
                     let (outer, last) = order.split_at(order.len() - 1);
                     let inner_axis = last[0];
-                    if *columns {
-                        // Stick columns: the outer axes row-major, one stick per position, and
-                        // the innermost axis's sticks a whole column apart.
-                        let held: Vec<u64> = outer.iter().map(|&a| shape[a]).collect();
-                        let physical = View::row_major(0, &held);
-                        for (k, &a) in outer.iter().enumerate() {
-                            view.axes[a].stride = physical.axes[k].stride * lanes;
+                    match innermost {
+                        Innermost::Columns => {
+                            // Stick columns: the outer axes row-major, one stick per position,
+                            // and the innermost axis's sticks a whole column apart.
+                            let held: Vec<Extent> = outer.iter().map(|&a| shape[a]).collect();
+                            let physical = View::row_major(Elems::ZERO, &held);
+                            for (k, &a) in outer.iter().enumerate() {
+                                view.axes[a].stride = physical.axes[k].stride.times(lanes.extent());
+                            }
+                            view.axes[inner_axis].stride = Stride::UNIT;
+                            view.tile = Some(crate::view::Tile {
+                                axis: inner_axis,
+                                lanes,
+                                pitch: Stride::of_lanes(lanes).times(Extent::product(&held)),
+                            });
                         }
-                        view.axes[inner_axis].stride = 1;
-                        view.tile = Some(crate::view::Tile {
-                            axis: inner_axis,
-                            lanes,
-                            pitch: held.iter().product::<u64>() * lanes,
-                        });
-                    } else {
-                        // Row-major in `order`, the innermost axis `inner` wide.
-                        let mut held: Vec<u64> = order.iter().map(|&a| shape[a]).collect();
-                        if let Some(l) = held.last_mut() {
-                            *l = (*inner).max(l.next_multiple_of(lanes));
-                        }
-                        let physical = View::row_major(0, &held);
-                        for (k, &a) in order.iter().enumerate() {
-                            view.axes[a].stride = physical.axes[k].stride;
+                        Innermost::Rows => {
+                            // Row-major in `order`, the innermost axis `inner` wide.
+                            let mut held: Vec<Extent> = order.iter().map(|&a| shape[a]).collect();
+                            if let Some(l) = held.last_mut() {
+                                *l = (*inner).max(l.whole_sticks(lanes));
+                            }
+                            let physical = View::row_major(Elems::ZERO, &held);
+                            for (k, &a) in order.iter().enumerate() {
+                                view.axes[a].stride = physical.axes[k].stride;
+                            }
                         }
                     }
                 }
@@ -1373,7 +1393,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                     let stated = Self::shape(op)?;
                     match &order {
                         Some(o) => {
-                            let mut block = vec![0u64; stated.len()];
+                            let mut block = vec![Extent::ZERO; stated.len()];
                             for (i, &a) in o.iter().enumerate() {
                                 block[a] = stated[i];
                             }
@@ -1386,10 +1406,10 @@ impl<G: DeviceGen> Cx<'_, G> {
                 let mut dynamic = None;
                 for (a, &s) in op.operands[1..].iter().enumerate() {
                     match self.get(s)? {
-                        Val::Int(i) => corner.push(i as u64),
+                        Val::Int(i) => corner.push(Extent::new(i as u64)),
                         Val::Dyn { index, scale, add } if dynamic.is_none() => {
                             dynamic = Some((a, index, scale, add));
-                            corner.push(0);
+                            corner.push(Extent::ZERO);
                         }
                         _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                     }
@@ -1416,12 +1436,16 @@ impl<G: DeviceGen> Cx<'_, G> {
                         }
                     }
                     (Some(_), Some(_)) => return Err(LiftError::DynamicIndex { op: op.op_type }),
-                    (Some((a, index, 1, add)), None) if shape[a] > 1 => self.row_tiles(
-                        op,
-                        (store, &view, format),
-                        (&corner, &shape),
-                        (a, index, add),
-                    )?,
+                    (Some((a, index, scale, add)), None)
+                        if scale == Extent::ONE && shape[a] > Extent::ONE =>
+                    {
+                        self.row_tiles(
+                            op,
+                            (store, &view, format),
+                            (&corner, &shape),
+                            (a, index, add),
+                        )?
+                    }
                     (Some((a, index, scale, add)), None) => self.block_tile(
                         op,
                         (store, &view, format),
@@ -1439,15 +1463,15 @@ impl<G: DeviceGen> Cx<'_, G> {
                 };
                 let mut at = Vec::with_capacity(op.operands.len() - 1);
                 for &s in &op.operands[1..] {
-                    at.push(self.int(op, s)? as u64);
+                    at.push(Extent::new(self.int(op, s)? as u64));
                 }
                 let elem = o.view.shifted(&at);
                 let index = Operand {
                     view: View {
                         offset: elem.offset,
-                        axes: vec![crate::view::Axis {
-                            extent: 1,
-                            stride: 1,
+                        axes: vec![Axis {
+                            extent: Extent::ONE,
+                            stride: Stride::UNIT,
                         }],
                         tile: None,
                     },
@@ -1457,8 +1481,8 @@ impl<G: DeviceGen> Cx<'_, G> {
                     op,
                     Val::Dyn {
                         index,
-                        scale: 1,
-                        add: 0,
+                        scale: Extent::ONE,
+                        add: Extent::ZERO,
                     },
                 );
             }
@@ -1513,12 +1537,11 @@ impl<G: DeviceGen> Cx<'_, G> {
                                 ..base
                             };
                             let space = value.view.shape();
-                            let row = Self::row_of(&out.view, axis, k as u64, &space).map_err(
-                                |error| LiftError::View {
+                            let row = Self::row_of(&out.view, axis, Extent::new(k as u64), &space)
+                                .map_err(|error| LiftError::View {
                                     op: op.op_type,
                                     error,
-                                },
-                            )?;
+                                })?;
                             self.graph.nodes.push(Node {
                                 func: OpFunc::Identity,
                                 space,
@@ -1553,12 +1576,12 @@ impl<G: DeviceGen> Cx<'_, G> {
                     Val::Tensor(o)
                     | Val::Dyn {
                         index: o,
-                        scale: 1,
-                        add: 0,
-                    } if o.view.numel() == 1 => {
+                        scale: Extent::ONE,
+                        add: Extent::ZERO,
+                    } if o.view.numel() == Elems::new(1) => {
                         let axes = shape
                             .iter()
-                            .map(|&extent| Axis { extent, stride: 0 })
+                            .map(|&extent| Axis::broadcast(extent))
                             .collect();
                         Val::Tensor(Operand {
                             view: View {
@@ -1592,7 +1615,7 @@ impl<G: DeviceGen> Cx<'_, G> {
             K::TensorExpandShape | K::TensorCollapseShape | K::TensorReshape => {
                 let to = int_list(op, AttrKey::TargetShape)
                     .or_else(|| int_list(op, AttrKey::Shape))
-                    .map(u64s)
+                    .map(extents)
                     .ok_or(malformed("a reshape states its result shape"))?;
                 self.view_op(op, |v| v.reshape(&to))?;
             }

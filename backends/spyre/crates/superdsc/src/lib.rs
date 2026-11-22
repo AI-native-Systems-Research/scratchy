@@ -18,6 +18,7 @@ pub mod graph;
 pub mod layout;
 pub mod lift;
 pub mod opfunc;
+pub mod qty;
 pub mod view;
 pub mod wire;
 
@@ -26,7 +27,7 @@ use ktir_core::ir::IRFunction;
 
 pub use emit::{Bindings, DevAddr, EmitError, Footprint};
 pub use layout::Residency;
-pub use lift::{Held, LiftError, ParamLayout};
+pub use lift::{Held, Innermost, LiftError, ParamLayout};
 
 /// Why a function did not lower.
 #[derive(Clone, Debug, PartialEq)]

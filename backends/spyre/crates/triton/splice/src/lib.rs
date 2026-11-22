@@ -1543,7 +1543,7 @@ pub use scratchy_spyre_bundle::rung::{HeadWidth, PoolPageSlots, SchedulerBlockTo
 
 /// An int32 stick: the generation's stick bytes over int32's four (spyre-inference's
 /// `INT32_ELEMS_PER_STICK`).
-pub const INT32_STICK: u32 = Df::UInt32.lanes::<ktir_core::ddl_binds::Baked>() as u32;
+pub const INT32_STICK: u32 = Df::UInt32.lanes::<ktir_core::ddl_binds::Baked>().get() as u32;
 
 /// ⭐ WHAT A PAGED BUNDLE'S ROWS ARE — the fact spyre-inference's dispatch reads besides the query
 /// width: one sequence's query rows, or one decode row of each sequence of a batch
@@ -1729,7 +1729,7 @@ impl BatchChunking {
         let landed = SchedulerBlockTokens::REFERENCE.get() as u64
             * (if nkvh < 1 { 1 } else { nkvh }) as u64
             * head_size as u64
-            * Df::Fp16.word_bytes()
+            * Df::Fp16.word_bytes().get()
             * seqs as u64;
         let reach =
             <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MUTABLE_REACH_BYTES

@@ -4,6 +4,8 @@
 use ktir_core::ddl_binds::DeviceGen;
 use ktir_core::dtypes::DType;
 
+use crate::qty::{Bytes, Lanes};
+
 /// A device element format.
 ///
 /// The device stores every format in 128-byte sticks; a format's lane count is the stick's bytes
@@ -36,18 +38,18 @@ impl DataFormat {
     }
 
     /// Bytes per element.
-    pub const fn word_bytes(self) -> u64 {
-        match self {
+    pub const fn word_bytes(self) -> Bytes {
+        Bytes::new(match self {
             DataFormat::Fp16 => 2,
             DataFormat::Fp32 | DataFormat::UInt32 => 4,
             DataFormat::Fp8 => 1,
             DataFormat::Int64 => 8,
-        }
+        })
     }
 
     /// Elements per stick on generation `G`.
-    pub const fn lanes<G: DeviceGen>(self) -> u64 {
-        G::FLIT_BYTES / self.word_bytes()
+    pub const fn lanes<G: DeviceGen>(self) -> Lanes {
+        Lanes::new(G::FLIT_BYTES / self.word_bytes().get())
     }
 
     /// The name dxp reads for this format.
