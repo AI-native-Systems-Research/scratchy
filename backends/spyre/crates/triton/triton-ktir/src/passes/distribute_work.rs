@@ -42,8 +42,8 @@ const PASS: &str = "DistributeWork";
 
 /// Default grid extent / compute-tile count for the 1-D scope.
 const DEFAULT_NUM_BLOCKS: i64 = 64;
-/// The frontend's default core count — the SAME fact ktir-superdsc's
-/// `MAX_CORES` states, READ from the one table (`<Baked as DeviceGen>::CORES`,
+/// The frontend's default core count — the SAME fact the SuperDSC lowering's
+/// division reads, READ from the one table (`<Baked as DeviceGen>::CORES`,
 /// senlib's `RCU_CORES` = 32, under its citation): the producer and the
 /// consumer of a work division cannot disagree about the array width.
 const DEFAULT_NUM_CORES: i64 =

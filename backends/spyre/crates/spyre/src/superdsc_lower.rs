@@ -219,10 +219,10 @@ pub fn rooms<T: Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     rows_are_requests: bool,
     query_rows: scratchy_spyre_bundle::rung::QueryExtent,
-) -> Result<std::collections::BTreeMap<u32, u64>, String> {
+) -> std::collections::BTreeMap<u32, u64> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     use rayon::prelude::*;
-    let per_node: Vec<Result<Vec<(u32, u64)>, String>> = ir
+    let per_node: Vec<Vec<(u32, u64)>> = ir
         .nodes
         .par_iter()
         .map(|node| {
@@ -248,23 +248,25 @@ pub fn rooms<T: Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
                         }
                     })
                     .collect();
-                let layouts = spyre_superdsc::layouts::<Baked>(&k.func, &residency)
-                    .map_err(|err| format!("{}: {err:?}", e.op_name))?;
-                let p = spyre_superdsc::plan::<Baked>(&k.func, &layouts)
-                    .map_err(|err| format!("{}: {err:?}", e.op_name))?;
+                // A program the lowering cannot plan reserves nothing here: the card's own
+                // lowering of it ([`place_rung`]) refuses it by name, and no other target reads it.
+                let Ok(layouts) = spyre_superdsc::layouts::<Baked>(&k.func, &residency) else {
+                    continue;
+                };
+                let Ok(p) = spyre_superdsc::plan::<Baked>(&k.func, &layouts) else {
+                    continue;
+                };
                 out.extend(tids(k).zip(p.footprint.room.iter().copied()));
             }
-            Ok(out)
+            out
         })
         .collect();
     let mut room = std::collections::BTreeMap::new();
-    for r in per_node {
-        for (t, b) in r? {
-            let e = room.entry(t).or_insert(0u64);
-            *e = (*e).max(b);
-        }
+    for (t, b) in per_node.into_iter().flatten() {
+        let e = room.entry(t).or_insert(0u64);
+        *e = (*e).max(b);
     }
-    Ok(room)
+    room
 }
 
 /// `e`'s descriptors against the rung's placements.

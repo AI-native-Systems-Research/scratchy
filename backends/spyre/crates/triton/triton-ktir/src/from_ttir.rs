@@ -500,7 +500,7 @@ fn dtype(t: &ttir::Type, in_desc: bool, what: &str) -> Result<DType> {
         // chain is card-proven on it). The LEGAL position is the weight VIEW's elem:
         // `tl.make_tensor_descriptor` over an fp8 pointer builds a tensordesc whose
         // elem is `f8E4M3FN`, and the memory view stamped from it must carry the
-        // attribute `ktir-superdsc`'s `regions()` reads (`is_fp8`). Computed values are
+        // attribute the SuperDSC lift reads as the view's format. Computed values are
         // f16 (the frontend refuses a mixed `tl.dot`, so the kernel widens with
         // `.to(tl.float16)`), so this arm is exercised by views, not by results.
         ttir::Type::Float(FloatKind::F8E4M3FN) => DType::Fp8E4m3,

@@ -10,7 +10,7 @@
 //! it is bound until its last use, so hoisting makes EVERY block's constants co-resident with
 //! the first block's working set.
 //!
-//! The row-block law (`ktir_superdsc::superdsc_opspec::rows_per_block`) sizes a block so ONE
+//! The row-block law sizes a block so ONE
 //! block's live set fits LX; it cannot see constants that belong to a LATER block but are
 //! already resident. MEASURED (gemma-4-12b emu prefill, m = 19, `gelu_fwd` over `[19, 15360]`
 //! blocked 11 + 8): the kernel's three constants (`0.044715`, `2·√(2/π)`, `1.0`) were splatted

@@ -435,15 +435,15 @@ pub fn compute_bundle_layout<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
         weight_ids,
         paged_rows == scratchy_triton_splice::PagedRows::Batch,
         query_rows,
-    )
-    .map_err(SuperDscError)?;
+    );
     // A `[rows, cols]` tensor is held row-major, each row whole sticks of its format.
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         let df = kernel_dfs.get(&tid).copied().unwrap_or(DataFormat::Fp16);
         let lanes = df.lanes::<ktir_core::ddl_binds::Baked>();
-        let natural =
-            u64::from(s.rows) * u64::from(s.cols).next_multiple_of(lanes) * df.word_bytes();
+        let natural = u64::from(s.rows)
+            * scratchy_spyre_bundle::rung::row_pitch(u64::from(s.cols), lanes)
+            * df.word_bytes();
         natural.max(room.get(&tid).copied().unwrap_or(0))
     };
     // ── Liveness: first def (output of node i) and last use (input of node j). A

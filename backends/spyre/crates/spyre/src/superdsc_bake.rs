@@ -1227,12 +1227,10 @@ impl DxpTool {
     /// ⛔ THE AMBIENT KNOBS NO dxp CHILD MAY INHERIT, because the emission has already decided them.
     ///
     /// `DXP_LX_FRAC_AVAIL` sets where dbo's `reserveFrontendLx` puts the boundary between the frontend's
-    /// LX and dxp's own (`dbo/src/Transforms/ProgramLayout.cpp:81-98`). The emitter pins LX
-    /// intermediates up to [`ktir_superdsc::superdsc_opspec::FRONTEND_LX_END`], which is computed at the
-    /// knob's default (0.2). An exported value would move dxp's floor under those pins: lower, and dxp
-    /// lands on them; higher, and an op that fits today stops fitting. Either way the bake would compile
-    /// a different contract than the one the emission was laid out for. So the bake removes the knob from
-    /// every child, and dxp always runs at its default.
+    /// LX and dxp's own (`dbo/src/Transforms/ProgramLayout.cpp:81-98`). An exported value would move
+    /// dxp's floor under the emission's layout, so the bake would compile a different contract than the
+    /// one the emission was laid out for. So the bake removes the knob from every child, and dxp always
+    /// runs at its default.
     ///
     /// The cache identity drops these too ([`Self::UNINHERITED_ENV`]): an ambient value no child sees
     /// cannot change a compile.

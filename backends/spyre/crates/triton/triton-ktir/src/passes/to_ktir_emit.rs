@@ -82,10 +82,9 @@ fn dtype(d: DType) -> Result<KDType> {
         DType::I32 | DType::SI32 => KDType::I32,
         DType::I64 => KDType::I64,
         // Same variant, same spelling -- theirs is the device's own. This is the arm
-        // that lights the fp8 door: a weight view whose elem maps through here stamps
-        // `AttrKey::Dtype = Fp8E4m3` (via `state_shape_and_dtype`), which
-        // `ktir-superdsc`'s `regions()` reads to set `is_fp8` and the arity-3
-        // `matmul_fp8_descriptors` door keys on. A load's RESULT never takes this arm:
+        // that makes an fp8 weight: a weight view whose elem maps through here stamps
+        // `AttrKey::Dtype = Fp8E4m3` (via `state_shape_and_dtype`), which the SuperDSC
+        // lift reads as the view's format. A load's RESULT never takes this arm:
         // the kernel widens with `.to(tl.float16)` (the frontend refuses a mixed
         // `tl.dot`), so results are F16 exactly as in scratchy's own producer
         // (`KTIR_ELEM`).

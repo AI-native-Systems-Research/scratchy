@@ -1310,7 +1310,7 @@ impl SpyreWorker {
         // prefix ladder's adoption below mints each rung's own beside its build), so no
         // BundleMeta in this file is spelled a second time.
         let mk_meta =
-            |p: Parsed, _prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
+            |p: Parsed, _prog: usize, _wiring: &'static scratchy_target_spyre::wiring::Wiring| {
                 BundleMeta {
                     #[cfg(not(feature = "spyre-hw"))]
                     prog: _prog,
@@ -1329,7 +1329,7 @@ impl SpyreWorker {
                     #[cfg(not(feature = "spyre-hw"))]
                     output_ids: p.output_ids,
                     #[cfg(feature = "spyre-hw")]
-                    wiring,
+                    wiring: _wiring,
                 }
             };
         // The serve span hosting every card's completion threads — built with the runtimes

@@ -704,6 +704,7 @@ jobs:
         model:
           - { name: granite-3.1-2b fp16, features: "scratchy-models/granite-3.1-2b-instruct" }
           - { name: granite-3.1-2b fp8, features: "scratchy-models/granite-3.1-2b-instruct,scratchy-quantizations/fp8-dynamic-per-channel" }
+          - { name: granite-3.1-2b fp8 KV, features: "scratchy-models/granite-3.1-2b-instruct,kv-fp8" }
           - { name: granite-3.1-8b fp16, features: "scratchy-models/granite-3.1-8b-instruct" }
           - { name: granite-3.1-8b fp8, features: "scratchy-models/granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel" }
     defaults:

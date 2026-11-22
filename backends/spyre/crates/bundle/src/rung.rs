@@ -13,6 +13,13 @@ pub const POOL_STICK: u32 = FP16_LANES;
 pub const FP16_LANES: u32 =
     (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES / 2) as u32;
 
+/// ⭐ AN ACTIVATION'S ROW AS THE DEVICE HOLDS IT — a `[rows, cols]` activation is row-major, each
+/// row whole sticks of its format: `cols` rounded up to the stick's `lanes`. The placement reserves
+/// rows of this pitch, the kernels' views address them, and a host read of one steps by it.
+pub const fn row_pitch(cols: u64, lanes: u64) -> u64 {
+    cols.next_multiple_of(lanes)
+}
+
 /// ⭐⭐⭐⭐⭐ A HEAD'S WIDTH, STATED IN THE POOL'S OWN STICKS — never a bare `head_dim` number.
 ///
 /// THE LAW: a head on this device is a WHOLE NUMBER of fp16 sticks — `head_dim = sticks · 64`,

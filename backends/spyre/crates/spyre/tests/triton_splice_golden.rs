@@ -536,6 +536,56 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     );
 }
 
+/// ⭐ THE LOGITS' ROWS ARE WHOLE STICKS. A result matmul of an odd width (granite's vocab 49155)
+/// writes each row at the activation row law's pitch — the width in whole fp16 sticks
+/// (`rung::row_pitch`) — so a host read of row `r` of the logits starts at `r · pitch`, not
+/// `r · width`. Two rows at width 100: row 1 begins at element 128.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn an_odd_width_result_holds_its_rows_at_the_stick_pitch() {
+    let (m, k, n) = (2u32, 64u32, 100u32);
+    let group = spliced_matmul_group(m, k, n);
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
+        .collect();
+    let want = host_matmul(&a, &w, m, k, n);
+    let mut session =
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
+            .expect("build the one-program session");
+    let out = session
+        .run_step(
+            0,
+            vec![
+                (0, a, vec![m as usize, k as usize]),
+                (1, w, vec![n as usize, k as usize]),
+            ],
+            &[(2, 0)],
+        )
+        .expect("run the spliced matmul program");
+    let pitch = scratchy_spyre_bundle::rung::row_pitch(
+        u64::from(n),
+        u64::from(scratchy_spyre_bundle::rung::FP16_LANES),
+    ) as usize;
+    assert_eq!(pitch, 128, "100 columns are two fp16 sticks");
+    let got = &out[&2];
+    assert_eq!(
+        got.len(),
+        m as usize * pitch,
+        "the result holds whole-stick rows"
+    );
+    for r in 0..m as usize {
+        let row = &got[r * pitch..r * pitch + n as usize];
+        let max_abs = max_abs_err(row, &want[r * n as usize..(r + 1) * n as usize]);
+        assert!(
+            max_abs < 0.05,
+            "row {r} at r·pitch is the product's row {r}: {max_abs}"
+        );
+    }
+}
+
 /// ⭐ TWO SESSIONS ON ONE THREAD READ THEIR OWN RESIDENT WEIGHTS. The emulator's GPU weight cache
 /// is per THREAD and keyed by a weight's HBM address, and a resident pass trusts the key without
 /// sampling content; two sessions over the same program lay the same weight tid out at the same

@@ -404,7 +404,7 @@ pub(crate) fn run_card_launch(
             let read = pf
                 .defer_read_tensor_ring(
                     scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
-                    answers.get() * vocab * 2,
+                    answers.get() * crate::spyre_forward::logits_pitch(vocab) * 2,
                 )
                 .map_err(|e| {
                     werr(format!(
@@ -653,13 +653,14 @@ pub(crate) enum SeatLaws<'a> {
 }
 
 /// Each answer row's token, drawn on the host from the `[rows, vocab]` logits as the card holds them
-/// (row `r`'s at `r · vocab`, SEN169 fp16), under its row's law.
+/// (row `r`'s at `r · pitch`, [`crate::spyre_forward::logits_pitch`], SEN169 fp16), under its row's law.
 fn draw_rows(bytes: &[u8], vocab: usize, laws: &[RowLaw<'_>]) -> ExecutorResult<Vec<u32>> {
+    let pitch = crate::spyre_forward::logits_pitch(vocab);
     laws.iter()
         .enumerate()
         .map(|(r, law)| {
             let row = bytes
-                .get(r * vocab * 2..(r + 1) * vocab * 2)
+                .get(r * pitch * 2..(r * pitch + vocab) * 2)
                 .ok_or_else(|| {
                     werr(format!(
                         "the logits read holds {} B, short of row {r}'s {vocab} lanes",
@@ -691,7 +692,7 @@ fn read_drawn_tokens(
     let read = session
         .defer_read_tensor_raw(
             scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
-            laws.len() * vocab * 2,
+            laws.len() * crate::spyre_forward::logits_pitch(vocab) * 2,
         )
         .map_err(|e| werr(format!("logits readback (t{result_id}): {e}")))?;
     session

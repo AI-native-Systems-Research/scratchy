@@ -84,6 +84,16 @@ pub(crate) fn draw_token(
         })
 }
 
+/// The elements between two logits rows as the device holds them: the vocab in whole fp16
+/// sticks, the activation row law ([`scratchy_spyre_bundle::rung::row_pitch`]) the lm-head's
+/// output view states.
+pub(crate) fn logits_pitch(vocab: usize) -> usize {
+    scratchy_spyre_bundle::rung::row_pitch(
+        vocab as u64,
+        u64::from(scratchy_spyre_bundle::rung::FP16_LANES),
+    ) as usize
+}
+
 /// Gumbel noise `-ln(-ln u)` for `lane` of a row at `step` under `seed`, `u ∈ (0, 1)` the
 /// splitmix64 finalizer of the three.
 fn gumbel(seed: u64, step: u32, lane: u32) -> f64 {
@@ -169,16 +179,13 @@ pub(crate) fn run_request_step(
     let chunk_w = n.max(1);
     #[cfg(not(feature = "spyre-hw"))]
     let chunk_w = b.m_cap;
-    // ⭐ THE PROMPT'S LAST TOKEN RUNS THROUGH PREFILL, exactly as on main. The
-    // prompt-final chunk's own minted sampler (the general mint — every prefill
-    // rung carries the draw) picks the first generated token ON THE CARD from
-    // the folded lm-head row, and the idx stick is read back exactly like a
-    // decode launch's. No decode launch runs a prompt step, so the last prompt
-    // position's KV is prefill-written, as main writes it. A generation step
-    // (n==1) prefills nothing and takes the DECODE pick launch below — every
-    // generated token past the first is the decode bundle's own draw. A
-    // mid-prompt wave (start+n still inside the prompt) forwards every token it
-    // was given and picks nothing: its chunks' suffixes never run.
+    // ⭐ THE PROMPT'S LAST TOKEN RUNS THROUGH PREFILL. The prompt-final chunk's folded lm-head
+    // row is read back and the host draws the first generated token from it, as it draws a
+    // decode launch's. No decode launch runs a prompt step, so the last prompt position's KV is
+    // prefill-written. A generation step (n==1) prefills nothing and takes the DECODE launch
+    // below — every generated token past the first is drawn from the decode bundle's logits. A
+    // mid-prompt wave (start+n still inside the prompt) forwards every token it was given and
+    // draws nothing.
     let finishes = start + n >= tokens.prompt_len(id);
     let prefill_n = if finishes && n > 1 {
         n
@@ -251,16 +258,10 @@ pub(crate) fn run_request_step(
         return Ok(None);
     }
     let tok = if n > 1 {
-        // The prompt-final chunk's on-card pick — the prefill rung's own minted
-        // sampler, read back as its idx stick. A `None` here means the final
-        // chunk never asked for its draw — a wiring bug, never a silent skip.
-        prompt_pick.ok_or_else(|| {
-            werr("the prompt-final chunk picked no token — its minted draw never ran".to_string())
-        })?
+        // The prompt-final chunk's draw.
+        prompt_pick.ok_or_else(|| werr("the prompt-final chunk drew no token".to_string()))?
     } else {
-        // THE PICK — on the card, through the decode bundle's sampler. No host
-        // logits, no host argmax, anywhere: the idx stick is the only answer that
-        // comes back.
+        // THE DRAW — from the decode launch's logits.
         let db = select_decode(&model.decode, start + n);
         match forward_chunk(
             &sh,
@@ -279,10 +280,10 @@ pub(crate) fn run_request_step(
         {
             Some(ts) => *ts
                 .last()
-                .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?,
+                .ok_or_else(|| werr("the decode launch drew no token".to_string()))?,
             None => {
                 return Err(werr(
-                    "the pick step ran no decode launch — this build has no device sampler"
+                    "the decode launch answered nothing — a decode row is always answered"
                         .to_string(),
                 ));
             }
@@ -325,7 +326,7 @@ mod draw_tests {
             draw: Some(&d),
             step,
         };
-        let flat = vec![0.0f32; 4];
+        let flat = [0.0f32; 4];
         let picks: Vec<u32> = (0..4000)
             .map(|s| draw_token(0, flat.iter().copied(), &law(s)).unwrap())
             .collect();

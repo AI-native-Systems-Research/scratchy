@@ -6,8 +6,10 @@
 |---|---|
 | `triton-frontend` | Triton `.py` → TTIR, in Rust. Python is parsed by an owned hand-rolled parser (`src/py/parser.rs`, no dependencies), with `src/py/census.rs` as the scope boundary (refuses out-of-census constructs by name at their source line). |
 | `triton-ktir` | TTIR value → KTIR value: the nine KTDP/KTDF passes, ported for behaviour. |
-| `triton-numeric` | The numeric verification harness: `.py` → TTIR → KTIR → `ktir-emulator`, scored against checked-in torch reference data in `test-numeric/`. |
-| `triton-ktir-superdsc` | The adapter: our KTIR value → `ktir-superdsc`'s `KtirNode` + per-kind entry points, plus the case table (`cases.rs`) and the `bake_py` example that drives the whole chain. |
+| `triton-numeric` | The numeric verification harness: `.py` → TTIR → KTIR → `ktir-emulator`, scored against checked-in torch reference data in `test-numeric/`, and the case table (`cases.rs`). |
+
+The KTIR → SuperDSC lowering these feed is `../superdsc` (`scratchy-spyre-superdsc`); its
+`lower_py` example drives the whole chain for one kernel.
 
 Test data (relocated from triton-spyre's `third_party/spyre/test/`):
 `test-fixtures/` (kernel `.py`), `test-goldens/` (KTIR + TTIR goldens),
@@ -23,11 +25,8 @@ effort lives under `third_party/spyre/rust/`.
 
 **The split, agreed with Nick 2026-10-02:**
 
-- **scratchy owns the lowering crates** (the four here). This tree already
-  owns `ktir-superdsc` — the KTIR→SuperDSC lowering triton-spyre vendored
-  and re-vendored from us (at `ec18ac1da`, local delta zero, PRs #197/#215
-  carried the door extensions back into main). The re-host completes the
-  arrow reversal: one home for the whole Triton→SuperDSC ladder.
+- **scratchy owns the lowering crates** (the ones here, and the KTIR→SuperDSC lowering
+  beside them): one home for the whole Triton→SuperDSC ladder.
 - **triton-spyre keeps the proof**: fixtures' numeric data generation
   (`gen_numeric_data.py`), card evidence, scorers, the parity table. It
   consumes these crates as a git dependency.
@@ -77,7 +76,6 @@ When triton-spyre regenerates the goldens, un-pin all three.
 ## What is deliberately NOT here
 
 - Their `triton-superdsc/` and `triton-superdsc-lower/` crates (their own
-  parallel KTIR→SuperDSC lowering, never card-proven, kept as reference) —
-  superseded by our `ktir-superdsc`.
+  parallel KTIR→SuperDSC lowering, never card-proven, kept as reference).
 - The pod scorers and card-run harness (`third_party/spyre/test/pod/`) —
   the proof side of the split.

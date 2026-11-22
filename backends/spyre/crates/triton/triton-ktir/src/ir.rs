@@ -822,9 +822,8 @@ pub enum DType {
     /// scratchy's W8A8 chain is card-proven on (`DType::Fp8E4m3`, `ktir_matmul_fp8.rs`).
     /// It exists in this enum for the WEIGHT VIEW only: a Triton kernel loads an fp8
     /// weight through a descriptor whose memref elem is `f8E4M3FN`, and the view's
-    /// `AttrKey::Dtype` -- the attribute `ktir-superdsc`'s `regions()` reads to set
-    /// `is_fp8` -- must carry it or the arity-3 fp8 door refuses ("the weight view
-    /// declares f16 but the program binds 3 input(s)"). A COMPUTED value is never fp8
+    /// `AttrKey::Dtype` -- the attribute the SuperDSC lift reads as the view's format --
+    /// must carry it, or the weight reads as f16. A COMPUTED value is never fp8
     /// here: the frontend refuses a mixed `tl.dot(f16, fp8)` (`semantic.py`'s "Both
     /// operands must be same dtype"), so the kernel widens with `.to(tl.float16)` and
     /// the load's RESULT type is f16 already -- which is also scratchy's own contract

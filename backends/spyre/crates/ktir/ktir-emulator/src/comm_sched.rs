@@ -1813,12 +1813,7 @@ pub fn set_parallel_safe(on: bool) -> bool {
 ///
 /// # THE SHAPE
 ///
-/// The same four discriminators the door's own chain proof uses
-/// (`ktir-superdsc`'s `program_rmsnorm_chains`, re-derived here because the
-/// emulator cannot depend on the door's crate — a re-derivation that is
-/// PINNED, not merely claimed: the spyre crate's recognizer-parity test runs
-/// this walk and the door's recognizer over the same shipped programs and
-/// asserts the two agree, which is also why this walk is `pub`): the chain rooted at
+/// Four discriminators: the chain rooted at
 /// `math.rsqrt`, whose operand is an `arith.addf` adding one splatted constant
 /// (the eps) to a value produced by an `arith.mulf` scaling a SUM-reduce by
 /// exactly `1/cols`, over a square whose two operands are the SAME value. A

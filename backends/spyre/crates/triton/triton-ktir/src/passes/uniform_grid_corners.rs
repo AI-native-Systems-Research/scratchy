@@ -3,9 +3,9 @@
 //! THE GRID-CORNER UNIFORM SPELLING.
 //!
 //! A 2-D `ktdp.construct_access_tile` whose corner is computed from the grid position
-//! is the one shape the whole-function door cannot address: `region_for_operand`
-//! (ktir-superdsc's `whole_function.rs`) resolves a 2-D window only when both corners
-//! are constants, and refuses everything else by name --
+//! is the one shape a whole-function reader cannot address without evaluating the grid: a
+//! 2-D window resolves only when both corners are constants, and everything else was refused
+//! by name --
 //!
 //! ```text
 //!   A loop-carried or computed corner needs hoisting or unrolling before the
@@ -36,20 +36,14 @@
 //! window), stays computed, and the fire gate still unrolls -- the designed outcome for
 //! the head-grouped family, not a miss.
 //!
-//! # THE TWO READERS, AND THE SHARED CONTRACT
+//! # THE PROPAGATION
 //!
-//! `ktir-superdsc` is a serde-only leaf that cannot depend on this crate, so the
-//! uniform family is stated TWICE: here, over this crate's ops, and there, over
-//! `ktir-core`'s. [`uniform_corners`] is this side's statement -- an affine-form
-//! propagation (`stride · ctid + base` per SSA, the same single-pass shape
-//! `index_constants` uses for constants) -- and the door carries its twin. The contract
-//! between them is exact: SOUND (only ops closed under affine forms propagate -- a
-//! cast is transparent, an add of a constant or another uniform composes, mul by a
-//! constant scales; div, rem, and a product of two position terms are dropped, so
-//! nothing is claimed the twin cannot also claim) and COMPLETE for every form this
-//! pass mints and for the two forms `fold_grid_work_loop` ships (the landmark itself,
-//! and `landmark + t · num_cores`). The bridge test in `triton-ktir-superdsc` runs one
-//! module through both and asserts they agree.
+//! [`uniform_corners`] is an affine-form propagation (`stride · ctid + base` per SSA, the same
+//! single-pass shape `index_constants` uses for constants). It is SOUND: only ops closed under
+//! affine forms propagate -- a cast is transparent, an add of a constant or another uniform
+//! composes, mul by a constant scales; div, rem, and a product of two position terms are
+//! dropped. It is COMPLETE for every form this pass mints and for the two forms
+//! `fold_grid_work_loop` ships (the landmark itself, and `landmark + t · num_cores`).
 //!
 //! # WHAT IS LEFT STANDING
 //!

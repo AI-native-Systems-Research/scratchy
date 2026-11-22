@@ -603,8 +603,8 @@ fn extf(
     // Widen float (e.g. f16 -> f32). Storage is already f32; relabel tiles —
     // EXCEPT the f16→f32 pair on the CARD, which IS `dl16tofp32`: that opcode
     // writes value-exact but LANE-PERMUTED output (the target-ABI fact
-    // `ktir_superdsc::element_arrangement` states as const tables; the 1:1
-    // naming of the pair is `convert_kind_of`'s, whole_function.rs). The staged
+    // `ddl_binds::DeviceGen::DL16TOFP32_PERMUTATION` states as a const table; the
+    // lowering names the pair `dl16tofp32` 1:1). The staged
     // tables a bundle binds are EMITTED in that arrangement, so an emulator
     // that relabels without permuting reads them at wrong lanes — the W=1 pick
     // flip (golden 12040, emulator 12048: the ramp's lane 16 read at lane 8's

@@ -198,6 +198,10 @@ pub(crate) fn forward_chunk(
             .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
         tokens.set_tokens_in_pool(id, start + n);
+        // A mid-prompt chunk answers nothing: no row of it is drawn.
+        if start + n < tokens.prompt_len(id) {
+            return Ok(ChunkOut::Prompt);
+        }
         // ⭐ THE ANSWER ROWS ARE THE RESULT'S FIRST ROWS: a prompt chunk's lm-head tail is folded to
         // its requests' last rows (request `r`'s logits at row `r`), a decode batch's rows are its
         // sequences'. The host draws each row's token under the request's own law; the caller
@@ -212,13 +216,13 @@ pub(crate) fn forward_chunk(
             }
         };
         let picks = logits
-            .chunks(vocab)
+            .chunks(crate::spyre_forward::logits_pitch(vocab))
             .take(answers)
             .enumerate()
             .map(|(r, row)| {
                 draw_token(
                     r,
-                    row.iter().copied(),
+                    row.iter().take(vocab).copied(),
                     &RowLaw {
                         draw: req.draw.as_ref(),
                         step: (start + n - 1) as u32,

@@ -1939,7 +1939,7 @@ const _: () = assert!(
 // large (measured at m=71, N=15360 — clean), and its un-blocked arm only
 // fires when `m·N ≤ 90_000` elements, whose whole tile is ~180 KB.
 //
-// The budget is the ONE const, read from ktir-superdsc beside the LX capacity
+// The budget is the ONE const, read beside the LX capacity
 // it derives from (`LX_FUSION_BUDGET_BYTES` = 7/8 of the 2 MiB LX — headroom
 // for the planner's model-vs-mechanism gap, which is exactly what the old
 // constant lacked); the tile count and the peak-bytes formula are the

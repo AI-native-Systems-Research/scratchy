@@ -2754,7 +2754,7 @@ impl StaggeredSite {
 /// The GATHER side of the card's `dl16tofp32` lane stagger:
 /// `DL16TOFP32_SOURCE_LANE[p]` is the logical lane a `Dl16ToFp32` block holds at
 /// buffer position `p`. The staging scatters (lane `i` is written at
-/// `DL16TOFP32_PERMUTATION[i]`, ktir-superdsc's ABI table); a kernel thread
+/// `DL16TOFP32_PERMUTATION[i]`, the generation's ABI table); a kernel thread
 /// computes one position, so it gathers, and reads this row. Inverted from that
 /// table at compile time, never re-derived from the rotation and never copied.
 const DL16TOFP32_SOURCE_LANE: [u8; 64] = inverse_of(&DL16TOFP32_PERMUTATION);

@@ -105,7 +105,6 @@ impl SpyreWorker {
             in_flight: Default::default(),
             #[cfg(feature = "spyre-hw")]
             drain_door: None,
-            #[cfg(feature = "spyre-hw")]
             input_batch: scratchy_serving_engine::input_batch::InputBatch::new(),
             declared_context: None,
             // Matches the CLI's own `--gpu-memory-utilization` default; `declare_workload` overwrites

@@ -69,7 +69,7 @@ impl GridExecutor {
 ///
 /// The choice needs no per-convert set, by the bake's own laws: the bake maps
 /// (ArithExtf, F16→F32) 1:1 to `dl16tofp32`
-/// (`ktir_superdsc`'s `convert_kind_of`), whose const-table row states the
+/// (the lowering's `OpFunc::Widen`), whose const-table row states the
 /// output is lane-permuted; the bake REFUSES a staggered input entering any
 /// convert, so in every bake-accepted program every `dl16tofp32`'s operand IS
 /// standard; and the bake refuses a staggered value reaching a store or meeting
