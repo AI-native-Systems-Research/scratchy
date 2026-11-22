@@ -40,7 +40,7 @@ pub fn preamble() -> proc_macro2::TokenStream {
         #[allow(unused_imports)]
         use ::scratchy_target_spyre::bundle_code::{
             Elementwise as __KElem, LaunchProgram as __KProg, PlaceId as __KPlace,
-            Program as __KProgram, SynthRole as __KRole,
+            Program as __KProgram,
         };
         #[allow(unused_imports)]
         use ::std::borrow::Cow::Borrowed as __KCow;
@@ -449,65 +449,6 @@ fn place_id_tokens(
         PlaceId::Act(t) => {
             let t = proc_macro2::Literal::u32_unsuffixed(t);
             quote! { __KPlace::Act(#t) }
-        }
-        PlaceId::Synth { of, role } => {
-            let of = proc_macro2::Literal::u32_unsuffixed(of);
-            let r = synth_role_tokens(role);
-            quote! { __KPlace::Synth { of: #of, role: #r } }
-        }
-        PlaceId::OpLocal { of, role } => {
-            let of = proc_macro2::Literal::u32_unsuffixed(of);
-            let r = crate::bake::op_local_role_tokens(&role);
-            quote! { __KPlace::OpLocal { of: #of, role: #r } }
-        }
-    }
-}
-
-fn synth_role_tokens(
-    role: scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::SynthRole,
-) -> proc_macro2::TokenStream {
-    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::SynthRole as R;
-    let path = quote! { __KRole };
-    // The four INDEXED roles carry a block number; every other is a unit variant, emitted by name.
-    match role {
-        R::Blk(i) => {
-            let i = proc_macro2::Literal::u32_unsuffixed(i);
-            quote! { #path::Blk(#i) }
-        }
-        R::Acc(i) => {
-            let i = proc_macro2::Literal::u32_unsuffixed(i);
-            quote! { #path::Acc(#i) }
-        }
-        R::LBlk(i) => {
-            let i = proc_macro2::Literal::u32_unsuffixed(i);
-            quote! { #path::LBlk(#i) }
-        }
-        R::LAcc(i) => {
-            let i = proc_macro2::Literal::u32_unsuffixed(i);
-            quote! { #path::LAcc(#i) }
-        }
-        // The amax partial slot — indexed like the four above; the catch-all below would render
-        // `FqAmaxP(2)` from Debug, which is not an ident.
-        R::FqAmaxP(j) => {
-            let j = proc_macro2::Literal::u32_unsuffixed(j);
-            quote! { #path::FqAmaxP(#j) }
-        }
-        // The long-reduce partial slot — indexed like the four above, same reason.
-        R::ReducePartial(j) => {
-            let j = proc_macro2::Literal::u32_unsuffixed(j);
-            quote! { #path::ReducePartial(#j) }
-        }
-        R::GatherKtLx(i) => {
-            let i = proc_macro2::Literal::u32_unsuffixed(i);
-            quote! { #path::GatherKtLx(#i) }
-        }
-        R::GatherVLx(h) => {
-            let h = proc_macro2::Literal::u32_unsuffixed(h);
-            quote! { #path::GatherVLx(#h) }
-        }
-        other => {
-            let v = variant(format!("{other:?}"));
-            quote! { #path::#v }
         }
     }
 }
