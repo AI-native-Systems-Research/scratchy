@@ -577,9 +577,6 @@ impl ResidentExecutor {
         })
     }
 
-
-
-
     /// Enable/disable LAST-TOKEN-ONLY mode. When ON, the final result-producing
     /// projection (the segment whose store writes a program RESULT tensor — e.g. a
     /// transformer's `lm_head`) computes ONLY the last output row (`m-1`) instead

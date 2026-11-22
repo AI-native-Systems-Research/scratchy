@@ -38,19 +38,42 @@ enum Val {
     Int(i64),
     Float(f64),
     /// A parameter's address, `offset` elements in.
-    Param { param: usize, offset: u64 },
+    Param {
+        param: usize,
+        offset: u64,
+    },
     /// A memory view or an access tile over a store.
-    Mem { store: Store, view: View, format: DataFormat },
+    Mem {
+        store: Store,
+        view: View,
+        format: DataFormat,
+    },
     /// An access tile read or written through an index tensor: `base` is the view with the indexed
     /// axis one row per index, `shape` the tile's own shape.
-    Indirect { base: Operand, gather: Gather, shape: Vec<u64> },
+    Indirect {
+        base: Operand,
+        gather: Gather,
+        shape: Vec<u64>,
+    },
     /// An access tile at a row offset read from memory: its rows along `axis`, each one row
     /// read or written through the offset.
-    Rows { axis: usize, rows: Vec<(Operand, Gather)>, shape: Vec<u64> },
+    Rows {
+        axis: usize,
+        rows: Vec<(Operand, Gather)>,
+        shape: Vec<u64>,
+    },
     /// An index the function reads from memory: `index[0] · scale + add`.
-    Dyn { index: Operand, scale: u64, add: u64 },
+    Dyn {
+        index: Operand,
+        scale: u64,
+        add: u64,
+    },
     Tensor(Operand),
-    Splat { value: f64, format: DataFormat, shape: Vec<u64> },
+    Splat {
+        value: f64,
+        format: DataFormat,
+        shape: Vec<u64>,
+    },
     /// An uninitialized tensor: what a destination-passing op writes into.
     Empty,
     Tuple(Vec<Val>),
@@ -100,7 +123,13 @@ pub fn lift_relocating<G: DeviceGen>(
     for point in 0..gx.max(1) * gy.max(1) * gz.max(1) {
         cx.env.clear();
         for (i, (ssa, _)) in f.arguments.iter().enumerate() {
-            cx.env.insert(*ssa, Val::Param { param: i, offset: 0 });
+            cx.env.insert(
+                *ssa,
+                Val::Param {
+                    param: i,
+                    offset: 0,
+                },
+            );
         }
         let coord = [
             point % gx.max(1),
@@ -117,17 +146,103 @@ pub fn lift_relocating<G: DeviceGen>(
         .collect();
     back.sort_by_key(|b| b.0);
     for (p, local, lv, pv, format) in back {
-        if cx.graph.nodes.iter().filter(|n| n.output.store == local).count() > 1 {
+        if cx
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.output.store == local)
+            .count()
+            > 1
+        {
             cx.graph.nodes.push(Node {
                 func: OpFunc::Restick,
                 space: pv.shape(),
-                inputs: vec![Operand { store: local, view: lv, format, gather: None }],
-                output: Operand { store: Store::Param(p), view: pv, format, gather: None },
+                inputs: vec![Operand {
+                    store: local,
+                    view: lv,
+                    format,
+                    gather: None,
+                }],
+                output: Operand {
+                    store: Store::Param(p),
+                    view: pv,
+                    format,
+                    gather: None,
+                },
             });
         }
     }
     forward_stores(&mut cx.graph);
+    convert_through_index(&mut cx.graph);
     Ok(cx.graph)
+}
+
+/// `operands` re-stated over `space`, a space their own differs from only in axes of one position.
+/// An operand read through an index keeps its space: its indexed axis is counted in it.
+fn over_space(operands: &[Operand], space: &[u64]) -> Option<Vec<Operand>> {
+    operands
+        .iter()
+        .map(|o| match &o.gather {
+            Some(_) if o.view.axes.len() != space.len() => None,
+            _ => Some(Operand {
+                view: o.view.over_space(space)?,
+                ..o.clone()
+            }),
+        })
+        .collect()
+}
+
+/// A conversion reads its input through the index: rows gathered by a copy whose only reader is a
+/// format conversion are converted straight out of the indexed buffer. dxp binds a copy for fp16
+/// and fp32 words only, so an fp8 gather exists only as the conversion that widens it.
+fn convert_through_index(g: &mut Graph) {
+    let mut i = 0;
+    while i < g.nodes.len() {
+        let n = &g.nodes[i];
+        let Store::Local(l) = n.output.store else {
+            i += 1;
+            continue;
+        };
+        if n.func != OpFunc::Identity || n.inputs.len() != 1 || n.inputs[0].gather.is_none() {
+            i += 1;
+            continue;
+        }
+        let touches = |m: &Node| {
+            m.inputs.iter().any(|o| {
+                o.store == Store::Local(l)
+                    || o.gather
+                        .as_ref()
+                        .is_some_and(|gt| gt.index.store == Store::Local(l))
+            })
+        };
+        let writers = g
+            .nodes
+            .iter()
+            .filter(|m| m.output.store == Store::Local(l))
+            .count();
+        let readers: Vec<usize> = (0..g.nodes.len())
+            .filter(|&j| touches(&g.nodes[j]))
+            .collect();
+        let fold = match readers[..] {
+            [j] if writers == 1 && j > i => {
+                let r = &g.nodes[j];
+                (r.func.converts()
+                    && r.inputs.len() == 1
+                    && r.inputs[0].store == Store::Local(l)
+                    && r.inputs[0].view.same_elements(&n.output.view)
+                    && r.space == n.space)
+                    .then_some(j)
+            }
+            _ => None,
+        };
+        let Some(j) = fold else {
+            i += 1;
+            continue;
+        };
+        let gathered = g.nodes[i].inputs[0].clone();
+        g.nodes[j].inputs[0] = gathered;
+        g.nodes.remove(i);
+    }
 }
 
 struct Cx<'l, G> {
@@ -180,7 +295,10 @@ impl<G: DeviceGen> Cx<'_, G> {
     }
 
     fn format(op: &Operation<'_>) -> Result<DataFormat, LiftError> {
-        match (op.attr(AttrKey::Dtype), op.result_type.and_then(|t| t.elem())) {
+        match (
+            op.attr(AttrKey::Dtype),
+            op.result_type.and_then(|t| t.elem()),
+        ) {
             (Some(Attr::Dtype(d)), _) => Ok(DataFormat::of(*d)),
             (_, Some(d)) => Ok(DataFormat::of(d)),
             _ => Err(LiftError::Malformed {
@@ -232,8 +350,13 @@ impl<G: DeviceGen> Cx<'_, G> {
     }
 
     /// A value as an operand over `shape`.
-    fn operand(&mut self, op: &Operation<'_>, v: &Val, shape: &[u64], format: DataFormat)
-        -> Result<Operand, LiftError> {
+    fn operand(
+        &mut self,
+        op: &Operation<'_>,
+        v: &Val,
+        shape: &[u64],
+        format: DataFormat,
+    ) -> Result<Operand, LiftError> {
         match v {
             Val::Tensor(o) => {
                 let mut o = o.clone();
@@ -284,8 +407,13 @@ impl<G: DeviceGen> Cx<'_, G> {
 
     /// A fresh intermediate whose axes are stored in the order of `like`'s strides (outermost
     /// first), else row-major.
-    fn local_like(&mut self, shape: &[u64], format: DataFormat, per_stick: bool, like: Option<&View>)
-        -> Operand {
+    fn local_like(
+        &mut self,
+        shape: &[u64],
+        format: DataFormat,
+        per_stick: bool,
+        like: Option<&View>,
+    ) -> Operand {
         let lanes = format.lanes::<G>();
         let numel: u64 = shape.iter().product();
         // The innermost axis is held in whole sticks: a partial stick pads to the stick.
@@ -313,7 +441,11 @@ impl<G: DeviceGen> Cx<'_, G> {
                     let mut order: Vec<usize> = (0..s.len()).collect();
                     // An axis `like` repeats along (stride 0) holds nothing of its own: outermost.
                     order.sort_by_key(|&a| {
-                        (l.axes[a].stride != 0, std::cmp::Reverse(l.axes[a].stride), a)
+                        (
+                            l.axes[a].stride != 0,
+                            std::cmp::Reverse(l.axes[a].stride),
+                            a,
+                        )
                     });
                     let held: Vec<u64> = order.iter().map(|&a| s[a]).collect();
                     let physical = View::row_major(0, &held);
@@ -375,7 +507,10 @@ impl<G: DeviceGen> Cx<'_, G> {
         let per_stick = !dense.is_empty()
             && dense.iter().all(|o| {
                 Self::per_stick(o)
-                    && o.view.axes.last().is_none_or(|a| a.stride != 0 || a.extent == 1)
+                    && o.view
+                        .axes
+                        .last()
+                        .is_none_or(|a| a.stride != 0 || a.extent == 1)
             });
         let like = dense
             .iter()
@@ -488,7 +623,10 @@ impl<G: DeviceGen> Cx<'_, G> {
     }
 
     fn matmul(&mut self, op: &Operation<'_>, batch: bool) -> Result<(), LiftError> {
-        let malformed = |what| LiftError::Malformed { op: op.op_type, what };
+        let malformed = |what| LiftError::Malformed {
+            op: op.op_type,
+            what,
+        };
         let (Val::Tensor(a), Val::Tensor(b)) =
             (self.get(op.operands[0])?, self.get(op.operands[1])?)
         else {
@@ -560,8 +698,11 @@ impl<G: DeviceGen> Cx<'_, G> {
         Ok(())
     }
 
-    fn view_op(&mut self, op: &Operation<'_>, f: impl Fn(&View) -> Result<View, ViewError>)
-        -> Result<(), LiftError> {
+    fn view_op(
+        &mut self,
+        op: &Operation<'_>,
+        f: impl Fn(&View) -> Result<View, ViewError>,
+    ) -> Result<(), LiftError> {
         let v = match self.get(op.operands[0])? {
             Val::Tensor(o) => match f(&o.view) {
                 Ok(view) => Val::Tensor(Operand { view, ..o }),
@@ -576,10 +717,18 @@ impl<G: DeviceGen> Cx<'_, G> {
                         inputs: vec![o],
                         output: copy.clone(),
                     });
-                    let view = f(&copy.view).map_err(|error| LiftError::View { op: op.op_type, error })?;
+                    let view = f(&copy.view).map_err(|error| LiftError::View {
+                        op: op.op_type,
+                        error,
+                    })?;
                     Val::Tensor(Operand { view, ..copy })
                 }
-                Err(error) => return Err(LiftError::View { op: op.op_type, error }),
+                Err(error) => {
+                    return Err(LiftError::View {
+                        op: op.op_type,
+                        error,
+                    });
+                }
             },
             Val::Splat { value, format, .. } => Val::Splat {
                 value,
@@ -612,20 +761,41 @@ impl<G: DeviceGen> Cx<'_, G> {
         if scale != e || add != 0 || axis.extent % e != 0 {
             return Err(LiftError::DynamicIndex { op: op.op_type });
         }
-        let mut base = view.window(corner, &{
-            let mut s = shape.to_vec();
-            s[a] = axis.extent;
-            s
-        })
-        .map_err(|error| LiftError::View { op: op.op_type, error })?;
+        let mut base = view
+            .window(corner, &{
+                let mut s = shape.to_vec();
+                s[a] = axis.extent;
+                s
+            })
+            .map_err(|error| LiftError::View {
+                op: op.op_type,
+                error,
+            })?;
         // Axis `a` as (block, row in block): the index walks blocks.
-        base.axes[a] = crate::view::Axis { extent: 1, stride: axis.stride * e };
-        base.axes.insert(a + 1, crate::view::Axis { extent: e, stride: axis.stride });
+        base.axes[a] = crate::view::Axis {
+            extent: 1,
+            stride: axis.stride * e,
+        };
+        base.axes.insert(
+            a + 1,
+            crate::view::Axis {
+                extent: e,
+                stride: axis.stride,
+            },
+        );
         if base.tile.is_some() {
-            return Err(LiftError::View { op: op.op_type, error: ViewError::Tiled });
+            return Err(LiftError::View {
+                op: op.op_type,
+                error: ViewError::Tiled,
+            });
         }
         Ok(Val::Indirect {
-            base: Operand { store, view: base, format, gather: None },
+            base: Operand {
+                store,
+                view: base,
+                format,
+                gather: None,
+            },
             gather: Gather {
                 axis: a,
                 index: Box::new(index),
@@ -657,23 +827,45 @@ impl<G: DeviceGen> Cx<'_, G> {
                 .ok_or(LiftError::DynamicIndex { op: op.op_type })?;
             let from = view
                 .window(&at, &extents)
-                .map_err(|error| LiftError::View { op: op.op_type, error })?;
-            let Val::Indirect { base, gather, .. } =
-                self.block_tile(op, (store, &from, format), (corner, &one), (a, index.clone(), 1, 0))?
+                .map_err(|error| LiftError::View {
+                    op: op.op_type,
+                    error,
+                })?;
+            let Val::Indirect { base, gather, .. } = self.block_tile(
+                op,
+                (store, &from, format),
+                (corner, &one),
+                (a, index.clone(), 1, 0),
+            )?
             else {
-                return Err(LiftError::Malformed { op: op.op_type, what: "a row of a tile" });
+                return Err(LiftError::Malformed {
+                    op: op.op_type,
+                    what: "a row of a tile",
+                });
             };
             rows.push((base, gather));
         }
-        Ok(Val::Rows { axis: a, rows, shape: shape.to_vec() })
+        Ok(Val::Rows {
+            axis: a,
+            rows,
+            shape: shape.to_vec(),
+        })
     }
 
     /// `ktdp.construct_indirect_access_tile`: along each `indirect` dimension the row is the index
     /// view's entry at `offset + d`; along each `direct_sub` dimension the coordinate is
     /// `offset + d`.
     fn indirect_tile(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
-        let malformed = |what| LiftError::Malformed { op: op.op_type, what };
-        let Val::Mem { store, view, format } = self.get(op.operands[0])? else {
+        let malformed = |what| LiftError::Malformed {
+            op: op.op_type,
+            what,
+        };
+        let Val::Mem {
+            store,
+            view,
+            format,
+        } = self.get(op.operands[0])?
+        else {
             return Err(malformed("an indirect tile indexes a memory view"));
         };
         let shape = Self::shape(op)?;
@@ -681,7 +873,8 @@ impl<G: DeviceGen> Cx<'_, G> {
             Some(Attr::StrList(k)) => *k,
             _ => return Err(malformed("an indirect tile states its dimension kinds")),
         };
-        let data = int_list(op, AttrKey::DimData).ok_or(malformed("an indirect tile states its index views"))?;
+        let data = int_list(op, AttrKey::DimData)
+            .ok_or(malformed("an indirect tile states its index views"))?;
         let offsets = match op.attr(AttrKey::IntermediateVars) {
             Some(Attr::Ssas(v)) => v.to_vec(),
             _ => return Err(malformed("an indirect tile states its offsets")),
@@ -692,8 +885,11 @@ impl<G: DeviceGen> Cx<'_, G> {
             match *kind {
                 "direct_sub" => corner[d] = self.int(op, offsets[d])? as u64,
                 "indirect" if indirect.is_none() => {
-                    let Val::Mem { store: istore, view: iview, format: ifmt } =
-                        self.get(op.operands[1 + data[d] as usize])?
+                    let Val::Mem {
+                        store: istore,
+                        view: iview,
+                        format: ifmt,
+                    } = self.get(op.operands[1 + data[d] as usize])?
                     else {
                         return Err(malformed("an index view is a memory view"));
                     };
@@ -703,17 +899,33 @@ impl<G: DeviceGen> Cx<'_, G> {
                     let index = match self.get(offsets[d])? {
                         Val::Int(o) => Operand {
                             store: istore,
-                            view: iview.window(&[o as u64], &[n]).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                            view: iview.window(&[o as u64], &[n]).map_err(|error| {
+                                LiftError::View {
+                                    op: op.op_type,
+                                    error,
+                                }
+                            })?,
                             format: ifmt,
                             gather: None,
                         },
                         Val::Dyn { index, scale, add } => {
-                            let Val::Indirect { base, gather, shape: s } =
-                                self.block_tile(op, (istore, &iview, ifmt), (&[0], &[n]), (0, index, scale, add))?
+                            let Val::Indirect {
+                                base,
+                                gather,
+                                shape: s,
+                            } = self.block_tile(
+                                op,
+                                (istore, &iview, ifmt),
+                                (&[0], &[n]),
+                                (0, index, scale, add),
+                            )?
                             else {
                                 return Err(malformed("a block of an index view"));
                             };
-                            let value = Operand { gather: Some(gather), ..base };
+                            let value = Operand {
+                                gather: Some(gather),
+                                ..base
+                            };
                             let out = self.local(&value.view.shape(), ifmt, false);
                             self.graph.nodes.push(Node {
                                 func: OpFunc::Identity,
@@ -721,7 +933,10 @@ impl<G: DeviceGen> Cx<'_, G> {
                                 inputs: vec![value],
                                 output: out.clone(),
                             });
-                            let v = out.view.reshape(&s).map_err(|error| LiftError::View { op: op.op_type, error })?;
+                            let v = out.view.reshape(&s).map_err(|error| LiftError::View {
+                                op: op.op_type,
+                                error,
+                            })?;
                             Operand { view: v, ..out }
                         }
                         _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
@@ -740,13 +955,25 @@ impl<G: DeviceGen> Cx<'_, G> {
         full[d] = rows;
         let mut base = view
             .window(&corner, &full)
-            .map_err(|error| LiftError::View { op: op.op_type, error })?;
+            .map_err(|error| LiftError::View {
+                op: op.op_type,
+                error,
+            })?;
         base.axes[d].extent = shape[d];
         self.bind(
             op,
             Val::Indirect {
-                base: Operand { store, view: base, format, gather: None },
-                gather: Gather { axis: d, index: Box::new(index), rows },
+                base: Operand {
+                    store,
+                    view: base,
+                    format,
+                    gather: None,
+                },
+                gather: Gather {
+                    axis: d,
+                    index: Box::new(index),
+                    rows,
+                },
                 shape,
             },
         );
@@ -777,28 +1004,53 @@ impl<G: DeviceGen> Cx<'_, G> {
         for (k, &a) in order.iter().enumerate() {
             lv.axes[a].stride = physical.axes[k].stride;
         }
-        self.graph.locals.push(Local { elements: lv.end(), format });
+        self.graph.locals.push(Local {
+            elements: lv.end(),
+            format,
+        });
         let store = Store::Local(self.graph.locals.len() - 1);
         self.graph.nodes.push(Node {
             func: OpFunc::Restick,
             space: shape,
-            inputs: vec![Operand { store: Store::Param(param), view: view.clone(), format, gather: None }],
-            output: Operand { store, view: lv.clone(), format, gather: None },
+            inputs: vec![Operand {
+                store: Store::Param(param),
+                view: view.clone(),
+                format,
+                gather: None,
+            }],
+            output: Operand {
+                store,
+                view: lv.clone(),
+                format,
+                gather: None,
+            },
         });
-        self.moved.insert(param, (store, lv.clone(), view.clone(), format));
+        self.moved
+            .insert(param, (store, lv.clone(), view.clone(), format));
         (store, lv)
     }
 
     fn store(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
         let value = self.get(op.operands[0])?;
         let (store, view, format) = match self.get(op.operands[1])? {
-            Val::Mem { store, view, format } => (store, view, format),
-            Val::Indirect { base, gather, shape } => {
+            Val::Mem {
+                store,
+                view,
+                format,
+            } => (store, view, format),
+            Val::Indirect {
+                base,
+                gather,
+                shape,
+            } => {
                 // The rows the index names, written: a scatter.
                 let input = self.operand(op, &value, &shape, base.format)?;
                 let rows = base.view.shape();
                 let input = Operand {
-                    view: input.view.reshape(&rows).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                    view: input.view.reshape(&rows).map_err(|error| LiftError::View {
+                        op: op.op_type,
+                        error,
+                    })?,
                     ..input
                 };
                 self.note_param(base.store, base.format);
@@ -806,27 +1058,44 @@ impl<G: DeviceGen> Cx<'_, G> {
                     func: OpFunc::Identity,
                     space: rows,
                     inputs: vec![input],
-                    output: Operand { gather: Some(gather), ..base },
+                    output: Operand {
+                        gather: Some(gather),
+                        ..base
+                    },
                 });
                 return Ok(());
             }
             Val::Rows { axis, rows, shape } => {
                 // Each row of the value, written to the row the offset names.
-                let format = rows.first().map(|(b, _)| b.format).ok_or(LiftError::Malformed {
-                    op: op.op_type,
-                    what: "a tile has rows",
-                })?;
+                let format = rows
+                    .first()
+                    .map(|(b, _)| b.format)
+                    .ok_or(LiftError::Malformed {
+                        op: op.op_type,
+                        what: "a tile has rows",
+                    })?;
                 let input = self.operand(op, &value, &shape, format)?;
                 for (k, (base, gather)) in rows.into_iter().enumerate() {
                     let space = base.view.shape();
-                    let row = Self::row_of(&input.view, axis, k as u64, &space)
-                        .map_err(|error| LiftError::View { op: op.op_type, error })?;
+                    let row =
+                        Self::row_of(&input.view, axis, k as u64, &space).map_err(|error| {
+                            LiftError::View {
+                                op: op.op_type,
+                                error,
+                            }
+                        })?;
                     self.note_param(base.store, base.format);
                     self.graph.nodes.push(Node {
                         func: OpFunc::Identity,
                         space,
-                        inputs: vec![Operand { view: row, ..input.clone() }],
-                        output: Operand { gather: Some(gather), ..base },
+                        inputs: vec![Operand {
+                            view: row,
+                            ..input.clone()
+                        }],
+                        output: Operand {
+                            gather: Some(gather),
+                            ..base
+                        },
                     });
                 }
                 return Ok(());
@@ -870,7 +1139,11 @@ impl<G: DeviceGen> Cx<'_, G> {
         }
     }
 
-    fn run(&mut self, ops: &[Operation<'_>], tile: &[usize; 3]) -> Result<Option<Vec<Val>>, LiftError> {
+    fn run(
+        &mut self,
+        ops: &[Operation<'_>],
+        tile: &[usize; 3],
+    ) -> Result<Option<Vec<Val>>, LiftError> {
         for op in ops {
             if let Some(y) = self.step(op, tile)? {
                 return Ok(Some(y));
@@ -879,9 +1152,16 @@ impl<G: DeviceGen> Cx<'_, G> {
         Ok(None)
     }
 
-    fn step(&mut self, op: &Operation<'_>, tile: &[usize; 3]) -> Result<Option<Vec<Val>>, LiftError> {
+    fn step(
+        &mut self,
+        op: &Operation<'_>,
+        tile: &[usize; 3],
+    ) -> Result<Option<Vec<Val>>, LiftError> {
         use OpKind as K;
-        let malformed = |what| LiftError::Malformed { op: op.op_type, what };
+        let malformed = |what| LiftError::Malformed {
+            op: op.op_type,
+            what,
+        };
         match op.op_type {
             K::ArithConstant => {
                 let v = match op.attr(AttrKey::Value) {
@@ -898,20 +1178,36 @@ impl<G: DeviceGen> Cx<'_, G> {
                     _ => 1,
                 };
                 let v = if n > 1 {
-                    Val::Tuple(tile[..n.min(3)].iter().map(|&t| Val::Int(t as i64)).collect())
+                    Val::Tuple(
+                        tile[..n.min(3)]
+                            .iter()
+                            .map(|&t| Val::Int(t as i64))
+                            .collect(),
+                    )
                 } else {
                     Val::Int(tile[0] as i64)
                 };
                 self.bind(op, v);
             }
-            K::ArithIndexCast | K::ArithIndexCastui | K::ArithExtsi | K::ArithExtui
+            K::ArithIndexCast
+            | K::ArithIndexCastui
+            | K::ArithExtsi
+            | K::ArithExtui
             | K::ArithTrunci => {
                 let v = self.get(op.operands[0])?;
                 self.bind(op, v);
             }
-            K::ArithAddi | K::ArithSubi | K::ArithMuli | K::ArithDivsi | K::ArithDivui
-            | K::ArithRemsi | K::ArithRemui | K::ArithMinsi | K::ArithMaxsi
-            | K::ArithFloordivsi | K::ArithCeildivsi => {
+            K::ArithAddi
+            | K::ArithSubi
+            | K::ArithMuli
+            | K::ArithDivsi
+            | K::ArithDivui
+            | K::ArithRemsi
+            | K::ArithRemui
+            | K::ArithMinsi
+            | K::ArithMaxsi
+            | K::ArithFloordivsi
+            | K::ArithCeildivsi => {
                 let (a, b) = (self.get(op.operands[0])?, self.get(op.operands[1])?);
                 let v = match (a, b) {
                     (Val::Int(x), Val::Int(y)) => Val::Int(match op.op_type {
@@ -939,8 +1235,16 @@ impl<G: DeviceGen> Cx<'_, G> {
                         if y >= 0 =>
                     {
                         match op.op_type {
-                            K::ArithAddi => Val::Dyn { index, scale, add: add + y as u64 },
-                            K::ArithMuli => Val::Dyn { index, scale: scale * y as u64, add: add * y as u64 },
+                            K::ArithAddi => Val::Dyn {
+                                index,
+                                scale,
+                                add: add + y as u64,
+                            },
+                            K::ArithMuli => Val::Dyn {
+                                index,
+                                scale: scale * y as u64,
+                                add: add * y as u64,
+                            },
                             _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                         }
                     }
@@ -949,18 +1253,29 @@ impl<G: DeviceGen> Cx<'_, G> {
                 self.bind(op, v);
             }
             K::KtdpConstructMemoryView => {
-                let shape = int_list(op, AttrKey::Shape).map(u64s).ok_or(malformed("a view states its shape"))?;
-                // A view stating no strides is row-major over its shape.
-                let strides = int_list(op, AttrKey::Strides)
+                let shape = int_list(op, AttrKey::Shape)
                     .map(u64s)
-                    .unwrap_or_else(|| View::row_major(0, &shape).axes.iter().map(|a| a.stride).collect());
+                    .ok_or(malformed("a view states its shape"))?;
+                // A view stating no strides is row-major over its shape.
+                let strides = int_list(op, AttrKey::Strides).map(u64s).unwrap_or_else(|| {
+                    View::row_major(0, &shape)
+                        .axes
+                        .iter()
+                        .map(|a| a.stride)
+                        .collect()
+                });
                 let format = Self::format(op)?;
                 let (param, offset) = match self.get(op.operands[0])? {
                     Val::Param { param, offset } => (param, offset),
                     _ => return Err(malformed("a memory view's base is a parameter")),
                 };
                 let mut view = View::of_memory(&shape, &strides);
-                if let Some(Some(Held { order, inner, columns })) = self.layouts.get(param) {
+                if let Some(Some(Held {
+                    order,
+                    inner,
+                    columns,
+                })) = self.layouts.get(param)
+                {
                     if view != View::row_major(0, &shape) {
                         return Err(malformed("a re-laid-out buffer's view is row-major"));
                     }
@@ -997,14 +1312,27 @@ impl<G: DeviceGen> Cx<'_, G> {
                 self.graph.param_views[param].push(view.clone());
                 let v = if self.relocated.contains(&param) {
                     let (store, view) = self.relocate(param, &view, format);
-                    Val::Mem { store, view, format }
+                    Val::Mem {
+                        store,
+                        view,
+                        format,
+                    }
                 } else {
-                    Val::Mem { store: Store::Param(param), view, format }
+                    Val::Mem {
+                        store: Store::Param(param),
+                        view,
+                        format,
+                    }
                 };
                 self.bind(op, v);
             }
             K::KtdpConstructAccessTile => {
-                let Val::Mem { store, view, format } = self.get(op.operands[0])? else {
+                let Val::Mem {
+                    store,
+                    view,
+                    format,
+                } = self.get(op.operands[0])?
+                else {
                     return Err(malformed("an access tile windows a memory view"));
                 };
                 // A tile read in another order states its shape in that order: the window is the
@@ -1037,20 +1365,38 @@ impl<G: DeviceGen> Cx<'_, G> {
                 }
                 let v = match (dynamic, order) {
                     (None, order) => {
-                        let window = view
-                            .window(&corner, &shape)
-                            .map_err(|error| LiftError::View { op: op.op_type, error })?;
+                        let window =
+                            view.window(&corner, &shape)
+                                .map_err(|error| LiftError::View {
+                                    op: op.op_type,
+                                    error,
+                                })?;
                         let view = match order {
-                            Some(o) => window.permute(&o).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                            Some(o) => window.permute(&o).map_err(|error| LiftError::View {
+                                op: op.op_type,
+                                error,
+                            })?,
                             None => window,
                         };
-                        Val::Mem { store, view, format }
+                        Val::Mem {
+                            store,
+                            view,
+                            format,
+                        }
                     }
                     (Some(_), Some(_)) => return Err(LiftError::DynamicIndex { op: op.op_type }),
-                    (Some((a, index, 1, add)), None) if shape[a] > 1 => {
-                        self.row_tiles(op, (store, &view, format), (&corner, &shape), (a, index, add))?
-                    }
-                    (Some((a, index, scale, add)), None) => self.block_tile(op, (store, &view, format), (&corner, &shape), (a, index, scale, add))?,
+                    (Some((a, index, 1, add)), None) if shape[a] > 1 => self.row_tiles(
+                        op,
+                        (store, &view, format),
+                        (&corner, &shape),
+                        (a, index, add),
+                    )?,
+                    (Some((a, index, scale, add)), None) => self.block_tile(
+                        op,
+                        (store, &view, format),
+                        (&corner, &shape),
+                        (a, index, scale, add),
+                    )?,
                 };
                 self.bind(op, v);
             }
@@ -1066,20 +1412,50 @@ impl<G: DeviceGen> Cx<'_, G> {
                 }
                 let elem = o.view.shifted(&at);
                 let index = Operand {
-                    view: View { offset: elem.offset, axes: vec![crate::view::Axis { extent: 1, stride: 1 }], tile: None },
+                    view: View {
+                        offset: elem.offset,
+                        axes: vec![crate::view::Axis {
+                            extent: 1,
+                            stride: 1,
+                        }],
+                        tile: None,
+                    },
                     ..o
                 };
-                self.bind(op, Val::Dyn { index, scale: 1, add: 0 });
+                self.bind(
+                    op,
+                    Val::Dyn {
+                        index,
+                        scale: 1,
+                        add: 0,
+                    },
+                );
             }
             K::KtdpLoad => {
                 let v = match self.get(op.operands[0])? {
-                    Val::Mem { store, view, format } => {
+                    Val::Mem {
+                        store,
+                        view,
+                        format,
+                    } => {
                         self.note_param(store, format);
-                        Val::Tensor(Operand { store, view, format, gather: None })
+                        Val::Tensor(Operand {
+                            store,
+                            view,
+                            format,
+                            gather: None,
+                        })
                     }
-                    Val::Indirect { base, gather, shape } => {
+                    Val::Indirect {
+                        base,
+                        gather,
+                        shape,
+                    } => {
                         // The rows the index names, copied out.
-                        let value = Operand { gather: Some(gather), ..base };
+                        let value = Operand {
+                            gather: Some(gather),
+                            ..base
+                        };
                         let out = self.local(&value.view.shape(), value.format, false);
                         self.graph.nodes.push(Node {
                             func: OpFunc::Identity,
@@ -1087,23 +1463,39 @@ impl<G: DeviceGen> Cx<'_, G> {
                             inputs: vec![value],
                             output: out.clone(),
                         });
-                        let view = out.view.reshape(&shape).map_err(|error| LiftError::View { op: op.op_type, error })?;
+                        let view = out.view.reshape(&shape).map_err(|error| LiftError::View {
+                            op: op.op_type,
+                            error,
+                        })?;
                         Val::Tensor(Operand { view, ..out })
                     }
                     Val::Rows { axis, rows, shape } => {
                         // Each row the offset names, copied into its row of one tile.
-                        let format = rows.first().map(|(b, _)| b.format).ok_or(malformed("a tile has rows"))?;
+                        let format = rows
+                            .first()
+                            .map(|(b, _)| b.format)
+                            .ok_or(malformed("a tile has rows"))?;
                         let out = self.local(&shape, format, false);
                         for (k, (base, gather)) in rows.into_iter().enumerate() {
-                            let value = Operand { gather: Some(gather), ..base };
+                            let value = Operand {
+                                gather: Some(gather),
+                                ..base
+                            };
                             let space = value.view.shape();
-                            let row = Self::row_of(&out.view, axis, k as u64, &space)
-                                .map_err(|error| LiftError::View { op: op.op_type, error })?;
+                            let row = Self::row_of(&out.view, axis, k as u64, &space).map_err(
+                                |error| LiftError::View {
+                                    op: op.op_type,
+                                    error,
+                                },
+                            )?;
                             self.graph.nodes.push(Node {
                                 func: OpFunc::Identity,
                                 space,
                                 inputs: vec![value],
-                                output: Operand { view: row, ..out.clone() },
+                                output: Operand {
+                                    view: row,
+                                    ..out.clone()
+                                },
                             });
                         }
                         Val::Tensor(out)
@@ -1116,12 +1508,35 @@ impl<G: DeviceGen> Cx<'_, G> {
             K::TensorSplat => {
                 let shape = Self::shape(op)?;
                 let v = match self.get(op.operands[0])? {
-                    Val::Float(value) => Val::Splat { value, format: Self::format(op)?, shape },
-                    Val::Int(i) => Val::Splat { value: i as f64, format: Self::format(op)?, shape },
+                    Val::Float(value) => Val::Splat {
+                        value,
+                        format: Self::format(op)?,
+                        shape,
+                    },
+                    Val::Int(i) => Val::Splat {
+                        value: i as f64,
+                        format: Self::format(op)?,
+                        shape,
+                    },
                     // A value read from memory repeats its one element over every axis.
-                    Val::Tensor(o) | Val::Dyn { index: o, scale: 1, add: 0 } if o.view.numel() == 1 => {
-                        let axes = shape.iter().map(|&extent| Axis { extent, stride: 0 }).collect();
-                        Val::Tensor(Operand { view: View { offset: o.view.offset, axes, tile: None }, ..o })
+                    Val::Tensor(o)
+                    | Val::Dyn {
+                        index: o,
+                        scale: 1,
+                        add: 0,
+                    } if o.view.numel() == 1 => {
+                        let axes = shape
+                            .iter()
+                            .map(|&extent| Axis { extent, stride: 0 })
+                            .collect();
+                        Val::Tensor(Operand {
+                            view: View {
+                                offset: o.view.offset,
+                                axes,
+                                tile: None,
+                            },
+                            ..o
+                        })
                     }
                     _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                 };
@@ -1136,7 +1551,11 @@ impl<G: DeviceGen> Cx<'_, G> {
                     Val::Int(i) => i as f64,
                     _ => return Err(LiftError::DynamicIndex { op: op.op_type }),
                 };
-                let v = Val::Splat { value, format: Self::format(op)?, shape: Self::shape(op)? };
+                let v = Val::Splat {
+                    value,
+                    format: Self::format(op)?,
+                    shape: Self::shape(op)?,
+                };
                 self.bind(op, v);
             }
             K::TensorExpandShape | K::TensorCollapseShape | K::TensorReshape => {
@@ -1170,8 +1589,12 @@ impl<G: DeviceGen> Cx<'_, G> {
             K::ArithSubf => self.pointwise(op, OpFunc::Sub)?,
             K::ArithMulf => self.pointwise(op, OpFunc::Mul)?,
             K::ArithDivf => self.pointwise(op, OpFunc::Div)?,
-            K::ArithMaximumf | K::ArithMaxnumf | K::ArithMaxf => self.pointwise(op, OpFunc::Maximum)?,
-            K::ArithMinimumf | K::ArithMinnumf | K::ArithMinf => self.pointwise(op, OpFunc::Minimum)?,
+            K::ArithMaximumf | K::ArithMaxnumf | K::ArithMaxf => {
+                self.pointwise(op, OpFunc::Maximum)?
+            }
+            K::ArithMinimumf | K::ArithMinnumf | K::ArithMinf => {
+                self.pointwise(op, OpFunc::Minimum)?
+            }
             K::ArithNegf => self.pointwise(op, OpFunc::Neg)?,
             K::ArithAbsf | K::MathAbsf => self.pointwise(op, OpFunc::Abs)?,
             K::MathExp => self.pointwise(op, OpFunc::Exp)?,
@@ -1194,7 +1617,11 @@ impl<G: DeviceGen> Cx<'_, G> {
                     "ole" | "ule" => Compare::Le,
                     "oeq" | "ueq" => Compare::Eq,
                     "one" | "une" => Compare::Ne,
-                    _ => return Err(malformed("arith.cmpf's predicate is an ordered or unordered compare")),
+                    _ => {
+                        return Err(malformed(
+                            "arith.cmpf's predicate is an ordered or unordered compare",
+                        ));
+                    }
                 };
                 self.pointwise(op, OpFunc::Cmp(c))?;
             }
@@ -1208,11 +1635,26 @@ impl<G: DeviceGen> Cx<'_, G> {
                 };
                 match (from, v) {
                     (Some(f), v) if f == to => self.bind(op, v),
-                    (_, Val::Splat { value, shape, .. }) => self.bind(op, Val::Splat { value, format: to, shape }),
-                    (Some(DataFormat::Fp16), _) if to == DataFormat::Fp32 => self.pointwise(op, OpFunc::Widen)?,
-                    (Some(DataFormat::Fp32), _) if to == DataFormat::Fp16 => self.pointwise(op, OpFunc::Narrow)?,
-                    (Some(DataFormat::Fp8), _) if to == DataFormat::Fp16 => self.pointwise(op, OpFunc::Fp8ToFp16)?,
-                    (Some(DataFormat::Fp16), _) if to == DataFormat::Fp8 => self.pointwise(op, OpFunc::Fp16ToFp8)?,
+                    (_, Val::Splat { value, shape, .. }) => self.bind(
+                        op,
+                        Val::Splat {
+                            value,
+                            format: to,
+                            shape,
+                        },
+                    ),
+                    (Some(DataFormat::Fp16), _) if to == DataFormat::Fp32 => {
+                        self.pointwise(op, OpFunc::Widen)?
+                    }
+                    (Some(DataFormat::Fp32), _) if to == DataFormat::Fp16 => {
+                        self.pointwise(op, OpFunc::Narrow)?
+                    }
+                    (Some(DataFormat::Fp8), _) if to == DataFormat::Fp16 => {
+                        self.pointwise(op, OpFunc::Fp8ToFp16)?
+                    }
+                    (Some(DataFormat::Fp16), _) if to == DataFormat::Fp8 => {
+                        self.pointwise(op, OpFunc::Fp16ToFp8)?
+                    }
                     _ => return Err(LiftError::Op(op.op_type)),
                 }
             }
@@ -1247,14 +1689,20 @@ impl<G: DeviceGen> Cx<'_, G> {
                 match carried.len() {
                     0 => {}
                     1 => {
-                        let v = carried.pop().ok_or(malformed("scf.for yields its carried value"))?;
+                        let v = carried
+                            .pop()
+                            .ok_or(malformed("scf.for yields its carried value"))?;
                         self.bind(op, v);
                     }
                     _ => self.bind(op, Val::Tuple(carried)),
                 }
             }
             K::ScfYield => {
-                let vs = op.operands.iter().map(|&s| self.get(s)).collect::<Result<Vec<_>, _>>()?;
+                let vs = op
+                    .operands
+                    .iter()
+                    .map(|&s| self.get(s))
+                    .collect::<Result<Vec<_>, _>>()?;
                 return Ok(Some(vs));
             }
             K::FuncReturn | K::RegionBb0Args => {}
@@ -1287,18 +1735,28 @@ fn forward_stores(g: &mut Graph) {
                 let readers = g
                     .nodes
                     .iter()
-                    .filter(|m| m.inputs.iter().any(|o| o.store == Store::Local(l)
-                        || o.gather.as_ref().is_some_and(|gt| gt.index.store == Store::Local(l))))
+                    .filter(|m| {
+                        m.inputs.iter().any(|o| {
+                            o.store == Store::Local(l)
+                                || o.gather
+                                    .as_ref()
+                                    .is_some_and(|gt| gt.index.store == Store::Local(l))
+                        })
+                    })
                     .count();
                 if let [w] = writers[..]
                     && readers == 1
                     && w < i
-                    && g.nodes[w].output.view == src.view
+                    && g.nodes[w].output.view.same_elements(&src.view)
                     && g.locals[l].elements == src.view.numel()
                     && g.nodes[w].output.format == g.nodes[i].output.format
+                    && let Some(inputs) = over_space(&g.nodes[w].inputs, &g.nodes[i].space)
                 {
-                    let out = g.nodes[i].output.clone();
-                    g.nodes[w].output = out;
+                    let (space, out) = (g.nodes[i].space.clone(), g.nodes[i].output.clone());
+                    let producer = &mut g.nodes[w];
+                    producer.space = space;
+                    producer.inputs = inputs;
+                    producer.output = out;
                     g.nodes.remove(i);
                     continue;
                 }

@@ -425,13 +425,6 @@ pub fn rope_cos_sin_kind(pos: u32, kind: crate::wiring::RotaryKind) -> (Vec<f32>
     (cos, sin)
 }
 
-// ⛔ THE HOST ARGMAX IS DELETED, AND ITS DOC IS KEPT AS THE LAW IT PINNED: the
-// device's draw is the FIRST maximum, NaN-skipping, floored at 0 — the running
-// max starts at the most-negative finite fp16 (the senulator's `0xFFFE` init)
-// and an element's index replaces the winner only on STRICT improvement, so
-// ties keep the earliest index. That law now lives in the minted sampler's
-// on-card kernel (sample_fwd.py); no host form of it may come back.
-
 #[cfg(test)]
 mod rope_tests {
     use super::rope_cos_sin;

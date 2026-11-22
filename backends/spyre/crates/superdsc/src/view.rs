@@ -52,7 +52,12 @@ pub enum ViewError {
     /// A permutation that is not one of the view's rank.
     Permutation { rank: usize, perm: Vec<usize> },
     /// A window that reads past an axis.
-    Window { axis: usize, corner: u64, extent: u64, of: u64 },
+    Window {
+        axis: usize,
+        corner: u64,
+        extent: u64,
+        of: u64,
+    },
     /// A reshape of a view held in stick columns, or a window that starts inside a stick column.
     Tiled,
 }
@@ -94,6 +99,44 @@ impl View {
     /// The logical shape.
     pub fn shape(&self) -> Vec<u64> {
         self.axes.iter().map(|a| a.extent).collect()
+    }
+
+    /// Whether the two views name the same elements in the same order: an axis of one position
+    /// names nothing, wherever it sits and whatever its stride.
+    pub fn same_elements(&self, other: &View) -> bool {
+        let spread =
+            |v: &View| -> Vec<Axis> { v.axes.iter().copied().filter(|a| a.extent > 1).collect() };
+        self.offset == other.offset
+            && match (self.tile, other.tile) {
+                (None, None) => spread(self) == spread(other),
+                _ => self.tile == other.tile && self.axes == other.axes,
+            }
+    }
+
+    /// This view over a space of `to` — `to` and the view's own shape the same axes apart from
+    /// axes of one position — with an axis of one position wherever `to` has one. `None` when the
+    /// two spaces differ in more than such axes, or the view is held in stick columns.
+    pub fn over_space(&self, to: &[u64]) -> Option<View> {
+        let spread = |s: &[u64]| -> Vec<u64> { s.iter().copied().filter(|&e| e > 1).collect() };
+        if self.tile.is_some() || spread(&self.shape()) != spread(to) {
+            return None;
+        }
+        let mut own = self.axes.iter().filter(|a| a.extent > 1);
+        let axes = to
+            .iter()
+            .map(|&e| match e {
+                1 => Some(Axis {
+                    extent: 1,
+                    stride: 0,
+                }),
+                _ => own.next().copied(),
+            })
+            .collect::<Option<Vec<Axis>>>()?;
+        Some(View {
+            offset: self.offset,
+            axes,
+            tile: None,
+        })
     }
 
     /// Element count.
@@ -193,7 +236,9 @@ impl View {
     /// in `added` repeat, the rest are this view's axes in order.
     pub fn broadcast(&self, out_shape: &[u64], added: &[usize]) -> View {
         let mut src = self.axes.iter();
-        let kept: Vec<usize> = (0..out_shape.len()).filter(|i| !added.contains(i)).collect();
+        let kept: Vec<usize> = (0..out_shape.len())
+            .filter(|i| !added.contains(i))
+            .collect();
         let axes = out_shape
             .iter()
             .enumerate()
@@ -204,7 +249,11 @@ impl View {
                     let a = src.next().copied().unwrap_or(Axis { extent, stride: 0 });
                     Axis {
                         extent,
-                        stride: if a.extent == 1 && extent != 1 { 0 } else { a.stride },
+                        stride: if a.extent == 1 && extent != 1 {
+                            0
+                        } else {
+                            a.stride
+                        },
                     }
                 }
             })
@@ -229,7 +278,11 @@ impl View {
                 .zip(out_shape)
                 .map(|(a, &extent)| Axis {
                     extent,
-                    stride: if a.extent == 1 && extent != 1 { 0 } else { a.stride },
+                    stride: if a.extent == 1 && extent != 1 {
+                        0
+                    } else {
+                        a.stride
+                    },
                 })
                 .collect(),
             tile: self.tile,
@@ -251,14 +304,25 @@ impl View {
                 to: to_n,
             });
         }
-        let src: Vec<Axis> = self.axes.iter().copied().filter(|a| a.extent != 1).collect();
+        let src: Vec<Axis> = self
+            .axes
+            .iter()
+            .copied()
+            .filter(|a| a.extent != 1)
+            .collect();
         let dst: Vec<(usize, u64)> = to
             .iter()
             .copied()
             .enumerate()
             .filter(|&(_, e)| e != 1)
             .collect();
-        let mut out = vec![Axis { extent: 1, stride: 0 }; to.len()];
+        let mut out = vec![
+            Axis {
+                extent: 1,
+                stride: 0
+            };
+            to.len()
+        ];
         for (i, &e) in to.iter().enumerate() {
             out[i].extent = e;
         }
@@ -276,11 +340,15 @@ impl View {
             di += 1;
             while sn != dn {
                 if sn < dn {
-                    let Some(a) = src.get(si) else { return Err(err()) };
+                    let Some(a) = src.get(si) else {
+                        return Err(err());
+                    };
                     sn *= a.extent;
                     si += 1;
                 } else {
-                    let Some(&(_, e)) = dst.get(di) else { return Err(err()) };
+                    let Some(&(_, e)) = dst.get(di) else {
+                        return Err(err());
+                    };
                     dn *= e;
                     di += 1;
                 }
@@ -318,25 +386,51 @@ mod tests {
         assert_eq!(
             r.axes,
             vec![
-                Axis { extent: 8, stride: 512 },
-                Axis { extent: 4, stride: 128 },
-                Axis { extent: 128, stride: 1 }
+                Axis {
+                    extent: 8,
+                    stride: 512
+                },
+                Axis {
+                    extent: 4,
+                    stride: 128
+                },
+                Axis {
+                    extent: 128,
+                    stride: 1
+                }
             ]
         );
-        assert_eq!(r.reshape(&[1, 4096]).unwrap().axes[1], Axis { extent: 4096, stride: 1 });
+        assert_eq!(
+            r.reshape(&[1, 4096]).unwrap().axes[1],
+            Axis {
+                extent: 4096,
+                stride: 1
+            }
+        );
     }
 
     #[test]
     fn a_window_merges_only_where_contiguous() {
-        let v = View::row_major(0, &[64, 4096]).window(&[0, 1024], &[64, 1024]).unwrap();
+        let v = View::row_major(0, &[64, 4096])
+            .window(&[0, 1024], &[64, 1024])
+            .unwrap();
         assert_eq!(v.offset, 1024);
         assert!(v.reshape(&[64 * 1024]).is_err());
         assert_eq!(
             v.reshape(&[64, 16, 64]).unwrap().axes,
             vec![
-                Axis { extent: 64, stride: 4096 },
-                Axis { extent: 16, stride: 64 },
-                Axis { extent: 64, stride: 1 }
+                Axis {
+                    extent: 64,
+                    stride: 4096
+                },
+                Axis {
+                    extent: 16,
+                    stride: 64
+                },
+                Axis {
+                    extent: 64,
+                    stride: 1
+                }
             ]
         );
     }
@@ -345,14 +439,38 @@ mod tests {
     fn a_broadcast_repeats_its_added_axes() {
         let w = View::row_major(0, &[4096]);
         let b = w.broadcast(&[64, 4096], &[0]);
-        assert_eq!(b.axes[0], Axis { extent: 64, stride: 0 });
-        assert_eq!(b.axes[1], Axis { extent: 4096, stride: 1 });
+        assert_eq!(
+            b.axes[0],
+            Axis {
+                extent: 64,
+                stride: 0
+            }
+        );
+        assert_eq!(
+            b.axes[1],
+            Axis {
+                extent: 4096,
+                stride: 1
+            }
+        );
     }
 
     #[test]
     fn a_transpose_permutes_the_strides() {
         let w = View::row_major(0, &[2048, 512]).permute(&[1, 0]).unwrap();
-        assert_eq!(w.axes[0], Axis { extent: 512, stride: 1 });
-        assert_eq!(w.axes[1], Axis { extent: 2048, stride: 512 });
+        assert_eq!(
+            w.axes[0],
+            Axis {
+                extent: 512,
+                stride: 1
+            }
+        );
+        assert_eq!(
+            w.axes[1],
+            Axis {
+                extent: 2048,
+                stride: 512
+            }
+        );
     }
 }

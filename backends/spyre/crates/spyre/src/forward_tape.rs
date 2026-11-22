@@ -217,11 +217,10 @@ pub struct ForwardShape {
     /// duplicated a `&'static` slice the macro put in the binary, once per forward, per token.
     pub cos_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
     pub sin_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
-    /// ⭐ THE BUNDLE'S PAGED STEP — its tables' tids. `Some` exactly when the bundle's attention reads
-    /// a paged step, so the tape carries a step per table iff the bundle placed it. A projection of the
-    /// wiring's own field, never a caller's opinion: a walk with no staged table gathers through zeros,
-    /// i.e. page 0.
-    pub paged: Option<crate::wiring::PagedStep>,
+    /// ⭐ THE BUNDLE'S PAGED STEPS — each attention class's tables' tids, so the tape carries a step
+    /// per table iff the bundle placed it. A projection of the wiring's own field, never a caller's
+    /// opinion: a walk with no staged table gathers through zeros, i.e. page 0.
+    pub paged: crate::wiring::ClassSteps,
 }
 
 impl ForwardShape {
@@ -249,7 +248,7 @@ impl ForwardShape {
         // ⭐ THE PAGED STEP'S TABLES — a step each, the ones its card placements stage every step.
         // See [`ForwardShape::paged`] for why the condition is the wiring and not a caller's opinion,
         // and [`kernel_values`] for why a forward with no KV blocks is a refusal rather than a buffer.
-        if let Some(p) = self.paged {
+        for p in self.paged.iter() {
             for (tid, seat, _) in p.card_placements() {
                 if seat == crate::wiring::CardSeat::Step {
                     v.push(ForwardStep {
@@ -381,6 +380,7 @@ mod tests {
                 ::core::panic!("the fixture's three rows by one request name a rung")
             }
         },
+        attends: crate::wiring::AttnMask::Causal,
     };
 
     fn shape() -> ForwardShape {
@@ -389,7 +389,10 @@ mod tests {
             embed_src: 0,
             cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
             sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
-            paged: Some(STEP),
+            paged: crate::wiring::ClassSteps {
+                full: Some(STEP),
+                sliding: None,
+            },
         }
     }
 
@@ -457,10 +460,13 @@ mod tests {
     #[test]
     fn a_decode_batch_stages_its_own_tables() {
         let batch = ForwardShape {
-            paged: Some(crate::wiring::PagedStep {
-                paged_rows: crate::paged_step::PagedRows::Batch,
-                ..STEP
-            }),
+            paged: crate::wiring::ClassSteps {
+                full: Some(crate::wiring::PagedStep {
+                    paged_rows: crate::paged_step::PagedRows::Batch,
+                    ..STEP
+                }),
+                sliding: None,
+            },
             ..shape()
         };
         let tids: Vec<PlaceId> = batch
@@ -524,7 +530,7 @@ mod tests {
     #[test]
     fn a_bake_fact_removes_the_step_rather_than_branching() {
         let mut sh = shape();
-        sh.paged = None;
+        sh.paged = crate::wiring::ClassSteps::default();
         let kinds: Vec<ForwardKernel> = sh.steps().iter().map(|x| x.kernel).collect();
         assert!(!kinds.contains(&ForwardKernel::Paged));
         assert_eq!(kinds.last(), Some(&ForwardKernel::Decode));

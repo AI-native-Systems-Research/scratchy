@@ -72,15 +72,6 @@ pub struct SpyreWorker {
     /// "cannot defer" case: those steps still submit and defer, then drain themselves in-call.
     #[cfg(feature = "spyre-hw")]
     pub(crate) drain_door: Option<scratchy_serving_engine::core_client::DrainDoor>,
-    /// ⭐ #32 (c4b) — THE LAST BATCHED STEP'S SEATING: which rung ran, and which request id sat in
-    /// each launch slot (dense `live i runs in slot i` order). The SEED LAW's churn test: a step
-    /// whose seating is IDENTICAL binds no chain seeds (the card's own ChainStage writes are every
-    /// seat's seed), and any difference — a join, a leave, a rung switch, a changed pad set — is
-    /// the churn that re-seats requests onto sticks holding the PREVIOUS occupant's pick, so those
-    /// steps drain first and bind seeds from the collected picks. `None` before the first batched
-    /// step (everything churns).
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) seating: Option<(crate::spyre_types::RungId, Vec<String>)>,
     /// ⭐ THE HOST'S PER-REQUEST BLOCK TABLE, IN THE STRUCT THE ENGINE ALREADY DEFINES FOR IT.
     ///
     /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what the GPU target
@@ -115,7 +106,6 @@ impl SpyreWorker {
             #[cfg(feature = "spyre-hw")]
             drain_door: None,
             #[cfg(feature = "spyre-hw")]
-            seating: None,
             input_batch: scratchy_serving_engine::input_batch::InputBatch::new(),
             declared_context: None,
             // Matches the CLI's own `--gpu-memory-utilization` default; `declare_workload` overwrites

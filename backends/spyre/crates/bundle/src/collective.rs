@@ -5,7 +5,6 @@
 
 pub use scratchy_tp_world::{Build, PerRank, Rank, TpWorld, World, ranks};
 
-
 /// The widest single p2p message, in bytes — the vendor's per-message RDMA window
 /// (`pf_runtime_scheduler.cpp:50`'s `P2P_RDMA_WINDOW_SIZE`, flex-rs
 /// `scheduler::P2P_RDMA_WINDOW_SIZE`, which the target crate pins equal): one F-send moves at most
@@ -762,8 +761,6 @@ mod tests {
         );
     }
 }
-
-
 
 /// One control block of a bundle's pipeline, in the order the compute FIFO runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

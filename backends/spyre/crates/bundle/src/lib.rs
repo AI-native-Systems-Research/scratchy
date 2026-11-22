@@ -386,8 +386,7 @@ impl<'a> BundleLayout<'a> {
     /// ⭐ THE KV POOL'S BYTES: bank 0 ([`Self::segment_bytes`] at `SegRole::Kv`) plus every extra
     /// bank ([`Self::kv_bank_bytes`]).
     pub fn kv_pool_bytes(&self) -> u64 {
-        self.segment_bytes[segments::SegRole::Kv.segment()]
-            + self.kv_bank_bytes.iter().sum::<u64>()
+        self.segment_bytes[segments::SegRole::Kv.segment()] + self.kv_bank_bytes.iter().sum::<u64>()
     }
 
     /// ⭐⭐⭐ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — this SHIPPED layout's packed size for

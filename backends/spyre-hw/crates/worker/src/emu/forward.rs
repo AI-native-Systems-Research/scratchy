@@ -166,28 +166,32 @@ pub(crate) fn forward_chunk(
     // staged: every layer's write scatters this step's K/V into them and its walk gathers from them,
     // on the device, step after step.
     {
-        let step = b
+        let first = b
             .paged
+            .first()
             .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
         let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
             werr(format!(
                 "request {id}: a decode step of zero rows — no token to run"
             ))
         })?;
-        let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
-            .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
-        session
-            .set_typed_sources(
-                srcs.int32
-                    .into_iter()
-                    .map(|(tid, bytes, shape)| {
-                        (tid as usize, bytes, scratchy_tensors::DType::I32, shape)
-                    })
-                    .collect(),
-            )
-            .map_err(|e| werr(format!("paged step: {e}")))?;
-        let (mask_tid, mask, mask_shape) = srcs.mask;
-        dynamic.push((u64::from(mask_tid), mask, mask_shape));
+        // Each attention class's tables, at the class's own tids.
+        for step in b.paged.iter() {
+            let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
+                .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
+            session
+                .set_typed_sources(
+                    srcs.int32
+                        .into_iter()
+                        .map(|(tid, bytes, shape)| {
+                            (tid as usize, bytes, scratchy_tensors::DType::I32, shape)
+                        })
+                        .collect(),
+                )
+                .map_err(|e| werr(format!("paged step: {e}")))?;
+            let (mask_tid, mask, mask_shape) = srcs.mask;
+            dynamic.push((u64::from(mask_tid), mask, mask_shape));
+        }
         // The result is the one readback, whole: the answer rows' logits, the host draws from.
         let outputs: Vec<(u64, usize)> = b.output_ids.iter().map(|id| (*id as u64, 0)).collect();
         let out = session
@@ -198,12 +202,14 @@ pub(crate) fn forward_chunk(
         // its requests' last rows (request `r`'s logits at row `r`), a decode batch's rows are its
         // sequences'. The host draws each row's token under the request's own law; the caller
         // consumes the last row's, the last real token's forward.
-        let logits = out.get(&(b.result_id as u64)).ok_or_else(|| {
-            werr(format!("the logits t{} came back unread", b.result_id))
-        })?;
-        let answers = match b.paged.map(|p| p.paged_rows) {
-            Some(scratchy_target_spyre::paged_step::PagedRows::Batch) => n,
-            _ => b.paged.map_or(1, |p| p.extent.requests().get() as usize),
+        let logits = out
+            .get(&(b.result_id as u64))
+            .ok_or_else(|| werr(format!("the logits t{} came back unread", b.result_id)))?;
+        let answers = match first.paged_rows {
+            scratchy_target_spyre::paged_step::PagedRows::Batch => n,
+            scratchy_target_spyre::paged_step::PagedRows::Sequence => {
+                first.extent.requests().get() as usize
+            }
         };
         let picks = logits
             .chunks(vocab)
@@ -212,7 +218,7 @@ pub(crate) fn forward_chunk(
             .map(|(r, row)| {
                 draw_token(
                     r,
-                    row,
+                    row.iter().copied(),
                     &RowLaw {
                         draw: req.draw.as_ref(),
                         step: (start + n - 1) as u32,

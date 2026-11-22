@@ -204,12 +204,6 @@ impl RungCap {
         self.0.get()
     }
 
-    /// The capacity as the nonzero count the shared IR's sampler fold takes
-    /// (`SampleRows::Folded`) — handed over, never re-minted.
-    pub const fn nonzero(self) -> NonZeroU32 {
-        self.0
-    }
-
     /// The sequence count as a host-side extent — the arithmetic exit.
     pub const fn count(self) -> usize {
         self.0.get() as usize
@@ -361,9 +355,8 @@ impl LiveRows {
 /// new tokens, query row `row` (0-based within the chunk) attends new-token column `col` iff `col <= row`
 /// — the token attends itself + all EARLIER new tokens, never a LATER one. Additive mask: 0 when valid,
 /// −∞ when `col > row`. This is the `[mq,mq]` causal block that folds (jointly with the prefix score
-/// [mq,cap]) into ONE softmax per query row. SINGLE SOURCE OF TRUTH shared by (a) the deleted builder's
-/// `cmask` fill for the mq>1 attention (`lower_attn_node`, the batched-prefill path replacing the mq>1 build-Err)
-/// and (b) the Kani proof (`prefill_causal_mask_partition_ok`). An off-by-one here (`col < row`, dropping
+/// [mq,cap]) into ONE softmax per query row. SINGLE SOURCE OF TRUTH for the host's mask fill
+/// ([`CausalKey`]) and the Kani proof (`prefill_causal_mask_partition_ok`). An off-by-one here (`col < row`, dropping
 /// the diagonal self-term) or wrong direction (`col >= row`) scrambles causal attention — a
 /// coherence bug with a preserved-ish norm, so it MUST be pinned, not eyeballed.
 pub fn prefill_causal_col_valid(col: usize, row: usize) -> bool {
@@ -642,9 +635,8 @@ impl ChunkRows {
 ///   `nqh`-sized reservation was `gqa`x dead space.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedKvPool {
-    /// DISTINCT kv heads — a query head reads its group's plane via [`gqa_kv_head`]. Nonzero by
-    /// construction: a pool with no heads is unrepresentable, which is exactly what the old
-    /// `nkvh == 0` refusals at every reader were checking.
+    /// DISTINCT kv heads — each group of query heads reads one. Nonzero by construction: a pool
+    /// with no heads is unrepresentable.
     nkvh: NonZeroU32,
     /// ⭐ THE HEAD WIDTH, AS A TYPE — minted once, in this pool's own constructor: whole sticks
     /// by construction, so no reader re-mints (or re-checks) it, and no `as` crosses it.
@@ -1286,33 +1278,6 @@ impl PagedKvPool {
         3 * self.plane_stride()
     }
 
-    // ── PLANE ORDER inside a page+layer: natural K, then V, then transposed K. ──
-    // This mirrors the pre-paged cache's own order (`kc`, `vc`, `kct`) on purpose. The order is free
-    // — every op addresses its plane relatively, so which plane sits where costs no memory and no
-    // work — but it decides the byte offset each plane lands on, and this path is measurably
-    // placement-sensitive. Having transposed-K first put all three planes at offsets the tuned
-    // layout never used.
-
-    #[allow(dead_code)]
-    fn v_block_base_first(&self, qh: usize, gqa: usize, b: u32) -> u32 {
-        // The head width is the POOL's (`self.hd`), never a caller's: a V page's geometry belongs to
-        // the pool that laid it out, and taking a second `hd` here let a caller name one width while
-        // the address used another.
-        // ⭐ `b * STK * hd`, NOT `b * STK * STK`. A 64-slot block advances 64 SLOTS of one stick each,
-        // and a whole slot is `hd` elements — the two agree ONLY at head_dim 64, which is every model that
-        // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
-        // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
-        // described this bug; it is now fixed rather than described.
-        // Both hd terms arrive through the type: `hd_elems` (the host usize widening, via
-        // `as_usize`) for the page-block product, `self.hd.get()` for the u32 block term. The
-        // one `as u32` narrows the page-block product to this fn's return, not the width.
-        let hd_elems = self.hd.as_usize();
-        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * hd_elems) as u32
-            + b * STK as u32 * self.hd.get()
-    }
-
-
-
     /// Head width this pool laid itself out for, AS THE TYPE — the one value every reader
     /// takes; no use site re-mints it.
     pub const fn head_width(&self) -> HeadWidth {
@@ -1362,41 +1327,6 @@ impl NewBlockForm {
             NewBlockForm::SubBlocks
         }
     }
-
-}
-
-/// ⭐⭐⭐ WHERE A LAUNCH'S EMBED-HEAD SEED COMES FROM — the seed law, as a type.
-///
-/// Every row a decode launch binds FEEDS one token to the chained head's gather: the persistent
-/// sticks the `EmbedRowGather` reads. The DEVICE writes those sticks itself — each step's
-/// `ChainStage` decomposes the pick that step drew into them — so on a seating that has not
-/// changed since the step that wrote them, the card's own write IS each seat's seed and the host
-/// binds nothing. A host bind is needed exactly when a seat's sticks are NOT the card's own
-/// current seed for their occupant:
-///
-/// - a request's FIRST step on a rung's session (its prompt's final token, host-known);
-/// - a CHURNED seat — slots are dense in the live list (`live i runs in slot i`), so any join or
-///   leave re-seats requests onto sticks that hold the PREVIOUS occupant's pick;
-/// - a PADDING seat at a changed live count — the pad must clamp to the last live row's token,
-///   and the card's stage writes the pad row's OWN drawn pick, not the clamp;
-/// - a RUNG SWITCH — a different session, whose sticks were never seeded.
-///
-/// A prompt chunk is always [`SeedSource::Host`]: its rows are the prompt's own tokens and the
-/// tape's head kernel is the host-pushed `EmbedRow` — the same arm, because "the host knows every
-/// row's token" is the one fact both regimes share.
-///
-/// ⛔ `OnCard` IS NOT "BIND NOTHING AND HOPE". It states the seating is stable — the host's
-/// assertion that every seat's sticks were written by this session's own previous step for the
-/// request now sitting there. The launch it widens to carries no token ([`RowInputs::token`] is
-/// `None`), so a consumer cannot accidentally stage a seed it does not have: the only way to
-/// bind a seed is the `Host` arm.
-#[derive(Clone, Copy)]
-pub enum SeedSource<'a> {
-    /// One token per LIVE row, host-known — seeded through the raw u32 channel this launch.
-    Host(&'a [usize]),
-    /// The device's own `ChainStage` writes are each seat's seed — a stable seating. Nothing is
-    /// bound, and no row's token is a host fact.
-    OnCard,
 }
 
 /// ⭐⭐⭐⭐⭐ THE KV POOL'S STICK WIDTH, DERIVED FROM THE FORMAT ITS PLANES ACTUALLY HOLD — never a bare 64.
@@ -1443,8 +1373,6 @@ impl PlaneExtent {
     }
 }
 
-
-
 /// WHICH PLANE OF A PAGE+LAYER — the three copies of the same keys the attention needs in different
 /// orders. Named, because "2" meaning Kᵀ is the sort of thing a comment has to say.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1482,7 +1410,6 @@ impl KvSlot {
     pub const fn get(self) -> u32 {
         self.0
     }
-
 }
 
 /// A NUMBER OF SLOTS — a prefill chunk's width, or 1 for a decode token. Distinct from [`KvSlot`]
@@ -1500,7 +1427,6 @@ impl SlotCount {
     pub const fn get(self) -> u32 {
         self.0
     }
-
 }
 
 /// A request of a packed rung's windows — minted only by [`AnswerRows::rows`], never spelled
@@ -1535,15 +1461,6 @@ pub fn decode_batch_causal_col_valid(col: usize, row: usize) -> bool {
     col == row
 }
 
-/// THE GQA HEAD MAP: query head `qh` attends the KV head `qh / gqa` (each contiguous group of `gqa` query
-/// heads shares one K/V head; `gqa = num_q_heads / num_kv_heads`). SINGLE SOURCE OF TRUTH shared by (a) the
-/// deleted builder's K/V GQA-replication in `lower_attn_node` (`copy(new_k, kvh*hd, krep, qh*hd)`) and (b) the Kani
-/// proof (`gqa_replicate_*`). If this map were wrong, query heads would attend the WRONG KV head — scrambled
-/// attention with a preserved-ish norm (still a real head's K/V), a norm-preserving-direction-shift class.
-pub(crate) fn gqa_kv_head(qh: usize, gqa: usize) -> usize {
-    qh / gqa
-}
-
 /// A ROW OF THE LAUNCH HAPPENING NOW — `0..width` of the rung being run, and the index every op's
 /// `kv_request` names. Minted only by [`SlotMap`], so a slot past the rung's width does not exist.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -1563,4 +1480,3 @@ impl LaunchSlot {
         self.0
     }
 }
-

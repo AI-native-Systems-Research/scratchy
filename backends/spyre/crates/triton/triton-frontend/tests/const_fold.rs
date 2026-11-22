@@ -484,9 +484,10 @@ fn computing(m: &Module, var: &str) -> Vec<String> {
 
 /// ONE CHUNK: the walk's loop runs once, its carries enter at `(-inf, 0, 0)`, and the online
 /// softmax's rescale is the identity -- `exp(-maxnum(chunk_max + inf, 0))` multiplies a zero
-/// sum and a zero output, so the rescale and the running sum's update are gone. Two ops of the
-/// identity stay, because neither is exact on every value: `maxnum(chunk_max, -inf)` (a NaN
-/// `chunk_max` gives `-inf`) and `chunk_out + 0` (a `-0` element gives `+0`).
+/// sum and a zero output, so the rescale and the running sum's update are gone. The scores are
+/// clamped at the mask's floor (`maxnum(sc, -65504)`), so `chunk_max` is never NaN and
+/// `maxnum(chunk_max, -inf)` is `chunk_max` itself: `new_max` is gone too. One op of the identity
+/// stays, because it is not exact on every value: `chunk_out + 0` (a `-0` element gives `+0`).
 #[test]
 fn a_one_chunk_decode_batch_drops_its_rescale_chain() {
     let m = batched_decode(4, 1);
@@ -501,7 +502,7 @@ fn a_one_chunk_decode_batch_drops_its_rescale_chain() {
     );
     assert_eq!(count(&m, "arith.mulf"), 1, "only the scores' scale is left");
     assert_eq!(computing(&m, "tile_output"), vec!["arith.addf".to_string()]);
-    assert_eq!(computing(&m, "new_max"), vec!["arith.maxnumf".to_string()]);
+    assert_eq!(computing(&m, "new_max"), Vec::<String>::new());
 }
 
 /// MANY CHUNKS: the carries are loop block arguments, of which nothing is known, so every op of

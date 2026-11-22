@@ -28,35 +28,23 @@ pub mod dxp_cache;
 /// arithmetic, lifted out of C++. No SDK dependency and no feature gate — it is arithmetic, so it
 /// builds and is tested on any host, including one with no Spyre toolchain.
 pub mod fold_plan;
-/// THE MODEL-GEOMETRY DOOR — all that is left of KTIR → SuperDSC on this side, and it is NOT the
-/// lowering. `lower()`'s name-keyed dispatch (our naming convention, so ours to read), the two arms
-/// that monomorphise a model's head geometry — whose match arms `scratchy-subtile`'s `build.rs`
-/// generates from the configs in scope, i.e. OUR model inventory — the two orphan-rule newtypes those
-/// arms need, and `BundleAttnParams`. Everything else — the emitter, the assemblers, main's eight
-/// `lower_*_node` bodies, the fp8 W8A8 descriptors — is `ktir_superdsc::emit`.
-///
-/// ⛔ IT WAS CALLED `lower_ktir_to_superdsc`, THE SAME NAME AS THE CRATE MODULE THAT HOLDS THE ACTUAL
-/// LOWERING, so the tree had two files by that name and this one read as though the lowering lived
-/// here. It does not, and none of what is here can move: an arm set generated from the consumer's
-/// configs cannot live in a leaf crate, and it cannot arrive as data either, because the point is that
-/// the values become `const` parameters.
-pub mod placement;
-pub mod superdsc_lower;
 /// SubtileIR → KTIR: the producer half. One KTIR program per node, and no descriptors.
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;
+/// The bundle's memory plan: every tensor's segment and offset, and each staged weight's walk into
+/// its held layout.
+pub mod placement;
+/// KTIR → SuperDSC for one rung: every program planned and placed in the rung's layout, then
+/// lowered to its descriptors (`scratchy-spyre-superdsc`).
+pub mod superdsc_lower;
 // ⚠️ TEMPORARY bake-time instrumentation — strip with its call sites before landing.
-mod pc;
-pub mod superdsc_bake;
-/// Spyre's half of tensor parallelism: the world and split granule the shared analysis takes as
-/// input, and the ring schedule its collectives run as.
-pub mod tp_plan;
 /// THE FORWARD TAPE — one decode step as ordered steps rather than a function
 /// body: which host kernels run, what each fills, and where the single device
 /// launch sits. The LAUNCHER is the worker's (it owns the session).
 pub mod forward_tape;
 pub mod manifest;
 pub mod paged_step;
+mod pc;
 /// Bundle execution on the `ktir_emulator` emulator — behind the `runner` feature
 /// (it links the emulator). Emit/weight-load paths use [`manifest`] alone.
 #[cfg(feature = "spyre-emu")]
@@ -66,6 +54,10 @@ pub mod runner;
 /// Pure bit arithmetic: no SDK dependency, no feature gate, tested on any host.
 pub mod sen_convert;
 pub mod stage_weight;
+pub mod superdsc_bake;
+/// Spyre's half of tensor parallelism: the world and split granule the shared analysis takes as
+/// input, and the ring schedule its collectives run as.
+pub mod tp_plan;
 /// The per-model launch wiring as spyre's OWN types, emitted by `#[forward]`
 /// as a `static` — the typed replacement for parsing `manifest.json` at load.
 pub mod wiring;

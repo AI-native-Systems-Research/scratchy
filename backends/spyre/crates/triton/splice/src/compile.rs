@@ -92,7 +92,9 @@ pub fn node_for_compiled(
     Ok(mint_node(func, program))
 }
 
-fn lower_handoff(m: &triton_ktir::ir::Module) -> Result<ktir_core::ir::IRFunction<'static>, String> {
+fn lower_handoff(
+    m: &triton_ktir::ir::Module,
+) -> Result<ktir_core::ir::IRFunction<'static>, String> {
     triton_ktir::passes::to_ktir_emit::lower(m, Arena::global())
         .map_err(|e| format!("handoff: {e}"))
 }
@@ -117,7 +119,10 @@ fn cached_handoff(
 }
 
 /// Parameter position is the buffer number until the caller rebinds it.
-fn mint_node(func: ktir_core::ir::IRFunction<'static>, program: ktir_core::program::Program) -> KtirNode {
+fn mint_node(
+    func: ktir_core::ir::IRFunction<'static>,
+    program: ktir_core::program::Program,
+) -> KtirNode {
     let bindings = (0..func.arguments.len())
         .map(|i| BufferId::new(i as u32))
         .collect();

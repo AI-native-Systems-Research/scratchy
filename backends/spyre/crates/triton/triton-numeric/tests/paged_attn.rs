@@ -27,6 +27,10 @@ const DECODE: &str = include_str!("../../../../kernels/page_attn_head_major_deco
 const PREFILL: &str = include_str!("../../../../kernels/page_attn_head_major_prefill.py");
 const KV_WRITE: &str = include_str!("../../../../kernels/reshape_and_cache_head_major.py");
 const BATCHED: &str = include_str!("../../../../kernels/batched_decode_head_major.py");
+const DECODE_FP8: &str = include_str!("../../../../kernels/page_attn_head_major_decode_fp8.py");
+const PREFILL_FP8: &str = include_str!("../../../../kernels/page_attn_head_major_prefill_fp8.py");
+const KV_WRITE_FP8: &str = include_str!("../../../../kernels/reshape_and_cache_head_major_fp8.py");
+const BATCHED_FP8: &str = include_str!("../../../../kernels/batched_decode_head_major_fp8.py");
 
 /// A kernel through the whole ladder to the emulator's IR.
 fn lower(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
@@ -608,7 +612,13 @@ fn a_walk_of_eight_pages_a_trip_is_the_walk_page_by_page() {
     let mask: Vec<f64> = (0..walk)
         .flat_map(|b| {
             (0..p).flat_map(move |r| {
-                (0..block).map(move |c| if b * block + c <= start + r { 0.0 } else { -65504.0 })
+                (0..block).map(move |c| {
+                    if b * block + c <= start + r {
+                        0.0
+                    } else {
+                        -65504.0
+                    }
+                })
             })
         })
         .collect();
@@ -650,14 +660,28 @@ fn a_walk_of_eight_pages_a_trip_is_the_walk_page_by_page() {
     // is taken.
     let gate = 2e-3;
     println!("trip walk vs page walk: {err:.3e}, gate {gate:.3e}");
-    assert!(err < gate, "eight pages a trip answers {err:.3e} apart from page by page");
+    assert!(
+        err < gate,
+        "eight pages a trip answers {err:.3e} apart from page by page"
+    );
     // The control: the trip walk over its pages read in another order must miss.
     let shifted: Vec<i32> = (0..walk).map(|b| page_of((b + 1) % walk)).collect();
-    let miss = max_abs(&run_walk(TRIP, i32_arg(&shifted, vec![walk])), &page_by_page);
+    let miss = max_abs(
+        &run_walk(TRIP, i32_arg(&shifted, vec![walk])),
+        &page_by_page,
+    );
     assert!(
         miss > CONTROL_MARGIN * gate,
         "the trip walk over shifted pages still matches ({miss:.3e})"
     );
+}
+
+/// The pools a batch reads: as recorded, or these values on fp16 head-major pages or fp8
+/// token-major ones.
+enum Pages<'a> {
+    Recorded,
+    Fp16(&'a [f64], &'a [f64]),
+    Fp8(&'a [f64], &'a [f64]),
 }
 
 /// ⭐ SEVERAL SEQUENCES' DECODE IN ONE LAUNCH — `batched_decode_head_major_kernel` over the pools
@@ -692,6 +716,11 @@ impl Batch {
 
     /// The kernel's answer for these query rows and page ids (each as recorded unless replaced).
     fn attend(&self, rep_row_ids: &[i32], page_ids: &[i32]) -> Vec<f64> {
+        self.attend_on(rep_row_ids, page_ids, Pages::Recorded)
+    }
+
+    /// [`Self::attend`] over `pages`.
+    fn attend_on(&self, rep_row_ids: &[i32], page_ids: &[i32], pages_of: Pages<'_>) -> Vec<f64> {
         let s = &self.step;
         let (nqh, nkvh, hd) = (s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
         let (block, pages) = (s.geom("BLOCK"), s.geom("NUM_PAGES"));
@@ -725,18 +754,28 @@ impl Batch {
             "SCALE".to_string(),
             Val::Float(s.meta["derived"]["scale"].as_f64().expect("scale")),
         );
-        let f = lower(BATCHED, &k);
         let (rows, width) = (self.seqs as usize, (nqh * hd) as usize);
         let e = self.entries() as usize;
         let index_rows = e * self.rows_per_page as usize;
         let page = vec![pages as usize, (nkvh * block * hd) as usize];
+        let (k, kp, vp) = match pages_of {
+            Pages::Recorded => ((BATCHED, k), s.arg("kp", page.clone()), s.arg("vp", page)),
+            Pages::Fp16(kp, vp) => ((BATCHED, k), f16_arg(kp, page.clone()), f16_arg(vp, page)),
+            Pages::Fp8(kp, vp) => (
+                fp8_twin(k, ["k_pages", "v_pages"]),
+                fp8_arg(kp, page.clone()),
+                fp8_arg(vp, page),
+            ),
+        };
+        let (src, k) = k;
+        let f = lower(src, &k);
         let out = run(
             &f,
             vec![
                 s.arg("q", vec![rows, width]),
                 i32_arg(rep_row_ids, vec![index_rows]),
-                s.arg("kp", page.clone()),
-                s.arg("vp", page),
+                kp,
+                vp,
                 i32_arg(page_ids, vec![self.num_chunks as usize * index_rows]),
                 self.mask_rows(e, nkvh as usize, block as usize),
                 f16_arg(&vec![0.0; rows * width], vec![rows, width]),
@@ -870,4 +909,276 @@ fn a_decode_batch_over_two_chunks_matches_spyre_inference() {
 #[test]
 fn a_decode_batch_under_the_gather_floor_matches_spyre_inference() {
     the_batch_matches_spyre_inference("batched_decode_floor");
+}
+
+// ── THE FP8 POOL: token-major pages, read back as the fp16 step reads head-major ones ───────────
+
+/// A head-major pool `[pages, kv, block, hd]` laid token-major, `[pages, block, kv, hd]`.
+fn token_major(head_major: &[f64], (nkvh, block, hd): (usize, usize, usize)) -> Vec<f64> {
+    let page = nkvh * block * hd;
+    let mut out = vec![0.0; head_major.len()];
+    for (p, src) in head_major.chunks_exact(page).enumerate() {
+        for h in 0..nkvh {
+            for t in 0..block {
+                let from = (h * block + t) * hd;
+                let to = p * page + (t * nkvh + h) * hd;
+                out[to..to + hd].copy_from_slice(&src[from..from + hd]);
+            }
+        }
+    }
+    out
+}
+
+/// [`token_major`]'s inverse.
+fn head_major(token_major: &[f64], (nkvh, block, hd): (usize, usize, usize)) -> Vec<f64> {
+    let page = nkvh * block * hd;
+    let mut out = vec![0.0; token_major.len()];
+    for (p, src) in token_major.chunks_exact(page).enumerate() {
+        for h in 0..nkvh {
+            for t in 0..block {
+                let from = (t * nkvh + h) * hd;
+                let to = p * page + (h * block + t) * hd;
+                out[to..to + hd].copy_from_slice(&src[from..from + hd]);
+            }
+        }
+    }
+    out
+}
+
+fn fp8_bytes(values: &[f64]) -> Vec<u8> {
+    ktir_core::codec::encode(
+        &values.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        DType::Fp8E4m3,
+    )
+}
+
+fn fp8_arg(values: &[f64], shape: Vec<usize>) -> Arg {
+    Arg::TensorBytes {
+        data: fp8_bytes(values),
+        shape,
+        dtype: DType::Fp8E4m3,
+    }
+}
+
+/// `values` rounded to fp8 E4M3 and read back.
+fn fp8_round(values: &[f64]) -> Vec<f64> {
+    ktir_core::codec::decode(&fp8_bytes(values), values.len(), DType::Fp8E4m3)
+        .into_iter()
+        .map(f64::from)
+        .collect()
+}
+
+/// A paged kernel's fp8-pool twin: its `_fp8` file's `_fp8_kernel` entry, its pool pointers fp8,
+/// and its source.
+fn fp8_twin(mut k: KernelSpec, pools: [&str; 2]) -> (&'static str, KernelSpec) {
+    k.kernel = k.kernel.replace("_kernel", "_fp8_kernel");
+    k.file = k.file.replace(".py", "_fp8.py");
+    let src = match k.file.as_str() {
+        "page_attn_head_major_decode_fp8.py" => DECODE_FP8,
+        "page_attn_head_major_prefill_fp8.py" => PREFILL_FP8,
+        "reshape_and_cache_head_major_fp8.py" => KV_WRITE_FP8,
+        "batched_decode_head_major_fp8.py" => BATCHED_FP8,
+        other => panic!("{other}: no fp8 twin"),
+    };
+    for p in pools {
+        k.signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp8e4nv").expect("pointer spec"),
+        );
+    }
+    (src, k)
+}
+
+/// The step's attention on the fp8 twin over token-major fp8 pools `kp`/`vp`.
+fn attend_fp8(s: &Step, kp: &[f64], vp: &[f64]) -> Vec<f64> {
+    let (mq, nqh, nkvh, hd) = (s.mq(), s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
+    let (block, pages) = (s.geom("BLOCK"), s.geom("NUM_PAGES"));
+    let rows = mq as usize;
+    let shape = AttnShape {
+        padded_query_len: mq,
+        num_heads: nqh,
+        num_kv_heads: nkvh,
+        head_size: hd,
+        block_size: block,
+        num_pages: pages,
+        num_blocks: s.num_blocks(),
+        blocks_per_trip: 1,
+    };
+    let (_, k) = attn_kernel(&shape);
+    let (src, k) = fp8_twin(k, ["k_pages", "v_pages"]);
+    let f = lower(src, &k);
+    let width = (nqh * hd) as usize;
+    let q_shape = vec![rows, width];
+    let row_index: Vec<i32> = (0..mq as i32).collect();
+    let unfolded = vec![pages as usize, (nkvh * block * hd) as usize];
+    let mask = s.arg("mask", vec![s.num_blocks() as usize * rows, block as usize]);
+    let bound = vec![
+        s.arg("q", q_shape.clone()),
+        i32_arg(&row_index, vec![rows]),
+        fp8_arg(kp, unfolded.clone()),
+        fp8_arg(vp, unfolded),
+        page_table(s, 0),
+        mask,
+        f16_arg(&vec![0.0; rows * width], q_shape),
+    ];
+    run(&f, bound).last().expect("the out operand").clone()
+}
+
+/// ⭐ ONE SERVING STEP OVER AN FP8 POOL. The fp8 write narrows this step's K/V into token-major
+/// pages — exactly the pools spyre-inference's step leaves, rounded to fp8 and laid token-major —
+/// and the fp8 walk over them answers what the fp16 walk answers over the same values laid
+/// head-major. The control: the fp8 walk over the same bytes laid head-major misses.
+fn the_fp8_step_is_the_fp16_step_on_its_values(config: &str) {
+    let s = Step::load(config);
+    let (mq, nkvh, hd, block) = (s.mq(), s.geom("NKVH"), s.geom("HD"), s.geom("BLOCK"));
+    let geom = (nkvh as usize, block as usize, hd as usize);
+    let pool_rows = s.geom("NUM_PAGES") * nkvh * block;
+    let stick = <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES;
+    let (src, k) = fp8_twin(
+        spec(
+            "reshape_and_cache_head_major.py",
+            "reshape_and_cache_head_major_kernel",
+            &[
+                ("key", "*fp16"),
+                ("value", "*fp16"),
+                ("k_rows", "*fp16"),
+                ("v_rows", "*fp16"),
+                ("row_index", "*i32"),
+            ],
+            &[
+                ("T", mq),
+                ("NUM_KV_HEADS", nkvh),
+                ("HEAD_SIZE", hd),
+                ("NUM_ROWS", pool_rows),
+                ("STICK", i128::from(stick)),
+            ],
+        ),
+        ["k_rows", "v_rows"],
+    );
+    let w = lower(src, &k);
+    // Each token's row on a token-major page, from the recording's head-0 row
+    // `(page · nkvh + 0) · block + slot`.
+    let (raw, _, _) = s.file("write_rows");
+    let recorded: Vec<i32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| i32::from_le_bytes(*w))
+        .collect();
+    let (t, kvh, blk) = (mq as usize, nkvh as usize, block as usize);
+    let rows: Vec<i32> = (0..t)
+        .map(|tok| {
+            let r = recorded[tok * kvh] as usize;
+            ((r / (kvh * blk)) * blk + r % blk) as i32
+        })
+        .collect();
+    let pool = vec![(pool_rows / nkvh) as usize, (nkvh * hd) as usize];
+    let kv_shape = vec![t, (nkvh * hd) as usize];
+    let after = run(
+        &w,
+        vec![
+            s.arg("k_new", kv_shape.clone()),
+            s.arg("v_new", kv_shape),
+            fp8_arg(&token_major(&s.values("kp_pre"), geom), pool.clone()),
+            fp8_arg(&token_major(&s.values("vp_pre"), geom), pool),
+            i32_arg(&rows, vec![t]),
+        ],
+    );
+    let (kp, vp) = (after[2].clone(), after[3].clone());
+    assert!(
+        kp == fp8_round(&token_major(&s.values("kp_post"), geom)),
+        "{config}: the fp8 K pool after the write is not spyre-inference's, rounded and token-major"
+    );
+    assert!(
+        vp == fp8_round(&token_major(&s.values("vp_post"), geom)),
+        "{config}: the fp8 V pool after the write is not spyre-inference's, rounded and token-major"
+    );
+
+    let got = attend_fp8(&s, &kp, &vp);
+    let fp16 = attend(
+        &s,
+        &head_major(&kp, geom),
+        &head_major(&vp, geom),
+        page_table(&s, 0),
+    );
+    let err = max_abs(&got, &fp16);
+    let theirs = max_abs(&s.values("out_f16"), &s.values("out_f32"));
+    let gate = 4.0 * theirs.max(5e-4);
+    println!(
+        "{config}: fp8 walk vs fp16 walk on its values {err:.3e}, gate {gate:.3e}; \
+         vs spyre-inference's f32 {:.3e}",
+        max_abs(&got, &s.values("out_f32"))
+    );
+    assert!(
+        err < gate,
+        "{config}: the fp8 walk misses the fp16 walk on the same values by {err:.3e}, gate {gate:.3e}"
+    );
+    // CONTROL — the pages are read token-major: the same bytes laid head-major must miss.
+    let wrong = attend_fp8(&s, &head_major(&kp, geom), &head_major(&vp, geom));
+    let miss = max_abs(&wrong, &fp16);
+    println!("{config}: the fp8 walk over head-major bytes misses by {miss:.3e}");
+    assert!(
+        miss > CONTROL_MARGIN * gate,
+        "{config}: the fp8 walk over head-major bytes still matches ({miss:.3e})"
+    );
+}
+
+/// One decode token: under the scatter's floor, its row stored as one block of whole sticks.
+#[test]
+fn an_fp8_decode_step_is_the_fp16_step_on_its_values() {
+    the_fp8_step_is_the_fp16_step_on_its_values("paged_attn_decode");
+}
+
+/// A prompt chunk of 32 tokens: every row scattered at once.
+#[test]
+fn an_fp8_prompt_chunk_is_the_fp16_chunk_on_its_values() {
+    the_fp8_step_is_the_fp16_step_on_its_values("paged_attn_prefill");
+}
+
+/// ⭐ A DECODE BATCH OVER AN FP8 POOL: the fp8 twin over the recorded pools rounded to fp8 and laid
+/// token-major answers what the fp16 kernel answers over the same values laid head-major. The
+/// control: the fp8 twin over the same bytes laid head-major misses.
+fn the_fp8_batch_is_the_fp16_batch_on_its_values(config: &str) {
+    let b = Batch::load(config);
+    let s = &b.step;
+    let geom = (
+        s.geom("NKVH") as usize,
+        s.geom("BLOCK") as usize,
+        s.geom("HD") as usize,
+    );
+    let (rep, ids) = (b.words("rep_row_ids"), b.words("chunk_page_ids"));
+    let (kp, vp) = (fp8_round(&s.values("kp")), fp8_round(&s.values("vp")));
+    let (kt, vt) = (token_major(&kp, geom), token_major(&vp, geom));
+    let got = b.attend_on(&rep, &ids, Pages::Fp8(&kt, &vt));
+    let fp16 = b.attend_on(&rep, &ids, Pages::Fp16(&kp, &vp));
+    let err = max_abs(&got, &fp16);
+    let theirs = max_abs(&s.values("out_f16"), &s.values("out_f32"));
+    let gate = 4.0 * theirs.max(5e-4);
+    println!("{config}: fp8 batch vs fp16 batch on its values {err:.3e}, gate {gate:.3e}");
+    assert!(
+        err < gate,
+        "{config}: the fp8 batch misses the fp16 batch on the same values by {err:.3e}, gate {gate:.3e}"
+    );
+    let wrong = b.attend_on(&rep, &ids, Pages::Fp8(&kp, &vp));
+    let miss = max_abs(&wrong, &fp16);
+    println!("{config}: the fp8 batch over head-major bytes misses by {miss:.3e}");
+    assert!(
+        miss > CONTROL_MARGIN * gate,
+        "{config}: the fp8 batch over head-major bytes still matches ({miss:.3e})"
+    );
+}
+
+#[test]
+fn an_fp8_decode_batch_is_the_fp16_batch_on_its_values() {
+    the_fp8_batch_is_the_fp16_batch_on_its_values("batched_decode");
+}
+
+#[test]
+fn an_fp8_decode_batch_over_two_chunks_is_the_fp16_batch_on_its_values() {
+    the_fp8_batch_is_the_fp16_batch_on_its_values("batched_decode_chunks");
+}
+
+#[test]
+fn an_fp8_decode_batch_under_the_gather_floor_is_the_fp16_batch_on_its_values() {
+    the_fp8_batch_is_the_fp16_batch_on_its_values("batched_decode_floor");
 }

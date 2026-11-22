@@ -86,5 +86,7 @@ pub enum Program {
     /// A 2-D transpose of a whole tensor.
     Transpose,
     /// The norm applied per head window.
-    WindowedRmsNorm { unit: bool },
+    WindowedRmsNorm {
+        unit: bool,
+    },
 }

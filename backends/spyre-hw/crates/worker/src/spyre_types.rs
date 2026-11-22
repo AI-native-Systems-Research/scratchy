@@ -47,7 +47,7 @@ pub(crate) struct BundleMeta {
     ///
     /// ⛔ EMULATOR-ONLY (cfg'd): the card's own staging rides its forward tape.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
+    pub(crate) paged: scratchy_target_spyre::wiring::ClassSteps,
     /// Prefix capacity (mask cols) — max context length this bundle serves.
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
@@ -85,8 +85,8 @@ impl BundleMeta {
     /// below it can run here from any start; on the card, its prefix capacity.
     pub(crate) fn reach(&self) -> usize {
         #[cfg(not(feature = "spyre-hw"))]
-        if let Some(p) = self.paged {
-            return p.reach();
+        if let Some(r) = self.paged.reach() {
+            return r;
         }
         self.capacity
     }

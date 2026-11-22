@@ -228,7 +228,14 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         borrowed: &[i64],
         spilled_tail: &[u32],
     ) -> Result<Self> {
-        Self::build_inner(cards, code, dims, Staged { weights: None }, borrowed, spilled_tail)
+        Self::build_inner(
+            cards,
+            code,
+            dims,
+            Staged { weights: None },
+            borrowed,
+            spilled_tail,
+        )
     }
 
     /// Allocate every segment at FULL size but populate none — no weights bound, so staging no-ops.
@@ -245,7 +252,14 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         dims: SessionDims,
         spilled_tail: &[u32],
     ) -> Result<Self> {
-        Self::new_inner(cards, code, dims, Staged { weights: None }, &[], spilled_tail)
+        Self::new_inner(
+            cards,
+            code,
+            dims,
+            Staged { weights: None },
+            &[],
+            spilled_tail,
+        )
     }
 
     /// Every constructor, composed: the HOST half then the DEVICE half. The ladder fan-outs are
@@ -747,15 +761,6 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
             .each(|e| e.stage_keyed(id, key, bytes.clone()))?
             .into_iter()
             .sum())
-    }
-
-    /// ⭐⭐⭐ THE ONCARD HAND-OFF — the sticks a stable decode seating leaves to the card's own
-    /// ChainStage writes. Ends the refill's re-send of a previous `Host` launch's seed bind
-    /// (see `Executor::hand_to_card`); a churned seating's re-bind re-inserts it.
-    pub fn hand_to_card(&mut self, id: scratchy_target_spyre::bundle_code::PlaceId) {
-        for e in self.ranks.values_mut() {
-            e.hand_to_card(id);
-        }
     }
 
     /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE

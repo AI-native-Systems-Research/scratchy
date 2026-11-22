@@ -58,7 +58,10 @@ impl Planned {
 
 /// The layouts `f`'s staged parameters must be held in: each re-laid-out so every op reads it on
 /// its own stick, and held as wide as every op's division pads it.
-pub fn layouts<G: DeviceGen>(f: &IRFunction<'_>, residency: &[Residency]) -> Result<Vec<ParamLayout>, Error> {
+pub fn layouts<G: DeviceGen>(
+    f: &IRFunction<'_>,
+    residency: &[Residency],
+) -> Result<Vec<ParamLayout>, Error> {
     let natural = lift::lift::<G>(f, &vec![None; f.arguments.len()]).map_err(Error::Lift)?;
     let mut held = layout::staged_layouts(&natural, residency);
     let relaid = lift::lift::<G>(f, &held).map_err(Error::Lift)?;
@@ -82,5 +85,9 @@ pub fn plan<G: DeviceGen>(f: &IRFunction<'_>, layouts: &[ParamLayout]) -> Result
     layout::restick::<G>(&mut graph);
     layout::index_inner::<G>(&mut graph);
     let footprint = emit::footprint::<G>(&graph);
-    Ok(Planned { graph, layouts: layouts.to_vec(), footprint })
+    Ok(Planned {
+        graph,
+        layouts: layouts.to_vec(),
+        footprint,
+    })
 }

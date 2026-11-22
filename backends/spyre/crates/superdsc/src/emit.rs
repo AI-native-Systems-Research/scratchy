@@ -51,6 +51,13 @@ pub enum EmitError {
     Unbound { param: usize },
     /// A constant the bindings give no stick.
     Unplaced { constant: usize },
+    /// An operand held in a format dxp binds the op over none of ([`OpFunc::binds`]).
+    Format {
+        node: usize,
+        operand: usize,
+        func: OpFunc,
+        format: DataFormat,
+    },
 }
 
 /// One space axis.
@@ -145,7 +152,11 @@ impl Plan {
     }
 
     fn proj<'g>(&self, node: &'g Node, oi: usize) -> Proj<'g> {
-        let operand = if oi < node.inputs.len() { &node.inputs[oi] } else { &node.output };
+        let operand = if oi < node.inputs.len() {
+            &node.inputs[oi]
+        } else {
+            &node.output
+        };
         let (at, stick) = &self.projs[oi];
         Proj {
             operand,
@@ -166,7 +177,11 @@ pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
     for (ni, node) in g.nodes.iter().enumerate() {
         let p = plan::<G>(node);
         for oi in 0..=node.inputs.len() {
-            let o = if oi < node.inputs.len() { &node.inputs[oi] } else { &node.output };
+            let o = if oi < node.inputs.len() {
+                &node.inputs[oi]
+            } else {
+                &node.output
+            };
             let end = p.end(node, oi);
             match o.store {
                 Store::Local(l) => {
@@ -192,7 +207,9 @@ pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
     let mut placed: Vec<(u64, u64, usize)> = Vec::new();
     let mut scratch_bytes = 0u64;
     for l in order {
-        let Some((first, last)) = live[l] else { continue };
+        let Some((first, last)) = live[l] else {
+            continue;
+        };
         placed.retain(|&(_, _, end)| end >= first);
         let mut taken: Vec<(u64, u64)> = placed.iter().map(|&(a, b, _)| (a, b)).collect();
         taken.sort_unstable();
@@ -207,7 +224,11 @@ pub fn footprint<G: DeviceGen>(g: &Graph) -> Footprint {
         placed.push((at, at + bytes[l], last));
         scratch_bytes = scratch_bytes.max(at + bytes[l]);
     }
-    Footprint { scratch_bytes, room, locals }
+    Footprint {
+        scratch_bytes,
+        room,
+        locals,
+    }
 }
 
 /// `g`'s descriptors in launch order, against `bindings`, for generation `G`.
@@ -246,7 +267,11 @@ pub fn staged_widths<G: DeviceGen>(g: &Graph) -> Vec<Option<u64>> {
     for node in &g.nodes {
         let p = plan::<G>(node);
         for oi in 0..=node.inputs.len() {
-            let o = if oi < node.inputs.len() { &node.inputs[oi] } else { &node.output };
+            let o = if oi < node.inputs.len() {
+                &node.inputs[oi]
+            } else {
+                &node.output
+            };
             let Store::Param(q) = o.store else { continue };
             let pr = p.proj(node, oi);
             if pr.stride(pr.stick) != Some(1) {
@@ -311,8 +336,16 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
             )
         }
         Family::Pointwise | Family::StickReduce | Family::NonStickReduce => {
-            let src = if family == Family::Pointwise { &node.output } else { &node.inputs[0] };
-            let unit = src.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1)
+            let src = if family == Family::Pointwise {
+                &node.output
+            } else {
+                &node.inputs[0]
+            };
+            let unit = src
+                .view
+                .axes
+                .iter()
+                .position(|a| a.stride == 1 && a.extent > 1)
                 .or_else(|| src.view.axes.iter().position(|a| a.stride == 1));
             let (stick, lanes_axis) = match unit {
                 Some(s) => (s, false),
@@ -325,18 +358,31 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
             let mut labels = Vec::with_capacity(space.len());
             let mut outer = OUTER.iter();
             for i in 0..space.len() {
-                labels.push(if i == stick { Dim::Out } else { *outer.next().unwrap_or(&Dim::J) });
+                labels.push(if i == stick {
+                    Dim::Out
+                } else {
+                    *outer.next().unwrap_or(&Dim::J)
+                });
             }
             let projs = operands
                 .iter()
                 .map(|o| {
-                    let mut s: Vec<Option<At>> = (0..o.view.axes.len()).map(|j| Some(At::View(j))).collect();
+                    let mut s: Vec<Option<At>> =
+                        (0..o.view.axes.len()).map(|j| Some(At::View(j))).collect();
                     // A constant is one value: its lanes repeat like every other axis of it.
                     if lanes_axis {
-                        s.push(Some(if matches!(o.store, Store::Const(_)) { At::Broadcast } else { At::Lanes }));
+                        s.push(Some(if matches!(o.store, Store::Const(_)) {
+                            At::Broadcast
+                        } else {
+                            At::Lanes
+                        }));
                     }
                     // A restick reads each operand on its own stick.
-                    let own = o.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1);
+                    let own = o
+                        .view
+                        .axes
+                        .iter()
+                        .position(|a| a.stride == 1 && a.extent > 1);
                     let stick = match (node.func, own) {
                         (OpFunc::Restick, Some(own)) => own,
                         _ => stick,
@@ -376,7 +422,9 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
     let budget = match (family, gathered) {
         (_, Some(_)) => 1,
         (Family::Contraction, None) => u64::from(G::CORES),
-        (_, None) => bytes.div_ceil(G::BYTES_PER_CORE).clamp(1, u64::from(G::CORES)),
+        (_, None) => bytes
+            .div_ceil(G::BYTES_PER_CORE)
+            .clamp(1, u64::from(G::CORES)),
     };
     // Every axis some operand is sticked on cuts in whole sticks.
     let sticks: Vec<usize> = projs
@@ -418,7 +466,12 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
     // every row count that reads it. The padding is lanes every operand's buffer holds.
     if family == Family::Contraction {
         let units = space[stick_axis] / lanes;
-        let splits = |u: u64| (1..=budget.min(u)).rev().find(|d| u.is_multiple_of(*d)).unwrap_or(1);
+        let splits = |u: u64| {
+            (1..=budget.min(u))
+                .rev()
+                .find(|d| u.is_multiple_of(*d))
+                .unwrap_or(1)
+        };
         if splits(units) < budget.min(units) / 2 {
             let best = (units..=units + units / 8)
                 .max_by_key(|&u| (splits(u), std::cmp::Reverse(u)))
@@ -467,7 +520,22 @@ fn op<G: DeviceGen>(
     let family = node.func.family();
     let mut operands: Vec<&Operand> = node.inputs.iter().collect();
     operands.push(&node.output);
-    let Plan { axes, split, per_core, slices, projs, gathered } = plan;
+    if let Some(o) = operands.iter().position(|o| !node.func.binds(o.format)) {
+        return Err(EmitError::Format {
+            node: ni,
+            operand: o,
+            func: node.func,
+            format: operands[o].format,
+        });
+    }
+    let Plan {
+        axes,
+        split,
+        per_core,
+        slices,
+        projs,
+        gathered,
+    } = plan;
     let cores: u64 = split.iter().product();
     let space: Vec<u64> = axes.iter().map(|a| a.extent).collect();
     // ── the operands
@@ -486,7 +554,10 @@ fn op<G: DeviceGen>(
     // ── an access through an index tensor: the index is one more tensor, over the indexed axis
     let index_at = match gathered {
         Some((vi, g)) => {
-            let gather = operands[*vi].gather.as_ref().ok_or(EmitError::Stick { node: ni, operand: *vi })?;
+            let gather = operands[*vi].gather.as_ref().ok_or(EmitError::Stick {
+                node: ni,
+                operand: *vi,
+            })?;
             let index = &gather.index;
             let lanes = index.format.lanes::<G>();
             let n = axes[*g].extent as i64;
@@ -498,7 +569,13 @@ fn op<G: DeviceGen>(
                 elem_arr: 2,
                 padding: "nopad",
                 folds: wire::Folds {
-                    dim_prop_func: vec![affine(n), affine(0), affine(0), affine(lanes as i64), affine(1)],
+                    dim_prop_func: vec![
+                        affine(n),
+                        affine(0),
+                        affine(0),
+                        affine(lanes as i64),
+                        affine(1),
+                    ],
                     dim_prop_attr: vec![
                         prop(1, "core_fold"),
                         prop(1, "corelet_fold"),
@@ -513,7 +590,8 @@ fn op<G: DeviceGen>(
             // The value's indexed axis holds one row per index. Rows one stick apart are the rows of
             // a stick array, the rest of which are a gap; a whole multi-stick row per index is the
             // value's outermost block, past which there is nothing.
-            let one_stick = plan.proj(node, *vi).stride(*g) == Some(operands[*vi].format.lanes::<G>());
+            let one_stick =
+                plan.proj(node, *vi).stride(*g) == Some(operands[*vi].format.lanes::<G>());
             let vt = &mut tensors[*vi];
             if !one_stick {
                 // dxp sizes a whole row's own dims itself; it is told only that each index names
@@ -578,7 +656,10 @@ fn op<G: DeviceGen>(
             stick_size: vec![t.format.lanes::<G>()],
         });
     }
-    let core_prop = |n: u64| wire::Prop { factor: n as i64, label: "core" };
+    let core_prop = |n: u64| wire::Prop {
+        factor: n as i64,
+        label: "core",
+    };
     let one = |label| wire::Prop { factor: 1, label };
     let schedule: Vec<wire::Allocate> = tensors
         .iter()
@@ -611,7 +692,11 @@ fn op<G: DeviceGen>(
             }),
             index_tensor_type: index_at.and_then(|(_, ii)| (ti == ii).then_some("index")),
             start_address_core_corelet: wire::Folds {
-                dim_prop_func: vec![wire::Func::Map {}, wire::Func::Const {}, wire::Func::Const {}],
+                dim_prop_func: vec![
+                    wire::Func::Map {},
+                    wire::Func::Const {},
+                    wire::Func::Const {},
+                ],
                 dim_prop_attr: vec![core_prop(cores), one("corelet"), one("time")],
                 data: Some(
                     t.addrs
@@ -643,18 +728,25 @@ fn op<G: DeviceGen>(
             // An index tensor is read from HBM only: indices never stage through LX.
             mem_org: wire::MemOrg {
                 hbm: Some(wire::MemPresence { is_present: 1 }),
-                lx: (!index_at.is_some_and(|(_, ii)| ii == ti)).then_some(wire::MemPresence { is_present: 1 }),
+                lx: (!index_at.is_some_and(|(_, ii)| ii == ti))
+                    .then_some(wire::MemPresence { is_present: 1 }),
             },
         })
         .collect();
-    let mut inputs: Vec<String> = (first..first + n_in).map(|i| format!("Tensor{i}-idx{i}")).collect();
+    let mut inputs: Vec<String> = (first..first + n_in)
+        .map(|i| format!("Tensor{i}-idx{i}"))
+        .collect();
     if node.func.accumulates() {
         inputs.push(format!("Tensor{out_idx}-idx{out_idx}"));
     }
     let compute_format = node.inputs.first().map_or(node.output.format, |o| o.format);
     let space_of = |name, ext: &[u64]| wire::Space {
         name,
-        dims: axes.iter().zip(ext).map(|(a, &e)| (a.dim.extent_key(), e)).collect(),
+        dims: axes
+            .iter()
+            .zip(ext)
+            .map(|(a, &e)| (a.dim.extent_key(), e))
+            .collect(),
     };
     let dsc = wire::Dsc {
         num_cores_used: cores as u32,
@@ -700,18 +792,27 @@ fn op<G: DeviceGen>(
         corelet_fold_prop: one("corelet"),
         num_cores_used: cores as u32,
         core_id_to_dsc: (0..cores).map(|c| (c.to_string(), 0)).collect(),
-        num_wk_slices_per_dim: axes.iter().zip(split).map(|(a, &s)| (a.dim.wire(), s)).collect(),
+        num_wk_slices_per_dim: axes
+            .iter()
+            .zip(split)
+            .map(|(a, &s)| (a.dim.wire(), s))
+            .collect(),
         core_id_to_wk_slice: slices
             .iter()
             .enumerate()
             .map(|(c, s)| {
                 (
                     c.to_string(),
-                    axes.iter().zip(s).map(|(a, &v)| (a.dim.wire(), v)).collect(),
+                    axes.iter()
+                        .zip(s)
+                        .map(|(a, &v)| (a.dim.wire(), v))
+                        .collect(),
                 )
             })
             .collect(),
-        core_id_to_dsc_schedule: (0..cores).map(|c| (c.to_string(), vec![[-1, 0, 0, 0]])).collect(),
+        core_id_to_dsc_schedule: (0..cores)
+            .map(|c| (c.to_string(), vec![[-1, 0, 0, 0]]))
+            .collect(),
         dscs: vec![BTreeMap::from([(node.func.wire(), dsc)])],
     })
 }
@@ -735,7 +836,12 @@ fn tensor<G: DeviceGen>(
     d: &Division<'_>,
     base: &dyn Fn(Store) -> Result<u64, EmitError>,
 ) -> Result<Tensor, EmitError> {
-    let Division { axes, split, per_core, slices } = *d;
+    let Division {
+        axes,
+        split,
+        per_core,
+        slices,
+    } = *d;
     let o = p.operand;
     let lanes = o.format.lanes::<G>();
     #[derive(Clone, Copy)]
@@ -746,21 +852,48 @@ fn tensor<G: DeviceGen>(
     }
     let mut entries: Vec<Entry> = Vec::new();
     for (axis, ax) in axes.iter().enumerate() {
-        let Some(stride) = p.stride(axis) else { continue };
+        let Some(stride) = p.stride(axis) else {
+            continue;
+        };
         let e = if axis == p.stick {
             match stride {
                 // The stick's index advances a stick at a time — or a whole stick column.
-                1 => Entry { axis, scale: 1, key: p.columns(axis).unwrap_or(lanes) },
-                0 => Entry { axis, scale: -2, key: 0 },
-                _ => return Err(EmitError::Stick { node: ni, operand: oi }),
+                1 => Entry {
+                    axis,
+                    scale: 1,
+                    key: p.columns(axis).unwrap_or(lanes),
+                },
+                0 => Entry {
+                    axis,
+                    scale: -2,
+                    key: 0,
+                },
+                _ => {
+                    return Err(EmitError::Stick {
+                        node: ni,
+                        operand: oi,
+                    });
+                }
             }
         } else if p.indexed != Some(axis) && (stride == 0 || ax.extent == 1) {
-            Entry { axis, scale: -1, key: u64::MAX }
+            Entry {
+                axis,
+                scale: -1,
+                key: u64::MAX,
+            }
         } else if stride == 0 {
             // The indexed axis of an operand holding one row: outermost, one row.
-            Entry { axis, scale: 1, key: u64::MAX - 1 }
+            Entry {
+                axis,
+                scale: 1,
+                key: u64::MAX - 1,
+            }
         } else {
-            Entry { axis, scale: 1, key: stride }
+            Entry {
+                axis,
+                scale: 1,
+                key: stride,
+            }
         };
         entries.push(e);
     }
@@ -768,8 +901,18 @@ fn tensor<G: DeviceGen>(
     // outside every row its columns are pitched past.
     let columns = p.columns(p.stick).is_some();
     // An indexed axis one stick apart sits directly outside the lanes: dxp reads it as the rows.
-    entries.sort_by_key(|e| (e.key, p.indexed != Some(e.axis), (e.axis == p.stick) == columns));
-    let real: Vec<Entry> = entries.iter().copied().filter(|e| e.key < u64::MAX - 1).collect();
+    entries.sort_by_key(|e| {
+        (
+            e.key,
+            p.indexed != Some(e.axis),
+            (e.axis == p.stick) == columns,
+        )
+    });
+    let real: Vec<Entry> = entries
+        .iter()
+        .copied()
+        .filter(|e| e.key < u64::MAX - 1)
+        .collect();
     // Each axis's extent in storage: the next axis's step over this one's — counted in elements
     // for the stick, which holds `lanes` per step.
     let mut max_dims = Vec::with_capacity(entries.len());
@@ -782,17 +925,27 @@ fn tensor<G: DeviceGen>(
         let md = match (e.scale, real.get(pos + 1)) {
             (-2, Some(n)) => {
                 if n.key % lanes != 0 {
-                    return Err(EmitError::Nesting { node: ni, operand: oi });
+                    return Err(EmitError::Nesting {
+                        node: ni,
+                        operand: oi,
+                    });
                 }
                 lanes as i64
             }
             (-2, None) => lanes as i64,
             (_, Some(n)) => {
                 if n.key % e.key != 0 {
-                    return Err(EmitError::Nesting { node: ni, operand: oi });
+                    return Err(EmitError::Nesting {
+                        node: ni,
+                        operand: oi,
+                    });
                 }
                 let ratio = n.key / e.key;
-                (if e.axis == p.stick { ratio * lanes } else { ratio }) as i64
+                (if e.axis == p.stick {
+                    ratio * lanes
+                } else {
+                    ratio
+                }) as i64
             }
             (_, None) => -1,
         };
@@ -844,7 +997,14 @@ fn tensor<G: DeviceGen>(
                         prop(ns as i64, "core_fold"),
                         prop(1, "corelet_fold"),
                         prop(1, "row_fold"),
-                        prop(if red { 1 } else { (size as u64).div_ceil(lanes) as i64 }, "elem_arr_1"),
+                        prop(
+                            if red {
+                                1
+                            } else {
+                                (size as u64).div_ceil(lanes) as i64
+                            },
+                            "elem_arr_1",
+                        ),
                         prop(l, "elem_arr_0"),
                     ],
                     data: None,
@@ -859,10 +1019,16 @@ fn tensor<G: DeviceGen>(
             Some(At::View(j)) => o.view.axes[j].extent,
             _ => axes[p.stick].extent,
         };
-        let outer_aligned = (0..axes.len())
-            .all(|i| i == p.stick || axes[i].extent == 1 || p.stride(i).is_none_or(|s| s.is_multiple_of(lanes)));
+        let outer_aligned = (0..axes.len()).all(|i| {
+            i == p.stick
+                || axes[i].extent == 1
+                || p.stride(i).is_none_or(|s| s.is_multiple_of(lanes))
+        });
         if !o.view.offset.is_multiple_of(lanes) || !outer_aligned {
-            return Err(EmitError::Nesting { node: ni, operand: oi });
+            return Err(EmitError::Nesting {
+                node: ni,
+                operand: oi,
+            });
         }
         if logical % lanes != 0 && logical != axes[p.stick].extent {
             let pitch = max_dims
@@ -870,7 +1036,10 @@ fn tensor<G: DeviceGen>(
                 .copied()
                 .unwrap_or(-1);
             if pitch != -1 && (pitch as u64) < axes[p.stick].extent {
-                return Err(EmitError::Nesting { node: ni, operand: oi });
+                return Err(EmitError::Nesting {
+                    node: ni,
+                    operand: oi,
+                });
             }
         }
     }
@@ -900,14 +1069,18 @@ fn tensor<G: DeviceGen>(
 }
 
 /// The files of one dxp group: `sdsc_<i>.json` per op in order, then `bundle.mlir`.
-pub fn group_files(ops: &[(OpFunc, wire::Sdsc)]) -> Result<Vec<(String, String)>, serde_json::Error> {
+pub fn group_files(
+    ops: &[(OpFunc, wire::Sdsc)],
+) -> Result<Vec<(String, String)>, serde_json::Error> {
     let mut files = Vec::with_capacity(ops.len() + 1);
     let mut body = String::new();
     for (i, (func, sdsc)) in ops.iter().enumerate() {
         let key = format!("{i}_{}", func.wire());
         let json = serde_json::to_string(&BTreeMap::from([(key, sdsc)]))?;
         let name = format!("sdsc_{i}.json");
-        body.push_str(&format!("    sdscbundle.sdsc_execute () {{sdsc_filename=\"{name}\"}}\n"));
+        body.push_str(&format!(
+            "    sdscbundle.sdsc_execute () {{sdsc_filename=\"{name}\"}}\n"
+        ));
         files.push((name, json));
     }
     files.push((

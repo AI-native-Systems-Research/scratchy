@@ -562,7 +562,7 @@ jobs:
   # macOS build would collide with Accelerate in the same way the linux-spyre-emu
   # job documents.
   #
-  # The re-hosted triton crates (frontend, ktir, ktir-superdsc, numeric, splice)
+  # The re-hosted triton crates (frontend, ktir, numeric, splice)
   # are pure Rust — no hardware — but the linux-workspace job's clippy has
   # no `--all-targets`, so nothing else in CI compiled their tests or examples:
   # the 141 ktir tests, the stale-golden pins PROVENANCE.md leans on, and the
@@ -637,23 +637,17 @@ jobs:
         working-directory: backends/spyre-hw
         run: cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli
           --features spyre-emu,model/llama-3.2-1b --all-targets -- -D warnings
-      # The spyre-side ktir-superdsc and spyre-bundle crates' TEST targets compile
+      # The spyre-side superdsc and spyre-bundle crates' TEST targets compile
       # under no other CI step: this job's clippy above is -p scratchy-target-spyre,
-      # the triton clippy below is the five re-host crates, and the linux-workspace job's
+      # the triton clippy below is the four re-host crates, and the linux-workspace job's
       # workspace clippy has no --all-targets, so workspace members' test builds
-      # never happen there. #714's dangling `Df::Fp8` sat in exactly that gap (the
-      # import deleted with MatmulStaging, the usage left in
-      # zz_a_one_row_matmul_fills_every_core.rs) — main could not compile that test
-      # binary and no check was red. This leg is the compile cover for that class.
-      # The same gap at clippy: the test step below compiles ktir-superdsc's test
-      # targets, but no step LINTS them (the triton clippy is the five re-host
-      # crates, the workspace clippy has no --all-targets), so lint debt piled
-      # unseen — main was red in this leg nobody ran (chain_stage_program's
-      # nine positional args, an identity op in the broadcast-prefix-row test).
-      - name: Clippy (spyre ktir-superdsc, all targets)
-        run: cargo clippy -p ktir-superdsc --all-targets -- -D warnings
-      - name: Test (spyre ktir-superdsc + bundle)
-        run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
+      # never happen there. #714's dangling `Df::Fp8` sat in exactly that gap — main
+      # could not compile a test binary and no check was red. This leg is the compile
+      # and lint cover for that class.
+      - name: Clippy (spyre superdsc, all targets)
+        run: cargo clippy -p scratchy-spyre-superdsc --all-targets -- -D warnings
+      - name: Test (spyre superdsc + bundle)
+        run: cargo test -p scratchy-spyre-superdsc -p scratchy-spyre-bundle
       # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
       # a missing initializer field kept the lib tests from compiling). Pure Rust, no device.
       - name: Test (scratchy-subtile)
@@ -685,14 +679,14 @@ jobs:
           cargo test -p scratchy-target-spyre-compiler --features spyre-emu --lib
           cargo clippy -p scratchy-target-spyre-compiler --features spyre-emu --tests -- -D warnings
       - name: Clippy (triton re-host crates, all targets)
-        run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
+        run: cargo clippy -p triton-frontend -p triton-ktir -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)
-        run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice
+        run: cargo test -p triton-frontend -p triton-ktir -p triton-numeric -p scratchy-triton-splice
 
   # ---------------------------------------------------------------------------
   # ⭐ THE CARD'S LOWERING, WITHOUT A CARD. `spyre-lower` lowers every rung a card build bakes — the
   # decode ceiling and its batch rungs, every prefill width to 512, the prefix and CB rungs — through
-  # the card's own path (`ktir_groups_via_superdsc`, `render_dxp_input`, `launch_index`) and every
+  # the card's own path (`place_rung`, `lower_op`, `launch_groups`) and every
   # refusal on the way, and compiles no device image. Before it, a lowering defect only the card path
   # reaches (#1162's fold: an aliasing time-tiled write at 8b fp8's prefill m=384) was invisible to
   # every CI job and surfaced on the card. That fold FAILS this step; main passes it.

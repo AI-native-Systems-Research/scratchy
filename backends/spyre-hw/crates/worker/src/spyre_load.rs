@@ -49,34 +49,6 @@ pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
 #[cfg(feature = "spyre-hw")]
 const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident KV")];
 
-/// ⭐⭐ THE KV POOL'S TABLES A **PREFILL** SESSION MUST STAGE FOR ITSELF — `kv_row_pool` and the int32
-/// zero beside it, from the PREFILL bundle's own paged step.
-///
-/// ⛔ NOT COVERED BY [`adopt_from_owner`], AND THAT IS THE WHOLE POINT. The pool is placed as an
-/// INTERMEDIATE colour segment (`CardSeat::Static` → `SegRole::Intermediate`) while the alias list is
-/// the RESIDENT segments — weights and KV — alone. So a prefill session that staged none gathered its
-/// prefix KV through an **unstaged buffer**: a clean launch, and garbage from the first token of every
-/// prompt chunk. Measured on the card (granite-2b and -8b, solo and concurrent alike) the moment the
-/// prompt trip began reading the pool. Every prefill session therefore stages its own copy, exactly as
-/// it already does for the sampler's staged constants, which sit in the same never-aliased segment.
-///
-/// ⛔ AND IT COMES FROM THE PREFILL BUNDLE'S STEP, NEVER THE DECODE ONE. A decode bundle's rows are
-/// its requests' (`PagedRows::Batch`), which reads its pages through `chunk_page_ids` and stages no
-/// pool at all — so `card_statics` on the decode step is EMPTY, and deriving a prefill session's
-/// statics from it would leave the defect exactly where it was.
-///
-/// Empty when this model bakes no prefill bundle, or when its prompt trip reads no pool.
-#[cfg(feature = "spyre-hw")]
-fn prefill_pool_statics(
-    wirings: &'static scratchy_target_spyre::wiring::Wirings,
-) -> ExecutorResult<Vec<(u32, Vec<u8>)>> {
-    let Some(step) = wirings.prefill.as_ref().unwrap_or(&wirings.decode).paged else {
-        return Ok(Vec::new());
-    };
-    scratchy_target_spyre::paged_step::card_statics(&step)
-        .map_err(|e| werr(format!("the prefill sessions' KV pool statics: {e}")))
-}
-
 /// ⭐ EVERYTHING A BORROWING SESSION NEEDS FROM THE OWNER, AS ONE CALL: the resident segments it
 /// ADOPTS by alias, and the spilled weight tail it must be handed its own COPY of.
 ///
@@ -169,7 +141,7 @@ pub(crate) struct Parsed {
     pub(crate) embed_src: usize,
     /// The paged step the wiring states — see `BundleMeta::paged`.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
+    pub(crate) paged: scratchy_target_spyre::wiring::ClassSteps,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
     /// gives classes different tables. Each is filled by tiling the class's own
@@ -203,10 +175,6 @@ pub(crate) struct Parsed {
 pub(crate) fn wiring_to_parsed(
     w: &'static scratchy_target_spyre::wiring::Wiring,
 ) -> ExecutorResult<Parsed> {
-    // (The kernel-table check moved to where the LAYOUT is in hand: `BakeFacts::of` is followed by
-    // `Wiring::verify_class_placements(&code.layout)` once per baked bundle, which cross-checks the
-    // class sets against the placements — the fact that actually failed on gemma-4, where a fresh
-    // re-staging at the same base head dim agreed with a wrong table.)
     let capacity = w
         .capacity()
         .ok_or_else(|| werr("wiring has no attn_mask (re-bake with the length mask)"))?;
@@ -1432,7 +1400,7 @@ impl SpyreWorker {
                 // the KV segment, at the decode wiring's own page count (the model's context). Nothing
                 // here sizes it: the OWNER session allocates the regions once, and every other session
                 // aliases them.
-                let step = wirings.decode.paged.ok_or_else(|| {
+                let step = wirings.decode.paged.first().ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
                 let num_blocks = step.pages as usize;
@@ -1808,39 +1776,13 @@ impl SpyreWorker {
                     pool_need_bytes / (1024 * 1024),
                     step.host_blocks(),
                 );
-                // What the DECODE bake placed — one call, and its own refusal.
-                let df = scratchy_target_spyre::wiring::BakeFacts::of(&code.layout);
-                df.require_identity(&code.fp).map_err(werr)?;
-                // ⭐ THE CLASS SETS vs THE PLACEMENTS — the load-time cross-check that closes the
-                // "emu green, card garbage" gap for the kernel-table class: the emulator executes
-                // the KTIR dialect ops and never reads these tids, so nothing on its path can see
-                // a wiring/layout desync. Here, every rope-P and identity class tid must be placed
-                // at exactly its `hd²·2` footprint, and every placed class tid must be in the
-                // wiring's set — the gemma-4 defect (a base-hd table in a max-hd placement) is
-                // unrepresentable once this runs.
-                wirings
-                    .decode
-                    .verify_class_placements(&code.layout)
-                    .map_err(werr)?;
-                // ⭐ AND THE TAPE IS CHECKED AGAINST THE ARTIFACT, ONCE, HERE. Every tensor the
-                // forward would bind must be one this bundle placed. They come from the same bake
-                // and so agree "by construction" — which is exactly what was also true of the
-                // K-split merge-init zero: a bind for a tid the emitter names nowhere, matching no
-                // placement, reported by nothing for as long as it existed.
-                let n_consts =
-                    scratchy_target_spyre::wiring::synthetic_constants(&df.constant_env(
-                        &wirings.decode,
-                        // The emitter's own row pad (one stick) — the ONE home
-                        // (`mq_pad`), never a second spelling of the stick here.
-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::mq_pad(1),
-                        scratchy_target_spyre::wiring::StagedRows::ONE,
-                    ))
-                    .len();
+                // ⭐ THE TAPE IS CHECKED AGAINST THE ARTIFACT, ONCE, HERE: every tensor the forward
+                // would bind must be one this bundle placed.
                 // One row: the load-time check only asks WHICH tensors the tape names, and that set
                 // does not vary with the row count.
                 let unplaced = wirings
                     .decode
-                    .forward_shape(scratchy_target_spyre::wiring::StagedRows::ONE, n_consts)
+                    .forward_shape(scratchy_target_spyre::wiring::StagedRows::ONE)
                     .unplaced(&code.layout);
                 if !unplaced.is_empty() {
                     return Err(werr(format!(
@@ -1962,18 +1904,6 @@ impl SpyreWorker {
                         // the BORROWING form — identical to every ladder rung: placeholders here,
                         // `adopt_from_owner` onto decode's regions after the owner is built — when
                         // it does not. What that costs is the placement effect, never the run.
-                        // ⭐ THE PREFILL WIRING'S OWN STAGED CONSTANTS — the general mint puts
-                        // the sampler's nine tables in every prefill rung, and they sit in each
-                        // session's own seg3 (never aliased), so every prefill session stages
-                        // its own copy through the same load-time channel the decode rungs use.
-                        let prefill_consts = wirings
-                            .prefill
-                            .as_ref()
-                            .unwrap_or(&wirings.decode)
-                            .load_consts;
-                        // The pool's own tables, staged per prefill session — see
-                        // [`prefill_pool_statics`] for why they cannot be aliased.
-                        let anchor_pool = prefill_pool_statics(wirings)?;
                         let pss = if anchor_reserves {
                             SuperDscSession::new_reserving(
                                 cards,
@@ -1983,12 +1913,10 @@ impl SpyreWorker {
                                     kv_dim,
                                     num_blocks,
                                 },
-                                prefill_consts,
-                                &anchor_pool,
                                 &spill_tids,
                             )
                         } else {
-                            SuperDscSession::new_borrowing_with_consts(
+                            SuperDscSession::new_borrowing(
                                 cards,
                                 pcode,
                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -1997,8 +1925,6 @@ impl SpyreWorker {
                                     num_blocks,
                                 },
                                 &RESIDENT_SEGS.map(|(seg, _)| seg),
-                                prefill_consts,
-                                &anchor_pool,
                                 &spill_tids,
                             )
                         }
@@ -2055,7 +1981,7 @@ impl SpyreWorker {
                     .collect();
                 // ⛔ THE LADDER'S HOST HALF SPAWNS HERE, BEFORE THE OWNER — ITS DEVICE HALF DOES
                 // NOT. A rung's build is two halves: the HOST half
-                // (`SuperDscSession::build_borrowing_with_consts` — `Executor::load`, the binds,
+                // (`SuperDscSession::build_borrowing` — `Executor::load`, the binds,
                 // the staging walk) touches NO device state, so it may run while the owner builds;
                 // the DEVICE half (`prepare` — the stream, the program and tensor-segment
                 // allocations, the H2Ds, the sync) is everything the owner-first laws order, and
@@ -2073,18 +1999,11 @@ impl SpyreWorker {
                 // is why 2b's startup barely moved while 8b's fell by two thirds. Splitting the rungs
                 // across threads removes the cost instead of hiding it.
                 //
-                // The rungs are independent: each is a `build_borrowing_with_consts` on its own bundle dir with no
+                // The rungs are independent: each is a `build_borrowing` on its own bundle dir with no
                 // shared state, and every `alias_seg_from` still happens later on the owning thread.
                 // Capped at the smaller of the rung count and the core count, so a short ladder does
                 // not spawn threads it cannot use.
                 let ladder_join = {
-                    // The prefill wiring's staged constants, staged by every rung through its own
-                    // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
-                    let prefill_consts = wirings
-                        .prefill
-                        .as_ref()
-                        .unwrap_or(&wirings.decode)
-                        .load_consts;
                     let nthreads = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(4)
@@ -2103,9 +2022,6 @@ impl SpyreWorker {
                     // Owned copy for the background build: the spilled tail's ids are declared
                     // resident by every session, and these rungs are built off this thread.
                     let ladder_spill = spill_tids.clone();
-                    // These are PREFILL rungs (`rung_consts = prefill_consts`), so each stages the
-                    // pool's tables for itself ([`prefill_pool_statics`]).
-                    let ladder_pool = prefill_pool_statics(wirings)?;
                     // The cards are the loader's `&'static` borrow, so the background build takes
                     // the reference itself — nothing to clone, nothing kept alive by the build.
                     std::thread::spawn(move || {
@@ -2113,12 +2029,10 @@ impl SpyreWorker {
                             .into_iter()
                             .map(|part| {
                                 let rung_spill = ladder_spill.clone();
-                                let rung_consts = prefill_consts;
-                                let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
-                                            let r = SuperDscSession::build_borrowing_with_consts(
+                                            let r = SuperDscSession::build_borrowing(
                                                 cards,
                                                 rcode,
                                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -2127,8 +2041,6 @@ impl SpyreWorker {
                                                     num_blocks,
                                                 },
                                                 &[1, 2],
-                                                rung_consts,
-                                                &rung_pool,
                                                 &rung_spill,
                                             );
                                             (rm, r)
@@ -2158,7 +2070,7 @@ impl SpyreWorker {
                 // that fails to load is a LOAD ERROR — every rung the bake shipped must load.
                 // ⭐ THE FAN-OUT IS SPAWNED WITH THE PREFILL LADDER'S, BEFORE THE OWNER — a
                 // prefix rung is the same kind of build the prefill rungs are (an independent
-                // host-half `build_borrowing_with_consts` over a static bundle, whose device
+                // host-half `build_borrowing` over a static bundle, whose device
                 // half waits for the owner), so it shares the prefill fan-out's window instead
                 // of paying its own after that fan-out's join (MEASURED 2b fp8, nickm3,
                 // 2026-11-11: the three fan-outs ran sequentially — prefill 0.51 s, prefix
@@ -2173,14 +2085,9 @@ impl SpyreWorker {
                     seqs: u32,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                     /// ⭐ THE RUNG'S OWN WIRING — a SOLO rung's the prefill graph's, a PACKED
-                    /// rung's its OWN pair's cell. The job's consts (the general mint's nine
-                    /// tables, each bundle's own seg3 copy — a packed rung's uniform
-                    /// `[rows, 1]` tables stage at the product's rows, the decode ladder's
-                    /// law) and the adopted rung's meta both read this one cell, so the
-                    /// lookup is stated once.
+                    /// rung's its OWN pair's cell; the adopted rung's meta reads this one cell.
                     wiring: &'static scratchy_target_spyre::wiring::Wiring,
                 }
-                let pool_for_prefix = prefill_pool_statics(wirings)?;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
                 for &(pmq, seqs, psent) in g0.prefill_prefix {
                     if pmq <= 1 || psent.is_empty() {
@@ -2219,13 +2126,11 @@ impl SpyreWorker {
                 }
                 // ── BUILD THE PREFIX RUNGS IN PARALLEL ── one thread per rung (a handful at
                 // most), inside a detached thread joined at the adoption site below. The jobs
-                // are independent host-half `build_borrowing_with_consts` builds over static bundles;
-                // `spill_tids` and
-                // the pool are CLONED into the thread — a detached spawn cannot borrow this
+                // are independent host-half `build_borrowing` builds over static bundles;
+                // `spill_tids` is CLONED into the thread — a detached spawn cannot borrow this
                 // frame.
                 let prefix_join = {
                     let spill = spill_tids.clone();
-                    let pool = pool_for_prefix.clone();
                     std::thread::spawn(move || {
                         let _t = std::time::Instant::now();
                         // Spawn EVERY rung first, join in a second pass — a `map` that joins
@@ -2237,9 +2142,8 @@ impl SpyreWorker {
                                     .iter()
                                     .map(|job| {
                                         let spill = spill.clone();
-                                        let pool = pool.clone();
                                         scope.spawn(move || {
-                                            SuperDscSession::build_borrowing_with_consts(
+                                            SuperDscSession::build_borrowing(
                                                 cards,
                                                 job.rcode,
                                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -2248,8 +2152,6 @@ impl SpyreWorker {
                                                     num_blocks,
                                                 },
                                                 &[1, 2],
-                                                job.wiring.load_consts,
-                                                &pool,
                                                 &spill,
                                             )
                                             .map_err(|e| {
@@ -2296,14 +2198,13 @@ impl SpyreWorker {
                 // the same reason the prefix rungs are (see `prefix_join` above); the adoption
                 // runs at the join below, on this thread.
                 // A validated, UNBUILT decode rung: everything the background build needs,
-                // held until the fan-out below. `rcode`/`rung_consts` are static bundle facts;
+                // held until the fan-out below. `rcode` is a static bundle fact;
                 // the rest are this loop's own derived facts, refused above where they were
                 // derived.
                 struct DecodeRungJob {
                     rn: usize,
                     rung_width: scratchy_spyre_bundle::rung::RungWidth,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                    rung_consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
                     logits: LogitsGeom,
                 }
                 let mut decode_jobs: Vec<DecodeRungJob> = Vec::new();
@@ -2311,7 +2212,7 @@ impl SpyreWorker {
                 // one number per BATCH WIDTH — and the two host decisions that used to read it are
                 // per-BODY (see `DecodeRung`). Binding it to `_` rather than to a name is the point: a
                 // named ceiling sitting in this loop is what got copied onto the rung three times.
-                for (rung_n, _ceiling_swept, sentinel, rung_consts) in g0.decode_rungs {
+                for (rung_n, _ceiling_swept, sentinel) in g0.decode_rungs {
                     // ⛔ `RungSeqs::get`, so this reads a BATCH WIDTH and says so. The sibling ladder
                     // (`sk_bucket_rungs`) is keyed by the SWEEP EXTENT `active_cap`; selecting over it with
                     // `>= live` would bind a body baked for a 64-column sweep because four requests are
@@ -2344,20 +2245,7 @@ impl SpyreWorker {
                     // this rung's `seqs`, so both differ per rung. A rung whose placement does not
                     // describe `rn` whole rows is a LOAD ERROR — a gathered-from guess would read
                     // rows nobody wrote.
-                    // ⭐ THE LOGITS TID IS THE SEAT'S `row` WHEN THE BAKE MINTED A DRAW. The
-                    // token-draw mint re-points the rung's RESULT to the idx stick, so
-                    // `dparsed.result_id` names the `[rows, BLOCK]` pick — the placement exists
-                    // but is not `seqs` rows of vocab, and reading it as logits refused every
-                    // rung at load. The wiring's `SampleSeat.row` is the Sample node's
-                    // inputs[0] — the logits row the mint deliberately keeps placed and
-                    // readable by tid — the same fact the solo launch reads the pick through.
-                    // A bake without a draw keeps the result AS the logits (the host-argmax
-                    // readback this front replaces), so `result_id` stays the fallback.
-                    let logits_tid = wirings
-                        .decode
-                        .sample_seat
-                        .map(|seat| seat.row)
-                        .unwrap_or(dparsed.result_id as u32);
+                    let logits_tid = dparsed.result_id as u32;
                     let logits = rcode
                         .layout
                         .place_of_tid(logits_tid)
@@ -2370,37 +2258,6 @@ impl SpyreWorker {
                             dparsed.result_id
                         )
                     });
-                    // ⛔ THE RUNG'S OWN KINDS, AND EVERY KIND'S ROWS ARE THE RUNG'S OWN —
-                    // the auditor's Finding-1 refusal. A kind whose `rows` is
-                    // not this rung's width is a manifest that describes a
-                    // different rung than the one it rides (the mint's own
-                    // `rows` fact is the rung's bake width), and staging it
-                    // would leave some rows' stick heads reading ZERO — a
-                    // zero hash multiplier folds every row's noise to one
-                    // value. Refuse by name, never serve.
-                    // `rung_consts` arrives DOUBLE-referenced (the rungs loop
-                    // iterates `g0.decode_rungs` by reference, so the tuple's
-                    // `&[(u32, LoadConst)]` field re-borrows) — deref through
-                    // `.iter()`, the auditor's fix for the E0277 the chat leg's
-                    // pod build measured (this arm cannot compile on mac).
-                    for &(tid, kind) in rung_consts.iter() {
-                        // The rung-rows law is the SAMPLER tables' own — the
-                        // chain's decompose tables are functions of the vocab
-                        // alone (`chain_staged_tables`), never the rung's
-                        // width, so they carry no `rows` to check.
-                        if let scratchy_target_spyre::wiring::LoadConst::SampleTable {
-                            rows, ..
-                        } = kind
-                            && rows != rung_n.get()
-                        {
-                            panic!(
-                                "decode batch rung seqs={rn}: its staged constant t{tid} \
-                                 carries rows={rows}, not the rung's own {rn} — the kind and \
-                                 the rung disagree about the bake width, and the short side's \
-                                 rows would read ZERO at their stick heads. REFUSING"
-                            );
-                        }
-                    }
                     // FANNED OUT BELOW (the prefill ladder's shape): a rung's build is
                     // ~0.2 s of per-BUNDLE work, and the rungs sit on the load's critical
                     // path serially. Adoptions run one thread per session below, the
@@ -2411,13 +2268,12 @@ impl SpyreWorker {
                         rn,
                         rung_width,
                         rcode,
-                        rung_consts,
                         logits,
                     });
                 }
                 // ── BUILD THE DECODE RUNGS IN PARALLEL ── one thread per rung, inside a
                 // detached thread joined at the adoption site below. The jobs are independent
-                // host-half `build_borrowing_with_consts` builds over static bundles; `spill_tids` is
+                // host-half `build_borrowing` builds over static bundles; `spill_tids` is
                 // CLONED into the
                 // thread — a detached spawn cannot borrow this frame.
                 let decode_join = {
@@ -2434,7 +2290,7 @@ impl SpyreWorker {
                                     .map(|job| {
                                         let spill = spill.clone();
                                         scope.spawn(move || {
-                                            SuperDscSession::build_borrowing_with_consts(
+                                            SuperDscSession::build_borrowing(
                                                 cards,
                                                 job.rcode,
                                                 scratchy_target_spyre_card::sdsc_runner::SessionDims {
@@ -2443,11 +2299,6 @@ impl SpyreWorker {
                                                     num_blocks,
                                                 },
                                                 &[1, 2],
-                                                job.rung_consts,
-                                                // A decode rung's rows are its requests', so its
-                                                // attention reads its pages through `chunk_page_ids`
-                                                // and stages no pool (`PagedStep::reads_kv_row_pool`).
-                                                &[],
                                                 &spill,
                                             )
                                             .map_err(|e| {
@@ -2492,10 +2343,6 @@ impl SpyreWorker {
                 // buffer is ever made. It runs WHILE the ladder fan-outs above build their host halves:
                 // those touch no device state, and this session's allocations are what the ladder's
                 // device half (the prepare wave below) waits for.
-                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
-                // decode kernel's walk reads; every other session's kernels read none.
-                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
-                    .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
                     cards,
                     code,
@@ -2505,8 +2352,6 @@ impl SpyreWorker {
                         num_blocks,
                     },
                     Some(weights),
-                    wirings.decode.load_consts,
-                    &pool_statics,
                     &spill_tids,
                 )
                 .map_err(|e| werr_chain("build SuperDSC dxp session", &e))?;
@@ -3066,8 +2911,15 @@ impl SpyreWorker {
             let page_slots =
                 scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize();
             let at_walk = |mut meta: BundleMeta, reach: Option<usize>| {
-                if let (Some(r), Some(p)) = (reach, meta.paged.as_mut()) {
-                    p.walk = (r / page_slots) as u32;
+                if let Some(r) = reach {
+                    let walk =
+                        scratchy_target_spyre::paged_step::whole_trips((r / page_slots) as u32);
+                    for p in [&mut meta.paged.full, &mut meta.paged.sliding]
+                        .into_iter()
+                        .flatten()
+                    {
+                        p.walk = walk;
+                    }
                 }
                 meta
             };

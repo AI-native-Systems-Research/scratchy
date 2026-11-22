@@ -53,8 +53,8 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use spyre_superdsc::wire::Sdsc;
 use scratchy_spyre_bundle::correction;
+use spyre_superdsc::wire::Sdsc;
 // The dxp-group descriptor ceiling — ONE const, owned by the leaf crate beside the window-chunk
 // split that targets it (re-exported from `lower_subtile_tape_to_superdsc` under this same name
 // for the emission's own paths). See its doc in `sdsc_abstract` for 4204's measured pedigree.

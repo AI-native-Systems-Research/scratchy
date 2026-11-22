@@ -15,10 +15,10 @@
 //! [`EmittedOp`]: scratchy_triton_splice::EmittedOp
 
 use crate::lower_subtile_tape_to_superdsc::*;
-use scratchy_triton_splice::EmittedOp;
 use scratchy_spyre_bundle::program::ActiveCap;
 use scratchy_spyre_bundle::rung::QueryExtent;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
+use scratchy_triton_splice::EmittedOp;
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
 /// reconnaissance set. These ops never become SuperDSC tiles — the host threads
@@ -741,10 +741,7 @@ pub(crate) fn lower_one_node<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
         | SubOp::DraftContextKv { .. }
         | SubOp::DraftWindowStore
         | SubOp::DraftWindowLoad
-        | SubOp::DraftSelect
-        | SubOp::Sample { .. }
-        | SubOp::EmbedRowGather { .. }
-        | SubOp::ChainStage { .. } => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        | SubOp::DraftSelect => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ── THE 2a KINDS — every one through `lower_all`: the TanhSoftCap logits fold
         // and the head-norm sandwich's three seats (Reshape split / norm middle /
         // Reshape flatten) are `lower_all`'s interceptions, and every other node of
@@ -1004,7 +1001,7 @@ pub struct BundleWiring {
     /// `num_sources` and is written by no node.
     pub attn_mask: Option<u32>,
     /// The paged step's sources and pool — see [`crate::wiring::PagedStep`].
-    pub paged: Option<crate::wiring::PagedStep>,
+    pub paged: crate::wiring::ClassSteps,
     /// The weight folds this graph admits: `(tensor id, multiplier)` for each matmul weight the
     /// worker must scale at load instead of the tape applying the multiplier at runtime —
     /// EITHER a `ScalarMul` fold ([`scalar_mul_weight_folds`], whose refusal set — sliced reads,
@@ -1032,15 +1029,10 @@ pub struct NodeArgs {
 /// `shapes` tokens and the per-tensor `{"rows","cols"}` entries), and the worker's
 /// `stage_bound_weights` sizes everything off it — the disk guard (`rows·cols·elem`
 /// against the checkpoint bytes), the re-tile, the `DeviceWidth` N-pad, and the fp8
-/// K-pad rebuild. The STATED shape is what the placement RESERVES:
-/// `widen_tied_embed_weight` widens the tied embed weight's stated cols to the pick's
-/// pad so the chained head's gather is in extent BY TYPE, while every matmul's weight
-/// view keeps the region the lower baked from the OP DESCRIPTOR'S OWN `n`
-/// (`Range::new(0, n)` — never the tensor's stated cols), a partial view over the
-/// widened tensor. Pre-widen no source ever had stated ≠ region, so a stated-driven
-/// pair was indistinguishable from a region-driven one; the widen is the first, and
-/// the three-width-laws check caught the divergence at bake (2026-10-24: "the manifest
-/// declares 51200, the worker's N-pad law says 65536").
+/// K-pad rebuild. The STATED shape is what the placement RESERVES, while every matmul's
+/// weight view keeps the region the lower baked from the OP DESCRIPTOR'S OWN `n`
+/// (`Range::new(0, n)` — never the tensor's stated cols), a partial view over a tensor
+/// stated wider.
 ///
 /// ONE WALK, ONE MAP, every stager reads: `graph_wiring`'s `tensor_shapes` and the
 /// three-width-laws check's worker law both take their pairs from HERE, so the host
@@ -1156,10 +1148,9 @@ pub fn paged_step_of_ir<F: RopeForm>(
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
     query_rows: scratchy_spyre_bundle::rung::QueryExtent,
-) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
-    let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+) -> Result<crate::wiring::ClassSteps, SuperDscError> {
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
-    let mut out: Option<crate::wiring::PagedStep> = None;
+    let mut out = crate::wiring::ClassSteps::default();
     for n in &ir.nodes {
         let SubOp::AttnDecode {
             mask, attention, ..
@@ -1194,6 +1185,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             )));
         }
         let walk = scratchy_triton_splice::walk_pages(pages, mq, active_cap);
+        let tids = scratchy_triton_splice::PagedStepTids::of(mask.class());
         let step = crate::wiring::PagedStep {
             mask: tids.mask,
             page_table: tids.page_table,
@@ -1211,15 +1203,22 @@ pub fn paged_step_of_ir<F: RopeForm>(
             walk,
             paged_rows,
             extent: query_rows,
+            attends: *mask,
         };
-        match out {
+        let seat = match mask.class() {
+            crate::wiring::AttnClass::Full => &mut out.full,
+            crate::wiring::AttnClass::Sliding => &mut out.sliding,
+        };
+        match *seat {
             Some(prev) if prev != step => {
                 return Err(SuperDscError(format!(
-                    "the graph's attentions disagree about the paged step ({prev:?} vs {step:?}) — \
-                     one page table, one mask stack and one write-row table serve every layer"
+                    "the graph's {:?} attentions disagree about their paged step ({prev:?} vs \
+                     {step:?}) — one page table, one mask stack and one write-row table serve \
+                     every layer of a class",
+                    mask.class()
                 )));
             }
-            _ => out = Some(step),
+            _ => *seat = Some(step),
         }
     }
     Ok(out)
@@ -1269,7 +1268,9 @@ pub fn graph_wiring<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
         result_dtype: result_dtype_of_ir(ir)?,
         tensor_shapes: tensor_shapes_of_ir(ir)?,
         // The attention reads its mask stack at the paged step's own tid.
-        attn_mask: paged.map(|p| if batch { p.chunk_masks } else { p.mask }),
+        attn_mask: paged
+            .first()
+            .map(|p| if batch { p.chunk_masks } else { p.mask }),
         paged,
         weight_scale_folds: weight_scale_folds(ir)
             .into_iter()

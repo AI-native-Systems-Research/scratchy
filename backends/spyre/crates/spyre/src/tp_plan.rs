@@ -422,7 +422,11 @@ mod tests {
                 let ir = local_ir::<T>(&mlp_sublayer(2048, 8192));
                 let placed = lower_rung::<T>(&ir, &[2, 3, 4]);
                 let consumes: Vec<_> = groups(&placed).iter().filter_map(|g| g.tp).collect();
-                assert_eq!(consumes.len(), T::RANKS as usize, "one launch group per rank's consume");
+                assert_eq!(
+                    consumes.len(),
+                    T::RANKS as usize,
+                    "one launch group per rank's consume"
+                );
                 let mut at: Vec<u32> = consumes.iter().map(|c| c.plays_at.get()).collect();
                 at.sort_unstable();
                 assert_eq!(at, (0..T::RANKS).collect::<Vec<_>>());
@@ -486,16 +490,26 @@ mod tests {
                 let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
                 for me in ranks::<T>() {
                     let descriptors = rank_descriptors(&placed, me.get());
-                    assert!(!descriptors.is_empty(), "rank {}'s consume states nothing", me.get());
+                    assert!(
+                        !descriptors.is_empty(),
+                        "rank {}'s consume states nothing",
+                        me.get()
+                    );
                     for s in ranks::<T>() {
                         let tid = cut.block_tid(s);
-                        let (want, size) = (layout.address(tid).unwrap(), layout.placements[&tid].size);
+                        let (want, size) =
+                            (layout.address(tid).unwrap(), layout.placements[&tid].size);
                         let readers: Vec<(usize, u32)> = descriptors
                             .iter()
                             .map(|(d, cores)| {
                                 let mut all = Vec::new();
                                 starts(d, false, &mut all);
-                                (all.iter().filter(|a| (want..want + size).contains(a)).count(), *cores)
+                                (
+                                    all.iter()
+                                        .filter(|a| (want..want + size).contains(a))
+                                        .count(),
+                                    *cores,
+                                )
                             })
                             .filter(|(n, _)| *n > 0)
                             .collect();
@@ -564,7 +578,11 @@ mod tests {
                     copies.sort_unstable();
                     let mut want: Vec<(u64, u64)> = ranks::<T>()
                         .map(|s| {
-                            let src = if s == me { local } else { layout.address(cut.block_tid(s)).unwrap() };
+                            let src = if s == me {
+                                local
+                            } else {
+                                layout.address(cut.block_tid(s)).unwrap()
+                            };
                             (src, out + u64::from(s.get()) * lc * 2)
                         })
                         .collect();
@@ -608,8 +626,15 @@ mod tests {
                         .filter_map(|e| e.tp_consume)
                         .find(|c| c.plays_at == me)
                         .unwrap();
-                    assert_eq!(c.operand, scratchy_spyre_bundle::place::PlaceId::Act(partial));
-                    assert_eq!(c.fragment.byte_offset(), 0, "one fragment, from its first byte");
+                    assert_eq!(
+                        c.operand,
+                        scratchy_spyre_bundle::place::PlaceId::Act(partial)
+                    );
+                    assert_eq!(
+                        c.fragment.byte_offset(),
+                        0,
+                        "one fragment, from its first byte"
+                    );
                     assert_eq!(c.fragment.bytes().get(), natural, "the whole partial");
                     let mut firsts = Vec::new();
                     for (d, _) in rank_descriptors(&placed, me.get()) {

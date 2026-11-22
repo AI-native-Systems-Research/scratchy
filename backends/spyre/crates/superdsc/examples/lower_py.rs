@@ -28,16 +28,30 @@ fn main() {
     let mut constexprs = HashMap::new();
     for a in rest {
         if let Some(list) = a.strip_prefix("staged=") {
-            staged = list.split(',').map(|p| p.parse().expect("staged param")).collect();
+            staged = list
+                .split(',')
+                .map(|p| p.parse().expect("staged param"))
+                .collect();
         } else if let Some((k, v)) = a.split_once('=') {
-            signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
-            let val = v.parse::<i128>().map(Val::Int).unwrap_or_else(|_| Val::Float(v.parse().expect("value")));
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
+            let val = v
+                .parse::<i128>()
+                .map(Val::Int)
+                .unwrap_or_else(|_| Val::Float(v.parse().expect("value")));
             constexprs.insert(k.to_string(), val);
         } else if let Some((k, t)) = a.split_once(':') {
             signature.insert(k.to_string(), ArgSpec::parse(t).expect("type"));
         }
     }
-    let spec = KernelSpec { kernel: kernel.clone(), signature, constexprs, file: file.clone() };
+    let spec = KernelSpec {
+        kernel: kernel.clone(),
+        signature,
+        constexprs,
+        file: file.clone(),
+    };
     let src = std::fs::read_to_string(file).expect("read kernel");
     let mut tt = triton_frontend::codegen::compile(&src, &spec, Target::spyre()).expect("codegen");
     triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
@@ -48,8 +62,20 @@ fn main() {
     if rest.iter().any(|a| a == "dump") {
         fn dump(ops: &[ktir_core::ir::Operation<'_>], depth: usize) {
             for o in ops {
-                let attrs: Vec<String> = o.attributes.iter().map(|(k, v)| format!("{k:?}={v:?}")).collect();
-                println!("{:w$}{:?} = {:?}({:?}) {}", "", o.result, o.op_type, o.operands, attrs.join(" ").chars().take(400).collect::<String>(), w = depth * 2);
+                let attrs: Vec<String> = o
+                    .attributes
+                    .iter()
+                    .map(|(k, v)| format!("{k:?}={v:?}"))
+                    .collect();
+                println!(
+                    "{:w$}{:?} = {:?}({:?}) {}",
+                    "",
+                    o.result,
+                    o.op_type,
+                    o.operands,
+                    attrs.join(" ").chars().take(400).collect::<String>(),
+                    w = depth * 2
+                );
                 for r in o.regions {
                     dump(r, depth + 1);
                 }
@@ -58,9 +84,17 @@ fn main() {
         println!("args {:?} grid {:?}", f.arguments, f.grid);
         dump(f.operations, 0);
     }
-    let params: Vec<u64> = (0..f.arguments.len() as u64).map(|i| 0x4_0000_0000 + i * 0x4000_0000).collect();
+    let params: Vec<u64> = (0..f.arguments.len() as u64)
+        .map(|i| 0x4_0000_0000 + i * 0x4000_0000)
+        .collect();
     let residency: Vec<spyre_superdsc::Residency> = (0..f.arguments.len())
-        .map(|p| if staged.contains(&p) { spyre_superdsc::Residency::Staged } else { spyre_superdsc::Residency::Device })
+        .map(|p| {
+            if staged.contains(&p) {
+                spyre_superdsc::Residency::Staged
+            } else {
+                spyre_superdsc::Residency::Device
+            }
+        })
         .collect();
     let layouts = spyre_superdsc::layouts::<Baked>(&f, &residency).expect("layouts");
     println!("layouts {layouts:?}");
@@ -75,18 +109,46 @@ fn main() {
     };
     spyre_superdsc::layout::restick::<Baked>(&mut g);
     spyre_superdsc::layout::index_inner::<Baked>(&mut g);
-            for (i, n) in g.nodes.iter().enumerate() {
-                println!("node {i}: {:?} space {:?} ins {:?} out {:?}", n.func, n.space,
-                    n.inputs.iter().map(|o| (o.store, o.view.offset, o.view.axes.iter().map(|a| (a.extent, a.stride)).collect::<Vec<_>>())).collect::<Vec<_>>(),
-                    (n.output.store, n.output.view.offset, n.output.view.axes.iter().map(|a| (a.extent, a.stride)).collect::<Vec<_>>()));
-            }
+    for (i, n) in g.nodes.iter().enumerate() {
+        println!(
+            "node {i}: {:?} space {:?} ins {:?} out {:?}",
+            n.func,
+            n.space,
+            n.inputs
+                .iter()
+                .map(|o| (
+                    o.store,
+                    o.view.offset,
+                    o.view
+                        .axes
+                        .iter()
+                        .map(|a| (a.extent, a.stride))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            (
+                n.output.store,
+                n.output.view.offset,
+                n.output
+                    .view
+                    .axes
+                    .iter()
+                    .map(|a| (a.extent, a.stride))
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
     let placed: Vec<(spyre_superdsc::graph::ConstStick, u64)> = g
         .consts
         .iter()
         .enumerate()
         .map(|(i, c)| (*c, 0x2000_0000 + i as u64 * 128))
         .collect();
-    let b = spyre_superdsc::Bindings { params: &params, consts: &placed, scratch: 0x1000_0000 };
+    let b = spyre_superdsc::Bindings {
+        params: &params,
+        consts: &placed,
+        scratch: 0x1000_0000,
+    };
     let fp = spyre_superdsc::emit::footprint::<Baked>(&g);
     match spyre_superdsc::emit::emit::<Baked>(&g, &fp, &b) {
         Ok(ops) => {
@@ -96,7 +158,12 @@ fn main() {
             for (name, body) in files {
                 std::fs::write(std::path::Path::new(out).join(name), body).expect("write");
             }
-            println!("LOWERED {} ops, scratch {} B, consts {:?}", ops.len(), fp.scratch_bytes, g.consts);
+            println!(
+                "LOWERED {} ops, scratch {} B, consts {:?}",
+                ops.len(),
+                fp.scratch_bytes,
+                g.consts
+            );
         }
         Err(e) => {
             println!("REFUSED {e:?}");

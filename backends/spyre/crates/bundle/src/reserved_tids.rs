@@ -421,6 +421,32 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 /// carry their old slots), and nothing has ever been baked here.
 pub const PAGED_STEP_BASE: u32 = u32::MAX - 2_000_171;
 
+/// The slots one attention class's paged step owns.
+pub const PAGED_STEP_SLOTS: u32 = 9;
+
+/// How many attention classes the paged step's tables are reserved for: a uniform model's one, and
+/// a hybrid model's local (sliding) layers beside it — each class's step its own tables, since its
+/// kv heads, head dim and mask are its own.
+pub const PAGED_CLASSES: u32 = 2;
+
+/// ⭐ CLASS `class`'s COPY OF PAGED-STEP SLOT `slot`. **Class 0's are the `paged_step` sentinels**
+/// (`PAGED_MASK_TID` ..), so a uniform model binds the tids it has always bound; every later class
+/// takes the same slot of its own block of the `paged_class` region.
+pub const fn paged_class_tid(class: u32, slot: u32) -> u32 {
+    assert!(
+        class < PAGED_CLASSES,
+        "an attention class past PAGED_CLASSES"
+    );
+    assert!(
+        slot < PAGED_STEP_SLOTS,
+        "a paged-step slot past the step's own"
+    );
+    match class {
+        0 => reserved_region("paged_step").at(slot),
+        c => reserved_region("paged_class").at((c - 1) * PAGED_STEP_SLOTS + slot),
+    }
+}
+
 /// The paged step's mask stack — see [`PAGED_STEP_BASE`].
 pub const PAGED_MASK_TID: u32 = reserved_region("paged_step").at(0);
 /// The paged step's page table — see [`PAGED_STEP_BASE`].
@@ -444,7 +470,7 @@ pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 9] = [
+pub const RESERVED_REGIONS: [TidRegion; 10] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -496,7 +522,7 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
     TidRegion {
         name: "paged_step",
         base: PAGED_STEP_BASE,
-        slots: 9,
+        slots: PAGED_STEP_SLOTS,
     },
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S BLOCKS — see [`tp_recv_block_tid`]. Below
     // `paged_step`'s floor, in tids no artifact has ever carried.
@@ -513,7 +539,14 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
     TidRegion {
         name: "paged_window",
         base: PAGED_WINDOW_BASE,
-        slots: PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1),
+        slots: PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1) * PAGED_CLASSES,
+    },
+    // ⭐ THE LATER ATTENTION CLASSES' STEP TABLES — see [`paged_class_tid`]. Class 0's are the
+    // `paged_step` sentinels; the region holds every later class's copy of the same slots.
+    TidRegion {
+        name: "paged_class",
+        base: PAGED_CLASS_BASE,
+        slots: PAGED_STEP_SLOTS * (PAGED_CLASSES - 1),
     },
 ];
 
@@ -556,6 +589,10 @@ pub const fn tp_recv_block_tid(cut: u32, sender: u32) -> u32 {
 /// below the lowest region).
 pub const PAGED_WINDOW_BASE: u32 = TP_RECV_TID - (TP_WINDOW_CUTS * TP_MAX_WORLD);
 
+/// The later attention classes' step tables — see [`paged_class_tid`]. Below `paged_window`'s floor.
+pub const PAGED_CLASS_BASE: u32 =
+    PAGED_WINDOW_BASE - PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1) * PAGED_CLASSES;
+
 /// How many per-request tables a packed prefill window owns: the query row index, the page index
 /// table, and the mask stack — the same three the `paged_step` sentinels name for window 0.
 pub const PAGED_WINDOW_TABLES: u32 = 3;
@@ -566,32 +603,38 @@ pub const PAGED_WINDOW_TABLES: u32 = 3;
 /// another region's tids.
 pub const PAGED_MAX_WINDOWS: u32 = 8;
 
-/// ⭐ A PACKED PREFILL WINDOW'S TABLES — window `r`'s copy of one of the three per-request tables
-/// the attention reads. **Window 0 IS the sentinels**: `paged_window_tid(0, ·)` answers
-/// `PAGED_QUERY_ROWS_TID` / `PAGED_PAGE_TABLE_TID` / `PAGED_MASK_TID`, the step's own reserved
-/// tids, exactly as `rope_p_class_tid(0) == ROPE_P_TID` — so a one-window (solo) rung binds the
-/// tids it has always bound and its bundle is byte-identical. The windows past the first count
-/// DOWN from [`PAGED_WINDOW_BASE`], three tids each, bounded by [`PAGED_MAX_WINDOWS`].
+/// ⭐ A PACKED PREFILL WINDOW'S TABLES — attention class `class`'s window `r` copy of one of the
+/// three per-request tables the attention reads. **Window 0 IS the class's own step tables**
+/// ([`paged_class_tid`]): class 0's window 0 answers `PAGED_QUERY_ROWS_TID` / `PAGED_PAGE_TABLE_TID`
+/// / `PAGED_MASK_TID`, so a one-window (solo) rung binds the tids it has always bound. The windows
+/// past the first count DOWN from [`PAGED_WINDOW_BASE`], three tids each, class by class, bounded by
+/// [`PAGED_MAX_WINDOWS`].
 ///
 /// Which table a window's slot names:
-/// `0` the query row index, `1` the page index table, `2` the mask stack — the order the
-/// `paged_step` region numbers its own sentinels in, so the two spellings of "the step's three
-/// tables" agree by construction.
-pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
+/// `0` the query row index, `1` the page index table, `2` the mask stack.
+pub const fn paged_window_tid(class: u32, window: u32, table: u32) -> u32 {
     assert!(table < PAGED_WINDOW_TABLES, "a window has three tables");
+    assert!(
+        class < PAGED_CLASSES,
+        "an attention class past PAGED_CLASSES"
+    );
     match window {
-        0 => match table {
-            0 => PAGED_QUERY_ROWS_TID,
-            1 => PAGED_PAGE_TABLE_TID,
-            _ => PAGED_MASK_TID,
-        },
+        0 => paged_class_tid(
+            class,
+            match table {
+                0 => 3,
+                1 => 1,
+                _ => 0,
+            },
+        ),
         w => {
             assert!(
                 w < PAGED_MAX_WINDOWS,
                 "a packed rung asked for a window past PAGED_MAX_WINDOWS — the bake's packed \
                  table outgrew the reserved tid space"
             );
-            PAGED_WINDOW_BASE - ((w - 1) * PAGED_WINDOW_TABLES + table)
+            PAGED_WINDOW_BASE
+                - ((class * (PAGED_MAX_WINDOWS - 1) + w - 1) * PAGED_WINDOW_TABLES + table)
         }
     }
 }
@@ -675,6 +718,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
     assert!(reserved_region("paged_window").base == PAGED_WINDOW_BASE);
+    assert!(reserved_region("paged_class").base == PAGED_CLASS_BASE);
 };
 
 /// ⭐ WINDOW 0 IS THE SENTINELS — the law a solo rung's byte-identity stands on. Every window
@@ -683,19 +727,24 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
 /// call sites; this pins the LAW at the table, so a region edit that broke either fails the build
 /// here rather than at whichever bake first minted a window).
 pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
-    assert!(paged_window_tid(0, 0) == PAGED_QUERY_ROWS_TID);
-    assert!(paged_window_tid(0, 1) == PAGED_PAGE_TABLE_TID);
-    assert!(paged_window_tid(0, 2) == PAGED_MASK_TID);
-    // The region's floor holds the LAST window's LAST table, and nothing past it.
+    assert!(paged_window_tid(0, 0, 0) == PAGED_QUERY_ROWS_TID);
+    assert!(paged_window_tid(0, 0, 1) == PAGED_PAGE_TABLE_TID);
+    assert!(paged_window_tid(0, 0, 2) == PAGED_MASK_TID);
+    // The region's floor holds the LAST class's widest window's LAST table, and nothing past it.
     let r = reserved_region("paged_window");
     assert!(
-        paged_window_tid(PAGED_MAX_WINDOWS - 1, PAGED_WINDOW_TABLES - 1) == r.floor(),
+        paged_window_tid(
+            PAGED_CLASSES - 1,
+            PAGED_MAX_WINDOWS - 1,
+            PAGED_WINDOW_TABLES - 1
+        ) == r.floor(),
         "the widest window's last table is not the paged_window region's floor — the region \
          does not hold every window the tid mint admits"
     );
+    // And the last class's step tables end at the paged_class region's floor.
     assert!(
-        r.floor() > PAGED_WINDOW_BASE - PAGED_WINDOW_TABLES * PAGED_MAX_WINDOWS,
-        "the paged_window region runs into tids below its own widest use"
+        paged_class_tid(PAGED_CLASSES - 1, PAGED_STEP_SLOTS - 1)
+            == reserved_region("paged_class").floor()
     );
 };
 

@@ -82,10 +82,8 @@ fn spliced_rmsnorm_lowers_to_the_card() {
         // The splice — the row compiles the kernel for this node. Every width is
         // splicable (the kernel's ceiling-safe pre-scale), so an Err here is a broken row.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — `rmsnorm_s{id}`, the law the bundle's own consumers key on.
         assert_eq!(
@@ -97,7 +95,7 @@ fn spliced_rmsnorm_lowers_to_the_card() {
         // The program lowers to the card's descriptors under the walk's own layout — the
         // descriptors that reach the card are minted here, so a refusal is a broken row.
         let _emitted = card_lower(&spliced, &layout)
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
+            .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
     }
 }
 
@@ -122,10 +120,8 @@ fn spliced_oneplus_rmsnorm_lowers_to_the_card() {
 
         // The splice — the row compiles the oneplus entry for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled the oneplus row m={m} c={c}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled the oneplus row m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — the SAME stem as the Scale row: the convention differs
         // in the ENTRY and one constexpr, never in the op the bundle keys on.
@@ -138,7 +134,10 @@ fn spliced_oneplus_rmsnorm_lowers_to_the_card() {
         // The program lowers to the card's descriptors under the walk's own layout.
         let emitted = card_lower(&spliced, &layout)
             .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {e}"));
-        assert!(!emitted.is_empty(), "the oneplus program lowered to nothing (m={m} c={c})");
+        assert!(
+            !emitted.is_empty(),
+            "the oneplus program lowered to nothing (m={m} c={c})"
+        );
     }
 }
 
@@ -200,10 +199,8 @@ fn spliced_silumul_lowers_to_the_card() {
         // the kernel (the `rows_per_block` law), so an Err here is a broken row or a
         // broken block law.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — `silumul_s{id}`.
         assert_eq!(
@@ -214,7 +211,7 @@ fn spliced_silumul_lowers_to_the_card() {
 
         // The program lowers to the card's descriptors under the walk's own layout.
         let _emitted = card_lower(&spliced, &layout)
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
+            .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
     }
 }
 
@@ -281,12 +278,8 @@ fn a_column_chunked_silumul_lowers_to_the_card() {
     .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
-    let spliced = scratchy_triton_splice::lower::<One, _>(
-        &chunked.nodes[0],
-        &chunked,
-        false,
-    )
-    .unwrap_or_else(|e| panic!("splice compiled the chunked node: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(&chunked.nodes[0], &chunked, false)
+        .unwrap_or_else(|e| panic!("splice compiled the chunked node: {e}"));
     assert_eq!(
         spliced.op_name,
         format!("silumul_s{}", chunked.nodes[0].id.index()),
@@ -295,16 +288,14 @@ fn a_column_chunked_silumul_lowers_to_the_card() {
 
     // Through the door: the regions the door reads must resolve, or the descriptors
     // mis-address on the card.
-    let _emitted = card_lower(&spliced, &layout)
-        .unwrap_or_else(|e| panic!("spliced program lowered: {e}"));
+    let _emitted =
+        card_lower(&spliced, &layout).unwrap_or_else(|e| panic!("spliced program lowered: {e}"));
 
     // THE CONTROL: the whole-tensor node at the same total width still splices — the
     // discrimination is by REGION, never by width.
     let whole_node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower::<One, _>(
-        whole_node, &ir, false,
-    )
-    .expect("the whole-tensor node compiles");
+    let spliced = scratchy_triton_splice::lower::<One, _>(whole_node, &ir, false)
+        .expect("the whole-tensor node compiles");
     assert_eq!(
         spliced.op_name,
         format!("silumul_s{}", whole_node.id.index()),
@@ -378,10 +369,7 @@ fn spliced_elementwise_lowers_to_the_card() {
             // inside the kernel (the `rows_per_block` law), so an Err here is a
             // broken row or a broken block law.
             let node = &ir.nodes[0];
-            let spliced =
-                scratchy_triton_splice::lower::<One, _>(
-                    node, &ir, false,
-                )
+            let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
                 .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
 
             // ⛔ THE NAME LAW — the producer's own stem law (`add_s{id}`,
@@ -394,9 +382,8 @@ fn spliced_elementwise_lowers_to_the_card() {
             );
 
             // The program lowers to the card's descriptors under the walk's own layout.
-            let _emitted = card_lower(&spliced, &layout).unwrap_or_else(|e| {
-                panic!("spliced program lowered ({kind:?} m={m} c={c}): {e}")
-            });
+            let _emitted = card_lower(&spliced, &layout)
+                .unwrap_or_else(|e| panic!("spliced program lowered ({kind:?} m={m} c={c}): {e}"));
         }
     }
 }
@@ -474,10 +461,8 @@ fn spliced_dense_matmul_lowers_to_the_card() {
 
         // The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, true,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, true)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
 
         // ⛔ THE NAME LAW — `matmul_s{id}`.
         assert_eq!(
@@ -488,7 +473,7 @@ fn spliced_dense_matmul_lowers_to_the_card() {
 
         // The program lowers to the card's descriptors under the walk's own layout.
         let _emitted = card_lower(&spliced, &layout)
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
+            .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
     }
 }
 
@@ -649,8 +634,7 @@ fn spliced_matmul_group(
     m: u32,
     k: u32,
     n: u32,
-) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, One>
-{
+) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, One> {
     spliced_node_group(&matmul_ir(m, k, n), 0)
 }
 
@@ -659,14 +643,12 @@ fn spliced_matmul_group(
 fn spliced_node_group(
     ir: &SubtileIR,
     at: usize,
-) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, One>
-{
+) -> scratchy_target_spyre::bundle_code::LaunchGroup<'static, One> {
     use std::borrow::Cow;
 
     let node = &ir.nodes[at];
-    let spliced =
-        scratchy_triton_splice::lower::<One, _>(node, ir, true)
-            .unwrap_or_else(|e| panic!("splice compiled node {at}: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(node, ir, true)
+        .unwrap_or_else(|e| panic!("splice compiled node {at}: {e}"));
     let k_node = &spliced.ktir;
 
     // The launch binding: parameter `i` -> `bindings[i]`, exactly the pairing
@@ -725,9 +707,8 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
 
     let ir = elementwise_ir(m, c, kind);
     let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<One, _>(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
     let k_node = &spliced.ktir;
 
     let args: Vec<(
@@ -744,18 +725,17 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
             )
         })
         .collect();
-    let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
-            kv: Default::default(),
-            programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-                func: k_node.func,
-                program: k_node.program,
-                args: Cow::Owned(args),
-            }]),
-            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
-            job_bin_ptr: 0,
-            correction: Cow::Borrowed(&[]),
-        };
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            program: k_node.program,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
 
     // Two operands and the host reference over them, per kind — the same f16 values
     // the program reads (run_step narrows to f16).
@@ -832,9 +812,8 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
 
     let ir = elementwise_ir(m, c, EwKind::Gelu);
     let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<One, _>(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled gelu m={m} c={c}: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled gelu m={m} c={c}: {e}"));
     let k_node = &spliced.ktir;
 
     let args: Vec<(
@@ -851,18 +830,17 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
             )
         })
         .collect();
-    let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
-            kv: Default::default(),
-            programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-                func: k_node.func,
-                program: k_node.program,
-                args: Cow::Owned(args),
-            }]),
-            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
-            job_bin_ptr: 0,
-            correction: Cow::Borrowed(&[]),
-        };
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            program: k_node.program,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
 
     let n = (m * c) as usize;
     let a: Vec<f32> = (0..n).map(|i| ((i % 23) as f32) * 0.02 - 0.22).collect();
@@ -930,10 +908,8 @@ fn spliced_scalarmul_lowers_to_the_card() {
 
         // The splice — the row compiles `scalarmul.py` for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW — `scalarmul_s{id}`.
         assert_eq!(
@@ -945,7 +921,7 @@ fn spliced_scalarmul_lowers_to_the_card() {
         // The program lowers to the card's descriptors under the walk's own layout, its scale a
         // constant stick of its own value.
         let _emitted = card_lower(&spliced, &layout)
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
+            .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {e}"));
     }
 }
 
@@ -987,12 +963,10 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
         chunked.nodes[0].output = window(1);
 
         // The splice — every chunk compiles (`C_START` states the corner).
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            &chunked.nodes[0],
-            &chunked,
-            false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(&chunked.nodes[0], &chunked, false)
+            .unwrap_or_else(|e| {
+                panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}")
+            });
         assert_eq!(
             spliced.op_name,
             format!("scalarmul_s{}", chunked.nodes[0].id.index()),
@@ -1072,12 +1046,8 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
     // it).
     let ops_at = |mq: u32, heads: u32| {
         let ir = rope_plane_ir(mq, heads, 64);
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            &ir.nodes[0],
-            &ir,
-            false,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(&ir.nodes[0], &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads}: {e}"));
         let k = spliced.ktir;
         let ops = k.func.ops_deep();
         let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
@@ -1109,9 +1079,8 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     // (p, h·hd + d) is tall row p·heads + h, column d of the worker's staging.
     let ir = rope_plane_ir(mq, heads, hd);
     let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<One, _>(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
     let k_node = &spliced.ktir;
 
     let args: Vec<(
@@ -1128,18 +1097,17 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
             )
         })
         .collect();
-    let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
-            kv: Default::default(),
-            programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-                func: k_node.func,
-                program: k_node.program,
-                args: Cow::Owned(args),
-            }]),
-            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
-            job_bin_ptr: 0,
-            correction: Cow::Borrowed(&[]),
-        };
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            program: k_node.program,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
 
     // The host data, staged EXACTLY as the worker stages it: x token-major
     // `[mq*heads, hd]` (row = position*heads + head), and cos/sin as `spyre_forward`'s
@@ -1242,9 +1210,8 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
     // SingleCorelet re-patterning), never refuse.
     let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<One, _>(node, &ir, true)
-            .unwrap_or_else(|e| panic!("odd vocab must splice at any row count: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, true)
+        .unwrap_or_else(|e| panic!("odd vocab must splice at any row count: {e}"));
     assert_eq!(
         spliced.op_name,
         format!("matmul_s{}", node.id.index()),
@@ -1288,11 +1255,9 @@ fn spliced_prefill_lm_head_fold_lowers_to_the_card() {
 
         // The splice — `lower_all` takes the fold route for this shape.
         let node = &ir.nodes[0];
-        let spliced_ops = scratchy_triton_splice::lower_all::<
-            One,
-            _,
-        >(node, &ir, false, pair_of_one_request(mq))
-        .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
+        let spliced_ops =
+            scratchy_triton_splice::lower_all::<One, _>(node, &ir, false, pair_of_one_request(mq))
+                .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
         assert_eq!(
             spliced_ops.len(),
             2,
@@ -1302,9 +1267,8 @@ fn spliced_prefill_lm_head_fold_lowers_to_the_card() {
 
         // Each program lowers to the card's descriptors under the SAME layout.
         for s_op in &spliced_ops {
-            let _emitted = card_lower(s_op, &layout).unwrap_or_else(|e| {
-                panic!("spliced program lowered (mq={mq} k={k} n={n}): {e}")
-            });
+            let _emitted = card_lower(s_op, &layout)
+                .unwrap_or_else(|e| panic!("spliced program lowered (mq={mq} k={k} n={n}): {e}"));
         }
     }
 }
@@ -1352,10 +1316,8 @@ fn spliced_fp8_matmul_lowers_to_the_card() {
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, true,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, true)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
 
         // ⛔ THE NAME LAW — `matmul_s{id}` (fp8 shares dense's `Program::Matmul`).
         assert_eq!(
@@ -1367,7 +1329,7 @@ fn spliced_fp8_matmul_lowers_to_the_card() {
         // The program lowers to the card's descriptors under the walk's own layout.
         // One node is one grain: the full quant chain is emitted and minted.
         let _emitted = card_lower(&spliced, &layout)
-        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
+            .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {e}"));
     }
 }
 
@@ -1404,9 +1366,8 @@ fn spliced_fp8_matmul_executes_the_real_program() {
 fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let ir = matmul_fp8_ir(m, k, n);
     let node = &ir.nodes[0];
-    let spliced =
-        scratchy_triton_splice::lower::<One, _>(node, &ir, true)
-            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
+    let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, true)
+        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
     let k_node = &spliced.ktir;
 
     // The host data, bound EXACTLY as the worker binds it: x `[m, k]` as f16
@@ -1479,18 +1440,17 @@ fn execute_fp8_program(
             )
         })
         .collect();
-    let group =
-        scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
-            kv: Default::default(),
-            programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-                func: k_node.func,
-                program: k_node.program,
-                args: Cow::Owned(args),
-            }]),
-            init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
-            job_bin_ptr: 0,
-            correction: Cow::Borrowed(&[]),
-        };
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            program: k_node.program,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(Cow::Borrowed(&[])),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
 
     // W and ws are WEIGHTS (resident, typed bytes); x is the per-step SOURCE.
     // Both cross through `new_multi`/`weight_arg`'s own dtype mapping — the
@@ -1633,12 +1593,7 @@ fn spliced_rope_lowers_to_the_card() {
             // no rope-specific refusal (the historical builder's own `total % hd` refusal is
             // mirrored as an Err, not a fallthrough), so an Err here is a broken row.
             let node = &ir.nodes[0];
-            let spliced =
-                scratchy_triton_splice::lower::<One, _>(
-                    node,
-                    &ir,
-                    rows_are_requests,
-                )
+            let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, rows_are_requests)
                 .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
 
             // ⛔ THE NAME LAW — `rope_s{id}`.
@@ -2162,32 +2117,63 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     }
 }
 
-/// spyre-inference's paged kernels attend causally, so a sliding-window attention (gemma's local
-/// layers) is refused by name rather than run as causal.
+/// A sliding-window attention (gemma's local layers) splices to the paged kernel a full one does:
+/// its window is its step's mask stack (`paged_step::attends`), and its step tables are its own
+/// class's (`PagedStepTids::of`), so a hybrid forward's two classes never read one table.
 #[test]
-fn a_sliding_window_attention_is_refused() {
+fn a_sliding_window_attention_reads_its_own_class_tables() {
+    use scratchy_subtile::subtile_ir::AttnMask;
+    use scratchy_target_spyre::wiring::AttnClass;
+    use scratchy_triton_splice::PagedStepTids;
     let s = ATTN_SHAPES[0];
-    let mut ir = attn_ir(s, 0.015625);
-    let node = ir.nodes.last_mut().expect("the attention");
-    let scratchy_subtile::subtile_ir::SubOp::AttnDecode { mask, .. } = &mut node.op else {
-        panic!("the last node is the attention");
+    let bound = |mask: AttnMask| -> Vec<u32> {
+        let mut ir = attn_ir(s, 0.015625);
+        let node = ir.nodes.last_mut().expect("the attention");
+        let scratchy_subtile::subtile_ir::SubOp::AttnDecode { mask: m, .. } = &mut node.op else {
+            panic!("the last node is the attention");
+        };
+        *m = mask;
+        let node = ir.nodes.last().expect("the attention");
+        scratchy_triton_splice::lower_attn::<One, _>(
+            node,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            pair_of_one_request(s.mq),
+            PagedRows::Sequence,
+        )
+        .unwrap_or_else(|e| panic!("{mask:?} splices: {e}"))
+        .iter()
+        .flat_map(|e| e.ktir.bindings.iter().map(|b| b.get()))
+        .collect()
     };
-    *mask = scratchy_subtile::subtile_ir::AttnMask::SlidingWindow {
-        window: std::num::NonZeroU32::new(4096).expect("a window"),
+    let window = std::num::NonZeroU32::new(4096).expect("a window");
+    let sliding = bound(AttnMask::SlidingWindow { window });
+    let full = bound(AttnMask::Causal);
+    let tables = |c: AttnClass| {
+        let t = PagedStepTids::of(c);
+        [t.mask, t.page_table]
     };
-    let node = ir.nodes.last().expect("the attention");
-    let Err(e) = scratchy_triton_splice::lower_attn::<One, _>(
-        node,
-        &ir,
-        scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-        s.active_cap(),
-        // One request of the graph's `mq` rows — the walk this refusal gates.
-        pair_of_one_request(s.mq),
-        PagedRows::Sequence,
-    ) else {
-        panic!("a sliding window must be refused");
-    };
-    assert!(e.contains("sliding window"), "{e}");
+    for t in tables(AttnClass::Sliding) {
+        assert!(
+            sliding.contains(&t),
+            "the sliding attention reads its class's t{t}"
+        );
+        assert!(
+            !full.contains(&t),
+            "the full attention reads the sliding class's t{t}"
+        );
+    }
+    for t in tables(AttnClass::Full) {
+        assert!(
+            full.contains(&t),
+            "the full attention reads its class's t{t}"
+        );
+        assert!(
+            !sliding.contains(&t),
+            "the sliding attention reads the full class's t{t}"
+        );
+    }
 }
 
 /// ⛔ A POOL NO BIGGER THAN A CHUNK IS REFUSED BY NAME — spyre-inference's own eligibility
@@ -2281,15 +2267,13 @@ fn the_paged_attention_splices_with_its_contract() {
             "{at}"
         );
         let k = &spliced.ktir;
-        assert_eq!(
-            k.program,
-            scratchy_spyre_bundle::Program::PagedAttn,
-            "{at}"
-        );
+        assert_eq!(k.program, scratchy_spyre_bundle::Program::PagedAttn, "{at}");
         // spyre-inference's operands, in their order: query, query_row_index, the K and V pools, the
         // page index table, the mask stack and out — the step's sources at the ids the one law
         // (`PagedStepTids`) states.
-        let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+        let tids = scratchy_triton_splice::PagedStepTids::of(
+            scratchy_target_spyre::wiring::AttnClass::Full,
+        );
         let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
         let mut want = vec![
             node.inputs[0].tensor.index() as u32,
@@ -2310,7 +2294,8 @@ fn the_paged_attention_splices_with_its_contract() {
             pair_of_one_request(s.mq),
         )
         .unwrap_or_else(|e| panic!("{at}: layout: {e}"));
-        let ops = card_lower(spliced, &layout).unwrap_or_else(|e| panic!("{at}: the walk lowers: {e}"));
+        let ops =
+            card_lower(spliced, &layout).unwrap_or_else(|e| panic!("{at}: the walk lowers: {e}"));
         assert!(!ops.is_empty(), "{at}: the walk emitted nothing");
     }
 }
@@ -2615,13 +2600,8 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         s.geom, s.mq, s.cap
     );
     let mut programs =
-        scratchy_triton_splice::lower_all::<One, _>(
-            rope,
-            &ir,
-            false,
-            pair_of_one_request(s.mq),
-        )
-        .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
+        scratchy_triton_splice::lower_all::<One, _>(rope, &ir, false, pair_of_one_request(s.mq))
+            .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.extend(
         scratchy_triton_splice::lower_attn(
             attn,
@@ -2643,46 +2623,38 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             .expect("out is the walk's last operand")
             .get(),
     );
-    let groups: Vec<
-        scratchy_target_spyre::bundle_code::LaunchGroup<
-            'static,
-            One,
-        >,
-    > =
-        programs
-            .into_iter()
-            .map(|e| {
-                let k = e.ktir;
-                let args = k
-                    .func
-                    .arguments
-                    .iter()
-                    .map(|(ssa, _)| {
-                        (
-                            *ssa,
-                            scratchy_target_spyre::bundle_code::PlaceId::Act(
-                                k.bindings[ssa.slot()].get(),
-                            ),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                scratchy_target_spyre::bundle_code::LaunchGroup::<
-                    One,
-                > {
-                    kv: Default::default(),
-                    programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-                        func: k.func,
-                        program: k.program,
-                        args: Cow::Owned(args),
-                    }]),
-                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
-                        Cow::Borrowed(&[]),
-                    ),
-                    job_bin_ptr: 0,
-                    correction: Cow::Borrowed(&[]),
-                }
-            })
-            .collect();
+    let groups: Vec<scratchy_target_spyre::bundle_code::LaunchGroup<'static, One>> = programs
+        .into_iter()
+        .map(|e| {
+            let k = e.ktir;
+            let args = k
+                .func
+                .arguments
+                .iter()
+                .map(|(ssa, _)| {
+                    (
+                        *ssa,
+                        scratchy_target_spyre::bundle_code::PlaceId::Act(
+                            k.bindings[ssa.slot()].get(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
+                kv: Default::default(),
+                programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+                    func: k.func,
+                    program: k.program,
+                    args: Cow::Owned(args),
+                }]),
+                init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                    Cow::Borrowed(&[]),
+                ),
+                job_bin_ptr: 0,
+                correction: Cow::Borrowed(&[]),
+            }
+        })
+        .collect();
 
     // The step: `cached` keys already in the pools, this step's `mq` rows after them; the request's
     // blocks are the pool's pages REVERSED.
@@ -2693,6 +2665,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         pair_of_one_request(s.mq),
     )
     .expect("the paged step derives")
+    .full
     .expect("the graph has attention");
     let mq = s.mq as usize;
     let rows = StepRows::new(cached, mq).expect("the golden step holds its query rows");
@@ -2910,14 +2883,13 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         "geom={:?} B={} cap={} rung={} contexts={contexts:?}",
         s.geom, s.mq, s.cap, s.rung
     );
-    let mut programs =
-        scratchy_triton_splice::lower_all::<One, _>(
-            rope,
-            &ir,
-            true,
-            batch_pair_of_one_row_each(s.mq),
-        )
-        .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
+    let mut programs = scratchy_triton_splice::lower_all::<One, _>(
+        rope,
+        &ir,
+        true,
+        batch_pair_of_one_row_each(s.mq),
+    )
+    .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.extend(
         scratchy_triton_splice::lower_attn(
             attn,
@@ -2934,7 +2906,8 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
     );
     assert_eq!(programs.len(), 3, "{at}: rope, KV write, batched walk");
     let walk = &programs[2].ktir;
-    let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+    let tids =
+        scratchy_triton_splice::PagedStepTids::of(scratchy_target_spyre::wiring::AttnClass::Full);
     let bound: Vec<u32> = walk.bindings.iter().map(|b| b.get()).collect();
     assert!(
         [tids.rep_rows, tids.chunk_pages, tids.chunk_masks]
@@ -2949,46 +2922,38 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             .expect("out is the walk's last operand")
             .get(),
     );
-    let groups: Vec<
-        scratchy_target_spyre::bundle_code::LaunchGroup<
-            'static,
-            One,
-        >,
-    > =
-        programs
-            .into_iter()
-            .map(|e| {
-                let k = e.ktir;
-                let args = k
-                    .func
-                    .arguments
-                    .iter()
-                    .map(|(ssa, _)| {
-                        (
-                            *ssa,
-                            scratchy_target_spyre::bundle_code::PlaceId::Act(
-                                k.bindings[ssa.slot()].get(),
-                            ),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                scratchy_target_spyre::bundle_code::LaunchGroup::<
-                    One,
-                > {
-                    kv: Default::default(),
-                    programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-                        func: k.func,
-                        program: k.program,
-                        args: Cow::Owned(args),
-                    }]),
-                    init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
-                        Cow::Borrowed(&[]),
-                    ),
-                    job_bin_ptr: 0,
-                    correction: Cow::Borrowed(&[]),
-                }
-            })
-            .collect();
+    let groups: Vec<scratchy_target_spyre::bundle_code::LaunchGroup<'static, One>> = programs
+        .into_iter()
+        .map(|e| {
+            let k = e.ktir;
+            let args = k
+                .func
+                .arguments
+                .iter()
+                .map(|(ssa, _)| {
+                    (
+                        *ssa,
+                        scratchy_target_spyre::bundle_code::PlaceId::Act(
+                            k.bindings[ssa.slot()].get(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            scratchy_target_spyre::bundle_code::LaunchGroup::<One> {
+                kv: Default::default(),
+                programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+                    func: k.func,
+                    program: k.program,
+                    args: Cow::Owned(args),
+                }]),
+                init_binary: scratchy_target_spyre::bundle_code::BakedImage::Raw(
+                    Cow::Borrowed(&[]),
+                ),
+                job_bin_ptr: 0,
+                correction: Cow::Borrowed(&[]),
+            }
+        })
+        .collect();
 
     let step = scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(
         &ir,
@@ -2997,6 +2962,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         batch_pair_of_one_row_each(s.mq),
     )
     .expect("the paged step derives")
+    .full
     .expect("the graph has attention");
     let (b, n) = (s.mq as usize, contexts.len());
     let slots = step.page_slots as usize;
@@ -3151,23 +3117,18 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
         };
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
-        let spliced =
-            scratchy_triton_splice::lower_attn::<One, _>(
-                node,
-                &ir,
-                scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-                s.active_cap(),
-                // One request of the graph's `mq` rows — the flat walk's own pair.
-                pair_of_one_request(mq),
-                PagedRows::Sequence,
-            )
-            .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
+        let spliced = scratchy_triton_splice::lower_attn::<One, _>(
+            node,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            // One request of the graph's `mq` rows — the flat walk's own pair.
+            pair_of_one_request(mq),
+            PagedRows::Sequence,
+        )
+        .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
         assert_eq!(spliced.len(), 1, "one window at one request");
-        spliced[0]
-            .ktir
-            .func
-            .ops_deep()
-            .len()
+        spliced[0].ktir.func.ops_deep().len()
     };
     // The prompt walk is one head's rows against each page, so its program is a function of the
     // heads and the pages, never of the row count: 8x the rows is the same program.
@@ -3196,10 +3157,8 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
     for (m, k, n) in [(8u32, 128u32, 256u32), (35u32, 2048u32, 8192u32)] {
         let ir = matmul_fp8_ir(m, k, n);
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower::<One, _>(
-            node, &ir, true,
-        )
-        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
+        let spliced = scratchy_triton_splice::lower::<One, _>(node, &ir, true)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
         let prog = &spliced.ktir;
         let ops = prog.func.ops_deep();
         let is_mn_f16 = |v: ktir_core::ir::Ssa| {
@@ -3247,4 +3206,3 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
         );
     }
 }
-

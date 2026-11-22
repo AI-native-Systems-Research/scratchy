@@ -172,8 +172,8 @@ impl Wiring {
         cap: RowCapacity,
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
-        // The step of the body that runs — this wiring's own for its own bundle.
-        paged: Option<PagedStep>,
+        // The steps of the body that runs — this wiring's own for its own bundle.
+        paged: ClassSteps,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
             cap.admits(rows),
@@ -470,6 +470,61 @@ pub struct PagedStep {
     /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
     /// disagree with.
     pub extent: QueryExtent,
+    /// ⭐ WHICH KEYS A ROW ATTENDS — the class's mask: every position up to the row's own, or (a
+    /// hybrid model's local layers) only the last `window` of them. The host's mask stack states
+    /// it; the kernels read it as data.
+    pub attends: AttnMask,
+}
+
+pub use scratchy_ir::model_facts::AttnClass;
+pub use scratchy_subtile::subtile_ir::AttnMask;
+
+/// ⭐ THE PAGED STEP OF EACH ATTENTION CLASS — a uniform model's one class, a hybrid model's local
+/// (sliding) class beside its full one: each class's step its own tables, kv heads, head dim and
+/// mask (`scratchy_triton_splice::PagedStepTids::of`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ClassSteps {
+    pub full: Option<PagedStep>,
+    pub sliding: Option<PagedStep>,
+}
+
+impl ClassSteps {
+    /// The classes' steps the graph has, the full class first.
+    pub fn iter(self) -> impl Iterator<Item = PagedStep> {
+        self.full.into_iter().chain(self.sliding)
+    }
+
+    /// Class `class`'s step.
+    pub const fn of(self, class: AttnClass) -> Option<PagedStep> {
+        match class {
+            AttnClass::Full => self.full,
+            AttnClass::Sliding => self.sliding,
+        }
+    }
+
+    /// The facts every class's step shares (rows, extent, slots, capacity): the first class's step.
+    pub fn first(self) -> Option<PagedStep> {
+        self.iter().next()
+    }
+
+    /// Every class's step mapped through `f`.
+    pub fn map(self, f: impl Fn(PagedStep) -> Option<PagedStep>) -> Option<ClassSteps> {
+        let each = |s: Option<PagedStep>| -> Option<Option<PagedStep>> {
+            match s {
+                Some(s) => f(s).map(Some),
+                None => Some(None),
+            }
+        };
+        Some(ClassSteps {
+            full: each(self.full)?,
+            sliding: each(self.sliding)?,
+        })
+    }
+
+    /// The positions every class's walk reaches.
+    pub fn reach(self) -> Option<usize> {
+        self.iter().map(PagedStep::reach).min()
+    }
 }
 
 impl PagedStep {
@@ -581,8 +636,9 @@ impl PagedStep {
                 // At either pitch: a rung of the same pool may walk at the other.
                 let walk = u64::from(self.pages.max(self.walk));
                 let table = walk * crate::paged_step::INT32_ELEMS_PER_STICK as u64 * 4;
+                let class = scratchy_triton_splice::paged_class(self.attends.class());
                 let window_tid = |r: u64, table: u32| {
-                    scratchy_spyre_bundle::reserved_tids::paged_window_tid(r as u32, table)
+                    scratchy_spyre_bundle::reserved_tids::paged_window_tid(class, r as u32, table)
                 };
                 for r in 0..windows {
                     v.extend([
@@ -615,7 +671,8 @@ impl PagedStep {
         paged_rows: crate::paged_step::PagedRows,
         swept: u32,
     ) -> Option<PagedStep> {
-        let walk = swept / self.page_slots;
+        let pages = swept / self.page_slots;
+        let walk = scratchy_triton_splice::whole_trips(pages);
         let extent = match paged_rows {
             crate::paged_step::PagedRows::Sequence => {
                 QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
@@ -624,7 +681,7 @@ impl PagedStep {
                 QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
             }
         };
-        (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
+        (rows > 0 && pages > 0 && swept.is_multiple_of(self.page_slots) && pages <= self.pages)
             .then_some(PagedStep {
                 rows,
                 paged_rows,
@@ -643,12 +700,15 @@ impl PagedStep {
     /// there is no pair to re-derive from the launch's rows. Only the walk is the launch's to
     /// derive, from the sweep of the body the session selected — exactly `on_body`'s own law.
     pub fn on_body_packed(self, swept: u32) -> Option<PagedStep> {
-        let walk = swept / self.page_slots;
+        let pages = swept / self.page_slots;
         (self.extent.requests().get() > 1
-            && walk > 0
+            && pages > 0
             && swept.is_multiple_of(self.page_slots)
-            && walk <= self.pages)
-            .then_some(PagedStep { walk, ..self })
+            && pages <= self.pages)
+            .then_some(PagedStep {
+                walk: scratchy_triton_splice::whole_trips(pages),
+                ..self
+            })
     }
 }
 
@@ -684,8 +744,8 @@ pub struct Wiring {
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
     pub attn_mask: Option<u32>,
-    /// The paged step's sources and pool — see [`PagedStep`]. `None` for a graph with no attention.
-    pub paged: Option<PagedStep>,
+    /// Each attention class's paged step — see [`ClassSteps`]. Empty for a graph with no attention.
+    pub paged: ClassSteps,
     /// Baked `valid_len - 1`; a worker overrides per generated token.
     pub decode_position: u32,
     /// `[rows, cols]` per tensor id.
@@ -718,7 +778,6 @@ pub struct Wiring {
     /// requantize: dense weights scale in place, fp8 dequant rows scale their `ws` row.
     pub weight_scale_folds: &'static [(u32, f32)],
 }
-
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
 ///
@@ -1085,7 +1144,7 @@ impl Wiring {
     /// The KV capacity the bundle was baked at — its pools' token slots.
     #[inline]
     pub fn capacity(&self) -> Option<usize> {
-        self.paged.map(PagedStep::capacity)
+        self.paged.first().map(PagedStep::capacity)
     }
 }
 

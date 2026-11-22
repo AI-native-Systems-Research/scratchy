@@ -56,7 +56,11 @@ pub(crate) struct RowLaw<'a> {
 /// of the request's seed, the row's step and the lane, so a seeded request replays and the same
 /// seed draws afresh at every position. A row with no logit but NaN answers nothing, and is refused
 /// by name rather than served a token the model never chose.
-pub(crate) fn draw_token(r: usize, logits: &[f32], law: &RowLaw<'_>) -> ExecutorResult<u32> {
+pub(crate) fn draw_token(
+    r: usize,
+    logits: impl IntoIterator<Item = f32>,
+    law: &RowLaw<'_>,
+) -> ExecutorResult<u32> {
     let score = |lane: usize, x: f32| -> f64 {
         match law.draw {
             None => f64::from(x),
@@ -64,22 +68,27 @@ pub(crate) fn draw_token(r: usize, logits: &[f32], law: &RowLaw<'_>) -> Executor
         }
     };
     logits
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(_, x)| !x.is_nan())
-        .map(|(lane, &x)| (lane, score(lane, x)))
+        .map(|(lane, x)| (lane, score(lane, x)))
         .fold(None, |best: Option<(usize, f64)>, (lane, s)| match best {
             Some((_, b)) if b >= s => best,
             _ => Some((lane, s)),
         })
         .map(|(lane, _)| lane as u32)
-        .ok_or_else(|| werr(format!("row {r}'s logits are NaN in every lane — no token to draw")))
+        .ok_or_else(|| {
+            werr(format!(
+                "row {r}'s logits are NaN in every lane — no token to draw"
+            ))
+        })
 }
 
 /// Gumbel noise `-ln(-ln u)` for `lane` of a row at `step` under `seed`, `u ∈ (0, 1)` the
 /// splitmix64 finalizer of the three.
 fn gumbel(seed: u64, step: u32, lane: u32) -> f64 {
-    let mut z = seed ^ ((u64::from(step) << 32) | u64::from(lane)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut z =
+        seed ^ ((u64::from(step) << 32) | u64::from(lane)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
@@ -291,10 +300,16 @@ mod draw_tests {
     /// The greedy law answers the FIRST arg-max, past NaN lanes; a row of NaN answers nothing.
     #[test]
     fn the_greedy_draw_is_the_first_arg_max() {
-        let greedy = RowLaw { draw: None, step: 7 };
-        assert_eq!(draw_token(0, &[0.5, 2.0, f32::NAN, 2.0, -1.0], &greedy).unwrap(), 1);
-        assert_eq!(draw_token(0, &[f32::NAN, -3.0], &greedy).unwrap(), 1);
-        assert!(draw_token(0, &[f32::NAN; 4], &greedy).is_err());
+        let greedy = RowLaw {
+            draw: None,
+            step: 7,
+        };
+        assert_eq!(
+            draw_token(0, [0.5, 2.0, f32::NAN, 2.0, -1.0], &greedy).unwrap(),
+            1
+        );
+        assert_eq!(draw_token(0, [f32::NAN, -3.0], &greedy).unwrap(), 1);
+        assert!(draw_token(0, [f32::NAN; 4], &greedy).is_err());
     }
 
     /// A sampled draw replays under its seed and step, moves with the step, and follows the
@@ -302,16 +317,32 @@ mod draw_tests {
     /// drawn about as often.
     #[test]
     fn a_sampled_draw_is_a_function_of_seed_step_and_logits() {
-        let d = SampledDraw { seed: 0x1234_5678_9abc_def0, inv_t: 1.0 };
-        let law = |step| RowLaw { draw: Some(&d), step };
+        let d = SampledDraw {
+            seed: 0x1234_5678_9abc_def0,
+            inv_t: 1.0,
+        };
+        let law = |step| RowLaw {
+            draw: Some(&d),
+            step,
+        };
         let flat = vec![0.0f32; 4];
-        let picks: Vec<u32> = (0..4000).map(|s| draw_token(0, &flat, &law(s)).unwrap()).collect();
-        assert_eq!(picks, (0..4000).map(|s| draw_token(0, &flat, &law(s)).unwrap()).collect::<Vec<_>>());
+        let picks: Vec<u32> = (0..4000)
+            .map(|s| draw_token(0, flat.iter().copied(), &law(s)).unwrap())
+            .collect();
+        assert_eq!(
+            picks,
+            (0..4000)
+                .map(|s| draw_token(0, flat.iter().copied(), &law(s)).unwrap())
+                .collect::<Vec<_>>()
+        );
         for lane in 0..4u32 {
             let n = picks.iter().filter(|&&p| p == lane).count();
-            assert!((800..1200).contains(&n), "lane {lane} drawn {n} of 4000 times");
+            assert!(
+                (800..1200).contains(&n),
+                "lane {lane} drawn {n} of 4000 times"
+            );
         }
         let peaked = [0.0f32, 40.0, 0.0, 0.0];
-        assert!((0..200).all(|s| draw_token(0, &peaked, &law(s)).unwrap() == 1));
+        assert!((0..200).all(|s| draw_token(0, peaked, &law(s)).unwrap() == 1));
     }
 }

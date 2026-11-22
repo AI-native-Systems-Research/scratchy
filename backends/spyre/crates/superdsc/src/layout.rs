@@ -24,8 +24,17 @@ pub enum Residency {
 
 /// The operand axis operand `oi` of `node` must have as its unit stride, if the op fixes one.
 pub fn required(node: &Node, oi: usize) -> Option<usize> {
-    let operand = if oi < node.inputs.len() { &node.inputs[oi] } else { &node.output };
-    let unit = |o: &Operand| o.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1);
+    let operand = if oi < node.inputs.len() {
+        &node.inputs[oi]
+    } else {
+        &node.output
+    };
+    let unit = |o: &Operand| {
+        o.view
+            .axes
+            .iter()
+            .position(|a| a.stride == 1 && a.extent > 1)
+    };
     match (node.func, node.func.family()) {
         (OpFunc::Restick, _) => None,
         (_, Family::Contraction) => Some(operand.view.axes.len() - 1),
@@ -53,20 +62,30 @@ pub fn staged_layouts(g: &Graph, residency: &[Residency]) -> Vec<ParamLayout> {
     let mut out: Vec<ParamLayout> = vec![None; g.params.len()];
     for node in &g.nodes {
         for oi in 0..=node.inputs.len() {
-            let o = if oi < node.inputs.len() { &node.inputs[oi] } else { &node.output };
+            let o = if oi < node.inputs.len() {
+                &node.inputs[oi]
+            } else {
+                &node.output
+            };
             let Store::Param(p) = o.store else { continue };
             if residency.get(p) != Some(&Residency::Staged) {
                 continue;
             }
-            let Some(axis) = required(node, oi) else { continue };
+            let Some(axis) = required(node, oi) else {
+                continue;
+            };
             let kernel = node.func.family() == Family::Contraction && oi == 1;
             if on_stick(o, axis) && !kernel {
                 continue;
             }
             // The memory-view axis the needed stick walks: the one whose stride it carries.
             let want = o.view.axes[axis].stride;
-            let Some(mv) = g.param_views[p].first() else { continue };
-            let Some(a) = mv.axes.iter().position(|x| x.stride == want) else { continue };
+            let Some(mv) = g.param_views[p].first() else {
+                continue;
+            };
+            let Some(a) = mv.axes.iter().position(|x| x.stride == want) else {
+                continue;
+            };
             let mut order: Vec<usize> = (0..mv.axes.len()).filter(|&x| x != a).collect();
             order.push(a);
             out[p] = Some(Held {
@@ -84,7 +103,9 @@ pub fn restick<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
     let mut i = 0;
     while i < g.nodes.len() {
         for oi in 0..g.nodes[i].inputs.len() {
-            let Some(axis) = required(&g.nodes[i], oi) else { continue };
+            let Some(axis) = required(&g.nodes[i], oi) else {
+                continue;
+            };
             let o = g.nodes[i].inputs[oi].clone();
             if on_stick(&o, axis) {
                 continue;
@@ -134,7 +155,8 @@ pub fn restick<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
 /// to an address one stick per row.
 fn indexable(v: &View, axis: usize, lanes: u64) -> bool {
     let stick = v.axes.iter().position(|a| a.stride == 1 && a.extent > 1);
-    let one_column = stick.is_none_or(|s| v.axes[s].extent <= lanes || v.tile.is_some_and(|t| t.axis == s));
+    let one_column =
+        stick.is_none_or(|s| v.axes[s].extent <= lanes || v.tile.is_some_and(|t| t.axis == s));
     v.axes[axis].stride == lanes && one_column
 }
 
@@ -158,7 +180,11 @@ fn row_indexable(v: &View, axis: usize, lanes: u64) -> bool {
         if a.stride != unit {
             return false;
         }
-        unit *= if k == 0 { a.extent.next_multiple_of(lanes) } else { a.extent };
+        unit *= if k == 0 {
+            a.extent.next_multiple_of(lanes)
+        } else {
+            a.extent
+        };
     }
     unit > lanes && v.axes[axis].stride == unit
 }
@@ -168,8 +194,17 @@ fn row_indexable(v: &View, axis: usize, lanes: u64) -> bool {
 fn split_sticks(v: &View, s: usize, lanes: u64) -> View {
     let mut out = v.clone();
     let a = out.axes[s];
-    out.axes[s] = crate::view::Axis { extent: lanes, stride: a.stride };
-    out.axes.insert(s, crate::view::Axis { extent: a.extent / lanes, stride: a.stride * lanes });
+    out.axes[s] = crate::view::Axis {
+        extent: lanes,
+        stride: a.stride,
+    };
+    out.axes.insert(
+        s,
+        crate::view::Axis {
+            extent: a.extent / lanes,
+            stride: a.stride * lanes,
+        },
+    );
     out
 }
 
@@ -229,7 +264,12 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
         };
         let lanes = operand.format.lanes::<G>();
         let axis = gather.axis;
-        let Some(stick) = operand.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1) else {
+        let Some(stick) = operand
+            .view
+            .axes
+            .iter()
+            .position(|a| a.stride == 1 && a.extent > 1)
+        else {
             i += 1;
             continue;
         };
@@ -237,7 +277,11 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
         // rows contiguous, one per index.
         let rows = row_indexable(&operand.view, axis, lanes);
         // The other side of the copy is held the same way, rows one per index.
-        let other = if is_input { g.nodes[i].output.clone() } else { g.nodes[i].inputs[0].clone() };
+        let other = if is_input {
+            g.nodes[i].output.clone()
+        } else {
+            g.nodes[i].inputs[0].clone()
+        };
         let other_shape = other.view.shape();
         let other_held = if rows {
             row_view(&other_shape, lanes)
@@ -258,7 +302,11 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
             let copy = Node {
                 func: OpFunc::Identity,
                 space: other_shape,
-                inputs: vec![if is_input { staged.clone() } else { other.clone() }],
+                inputs: vec![if is_input {
+                    staged.clone()
+                } else {
+                    other.clone()
+                }],
                 output: if is_input { other } else { staged.clone() },
             };
             if is_input {
@@ -351,7 +399,11 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
 /// Does `o`'s window start inside a stick along its unit-stride axis? A descriptor addresses whole
 /// sticks, so such a window is unreachable where it lies.
 fn starts_inside_a_stick(o: &Operand, lanes: u64) -> Option<usize> {
-    let s = o.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1)?;
+    let s = o
+        .view
+        .axes
+        .iter()
+        .position(|a| a.stride == 1 && a.extent > 1)?;
     let outer_aligned = o
         .view
         .axes

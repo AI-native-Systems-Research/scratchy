@@ -33,8 +33,8 @@ use crate::interpreter::{Arg, Output};
 use crate::ir::{Attr, IRFunction, Operation, Scalar, Ssa};
 use crate::irtype::IrType;
 use crate::opkind::OpKind;
-use ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec};
 use ktir_core::program::Program;
+use ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec};
 use std::collections::{HashMap, HashSet};
 
 /// One tensor argument of an example kernel: the function arg name (no `%`), the

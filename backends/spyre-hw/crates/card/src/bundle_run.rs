@@ -459,10 +459,8 @@ fn run_loaded(
         weight_tail: scratchy_target_spyre::bundle_code::WeightTail::InPlace,
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(Vec::new()),
-        // The producer's scalar registry. `layout::for_node` fills it for an rmsnorm epsilon or a
-        // scalarmul multiplier; a bundle whose ops read none states an empty one, and an empty one is
-        // what every current Triton-derived bundle states.
-        scalarmul_scales: std::borrow::Cow::Owned(Vec::new()),
+        // No constants: a bundle run from files stages its inputs itself.
+        stick_consts: std::borrow::Cow::Owned(Vec::new()),
         // No weight folds: the ScalarMul fold multiplies the WORKER's staged weight bytes at load,
         // and this runner stages inputs from files, not through the worker's binding. An empty list
         // is also what every Triton-derived bundle's layout states (`layout::for_regions`).
@@ -471,14 +469,6 @@ fn run_loaded(
         // lowers Triton kernels — no permuted copy exists to materialize.
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
-        // No op-local LX pin slots: this runner lowers Triton kernels — no rmsnorm decomposition
-        // ever declares an `rinv` pin — so the rung's slot sum is zero.
-        lx_op_local_bytes: 0,
-        // No chunk form either, so no probability-part pins beside absent gathers.
-        lx_prob_pin_bytes: 0,
-        // And no pin window: no placement layout was ever computed for a Triton-lowered
-        // bundle, so there is no proven window to state — `None`, not a silent zero.
-        lx_pin_window_bytes: None,
         // The graph's own source bound, read off the parse with the same KIND split the
         // launch-time `declare_sources` below applies to the bound inputs (activation-role,
         // below the reserved-const floor): a run that binds every kernel tensor states exactly

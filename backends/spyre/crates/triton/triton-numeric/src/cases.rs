@@ -334,14 +334,8 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>)> {
         //
         // `H` still separates the two configurations, but now only through the plane width
         // (`H * HEAD_DIM`), which is exactly what `drive_rope` cross-checks against the output view.
-        "rope_q32" => (
-            spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
-            vec![256],
-        ),
-        "rope_kv8" => (
-            spec("rope", "rope_fwd", ROPE, &rope_ce(8)),
-            vec![256],
-        ),
+        "rope_q32" => (spec("rope", "rope_fwd", ROPE, &rope_ce(32)), vec![256]),
+        "rope_kv8" => (spec("rope", "rope_fwd", ROPE, &rope_ce(8)), vec![256]),
         // EMBEDDING. `Program::ScalarMul` is the kind of the one COMPUTE op (`rows * EMB_SCALE`);
         // the gather itself is addressing, and whether this crate has a door for an INDIRECT access
         // tile is what these three measure. BLOCK_M 64 is the Granite launch; the 128 case is the

@@ -3,6 +3,8 @@
 //! that runs it, and how its operands must be sticked. This is a TABLE the lowering reads — the
 //! only place a fact about one op lives.
 
+use crate::format::DataFormat;
+
 /// The execution unit an op runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExUnit {
@@ -110,7 +112,20 @@ impl OpFunc {
     /// Whether this op converts its operand's element format — its two sides hold different
     /// sticks, and dxp's conversion templates bind them by role.
     pub const fn converts(self) -> bool {
-        matches!(self, OpFunc::Widen | OpFunc::Narrow | OpFunc::Fp8ToFp16 | OpFunc::Fp16ToFp8)
+        matches!(
+            self,
+            OpFunc::Widen | OpFunc::Narrow | OpFunc::Fp8ToFp16 | OpFunc::Fp16ToFp8
+        )
+    }
+
+    /// Whether dxp binds this op over values held in `format`. A copy binds the two float
+    /// compute formats only (`ddl_templates/unary_parallel.ddl`'s `identity` row); an index
+    /// tensor is no value of the op's and is not asked about.
+    pub const fn binds(self, format: DataFormat) -> bool {
+        match self {
+            OpFunc::Identity => matches!(format, DataFormat::Fp16 | DataFormat::Fp32),
+            _ => true,
+        }
     }
 
     /// The `opFuncName` dxp reads.

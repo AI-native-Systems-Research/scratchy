@@ -1134,14 +1134,6 @@ enum SourceFiller {
     /// cannot be aliased: the slot also carries an intermediate color, so no two bundles agree on that
     /// segment's extent and [`Self::SegmentOwner`] is unavailable to it.
     DeclaredResident,
-    /// ⭐ THE DEVICE'S OWN CHAINSTAGE WROTE IT — the chain's s/l sticks on a stable (`OnCard`)
-    /// decode seating, handed over by [`Executor::hand_to_card`]. Not [`SourceFiller::DeclaredResident`]:
-    /// that is a LOADER's permanent statement about a source no launch ever binds, while this is a
-    /// PER-SEATING hand-off — the host takes the stick back the moment a `Host`-seeded launch
-    /// re-binds it (a churned seating's re-seed), which is why [`Executor::bind_input_raw`]
-    /// clears it. Baking it resident instead would mask exactly the refusal that catches a
-    /// forgotten seed bind on the first step of a seating.
-    ChainStage,
     /// Its segment is ALIASED onto another session's region, so the OWNER filled it. The prefill
     /// ladder rungs and the batched-prefill session are entirely this case for seg1 (weights) and
     /// seg2 (KV): they bind NOTHING, precisely so the 2.6 GB stage+H2D happens once.
@@ -1221,11 +1213,6 @@ pub struct Executor<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> {
     /// but no `bind_input` ever names it, so a completeness check that does not know this refuses
     /// EVERY launch.
     resident_sources: std::collections::BTreeSet<u32>,
-    /// ⭐ THE STICKS A STABLE SEATING HANDED TO THE CARD ([`Executor::hand_to_card`]) — the chain's
-    /// s/l sources, written by the previous step's ChainStage on the device. A PER-SEATING set, not
-    /// a loader declaration: [`Executor::bind_input_raw`] clears an id from it the moment the host
-    /// binds that stick again.
-    card_owned: std::collections::BTreeSet<bundle::PlaceId>,
 
     // ── Programs ──
     rolled: Option<Rolled>,
@@ -1691,7 +1678,6 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
             logits_id,
             num_sources: None,
             resident_sources: std::collections::BTreeSet::new(),
-            card_owned: std::collections::BTreeSet::new(),
             rolled: None,
             prefix_ops: Vec::new(),
             body_ops: Vec::new(),
@@ -1779,8 +1765,7 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
         self.seat.identity()
     }
 
-    /// The rank this executor plays as — `None` alone. What the host stages per rank reads it:
-    /// the chained head's tables and seeds are its rank's vocabulary block.
+    /// The rank this executor plays as — `None` alone. What the host stages per rank reads it.
     pub fn tp_identity(&self) -> Option<bundle::collective::Rank<T>> {
         self.session()
     }
@@ -1979,7 +1964,6 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
                 | SourceFiller::WeightLoader
                 | SourceFiller::TapeStep
                 | SourceFiller::DeclaredResident
-                | SourceFiller::ChainStage
                 | SourceFiller::SegmentOwner => false,
             })
             .collect();
@@ -2026,8 +2010,6 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
             SourceFiller::TapeStep
         } else if self.resident_sources.contains(&id.tid()) {
             SourceFiller::DeclaredResident
-        } else if self.card_owned.contains(id) {
-            SourceFiller::ChainStage
         } else if self.source_segment_is_aliased(id) {
             SourceFiller::SegmentOwner
         } else {
@@ -2250,32 +2232,6 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
         self.raw_ids.insert(b.id);
         self.staged.remove(&b.id);
         self.bound.insert(b.id, HostBytes::Owned(b.bytes));
-        // ⭐ THE HOST TAKES THE STICK BACK. A bind is the opposite of [`Self::hand_to_card`]:
-        // a churned seating re-seeds from the collected picks, so the id leaves the card-owned
-        // set and counts as a `TapeStep` fill from here on.
-        self.card_owned.remove(&b.id);
-    }
-
-    /// ⭐⭐⭐ HAND AN ACTIVATION TO THE CARD — the sticks of a stable decode seating. The
-    /// previous step's ChainStage writes them on the device, and this step's gather reads
-    /// them there; a `Host`-seeded launch's raw seed bind sits in [`Self::bound`], and the
-    /// refill re-sends every unkeyed `bound` entry on EVERY submit — so without this door
-    /// each stable step's preamble H2D would overwrite the card's own pick with the last
-    /// host seed before the gather reads it (the stuck-seed repetition, pinned on card
-    /// 2026-10-27: every batched text from the third token on was the seed token
-    /// re-emitted). Removing the id from all three maps ends the re-send; a later `Host`
-    /// launch re-binds it (a churned seating re-seeds from the collected picks), which
-    /// re-inserts it exactly as a fresh bind would.
-    pub fn hand_to_card(&mut self, id: bundle::PlaceId) {
-        self.raw_ids.remove(&id);
-        self.staged.remove(&id);
-        self.bound.remove(&id);
-        // ⭐ AND THE COMPLETENESS WALK LEARNS THE NEW OWNER. Dropping the binds alone would
-        // leave `filler_of` reading the stick as `Nobody`-filled and refusing every stable
-        // launch (`predict: caller-filled source(s) were never written`); declaring it here,
-        // per seating, is what keeps the first step's refusal — the one that catches a
-        // forgotten `Host` seed bind — intact.
-        self.card_owned.insert(id);
     }
 
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
@@ -2340,9 +2296,9 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> Executor<'a, 'c, T> {
             let bytes = c.host_bytes(bundle::collective::STICK_BYTES as usize);
             match c.format {
                 bundle::StickFormat::Fp16 => self.bind_weight(c.id, HostBytes::Owned(bytes)),
-                bundle::StickFormat::Fp32 | bundle::StickFormat::Fp8 | bundle::StickFormat::UInt32 => {
-                    self.bind_const_fp32(c.id, bytes)?
-                }
+                bundle::StickFormat::Fp32
+                | bundle::StickFormat::Fp8
+                | bundle::StickFormat::UInt32 => self.bind_const_fp32(c.id, bytes)?,
             }
         }
         Ok(())

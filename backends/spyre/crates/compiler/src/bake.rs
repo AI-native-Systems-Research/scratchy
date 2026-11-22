@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use quote::quote;
 use scratchy_forward_compiler_frontend::classified::{OpKind, Program, WeightId};
-use scratchy_forward_compiler_macro::codegen::tie_word_embeddings;
 use scratchy_forward_compiler_macro::config::ModelParams;
 use scratchy_forward_compiler_macro::fuf::{Fuf, FufInput, TileId};
 
@@ -64,14 +63,6 @@ use scratchy_forward_compiler_macro::fuf::{Fuf, FufInput, TileId};
 ///
 /// The manifest is still emitted (the KTIR emulator's session takes it), so both answers exist at
 /// bake and this costs one parse per model.
-/// ⭐ THE ROW A TIED DECODE STEP GATHERS — the `RowGather` the sharding analysis reads for a
-/// forward whose input row the chained head fills: a tied model's decode, its embedded-hidden
-/// source read on device out of the vocabulary projection's own table at the token the previous
-/// step drew. `mint_embed_chain` builds that gather on the lowered graph; the analysis needs only
-/// the fact, and places the row's all-reduce where it is first read whole when the table splits.
-/// A prefill forward's rows are the prompt's, staged whole by the host, and an untied model's
-/// decode does not chain: both state none. `decode` is the predicate the chain's mint runs under
-/// (a decode rung, never a prefill one), so the two cannot disagree about which bakes chain.
 /// ⭐ A RUNG OF THE SHARDED WORLD READS THE DECODE'S STAGED WEIGHTS — one copy per rank, cut by the
 /// decode's slice laws — so a rung whose own analysis cuts a staged source differently would read
 /// the wrong slice. That is a BUILD error, naming the bundle, the binding and both cuts
@@ -115,23 +106,6 @@ fn bake_tape(
              a decoder, whose host gather lands in its one EmbeddedHidden source"
         )
     })
-}
-
-fn chained_row_gathers(
-    lwd: &BakeTape,
-    model: &ModelParams,
-    decode: bool,
-) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
-    if !(decode && tie_word_embeddings(model)) {
-        return Vec::new();
-    }
-    match lwd.input.vocab_table() {
-        Some(table) => vec![scratchy_subtile::tensor_parallel::RowGather {
-            row: lwd.embed_row().index(),
-            table,
-        }],
-        None => Vec::new(),
-    }
 }
 
 // ── The rotary-class VALUE law, shared by the wiring's tokens and the gate ──
@@ -421,7 +395,13 @@ fn emit_superdsc_wiring(
     // source). Nothing else of the layer leaves the device — the step's K/V are scattered into the
     // pools by the layer's own write — so the pools are the whole per-layer wiring.
     let mut layers: Vec<(u64, u32, u32)> = Vec::new();
-    if let Some(mask) = gk.attn_mask {
+    // Every class's attention reads its own class's mask stack (or a decode batch's chunk masks).
+    let masks: Vec<u32> = gk
+        .paged
+        .iter()
+        .flat_map(|p| [p.mask, p.chunk_masks])
+        .collect();
+    if !masks.is_empty() {
         let pk: std::collections::HashMap<u32, u64> = lwd
             .bindings()
             .iter()
@@ -441,7 +421,7 @@ fn emit_superdsc_wiring(
             })
             .collect();
         for node in &gk.nodes {
-            if !node.args.iter().any(|a| *a as u32 == mask) {
+            if !node.args.iter().any(|a| masks.contains(&(*a as u32))) {
                 continue;
             }
             let k_pool = node
@@ -661,7 +641,7 @@ fn emit_superdsc_wiring(
     };
     // ⭐ THE PAGED STEP, as the bake derived it (`paged_step_of_ir`) — the worker stages its three
     // sources every step against this pool.
-    let paged = match gk.paged {
+    let step_tokens = |step: Option<scratchy_target_spyre::wiring::PagedStep>| match step {
         Some(p) => {
             let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
             let q = u32l(p.query_rows);
@@ -704,6 +684,25 @@ fn emit_superdsc_wiring(
                     ),
                 }
             };
+            let attends = match p.attends {
+                scratchy_target_spyre::wiring::AttnMask::Causal => {
+                    quote! { ::scratchy_target_spyre::wiring::AttnMask::Causal }
+                }
+                scratchy_target_spyre::wiring::AttnMask::SlidingWindow { window } => {
+                    let w = u32l(window.get());
+                    quote! {
+                        ::scratchy_target_spyre::wiring::AttnMask::SlidingWindow {
+                            window: match ::core::num::NonZeroU32::new(#w) {
+                                ::core::option::Option::Some(w) => w,
+                                ::core::option::Option::None => ::core::panic!(
+                                    "a sliding window of no positions — a bake bug this static \
+                                     cannot carry"
+                                ),
+                            },
+                        }
+                    }
+                }
+            };
             let paged_rows = match p.paged_rows {
                 scratchy_target_spyre::paged_step::PagedRows::Batch => {
                     quote! { ::scratchy_target_spyre::paged_step::PagedRows::Batch }
@@ -720,10 +719,15 @@ fn emit_superdsc_wiring(
                     head_size: #head_size, walk: #walk,
                     paged_rows: #paged_rows,
                     extent: #extent,
+                    attends: #attends,
                 })
             }
         }
         None => quote! { ::core::option::Option::None },
+    };
+    let (full, sliding) = (step_tokens(gk.paged.full), step_tokens(gk.paged.sliding));
+    let paged = quote! {
+        ::scratchy_target_spyre::wiring::ClassSteps { full: #full, sliding: #sliding }
     };
 
     // The ScalarMul weight folds, straight off the bake's recognition — the worker scales these
@@ -1020,12 +1024,6 @@ fn synth_role_tokens(
     let b = quote! { ::scratchy_target_spyre::bundle_code::SynthRole };
     match r {
         R::Rot => quote! { #b::Rot },
-        // The chained head's synthetics (Front C): the per-request slabs the
-        // gather walks, their leg-2 transposes with the sentinel's reserved
-        // zero row, and the request-major leg-3 rows.
-        R::ChainSlab => quote! { #b::ChainSlab },
-        R::ChainSlabT => quote! { #b::ChainSlabT },
-        R::ChainRow => quote! { #b::ChainRow },
         R::Xc => quote! { #b::Xc },
         R::Rs => quote! { #b::Rs },
         R::Silu => quote! { #b::Silu },
@@ -3191,14 +3189,16 @@ pub(crate) fn dump_wavefront_mega(
                                             // — proven over the ladder the executor reads and the
                                             // selection it runs (`paged_step::prove_ladder_walks`),
                                             // so a ladder read as no walk fails here, not on a card.
-                                            if card
-                                                && let Some(step) = gk.paged
-                                                && let Err(e) =
-                                                    scratchy_target_spyre::paged_step::prove_ladder_walks(
-                                                        &meta, step,
-                                                    )
-                                            {
-                                                panic!("[spyre-superdsc] {base}: {e}");
+                                            if card {
+                                                for step in gk.paged.iter() {
+                                                    if let Err(e) =
+                                                        scratchy_target_spyre::paged_step::prove_ladder_walks(
+                                                            &meta, step,
+                                                        )
+                                                    {
+                                                        panic!("[spyre-superdsc] {base}: {e}");
+                                                    }
+                                                }
                                             }
                                             superdsc::attach_reroll::<$W>(&bfp, meta);
                                             // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
@@ -3811,7 +3811,7 @@ pub(crate) fn dump_wavefront_mega(
         >(
                 &lowered,
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                &chained_row_gathers(&lowered, model, true),
+                &[],
             )
             .unwrap_or_else(|e| {
                 panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
@@ -3880,18 +3880,6 @@ pub(crate) fn dump_wavefront_mega(
                     at,
                     tp_lwd.input.ops[at].op,
                     weights_of(at).join(", ")
-                );
-            }
-            // ⭐ A VOCABULARY-SPLIT HEAD SHIPS ITS WORLD. The decode's chained head gathers the
-            // drawn token's row from the lm head's own table, which the analysis split by columns
-            // with the head; the gather fact (`chained_row_gathers`) made that row a partial sum the
-            // analysis reduces, and each rank's chain gathers its own block (`mint_embed_chain`
-            // over the split tail, the rank's `ChainBlock` in its tables and seeds).
-            for g in &sf.gathered {
-                eprintln!(
-                    "[spyre-tp] {stem}: the decode's input row t{} is gathered from the \
-                     column-split table t{} — each rank gathers its own vocabulary block",
-                    g.row, g.table
                 );
             }
             let (_, fx) = emit_bundle_deferred_sharded(
@@ -3984,7 +3972,7 @@ pub(crate) fn dump_wavefront_mega(
                                 >(
                                     &lwd_b,
                                     scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                                    &chained_row_gathers(&lwd_b, model, true),
+                                    &[],
                                 )
                                 .unwrap_or_else(|e| {
                                     panic!(

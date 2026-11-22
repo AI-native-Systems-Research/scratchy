@@ -85,4 +85,3 @@ pub fn count(name: &str, n: u64) {
         ROWS[i].items.fetch_add(n, Ordering::Relaxed);
     }
 }
-

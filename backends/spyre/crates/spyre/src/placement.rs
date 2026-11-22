@@ -80,7 +80,9 @@ pub fn align128(n: u64) -> u64 {
 impl BundleLayout {
     /// The device address of `tid`'s first byte: its segment's base plus its offset.
     pub fn address(&self, tid: u32) -> Option<u64> {
-        self.placements.get(&tid).map(|p| segment_base(p.segment) + p.offset)
+        self.placements
+            .get(&tid)
+            .map(|p| segment_base(p.segment) + p.offset)
     }
 }
 

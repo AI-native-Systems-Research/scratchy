@@ -19,17 +19,18 @@
 #       workspace's — and no macOS job compiles its crates, which is what the list states.
 set -euo pipefail
 
-# One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
-# ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
+# One crate directory per line: the Spyre target, its KTIR -> SuperDSC lowering and its triton
+# re-host crates. Not ktir-core, ktir-emulator or ktir-optimizer: the tests job runs the first two,
+# and both depend on the third.
 MACOS_UNBUILT='backends/spyre/crates/spyre
 backends/spyre-hw/crates/card
 backends/spyre-hw/crates/builder
 backends/spyre/crates/bundle
 backends/spyre/crates/compiler
+backends/spyre/crates/superdsc
 backends/spyre/crates/triton/splice
 backends/spyre/crates/triton/triton-frontend
 backends/spyre/crates/triton/triton-ktir
-backends/spyre/crates/triton/triton-ktir-superdsc
 backends/spyre/crates/triton/triton-numeric'
 
 changed() {

@@ -14,11 +14,10 @@
 //!   RED-stop: an op the card binds at fp32 lowers AS f32 — nothing narrows,
 //!   so there is nothing to refuse — exactly the decision the pass's old
 //!   inline `FP32_CARD_BINDS` table made, now read through the typed key;
-//! * the ARRANGEMENT PROPAGATION (`ktir-superdsc`'s
-//!   `element_arrangement`-fed walk) reads each row's arrangement — the
-//!   output layout an op carries when both operands are standard — so no
-//!   staging rule lives in a match arm (the old `OP_OUTPUT_ARRANGEMENT`
-//!   string-keyed table, absorbed here).
+//! * the EMULATOR reads each row's arrangement — the output layout an op
+//!   carries when both operands are standard — so no staging rule lives in a
+//!   match arm (the old `OP_OUTPUT_ARRANGEMENT` string-keyed table, absorbed
+//!   here).
 //!
 //! This commit is the RE-HOMING only: every reader decides exactly what it
 //! decided before, and the emitted bundles are byte-identical. The rows the
@@ -85,9 +84,8 @@ pub enum DdlDf {
 /// granite-2b fp8, probe-8): when both operands are addressed standard, the
 /// convert writes value-exact but lane-permuted output — within each
 /// 64-element block, the sixteen 4-lane groups permute by a 1-bit right
-/// rotation of the 4-bit group index. The permutation itself (and the
-/// staging over it) stays in `ktir-superdsc`'s `element_arrangement`, which
-/// re-exports this enum.
+/// rotation of the 4-bit group index. The permutation itself is
+/// [`DeviceGen::DL16TOFP32_PERMUTATION`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ElementArrangement {
     /// Logical lane `i` at buffer position `i` — every buffer the card's ops
@@ -383,7 +381,7 @@ pub trait DeviceGen {
     /// The bytes one core's share of an elementwise op may carry before another core pays for
     /// itself. A descriptor's fixed cost grows with the cores it is spread over while its byte cost
     /// is flat for a few KiB a core, so a free elementwise division spends one core per this many of
-    /// the bytes the op moves (`ktir-superdsc`'s `CoreBudget::for_bytes`).
+    /// the bytes the op moves.
     const BYTES_PER_CORE: u64;
     /// The fewest cores a FLOP-heavy matmul (`macs ≥ 2^20`) may be split onto — the floor the
     /// windowed drop test, guard #11 and the bridge's floor test share.
@@ -391,8 +389,7 @@ pub trait DeviceGen {
     /// This generation's `dl16tofp32` lane permutation:
     /// `DL16TOFP32_PERMUTATION[i]` is the buffer position logical lane `i`
     /// of a 64-element block occupies in a staggered buffer. A const
-    /// table, not a derivation — the staging over it lives in
-    /// `ktir-superdsc`'s `element_arrangement`.
+    /// table, not a derivation.
     const DL16TOFP32_PERMUTATION: [u8; 64];
 }
 
@@ -781,9 +778,8 @@ impl DeviceGen for Gen1 {
     /// of the f32 word stream, the sixteen 4-lane groups permute by a
     /// 1-bit RIGHT rotation of the 4-bit group index — logical lane `4g+r`
     /// lands at buffer position `4·ror(g)+r`, `ror(g) = (g>>1) |
-    /// ((g&1)<<3)`. The staging over this table stays in ktir-superdsc's
-    /// `element_arrangement`; only the table itself moved here, so a
-    /// generation is one impl with its own measured permutation.
+    /// ((g&1)<<3)`. A generation is one impl with its own measured
+    /// permutation.
     const DL16TOFP32_PERMUTATION: [u8; 64] = dl16tofp32_permutation();
 }
 

@@ -5,28 +5,28 @@
 //! [`emit_bundle`] partitions the descriptors into dxp launch groups and hands them to the bake
 //! queue ([`crate::superdsc_bake`]).
 
-use ktir_core::attrkey::AttrKey;
-use ktir_core::ir::Attr;
-use ktir_core::opkind::OpKind;
-/// The baked bundle's types: this lowering's output is a `bundle::BundleCode`.
-pub use scratchy_spyre_bundle as bundle;
 pub use crate::lower_subtile_tape_to_ktir::{
     BundleWiring, NodeArgs, graph_wiring, lower_subtile_tape_to_ktir,
-};
-pub use scratchy_spyre_bundle::program::ActiveCap;
-use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR};
-use std::collections::BTreeMap;
-pub use scratchy_spyre_bundle::rung::DxGroupCeiling;
-pub use scratchy_spyre_bundle::reserved_tids::{
-    ATTN_MASK_TID, LAST_HIDDEN_TID, PAGED_WRITE_ROWS_TID, RESERVED_REGIONS,
-    RESERVED_REGIONS_ARE_DISJOINT, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, reserved_region,
 };
 pub use crate::placement::{
     BundleLayout, KvBank, RetileDescriptor, SegRole, TensorPlacement, WEIGHT_SPILL_SEGS,
     WeightTail, align128,
 };
+use ktir_core::attrkey::AttrKey;
+use ktir_core::ir::Attr;
+use ktir_core::opkind::OpKind;
+/// The baked bundle's types: this lowering's output is a `bundle::BundleCode`.
+pub use scratchy_spyre_bundle as bundle;
+pub use scratchy_spyre_bundle::program::ActiveCap;
+pub use scratchy_spyre_bundle::reserved_tids::{
+    ATTN_MASK_TID, LAST_HIDDEN_TID, PAGED_WRITE_ROWS_TID, RESERVED_REGIONS,
+    RESERVED_REGIONS_ARE_DISJOINT, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, reserved_region,
+};
+pub use scratchy_spyre_bundle::rung::DxGroupCeiling;
+use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR};
 use scratchy_triton_splice::EmittedOp;
 use spyre_superdsc::format::DataFormat;
+use std::collections::BTreeMap;
 
 /// Bytes in one stick: the generation's flit.
 pub const STICK_BYTES: u64 =
@@ -217,9 +217,10 @@ fn audit_layout_addresses(
 /// read by the body from bytes the host never wrote there: a clean bake, no fault, a wrong value. The
 /// macro calls this on every rung it bakes, so a disagreement is a build failure.
 pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> Result<(), String> {
-    let consts = |l: &BundleLayout| -> std::collections::BTreeMap<u32, spyre_superdsc::graph::ConstStick> {
-        l.stick_consts.iter().copied().collect()
-    };
+    let consts =
+        |l: &BundleLayout| -> std::collections::BTreeMap<u32, spyre_superdsc::graph::ConstStick> {
+            l.stick_consts.iter().copied().collect()
+        };
     let (cc, rc) = (consts(ceiling), consts(rung));
     // A constant both place sits at one address holding one value.
     if let Some((tid, (a, b))) = cc
@@ -239,7 +240,9 @@ pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> 
              session stages the ceiling's constants alone"
         ));
     }
-    let staged = |l: &BundleLayout, own: &std::collections::BTreeMap<u32, _>| -> Vec<(u32, usize, u64, u64)> {
+    let staged = |l: &BundleLayout,
+                  own: &std::collections::BTreeMap<u32, _>|
+     -> Vec<(u32, usize, u64, u64)> {
         l.placements
             .values()
             .filter(|p| matches!(p.role, SegRole::Activation) && !own.contains_key(&p.tid))
@@ -247,7 +250,10 @@ pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> 
             .collect()
     };
     let (c, r) = (staged(ceiling, &cc), staged(rung, &rc));
-    if c == r && ceiling.segment_bytes[SegRole::Activation.segment()] == rung.segment_bytes[SegRole::Activation.segment()] {
+    if c == r
+        && ceiling.segment_bytes[SegRole::Activation.segment()]
+            == rung.segment_bytes[SegRole::Activation.segment()]
+    {
         return Ok(());
     }
     let first = c
@@ -424,23 +430,20 @@ pub fn compute_bundle_layout<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
     };
     // ⭐ EACH BUFFER HOLDS EVERY ELEMENT ITS PROGRAMS REACH — a card bake's division pads a stick
     // axis past the tensor's own extent ([`crate::superdsc_lower::rooms`]).
-    let room = if cfg!(feature = "spyre-lower") {
-        crate::superdsc_lower::rooms::<T, F>(
-            ir,
-            weight_ids,
-            paged_rows == scratchy_triton_splice::PagedRows::Batch,
-            query_rows,
-        )
-        .map_err(SuperDscError)?
-    } else {
-        Default::default()
-    };
+    let room = crate::superdsc_lower::rooms::<T, F>(
+        ir,
+        weight_ids,
+        paged_rows == scratchy_triton_splice::PagedRows::Batch,
+        query_rows,
+    )
+    .map_err(SuperDscError)?;
     // A `[rows, cols]` tensor is held row-major, each row whole sticks of its format.
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         let df = kernel_dfs.get(&tid).copied().unwrap_or(DataFormat::Fp16);
         let lanes = df.lanes::<ktir_core::ddl_binds::Baked>();
-        let natural = u64::from(s.rows) * u64::from(s.cols).next_multiple_of(lanes) * df.word_bytes();
+        let natural =
+            u64::from(s.rows) * u64::from(s.cols).next_multiple_of(lanes) * df.word_bytes();
         natural.max(room.get(&tid).copied().unwrap_or(0))
     };
     // ── Liveness: first def (output of node i) and last use (input of node j). A
@@ -664,16 +667,18 @@ pub fn compute_bundle_layout<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
         widest_cols.filter(|_| <T as scratchy_spyre_bundle::collective::World>::SHARDED)
     {
         let w = SegRole::Weight.segment();
-        let block = scratchy_spyre_bundle::collective::RecvWindow::<T>::block_bytes_for(widest_cols)
-            .ok_or_else(|| {
-                SuperDscError(format!(
-                    "a collective's operand has {widest_cols} columns — no receive window of a \
+        let block =
+            scratchy_spyre_bundle::collective::RecvWindow::<T>::block_bytes_for(widest_cols)
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "a collective's operand has {widest_cols} columns — no receive window of a \
                      {}-rank world holds it",
-                    <T as scratchy_spyre_bundle::collective::World>::RANKS
-                ))
-            })?;
-        let window = scratchy_spyre_bundle::collective::RecvWindow::<T>::new(align128(seg_bytes[w]), block)
-            .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
+                        <T as scratchy_spyre_bundle::collective::World>::RANKS
+                    ))
+                })?;
+        let window =
+            scratchy_spyre_bundle::collective::RecvWindow::<T>::new(align128(seg_bytes[w]), block)
+                .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
         if window.end() > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
                 "the tensor-parallel receive window [{}, {}) does not fit the weight segment's \
@@ -793,12 +798,14 @@ pub fn compute_bundle_layout<T: scratchy_spyre_bundle::collective::Tp, F: RopeFo
     //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
     //    (the KV segment moves with every layer). `PagedStep::card_placements` is
     //    the one statement of what they are and how big — the card stagers stage within it.
-    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+    for step in crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         ActiveCap::FULL,
         paged_rows,
         query_rows,
-    )? {
+    )?
+    .iter()
+    {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
                 crate::wiring::CardSeat::Step => SegRole::Activation,
@@ -1714,8 +1721,7 @@ pub(crate) struct StagedWeightView<'a> {
     /// them wherever they compute — so the reference legs take them through
     /// [`Self::stage_load_consts`] at buffer init instead, never through the
     /// read-time channel. Each entry is already BUILT (`LoadConst::build`) for
-    /// the rank the probe stages — a chained head's tables are its rank's
-    /// vocabulary block — so the view carries no rank of its own.
+    /// the rank the probe stages, so the view carries no rank of its own.
     pub load_consts: &'a [BuiltConst],
 }
 
@@ -2766,16 +2772,10 @@ fn teacher_forced_walk<F: RopeForm>(
                 // row (the `selector_lastrow_col` extraction the lowering
                 // pins). The teacher still pins — the fold's own pin: the
                 // program wrote S rows starting at row 0, the rows the fold's
-                // consumers read (the Sample's `SampleRows::Folded` region is
-                // rows 0..S), so the emulator's row 0 is pinned there and rows
-                // 1.. stay as the walk computed them (the program never wrote
-                // them, and the fold law of every downstream folded tid reads
-                // the walk's LAST row). Without this pin the walk's Sample
-                // re-drew from the WALK's row 0 — the FIRST prompt
-                // position's logits, not the fold's product — and the draw's
-                // local read golden-draw-vs-emu-draw (measured: granite
-                // 1771-vs-12660 = 6.1485, llama 113360-vs-67129 = 0.4078,
-                // both exactly |g−e|/g).
+                // consumers read, so the emulator's row 0 is pinned there and
+                // rows 1.. stay as the walk computed them (the program never
+                // wrote them, and the fold law of every downstream folded tid
+                // reads the walk's LAST row).
                 let rcols = node.output.region.cols.len as usize;
                 if lm_head_folded.contains(&tid)
                     && rcols > 0
@@ -2960,7 +2960,7 @@ struct GateProbe {
 }
 
 #[cfg(feature = "spyre-emu")]
-fn stage_gate_probe<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
+fn stage_gate_probe<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     covering: Option<&std::collections::HashSet<u64>>,
@@ -3019,25 +3019,26 @@ fn stage_gate_probe<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
         rung.query_rows,
     )
     .map_err(|e| e.0)?;
-    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode {
-            mask, attention, ..
-        } => Some(attention.class(mask.class()).head_dim().get() as usize),
-        _ => None,
-    });
-    let pool_tids: std::collections::HashSet<u32> = ir
+    // Each pool's class: its step, and its head's width.
+    let pool_class: std::collections::HashMap<u32, (crate::wiring::PagedStep, usize)> = ir
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
-                n.inputs[1].tensor.index() as u32,
-                n.inputs[2].tensor.index() as u32,
-            ]),
+            SubOp::AttnDecode {
+                mask, attention, ..
+            } if n.inputs.len() >= 3 => {
+                let step = paged.of(mask.class())?;
+                let hd = attention.class(mask.class()).head_dim().get() as usize;
+                Some([
+                    (n.inputs[1].tensor.index() as u32, (step, hd)),
+                    (n.inputs[2].tensor.index() as u32, (step, hd)),
+                ])
+            }
             _ => None,
         })
         .flatten()
         .collect();
-    let step_rows = match (prefill, paged) {
+    let step_rows = match (prefill, paged.first()) {
         (Some(pg), _) => crate::paged_step::StepRows::new(0, pg.mq as usize).expect(
             "the prefill wiring's rung holds no query rows — the bake cannot stage its step",
         ),
@@ -3061,6 +3062,7 @@ fn stage_gate_probe<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     // every page through the table rather than at its block's own index, and the pages the step
     // touches stay at the pool's start (the staging below writes only that prefix).
     let blocks: Vec<u32> = paged
+        .first()
         .map(|p| {
             let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
             if need < p.pages {
@@ -3076,15 +3078,13 @@ fn stage_gate_probe<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
         // part of the graph under test. The reserved-tid sources appended
         // below (the scalars, the mask) stay UNfiltered — the twin's programs
         // bind them exactly as the full bundle does.
-        if weight_ids.contains(&tid)
-            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
-        {
+        if weight_ids.contains(&tid) || covering.is_some_and(|c| !c.contains(&(tid as u64))) {
             continue;
         }
         let t = ir.tensors[tid as usize];
         // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
         // session's own allocation holds them at zero.
-        let n = if pool_tids.contains(&tid) {
+        let n = if pool_class.contains_key(&tid) {
             step_rows.start * t.cols as usize
         } else {
             (t.rows as usize) * (t.cols as usize)
@@ -3100,8 +3100,8 @@ fn stage_gate_probe<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
         } else {
             (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
         };
-        match (paged, paged_hd) {
-            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
+        match pool_class.get(&tid) {
+            Some(&(p, hd)) => {
                 let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
                     .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
                 if !pool.is_empty() {
@@ -3109,13 +3109,13 @@ fn stage_gate_probe<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
                     sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
                 }
             }
-            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
+            None => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
         }
     }
-    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
+    // Each class's paged step's sources, by the worker's law: the mask stack an f16 source like any
     // other, the page table and the write rows int32 words on the typed channel (the f16 source
     // channel would encode them into half the bytes their views span).
-    if let Some(p) = paged {
+    for p in paged.iter() {
         let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
             .map_err(|e| format!("the gate's paged step: {e}"))?;
         for (tid, bytes, shape) in srcs.int32 {
@@ -3503,14 +3503,7 @@ pub fn numeric_gate<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
         load_consts,
         staged_rope,
         sources,
-    } = stage_gate_probe::<T, F>(
-        ir,
-        weight_ids,
-        covering,
-        prefill,
-        rung,
-        &|tid| tid as usize,
-    )?;
+    } = stage_gate_probe::<F>(ir, weight_ids, covering, prefill, rung, &|tid| tid as usize)?;
     let view = StagedWeightView {
         bytes: &view_bytes,
         gemm: &gemm,
@@ -4199,7 +4192,7 @@ fn numeric_gate_sharded<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
     };
     let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
     for me in &ranks {
-        probes.push(stage_gate_probe::<T, F>(
+        probes.push(stage_gate_probe::<F>(
             ir,
             weight_ids,
             covering,
@@ -4771,7 +4764,7 @@ pub enum PendingGroups<T: scratchy_spyre_bundle::collective::Tp> {
     /// finished the moment it is constructed.
     Ready(Vec<bundle::LaunchGroup<'static, T>>),
     /// `-Fspyre-hw`'s shape: each group's SuperDSC directory is staged and submitted
-    /// ([`ktir_groups_via_superdsc`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
+    /// ([`launch_groups`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
     /// find the compiled artifact once `superdsc_bake::finish_global()` has drained the queue —
     /// exactly the id `emit_bundle_inner` "used to" carry before this branch pivoted to KTIR.
     Staged(Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>),
@@ -4930,7 +4923,7 @@ pub fn attach_reroll<T: scratchy_spyre_bundle::collective::Tp>(
 /// the ceiling was the widest chunk, and the widest chunk had the widest HBM scratches.
 ///
 /// ⛔ MEASURED ON CARD, granite-3.1-2b fp16 (pod nickm), when that stopped being true. With the split-KV
-/// chunk's Kᵗ and V gathered into LX (the chunk's LX form in `ktir_superdsc::sdsc_abstract`), the
+/// chunk's Kᵗ and V gathered into LX, the
 /// 64-page ceiling keeps NO gather scratch in HBM, while a rung with a tail keeps HBM scratches the
 /// ceiling lacks:
 ///   * with Kᵗ whole in HBM at the 12-page rung, its first step faults `RAS::PCI::BusFence` (0xa35e,
@@ -4946,7 +4939,9 @@ pub fn attach_reroll<T: scratchy_spyre_bundle::collective::Tp>(
 /// less of it; under-allocating it is an address. Under this law the first case's 12-page rung runs,
 /// with replies byte-identical to the V-only build's: a 2,413-token prompt that decodes in that rung
 /// from its first step, and a 1,987-token one that crosses into it from the 8-page rung.
-pub fn cover_ladder_allocation<T: scratchy_spyre_bundle::collective::Tp>(fp: &str) -> Result<(), String> {
+pub fn cover_ladder_allocation<T: scratchy_spyre_bundle::collective::Tp>(
+    fp: &str,
+) -> Result<(), String> {
     let mut c = emitted::<T>()
         .lock()
         .map_err(|_| "the emit collector was poisoned by a panic".to_string())?;
@@ -5125,7 +5120,7 @@ impl<T: scratchy_spyre_bundle::collective::Tp> EmittedBundle<T> {
                 let mut out = Vec::with_capacity(staged.len());
                 for (kv, id) in &staged {
                     // `bake` is `None` on a `spyre-lower` build without `spyre-hw` (no device image
-                    // is compiled) — `ktir_groups_via_superdsc` staged/submitted nothing FOR that
+                    // is compiled) — `staged_groups` staged/submitted nothing FOR that
                     // same reason, so there is nothing to have lost here either. Empty
                     // `init_binary` matches `ktir_groups`'s own plan-only default.
                     let (init_binary, job_bin_ptr, correction) = match bake {
@@ -5477,10 +5472,7 @@ pub fn covering_twin_groups<T: scratchy_spyre_bundle::collective::Tp>(
 
 /// ⭐⭐⭐ THIS BUNDLE'S LAUNCH GROUPS: ITS PROGRAMS, IN LAUNCH ORDER.
 ///
-/// One node is one program and one program is one launch. Nothing here partitions by trip kind or
-/// carries a shift, and that is not a simplification — it is what is left once the parts with no
-/// counterpart are removed.
-///
+/// One node is one program and one program is one launch, in the order the tape runs them.
 pub fn ktir_groups<T: scratchy_spyre_bundle::collective::Tp>(
     ops: &[EmittedOp<T>],
 ) -> Result<Vec<bundle::LaunchGroup<'static, T>>, SuperDscError> {
@@ -5563,11 +5555,10 @@ impl<'a> DumpRoot<'a> {
 ///
 ///   1. [`lower_subtile_tape_to_ktir`] walks the rerolled tape and builds ONE KTIR program per node
 ///      (the producer half, in its own file — nothing there emits a descriptor);
-///   2. [`crate::ktir_superdsc_door::lower`] turns each of those programs into the real SuperDSC
-///      descriptors, reached from [`ktir_groups_via_superdsc`] below (the consumer half, in its own
-///      file — main's proven bodies with their input door changed);
-///   3. the bake — [`render_dxp_input`] + `superdsc_bake`'s stage/seal/submit, also in
-///      [`ktir_groups_via_superdsc`] — compiles them and `inventory::submit`s the result.
+///   2. [`crate::superdsc_lower`] places the rung and lowers each program to its SuperDSC
+///      descriptors ([`launch_groups`]);
+///   3. the bake — the groups rendered and handed to `superdsc_bake`'s stage/seal/submit
+///      ([`emit_bundle`]) — compiles them and `inventory::submit`s the result.
 ///
 /// Steps 2 and 3 run per BUNDLE, from [`emit_bundle`], because the tape walk's three segments
 /// (prefix / body / suffix) are baked as three bundles over one layout; this entry is step 1 plus
@@ -5628,12 +5619,17 @@ pub fn launch_groups<T: scratchy_spyre_bundle::collective::Tp>(
         .map(|e| Ok((e, crate::superdsc_lower::lower_op(e, layout)?)))
         .collect::<Result<_, String>>()?;
     let descriptors: usize = lowered.iter().map(|(_, d)| d.len()).sum();
-    crate::superdsc_bake::BakeBudget::bundle_verdict(fp, descriptors, descriptors as u64).map_err(|e| {
-        let mut heaviest: Vec<(&str, usize)> = lowered.iter().map(|(e, d)| (e.op_name.as_str(), d.len())).collect();
-        heaviest.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-        heaviest.truncate(8);
-        format!("{e} The heaviest programs: {heaviest:?}")
-    })?;
+    crate::superdsc_bake::BakeBudget::bundle_verdict(fp, descriptors, descriptors as u64).map_err(
+        |e| {
+            let mut heaviest: Vec<(&str, usize)> = lowered
+                .iter()
+                .map(|(e, d)| (e.op_name.as_str(), d.len()))
+                .collect();
+            heaviest.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            heaviest.truncate(8);
+            format!("{e} The heaviest programs: {heaviest:?}")
+        },
+    )?;
     let mut groups: Vec<LoweredGroup<T>> = Vec::new();
     for (e, descriptors) in lowered {
         for d in descriptors {
@@ -5889,7 +5885,11 @@ fn staged_groups<T: scratchy_spyre_bundle::collective::Tp>(
             for (name, contents) in &r.files {
                 std::fs::write(gdir.join(name), contents).map_err(|e| e.to_string())?;
             }
-            bake.submit(crate::superdsc_bake::SealedGroup::of_rendered(gdir, id.clone(), r))?;
+            bake.submit(crate::superdsc_bake::SealedGroup::of_rendered(
+                gdir,
+                id.clone(),
+                r,
+            ))?;
         }
         out.push((kv, id));
     }

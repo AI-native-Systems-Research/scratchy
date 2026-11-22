@@ -14,7 +14,9 @@
 //!   the last real one;
 //! * the KV WRITE INDEX — `kv_write_index`: one `[rows]` index per kv head, one after another, head
 //!   `h` of the token at `block · page_slots + offset` at row
-//!   `(block · nkvh + h) · page_slots + offset`;
+//!   `(block · nkvh + h) · page_slots + offset` — on an fp8 pool, whose pages are token-major, one
+//!   `[rows]` index of the tokens' own rows (the pool's law,
+//!   [`scratchy_triton_splice::PageOrder::write_index`]);
 //! * the QUERY ROW INDEX `[rows]` int32 — `_build_query_row_tables`: the sequence's rows of the
 //!   query. A forward here is one sequence whose padded rows already repeat its last real row (the
 //!   worker's pad law), so its rows are `0..rows` in order.
@@ -31,7 +33,7 @@ use crate::wiring::PagedStep;
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
 pub use scratchy_triton_splice::{
-    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages,
+    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages, whole_trips,
 };
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
@@ -254,7 +256,7 @@ fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
             let pos = rows.pos(r);
             let base = (i * q + r) * slots;
             for c in 0..slots {
-                if i * slots + c <= pos {
+                if attends(step, pos, i * slots + c) {
                     m[base + c] = 0.0;
                 }
             }
@@ -263,25 +265,56 @@ fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
     m
 }
 
-/// The KV write index: one `[rows]` index per kv head, one after another — head `h` of row `r`'s
-/// token at cache row `(page · nkvh + h) · page_slots + slot`, at the row's position.
+/// ⭐ WHETHER A ROW AT `pos` ATTENDS THE KEY AT `key` — the class's mask: every position up to the
+/// row's own, and (a local layer) only the last `window` of them.
+pub fn attends(step: &PagedStep, pos: usize, key: usize) -> bool {
+    key <= pos
+        && step
+            .attends
+            .window()
+            .is_none_or(|w| pos - key < w.get() as usize)
+}
+
+/// The KV write's index entry `h` of the token at `slot` of `page` — the build pool's law
+/// ([`scratchy_triton_splice::PageOrder::write_index`]).
+fn write_entry(step: &PagedStep, page: usize, slot: usize, h: usize) -> i32 {
+    KV_PAGES.write_index(
+        step.nkvh,
+        step.page_slots,
+        page as u32,
+        slot as u32,
+        h as u32,
+    ) as i32
+}
+
+/// The KV write's index entries per token on this build's pool.
+fn write_entries(step: &PagedStep) -> usize {
+    KV_PAGES.write_entries(step.nkvh) as usize
+}
+
+/// This build's page layout.
+const KV_PAGES: scratchy_triton_splice::PageOrder =
+    scratchy_triton_splice::KvPool::BUILD.page_order();
+
+/// The KV write index: one `[rows]` index per write entry, one after another — entry `h` of row
+/// `r`'s token at its position ([`write_entry`]).
 pub fn write_rows(
     step: &PagedStep,
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
     check(step, step.rows as usize, blocks, rows)?;
-    let (slots, nkvh, q) = (
-        step.page_slots as usize,
-        step.nkvh as usize,
-        step.rows as usize,
-    );
-    let mut w = Vec::with_capacity(nkvh * q);
-    for h in 0..nkvh {
+    let (slots, q) = (step.page_slots as usize, step.rows as usize);
+    let mut w = Vec::with_capacity(write_entries(step) * q);
+    for h in 0..write_entries(step) {
         for r in 0..q {
             let pos = rows.pos(r);
-            let page = blocks[pos / slots] as usize;
-            w.push(((page * nkvh + h) * slots + pos % slots) as i32);
+            w.push(write_entry(
+                step,
+                blocks[pos / slots] as usize,
+                pos % slots,
+                h,
+            ));
         }
     }
     Ok(w)
@@ -415,7 +448,7 @@ pub fn batch_sources(
             "a decode batch of {n} sequence(s) in a {b}-sequence bundle"
         )));
     }
-    let (slots, nkvh) = (step.page_slots as usize, step.nkvh as usize);
+    let slots = step.page_slots as usize;
     let (j, c) = (
         chunking.blocks_per_chunk as usize,
         chunking.num_chunks as usize,
@@ -460,7 +493,7 @@ pub fn batch_sources(
         for i in 0..need {
             pages[i * b + s] = q.blocks[i] as i32;
             for col in 0..slots {
-                mask_bs[(s * padded + i) * slots + col] = if i * slots + col <= q.pos {
+                mask_bs[(s * padded + i) * slots + col] = if attends(step, q.pos, i * slots + col) {
                     0.0
                 } else {
                     MASKED
@@ -484,14 +517,14 @@ pub fn batch_sources(
         }
     }
     // One token per real row, at its position; a padded row at the null slot.
-    let mut write = Vec::with_capacity(nkvh * b);
-    for h in 0..nkvh {
+    let mut write = Vec::with_capacity(write_entries(step) * b);
+    for h in 0..write_entries(step) {
         for r in 0..b {
             let (page, slot) = match seqs.get(r) {
                 Some(q) => (q.blocks[q.pos / slots] as usize, q.pos % slots),
                 None => (NULL_SLOT / slots, NULL_SLOT % slots),
             };
-            write.push(((page * nkvh + h) * slots + slot) as i32);
+            write.push(write_entry(step, page, slot, h));
         }
     }
     let e = j * b;
@@ -504,7 +537,7 @@ pub fn batch_sources(
                 words(fold(&pages)),
                 vec![c * e * per as usize],
             ),
-            (step.write_rows, words(write), vec![nkvh * b]),
+            (step.write_rows, words(write), vec![write_entries(step) * b]),
         ],
     })
 }
@@ -587,11 +620,7 @@ pub fn card_step_sources(
         check(step, w, req.blocks, &req.rows)
             .map_err(|e| PagedStepError(format!("request {r}: {}", e.0)))?;
     }
-    let (walk, slots, nkvh) = (
-        step.walk as usize,
-        step.page_slots as usize,
-        step.nkvh as usize,
-    );
+    let (walk, slots) = (step.walk as usize, step.page_slots as usize);
     // ⭐ THE WINDOW FAMILY — window `r`'s three tables at its own tids, each exactly the
     // one-request size: the page index table (`[walk, INT32_ELEMS_PER_STICK]` rows, request `r`'s
     // page ids one block per trip), the mask stack (`[walk·w, page_slots]`), and the query row index (the consecutive window `r·w .. r·w+w`). An empty
@@ -601,7 +630,10 @@ pub fn card_step_sources(
     let mut masks = Vec::with_capacity(cap);
     let mut int32 = Vec::with_capacity(cap * 2 + 1);
     for r in 0..cap {
-        let tid = |table: u32| scratchy_spyre_bundle::reserved_tids::paged_window_tid(r as u32, table);
+        let class = scratchy_triton_splice::paged_class(step.attends.class());
+        let tid = |table: u32| {
+            scratchy_spyre_bundle::reserved_tids::paged_window_tid(class, r as u32, table)
+        };
         // THE PAGE INDEX TABLE — request `r`'s page ids at the step's pitch; an empty window's
         // rows stay zero.
         let table = le_words(page_words(step, reqs.get(r).map_or(&[], |req| req.blocks)));
@@ -622,20 +654,24 @@ pub fn card_step_sources(
     // its request's last real one (the host law, an idempotent rewrite); an EMPTY slot's rows name
     // [`NULL_SLOT`], the null page's own slot. One table for the whole graph: the KV writers run
     // once per step over every row — they are not per-window.
-    let mut write: Vec<i32> = Vec::with_capacity(nkvh * cap * w);
-    for h in 0..nkvh {
+    let mut write: Vec<i32> = Vec::with_capacity(write_entries(step) * cap * w);
+    for h in 0..write_entries(step) {
         for r in 0..cap {
             match reqs.get(r) {
                 Some(req) => {
                     for j in 0..w {
                         let pos = req.rows.pos(j);
-                        let page = req.blocks[pos / slots] as usize;
-                        write.push(((page * nkvh + h) * slots + pos % slots) as i32);
+                        write.push(write_entry(
+                            step,
+                            req.blocks[pos / slots] as usize,
+                            pos % slots,
+                            h,
+                        ));
                     }
                 }
                 None => {
-                    let null = ((NULL_SLOT / slots) * nkvh + h) * slots + NULL_SLOT % slots;
-                    write.extend(std::iter::repeat_n(null as i32, w));
+                    let null = write_entry(step, NULL_SLOT / slots, NULL_SLOT % slots, h);
+                    write.extend(std::iter::repeat_n(null, w));
                 }
             }
         }
@@ -688,8 +724,8 @@ pub fn request_sources(
 }
 
 /// A pool holding token-major cache rows: row `t` of `cache` (`[·, nkvh · hd]`) laid into its page —
-/// head `h` at pool row `(blocks[t / page_slots] · nkvh + h) · page_slots + t % page_slots` — for
-/// every `t < valid`; every other row zero. Returned as the pool's PREFIX through the last page a
+/// head `h` where this build's page layout puts it ([`scratchy_triton_splice::PageOrder::head_element`])
+/// — for every `t < valid`; every other row zero. Returned as the pool's PREFIX through the last page a
 /// row lands on (empty when `valid` is 0): a pool is the model's whole context, and the rows past
 /// that page are the zeroed allocation the session already holds. The bake's numeric gate stages its
 /// reference's cached keys this way, so the paged walk reads the very rows the reference attends.
@@ -732,7 +768,14 @@ pub fn pool_of_rows(
     for t in 0..valid {
         let page = blocks[t / slots] as usize;
         for h in 0..nkvh {
-            let dst = ((page * nkvh + h) * slots + t % slots) * hd;
+            let dst = KV_PAGES.head_element(
+                nkvh as u64,
+                slots as u64,
+                hd as u64,
+                page as u64,
+                (t % slots) as u64,
+                h as u64,
+            ) as usize;
             let src = t * width + h * hd;
             pool[dst..dst + hd].copy_from_slice(&cache[src..src + hd]);
         }
@@ -762,10 +805,10 @@ mod tests {
     }
 
     fn step() -> PagedStep {
-        // The reserved sentinels, as every real wiring's step carries them (`PagedStepTids::RESERVED`
-        // through `paged_step_of_ir`) — window 0's tids in the card stagers and the placements ARE
-        // these, which is what keeps a packed rung byte-identical at one request.
-        let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+        // The full class's reserved sentinels, as every real wiring's step carries them
+        // (`PagedStepTids::of` through `paged_step_of_ir`) — window 0's tids in the card stagers and
+        // the placements ARE these, which is what keeps a packed rung byte-identical at one request.
+        let tids = scratchy_triton_splice::PagedStepTids::of(crate::wiring::AttnClass::Full);
         PagedStep {
             mask: tids.mask,
             page_table: tids.page_table,
@@ -785,6 +828,7 @@ mod tests {
             walk: 4,
             paged_rows: PagedRows::Sequence,
             extent: pair(3, 1),
+            attends: crate::wiring::AttnMask::Causal,
         }
     }
 
@@ -1167,6 +1211,33 @@ mod tests {
         assert_eq!(card.masks, vec![(logical.mask.0, logical.mask.1)]);
     }
 
+    /// ⭐ A LOCAL LAYER'S ROW ATTENDS ONLY THE LAST `window` POSITIONS — the class's mask, stated by
+    /// the host's mask stack: at a window of 3, row 2 of a chunk at position 5 (position 7) attends
+    /// keys 5, 6 and 7 and nothing before them, where the full class attends 0..=7.
+    #[test]
+    fn a_local_layers_row_attends_only_its_window() {
+        let local = PagedStep {
+            attends: crate::wiring::AttnMask::SlidingWindow {
+                window: std::num::NonZeroU32::new(3).expect("a window"),
+            },
+            ..step()
+        };
+        let rows = StepRows {
+            start: 5,
+            real: nz(3),
+        };
+        let slots = local.page_slots as usize;
+        let row = |s: &PagedStep, r: usize| -> Vec<usize> {
+            let m = mask_stack(s, &rows);
+            (0..s.walk as usize * slots)
+                .filter(|&k| m[((k / slots) * s.rows as usize + r) * slots + k % slots] == 0.0)
+                .collect()
+        };
+        assert_eq!(row(&local, 2), vec![5, 6, 7]);
+        assert_eq!(row(&step(), 2), (0..=7).collect::<Vec<_>>());
+        assert!(!attends(&local, 7, 4) && attends(&local, 7, 5) && !attends(&local, 7, 8));
+    }
+
     /// ⭐ A PROMPT WALK OF SEVERAL PAGES A TRIP HOLDS ITS PAGE IDS ONE WORD A BLOCK — the trip's
     /// pages are one gather's index (`scratchy_triton_splice::trip_pages`); a walk of one page a trip
     /// keeps spyre-inference's one int32 stick a block.
@@ -1193,7 +1264,11 @@ mod tests {
             extent: pair(1, 1),
             ..long
         };
-        assert_eq!(decode.page_pitch(), INT32_ELEMS_PER_STICK, "the decode kernel walks page by page");
+        assert_eq!(
+            decode.page_pitch(),
+            INT32_ELEMS_PER_STICK,
+            "the decode kernel walks page by page"
+        );
     }
 
     /// ⭐ EVERY CARD SOURCE FITS ITS PLACEMENT — at the pool's whole walk the bake places by, and at a
@@ -1280,7 +1355,9 @@ mod tests {
         };
         let (trip, slots, nkvh) = (s.page_pitch() * 4, 4, 2);
         assert_eq!(trip, 128, "one int32 stick a block");
-        let wtid = |r: u32, table: u32| scratchy_spyre_bundle::reserved_tids::paged_window_tid(r, table);
+        let wtid = |r: u32, table: u32| {
+            scratchy_spyre_bundle::reserved_tids::paged_window_tid(0, r, table)
+        };
         let a = [2u32, 3];
         let b = [1u32, 0, 3];
         let ra = StepRows {
@@ -1364,7 +1441,11 @@ mod tests {
                 .unwrap()
         };
         for r in 0..2u32 {
-            assert_eq!(size(wtid(r, 1)), 4 * 128, "window {r}'s page table, a stick a block");
+            assert_eq!(
+                size(wtid(r, 1)),
+                4 * 128,
+                "window {r}'s page table, a stick a block"
+            );
             assert_eq!(
                 size(wtid(r, 2)),
                 (4 * 3 * 4 * 2) as u64,
@@ -1398,7 +1479,9 @@ mod tests {
             ..step()
         };
         let trip = s.page_pitch() * 4;
-        let wtid = |r: u32, table: u32| scratchy_spyre_bundle::reserved_tids::paged_window_tid(r, table);
+        let wtid = |r: u32, table: u32| {
+            scratchy_spyre_bundle::reserved_tids::paged_window_tid(0, r, table)
+        };
         let a = [2u32, 3];
         let ra = StepRows {
             start: 5,
@@ -1522,7 +1605,9 @@ mod tests {
             extent: pair(3, 2),
             ..step()
         };
-        let wtid = |r: u32, table: u32| scratchy_spyre_bundle::reserved_tids::paged_window_tid(r, table);
+        let wtid = |r: u32, table: u32| {
+            scratchy_spyre_bundle::reserved_tids::paged_window_tid(0, r, table)
+        };
         let own = |s: &PagedStep, tid: u32| {
             s.card_placements()
                 .iter()

@@ -15,7 +15,13 @@ pub fn divide(axes: &[Cuttable], cores: u64) -> Vec<u64> {
     fn divisors(n: u64, cap: u64) -> Vec<u64> {
         (1..=n.min(cap)).filter(|&d| n.is_multiple_of(d)).collect()
     }
-    fn search(axes: &[Cuttable], cores: u64, at: usize, split: &mut Vec<u64>, best: &mut (u64, u64, Vec<u64>)) {
+    fn search(
+        axes: &[Cuttable],
+        cores: u64,
+        at: usize,
+        split: &mut Vec<u64>,
+        best: &mut (u64, u64, Vec<u64>),
+    ) {
         if at == axes.len() {
             let used: u64 = split.iter().product();
             // Balance: the smallest per-core share, larger is better.
@@ -39,7 +45,13 @@ pub fn divide(axes: &[Cuttable], cores: u64) -> Vec<u64> {
         }
     }
     let mut best = (0, 0, vec![1; axes.len()]);
-    search(axes, cores, 0, &mut Vec::with_capacity(axes.len()), &mut best);
+    search(
+        axes,
+        cores,
+        0,
+        &mut Vec::with_capacity(axes.len()),
+        &mut best,
+    );
     best.2
 }
 
@@ -49,12 +61,20 @@ mod tests {
 
     #[test]
     fn a_wide_row_splits_its_sticks_across_the_machine() {
-        assert_eq!(divide(&[Cuttable { units: 1 }, Cuttable { units: 64 }], 32), vec![1, 32]);
+        assert_eq!(
+            divide(&[Cuttable { units: 1 }, Cuttable { units: 64 }], 32),
+            vec![1, 32]
+        );
     }
 
     #[test]
     fn the_budget_bounds_the_split() {
-        assert_eq!(divide(&[Cuttable { units: 64 }, Cuttable { units: 2 }], 8).iter().product::<u64>(), 8);
+        assert_eq!(
+            divide(&[Cuttable { units: 64 }, Cuttable { units: 2 }], 8)
+                .iter()
+                .product::<u64>(),
+            8
+        );
     }
 
     #[test]

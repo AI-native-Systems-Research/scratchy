@@ -505,7 +505,10 @@ pub struct WorldCards<T: scratchy_spyre_bundle::collective::Tp>(PerRank<T, World
 /// One rank's card of a [`WorldCards`] — only a claim mints one, so a card opened as a rank's is a
 /// card its world claimed.
 #[derive(Debug)]
-pub struct WorldCard<T: scratchy_spyre_bundle::collective::Tp>(EnumeratedCard, std::marker::PhantomData<T>);
+pub struct WorldCard<T: scratchy_spyre_bundle::collective::Tp>(
+    EnumeratedCard,
+    std::marker::PhantomData<T>,
+);
 
 impl<T: scratchy_spyre_bundle::collective::Tp> WorldCard<T> {
     /// The claimed card's PCIe address.

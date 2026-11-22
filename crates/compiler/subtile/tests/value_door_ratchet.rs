@@ -26,9 +26,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The law asserts left: `assert!`/`assert_eq!`/`assert_ne!`/`panic!` in a `fn new`.
-const LAW_ASSERTS: usize = 30;
+const LAW_ASSERTS: usize = 27;
 /// The value→type doors left: value constructors beside a typed one, and value→const match arms.
-const VALUE_DOORS: usize = 10;
+const VALUE_DOORS: usize = 7;
 
 /// The crates scanned, from the repository root: the root workspace's compiler, tensor, layer and
 /// target crates, and the spyre backend's own two workspaces (its crates left `crates/targets`).

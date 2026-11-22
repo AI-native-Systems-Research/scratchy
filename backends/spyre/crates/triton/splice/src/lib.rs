@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE SPLICE — where the tape's node and the kernel meet.
 //!
-//! Two producers can hand [`ktir_superdsc::ktir_node::KtirNode`] to the one KTIR→SuperDSC
-//! lowering, and this crate is the second one's door:
+//! The splice hands each node's [`scratchy_spyre_bundle::program::KtirNode`] to the one KTIR→SuperDSC
+//! lowering (`scratchy-spyre-superdsc`):
 //!
 //! * the TRITON LADDER (`triton-frontend` → TTIR → `triton-ktir` → KTIR), re-hosted at
 //!   `backends/spyre/crates/triton/` — a `.py` kernel compiled at `#[forward]` expansion time, in-process,
@@ -118,16 +118,16 @@ use std::collections::HashMap;
 use ktir_core::arena::Arena;
 use ktir_core::program::{Elementwise, Program};
 use scratchy_spyre_bundle::program::{BufferId, KtirNode};
-use spyre_superdsc::format::DataFormat as Df;
 use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::subtile_ir::{
     AttnScaleSite, EwKind, GainConvention, SubOp, SubtileIR, SubtileNode,
 };
+use spyre_superdsc::format::DataFormat as Df;
 
+use crate::compile::CompiledKernel;
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
-use crate::compile::CompiledKernel;
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -458,17 +458,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ExpertAct { .. }
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter
-        | SubOp::AllRowsMatmul
-        // ⛔ THE CHAINED HEAD'S PAIR — its by-name refusals DIED with the
-        // chained-head emission rung: both ops are HAND-MINTED KTIR programs
-        // (`lower_one_node`'s chain arms, the spyre emitter — the door bodies
-        // `lk::embed_row_gather`/`lk::chain_stage`, never Triton kernels), so
-        // they are ordinary members of the "not a spliced kind" class: reaching
-        // the splice means the routing changed, not that a kernel is missing.
-        | SubOp::EmbedRowGather { .. }
-        | SubOp::ChainStage { .. }
-        // The decode reads its logits back and the host samples them.
-        | SubOp::Sample { .. } => TritonKernelRow::Refused(
+        | SubOp::AllRowsMatmul => TritonKernelRow::Refused(
             "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
@@ -503,7 +493,10 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
 ///
 /// ⭐ ONE NODE MAY LOWER TO MORE THAN ONE OP, and only the splice knows which kinds:
 /// [`lower_all`] is the entry the walk calls, and it routes every one-op kind here.
-pub fn lower<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn lower<
+    T: scratchy_spyre_bundle::collective::Tp,
+    F: scratchy_subtile::subtile_ir::RopeForm,
+>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     // Whether this bundle's rows are separate requests (the lm-head fold's own fact).
@@ -587,7 +580,10 @@ fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=S matmul — main's
 /// `lower_prefill_lm_head_at_m1` shape, stated at the rung's own request count
 /// (exactly m=1 there, byte-identical).
-pub fn lower_all<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn lower_all<
+    T: scratchy_spyre_bundle::collective::Tp,
+    F: scratchy_subtile::subtile_ir::RopeForm,
+>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -653,13 +649,6 @@ pub fn lower_all<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::
         let at_tail = node_at_tail_rows(node, tail_requests(query_rows));
         return lower_one(&at_tail, ir, rows_are_requests).map(|e| vec![e]);
     }
-    // ⭐ THE TOKEN DRAW NEEDS NO ARM OF ITS OWN — the mint states its window:
-    // `mint_sample`'s Folded arm reads the rung's request count and hands the
-    // node the `[S, vocab]` region the folded tail writes (row 0 alone at
-    // S = 1), so the ordinary one-op row below lowers the draw as minted and
-    // the splice never re-derives the window (the draw's kernel view IS the
-    // region — both corners 0, extents free — the law `lower_one`'s
-    // whole-region guard already states for it).
     // ⭐ A KV WRITER IS TWO PROGRAMS: the rotation (`rope.py`, the node's own output) and the paged
     // write that scatters the rotated K and the V into the pools (`reshape_and_cache_head_major.py`) — spyre-
     // inference's `do_kv_cache_update`, run before the step's attention reads the pages.
@@ -1101,7 +1090,10 @@ pub fn tensor_feeds_result_through_row_local_ops<F: scratchy_subtile::subtile_ir
     any_reader
 }
 
-fn lower_one<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+fn lower_one<
+    T: scratchy_spyre_bundle::collective::Tp,
+    F: scratchy_subtile::subtile_ir::RopeForm,
+>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -1212,8 +1204,7 @@ fn lower_one<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subt
         // storage (row 0 alone at S = 1), a legal prefix view — and every operand
         // the draw binds (the per-row pair, the nine tables, the idx stick) is
         // whole at corner 0.
-        let states_neither_corner =
-            matches!(&node.op, SubOp::TanhSoftCap { .. });
+        let states_neither_corner = matches!(&node.op, SubOp::TanhSoftCap { .. });
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
                 tr.region.rows.start == 0 && tr.region.cols.start == 0
@@ -1609,13 +1600,13 @@ pub fn lower_block_copy<
 ///
 /// A whole page gathered as ONE index entry (the prompt kernel's `k_pages.index_select(0,
 /// page_idx)`, every kv head) — 128 KB at 8 kv heads × 64 head dims, 256 KB at 128 — is gathered in
-/// one op, as torch-spyre's compiled prefill gathers it
-/// ([`ktir_superdsc::ir::bridge::tiled_op_sdsc_op::index_select_opspec`]).
+/// one op, as torch-spyre's compiled prefill gathers it (`index_select` in its
+/// `codegen/compute_ops.py`).
 ///
 /// ⭐ THE TWO PAGE QUANTITIES, AS TYPES — re-exported from their one home in
-/// `sdsc_abstract` (the law that relates them, [`PoolPageSlots::of_scheduler_blocks`],
-/// needs both types in one scope, and the dependency edge runs this crate →
-/// ktir-superdsc, so that is the only home both can see):
+/// the bundle crate's `rung` (the law that relates them, [`PoolPageSlots::of_scheduler_blocks`],
+/// needs both types in one scope, and both this crate and the bake depend on the bundle crate,
+/// so that is the one home both can see):
 /// [`SchedulerBlockTokens`] is the block size of the serving step we port — a TYPED
 /// REFERENCE INPUT, NOT A DERIVATION, minted ONCE at
 /// [`SchedulerBlockTokens::REFERENCE`]. The reference's own law for the value — a
@@ -1770,7 +1761,11 @@ impl BatchChunking {
         let floor = Self::GATHER_FLOOR.div_ceil(seqs * rows_per_page);
         let bounded = blocks.div_ceil(Self::MAX_CHUNKS);
         let under_pool = if pages > seqs { (pages - 1) / seqs } else { 1 };
-        let bounded = if bounded < under_pool { bounded } else { under_pool };
+        let bounded = if bounded < under_pool {
+            bounded
+        } else {
+            under_pool
+        };
         let blocks_per_chunk = if theirs < floor { floor } else { theirs };
         let blocks_per_chunk = if blocks_per_chunk < bounded {
             bounded
@@ -1827,15 +1822,31 @@ pub struct PagedStepTids {
 }
 
 impl PagedStepTids {
-    pub const RESERVED: PagedStepTids = PagedStepTids {
-        mask: scratchy_spyre_bundle::reserved_tids::PAGED_MASK_TID,
-        page_table: scratchy_spyre_bundle::reserved_tids::PAGED_PAGE_TABLE_TID,
-        write_rows: scratchy_spyre_bundle::reserved_tids::PAGED_WRITE_ROWS_TID,
-        query_rows: scratchy_spyre_bundle::reserved_tids::PAGED_QUERY_ROWS_TID,
-        rep_rows: scratchy_spyre_bundle::reserved_tids::PAGED_REP_ROWS_TID,
-        chunk_pages: scratchy_spyre_bundle::reserved_tids::PAGED_CHUNK_PAGES_TID,
-        chunk_masks: scratchy_spyre_bundle::reserved_tids::PAGED_CHUNK_MASKS_TID,
-    };
+    /// ⭐ ATTENTION CLASS `class`'s TABLES — each class's step its own, since its kv heads, head dim
+    /// and mask are its own: the full class's at the `paged_step` sentinels, a hybrid model's sliding
+    /// class's at its own (`reserved_tids::paged_class_tid`).
+    pub const fn of(class: scratchy_ir::model_facts::AttnClass) -> PagedStepTids {
+        use scratchy_spyre_bundle::reserved_tids::paged_class_tid;
+        let c = paged_class(class);
+        PagedStepTids {
+            mask: paged_class_tid(c, 0),
+            page_table: paged_class_tid(c, 1),
+            write_rows: paged_class_tid(c, 2),
+            query_rows: paged_class_tid(c, 3),
+            rep_rows: paged_class_tid(c, 5),
+            chunk_pages: paged_class_tid(c, 6),
+            chunk_masks: paged_class_tid(c, 7),
+        }
+    }
+}
+
+/// The reserved-tid index of attention class `class`'s paged step — the full class first, so a
+/// uniform model's step keeps the `paged_step` sentinels.
+pub const fn paged_class(class: scratchy_ir::model_facts::AttnClass) -> u32 {
+    match class {
+        scratchy_ir::model_facts::AttnClass::Full => 0,
+        scratchy_ir::model_facts::AttnClass::Sliding => 1,
+    }
 }
 
 /// THE ATTENTION FAMILY's prefill kernel — `page_attn_head_major_prefill.py`, spyre-inference's
@@ -1843,9 +1854,15 @@ impl PagedStepTids {
 /// kernel past one query row, [`attn_decode_row`]'s at one.
 pub fn attn_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../../kernels/page_attn_head_major_prefill.py"),
-        file: "page_attn_head_major_prefill.py",
-        entry: KvPool::BUILD.entry(
+        src: KvPool::BUILD.pick(
+            include_str!("../../../../kernels/page_attn_head_major_prefill.py"),
+            include_str!("../../../../kernels/page_attn_head_major_prefill_fp8.py"),
+        ),
+        file: KvPool::BUILD.pick(
+            "page_attn_head_major_prefill.py",
+            "page_attn_head_major_prefill_fp8.py",
+        ),
+        entry: KvPool::BUILD.pick(
             "page_attn_head_major_prefill_kernel",
             "page_attn_head_major_prefill_fp8_kernel",
         ),
@@ -1870,8 +1887,9 @@ impl KvPool {
         KvPool::Fp16
     };
 
-    /// A paged kernel's entry for this pool: spyre-inference's own, or its fp8-pool twin.
-    pub const fn entry(self, fp16: &'static str, fp8: &'static str) -> &'static str {
+    /// This pool's half of a paged kernel's pair — spyre-inference's own kernel, or its fp8-pool
+    /// twin: the source, the file or the entry.
+    pub const fn pick(self, fp16: &'static str, fp8: &'static str) -> &'static str {
         match self {
             KvPool::Fp16 => fp16,
             KvPool::Fp8 => fp8,
@@ -1885,15 +1903,101 @@ impl KvPool {
             KvPool::Fp8 => "*fp8e4nv",
         }
     }
+
+    /// Bytes one pool element holds.
+    pub const fn element_bytes(self) -> u32 {
+        match self {
+            KvPool::Fp16 => 2,
+            KvPool::Fp8 => 1,
+        }
+    }
+
+    /// Pool elements one device stick holds.
+    pub const fn stick_lanes(self) -> u32 {
+        <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES as u32
+            / self.element_bytes()
+    }
+
+    /// How this pool's pages are laid out.
+    pub const fn page_order(self) -> PageOrder {
+        match self {
+            KvPool::Fp16 => PageOrder::HeadMajor,
+            KvPool::Fp8 => PageOrder::TokenMajor,
+        }
+    }
+}
+
+/// ⭐ HOW A PAGE IS LAID OUT. spyre-inference's fp16 page is head-major, `[kv_heads, block, head]`:
+/// a head's keys at one token are one stick at head size 64. An fp8 page is token-major,
+/// `[block, kv_heads, head]`: one token's keys are `kv_heads · head` bytes, whole sticks at every
+/// head size, so the write lands whole sticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageOrder {
+    HeadMajor,
+    TokenMajor,
+}
+
+impl PageOrder {
+    /// The KV write's index entries per written token: one per kv head on a head-major page, one
+    /// on a token-major page.
+    pub const fn write_entries(self, nkvh: u32) -> u32 {
+        match self {
+            PageOrder::HeadMajor => nkvh,
+            PageOrder::TokenMajor => 1,
+        }
+    }
+
+    /// ⭐ THE KV WRITE'S INDEX LAW — entry `h` of the token at `slot` of `page`, `page_slots` slots
+    /// a page: head `h`'s cache row `(page · nkvh + h) · page_slots + slot` on a head-major page,
+    /// the token's own row `page · page_slots + slot` on a token-major one. Every stager of the
+    /// write's index reads it.
+    pub const fn write_index(
+        self,
+        nkvh: u32,
+        page_slots: u32,
+        page: u32,
+        slot: u32,
+        h: u32,
+    ) -> u32 {
+        match self {
+            PageOrder::HeadMajor => (page * nkvh + h) * page_slots + slot,
+            PageOrder::TokenMajor => page * page_slots + slot,
+        }
+    }
+
+    /// The pool element where head `h`'s `head_size` keys of the token at `slot` of `page` begin.
+    pub const fn head_element(
+        self,
+        nkvh: u64,
+        page_slots: u64,
+        head_size: u64,
+        page: u64,
+        slot: u64,
+        h: u64,
+    ) -> u64 {
+        match self {
+            PageOrder::HeadMajor => ((page * nkvh + h) * page_slots + slot) * head_size,
+            PageOrder::TokenMajor => ((page * page_slots + slot) * nkvh + h) * head_size,
+        }
+    }
 }
 
 /// THE ATTENTION FAMILY's decode kernel — `page_attn_head_major_decode.py`, spyre-inference's
 /// `page_attn_head_major_decode_kernel`, at one query row.
 pub fn attn_decode_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../../kernels/page_attn_head_major_decode.py"),
-        file: "page_attn_head_major_decode.py",
-        entry: KvPool::BUILD.entry("page_attn_head_major_decode_kernel", "page_attn_head_major_decode_fp8_kernel"),
+        src: KvPool::BUILD.pick(
+            include_str!("../../../../kernels/page_attn_head_major_decode.py"),
+            include_str!("../../../../kernels/page_attn_head_major_decode_fp8.py"),
+        ),
+        file: KvPool::BUILD.pick(
+            "page_attn_head_major_decode.py",
+            "page_attn_head_major_decode_fp8.py",
+        ),
+        entry: KvPool::BUILD.pick(
+            "page_attn_head_major_decode_kernel",
+            "page_attn_head_major_decode_fp8_kernel",
+        ),
         program: Program::PagedAttn,
     }
 }
@@ -1902,9 +2006,18 @@ pub fn attn_decode_row() -> TritonKernelRow {
 /// `batched_decode_head_major_kernel`, for a decode rung whose rows are separate sequences.
 pub fn batched_decode_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../../kernels/batched_decode_head_major.py"),
-        file: "batched_decode_head_major.py",
-        entry: KvPool::BUILD.entry("batched_decode_head_major_kernel", "batched_decode_head_major_fp8_kernel"),
+        src: KvPool::BUILD.pick(
+            include_str!("../../../../kernels/batched_decode_head_major.py"),
+            include_str!("../../../../kernels/batched_decode_head_major_fp8.py"),
+        ),
+        file: KvPool::BUILD.pick(
+            "batched_decode_head_major.py",
+            "batched_decode_head_major_fp8.py",
+        ),
+        entry: KvPool::BUILD.pick(
+            "batched_decode_head_major_kernel",
+            "batched_decode_head_major_fp8_kernel",
+        ),
         program: Program::PagedAttn,
     }
 }
@@ -1914,9 +2027,18 @@ pub fn batched_decode_row() -> TritonKernelRow {
 /// program.
 pub fn kv_write_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../../kernels/reshape_and_cache_head_major.py"),
-        file: "reshape_and_cache_head_major.py",
-        entry: KvPool::BUILD.entry("reshape_and_cache_head_major_kernel", "reshape_and_cache_head_major_fp8_kernel"),
+        src: KvPool::BUILD.pick(
+            include_str!("../../../../kernels/reshape_and_cache_head_major.py"),
+            include_str!("../../../../kernels/reshape_and_cache_head_major_fp8.py"),
+        ),
+        file: KvPool::BUILD.pick(
+            "reshape_and_cache_head_major.py",
+            "reshape_and_cache_head_major_fp8.py",
+        ),
+        entry: KvPool::BUILD.pick(
+            "reshape_and_cache_head_major_kernel",
+            "reshape_and_cache_head_major_fp8_kernel",
+        ),
         program: Program::PagedKvWrite,
     }
 }
@@ -2004,17 +2126,27 @@ pub fn trip_pages(walk: u32) -> u32 {
 /// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(pages: u32, mq: u32, active_cap: scratchy_spyre_bundle::program::ActiveCap) -> u32 {
+pub fn walk_pages(
+    pages: u32,
+    mq: u32,
+    active_cap: scratchy_spyre_bundle::program::ActiveCap,
+) -> u32 {
     let swept = active_cap.resolve(
         pages * SchedulerBlockTokens::REFERENCE.get(),
         scratchy_spyre_bundle::rung::POOL_STICK,
     );
     let walked = if swept == 0 { mq } else { swept };
-    let walk = walked
-        .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(pages);
-    // Whole trips: the pages past the pool's own are page 0 under a fully masked tile.
-    walk.next_multiple_of(trip_pages(walk))
+    whole_trips(
+        walked
+            .div_ceil(SchedulerBlockTokens::REFERENCE.get())
+            .min(pages),
+    )
+}
+
+/// `pages` rounded up to whole trips of [`trip_pages`]: the pages past the pool's own are page 0
+/// under a fully masked tile.
+pub fn whole_trips(pages: u32) -> u32 {
+    pages.next_multiple_of(trip_pages(pages))
 }
 
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
@@ -2051,7 +2183,10 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
 /// `S` ordinary ops over the graph's absolute rows — the outputs are disjoint by construction
 /// (window `r` scatters rows `r·w .. r·w+w` through its own query row index), the kvwrite stays
 /// the one whole-graph program, and nothing below the splice knows a window exists.
-pub fn lower_attn<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn lower_attn<
+    T: scratchy_spyre_bundle::collective::Tp,
+    F: scratchy_subtile::subtile_ir::RopeForm,
+>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     scale_site: AttnScaleSite,
@@ -2100,15 +2235,6 @@ pub fn lower_attn<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile:
             "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),
         );
     };
-    // Their paged kernels attend causally; a sliding window (gemma's local layers) is not theirs.
-    if let scratchy_subtile::subtile_ir::AttnMask::SlidingWindow { window } = mask {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: a {window}-position sliding window — spyre-inference's \
-             paged attention kernels attend every position up to the query's own, and have no \
-             window",
-            node.output.tensor.index()
-        ));
-    }
     if node.inputs.len() < 5 {
         return Err(format!(
             "triton splice: AttnDecode t{} expects 5 inputs [q, k cache, v cache, new k, new v], \
@@ -2176,7 +2302,7 @@ pub fn lower_attn<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile:
     } else {
         walk_pages(pages, query_rows.per_request().get(), active_cap)
     };
-    let tids = PagedStepTids::RESERVED;
+    let tids = PagedStepTids::of(mask.class());
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     let t =
@@ -2336,8 +2462,13 @@ pub fn lower_attn<T: scratchy_spyre_bundle::collective::Tp, F: scratchy_subtile:
     let KtirNode { func, program, .. } = positional;
     let mut out = Vec::with_capacity(windows as usize);
     for r in 0..windows {
-        let window =
-            |table: u32| BufferId::new(scratchy_spyre_bundle::reserved_tids::paged_window_tid(r, table));
+        let window = |table: u32| {
+            BufferId::new(scratchy_spyre_bundle::reserved_tids::paged_window_tid(
+                paged_class(mask.class()),
+                r,
+                table,
+            ))
+        };
         let bindings = vec![
             t(&node.inputs[0]),
             window(0),
@@ -2454,7 +2585,7 @@ pub fn lower_kv_write<
             ArgSpec::parse(ty).map_err(|e| e.to_string())?,
         );
     }
-    for (k, v) in [
+    let mut ces = vec![
         ("T", rows),
         ("NUM_KV_HEADS", nkvh),
         ("HEAD_SIZE", hd.get()),
@@ -2462,7 +2593,12 @@ pub fn lower_kv_write<
             "NUM_ROWS",
             pages * nkvh * SchedulerBlockTokens::REFERENCE.get(),
         ),
-    ] {
+    ];
+    // A token-major page's write lands whole sticks, and takes the stick's width.
+    if let PageOrder::TokenMajor = KvPool::BUILD.page_order() {
+        ces.push(("STICK", KvPool::BUILD.stick_lanes()));
+    }
+    for (k, v) in ces {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
@@ -2482,7 +2618,7 @@ pub fn lower_kv_write<
         t(&node.inputs[3]),
         t(&node.inputs[4]),
         t(&node.inputs[5]),
-        BufferId::new(PagedStepTids::RESERVED.write_rows),
+        BufferId::new(PagedStepTids::of(attn.class()).write_rows),
     ];
     let name = format!("kvwrite_s{}", node.id.index());
     let k = rebind(positional, name.clone(), bindings)?;
@@ -2492,11 +2628,7 @@ pub fn lower_kv_write<
 
 /// A compiled program re-stated with this node's own name and bindings (`node_for` mints positional
 /// buffer ids), refused if the kernel's parameter list and the bindings disagree in length.
-fn rebind(
-    positional: KtirNode,
-    name: String,
-    bindings: Vec<BufferId>,
-) -> Result<KtirNode, String> {
+fn rebind(positional: KtirNode, name: String, bindings: Vec<BufferId>) -> Result<KtirNode, String> {
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
         return Err(format!(
@@ -2670,8 +2802,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // BITS, and the registry holds the tape's f32 eps. The Triton ladder's
             // `LegalizeTypes` collapses the f32 island around `rsqrt` and
             // `step_2b_island_constants` ROUNDS THE VALUE to f16 (`f.to_f16()`), so
-            // `1e-5f32` becomes `0.00001001358` in the program — measured in
-            // triton-ktir-superdsc's own layout docs. The consumer's lookup therefore
+            // `1e-5f32` becomes `0.00001001358` in the program. The consumer's lookup therefore
             // takes an f16-image fallback (builder-exact bits first, then the registry
             // entry whose f16 image equals the program's eps), which is physically exact:
             // the worker binds ONE fp16 per registry slot (`SCALE_BYTES = 2`), so the
@@ -2835,8 +2966,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // builder's `load_region`/`store_region` state it. A whole-region node
             // states `N_TOTAL = N`, `C_START = 0`.
             let (n_total, c_start) = window_of(node, ir)?;
-            let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, SILU_MUL_LIVE_TILES);
+            let (block_m, n_blocks, tail_h) = blocks_of(m, c, SILU_MUL_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -2859,8 +2989,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             let (n_total, c_start) = window_of(node, ir)?;
-            let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, EW_SILU_LIVE_TILES);
+            let (block_m, n_blocks, tail_h) = blocks_of(m, c, EW_SILU_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -2888,8 +3017,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             let (n_total, c_start) = window_of(node, ir)?;
-            let (block_m, n_blocks, tail_h) =
-                blocks_of(m, c, EW_BINARY_LIVE_TILES);
+            let (block_m, n_blocks, tail_h) = blocks_of(m, c, EW_BINARY_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
@@ -3174,7 +3302,6 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((n_total, c_start))
 }
 
-
 fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -3308,7 +3435,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 ///
 /// ⭐ THE KEY RIDES ALONG, INSIDE THE VALUE ([`CompiledKernel`]): the memo's own mint
 /// pairs the module with the key that produced it, and the mint hands the pair to
-/// `triton_ktir_superdsc::node_for_compiled`, so the KTIR handoff lowers each kernel
+/// [`compile::node_for_compiled`], so the KTIR handoff lowers each kernel
 /// ONCE, not once per node that splices it (the same layers-times-rungs law that
 /// motivated this memo).
 fn compile_kernel(src: &str, spec: &KernelSpec, grid: &[i64]) -> Result<CompiledKernel, String> {
@@ -3535,58 +3662,6 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     if matches!(node.op, SubOp::AttnDecode { .. }) {
         return Ok(None);
     }
-    // ⭐ THE CHAINED HEAD'S PAIR — HAND-MINTED KTIR, NOT SPLICED, but its
-    // operand formats are still THIS census's to state, because the placement
-    // widths read no other seat: the door's own u32-stick law (a staged
-    // table's gathered destination is exactly one `[1, 32]` SENUINT32 stick,
-    // and the pick's `[1, 64]` i32 lanes are the same bytes at the argmax's
-    // own SenUint32 statement) sizes those tensors at FOUR bytes an element.
-    // Left to the fp16 default the placement under-reserves by half and the
-    // footprint guard refuses the CORRECT descriptor — the exact defect this
-    // census exists to prevent. The formats are the DOOR's law
-    // (`lk::embed_row_gather`'s idx-stick class check, `lk::chain_stage`'s
-    // destination class check), stated here because the emitter that mints
-    // the programs has no kernel signature to read them from.
-    if matches!(
-        node.op,
-        SubOp::EmbedRowGather { .. } | SubOp::ChainStage { .. }
-    ) {
-        let bindings = default_bindings(node);
-        let dfs = match &node.op {
-            // `[s_stick, l_stick, weight, out]`: the two index sticks are
-            // SENUINT32; the weight and the `[1, hidden]` row are fp16. ⭐ The
-            // list is the COMPLETE operand census in `default_bindings` order,
-            // the output LAST — the ktir consumers (`node_output_on_f16_stick`,
-            // `result_dtype_of_ir`) read it as the node's full parameter list
-            // and refuse a node whose own output is absent (the check-8
-            // pre-scan catch: the u32-only partial list panicked the reference
-            // legs' stick walk at the gather). The Fp16 entries are inert for
-            // the placement census by its own skip law (`df != Df::Fp16`), so
-            // completion changes no sizing.
-            SubOp::EmbedRowGather { .. } if bindings.len() == 4 => vec![
-                (bindings[0].get(), Df::UInt32),
-                (bindings[1].get(), Df::UInt32),
-                (bindings[2].get(), Df::Fp16),
-                (bindings[3].get(), Df::Fp16),
-            ],
-            // `[pick, s_stick, l_stick, s_tab, l_tab, out]`: every operand is
-            // a u32 stick or a u32 table — all SENUINT32.
-            SubOp::ChainStage { .. } if bindings.len() == 6 => {
-                bindings.iter().map(|b| (b.get(), Df::UInt32)).collect()
-            }
-            // A chain node off the mint's arity — the operand-order contract
-            // this function's own zip law states below.
-            _ => {
-                return Err(format!(
-                    "triton splice: a chained-head node states {} operand(s) — the mint's \
-                     shape is exactly four for the gather and six for the stage (see \
-                     `mint_embed_chain`)",
-                    bindings.len()
-                ));
-            }
-        };
-        return Ok(Some(dfs));
-    }
     let row = row(&node.op);
     let TritonKernelRow::Spliced {
         src, file, entry, ..
@@ -3778,6 +3853,14 @@ mod production_ktir_dump {
     const PAGED_KV_WRITE: &str =
         include_str!("../../../../kernels/reshape_and_cache_head_major.py");
     const BATCHED_DECODE: &str = include_str!("../../../../kernels/batched_decode_head_major.py");
+    const PAGED_DECODE_FP8: &str =
+        include_str!("../../../../kernels/page_attn_head_major_decode_fp8.py");
+    const PAGED_PREFILL_FP8: &str =
+        include_str!("../../../../kernels/page_attn_head_major_prefill_fp8.py");
+    const PAGED_KV_WRITE_FP8: &str =
+        include_str!("../../../../kernels/reshape_and_cache_head_major_fp8.py");
+    const BATCHED_DECODE_FP8: &str =
+        include_str!("../../../../kernels/batched_decode_head_major_fp8.py");
     const ELEMENTWISE: &str = include_str!("../../../../kernels/elementwise.py");
     const LMLAST: &str = include_str!("../../../../kernels/lmlast.py");
     const MATMUL: &str = include_str!("../../../../kernels/matmul.py");
@@ -3817,7 +3900,6 @@ mod production_ktir_dump {
             file: file.to_string(),
         }
     }
-
 
     /// One entry per (kernel file, entry point) — the multi-entry files (`elementwise.py`,
     /// `rmsnorm.py`, `windowedrmsnorm.py`, `matmul.py`, `page_attn_head_major_*.py`) state every entry, so a
@@ -4177,26 +4259,46 @@ mod production_ktir_dump {
         // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 2048
         // pages — decoding over the whole of it and a prompt chunk walking four pages, so the card
         // compile is checked at the extents a bake states, not only at a toy pool.
-        for (name, mq, blocks, pages, hd) in [
-            ("paged_attn_decode", 1i128, 4i128, 4i128, 64i128),
-            ("paged_attn_prefill", 64, 1, 4, 64),
-            ("paged_attn_decode_pool", 1, 2048, 2048, 64),
-            ("paged_attn_prefill_walk", 64, 4, 2048, 64),
+        for (name, mq, blocks, pages, hd, pool) in [
+            (
+                "paged_attn_decode",
+                1i128,
+                4i128,
+                4i128,
+                64i128,
+                KvPool::Fp16,
+            ),
+            ("paged_attn_prefill", 64, 1, 4, 64, KvPool::Fp16),
+            ("paged_attn_decode_pool", 1, 2048, 2048, 64, KvPool::Fp16),
+            ("paged_attn_prefill_walk", 64, 4, 2048, 64, KvPool::Fp16),
             // granite-3.1-8b's head dim: a kv-head slab is two sticks wide.
-            ("paged_attn_decode_hd128", 1, 4, 4, 128),
-            ("paged_attn_prefill_hd128", 64, 4, 4, 128),
+            ("paged_attn_decode_hd128", 1, 4, 4, 128, KvPool::Fp16),
+            ("paged_attn_prefill_hd128", 64, 4, 4, 128, KvPool::Fp16),
             // under Triton's 8-row gather floor: the rows read and written at the first row
             // `query_row_index` names.
-            ("paged_attn_prefill_p7", 7, 1, 4, 64),
+            ("paged_attn_prefill_p7", 7, 1, 4, 64, KvPool::Fp16),
             // a prompt chunk over granite-3.1-2b's whole pool, sixteen pages a trip
-            ("paged_attn_prefill_trips", 64, 1024, 1024, 64),
+            ("paged_attn_prefill_trips", 64, 1024, 1024, 64, KvPool::Fp16),
+            // the fp8 pool's twins, at the head dim whose fp8 row is whole sticks
+            ("paged_attn_decode_hd128_fp8", 1, 4, 4, 128, KvPool::Fp8),
+            ("paged_attn_prefill_hd128_fp8", 64, 4, 4, 128, KvPool::Fp8),
+            ("paged_attn_decode_fp8", 1, 4, 4, 64, KvPool::Fp8),
+            ("paged_attn_prefill_fp8", 64, 1, 4, 64, KvPool::Fp8),
+            (
+                "paged_attn_prefill_trips_fp8",
+                64,
+                1024,
+                1024,
+                64,
+                KvPool::Fp8,
+            ),
         ] {
             let decode = mq == 1;
             let ptrs: Vec<(&str, &str)> = vec![
                 ("query", "*fp16"),
                 ("query_row_index", "*i32"),
-                ("k_pages", "*fp16"),
-                ("v_pages", "*fp16"),
+                ("k_pages", pool.pointer()),
+                ("v_pages", pool.pointer()),
                 ("page_index_table", "*i32"),
                 ("mask_stack", "*fp16"),
                 ("out", "*fp16"),
@@ -4216,17 +4318,32 @@ mod production_ktir_dump {
             ];
             let (src, file, entry) = if decode {
                 (
-                    PAGED_DECODE,
-                    "page_attn_head_major_decode.py",
-                    "page_attn_head_major_decode_kernel",
+                    pool.pick(PAGED_DECODE, PAGED_DECODE_FP8),
+                    pool.pick(
+                        "page_attn_head_major_decode.py",
+                        "page_attn_head_major_decode_fp8.py",
+                    ),
+                    pool.pick(
+                        "page_attn_head_major_decode_kernel",
+                        "page_attn_head_major_decode_fp8_kernel",
+                    ),
                 )
             } else {
                 ces.push(("PADDED_QUERY_LEN", Val::Int(mq)));
-                ces.push(("BLOCKS_PER_TRIP", Val::Int(i128::from(trip_pages(blocks as u32)))));
+                ces.push((
+                    "BLOCKS_PER_TRIP",
+                    Val::Int(i128::from(trip_pages(blocks as u32))),
+                ));
                 (
-                    PAGED_PREFILL,
-                    "page_attn_head_major_prefill.py",
-                    "page_attn_head_major_prefill_kernel",
+                    pool.pick(PAGED_PREFILL, PAGED_PREFILL_FP8),
+                    pool.pick(
+                        "page_attn_head_major_prefill.py",
+                        "page_attn_head_major_prefill_fp8.py",
+                    ),
+                    pool.pick(
+                        "page_attn_head_major_prefill_kernel",
+                        "page_attn_head_major_prefill_fp8_kernel",
+                    ),
                 )
             };
             v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
@@ -4281,27 +4398,37 @@ mod production_ktir_dump {
         // pages, 32 kv rows), and 32 on the 4-page rung (4 chunks of ONE block slot —
         // the widest batch rung, where the slots' merge folds one). At head dim 128 (granite-3.1-8b)
         // the one-chunk and many-chunk batches, and the widest rung on its one-page walk.
-        for (name, seqs, walk, hd) in [
-            ("batched_decode", 4u32, 4u32, 64i128),
-            ("batched_decode_chunks", 4, 64, 64),
-            ("batched_decode_pair", 2, 2, 64),
-            ("batched_decode_one_slot", 32, 4, 64),
-            ("batched_decode_hd128", 4, 4, 128),
-            ("batched_decode_chunks_hd128", 4, 64, 128),
-            ("batched_decode_one_slot_hd128", 32, 1, 128),
+        for (name, seqs, walk, hd, pool) in [
+            ("batched_decode", 4u32, 4u32, 64i128, KvPool::Fp16),
+            ("batched_decode_chunks", 4, 64, 64, KvPool::Fp16),
+            ("batched_decode_pair", 2, 2, 64, KvPool::Fp16),
+            ("batched_decode_one_slot", 32, 4, 64, KvPool::Fp16),
+            ("batched_decode_hd128", 4, 4, 128, KvPool::Fp16),
+            ("batched_decode_chunks_hd128", 4, 64, 128, KvPool::Fp16),
+            ("batched_decode_one_slot_hd128", 32, 1, 128, KvPool::Fp16),
+            ("batched_decode_hd128_fp8", 4, 4, 128, KvPool::Fp8),
+            ("batched_decode_one_slot_hd128_fp8", 32, 1, 128, KvPool::Fp8),
+            ("batched_decode_fp8", 4, 4, 64, KvPool::Fp8),
+            ("batched_decode_chunks_fp8", 4, 64, 64, KvPool::Fp8),
         ] {
             let c = BatchChunking::of(seqs, walk, 2048, 8, 32 * hd as u32, hd as u32);
             v.push((
                 name,
-                BATCHED_DECODE,
+                pool.pick(BATCHED_DECODE, BATCHED_DECODE_FP8),
                 spec(
-                    "batched_decode_head_major.py",
-                    "batched_decode_head_major_kernel",
+                    pool.pick(
+                        "batched_decode_head_major.py",
+                        "batched_decode_head_major_fp8.py",
+                    ),
+                    pool.pick(
+                        "batched_decode_head_major_kernel",
+                        "batched_decode_head_major_fp8_kernel",
+                    ),
                     &[
                         ("query", "*fp16"),
                         ("rep_row_ids", "*i32"),
-                        ("k_pages", "*fp16"),
-                        ("v_pages", "*fp16"),
+                        ("k_pages", pool.pointer()),
+                        ("v_pages", pool.pointer()),
                         ("chunk_page_ids", "*i32"),
                         ("mask_by_chunk", "*fp16"),
                         ("out", "*fp16"),
@@ -4329,36 +4456,50 @@ mod production_ktir_dump {
         // A decode step's write (8 kv heads, one store per head), one below the scatter floor (2
         // heads, one store per row), a 20-token prompt chunk's (160 index entries, five scatter ops
         // of 32), and at head dim 128 the first two and a prompt chunk's.
-        for (name, t, nkvh, hd) in [
-            ("paged_kv_write", 1i128, 8i128, 64i128),
-            ("paged_kv_write_rows", 1, 2, 64),
-            ("paged_kv_write_prompt", 20, 8, 64),
-            ("paged_kv_write_hd128", 1, 8, 128),
-            ("paged_kv_write_rows_hd128", 1, 2, 128),
-            ("paged_kv_write_prompt_hd128", 96, 8, 128),
+        for (name, t, nkvh, hd, pool) in [
+            ("paged_kv_write", 1i128, 8i128, 64i128, KvPool::Fp16),
+            ("paged_kv_write_rows", 1, 2, 64, KvPool::Fp16),
+            ("paged_kv_write_prompt", 20, 8, 64, KvPool::Fp16),
+            ("paged_kv_write_hd128", 1, 8, 128, KvPool::Fp16),
+            ("paged_kv_write_rows_hd128", 1, 2, 128, KvPool::Fp16),
+            ("paged_kv_write_prompt_hd128", 96, 8, 128, KvPool::Fp16),
+            ("paged_kv_write_hd128_fp8", 1, 8, 128, KvPool::Fp8),
+            ("paged_kv_write_prompt_hd128_fp8", 96, 8, 128, KvPool::Fp8),
+            ("paged_kv_write_fp8", 1, 8, 64, KvPool::Fp8),
+            ("paged_kv_write_prompt_fp8", 20, 8, 64, KvPool::Fp8),
         ] {
+            let mut ces = vec![
+                ("T", Val::Int(t)),
+                ("NUM_KV_HEADS", Val::Int(nkvh)),
+                ("HEAD_SIZE", Val::Int(hd)),
+                (
+                    "NUM_ROWS",
+                    Val::Int(4 * nkvh * i128::from(SchedulerBlockTokens::REFERENCE.get())),
+                ),
+            ];
+            if let PageOrder::TokenMajor = pool.page_order() {
+                ces.push(("STICK", Val::Int(i128::from(pool.stick_lanes()))));
+            }
             v.push((
                 name,
-                PAGED_KV_WRITE,
+                pool.pick(PAGED_KV_WRITE, PAGED_KV_WRITE_FP8),
                 spec(
-                    "reshape_and_cache_head_major.py",
-                    "reshape_and_cache_head_major_kernel",
+                    pool.pick(
+                        "reshape_and_cache_head_major.py",
+                        "reshape_and_cache_head_major_fp8.py",
+                    ),
+                    pool.pick(
+                        "reshape_and_cache_head_major_kernel",
+                        "reshape_and_cache_head_major_fp8_kernel",
+                    ),
                     &[
                         ("key", "*fp16"),
                         ("value", "*fp16"),
-                        ("k_rows", "*fp16"),
-                        ("v_rows", "*fp16"),
+                        ("k_rows", pool.pointer()),
+                        ("v_rows", pool.pointer()),
                         ("row_index", "*i32"),
                     ],
-                    &[
-                        ("T", Val::Int(t)),
-                        ("NUM_KV_HEADS", Val::Int(nkvh)),
-                        ("HEAD_SIZE", Val::Int(hd)),
-                        (
-                            "NUM_ROWS",
-                            Val::Int(4 * nkvh * i128::from(SchedulerBlockTokens::REFERENCE.get())),
-                        ),
-                    ],
+                    &ces,
                 ),
                 vec![1],
             ));
@@ -4474,13 +4615,26 @@ mod production_ktir_dump {
             | "batched_decode_one_slot"
             | "batched_decode_hd128"
             | "batched_decode_chunks_hd128"
-            | "batched_decode_one_slot_hd128" => Program::PagedAttn,
+            | "batched_decode_one_slot_hd128"
+            | "paged_attn_decode_hd128_fp8"
+            | "paged_attn_prefill_hd128_fp8"
+            | "batched_decode_hd128_fp8"
+            | "batched_decode_one_slot_hd128_fp8"
+            | "paged_attn_decode_fp8"
+            | "paged_attn_prefill_fp8"
+            | "paged_attn_prefill_trips_fp8"
+            | "batched_decode_fp8"
+            | "batched_decode_chunks_fp8" => Program::PagedAttn,
             "paged_kv_write"
             | "paged_kv_write_rows"
             | "paged_kv_write_prompt"
             | "paged_kv_write_hd128"
             | "paged_kv_write_rows_hd128"
-            | "paged_kv_write_prompt_hd128" => Program::PagedKvWrite,
+            | "paged_kv_write_prompt_hd128"
+            | "paged_kv_write_hd128_fp8"
+            | "paged_kv_write_prompt_hd128_fp8"
+            | "paged_kv_write_fp8"
+            | "paged_kv_write_prompt_fp8" => Program::PagedKvWrite,
             other => panic!(
                 "`{other}` is in the dump table but `program_of` states no Program for it — \
                  a dumped kernel with no program is a silent skip of the SDSC leg, which the \
@@ -4652,4 +4806,3 @@ mod production_ktir_dump {
         }
     }
 }
-
