@@ -22,7 +22,7 @@ runs everything else.
 - A **quick run** is the default, and what the user means by "run the
   benchmark" unless they say otherwise. **It asks no questions:** see
   **Quick run** below. The script with no flags but `--unpinned`: the small
-  set's four models, on every Mac whatever its memory, scratchy
+  set's five models, on every Mac whatever its memory, scratchy
   alone, cold and warm, one rep, the users × prompt grid at 1, 2 and 4
   users, 64-token answers and 50 requests a cell, every request kept (the
   page plots each one). Prompts are 128, 512, 1024 and 4096 tokens below
@@ -50,7 +50,7 @@ runs everything else.
 so each overview column is one model across every chip; the large set (64 GB
 only) runs by name. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
 nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
-qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-3b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
+qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: qwen2.5-3b / granite-4.2-30b. MLA: glm-4.7-flash / glm-4.7-flash (it fits 36 GB, so both sets run it). The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
 `--models small`, `large` or `full` picks a set (`large` is the 120B round,
 on a 64 GB Mac; `full` runs both where each fits); glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
@@ -456,8 +456,8 @@ A smoke run ends here.
 
 Before copying, ask the user to confirm if any of these is true:
 - `scope` is `PARTIAL` (`quick` and `full` are both fine)
-- the run has fewer models than the round it ran (this Mac's four, or all
-  eight with `--models full`), not counting a model skipped for memory
+- the run has fewer models than the round it ran (this Mac's five, or all
+  nine with `--models full`), not counting a model skipped for memory
 - `commit` isn't upstream `main`
 - any model's `parity` is `False` (it failed the gate), or `None` with no
   `parity_skipped` reason (the gate should have run but didn't, as on a full
