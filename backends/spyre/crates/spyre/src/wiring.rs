@@ -562,12 +562,16 @@ impl PagedStep {
     pub const fn batch(self) -> Option<crate::paged_step::BatchChunking> {
         match self.paged_rows {
             crate::paged_step::PagedRows::Batch => Some(crate::paged_step::BatchChunking::of(
-                self.rows,
-                self.walk,
-                self.pages,
-                self.nkvh,
-                self.q_width,
-                self.head_size,
+                scratchy_triton_splice::DecodeWalk {
+                    seqs: self.rows,
+                    blocks: self.walk,
+                    pages: self.pages,
+                },
+                scratchy_triton_splice::DecodeHeads {
+                    kv_heads: self.nkvh,
+                    q_width: self.q_width,
+                    head_size: self.head_size,
+                },
             )),
             crate::paged_step::PagedRows::Sequence => None,
         }

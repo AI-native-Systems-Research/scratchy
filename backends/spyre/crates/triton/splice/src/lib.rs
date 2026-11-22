@@ -1568,6 +1568,23 @@ impl PagedRows {
     }
 }
 
+/// A decode batch's walk: its sequences, the blocks each walks, and the pages the pool holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeWalk {
+    pub seqs: u32,
+    pub blocks: u32,
+    pub pages: u32,
+}
+
+/// A decode batch's heads: the kv heads a page holds, the query row's width (`num_heads ·
+/// head_size`), and one head's width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeHeads {
+    pub kv_heads: u32,
+    pub q_width: u32,
+    pub head_size: u32,
+}
+
 /// ⭐ A DECODE BATCH'S CHUNKING — spyre-inference's `batched_decode_chunking`
 /// (`spyre_attn_bucketer.py`, 297fc48) over a batch of `seqs` sequences walking `blocks` blocks:
 /// `blocks_per_chunk` block slots per chunk, so a chunk gathers `entries = blocks_per_chunk · seqs`
@@ -1655,15 +1672,18 @@ impl BatchChunking {
     /// stay under the reach at any page a model has.
     ///
     /// [`DeviceGen::MUTABLE_REACH_BYTES`]: ktir_core::ddl_binds::DeviceGen::MUTABLE_REACH_BYTES
-    pub const fn of(
-        seqs: u32,
-        blocks: u32,
-        pages: u32,
-        nkvh: u32,
-        q_width: u32,
-        head_size: u32,
-    ) -> BatchChunking {
+    pub const fn of(walk: DecodeWalk, heads: DecodeHeads) -> BatchChunking {
         let () = Self::PAGE_TAKES_THE_CUT;
+        let DecodeWalk {
+            seqs,
+            blocks,
+            pages,
+        } = walk;
+        let DecodeHeads {
+            kv_heads: nkvh,
+            q_width,
+            head_size,
+        } = heads;
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
             let j = Self::CORES / seqs;
@@ -1746,7 +1766,7 @@ impl BatchChunking {
 
 #[cfg(test)]
 mod chunking {
-    use super::{BatchChunking, SchedulerBlockTokens};
+    use super::{BatchChunking, DecodeHeads, DecodeWalk, SchedulerBlockTokens};
     use ktir_core::ddl_binds::{Baked, DeviceGen};
 
     /// Every chunk lands within one access's reach and the chunks still cover the walk, at every
@@ -1764,7 +1784,18 @@ mod chunking {
                 (16, 512),
             ] {
                 for blocks in [1u32, 7, 64, 1024, 2048, 4096] {
-                    let c = BatchChunking::of(seqs, blocks, 8192, nkvh, 32 * hd, hd);
+                    let c = BatchChunking::of(
+                        DecodeWalk {
+                            seqs,
+                            blocks,
+                            pages: 8192,
+                        },
+                        DecodeHeads {
+                            kv_heads: nkvh,
+                            q_width: 32 * hd,
+                            head_size: hd,
+                        },
+                    );
                     let landed = u64::from(c.entries())
                         * u64::from(SchedulerBlockTokens::REFERENCE.get() * nkvh * hd)
                         * 2;
@@ -1780,7 +1811,18 @@ mod chunking {
             }
         }
         // The decode batch dxp refused: 32 sequences of 512 KiB pages over a 2048-block walk.
-        let c = BatchChunking::of(32, 2048, 8192, 8, 16 * 256, 256);
+        let c = BatchChunking::of(
+            DecodeWalk {
+                seqs: 32,
+                blocks: 2048,
+                pages: 8192,
+            },
+            DecodeHeads {
+                kv_heads: 8,
+                q_width: 16 * 256,
+                head_size: 256,
+            },
+        );
         assert_eq!((c.blocks_per_chunk, c.num_chunks), (16, 128));
     }
 }
@@ -2317,7 +2359,18 @@ pub fn lower_attn<
         // of at most `CORES · SchedulerBlockTokens::REFERENCE` positions, and the one config in scope that small
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
-        let chunking = BatchChunking::of(mq, blocks, pages, nkvh, g.q_width(), g.head_dim().get());
+        let chunking = BatchChunking::of(
+            DecodeWalk {
+                seqs: mq,
+                blocks,
+                pages,
+            },
+            DecodeHeads {
+                kv_heads: nkvh,
+                q_width: g.q_width(),
+                head_size: g.head_dim().get(),
+            },
+        );
         if chunking.entries() >= pages {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
@@ -4459,7 +4512,18 @@ mod production_ktir_dump {
             ("batched_decode_fp8", 4, 4, 64, KvPool::Fp8),
             ("batched_decode_chunks_fp8", 4, 64, 64, KvPool::Fp8),
         ] {
-            let c = BatchChunking::of(seqs, walk, 2048, 8, 32 * hd as u32, hd as u32);
+            let c = BatchChunking::of(
+                DecodeWalk {
+                    seqs,
+                    blocks: walk,
+                    pages: 2048,
+                },
+                DecodeHeads {
+                    kv_heads: 8,
+                    q_width: 32 * hd as u32,
+                    head_size: hd as u32,
+                },
+            );
             v.push((
                 name,
                 pool.pick(BATCHED_DECODE, BATCHED_DECODE_FP8),
