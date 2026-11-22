@@ -78,14 +78,17 @@ fn build_spec(programs: &[bundle::LaunchProgram<'static>], results: &[u64]) -> P
 
 /// Which of a function's arguments it WRITES — read off the program, never declared beside it.
 struct Writes {
-    /// Written through a direct access tile.
+    /// Written through a direct access tile over the whole view.
     whole: std::collections::HashSet<Ssa>,
-    /// Written through an INDIRECT access tile — a scatter, which writes only the rows its index
-    /// names.
+    /// Written IN PART: through an INDIRECT access tile — a scatter, which writes only the rows its
+    /// index names — or a tile over part of the view, at a corner the program reads or computes.
+    /// Either way the bytes it does not name keep their prior contents.
     in_part: std::collections::HashSet<Ssa>,
 }
 
 fn written_args(f: &ktir_core::ir::IRFunction<'static>) -> Writes {
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::ir::Attr;
     use ktir_core::opkind::OpKind;
     let producer = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
     let mut out = Writes {
@@ -105,10 +108,15 @@ fn written_args(f: &ktir_core::ir::IRFunction<'static>) -> Writes {
         };
         let Some(v) = producer(view) else { continue };
         if let Some(&ptr) = v.operands.first() {
-            if t.op_type == OpKind::KtdpConstructIndirectAccessTile {
-                out.in_part.insert(ptr);
-            } else {
+            let whole_view = t.op_type == OpKind::KtdpConstructAccessTile
+                && matches!(
+                    (t.attr(AttrKey::Shape), v.attr(AttrKey::Shape)),
+                    (Some(Attr::IntList(tile)), Some(Attr::IntList(view))) if tile == view
+                );
+            if whole_view {
                 out.whole.insert(ptr);
+            } else {
+                out.in_part.insert(ptr);
             }
         }
     }

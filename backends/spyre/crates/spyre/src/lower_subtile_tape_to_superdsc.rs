@@ -2072,6 +2072,49 @@ impl GatePeer<'_> {
     }
 }
 
+/// The KV pools that store on the e4m3 grid: every pool of an fp8 build, none of an fp16 one.
+fn e4m3_pools<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::HashSet<usize> {
+    match scratchy_triton_splice::KvPool::BUILD {
+        scratchy_triton_splice::KvPool::Fp16 => Default::default(),
+        scratchy_triton_splice::KvPool::Fp8 => {
+            kv_pool_tids(ir).into_iter().map(|t| t as usize).collect()
+        }
+    }
+}
+
+/// ONE NODE OF THE REFERENCE, as both of the gate's walks evaluate it: a collective against the
+/// rank's `peer`, every other node by `eval_node` — an attention over an fp8 pool reading its own
+/// rows' K and V (`inputs[3..5]`, the writer's) through the pool's e4m3 store, as it reads the
+/// cached rows.
+fn eval_reference_node<F: RopeForm>(
+    node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    scale_site: scratchy_subtile::subtile_ir::AttnScaleSite,
+    bufs: &mut [Vec<f32>],
+    peer: Option<GatePeer<'_>>,
+    e4m3_pools: &std::collections::HashSet<usize>,
+) -> Vec<f32> {
+    let mut stored: Vec<(usize, Vec<f32>)> = Vec::new();
+    if matches!(&node.op, SubOp::AttnDecode { .. }) && !e4m3_pools.is_empty() {
+        for r in node.inputs.iter().skip(3).take(2) {
+            let t = r.tensor.index();
+            let rounded: Vec<f32> = bufs[t]
+                .iter()
+                .map(|&v| ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(v)))
+                .collect();
+            stored.push((t, std::mem::replace(&mut bufs[t], rounded)));
+        }
+    }
+    let out = match peer {
+        Some(p) if is_collective(&node.op) => p.collective(node, ir, bufs),
+        _ => scratchy_subtile::subtile_ir::eval_node(node, ir, scale_site, bufs),
+    };
+    for (t, held) in stored {
+        bufs[t] = held;
+    }
+    out
+}
+
 /// ⭐ THE IN-MEMORY HALF OF THE GOLDEN — the reference semantics of the same
 /// `dsl_math`, computed independently of the spyre lowering: every tensor's f32
 /// values under the synthetic source law (`dbg_synth_val`), with the fold's WHOLE
@@ -2215,8 +2258,14 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             _ => None,
         })
         .collect();
+    // An fp8 KV pool's stick is e4m3: its cached rows sit on that grid.
+    let e4m3_pools = e4m3_pools(ir);
     for (id, vals) in src_vals.iter_mut().enumerate() {
-        if !fp8_payloads.contains(&id) {
+        if e4m3_pools.contains(&id) {
+            for v in vals.iter_mut() {
+                *v = ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(*v));
+            }
+        } else if !fp8_payloads.contains(&id) {
             for v in vals.iter_mut() {
                 *v = half::f16::from_f32(*v).to_f32();
             }
@@ -2360,10 +2409,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 (node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             }
         };
-        let mut out = match peer {
-            Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &bufs),
-            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &bufs),
-        };
+        let mut out = eval_reference_node(node_ref, ir, scale_site, &mut bufs, peer, &e4m3_pools);
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
         // The payload swap is temporary and per node: `eval_node` reads `inputs[1]` and
@@ -2629,6 +2675,7 @@ fn teacher_forced_walk<F: RopeForm>(
     // per node (they already carry their staged bytes there), so only its
     // non-source buffers take initial bytes here.
     weights.stage_load_consts(&mut tf, nsrc);
+    let e4m3_pools = e4m3_pools(ir);
     // The off-f16 sticks, the golden's own law verbatim (`eval_golden_buffers`'s
     // set above is the statement): the rounding hop below must skip an output
     // whose signature states a non-f16 stick, or the walk's OWN local leg lies
@@ -2695,10 +2742,7 @@ fn teacher_forced_walk<F: RopeForm>(
                 tf[w] = vals;
             }
         }
-        let mut tf_out = match peer {
-            Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &tf),
-            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf),
-        };
+        let mut tf_out = eval_reference_node(node_ref, ir, scale_site, &mut tf, peer, &e4m3_pools);
         if let SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..
@@ -3105,8 +3149,20 @@ fn stage_gate_probe<F: RopeForm>(
                 let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
                     .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
                 if !pool.is_empty() {
-                    let rows = pool.len() / t.cols as usize;
-                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
+                    let shape = vec![pool.len() / t.cols as usize, t.cols as usize];
+                    // The pool's cached rows at the pool's own element format: an fp8 pool's
+                    // stick is e4m3, staged through the typed channel as its bytes.
+                    match scratchy_triton_splice::KvPool::BUILD {
+                        scratchy_triton_splice::KvPool::Fp16 => {
+                            sources.push((tid as u64, pool, shape))
+                        }
+                        scratchy_triton_splice::KvPool::Fp8 => emu_weights.push((
+                            tid as usize,
+                            ktir_core::codec::encode(&pool, ktir_core::dtypes::DType::Fp8E4m3),
+                            scratchy_tensors::DType::Fp8E4m3,
+                            shape,
+                        )),
+                    }
                 }
             }
             None => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
@@ -3413,6 +3469,9 @@ pub fn numeric_gate<T: scratchy_spyre_bundle::collective::Tp, F: RopeForm>(
             SubOp::MatmulTile { weight, .. } if matches!(weight, GemmWeight::Fp8Dynamic))
             || matches!(&node.op,
             SubOp::AllRowsMatmul if node.inputs.len() == 4)
+            // An attention over an fp8 pool reads this step's keys and values narrowed to e4m3.
+            || (matches!(&node.op, SubOp::AttnDecode { .. })
+                && scratchy_triton_splice::KvPool::BUILD == scratchy_triton_splice::KvPool::Fp8)
             || node
                 .inputs
                 .iter()
