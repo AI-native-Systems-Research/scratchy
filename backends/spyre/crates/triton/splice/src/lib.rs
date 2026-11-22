@@ -1940,39 +1940,47 @@ impl PageOrder {
         }
     }
 
-    /// ⭐ THE KV WRITE'S INDEX LAW — entry `h` of the token at `slot` of `page`, `page_slots` slots
-    /// a page: head `h`'s cache row `(page · nkvh + h) · page_slots + slot` on a head-major page,
-    /// the token's own row `page · page_slots + slot` on a token-major one. Every stager of the
-    /// write's index reads it.
-    pub const fn write_index(
-        self,
-        nkvh: u32,
-        page_slots: u32,
-        page: u32,
-        slot: u32,
-        h: u32,
-    ) -> u32 {
+    /// ⭐ THE KV WRITE'S INDEX LAW — the cache row `cell`'s write entry lands at: head `cell.head`'s
+    /// row `(page · kv_heads + head) · page_slots + slot` on a head-major page, the token's own row
+    /// `page · page_slots + slot` on a token-major one. Every stager of the write's index reads it.
+    pub const fn write_index(self, pool: PageGeometry, cell: PageCell) -> u32 {
         match self {
-            PageOrder::HeadMajor => (page * nkvh + h) * page_slots + slot,
-            PageOrder::TokenMajor => page * page_slots + slot,
+            PageOrder::HeadMajor => {
+                (cell.page * pool.kv_heads + cell.head) * pool.page_slots + cell.slot
+            }
+            PageOrder::TokenMajor => cell.page * pool.page_slots + cell.slot,
         }
     }
 
-    /// The pool element where head `h`'s `head_size` keys of the token at `slot` of `page` begin.
-    pub const fn head_element(
-        self,
-        nkvh: u64,
-        page_slots: u64,
-        head_size: u64,
-        page: u64,
-        slot: u64,
-        h: u64,
-    ) -> u64 {
+    /// The pool element where `cell`'s head's `head_size` keys begin.
+    pub const fn head_element(self, pool: PageGeometry, head_size: u32, cell: PageCell) -> u64 {
+        let (kv_heads, slots, width) = (
+            pool.kv_heads as u64,
+            pool.page_slots as u64,
+            head_size as u64,
+        );
+        let (page, slot, head) = (cell.page as u64, cell.slot as u64, cell.head as u64);
         match self {
-            PageOrder::HeadMajor => ((page * nkvh + h) * page_slots + slot) * head_size,
-            PageOrder::TokenMajor => ((page * page_slots + slot) * nkvh + h) * head_size,
+            PageOrder::HeadMajor => ((page * kv_heads + head) * slots + slot) * width,
+            PageOrder::TokenMajor => ((page * slots + slot) * kv_heads + head) * width,
         }
     }
+}
+
+/// A paged pool's extents — what every address law over its pages reads: the kv heads a page
+/// holds and the token slots a page holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageGeometry {
+    pub kv_heads: u32,
+    pub page_slots: u32,
+}
+
+/// One kv head of one cached token: its page, its slot in the page, and the head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageCell {
+    pub page: u32,
+    pub slot: u32,
+    pub head: u32,
 }
 
 /// THE ATTENTION FAMILY's decode kernel — `page_attn_head_major_decode.py`, spyre-inference's

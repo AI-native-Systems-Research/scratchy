@@ -279,12 +279,21 @@ pub fn attends(step: &PagedStep, pos: usize, key: usize) -> bool {
 /// ([`scratchy_triton_splice::PageOrder::write_index`]).
 fn write_entry(step: &PagedStep, page: usize, slot: usize, h: usize) -> i32 {
     KV_PAGES.write_index(
-        step.nkvh,
-        step.page_slots,
-        page as u32,
-        slot as u32,
-        h as u32,
+        geometry(step),
+        scratchy_triton_splice::PageCell {
+            page: page as u32,
+            slot: slot as u32,
+            head: h as u32,
+        },
     ) as i32
+}
+
+/// The step's pool extents, as every page address law reads them.
+fn geometry(step: &PagedStep) -> scratchy_triton_splice::PageGeometry {
+    scratchy_triton_splice::PageGeometry {
+        kv_heads: step.nkvh,
+        page_slots: step.page_slots,
+    }
 }
 
 /// The KV write's index entries per token on this build's pool.
@@ -769,12 +778,13 @@ pub fn pool_of_rows(
         let page = blocks[t / slots] as usize;
         for h in 0..nkvh {
             let dst = KV_PAGES.head_element(
-                nkvh as u64,
-                slots as u64,
-                hd as u64,
-                page as u64,
-                (t % slots) as u64,
-                h as u64,
+                geometry(step),
+                hd as u32,
+                scratchy_triton_splice::PageCell {
+                    page: page as u32,
+                    slot: (t % slots) as u32,
+                    head: h as u32,
+                },
             ) as usize;
             let src = t * width + h * hd;
             pool[dst..dst + hd].copy_from_slice(&cache[src..src + hd]);
