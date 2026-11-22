@@ -65,14 +65,16 @@ fn main() {
         .collect();
     let layouts = spyre_superdsc::layouts::<Baked>(&f, &residency).expect("layouts");
     println!("layouts {layouts:?}");
-    let mut g = match spyre_superdsc::lift::lift::<Baked>(&f, &layouts) {
+    let natural = spyre_superdsc::lift::lift::<Baked>(&f, &layouts).expect("natural lift");
+    let relocated = spyre_superdsc::layout::misaligned::<Baked>(&natural);
+    let mut g = match spyre_superdsc::lift::lift_relocating::<Baked>(&f, &layouts, &relocated) {
         Ok(g) => g,
         Err(e) => {
             println!("REFUSED {e:?}");
             std::process::exit(1);
         }
     };
-    spyre_superdsc::layout::restick(&mut g);
+    spyre_superdsc::layout::restick::<Baked>(&mut g);
     spyre_superdsc::layout::index_inner::<Baked>(&mut g);
             for (i, n) in g.nodes.iter().enumerate() {
                 println!("node {i}: {:?} space {:?} ins {:?} out {:?}", n.func, n.space,

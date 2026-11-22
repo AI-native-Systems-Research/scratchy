@@ -338,6 +338,10 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
         .map(|((_, st), _)| *st)
         .chain([stick_axis])
         .collect();
+    // Every axis some operand is sticked on computes on whole sticks.
+    for &a in &sticks {
+        space[a] = space[a].next_multiple_of(lanes);
+    }
     let cuttable = |space: &[u64]| -> Vec<Cuttable> {
         space
             .iter()
@@ -698,7 +702,8 @@ fn tensor<G: DeviceGen>(
     // A contiguous stick sits inside every other axis of its key; a stick held in columns sits
     // outside every row its columns are pitched past.
     let columns = p.columns(p.stick).is_some();
-    entries.sort_by_key(|e| (e.key, (e.axis == p.stick) == columns));
+    // An indexed axis one stick apart sits directly outside the lanes: dxp reads it as the rows.
+    entries.sort_by_key(|e| (e.key, p.indexed != Some(e.axis), (e.axis == p.stick) == columns));
     let real: Vec<Entry> = entries.iter().copied().filter(|e| e.key < u64::MAX - 1).collect();
     // Each axis's extent in storage: the next axis's step over this one's — counted in elements
     // for the stick, which holds `lanes` per step.

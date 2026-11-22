@@ -69,6 +69,16 @@ pub type ParamLayout = Option<Held>;
 
 /// Lift `f` for generation `G`, each parameter's buffer held as `layouts` states.
 pub fn lift<G: DeviceGen>(f: &IRFunction<'_>, layouts: &[ParamLayout]) -> Result<Graph, LiftError> {
+    lift_relocating::<G>(f, layouts, &[])
+}
+
+/// [`lift`], with the parameters in `relocated` worked on relocated: copied at their first view
+/// into an intermediate sticked on another axis, and copied back whole at the end when written.
+pub fn lift_relocating<G: DeviceGen>(
+    f: &IRFunction<'_>,
+    layouts: &[ParamLayout],
+    relocated: &[usize],
+) -> Result<Graph, LiftError> {
     let mut cx = Cx::<G> {
         graph: Graph {
             params: vec![None; f.arguments.len()],
@@ -78,6 +88,8 @@ pub fn lift<G: DeviceGen>(f: &IRFunction<'_>, layouts: &[ParamLayout]) -> Result
         env: HashMap::new(),
         consts: HashMap::new(),
         layouts,
+        relocated,
+        moved: HashMap::new(),
         _g: std::marker::PhantomData,
     };
     let (gx, gy, gz) = f.grid;
@@ -93,6 +105,23 @@ pub fn lift<G: DeviceGen>(f: &IRFunction<'_>, layouts: &[ParamLayout]) -> Result
         ];
         cx.run(f.operations, &coord)?;
     }
+    // Every relocated buffer the function wrote is copied back whole.
+    let mut back: Vec<(usize, Store, View, View, DataFormat)> = cx
+        .moved
+        .iter()
+        .map(|(&p, (local, lv, pv, fmt))| (p, *local, lv.clone(), pv.clone(), *fmt))
+        .collect();
+    back.sort_by_key(|b| b.0);
+    for (p, local, lv, pv, format) in back {
+        if cx.graph.nodes.iter().filter(|n| n.output.store == local).count() > 1 {
+            cx.graph.nodes.push(Node {
+                func: OpFunc::Restick,
+                space: pv.shape(),
+                inputs: vec![Operand { store: local, view: lv, format, gather: None }],
+                output: Operand { store: Store::Param(p), view: pv, format, gather: None },
+            });
+        }
+    }
     forward_stores(&mut cx.graph);
     Ok(cx.graph)
 }
@@ -102,6 +131,9 @@ struct Cx<'l, G> {
     env: HashMap<Ssa, Val>,
     consts: HashMap<ConstStick, usize>,
     layouts: &'l [ParamLayout],
+    relocated: &'l [usize],
+    /// Each relocated parameter's copy: its store, its view, the parameter's view, its format.
+    moved: HashMap<usize, (Store, View, View, DataFormat)>,
     _g: std::marker::PhantomData<G>,
 }
 
@@ -491,16 +523,27 @@ impl<G: DeviceGen> Cx<'_, G> {
         Ok(())
     }
 
-    fn view_op(&mut self, op: &Operation<'_>, f: impl FnOnce(&View) -> Result<View, ViewError>)
+    fn view_op(&mut self, op: &Operation<'_>, f: impl Fn(&View) -> Result<View, ViewError>)
         -> Result<(), LiftError> {
         let v = match self.get(op.operands[0])? {
-            Val::Tensor(o) => {
-                let view = f(&o.view).map_err(|error| LiftError::View {
-                    op: op.op_type,
-                    error,
-                })?;
-                Val::Tensor(Operand { view, ..o })
-            }
+            Val::Tensor(o) => match f(&o.view) {
+                Ok(view) => Val::Tensor(Operand { view, ..o }),
+                // A value the shape op cannot re-describe in place is copied out contiguous first,
+                // which every shape op can.
+                Err(ViewError::NotContiguous { .. } | ViewError::Tiled) => {
+                    let shape = o.view.shape();
+                    let copy = self.local(&shape, o.format, false);
+                    self.graph.nodes.push(Node {
+                        func: OpFunc::Identity,
+                        space: shape,
+                        inputs: vec![o],
+                        output: copy.clone(),
+                    });
+                    let view = f(&copy.view).map_err(|error| LiftError::View { op: op.op_type, error })?;
+                    Val::Tensor(Operand { view, ..copy })
+                }
+                Err(error) => return Err(LiftError::View { op: op.op_type, error }),
+            },
             Val::Splat { value, format, .. } => Val::Splat {
                 value,
                 format,
@@ -640,6 +683,42 @@ impl<G: DeviceGen> Cx<'_, G> {
         Ok(())
     }
 
+    /// The relocated copy of parameter `param` seen through `view`: made at its first view, sticked
+    /// on the axis outermost in the view (padded to whole sticks), the rest in their own order.
+    fn relocate(&mut self, param: usize, view: &View, format: DataFormat) -> (Store, View) {
+        if let Some((store, lv, _, _)) = self.moved.get(&param) {
+            return (*store, lv.clone());
+        }
+        let shape = view.shape();
+        let lanes = format.lanes::<G>();
+        let t = (0..shape.len())
+            .filter(|&a| view.axes[a].stride != 1 && shape[a] > 1)
+            .max_by_key(|&a| view.axes[a].stride)
+            .unwrap_or(0);
+        let mut order: Vec<usize> = (0..shape.len()).filter(|&a| a != t).collect();
+        order.sort_by_key(|&a| (std::cmp::Reverse(view.axes[a].stride), a));
+        order.push(t);
+        let mut held: Vec<u64> = order.iter().map(|&a| shape[a]).collect();
+        if let Some(l) = held.last_mut() {
+            *l = l.next_multiple_of(lanes);
+        }
+        let physical = View::row_major(0, &held);
+        let mut lv = View::row_major(0, &shape);
+        for (k, &a) in order.iter().enumerate() {
+            lv.axes[a].stride = physical.axes[k].stride;
+        }
+        self.graph.locals.push(Local { elements: lv.end(), format });
+        let store = Store::Local(self.graph.locals.len() - 1);
+        self.graph.nodes.push(Node {
+            func: OpFunc::Restick,
+            space: shape,
+            inputs: vec![Operand { store: Store::Param(param), view: view.clone(), format, gather: None }],
+            output: Operand { store, view: lv.clone(), format, gather: None },
+        });
+        self.moved.insert(param, (store, lv.clone(), view.clone(), format));
+        (store, lv)
+    }
+
     fn store(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
         let value = self.get(op.operands[0])?;
         let (store, view, format) = match self.get(op.operands[1])? {
@@ -771,7 +850,10 @@ impl<G: DeviceGen> Cx<'_, G> {
             }
             K::KtdpConstructMemoryView => {
                 let shape = int_list(op, AttrKey::Shape).map(u64s).ok_or(malformed("a view states its shape"))?;
-                let strides = int_list(op, AttrKey::Strides).map(u64s).ok_or(malformed("a view states its strides"))?;
+                // A view stating no strides is row-major over its shape.
+                let strides = int_list(op, AttrKey::Strides)
+                    .map(u64s)
+                    .unwrap_or_else(|| View::row_major(0, &shape).axes.iter().map(|a| a.stride).collect());
                 let format = Self::format(op)?;
                 let (param, offset) = match self.get(op.operands[0])? {
                     Val::Param { param, offset } => (param, offset),
@@ -813,7 +895,13 @@ impl<G: DeviceGen> Cx<'_, G> {
                 }
                 view.offset = offset;
                 self.graph.param_views[param].push(view.clone());
-                self.bind(op, Val::Mem { store: Store::Param(param), view, format });
+                let v = if self.relocated.contains(&param) {
+                    let (store, view) = self.relocate(param, &view, format);
+                    Val::Mem { store, view, format }
+                } else {
+                    Val::Mem { store: Store::Param(param), view, format }
+                };
+                self.bind(op, v);
             }
             K::KtdpConstructAccessTile => {
                 let Val::Mem { store, view, format } = self.get(op.operands[0])? else {

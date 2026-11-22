@@ -65,8 +65,14 @@ pub fn lower<G: DeviceGen>(
     layouts: &[ParamLayout],
     bindings: &Bindings<'_>,
 ) -> Result<Lowering, Error> {
-    let mut graph = lift::lift::<G>(f, layouts).map_err(Error::Lift)?;
-    layout::restick(&mut graph);
+    let natural = lift::lift::<G>(f, layouts).map_err(Error::Lift)?;
+    let relocated = layout::misaligned::<G>(&natural);
+    let mut graph = if relocated.is_empty() {
+        natural
+    } else {
+        lift::lift_relocating::<G>(f, layouts, &relocated).map_err(Error::Lift)?
+    };
+    layout::restick::<G>(&mut graph);
     layout::index_inner::<G>(&mut graph);
     let lowered = emit::emit::<G>(&graph, bindings).map_err(Error::Emit)?;
     Ok(Lowering { graph, layouts: layouts.to_vec(), lowered })

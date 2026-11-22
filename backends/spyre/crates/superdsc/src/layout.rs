@@ -80,7 +80,7 @@ pub fn staged_layouts(g: &Graph, residency: &[Residency]) -> Vec<ParamLayout> {
 }
 
 /// Copy every operand some op reads off its stick into an intermediate that holds it there.
-pub fn restick(g: &mut Graph) {
+pub fn restick<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
     let mut i = 0;
     while i < g.nodes.len() {
         for oi in 0..g.nodes[i].inputs.len() {
@@ -94,14 +94,17 @@ pub fn restick(g: &mut Graph) {
             let mut order: Vec<usize> = (0..shape.len()).filter(|&a| a != axis).collect();
             order.sort_by_key(|&a| (std::cmp::Reverse(o.view.axes[a].stride), a));
             order.push(axis);
-            let held: Vec<u64> = order.iter().map(|&a| shape[a]).collect();
+            let mut held: Vec<u64> = order.iter().map(|&a| shape[a]).collect();
+            if let Some(l) = held.last_mut() {
+                *l = l.next_multiple_of(o.format.lanes::<G>());
+            }
             let physical = View::row_major(0, &held);
             let mut view = View::row_major(0, &shape);
             for (k, &a) in order.iter().enumerate() {
                 view.axes[a].stride = physical.axes[k].stride;
             }
             g.locals.push(Local {
-                elements: o.view.numel(),
+                elements: view.end(),
                 format: o.format,
             });
             let copy = Operand {
@@ -265,4 +268,34 @@ pub fn index_inner<G: ktir_core::ddl_binds::DeviceGen>(g: &mut Graph) {
             i += 3;
         }
     }
+}
+
+/// Does `o`'s window start inside a stick along its unit-stride axis? A descriptor addresses whole
+/// sticks, so such a window is unreachable where it lies.
+fn starts_inside_a_stick(o: &Operand, lanes: u64) -> Option<usize> {
+    let s = o.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1)?;
+    let outer_aligned = o
+        .view
+        .axes
+        .iter()
+        .enumerate()
+        .all(|(i, a)| i == s || a.extent == 1 || a.stride % lanes == 0);
+    (o.view.tile.is_none() && outer_aligned && o.view.offset % lanes != 0).then_some(s)
+}
+
+/// The parameters some op reads or writes in a window that starts inside a stick: each is worked
+/// on relocated — copied in sticked on another axis, and copied back whole when written.
+pub fn misaligned<G: ktir_core::ddl_binds::DeviceGen>(g: &Graph) -> Vec<usize> {
+    let mut moved: Vec<usize> = Vec::new();
+    for node in &g.nodes {
+        for o in node.inputs.iter().chain([&node.output]) {
+            if let Store::Param(p) = o.store
+                && starts_inside_a_stick(o, o.format.lanes::<G>()).is_some()
+                && !moved.contains(&p)
+            {
+                moved.push(p);
+            }
+        }
+    }
+    moved
 }
