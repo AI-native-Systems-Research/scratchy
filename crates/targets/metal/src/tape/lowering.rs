@@ -212,8 +212,36 @@ pub fn lower_with_rows(
     p: &ModelFacts,
     at: BakePoint<'_>,
 ) -> Result<(LoweredMetalTape, Vec<CommandRows>), LoweringError> {
+    // One weight, one vote: the source families whose codes some reader reads as the device
+    // stores them, never planes — stated once for both halves, consumed wherever the backbone
+    // reads one of them (`codes_for`). Three readers make a family's vote as-stored:
+    // - the lm_head tail's affine matmuls: the tail lowers under [`Planes::Never`] (a drafter
+    //   borrows the lm_head and reads it as the device stores it);
+    // - the embedding table's gather, which reads each row's codes whole ([`MetalStep::AffineEmbed`]);
+    // - a tied lm_head (`MetalStepTape::embed_table_readers`): the table's weight, read whole by
+    //   its gather, is the head's too.
+    let mut as_stored: Vec<SourceIx> = steps.embed_table_readers.clone();
+    as_stored.extend(
+        affine_matmul_reads(steps)?
+            .into_iter()
+            .filter(|(half, ..)| *half == TapeHalf::LmHead)
+            .map(|(.., ix, _)| ix),
+    );
+    for (row, sites) in steps.backbone.iter().zip(&steps.backbone_sources) {
+        if matches!(row, StepRow::Step(MetalStep::AffineEmbed(..), _)) {
+            as_stored.extend(
+                sites
+                    .iter()
+                    .filter(|s| s.kind == WeightKind::AffineQuantEmbedding)
+                    .map(|s| s.ix),
+            );
+        }
+    }
+    let as_stored = AsStoredCodes {
+        sources: &as_stored,
+    };
     let half = |rows, barriers, sources, live, planes| {
-        lower(p, rows, barriers, sources, live, &at, planes)
+        lower(p, rows, barriers, sources, live, &at, planes, &as_stored)
     };
     let (bb, bb_logits, bb_rows) = half(
         &steps.backbone,
@@ -343,6 +371,7 @@ fn sample_rows(
     profile: Option<&crate::targets::MetalTargetProfile>,
     class: crate::tape::lowered::GenClass,
     half_planes: Planes,
+    as_stored: &AsStoredCodes<'_>,
 ) -> Result<(Vec<GatedCommand>, Option<LogitsRows>), LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
     use SampleRowsStep as R;
@@ -374,6 +403,8 @@ fn sample_rows(
                 profile,
                 class,
                 half_planes,
+                as_stored,
+                ix,
                 a.bits.get(),
                 a.k.get(),
                 a.group_size,
@@ -469,17 +500,27 @@ fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<L
 ///
 /// A weight of group size 32 has no W4A8 GEMM, so its small-M steps take the bf16 twin, which
 /// reads the codes as written: it stays offset-8.
+///
+/// A weight some reader reads as-stored (`as_stored.reads(ix)`) never lowers as planes,
+/// whichever half its reader sits in: one weight has one vote, and an as-stored reader's is
+/// never planes, so every other reader of it — the backbone's included — consumes that vote. A
+/// backbone step reading the lm_head lowered as planes on the wide class while a reader it
+/// shared the weight with voted offset-8, and the load refused (`ReadersDisagree`): the vote is
+/// the weight's, not the half's.
 fn codes_for(
     p: &ModelFacts,
     profile: Option<&crate::targets::MetalTargetProfile>,
     class: crate::tape::lowered::GenClass,
     half: Planes,
+    as_stored: &AsStoredCodes<'_>,
+    ix: SourceIx,
     bits: u32,
     k: u32,
     group: AffineGroupSize,
 ) -> super::kernel_constants::AffineCodes {
     let codes = super::kernel_constants::AffineCodes::of(profile, bits);
     let planes = half == Planes::Backbone
+        && !as_stored.reads(ix)
         && class == crate::tape::lowered::GenClass::M5Wide
         && p.drafter().is_none()
         && group.nax().is_some();
@@ -489,10 +530,30 @@ fn codes_for(
 /// Whether a half of a tape may store its weights' codes as planes ([`codes_for`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Planes {
-    /// The backbone: its target model's weights, read by it alone.
+    /// The backbone: its target model's weights, read by it alone — save those a reader shares
+    /// with another ([`AsStoredCodes`]): one weight, one vote, and an as-stored reader's is
+    /// never planes.
     Backbone,
     /// The lm_head tail, whose weight a drafter borrows.
     Never,
+}
+
+/// The source families whose codes some reader reads as the device stores them, never planes.
+/// One weight has one vote, so wherever the backbone reads one of these, [`codes_for`] votes the
+/// as-stored way. Stated once per tape, from the step tape itself: the tail's affine matmuls'
+/// first linear source ([`affine_matmul_reads`], the same rule the lowering binds), the
+/// embedding table its gather reads row-whole, and the families the weight map ties to that
+/// table (`MetalStepTape::embed_table_readers`, a tied lm_head).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AsStoredCodes<'a> {
+    sources: &'a [SourceIx],
+}
+
+impl<'a> AsStoredCodes<'a> {
+    /// Whether `ix` is one of the as-stored weights.
+    fn reads(&self, ix: SourceIx) -> bool {
+        self.sources.contains(&ix)
+    }
 }
 
 /// Whether the sampled rows slice at this bake point: a multi-row bucket whose matmul lowers to
@@ -1165,6 +1226,7 @@ fn route_small_m(
     profile: Option<&crate::targets::MetalTargetProfile>,
     class: crate::tape::lowered::GenClass,
     half_planes: Planes,
+    as_stored: &AsStoredCodes<'_>,
     splitk_scratch_bytes: &mut u32,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
@@ -1194,9 +1256,11 @@ fn route_small_m(
         return Ok(cmds);
     };
     let group_size = group.get();
+    // The weight this row's matmul binds — its vote is every reader's (`codes_for`).
+    let ix = w.of(WeightKind::Linear, 0)?;
     // The small-M kernels read the codes as stored, signed (offset-8). The bf16 twin
     // (`AffineQmmSmallM`) reads them row-major only: planes codes take the W4A8 tile below.
-    let codes = codes_for(p, profile, class, half_planes, 4, k, group);
+    let codes = codes_for(p, profile, class, half_planes, as_stored, ix, 4, k, group);
     let tile = match SmallMTile::for_bucket(bucket_m) {
         Some(tile) if codes.signed() && n.is_multiple_of(SMALL_M_TILE_COLS) => tile,
         _ => return Ok(cmds),
@@ -1988,6 +2052,7 @@ fn lower(
     live_rows: &[PlayLive],
     at: &BakePoint<'_>,
     half_planes: Planes,
+    as_stored: &AsStoredCodes<'_>,
 ) -> Result<(LoweredMetalTape, Option<LogitsRows>, Vec<Vec<u32>>), LoweringError> {
     let BakePoint {
         chunked,
@@ -2123,6 +2188,7 @@ fn lower(
                     profile,
                     class,
                     half_planes,
+                    as_stored,
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
@@ -2135,6 +2201,7 @@ fn lower(
                     profile,
                     class,
                     half_planes,
+                    as_stored,
                     &mut splitk_scratch_bytes,
                 )?;
                 let cmds = route_gdn(p, step, cmds, bucket_m)?;
@@ -2150,7 +2217,7 @@ fn lower(
                     i,
                 )?;
                 let (cmds, rows) =
-                    sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes)?;
+                    sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes, as_stored)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
                 // (a fold the tail joined) runs over the step's every row: the buffer holds them.
@@ -2798,6 +2865,8 @@ fn lower_one(
     gen_class: crate::tape::lowered::GenClass,
     // Whether this half of the tape may store its weights' codes as planes (`codes_for`).
     half_planes: Planes,
+    // The as-stored weights, whose vote the backbone consumes (`codes_for`).
+    as_stored: &AsStoredCodes<'_>,
     // The row-count divisor in force, threaded by `lower()` (1 normally;
     // `vision_merge_factor` after the merger reshape) so post-merge ops
     // dispatch over `bucket_m / m_divisor` rows.
@@ -2846,6 +2915,7 @@ fn lower_one(
                 profile,
                 gen_class,
                 half_planes,
+                as_stored,
                 m_divisor,
             );
         }
@@ -2874,6 +2944,7 @@ fn lower_one(
                     profile,
                     gen_class,
                     half_planes,
+                    as_stored,
                     m_divisor,
                 )
             };
@@ -3475,6 +3546,8 @@ fn lower_one(
             let (group, width_bits) = (*group, *width_bits);
             let (bits_v, gs) = (width_bits.get(), group.get());
             let vl = *vector_limit;
+            // The weight this row's matmul binds — its vote is every reader's (`codes_for`).
+            let ix = w.of(WeightKind::Linear, 0)?;
 
             // A narrow projection at a bucket of up to 64 rows on the matrix unit's chips runs the
             // row-parallel fast matvec (`narrow_matvec`): its few columns give the wide matvec a
@@ -3484,7 +3557,8 @@ fn lower_one(
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, group);
+                let codes =
+                    codes_for(p, profile, gen_class, half_planes, as_stored, ix, bits_v, k_v, group);
                 affine_qmv_command(
                     p,
                     g,
@@ -3509,6 +3583,8 @@ fn lower_one(
                     profile,
                     gen_class,
                     half_planes,
+                    as_stored,
+                    ix,
                     g.bits.get(),
                     g.k.get(),
                     g.group_size,
@@ -3604,7 +3680,8 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes = codes_for(p, profile, gen_class, half_planes, bits_v, k_v, group);
+                let codes =
+                    codes_for(p, profile, gen_class, half_planes, as_stored, ix, bits_v, k_v, group);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax(_))
                         && codes.signed()
@@ -3719,6 +3796,8 @@ fn lower_one(
                                     profile,
                                     gen_class,
                                     half_planes,
+                                    as_stored,
+                                    ix,
                                     bits_v,
                                     k_v,
                                     group,
@@ -3766,6 +3845,8 @@ fn lower_one(
                                     profile,
                                     gen_class,
                                     half_planes,
+                                    as_stored,
+                                    ix,
                                     bits_v,
                                     k_v,
                                     group,
@@ -3841,6 +3922,8 @@ fn lower_one(
                                     profile,
                                     gen_class,
                                     half_planes,
+                                    as_stored,
+                                    ix,
                                     bits_v,
                                     k_v,
                                     group,
@@ -4707,7 +4790,17 @@ fn lower_one(
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
-            let codes = codes_for(p, profile, gen_class, half_planes, bits, k, g.group_size);
+            let codes = codes_for(
+                p,
+                profile,
+                gen_class,
+                half_planes,
+                as_stored,
+                w.of(WeightKind::Linear, 0)?,
+                bits,
+                k,
+                g.group_size,
+            );
             let constants = super::kernel_constants::AffineGatedQmvConstants {
                 qmv: super::kernel_constants::AffineQmvConstants {
                     k: super::ids::KDimI32(k as i32),
@@ -6324,6 +6417,7 @@ fn lower_one(
                 profile,
                 gen_class,
                 half_planes,
+                as_stored,
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
@@ -12701,6 +12795,123 @@ mod tests {
         }
     }
 
+    /// One weight, one vote: a weight the lm_head half reads — the tail's, which a drafter
+    /// borrows and reads as the device stores it — never lowers as planes, whichever half its
+    /// reader sits in. A backbone step reading it (Gemma-4's verify-pass matmul over its
+    /// lm_head) voted planes on the wide class while the tail voted offset-8, and the pool
+    /// refused the load (`ReadersDisagree`): the vote is the weight's, not the half's.
+    #[test]
+    fn a_weight_the_tail_reads_never_lowers_as_planes_in_the_backbone() {
+        let gemm = |n, k| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(k),
+                group_size: AffineGroupSize::new(64).unwrap(),
+                bits: AffineBits::new(4).unwrap(),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })
+        };
+        // Past the wide band's one-threadgroup-a-core line, k a 64 multiple: the wide class's
+        // W4A8 path, the one that votes planes.
+        let (n, k) = (2 * SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES, 2048);
+        let at = BakePoint {
+            class: crate::tape::lowered::GenClass::M5Wide,
+            ..bake_point(8, Some(&crate::targets::M5_10CORE))
+        };
+        let planes = |tape: &crate::tape::lowered::LoweredMetalTape| {
+            tape.commands
+                .iter()
+                .flat_map(|c| c.lowered().constants.iter().copied())
+                .filter(|v| v.index == crate::tape::kernel_constants::AFFINE_CODES_PLANES_SLOT.0)
+                .count()
+        };
+        // The control: alone in the backbone, the wide class stores its codes as planes.
+        let alone =
+            lower_subtile_tape_to_metal(&row_tape(plain(&[gemm(n, k)])), &tp(), at).expect("lowers");
+        assert!(
+            planes(&alone) > 0,
+            "the control: a backbone-only weight votes planes on the wide class"
+        );
+        // The same weight read by the tail too: no reader of it votes planes.
+        let mut both = row_tape(plain(&[gemm(n, k)]));
+        both.lm_head = plain(&[gemm(n, k)]);
+        both.lm_head_barriers = vec![Fence::Coherent];
+        both.lm_head_sources = vec![TEST_SITE.clone()];
+        let both = lower_subtile_tape_to_metal(&both, &tp(), at).expect("lowers");
+        assert_eq!(
+            planes(&both),
+            0,
+            "the backbone consumes the tail's vote for a weight the tail reads"
+        );
+    }
+
+    /// One weight, one vote: the embedding table's gather reads each row's codes whole, as the
+    /// device stores them, and a tied lm_head reads the table's weight — so the head's matmuls
+    /// vote as-stored too, the backbone's included. Gemma-4 (tied, its embedding affine) lowered
+    /// its lm_head matmul as planes on the wide class while its embed gather read the same codes
+    /// offset-8, and the pool refused the load (`ReadersDisagree`).
+    #[test]
+    fn a_tied_lm_head_never_lowers_as_planes_in_the_backbone() {
+        let gemm = |n, k| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(k),
+                group_size: AffineGroupSize::new(64).unwrap(),
+                bits: AffineBits::new(4).unwrap(),
+                vector_limit: QmvBatchLimit(10),
+                ends: QmvEnds::default(),
+            })
+        };
+        let embed = |width| {
+            MetalStep::AffineEmbed(
+                Slot(0),
+                AffineGroupSize::new(64).unwrap(),
+                AffineBits::new(4).unwrap(),
+                crate::interpreter::metal::lowered::ActivationWidth::of_cols(width),
+            )
+        };
+        let (n, k) = (2 * SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES, 2048);
+        let at = BakePoint {
+            class: crate::tape::lowered::GenClass::M5Wide,
+            ..bake_point(8, Some(&crate::targets::M5_10CORE))
+        };
+        let planes = |tape: &crate::tape::lowered::LoweredMetalTape| {
+            tape.commands
+                .iter()
+                .flat_map(|c| c.lowered().constants.iter().copied())
+                .filter(|v| v.index == crate::tape::kernel_constants::AFFINE_CODES_PLANES_SLOT.0)
+                .count()
+        };
+        let rows = plain(&[embed(k), gemm(n, k)]);
+        // The weight map's tie, projected onto the tape: the matmul's linear family reads the
+        // table's weight.
+        let mut tied = row_tape(rows.clone());
+        tied.embed_table_readers = vec![TEST_SITE
+            .iter()
+            .find(|s| s.kind == WeightKind::Linear)
+            .expect("a linear source")
+            .ix];
+        let tied = lower_subtile_tape_to_metal(&tied, &tp(), at).expect("lowers");
+        assert_eq!(
+            planes(&tied), 0,
+            "the backbone consumes the table's as-stored vote for the weight the head shares"
+        );
+        // The control: the same tape untied votes planes — the gather alone does not reach the
+        // matmul's family.
+        let untied = lower_subtile_tape_to_metal(&row_tape(rows), &tp(), at).expect("lowers");
+        assert!(
+            planes(&untied) > 0,
+            "the control: an untied weight votes planes on the wide class"
+        );
+    }
+
     /// The small-M wide band follows MLX's gen-15 boundary
     /// (`affine_qmv_wide_ok`): every production bake profile from the M3 on —
     /// the Mid class bakes against an M4 profile, the M5 class its own —
@@ -14061,6 +14272,7 @@ mod tests {
             None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             1,
         )
         .expect("lower scalar_mul");
@@ -14106,6 +14318,7 @@ mod tests {
             None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             1,
         )
         .expect("lower")
@@ -14153,6 +14366,7 @@ mod tests {
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14249,6 +14463,7 @@ mod tests {
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14307,6 +14522,7 @@ mod tests {
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14395,6 +14611,7 @@ mod tests {
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14475,6 +14692,7 @@ mod tests {
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -14520,6 +14738,7 @@ mod tests {
             /*profile=*/ None,
             crate::tape::lowered::GenClass::M1,
             Planes::Backbone,
+            &AsStoredCodes::default(),
             /*m_divisor=*/ 1,
         )
         .expect("lower");

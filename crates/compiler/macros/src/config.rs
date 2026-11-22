@@ -25,6 +25,12 @@ use crate::draft_capture::DRAFT_CAPTURE_LAYERS;
 use crate::hf_config::{extract_bounds, normalize_hf_config};
 use crate::quantization::QuantizationConfig;
 
+/// The DSL role a model's untied logits read, the one weight `tie_word_embeddings` ties to the
+/// embedding table. Stated once here; every consumer of the tie — the codegen loader plan
+/// (`FieldLoad::LinearTiedToEmbedding`), the quant resolver, and the metal tape's
+/// `embed_table_readers` — names this role, never its own copy of the string.
+pub const LM_HEAD_ROLE: &str = "lm_head";
+
 /// One model's parameters, loaded from one `config.json`.
 #[derive(Clone, Debug)]
 pub struct ModelParams {

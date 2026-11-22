@@ -1397,11 +1397,11 @@ pub fn storage_format_for_weight(
     // `LinearTiedToEmbedding { affine: Some((gs, bits)) }` arm
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.
-    if dotted == "lm_head" && model.tie_word_embeddings {
+    if dotted == crate::config::LM_HEAD_ROLE && model.tie_word_embeddings {
         // The table it shares: the embedding's, unless the arch renames the head onto a table of
         // its own (Gemma 4's drafter embeds with its target's lent table, its logits its own).
-        let tied_role = match program.rename_dotted("lm_head") {
-            renamed if renamed != "lm_head" => renamed,
+        let tied_role = match program.rename_dotted(crate::config::LM_HEAD_ROLE) {
+            renamed if renamed != crate::config::LM_HEAD_ROLE => renamed,
             _ => embed_role.clone(),
         };
         if let QuantMethod::Affine {

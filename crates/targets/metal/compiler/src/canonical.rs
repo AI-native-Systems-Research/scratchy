@@ -303,6 +303,10 @@ pub struct MetalStepFacts<'a> {
     pub embed_base: &'a str,
     /// The embedding's MLX-affine storage; `None` = dense.
     pub embed_quant: Option<(AffineGroupSize, AffineBits)>,
+    /// The tied lm_head's `WeightId`, when the model ties its logits to its embedding table
+    /// (`tie_word_embeddings`): the table's codes are the head's, so the families reading this
+    /// weight vote the table's as-stored way (`MetalStepTape::embed_table_readers`).
+    pub tied_lm_head: Option<u32>,
     pub mlp: MlpForm,
     /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own).
     /// `None` altogether for an unquantized model: its MoE bits are never repacked.
@@ -658,6 +662,22 @@ pub fn lower_canonical(
         result.index(),
         barriers,
     );
+    // One weight, one vote: the families that read the embedding table's weight besides its own
+    // gather — the tied lm_head's. The table's gather reads each row's codes whole, as the device
+    // stores them, so the bake votes these families' matmuls the same way
+    // (`tape::lowering::codes_for`); without this the backbone's lm_head matmul would vote planes
+    // on a wide M5 while the gather it shares a weight with votes as-stored, and the two readers
+    // would refuse the load.
+    let mut embed_table_readers = Vec::new();
+    if let Some(tied) = facts.tied_lm_head {
+        for (ix, id) in (backbone_weights.iter().chain(rolled.lm_weights.iter()))
+            .flat_map(|r| sources.reads(r))
+        {
+            if id == tied && !embed_table_readers.contains(&ix) {
+                embed_table_readers.push(ix);
+            }
+        }
+    }
     Ok(MetalCanonical {
         steps: MetalStepTape {
             backbone,
@@ -675,6 +695,7 @@ pub fn lower_canonical(
                 .map(|s| sources.row(s, facts.embed_base))
                 .collect(),
             lm_head_live,
+            embed_table_readers,
         },
         operands: StepOperands {
             backbone: backbone_operands,

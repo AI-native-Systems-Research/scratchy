@@ -812,6 +812,21 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         let weight_paths: Vec<Vec<String>> = (program.weights.ids())
             .map(|id| program.weights.path(id).to_vec())
             .collect();
+        // The tied lm_head's weight, when the model ties its logits to its embedding table
+        // (`tie_word_embeddings`): the same weight the codegen loader plan resolves the head onto
+        // (`FieldLoad::LinearTiedToEmbedding`), found by the one role name that plan keys on. The
+        // metal tape carries its reader families (`MetalStepFacts::tied_lm_head` →
+        // `MetalStepTape::embed_table_readers`) so the bake votes the table's codes one way.
+        let tied_lm_head = model
+            .tie_word_embeddings
+            .then(|| {
+                (program.weights.ids()).find_map(|id| {
+                    let path = program.weights.path(id);
+                    (path.len() == 1 && path[0] == scratchy_forward_compiler_macro::config::LM_HEAD_ROLE)
+                        .then_some(id.0)
+                })
+            })
+            .flatten();
         let embed_base = weight_paths
             .iter()
             .map(|p| p.join("_"))
@@ -845,6 +860,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             shared_expert_banks: &shared_expert_banks,
             embed_base: &embed_base,
             embed_quant,
+            tied_lm_head,
             mlp: if fused_mlp {
                 mc3::MlpForm::Packed
             } else {
