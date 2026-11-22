@@ -24,6 +24,8 @@ METAL_CRATES=(scratchy-target-metal scratchy-target-metal-cli scratchy-target-me
     scratchy-target-metal-models scratchy-target-metal-worker)
 ROOT_FEATURES=scratchy-models/granite-3.1-8b-instruct
 SPYRE_FEATURES=scratchy-models/granite-3.1-8b-instruct
+# The card workspace's own alias for the models crate; it panics at build time with zero models.
+SPYRE_HW_FEATURES=model/granite-3.1-8b-instruct,snt1p0
 METAL_FEATURES=scratchy-models/qwen3-0.6b
 METAL_ALL_FEATURES=scratchy-models/all,scratchy-models/mtp,scratchy-target-metal-models/turboquant,scratchy-target-metal-models/vision
 
@@ -76,7 +78,8 @@ scope() { # name
             lint backends/spyre --workspace --features "${SPYRE_FEATURES}" ;;
         spyre-hw)
             card_host || { say "backends/spyre-hw builds only on a card host; skipped"; return 0; }
-            lint backends/spyre-hw --workspace ;;
+            # Nothing here links, so the build script's FFI link directives are skipped.
+            SCRATCHY_SKIP_SENDNN_CXX=1 lint backends/spyre-hw --workspace --features "${SPYRE_HW_FEATURES}" ;;
         all)
             local rc=0 s
             for s in root spyre metal spyre-hw; do scope "${s}" || rc=1; done
@@ -131,9 +134,8 @@ file() { # path
         /backends/spyre)
             while IFS= read -r a; do feat+=("${a}"); done < <(features_for "${manifest}" "${SPYRE_FEATURES}")
             lint backends/spyre -p "${name}" ${feat[@]+"${feat[@]}"} ;;
-        /backends/spyre-hw)
-            card_host || { say "${name} builds only on a card host; skipped"; return 0; }
-            lint backends/spyre-hw -p "${name}" ;;
+        # The card workspace's members need its model alias, so a file there lints the workspace.
+        /backends/spyre-hw) scope spyre-hw ;;
         *) say "${manifest#"${ROOT}"/} is in no workspace this runner lints; nothing to lint"; return 0 ;;
     esac
 }
