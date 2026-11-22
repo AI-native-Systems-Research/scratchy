@@ -1755,6 +1755,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-spyre-superdsc"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "ktir-core",
+ "serde",
+ "serde_json",
+ "triton-frontend",
+ "triton-ktir",
+]
+
+[[package]]
 name = "scratchy-subtile"
 version = "0.1.0"
 dependencies = [

@@ -21,6 +21,8 @@ members = [
     # KTIR -> SuperDSC as a leaf: the typed SuperDSC IR, with no scratchy dependency, so a
     # third-party KTIR producer can consume the lowering.
     "crates/ktir/ktir-superdsc",
+    # KTIR -> SuperDSC: the lowering of one KTIR function to the descriptors dxp compiles.
+    "crates/superdsc",
     # The Triton front end, re-hosted from triton-spyre (see crates/triton/PROVENANCE.md):
     # Triton.py -> TTIR -> KTIR, pure Rust, so kernels are authored in Triton and compiled at
     # #[forward] expansion time like the torch carriers are (#112).

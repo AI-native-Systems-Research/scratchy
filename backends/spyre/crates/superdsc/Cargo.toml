@@ -1,0 +1,24 @@
+[package]
+name = "scratchy-spyre-superdsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KTIR -> SuperDSC: Spyre's lowering of a KTIR function to the SuperDSC descriptors dxp compiles"
+
+[lib]
+name = "spyre_superdsc"
+
+[dependencies]
+# THE INPUT: a KTIR function as `ktir-core` constructs it, and the device generation's facts
+# (`ddl_binds::DeviceGen`) every division and address reads.
+ktir-core = { path = "../ktir/ktir-core" }
+# THE OUTPUT FORMAT: SuperDSC is the JSON dxp reads.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# fp16/fp32 bit patterns of the constants an op carries.
+half = { workspace = true }
+
+# The Triton ladder, for the example that lowers a `kernels/*.py` kernel end to end.
+[dev-dependencies]
+triton-frontend = { path = "../triton/triton-frontend" }
+triton-ktir = { path = "../triton/triton-ktir" }

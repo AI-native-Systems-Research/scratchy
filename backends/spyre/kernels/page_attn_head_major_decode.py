@@ -33,7 +33,7 @@ import triton.language as tl
 
 @triton.jit
 def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,  #
-                                       page_index_table, kv_row_pool, mask_stack, out,  #
+                                       page_index_table, mask_stack, out,  #
                                        NUM_TOKENS: tl.constexpr, NUM_HEADS: tl.constexpr,  #
                                        NUM_KV_HEADS: tl.constexpr, HEAD_SIZE: tl.constexpr,  #
                                        BLOCK_SIZE: tl.constexpr, NUM_PAGES: tl.constexpr,  #
@@ -46,27 +46,15 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
     out_rows = tl.make_tensor_descriptor(out, shape=[NUM_TOKENS, NUM_HEADS * HEAD_SIZE],
                                          strides=[NUM_HEADS * HEAD_SIZE, 1],
                                          block_shape=[1, NUM_HEADS * HEAD_SIZE])
-    k_folded = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                         BLOCK_SIZE * HEAD_SIZE],
-                                         strides=[BLOCK_SIZE * HEAD_SIZE, 1],
-                                         block_shape=[1, BLOCK_SIZE * HEAD_SIZE])
-    v_folded = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                         BLOCK_SIZE * HEAD_SIZE],
-                                         strides=[BLOCK_SIZE * HEAD_SIZE, 1],
-                                         block_shape=[1, BLOCK_SIZE * HEAD_SIZE])
-    # Under the gather floor: num_kv_heads consecutive rows of the folded cache.
-    k_tiles = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                        BLOCK_SIZE * HEAD_SIZE],
-                                        strides=[BLOCK_SIZE * HEAD_SIZE, 1],
-                                        block_shape=[NUM_KV_HEADS, BLOCK_SIZE * HEAD_SIZE])
-    v_tiles = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES * NUM_KV_HEADS,
-                                                        BLOCK_SIZE * HEAD_SIZE],
-                                        strides=[BLOCK_SIZE * HEAD_SIZE, 1],
-                                        block_shape=[NUM_KV_HEADS, BLOCK_SIZE * HEAD_SIZE])
-    # kv_row_pool `[num_pages, num_kv_heads, 1]`, contiguous: page p's slab is the num_kv_heads
-    # elements at p * num_kv_heads.
-    pool = tl.make_tensor_descriptor(kv_row_pool, shape=[NUM_PAGES * NUM_KV_HEADS], strides=[1],
-                                     block_shape=[NUM_KV_HEADS])
+    # One row per page: the page's num_kv_heads · block_size · head_size elements, contiguous.
+    k_unfolded = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES,
+                                                           NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE],
+                                           strides=[NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE, 1],
+                                           block_shape=[1, NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE])
+    v_unfolded = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES,
+                                                           NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE],
+                                           strides=[NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE, 1],
+                                           block_shape=[1, NUM_KV_HEADS * BLOCK_SIZE * HEAD_SIZE])
     masks = tl.make_tensor_descriptor(mask_stack, shape=[NUM_BLOCKS, BLOCK_SIZE],
                                       strides=[BLOCK_SIZE, 1], block_shape=[1, BLOCK_SIZE])
 
@@ -83,16 +71,10 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
         # kv_rows = kv_row_pool.index_select(0, page_index[0, 0:1])
         page = tl.load(page_index_table + i * INT32_ELEMS_PER_STICK)
         # k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
-        kv_rows = pool.load([page * NUM_KV_HEADS])
-        if NUM_KV_HEADS >= 8:
-            k_page = tl.reshape(k_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
-            v_page = tl.reshape(v_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
-        else:
-            # Under the gather floor. The rows `kv_row_pool[page]` names ascend by one
-            # (`page * num_kv_heads + kv`), so they are the num_kv_heads-row tile at the first.
-            first = tl.min(kv_rows, 0)
-            k_page = tl.reshape(k_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
-            v_page = tl.reshape(v_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
+        # k_page = k_pages[page].reshape(num_kv_heads, block_size, head_size): the page's one
+        # row of the unfolded pool, read through the page index.
+        k_page = tl.reshape(k_unfolded.load([page, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
+        v_page = tl.reshape(v_unfolded.load([page, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
         # scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
         scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
         # scores = scores + mask_tile[0]
