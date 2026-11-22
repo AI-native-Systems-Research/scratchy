@@ -974,6 +974,7 @@ impl StageRoot {
             Some(p) => PathBuf::from(p),
             None => std::env::temp_dir(),
         };
+        sweep_dead_stages(&base);
         // Per-process, so two concurrent cargo units running this expansion never share a staging dir.
         StageRoot(base.join(format!("superdsc-stage-{}", std::process::id())))
     }
@@ -991,6 +992,32 @@ impl StageRoot {
 
     pub fn path(&self) -> &Path {
         &self.0
+    }
+}
+
+/// Remove the staging roots of bakes whose process is gone. A bake killed by a signal (an
+/// interrupted build, a stopped job) never runs its own cleanup, and each one left behind holds up
+/// to [`MAX_STAGED_BYTES`] of json and dxp output. A root whose process still runs — another
+/// concurrent expansion — is never touched; one whose name carries no pid is not ours.
+fn sweep_dead_stages(base: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("superdsc-stage-"))
+            .and_then(|p| p.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        // SAFETY: signal 0 delivers nothing; it only asks whether `pid` names a process.
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 
