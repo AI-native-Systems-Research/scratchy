@@ -1683,11 +1683,6 @@ pub struct BakeQueue {
     shared: Arc<Shared>,
     /// Submission counter — the tie-break that keeps equal-sized groups in emission order.
     submitted: std::sync::atomic::AtomicU64,
-    /// The pool's threads. RETAINED, not read: the pool is process-lived now that [`Self::finish`] is a
-    /// barrier rather than a shutdown, and these are what own it. Dropping the handles would only detach
-    /// the threads; keeping them is what leaves a real shutdown available if one is ever wanted.
-    #[allow(dead_code)]
-    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl BakeQueue {
@@ -1719,17 +1714,16 @@ impl BakeQueue {
             results: Mutex::new(HashMap::new()),
             inflight: Latch::default(),
         });
-        let workers = (0..compile_width())
-            .map(|_| {
-                let (shared, tool) = (Arc::clone(&shared), tool.clone());
-                std::thread::spawn(move || shared.work(&tool))
-            })
-            .collect();
+        // The pool is process-lived ([`Self::finish`] is a barrier, not a shutdown), so its threads
+        // run detached.
+        for _ in 0..compile_width() {
+            let (shared, tool) = (Arc::clone(&shared), tool.clone());
+            std::thread::spawn(move || shared.work(&tool));
+        }
         Some(BakeQueue {
             stage: StageRoot::resolve(),
             shared,
             submitted: std::sync::atomic::AtomicU64::new(0),
-            workers: Mutex::new(workers),
         })
     }
 
@@ -2198,7 +2192,6 @@ mod tests {
                 inflight: Latch::default(),
             }),
             submitted: std::sync::atomic::AtomicU64::new(0),
-            workers: Mutex::new(Vec::new()),
         }
     }
 

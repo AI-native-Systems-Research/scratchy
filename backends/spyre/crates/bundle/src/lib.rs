@@ -350,9 +350,8 @@ impl<'a> BundleLayout<'a> {
     /// The placement of `id`, if this bundle placed it.
     ///
     /// ⛔ BY IDENTITY, NOT BY A FORMATTED NAME. The reserved ids are `u32` consts
-    /// (`IDENTITY_TID`, `ATTN_MASK_TID`, `ksplit_block_tid(0)`), so asking by id keeps the question in
-    /// the type the answer is in — no `format!("t{}", CONST)` round trip. This was TWO lookups, one
-    /// by name and one by tid, which is what having two spellings of one identity costs.
+    /// (`SCRATCH_TID`, `ATTN_MASK_TID`, `stick_const_tid(0)`), so asking by id keeps the question in
+    /// the type the answer is in — no `format!("t{}", CONST)` round trip.
     pub fn place(&self, id: PlaceId) -> Option<&Placement> {
         self.places.iter().find(|p| p.id == id)
     }

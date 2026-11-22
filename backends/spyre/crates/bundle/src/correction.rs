@@ -13,8 +13,9 @@
 //!
 //! ⭐ IT RUNS ONCE, IN THE EMITTER, because **its output is a constant**. Nothing in the chain reads
 //! runtime state — the substitution's `inputs` are `vec![]`, since a statically-shaped bundle has no
-//! runtime symbols — so the flits are fixed at compile time. [`parse_spyrecode`] computes them and what
-//! reaches the binary is [`crate::GroupCode::correction`], a `&'static [u8]` the launch H2Ds directly.
+//! runtime symbols — so the flits are fixed at compile time.
+//! [`parse_spyrecode`](crate::correction::parse_spyrecode) computes them and what reaches the
+//! binary is [`crate::LaunchGroup::correction`], a `&'static [u8]` the launch H2Ds directly.
 //!
 //! A malformed HCM is therefore a BUILD error naming the group, which is the only place a malformed
 //! compiler output can honestly be reported.
@@ -818,7 +819,7 @@ impl<'de> Deserialize<'de> for DxpU64 {
     }
 }
 
-/// What one dxp-compiled group contributes to its [`crate::GroupCode`].
+/// What one dxp-compiled group contributes to its group's code.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompiledProgram {
     /// `ComputeOnDevice.job_bin_ptr` — the device VA execution starts at.

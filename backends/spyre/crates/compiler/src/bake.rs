@@ -1862,20 +1862,15 @@ const PREFILL_RUNGS: [u32; 27] = [
 /// ladder in `dump_wavefront_mega`.
 const SUB_BLOCKED_PREFILL_CEILING: u32 = 128;
 
-// ⛔ THE POOL SIZES ITS SLACK FROM THIS CEILING, so the two cannot be allowed to drift.
-//
-// A continuation chunk's cache write covers the PREFIX BUNDLE'S BAKED ROW COUNT — this ceiling —
-// not the chunk's real length, and `PagedKvPool::WRITE_SLACK` is exactly the amount by which that
-// write may overrun a page. Raise the ceiling without raising the slack and the overrun lands on
-// the next kv head's keys again: a correct first token, then fluent garbage, for every prompt
-// needing a third chunk. A `const` assertion makes that a `cargo build` error instead, in every
-// build that has the pool (`spyre`: its `sdsc_abstract` is the Spyre target's).
+// ⛔ THE POOL'S PROMPT WINDOW IS THIS CEILING. A continuation chunk's cache write covers the PREFIX
+// BUNDLE'S BAKED ROW COUNT — this ceiling — not the chunk's real length, and the window
+// (`PagedKvPool::PREFILL_CHUNK_SLOTS`) is the whole pages that write spans. A `const` assertion
+// keeps the two one number.
 const _: () = assert!(
     PREFILL_RUNGS[PREFILL_RUNGS.len() - 1] as usize
         == scratchy_spyre_bundle::rung::PagedKvPool::PREFILL_CHUNK_SLOTS,
-    "PagedKvPool::PREFILL_CHUNK_SLOTS must equal the PREFILL_RUNGS ceiling — the pool's \
-     WRITE_SLACK is derived from it, and a padded chunk write that overruns by more than the \
-     slack corrupts the next kv head's keys"
+    "PagedKvPool::PREFILL_CHUNK_SLOTS must equal the PREFILL_RUNGS ceiling — a continuation \
+     chunk's cache write is the prefix bundle's baked width, and the window is the pages it spans"
 );
 
 // ⛔ THE LADDER'S OWN SHAPE LAWS (the table is POLICY — measured cost-law discretization,

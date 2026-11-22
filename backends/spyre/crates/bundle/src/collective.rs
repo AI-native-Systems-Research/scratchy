@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE COLLECTIVE PLAN — tensor parallelism's control-block pipeline, as baked data: the world,
 //! the rank, the p2p payload and its stick-column fragments, the receive window, the sids, the
-//! [`TpConsume`] a launch group carries, and the bundle's CB pipeline derived from its groups.
+//! [`TpConsume`](crate::collective::TpConsume) a launch group carries, and the bundle's CB pipeline derived from its groups.
 
 pub use scratchy_tp_world::{Build, PerRank, Rank, TpWorld, World, ranks};
 

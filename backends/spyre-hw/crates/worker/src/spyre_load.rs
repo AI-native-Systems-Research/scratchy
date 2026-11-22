@@ -1119,11 +1119,6 @@ impl SpyreWorker {
             .name("checkpoint-drop".into())
             .spawn(move || drop(gw))
             .ok();
-        // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
-        // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
-        // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
-        // which binds ONLY the manifest's model weights, leaving a synthetic P at ZERO.
-
         // KTIR: ONE resident session over [prefill rungs, decode rungs]. sendnn: N layer-group
         // [prefill, decode] sessions (the host threads the hidden state group→group).
         // Program order: the prefill rungs first, then the decode rungs, each ascending by reach —

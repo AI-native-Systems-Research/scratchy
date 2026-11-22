@@ -107,42 +107,16 @@ impl HeadWidth {
     }
 }
 
-/// [`dev_off`] with an EXPLICIT stick width `stk` (elements per 128-byte stick): 64 for fp16, 128 for
-/// fp8/int8, 32 for fp32. `dev_off` is exactly `dev_off_stk(.., STK)`; [`StickLayout::dev_off`] passes
-/// `self.lanes()` so a device tensor is addressed at its OWN format's stick. This is what makes an fp8
-/// (128-stick, 1-byte) weight addressable in the SAME formula without touching the fp16 path — fp16 has
-/// `stk == STK`, so every existing address is byte-identical.
-pub fn dev_off_stk(dims: &[usize], stick_idx: usize, idx: &[usize], stk: usize) -> usize {
-    debug_assert_eq!(dims.len(), idx.len());
-    if dims.len() == 2 && stick_idx == 1 {
-        let a = dims[0];
-        let (i, j) = (idx[0], idx[1]);
-        (j / stk) * (a * stk) + i * stk + (j % stk)
-    } else {
-        // flat row-major (device [total/64,64] stores host elements in row-major order)
-        let mut off = 0usize;
-        for d in 0..dims.len() {
-            off = off * dims[d] + idx[d];
-        }
-        off
-    }
-}
-
 /// ⭐ THE WIDTH A LAUNCH BINDS — the row count a bundle was BAKED at (`mq` on the emitter side,
 /// `seqs` on the worker side), padding included.
 ///
-/// One of four widths that all travelled as bare integers named `mq`: this baked rung width, the
-/// LIVE request count ([`LiveRows`] — how many requests the scheduler actually admitted this step),
-/// the mask row count ([`MaskRows`] = `nqh * mq`), and the stick-padded row count
-/// (`mq.div_ceil(64) * 64`). With `nqh = 32` the last two coincide at 64 for every `mq <= 2` and
-/// separate at `mq = 4` (128 vs 64), and a 3-live step runs the 4-row rung — so a slot fed the
-/// wrong width is numerically right on every narrow rung and wrong from the first wide one.
+/// One of the widths that travel as integers named `mq`: this baked rung width, the LIVE request
+/// count ([`LiveRows`] — how many requests the scheduler admitted this step), and the stick-padded
+/// row count (`mq.div_ceil(64) * 64`). A 3-live step runs the 4-row rung, so a slot fed the wrong
+/// width is right on the narrow rungs and wrong from the first wide one.
 ///
-/// Every slot that means "rows the launch binds" takes THIS type: the fold grid's row axis
-/// ([`FoldPages::grid`]), the slot map's width ([`SlotMap::of_live`]), the mask's row law
-/// ([`MaskRows::new`], [`PrefixMaskShape::new`]) and the capacities read back off a baked bundle
-/// ([`BakedMaskBlocks::of_placement`]). The constructors name where the width came FROM, so a live
-/// count cannot arrive in a rung slot without saying so at the call site.
+/// Every slot that means "rows the launch binds" takes THIS type. The constructors name where the
+/// width came FROM, so a live count cannot arrive in a rung slot without saying so at the call site.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct RungWidth(NonZeroU32);
 
@@ -288,7 +262,7 @@ impl QueryExtent {
 /// `r`'s answer row is `r·w + selector_lastrow_col(w)`, its window's last BAKED row — the row
 /// whose hidden the lm-head fold extracts, [`selector_lastrow_col`]'s own law stated per
 /// request. Minted ONCE, from the graph's [`QueryExtent`] at the bake; every tail site reads
-/// it, none re-derives a row. The host's window law ([`crate::paged_step`]'s `RowSpan::last`)
+/// it, none re-derives a row. The host's window law (the target's `paged_step::RowSpan::last`)
 /// states the SAME law at the slot — the two are one statement in two spellings, pinned equal
 /// by fixture, never two laws that agree by accident.
 ///
@@ -362,7 +336,7 @@ impl LiveRows {
 /// new tokens, query row `row` (0-based within the chunk) attends new-token column `col` iff `col <= row`
 /// — the token attends itself + all EARLIER new tokens, never a LATER one. Additive mask: 0 when valid,
 /// −∞ when `col > row`. This is the `[mq,mq]` causal block that folds (jointly with the prefix score
-/// [mq,cap]) into ONE softmax per query row. SINGLE SOURCE OF TRUTH for the host's mask fill
+/// `[mq, cap]`) into ONE softmax per query row. SINGLE SOURCE OF TRUTH for the host's mask fill
 /// ([`CausalKey`]) and the Kani proof (`prefill_causal_mask_partition_ok`). An off-by-one here (`col < row`, dropping
 /// the diagonal self-term) or wrong direction (`col >= row`) scrambles causal attention — a
 /// coherence bug with a preserved-ish norm, so it MUST be pinned, not eyeballed.
@@ -387,7 +361,7 @@ pub const ATTN_MASK_NEG: f32 = -(half::f16::MAX.to_f32_const() / 2.0);
 ///   exactly `[0, real)`). A FULL chunk (`real == rows`) is the plain triangle, so every full chunk of
 ///   a rung binds the same mask;
 /// * a decode batch — the rung's rows and how many are `live` (live slot `s` attends its own column;
-///   a padding slot is live 0 complete, [`PadRowReplica`], so it attends column 0).
+///   a padding slot is a replica of live 0, so it attends column 0).
 ///
 /// ⭐ SO IT IS A STAGED CONSTANT, KEYED. A session holds the mask of ONE key at a time. A launch whose
 /// key matches what the session holds re-binds nothing: the host never wrote anything else to that
@@ -472,7 +446,7 @@ impl CausalKey {
 /// row `m-1` is SCATTERED: its stick-group `j` is 64 contiguous elements at `(j·m + (m-1))·64`. The
 /// DEPLOYED extraction copies those `hidden/64` runs one stick at a time (see `LAST_HIDDEN_TID`); a
 /// one-hot `sel[1,m] @ hidden[m,hidden]` cannot be used because `k = m` is never a whole 64-stick, and
-/// a single strided read cannot be expressed at fp16 (see [`StickLayout::group_stride`]). Either way the
+/// a single strided read cannot be expressed at fp16 (dxp's `LX_MODLRFIMM` at `rows·lanes`). Either way the
 /// ROW is the same fact, and this is its SINGLE SOURCE OF TRUTH — shared by the emitter's copy offsets
 /// and the Kani proof (`selector_lastrow_picks_last_row`). A wrong row feeds the WRONG token's hidden to
 /// the lm_head → a wrong first generated token, with everything downstream still perfectly fluent.
@@ -578,7 +552,7 @@ impl ChunkRows {
     /// rather than a free function. Its clamp sends a pad row to the LAST real row — correct here,
     /// because "the last row must carry the last token" is the whole reason it exists. A decode batch's
     /// rows are separate requests whose pad rows must replicate LIVE 0 instead (their K/V write races
-    /// live 0's at one pool cell — see [`PadRowReplica`]), and taking this clamp there is exactly the
+    /// live 0's at one pool cell), and taking this clamp there is exactly the
     /// defect: it gives the pad row the LAST live request's column, so its forward, and therefore the
     /// bytes it writes into live 0's cell, differ from live 0's. As a free function both kinds could
     /// call it; as a method only a chunk can.
@@ -593,62 +567,12 @@ impl ChunkRows {
     }
 }
 
-/// THE PAGED K/V POOL — the one authority for every resident K/V address.
-///
-/// The pre-paged cache is `[nqh, cap, hd]` per layer, so `cap` appears in every per-head base and
-/// the servable context is fixed when the bundle is built: past it, generation dies mid-stream and
-/// the only cure is a re-emit. Here the page index is the OUTERMOST axis, so no address inside an op
-/// mentions the pool size at all — an op is baked at page 0 and the runtime adds
-/// `layer + physical page`. The pool becomes a launch-time allocation and the context limit becomes
-/// memory rather than a constant.
-///
-/// ```text
-///   pool : [page][layer][Kᵀ | V | Knat][kvh][request][ ... ]
-///            Kᵀ   : [kvh][hd][POOL_PAGE_SLOTS]         stick-major on slots — the score kernel
-///            V    : [kvh][POOL_PAGE_SLOTS][hd]         sticked on hd       — the value kernel
-///            Knat : [kvh][POOL_PAGE_SLOTS][hd]         natural K           — the Kᵀ re-transpose source
-/// ```
-///
-/// ⛔ **THE REQUEST IS NOT A DIMENSION HERE AT ALL — IT IS A CHOICE OF PAGES.**
-///
-/// This layout used to put `ROWS = 32` requests side by side inside every page, immediately inside `kvh`,
-/// so that "the distance between two requests" was bakeable geometry (`hd * POOL_PAGE_SLOTS`) and one additive
-/// shift relocated all three planes onto request `r`. That siting is exactly what taught the device what a
-/// request is, and it cost more than it bought:
-///
-/// * every address carried a request term, so the emitter, the runtime and the worker each maintained a
-///   request→row mapping — and prefill and decode DISAGREED about it, which is why a ragged batch produced
-///   wrong tokens while an equal-length batch looked fine;
-/// * a page cost `ROWS` times its own slots (`page_stride` ~1 GB, an 8-page pool 7.6 GB);
-/// * and the widest decode rung was pinned to `ROWS` by a const assert.
-///
-/// Now a page holds SLOTS and a request owns PAGES, through the host's block table — ordinary paged
-/// attention. A request's identity exists only in the host-staged mask. The pool's coordinate is
-/// `(plane, kvh, slot, feat)` with `slot` ABSOLUTE within the page, and nothing below the host can name a
-/// request, so nothing below the host can disagree about one.
-///
-/// Three properties this layout has to have, each paid for by a bug:
-///
-/// * **All three planes in ONE page, in the KV segment.** The re-roll executor advances only the
-///   weight and KV segments per layer, so a plane parked anywhere else is never advanced and every
-///   layer rebuilds its Kᵀ from another layer's keys. And a second POOL would have a base that
-///   depends on the runtime page count, shifting every baked address in it.
-/// * **The page is [`POOL_PAGE_SLOTS`](Self::POOL_PAGE_SLOTS) = the pre-paged `cap`.** A fold covers one page
-///   per launch, so the page IS the swept extent: making it wider than the old cache would sweep
-///   more KV for the same context — a straight performance regression, which is exactly what a
-///   512-slot page cost. Equal to the old cap, a single page's fold is bit-for-bit the work the
-///   baseline did, and longer contexts cost additional launches rather than a wider sweep.
-/// * **GQA-DEDUPED.** The score and value kernels already read only the group representative, so the
-///   `nqh`-sized reservation was `gqa`x dead space.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PagedKvPool {
-    /// DISTINCT kv heads — each group of query heads reads one. Nonzero by construction: a pool
-    /// with no heads is unrepresentable.
-    nkvh: NonZeroU32,
-    /// ⭐ THE HEAD WIDTH, AS A TYPE — minted once, in this pool's own constructor: whole sticks
-    /// by construction, so no reader re-mints (or re-checks) it, and no `as` crosses it.
-    hd: HeadWidth,
-}
+/// THE PAGED K/V POOL'S LADDER — the page the scheduler's blocks tile, the prompt window a
+/// continuation chunk writes, and the rungs baked against them. A request owns pages through the
+/// host's block table, so no baked address names a request or the pool's size: the pool is a
+/// launch-time allocation, and the context a request reaches is memory, not a constant. A page's own
+/// layout (head-major, or token-major for an fp8 pool) is the splice's `PageOrder`.
+pub enum PagedKvPool {}
 
 /// ⛔ THE LARGEST SINGLE dxp GROUP A BUNDLE MAY STAGE (descriptors) — the ONE ceiling the emitter's
 /// gathered-fold chunk split and the bake-side oversized-group guard BOTH read.
@@ -722,7 +646,7 @@ impl SchedulerBlockTokens {
 }
 
 /// ⭐ THE POOL'S ADDRESSABLE PAGE — how many slots one page of the KV pool holds: masks are
-/// blocked by it, the fold sweeps it, a `KvSlot` never exceeds it. A MEASURED POLICY, NOT A
+/// blocked by it and a prompt window spans whole ones. A MEASURED POLICY, NOT A
 /// DERIVATION (see [`PagedKvPool::POOL_PAGE_SLOTS`]'s own rationale for the k it picks).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolPageSlots(std::num::NonZeroU32);
@@ -760,46 +684,12 @@ impl PoolPageSlots {
 }
 
 impl PagedKvPool {
-    ///
-    /// Positions per page.
-    ///
-    /// WAS 256, on the stated reasoning that "the page is the swept extent, so anything larger is a
-    /// regression for the same context". MEASURED, that is false. Holding requests and passes fixed
-    /// and varying only the swept width through the ladder's own rungs: 64 slots 39.5 ms, 128 slots
-    /// 39.0 ms, 256 slots 42.0 ms at eight requests. Four times the sweep costs six percent, because a
-    /// fold pass is a fixed cost — it is also flat in the ROWS it computes (256 rows to 32 changed
-    /// nothing measurable).
-    ///
-    /// What a pass is NOT flat in is how many of them there are. `reps = pages * requests`, so the page
-    /// size sets the pass count: at 576 tokens a 256-slot page is three passes per request and costs
-    /// 137 ms of a bs=8 step against 39 ms at one page. A 1024-slot page makes that context ONE pass.
-    ///
-    /// The ceiling is memory, not time. A page is `nkvh * hd * slots * 2 * layers`, so 1024 slots is
-    /// 125.8 MB and a pool wide enough for 32 one-page requests would be 4 GB — more than the weights.
-    /// That is the trade a 4-bit KV cache removes: four times the positions for the same bytes buys the
-    /// pass reduction without the page growth. Until then the pool must be sized for the batch width
-    /// actually run (`SUPERDSC_POOL_PAGES`).
-    /// REVERTED TO 256 (2026-08-06). 1024 measured a genuine 3.25x on device compute at a 576-token
-    /// context — a fold pass is a fixed cost and `reps = pages * requests`, so a wider page is fewer
-    /// passes (the measurements above stand). But it is not shippable as it stands: a page is
-    /// `nkvh * hd * slots * 2 * layers`, so 1024 slots is 125.8 MB and the DEFAULT pool
-    /// (`DEFAULT_POOL_PAGES.max(widest_rung)` = 32 pages) became 3.84 GB of device memory — larger than
-    /// the 2.64 GB of weights — plus, until the host KV shadow is gone, the same again in host RAM.
-    /// Paying 4x memory for 3.25x on one workload is not a trade to make silently.
-    ///
-    /// Two things unlock it, in order: size the pool to the batch actually being run rather than to the
-    /// widest baked rung, and make a page DENSER instead of BIGGER (a 4-bit KV cache gives four times
-    /// the positions for the same bytes — TurboQuant is already in-tree for the GPU target). Then this goes back
-    /// up and the win comes with it.
-    ///
-    /// ⭐ A MEASURED POLICY, NOT A DERIVATION: 256 is chosen on the measurements above
-    /// (64/128/256 slots cost 39.5/39.0/42.0 ms at eight requests; the 1024-slot page
-    /// measured a genuine 3.25× on device compute, but its DEFAULT pool became 3.84 GB —
-    /// larger than the weights — and was reverted). A DISTINCT QUANTITY from the
-    /// scheduler's block ([`SchedulerBlockTokens::REFERENCE`], the reference's own 128):
-    /// a pool page is a WHOLE NUMBER of scheduler blocks, and k=2 is the policy this
-    /// const states through [`PoolPageSlots::of_scheduler_blocks`] — the type's ONLY
-    /// constructor, so the relation is law, not assert.
+    /// Positions per page: two scheduler blocks. A MEASURED POLICY, NOT A DERIVATION — a wider page
+    /// is fewer passes over a long context (1024 slots measured 3.25× on device compute at a 576-token
+    /// context) but a page is `nkvh · hd · slots · 2 · layers` bytes, and at 1024 slots the default
+    /// pool outgrows the weights. A pool page is a WHOLE NUMBER of scheduler blocks
+    /// ([`SchedulerBlockTokens::REFERENCE`]): [`PoolPageSlots::of_scheduler_blocks`] is the type's
+    /// only constructor, so the relation is law, not assert.
     pub const POOL_PAGE_SLOTS: PoolPageSlots = PoolPageSlots::of_scheduler_blocks(
         SchedulerBlockTokens::REFERENCE,
         match std::num::NonZeroU32::new(2) {
@@ -809,30 +699,20 @@ impl PagedKvPool {
     );
 
     /// ⭐ THE WIDEST PREFILL CHUNK — the baked row count of the prefix-capable prefill bundle, and
-    /// therefore the number of slots ONE continuation chunk's cache write actually touches.
+    /// therefore the slots ONE continuation chunk's cache write touches: every continuation chunk runs
+    /// on that one bundle, so a chunk of 12 real rows still writes the bundle's width of consecutive
+    /// slots, the rest padding. `codegen`'s `PREFILL_RUNGS` ceiling is asserted equal to it.
     ///
-    /// ⛔ IT IS NOT THE CHUNK'S REAL LENGTH. Every continuation chunk runs on that ONE bundle
-    /// (`use_prefix = chunk_start > 0`), and its cache write is a single `[mq, hd]` copy per kv head —
-    /// so a chunk with 12 real rows still writes 128 CONSECUTIVE SLOTS, the last 116 of them padding.
-    /// That is why this number, and not the chunk length, is what the page has to accommodate.
-    ///
-    /// Kept here rather than beside the prefill rung ladder because the POOL is what must make room for
-    /// it; `codegen`'s `PREFILL_RUNGS` ceiling is asserted equal to it, so the two cannot drift.
-    ///
-    /// ⭐ 512 — TWO WHOLE PAGES ([`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES)). A window wider
-    /// than a page is cut, at emission, into one cache-write part per page, each resolving its own page
-    /// through the request's block table — so the window may span whole pages, never part of one. A
-    /// prompt chunked from a page boundary starts every chunk at offset 0, so no padded write needs
-    /// [`chunk_write_start`](Self::chunk_write_start) to step back. It is the ceiling of the ladder, not
-    /// every model's: a model whose causal block stays sub-blocked bakes to 128 (see `codegen`'s
-    /// `PREFILL_RUNGS`), and the runtime writes at the bundle's own baked width either way. (At 96 the
-    /// third chunk of every page stepped back and re-processed the overlap; at 256, one page, a 10k
-    /// prompt ran 40 chunks, each re-reading every weight once.)
+    /// ⭐ 512 — TWO WHOLE PAGES ([`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES)): a window spans
+    /// whole pages, never part of one, so a prompt chunked from a page boundary starts every chunk at
+    /// offset 0. It is the ceiling of the ladder, not every model's: a model whose causal block stays
+    /// sub-blocked bakes to 128 (see `codegen`'s `PREFILL_RUNGS`), and the runtime writes at the
+    /// bundle's own baked width either way. (At one page, a 10k prompt runs 40 chunks, each
+    /// re-reading every weight once.)
     pub const PREFILL_CHUNK_SLOTS: usize = 512;
 
     /// ⭐ PAGES ONE PROMPT WINDOW MAY SPAN — the widest prefill chunk in whole pages (1 when it fits in
-    /// one). A window starting at a page boundary may fill all of them; one starting mid-page stays
-    /// inside that page (see [`chunk_room`](Self::chunk_room)).
+    /// one).
     pub const PREFILL_WINDOW_PAGES: usize =
         Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::POOL_PAGE_SLOTS.as_usize());
 
@@ -884,18 +764,17 @@ impl PagedKvPool {
     /// ⭐ THE WIDTHS A PREFIX-CAPABLE PREFILL BUNDLE IS BAKED AT, out of the prefix-free widths that baked
     /// (`baked`): the top, and one page when the top is wider than a page. Ascending.
     ///
-    /// A continuation chunk is capped at the top width, and [`chunk_write_start`](Self::chunk_write_start)
-    /// leaves every mid-prompt chunk room for a whole window, so only a prompt's LAST chunk is ever
-    /// narrower — and a page is the narrowest a padded write can take without stepping back into slots an
+    /// A continuation chunk is capped at the top width, and every mid-prompt chunk has room for a
+    /// whole window, so only a prompt's LAST chunk is ever narrower — and a page is the narrowest a padded write can take without stepping back into slots an
     /// earlier chunk owns. So a tail of at most one page runs one page wide, and anything longer runs a
     /// full window. Nothing in between: a width that is neither would step its write back across the page
     /// it starts in.
     ///
-    /// ⛔ ONE WIDTH WAS THE MEASURED COST. Only the top was baked, so a 52-row tail ran a full 512-row
-    /// chunk: granite-3.1-2b at ~2k tokens took 460 ms against 384 ms on the 256-row build.
+    /// ⛔ MEASURED: with the top alone, a 52-row tail runs a full 512-row chunk, 460 ms against 384 ms
+    /// on the page-wide rung.
     ///
     /// Empty when nothing baked; just the top when the top fits one page (every model whose causal block
-    /// stays sub-blocked, so its bake is byte-for-byte unchanged).
+    /// stays sub-blocked).
     pub fn prefix_rungs(baked: &[u32]) -> Vec<u32> {
         let page = Self::POOL_PAGE_SLOTS.get();
         let Some(top) = baked.iter().copied().max() else {
@@ -920,9 +799,8 @@ impl PagedKvPool {
     pub const PACKED_WINDOW_MIN_WIDTH: u32 = 8;
 
     /// ⛔ THE CEILING OF A PACKED WINDOW'S WIDTH — MEASURED, NOT DERIVED. Widths past one
-    /// scheduler block refused at the bake when the packed table was first cut (the nuked line's
-    /// measurement, 2026-11-11: `(192, 2)` and `(256, 2)` refused to lower; every width ≤ 128
-    /// baked at every count), so the table stops at the block width and never asks for a rung the
+    /// scheduler block refuse at the bake (measured 2026-11-11: `(192, 2)` and `(256, 2)` refused to
+    /// lower; every width ≤ 128 baked at every count), so the table stops at the block width and never asks for a rung the
     /// bake would refuse — the rung set is exactly what the bake ships.
     pub const PACKED_WINDOW_MAX_WIDTH: u32 = SchedulerBlockTokens::REFERENCE.get();
 
@@ -992,16 +870,6 @@ impl PagedKvPool {
         v
     }
 
-    /// Which prefix rung a continuation chunk runs on: the index into `widths` (ascending, the rungs
-    /// that built) of the smallest width holding the `rows_left` rows of the prompt, else the widest
-    /// (the chunk is then capped at it and the prompt continues). `None` only for an empty ladder.
-    pub fn prefix_rung_for(widths: &[u32], rows_left: u32) -> Option<usize> {
-        widths
-            .iter()
-            .position(|&m| rows_left <= m)
-            .or_else(|| widths.len().checked_sub(1))
-    }
-
     /// ⛔⛔⛔ THE PREFIX-CAPABLE LADDER THAT BAKED MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP — the bake's
     /// proof, panicked on by the macro.
     ///
@@ -1029,12 +897,9 @@ impl PagedKvPool {
     /// ⛔⛔⛔ EVERY PREFIX RUNG THE LADDER ASKED FOR MUST HAVE BAKED. This is the bake's proof, and the macro
     /// panics on it.
     ///
-    /// A prefix rung that does not lower used to be logged and skipped. The host then runs the chunk on the
-    /// next wider rung that did bake (`prefix_rung_for` over what was built), so the build stays green and
-    /// every tail that rung was for pays the wider width. Nothing says so: the log line is build-script
-    /// stderr, which cargo swallows on a successful build. MEASURED, the cost of the one rung this ladder
-    /// adds: without the page rung, granite-3.1-2b's ~2k-token prompt ran its 52-row tail on the window,
-    /// 460 ms against 384.
+    /// A missing prefix rung is otherwise silent: the host runs its chunks on the next wider rung that
+    /// baked, so the build stays green and every tail that rung was for pays the wider width (MEASURED,
+    /// the page rung: a 52-row tail on the 512-row window took 460 ms against 384).
     ///
     /// [`prefix_ladder_tops_the_ladder`](Self::prefix_ladder_tops_the_ladder) proves the TOP baked, which
     /// mid-prompt chunks need to run at all. This proves the rungs BELOW it, which only cost speed when
@@ -1068,233 +933,18 @@ impl PagedKvPool {
         ))
     }
 
-    /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
-    /// past its addressable [`POOL_PAGE_SLOTS`](Self::POOL_PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
-    /// of the next kv head's keys.
-    ///
-    /// ⛔ THIS IS THE LONG-CONTEXT BUG, MADE UNREACHABLE. `PREFILL_CHUNK_SLOTS` was 96, which does not
-    /// divide `POOL_PAGE_SLOTS` (256), so a chunk eventually started with less than a full chunk of room left: with
-    /// chunks clipped to the room remaining, starts land on page offsets 0, 96, 192, and the one at 192
-    /// has 64 slots of room for a 96-slot write. The 32-slot tail used to land at
-    /// `block + POOL_PAGE_SLOTS*hd`, which IS the next kv head's block — so kv heads 1..nkvh lost the first
-    /// 32 slots of their context. On card that read as a correct FIRST token (the last chunk scores from
-    /// its own freshly computed K/V) and then fluent garbage from the second on, for every prompt long
-    /// enough to need a third chunk. Measured boundary: coherent at a 192-token prompt, garbage at 204.
-    ///
-    /// `POOL_PAGE_SLOTS % PREFILL_CHUNK_SLOTS` is the room the last chunk of a page gets; the write needs a
-    /// whole `PREFILL_CHUNK_SLOTS`, so the shortfall is the difference. Zero when the chunk divides the
-    /// page, which is the only configuration that needs no slack at all.
-    /// ⛔ ZERO, AND IT MUST STAY ZERO — the plane is EXACTLY the addressable page.
-    ///
-    /// This was `PREFILL_CHUNK_SLOTS - POOL_PAGE_SLOTS % PREFILL_CHUNK_SLOTS` (= 32), widening every plane so a
-    /// prefill chunk's PADDED write had dead space to land in. **MEASURED: that broke hd=128.** On
-    /// granite-3.1-8b it turned ` Rome. Q` / ` Madrid. Q` into ` Romes,` / ` Madridge.` — the right answer
-    /// plus corruption — and forcing this to 0 restored them to the byte-for-byte 2b outputs. Some consumer
-    /// of the feature-stick GROUP stride does not follow this constant at `hd > 64`, where a head spans two
-    /// sticks; auditing the V write/read, Knat, Kᵀ and Q did not find it.
-    ///
-    /// The padded write is instead kept inside the page by the HOST choosing the write slot
-    /// ([`PagedKvPool::chunk_room`] clips a chunk to its page, and a chunk whose PADDED window would still
-    /// leave the page starts at the NEXT page instead, taking a [`KvHistory`] hole the mask already masks).
-    ///
-    /// ⭐ PREFER THE FIX THAT CHANGES THE FEWEST ADDRESSES. A stride EVERYTHING reads is the worst place to
-    /// solve a problem the host can solve by choosing one number differently — "just +32 slots" reached every
-    /// plane, every kv head and every feature stick at every head dim.
-    pub const WRITE_SLACK: usize = 0;
-
-    /// ⭐ THE PLANE'S PHYSICAL SLOT EXTENT — what separates one kv head's block from the next.
-    ///
-    /// DISTINCT FROM [`POOL_PAGE_SLOTS`](Self::POOL_PAGE_SLOTS), which is how many slots are ADDRESSABLE: masks are
-    /// blocked by it, the fold sweeps it, and a [`KvSlot`] never exceeds it. The extra
-    /// [`WRITE_SLACK`](Self::WRITE_SLACK) slots exist only so a padded chunk write has somewhere harmless
-    /// to land, and nothing ever reads them — keeping the two numbers separate is what lets the overrun
-    /// be absorbed without widening anything the attention actually sweeps.
-    pub const PLANE_SLOTS: usize = Self::POOL_PAGE_SLOTS.as_usize() + Self::WRITE_SLACK;
-
-    // REQUESTS ONE PAGE HOLDS — the extent of the pool's request dimension, and the widest batch any
-    // launch can express.
-    //
-    // A BAKE CONSTANT, and it has to be: the decode rungs and the prefill rungs are separate baked
-    // programs sharing one KV segment by alias, so a value that differed between them would give the
-    // same tensor two layouts and one of them would read the other's keys. Being a `const` is what
-    // makes that unexpressible rather than checked.
-    //
-    // 32 = the widest rung of `BATCH_RUNGS`, and it costs NOTHING against the pool the flat layout
-    // defaulted to. There the default was `8 pages * widest_rung` = 256 pages, each 31.5 MB at
-    // granite-3.1-2b, because a run had to be cut per row; here it is 8 pages of `32 * 31.5 MB`. Same
-    // 8 GB, same 2048 positions per request, same 32 concurrent requests — the bytes moved from the
-    // page count to the page.
-    //
-    // ⛔ `ROWS` IS GONE. A page used to hold `ROWS = 32` REQUESTS side by side, which is what taught the
-    // device what a request is: every address carried a request term, the head stride was `ROWS` request
-    // strides, and a page cost `ROWS`x its own slots (~1 GB, so an 8-page pool was 7.6 GB).
-    //
-    // A page is now SLOTS AND NOTHING ELSE, and a request owns a LIST OF PAGES through the host's block
-    // table — ordinary paged attention. Request identity exists only in the host-staged mask. Two things
-    // follow that were the whole bug family: prefill and decode cannot disagree about which row a request
-    // occupies, because there is no such row; and a ragged batch has no per-request hole to mask, because
-    // requests do not share a page's slot axis.
-
-    /// ⛔ THERE IS NO `MAX_PAGES_PER_ROW`, AND ITS ABSENCE IS THE LAW.
-    ///
-    /// It was a hand-picked const (6, then 16, then 32) that bound a row's context before the
-    /// pool's memory ever got a vote — 8192 tokens reachable inside a pool that could hold ~70k,
-    /// on a card with 100 Gi. The prefix mask's block count is now DERIVED at bake —
-    /// `compute_bundle_layout` reserves `MAX_SEGMENT_BYTES / page_bytes` blocks, the most pages
-    /// ONE region of KV can hold, which is ≥ the pages any runtime pool can be budgeted for
-    /// (`max_single_allocation()` is one region) — so the reservation covers every pool any card
-    /// can express and MEMORY is the binding constraint at runtime, exactly as it is on a GPU.
-    /// The number itself lives in each bundle's own pmask placement, read back as
-    /// [`BakedMaskBlocks`]; the per-step `MaskBlocks::fits` check and `RowPages::within_mask_reach`
-    /// enforce it from the artifact, never from a const.
-    ///
-    /// The `rows_are_requests == false` arm (solo decode, prompt chunks) reserves the SAME
-    /// derived count — one expression feeds both arms, so the old guard tying a separate
-    /// `MAX_PAGES_PER_REQUEST` to this const is gone with the pair of constants it related.
-    ///
-    /// THE DECODE BATCH LADDER, so the widths that get baked and the requests a page holds cannot
-    /// disagree. A rung wider than [`ROWS`](Self::ROWS) would bake a launch whose request axis walks
-    /// off the end of the page into the next kv head's keys — silently, and only for the highest rows.
-    /// ⛔ ONLY RUNGS THE PREFIX MASK CAN SERVE AT THE DERIVED PAGE CEILING.
-    ///
-    /// A gathered fold takes ONE mask block per page, and every rung reserves the same derived
-    /// block count (see the note above), so EVERY rung serves the full depth at full width. An
-    /// UNGATHERED rung body — per-(row, page) fold — is still bounded by `blocks / width`, and the
-    /// launch-side `MaskBlocks::fits` check refuses such a step loudly rather than letting it read
-    /// unstaged mask bytes.
+    /// THE DECODE BATCH LADDER — the request counts a decode batch rung is baked at. A page holds
+    /// slots and no request, so a rung's width is bounded by the pool's pages, a host allocation, and
+    /// never by the page.
     pub const BATCH_RUNGS: [u32; 5] = [2, 4, 8, 16, 32];
 
-    /// THE WIDEST BAKED RUNG, as a const — how many ROWS a pool must be able to give a page each.
-    ///
-    /// A const rather than a runtime max over the ladder, because the pool has to be sized before any
-    /// batch exists and the answer is known at bake. It is the factor the pool's page count scales by:
-    /// every row owns its own pages now, so `pool_pages = pages_per_row * WIDEST_BATCH_RUNG`.
+    /// THE WIDEST BAKED RUNG, as a const — the requests a pool must be able to give pages each, known
+    /// at bake, before any batch exists: `pool_pages = pages_per_row * WIDEST_BATCH_RUNG`.
     pub(crate) const WIDEST_BATCH_RUNG: u32 = Self::BATCH_RUNGS[Self::BATCH_RUNGS.len() - 1];
-
-    // ⛔ NO `TARGET_POSITIONS_PER_ROW`, AND NO LADDER-FITS ASSERT. The target const was the depth
-    // of a deleted depth-vs-width trade (`widest_reaching` — see `PoolRows::for_admission`'s doc for
-    // how the free list dissolved it), and it tracked the mask ceiling by reading the const that
-    // no longer exists. The ladder-fits assert tied the widest decode rung to the requests a page
-    // holds; a page holds no requests now, so a batch rung is bounded by the pool's PAGES, which is
-    // a host allocation question and not a baked one — and the depth a row may reach is the
-    // artifact-derived pmask ceiling, enforced per launch.
-
-    pub const fn new(nkvh: NonZeroU32, hd: HeadWidth) -> PagedKvPool {
-        PagedKvPool { nkvh, hd }
-    }
-
-    /// DISTINCT kv heads, as the nonzero count the pool's own field already is — the reader that
-    /// needs the integer calls `.get()` at its boundary and never re-proves it nonzero.
-    pub const fn nkvh(&self) -> NonZeroU32 {
-        self.nkvh
-    }
-
-    /// THE (kv head, request) CELL INDEX inside a plane — the ONE place the `ROWS` factor is written.
-    ///
-    /// Every per-head base below is `block_index(kvh) * <block elements>`, and the emitter's nests
-    /// reproduce the same base as `.block(block_index(kvh))` over the block's own footprint. Naming it
-    /// once is the guard: the head stride and the request stride cannot drift apart, because the head
-    /// stride IS `ROWS` request strides.
-    ///
-    /// Row 0, deliberately. The live request's row is a RUNTIME fact (which pool row it holds for its
-    /// lifetime), so it is added by the launch as a segment shift, never baked into an op — the same
-    /// division of labour the physical page already had.
-    /// ELEMENTS IN ONE KV HEAD'S BLOCK of a plane — `hd * POOL_PAGE_SLOTS`, the whole of one head's page.
-    ///
-    /// This replaced `block_index(kvh) = kvh * ROWS` and `request_stride`. The head stride used to be
-    /// `ROWS` request strides; it is now simply a head's own footprint, so there is no second quantity to
-    /// drift against.
-    /// ⭐ HOW MANY SLOTS A PREFILL CHUNK STARTING AT `start` MAY CLAIM — the room left in its window.
-    ///
-    /// A chunk's cache write is cut into one part per PAGE, each part resolving its own page through the
-    /// request's block table (`EmittedOp::kv_slot_offset`) — so a chunk starting at a page boundary may
-    /// fill all [`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES) pages of its window, and part `p`
-    /// lands at the start of the window's page `p`.
-    ///
-    /// ⛔ A CHUNK STARTING MID-PAGE STAYS INSIDE THAT PAGE. A part addresses the page its FIRST row's slot
-    /// falls in and writes its rows consecutively from there, so a part that begins mid-page cannot cross
-    /// the page end: the slots past it belong to a page that part does not address, and writing real rows
-    /// there would put them somewhere nothing reads them back from. Hence the room is the page remainder
-    /// whenever the offset is not zero. (A padded window wider than a page never starts mid-page —
-    /// [`chunk_write_start`](Self::chunk_write_start) steps it back to the page start.)
-    ///
-    /// Total, not fallible: every slot is inside some page, so there is always at least one slot of room.
-    pub fn chunk_room(start: KvSlot) -> SlotCount {
-        let page = Self::POOL_PAGE_SLOTS.get();
-        match start.get() % page {
-            0 => SlotCount::new(Self::PREFILL_WINDOW_PAGES as u32 * page),
-            off => SlotCount::new(page - off),
-        }
-    }
-
-    /// ⭐ THE PHYSICAL EXTENT, TYPED — the only way the address law can obtain it, so the ADDRESSABLE count cannot
-    /// be substituted for it in a stride.
-    pub(crate) const fn plane_extent() -> PlaneExtent {
-        PlaneExtent(Self::PLANE_SLOTS as u32)
-    }
-
-    pub fn plane_block_elems(&self) -> u64 {
-        // `PLANE_SLOTS`, NOT `POOL_PAGE_SLOTS`: this is the distance to the NEXT KV HEAD, so it is exactly the
-        // quantity a padded chunk write overruns. Sizing it by the addressable slot count is what put
-        // that overrun on top of the next head's keys.
-        // Physical, for the same reason: this is the distance to the NEXT KV HEAD, which is exactly what a padded
-        // chunk write overruns.
-        u64::from(self.hd.get()) * u64::from(Self::plane_extent().get())
-    }
-
-    /// ⭐⭐⭐ THE GATHER'S QUANTUM — the ELEMENTS in one 64-slot Kᵗ block, `hd * POOL_STICK`.
-    ///
-    /// This is the unit an index entry names. The whole pool is a uniform array of these: every stride
-    /// it defines ([`plane_block_elems`](Self::plane_block_elems) `= 4 *` this, the plane, layer and
-    /// page strides above it) is an exact multiple, so ONE integer reaches any cell and
-    /// `addr = idx * skip_addr + base` is exact whenever `skip_addr` divides this.
-    ///
-    /// ⛔ NOT `plane_block_elems`, WHICH IS FOUR OF THESE. That is the distance to the next KV HEAD; a
-    /// gather stepping by it would skip three quarters of every head's keys and still bake.
-    /// `the_pool_is_a_uniform_array_of_stick_blocks` holds the two apart.
-    pub fn stick_block_elems(&self) -> u64 {
-        u64::from(self.hd.get()) * STK as u64
-    }
-
-    /// ⭐ THE ENTRY IN **BYTES** — what one index step advances the address by. `stick_block_elems`
-    /// times the pool's word length; stated here so the `* 2` is not respelled at every caller.
-    pub fn stick_block_bytes(&self) -> u64 {
-        self.stick_block_elems() * 2
-    }
-
-    /// Elements in one K-or-V plane of a page+layer — `nkvh` kv heads, each holding one page.
-    ///
-    /// ⭐ `nkvh` BLOCKS, with the block size stated ONCE in
-    /// [`plane_block_elems`](Self::plane_block_elems). It used to spell `hd * POOL_PAGE_SLOTS` again here,
-    /// which is the same number only while nothing separates the addressable page from the physical
-    /// plane — and once [`WRITE_SLACK`](Self::WRITE_SLACK) did, the two disagreed: the stride between
-    /// kv heads grew while the PLACEMENT reserved from this function did not, so kv head 7 addressed
-    /// 258048+8192 B inside a 262144 B footprint. The emitter's own placement guard caught it at build
-    /// time ("the op addresses PAST its own tensor"), which is exactly the argument for deriving both
-    /// from one function rather than two copies of one product.
-    ///
-    /// The KV segment is three placements of `plane_stride` advanced by
-    /// [`layer_stride`](Self::layer_stride), and the runtime's page stride is derived from those same
-    /// placement deltas — so this is the one number that sizes the pool.
-    pub(crate) fn plane_stride(&self) -> u64 {
-        u64::from(self.nkvh.get()) * self.plane_block_elems()
-    }
-
-    /// Elements in one page+layer: Kᵀ, then V, then natural K.
-    pub fn layer_stride(&self) -> u64 {
-        3 * self.plane_stride()
-    }
-
-    /// Head width this pool laid itself out for, AS THE TYPE — the one value every reader
-    /// takes; no use site re-mints it.
-    pub const fn head_width(&self) -> HeadWidth {
-        self.hd
-    }
 }
 
-/// ⭐⭐⭐ HOW A LAUNCH'S CAUSAL NEW-TOKEN BLOCK IS EMITTED — one law, read by the emitter (`assemble_attn`)
-/// and by the host that tiles the causal mask (`forward_tape::causal_tiled`), so the mask's layout and the
-/// ops that read it cannot disagree.
+/// ⭐⭐⭐ THE FORM OF A LAUNCH'S CAUSAL NEW-TOKEN BLOCK — read by the bake to admit a prefill rung
+/// past the sub-blocked ceiling.
 ///
 /// ⭐ WHY THERE ARE TWO. The block is `mq_pad` columns wide. Folded as `mq_pad / 64` stick-wide sub-blocks
 /// per QUERY HEAD, its op count grows with the chunk's width: granite-2b at 256 prompt rows spends about
@@ -1306,10 +956,9 @@ pub enum NewBlockForm {
     /// Stick-wide sub-blocks folded per query head: decode, every batch, every prompt rung that is not a
     /// whole number of sticks, and every head dim past [`NewBlockForm::CHUNK_MAX_SLABS`].
     SubBlocks,
-    /// One block per chunk ROW BLOCK ([`ChunkRowBlocks`]: a kv head at one feature slab, a query head
-    /// above it) over all `mq_pad` columns: a prompt chunk whose width is a whole number of sticks (so
-    /// its new-V block is exactly `mq_pad` rows and PV can contract it whole) — the split-KV chunk's own
-    /// `[rows, slots]` blocks, see [`ChunkScratch`].
+    /// One block per chunk ROW BLOCK (a kv head at one feature slab, a query head above it) over all
+    /// `mq_pad` columns: a prompt chunk whose width is a whole number of sticks (so its new-V block is
+    /// exactly `mq_pad` rows and PV can contract it whole).
     Chunk,
 }
 
@@ -1333,106 +982,6 @@ impl NewBlockForm {
         } else {
             NewBlockForm::SubBlocks
         }
-    }
-}
-
-/// ⭐⭐⭐⭐⭐ THE KV POOL'S STICK WIDTH, DERIVED FROM THE FORMAT ITS PLANES ACTUALLY HOLD — never a bare 64.
-///
-/// ⛔ AT head_dim 128 THIS NUMBER HAS A TWIN, AND THAT IS THE WHOLE HAZARD:
-///
-/// | quantity | value on granite-8b |
-/// |---|---|
-/// | `head_dim` | **128** |
-/// | **fp8** elems-per-stick | **128** |
-/// | fp16 elems-per-stick | 64 |
-/// | `hd / fp16_stick` (slabs) | 2 |
-/// | `hd / fp8_stick` (slabs) | **1** |
-///
-/// The MODEL is fp8 — its weights are — but the KV planes and every attention operand are **fp16**
-/// (`matmul_opspec_off::<Fp16>`). So at head_dim 128, `head_dim` and the fp8 stick width are the SAME NUMBER, and
-/// any site that takes "the stick" without saying WHICH FORMAT'S stick gets one slab where it needs two, or
-/// treats a head as one stick when it spans two. At head_dim 64 the two disagree (64 vs 128) and the mistake is
-/// visible; at 128 they coincide and it is not. That is the defect shape this whole file's newtypes exist to
-/// prevent, in the one place that was still a literal.
-///
-/// Naming the provenance costs nothing and makes the question askable: this is `Fp16`'s stick because the POOL
-/// holds fp16, and if a future pool holds fp8 planes this line is where that changes — not fifteen `64`s.
-const STK: usize = POOL_STICK as usize;
-
-/// ⭐⭐⭐⭐ A PLANE'S **PHYSICAL** SLOT EXTENT — the distance to the next kv head, not the addressable count.
-///
-/// ⛔ `POOL_PAGE_SLOTS` AND `PLANE_SLOTS` ARE BOTH 256 AND MEAN DIFFERENT THINGS. Addressable: masks are blocked by it,
-/// the fold sweeps it, a `KvSlot` never exceeds it. Physical: what separates one kv head's block from the next,
-/// and therefore the quantity a padded chunk write overruns. They differ by `WRITE_SLACK`, which is 0 today —
-/// **and was 32 once, which BROKE head_dim 128** (` Rome. Q` became ` Romes,`), because the extra slots move the
-/// feature-stick GROUP stride that every reader re-derives and a head spans two sticks above hd=64.
-///
-/// So this is a coincidence with a proven failure history: the two were equal, a commit made them differ, and the
-/// difference reached the addresses through expressions that could not say which extent they meant. A type at the
-/// one site where both appear is what makes the substitution refuse to compile.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct PlaneExtent(u32);
-
-impl PlaneExtent {
-    /// The physical extent, for the stride arithmetic that is the only consumer.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// WHICH PLANE OF A PAGE+LAYER — the three copies of the same keys the attention needs in different
-/// orders. Named, because "2" meaning Kᵀ is the sort of thing a comment has to say.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KvPlane {
-    /// Natural K, `[POOL_PAGE_SLOTS, hd]` — what the cache write produces.
-    Knat,
-    /// V, `[POOL_PAGE_SLOTS, hd]` — the value kernel.
-    V,
-    /// Transposed K, `[hd, POOL_PAGE_SLOTS]` — the score kernel.
-    Kt,
-}
-
-/// A SLOT OF THE KV POOL — where one key/value pair lives inside a request's page row.
-///
-/// ⛔ NOT a token count, NOT a byte offset, NOT a row, NOT a page. Those are the other four small
-/// integers in scope here, and a bare `u32` lets any of them be passed for this one: a launch slot
-/// passed as a pool row cost a session (`KvRow` vs `LaunchSlot` exist for that reason), and one
-/// untyped `kv_request` produced seven separate bugs. A slot count is [`SlotCount`], deliberately a
-/// different type, because "how many slots" and "which slot" are not interchangeable either.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
-pub struct KvSlot(u32);
-
-impl KvSlot {
-    /// The first slot of a page row. The one slot that needs no derivation.
-    pub const ZERO: KvSlot = KvSlot(0);
-
-    /// A slot named by its index. Total: every `u32` is a slot of some pool, and whether it is a slot
-    /// this REQUEST holds is [`KvHistory::contains`]'s question, not this constructor's.
-    pub const fn new(i: u32) -> KvSlot {
-        KvSlot(i)
-    }
-
-    /// The index, for addressing and for printing. Named rather than `From`, so a slot cannot silently
-    /// become a count, a row, or a byte offset at a call site.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// A NUMBER OF SLOTS — a prefill chunk's width, or 1 for a decode token. Distinct from [`KvSlot`]
-/// because a count added to a count is a count while a slot added to a slot is nothing at all.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
-pub struct SlotCount(u32);
-
-impl SlotCount {
-    pub const ONE: SlotCount = SlotCount(1);
-
-    pub const fn new(n: u32) -> SlotCount {
-        SlotCount(n)
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0
     }
 }
 
@@ -1468,16 +1017,13 @@ pub fn decode_batch_causal_col_valid(col: usize, row: usize) -> bool {
     col == row
 }
 
-/// A ROW OF THE LAUNCH HAPPENING NOW — `0..width` of the rung being run, and the index every op's
-/// `kv_request` names. Minted only by [`SlotMap`], so a slot past the rung's width does not exist.
+/// A ROW OF THE LAUNCH HAPPENING NOW — `0..width` of the rung being run.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LaunchSlot(usize);
 
 impl LaunchSlot {
-    /// The only slot a SINGLE-row launch has — every prefill and every unbatched decode. There is no
-    /// batch to be a row of, so there is nothing for a [`SlotMap`] to lay out; naming it here keeps
-    /// slot 0 from being written as a bare `0` at those call sites, which is how a KV row came to be
-    /// passed as a slot in the first place. Matches `fold_plan::LaunchWidth::Single`.
+    /// The only slot a SINGLE-row launch has — every prefill and every unbatched decode; naming it
+    /// keeps slot 0 from being written as a bare `0` where a slot is meant.
     pub fn solo() -> LaunchSlot {
         LaunchSlot(0)
     }

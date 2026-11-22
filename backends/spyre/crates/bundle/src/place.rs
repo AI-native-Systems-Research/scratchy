@@ -17,9 +17,8 @@ use std::fmt;
 
 /// What a synthetic intermediate IS — the role it plays for the tensor it derives from.
 ///
-/// ⛔ THESE ARE NOT NAME SUFFIXES. Every one of these was a `format!("{out}_rot")`-style
-/// string built at one site and matched at another, which is a join on a spelling. The role
-/// is a fact about the lowering, so it is a value; the spelling exists only in [`Display`].
+/// ⛔ THESE ARE NOT NAME SUFFIXES: the role is a fact about the lowering, so it is a value; the
+/// spelling exists only in its `Display`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SynthRole {
     // ── rope ──
@@ -49,7 +48,7 @@ pub enum SynthRole {
     FqMm,
     FqRaw,
     /// ⭐ ONE amax PARTIAL SLOT — the `[m, 64]` max a SINGLE time-slice of the wide reduce produced,
-    /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
+    /// before the `maximum` combine folds them into [`Self::FqAmax`]. Indexed (like `Blk`) because the number
     /// of partials is the reduce's own time-tile count, known only at bake.
     FqAmaxP(u32),
     /// ⭐ ONE SEEDED-REDUCE PARTIAL SLOT — the `[rows, stick]` result a SINGLE time-slice of a
@@ -240,18 +239,15 @@ impl fmt::Display for SynthRole {
 pub enum PlaceId {
     /// A buffer the CALLER numbered — the only kind the host ever binds.
     ///
-    /// The number is the caller's, carried in on
-    /// [`KtirNode::bindings`](crate::ktir_node::KtirNode::bindings) as a
-    /// [`BufferId`](crate::ktir_node::BufferId); this crate only names it and looks it up in the
-    /// caller's [`BundleLayout`](crate::placement::BundleLayout). Whatever the number MEANS to the
-    /// producer — a graph tensor index, a Triton buffer slot — is a fact of that side of the door and
-    /// not of this type.
+    /// The number is the caller's, carried in on a program's bindings as a
+    /// [`BufferId`](crate::program::BufferId); this crate only names it and looks it up in the
+    /// caller's [`BundleLayout`](crate::BundleLayout). Whatever the number MEANS to the producer — a
+    /// graph tensor index, a Triton buffer slot — is a fact of the producer and not of this type.
     Act(u32),
     /// An intermediate the lowering invented, derived from `of`. Device-internal.
     Synth { of: u32, role: SynthRole },
     /// An OP-LOCAL LX pin, derived from `of` — scratch written by one op and read by the next inside
-    /// one program, sharing its class's slot. Declared, slotted and spelled ONLY by its pair
-    /// ([`crate::emit::lx_op_local_pair`]): every layout constructor takes a [`SynthId`], which has
+    /// one program, sharing its class's slot. Every layout constructor takes a [`SynthId`], which has
     /// no variant for it.
     OpLocal { of: u32, role: OpLocalRole },
 }
@@ -268,7 +264,7 @@ pub struct OpLocalRole(OpLocalKind);
 /// Which op-local pin an [`OpLocalRole`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OpLocalKind {
-    /// The gained rmsnorm's `1/√(E[x²]+eps)`, read back at its E[x²] lane by the normalising
+    /// The gained rmsnorm's `1/√(E(x²)+eps)`, read back at its `E(x²)` lane by the normalising
     /// multiply.
     Rinv,
 }
@@ -320,10 +316,9 @@ impl PlaceId {
     }
 }
 
-/// A placed id a LAYOUT CONSTRUCTOR takes ([`crate::placement::BundleLayout::synth`] and its
-/// siblings, [`crate::placement::syn`]) — a caller-numbered buffer or a synthetic. It has no op-local
-/// variant, so an op-local pin cannot be declared, slotted or spelled through any of them: its one
-/// door is [`crate::emit::lx_op_local_pair`]. Every way INTO it ([`SynthId::Act`], `From<u32>`,
+/// A placed id a LAYOUT CONSTRUCTOR takes — a caller-numbered buffer or a synthetic. It has no
+/// op-local variant, so an op-local pin cannot be declared, slotted or spelled through any of them.
+/// Every way INTO it ([`SynthId::Act`], `From<u32>`,
 /// [`PlaceId::synth`], [`SynthId::synth`]) produces one of these two variants by its type; there is
 /// no conversion from a [`PlaceId`].
 ///

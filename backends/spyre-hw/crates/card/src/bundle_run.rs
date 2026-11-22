@@ -737,8 +737,8 @@ fn run_loaded(
     // program over a buffer nobody filled — `declare_sources`' own completeness check. No source is
     // resident here: a single-kernel bundle has no prefix-KV cache for the device to fill.
     // ⛔⛔⛔ `declare_sources(n)` MEANS "ids 0..n ARE CALLER-FILLED", BY ID AND NOT BY COUNT. Our
-    // producer places reserved device constants at ids near u32::MAX (`RMS_INVCOLS_TID` is
-    // 4294967275), so counting binds declared ids 0..4 — which claimed a t3 that does not exist and
+    // producer places reserved device constants at ids near u32::MAX (`SCRATCH_TID` is
+    // 4294967289), so counting binds declared ids 0..4 — which claimed a t3 that does not exist and
     // said nothing about the reserved one. MEASURED: every activation segment then came back
     // `unreadable` and seg4's D2H failed rc=-1, while seg1 (the weights, staged) read fine.
     //

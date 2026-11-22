@@ -3,247 +3,37 @@
 //! disjoint at COMPILE TIME.
 //!
 //! ⭐ THIS IS THE PRODUCER↔LOWERING ABI, which is why it belongs in this crate rather than behind a
-//! trait. Each id names a tensor the *lowering* invents or requires and the caller binds: the RoPE
-//! permutation matrix, the attention scale/mask/causal constants, the rmsnorm Newton constants, the
-//! fp8 clamp bounds, the head-major selectors. A third-party KTIR producer has to agree with these
-//! numbers to bind anything, so they are part of the interface, not of scratchy's plan.
+//! trait. Each id names a tensor the lowering invents or requires and the caller binds: a rung's
+//! scratch, the stick constants its descriptors read, the paged step's host tables, a packed
+//! prefill's window tables, the tensor-parallel receive window. A third-party KTIR producer has to
+//! agree with these numbers to bind anything, so they are part of the interface.
 //!
-//! ⛔ AND THE ARITHMETIC IS THE POINT. Every id used to be raw `SOME_BASE - index` with no bound on
-//! the index and nothing proving the regions disjoint — see [`TidRegion`] for what two tensors
-//! landing on one tid costs on a device with no stack to attach to.
+//! ⛔ AND THE ARITHMETIC IS THE POINT. Every id is a slot of a
+//! [`TidRegion`](crate::reserved_tids::TidRegion), every region is in
+//! [`RESERVED_REGIONS`](crate::reserved_tids::RESERVED_REGIONS), and the regions are proven
+//! disjoint at compile time — two tensors on one tid would share one placement, on a device with
+//! no stack to attach the fault to.
 
-/// RESERVED tensor id for the RoPE rotate-half permutation matrix `P` (in-bundle
-/// RoPE). It is NOT a SubtileIR tensor (no model source produces it) — the emitter
-/// references it as `t{ROPE_P_TID}` in main's `lower_rope_node` `matmul(x, P)`, places it
-/// as a seg0 ACTIVATION in `compute_bundle_layout` (re-bound per step like RMS_SEED —
-/// a seg1 weight is only H2D'd at PrepareModel, which binds ONLY the manifest weights,
-/// so a synthetic seg1 P would stay ZERO), and the WORKER recognizes this id to
-/// synthesize + bind the fixed matrix each step. Chosen far above any real tensor id.
-pub const ROPE_P_TID: u32 = u32::MAX - 1;
-
-/// ⭐ THE RESERVED RANGE'S OWN FLOOR — tensor ids at or above this are the producer's
-/// RESERVED DEVICE CONSTANTS, not kernel parameters. The regions above count down from
-/// `u32::MAX`; this const states where the reserved space ends, with headroom for the
-/// regions that exist and any the ladder adds. ONE home (it lived as a private literal
-/// in the bundle runner before): the runner that must decide "reserved vs parameter"
-/// reads it here, so the range's extent and its use cannot drift apart.
+/// ⭐ THE RESERVED RANGE'S OWN FLOOR — tensor ids at or above this are the producer's one-off
+/// sentinels, never kernel parameters: the runner that decides "reserved vs parameter" reads it
+/// here.
 pub const RESERVED_TID_FLOOR: u32 = u32::MAX - 1024;
 
-/// RESERVED tensor id for the attention `scale` constant (`1/sqrt(head_dim)`), a
-/// `[1,1]` fp16 the worker synthesizes + binds (seg1). Shared across all layers.
-pub const ATTN_SCALE_TID: u32 = u32::MAX - 2;
-
-/// RESERVED tensor id for the attention additive PREFIX length-mask `[mq, cap]` (0
-/// on valid prefix cols `[0..p)`, −inf elsewhere) — a per-step ACTIVATION (seg0) the
-/// worker binds each step. Broadcast over the nqh batch. Shared across layers.
+/// RESERVED tensor id for the attention's additive PREFIX length-mask `[mq, cap]` (0 on valid
+/// prefix columns, −inf elsewhere): a per-step activation the worker binds, shared across layers.
 pub const ATTN_MASK_TID: u32 = u32::MAX - 3;
-
-/// RESERVED tensor id for the attention additive CAUSAL mask `[mq, mq_pad]` over the
-/// NEW chunk (0 where new token i attends new token j ≤ i, −inf above the diagonal
-/// and on the `[mq..mq_pad)` stick-pad) — a per-step ACTIVATION (seg0) the worker
-/// binds (the `triu(-inf,diag=1)` of the reference SDPA). Broadcast over nqh. For
-/// decode (mq=1) it is `[1, mq_pad]` with col 0 = 0 (the token attends itself).
-pub const ATTN_CAUSAL_TID: u32 = u32::MAX - 4;
-
-/// RESERVED tensor id for the RMSNorm Newton-rsqrt SEED FLOOR constant (`≈1e-4`), a
-/// `[1,1]` fp16 the worker synthesizes + binds (seg0 activation). The decomposed rmsnorm
-/// computes `inv = 1/√meps` by a range-safe Newton iteration `y ← y·(1.5 − 0.5·meps·y²)`
-/// (uses `meps` DIRECTLY — no `reciprocal(meps)` that underflows fp16 for large residuals).
-/// Its seed is `max(reciprocal(meps), SEED_CONST)`: `reciprocal(meps)` is a good seed for
-/// small meps (early layers) and underflows→~0 for large meps, where this floor takes over —
-/// so ~10 iterations converge across the whole residual-stream dynamic range. The iteration
-/// constants `1.0/0.5/1.5` are derived ON-CARD from this one bound value via bounded
-/// reciprocals (`1 = SEED·recip(SEED)`, `½ = recip(1+1)`, `1½ = 1+½`), so only ONE const
-/// needs binding. (Sengraph gets a working native `Rsqrt` free from CompileGraph; the
-/// SuperDSC per-op-dxp `rsqrt`/`sqrt` return the unrefined seed, so we build it explicitly.)
-pub const RMS_SEED_TID: u32 = u32::MAX - 5;
 
 /// RESERVED tensor id for a rung's scratch: the one device-only region every program's
 /// intermediates are packed into, in the intermediate segment.
 pub const SCRATCH_TID: u32 = u32::MAX - 6;
 
-/// RESERVED tensor id for the RMSNorm `1/cols` constant (`[1,stick]`, worker-bound = `1/hidden`). Used
-/// ONLY by the mq>1 (prefill) SUM-BASED amax: reduce-MAX is unusable on a multi-row TENSOR (returns seed 0
-/// even with a per-row mb=1 slice — CONFIRMED, Kani `rmsnorm_max_reduce_seeds_on_multirow_tensor`), so amax
-/// = `sum|x|` via a MULTI-ROW SUM. Pre-scaling `|x|·(1/cols)` before the sum keeps every partial ≤ max|x| ≤
-/// fp16-max (no overflow, Kani `rmsnorm_sumbased_amax_finite`); `ramax = recip(mean|x|)·(1/cols) = 1/sum|x|`.
-pub const RMS_INVCOLS_TID: u32 = u32::MAX - 11;
-
-/// DIAGNOSTIC (2026-07-08): a persistent seg0 probe tid holding LAYER-0's `new_v` (the V-proj output,
-/// PRE-selector) `[mq_pad, nkvh·hd]`. The structural mq>1 inf is in the shared M=8 proj-matmul/selector
-/// path (K+V caches both inf, rope exonerated). This splits it: the emitter copies layer-0 (k_id==9) new_v
-/// here BEFORE the selector; the worker reads it. INF ⇒ the V-proj M=8 matmul is the source; FINITE ⇒ the
-/// selector (which reads new_v's mqp-padded [mqu..mqp) rows) is. Persistent (never reused) so it survives.
-pub const NEW_V_PROBE_TID: u32 = u32::MAX - 12;
-
-/// DIAGNOSTIC (mq>1 fp32 rmsnorm root-cause, gated on `SCRATCHY_SUPERDSC_ISLAND_PROBE`): persistent
-/// fp32 probe tids holding the reduce output `var32` and the final Newton `rsqrt` (per row). The
-/// approved measurement (audit) reads these to localize the batched `V=0`: `var32` tiny ⇒ the reduce
-/// output-side is broken (⇒ matmul-by-ones fix); `var32` finite but `rsqrt` huge ⇒ the Newton
-/// broadcast diverges. Persistent (never reused) so the value survives to the worker readback.
-pub const RMS_VAR_PROBE_TID: u32 = u32::MAX - 18; // MAX-16 collides with ONES_REDUCE_TID
-// ⛔ MAX-17, NOT MAX-19 — MAX-19 IS `IDENTITY_TID`. The probe moved, not
-// IDENTITY: IDENTITY is on the live KV-matmul path and any already-baked bundle
-// encodes MAX-19 as IDENTITY, so moving IT would silently reinterpret existing
-// artifacts. MAX-17 was the one free slot in MAX-1..MAX-19.
-// Locked by `sentinel_tids_are_pairwise_distinct`, which was RED on this line.
-pub const RMS_RSQRT_PROBE_TID: u32 = u32::MAX - 17;
-
-/// fp8 W8A8 activation-quant constants (worker-bound f16, seg0, shape [1, stick]): the E4M3 clamp bounds
-/// `+448` / `-448` and `1/448` (for `a_scale = amax·(1/448)`). Placed when the tape has an fp8 (arity-3)
-/// MatmulTile. `qfp8ch` requires its input CLAMPED into [-448,448] (fp16 rounding can push a per-token-scaled
-/// value past 448 — the bound is NOT free, per the clamp guard on [`crate::superdsc_opspec::OpFunc::Qfp8ch`]).
-pub const FP8_POS448_TID: u32 = u32::MAX - 13;
-pub const FP8_NEG448_TID: u32 = u32::MAX - 14;
-pub const FP8_INV448_TID: u32 = u32::MAX - 15;
-
-/// RESERVED tid for the mq>1 (prefill) MATMUL-BY-ONES row-sum weight — a `[hidden, stick]` all-ones fp16
-/// seg0 ACTIVATION (worker-bound flat like the head-major selectors).
-/// The on-card reduce returns the SEED (0) for any tensor with >1 PHYSICAL row (#33), so the multi-row
-/// rmsnorm `sum|x|`/`mean(xs²)` reduces (and the softmax denom) yield 0 → recip(0)=inf → the whole prefill
-/// (NEW_V, K/V) goes inf. matmul IS proven correct AND multi-row on-card (it is the q/k/v/o proj path), so
-/// `matmul(A[rows,cols], ones[cols,stick])` gives Σ_c A[r,c] in EVERY output col — a drop-in row-sum. n=stick
-/// (=64, one output stick) ⇒ the device retile is identity of row-major, and an all-ones tile is
-/// retile-invariant, so it needs NO RetileDescriptor (exactly like the selectors). `cols≤hidden` ⇒ w_off=0
-/// reads the first `cols` all-ones rows. Placed + bound iff the bundle has a multi-row (prefill) rmsnorm;
-/// a decode (m=1) bundle omits it, byte-identical to the pre-fix baseline. Prefill-only (mq>1). Free tid
-/// (u32::MAX-16; -17/-18 = Claude2's block_table/slot_mapping, -19 = IDENTITY_TID, up to SCALARMUL_BASE=-20).
-pub const ONES_REDUCE_TID: u32 = u32::MAX - 16;
-
-/// RESERVED tensor id for the mq>1 PREFILL KV-CACHE-WRITE matmul-by-IDENTITY (#3) — a `[hd,hd]`
-/// identity, worker-bound seg0 const (bound like [`ONES_REDUCE_TID`]). The mq>1 per-slot cachewr
-/// used `nqh·mqu·2` single-row `[1,hd]` `slot_no_fuse` copies (SlotSolo singletons) because the
-/// on-card multi-row `[mqu,hd]` copy is BROKEN (writes nothing). Mirroring #0's reduce→matmul-by-ones,
-/// the copy becomes `matmul(kh[mqu,hd], I[hd,hd]) = kh` — matmul is the ONE m>1-correct primitive — so
-/// ONE fusable op per head replaces `mqu` singletons (1,984→64 for granite-2b prefill). For hd==64 the
-/// identity is single-stick (retile == row-major, like the all-ones), so no `kernel_weights` descriptor.
-/// Placed only when the tape has an mq>1 `AttnDecode` AND `SCRATCHY_SUPERDSC_KV_MATMUL` (default-off A/B).
-pub const IDENTITY_TID: u32 = u32::MAX - 19;
-
-/// RESERVED tensor id for the mq>1 PREFILL HEAD-MAJOR SELECTOR weights — `nqh` stacked one-hot
-/// `[nqh·hd, hd]` column-selectors (total `[nqh·nqh·hd, hd]`, worker-bound f16 const, seg0). For head
-/// `h`, `Sel_h` (row-block `h`, element offset `h·nqh·hd·hd`) has `Sel_h[i,j]=1` iff
-/// `i == `[`selector_head_src_col`](crate::sdsc_abstract::selector_head_src_col)`(h,hd,j)` — so
-/// `matmul(q[mq,nqh·hd], Sel_h) = q_h[mq,hd]` = head h's columns, written head-major at `h·mq·hd`. The
-/// ONLY deployed way to head-major-ize row-major q/k/v for the per-head mq>1 attention ops (a strided
-/// read / 3D reshape / restickify all fail — see [`kt_write_off`] + Kani `selector_extracts_head_column`).
-/// Fixed (position/layer-independent) ⇒ bound ONCE at prepare, like [`ROPE_P_TID`]. Placed only when the
-/// tape has an mq>1 `AttnDecode` (the prefill bundle); the mq=1 decode bundle never references it.
-///
-/// [`kt_write_off`]: crate::sdsc_abstract::PagedKvPool::kt_write_off
-pub const SEL_HEADMAJOR_TID: u32 = u32::MAX - 7;
-
-/// RESERVED tid for the mq>1 prefill KV-width head-major selector — `nkvh` stacked one-hot
-/// `[nkvh·hd, hd]` selectors (worker-bound f16 const, seg0). Same role as [`SEL_HEADMAJOR_TID`] but for
-/// the `nkvh`-headed new-K/new-V `[mq_pad, nkvh·hd]` → head-major `[nkvh, mq_pad, hd]` (a distinct k-dim
-/// `nkvh·hd`, so a distinct selector). Placed only for the prefill (mq>1) bundle.
-pub const SEL_KV_HEADMAJOR_TID: u32 = u32::MAX - 8;
-
-/// RESERVED tid for the mq>1 prefill INVERSE head-major selector — `nqh` stacked one-hot `[hd, nqh·hd]`
-/// selectors (`SelT_h[j,c]=1` iff `c == h·hd+j`, worker-bound f16 const, seg0). Scatters the head-major
-/// attention output `out_h[mq,hd]` back to ROW-MAJOR `out[mq, nqh·hd]` (columns `[h·hd,(h+1)·hd)`) that
-/// `o_proj` reads: `out += matmul(out_h[mq,hd], SelT_h[hd, nqh·hd])`. Placed only for the prefill bundle.
-pub const SELT_HEADMAJOR_TID: u32 = u32::MAX - 9;
-
-/// RESERVED tid for the mq>1 prefill ZERO-PAD const — a worker-bound `[mqp, hd]` f16 ZERO buffer (seg0).
-/// The head-major K/V selector writes only the `mqu` REAL rows of `kh`/`vh` (`[nkvh, mqp, hd]`); rows
-/// `[mqu..mqp)` (stick padding) are UNINITIALIZED. The restickify+score then reads those as garbage K in
-/// the masked padding columns `[mqu..mqp)`, and the NO-MAX softmax `exp(garbage·scale + MASK_NEG)`
-/// OVERFLOWS to inf (Kani `prefill_softmax_padding_must_be_zeroed`, fail-first) → the whole prefill goes
-/// inf. Copying this zero into `kh`/`vh` padding rows makes the padding-col score 0 ⇒ `exp(MASK_NEG)=0`
-/// (safe). Placed only when the tape has an mq>1 AttnDecode.
-pub const ATTN_ZERO_TID: u32 = u32::MAX - 10;
-
-/// RESERVED tensor id for the mq>1 PREFILL LAST-ROW HIDDEN `[1, hidden]` — the last prompt token's
-/// final-norm output, extracted from the `[mq, hidden]` residual stream so the lm_head tail can run at
-/// `m=1` INSIDE the prefill bundle (folding away the separate decode-of-the-last-token forward, which
-/// existed only to make the first generated token's logits and re-paid the whole weight-stream floor).
-///
-/// NOT worker-bound: it is written ON-CARD by `lower_one_node`'s per-stick copies and read by the
-/// re-lowered lm_head. It is registered as a SYNTH under this name (`t{LAST_HIDDEN_TID}`), so it costs
-/// one intermediate-segment reservation and NO manifest placement — the decode bundle never references
-/// it and is byte-identical.
-///
-/// WHY A COPY AND NOT A ONE-HOT MATMUL: `hidden[mq, hidden]` is `RowBlocked`, so row `mq-1` lives in
-/// `hidden/64` chunks of 64 elements at stride `mq·64` — a `sel[1,mq] @ hidden[mq,hidden]` extraction
-/// would need `k = mq` to be a whole 64-stick (the rungs are 15/23/31/39/47/63/80/96 — never), and
-/// reading `hidden` at a row offset in ONE op would need a `rows·lanes` coordInfo stride, which
-/// [`crate::sdsc_abstract::StickLayout::group_stride`] documents as unrepresentable for fp16 (dxp
-/// `LX_MODLRFIMM` at exactly `rows·lanes = 31·64`). So the extraction is `hidden/64` single-stick
-/// `[1,64]` identity copies — each self-consistently addressed at `lanes`, the one proven form.
+/// RESERVED tensor id for a prefill rung's ANSWER ROWS `[S, hidden]` — each request's last prompt
+/// row of the final-norm output, extracted on card so the lm-head tail runs at the answer rows
+/// inside the prefill bundle (`lmlast`). Written and read inside the rung; never worker-bound.
 pub const LAST_HIDDEN_TID: u32 = u32::MAX;
 
-/// ⛔ THE SENTINEL TIDS MUST BE PAIRWISE DISTINCT, AND NOTHING WAS CHECKING.
-///
-/// These are hand-assigned `u32::MAX - N` magic numbers naming synthetic
-/// tensors (constants, probes, selectors) that the emitter places and the worker
-/// binds. Two names sharing one value means two DIFFERENT tensors resolve to one
-/// placement: whichever is bound last wins and the other silently reads someone
-/// else's bytes. There is no crash — the id is valid, it is just not yours.
-///
-/// This is not hypothetical. `RMS_VAR_PROBE_TID` carries the comment
-/// "MAX-16 collides with ONES_REDUCE_TID", so the collision was hit ONCE and
-/// fixed by hand — and then `RMS_RSQRT_PROBE_TID` was given MAX-19, which
-/// `IDENTITY_TID` already had. A hand-assigned space with no uniqueness check
-/// re-collides as soon as someone adds a name.
-#[test]
-fn sentinel_tids_are_pairwise_distinct() {
-    // Every sentinel, by name, so a new one added without a slot shows up here.
-    const SENTINELS: &[(&str, u32)] = &[
-        ("LAST_HIDDEN", LAST_HIDDEN_TID),
-        ("ROPE_P", ROPE_P_TID),
-        ("ATTN_SCALE", ATTN_SCALE_TID),
-        ("ATTN_MASK", ATTN_MASK_TID),
-        ("ATTN_CAUSAL", ATTN_CAUSAL_TID),
-        ("RMS_SEED", RMS_SEED_TID),
-        ("SCRATCH", SCRATCH_TID),
-        ("SEL_HEADMAJOR", SEL_HEADMAJOR_TID),
-        ("SEL_KV_HEADMAJOR", SEL_KV_HEADMAJOR_TID),
-        ("SELT_HEADMAJOR", SELT_HEADMAJOR_TID),
-        ("ATTN_ZERO", ATTN_ZERO_TID),
-        ("RMS_INVCOLS", RMS_INVCOLS_TID),
-        ("NEW_V_PROBE", NEW_V_PROBE_TID),
-        ("FP8_POS448", FP8_POS448_TID),
-        ("FP8_NEG448", FP8_NEG448_TID),
-        ("FP8_INV448", FP8_INV448_TID),
-        ("ONES_REDUCE", ONES_REDUCE_TID),
-        ("RMS_VAR_PROBE", RMS_VAR_PROBE_TID),
-        ("RMS_RSQRT_PROBE", RMS_RSQRT_PROBE_TID),
-        ("IDENTITY", IDENTITY_TID),
-    ];
-    let mut seen: std::collections::BTreeMap<u32, &str> = Default::default();
-    let mut clashes: Vec<String> = Vec::new();
-    for (name, tid) in SENTINELS {
-        if let Some(prev) = seen.insert(*tid, name) {
-            clashes.push(format!(
-                "{name} and {prev} are both u32::MAX - {}",
-                u32::MAX - *tid
-            ));
-        }
-    }
-    assert!(
-        clashes.is_empty(),
-        "sentinel tids collide — two synthetic tensors would share one placement: {clashes:?}"
-    );
-}
-
-// ══════════════════════════════════════════════════════════════════════════════════════════════
-//  THE RESERVED TID SPACE — declared, bounded, and proven disjoint AT COMPILE TIME
-// ══════════════════════════════════════════════════════════════════════════════════════════════
-
-/// One reserved region of the tid space: a base and how many slots it owns, counting DOWN.
-///
-/// ⛔⛔⛔ THIS EXISTS BECAUSE THE REGIONS WERE RAW `u32` SUBTRACTION. Every reserved tid was
-/// `SOME_BASE - index`, with each base defined in terms of the previous one, no bound on any
-/// index, and nothing anywhere proving the regions do not overlap. `scalarmul_scale_tid(idx)` owns
-/// exactly 100 slots before it walks into `KSPLIT_BLOCK_BASE`, and it took `idx: usize` unchecked;
-/// `downproj_block_tid` multiplies a REAL TENSOR ID by a stride and subtracts that.
-///
-/// Two tensors landing on one tid is not an error anyone sees. They get ONE placement, so the
-/// second one's producer writes over the first one's bytes and its consumer reads them — on a
-/// device with no stack to attach to, which surfaces as wrong output or as a hang.
-///
-/// A region cannot be added or resized without [`RESERVED_REGIONS_ARE_DISJOINT`] re-proving the
+/// One reserved region of the tid space: a base and how many slots it owns, counting DOWN. A
+/// region cannot be added or resized without [`RESERVED_REGIONS_ARE_DISJOINT`] re-proving the
 /// whole layout, and no index can leave its region without [`Self::at`] refusing during the bake.
 #[derive(Clone, Copy, Debug)]
 pub struct TidRegion {
@@ -275,150 +65,12 @@ impl TidRegion {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ RESERVED tensor id for the KV BLOCK INDEX — the index tensor a gathered KV read is
-/// addressed through, and the last piece the hardware gather needs.
-///
-/// Today the block table is HOST-SIDE state (`fold_plan`'s `block_tables: Vec<Vec<i64>>`), consulted
-/// per launch to compute ONE page base. `SessionKv::fold_requests` names what that costs: *"ONE LAUNCHED
-/// OP HAS ONE PAGE BASE, so B requests cannot share a pass: the fold runs `pages x requests` times"*.
-/// A gather replaces that scalar with a tensor, so every row reads its own keys in ONE launch — which is
-/// what batch-size-invariant attention means.
-///
-/// ## What the worker stages here, and why the arithmetic is already settled
-/// int32 GLOBAL 4096-ELEMENT BLOCK INDICES. `addr = idx * skip_addr + base` with `skip_addr = 4096`,
-/// which is what the score leg's Kᵗ operand already emits as its entry (MEASURED: per-core `in=64`,
-/// `out=64`). That works because the whole pool is a uniform array of 4096-element blocks — stick-groups
-/// at 0/4096/8192/12288, `plane_block_elems = 4*4096`, and `plane_stride`/`layer_stride`/`page_stride`
-/// all multiples of it — so one index reaches any cell with no relayout and no `device_extent` change.
-///
-/// It is the same affine map the host already computes: `fold_plan::page_base_bytes` is
-/// `phys * page_stride_bytes`, and dxp's `ConvertData_gather_idx` is `idx * skip_addr + base_addr`.
-///
-/// ## Why a NEW region rather than a 20th sentinel
-/// The sentinel region is FULL — `MAX-1 .. MAX-19` are all taken and `MAX-20` is
-/// `scalarmul_scale`'s base. Growing the sentinels would slide that region down, and this file warns
-/// exactly against it: *"every reserved id is a number that has been baked into artifacts, and moving
-/// one to tidy the map would silently repoint it"*. So this takes the top of the deliberately empty gap
-/// and declares its own region, which the compile-time disjointness proof then covers.
-pub const KV_BLOCK_INDEX_TID: u32 = u32::MAX - 120;
-
-/// ⭐⭐⭐⭐⭐ THE ROPE-P **CLASS** REGION — one P placement per DISTINCT rope head dim.
-///
-/// A hybrid-attention model (gemma-4) carries TWO rope classes in one tape — sliding `hd` and a wider
-/// global `hd` — and a composite single P is IMPOSSIBLE, not merely awkward: the big class's
-/// `[hd,hd]` contraction sweeps every input lane, so it would read the small class's nonzero block as
-/// spurious ±1 terms. Each class needs its OWN `[hd_c, hd_c]` table and its OWN seg0 placement.
-///
-/// ## Class ordering, and why class 0 keeps the old sentinel
-/// Classes are the tape's DISTINCT rope head dims sorted DESCENDING, so class 0 is the widest. Class 0
-/// answers [`ROPE_P_TID`] itself: a UNIFORM model (every rope node one head dim) has exactly one class,
-/// so its ops still name `ROPE_P_TID` and its bundle is byte-identical to the pre-class layout. Classes
-/// `1..N-1` take this region's slots. The alternative — renumbering every class — would change the tid a
-/// uniform model's ops name, for no benefit and one silent-repoint risk more.
-///
-/// [`rope_p_class_hds`]: crate::reserved_tids::rope_p_class_hds
-pub const ROPE_P_CLASS_BASE: u32 = u32::MAX - 121;
-
-/// Reserved tid for the rope-P table of rope class `idx` (distinct rope head dims, sorted descending;
-/// class 0 = the widest = [`ROPE_P_TID`] itself, so a uniform model's bundle is unchanged).
-pub fn rope_p_class_tid(idx: usize) -> u32 {
-    if idx == 0 {
-        // ⭐ DOCUMENTED WHY: class 0 IS the old single-class tid. Keeping it there is what makes a
-        // uniform model's ops name `ROPE_P_TID` exactly as before — byte-identical bundles — instead
-        // of renumbering every class and silently repointing ids already baked into artifacts.
-        return ROPE_P_TID;
-    }
-    // Class 1 takes the region's BASE slot (class 0 lives on the sentinel, so no slot is wasted).
-    reserved_region("rope_p_class").at(idx as u32 - 1)
-}
-
-/// ⭐⭐⭐⭐⭐ THE IDENTITY **CLASS** REGION — one `[hd,hd]` identity per DISTINCT attention head dim.
-///
-/// Same defect, same fix, one axis over: `IDENTITY_TID`'s placement was sized at the WIDEST
-/// `AttnDecode` head dim while the bound value was staged at the BASE head dim, so on a hybrid
-/// (gemma-4 tiny-allglobal: classes 128 and 64) the wide class's GQA krep/vrep matmuls read slab 1 of
-/// a `[128,128]` placement holding only a `[64,64]` table — lanes 64..127 all zero (dump-proven,
-/// `op11_prog0_seg0_tt108_newkrep.bin`). Attention classes are the tape's DISTINCT `AttnDecode` head
-/// dims sorted DESCENDING; class 0 = the widest = [`IDENTITY_TID`] itself, for the same
-/// byte-identity reason as rope class 0.
-pub const IDENTITY_CLASS_BASE: u32 = u32::MAX - 129;
-
-/// Reserved tid for the identity table of attention class `idx` (distinct AttnDecode head dims,
-/// sorted descending; class 0 = the widest = [`IDENTITY_TID`] itself).
-pub fn identity_class_tid(idx: usize) -> u32 {
-    if idx == 0 {
-        // ⭐ Same law as `rope_p_class_tid(0)`: the widest class keeps the old single-class tid so a
-        // uniform model's bundle is byte-identical.
-        return IDENTITY_TID;
-    }
-    // Class 1 takes the region's BASE slot (class 0 lives on the sentinel, so no slot is wasted).
-    reserved_region("identity_class").at(idx as u32 - 1)
-}
-
-// ⛔ THE ROUTER CONST REGION IS GONE — the hand-written per-op MoE card lowering that
-// placed its tables (the tie table, the identity table, the iota row, the argsort/
-// softmax pad-masks, the sub-page index bank, the fused top-k's pad row) is deleted;
-// the MoE lowers only from `kernels/moe.py` through KTIR. The region's slots are
-// BURNED, never reused: a stale artifact still carrying an old slot would silently
-// alias anything that took its place, so the ids stay unallocated (the same law the
-// retired one-hot top-k slots followed inside the region while it lived).
-
-/// Does `tid` name a KERNEL-TABLE class table of family `what` (`"rope-P"` or `"identity"`)?
-///
-/// The load-time placement cross-check walks every PLACED tid and asks this, because the reverse
-/// direction of the check ("every placed class tid is in the wiring's set") cannot enumerate the
-/// class ids from a placement — it can only test a tid it finds. Class 0 is the family's sentinel;
-/// classes 1.. live in the family's region.
-pub fn is_kernel_table_class_tid(tid: u32, what: &str) -> bool {
-    match what {
-        "rope-P" => {
-            tid == ROPE_P_TID || {
-                let r = reserved_region("rope_p_class");
-                (r.floor()..=r.base).contains(&tid)
-            }
-        }
-        "identity" => {
-            tid == IDENTITY_TID || {
-                let r = reserved_region("identity_class");
-                (r.floor()..=r.base).contains(&tid)
-            }
-        }
-        _ => false,
-    }
-}
-
-/// ⭐ THE ONE SOURCE OF TRUTH FOR A CLASS SET, IN THE ORDER THE TIDS ARE ASSIGNED.
-///
-/// Both consumers of the class list — the PLACEMENT site (`compute_bundle_layout`, which sizes each
-/// class's seg0 placement) and the macro's `gk` (which bakes the list into the wiring the worker's
-/// load-time bind reads) — must produce the SAME set in the SAME order or a class tid names a
-/// placement sized for a different class. This is the shared helper both call: distinct values,
-/// sorted DESCENDING so class 0 is the widest (and a uniform model's single class is class 0, which
-/// [`rope_p_class_tid`] answers with the pre-class sentinel).
-///
-/// ⛔ TAKES THE HEAD DIMS AS PLAIN DATA, not a `SubtileIR`: this crate cannot depend on
-/// `scratchy-subtile` (the dependency runs the other way), so the callers iterate their own rope/attn
-/// nodes and hand the dims over. The ORDERING LAW lives here, once, where both callers meet it.
-pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
-    let mut out: Vec<u32> = hds.collect();
-    out.sort_unstable_by(|a, b| b.cmp(a));
-    out.dedup();
-    out
-}
-
 /// ⭐⭐⭐ THE PAGED STEP's HOST SOURCES — spyre-inference's own attention operands besides the pools:
-/// the mask stack, the page index table, the KV write index, the query row index and `kv_row_pool`,
-/// and a decode batch's `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk`.
-///
-/// ⛔ RESERVED, NOT NUMBERED PAST THE GRAPH. They were `ir.tensors.len() + k`, the attention mask's
-/// old law — and a resident session holds the decode AND the prefill programs, whose graphs differ in
-/// size (the prefill's sampler mint and lm-head fold give it fewer tensors): MEASURED on granite-2b,
-/// the prefill's sources sat at t1157–t1159, which are REAL tensors of the decode graph, so every
-/// prompt step's staging overwrote decode-program state and the forward printed garbage. A reserved
-/// region names the same ids for every bundle and no graph can produce one.
-///
-/// A NEW REGION, below `kct_resident`'s floor: the gaps above it are burned (stale artifacts may still
-/// carry their old slots), and nothing has ever been baked here.
+/// the mask stack, the page index table, the KV write index, the query row index, and a decode
+/// batch's `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk`. A resident session holds the decode
+/// and the prefill programs, whose graphs differ in size, so a source numbered past one graph could
+/// be a real tensor of the other: the reserved region names the same ids for every bundle, and no
+/// graph produces one. Slots 4 and 8 are held, unnamed, so the regions below keep their ids.
 pub const PAGED_STEP_BASE: u32 = u32::MAX - 2_000_171;
 
 /// The slots one attention class's paged step owns.
@@ -430,8 +82,8 @@ pub const PAGED_STEP_SLOTS: u32 = 9;
 pub const PAGED_CLASSES: u32 = 2;
 
 /// ⭐ CLASS `class`'s COPY OF PAGED-STEP SLOT `slot`. **Class 0's are the `paged_step` sentinels**
-/// (`PAGED_MASK_TID` ..), so a uniform model binds the tids it has always bound; every later class
-/// takes the same slot of its own block of the `paged_class` region.
+/// (`PAGED_MASK_TID` ..); every later class takes the same slot of its own block of the
+/// `paged_class` region.
 pub const fn paged_class_tid(class: u32, slot: u32) -> u32 {
     assert!(
         class < PAGED_CLASSES,
@@ -455,61 +107,20 @@ pub const PAGED_PAGE_TABLE_TID: u32 = reserved_region("paged_step").at(1);
 pub const PAGED_WRITE_ROWS_TID: u32 = reserved_region("paged_step").at(2);
 /// The paged step's query row index — see [`PAGED_STEP_BASE`].
 pub const PAGED_QUERY_ROWS_TID: u32 = reserved_region("paged_step").at(3);
-/// The paged step's `kv_row_pool` — see [`PAGED_STEP_BASE`].
-pub const PAGED_KV_ROW_POOL_TID: u32 = reserved_region("paged_step").at(4);
 /// A decode batch's `rep_row_ids` — see [`PAGED_STEP_BASE`].
 pub const PAGED_REP_ROWS_TID: u32 = reserved_region("paged_step").at(5);
 /// A decode batch's `chunk_page_ids` — see [`PAGED_STEP_BASE`].
 pub const PAGED_CHUNK_PAGES_TID: u32 = reserved_region("paged_step").at(6);
 /// A decode batch's `mask_by_chunk` — see [`PAGED_STEP_BASE`].
 pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
-/// The decode step's int32 ZERO stick — `INDEX_RUN_WORDS` i32 zeros the host stages beside
-/// `kv_row_pool`: the add identity the chained index's run copy reads (`addi32toi32(zero, run)`, the
-/// int32 copy dxp binds — it has no int32 `identity`). Host-staged, as every int32 the attention
-/// reads is (SENUINT32-tagged i32 bytes) — see [`PAGED_STEP_BASE`].
-pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 10] = [
-    // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
+pub const RESERVED_REGIONS: [TidRegion; 6] = [
+    // The one-off sentinels: the attention mask (MAX-3) and the scratch (MAX-6).
     TidRegion {
         name: "sentinels",
         base: u32::MAX - 1,
-        slots: 19,
-    },
-    // ⭐ THE KV BLOCK INDEX takes the TOP of the old K-split gap — see [`KV_BLOCK_INDEX_TID`] for why it
-    // is a new region instead of a 20th sentinel (the sentinel region is full, and sliding
-    // `scalarmul_scale` down would repoint ids already baked into artifacts).
-    TidRegion {
-        name: "kv_block_index",
-        base: KV_BLOCK_INDEX_TID,
-        slots: 1,
-    },
-    // ⭐ THE ROPE-P CLASS REGION — one slot per rope head-dim class past the first (class 0 keeps
-    // `ROPE_P_TID`; see [`rope_p_class_tid`] for why). 8 slots: two classes is the gemma-4 shape, and
-    // a model with more DISTINCT rope head dims than that is a config error the region's own overflow
-    // assert turns into a bake refusal.
-    TidRegion {
-        name: "rope_p_class",
-        base: ROPE_P_CLASS_BASE,
-        slots: 8,
-    },
-    // ⭐ THE IDENTITY CLASS REGION — the same law one rung down, for the attention classes (see
-    // [`identity_class_tid`]).
-    TidRegion {
-        name: "identity_class",
-        base: IDENTITY_CLASS_BASE,
-        slots: 8,
-    },
-    // ⭐ THE HEAD-MAJOR o_proj COPY takes the slot below the burned router-const hole and
-    // above the deliberately-kept-empty gap. See [`OPROJ_HEADMAJOR_BASE`] for what it names.
-    // (Rebased off main's MAX-121 — that slot is the rope-p class region on this line — to
-    // MAX-147, the first free slot below where the router consts lived; `OPROJ_HEADMAJOR_BASE`
-    // derives from this row, so nothing else moves.)
-    TidRegion {
-        name: "oproj_headmajor",
-        base: u32::MAX - 147,
-        slots: 1_000_000,
+        slots: 6,
     },
     // ⭐ THE STICK CONSTANTS — one slot per value a rung's descriptors read, the slot keyed by
     // the value itself (see [`stick_const_tid`]).
@@ -524,18 +135,15 @@ pub const RESERVED_REGIONS: [TidRegion; 10] = [
         base: PAGED_STEP_BASE,
         slots: PAGED_STEP_SLOTS,
     },
-    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S BLOCKS — see [`tp_recv_block_tid`]. Below
-    // `paged_step`'s floor, in tids no artifact has ever carried.
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S BLOCKS — see [`tp_recv_block_tid`].
     TidRegion {
         name: "tp_recv",
         base: TP_RECV_TID,
         slots: TP_WINDOW_CUTS * TP_MAX_WORLD,
     },
-    // ⭐ THE PACKED PREFILL'S WINDOW TABLES — see [`paged_window_tid`]. Below `tp_recv`'s floor,
-    // in tids no artifact has ever carried: the FIRST window's tids are the `paged_step`
-    // sentinels (window 0 IS the step's own tables, the `rope_p_class_tid(0) == ROPE_P_TID`
-    // law), so the region holds only the windows PAST the first, three tables each, bounded by
-    // [`PAGED_MAX_WINDOWS`].
+    // ⭐ THE PACKED PREFILL'S WINDOW TABLES — see [`paged_window_tid`]. The FIRST window's tids are
+    // the `paged_step` sentinels (window 0 IS the step's own tables), so the region holds only the
+    // windows PAST the first, three tables each, bounded by [`PAGED_MAX_WINDOWS`].
     TidRegion {
         name: "paged_window",
         base: PAGED_WINDOW_BASE,
@@ -553,12 +161,8 @@ pub const RESERVED_REGIONS: [TidRegion; 10] = [
 /// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first block
 /// ([`tp_recv_block_tid`]), and the base of the one `(segment, offset, size)` triple per card
 /// (`scratchy_spyre_bundle::collective::RecvWindow`) whose blocks every collective's consume reads.
-///
-/// ⛔ NOT IN THE ROUTER-CONST HOLE (MAX-137 .. MAX-146) — those slots are BURNED (see the note
-/// above the region table): a stale artifact still naming one would alias the window. It takes the
-/// first tids below `paged_step`'s floor instead, which nothing has been baked against;
-/// `RESERVED_REGIONS_ARE_DISJOINT` holds the two apart.
-pub const TP_RECV_TID: u32 = PAGED_STEP_BASE - 9;
+/// The first tids below `paged_step`'s floor.
+pub const TP_RECV_TID: u32 = PAGED_STEP_BASE - PAGED_STEP_SLOTS;
 
 /// How many disjoint cuts the receive window is. The forward's `k`-th collective uses cut
 /// `k % TP_WINDOW_CUTS` (`collective::WindowCut`), so a peer's send for collective `k + 1` never
@@ -585,8 +189,7 @@ pub const fn tp_recv_block_tid(cut: u32, sender: u32) -> u32 {
 }
 
 /// Base of the RESERVED tid block for a PACKED PREFILL's window tables — the first tid below
-/// `tp_recv`'s floor, which nothing has been baked against (the `tp_recv` precedent: the next gap
-/// below the lowest region).
+/// `tp_recv`'s floor.
 pub const PAGED_WINDOW_BASE: u32 = TP_RECV_TID - (TP_WINDOW_CUTS * TP_MAX_WORLD);
 
 /// The later attention classes' step tables — see [`paged_class_tid`]. Below `paged_window`'s floor.
@@ -606,7 +209,7 @@ pub const PAGED_MAX_WINDOWS: u32 = 8;
 /// ⭐ A PACKED PREFILL WINDOW'S TABLES — attention class `class`'s window `r` copy of one of the
 /// three per-request tables the attention reads. **Window 0 IS the class's own step tables**
 /// ([`paged_class_tid`]): class 0's window 0 answers `PAGED_QUERY_ROWS_TID` / `PAGED_PAGE_TABLE_TID`
-/// / `PAGED_MASK_TID`, so a one-window (solo) rung binds the tids it has always bound. The windows
+/// / `PAGED_MASK_TID`, so a one-window (solo) rung binds the step's own tables. The windows
 /// past the first count DOWN from [`PAGED_WINDOW_BASE`], three tids each, class by class, bounded by
 /// [`PAGED_MAX_WINDOWS`].
 ///
@@ -639,37 +242,8 @@ pub const fn paged_window_tid(class: u32, window: u32, table: u32) -> u32 {
     }
 }
 
-/// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
-/// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses
-/// it)?
-///
-/// ⭐ THE WHOLE-FUNCTION WALK'S INTERMEDIATE MINT ASKS. It numbers fresh intermediates strictly
-/// above every bound tid, and a bound reserved tid is legal — the LmLast extraction binds its
-/// destination to `LAST_HIDDEN_TID`, the one tid its consumer re-reads — so minting past the
-/// maximum would overflow `u32::MAX` and panic, while minting AT a reserved tid would alias the
-/// intermediate onto that synthetic's placement. A reserved tid names a producer-staged tensor,
-/// never a walk-minted intermediate, so the mint skips them and this predicate is what says which.
-pub fn is_reserved(tid: u32) -> bool {
-    tid == LAST_HIDDEN_TID
-        || RESERVED_REGIONS
-            .iter()
-            .any(|r| tid <= r.base && tid >= r.floor())
-}
-
-/// ⛔⛔⛔ A REGION IS ADDRESSED BY ITS **NAME**, NEVER BY ITS ARRAY INDEX — and this function exists
-/// because indexing it by position has already cost exactly the bug the table was built to prevent.
-///
-/// `KCT_RESIDENT_BASE` and `kct_resident_tid` were spelled `RESERVED_REGIONS[2]`. Inserting the
-/// `kv_block_index` region AT position 2 (it belongs there — the table is ordered high tid → low)
-/// slid `kct_resident` to 3 and silently repointed both: `kct_resident_tid(0)` began answering
-/// `KV_BLOCK_INDEX_TID`, i.e. the resident Kᵗ kernel of layer 0 and the gather's index tensor became
-/// ONE tid with ONE placement. Only the region's `slots: 1` made it loud — `kct_resident_tid(k_id)`
-/// for any `k_id >= 1` overflowed a one-slot region and failed the bake. A wider new region would
-/// have aliased in silence, which is precisely "two tensors landing on one tid is not an error anyone
-/// sees" from this file's own header.
-///
-/// A name cannot be shifted by an insertion, and a name that is not in the table is a BUILD failure
-/// rather than a neighbouring region's base.
+/// The region named `name` — the ONE way a reader reaches a region, so inserting a region never
+/// repoints a reader the way indexing the table by position would.
 pub const fn reserved_region(name: &str) -> TidRegion {
     let want = name.as_bytes();
     let mut i = 0;
@@ -693,39 +267,25 @@ pub const fn reserved_region(name: &str) -> TidRegion {
     panic!("no reserved tid region by that name — a region was renamed or removed");
 }
 
-/// ⭐ THE PROOF, EVALUATED AT COMPILE TIME. Adding or resizing a region re-runs it; an overlap is
-/// a build error naming both regions, not a tensor that quietly answers to two names.
-#[allow(clippy::let_unit_value)]
-const _: () = {
-    // Referencing both proofs is what makes the compiler EVALUATE them; an unused `const` item is
-    // not const-evaluated, so a lock nothing mentions is a lock that never runs.
-    let _ = SENTINELS_ARE_INSIDE_THEIR_REGION;
-    let _ = RESERVED_REGIONS_ARE_DISJOINT;
-    let _ = EVERY_NAMED_REGION_RESOLVES;
-    let _ = PAGED_WINDOW_0_IS_THE_SENTINELS;
-};
+// Naming each proof is what makes the compiler EVALUATE it: an unused `const` item is not
+// const-evaluated, so a lock nothing mentions is a lock that never runs.
+const _: () = SENTINELS_ARE_INSIDE_THEIR_REGION;
+const _: () = RESERVED_REGIONS_ARE_DISJOINT;
+const _: () = EVERY_NAMED_REGION_RESOLVES;
+const _: () = PAGED_WINDOW_0_IS_THE_SENTINELS;
 
-/// ⭐⭐⭐ EVERY NAME THIS MODULE ADDRESSES A REGION BY, RESOLVED AT COMPILE TIME.
-///
-/// [`reserved_region`] panics on a name the table does not hold, and a `const fn` only panics when it
-/// is EVALUATED — so a rename would break the bake at whatever site first called it, or not at all if
-/// that site is behind a `cfg`. Naming them here makes the lookup run at every build.
+/// Every region a reader names resolves, at the base its door states.
 pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("sentinels").base == u32::MAX - 1);
     assert!(reserved_region("stick_const").slots > 0);
-    assert!(reserved_region("kv_block_index").base == KV_BLOCK_INDEX_TID);
-    assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
-    assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
+    assert!(reserved_region("tp_recv").base == TP_RECV_TID);
     assert!(reserved_region("paged_window").base == PAGED_WINDOW_BASE);
     assert!(reserved_region("paged_class").base == PAGED_CLASS_BASE);
 };
 
-/// ⭐ WINDOW 0 IS THE SENTINELS — the law a solo rung's byte-identity stands on. Every window
-/// tid the family mints at window 0 must answer the `paged_step` sentinel of the same table, and
-/// the windows past the first must stay inside the region (the `paged_window_tid` asserts run at
-/// call sites; this pins the LAW at the table, so a region edit that broke either fails the build
-/// here rather than at whichever bake first minted a window).
+/// Window 0 of class 0 is the paged step's own tables, and the window and class regions' floors
+/// hold exactly the last tid their mints admit.
 pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
     assert!(paged_window_tid(0, 0, 0) == PAGED_QUERY_ROWS_TID);
     assert!(paged_window_tid(0, 0, 1) == PAGED_PAGE_TABLE_TID);
@@ -748,15 +308,17 @@ pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
     );
 };
 
+/// The one-off sentinels sit inside their region, and the region sits above the stick constants.
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
-    // ⛔ THE ONE-OFF SENTINELS ARE DECLARED SEPARATELY (`ROPE_P_TID` .. `IDENTITY_TID`), so the
-    // region table would happily describe a span they had already outgrown. Adding a 20th sentinel
-    // now fails the build instead of silently taking `scalarmul_scale_tid(0)`'s slot.
     let r = reserved_region("sentinels");
     assert!(r.base == u32::MAX - 1, "sentinels start at MAX-1");
     assert!(
-        IDENTITY_TID >= r.floor(),
-        "a one-off sentinel has fallen below the sentinel region and into the scalarmul scales",
+        ATTN_MASK_TID <= r.base && ATTN_MASK_TID >= r.floor(),
+        "the attention mask has left the sentinel region"
+    );
+    assert!(
+        SCRATCH_TID <= r.base && SCRATCH_TID >= r.floor(),
+        "the scratch has left the sentinel region"
     );
     assert!(
         STICK_CONST_BASE < r.floor(),
@@ -764,6 +326,7 @@ pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
     );
 };
 
+/// Every region is disjoint from every other, and none wraps past zero.
 pub const RESERVED_REGIONS_ARE_DISJOINT: () = {
     let mut i = 0;
     while i < RESERVED_REGIONS.len() {
@@ -784,7 +347,6 @@ pub const RESERVED_REGIONS_ARE_DISJOINT: () = {
     }
 };
 
-/// Base of the RESERVED tensor-id block for granite ScalarMul scale constants. The `i`-th DISTINCT
 /// The region of a rung's stick constants: the `i`-th distinct constant its descriptors read is
 /// staged at `stick_const_tid(i)` (see [`crate::StickConst`]).
 pub const STICK_CONST_BASE: u32 = reserved_region("stick_const").base;
@@ -792,105 +354,4 @@ pub const STICK_CONST_BASE: u32 = reserved_region("stick_const").base;
 /// The tid the `i`-th distinct stick constant is placed under.
 pub fn stick_const_tid(idx: usize) -> u32 {
     reserved_region("stick_const").at(idx as u32)
-}
-
-/// Base of the RESERVED tid block for the HEAD-MAJOR o_proj weight copy (the "kill the 64-op
-/// attn_o finalize" restructure — 32 heads × 2 slabs of single-core realdiv collapse to one op
-/// per feature slab). At `mq == 1 && nslab > 1` the attention finalize can write `out`
-/// head-major ONLY if the o matmul's B
-/// operand is k-axis-block-shuffled to match — a SECOND, permuted copy of each layer's o_proj
-/// weight, resident in seg1 next to its source. KEYED ON THE o_proj WEIGHT SOURCE TID `w_id`
-/// (like [`kct_resident_tid`]) so the emitter (which has the matmul's `w.tid`) and the
-/// layout/guard (which iterate every layer's `w_id`) compute the SAME copy tid with no
-/// layer-index handoff. A 1M region keeps it disjoint from `kct_resident` below and from real
-/// source tids (~thousands) — and unlike the kct region, only ~40 slots (one per layer) are ever
-/// taken.
-pub const OPROJ_HEADMAJOR_BASE: u32 = reserved_region("oproj_headmajor").base;
-/// Reserved tid for the head-major permuted copy of the o_proj weight with source tid `w_id`.
-pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
-    reserved_region("oproj_headmajor").at(w_id)
-}
-
-/// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's
-/// index tensor must not be one tid.
-///
-/// `kct_resident_tid` / `KCT_RESIDENT_BASE` were `RESERVED_REGIONS[2]`, and the `kv_block_index` region
-/// was inserted at 2 (correctly — the table is ordered high tid → low). `kct_resident_tid(0)` then
-/// answered `KV_BLOCK_INDEX_TID`, and layer 0's resident Kᵗ kernel and the index table shared one
-/// placement. That is exactly this file's own stated failure — *"whichever is bound last wins and the
-/// other silently reads someone else's bytes"* — with the additional twist that the Kᵗ kernel is what
-/// the gather READS THROUGH the index.
-///
-/// It surfaced only because the new region has ONE slot, so every `k_id >= 1` overflowed and failed the
-/// bake. A region with room would have aliased in silence. This test does not depend on that luck.
-#[test]
-fn a_named_region_survives_an_insertion_above_it() {
-    assert_eq!(
-        STICK_CONST_BASE,
-        reserved_region("stick_const").base,
-        "STICK_CONST_BASE names a different region than stick_const_tid does"
-    );
-    // Every region this module has a door for, resolved by name and asserted to hold the tid that
-    // door hands out — so a rename shows up here rather than as a neighbouring region's base.
-    assert_eq!(
-        reserved_region("kv_block_index").at(0),
-        KV_BLOCK_INDEX_TID,
-        "the kv_block_index region's only slot is not KV_BLOCK_INDEX_TID"
-    );
-}
-
-/// ⭐ THE CLASS LAWS, PINNED — a class tid answers the right table, and a uniform model sees none of it.
-///
-/// Class 0 of both class families KEEPS the pre-class sentinel, which is what makes a uniform model's
-/// bundle byte-identical (its ops name `ROPE_P_TID`/`IDENTITY_TID` exactly as before). Classes 1.. live
-/// in their own named regions, disjoint from every neighbour — including each other, which is the
-/// pairing this file exists to make un-silentable: a rope class tid and an identity class tid are both
-/// "MAX-minus-small" numbers a hand-assigned space would happily have collide.
-#[test]
-fn class_tids_keep_class_zero_on_the_sentinel_and_descend_their_own_regions() {
-    // Class 0 IS the old single-class tid, for both families.
-    assert_eq!(rope_p_class_tid(0), ROPE_P_TID);
-    assert_eq!(identity_class_tid(0), IDENTITY_TID);
-    // Class 1 descends into its own region, one rung below the kv_block_index region.
-    assert_eq!(rope_p_class_tid(1), ROPE_P_CLASS_BASE);
-    assert_eq!(identity_class_tid(1), IDENTITY_CLASS_BASE);
-    // The two class families never share a tid.
-    for i in 0..8u32 {
-        for j in 0..8u32 {
-            assert_ne!(
-                reserved_region("rope_p_class").at(i),
-                reserved_region("identity_class").at(j),
-                "rope class {i} and identity class {j} are one tid — two kernel tables share one \
-                 placement"
-            );
-        }
-    }
-    // A class tid never leaves its region (the floor check `at` already refuses the overflow, but the
-    // law is worth stating where the class scheme is defined). With 8 slots and class 0 on the
-    // sentinel, classes 1..8 are the addressable ones.
-    assert!(
-        rope_p_class_tid(8) >= reserved_region("rope_p_class").floor(),
-        "rope class 8 walked below the rope_p_class region"
-    );
-}
-
-/// ⛔ THE OVERFLOW IS A REFUSAL, NOT A WRAP — a 9th rope class must not alias the identity classes.
-/// `#[should_panic]` is the honest shape here: `TidRegion::at` is a `const fn` assert the bake hits.
-#[test]
-#[should_panic(expected = "reserved tid region overflow")]
-fn a_ninth_rope_class_is_a_refusal_not_an_alias() {
-    let _ = rope_p_class_tid(9);
-}
-
-/// The class set is DISTINCT and DESCENDING — the order the tids are assigned in, so class 0 is the
-/// widest head dim and a uniform model's single class is class 0.
-#[test]
-fn the_class_set_is_distinct_and_descending() {
-    assert_eq!(
-        rope_p_class_hds([128u32, 64, 128, 256, 64].into_iter()),
-        vec![256, 128, 64]
-    );
-    assert_eq!(rope_p_class_hds([64u32].into_iter()), vec![64]);
-    let empty: std::iter::Empty<u32> = std::iter::empty();
-    assert_eq!(rope_p_class_hds(empty), Vec::<u32>::new());
 }
