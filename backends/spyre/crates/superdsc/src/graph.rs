@@ -56,12 +56,19 @@ pub struct Node {
     pub output: Operand,
 }
 
-/// A constant stick's value: one lane's bits, repeated across the stick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A constant an op reads: one value, every lane of its stick. The value is stated in f32 (an
+/// integer constant exactly so); the stick holds it in `format`, which the stager converts it to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConstStick {
     pub format: DataFormat,
-    /// The value's bits in `format` (an fp16 value is its 16-bit pattern).
-    pub bits: u64,
+    /// The value's f32 bits.
+    pub bits: u32,
+}
+
+impl ConstStick {
+    pub fn value(self) -> f32 {
+        f32::from_bits(self.bits)
+    }
 }
 
 /// An intermediate's storage: `elements` of `format`, contiguous.

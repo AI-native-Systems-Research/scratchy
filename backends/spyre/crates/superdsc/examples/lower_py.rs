@@ -59,7 +59,6 @@ fn main() {
         dump(f.operations, 0);
     }
     let params: Vec<u64> = (0..f.arguments.len() as u64).map(|i| 0x4_0000_0000 + i * 0x4000_0000).collect();
-    let b = spyre_superdsc::Bindings { params: &params, consts: 0, scratch: 0x1000_0000 };
     let residency: Vec<spyre_superdsc::Residency> = (0..f.arguments.len())
         .map(|p| if staged.contains(&p) { spyre_superdsc::Residency::Staged } else { spyre_superdsc::Residency::Device })
         .collect();
@@ -81,6 +80,13 @@ fn main() {
                     n.inputs.iter().map(|o| (o.store, o.view.offset, o.view.axes.iter().map(|a| (a.extent, a.stride)).collect::<Vec<_>>())).collect::<Vec<_>>(),
                     (n.output.store, n.output.view.offset, n.output.view.axes.iter().map(|a| (a.extent, a.stride)).collect::<Vec<_>>()));
             }
+    let placed: Vec<(spyre_superdsc::graph::ConstStick, u64)> = g
+        .consts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (*c, 0x2000_0000 + i as u64 * 128))
+        .collect();
+    let b = spyre_superdsc::Bindings { params: &params, consts: &placed, scratch: 0x1000_0000 };
     match spyre_superdsc::emit::emit::<Baked>(&g, &b) {
         Ok(l) => {
             let files = spyre_superdsc::emit::group_files(&l.ops).expect("render");

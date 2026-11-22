@@ -8,7 +8,7 @@ use ktir_core::dtypes::DType;
 ///
 /// The device stores every format in 128-byte sticks; a format's lane count is the stick's bytes
 /// over the element's ([`Self::lanes`]), the vendor's own stick law (`getNumElemsInStick`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DataFormat {
     /// The device's 16-bit float (DLF16, `SEN169_FP16`): what an `f16` KTIR value is on the card.
     Fp16,

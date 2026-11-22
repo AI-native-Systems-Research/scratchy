@@ -14,7 +14,7 @@ use ktir_core::ddl_binds::DeviceGen;
 use crate::dim::{Dim, MATMUL_BATCH, OUTER};
 use crate::divide::{Cuttable, divide};
 use crate::format::DataFormat;
-use crate::graph::{Graph, Node, Operand, Store};
+use crate::graph::{ConstStick, Graph, Node, Operand, Store};
 use crate::opfunc::{Family, OpFunc};
 use crate::wire;
 
@@ -23,8 +23,8 @@ use crate::wire;
 pub struct Bindings<'a> {
     /// Byte address of each parameter's buffer, by parameter.
     pub params: &'a [u64],
-    /// Byte address of constant stick 0; stick `i` is `i` flits after it.
-    pub consts: u64,
+    /// Byte address of each constant's stick, by constant.
+    pub consts: &'a [(ConstStick, u64)],
     /// Byte address of the region the intermediates are packed into.
     pub scratch: u64,
 }
@@ -48,6 +48,8 @@ pub enum EmitError {
     Nesting { node: usize, operand: usize },
     /// A parameter the bindings give no address.
     Unbound { param: usize },
+    /// A constant the bindings give no stick.
+    Unplaced { constant: usize },
 }
 
 /// One space axis.
@@ -71,6 +73,8 @@ struct Division<'a> {
 enum At {
     View(usize),
     Lanes,
+    /// An axis the operand repeats along without a view axis of its own.
+    Broadcast,
 }
 
 /// One operand projected onto the space: where each space axis it lists lands, and the space axis
@@ -89,6 +93,7 @@ impl Proj<'_> {
         self.at[i].map(|a| match a {
             At::View(j) => self.operand.view.axes[j].stride,
             At::Lanes => 1,
+            At::Broadcast => 0,
         })
     }
 
@@ -97,7 +102,7 @@ impl Proj<'_> {
         match self.at[i] {
             Some(At::View(j)) => self.operand.view.distance(j, c),
             Some(At::Lanes) => c,
-            None => 0,
+            Some(At::Broadcast) | None => 0,
         }
     }
 
@@ -183,7 +188,12 @@ pub fn emit<G: DeviceGen>(g: &Graph, bindings: &Bindings<'_>) -> Result<Lowered,
                 .copied()
                 .ok_or(EmitError::Unbound { param: p }),
             Store::Local(l) => Ok(local_at[l]),
-            Store::Const(c) => Ok(bindings.consts + c as u64 * G::FLIT_BYTES),
+            Store::Const(c) => g
+                .consts
+                .get(c)
+                .and_then(|k| bindings.consts.iter().find(|(b, _)| b == k))
+                .map(|(_, a)| *a)
+                .ok_or(EmitError::Unplaced { constant: c }),
         }
     };
     let mut ops = Vec::with_capacity(g.nodes.len());
@@ -279,8 +289,9 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
                 .iter()
                 .map(|o| {
                     let mut s: Vec<Option<At>> = (0..o.view.axes.len()).map(|j| Some(At::View(j))).collect();
+                    // A constant is one value: its lanes repeat like every other axis of it.
                     if lanes_axis {
-                        s.push(Some(At::Lanes));
+                        s.push(Some(if matches!(o.store, Store::Const(_)) { At::Broadcast } else { At::Lanes }));
                     }
                     // A restick reads each operand on its own stick.
                     let own = o.view.axes.iter().position(|a| a.stride == 1 && a.extent > 1);
@@ -333,6 +344,7 @@ fn plan<G: DeviceGen>(node: &Node) -> Plan {
             at.get(*st).copied().flatten().is_some_and(|a| match a {
                 At::View(j) => o.view.axes[j].stride == 1,
                 At::Lanes => true,
+                At::Broadcast => false,
             })
         })
         .map(|((_, st), _)| *st)
@@ -489,7 +501,7 @@ fn op<G: DeviceGen>(
     // ── the layout labels: one per distinct (order, stick), the contraction's by role
     let mut labels_of: Vec<&'static str> = Vec::with_capacity(tensors.len());
     let mut primary: BTreeMap<&'static str, wire::LayoutInfo> = BTreeMap::new();
-    let mut seen: Vec<(Vec<Dim>, Dim, &'static str)> = Vec::new();
+    let mut seen: Vec<(Vec<Dim>, Dim, u64, &'static str)> = Vec::new();
     const NAMES: [&str; 4] = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"];
     const ROLES: [&str; 3] = ["INPUT", "KERNEL", "OUTPUT"];
     for (ti, t) in tensors.iter().enumerate() {
@@ -497,11 +509,14 @@ fn op<G: DeviceGen>(
             "KERNEL_IDX"
         } else if family == Family::Contraction {
             ROLES[ti]
-        } else if let Some((_, _, l)) = seen.iter().find(|(o, s, _)| *o == t.order && *s == t.stick) {
+        } else if let Some((_, _, _, l)) = seen
+            .iter()
+            .find(|(o, s, w, _)| *o == t.order && *s == t.stick && *w == t.format.lanes::<G>())
+        {
             l
         } else {
             let l = NAMES[seen.len().min(NAMES.len() - 1)];
-            seen.push((t.order.clone(), t.stick, l));
+            seen.push((t.order.clone(), t.stick, t.format.lanes::<G>(), l));
             l
         };
         labels_of.push(label);

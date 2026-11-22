@@ -176,8 +176,9 @@ impl<G: DeviceGen> Cx<'_, G> {
     }
 
     fn format(op: &Operation<'_>) -> Result<DataFormat, LiftError> {
-        match op.attr(AttrKey::Dtype) {
-            Some(Attr::Dtype(d)) => Ok(DataFormat::of(*d)),
+        match (op.attr(AttrKey::Dtype), op.result_type.and_then(|t| t.elem())) {
+            (Some(Attr::Dtype(d)), _) => Ok(DataFormat::of(*d)),
+            (_, Some(d)) => Ok(DataFormat::of(d)),
             _ => Err(LiftError::Malformed {
                 op: op.op_type,
                 what: "a tensor op states its element type",
@@ -195,12 +196,10 @@ impl<G: DeviceGen> Cx<'_, G> {
     }
 
     fn const_stick(&mut self, format: DataFormat, value: f64) -> usize {
-        let bits = match format {
-            DataFormat::Fp16 => u64::from(half::f16::from_f64(value).to_bits()),
-            DataFormat::Fp32 => u64::from((value as f32).to_bits()),
-            DataFormat::Fp8 | DataFormat::UInt32 | DataFormat::Int64 => value as i64 as u64,
+        let key = ConstStick {
+            format,
+            bits: (value as f32).to_bits(),
         };
-        let key = ConstStick { format, bits };
         let n = self.graph.consts.len();
         *self.consts.entry(key).or_insert_with(|| {
             self.graph.consts.push(key);
@@ -1068,6 +1067,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                     (Some(DataFormat::Fp16), _) if to == DataFormat::Fp32 => self.pointwise(op, OpFunc::Widen)?,
                     (Some(DataFormat::Fp32), _) if to == DataFormat::Fp16 => self.pointwise(op, OpFunc::Narrow)?,
                     (Some(DataFormat::Fp8), _) if to == DataFormat::Fp16 => self.pointwise(op, OpFunc::Fp8ToFp16)?,
+                    (Some(DataFormat::Fp16), _) if to == DataFormat::Fp8 => self.pointwise(op, OpFunc::Fp16ToFp8)?,
                     _ => return Err(LiftError::Op(op.op_type)),
                 }
             }

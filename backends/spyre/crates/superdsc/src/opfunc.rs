@@ -90,6 +90,8 @@ pub enum OpFunc {
     Narrow,
     /// fp8 → fp16.
     Fp8ToFp16,
+    /// fp16 → fp8: a format conversion, the value already in fp8's range.
+    Fp16ToFp8,
     // ── reductions
     Reduce(Combine, Axis),
     // ── contractions
@@ -137,6 +139,7 @@ impl OpFunc {
             OpFunc::Widen => "dl16tofp32",
             OpFunc::Narrow => "fp32todl16",
             OpFunc::Fp8ToFp16 => "fp8todl16",
+            OpFunc::Fp16ToFp8 => "qfp8ch",
             OpFunc::Reduce(Combine::Sum, Axis::Stick) => "sum",
             OpFunc::Reduce(Combine::Max, Axis::Stick) => "max",
             OpFunc::Reduce(Combine::Min, Axis::Stick) => "min",
