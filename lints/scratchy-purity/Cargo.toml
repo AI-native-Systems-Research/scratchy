@@ -1,0 +1,22 @@
+[package]
+name = "scratchy_purity"
+version = "0.1.0"
+description = "The scratchy purity rules (the scratchy-purity-audit skill) as rustc lints, run by dylint."
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clippy_utils = { git = "https://github.com/rust-lang/rust-clippy", rev = "21baba9c10c5d179915cae82e6247bc2337872fb" }
+dylint_linting = "6.0"
+
+[dev-dependencies]
+dylint_testing = "6.0"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+# Its own workspace: it builds on its own pinned nightly, apart from every scratchy workspace.
+[workspace]
