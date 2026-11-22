@@ -79,6 +79,22 @@ pub mod steel_paged {
             }
         }
 
+        /// The verify lanes' kernels at `dtype_tag` — `attention_verify_pack_q`, then the wide
+        /// kernel's packed tile split its keys `NAXP_SPLITS` ways — where this tile runs the wide
+        /// kernel, whose packed form alone holds a KV head's group of lanes.
+        pub fn verify_symbols(self, dtype_tag: &str) -> Option<(&'static str, &'static str)> {
+            (self.wn > 1).then_some(match dtype_tag {
+                "bf16" => (
+                    "attention_verify_pack_q_bf16",
+                    "attention_nax_paged_verify_split_bf16",
+                ),
+                _ => (
+                    "attention_verify_pack_q_f16",
+                    "attention_nax_paged_verify_split_f16",
+                ),
+            })
+        }
+
         /// The rope-once kernel's symbol at `dtype_tag` (its head dim and page the bake's).
         pub fn rope_once_symbol(dtype_tag: &str) -> &'static str {
             match dtype_tag {

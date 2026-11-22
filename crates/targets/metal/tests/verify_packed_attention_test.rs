@@ -89,27 +89,25 @@ fn split_verify_attention_matches_the_plain_tile() {
             ConstantValue::int(7, 0),
             ConstantValue::uint(99, 0),
         ];
-        let nax = |sym: &'static str| {
+        let tile = scratchy_target_metal::steel_paged::NaxTile::of(HD as u32, BS as u32)
+            .expect("NAX bd256");
+        let (pack_sym, split_sym) = tile.verify_symbols("bf16").expect("the wide tile");
+        let tiled = [consts.clone(), tile.constants().to_vec()].concat();
+        let nax_tiled = |sym: &'static str, extra: &[ConstantValue]| {
             baked_build(
                 &cache,
-                &PipelineKey::new("attention_steel_nax_paged", sym, consts.clone()),
+                &PipelineKey::new(
+                    "attention_steel_nax_paged",
+                    sym,
+                    [tiled.clone(), extra.to_vec()].concat(),
+                ),
             )
             .expect(sym)
         };
-        let tile = scratchy_target_metal::steel_paged::NaxTile::of(HD as u32, BS as u32)
-            .expect("NAX bd256");
-        let plain = baked_build(
-            &cache,
-            &PipelineKey::new(
-                "attention_steel_nax_paged",
-                tile.symbol("bf16"),
-                [consts.clone(), tile.constants().to_vec()].concat(),
-            ),
-        )
-        .expect("the plain tile");
-        let split =
-            nax("attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4");
-        let pack = nax("attention_verify_pack_q_bf16_bd256");
+        let split = nax_tiled(split_sym, &[ConstantValue::uint(34, SPLITS as u32)]);
+        let pack = nax_tiled(pack_sym, &[]);
+        let plain = nax_tiled(tile.symbol("bf16"), &[]);
+        let combine_groups = scratchy_target_metal::kv_int8::combine_groups(HD as u32);
         let combine = baked_build(
             &cache,
             &PipelineKey::new(
@@ -121,6 +119,7 @@ fn split_verify_attention_matches_the_plain_tile() {
                     ConstantValue::uint(2, NKV as u32),
                     ConstantValue::float(3, 1.0 / (HD as f32).sqrt()),
                     ConstantValue::uint(18, SPLITS as u32),
+                    ConstantValue::uint(25, combine_groups),
                 ],
             ),
         )
@@ -141,7 +140,7 @@ fn split_verify_attention_matches_the_plain_tile() {
         let cu_b = shared_slice(&device, &cu);
         let used_b = shared_slice(&device, &used);
         let bt_b = shared_slice(&device, &bt);
-        let qp = shared_zeroed(&device, seqs * NKV * 64 * HD * 2);
+        let qp = shared_zeroed(&device, seqs * NKV * tile.bq() as usize * HD * 2);
         let partials = shared_zeroed(&device, tokens * NQ * SPLITS * (HD + 2) * 4);
         let o_plain = shared_zeroed(&device, tokens * NQ * HD * 2);
         let o_split = shared_zeroed(&device, tokens * NQ * HD * 2);
@@ -172,7 +171,7 @@ fn split_verify_attention_matches_the_plain_tile() {
             &[],
             &[],
             &[],
-            size(64, NKV, seqs),
+            size(tile.bq() as usize, NKV, seqs),
             size(HD, 1, 1),
         );
         b.barrier();
@@ -195,7 +194,7 @@ fn split_verify_attention_matches_the_plain_tile() {
             &[],
             &[],
             size(tokens, NQ, 1),
-            size(128, 1, 1),
+            size(32 * combine_groups as usize, 1, 1),
         );
         b.commit(true);
         let a: Vec<u16> = read_slice(&o_plain, tokens * NQ * HD);

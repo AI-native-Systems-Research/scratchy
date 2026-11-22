@@ -320,6 +320,13 @@ constant bool ATTN_SINKS_ON = ATTN_SINKS_SET;
 //     decoding. A decode step's rows are its sequences, so it reads the same.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_ROW_QUERIES, 22);
 
+// 24  ATTN_DECODE_SG — the simdgroups of `attention_decode_gqa_int8` that share a key block, each
+//     a slice of the head dims (`kv_int8::decode_key_group`).
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_DECODE_SG, 24);
+// 25  ATTN_COMBINE_GROUPS_FC — the simdgroups of `attention_via_cache_v2_combine`
+//     (`kv_int8::combine_groups`).
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_COMBINE_GROUPS_FC, 25);
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -877,11 +884,10 @@ SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<
 // the coded domain) and writes the head's output as `attention_via_cache_v2`'s merge does.
 // Attention sinks (ATTN_SINKS, buffer 17 — the layer's sink logits): the splits store the keys'
 // partials alone, and the sink column joins here, once a head, as the twin's merge carries it.
-// Its ATTN_COMBINE_GROUPS simdgroups each sum their share of every lane's elements over the
-// splits; the first divides and rotates them. Head_dim 64's partials fill two simdgroups'
-// lanes — the head_dim/32 elements each — so the count follows the head dim. Dispatch:
+// Its ATTN_COMBINE_GROUPS simdgroups (`kv_int8::combine_groups`) each sum their share of every
+// lane's head_dim/32 elements over the splits; the first divides and rotates them. Dispatch:
 // threadgroups (batch, num_q_heads, 1), threads (32 · ATTN_COMBINE_GROUPS, 1, 1).
-constant constexpr uint ATTN_COMBINE_GROUPS = ATTN_HEAD_DIM >= 128u ? 4u : 2u;
+constant constexpr uint ATTN_COMBINE_GROUPS = ATTN_COMBINE_GROUPS_FC_SET ? ATTN_COMBINE_GROUPS_FC : 1u;
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(32 * ATTN_COMBINE_GROUPS)]] void
 attention_via_cache_v2_combine(
@@ -912,7 +918,8 @@ attention_via_cache_v2_combine(
     // Another kernel's bake may set a head dim this one cannot take: its arrays need a size all
     // the same (the assert refuses baking this kernel with one).
     constexpr bool D_OK = ATTN_HEAD_DIM % (32u * ATTN_COMBINE_GROUPS) == 0u && ATTN_HEAD_DIM != 0u;
-    static_assert(sizeof(T) && D_OK, "head_dim a multiple of 32 lanes x the combine's groups");
+    static_assert(sizeof(T) && ATTN_COMBINE_GROUPS_FC_SET && D_OK,
+                  "the bake's simdgroups, head_dim a multiple of 32 lanes x them");
     constexpr uint QG = D_OK ? ATTN_HEAD_DIM / 32u / ATTN_COMBINE_GROUPS : 1u;
     threadgroup U sums[32u * (QG * ATTN_COMBINE_GROUPS + 1u)];
     const uint e0 = simd_lid * qk_per_thread;
@@ -940,7 +947,7 @@ attention_via_cache_v2_combine(
     if (simd_gid != 0u) {
         return;
     }
-    U o_loc[16];
+    U o_loc[QG * ATTN_COMBINE_GROUPS];
     for (uint j = 0; j < qk_per_thread; ++j) {
         o_loc[j] = sums[simd_lid * (qk_per_thread + 1u) + j];
     }
@@ -1025,10 +1032,9 @@ template <typename T>
     constexpr bool D_OK = ATTN_HEAD_DIM % 64u == 0u && ATTN_HEAD_DIM - 1u < 512u;
     constexpr uint D = D_OK ? ATTN_HEAD_DIM : 128u;
     constexpr uint NSG = D / 32u;
-    // A key group's simdgroups, each a slice of the head dims (8 at head_dim 512: 8 Q and 8 O
-    // fragments a lane), and its keys of a span block. Head_dim 64's two simdgroups form one
-    // group of two — the butterfly, the span keys and the fragments all take it.
-    constexpr uint SG = NSG >= 16u ? 8u : (NSG >= 4u ? 4u : 2u);
+    // A key group's simdgroups (the bake's `ATTN_DECODE_SG`), each a slice of the head dims, and
+    // its keys of a span block.
+    constexpr uint SG = ATTN_DECODE_SG_SET ? ATTN_DECODE_SG : 2u;
     constexpr uint KG = NSG / SG;
     constexpr uint KPS = KB / SG;
     constexpr uint DS = D / SG;
@@ -1042,13 +1048,14 @@ template <typename T>
     constexpr uint XS = XS_S > XS_ENC ? XS_S : XS_ENC;
     // Checked where this kernel is baked (`sizeof(T)` defers them to its instantiation).
     static_assert(sizeof(T) && ATTN_INT8, "reads the int8 store");
+    static_assert(sizeof(T) && ATTN_DECODE_SG_SET && SG >= 1u && KB % SG == 0u,
+                  "a key group of whole slices, its block's keys split evenly");
     static_assert(sizeof(T) && ATTN_DECODE_HEADS <= G &&
                       (ATTN_NUM_Q_HEADS / ATTN_NUM_KV_HEADS) % ATTN_DECODE_HEADS == 0u,
                   "a threadgroup's heads divide its KV head's group and fit the fragment rows");
     static_assert(sizeof(T) && D_OK, "head_dim a multiple of 64, at most 512");
     static_assert(sizeof(T) && NSG % SG == 0u, "the simdgroups tile into whole key groups");
     static_assert(sizeof(T) && ATTN_BLOCK_SIZE % KB == 0u, "a key block in one KV block");
-    static_assert(sizeof(T) && ATTN_WINDOW <= 0, "full attention");
     static_assert(sizeof(T) && (ATTN_ROR == 0u || ATTN_PAIR_OFF % QK == 0u),
                   "a rotary pair's partner a whole lane stride away");
     const uint num_q = ATTN_NUM_Q_HEADS;
@@ -1244,9 +1251,14 @@ template <typename T>
     const uint qid = simd_lid / 4u;
     const uint fm = (qid & 4u) + ((simd_lid / 2u) % 4u);
     const uint fn = (qid & 2u) * 2u + (simd_lid % 2u) * 2u;
+    // A sliding window (the query at kv_len - 1) attends keys `kv_len - window` on: the splits
+    // spread the blocks from the window's first, and keys before it read as past the context.
+    const uint key_lo =
+        (ATTN_WINDOW > 0 && kv_len > uint(ATTN_WINDOW)) ? kv_len - uint(ATTN_WINDOW) : 0u;
+    const uint b_first = key_lo / KB;
     const uint n_blocks = (n_packed + KB - 1u) / KB;
-    const uint per = (n_blocks + ATTN_SPLITS - 1u) / ATTN_SPLITS;
-    const uint b_lo = min(z * per, n_blocks);
+    const uint per = (n_blocks - min(b_first, n_blocks) + ATTN_SPLITS - 1u) / ATTN_SPLITS;
+    const uint b_lo = min(b_first + z * per, n_blocks);
     const uint b_hi = min(b_lo + per, n_blocks);
     // This simdgroup's first dim: its tile t is dims d0 + t·8 + [0, 8).
     const uint d0 = sg * DS;
@@ -1268,8 +1280,8 @@ template <typename T>
         auto packed_row = [&](uint key) { return (base + key - kb) * num_kv + kvh; };
         const uint k0 = kb + fn;
         const uint k1 = k0 + 1u;
-        const bool v0 = live && k0 < n_packed;
-        const bool v1 = live && k1 < n_packed;
+        const bool v0 = live && k0 < n_packed && k0 >= key_lo;
+        const bool v1 = live && k1 < n_packed && k1 >= key_lo;
         float s0 = 0.0f;
         float s1 = 0.0f;
         if (live && !do_rot) {
@@ -1298,7 +1310,7 @@ template <typename T>
                 for (uint h = 0; h < GA; ++h) {
                     sc[u][h] = 0.0f;
                 }
-                if (key < n_packed) {
+                if (key < n_packed && key >= key_lo) {
                     const uint r = packed_row(key);
                     float x[QK];
                     for (uint j = 0; j < QK; ++j) {
@@ -1321,17 +1333,21 @@ template <typename T>
             s0 = c0 < KPS ? sc[c0][fm] : 0.0f;
             s1 = c1 < KPS ? sc[c1][fm] : 0.0f;
         }
-        threadgroup float* sx = xs + (kg * 2u + buf) * SG * 64u;
-        sx[sg * 64u + fm * 8u + fn] = s0;
-        sx[sg * 64u + fm * 8u + fn + 1u] = s1;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        s0 = 0.0f;
-        s1 = 0.0f;
-        for (uint g = 0; g < SG; ++g) {
-            s0 += sx[g * 64u + fm * 8u + fn];
-            s1 += sx[g * 64u + fm * 8u + fn + 1u];
+        // The key group's slices' S partials meet in threadgroup memory; a group of one holds
+        // its S whole.
+        if (SG > 1u) {
+            threadgroup float* sx = xs + (kg * 2u + buf) * SG * 64u;
+            sx[sg * 64u + fm * 8u + fn] = s0;
+            sx[sg * 64u + fm * 8u + fn + 1u] = s1;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            s0 = 0.0f;
+            s1 = 0.0f;
+            for (uint g = 0; g < SG; ++g) {
+                s0 += sx[g * 64u + fm * 8u + fn];
+                s1 += sx[g * 64u + fm * 8u + fn + 1u];
+            }
+            buf ^= 1u;
         }
-        buf ^= 1u;
         if (!live) {
             continue;
         }
@@ -1355,7 +1371,7 @@ template <typename T>
         P.thread_elements()[1] = p1;
         // O = O·factor + P·V: V's tile t is key kb + fm's dims d0 + t·8 + fn, fn + 1.
         const uint kv_key = kb + fm;
-        const bool vv = kv_key < n_packed;
+        const bool vv = kv_key < n_packed && kv_key >= key_lo;
         const uint rv = packed_row(vv ? kv_key : kb);
         const float nv = vv ? kv_n(kv_scales_v, rv) : 0.0f;
         device const char2* cv = (device const char2*)(kv_codes_v + rv * D + d0 + fn);

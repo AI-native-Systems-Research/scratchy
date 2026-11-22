@@ -271,6 +271,10 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             attn_constants.extend([
                 ConstantValue::uint(13, 1),
                 ConstantValue::uint(16, rows as u32),
+                ConstantValue::uint(
+                    24,
+                    scratchy_target_metal::kv_int8::decode_key_group(hd as u32),
+                ),
                 ConstantValue::uint(18, splits as u32),
             ]);
             rows
@@ -293,9 +297,16 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         "attention_via_cache_v2_combine_{}_specialized",
         c.dtype.tag()
     ));
+    let combine_groups = scratchy_target_metal::kv_int8::combine_groups(hd as u32);
+    let combine_threads = 32 * combine_groups as usize;
+    let combine_constants = [
+        attn_constants.clone(),
+        vec![ConstantValue::uint(25, combine_groups)],
+    ]
+    .concat();
     let combine = baked_build(
         &cache,
-        &PipelineKey::new("attention", combine_name, attn_constants.clone()),
+        &PipelineKey::new("attention", combine_name, combine_constants),
     )
     .expect("combine");
     let attention = baked_build(
@@ -362,7 +373,15 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1));
             batch.barrier();
             let binds = [(&out, 0), (&partials, 16)];
-            batch.encode(&combine, &binds, &[], &[], &[], tg(1, nq), tg(128, 1));
+            batch.encode(
+                &combine,
+                &binds,
+                &[],
+                &[],
+                &[],
+                tg(1, nq),
+                tg(combine_threads, 1),
+            );
         }
         None => batch.encode(
             &attention,

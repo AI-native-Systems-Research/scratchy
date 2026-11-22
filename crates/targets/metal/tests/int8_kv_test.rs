@@ -129,11 +129,13 @@ impl Store {
     }
 }
 
-/// Host attention of one query row's heads over the first `kv_len` tokens of `store`.
+/// Host attention of one query row's heads over the first `kv_len` tokens of `store`, the last
+/// `window` of them when one is given.
 fn reference(
     q: &[f32],
     store: &Store,
     kv_len: usize,
+    window: Option<usize>,
     num_q: usize,
     num_kv: usize,
     d: usize,
@@ -145,13 +147,17 @@ fn reference(
         let kvh = h / group;
         let row = |t: usize| (t * num_kv + kvh) * d;
         let qh = &q[h * d..][..d];
+        let lo = window.map_or(0, |w| kv_len.saturating_sub(w));
         let scores: Vec<f32> = (0..kv_len)
-            .map(|t| {
-                qh.iter()
-                    .zip(&store.k[row(t)..][..d])
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>()
-                    * scale
+            .map(|t| match t < lo {
+                true => f32::NEG_INFINITY,
+                false => {
+                    qh.iter()
+                        .zip(&store.k[row(t)..][..d])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        * scale
+                }
             })
             .collect();
         let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -175,14 +181,39 @@ fn decode_heads(group: usize) -> usize {
         .unwrap_or(1)
 }
 
-fn decode_case(num_q: usize, num_kv: usize, d: usize, kv_len: usize, splits: usize) {
-    let name = format!("decode q{num_q} kv{num_kv} d{d} len{kv_len} splits{splits}");
+fn decode_case(
+    num_q: usize,
+    num_kv: usize,
+    d: usize,
+    kv_len: usize,
+    splits: usize,
+    window: Option<usize>,
+) {
+    decode_run(num_q, num_kv, d, kv_len, splits, window, None);
+}
+
+/// The decode at `key_group` simdgroups a key block (the law's when `None`): its output checked
+/// against the host, and the seconds a call takes over `reps` more calls when there are any.
+fn decode_run(
+    num_q: usize,
+    num_kv: usize,
+    d: usize,
+    kv_len: usize,
+    splits: usize,
+    window: Option<usize>,
+    key_group: Option<(u32, usize)>,
+) -> Option<f64> {
+    let name = format!("decode q{num_q} kv{num_kv} d{d} len{kv_len} splits{splits} {window:?}");
     let Some(di) = detect_device() else {
         eprintln!("{name}: no Metal device, skipped");
-        return;
+        return None;
     };
     let device = di.device.clone();
     let store = Store::new(&device, kv_len, num_kv, d, 7 + d as u64);
+    let (sg, reps) = key_group.unwrap_or((
+        scratchy_target_metal::kv_int8::decode_key_group(d as u32),
+        0,
+    ));
     let max_blocks = kv_len.div_ceil(BLOCK_SIZE);
     let q = round_bf16(&pseudo(3, num_q * d, 2.0));
     let heads = decode_heads(num_q / num_kv);
@@ -194,15 +225,23 @@ fn decode_case(num_q: usize, num_kv: usize, d: usize, kv_len: usize, splits: usi
         ConstantValue::uint(4, BLOCK_SIZE as u32),
         ConstantValue::uint(5, max_blocks as u32),
         ConstantValue::uint(6, 0),
-        ConstantValue::int(7, 0),
+        ConstantValue::int(7, window.map_or(0, |w| w as i32)),
         ConstantValue::uint(13, 1),
         ConstantValue::uint(18, splits as u32),
+        ConstantValue::uint(25, scratchy_target_metal::kv_int8::combine_groups(d as u32)),
     ];
     let split = pipeline(
         &device,
         "attention",
         "attention_decode_gqa_int8_bf16_specialized",
-        [base.clone(), vec![ConstantValue::uint(16, heads as u32)]].concat(),
+        [
+            base.clone(),
+            vec![
+                ConstantValue::uint(16, heads as u32),
+                ConstantValue::uint(24, sg),
+            ],
+        ]
+        .concat(),
     );
     let combine = pipeline(
         &device,
@@ -240,7 +279,7 @@ fn decode_case(num_q: usize, num_kv: usize, d: usize, kv_len: usize, splits: usi
     let mut cbufs: Vec<&Buffer> = vec![&unread; 17];
     cbufs[0] = &out;
     cbufs[16] = &partials;
-    let combine_threads = 32 * if d >= 128 { 4 } else { 2 };
+    let combine_threads = 32 * scratchy_target_metal::kv_int8::combine_groups(d as u32) as usize;
     assert!(common::dispatch_threadgroups(
         &device,
         &combine,
@@ -249,7 +288,7 @@ fn decode_case(num_q: usize, num_kv: usize, d: usize, kv_len: usize, splits: usi
         size(combine_threads, 1, 1),
     ));
     let got = read_bf16(&out, num_q * d);
-    let want = reference(&q, &store, kv_len, num_q, num_kv, d);
+    let want = reference(&q, &store, kv_len, window, num_q, num_kv, d);
     let err = got
         .iter()
         .zip(&want)
@@ -257,6 +296,90 @@ fn decode_case(num_q: usize, num_kv: usize, d: usize, kv_len: usize, splits: usi
         .fold(0f32, f32::max);
     eprintln!("{name}: max err {err}");
     assert!(err < 2e-2, "{name}: max err {err}");
+    // `reps` calls in one command buffer, each after the last (a decode step's order).
+    let mut batch = scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch::begin(&device)?;
+    let binds: Vec<(&Buffer, usize)> = bufs.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        batch.encode(
+            &split,
+            &binds,
+            &[],
+            &[],
+            &[],
+            size(1, num_q / heads, splits),
+            size(d, 1, 1),
+        );
+        batch.barrier();
+    }
+    batch.commit(true);
+    (reps > 0).then(|| t.elapsed().as_secs_f64() / reps as f64)
+}
+
+/// The decode's key-group width, timed: an 8192-key context (16 query heads over 2, eight splits)
+/// at each head dim, every key group the kernel takes, interleaved rounds. A probe, not a gate:
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "a timing probe: --ignored --nocapture"]
+fn decode_key_group_timings() {
+    for d in [64usize, 128, 256, 512] {
+        let groups: Vec<u32> = [1u32, 2, 4, 8]
+            .into_iter()
+            .filter(|sg| (d as u32 / 32).is_multiple_of(*sg))
+            .collect();
+        let mut times = vec![Vec::new(); groups.len()];
+        for _ in 0..5 {
+            for (i, &sg) in groups.iter().enumerate() {
+                if let Some(t) = decode_run(16, 2, d, 8192, 8, None, Some((sg, 50))) {
+                    times[i].push(t);
+                }
+            }
+        }
+        let line: Vec<String> = (groups.iter().zip(&mut times))
+            .map(|(sg, t)| {
+                t.sort_by(f64::total_cmp);
+                format!("sg{sg} {:.1} us", t[t.len() / 2] * 1e6)
+            })
+            .collect();
+        eprintln!("decode d{d}: {}", line.join(", "));
+    }
+}
+
+/// The decode's split count, timed: an 8192-key context at each geometry (query heads, KV heads,
+/// head dim, window), the law's key group, interleaved rounds. A probe, not a gate:
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "a timing probe: --ignored --nocapture"]
+fn decode_split_timings() {
+    let shapes: [(usize, usize, usize, Option<usize>); 5] = [
+        (16, 2, 512, None),
+        (16, 2, 256, None),
+        (32, 2, 128, None),
+        (64, 8, 64, None),
+        (16, 8, 256, Some(1024)),
+    ];
+    for (nq, nkv, d, window) in shapes {
+        let splits = [4usize, 8, 16, 32, 64];
+        let sg = scratchy_target_metal::kv_int8::decode_key_group(d as u32);
+        let mut times = vec![Vec::new(); splits.len()];
+        for _ in 0..5 {
+            for (i, &s) in splits.iter().enumerate() {
+                if let Some(t) = decode_run(nq, nkv, d, 8192, s, window, Some((sg, 50))) {
+                    times[i].push(t);
+                }
+            }
+        }
+        let line: Vec<String> = (splits.iter().zip(&mut times))
+            .map(|(s, t)| {
+                t.sort_by(f64::total_cmp);
+                format!("{s}: {:.1} us", t[t.len() / 2] * 1e6)
+            })
+            .collect();
+        eprintln!(
+            "decode {nq}q/{nkv}kv d{d} window {window:?}: {}",
+            line.join(", ")
+        );
+    }
 }
 
 /// Every head dim the codec takes, its query-head group below the fragment's 8 rows (2), at it
@@ -267,7 +390,20 @@ fn the_decode_reads_the_store_as_the_host_decodes_it() {
     for d in [64, 128, 256, 512] {
         for (num_q, num_kv) in [(4, 2), (16, 2), (32, 2), (2, 2)] {
             for splits in [1, 3] {
-                decode_case(num_q, num_kv, d, 300, splits);
+                decode_case(num_q, num_kv, d, 300, splits, None);
+            }
+        }
+    }
+}
+
+/// A sliding window: the keys before its first read as past the context, whichever split, or
+/// block's key, they fall in — a window ending mid-block, and one wider than the context.
+#[test]
+fn the_decode_reads_a_sliding_window() {
+    for d in [64, 256] {
+        for splits in [1, 3] {
+            for window in [100, 128, 1000] {
+                decode_case(16, 2, d, 300, splits, Some(window));
             }
         }
     }

@@ -140,3 +140,41 @@ pub fn build_int8_provision(
         mapped,
     }
 }
+
+/// The floats one lane of the int8 decode holds of its Q and O fragments, at most. A hand-picked
+/// register budget, measured on a base M5. In the kernel alone (an 8192-key context, 16 query
+/// heads over 2, µs a call) 128 floats spill — head_dim 256 at a key group of one ran 1498
+/// against two's 293, 512 at two 2890 against four's 404 — and 64 run: 128 at one ran 93 against
+/// two's 146. Serving (8192-token prompts, batch 1, TPOT, two interleaved runs) sets it below
+/// that: Gemma 4 26B-A4B (head_dim 512) ran 3-4% slower at four (64 floats) than at eight in both
+/// runs, gpt-oss-20b (64) 1.5% faster at one (32 floats) than at two, and Nemotron-3-Nano (128)
+/// and Qwen3.6-35B-A3B (256) the same at one or two and two or four.
+pub const DECODE_LANE_FRAGMENT_FLOATS: u32 = 32;
+
+/// The simdgroups of the int8 decode (`attention_decode_gqa_int8`) that share a key block, each a
+/// slice of the head dims (`ATTN_DECODE_SG`): the fewest whose slice's Q and O fragments
+/// (`head_dim / (8 · key group)` 8x8 fragments each, two floats a lane a fragment) fit
+/// [`DECODE_LANE_FRAGMENT_FLOATS`]. The rest of a threadgroup's `head_dim / 32` simdgroups take
+/// other key blocks.
+pub const fn decode_key_group(head_dim: u32) -> u32 {
+    let mut group = 1;
+    while 4 * head_dim / (8 * group) > DECODE_LANE_FRAGMENT_FLOATS {
+        group *= 2;
+    }
+    group
+}
+
+/// The most simdgroups the decode's combine (`attention_via_cache_v2_combine`) sums a query
+/// head's partials over. A hand-picked constant.
+pub const COMBINE_MAX_SIMDGROUPS: u32 = 4;
+
+/// The simdgroups of the decode's combine (`ATTN_COMBINE_GROUPS`): one a lane slice of the head
+/// dims, at most [`COMBINE_MAX_SIMDGROUPS`].
+pub const fn combine_groups(head_dim: u32) -> u32 {
+    let slices = head_dim / 32;
+    if slices < COMBINE_MAX_SIMDGROUPS {
+        slices
+    } else {
+        COMBINE_MAX_SIMDGROUPS
+    }
+}

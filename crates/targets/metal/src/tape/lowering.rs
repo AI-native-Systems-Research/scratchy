@@ -1419,12 +1419,6 @@ const ATTN_MAX_SPLITS: u32 = 16;
 /// a threadgroup takes the largest divisor of the GQA group that fits them.
 const DECODE_FRAGMENT_ROWS: u32 = 8;
 
-/// The threads of `attention_via_cache_v2_combine`'s threadgroup: its `ATTN_COMBINE_GROUPS`
-/// simdgroups — four, or two at head_dim 64, where the partials fill two lanes' elements.
-const fn combine_threads(hd: u32) -> u32 {
-    32 * if hd >= 128 { 4 } else { 2 }
-}
-
 /// The threadgroups a KV head's keys spread over at the KV cap rung `block_cap`.
 fn decode_splits(p: &ModelFacts, block_cap: u32) -> Result<u32, LoweringError> {
     let keys = block_cap.saturating_mul(global(p)?.page().get());
@@ -1465,13 +1459,17 @@ fn int8_decode_commands(
         .chain([
             ConstantValue::uint(C::INT8, 1),
             ConstantValue::uint(18, splits),
+            ConstantValue::uint(25, crate::kv_int8::combine_groups(hd)),
         ])
         .collect();
-    // The split's own: its heads, and no sink column — the combine's.
+    // The split's own: its heads and key groups, and no sink column — the combine's.
     let split_constants = (shared.iter())
         .filter(|k| k.index != sinks_const)
         .copied()
-        .chain([ConstantValue::uint(C::HEADS, rows)])
+        .chain([
+            ConstantValue::uint(C::HEADS, rows),
+            ConstantValue::uint(24, crate::kv_int8::decode_key_group(hd)),
+        ])
         .collect();
     // A sinks dispatch's sink column (the row's sinks source, the dense command binds at its 16)
     // joins in the combine, at its buffer 17: the split's 16 is the partials.
@@ -1525,7 +1523,7 @@ fn int8_decode_commands(
         constants: baked(shared),
         dispatch: DispatchShape {
             threadgroups: (x, q_heads, 1),
-            threads_per_threadgroup: (combine_threads(hd), 1, 1),
+            threads_per_threadgroup: (32 * crate::kv_int8::combine_groups(hd), 1, 1),
             ..dense.dispatch
         },
         bindings: baked(output.chain([scratch]).chain(sinks).collect()),
@@ -2303,12 +2301,10 @@ fn sdpa_paged_command(
 /// 273 µs, 8 in 291 and 16 in 256, against 644 for one and 962 for the per-query-head tile.
 const VERIFY_SPLITS: u32 = 4;
 
-/// The rows a packed verify tile holds: the NAX tile's (`BQ`), a group's heads' 8-row lanes.
-const VERIFY_TILE_ROWS: u32 = 64;
-
 /// The geometry of a layer class a verify lane attention lowers at.
 struct VerifyLaneShape<'a> {
     dtype_tag: &'a str,
+    tile: crate::steel_paged::NaxTile,
     class: scratchy_ir::model_facts::HeadGeometry,
     bucket_m: u32,
 }
@@ -2316,12 +2312,12 @@ struct VerifyLaneShape<'a> {
 /// A verify step's lanes' attention, in place of the paged NAX attention's `plain` twin (one
 /// threadgroup a query head, its 64-row tile holding a lane's 8 rows, the whole context walked
 /// serially): `attention_verify_pack_q` packs each KV head's group of query heads' lanes into one
-/// tile, `..._packed_split<VERIFY_SPLITS>` reads each KV page once for the group, its keys split
+/// tile, `attention_nax_paged_verify_split` reads each KV page once for the group, its keys split
 /// [`VERIFY_SPLITS`] ways, storing token-keyed partials `[token][q_head][splits][2 + head_dim]`,
 /// and `attention_via_cache_v2_combine` merges them into the output, a threadgroup a (token, query
-/// head). Taken where the instantiations exist (head_dim 256 over 16-token pages), the group's
-/// lanes fit the tile, and the bucket's partials and packed rows stay small (at most
-/// [`VERIFY_TILE_ROWS`] rows: the scratch scales with them). `None` keeps the plain twin alone.
+/// head). Taken where the class's NAX tile runs the wide kernel (`NaxTile::verify_symbols`), the
+/// group's lanes fit its Q tile, and the bucket holds at most a tile's rows (the scratch scales
+/// with them). `None` keeps the plain twin alone.
 fn verify_lane_attention(
     p: &ModelFacts,
     s: VerifyLaneShape<'_>,
@@ -2333,28 +2329,16 @@ fn verify_lane_attention(
     let (q_heads, num_kv_heads) = (s.class.q_heads().get(), s.class.kv_heads().get());
     let gqa = s.class.gqa().get();
     let scale = p.attention()?.scale().get();
-    let (split_sym, pack_sym) = match (s.dtype_tag, s.class.head_dim().get(), s.class.page().get())
-    {
-        ("bf16", 256, 16) => (
-            "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4",
-            "attention_verify_pack_q_bf16_bd256",
-        ),
-        ("f16", 256, 16) => (
-            "attention_steel_nax_paged_f16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4",
-            "attention_verify_pack_q_f16_bd256",
-        ),
-        _ => return None,
-    };
-    const _: () = assert!(VERIFY_SPLITS == 4, "the instantiated split count");
-    let fits = gqa * crate::op_abi::METAL_LANE_VERIFY_ROWS <= VERIFY_TILE_ROWS
-        && s.bucket_m <= VERIFY_TILE_ROWS;
+    let (pack_sym, split_sym) = s.tile.verify_symbols(s.dtype_tag)?;
+    let tile_rows = s.tile.bq();
+    let fits = gqa * crate::op_abi::METAL_LANE_VERIFY_ROWS <= tile_rows && s.bucket_m <= tile_rows;
     if !fits {
         return None;
     }
     let (hd, m) = (s.class.head_dim().get(), s.bucket_m);
     // Packed rows, a sequence's tile per KV head (a step brings at most a sequence a row), then
     // the partials, a row's per query head and split.
-    let packed_bytes = m * num_kv_heads * VERIFY_TILE_ROWS * hd * 2;
+    let packed_bytes = m * num_kv_heads * tile_rows * hd * 2;
     let partials_bytes = m * q_heads * VERIFY_SPLITS * (hd + 2) * 4;
     *moe_scratch_bytes = (*moe_scratch_bytes).max(packed_bytes + partials_bytes);
     let packed = scratch_at(1, 0);
@@ -2370,7 +2354,7 @@ fn verify_lane_attention(
         kernel: KernelId::AttentionVerifyPack,
         function: pack_sym,
         dispatch: DispatchShape {
-            threadgroups: (VERIFY_TILE_ROWS, num_kv_heads, m),
+            threadgroups: (tile_rows, num_kv_heads, m),
             threads_per_threadgroup: (hd, 1, 1),
             m_scaling: by_seqs,
         },
@@ -2387,6 +2371,12 @@ fn verify_lane_attention(
     let split = LoweredCommand {
         kernel: KernelId::AttentionVerifySplit,
         function: split_sym,
+        constants: baked(
+            (plain.constants.iter())
+                .copied()
+                .chain([ConstantValue::uint(34, VERIFY_SPLITS)])
+                .collect(),
+        ),
         dispatch: DispatchShape {
             threadgroups: (VERIFY_SPLITS, num_kv_heads, m),
             m_scaling: by_seqs,
@@ -2408,7 +2398,8 @@ fn verify_lane_attention(
             "attention_via_cache_v2_combine_bf16_specialized",
             p.act_dtype(),
         ),
-        // The combine's own slots (`attention.metal`): the geometry and ATTN_SPLITS, ATTN_TQ unset.
+        // The combine's own slots (`attention.metal`): the geometry, ATTN_SPLITS and its
+        // simdgroups, ATTN_INT8 unset.
         constants: baked(vec![
             ConstantValue::uint(0, hd),
             ConstantValue::uint(1, q_heads),
@@ -2419,10 +2410,11 @@ fn verify_lane_attention(
             ConstantValue::uint(6, crate::BLOCKS_PER_CHUNK),
             ConstantValue::int(7, 0),
             ConstantValue::uint(18, VERIFY_SPLITS),
+            ConstantValue::uint(25, crate::kv_int8::combine_groups(hd)),
         ]),
         dispatch: DispatchShape {
             threadgroups: (m, q_heads, 1),
-            threads_per_threadgroup: (combine_threads(hd), 1, 1),
+            threads_per_threadgroup: (32 * crate::kv_int8::combine_groups(hd), 1, 1),
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::X,
                 bucket_m: super::ids::BucketM(m),
@@ -5256,20 +5248,20 @@ fn lower_one(
                     let reroping = sdpa_paged(reroping_constants, bindings_for(false, true));
                     // A verify step's lanes take the packed split attention in the plain twin's
                     // place (`route_by_sequence_count` gates the two).
-                    let lanes = (use_nax && !sliding && sinks.is_none())
-                        .then(|| {
+                    let lanes = (nax_kernel.filter(|_| use_nax && !sliding && sinks.is_none()))
+                        .and_then(|tile| {
                             verify_lane_attention(
                                 p,
                                 VerifyLaneShape {
                                     dtype_tag: steel_dtype_tag,
+                                    tile,
                                     class,
                                     bucket_m,
                                 },
                                 &plain,
                                 moe_scratch_bytes,
                             )
-                        })
-                        .flatten();
+                        });
                     let mut cmds = vec![rope_cmd, attn_cmd, plain];
                     cmds.extend(lanes.into_iter().flatten());
                     cmds.push(reroping);
@@ -5674,7 +5666,7 @@ fn lower_one(
         }
 
         // ── The KV codec (int8): its row's guard gates every command ──
-        I::KvStage(operand, layer, _class, _offsets) => {
+        I::KvStage(operand, layer) => {
             return dispatched([kv_stage_command(
                 p,
                 layer.get() + layer_offset,
@@ -5684,7 +5676,7 @@ fn lower_one(
         }
         // The decode attention of its class, reading the int8 store, and the combine of its
         // splits' partials.
-        I::AttnPackedKv(q, out, layer, pairing, class, _offsets) => {
+        I::AttnPackedKv(q, out, layer, pairing, class) => {
             let decode = match class {
                 AttnMask::Causal => I::AttentionViaCache(*q, *out, *layer, *pairing),
                 AttnMask::SlidingWindow { .. } => {
@@ -9532,8 +9524,7 @@ mod tests {
     /// them from `op_abi::METAL_KV_CODEC` and the folds leave them, each gated by its guard's gate
     /// in `guards` (a bucket's `op_abi::metal_guard_gates`, as the bake realizes them) or dropped
     /// where they drop it: the writer encoding its rows (its encodes folded in), then the
-    /// attention's decode or prefill form around it. Every codec row carries the writer's offsets,
-    /// as the step records give it them.
+    /// attention's decode or prefill form around it.
     fn coded_with(
         guards: &scratchy_subtile::kv_codec::GuardGates<GuardRun>,
         writer: MetalStep,
@@ -9565,14 +9556,14 @@ mod tests {
         let around = if decode { codec.decode } else { codec.prefill };
         for g in around.before {
             let step = match g.step {
-                Before::Stage(operand) => S::KvStage(operand, layer, class, offsets),
+                Before::Stage(operand) => S::KvStage(operand, layer),
             };
             rows.extend(gated(step, g.guard));
         }
         rows.extend(gated(attention, around.anchor));
         for g in around.after {
             let step = match g.step {
-                After::PackedTwin => S::AttnPackedKv(q, out, layer, pairing, class, offsets),
+                After::PackedTwin => S::AttnPackedKv(q, out, layer, pairing, class),
             };
             rows.extend(gated(step, g.guard));
         }
@@ -9675,7 +9666,7 @@ mod tests {
     #[test]
     fn roped_attention_lowers_to_one_command_in_the_one_row_bucket() {
         use crate::tape::step::RopedAttention;
-        let packed = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
+        let packed = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal);
         let fold_tape = |writer: &MetalStep, attention: &MetalStep| MetalStepTape {
             backbone: plain(&[MetalStep::RopedAttention(Box::new(RopedAttention {
                 writer: writer.clone(),
@@ -9986,7 +9977,7 @@ mod tests {
         assert!(c.constants.iter().all(|k| k.index < 10));
         assert!(c.bindings.iter().all(|b| b.index() < 16));
         // The layer's int8 decode, after its coded writer: the split pair.
-        let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
+        let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal);
         let rows = plain(&[writer(LLAMA_KV, KvWrite::PoolAndPacked), twin]);
         let layer = try_lower_int8(&int8_consts(), rows, 1).expect("the coded layer lowers");
         let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.lowered().kernel).collect();
@@ -10365,7 +10356,8 @@ mod tests {
             ((1, a(&p).q_heads().get(), 1), (64, 1, 1))
         );
         // The split takes the plain set less its baked heads (slot 16), then the int8 switch,
-        // the rung's split count and its own heads; the combine the same less its heads.
+        // the rung's split count, the combine's simdgroups (two at head_dim 64), and its own heads
+        // and key group; the combine the same less its heads and key group.
         let mut dense = fp16.constants.to_vec();
         assert_eq!(dense.pop(), Some(ConstantValue::uint(16, 8)));
         assert_eq!(split.constants[..dense.len()], *dense);
@@ -10374,14 +10366,20 @@ mod tests {
             [
                 ConstantValue::uint(13, 1),
                 ConstantValue::uint(18, splits),
+                ConstantValue::uint(25, 2),
                 ConstantValue::uint(16, 8),
+                ConstantValue::uint(24, 1),
             ]
         );
         assert_eq!(
             *combine.constants,
             [
                 dense,
-                vec![ConstantValue::uint(13, 1), ConstantValue::uint(18, splits)]
+                vec![
+                    ConstantValue::uint(13, 1),
+                    ConstantValue::uint(18, splits),
+                    ConstantValue::uint(25, 2),
+                ]
             ]
             .concat()
         );
@@ -10514,15 +10512,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [&partials]
         );
-        // The combine: the split's constants less its heads, plus the sink const, and its whole
-        // binding list — the output, the partials, the sinks.
+        // The combine: the split's constants less its heads and key group, plus the sink const,
+        // and its whole binding list — the output, the partials, the sinks.
         assert_eq!(
             (combine.constants.iter())
                 .filter(|k| **k != sink_const)
                 .copied()
                 .collect::<Vec<_>>(),
             (split.constants.iter())
-                .filter(|k| k.index != 16)
+                .filter(|k| k.index != 16 && k.index != 24)
                 .copied()
                 .collect::<Vec<_>>()
         );
@@ -10706,11 +10704,19 @@ mod tests {
         let shared: Vec<_> = (dense.constants.iter())
             .filter(|k| k.index != 16)
             .copied()
-            .chain([ConstantValue::uint(13, 1), ConstantValue::uint(18, splits)])
+            .chain([
+                ConstantValue::uint(13, 1),
+                ConstantValue::uint(18, splits),
+                ConstantValue::uint(25, 4),
+            ])
             .collect();
         assert_eq!(
             *gqa.constants,
-            [shared.clone(), vec![ConstantValue::uint(16, 8)]].concat()
+            [
+                shared.clone(),
+                vec![ConstantValue::uint(16, 8), ConstantValue::uint(24, 4)]
+            ]
+            .concat()
         );
         let partials = scratch_at(16, 0);
         let int8 = Vec::from(super::super::kernel_bindings::Int8AttentionBindingSet {
@@ -10809,14 +10815,7 @@ mod tests {
             MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, KvWrite::PoolAndPacked);
         let fused = MetalStep::RopedAttention(Box::new(RopedAttention {
             writer,
-            attention: MetalStep::AttnPackedKv(
-                Slot(3),
-                Slot(6),
-                LayerId(0),
-                NeoX,
-                Causal,
-                LLAMA_KV,
-            ),
+            attention: MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal),
             writer_sources: TEST_SITE.len(),
         }));
         let folded = MetalStepTape {
@@ -11126,20 +11125,31 @@ mod tests {
         );
         let [pack, split, combine] = [3, 4, 5].map(|i| m5.commands.get(i).lowered());
         let (pack, split, combine) = (&pack, &split, &combine);
-        assert_eq!(pack.dispatch.threadgroups, (VERIFY_TILE_ROWS, 4, 64));
+        let tile = crate::steel_paged::NaxTile::of(256, 16).expect("the class's NAX tile");
+        assert_eq!(pack.dispatch.threadgroups, (tile.bq(), 4, 64));
         assert_eq!(split.dispatch.threadgroups, (VERIFY_SPLITS, 4, 64));
         assert_eq!(
-            split.function,
-            "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16_packed_split4"
+            (pack.function, split.function),
+            (
+                "attention_verify_pack_q_bf16",
+                "attention_nax_paged_verify_split_bf16"
+            )
+        );
+        // The split runs the plain twin's tile, its keys split the constant's ways.
+        assert!((tile.constants().iter()).all(|k| split.constants.contains(k)));
+        assert!(
+            split
+                .constants
+                .contains(&ConstantValue::uint(34, VERIFY_SPLITS))
         );
         assert_eq!(combine.dispatch.threadgroups, (64, 24, 1));
         assert!((combine.constants.iter()).any(|k| *k == ConstantValue::uint(18, VERIFY_SPLITS)));
         assert!(
             (combine.constants.iter()).all(|k| k.index != 13),
-            "ATTN_TQ unset"
+            "ATTN_INT8 unset"
         );
         // The packed rows then the partials, both in the op scratch.
-        let packed = 64 * 4 * VERIFY_TILE_ROWS * 256 * 2;
+        let packed = 64 * 4 * tile.bq() * 256 * 2;
         let partials = 64 * 24 * VERIFY_SPLITS * 258 * 4;
         assert!(m5.moe_scratch_bytes >= packed + partials);
         let has_trio = |t: &LoweredMetalTape| {
