@@ -403,7 +403,7 @@ pub struct MetalWorker {
     kv_full_block_size: usize,
     /// `true` iff this worker runs a hybrid-SWA KV layout (gemma4): the shared
     /// pool spans multiple chunks and the fp16 sliding tensors must be grown to
-    /// cover the live block set. Uniform pools (incl. uniform TurboQuant) are
+    /// cover the live block set. Uniform pools (incl. uniform int8) are
     /// single-chunk and never grow. The right discriminator for both the grow
     /// gate and `max_chunks` (`kv_full_block_size` is nonzero on uniform too, so
     /// it can't distinguish them). Set in `init_cache`.
@@ -576,7 +576,7 @@ impl MetalWorker {
 /// `u32::MAX` to write nothing. A slot has at most one writer per step. Two
 /// sequences can be handed the same block for tokens they both compute (a full
 /// prefix-cache hit backs off one block but keeps the hit block), and a second
-/// write races with the first (TurboQuant's prefill staging re-rotates the row
+/// write races with the first (int8's prefill staging re-rotates the row
 /// in place), so a later writer skips and reads the first writer's keys like
 /// any cached row.
 ///
@@ -627,7 +627,7 @@ const METAL_KV_ELEM_BYTES: usize = 2;
 /// carries it: a row for each of `max_num_seqs` sequences, plus the drafts of the ones that verify
 /// them: the most a head's budget drafts a step ([`DraftBudget::draft_rows`]), beside sequences
 /// that run plain in the same step, or an n-gram or draft model's every sequence's. The rows the
-/// TurboQuant decode split's partials, the sampler and the logits hold.
+/// int8 decode split's partials, the sampler and the logits hold.
 fn decode_rows(
     verify_seqs: VerifySeqs,
     max_num_seqs: usize,
@@ -710,7 +710,7 @@ fn pool_bytes_per_token(
     codec: scratchy_forward_compiler::KvCodec,
     dense_elem_bytes: usize,
 ) -> usize {
-    scratchy_target_metal::turboquant::kv_bytes_per_token(
+    scratchy_target_metal::kv_int8::kv_bytes_per_token(
         codec,
         model
             .kv_cache_layers()
@@ -759,21 +759,19 @@ fn hybrid_kv_layout(
     )
 }
 
-/// A uniform model built with TurboQuant: its KV lives in packed codes and the
-/// fp16 pool is a one-chunk seed (`initialize_cache`). A hybrid model's
-/// TurboQuant global layers keep their codes BESIDE its fp16 pool, which the
-/// sliding layers read ([`target_block_bytes`] charges both).
-fn uniform_turboquant(
+/// A uniform model built with int8 KV: its KV lives in int8 codes and the fp16 pool is a
+/// one-chunk seed (`initialize_cache`). A hybrid model's int8 global layers keep their codes
+/// BESIDE its fp16 pool, which the sliding layers read ([`target_block_bytes`] charges both).
+fn uniform_int8(
     model: &dyn scratchy_target_metal::MetalWeights,
     block_size: scratchy_core_common::KvBlockTokens,
 ) -> bool {
-    model.kv_codec().is_turboquant()
-        && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
+    model.kv_codec().is_int8() && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
 }
 
 /// Bytes one block of the TARGET pool costs: a hybrid model's page in each of
-/// its group-shared tensors plus, built with TurboQuant, the global layers'
-/// codes, norms and scratch; a uniform TurboQuant model's codes, norms and
+/// its group-shared tensors plus, built with int8 KV, the global layers'
+/// codes, scales and scratch; a uniform int8 model's codes, scales and
 /// scratch; every other model's dense rows.
 fn target_block_bytes(
     model: &dyn scratchy_target_metal::MetalWeights,
@@ -782,27 +780,26 @@ fn target_block_bytes(
     if let Some(layout) = hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES) {
         let shared_pages = layout.page_size_bytes * layout.group_size;
         let codec = model.kv_codec();
-        if !codec.is_turboquant() {
+        if !codec.is_int8() {
             return shared_pages;
         }
-        // What `build_tq_provision` allocates per block: the GLOBAL group's
+        // What `build_int8_provision` allocates per block: the GLOBAL group's
         // (group 0) layers at the global geometry, `full_block_size` tokens each.
-        let tq = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs())
-            .expect("a metal model's baked rungs are MetalRungs")
-            .tq
-            .expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
+        let geometry = model.kv_layer_geometry().unwrap_or_default();
+        let global = (geometry.iter()).find(|g| !g.is_sliding);
+        let (kv_heads, head_dim) = global.map_or((0, 0), |g| (g.num_kv_heads, g.head_size));
         let num_global = layout.layer_to_group.iter().filter(|&&g| g == 0).count();
         return shared_pages
             + layout.full_block_size()
-                * scratchy_target_metal::turboquant::kv_bytes_per_token(
+                * scratchy_target_metal::kv_int8::kv_bytes_per_token(
                     codec,
                     num_global,
-                    tq.kv_heads.get() as usize,
-                    tq.head_dim.get() as usize,
+                    kv_heads,
+                    head_dim,
                     METAL_KV_ELEM_BYTES,
                 );
     }
-    if uniform_turboquant(model, block_size) {
+    if uniform_int8(model, block_size) {
         block_size.get().saturating_mul(pool_bytes_per_token(
             model,
             model.kv_codec(),
@@ -813,8 +810,8 @@ fn target_block_bytes(
     }
 }
 
-/// Bytes one block of the DRAFT pool costs: a dense draft's rows; a TurboQuant one's codes and
-/// norms (its dense pool a one-chunk seed, as the target's: `initialize_draft_cache_metal`) and
+/// Bytes one block of the DRAFT pool costs: a dense draft's rows; an int8 one's codes and
+/// scales (its dense pool a one-chunk seed, as the target's: `initialize_draft_cache_metal`) and
 /// its fp16 scratch — none of the scratch when it stages through its target's
 /// ([`DraftScratch::Target`]).
 fn draft_block_bytes(
@@ -823,12 +820,12 @@ fn draft_block_bytes(
     scratch: DraftScratch,
 ) -> usize {
     let codec = model.kv_codec();
-    if !codec.is_turboquant() {
+    if !codec.is_int8() {
         return kv_per_block_bytes(model, block_size);
     }
     let lent = match scratch {
         DraftScratch::Own => 0,
-        DraftScratch::Target => scratchy_target_metal::turboquant::scratch_bytes_per_token(
+        DraftScratch::Target => scratchy_target_metal::kv_int8::scratch_bytes_per_token(
             model.num_key_value_heads() as usize,
             model.head_dim() as usize,
         ),
@@ -859,11 +856,11 @@ struct SharedKv {
     num_blocks: usize,
     granules: Vec<bool>,
     units: Vec<bool>,
-    /// Whose stores a granule maps: the dense pools' (target, draft) or the TurboQuant stores'
+    /// Whose stores a granule maps: the dense pools' (target, draft) or the int8 stores'
     /// (`SparseRegistry`), as the models' codecs lay their KV out.
     dense_target: bool,
     dense_draft: bool,
-    turboquant: bool,
+    int8: bool,
 }
 
 impl SharedKv {
@@ -890,9 +887,9 @@ impl SharedKv {
     }
 }
 
-/// Where a TurboQuant draft stages its KV: its own fp16 scratch, or — a head, which runs after its
+/// Where a int8 draft stages its KV: its own fp16 scratch, or — a head, which runs after its
 /// target and never beside it, of the target's KV geometry — the target's
-/// (`HostArena::tq_scratch`).
+/// (`HostArena::kv_scratch`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DraftScratch {
     Own,
@@ -1653,15 +1650,15 @@ impl MetalWorker {
         (self.draft_model.as_ref()).is_some_and(|m| m.reads_target_hidden())
     }
 
-    /// Where the draft's TurboQuant KV stages ([`DraftScratch`]): a head whose KV geometry is its
-    /// TurboQuant target's stages through the target's scratch, as `build_tq_provision` places it.
+    /// Where the draft's int8 KV stages ([`DraftScratch`]): a head whose KV geometry is its
+    /// int8 target's stages through the target's scratch, as `build_int8_provision` places it.
     fn draft_scratch(&self) -> DraftScratch {
         let bs = self.config.block_size;
         let lends = match (self.model.as_deref(), self.draft_model.as_deref()) {
             (Some(target), Some(draft)) => {
                 self.draft_is_head()
-                    && uniform_turboquant(target, bs)
-                    && uniform_turboquant(draft, bs)
+                    && uniform_int8(target, bs)
+                    && uniform_int8(draft, bs)
                     && target.num_key_value_heads() == draft.num_key_value_heads()
                     && target.head_dim() == draft.head_dim()
             }
@@ -2844,7 +2841,7 @@ impl MetalWorker {
     /// releases first — they make the room a map in the same step takes — and only once every
     /// step in flight is done, since one scheduled before this may still read what is released;
     /// then maps, before the forward that reads them. Every KV store a granule spans — the dense
-    /// pools', the TurboQuant stores' — and the GDN state buffers' snapshot run.
+    /// pools', the int8 stores' — and the GDN state buffers' snapshot run.
     fn apply_shared_memory(&mut self, ops: &SharedMemoryOps) -> ExecutorResult<()> {
         if ops.is_empty() {
             return Ok(());
@@ -2877,8 +2874,8 @@ impl MetalWorker {
                 .collect::<Vec<_>>()
         };
         let (release_units, map_units) = (units(&ops.release_snapshots), units(&ops.map_snapshots));
-        let (dense_target, dense_draft, turboquant) =
-            (shared.dense_target, shared.dense_draft, shared.turboquant);
+        let (dense_target, dense_draft, int8) =
+            (shared.dense_target, shared.dense_draft, shared.int8);
         let registry = device.allocator.sparse_kv.lock();
         let mut registry = registry.expect("sparse KV registry");
         let mut each_kv_store = |run: &std::ops::Range<usize>, map: bool| -> Result<(), String> {
@@ -2886,7 +2883,7 @@ impl MetalWorker {
                 true => s.map_apart(run.clone(), mapper),
                 false => s.release(run.clone(), mapper),
             };
-            if turboquant {
+            if int8 {
                 match map {
                     true => registry.map_apart(run.clone(), mapper)?,
                     false => registry.release(run.clone(), mapper)?,
@@ -2948,7 +2945,7 @@ impl MetalWorker {
     /// allocator's shared residency set so attention reads don't race
     /// the Apple pager.
     /// Reactive KV (2b): map the KV stores through every block the step names before a forward
-    /// derefs them — TurboQuant's through group 0's (`max_full_block`), the chunked fp16 pool's
+    /// derefs them — int8's through group 0's (`max_full_block`), the chunked fp16 pool's
     /// through every group's (`max_block`) — mapped, wired and zeroed where they must be by
     /// `SparseStores::grow_to`: on Apple Silicon a GPU read of un-wired device memory does not
     /// raise a recoverable fault, it hangs the command buffer past the watchdog (a reboot).
@@ -2968,7 +2965,7 @@ impl MetalWorker {
                 ExecutorError::WorkerExecution(format!("{what} grow to block {block}: {e}"))
             }
         };
-        // TurboQuant's stores hold group 0's blocks (`build_tq_provision`), as the scheduler
+        // int8's stores hold group 0's blocks (`build_int8_provision`), as the scheduler
         // numbers them (a span block's table entry carries `UNROTATED_BLOCK_BIT`; its ID here
         // does not).
         // A budget shared with the snapshots maps the granules the scheduler names, before the step
@@ -2979,35 +2976,30 @@ impl MetalWorker {
             true => Ok(false),
             false => (registry.expect("sparse KV registry")).reach(max_full_block + 1, mapper),
         };
-        if reached.map_err(refused("TurboQuant KV", max_full_block))? {
+        if reached.map_err(refused("int8 KV", max_full_block))? {
             info!(
-                "ScratchyWorker(metal): TurboQuant KV mapped through block {max_full_block} in \
+                "ScratchyWorker(metal): int8 KV mapped through block {max_full_block} in \
                  {:.1} ms",
                 t_grow.elapsed().as_secs_f64() * 1e3,
             );
         }
-        // TurboQuant on a UNIFORM model never reads the fp16 KV pool (every layer
+        // int8 on a UNIFORM model never reads the fp16 KV pool (every layer
         // uses the packed store + the one-layer fp16 scratch, both provisioned by
         // the RuntimeFactory). Skipping growth keeps the pool at its 1-chunk seed
         // — THE memory win: per-layer fp16 KV is replaced by the ~4.7x smaller
         // packed store + a single reused scratch.
         //
-        // 🛑 BUT a HYBRID SWA model (gemma4) only TurboQuant-compresses its GLOBAL
+        // 🛑 BUT a HYBRID SWA model (gemma4) only int8-codes its GLOBAL
         // layers; its FP16 SLIDING layers DO read the fp16 pool. Skipping growth
         // there leaves chunks past the 1-chunk seed un-committed, so once a sliding
         // group's blocks cross BLOCKS_PER_CHUNK (128) the sliding K-write/read hits
         // a stale chunk-address-table entry → KV corruption (garbage past ~384
         // tokens for gemma4-12b, where total blocks = 8 + 5·ceil(tok/16) ≥ 128).
-        // Uniform TurboQuant keeps a single-chunk pool that's never read here, so
+        // Uniform int8 keeps a single-chunk pool that's never read here, so
         // skip growth there; hybrid SWA must grow its fp16 sliding tensors. Gate
         // on `kv_is_hybrid` (the same discriminator `max_chunks` uses) — NOT
         // `kv_full_block_size`, which is nonzero on uniform too.
-        if self
-            .model
-            .as_ref()
-            .is_some_and(|m| m.kv_codec().is_turboquant())
-            && !self.kv_is_hybrid
-        {
+        if self.model.as_ref().is_some_and(|m| m.kv_codec().is_int8()) && !self.kv_is_hybrid {
             return Ok(());
         }
         let (Some(kv), Some(stores)) = (self.kv_cache.as_mut(), self.target_kv_stores.as_mut())
@@ -3114,7 +3106,7 @@ impl MetalWorker {
     /// ⭐ HOW A POOL OF `num_gpu_blocks` BLOCKS SHARES ITS BUDGET WITH THE SNAPSHOTS: a block costs
     /// what the engine sized the pool by — the target's and a draft's of its own
     /// (`target_block_bytes`, `draft_block_bytes`) — and a granule is the least run of blocks every
-    /// KV store maps on whole tiles: the target's dense rows (`target_layout`) or its TurboQuant
+    /// KV store maps on whole tiles: the target's dense rows (`target_layout`) or its int8
     /// stores, and a draft's.
     fn shared_kv_layout(
         &self,
@@ -3128,32 +3120,26 @@ impl MetalWorker {
             .snapshot_slot()?
             .ok_or_else(|| err("no snapshot slot"))?;
         let bs = self.config.block_size;
-        let turboquant_stores = |m: &dyn scratchy_target_metal::MetalWeights| {
-            let bits = match m.kv_codec() {
-                scratchy_forward_compiler::KvCodec::TurboQuant(bits) => bits.get(),
-                scratchy_forward_compiler::KvCodec::Dense => return Vec::new(),
-            };
+        let int8_stores = |m: &dyn scratchy_target_metal::MetalWeights| {
+            if !m.kv_codec().is_int8() {
+                return Vec::new();
+            }
             let (heads, head_dim) = (m.num_key_value_heads() as usize, m.head_dim() as usize);
-            let b = scratchy_target_metal::turboquant::TqBlockBytes::of(
-                bs.get(),
-                heads,
-                head_dim,
-                bits,
-            );
-            vec![b.packed, b.norms, b.scratch]
+            let b = scratchy_target_metal::kv_int8::Int8BlockBytes::of(bs.get(), heads, head_dim);
+            vec![b.codes, b.scales, b.scratch]
         };
-        let dense_target = !uniform_turboquant(model, bs);
+        let dense_target = !uniform_int8(model, bs);
         let mut store_bytes: Vec<usize> = match dense_target {
             true => target_layout.iter().map(|&(bytes, _)| bytes).collect(),
-            false => turboquant_stores(model),
+            false => int8_stores(model),
         };
         let draft = (self.draft_model.as_deref()).filter(|_| self.draft_keeps_kv());
-        let dense_draft = draft.is_some_and(|d| !uniform_turboquant(d, bs));
+        let dense_draft = draft.is_some_and(|d| !uniform_int8(d, bs));
         let draft_block = match draft {
             Some(d) => {
                 store_bytes.extend(match dense_draft {
                     true => vec![draft_store_block_bytes(d, bs.get())],
-                    false => turboquant_stores(d),
+                    false => int8_stores(d),
                 });
                 draft_block_bytes(d, bs.get(), self.draft_scratch())
             }
@@ -3175,7 +3161,7 @@ impl MetalWorker {
             units: vec![false; self.gdn_snapshot_cap / unit],
             dense_target,
             dense_draft,
-            turboquant: !dense_target || (draft.is_some() && !dense_draft),
+            int8: !dense_target || (draft.is_some() && !dense_draft),
         })
     }
 
@@ -3248,9 +3234,9 @@ impl MetalWorker {
         let block_bytes_draft =
             draft_store_block_bytes(model.as_ref(), self.config.block_size.get());
 
-        // A TurboQuant draft's dense rows are never read (its KV binds the TurboQuant scratch), so
+        // A int8 draft's dense rows are never read (its KV binds the int8 scratch), so
         // its pool is a one-chunk seed, as the target's (`initialize_cache`).
-        let draft_chunks = if uniform_turboquant(model.as_ref(), self.config.block_size) {
+        let draft_chunks = if uniform_int8(model.as_ref(), self.config.block_size) {
             1
         } else {
             num_chunks_total_draft
@@ -6464,14 +6450,14 @@ impl Worker for MetalWorker {
     }
 
     fn kv_block_bytes(&self, block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
-        // A uniform TurboQuant model's blocks are packed codes, and a hybrid
-        // model's are group-shared pages plus its TurboQuant global store — not
+        // A uniform int8 model's blocks are codes, and a hybrid
+        // model's are group-shared pages plus its int8 global store — not
         // the dense rows the engine would derive. The same cost the draft split
         // in `determine_available_memory` divides by.
         // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
         // engine's every-layer row would overcount.
         let model = self.model.as_deref()?;
-        (uniform_turboquant(model, block)
+        (uniform_int8(model, block)
             || hybrid_kv_layout(model, block, METAL_KV_ELEM_BYTES).is_some()
             || model.kv_cache_layers().is_some())
         .then(|| target_block_bytes(model, block))
@@ -6874,19 +6860,17 @@ impl Worker for MetalWorker {
                 "FP8 KV cache not supported on metal — use F16".into(),
             ));
         }
-        // The KV codec was fixed when the model was built (`KV_CODEC`, from the
-        // `turboquant` feature and the model's geometry). A `--kv-cache-dtype`
-        // naming one asserts it rather than choosing it.
+        // The KV codec was fixed when the model was built (`KV_CODEC`, from the model's
+        // geometry). A `--kv-cache-dtype` naming one asserts it rather than choosing it.
         let kv_codec = model.kv_codec();
         match (self.config.kv_cache_dtype.as_str(), kv_codec) {
             ("auto", _)
             | ("fp16", scratchy_forward_compiler::KvCodec::Dense)
-            | ("turboquant", scratchy_forward_compiler::KvCodec::TurboQuant(_)) => {}
+            | ("int8", scratchy_forward_compiler::KvCodec::Int8) => {}
             (asked, built) => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "--kv-cache-dtype {asked}: this binary stores the model's KV cache as \
-                     {built}, fixed when it was built by the `turboquant` feature and the \
-                     model's geometry"
+                     {built}, fixed when it was built by the model's geometry"
                 )));
             }
         }
@@ -6988,12 +6972,12 @@ impl Worker for MetalWorker {
             (None, Some(v)) => v[slot / 2] * elem_bytes,
             _ => per_block_elems * elem_bytes,
         };
-        // UNIFORM TurboQuant: the fp16 pool is never read (tape ops use the
+        // UNIFORM int8: the fp16 pool is never read (tape ops use the
         // packed store + scratch) and never grown, so reserve only ONE chunk
         // instead of the full num_chunks_total. That drops the per-layer fp16
         // VA reservation (~13 GB) to a seed — the packed store (~4.7x smaller)
         // is the canonical cache.
-        // 🛑 HYBRID SWA (gemma4): only the GLOBAL layers are TurboQuant'd; the
+        // 🛑 HYBRID SWA (gemma4): only the GLOBAL layers are int8-coded; the
         // FP16 SLIDING layers DO read this (shared) pool and grow it past the
         // seed once their blocks cross a chunk boundary (BLOCKS_PER_CHUNK=128,
         // ~384 tokens for gemma4-12b). A 1-chunk seed makes grow_to_cover fail
@@ -7001,7 +6985,7 @@ impl Worker for MetalWorker {
         // chunk-address-table entry → garbage. So the hybrid path needs the
         // full capacity; a chunk's pages are only mapped when the pool grows
         // into it, so the SWA win (global packed + sliding fp16-windowed) holds.
-        let max_chunks = if kv_codec.is_turboquant() && hybrid_layout.is_none() {
+        let max_chunks = if kv_codec.is_int8() && hybrid_layout.is_none() {
             1
         } else {
             num_chunks_total
@@ -7011,13 +6995,13 @@ impl Worker for MetalWorker {
             .collect();
         let capacity = (max_chunks * blocks_per_chunk).min(num_gpu_blocks);
         // ⭐ Sharing its budget with the snapshots (#495), a dense pool maps the granules the
-        // scheduler names, apart (`SharedKv`), and every TurboQuant store does (`SparseRegistry`);
-        // a TurboQuant model's dense rows stay a one-chunk seed nothing reads.
+        // scheduler names, apart (`SharedKv`), and every int8 store does (`SparseRegistry`);
+        // a int8 model's dense rows stay a one-chunk seed nothing reads.
         let shares = self.gdn_snapshot_cap > 0;
         if shares {
             let registry = device.allocator.sparse_kv.lock();
             (registry.expect("sparse KV registry").share_budget())
-                .map_err(|e| ExecutorError::WorkerInit(format!("TurboQuant KV: {e}")))?;
+                .map_err(|e| ExecutorError::WorkerInit(format!("int8 KV: {e}")))?;
         }
         let kv_stores = match shares && max_chunks == num_chunks_total {
             true => scratchy_target_metal::sparse_kv::SparseStores::apart(
@@ -7459,14 +7443,14 @@ impl Worker for MetalWorker {
             (false, true) => arena_peak.saturating_mul(2),
             _ => arena_peak,
         };
-        // A uniform TurboQuant pool still reserves one fp16 chunk per layer
+        // A uniform int8 pool still reserves one fp16 chunk per layer
         // (`initialize_cache`, `initialize_draft_cache_metal`), whatever its block count. A head
         // reading its target's KV builds no pool.
         let draft_pool = (self.draft_model.as_deref()).filter(|_| self.draft_keeps_kv());
-        let tq_seed = [self.model.as_deref(), draft_pool]
+        let int8_seed = [self.model.as_deref(), draft_pool]
             .into_iter()
             .flatten()
-            .filter(|m| uniform_turboquant(*m, self.config.block_size))
+            .filter(|m| uniform_int8(*m, self.config.block_size))
             .map(|m| {
                 scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
                     * kv_per_block_bytes(m, self.config.block_size.get())
@@ -7477,7 +7461,7 @@ impl Worker for MetalWorker {
         // time below the headroom the bucket selector just split.
         let kv_left = |peak: usize| {
             compute_available_kv_bytes(total, weights_and_overhead, peak, 1.0)
-                .saturating_sub(tq_seed)
+                .saturating_sub(int8_seed)
         };
         // ONE record of the peak-activation estimate (`metal_peak_activation_estimate`), at the
         // most blocks a sequence can reach: max_model_len, and no more blocks than the pool holds —
@@ -7551,14 +7535,14 @@ impl Worker for MetalWorker {
         };
         info!(
             "ScratchyWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             arena_peak={:.1} MiB (pair={:.1} MiB), rung_scratch={:.1} MiB, tq_seed={:.1} MiB, kv_budget={:.1} GiB \
+             arena_peak={:.1} MiB (pair={:.1} MiB), rung_scratch={:.1} MiB, int8_seed={:.1} MiB, kv_budget={:.1} GiB \
              (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
             arena_peak as f64 / 1_048_576.0,
             arena_peak_pair as f64 / 1_048_576.0,
             rung_scratch as f64 / 1_048_576.0,
-            tq_seed as f64 / 1_048_576.0,
+            int8_seed as f64 / 1_048_576.0,
             available as f64 / 1_073_741_824.0,
             available_reported as f64 / 1_073_741_824.0,
             draft_reservation as f64 / 1_073_741_824.0,
@@ -7803,11 +7787,11 @@ impl Worker for MetalWorker {
             // a stray bit 31 would corrupt the physical block id.
             if self.rope_on_read_active() {
                 if let Some(ref ann) = new_req.block_annotations {
-                    // Spans rope-on-read + TurboQuant compose: dequant runs first
+                    // Spans rope-on-read + int8 compose: dequant runs first
                     // (codes → K_unrotated), THEN rope-on-read rotates to the reuse
                     // position. Rotating the dequantized K (vs quantizing the
                     // rotated K) only adds quant noise of the same magnitude
-                    // TurboQuant already accepts — and on a REUSE there is no
+                    // int8 already accepts — and on a REUSE there is no
                     // rotate-on-write twin being recomputed, so there is nothing to
                     // "diverge" from; the reused block IS the source of truth.
                     // (Coherence validated end-to-end.) The earlier structural
@@ -8002,10 +7986,10 @@ impl Worker for MetalWorker {
                 // attention's ATTN_BT_MASK) BEFORE dividing/indexing — an
                 // unmasked read indexes ~2^31 elements OOB and silently corrupts
                 // the KV cache, but ONLY when spans are active, so it slips
-                // normal testing (this exact bug hit the TurboQuant + fused-QKV
+                // normal testing (this exact bug hit the int8 + fused-QKV
                 // V kernels). Consumers: attention.metal, rope.metal,
                 // fused_qkv_rope_cache, fused_affine_qkv_rope_cache,
-                // turboquant.metal. Enforced by
+                // kv_int8.h. Enforced by
                 // crates/targets/metal/tests/kv_index_bit31_mask_test.rs.
                 let unrotated = ann.is_some_and(|a| {
                     a.get(&block_idx)
@@ -9699,13 +9683,13 @@ impl Worker for MetalWorker {
         self.mtp_drafter.is_some() && self.select_rows_kernel.is_some()
     }
 
-    /// TurboQuant codes a hybrid model's global layers into stores of their own: packed codes, norms
-    /// and an fp16 scratch, bound at each global layer's `kv_cache_k/v` and mapped through group 0's
-    /// blocks (`build_tq_provision`). The shared pool then backs the sliding layers alone — unless a
-    /// head reading its target's KV is not TurboQuant itself, and so reads the target's global layer
+    /// An int8 KV cache holds a hybrid model's global layers in stores of their own: codes,
+    /// scales and an fp16 scratch, bound at each global layer's `kv_cache_k/v` and mapped through group 0's
+    /// blocks (`build_int8_provision`). The shared pool then backs the sliding layers alone — unless a
+    /// head reading its target's KV is not int8 itself, and so reads the target's global layer
     /// from the shared pool at group 0's blocks (a coded one binds its target's stores).
     fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
-        let coded = |m: &dyn scratchy_target_metal::MetalWeights| m.kv_codec().is_turboquant();
+        let coded = |m: &dyn scratchy_target_metal::MetalWeights| m.kv_codec().is_int8();
         let target_coded = self.model.as_deref().is_some_and(coded);
         let head_coded =
             !self.head_reads_target_kv() || self.draft_model.as_deref().is_some_and(coded);
@@ -9729,7 +9713,7 @@ impl Worker for MetalWorker {
         }
     }
 
-    /// The blocks the shared pool's stores have mapped, and TurboQuant's (every store registered for
+    /// The blocks the shared pool's stores have mapped, and int8's (every store registered for
     /// the global group's blocks): a block ID space is backed as far as every store it addresses.
     fn kv_backed(&self) -> Option<scratchy_core_common::KvBackedBlocks> {
         use scratchy_core_common::{KvBackedBlocks, KvBacking};

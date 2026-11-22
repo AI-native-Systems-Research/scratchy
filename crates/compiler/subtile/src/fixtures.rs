@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::kv_codec::CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
-use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCodecFacts};
+use crate::kv_codec::{After, Before, CodecAround, Guarded, KvCodecFacts};
 use crate::lower::{InputRef, LoweringInput, OpDesc};
 use crate::subtile_ir::{
     AttnMask, EwKind, GainConvention, KvOperand, RopeClass, RopeFormTag, SourceShape, SubOp,
@@ -730,9 +730,8 @@ pub fn gemm_m1_only_input() -> LoweringInput {
     }
 }
 
-/// A codec shaped like a TurboQuant one.
-pub const TURBOQUANT_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
-    head_dims: CodecHeadDims::PowerOfTwoAtMost(512),
+/// A codec shaped like the int8 one.
+pub const INT8_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
     coded_class: AttnMask::Causal,
     after_writer: &[
         Guarded {
@@ -762,22 +761,12 @@ pub const TURBOQUANT_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
                 step: Before::Stage(KvOperand::V),
                 guard: CodecNotDecode,
             },
-            Guarded {
-                step: Before::RotateQuery,
-                guard: CodecNotDecode,
-            },
         ],
         anchor: UnlessCodecDecode,
-        after: &[
-            Guarded {
-                step: After::RotateOutput,
-                guard: CodecNotDecode,
-            },
-            Guarded {
-                step: After::PackedTwin,
-                guard: CodecDecode,
-            },
-        ],
+        after: &[Guarded {
+            step: After::PackedTwin,
+            guard: CodecDecode,
+        }],
     },
 };
 

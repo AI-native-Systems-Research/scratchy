@@ -169,7 +169,7 @@
 //!   without a head, so the base-M5 numbers above at 2 and 8 sequences are development runs at
 //!   `--max-num-seqs 8`. There the head costs its KV cache 145,936 -> 89,520 tokens (-39%): its
 //!   weights (weights+overhead 19.3 -> 19.8 GiB) come out of a KV budget of about 1 GiB, and its
-//!   layer's KV takes 528 bytes a token beside the target's 7,328 (its target's TurboQuant codes,
+//!   layer's KV takes 528 bytes a token beside the target's 7,328 (its target's int8 codes,
 //!   staged through its target's scratch). The prefill bucket stays 2048. Winning the weights'
 //!   share back on a small Mac means shrinking something else there, such as the prefill bucket.
 //! - TODO: `--num-speculative-tokens 0` serves without the head; any other count given with a head

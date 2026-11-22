@@ -18,8 +18,7 @@ use scratchy_subtile::handoff::WeightKind;
 /// (`Causal` takes the `GLOBAL_*` consts, `SlidingWindow` the base ones; on uniform arches the two
 /// are equal), and a rope pairs a head's lanes as its [`RopeFormTag`] says — the tape's own types.
 pub use scratchy_subtile::subtile_ir::{
-    AttnMask, ExpertBundle, ExpertProj, GatedAct, KvOperand, RopeFormTag, RotatedRows,
-    RouterBundle, UngatedAct,
+    AttnMask, ExpertBundle, ExpertProj, GatedAct, KvOperand, RopeFormTag, RouterBundle, UngatedAct,
 };
 
 pub use super::lowered::ActivationWidth;
@@ -352,12 +351,9 @@ pub enum MetalStep {
     Mamba2(Slot, Slot, LayerId),
     /// One step of a MoE block.
     Moe(MoeBlock, MoeStep),
-    /// `(operand, layer, class, offsets)`: the layer's `operand` staged out of its packed store for
-    /// an attention of `class`, the writer's `offsets` restored. Its site is the writer's.
+    /// `(operand, layer, class, offsets)`: the layer's cached `operand` rows staged out of its int8
+    /// store into the dense scratch an attention of `class` reads. Its site is the writer's.
     KvStage(KvOperand, LayerId, AttnMask, KvOffsets),
-    /// `(rows, which)`: an attention's query or output rows turned into or out of the codebook's
-    /// domain, in place.
-    RotateRows(Slot, RotatedRows),
     /// `(q, out, layer, pairing, class, offsets)`: the decode attention of `class`, read straight
     /// off the packed store into `out`, the writer's `offsets` restored. Its site is the writer's.
     AttnPackedKv(Slot, Slot, LayerId, RopeFormTag, AttnMask, KvOffsets),
@@ -807,7 +803,6 @@ impl MetalStep {
             | S::DraftWindowStore(..)
             | S::DraftWindowLoad(..)
             | S::DraftSelect(..)
-            | S::RotateRows(..)
             | S::SampleRows(..)
             | S::Moe(..)
             | S::RowProgram(..) => None,

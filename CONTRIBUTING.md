@@ -202,7 +202,7 @@ cargo fmt --manifest-path backends/spyre-hw/Cargo.toml --all -- --check
 
 # macOS / metal job
 cargo clippy -p scratchy-target-metal-models \
-  --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings
+  --features scratchy-models/all,scratchy-models/mtp,vision -- -D warnings
 
 # macOS / metal job, the hf-completions path (`all` doesn't enable it, so this
 # is the only lint coverage the build-time HF query gets). Needs network.

@@ -397,8 +397,7 @@ fn write_steel_paged_kernels_rs(out_dir: &std::path::Path) {
 /// is a precise, false-positive-free marker of classic MTL3. Any dispatch must
 /// go through `crate::mtl4_dispatch` (tests / cost-sweep) or
 /// `interpreter::metal::run_bucket_mtl4` (production). Do NOT reintroduce classic
-/// command buffers — there is no exception (turboquant, the last holdout, was
-/// ported 2026-06-29). This is the build-time enforcement of the METAL-4-only
+/// command buffers — there is no exception. This is the build-time enforcement of the METAL-4-only
 /// rule; clippy's `disallowed-methods` (clippy.toml) is the semantic/editor twin.
 fn guard_no_classic_mtl3(manifest_dir: &std::path::Path) {
     const BANNED: &str = ".commandBuffer()";

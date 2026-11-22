@@ -819,14 +819,6 @@ pub enum KvOperand {
     V,
 }
 
-/// Which rows a codec rotation turns: the query into the codebook's domain (`R·q`), or the
-/// attention's output back out of it (`Rᵀ·o`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RotatedRows {
-    Query,
-    Output,
-}
-
 /// What makes two nodes the SAME PROGRAM for re-rolling purposes.
 ///
 /// ⭐ THE CLASS, NOT THE INSTANCE. Hashes every attribute that decides what a node *does*, and
@@ -981,7 +973,6 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::ExpertAct { act } => act.hash(h),
             SubOp::ExpertCombine { hidden, shared } => (hidden, shared).hash(h),
             SubOp::KvEncode { operand } | SubOp::KvStage { operand } => operand.hash(h),
-            SubOp::RotateRows { rows } => rows.hash(h),
             SubOp::AttnPackedKv
             | SubOp::SampleRowsGather
             | SubOp::SampleRowsScatter
@@ -1572,11 +1563,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// offset removed first. `inputs` = `[cache, cos?, bias?]`: the cache half the writer filled,
     /// a rotating writer's rotary row, and the projection whose bias the operand carries.
     KvEncode { operand: KvOperand },
-    /// The layer's `operand`, decoded out of its packed store into the codec's rotated domain,
-    /// where the attention reads it. `inputs` = `[packed]`.
+    /// The layer's `operand`, decoded out of its packed store into the dense cache the attention
+    /// reads. `inputs` = `[packed]`.
     KvStage { operand: KvOperand },
-    /// `rows` turned into or out of the codebook's domain, in place. `inputs` = `[x]`.
-    RotateRows { rows: RotatedRows },
     /// An attention read straight off the packed store: its query, the output it replaces, and
     /// the store's two halves. `inputs` = `[q, out, packed_k, packed_v]`, optionally with the
     /// attention's trailing `[num_heads]` sinks weight source (the dense form's 6th operand).
@@ -4686,7 +4675,6 @@ pub fn lower_region(
             SubOp::ExpertCombine { hidden, shared } => SubOp::ExpertCombine { hidden, shared },
             SubOp::KvEncode { operand } => SubOp::KvEncode { operand },
             SubOp::KvStage { operand } => SubOp::KvStage { operand },
-            SubOp::RotateRows { rows } => SubOp::RotateRows { rows },
             SubOp::AttnPackedKv => SubOp::AttnPackedKv,
             SubOp::SampleRowsGather => SubOp::SampleRowsGather,
             SubOp::SampleRowsScatter => SubOp::SampleRowsScatter,

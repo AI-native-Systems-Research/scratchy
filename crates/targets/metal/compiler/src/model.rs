@@ -403,41 +403,6 @@ fn metal_vocab_suffix(
     })
 }
 
-/// The model's `METAL_TQ_CODEBOOK`: its TurboQuant codebook at the global head dim, computed here
-/// (`None` for a dense KV cache).
-fn metal_tq_codebook_tokens(mc: &scratchy_ir::model_facts::ModelFacts) -> TokenStream {
-    use scratchy_target_metal::turboquant::TqCodebook;
-    let codebook = match mc.kv_codec() {
-        scratchy_forward_compiler::KvCodec::Dense => quote!(::core::option::Option::None),
-        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
-            // The global class's head: the codebook rotates the full layers' keys.
-            let attention =
-                (mc.attention()).expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
-            let cb = TqCodebook::compute(attention.global().head_dim().get() as usize, bits);
-            let table = |t: &[f32]| {
-                let words = t.iter().map(|v| v.to_bits());
-                quote!(&[#(f32::from_bits(#words)),*])
-            };
-            let (signs, centroids) = (table(cb.signs), table(cb.centroids));
-            let (boundaries, bits, packed_dim) = (table(cb.boundaries), bits.get(), cb.packed_dim);
-            quote!(::core::option::Option::Some(::scratchy_target_metal::turboquant::TqCodebook {
-                bits: ::scratchy_forward_compiler::TqBits::new(#bits),
-                packed_dim: #packed_dim,
-                signs: #signs,
-                centroids: #centroids,
-                boundaries: #boundaries,
-            }))
-        }
-    };
-    quote! {
-        /// This model's TurboQuant codebook (`None`: dense KV cache).
-        #[cfg(scratchy_target = "metal")]
-        pub static METAL_TQ_CODEBOOK: ::core::option::Option<
-            ::scratchy_target_metal::turboquant::TqCodebook,
-        > = #codebook;
-    }
-}
-
 /// One canonical model's emission on metal.
 pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     let ModelCx {
@@ -451,7 +416,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         ..
     } = *cx;
     let model_facts = *cx.facts;
-    // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
+    // A head reading its target's KV (`reads_target_kv`) binds its target's int8 store.
     let reads_target_kv = model.arch.reads_target_kv;
     let emit_struct = cx.struct_with;
     let model_dims = cx.dims_of;
@@ -1281,7 +1246,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             )
         });
         // Bake this bucket's tape rungs at expansion — one per device
-        // generation, addressing, KV cap and TurboQuant decode heads —
+        // generation, addressing and KV cap —
         // every fact baked; the pool picks one. See static_tape.rs.
         let tapes_static_toks = {
             let mc = &model_facts;
@@ -1686,7 +1651,6 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     }
     {
         let mc = &model_facts;
-        metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc));
         // A multi-token-prediction head (its body reads the target's hidden rows) chains its
         // passes on the device.
         let head = reads_target_hidden.then(|| {
@@ -1720,9 +1684,6 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         pub static METAL_RUNGS: ::scratchy_target_metal::interpreter::metal::MetalRungs =
             ::scratchy_target_metal::interpreter::metal::MetalRungs {
                 buckets: METAL_BUCKETS,
-                tq: ::scratchy_target_metal::interpreter::metal::TqGroup::of(
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS,
-                ),
                 // Checked against the buckets as this static compiles: every slot of every bucket
                 // ranked once, and no bucket's final hidden states among the hosting ranks.
                 ranks: __arena::RANKED.ranks(METAL_BUCKETS),
@@ -1968,19 +1929,18 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                         .unzip();
                     (keys, values, pool.windows().buffer().clone())
                 });
-                // TurboQuant: captured (Copy) so the 'static factory closure can
-                // provision the packed stores + scratch per worker for a model
-                // whose `KV_CODEC` is TurboQuant. UNIFORM arches (num_kv_groups
-                // == 1): every layer is "global", compressed at the base
-                // geometry. HYBRID/SWA arches (gemma4: num_kv_groups > 1)
-                // compress ONLY the GLOBAL (full-context, group 0) layers at the
+                // Int8: captured (Copy) so the 'static factory closure can provision
+                // the int8 store + scratch per worker for a model whose `KV_CODEC` is
+                // int8. UNIFORM arches (num_kv_groups == 1): every layer is "global",
+                // coded at the base geometry. HYBRID/SWA arches (gemma4: num_kv_groups
+                // > 1) code ONLY the GLOBAL (full-context, group 0) layers at the
                 // GLOBAL geometry; the sliding layers stay fp16.
                 // `is_global[L]` = (group_of(L) == 0): group 0 is always the
                 // full-context group (see `compute_hybrid_kv_layout`); uniform →
                 // all-zero map → all-true. A recurrent hybrid's layers that hold
                 // no KV (`FACTS.kv_layers()`) get no store.
-                let __tq_nb = ctx.kv_cache.num_blocks;
-                let __tq_kv_layers = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
+                let __int8_nb = ctx.kv_cache.num_blocks;
+                let __int8_kv_layers = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
                     .kv_layers()
                     .map(::scratchy_forward_compiler::model_facts::KvLayers::get);
                 // The attention's global class: the full layers' pages and kv heads. `None` for a
@@ -1988,15 +1948,15 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 let __global = <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS
                     .attention()
                     .map(|a| a.global());
-                let __tq_is_global: ::std::vec::Vec<bool> = ctx
+                let __int8_is_global: ::std::vec::Vec<bool> = ctx
                     .kv_cache
                     .layer_to_group_u32()
                     .iter()
                     .zip(0u32..)
-                    .map(|(&g, l)| g == 0 && __tq_kv_layers.is_none_or(|kv| kv.contains(&l)))
+                    .map(|(&g, l)| g == 0 && __int8_kv_layers.is_none_or(|kv| kv.contains(&l)))
                     .collect();
                 // The stores register with the device's allocator, whose KV growth maps them.
-                let __tq_allocator = device.allocator.clone();
+                let __int8_allocator = device.allocator.clone();
                 // A step's block tables: a row per sequence, at most the serving batch (every
                 // row of the largest bucket when the worker has not stashed one), each the KV
                 // pool's row stride — the KV cap rung it runs on, which the host pads every row
@@ -2019,29 +1979,31 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                         // Provision at the GLOBAL geometry: uniform arches have
                         // GLOBAL_* == base, so this is identical to the base-geometry
                         // call (every layer global). gemma4 provisions GLOBAL-sized
-                        // packed/norms/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
+                        // codes/scales/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
                         // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
-                        let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
-                            // A head reading its target's KV binds its target's packed stores.
+                        let __int8_prov = (<Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC
+                            .is_int8())
+                        .then(|| {
+                            // A head reading its target's KV binds its target's int8 store.
                             if #reads_target_kv {
-                                return host.tq.clone().expect(
-                                    "a head reading its target's TurboQuant KV builds its pool in \
+                                return host.int8.clone().expect(
+                                    "a head reading its target's int8 KV builds its pool in \
                                      its target's, which shares it",
                                 );
                             }
                             let global = __global
-                                .expect("ModelFacts::new: a TurboQuant KV codec is an attention's");
-                            ::scratchy_target_metal::turboquant::build_tq_provision(
-                                &__tq_allocator,
-                                ::scratchy_target_metal::turboquant::TqPool {
-                                    is_global: &__tq_is_global,
-                                    num_blocks: __tq_nb,
+                                .expect("ModelFacts::new: an int8 KV codec is an attention's");
+                            ::scratchy_target_metal::kv_int8::build_int8_provision(
+                                &__int8_allocator,
+                                ::scratchy_target_metal::kv_int8::Int8Pool {
+                                    is_global: &__int8_is_global,
+                                    num_blocks: __int8_nb,
                                     block_size: global.page().get() as usize,
                                     num_kv_heads: global.kv_heads().get() as usize,
+                                    head_dim: global.head_dim().get() as usize,
                                     blocks_per_chunk: ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
                                 },
-                                codebook,
-                                host.tq_scratch.as_ref(),
+                                host.kv_scratch.as_ref(),
                             )
                         });
                         ::scratchy_target_metal::interpreter::metal::RuntimeBindings {
@@ -2069,18 +2031,17 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                                 .map(|_| alloc(__bt_rows * __bt_stride * 4))
                                 .collect(),
                             layer_to_group: kv_layer_to_group.clone(),
-                            // TurboQuant: when provisioned, the GLOBAL (group-0)
-                            // layers' KV points at the one fp16 scratch (the
-                            // injected per-layer dequant/quantize tape ops fill/drain
-                            // it); SLIDING layers keep the normal fp16 pool. For
-                            // uniform arches every layer is global → all scratch
-                            // (byte-identical to the prior all-layers override).
-                            // Without tq, every layer uses the fp16 pool.
-                            kv_cache_k: __tq_prov
+                            // Int8: when provisioned, the GLOBAL (group-0) layers' KV
+                            // points at the one fp16 scratch (the writers and the
+                            // per-layer staging fill it); SLIDING layers keep the
+                            // normal fp16 pool. For uniform arches every layer is
+                            // global → all scratch. Dense, every layer uses the fp16
+                            // pool.
+                            kv_cache_k: __int8_prov
                                 .as_ref()
                                 .map(|p| {
                                     (0..num_layers)
-                                        .map(|l| if __tq_is_global[l] {
+                                        .map(|l| if __int8_is_global[l] {
                                             p.scratch.k_table.clone()
                                         } else {
                                             kv_k[l].clone()
@@ -2088,11 +2049,11 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                                         .collect()
                                 })
                                 .unwrap_or_else(|| kv_k.clone()),
-                            kv_cache_v: __tq_prov
+                            kv_cache_v: __int8_prov
                                 .as_ref()
                                 .map(|p| {
                                     (0..num_layers)
-                                        .map(|l| if __tq_is_global[l] {
+                                        .map(|l| if __int8_is_global[l] {
                                             p.scratch.v_table.clone()
                                         } else {
                                             kv_v[l].clone()
@@ -2109,7 +2070,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                             block_unrotated_flags: (0..num_layers)
                                 .map(|_| alloc(16))
                                 .collect(),
-                            tq: __tq_prov,
+                            int8: __int8_prov,
                             // 4 bytes — worker writes the forward's
                             // `num_tokens` here before dispatch: the MoE
                             // sort counts the step's live pairs.

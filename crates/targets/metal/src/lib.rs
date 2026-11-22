@@ -263,6 +263,7 @@ pub mod metal_mem;
 // A loaded model as metal runs it (`MetalWeights`), and the registry its loaders live in.
 pub mod model;
 pub use model::{MetalArchRegistration, MetalWeights, try_load};
+pub mod kv_int8;
 pub mod mtl4_dispatch;
 pub mod off_tape;
 pub mod owned_metal;
@@ -279,7 +280,6 @@ pub mod stream;
 pub mod tape;
 /// Apple Silicon target profiles and cost models.
 pub mod targets;
-pub mod turboquant;
 pub mod vocab_suffix;
 
 // The bake: AoT metallib compiles.

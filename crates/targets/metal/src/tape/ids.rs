@@ -550,18 +550,16 @@ u32_newtype!(
     /// Steel attention `[[function_constant(99)]]` debug-mode toggle.
     /// Bound to `0` for production; `>0` selects diagnostic paths.
     AttnDebugMode,
-    /// TurboQuant codebook width, bits per packed code (`W::KV_CODEC`'s `TqBits`).
-    TqCodeBits,
-    /// Query heads one TurboQuant decode threadgroup covers
-    /// (`attention.metal` `ATTN_TQ_HEADS`, slot 16) — see [`TqDecodeHeads::for_group`].
-    TqDecodeHeads,
+    /// Query heads one one-pass decode threadgroup covers (`attention.metal`
+    /// `ATTN_DECODE_HEADS`, slot 16) — see [`DecodeHeads::largest_group`].
+    DecodeHeads,
     /// The GPU cores of the device a tape runs on, read at load
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
     /// The most rows a step samples, and a decode or verify step brings — one a sequence of the
     /// serving engine's `max_num_seqs`, a verify step's drafts too — read at load: the rows a
-    /// decode-gated TurboQuant decode split's partials are reserved for
+    /// decode-gated int8 decode split's partials are reserved for
     /// ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]), and the logits buffer holds
     /// ([`crate::tape::lowered::LoweredMetalTape::logits_rows`]).
     DecodeRows,
@@ -574,55 +572,21 @@ u32_newtype!(
     NumDrafts,
 );
 
-impl TqDecodeHeads {
-    /// Every head count the decode kernel serves for this geometry, ascending:
-    /// the divisors of the GQA group whose per-lane state fits
-    /// (`heads * head_dim / 32 <= 32`, at most 8 heads).
-    pub fn candidates(
-        head_dim: HeadDim,
-        num_q_heads: NumQHeads,
-        num_kv_heads: NumKvHeads,
-    ) -> impl Iterator<Item = Self> {
-        let group = num_q_heads.get() / num_kv_heads.get().max(1);
-        let lanes = head_dim.get() / 32;
-        (1..=group.min(8))
-            .filter(move |&h| group.is_multiple_of(h) && h * lanes <= 32)
-            .map(Self)
-    }
-
-    /// The most heads that still leave `4/5` of the GPU's cores a threadgroup
-    /// each (one per `heads` query heads). The threadgroup decodes each packed
-    /// key once for all of them, and TurboQuant decode is ALU-bound on that
-    /// decode — but too few threadgroups idle cores. Measured on a 10-core M5
-    /// (Llama-3.2-3B, Llama-3.1-8B, Qwen2.5-3B / -7B geometries at 8k): the
-    /// best count left 8 threadgroups in every case.
-    pub fn for_group(
-        head_dim: HeadDim,
-        num_q_heads: NumQHeads,
-        num_kv_heads: NumKvHeads,
-        gpu_cores: GpuCores,
-    ) -> Self {
-        let min_threadgroups = gpu_cores.get() * 4 / 5;
-        Self::candidates(head_dim, num_q_heads, num_kv_heads)
-            .filter(|h| num_q_heads.get() / h.get() >= min_threadgroups)
-            .last()
-            .unwrap_or(Self(1))
-    }
-
-    /// The most heads a threadgroup serves for this geometry, baked for the
-    /// plain (non-TurboQuant) decode: the largest divisor of the GQA group
-    /// that fits the per-lane state. Unlike [`Self::for_group`] there is no
-    /// occupancy floor — that filter is tuned for TurboQuant's ALU-bound
-    /// decode, while the plain walk is bound by the K/V reads, which the
-    /// largest group reads the fewest times over.
+impl DecodeHeads {
+    /// The most heads a threadgroup serves for this geometry: the largest divisor of the GQA
+    /// group whose per-lane state fits (`heads * head_dim / 32 <= 32`, at most 8 heads). The walk
+    /// is bound by the K/V reads, which the largest group reads the fewest times over.
     pub fn largest_group(
         head_dim: HeadDim,
         num_q_heads: NumQHeads,
         num_kv_heads: NumKvHeads,
     ) -> Self {
-        Self::candidates(head_dim, num_q_heads, num_kv_heads)
-            .last()
-            .unwrap_or(Self(1))
+        let group = num_q_heads.get() / num_kv_heads.get().max(1);
+        let lanes = head_dim.get() / 32;
+        (1..=group.min(8))
+            .rev()
+            .find(|&h| group.is_multiple_of(h) && h * lanes <= 32)
+            .map_or(Self(1), Self)
     }
 }
 

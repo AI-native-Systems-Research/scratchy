@@ -315,16 +315,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy + test.
-      # `turboquant` is on in every default `scr` build but not in the metal
-      # models crate's own (empty) default, so name it: every model then
-      # expands with the KV codec users get, and the lowering's check that a
-      # TurboQuant model's tape compresses its KV runs across the whole catalog.
-      # `mtp` adds the multi-token-prediction head of every model whose
+      # Every model expands with its int8 KV codec, and the lowering's check
+      # that an int8 model's tape compresses its KV runs across the whole
+      # catalog. `mtp` adds the multi-token-prediction head of every model whose
       # checkpoint carries one (heads have no configs of their own). `vision`:
       # `all` selects the vision arches, whose towers need it.
       - name: Clippy
         run: cargo clippy -p scratchy-target-metal-models
-          --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings
+          --features scratchy-models/all,scratchy-models/mtp,vision -- -D warnings
 
       # The other half of macos-scope's skip: fails if this job compiled a crate
       # whose PRs skip it. lock() reads the card workspace's metadata too, against

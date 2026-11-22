@@ -1784,15 +1784,8 @@ impl Recording<'_> {
     /// the writer-less attention that reads it, when one does.
     fn query_only_rotate(&self, i: usize) -> Option<(LayerId, AttnMask)> {
         let ops = &self.l.input.ops;
-        // The attention reads the rotation directly, or through the codec's query rotation.
-        let reads = |q: Option<&InputRef>| match q {
-            Some(&InputRef::Op(j)) if j == i => true,
-            Some(&InputRef::Op(j)) => {
-                matches!(ops[j].op, SubOp::RotateRows { .. })
-                    && ops[j].inputs.first() == Some(&InputRef::Op(i))
-            }
-            _ => false,
-        };
+        // The attention reads the rotation directly.
+        let reads = |q: Option<&InputRef>| matches!(q, Some(&InputRef::Op(j)) if j == i);
         ops.iter().enumerate().find_map(|(j, od)| match od.op {
             SubOp::AttnDecode { mask, .. } if od.inputs.len() == 3 && reads(od.inputs.first()) => {
                 Some((self.prefix_layer(j)?, mask))
@@ -2258,10 +2251,6 @@ impl Recording<'_> {
                 e.sig.kv_r = Some(layer);
                 e.sig.codec_staging = Access::Write;
                 e
-            }
-            L::RotateRows { rows } => {
-                let x = self.read(i, 0)?;
-                em(S::RotateRows(x, rows), &[x], &[x], Vec::new())
             }
             L::AttnPackedKv => {
                 // The layer's decode attention: its writer's layer and pairing.

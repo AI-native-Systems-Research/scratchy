@@ -560,7 +560,7 @@ pub struct MetalAllocator {
     /// vs memcpy" breakdown after `try_load` completes. Atomics are
     /// `Relaxed` — these aren't synchronization, just stats.
     load_stats: Arc<LoadStats>,
-    /// The sparse stores the KV pool's growth maps as its blocks are reached (TurboQuant's).
+    /// The sparse stores the KV pool's growth maps as its blocks are reached (the int8).
     pub sparse_kv: Arc<Mutex<crate::sparse_kv::SparseRegistry>>,
 }
 
@@ -887,7 +887,7 @@ impl MetalAllocator {
         }
     }
 
-    /// The buffer binding for the MLX-affine packed codes `ptr..ptr + len`,
+    /// The buffer binding for the MLX-affine codes `ptr..ptr + len`,
     /// stored the way the reading command's kernel reads them (`codes`,
     /// from its constants). On `Offset8` they are stored XOR 0x88 — signed
     /// q - 8 — once, in place: in a copied region (whose sidecar writer

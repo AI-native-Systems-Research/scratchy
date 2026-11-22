@@ -7,22 +7,17 @@
 //!
 //! Everything that varies is a rung, every fact of it baked; the pool only picks:
 //! - **device generation** → one rung per [`GenClass`];
-//! - **KV block-table capacity** → one rung per cap of the model's [`kv_cap_ladder`];
-//! - **TurboQuant decode heads** (from the device's core count) → one rung per head count the
-//!   geometry admits.
+//! - **KV block-table capacity** → one rung per cap of the model's [`kv_cap_ladder`].
 //!
 //! Rungs that lower identically share one body.
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use scratchy_target_metal::tape::ids::{
-    BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, SourceIx,
-    TqDecodeHeads,
-};
+use scratchy_target_metal::tape::ids::{BlockSize, MaxBlocksPerSeq, MaxPositions, SourceIx};
 use scratchy_target_metal::tape::lowered::{
     Activation, Binding, CommandTableBuilder, CommandTableParts, GatedCommand, Gemm, GenClass,
-    KernelId, KvAddressing, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
-    PackedKind, TapeCommand, TapeCommands, baked,
+    KvAddressing, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype, PackedKind,
+    TapeCommand, TapeCommands, baked,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -311,9 +306,7 @@ impl CommandPool {
         variant: TapeVariant,
     ) -> Result<(), BakeDefect> {
         for c in commands.iter() {
-            let keys = aot::bake_keys(&c.command, dtype, variant)
-                .map_err(|e| BakeDefect(format!("bake key: {e}")))?;
-            for key in keys {
+            for key in aot::bake_keys(&c.command, dtype, variant) {
                 if self.named_kernels.insert(key.clone()) {
                     self.kernels.push(key);
                 }
@@ -1394,14 +1387,12 @@ fn name_operands(
         .collect()
 }
 
-/// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` variant of one
-/// bucket's tape and emit the `&'static [ClassedTape]` expression. A tape with no TurboQuant decode
-/// attention serves every device (`tq_heads: None`); one with it has a variant per head count its
-/// geometry admits ([`TqDecodeHeads::candidates`]), which the device picks among. A cap rung whose
+/// Bake every `(gen class × KV addressing × KV cap)` variant of one bucket's tape and emit the
+/// `&'static [ClassedTape]` expression. A cap rung whose
 /// scratch cannot exist for this bucket ([`LoweringError::ScratchTooLarge`]) ends the bucket's
 /// ladder: it and every rung above it are not baked.
 ///
-/// A variant's cap and heads reach its commands only as variant-bound constants
+/// A variant's cap reaches its commands only as a variant-bound constant
 /// ([`ConstantType::KvCap`](scratchy_target_metal::tape::constants::ConstantType::KvCap)), so the
 /// variants of a `(class, addressing)` share one hoisted body and each carries only its cap-sized
 /// scratch ([`ClassedTape::rung`]); the kernels its values bake join the model's kernel table.
@@ -1417,17 +1408,6 @@ pub fn bake_bucket_tapes(
         pool.read_affine(wide.steps, wide.operands)?;
     }
     let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
-    // The TurboQuant decode's head groups the global class admits; a model without attention
-    // decodes no attention, so it bakes none.
-    let candidates: Vec<TqDecodeHeads> = match mc.attention() {
-        Some(a) => TqDecodeHeads::candidates(
-            HeadDim(a.global().head_dim().get()),
-            NumQHeads(a.q_heads().get()),
-            NumKvHeads(a.global().kv_heads().get()),
-        )
-        .collect(),
-        None => Vec::new(),
-    };
     let mut entries: Vec<TokenStream> = Vec::new();
     let mut body_statics: Vec<TokenStream> = Vec::new();
     // Dedupe: identical bodies share ONE hoisted static — every labelled variant would otherwise
@@ -1536,27 +1516,17 @@ pub fn bake_bucket_tapes(
             }
         };
         let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{body_ix}");
-        let serves_tq = (tape.commands.iter())
-            .any(|c| c.command.kernel() == Some(KernelId::AttentionViaCacheTq));
-        let heads: Vec<Option<TqDecodeHeads>> = match serves_tq {
-            true => candidates.iter().copied().map(Some).collect(),
-            false => vec![None],
-        };
-        for tq_heads in heads {
-            let variant = TapeVariant { cap, tq_heads };
-            pool.name_kernels(tape.commands, mc.act_dtype(), variant)?;
-            let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
-            let addressing_toks =
-                tok("addressing", crate::const_tokens::const_tokens(&addressing))?;
-            let cap_toks = tok("cap", crate::const_tokens::const_tokens(&cap))?;
-            let tq_toks = tok("tq heads", crate::const_tokens::const_tokens(&tq_heads))?;
-            entries.push(quote! {
-                __tl::ClassedTape::rung(
-                    #ident, #class_toks, #addressing_toks, #cap_toks, #tq_toks,
-                    [#roped_k, #attn_unfused],
-                ),
-            });
-        }
+        let variant = TapeVariant { cap };
+        pool.name_kernels(tape.commands, mc.act_dtype(), variant)?;
+        let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
+        let addressing_toks = tok("addressing", crate::const_tokens::const_tokens(&addressing))?;
+        let cap_toks = tok("cap", crate::const_tokens::const_tokens(&cap))?;
+        entries.push(quote! {
+            __tl::ClassedTape::rung(
+                #ident, #class_toks, #addressing_toks, #cap_toks,
+                [#roped_k, #attn_unfused],
+            ),
+        });
     }
     // ⭐ THE ALIASES THE WHOLE BAKED TAPE RESOLVES THROUGH, opened once for this block. Every
     // literal below names its type through `__tl`/`__tc`/`__ti` instead of spelling

@@ -8,10 +8,6 @@ description = "The selected models, compiled for metal: the model scope `scratch
 
 [features]
 default = []
-# TurboQuant KV compression, fixed per model at build time: every model whose geometry the codec
-# takes (`scratchy_layers::turboquant::codec_for`) is emitted with `KV_CODEC = TurboQuant`, the rest
-# stay dense and are named in the build output. Nothing selects it at runtime.
-turboquant = []
 # The vision towers' runtime surface. A scope that selects a vision arch (`scratchy-models`'
 # `vision`, which every `arch-<X>-vl` turns on) needs it: the build script refuses that scope
 # without it, rather than fail inside the emitted tower.

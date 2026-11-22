@@ -17,7 +17,6 @@
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
     BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartArray, PartIx, SourceIx,
-    TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -469,29 +468,17 @@ pub enum KernelId {
     /// `elementwise.metal`. Bindings: `(embed @ 0 in/out, mm @ 1,
     /// dst_rows @ 2)`, `MmEmbedSpliceConstants` baked.
     MmEmbedSplice,
-    /// TurboQuant prefill: write a layer's K (or V) for the step's sequences
-    /// into the reused fp16 scratch in the codebook's ROTATED domain (R·k),
-    /// right before that layer's prefill attention — a table lookup per cached
-    /// key, a Walsh-Hadamard transform per new key. Maps to
-    /// `tq_stage_rotated_{f16,bf16}` in `attention.metallib`. The packed store
-    /// (canonical, ~4.7x smaller) is the only persistent KV; the scratch holds
-    /// one layer's image for the attention read, then is reused.
-    TqStageRotated,
-    /// TurboQuant prefill: rotate the attention's q rows into the codebook
-    /// domain (R·q) before it and its output rows back (Rᵀ·o) after it, in
-    /// place. Maps to `tq_{rotate,unrotate}_rows_{f16,bf16}` in
-    /// `attention.metallib`.
-    TqRotateRows,
-    /// TurboQuant decode attention: `AttentionViaCache` reading the packed
-    /// store directly in the codebook domain (function constant 13), so a
-    /// decode step never dequantizes the context. Same symbol as
-    /// `AttentionViaCache`.
-    AttentionViaCacheTq,
-    /// A one-row TurboQuant decode attention serving each KV head's 8 query heads together
-    /// (`attention_decode_gqa_tq_*`): its threadgroups count KV heads and `ATTN_SPLITS` key runs,
-    /// whatever TurboQuant heads the variant serves.
-    AttentionDecodeGqaTq,
-    /// [`Self::AttentionDecodeGqaTq`]'s second pass (`attention_via_cache_v2_combine_*`): merges
+    /// Int8 prefill: write a layer's cached K (or V) rows for the step's sequences into the
+    /// reused fp16 scratch, decoded and rotated back, right before that layer's prefill
+    /// attention; the step's writer filled the new rows. Maps to `kv_stage_{f16,bf16}` in
+    /// `attention.metallib`. The int8 store is the only persistent KV; the scratch holds one
+    /// layer's dense image for the attention read, then is reused.
+    KvStage,
+    /// The decode attention reading the int8 store, a KV head's query heads together
+    /// (`attention_decode_gqa_int8_*`): its threadgroups count the query-head groups and
+    /// `ATTN_SPLITS` key runs.
+    AttentionDecodeInt8,
+    /// [`Self::AttentionDecodeInt8`]'s second pass (`attention_via_cache_v2_combine_*`): merges
     /// each query head's partials into its output.
     AttentionDecodeCombine,
     /// A verify step's lanes' query rows packed a KV head's group to a 64-row tile
@@ -635,11 +622,9 @@ impl KernelId {
             | Self::LoadRows
             | Self::ConcatRows
             | Self::MmEmbedSplice
-            | Self::TqStageRotated
-            | Self::TqRotateRows
+            | Self::KvStage
             | Self::RowProgram
-            | Self::AttentionViaCacheTq
-            | Self::AttentionDecodeGqaTq
+            | Self::AttentionDecodeInt8
             | Self::AttentionDecodeCombine
             | Self::AttentionVerifyPack
             | Self::AttentionVerifySplit
@@ -772,12 +757,11 @@ pub enum RuntimeGate {
     /// without an lm_head (issue #361).
     OnlyIfEveryRowSampled,
     /// Run only on a decode step — every sequence contributes exactly one
-    /// token (`num_tokens == num_seqs`): a TurboQuant model's
-    /// `AttentionViaCacheTq`, reading the packed store directly.
+    /// token (`num_tokens == num_seqs`): an int8 model's `AttentionDecodeInt8`, reading the
+    /// store directly.
     OnlyIfDecodeStep,
-    /// Run unless this is a decode step: the attention an
-    /// `AttentionViaCacheTq` twin replaces there, and the rotated-domain K/V
-    /// staging and q/output rotation around it.
+    /// Run unless this is a decode step: the attention an `AttentionDecodeInt8` twin replaces
+    /// there, and the K/V staging ahead of it.
     UnlessDecodeStep,
     /// Run only on a step whose token count is in
     /// `quantized::SMALL_M_TOKENS`: the `AffineQmmSmallM` twin of a GEMM.
@@ -1497,28 +1481,21 @@ pub enum RuntimeBindingKind {
     /// u32 SigLIP positional-embedding indices read by `PosEmbed`
     /// (`[0..vision_num_positions]` per image). Gemma3-MM.
     VisionPositionIds,
-    /// TurboQuant per-layer PACKED key/value code store (canonical KV, ~4.7x
-    /// smaller than fp16). Source for `TqStageRotated` and
-    /// `AttentionViaCacheTq`, dest for an encoding KV writer. Worker resolves
-    /// to `tq_packed_k/v[layer]`.
-    TqPackedK {
+    /// The int8 store's per-layer key/value codes (the canonical KV). Source for `KvStage` and
+    /// `AttentionDecodeInt8`, dest for an encoding KV writer.
+    KvCodesK {
         layer: LayerId,
     },
-    TqPackedV {
+    KvCodesV {
         layer: LayerId,
     },
-    /// TurboQuant per-layer f32 norm store (one norm per quantized vector).
-    TqNormsK {
+    /// The int8 store's per-layer f32 row scales (one per coded row).
+    KvScalesK {
         layer: LayerId,
     },
-    TqNormsV {
+    KvScalesV {
         layer: LayerId,
     },
-    /// TurboQuant codebook buffers (shared across layers): the random ±1 sign
-    /// vector, the Lloyd-Max boundaries, and the N(0,1) centroids.
-    TqSigns,
-    TqBoundaries,
-    TqCentroids,
 }
 
 pub fn baked<T>(v: Vec<T>) -> &'static [T] {
@@ -2287,16 +2264,16 @@ impl RuntimeBindingKind {
             Self::GdnSsmLanes { layer } => Self::GdnSsmLanes {
                 layer: layer.advance(by),
             },
-            Self::TqPackedK { layer } => Self::TqPackedK {
+            Self::KvCodesK { layer } => Self::KvCodesK {
                 layer: layer.advance(by),
             },
-            Self::TqPackedV { layer } => Self::TqPackedV {
+            Self::KvCodesV { layer } => Self::KvCodesV {
                 layer: layer.advance(by),
             },
-            Self::TqNormsK { layer } => Self::TqNormsK {
+            Self::KvScalesK { layer } => Self::KvScalesK {
                 layer: layer.advance(by),
             },
-            Self::TqNormsV { layer } => Self::TqNormsV {
+            Self::KvScalesV { layer } => Self::KvScalesV {
                 layer: layer.advance(by),
             },
             Self::DraftRingKeys { layer } => Self::DraftRingKeys {
@@ -2332,10 +2309,7 @@ impl RuntimeBindingKind {
             | Self::VisionCuSeqlensWindow
             | Self::VisionWindowIndex
             | Self::VisionReverseIndices
-            | Self::VisionPositionIds
-            | Self::TqSigns
-            | Self::TqBoundaries
-            | Self::TqCentroids => self,
+            | Self::VisionPositionIds => self,
         }
     }
 }
@@ -2464,7 +2438,7 @@ pub struct TapeLoop {
 pub enum ScratchKind {
     /// Split-K partial sums, reduced by the next command.
     SplitK,
-    /// MoE routing and expert rows, and the TurboQuant decode split's partials.
+    /// MoE routing and expert rows, and the int8 decode split's partials.
     Moe,
     /// The rope-once pre-roped K.
     RopedK,
@@ -2659,7 +2633,7 @@ pub enum LogitsRows {
     Sampled { tile: RowTile },
 }
 
-/// The TurboQuant decode split's partials a tape's steps write at the MoE scratch's front: a row's
+/// The int8 decode split's partials a tape's steps write at the MoE scratch's front: a row's
 /// bytes, for the rows the steps that run the split bring ([`LoweredMetalTape::scratch_bytes`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct DecodePartials {
@@ -2668,7 +2642,7 @@ pub struct DecodePartials {
     pub steps: SplitSteps,
 }
 
-/// The steps a tape's TurboQuant decode split runs on, as its gate admits them.
+/// The steps a tape's int8 decode split runs on, as its gate admits them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub enum SplitSteps {
     /// Decode steps alone ([`RuntimeGate::OnlyIfDecodeStep`]): a row a sequence, at most the
@@ -2822,7 +2796,7 @@ pub struct LoweredMetalTape {
     /// one bucket execute serially through the dispatch, so they can share
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
-    /// The TurboQuant decode split's partials at the MoE scratch's front: a decode-gated split's
+    /// The int8 decode split's partials at the MoE scratch's front: a decode-gated split's
     /// for the rows a decode step can bring, an every-step one's — a verify-sized bucket's, which
     /// a short prefill runs too — for the bucket's every row ([`Self::scratch_bytes`]).
     pub decode_partials: DecodePartials,
@@ -2944,15 +2918,6 @@ pub enum LoweringError {
         body_len: u32,
         remaining: usize,
     },
-    /// A TurboQuant codec command could not bind the additive offset of the
-    /// KV operand it compresses — quantizing without removing it would let the
-    /// offset's norm, not the signal's, set the codec's error: a K bias, with no
-    /// rotary table to rotate it to each key (rope-on-read off).
-    TurboQuantOffsetUnbound { index: usize },
-    /// A TurboQuant-coded KV writer at tape index `index` that writes its K/V un-rotated
-    /// (`KvAppend`) with an additive offset: the codec's restores rotate a K bias to the key and
-    /// bind the writer's rotary table for either, and such a writer has none.
-    UnrotatedWriterOffset { index: usize },
     /// A step at tape index `index` binds the `slot`-th `kind` weight of its site, and its
     /// site holds no such source — the step records and the opcode lowering disagree.
     NoSource {
@@ -2964,7 +2929,7 @@ pub enum LoweringError {
     NoRotaryTable { index: usize },
     /// A gated row whose realization already gates its commands: one command, two gates.
     DoubleGate { index: usize },
-    /// A decode attention at tape index `index` that the TurboQuant split takes binds, past its
+    /// A decode attention at tape index `index` that the int8 split takes binds, past its
     /// sinks, a buffer at `slot`: the split's partials slot, which that buffer would overlap.
     SplitPartialsSlotTaken {
         index: usize,
@@ -2979,13 +2944,10 @@ pub enum LoweringError {
     /// step has no per-row twin re-roping span blocks, so some step with
     /// several sequences would run no attention, or row 0's for every sequence.
     RowZeroWithoutPerRowTwin { index: usize, kernel: KernelId },
-    /// The model's KV codec is TurboQuant, but its backbone binds the KV cache
-    /// without compressing any of it: the factory would provision packed stores
-    /// nothing writes, and the worker would stop growing a pool the tape reads.
-    TurboQuantCompressesNothing,
-    /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
-    /// runs only on a TurboQuant model.
-    CodecStepOnDenseModel,
+    /// The model's KV codec is int8, but its backbone binds the KV cache without compressing any
+    /// of it: the factory would provision stores nothing writes, and the worker would stop
+    /// growing a pool the tape reads.
+    Int8CompressesNothing,
     /// A one-row fold — a gated matvec, a matmul's ends in the matmul band, a decode attention
     /// running its KV writer — in a bucket of `bucket_m` rows: its kernel computes one row, and
     /// the fold applies to that bucket only.
@@ -3057,16 +3019,6 @@ impl std::fmt::Display for LoweringError {
                 "lowering: malformed Loop({count}, {body_len}) at tape index {index} \
                  — body extends past tape end (only {remaining} rows remain)"
             ),
-            Self::TurboQuantOffsetUnbound { index } => write!(
-                f,
-                "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
-                 operand's additive offset (no rotary table rotates its K bias)"
-            ),
-            Self::UnrotatedWriterOffset { index } => write!(
-                f,
-                "lowering: the TurboQuant-coded un-rotated KV writer at tape index {index} \
-                 carries a projection bias the codec cannot restore"
-            ),
             Self::NoSource { index, kind, slot } => write!(
                 f,
                 "lowering: the step at tape index {index} binds {kind:?} weight #{slot} of its \
@@ -3089,7 +3041,7 @@ impl std::fmt::Display for LoweringError {
             } => write!(
                 f,
                 "lowering: the {kernel:?} at tape index {index} binds a buffer at slot {slot}, \
-                 the TurboQuant decode split's partials slot"
+                 the int8 decode split's partials slot"
             ),
             Self::CacheWriterSkipped { index } => write!(
                 f,
@@ -3102,12 +3054,9 @@ impl std::fmt::Display for LoweringError {
                  its step has no per-row twin re-roping span blocks for steps with \
                  several sequences"
             ),
-            Self::TurboQuantCompressesNothing => f.write_str(
-                "lowering: the model's KV codec is TurboQuant, but no KV writer in its \
+            Self::Int8CompressesNothing => f.write_str(
+                "lowering: the model's KV codec is int8, but no KV writer in its \
                  backbone is one the codec compresses",
-            ),
-            Self::CodecStepOnDenseModel => f.write_str(
-                "lowering: a KV codec step in the tape of a model whose KV cache is dense",
             ),
             Self::OneRowFold { bucket_m } => {
                 write!(f, "lowering: a one-row fold in the {bucket_m}-row bucket")
@@ -3221,7 +3170,7 @@ pub enum KvAddressing {
 }
 
 /// One baked tape rung: the full [`LoweredMetalTape`] lowered at expansion for a
-/// `(generation class, KV addressing, KV cap, TurboQuant decode heads)` point, every fact of
+/// `(generation class, KV addressing, KV cap)` point, every fact of
 /// it a constant. The pool picks the rung for its device, workload and KV capacity at load —
 /// selection only, no analysis, no substitution.
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
@@ -3231,21 +3180,17 @@ pub struct ClassedTape {
     /// The KV cap rung: the blocks per sequence the tape's block-table stride, scratch sizes and
     /// dispatches are baked for. It serves every capacity up to it.
     pub cap: MaxBlocksPerSeq,
-    /// The query heads each TurboQuant decode threadgroup serves, baked into the tape; `None` when
-    /// the tape has no TurboQuant decode attention (it serves every device alike).
-    pub tq_heads: Option<TqDecodeHeads>,
     pub tape: LoweredMetalTape,
 }
 
 impl ClassedTape {
-    /// The rung `(gen_class, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
+    /// The rung `(gen_class, addressing, cap)` of `body`, the tape its rungs share, with
     /// the roped-K and unfused-attention scratch bytes its cap sizes.
     pub const fn rung(
         body: LoweredMetalTape,
         gen_class: GenClass,
         addressing: KvAddressing,
         cap: MaxBlocksPerSeq,
-        tq_heads: Option<TqDecodeHeads>,
         [roped_k_scratch_bytes, attn_unfused_scratch_bytes]: [u32; 2],
     ) -> Self {
         let tape = LoweredMetalTape {
@@ -3257,7 +3202,6 @@ impl ClassedTape {
             gen_class,
             addressing,
             cap,
-            tq_heads,
             tape,
         }
     }

@@ -284,8 +284,7 @@ fn max_err_of(got: &[f32], want: &[f32]) -> (f32, usize) {
         .fold((0f32, 0usize), |a, b| if b.0 > a.0 { b } else { a })
 }
 
-/// ── Decode: `attention_via_cache_v2` (plain + sliding + TurboQuant's
-/// shared kernel), sinks at buffer 16 ──────────────────────────────────
+/// ── Decode: `attention_via_cache_v2` (plain + sliding), sinks at buffer 16 ──
 ///
 /// `sinks`: `Some` runs the sinks-on pipeline (const slot 21 + the
 /// buffer-16 binding) against the with-sink reference; `None` runs the

@@ -10,11 +10,7 @@ use scratchy_forward_compiler_macro::target::{
 };
 
 /// The metal target's emitter.
-pub struct Metal {
-    /// TurboQuant KV compression: every model whose geometry the codec takes stores its KV
-    /// cache as TurboQuant codes, the rest stay dense and are named in the build output.
-    pub turboquant: bool,
-}
+pub struct Metal;
 
 impl TargetEmitter for Metal {
     fn name(&self) -> &'static str {
@@ -54,8 +50,10 @@ impl TargetEmitter for Metal {
         true
     }
 
+    /// Every model whose geometry the int8 codec takes stores its KV cache as int8 codes; the
+    /// rest stay dense and are named in the build output.
     fn compresses_kv(&self) -> bool {
-        self.turboquant
+        true
     }
 
     /// The splice copies the tower's embeddings into the image-placeholder rows

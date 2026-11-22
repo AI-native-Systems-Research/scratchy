@@ -20,7 +20,7 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // `SCALE_DTYPE` consts. They relocated to the cfg-free
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
-pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
+pub use scratchy_layers::kv_int8::{DenseReason, KvCodec, KvGeometry, codec_for};
 use scratchy_tensors::{ActDtype, ScaleDtype};
 
 pub mod model_facts;
@@ -965,15 +965,14 @@ pub trait CanonicalParams: WeightAccessors {
     /// proc-macro emit path. Plan: `~/.claude/plans/distributed-mapping-map.md`.
     const MROPE_SECTION: Option<[u32; 3]> = model_facts::raw::mrope_section(Self::FACTS);
     /// How this model's KV cache is stored, fixed when it is built. A target's
-    /// lowering injects the TurboQuant commands, the RuntimeFactory provisions
-    /// the packed stores, and the worker sizes and grows the KV pool, all from
-    /// this one value — so the tape, its buffers and the pool always agree.
+    /// lowering injects the int8 commands, the RuntimeFactory provisions the
+    /// stores, and the worker sizes and grows the KV pool, all from this one
+    /// value — so the tape, its buffers and the pool always agree.
     const KV_CODEC: KvCodec = Self::FACTS.kv_codec();
     /// The layers that hold KV, ascending, when not every layer does: a
     /// recurrent hybrid's attention layers (its Mamba / Gated-DeltaNet layers
     /// keep recurrent state instead). The KV pool holds tensors for these
-    /// layers only and its budget counts them; the TurboQuant store provisions
-    /// none for the others. `None`: every layer holds KV.
+    /// layers only and its budget counts them. `None`: every layer holds KV.
     const KV_CACHE_LAYERS: Option<&'static [u32]> = model_facts::raw::kv_cache_layers(Self::FACTS);
     /// Vision-tower attention head count. Vision encoders run plain
     /// MHA (`num_kv_heads == num_heads`); only one head dim is needed.
@@ -1091,7 +1090,7 @@ pub trait CanonicalParams: WeightAccessors {
     const DRAFT_CAPTURE_SLOTS: u32 = model_facts::raw::draft_capture_slots(Self::FACTS);
 
     /// A block-table row stride (in u32s) for callers with no KV pool to read
-    /// one from: kernel tests, and the TurboQuant dequant grid before a
+    /// one from: kernel tests, and the int8 staging grid before a
     /// step has set its width. A served model's stride is its KV pool's
     /// (`KvCachePool::max_blocks_per_seq`, the KV cap rung it runs on).
     const MAX_BLOCKS_PER_SEQ: u32 = 128;

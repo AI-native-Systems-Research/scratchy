@@ -27,13 +27,12 @@ use crate::tape::kernel_constants::{QueryRows, norm_threads};
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
     ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,
-    KDim, KvOffsets, KvOperand, KvWrite, LayerId, LogitOp, MetalStep, MetalStepTape, MoeBlock,
-    MoeRegion, MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag,
-    RotaryTables, RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep,
-    SampledMatmul, Scale, StepRow, UnaryAct, UngatedAct,
+    KDim, KvOperand, KvWrite, LayerId, LogitOp, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
+    MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
+    RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, SampledMatmul, Scale,
+    StepRow, UnaryAct, UngatedAct,
 };
 use scratchy_ir::model_facts::{AttnClass, ModelFacts};
-use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
 use scratchy_subtile::subtile_ir::ExpertBody;
 
@@ -241,12 +240,12 @@ pub fn lower_with_rows(
     };
     // A KV writer encodes when it binds the packed store.
     let encodes =
-        |c: &GatedCommand| writer_binds(c, |k| matches!(k, RuntimeBindingKind::TqPackedK { .. }));
-    if p.kv_codec().is_turboquant()
+        |c: &GatedCommand| writer_binds(c, |k| matches!(k, RuntimeBindingKind::KvCodesK { .. }));
+    if p.kv_codec().is_int8()
         && bb.commands.iter().any(|c| writes_kv_cache(&c))
         && !bb.commands.iter().any(|c| encodes(&c))
     {
-        return Err(LoweringError::TurboQuantCompressesNothing);
+        return Err(LoweringError::Int8CompressesNothing);
     }
     let commands = bb.commands.iter().chain(lh.commands.iter());
     let of =
@@ -286,23 +285,21 @@ fn writer_binds(c: &GatedCommand, kind: fn(&RuntimeBindingKind) -> bool) -> bool
     };
     let writes = match c.kernel {
         KernelId::RopeAppend | KernelId::RopeAppendNormed | KernelId::KvAppend => true,
-        KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
-            c.constants.iter().any(|k| k.index == ATTN_FOLD.0)
-        }
+        KernelId::AttentionDecodeInt8 => c.constants.iter().any(|k| k.index == ATTN_FOLD.0),
         _ => false,
     };
     writes && (c.bindings.iter()).any(|b| matches!(b, Binding::Runtime { kind: k, .. } if kind(k)))
 }
 
 /// Whether `c` writes a cache its forward outlives: a KV writer binding the KV pool or its
-/// TurboQuant stores, or a command binding a recurrent state (a Gated-DeltaNet or Mamba-2 layer's).
+/// int8 stores, or a command binding a recurrent state (a Gated-DeltaNet or Mamba-2 layer's).
 /// A cache-only forward must run every such command ([`LoweringError::CacheWriterSkipped`]).
 fn writes_cache(c: &GatedCommand) -> bool {
     use RuntimeBindingKind as RB;
     let kv = |k: &RuntimeBindingKind| {
         matches!(
             k,
-            RB::KvCacheK { .. } | RB::KvCacheV { .. } | RB::TqPackedK { .. } | RB::TqPackedV { .. }
+            RB::KvCacheK { .. } | RB::KvCacheV { .. } | RB::KvCodesK { .. } | RB::KvCodesV { .. }
         )
     };
     let recurrent = |b: &Binding| {
@@ -711,172 +708,39 @@ fn sample_slice_command(
     }
 }
 
-/// A projection bias on the KV writer's weight site, and the writer's rotary table (K's bias
-/// was rotated with the key).
-#[derive(Clone, Copy)]
-struct TqBias {
-    which: WeightTensor,
-    layer: super::ids::LayerId,
-    bias: SourceIx,
-    rotary: CosSinTable,
-}
-
-impl TqBias {
-    /// The bias itself, bound at `index`.
-    fn bias_binding(self, index: u8) -> Binding {
-        source(self.bias, self.which, self.layer, index)
-    }
-}
-
-/// One TurboQuant'd cache operand and its writer's projection bias, if any.
-/// `IS_K` fixes the store it lives in AND how that bias is restored: K's was
-/// rotated with the key by the writer's rotary table (the same site's
-/// cos/sin source), V's is cached as-is.
-#[derive(Clone, Copy)]
-struct TqOperand<const IS_K: bool>(Option<TqBias>);
-
-/// The K and V a KV writer caches, as the TurboQuant codec must see them: it
-/// quantizes each vector relative to its own norm, so an additive offset it
-/// does not remove sets its error (`scratchy_ir::KvOffset`). Built only from the
-/// writer's declared `KvOffsets`; every codec command takes one.
-#[derive(Clone, Copy)]
-struct TqOperands {
-    k: TqOperand<true>,
-    v: TqOperand<false>,
-}
-
-impl TqOperands {
-    /// The operands a KV writer with `offsets` caches, each bias bound from the row's site `w`
-    /// — refused where a K bias has no rotary table to rotate it by.
-    fn of(
-        p: &ModelFacts,
-        offsets: KvOffsets,
-        layer: LayerId,
-        w: RowSources<'_>,
-    ) -> Result<Self, LoweringError> {
-        let bias = |b: Option<(BiasStorage, u32)>| {
-            b.map(|(storage, slot)| {
-                Ok(TqBias {
-                    which: match storage {
-                        BiasStorage::Dense => WeightTensor::Bias,
-                        BiasStorage::Affine => WeightTensor::AffineLinearBias,
-                    },
-                    layer,
-                    bias: w.of(WeightKind::Linear, slot)?,
-                    rotary: w.cos_sin(p)?,
-                })
-            })
-            .transpose()
-        };
-        let [k, v] = crate::op_abi::rope_append_bias_slots(offsets);
-        let ops = Self {
-            k: TqOperand(bias(k)?),
-            v: TqOperand(bias(v)?),
-        };
-        if ops.k.0.is_some() && !rope_on_read(p)? {
-            return Err(LoweringError::TurboQuantOffsetUnbound { index: w.index });
-        }
-        Ok(ops)
-    }
-}
-
-/// TurboQuant prefill: the per-layer staging command — the layer's K (or V)
-/// for every sequence of the step, written into the fp16 scratch in the
-/// codebook's rotated domain (`tq_stage_rotated`), its offset restored.
-/// `is_global` is the attention's layer class (its rope-on-read cos_sin for
-/// span blocks and a rotated K bias; V is never roped). The grid (block-table
-/// width, num_kv_heads, num_seqs) is overridden by the worker per forward; the
-/// baked shape is a placeholder.
-fn tq_stage_command<const IS_K: bool>(
+/// Int8 prefill: the per-layer staging command — the layer's cached K (or V) rows for every
+/// sequence of the step, decoded and rotated back into the fp16 scratch (`kv_stage`). The grid
+/// (block-table width, num_kv_heads, num_seqs) is overridden by the worker per forward; the baked
+/// shape is a placeholder.
+fn kv_stage_command(
     p: &ModelFacts,
     layer: u32,
-    operand: TqOperand<IS_K>,
-    is_global: bool,
-    table: Option<SourceIx>,
+    operand: KvOperand,
     bucket_m: u32,
-    pass: super::kernel_constants::TqStagePass,
-    bits: TqBits,
 ) -> Result<LoweredCommand, LoweringError> {
     let global = global(p)?;
-    let (ror_rd, ror_po, ror_on, _) = if IS_K {
-        rope_on_read_params(p, is_global)
-    } else {
-        (None, None, None, None)
-    };
-    let mut bindings = Vec::from(super::kernel_bindings::TqStageBindingSet {
-        kv_layer: super::ids::LayerId(layer),
-        is_v: !IS_K,
-        rope_on_read: table.filter(|_| IS_K),
-    });
-    bindings.extend(operand.0.map(|b| b.bias_binding(10)));
     Ok(LoweredCommand {
-        kernel: KernelId::TqStageRotated,
+        kernel: KernelId::KvStage,
         library: "attention",
-        function: pick_specialized_symbol(
-            "tq_stage_rotated_f16",
-            "tq_stage_rotated_bf16",
-            p.act_dtype(),
-        ),
-        constants: super::kernel_constants::TqStageConstants {
+        function: pick_specialized_symbol("kv_stage_f16", "kv_stage_bf16", p.act_dtype()),
+        constants: super::kernel_constants::KvStageConstants {
             head_dim: super::ids::HeadDim(global.head_dim().get()),
             num_kv_heads: super::ids::NumKvHeads(global.kv_heads().get()),
             block_size: super::ids::BlockSize(global.page().get()),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-            bits: super::ids::TqCodeBits(bits.get()),
-            rot_dim: ror_rd,
-            pair_off: ror_po,
-            rope_on_read: ror_on,
-            k_bias: IS_K && operand.0.is_some(),
-            v_bias: !IS_K && operand.0.is_some(),
-            pass,
         }
         .into_baked(),
+        // A simdgroup a row of the block.
         dispatch: DispatchShape {
             threadgroups: (1, global.kv_heads().get(), bucket_m),
-            threads_per_threadgroup: (32, 1, 1),
+            threads_per_threadgroup: (32 * global.page().get(), 1, 1),
             m_scaling: None,
         },
-        bindings: baked(bindings),
-    })
-}
-
-/// TurboQuant prefill: rotate the attention's q rows into the codebook domain
-/// in place (`inverse` false, R·q), or its output rows back (`inverse`, Rᵀ·o).
-fn tq_rotate_command(
-    p: &ModelFacts,
-    rows: Slot,
-    inverse: bool,
-    bucket_m: u32,
-) -> Result<LoweredCommand, LoweringError> {
-    let (global, q_heads) = (global(p)?, q_heads(p)?);
-    let function = if inverse {
-        pick_specialized_symbol(
-            "tq_unrotate_rows_f16",
-            "tq_unrotate_rows_bf16",
-            p.act_dtype(),
-        )
-    } else {
-        pick_specialized_symbol("tq_rotate_rows_f16", "tq_rotate_rows_bf16", p.act_dtype())
-    };
-    Ok(LoweredCommand {
-        kernel: KernelId::TqRotateRows,
-        library: "attention",
-        function,
-        constants: super::kernel_constants::TqRotateRowsConstants {
-            head_dim: super::ids::HeadDim(global.head_dim().get()),
-            num_q_heads: super::ids::NumQHeads(q_heads),
+        bindings: super::kernel_bindings::KvStageBindingSet {
+            kv_layer: super::ids::LayerId(layer),
+            operand,
         }
         .into_baked(),
-        dispatch: DispatchShape {
-            threadgroups: (bucket_m, q_heads, 1),
-            threads_per_threadgroup: (32, 1, 1),
-            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                set_axis: None,
-                axis: crate::tape::lowered::MScaleAxis::X,
-                bucket_m: super::ids::BucketM(bucket_m),
-            }),
-        },
-        bindings: super::kernel_bindings::TqRotateRowsBindingSet { rows }.into_baked(),
     })
 }
 
@@ -891,99 +755,33 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
         .collect()
 }
 
-/// A KV writer's folded-in TurboQuant encode ([`KvWrite::PoolAndPacked`]): the codebook, the
-/// layer's packed stores and each operand's offset, as the writer's constants and the bindings it
-/// adds from 16 (`kv_writer.h`'s `KV_WRITER_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
-/// The coded layers are the GLOBAL class (every layer on uniform arches).
+/// A KV writer's folded-in int8 encode ([`KvWrite::PoolAndPacked`]): the layer's int8 store, as
+/// the writer's constant and the bindings it adds from 16 (`kv_writer.h`'s
+/// `KV_WRITER_INT8_BUFFERS`). `None` for a writer that writes the pool alone. The coded layers are
+/// the GLOBAL class (every layer on uniform arches).
 fn kv_writer_codec(
-    p: &ModelFacts,
     write: KvWrite,
-    offsets: KvOffsets,
     layer: LayerId,
     layer_offset: u32,
-    w: RowSources<'_>,
-) -> Result<Option<(super::kernel_constants::RopeTqConstants, Vec<Binding>)>, LoweringError> {
-    use super::kernel_constants::{RopeTqConstants, TqOffset};
+) -> Option<(super::kernel_constants::KvInt8Constants, Vec<Binding>)> {
     use RuntimeBindingKind as RB;
     if matches!(write, KvWrite::Pool | KvWrite::None) {
-        return Ok(None);
+        return None;
     }
-    let bits = tq_bits(p)?;
-    let ops = TqOperands::of(p, offsets, layer, w)?;
     let li = super::ids::LayerId(layer.get() + layer_offset);
-    let mut bindings = runtime_at(
+    let bindings = runtime_at(
         16,
         [
-            RB::TqSigns,
-            RB::TqBoundaries,
-            RB::TqPackedK { layer: li },
-            RB::TqNormsK { layer: li },
-            RB::TqPackedV { layer: li },
-            RB::TqNormsV { layer: li },
+            RB::KvCodesK { layer: li },
+            RB::KvScalesK { layer: li },
+            RB::KvCodesV { layer: li },
+            RB::KvScalesV { layer: li },
         ],
     );
-    if let Some(k) = ops.k.0 {
-        bindings.extend([k.bias_binding(22), k.rotary.binding(k.layer, 24)]);
-    }
-    bindings.extend(ops.v.0.map(|v| v.bias_binding(23)));
-    let constants = RopeTqConstants {
-        bits: super::ids::TqCodeBits(bits.get()),
-        k_offset: ops.k.0.map_or(TqOffset::None, |_| TqOffset::RotatedBias),
-        v_offset: ops.v.0.map_or(TqOffset::None, |_| TqOffset::Bias),
-    };
-    Ok(Some((constants, bindings)))
+    Some((super::kernel_constants::KvInt8Constants, bindings))
 }
 
-/// TurboQuant decode: the `AttentionViaCacheTq` twin of a decode
-/// `AttentionViaCache` command — the same kernel, geometry and bindings plus
-/// `ATTN_TQ_BITS` and the packed-store bindings, so it reads every key but the
-/// one this step appended straight from the packed store, restoring each
-/// operand's offset (a rotated K bias by the rope-on-read table and pairing).
-/// Its threadgroups count query heads; one serves the tape variant's
-/// [`ConstantType::TqHeads`] of them, which divides them where the worker
-/// builds the dispatch — so the twin carries the UNdivided count, restoring
-/// the plain command's `num_q_heads / heads` to `n_q_heads`.
-///
-/// [`ConstantType::TqHeads`]: super::constants::ConstantType::TqHeads
-fn tq_attention_command(
-    attn: &LoweredCommand,
-    layer: u32,
-    ops: TqOperands,
-    bits: TqBits,
-    n_q_heads: u32,
-) -> LoweredCommand {
-    let mut constants = attn.constants.to_vec();
-    // The twin's heads are the tape variant's: drop the plain command's baked
-    // count so the variant-bound entry below is slot 16's only value.
-    let heads_slot = super::kernel_constants::AttentionViaCacheTqConstants::HEADS.0;
-    constants.retain(|k| k.index != heads_slot);
-    constants.extend(Vec::from(
-        super::kernel_constants::AttentionViaCacheTqConstants {
-            bits: super::ids::TqCodeBits(bits.get()),
-            k_bias: ops.k.0.is_some(),
-            v_bias: ops.v.0.is_some(),
-        },
-    ));
-    let mut bindings = attn.bindings.to_vec();
-    bindings.extend(Vec::from(super::kernel_bindings::TqAttentionBindingSet {
-        kv_layer: super::ids::LayerId(layer),
-    }));
-    bindings.extend(ops.k.0.map(|b| b.bias_binding(14)));
-    bindings.extend(ops.v.0.map(|b| b.bias_binding(15)));
-    let (tg_x, _, tg_z) = attn.dispatch.threadgroups;
-    LoweredCommand {
-        kernel: KernelId::AttentionViaCacheTq,
-        constants: baked(constants),
-        bindings: baked(bindings),
-        dispatch: DispatchShape {
-            threadgroups: (tg_x, n_q_heads, tg_z),
-            ..attn.dispatch
-        },
-        ..*attn
-    }
-}
-
-/// The slot `attention_decode_gqa_tq` binds its partials at, the op scratch's front, and
+/// The slot `attention_decode_gqa_int8` binds its partials at, the op scratch's front, and
 /// `attention_via_cache_v2_combine` reads them from.
 const SPLIT_PARTIALS_SLOT: u8 = 16;
 
@@ -993,9 +791,8 @@ const ATTN_FOLD: (u16, u16) = (19, 20);
 
 /// Where a decode attention running its KV writer (`attention.metal`'s `ATTN_FOLD`) binds the
 /// writer's buffers, by the writer's binding index (`rope.metal`): `None` where the attention
-/// binds that buffer itself — the query it ropes in place, the layer's cache and packed store, the
-/// codebook's signs and the operands' biases.
-const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 17] = [
+/// binds that buffer itself — the query it ropes in place, the layer's cache and int8 store.
+const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 12] = [
     (0, None),
     (1, Some(17)),
     (2, Some(18)),
@@ -1005,14 +802,9 @@ const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 17] = [
     (6, None),
     (7, None),
     (16, None),
-    (17, Some(20)),
+    (17, None),
     (18, None),
     (19, None),
-    (20, None),
-    (21, None),
-    (22, None),
-    (23, None),
-    (24, Some(22)),
 ];
 
 /// The decode attention `attention` running its KV `writer`'s work (`MetalFusion::RopedAttention`):
@@ -1046,9 +838,16 @@ fn roped_attention_command(
             None => bindings.push(moved),
         }
     }
+    // The int8 split runs the writer in one threadgroup past its splits.
+    let (x, y, z) = attention.dispatch.threadgroups;
+    let writer_threadgroup = u32::from(attention.kernel == KernelId::AttentionDecodeInt8);
     Some(LoweredCommand {
         constants: baked(constants),
         bindings: baked(bindings),
+        dispatch: DispatchShape {
+            threadgroups: (x, y, z + writer_threadgroup),
+            ..attention.dispatch
+        },
         ..*attention
     })
 }
@@ -1062,14 +861,6 @@ fn roped_k_bytes(dims: [u32; 5], block_cap: u32) -> Result<u32, LoweringError> {
         scratch: super::lowered::RungScratch::RopedK,
         block_cap: super::ids::MaxBlocksPerSeq(block_cap),
     })
-}
-
-/// The model's TurboQuant code width: a codec step lowers only on a model built with the codec.
-fn tq_bits(p: &ModelFacts) -> Result<TqBits, LoweringError> {
-    match p.kv_codec() {
-        KvCodec::TurboQuant(bits) => Ok(bits),
-        KvCodec::Dense => Err(LoweringError::CodecStepOnDenseModel),
-    }
 }
 
 /// A command that computes batch row 0 only ([`SeqScope::RowZero`]: the
@@ -1621,24 +1412,16 @@ fn route_gdn(
     Ok(out)
 }
 
-/// The keys of the rung's KV cap one threadgroup of `attention_decode_gqa_tq` takes.
+/// The keys of the rung's KV cap one threadgroup of `attention_decode_gqa_int8` takes: a
+/// hand-picked constant.
 const ATTN_SPLIT_KEYS: u32 = 1024;
 
-/// At most this many threadgroups a KV head's keys spread over.
+/// At most this many threadgroups a KV head's keys spread over: a hand-picked constant.
 const ATTN_MAX_SPLITS: u32 = 16;
 
-/// The widest bucket a sinks layer's (gpt-oss) decode takes the split in. A decode step lands in a
-/// bucket no wider than `max_num_seqs`, which reaches the target only at load, so the bake bounds
-/// it here: 512 covers any `max_num_seqs` up to 512. A sinks model's buckets past it lower
-/// byte-identical to the ones it had before the split took its decode — they are prefill buckets.
-/// Past 512 sequences a sinks decode still runs, correctly, on the twin there; it only loses the
-/// split's speed, a cliff in decode time and never a wrong answer.
-const SINKS_SPLIT_MAX_BUCKET_M: u32 = 512;
-
-/// The query heads `attention_decode_gqa_tq` serves a KV head: the matrix units' row count —
-/// the kernel takes the whole group when it divides the count evenly and fits, a smaller one
-/// zero-pads the fragment rows past it.
-const GQA_HEADS: u32 = 8;
+/// The rows of the matrix units' fragments `attention_decode_gqa_int8` serves its query heads in:
+/// a threadgroup takes the largest divisor of the GQA group that fits them.
+const DECODE_FRAGMENT_ROWS: u32 = 8;
 
 /// The threads of `attention_via_cache_v2_combine`'s threadgroup: its `ATTN_COMBINE_GROUPS`
 /// simdgroups — four, or two at head_dim 64, where the partials fill two lanes' elements.
@@ -1646,162 +1429,139 @@ const fn combine_threads(hd: u32) -> u32 {
     32 * if hd >= 128 { 4 } else { 2 }
 }
 
-/// A bucket's TurboQuant decode attention (the codec's packed twin, or it running its KV
-/// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, the whole query-head
-/// group a KV head (up to [`GQA_HEADS`] heads, dividing evenly), head_dim 64, 128, 256 or 512
-/// (the dims its simdgroup tiling steps), KV blocks of whole 8-key blocks, a rotary pair's
-/// partner a whole lane stride away, partials that fit the u32 the op scratch is sized in —
-/// serves each KV head's query heads together: its keys decode once for the
-/// group, where `attention_via_cache_v2` decodes them once per head. Every bucket m takes it:
-/// the kernel is per-row throughout (`seq = tg_pos.x` drives the row's length, block table,
-/// slot and position), so a batched step's rows spread the grid's x axis and nothing else
-/// changes; a multi-row bucket's rows are tokens (`ATTN_ROW_QUERIES`, each reading its
-/// sequence's keys up to its own: a verify step's last token and drafts). Its keys spread over the
-/// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
-/// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
-/// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
-/// into the output — a sinks layer's (gpt-oss) sink column with them, the combine binding the
-/// sinks and the splits storing the keys' partials alone, in the buckets decode steps land in
-/// ([`SINKS_SPLIT_MAX_BUCKET_M`]). A causal layer's only: a sliding window keeps the twin. It records a row's bytes and the steps it runs on, as its gate — the
-/// command's, or else `row_gate`, the row's — admits them (`partials`,
-/// [`LoweredMetalTape::scratch_bytes`]): gated to decode steps, a row a sequence, the scratch
-/// holds the partials of the rows such a step brings, not of the bucket's every row; a
-/// verify-sized bucket runs it on every step, a prefill of no more tokens than its rows too, so
-/// it holds every row's. A bucket whose every row's partials would outgrow the u32 its offsets
-/// are computed in keeps the twin — a wide prefill bucket carrying the gated decode row
-/// (gemma-4's 4096-token buckets at 4.3 GiB) is the case that refuses.
-fn decode_attention_per_kv_head(
+/// The threadgroups a KV head's keys spread over at the KV cap rung `block_cap`.
+fn decode_splits(p: &ModelFacts, block_cap: u32) -> Result<u32, LoweringError> {
+    let keys = block_cap.saturating_mul(global(p)?.page().get());
+    Ok(keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS))
+}
+
+/// The int8 decode attention of the coded class (`attention_decode_gqa_int8`) and the combine of
+/// its splits' partials (`attention_via_cache_v2_combine`), from `dense`, the class's one-pass
+/// decode command: its geometry, rows and bindings. A threadgroup serves a group of
+/// [`DECODE_FRAGMENT_ROWS`]-fitting query heads of one KV head, each key's codes read once for
+/// them; the keys spread over the threadgroups the rung's KV cap calls for (`ATTN_SPLITS`), each
+/// storing its heads' partials at the op scratch's front, `[rows, num_q_heads, splits, 2 +
+/// head_dim]` floats, which the combine merges into the output — a sinks layer's (gpt-oss) sink
+/// column with them, the combine binding the sinks. A multi-row bucket's rows are tokens
+/// (`ATTN_ROW_QUERIES`, each reading its sequence's keys up to its own).
+fn int8_decode_commands(
     p: &ModelFacts,
-    step: &MetalStep,
+    dense: &LoweredCommand,
+    layer: u32,
     sinks: Option<SourceIx>,
-    cmds: Vec<GatedCommand>,
+    block_cap: u32,
+    index: usize,
+) -> Result<[LoweredCommand; 2], LoweringError> {
+    use super::kernel_constants::AttentionViaCacheConstants as C;
+    let (global, q_heads) = (global(p)?, q_heads(p)?);
+    let hd = global.head_dim().get();
+    let group = global.gqa().get();
+    let rows = (1..=group.min(DECODE_FRAGMENT_ROWS))
+        .filter(|r| group.is_multiple_of(*r))
+        .fold(1, |_, r| r);
+    let splits = decode_splits(p, block_cap)?;
+    let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
+    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.act_dtype());
+    let (heads, sinks_const) = (C::HEADS.0, C::SINKS.0);
+    let shared: Vec<ConstantValue> = (dense.constants.iter())
+        .filter(|k| k.index != heads)
+        .copied()
+        .chain([
+            ConstantValue::uint(C::INT8, 1),
+            ConstantValue::uint(18, splits),
+        ])
+        .collect();
+    // The split's own: its heads, and no sink column — the combine's.
+    let split_constants = (shared.iter())
+        .filter(|k| k.index != sinks_const)
+        .copied()
+        .chain([ConstantValue::uint(C::HEADS, rows)])
+        .collect();
+    // A sinks dispatch's sink column (the row's sinks source, the dense command binds at its 16)
+    // joins in the combine, at its buffer 17: the split's 16 is the partials.
+    let is_sinks = |b: &&Binding| matches!(b, Binding::Source { ix, which: WeightTensor::Weight, .. } if Some(*ix) == sinks);
+    let (sinks, bindings): (Vec<Binding>, Vec<Binding>) = dense.bindings.iter().partition(is_sinks);
+    // Past the sinks, nothing may sit at the partials' slot: it would overlap them.
+    if bindings.iter().any(|b| b.index() == SPLIT_PARTIALS_SLOT) {
+        return Err(LoweringError::SplitPartialsSlotTaken {
+            index,
+            kernel: dense.kernel,
+            slot: SPLIT_PARTIALS_SLOT,
+        });
+    }
+    let int8 = Vec::from(super::kernel_bindings::Int8AttentionBindingSet {
+        kv_layer: super::ids::LayerId(layer),
+    });
+    let (x, _, _) = dense.dispatch.threadgroups;
+    let attention = LoweredCommand {
+        kernel: KernelId::AttentionDecodeInt8,
+        library: "attention",
+        function: symbol(
+            "attention_decode_gqa_int8_f16_specialized",
+            "attention_decode_gqa_int8_bf16_specialized",
+        ),
+        constants: baked(split_constants),
+        dispatch: DispatchShape {
+            threadgroups: (x, q_heads / rows, splits),
+            threads_per_threadgroup: (hd, 1, 1),
+            ..dense.dispatch
+        },
+        bindings: baked(
+            bindings
+                .iter()
+                .copied()
+                .chain(int8)
+                .chain([scratch])
+                .collect(),
+        ),
+    };
+    let output = (bindings.iter()).filter(|b| b.index() == 0).copied();
+    let sinks = sinks
+        .into_iter()
+        .map(|b| b.at(super::kernel_bindings::COMBINE_SINKS_SLOT));
+    let combine = LoweredCommand {
+        kernel: KernelId::AttentionDecodeCombine,
+        library: "attention",
+        function: symbol(
+            "attention_via_cache_v2_combine_f16_specialized",
+            "attention_via_cache_v2_combine_bf16_specialized",
+        ),
+        constants: baked(shared),
+        dispatch: DispatchShape {
+            threadgroups: (x, q_heads, 1),
+            threads_per_threadgroup: (combine_threads(hd), 1, 1),
+            ..dense.dispatch
+        },
+        bindings: baked(output.chain([scratch]).chain(sinks).collect()),
+    };
+    Ok([attention, combine])
+}
+
+/// The int8 decode split's partials the row's commands write ([`int8_decode_commands`]): a row's
+/// bytes, and the steps it runs on as its gate — the command's, or else `row_gate`, the row's —
+/// admits them ([`LoweredMetalTape::scratch_bytes`]): gated to decode steps, a row a sequence, the
+/// scratch holds the partials of the rows such a step brings; a verify-sized bucket runs it on
+/// every step, so it holds every row's.
+fn record_decode_partials(
+    p: &ModelFacts,
+    cmds: &[GatedCommand],
     at: &BakePoint<'_>,
     row_gate: Option<RuntimeGate>,
     partials: &mut DecodePartials,
-    index: usize,
-) -> Result<Vec<GatedCommand>, LoweringError> {
-    let attention = match step {
-        MetalStep::RopedAttention(f) => &f.attention,
-        step => step,
+) -> Result<(), LoweringError> {
+    let split = |c: &&GatedCommand| {
+        c.dispatch()
+            .is_some_and(|d| d.kernel == KernelId::AttentionDecodeInt8)
     };
-    let full = matches!(
-        attention,
-        MetalStep::AttnPackedKv(_, _, _, _, AttnMask::Causal, _)
-    );
-    if !full {
-        return Ok(cmds);
-    }
+    let Some(c) = cmds.iter().find(split) else {
+        return Ok(());
+    };
     let (global, q_heads) = (global(p)?, q_heads(p)?);
-    let hd = global.head_dim().get();
-    let lane_stride = |c: &LoweredCommand| {
-        (c.constants.iter())
-            .find(|k| k.index == 9)
-            .is_none_or(|pair_off| pair_off.bits % (hd / 32) == 0)
-    };
-    let takes = |c: &LoweredCommand| c.kernel == KernelId::AttentionViaCacheTq && lane_stride(c);
-    // The query heads a KV head serves, exact by `HeadGeometry`'s law.
-    let group = global.gqa().get();
-    let keys = at.block_cap.saturating_mul(global.page().get());
-    let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
-    // A row's partials are `[num_q_heads, splits, 2 + D]` f32s. Every row's, a wide prefill
-    // bucket carrying the gated decode row can push past the u32 the kernel's offsets are
-    // computed in — gemma-4's 4096-token prefill buckets land at 4.3 GiB — and such a bucket
-    // keeps the twin.
-    let row_partials = u64::from(q_heads) * u64::from(splits) * (u64::from(hd) + 2) * 4;
-    let bucket_partials = u64::from(at.bucket_m) * row_partials;
-    let geometry = p.kv_codec() == KvCodec::TurboQuant(TqBits::new(4))
-        && (1..=GQA_HEADS).contains(&group)
-        // The head dims the split's simdgroup tiling steps: head_dim/32 simdgroups in whole key
-        // groups of 8, 4 or 2 — {64, 128, 256, 512} and nothing between (the kernel's
-        // `NSG % SG` assert backs the same set at the bake).
-        && matches!(hd, 64 | 128 | 256 | 512)
-        && global.page().get().is_multiple_of(8)
-        && bucket_partials <= u32::MAX as u64
-        && (sinks.is_none() || at.bucket_m <= SINKS_SPLIT_MAX_BUCKET_M);
-    let taken = |c: &GatedCommand| c.dispatch().copied().filter(takes);
-    if !geometry || !cmds.iter().any(|c| taken(c).is_some()) {
-        return Ok(cmds);
-    }
-    let row_bytes = row_partials as u32;
-    let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
-    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.act_dtype());
-    let mut out = Vec::with_capacity(cmds.len() + 1);
-    for c in cmds {
-        let (Some(command), gate) = (taken(&c), c.gate) else {
-            out.push(c);
-            continue;
-        };
-        let steps = SplitSteps::of(gate.or(row_gate));
-        *partials = partials.max(DecodePartials { row_bytes, steps });
-        // The heads it serves are the kernel's own: no TurboQuant heads variant binds it.
-        let mut constants: Vec<_> = (command.constants.iter())
-            .filter(|k| k.ty != super::constants::ConstantType::TqHeads)
-            .copied()
-            .collect();
-        constants.push(ConstantValue::uint(18, splits));
-        // Running its KV writer, one threadgroup past the splits writes and encodes the row.
-        let writer = u32::from(constants.iter().any(|k| k.index == ATTN_FOLD.0));
-        let (x, _, _) = command.dispatch.threadgroups;
-        // A sinks dispatch's sink column (the row's sinks source, the twin binds at its 16)
-        // joins in the combine, at its buffer 17, under the twin's sink const: the split's 16
-        // is the partials, its splits storing the keys' alone, and it takes neither.
-        let is_sinks = |b: &&Binding| matches!(b, Binding::Source { ix, which: WeightTensor::Weight, .. } if Some(*ix) == sinks);
-        let (sinks, bindings): (Vec<Binding>, Vec<Binding>) =
-            command.bindings.iter().partition(is_sinks);
-        // Past the sinks, nothing may sit at the partials' slot: it would overlap them.
-        if bindings.iter().any(|b| b.index() == SPLIT_PARTIALS_SLOT) {
-            return Err(LoweringError::SplitPartialsSlotTaken {
-                index,
-                kernel: command.kernel,
-                slot: SPLIT_PARTIALS_SLOT,
-            });
-        }
-        let sinks_const = super::kernel_constants::AttentionViaCacheConstants::SINKS.0;
-        let split_constants: Vec<_> = (constants.iter())
-            .filter(|k| k.index != sinks_const)
-            .copied()
-            .collect();
-        let attention = LoweredCommand {
-            kernel: KernelId::AttentionDecodeGqaTq,
-            function: symbol(
-                "attention_decode_gqa_tq_f16_specialized",
-                "attention_decode_gqa_tq_bf16_specialized",
-            ),
-            constants: baked(split_constants),
-            dispatch: DispatchShape {
-                threadgroups: (x, global.kv_heads().get(), splits + writer),
-                threads_per_threadgroup: (hd, 1, 1),
-                ..command.dispatch
-            },
-            bindings: baked(bindings.iter().copied().chain([scratch]).collect()),
-            ..command
-        };
-        // The output, the rotation's signs and the V bias: the combine's buffers 0, 11 and 15.
-        let kept = (bindings.iter())
-            .filter(|b| matches!(b.index(), 0 | 11 | 15))
-            .copied();
-        let sinks = sinks
-            .into_iter()
-            .map(|b| b.at(super::kernel_bindings::COMBINE_SINKS_SLOT));
-        let combine = LoweredCommand {
-            kernel: KernelId::AttentionDecodeCombine,
-            library: "attention",
-            function: symbol(
-                "attention_via_cache_v2_combine_f16_specialized",
-                "attention_via_cache_v2_combine_bf16_specialized",
-            ),
-            constants: baked(constants),
-            dispatch: DispatchShape {
-                threadgroups: (x, q_heads, 1),
-                threads_per_threadgroup: (combine_threads(hd), 1, 1),
-                ..command.dispatch
-            },
-            bindings: baked(kept.chain([scratch]).chain(sinks).collect()),
-        };
-        let gated = |command: LoweredCommand| GatedCommand::gated_by(command, gate);
-        out.extend([gated(attention), gated(combine)]);
-    }
-    Ok(out)
+    let splits = decode_splits(p, at.block_cap)?;
+    let row_bytes = q_heads * splits * (global.head_dim().get() + 2) * 4;
+    let steps = SplitSteps::of(c.gate.or(row_gate));
+    *partials = partials.max(DecodePartials { row_bytes, steps });
+    Ok(())
 }
 
 /// A gated row's `gate` on every command of it. A command its realization already gated cannot
@@ -2139,16 +1899,7 @@ fn lower(
                 )?;
                 let cmds = route_gdn(p, step, cmds, bucket_m)?;
                 let cmds = route_draft_commit(step, cmds);
-                let cmds = decode_attention_per_kv_head(
-                    p,
-                    step,
-                    w.sinks(),
-                    cmds,
-                    at,
-                    *gate,
-                    &mut decode_partials,
-                    i,
-                )?;
+                record_decode_partials(p, &cmds, at, *gate, &mut decode_partials)?;
                 let (cmds, rows) =
                     sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes)?;
                 logits_rows = writes_logits(logits_rows, rows);
@@ -2880,14 +2631,15 @@ fn lower_one(
             let writer = part(&f.writer, writer_site)?;
             let attention = part(&f.attention, attention_site)?;
             let shape = || LoweringError::RopedAttentionShape { index: w.index };
-            let ([TapeCommand::Dispatch(writer)], [TapeCommand::Dispatch(attention)]) =
+            let ([TapeCommand::Dispatch(writer)], [TapeCommand::Dispatch(attention), rest @ ..]) =
                 (writer.as_slice(), attention.as_slice())
             else {
                 return Err(shape());
             };
-            return roped_attention_command(attention, writer)
-                .map(|c| vec![c.into()])
-                .ok_or_else(shape);
+            let fused = roped_attention_command(attention, writer).ok_or_else(shape)?;
+            return Ok(std::iter::once(fused.into())
+                .chain(rest.iter().cloned())
+                .collect());
         }
 
         // ── A row program: row-wise steps over one width as one command ──
@@ -4792,10 +4544,10 @@ fn lower_one(
             LayerId(layer),
             _pairing,
             class,
-            kv_offsets,
+            _kv_offsets,
             write,
         ) => {
-            let codec = kv_writer_codec(p, *write, *kv_offsets, LayerId(*layer), layer_offset, w)?;
+            let codec = kv_writer_codec(*write, LayerId(*layer), layer_offset);
             // 2D dispatch: (M, num_heads) — one threadgroup per
             // (token, head) pair rotates the head's `head_dim` slice
             // and writes K/V to the layer's paged cache page.
@@ -4848,7 +4600,7 @@ fn lower_one(
                     // Spans: store relocatable K unrotated (skip K-rotation
                     // for flagged blocks). None → byte-identical when off.
                     rope_on_read: if rope_on_read(p)? { Some(1) } else { None },
-                    tq: codec.as_ref().map(|(c, _)| *c),
+                    int8: codec.as_ref().map(|(c, _)| *c),
                     query_only,
                 }
                 .into_baked(),
@@ -4882,13 +4634,8 @@ fn lower_one(
         // One threadgroup per (token, kv head), one thread per head
         // element: K and V copied as projected into the layer's paged
         // cache page. Same geometry-class selection as `RopeAppend`.
-        I::KvAppend(Slot(k_slot), Slot(v_slot), LayerId(layer), class, offsets, write) => {
-            // Its codec restores no offset: a K bias's restore rotates it to the key, and a V
-            // bias's binds the rotary table the writer has none of.
-            if *write == KvWrite::PoolAndPacked && *offsets != KvOffsets::CENTERED {
-                return Err(LoweringError::UnrotatedWriterOffset { index: w.index });
-            }
-            let codec = kv_writer_codec(p, *write, *offsets, LayerId(*layer), layer_offset, w)?;
+        I::KvAppend(Slot(k_slot), Slot(v_slot), LayerId(layer), class, _offsets, write) => {
+            let codec = kv_writer_codec(*write, LayerId(*layer), layer_offset);
             let geometry = self::class(p, class.class())?;
             let (hd, n_kv, bs) = (
                 geometry.head_dim().get(),
@@ -4904,7 +4651,7 @@ fn lower_one(
                     num_kv_heads: super::ids::NumKvHeads(n_kv),
                     block_size: super::ids::BlockSize(bs),
                     blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-                    tq: codec.as_ref().map(|(c, _)| *c),
+                    int8: codec.as_ref().map(|(c, _)| *c),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -4943,9 +4690,7 @@ fn lower_one(
             class,
             write,
         ) => {
-            // A normed K/V carries no offset.
-            let centred = KvOffsets::CENTERED;
-            let codec = kv_writer_codec(p, *write, centred, LayerId(*layer), layer_offset, w)?;
+            let codec = kv_writer_codec(*write, LayerId(*layer), layer_offset);
             assert!(
                 *pairing == RopeFormTag::NeoX,
                 "metal lowering: RopeAppendNormed is NeoX-only (the matcher \
@@ -4984,7 +4729,7 @@ fn lower_one(
                     weight_offset: p.norm_offset().get(),
                     // Spans: store relocatable K NORMED-but-unrotated.
                     rope_on_read: if rope_on_read(p)? { Some(1) } else { None },
-                    tq: codec.as_ref().map(|(c, _)| *c),
+                    int8: codec.as_ref().map(|(c, _)| *c),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -5034,10 +4779,10 @@ fn lower_one(
             // degenerate output after the first decode token).
             let n_q_heads = q_heads(p)?;
             // One threadgroup serves the largest divisor of the GQA group
-            // (`TqDecodeHeads::largest_group`), so the walk reads each key
+            // (`DecodeHeads::largest_group`), so the walk reads each key
             // once for the whole group instead of once per query head; the
             // threadgroups count drops to the KV heads' head groups.
-            let served = super::ids::TqDecodeHeads::largest_group(
+            let served = super::ids::DecodeHeads::largest_group(
                 super::ids::HeadDim(global(p)?.head_dim().get()),
                 super::ids::NumQHeads(n_q_heads),
                 super::ids::NumKvHeads(global(p)?.kv_heads().get()),
@@ -5560,7 +5305,7 @@ fn lower_one(
             // for prompts > one bucket (~4096 tok) → garbage K → `!!!!`. FIXED by
             // sizing the scratch to `block_cap` blocks (rope-once command
             // construction below) and overriding the `RopeOnce*` grid to the live
-            // block-table width in the worker (worker.rs, the `tq_dequant_max_blocks`
+            // block-table width in the worker (worker.rs, the `kv_stage_max_blocks`
             // pattern). Steel stays ON (the fast kernel).
             let use_steel =
                 (steel_symbol.is_some() || nax_kernel.is_some() || steel_wide_kernel.is_some())
@@ -5971,7 +5716,7 @@ fn lower_one(
             let n_q_heads = q_heads(p)?;
             // The sliding class serves its own GQA group per threadgroup
             // (the global arm's note), on the sliding geometry.
-            let served = super::ids::TqDecodeHeads::largest_group(
+            let served = super::ids::DecodeHeads::largest_group(
                 super::ids::HeadDim(base(p)?.head_dim().get()),
                 super::ids::NumQHeads(n_q_heads),
                 super::ids::NumKvHeads(base(p)?.kv_heads().get()),
@@ -6271,38 +6016,18 @@ fn lower_one(
             }
         }
 
-        // ── The KV codec (TurboQuant): its row's guard gates every command ──
-        I::KvStage(operand, layer, class, offsets) => {
-            let bits = tq_bits(p)?;
-            let ops = TqOperands::of(p, *offsets, *layer, w)?;
-            let global = *class == AttnMask::Causal;
-            // Span blocks of K re-rope with the attention class's table.
-            let table = w.rotary(rope_on_read(p)?.then_some(global))?;
-            let layer = layer.get() + layer_offset;
-            // A row new for one sequence can be a prefix hit for another in the same step: the
-            // step's new rows stage first, the cached rows after.
-            use super::kernel_constants::TqStagePass;
-            return [TqStagePass::New, TqStagePass::Cached]
-                .map(|pass| match operand {
-                    KvOperand::K => {
-                        tq_stage_command(p, layer, ops.k, global, table, bucket_m, pass, bits)
-                    }
-                    KvOperand::V => {
-                        tq_stage_command(p, layer, ops.v, global, table, bucket_m, pass, bits)
-                    }
-                })
-                .into_iter()
-                .map(|c| c.map(TapeCommand::Dispatch))
-                .collect();
+        // ── The KV codec (int8): its row's guard gates every command ──
+        I::KvStage(operand, layer, _class, _offsets) => {
+            return dispatched([kv_stage_command(
+                p,
+                layer.get() + layer_offset,
+                *operand,
+                bucket_m,
+            )?]);
         }
-        I::RotateRows(rows, which) => {
-            let inverse = *which == RotatedRows::Output;
-            return dispatched(vec![tq_rotate_command(p, *rows, inverse, bucket_m)?]);
-        }
-        // The decode attention of its class, reading the packed store.
-        I::AttnPackedKv(q, out, layer, pairing, class, offsets) => {
-            let bits = tq_bits(p)?;
-            let ops = TqOperands::of(p, *offsets, *layer, w)?;
+        // The decode attention of its class, reading the int8 store, and the combine of its
+        // splits' partials.
+        I::AttnPackedKv(q, out, layer, pairing, class, _offsets) => {
             let decode = match class {
                 AttnMask::Causal => I::AttentionViaCache(*q, *out, *layer, *pairing),
                 AttnMask::SlidingWindow { .. } => {
@@ -6326,10 +6051,18 @@ fn lower_one(
                 half_planes,
                 m_divisor,
             )?;
+            let [TapeCommand::Dispatch(dense)] = via_cache.as_slice() else {
+                return Err(LoweringError::RopedAttentionShape { index: w.index });
+            };
             let layer = layer.get() + layer_offset;
-            let q_heads = q_heads(p)?;
-            let twin = |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits, q_heads);
-            return dispatched(via_cache.first().and_then(TapeCommand::dispatch).map(twin));
+            return dispatched(int8_decode_commands(
+                p,
+                dense,
+                layer,
+                w.sinks(),
+                block_cap,
+                w.index,
+            )?);
         }
         I::Moe(block, step) => {
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
@@ -9846,6 +9579,7 @@ mod tests {
     use super::*;
     use crate::tape::ids::DecodeRows;
     use scratchy_ir::CanonicalParams;
+    use scratchy_ir::KvCodec;
 
     use scratchy_ir::model_facts::{
         Attention, AttnScale, AttnWindow, BlockSize, ConvDim, ConvKernel, FactsParts, Gdn,
@@ -9950,12 +9684,9 @@ mod tests {
         TP
     }
 
-    /// The code width the TurboQuant fixture is built at.
-    const TQ_BITS: TqBits = TqBits::new(4);
-
-    /// `tp()` built with the `turboquant` feature: its KV codec is TurboQuant.
-    fn tq_consts() -> ModelFacts {
-        with(tp(), |x| x.kv_codec = KvCodec::TurboQuant(TQ_BITS))
+    /// `tp()` built with its KV cache int8.
+    fn int8_consts() -> ModelFacts {
+        with(tp(), |x| x.kv_codec = scratchy_ir::KvCodec::Int8)
     }
     /// The sliding class every test here binds — one window size, the
     /// gemma value, because these tests assert STRUCTURE (which step a
@@ -10022,27 +9753,8 @@ mod tests {
     /// The source [`sinks_tape`] names as the attention rows' sink weight.
     const SINKS_IX: SourceIx = SourceIx(500);
 
-    /// gpt-oss's sliding layer, sinks on: a windowed decode keeps the one-pass twin — the split
-    /// pair serves full attention only — so the twin's own contracts pin here.
-    fn sliding_sinks_tape() -> MetalStepTape {
-        sliding_sinks_tape_of(LLAMA_KV)
-    }
-
-    /// [`sliding_sinks_tape`], its writer's K and V carrying `offsets`.
-    fn sliding_sinks_tape_of(offsets: scratchy_ir::KvOffsets) -> MetalStepTape {
-        sinks_tape(coded(
-            tq_writer(0, SW, offsets),
-            attention(MetalStep::SlidingAttentionViaCache, 0, Interleaved),
-        ))
-    }
-
-    /// [`tq_consts`] with [`SW`]'s window: what [`sliding_sinks_tape`] lowers under.
-    fn sliding_tq_consts() -> ModelFacts {
-        with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(1024), KvRope::AtWrite)
-    }
-
     /// A layer's KV writer whose K and V carry `offsets`.
-    fn tq_writer(layer: u32, class: AttnMask, offsets: scratchy_ir::KvOffsets) -> MetalStep {
+    fn kv_writer(layer: u32, class: AttnMask, offsets: scratchy_ir::KvOffsets) -> MetalStep {
         let [q, k, v, q_out, k_out, v_out] = [0, 1, 2, 3, 4, 5].map(Slot);
         MetalStep::RopeAppend(
             q,
@@ -10160,7 +9872,7 @@ mod tests {
         coded_with(&crate::op_abi::METAL_GUARD_GATES, writer, attention)
     }
 
-    /// A TurboQuant-coded layer's rows — `writer`, then `attention` — as the codec steps expand
+    /// A int8-coded layer's rows — `writer`, then `attention` — as the codec steps expand
     /// them from `op_abi::METAL_KV_CODEC` and the folds leave them, each gated by its guard's gate
     /// in `guards` (a bucket's `op_abi::metal_guard_gates`, as the bake realizes them) or dropped
     /// where they drop it: the writer encoding its rows (its encodes folded in), then the
@@ -10198,14 +9910,12 @@ mod tests {
         for g in around.before {
             let step = match g.step {
                 Before::Stage(operand) => S::KvStage(operand, layer, class, offsets),
-                Before::RotateQuery => S::RotateRows(q, RotatedRows::Query),
             };
             rows.extend(gated(step, g.guard));
         }
         rows.extend(gated(attention, around.anchor));
         for g in around.after {
             let step = match g.step {
-                After::RotateOutput => S::RotateRows(out, RotatedRows::Output),
                 After::PackedTwin => S::AttnPackedKv(q, out, layer, pairing, class, offsets),
             };
             rows.extend(gated(step, g.guard));
@@ -10220,7 +9930,7 @@ mod tests {
     #[test]
     fn a_cache_only_forward_plays_the_rows_the_walk_keeps() {
         let rows = coded(
-            tq_writer(0, Causal, LLAMA_KV),
+            kv_writer(0, Causal, LLAMA_KV),
             attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
         );
         let n = rows.len();
@@ -10230,8 +9940,8 @@ mod tests {
                 .chain([false].repeat(n - 1))
                 .collect::<Vec<_>>(),
         );
-        let lowered =
-            lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(64, None)).expect("lowers");
+        let lowered = lower_subtile_tape_to_metal(&tape, &int8_consts(), bake_point(64, None))
+            .expect("lowers");
         let commands = lowered.commands_expanded();
         let live: Vec<bool> = (lowered.live_expanded().iter())
             .map(|p| p.cache_writes)
@@ -10248,7 +9958,7 @@ mod tests {
 
         let mut refused = row_tape(rows);
         refused.backbone_live = cache_plays(&vec![false; n]);
-        let err = lower_subtile_tape_to_metal(&refused, &tq_consts(), bake_point(64, None));
+        let err = lower_subtile_tape_to_metal(&refused, &int8_consts(), bake_point(64, None));
         assert!(matches!(
             err,
             Err(LoweringError::CacheWriterSkipped { index: 0 })
@@ -10283,16 +9993,16 @@ mod tests {
     }
 
     /// Lower one coded layer — the KV writer, then its attention — at `bucket_m`.
-    fn lower_tq_layer(attention: MetalStep, bucket_m: u32) -> LoweredMetalTape {
-        let rows = coded(tq_writer(0, Causal, LLAMA_KV), attention);
-        lower_tq(&tq_consts(), rows, bucket_m)
+    fn lower_int8_layer(attention: MetalStep, bucket_m: u32) -> LoweredMetalTape {
+        let rows = coded(kv_writer(0, Causal, LLAMA_KV), attention);
+        lower_int8(&int8_consts(), rows, bucket_m)
     }
 
-    fn lower_tq(p: &ModelFacts, rows: Vec<StepRow>, bucket_m: u32) -> LoweredMetalTape {
-        try_lower_tq(p, rows, bucket_m).expect("lower_subtile_tape_to_metal")
+    fn lower_int8(p: &ModelFacts, rows: Vec<StepRow>, bucket_m: u32) -> LoweredMetalTape {
+        try_lower_int8(p, rows, bucket_m).expect("lower_subtile_tape_to_metal")
     }
 
-    fn try_lower_tq(
+    fn try_lower_int8(
         p: &ModelFacts,
         rows: Vec<StepRow>,
         bucket_m: u32,
@@ -10300,12 +10010,11 @@ mod tests {
         lower_subtile_tape_to_metal(&row_tape(rows), p, bake_point(bucket_m, None))
     }
 
-    /// A one-row step's decode attention running its KV writer lowers to ONE command: the
-    /// attention's, plus the writer's rotation (`ATTN_FOLD`, from the writer's slots 3 / 6) and
-    /// the writer's raw K and V, positions, rotary table, slot mapping and — encoding — codebook
-    /// boundaries and bias table, where `FOLD_WRITER_BINDINGS` places them. It is the only KV
-    /// writer a coded tape needs. Any other bucket refuses it. At a head dim the split takes
-    /// (64 — granite's shape) the fold rides the split pair instead: the split's writer
+    /// A one-row step's decode attention running its KV writer lowers to ONE attention command:
+    /// the attention's, plus the writer's rotation (`ATTN_FOLD`, from the writer's slots 3 / 6)
+    /// and the writer's raw K and V, positions, rotary table and slot mapping, where
+    /// `FOLD_WRITER_BINDINGS` places them. It is the only KV writer a coded tape needs. Any other
+    /// bucket refuses it. Coded, the fold rides the int8 split pair: the split's writer
     /// threadgroup, one past its splits, encodes the row, and the combine follows it.
     #[test]
     fn roped_attention_lowers_to_one_command_in_the_one_row_bucket() {
@@ -10323,69 +10032,41 @@ mod tests {
         };
         let rewrite = |write| {
             let MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, _) =
-                tq_writer(0, Causal, LLAMA_KV)
+                kv_writer(0, Causal, LLAMA_KV)
             else {
                 unreachable!()
             };
             MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, write)
         };
-        let cases = [
-            (
-                tp(),
-                KvWrite::Pool,
-                attention(MetalStep::AttentionViaCache, 0, NeoX),
-            ),
-            // Head_dim 192 — a dim between the split's steps — keeps the fold twin.
-            (
-                with_attention(
-                    tq_consts(),
-                    TP_GEOM,
-                    geom(32, 4, 192, 64, 16),
-                    None,
-                    KvRope::AtWrite,
-                ),
-                KvWrite::PoolAndPacked,
-                packed.clone(),
-            ),
-        ];
-        for (p, write, attention) in cases {
-            let writer = rewrite(write);
-            let tape = fold_tape(&writer, &attention);
-            let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
-                .expect("a one-row fold lowers");
-            assert_eq!(lowered.commands.len(), 1, "one command");
-            let one = &lowered.commands.get(0);
-            let (cmd, w) = (&one.lowered(), lower_tq(&p, plain(&[writer]), 1));
-            let writer = &w.commands.get(0).lowered();
-            let constant = |c: &LoweredCommand, slot: u16| {
-                c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
-            };
-            assert_eq!(constant(cmd, ATTN_FOLD.0), constant(writer, 3));
-            assert_eq!(constant(cmd, ATTN_FOLD.1), constant(writer, 6));
-            let bound = |i: u8| cmd.bindings.iter().any(|b| b.index() == i);
-            let tq = write == KvWrite::PoolAndPacked;
-            assert_eq!(
-                cmd.kernel,
-                if tq {
-                    KernelId::AttentionViaCacheTq
-                } else {
-                    KernelId::AttentionViaCache
-                }
-            );
-            for i in [13, 17, 18, 19, 21] {
-                assert!(bound(i), "binding {i}");
-            }
-            assert_eq!((bound(20), bound(22)), (tq, false));
-            let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
-            assert!(matches!(
-                two,
-                Err(LoweringError::OneRowFold { bucket_m: 2 })
-            ));
+        let constant = |c: &LoweredCommand, slot: u16| {
+            c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
+        };
+        // Dense: the one-pass attention running its writer.
+        let p = tp();
+        let writer = rewrite(KvWrite::Pool);
+        let tape = fold_tape(&writer, &attention(MetalStep::AttentionViaCache, 0, NeoX));
+        let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
+            .expect("a one-row fold lowers");
+        assert_eq!(lowered.commands.len(), 1, "one command");
+        let (cmd, w) = (
+            &lowered.commands.get(0).lowered(),
+            lower_int8(&p, plain(&[writer]), 1),
+        );
+        let writer = &w.commands.get(0).lowered();
+        assert_eq!(cmd.kernel, KernelId::AttentionViaCache);
+        assert_eq!(constant(cmd, ATTN_FOLD.0), constant(writer, 3));
+        assert_eq!(constant(cmd, ATTN_FOLD.1), constant(writer, 6));
+        let bound = |i: u8| cmd.bindings.iter().any(|b| b.index() == i);
+        for i in [13, 17, 18, 19, 21] {
+            assert!(bound(i), "binding {i}");
         }
-        // Head_dim 64 takes the split: the fold is the split pair, the split carrying the
-        // writer's rotation, raw rows and encode bindings, one writer threadgroup past its
-        // splits.
-        let p = tq_consts();
+        assert!(matches!(
+            lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None)),
+            Err(LoweringError::OneRowFold { bucket_m: 2 })
+        ));
+        // Int8: the split pair, the split carrying the writer's rotation, raw rows and the
+        // int8 store, one writer threadgroup past its splits.
+        let p = int8_consts();
         let writer = rewrite(KvWrite::PoolAndPacked);
         let tape = fold_tape(&writer, &packed);
         let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
@@ -10396,28 +10077,24 @@ mod tests {
         assert_eq!(
             kernels,
             [
-                KernelId::AttentionDecodeGqaTq,
+                KernelId::AttentionDecodeInt8,
                 KernelId::AttentionDecodeCombine,
             ]
         );
         let split = &lowered.commands.get(0).lowered();
-        let w = lower_tq(&p, plain(&[writer]), 1);
+        let w = lower_int8(&p, plain(&[writer]), 1);
         let writer = &w.commands.get(0).lowered();
-        let constant = |c: &LoweredCommand, slot: u16| {
-            c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
-        };
         assert_eq!(constant(split, ATTN_FOLD.0), constant(writer, 3));
         assert_eq!(constant(split, ATTN_FOLD.1), constant(writer, 6));
         let bound = |i: u8| split.bindings.iter().any(|b| b.index() == i);
-        for i in [13, 17, 18, 19, 21] {
+        for i in [7, 8, 9, 10, 13, 17, 18, 19, 21] {
             assert!(bound(i), "binding {i}");
         }
-        assert_eq!((bound(20), bound(22)), (true, false));
+        assert!(!bound(20) && !bound(22));
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(split.dispatch.threadgroups.2, splits + 1);
-        let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
         assert!(matches!(
-            two,
+            lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None)),
             Err(LoweringError::OneRowFold { bucket_m: 2 })
         ));
     }
@@ -10444,7 +10121,7 @@ mod tests {
             });
             let step =
                 MetalStep::GatedDeltaNet(Slot(0), Slot(1), Slot(2), Slot(3), Slot(4), LayerId(0));
-            lower_tq(&p, plain(&[step]), bucket_m)
+            lower_int8(&p, plain(&[step]), bucket_m)
                 .commands
                 .iter()
                 .collect::<Vec<GatedCommand>>()
@@ -10620,69 +10297,48 @@ mod tests {
         assert_eq!(shape(&drafting((2, 4, 64, 48), 64, 2)), want);
     }
 
-    /// The un-rotated KV writer coded (`KvWrite::PoolAndPacked`, Nemotron-H under TurboQuant):
-    /// its one `kv_append` command carries the rope writer's encode constants (slots 10-14, no
-    /// offset) and binds the codebook and the layer's packed stores at 16-21 — no bias, no
-    /// rotary table. Plain (a dense model), it carries neither. With a projection bias the codec
-    /// cannot restore it refuses. Its layer's packed decode twin lowers after it. Pure-CPU
-    /// lowering checks.
+    /// The un-rotated KV writer coded (`KvWrite::PoolAndPacked`, Nemotron-H's): its one
+    /// `kv_append` command carries the rope writer's encode switch (slot 10) and binds the
+    /// layer's int8 store at 16-19. Plain (a dense model), it carries neither. Its layer's int8
+    /// decode lowers after it. Pure-CPU lowering checks.
     #[test]
     fn a_coded_kv_append_encodes_as_it_writes() {
-        use scratchy_ir::{BiasStorage, KvOffset};
         let writer = |offsets, write| {
             MetalStep::KvAppend(Slot(1), Slot(2), LayerId(0), Causal, offsets, write)
         };
-        let lower = |step: MetalStep| try_lower_tq(&tq_consts(), plain(&[step]), 1);
+        let lower = |step: MetalStep| try_lower_int8(&int8_consts(), plain(&[step]), 1);
         let coded = lower(writer(LLAMA_KV, KvWrite::PoolAndPacked)).expect("lowers");
         let c = &coded.commands.get(0).lowered();
         assert_eq!((c.library, coded.commands.len()), ("kv_append", 1));
         let slot = |i: u16| c.constants.iter().find(|k| k.index == i).map(|k| k.bits);
-        let hd = a(&tq_consts()).global().head_dim().get() as usize;
         assert_eq!(
             (10..15).map(slot).collect::<Vec<_>>(),
-            [
-                Some(TQ_BITS.get()),
-                Some(scratchy_layers::turboquant::vals_per_word(TQ_BITS.get()) as u32),
-                Some(scratchy_layers::turboquant::packed_dim(hd, TQ_BITS.get()) as u32),
-                Some(0),
-                Some(0)
-            ]
+            [Some(1), None, None, None, None]
         );
-        let mut tq: Vec<u8> = c
+        let mut int8: Vec<u8> = c
             .bindings
             .iter()
             .map(|b| b.index())
             .filter(|&i| i >= 16)
             .collect();
-        tq.sort_unstable();
-        assert_eq!(tq, [16, 17, 18, 19, 20, 21]);
+        int8.sort_unstable();
+        assert_eq!(int8, [16, 17, 18, 19]);
         // Plain on a dense model (a coded model refuses a writer that encodes nothing).
-        let plain_writer = try_lower_tq(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
+        let plain_writer = try_lower_int8(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
         let plain_writer = plain_writer.expect("lowers");
         let c = &plain_writer.commands.get(0).lowered();
         assert!(c.constants.iter().all(|k| k.index < 10));
         assert!(c.bindings.iter().all(|b| b.index() < 16));
-        let k_biased = scratchy_ir::KvOffsets {
-            k: KvOffset::LinearBias(BiasStorage::Dense),
-            v: KvOffset::Centered,
-        };
-        assert!(matches!(
-            lower(writer(k_biased, KvWrite::PoolAndPacked)),
-            Err(LoweringError::UnrotatedWriterOffset { index: 0 })
-        ));
-        // The layer's packed decode twin, after its coded writer. The fixture's geometry
-        // (TurboQuant-4, a whole query-head group of 8 per KV head, head_dim 64) is one
-        // `decode_attention_per_kv_head` serves per KV head (#350), so the twin lowers as
-        // the split pair, not the one-pass `attention_via_cache_v2`.
+        // The layer's int8 decode, after its coded writer: the split pair.
         let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
         let rows = plain(&[writer(LLAMA_KV, KvWrite::PoolAndPacked), twin]);
-        let layer = try_lower_tq(&tq_consts(), rows, 1).expect("the coded layer lowers");
+        let layer = try_lower_int8(&int8_consts(), rows, 1).expect("the coded layer lowers");
         let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.lowered().kernel).collect();
         assert_eq!(
             kernels,
             [
                 KernelId::KvAppend,
-                KernelId::AttentionDecodeGqaTq,
+                KernelId::AttentionDecodeInt8,
                 KernelId::AttentionDecodeCombine,
             ]
         );
@@ -10711,7 +10367,7 @@ mod tests {
                 ))
             });
             let step = MetalStep::Mamba2(Slot(0), Slot(1), LayerId(0));
-            lower_tq(&p, plain(&[step]), bucket_m)
+            lower_int8(&p, plain(&[step]), bucket_m)
                 .commands
                 .iter()
                 .collect::<Vec<GatedCommand>>()
@@ -10947,25 +10603,22 @@ mod tests {
         }
     }
 
-    /// A dense model's tape carries no TurboQuant command and gates nothing on
-    /// the step shape: the codec pass runs only on a model built with it, so its
-    /// layers lower as written. Pure-CPU lowering checks — never submit a Metal
-    /// command buffer.
+    /// A dense model's tape carries no int8 command and gates nothing on the step shape: the
+    /// codec pass runs only on a model built with it, so its layers lower as written. Pure-CPU
+    /// lowering checks — never submit a Metal command buffer.
     #[test]
-    fn dense_codec_lowers_no_turboquant_commands() {
-        assert_eq!(tp().kv_codec(), KvCodec::Dense);
+    fn dense_codec_lowers_no_int8_commands() {
+        assert_eq!(tp().kv_codec(), scratchy_ir::KvCodec::Dense);
         for (attention, bucket_m) in [
             (attention(MetalStep::AttentionViaCache, 0, Interleaved), 1),
             (attention(MetalStep::AttentionPrefillPaged, 0, NeoX), 64),
         ] {
-            let rows = plain(&[tq_writer(0, Causal, LLAMA_KV), attention.clone()]);
-            let tape = lower_tq(&tp(), rows, bucket_m);
+            let rows = plain(&[kv_writer(0, Causal, LLAMA_KV), attention.clone()]);
+            let tape = lower_int8(&tp(), rows, bucket_m);
             assert!(
                 tape.commands.iter().all(|c| !matches!(
                     c.lowered().kernel,
-                    KernelId::TqStageRotated
-                        | KernelId::TqRotateRows
-                        | KernelId::AttentionViaCacheTq
+                    KernelId::KvStage | KernelId::AttentionDecodeInt8
                 )),
                 "{attention:?}"
             );
@@ -10974,59 +10627,42 @@ mod tests {
                 Some(RuntimeGate::OnlyIfDecodeStep | RuntimeGate::UnlessDecodeStep)
             )));
         }
-        // A codec step reaching a dense model's lowering is refused, never lowered.
-        let coded_rows = coded(
-            tq_writer(0, Causal, LLAMA_KV),
-            attention(MetalStep::AttentionViaCache, 0, Interleaved),
-        );
-        assert!(matches!(
-            try_lower_tq(&tp(), coded_rows, 1),
-            Err(LoweringError::CodecStepOnDenseModel)
-        ));
     }
 
-    /// A TurboQuant model whose backbone binds the KV cache but compresses
-    /// none of it does not lower: a hybrid model's sliding layers alone stay
-    /// fp16, so nothing would write the packed stores its factory provisions.
+    /// An int8 model whose backbone binds the KV cache but compresses none of it does not lower:
+    /// a hybrid model's sliding layers alone stay fp16, so nothing would write the stores its
+    /// factory provisions.
     #[test]
-    fn turboquant_that_compresses_nothing_does_not_lower() {
+    fn int8_that_compresses_nothing_does_not_lower() {
         let p = with_attention(
-            tq_consts(),
+            int8_consts(),
             TP_GEOM,
             geom(32, 1, 512, 128, 32),
             Some(1024),
             KvRope::AtWrite,
         );
         let rows = plain(&[
-            tq_writer(1, SW, LLAMA_KV),
+            kv_writer(1, SW, LLAMA_KV),
             attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved),
         ]);
         assert!(matches!(
-            try_lower_tq(&p, rows, 1),
-            Err(LoweringError::TurboQuantCompressesNothing)
+            try_lower_int8(&p, rows, 1),
+            Err(LoweringError::Int8CompressesNothing)
         ));
     }
 
-    /// Each TurboQuant codec command must carry the `OnlyIfTurboquant` gate
-    /// so it is skipped on a non-turboquant (fp16) KV cache — otherwise the TQ
-    /// kernels dispatch on fp16, read OOB from the unbound packed/norms fallback
-    /// bindings, and silently WEDGE the GPU. The gate is fused onto each
-    /// `GatedCommand`, so it can no longer be dropped by a parallel-vec mishap
-    /// (that is now a compile error); these tests verify a codec row's guard
-    /// reaches every command of it with the gate VALUE `op_abi::METAL_GUARD_GATES`
-    /// declares, and `lower_subtile_tape_to_metal` carries it. Pure-CPU lowering
-    /// checks — never submit a Metal command buffer.
+    /// A codec row's guard reaches every command of it with the gate VALUE
+    /// `op_abi::METAL_GUARD_GATES` declares, and `lower_subtile_tape_to_metal` carries it.
+    /// Pure-CPU lowering checks — never submit a Metal command buffer.
     ///
-    /// Decode: no dequant pass; the plain attention runs only off TurboQuant and the split
-    /// pair — the per-KV-head kernel and its combine, the packed store's bindings on the
-    /// first — only on TurboQuant KV. A sliding layer (gpt-oss's, sinks on) keeps the
-    /// `AttentionViaCacheTq` twin instead: same geometry as the plain command, plus the
-    /// codebook width and the packed-store bindings.
+    /// Decode: no staging; the plain attention runs only off decode steps and the split pair —
+    /// the per-KV-head kernel and its combine, the int8 store's bindings on the first — only on
+    /// them.
     #[test]
-    fn decode_turboquant_reads_packed_store_without_dequant() {
+    fn decode_int8_reads_the_store_without_staging() {
         use crate::tape::lowered::RuntimeGate::{self, OnlyIfDecodeStep, UnlessDecodeStep};
         let rows = coded(
-            tq_writer(0, Causal, LLAMA_KV),
+            kv_writer(0, Causal, LLAMA_KV),
             attention(MetalStep::AttentionViaCache, 0, Interleaved),
         );
         let steps = |tape: &LoweredMetalTape| {
@@ -11035,14 +10671,14 @@ mod tests {
                 .map(|c| (c.lowered().kernel, c.gate))
                 .collect::<Vec<(KernelId, Option<RuntimeGate>)>>()
         };
-        let p = tq_consts();
-        let tape = lower_tq(&p, rows.clone(), 1);
+        let p = int8_consts();
+        let tape = lower_int8(&p, rows, 1);
         assert_eq!(
             steps(&tape),
             [
                 (KernelId::RopeAppend, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
@@ -11051,8 +10687,9 @@ mod tests {
             &tape.commands.get(2).lowered(),
             &tape.commands.get(3).lowered(),
         );
-        // A threadgroup a (KV head, split) of head_dim threads, its combine one a query
-        // head of two simdgroups — head_dim 64's share of every lane's elements.
+        // A threadgroup a (query-head group, split) of head_dim threads — the fixture's group of
+        // 8 a KV head's — its combine one a query head of two simdgroups — head_dim 64's share
+        // of every lane's elements.
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(
             (
@@ -11071,141 +10708,76 @@ mod tests {
             ),
             ((1, a(&p).q_heads().get(), 1), (64, 1, 1))
         );
-        let bits = TQ_BITS.get();
-        // The split keeps the twin's constants — the plain set's less its baked heads (slot
-        // 16, the twin's variant-bound one is dropped too), plus the codebook width and the
-        // rung's split count — and its bindings are the twin's plus the partials at the op
-        // scratch's front.
+        // The split takes the plain set less its baked heads (slot 16), then the int8 switch,
+        // the rung's split count and its own heads; the combine the same less its heads.
         let mut dense = fp16.constants.to_vec();
         assert_eq!(dense.pop(), Some(ConstantValue::uint(16, 8)));
         assert_eq!(split.constants[..dense.len()], *dense);
         assert_eq!(
             split.constants[dense.len()..],
             [
-                ConstantValue::uint(13, bits),
-                ConstantValue::uint(18, splits)
+                ConstantValue::uint(13, 1),
+                ConstantValue::uint(18, splits),
+                ConstantValue::uint(16, 8),
             ]
         );
+        assert_eq!(
+            *combine.constants,
+            [
+                dense,
+                vec![ConstantValue::uint(13, 1), ConstantValue::uint(18, splits)]
+            ]
+            .concat()
+        );
+        // The split binds the plain set, then the int8 store and the slot mapping, then the
+        // partials at the op scratch's front; the combine the output and the partials.
         assert_eq!(split.bindings[..fp16.bindings.len()], *fp16.bindings);
         let layer = crate::tape::ids::LayerId(0);
         let n = fp16.bindings.len();
-        let tq_kinds: Vec<(u8, RuntimeBindingKind)> = split.bindings[n..n + 7]
+        let int8_kinds: Vec<(u8, RuntimeBindingKind)> = split.bindings[n..n + 5]
             .iter()
             .map(|b| match b {
                 Binding::Runtime {
                     kind,
                     binding_index,
                 } => (*binding_index, *kind),
-                other => panic!("TurboQuant attention binding {other:?} is not a runtime buffer"),
+                other => panic!("int8 attention binding {other:?} is not a runtime buffer"),
             })
             .collect();
         assert_eq!(
-            tq_kinds,
+            int8_kinds,
             [
-                (7, RuntimeBindingKind::TqPackedK { layer }),
-                (8, RuntimeBindingKind::TqPackedV { layer }),
-                (9, RuntimeBindingKind::TqNormsK { layer }),
-                (10, RuntimeBindingKind::TqNormsV { layer }),
-                (11, RuntimeBindingKind::TqSigns),
-                (12, RuntimeBindingKind::TqCentroids),
+                (7, RuntimeBindingKind::KvCodesK { layer }),
+                (8, RuntimeBindingKind::KvCodesV { layer }),
+                (9, RuntimeBindingKind::KvScalesK { layer }),
+                (10, RuntimeBindingKind::KvScalesV { layer }),
                 (13, RuntimeBindingKind::SlotMapping { layer }),
             ]
         );
         let partials = scratch_at(16, 0);
         assert_eq!(split.bindings.last(), Some(&partials));
-        // The combine keeps the output, the rotation's signs and (a biased layer's) the V
-        // bias, plus the partials.
-        let kept = (split.bindings.iter())
-            .filter(|b| matches!(b.index(), 0 | 11 | 15))
-            .copied();
+        let output = (split.bindings.iter()).filter(|b| b.index() == 0).copied();
         assert_eq!(
             *combine.bindings,
-            kept.chain([partials]).collect::<Vec<_>>()
-        );
-
-        // The twin's own contract, on the sliding layer that keeps it:
-        let tape = lower_subtile_tape_to_metal(
-            &sliding_sinks_tape(),
-            &sliding_tq_consts(),
-            bake_point(1, None),
-        )
-        .expect("lower_subtile_tape_to_metal");
-        assert_eq!(
-            steps(&tape),
-            [
-                (KernelId::RopeAppend, None),
-                (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-                (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
-            ]
-        );
-        let (fp16, tq) = (
-            &tape.commands.get(1).lowered(),
-            &tape.commands.get(2).lowered(),
-        );
-        // Same kernel; the plain command's threadgroups count head groups —
-        // the baked GQA divisor, 8 heads a group here — while the twin's
-        // count heads for the worker's variant division.
-        assert_eq!((fp16.library, fp16.function), (tq.library, tq.function));
-        assert_eq!(fp16.dispatch.threadgroups, (1, 4, 1));
-        assert_eq!(tq.dispatch.threadgroups, (1, 32, 1));
-        assert_eq!(
-            fp16.dispatch.threads_per_threadgroup,
-            tq.dispatch.threads_per_threadgroup
-        );
-        // The twin drops the plain set's baked heads (slot 16, its last
-        // entry) for its variant-bound one, then adds the codebook width.
-        let mut dense = fp16.constants.to_vec();
-        assert_eq!(dense.pop(), Some(ConstantValue::uint(16, 8)));
-        assert_eq!(tq.constants[..dense.len()], *dense);
-        assert_eq!(
-            tq.constants[dense.len()..],
-            [ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)]
-        );
-        assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
-        let tq_kinds: Vec<(u8, RuntimeBindingKind)> = tq.bindings[fp16.bindings.len()..]
-            .iter()
-            .map(|b| match b {
-                Binding::Runtime {
-                    kind,
-                    binding_index,
-                } => (*binding_index, *kind),
-                other => panic!("TurboQuant attention binding {other:?} is not a runtime buffer"),
-            })
-            .collect();
-        assert_eq!(
-            tq_kinds,
-            [
-                (7, RuntimeBindingKind::TqPackedK { layer }),
-                (8, RuntimeBindingKind::TqPackedV { layer }),
-                (9, RuntimeBindingKind::TqNormsK { layer }),
-                (10, RuntimeBindingKind::TqNormsV { layer }),
-                (11, RuntimeBindingKind::TqSigns),
-                (12, RuntimeBindingKind::TqCentroids),
-                (13, RuntimeBindingKind::SlotMapping { layer }),
-            ]
+            output.chain([partials]).collect::<Vec<_>>()
         );
     }
 
-    /// A sinks attention's TurboQuant twin keeps the dense command's sink column: both the
-    /// `AttentionViaCache` dispatch and its `AttentionViaCacheTq` twin carry the sink const
-    /// (slot 21) and the sinks weight binding (slot 16 — free between the TQ projection
-    /// biases and the fold buffers, so the twin's TQ slots 7..=13 cannot collide with it).
-    /// The codec expansion used to build the twin without the attention's trailing sinks
-    /// operand, so the twin's row had no sink site and every TurboQuant decode of a
-    /// sink-attention arch (gpt-oss) silently dropped the column its dense twin still
-    /// carried — decode diverged from prefill and the model echoed.
+    /// A sinks attention's int8 decode keeps the dense command's sink column: the dense
+    /// `AttentionViaCache` dispatch carries the sink const (slot 21) and the sinks weight binding
+    /// (slot 16), and the combine after the split carries them both (its slot 17). A decode that
+    /// drops the column diverges from prefill: gpt-oss echoes.
     #[test]
-    fn decode_turboquant_twin_keeps_the_attention_sinks() {
+    fn decode_int8_keeps_the_attention_sinks() {
         use crate::tape::ids::LayerId;
+        use crate::tape::kernel_bindings::COMBINE_SINKS_SLOT;
         use crate::tape::lowered::{Binding, WeightTensor};
-        // gpt-oss's sliding layer: the attention rows' site, plus the attention's trailing
-        // sinks weight — what its rows look like once the codec carries the operand.
-        let tape = lower_subtile_tape_to_metal(
-            &sliding_sinks_tape(),
-            &sliding_tq_consts(),
-            bake_point(1, None),
-        )
-        .expect("lower_subtile_tape_to_metal");
+        let tape = sinks_tape(coded(
+            kv_writer(0, Causal, LLAMA_KV),
+            attention(MetalStep::AttentionViaCache, 0, Interleaved),
+        ));
+        let tape = lower_subtile_tape_to_metal(&tape, &int8_consts(), bake_point(1, None))
+            .expect("lower_subtile_tape_to_metal");
         let find = |k| {
             tape.commands
                 .iter()
@@ -11213,28 +10785,20 @@ mod tests {
                 .find(|c| c.kernel == k)
                 .expect("the command")
         };
-        let (fp16, tq) = (
+        let (fp16, combine) = (
             find(KernelId::AttentionViaCache),
-            find(KernelId::AttentionViaCacheTq),
+            find(KernelId::AttentionDecodeCombine),
         );
-        // The plain set bakes its served heads at slot 16, after the sinks
-        // entry; the twin drops that entry (its own slot 16 is variant-bound)
-        // and copies the rest wholesale — sinks included — then extends with
-        // the TQ pair. The geometry's group of 8 at head_dim 64 serves 8.
-        assert_eq!(fp16.constants.last(), Some(&ConstantValue::uint(16, 8)));
-        let mut dense = fp16.constants.to_vec();
-        dense.pop();
-        assert_eq!(dense.last(), Some(&ConstantValue::uint(21, 1)));
-        assert_eq!(tq.constants[..dense.len()], *dense);
-        // Both bind the layer's `[num_heads]` sink tensor at slot 16.
-        let sink_binding = Binding::Source {
+        let sink_const = ConstantValue::uint(21, 1);
+        let sinks = |binding_index| Binding::Source {
             ix: SINKS_IX,
             which: WeightTensor::Weight,
             layer: LayerId(0),
-            binding_index: 16,
+            binding_index,
         };
-        assert!(fp16.bindings.contains(&sink_binding));
-        assert!(tq.bindings.contains(&sink_binding));
+        assert!(fp16.constants.contains(&sink_const) && combine.constants.contains(&sink_const));
+        assert!(fp16.bindings.contains(&sinks(16)));
+        assert!(combine.bindings.contains(&sinks(COMBINE_SINKS_SLOT)));
     }
 
     /// A full-attention sinks decode (gpt-oss's) takes the split pair, the sink column joining
@@ -11244,16 +10808,16 @@ mod tests {
     /// model's split runs. The successor of the twin's contract on this route: a decode that
     /// drops the sink column is the bug that made gpt-oss echo.
     #[test]
-    fn decode_turboquant_split_binds_the_sinks_on_the_combine() {
+    fn decode_int8_split_binds_the_sinks_on_the_combine() {
         use crate::tape::ids::LayerId;
         use crate::tape::kernel_bindings::COMBINE_SINKS_SLOT;
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         use crate::tape::lowered::{Binding, WeightTensor};
         let tape = sinks_tape(coded(
-            tq_writer(0, Causal, LLAMA_KV),
+            kv_writer(0, Causal, LLAMA_KV),
             attention(MetalStep::AttentionViaCache, 0, Interleaved),
         ));
-        let tape = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(1, None))
+        let tape = lower_subtile_tape_to_metal(&tape, &int8_consts(), bake_point(1, None))
             .expect("lower_subtile_tape_to_metal");
         let steps: Vec<_> = (tape.commands.iter())
             .map(|c| (c.lowered().kernel, c.gate))
@@ -11263,7 +10827,7 @@ mod tests {
             [
                 (KernelId::RopeAppend, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
@@ -11294,14 +10858,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             [&partials]
         );
-        // The combine: the split's constants plus the sink const, and its whole binding list —
-        // the output and the rotation's signs, the partials, the sinks.
+        // The combine: the split's constants less its heads, plus the sink const, and its whole
+        // binding list — the output, the partials, the sinks.
         assert_eq!(
             (combine.constants.iter())
                 .filter(|k| **k != sink_const)
                 .copied()
                 .collect::<Vec<_>>(),
-            *split.constants
+            (split.constants.iter())
+                .filter(|k| k.index != 16)
+                .copied()
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             (combine.constants.iter())
@@ -11310,83 +10877,34 @@ mod tests {
             [&sink_const]
         );
         let kept: Vec<_> = (split.bindings.iter())
-            .filter(|b| matches!(b.index(), 0 | 11 | 15))
+            .filter(|b| b.index() == 0)
             .copied()
             .collect();
-        assert_eq!(kept.iter().map(|b| b.index()).collect::<Vec<_>>(), [0, 11]);
         assert_eq!(
             *combine.bindings,
             [kept, vec![partials, sinks(COMBINE_SINKS_SLOT)]].concat()
         );
     }
 
-    /// A sinks layer takes the split in every bucket up to [`SINKS_SPLIT_MAX_BUCKET_M`] and no
-    /// wider: a wider bucket is a prefill bucket and keeps the twin, so its tape is the one a sinks
-    /// model ran before the split took its decode. A layer without sinks takes the split in it.
+    /// A dense decode command binding something other than the row's sinks at the partials' slot
+    /// is a lowering error, never a silent overlap with the partials: here a sinks binding the
+    /// split is not told is the row's.
     #[test]
-    fn a_sinks_decode_keeps_the_twin_past_the_decode_buckets() {
-        let rows = || {
-            coded(
-                tq_writer(0, Causal, LLAMA_KV),
-                attention(MetalStep::AttentionViaCache, 0, Interleaved),
-            )
-        };
-        let kernels = |tape: MetalStepTape, bucket_m| {
-            let lowered =
-                lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(bucket_m, None))
-                    .expect("lower_subtile_tape_to_metal");
-            (lowered.commands.iter())
-                .map(|c| c.lowered().kernel)
-                .filter(|k| {
-                    matches!(
-                        k,
-                        KernelId::AttentionViaCacheTq
-                            | KernelId::AttentionDecodeGqaTq
-                            | KernelId::AttentionDecodeCombine
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let split = vec![
-            KernelId::AttentionDecodeGqaTq,
-            KernelId::AttentionDecodeCombine,
-        ];
-        for bucket_m in [1, 8, 64, SINKS_SPLIT_MAX_BUCKET_M] {
-            assert_eq!(
-                kernels(sinks_tape(rows()), bucket_m),
-                split,
-                "bucket {bucket_m}"
-            );
-        }
-        for bucket_m in [1024, 2048, 4096] {
-            assert_eq!(
-                kernels(sinks_tape(rows()), bucket_m),
-                [KernelId::AttentionViaCacheTq],
-                "bucket {bucket_m}"
-            );
-            assert_eq!(
-                kernels(row_tape(rows()), bucket_m),
-                split,
-                "no sinks, bucket {bucket_m}"
-            );
-        }
-    }
-
-    /// A twin the split takes binding something other than the row's sinks at the partials' slot
-    /// is a lowering error, never a silent overlap with the partials nor a quiet twin: here the
-    /// sliding twin's sinks, which the split is not told are the row's.
-    #[test]
-    fn decode_turboquant_split_refuses_a_buffer_at_its_partials_slot() {
+    fn decode_int8_split_refuses_a_buffer_at_its_partials_slot() {
         let tape = lower_subtile_tape_to_metal(
-            &sliding_sinks_tape(),
-            &sliding_tq_consts(),
+            &sinks_tape(plain(&[
+                kv_writer(0, Causal, LLAMA_KV),
+                attention(MetalStep::AttentionViaCache, 0, Interleaved),
+            ])),
+            &tp(),
             bake_point(1, None),
         )
         .expect("lower_subtile_tape_to_metal");
-        let twin = (tape.commands.iter())
-            .find(|c| c.lowered().kernel == KernelId::AttentionViaCacheTq)
-            .expect("the twin");
-        assert!((twin.lowered().bindings.iter()).any(|b| matches!(
+        let dense = (tape.commands.iter())
+            .find(|c| c.lowered().kernel == KernelId::AttentionViaCache)
+            .expect("the dense decode")
+            .lowered();
+        assert!((dense.bindings.iter()).any(|b| matches!(
             b,
             Binding::Source {
                 ix: SINKS_IX,
@@ -11394,140 +10912,45 @@ mod tests {
                 ..
             }
         )));
-        let causal =
-            MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), Interleaved, Causal, LLAMA_KV);
-        let mut partials = DecodePartials::default();
-        let lowered = decode_attention_per_kv_head(
-            &tq_consts(),
-            &causal,
-            None,
-            vec![twin],
-            &bake_point(1, None),
-            None,
-            &mut partials,
-            7,
-        );
+        let lowered = int8_decode_commands(&int8_consts(), &dense, 0, None, 128, 7);
         assert!(matches!(
             lowered,
             Err(LoweringError::SplitPartialsSlotTaken {
                 index: 7,
-                kernel: KernelId::AttentionViaCacheTq,
+                kernel: KernelId::AttentionViaCache,
                 slot: 16,
             })
         ));
     }
 
-    /// The TurboQuant decode twin's query heads per threadgroup turn on the
-    /// device's GPU core count, which no baked class knows: every class's
-    /// profile lowers it at one head, and the pool serves the device's count
-    /// at load. The test geometry's GQA group of 8 (head_dim 64) fits 8 heads;
-    /// the most that leave 4/5 of the cores a threadgroup is 4 on an 8-core
-    /// M1, 2 on a 16-core M1 Pro, and 1 on a 32-core M1 Max. The rows are
-    /// gpt-oss's sliding layer, sinks on: the split serves full attention only,
-    /// so the window keeps the twin — the shape the heads contract still serves.
-    #[test]
-    fn decode_turboquant_heads_follow_the_device_not_the_baked_class() {
-        use crate::tape::ids::{GpuCores, HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
-        let p = sliding_tq_consts();
-        let tape = sliding_sinks_tape();
-        let find = |profile, k| {
-            let tape =
-                lower_subtile_tape_to_metal(&tape, &p, bake_point(/*bucket_m=*/ 1, Some(profile)))
-                    .expect("lower_subtile_tape_to_metal");
-            tape.commands
-                .iter()
-                .find(|c| c.lowered().kernel == k)
-                .expect("command")
-                .lowered()
-        };
-        let (fp16, tq) = (
-            find(&crate::targets::M1_MAX, KernelId::AttentionViaCache),
-            find(&crate::targets::M1_MAX, KernelId::AttentionViaCacheTq),
-        );
-        for class in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
-            assert!(
-                find(class, KernelId::AttentionViaCacheTq) == tq,
-                "one tape per class"
-            );
-        }
-        assert_eq!(a(&p).q_heads().get() / a(&p).base().kv_heads().get(), 8);
-        // The plain command bakes the largest group divisor — 8 heads at
-        // head_dim 64 — so its threadgroups count head groups, not heads; the
-        // twin keeps the undivided count for the variant's division.
-        let (x, y, z) = fp16.dispatch.threadgroups;
-        assert_eq!(y, a(&p).q_heads().get() / 8);
-        assert_eq!(
-            (fp16.constants.iter()).find(|k| k.index == 16),
-            Some(&ConstantValue::uint(16, 8))
-        );
-        assert_eq!(tq.dispatch.threadgroups, (x, a(&p).q_heads().get(), z));
-        assert_eq!(tq.constants.last(), Some(&ConstantValue::tq_heads(16)));
-        let bound_heads = |c: &LoweredCommand| {
-            (c.constants.iter()).any(|k| k.ty == super::super::constants::ConstantType::TqHeads)
-        };
-        assert!(
-            !bound_heads(&fp16),
-            "only the TurboQuant decode command takes the heads"
-        );
-        for (cores, heads) in [(8, 4), (16, 2), (32, 1)] {
-            let served_heads = TqDecodeHeads::for_group(
-                HeadDim(a(&p).global().head_dim().get()),
-                NumQHeads(a(&p).q_heads().get()),
-                NumKvHeads(a(&p).global().kv_heads().get()),
-                GpuCores(cores),
-            );
-            assert_eq!(served_heads, TqDecodeHeads(heads), "{cores} cores");
-            let variant = super::super::constants::TapeVariant {
-                cap: crate::tape::ids::MaxBlocksPerSeq(128),
-                tq_heads: Some(served_heads),
-            };
-            let served = (tq.constants.iter())
-                .map(|k| k.resolve(variant))
-                .collect::<Result<Vec<_>, _>>()
-                .expect("the variant binds the heads");
-            assert_eq!(served.last(), Some(&ConstantValue::uint(16, heads)));
-        }
-    }
-
     use crate::tape::lowered::RuntimeGate;
 
-    /// The TurboQuant commands a multi-token tape wraps around one layer's
-    /// paged attention: stage K and V and rotate q before it, rotate its output
-    /// back after it (off decode steps), then the layer's decode form (on
-    /// decode steps) — `decode`: the split pair at a geometry
-    /// `attention_decode_gqa_tq` takes, else its `AttentionViaCacheTq` twin.
-    fn tq_attention_steps(
+    /// The int8 commands a multi-token tape wraps around one layer's paged attention: stage K and
+    /// V before it (off decode steps), then the layer's decode form (on decode steps).
+    fn int8_attention_steps(
         prefill_attention: &[(KernelId, Option<RuntimeGate>)],
         decode: &[(KernelId, Option<RuntimeGate>)],
     ) -> Vec<(KernelId, Option<RuntimeGate>)> {
         use crate::tape::lowered::RuntimeGate::UnlessDecodeStep;
-        // K and V staged twice: the new rows, then the cached ones.
         let mut steps = vec![
-            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
-            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
-            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
-            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
-            (KernelId::TqRotateRows, Some(UnlessDecodeStep)),
+            (KernelId::KvStage, Some(UnlessDecodeStep)),
+            (KernelId::KvStage, Some(UnlessDecodeStep)),
         ];
         steps.extend(
             prefill_attention
                 .iter()
                 .map(|&(k, _)| (k, Some(UnlessDecodeStep))),
         );
-        steps.push((KernelId::TqRotateRows, Some(UnlessDecodeStep)));
         steps.extend_from_slice(decode);
         steps
     }
 
-    /// The attention's own commands in `tape`: off decode steps, and not one
-    /// of the codec's staging or rotation commands around it.
+    /// The attention's own commands in `tape`: off decode steps, and not one of the codec's
+    /// staging commands ahead of it.
     fn own_attention_steps(tape: &LoweredMetalTape) -> Vec<(KernelId, Option<RuntimeGate>)> {
         gated_steps(tape)
             .into_iter()
-            .filter(|&(k, g)| {
-                g == Some(RuntimeGate::UnlessDecodeStep)
-                    && !matches!(k, KernelId::TqStageRotated | KernelId::TqRotateRows)
-            })
+            .filter(|&(k, g)| g == Some(RuntimeGate::UnlessDecodeStep) && k != KernelId::KvStage)
             .collect()
     }
 
@@ -11573,18 +10996,16 @@ mod tests {
         }
     }
 
-    /// A one-row bucket's TurboQuant decode at `attention_decode_gqa_tq`'s geometry (8 query
-    /// heads a KV head, head_dim 256) serves each KV head's heads together: the packed twin's
-    /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
-    /// front, its constants less the TurboQuant heads and plus the rung's split count, a
-    /// threadgroup per (KV head, split) of head_dim threads — then a combine of one simdgroup a
-    /// query head. A verify-sized bucket's takes it a token a threadgroup row; a bucket past the
-    /// verify rows, and a geometry it cannot take, keep the per-head-group kernel.
+    /// A one-row bucket's int8 decode (8 query heads a KV head, head_dim 256) serves each KV
+    /// head's heads together: the per-KV-head kernel — the dense command's bindings, the int8
+    /// store's and the partials at the op scratch's front, a threadgroup per (head group, split)
+    /// of head_dim threads — then a combine of one simdgroup a query head. A verify-sized
+    /// bucket's takes it a token a threadgroup row.
     #[test]
-    fn turboquant_decode_serves_each_kv_heads_query_heads_together() {
+    fn int8_decode_serves_each_kv_heads_query_heads_together() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         let p = with_attention(
-            tq_consts(),
+            int8_consts(),
             TP_GEOM,
             geom(32, 4, 256, 64, 16),
             None,
@@ -11592,17 +11013,17 @@ mod tests {
         );
         let rows = || {
             coded(
-                tq_writer(0, Causal, LLAMA_KV),
+                kv_writer(0, Causal, LLAMA_KV),
                 attention(MetalStep::AttentionViaCache, 0, Interleaved),
             )
         };
-        let tape = lower_tq(&p, rows(), 1);
+        let tape = lower_int8(&p, rows(), 1);
         assert_eq!(
             gated_steps(&tape),
             [
                 (KernelId::RopeAppend, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
@@ -11610,10 +11031,7 @@ mod tests {
             &tape.commands.get(2).lowered(),
             &tape.commands.get(3).lowered(),
         );
-        let twin = with_attention(p, TP_GEOM, geom(32, 2, 256, 64, 16), None, KvRope::AtWrite);
-        let twin = lower_tq(&twin, rows(), 1);
-        let twin = &twin.commands.get(2).lowered();
-        assert_eq!(twin.kernel, KernelId::AttentionViaCacheTq);
+        let dense = &tape.commands.get(1).lowered();
         // 128 blocks of 16 keys: two threadgroups of `ATTN_SPLIT_KEYS`.
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(splits, 2);
@@ -11624,27 +11042,25 @@ mod tests {
                 gqa.dispatch.threads_per_threadgroup
             ),
             (
-                "attention_decode_gqa_tq_bf16_specialized",
+                "attention_decode_gqa_int8_bf16_specialized",
                 (1, 4, splits),
                 (256, 1, 1)
             )
         );
-        let heads = super::super::constants::ConstantType::TqHeads;
-        assert!(twin.constants.iter().any(|k| k.ty == heads));
-        let without_heads = (twin.constants.iter()).filter(|k| k.ty != heads).copied();
-        let constants: Vec<_> = without_heads
-            .chain([ConstantValue::uint(18, splits)])
+        let shared: Vec<_> = (dense.constants.iter())
+            .filter(|k| k.index != 16)
+            .copied()
+            .chain([ConstantValue::uint(13, 1), ConstantValue::uint(18, splits)])
             .collect();
-        let constants: Vec<_> = constants
-            .into_iter()
-            .map(|k| match k.index {
-                2 => ConstantValue::uint(2, 4),
-                _ => k,
-            })
-            .collect();
-        assert_eq!(*gqa.constants, *constants);
+        assert_eq!(
+            *gqa.constants,
+            [shared.clone(), vec![ConstantValue::uint(16, 8)]].concat()
+        );
         let partials = scratch_at(16, 0);
-        assert_eq!(*gqa.bindings, [twin.bindings, &[partials]].concat());
+        let int8 = Vec::from(super::super::kernel_bindings::Int8AttentionBindingSet {
+            kv_layer: crate::tape::ids::LayerId(0),
+        });
+        assert_eq!(*gqa.bindings, [dense.bindings, &int8, &[partials]].concat());
         assert_eq!(
             (combine.function, combine.dispatch.threadgroups),
             (
@@ -11653,11 +11069,11 @@ mod tests {
             )
         );
         assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
-        assert_eq!(combine.constants, gqa.constants);
-        let out_and_signs = (twin.bindings.iter()).filter(|b| matches!(b.index(), 0 | 11));
+        assert_eq!(*combine.constants, *shared);
+        let output = (dense.bindings.iter()).filter(|b| b.index() == 0);
         assert_eq!(
             *combine.bindings,
-            out_and_signs.copied().chain([partials]).collect::<Vec<_>>()
+            output.copied().chain([partials]).collect::<Vec<_>>()
         );
         let row = a(&p).q_heads().get() * splits * (2 + a(&p).global().head_dim().get()) * 4;
         let steps = SplitSteps::Decode;
@@ -11679,23 +11095,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // A batched bucket's rows ride the split too: the kernel is per-row throughout,
-        // its x threadgroups the rows (`turboquant_decode_takes_groups_below_the_matrix_rows`
+        // its x threadgroups the rows (`int8_decode_takes_groups_below_the_matrix_rows`
         // pins the grid and the partials it sizes).
-        assert!(kernels(&lower_tq(&p, rows(), 2)).contains(&KernelId::AttentionDecodeGqaTq));
-        // A head dim between the tiling's steps keeps the twin: 192's six simdgroups do not
-        // tile into whole key groups.
-        let between = lower_tq(
-            &with_attention(
-                tq_consts(),
-                TP_GEOM,
-                geom(32, 4, 192, 64, 16),
-                None,
-                KvRope::AtWrite,
-            ),
-            rows(),
-            1,
-        );
-        assert!(kernels(&between).contains(&KernelId::AttentionViaCacheTq));
+        assert!(kernels(&lower_int8(&p, rows(), 2)).contains(&KernelId::AttentionDecodeInt8));
         // A verify-sized bucket, its guards as the bake realizes them (`metal_guard_gates`): the
         // packed-store attention on every step, the prefill form dropped, a threadgroup row a
         // token (`ATTN_ROW_QUERIES`, its sequence's start in `cu_seqlens_q`), a row's partials
@@ -11704,15 +11106,15 @@ mod tests {
         // the rest of a short prefill's ran past what the bucket maps of it (#475).
         let verify_rows = coded_with(
             crate::op_abi::metal_guard_gates(4),
-            tq_writer(0, Causal, LLAMA_KV),
+            kv_writer(0, Causal, LLAMA_KV),
             attention(MetalStep::AttentionViaCache, 0, Interleaved),
         );
-        let verify = lower_tq(&p, verify_rows, 4);
+        let verify = lower_int8(&p, verify_rows, 4);
         assert_eq!(
             gated_steps(&verify),
             [
                 (KernelId::RopeAppend, None),
-                (KernelId::AttentionDecodeGqaTq, None),
+                (KernelId::AttentionDecodeInt8, None),
                 (KernelId::AttentionDecodeCombine, None),
             ]
         );
@@ -11743,7 +11145,7 @@ mod tests {
         // Running its KV writer (Gemma 4's global layers), it is the tape's only encoder.
         use crate::tape::step::RopedAttention;
         let MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, _) =
-            tq_writer(0, Causal, LLAMA_KV)
+            kv_writer(0, Causal, LLAMA_KV)
         else {
             unreachable!()
         };
@@ -11772,7 +11174,7 @@ mod tests {
         assert_eq!(
             kernels(&folded),
             [
-                KernelId::AttentionDecodeGqaTq,
+                KernelId::AttentionDecodeInt8,
                 KernelId::AttentionDecodeCombine
             ]
         );
@@ -11789,15 +11191,15 @@ mod tests {
     }
 
     /// A group smaller than the matrix units' 8 rows takes the split kernel too —
-    /// qwen2.5-7b's GQA 7 (28 query heads over 4 KV heads, head_dim 128): the twin's
-    /// per-head decode would walk and decode each of its KV head's keys seven times.
+    /// qwen2.5-7b's GQA 7 (28 query heads over 4 KV heads, head_dim 128) — and one past them two
+    /// threadgroups a KV head (Nemotron's 16).
     /// The dispatch keeps the split pair's shape — KV heads and key runs in the grid,
     /// one thread a head dim — and the partials the whole query-head count.
     #[test]
-    fn turboquant_decode_takes_groups_below_the_matrix_rows() {
+    fn int8_decode_takes_groups_below_and_past_the_matrix_rows() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         let p = with_attention(
-            tq_consts(),
+            int8_consts(),
             geom(28, 4, 64, 64, 16),
             geom(28, 4, 128, 64, 16),
             None,
@@ -11805,17 +11207,17 @@ mod tests {
         );
         let rows = || {
             coded(
-                tq_writer(0, Causal, LLAMA_KV),
+                kv_writer(0, Causal, LLAMA_KV),
                 attention(MetalStep::AttentionViaCache, 0, Interleaved),
             )
         };
-        let tape = lower_tq(&p, rows(), 1);
+        let tape = lower_int8(&p, rows(), 1);
         assert_eq!(
             gated_steps(&tape),
             [
                 (KernelId::RopeAppend, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
@@ -11845,11 +11247,6 @@ mod tests {
         // A group that does not divide the query heads evenly — 29 over 4 — is no geometry at all:
         // its constructor refuses it, so no lowering is handed one.
         assert!(std::panic::catch_unwind(|| geom(29, 4, 128, 64, 16)).is_err());
-        let kernels = |tape: &LoweredMetalTape| {
-            (tape.commands.iter())
-                .map(|c| c.lowered().kernel)
-                .collect::<Vec<_>>()
-        };
         // granite-3.3-2b (head_dim 64, GQA 4) takes it too: its two simdgroups form one key
         // group of two — the butterfly, the span keys and the fragments step the same tiling —
         // and the combine narrows to two simdgroups of threads.
@@ -11860,9 +11257,9 @@ mod tests {
             None,
             KvRope::AtWrite,
         );
-        let granite = lower_tq(&granite, rows(), 1);
+        let granite = lower_int8(&granite, rows(), 1);
         let granite_split = (granite.commands.iter())
-            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeGqaTq)
+            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeInt8)
             .expect("granite's head_dim 64 takes the split");
         assert_eq!(
             granite_split.lowered().dispatch.threads_per_threadgroup,
@@ -11875,73 +11272,31 @@ mod tests {
             granite_combine.lowered().dispatch.threads_per_threadgroup,
             (64, 1, 1)
         );
-        // The head dims between the tiling's steps stay on the twin: 192's six simdgroups do
-        // not tile into whole key groups of 8, 4 or 2.
-        let between = with_attention(
+        // A group of 16 a KV head: two threadgroups of 8 heads each.
+        let wide = with_attention(
             p,
-            geom(28, 4, 64, 64, 16),
-            geom(28, 4, 192, 64, 16),
+            geom(32, 2, 64, 64, 16),
+            geom(32, 2, 128, 64, 16),
             None,
             KvRope::AtWrite,
         );
-        let between = kernels(&lower_tq(&between, rows(), 1));
-        assert!(between.contains(&KernelId::AttentionViaCacheTq));
-        assert!(!between.contains(&KernelId::AttentionDecodeGqaTq));
-        // Qwen2's biased K/V projections ride the split too: the store's centered codes and
-        // the combine's V-bias add are the twin's own contract, carried over — the refusal
-        // the twin's per-head decode forced on them is gone. The split inherits the twin's
-        // bias constants and bindings.
-        let biased_rows = || {
-            coded(
-                tq_writer(
-                    0,
-                    Causal,
-                    scratchy_ir::KvOffsets {
-                        k: scratchy_ir::KvOffset::LinearBias(scratchy_ir::BiasStorage::Affine),
-                        v: scratchy_ir::KvOffset::LinearBias(scratchy_ir::BiasStorage::Affine),
-                    },
-                ),
-                attention(MetalStep::AttentionViaCache, 0, Interleaved),
-            )
-        };
-        let biased = lower_tq(
-            &with_attention(
-                p,
-                geom(28, 4, 64, 64, 16),
-                geom(28, 4, 128, 64, 16),
-                None,
-                KvRope::OnRead,
-            ),
-            biased_rows(),
-            1,
-        );
-        let split = (biased.commands.iter())
-            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeGqaTq)
-            .expect("the biased twin takes the split");
-        assert!(
-            split
-                .lowered()
-                .constants
-                .contains(&ConstantValue::uint(14, 1))
-        );
-        assert!(
-            split
-                .lowered()
-                .constants
-                .contains(&ConstantValue::uint(15, 1))
-        );
-        assert!(split.lowered().bindings.iter().any(|b| b.index() == 14));
-        assert!(split.lowered().bindings.iter().any(|b| b.index() == 15));
+        let wide = lower_int8(&wide, rows(), 1);
+        let wide_split = (wide.commands.iter())
+            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeInt8)
+            .expect("the split")
+            .lowered();
+        assert_eq!(wide_split.dispatch.threadgroups, (1, 4, splits));
+        assert!(wide_split.constants.contains(&ConstantValue::uint(16, 8)));
         // A batched bucket's rows ride the grid's x axis: the kernel is per-row throughout
         // (its length, block table, slot and position all key off `seq = tg_pos.x`), so the
         // split serves m rows as m x-threadgroups and the partials carry them.
-        let batched = lower_tq(&p, rows(), 4);
+        let batched = lower_int8(&p, rows(), 4);
         assert_eq!(
             gated_steps(&batched),
             [
                 (KernelId::RopeAppend, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
@@ -11972,46 +11327,6 @@ mod tests {
         assert_eq!(
             batched.scratch_bytes(Some(DecodeRows(128)))[crate::tape::lowered::ScratchKind::Moe],
             4 * row
-        );
-    }
-
-    /// A bucket whose partials scratch would not fit the u32 the op scratch is sized in
-    /// keeps the twin: gemma-4's global layers (32 query heads, head_dim 512, the cap's
-    /// sixteen splits) at a 4096-token prefill bucket land at 4.3 GiB — the gated decode
-    /// row such a bucket carries is served by the twin there, while the same geometry at
-    /// a decode bucket fits and takes the split.
-    #[test]
-    fn turboquant_decode_refuses_buckets_whose_partials_do_not_fit() {
-        let p = with_attention(
-            tq_consts(),
-            TP_GEOM,
-            geom(32, 4, 512, 128, 256),
-            None,
-            KvRope::AtWrite,
-        );
-        let rows = || {
-            coded(
-                tq_writer(0, Causal, LLAMA_KV),
-                attention(MetalStep::AttentionViaCache, 0, Interleaved),
-            )
-        };
-        let kernels = |tape: &LoweredMetalTape| {
-            (tape.commands.iter())
-                .map(|c| c.lowered().kernel)
-                .collect::<Vec<_>>()
-        };
-        let splits = (128 * a(&p).global().page().get())
-            .div_ceil(ATTN_SPLIT_KEYS)
-            .clamp(1, ATTN_MAX_SPLITS);
-        assert_eq!(splits, ATTN_MAX_SPLITS);
-        let wide = kernels(&lower_tq(&p, rows(), 4096));
-        assert!(wide.contains(&KernelId::AttentionViaCacheTq));
-        assert!(!wide.contains(&KernelId::AttentionDecodeGqaTq));
-        let decode = kernels(&lower_tq(&p, rows(), 8));
-        assert!(decode.contains(&KernelId::AttentionDecodeGqaTq));
-        assert_eq!(
-            lower_tq(&p, rows(), 8).scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
-            8 * a(&p).q_heads().get() * splits * (2 + a(&p).global().head_dim().get()) * 4
         );
     }
 
@@ -12168,31 +11483,32 @@ mod tests {
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass
     /// expands the declared class only (`kv_codec`'s
     /// `a_hybrid_arch_codes_its_declared_class_only`): the global layer's rows lower
-    /// to its writer, encoding its rows, and the TurboQuant commands around its
+    /// to its writer, encoding its rows, and the int8 commands around its
     /// attention, while the sliding layer's rows stay plain fp16.
     #[test]
-    fn hybrid_turboquant_compresses_global_layers_only() {
+    fn hybrid_int8_compresses_global_layers_only() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         let p = with_attention(
-            tq_consts(),
+            int8_consts(),
             TP_GEOM,
             geom(32, 1, 512, 128, 32),
             Some(1024),
             KvRope::AtWrite,
         );
-        let global_writer = tq_writer(0, Causal, LLAMA_KV);
-        let sliding_writer = tq_writer(1, SW, LLAMA_KV);
+        let global_writer = kv_writer(0, Causal, LLAMA_KV);
+        let sliding_writer = kv_writer(1, SW, LLAMA_KV);
         let global = attention(MetalStep::AttentionViaCache, 0, Interleaved);
         let sliding = attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved);
         let rows = [
             coded(global_writer.clone(), global),
             plain(&[sliding_writer.clone(), sliding]),
         ];
-        let decode = lower_tq(&p, rows.concat(), 1);
+        let decode = lower_int8(&p, rows.concat(), 1);
         let want = [
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
-            (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
+            (KernelId::AttentionDecodeInt8, Some(OnlyIfDecodeStep)),
+            (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, None),
         ];
@@ -12201,14 +11517,15 @@ mod tests {
         let global_attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
         let sliding_attention = attention(MetalStep::SlidingAttentionPrefillPaged, 1, NeoX);
         // A sliding layer lowers as it would in a dense model; alone in a tape
-        // it compresses nothing, which a TurboQuant model's tape may not do.
+        // it compresses nothing, which an int8 model's tape may not do.
         let dense = with(p, |x| x.kv_codec = KvCodec::Dense);
-        let fp16 = |i: MetalStep| gated_steps(&lower_tq(&dense, plain(&[i]), 64));
-        // A TurboQuant'd attention compresses its layer's writer's operands, so
+        let fp16 = |i: MetalStep| gated_steps(&lower_int8(&dense, plain(&[i]), 64));
+        // An int8 attention compresses its layer's writer's operands, so
         // its own commands are read off a tape that has the writer.
-        let own =
-            |i: MetalStep| own_attention_steps(&lower_tq(&p, coded(global_writer.clone(), i), 64));
-        let prefill = lower_tq(
+        let own = |i: MetalStep| {
+            own_attention_steps(&lower_int8(&p, coded(global_writer.clone(), i), 64))
+        };
+        let prefill = lower_int8(
             &p,
             [
                 coded(global_writer.clone(), global_attention.clone()),
@@ -12218,13 +11535,18 @@ mod tests {
             64,
         );
         let mut want = vec![(KernelId::RopeAppend, None)];
-        want.extend(tq_attention_steps(
+        want.extend(int8_attention_steps(
             &own(global_attention),
-            // The global layer's group of 32 exceeds the split's 8 heads a KV head.
-            &[(
-                KernelId::AttentionViaCacheTq,
-                Some(RuntimeGate::OnlyIfDecodeStep),
-            )],
+            &[
+                (
+                    KernelId::AttentionDecodeInt8,
+                    Some(RuntimeGate::OnlyIfDecodeStep),
+                ),
+                (
+                    KernelId::AttentionDecodeCombine,
+                    Some(RuntimeGate::OnlyIfDecodeStep),
+                ),
+            ],
         ));
         want.push((KernelId::RopeAppend, None));
         want.extend(fp16(sliding_attention));
@@ -13401,24 +12723,21 @@ mod tests {
         }
     }
 
-    /// A multi-token tape runs its own attention off decode steps, in the
-    /// codebook's rotated domain: K/V staged and q rotated before it, the
-    /// output rotated back after it. On a decode step — one token per
-    /// sequence, e.g. a batch of decoding sequences — it yields to the
-    /// decode form of its decode-kernel form: the split pair at head_dim 64.
-    /// There is no dequant pass on any step.
+    /// A multi-token tape runs its own attention off decode steps over the dense scratch: K and V
+    /// staged before it — K re-roping no span block: the stage writes it as the dense cache holds
+    /// it. On a decode step it yields to the int8 decode: the split pair.
     #[test]
-    fn prefill_turboquant_attends_in_the_rotated_domain() {
+    fn prefill_int8_attends_the_staged_scratch() {
         let prefill = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
-        let tape = lower_tq_layer(prefill, 64);
+        let tape = lower_int8_layer(prefill, 64);
         let mut want = vec![(KernelId::RopeAppend, None)];
         let own = own_attention_steps(&tape);
         assert!(!own.is_empty(), "the attention's own commands");
-        want.extend(tq_attention_steps(
+        want.extend(int8_attention_steps(
             &own,
             &[
                 (
-                    KernelId::AttentionDecodeGqaTq,
+                    KernelId::AttentionDecodeInt8,
                     Some(RuntimeGate::OnlyIfDecodeStep),
                 ),
                 (
@@ -13428,63 +12747,36 @@ mod tests {
             ],
         ));
         assert_eq!(gated_steps(&tape), want);
-
-        // q rotated in, the output rotated back: the attention's own slots.
-        let rotations: Vec<(&str, u32)> = tape
-            .commands
-            .iter()
-            .filter(|c| c.lowered().kernel == KernelId::TqRotateRows)
-            .map(|c| match c.lowered().bindings[0] {
-                Binding::ArenaSlot { slot, .. } => (c.lowered().function, slot),
-                other => panic!("rotated rows bound as {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            rotations,
-            [("tq_rotate_rows_bf16", 3), ("tq_unrotate_rows_bf16", 6)]
-        );
-        // K then V staged, only K re-roping span blocks (cos_sin at slot 9),
-        // each operand's new rows (pass 1, slot 17) before its cached ones (pass 2).
-        let staged: Vec<(bool, Option<u32>)> = tape
-            .commands
-            .iter()
-            .filter(|c| c.lowered().kernel == KernelId::TqStageRotated)
+        // K, then V: each binds its own codes and scales, and no rotary table.
+        use RuntimeBindingKind as RB;
+        let layer = crate::tape::ids::LayerId(0);
+        let staged: Vec<(RB, RB)> = (tape.commands.iter())
+            .filter(|c| c.lowered().kernel == KernelId::KvStage)
             .map(|c| {
-                let reropes = c
-                    .lowered()
-                    .bindings
-                    .iter()
-                    .any(|b| matches!(b, Binding::Source { .. }));
-                let pass = c
-                    .lowered()
-                    .constants
-                    .iter()
-                    .find(|k| k.index == 17)
-                    .map(|k| k.bits);
-                (reropes, pass)
+                let c = c.lowered();
+                assert!(!(c.bindings.iter()).any(|b| matches!(b, Binding::Source { .. })));
+                let kind = |i: usize| match c.bindings[i] {
+                    Binding::Runtime { kind, .. } => kind,
+                    other => panic!("staging binding {other:?}"),
+                };
+                (kind(5), kind(6))
             })
             .collect();
-        let ror = a(&tp())
-            .rope()
-            .is_some_and(|r| r.kv_rope() == KvRope::OnRead);
         assert_eq!(
             staged,
             [
-                (ror, Some(1)),
-                (ror, Some(2)),
-                (false, Some(1)),
-                (false, Some(2))
+                (RB::KvCodesK { layer }, RB::KvScalesK { layer }),
+                (RB::KvCodesV { layer }, RB::KvScalesV { layer }),
             ]
         );
-
         let split = |tape: &LoweredMetalTape| {
             tape.commands
                 .iter()
-                .find(|c| c.lowered().kernel == KernelId::AttentionDecodeGqaTq)
+                .find(|c| c.lowered().kernel == KernelId::AttentionDecodeInt8)
                 .map(|c| c.lowered())
                 .expect("the split")
         };
-        let decode_form = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, NeoX), 64);
+        let decode_form = lower_int8_layer(attention(MetalStep::AttentionViaCache, 0, NeoX), 64);
         assert!(
             split(&tape) == split(&decode_form),
             "the split is the decode kernel's form of the same attention"
@@ -13496,7 +12788,7 @@ mod tests {
     /// sequences runs a per-row twin reading K through each sequence's own
     /// block-table row: the same kernel reading the cache's roped K as is, or,
     /// when the step holds an unrotated span block, the sdpa-paged kernel
-    /// re-roping it (cos_sin). All keep their TurboQuant gate. Checked for the
+    /// re-roping it (cos_sin). All keep their int8 gate. Checked for the
     /// full and sliding arms.
     #[test]
     fn prefill_attention_reads_the_rope_once_scratch_only_for_one_sequence() {
@@ -13504,7 +12796,7 @@ mod tests {
             OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence,
             UnlessUnrotatedBlocks,
         };
-        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(512), KvRope::OnRead);
+        let p = with_attention(int8_consts(), TP_GEOM, TP_GEOM, Some(512), KvRope::OnRead);
         let one = RuntimeGate::All(&[UnlessDecodeStep, OnlyIfOneSequence]);
         let plain = RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         let reroping =
@@ -13513,9 +12805,9 @@ mod tests {
             attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
             attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX),
         ] {
-            let tape = lower_tq(
+            let tape = lower_int8(
                 &p,
-                coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()),
+                coded(kv_writer(0, Causal, LLAMA_KV), attention.clone()),
                 64,
             );
             let own: Vec<GatedCommand> = tape
@@ -13564,7 +12856,7 @@ mod tests {
         use crate::tape::lowered::RuntimeGate::{
             OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks,
         };
-        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(512), KvRope::OnRead);
+        let p = with_attention(int8_consts(), TP_GEOM, TP_GEOM, Some(512), KvRope::OnRead);
         let plain = RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         let reroping =
             RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, OnlyIfUnrotatedBlocks]);
@@ -13572,7 +12864,7 @@ mod tests {
             attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
             attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX),
         ] {
-            let mut tape = row_tape(coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()));
+            let mut tape = row_tape(coded(kv_writer(0, Causal, LLAMA_KV), attention.clone()));
             let mut site = TEST_SITE.clone();
             site.push(RowSource {
                 kind: WeightKind::AttnSinks,
@@ -13633,7 +12925,7 @@ mod tests {
         use crate::tape::lowered::SeqScope;
         for (codec, step_gate) in [
             (KvCodec::Dense, None),
-            (KvCodec::TurboQuant(TQ_BITS), Some(UnlessDecodeStep)),
+            (KvCodec::Int8, Some(UnlessDecodeStep)),
         ]
         .into_iter()
         {
@@ -13652,14 +12944,14 @@ mod tests {
                 |x| x.kv_codec = codec,
             );
             let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
-            let writer = tq_writer(0, Causal, LLAMA_KV);
+            let writer = kv_writer(0, Causal, LLAMA_KV);
             // A dense model's tape carries the layer as written; a coded one's, as the codec
             // pass expands it.
             let rows = match codec {
                 KvCodec::Dense => plain(&[writer, attention]),
-                KvCodec::TurboQuant(_) => coded(writer, attention),
+                KvCodec::Int8 => coded(writer, attention),
             };
-            let tape = lower_tq(&p, rows, 64);
+            let tape = lower_int8(&p, rows, 64);
             let gated = |g: RuntimeGate| {
                 tape.commands
                     .iter()
@@ -13713,7 +13005,7 @@ mod tests {
         use crate::tape::lowered::SeqScope;
         for ((codec, step_gate), (kv_heads, per_row)) in [
             (KvCodec::Dense, None),
-            (KvCodec::TurboQuant(TQ_BITS), Some(UnlessDecodeStep)),
+            (KvCodec::Int8, Some(UnlessDecodeStep)),
         ]
         .into_iter()
         .flat_map(|c| {
@@ -13736,14 +13028,14 @@ mod tests {
                 |x| x.kv_codec = codec,
             );
             let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
-            let writer = tq_writer(0, Causal, LLAMA_KV);
+            let writer = kv_writer(0, Causal, LLAMA_KV);
             // A dense model's tape carries the layer as written; a coded one's, as the codec
             // pass expands it.
             let rows = match codec {
                 KvCodec::Dense => plain(&[writer, attention]),
-                KvCodec::TurboQuant(_) => coded(writer, attention),
+                KvCodec::Int8 => coded(writer, attention),
             };
-            let tape = lower_tq(&p, rows, 64);
+            let tape = lower_int8(&p, rows, 64);
             let gated = |g: RuntimeGate| {
                 tape.commands
                     .iter()
@@ -13767,9 +13059,9 @@ mod tests {
     #[test]
     fn a_row_zero_command_without_a_reroping_per_row_twin_is_refused() {
         use crate::tape::lowered::SeqScope;
-        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, None, KvRope::OnRead);
+        let p = with_attention(int8_consts(), TP_GEOM, TP_GEOM, None, KvRope::OnRead);
         let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
-        let tape = lower_tq(&p, coded(tq_writer(0, Causal, LLAMA_KV), attention), 64);
+        let tape = lower_int8(&p, coded(kv_writer(0, Causal, LLAMA_KV), attention), 64);
         let cmds: Vec<GatedCommand> = tape
             .commands
             .iter()
@@ -13805,7 +13097,7 @@ mod tests {
             | Binding::Source { binding_index, .. }
             | Binding::ArenaSlot { binding_index, .. }
             | Binding::MoeScratch { binding_index, .. } => binding_index,
-            other => panic!("TurboQuant command binding {other:?}"),
+            other => panic!("int8 command binding {other:?}"),
         };
         cmd.bindings
             .iter()
@@ -13814,211 +13106,33 @@ mod tests {
             .collect()
     }
 
-    /// A Qwen2 writer's projection biases reach every codec command: the
-    /// writer's encode removes them (K's rotated by the writer's rotary table at
-    /// each token's position — mode 2 — V's as-is, mode 1), and the prefill
-    /// staging and the decode split restore them — the K bias folded into the
-    /// S partials, the V bias the combine's — all bound at the writer's weight
-    /// site in `op_abi::rope_append_bias_slots` order. The twin's restore
-    /// survives where the twin does (the sinks geometries the split refuses).
-    /// The same layer with a centered writer binds none of it and runs mode 0:
-    /// the offset is the difference.
+    /// The writer's encode binds exactly the ABI `kv_writer.h`'s `KV_WRITER_INT8_BUFFERS`
+    /// declares, in order, and carries its switch at slot 10 alone.
     #[test]
-    fn turboquant_restores_a_biased_writers_offsets() {
-        use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
-        let p = with_attention(tq_consts(), TP_GEOM, TP_GEOM, None, KvRope::OnRead);
-        let qwen2 = KvOffsets {
-            k: KvOffset::LinearBias(BiasStorage::Affine),
-            v: KvOffset::LinearBias(BiasStorage::Affine),
-        };
-        let layer = crate::tape::ids::LayerId(0);
-        let linear = |slot| src(WeightKind::Linear, slot);
-        let bias = |slot, bi| source(linear(slot), WeightTensor::AffineLinearBias, layer, bi);
-        let cos_sin = source(src(WeightKind::CosSin, 0), WeightTensor::Weight, layer, 24);
-        let modes = |k, v| vec![ConstantValue::uint(13, k), ConstantValue::uint(14, v)];
-        // Each codec command's offset bindings and offset constants, in tape order.
-        let offsets = |offsets, attention, bucket_m| {
-            let rows = coded(tq_writer(0, Causal, offsets), attention);
-            let tape = lower_tq(&p, rows, bucket_m);
-            tape.commands
-                .iter()
-                .filter_map(|c| {
-                    let c = &c.lowered();
-                    let (from, slots): (u8, &[u16]) = match c.kernel {
-                        KernelId::RopeAppend => (22, &[13, 14]),
-                        KernelId::TqStageRotated => (10, &[14, 15]),
-                        KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
-                            (14, &[14, 15])
-                        }
-                        KernelId::AttentionDecodeCombine => (15, &[14, 15]),
-                        _ => return None,
-                    };
-                    let offset_consts: Vec<_> = c
-                        .constants
-                        .iter()
-                        .filter(|k| slots.contains(&k.index))
-                        .copied()
-                        .collect();
-                    Some((c.kernel, bound_from(c, from), offset_consts))
-                })
-                .collect::<Vec<_>>()
-        };
-        let (writer, stage, split, combine) = (
-            KernelId::RopeAppend,
-            KernelId::TqStageRotated,
-            KernelId::AttentionDecodeGqaTq,
-            KernelId::AttentionDecodeCombine,
-        );
-        let (k_bias, v_bias) = (ConstantValue::uint(14, 1), ConstantValue::uint(15, 1));
-        let decode = attention(MetalStep::AttentionViaCache, 0, Interleaved);
-        let prefill = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
-        let partials = scratch_at(16, 0);
-
-        let encode = (writer, vec![bias(0, 22), cos_sin, bias(1, 23)], modes(2, 1));
-        let split_restores = (
-            split,
-            vec![bias(0, 14), bias(1, 15), partials],
-            vec![k_bias, v_bias],
-        );
-        let combine_restores = (combine, vec![bias(1, 15), partials], vec![k_bias, v_bias]);
-        assert_eq!(
-            offsets(qwen2, decode.clone(), 1),
-            [
-                encode.clone(),
-                split_restores.clone(),
-                combine_restores.clone()
-            ]
-        );
-
-        let mut want = vec![encode];
-        // Each operand staged twice: its new rows, then its cached ones.
-        want.extend(std::iter::repeat_n(
-            (stage, vec![bias(0, 10)], vec![k_bias]),
-            2,
-        ));
-        want.extend(std::iter::repeat_n(
-            (stage, vec![bias(1, 10)], vec![v_bias]),
-            2,
-        ));
-        // A multi-row bucket's split reads each row's sequence from `cu_seqlens_q` (one query row
-        // per token), bound before the codec's operands.
-        let rows = Binding::Runtime {
-            kind: RuntimeBindingKind::CuSeqlensQ,
-            binding_index: 23,
-        };
-        let (_, mut split_bindings, split_consts) = split_restores;
-        split_bindings.insert(0, rows);
-        want.push((split, split_bindings, split_consts));
-        want.push(combine_restores);
-        assert_eq!(offsets(qwen2, prefill.clone(), 64), want);
-
-        let mut want = vec![(writer, vec![], modes(0, 0))];
-        want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
-        want.push((split, vec![rows, partials], vec![]));
-        want.push((combine, vec![partials], vec![]));
-        assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
-
-        // The twin's restore survives where the twin does — gpt-oss's sliding layer (biased,
-        // sinks on): the split serves full attention only, so the twin keeps the biases.
-        let sinks = lower_subtile_tape_to_metal(
-            &sliding_sinks_tape_of(qwen2),
-            &with_attention(tq_consts(), TP_GEOM, TP_GEOM, Some(1024), KvRope::OnRead),
-            bake_point(1, None),
-        )
-        .expect("lower_subtile_tape_to_metal");
-        let twin = (sinks.commands.iter())
-            .find(|c| c.lowered().kernel == KernelId::AttentionViaCacheTq)
-            .expect("the twin")
-            .lowered();
-        // The sink column (slot 16) rides along.
-        assert_eq!(
-            bound_from(&twin, 14),
-            vec![
-                source(SINKS_IX, WeightTensor::Weight, layer, 16),
-                bias(0, 14),
-                bias(1, 15)
-            ]
-        );
-        assert_eq!(
-            (twin.constants.iter())
-                .filter(|k| [14u16, 15].contains(&k.index))
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![k_bias, v_bias]
-        );
-    }
-
-    /// The writer's encode binds exactly the ABI `kv_writer.h`'s `KV_WRITER_TQ_BUFFERS` declares,
-    /// in order, and carries its constants slot by slot — written out here, independently of the
-    /// builder, for a centered layer (the offset tail is pinned above).
-    #[test]
-    fn turboquant_writer_encode_binds_the_kernel_abi() {
+    fn int8_writer_encode_binds_the_kernel_abi() {
         use RuntimeBindingKind as RB;
-        let p = tq_consts();
         let layer = crate::tape::ids::LayerId(0);
         let rt = |binding_index, kind| Binding::Runtime {
             kind,
             binding_index,
         };
-        let k = ConstantValue::uint;
-        let bits = TQ_BITS.get();
-        // vpw comes from `vals_per_word` (10 at bits=3 — no straddling), not
-        // `32 / bits`, which only agrees with it by floor-division coincidence.
-        let vpw = scratchy_layers::turboquant::vals_per_word(bits) as u32;
-        let hd = a(&p).base().head_dim().get();
-        let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
+        let tape = lower_int8_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
         let writer = tape.commands.get(0).lowered();
         assert_eq!(writer.kernel, KernelId::RopeAppend);
         assert_eq!(
             bound_from(&writer, 16),
             [
-                rt(16, RB::TqSigns),
-                rt(17, RB::TqBoundaries),
-                rt(18, RB::TqPackedK { layer }),
-                rt(19, RB::TqNormsK { layer }),
-                rt(20, RB::TqPackedV { layer }),
-                rt(21, RB::TqNormsV { layer }),
+                rt(16, RB::KvCodesK { layer }),
+                rt(17, RB::KvScalesK { layer }),
+                rt(18, RB::KvCodesV { layer }),
+                rt(19, RB::KvScalesV { layer }),
             ]
         );
         let encode: Vec<ConstantValue> = (writer.constants.iter())
             .filter(|c| c.index >= 10)
             .copied()
             .collect();
-        assert_eq!(
-            encode,
-            [
-                k(10, bits),
-                k(11, vpw),
-                k(12, hd.div_ceil(vpw)),
-                k(13, 0),
-                k(14, 0)
-            ]
-        );
-    }
-
-    /// A codec command with nothing to take its operands' offsets from does not
-    /// lower: a K bias with no rotary table bound to rotate it to each key — the
-    /// first codec row, the writer encoding its rows (row 0), is refused. (An attention
-    /// with no KV writer before it has no offsets to carry and never becomes a
-    /// codec row: the codec pass refuses it, `kv_codec`'s
-    /// `an_attention_without_its_writer_does_not_expand`.)
-    #[test]
-    fn turboquant_without_its_writers_offsets_does_not_lower() {
-        use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
-        let decode = attention(MetalStep::AttentionViaCache, 0, Interleaved);
-        let k_biased = KvOffsets {
-            k: KvOffset::LinearBias(BiasStorage::Dense),
-            v: KvOffset::Centered,
-        };
-        assert_eq!(a(&tp()).rope().map(|r| r.kv_rope()), Some(KvRope::AtWrite));
-        assert!(matches!(
-            try_lower_tq(
-                &tq_consts(),
-                coded(tq_writer(0, Causal, k_biased), decode),
-                1
-            ),
-            Err(LoweringError::TurboQuantOffsetUnbound { index: 0 })
-        ));
+        assert_eq!(encode, [ConstantValue::uint(10, 1)]);
     }
 
     /// granite regression: the terminal `logits *= recip(logits_scaling)`

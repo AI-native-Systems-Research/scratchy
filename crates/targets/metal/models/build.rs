@@ -76,9 +76,7 @@ fn main() {
     let built = scratchy_models_build::build(&ModelsBuild {
         metadata: &metadata,
         out_dir: &out_dir,
-        emitter: &scratchy_target_metal_compiler::Metal {
-            turboquant: cfg!(feature = "turboquant"),
-        },
+        emitter: &scratchy_target_metal_compiler::Metal,
         dump_dir: None,
         inspect: &metal_tape_models,
     });

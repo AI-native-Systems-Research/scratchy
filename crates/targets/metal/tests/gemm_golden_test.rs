@@ -189,7 +189,6 @@ fn make_pipelines() -> Option<(common::Device, SpecializedPipelines)> {
     // A GEMM binds no variant-bound constant: any variant serves.
     let variant = scratchy_target_metal::tape::constants::TapeVariant {
         cap: scratchy_target_metal::tape::ids::MaxBlocksPerSeq(128),
-        tq_heads: None,
     };
     Some((
         device,

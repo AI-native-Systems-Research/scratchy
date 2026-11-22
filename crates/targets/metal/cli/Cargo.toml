@@ -16,10 +16,6 @@ description = "`scr`: the scratchy CLI on Apple silicon — the common CLI core'
 # `model/<feature>` already reaches every scratchy-models feature (see
 # `tests/arch_feature_passthrough.rs`).
 #
-# `turboquant` — TurboQuant KV compression. Every model whose geometry the
-# codec takes stores its KV cache as TurboQuant codes; the rest stay dense, and
-# the build output names them. `--kv-cache-dtype` cannot change it at runtime.
-#
 # `mtp-heads` — multi-token-prediction drafting. Every selected model whose
 # checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
 # selected model whose drafter is published as a model of its own (Gemma 4
@@ -28,11 +24,10 @@ description = "`scr`: the scratchy CLI on Apple silicon — the common CLI core'
 # `spec/mtp` adds the other published drafters (Gemma 4's bf16 and QAT
 # assistants), which draft only when `--speculative-model` names them.
 #
-# Dropping the defaults builds the same engine with a dense KV cache, no MTP
-# heads and NO network access at build time (air-gapped); name back what you want:
+# Dropping the defaults builds the same engine with no MTP heads and NO network access at build
+# time (air-gapped); name back what you want:
 #   cargo build -p scratchy-target-metal-cli --no-default-features --features chat,model/<stem>
-default = ["chat", "model/hf-completions", "turboquant", "model/mtp-heads"]
-turboquant = ["scratchy-target-metal-worker/turboquant"]
+default = ["chat", "model/hf-completions", "model/mtp-heads"]
 
 # The common core's features, here so `scr`'s own build line names them.
 chat = ["scratchy-cli/chat"]

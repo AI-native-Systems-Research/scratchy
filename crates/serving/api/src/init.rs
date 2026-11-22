@@ -2132,7 +2132,7 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
 /// requests until blocks run out, so a pool smaller than the budget is a
 /// concurrency cap nobody asked for. `block_bytes` is the worker's own cost of
 /// one block ([`Worker::kv_block_bytes`]) when it is not the dense row derived
-/// here — TurboQuant codes, or a hybrid model's shared page plus its TurboQuant
+/// here — int8 codes, or a hybrid model's shared page plus its int8
 /// global store — and the budget buys that many blocks.
 ///
 /// For a model without sliding-window layers this is [`compute_num_blocks`] with no hybrid
@@ -2192,7 +2192,7 @@ fn compute_kv_blocks(
             // preempts 12 requests of 640 tokens and never fits 8 of 4.6k. The
             // pool commits lazily and the lowest-free-first allocator keeps live
             // block ids near the working set, so a large pool costs reserved VA;
-            // charging each block its TurboQuant global store (`block_bytes`)
+            // charging each block its int8 global store (`block_bytes`)
             // keeps that inside the budget the activation arena was carved from.
             let num_blocks = block_bytes
                 .map_or(layout.config.num_blocks, |bytes| {
@@ -2473,7 +2473,7 @@ mod tests {
         // gemma-4-26b's sliding page: 16 tokens × 8 KV heads × (256 K + 256 V) × 2 B.
         let page = 16 * 8 * 512 * 2;
         let group_size = 5;
-        // ~ what a hybrid-SWA TurboQuant worker reports: the shared pages + the TurboQuant global store.
+        // ~ what a hybrid-SWA int8 worker reports: the shared pages + the int8 global store.
         let block_bytes = page * group_size + 297_472;
         // The per-layer geometry the worker reports (`kv_layer_geometry`): a sliding layer at the
         // base class's dims and the window, a full layer at the global class's.

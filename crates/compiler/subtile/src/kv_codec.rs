@@ -3,8 +3,8 @@
 //!
 //! A target that stores its KV cache compressed runs extra steps around every KV writer and every
 //! attention of a coded class: the writer's new K and V are encoded into a packed store, and the
-//! attention either reads that store directly (its packed twin) or reads it staged back into the
-//! codec's rotated domain, its query rotated in and its output rotated back. WHICH steps, in WHICH
+//! attention either reads that store directly (its packed twin) or reads it staged back into a
+//! dense cache. WHICH steps, in WHICH
 //! order, under WHICH runtime guard, and which classes and head dims are coded, are the target's
 //! facts ([`KvCodecFacts`]); inserting them is this one pass over the front end's op list. A
 //! target without a codec never calls it.
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use crate::handoff::{Expansion, ExpansionId, LoweredDecode};
 use crate::lower::{ArchOp, InputRef, LoweringInput, OpDesc, kv_operand_bias};
-use crate::subtile_ir::{AttnMask, KvOperand, RotatedRows, SubOp};
+use crate::subtile_ir::{AttnMask, KvOperand, SubOp};
 
 /// When a codec step runs: a runtime condition the target's worker evaluates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -80,17 +80,14 @@ pub struct Guarded<S> {
 /// A step ahead of a coded attention: it prepares what the attention reads.
 #[derive(Clone, Copy, Debug)]
 pub enum Before {
-    /// The layer's `operand`, staged out of its packed store.
+    /// The layer's `operand`, staged out of its packed store into the dense cache the attention
+    /// reads.
     Stage(KvOperand),
-    /// The query, rotated into the codebook's domain: the attention reads the rotated rows.
-    RotateQuery,
 }
 
 /// A step after a coded attention: it takes over the attention's output.
 #[derive(Clone, Copy, Debug)]
 pub enum After {
-    /// The output, rotated back out of the codebook's domain.
-    RotateOutput,
     /// The attention read straight off the packed store, into the same output.
     PackedTwin,
 }
@@ -102,25 +99,8 @@ pub struct CodecAround {
     pub after: &'static [Guarded<After>],
 }
 
-/// The head dims a codec's kernels take.
-#[derive(Clone, Copy, Debug)]
-pub enum CodecHeadDims {
-    PowerOfTwoAtMost(u32),
-}
-
-impl CodecHeadDims {
-    pub const fn admits(self, head_dim: u32) -> bool {
-        match self {
-            Self::PowerOfTwoAtMost(max) => head_dim.is_power_of_two() && head_dim <= max,
-        }
-    }
-}
-
 /// A target's KV codec, as data.
 pub struct KvCodecFacts {
-    /// Every head dim the coded class's KV writers and attentions run at must be one of these, or
-    /// nothing is coded.
-    pub head_dims: CodecHeadDims,
     /// The one class coded, on every arch. A layer of another class (a sliding window) keeps its
     /// KV dense, in a group of its own in the KV pool (`compute_hybrid_kv_layout`).
     pub coded_class: AttnMask,
@@ -179,7 +159,6 @@ impl std::fmt::Display for KvCodecError {
 
 /// Insert `facts`' codec steps around every coded KV writer and attention of `l`.
 ///
-/// ⛔ A GEOMETRY THE KERNELS DO NOT TAKE CODES NOTHING: the op list comes back as it was.
 /// `attention` is the model's attention facts — a codec codes an attention's keys and values,
 /// so a body it runs on always has them; a body without attention holds no coded writer and
 /// comes back as it was.
@@ -189,22 +168,14 @@ pub fn expand_kv_codec(
 ) -> Result<LoweredDecode, KvCodecError> {
     let ops = &l.input.ops;
     let coded = |class: AttnMask| class == facts.coded_class;
-    // The coded class's head dims: a writer states the model's base head dim (the rope class's,
-    // off the op's own attention facts), an attention its class's.
-    let mut dims: Vec<u32> = ops
-        .iter()
-        .filter_map(|od| match od.op {
-            SubOp::RopeAppend { attn, .. } if coded(attn) => od.op.rope_head_dim().map(|d| d.get()),
-            SubOp::KvAppend { head_dim, attn, .. } if coded(attn) => Some(head_dim.get()),
-            SubOp::AttnDecode {
-                mask, attention, ..
-            } if coded(mask) => Some(attention.class(mask.class()).head_dim().get()),
-            _ => None,
-        })
-        .collect();
-    dims.sort_unstable();
-    dims.dedup();
-    if dims.is_empty() || !dims.iter().all(|hd| facts.head_dims.admits(*hd)) {
+    // A body with no op of the coded class (a vision tower, a recurrent-only body) comes back as
+    // it was.
+    let codes = ops.iter().any(|od| match od.op {
+        SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } => coded(attn),
+        SubOp::AttnDecode { mask, .. } => coded(mask),
+        _ => false,
+    });
+    if !codes {
         return Ok(l.clone());
     }
     let first_id = l.op_expansion.iter().flatten().map(|e| e.id.0 + 1).max();
@@ -334,14 +305,6 @@ impl Expander<'_> {
         })
     }
 
-    /// The tile an expanded op's output realizes, when it realizes one.
-    fn tile(&self, r: InputRef) -> Option<(u32, u8)> {
-        match r {
-            InputRef::Op(j) => self.tiles[j],
-            InputRef::Ext(_) => None,
-        }
-    }
-
     fn push(
         &mut self,
         op: ArchOp,
@@ -446,7 +409,7 @@ impl Expander<'_> {
         let (pk, pv) = (packed_of(KvOperand::K)?, packed_of(KvOperand::V)?);
         let id = self.open(i)?;
         let m = self.l.input.ops[i].m;
-        let mut q = self.input(self.operand(i, 0)?);
+        let q = self.input(self.operand(i, 0)?);
         let mut staged = Vec::new();
         for g in around.before {
             let expansion = Some(Expansion {
@@ -457,17 +420,6 @@ impl Expander<'_> {
                 Before::Stage(operand) => {
                     let stage = SubOp::KvStage { operand };
                     staged.push(self.push(stage, m, vec![packed_of(operand)?], None, expansion));
-                }
-                Before::RotateQuery => {
-                    let rows = RotatedRows::Query;
-                    let tile = self.tile(q);
-                    q = InputRef::Op(self.push(
-                        SubOp::RotateRows { rows },
-                        m,
-                        vec![q],
-                        tile,
-                        expansion,
-                    ));
                 }
             }
         }
@@ -486,10 +438,6 @@ impl Expander<'_> {
                 guard: Some(g.guard),
             });
             let (op, inputs) = match g.step {
-                After::RotateOutput => {
-                    let rows = RotatedRows::Output;
-                    (SubOp::RotateRows { rows }, vec![InputRef::Op(out)])
-                }
                 After::PackedTwin => {
                     // The twin IS the attention under the codec, so the attention's trailing
                     // weight inputs (gpt-oss sinks — operand 5, past the cached form's
@@ -513,7 +461,7 @@ impl Expander<'_> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-        TURBOQUANT_SHAPED_CODEC as FACTS, front_end_lowered as lowered, one_layer_attention,
+        INT8_SHAPED_CODEC as FACTS, front_end_lowered as lowered, one_layer_attention,
         one_layer_input_shaped,
     };
     use crate::lower::GemmWeight;
@@ -590,7 +538,7 @@ mod tests {
             [
                 ("KvStage", Some(CodecNotDecode)),
                 ("KvStage", Some(CodecNotDecode)),
-                ("RotateRows", Some(CodecNotDecode)),
+                ("AttnDecode", Some(UnlessCodecDecode)),
             ]
         );
         assert_eq!((ins(&l, 8), ins(&l, 9)), (vec![Op(6)], vec![Op(7)]));
@@ -663,23 +611,21 @@ mod tests {
         assert_eq!(x.input.ops[7].inputs, [Ext(8), Ext(5)]);
     }
 
-    /// Every other form: the layer's K and V staged and the query rotated in ahead of the
-    /// attention, which reads the rotated rows; its output rotated back, then the packed twin.
+    /// Every other form: the layer's K and V staged ahead of the attention, which reads the
+    /// dense cache they fill; then the packed twin.
     #[test]
-    fn prefill_stages_rotates_and_twins_the_attention() {
+    fn prefill_stages_and_twins_the_attention() {
         let l = expand_kv_codec(&layer(64, 2), &FACTS).expect("expands");
         let s = shape(&l);
         assert_eq!(
-            s[5..15],
+            s[5..13],
             [
                 ("RopeAppend", None),
                 ("KvEncode", Some(Codec)),
                 ("KvEncode", Some(Codec)),
                 ("KvStage", Some(CodecNotDecode)),
                 ("KvStage", Some(CodecNotDecode)),
-                ("RotateRows", Some(CodecNotDecode)),
                 ("AttnDecode", Some(UnlessCodecDecode)),
-                ("RotateRows", Some(CodecNotDecode)),
                 ("AttnPackedKv", Some(CodecDecode)),
                 ("MatmulTile", None),
             ]
@@ -687,14 +633,11 @@ mod tests {
         use InputRef::Op;
         let ins = |i: usize| l.input.ops[i].inputs.clone();
         assert_eq!((ins(8), ins(9)), (vec![Op(6)], vec![Op(7)]));
-        assert_eq!(ins(10), [Op(4)]);
-        assert_eq!(ins(11)[0], Op(10));
-        assert_eq!(ins(12), [Op(11)]);
-        assert_eq!(ins(13), [Op(10), Op(12), Op(6), Op(7)]);
-        assert_eq!(ins(14)[0], Op(13));
-        assert_eq!(l.op_tiles[10], l.op_tiles[4]);
-        assert_eq!(l.op_tiles[12], l.op_tiles[11]);
-        let ids: Vec<_> = (8..14).map(|i| l.op_expansion[i].map(|e| e.id)).collect();
+        assert_eq!(ins(10)[0], Op(4));
+        assert_eq!(ins(11), [Op(4), Op(10), Op(6), Op(7)]);
+        assert_eq!(ins(12)[0], Op(11));
+        assert_eq!(l.op_tiles[11], l.op_tiles[10]);
+        let ids: Vec<_> = (8..12).map(|i| l.op_expansion[i].map(|e| e.id)).collect();
         assert!(ids.iter().all(|id| id.is_some() && *id == ids[0]));
     }
 
@@ -724,16 +667,6 @@ mod tests {
             ]
         );
         assert_eq!(x.input.ops.len(), l.input.ops.len() + 2);
-    }
-
-    /// A head dim the codec's kernels do not take codes nothing: the op list comes back as it was.
-    #[test]
-    fn an_unsupported_head_dim_codes_nothing() {
-        for (h, hd) in [(384, 96), (2048, 1024)] {
-            let l = lowered(one_layer_input_shaped(h, hd, 512, hd));
-            let x = expand_kv_codec(&l, &FACTS).expect("passes through");
-            assert_eq!(shape(&x), shape(&l), "head dim {hd}");
-        }
     }
 
     /// Two attention classes of different head dims (a hybrid arch): only the declared class is
