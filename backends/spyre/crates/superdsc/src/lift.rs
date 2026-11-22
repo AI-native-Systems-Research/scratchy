@@ -79,6 +79,21 @@ enum Val {
     Tuple(Vec<Val>),
 }
 
+/// How an intermediate holds its values: densely, or one value per stick (a reduction's result
+/// and what is computed from it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holding {
+    Dense,
+    PerStick,
+}
+
+/// Which contraction a matmul op states: one, or one per batch position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Contraction {
+    Single,
+    Batched,
+}
+
 /// How a staged parameter's buffer holds its memory view: the view's axes, outermost first, in the
 /// order the buffer stores them row-major, the innermost held `inner` elements wide (whole sticks,
 /// at least the view's extent — the padding every op reading it divides over).
@@ -401,8 +416,8 @@ impl<G: DeviceGen> Cx<'_, G> {
 
     /// A fresh intermediate for a result of `shape`. A result whose dense inputs all hold one
     /// value per stick (a reduction's result and what is computed from it) is held the same way.
-    fn local(&mut self, shape: &[u64], format: DataFormat, per_stick: bool) -> Operand {
-        self.local_like(shape, format, per_stick, None)
+    fn local(&mut self, shape: &[u64], format: DataFormat, holding: Holding) -> Operand {
+        self.local_like(shape, format, holding, None)
     }
 
     /// A fresh intermediate whose axes are stored in the order of `like`'s strides (outermost
@@ -411,7 +426,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         &mut self,
         shape: &[u64],
         format: DataFormat,
-        per_stick: bool,
+        holding: Holding,
         like: Option<&View>,
     ) -> Operand {
         let lanes = format.lanes::<G>();
@@ -458,15 +473,18 @@ impl<G: DeviceGen> Cx<'_, G> {
                 _ => View::row_major(0, s),
             })
         };
-        let (elements, view) = if per_stick {
-            let mut v = View::row_major(0, shape);
-            for a in &mut v.axes {
-                a.stride *= lanes;
+        let (elements, view) = match holding {
+            Holding::PerStick => {
+                let mut v = View::row_major(0, shape);
+                for a in &mut v.axes {
+                    a.stride *= lanes;
+                }
+                (numel * lanes, v)
             }
-            (numel * lanes, v)
-        } else {
-            let v = ordered(shape);
-            (v.end(), v)
+            Holding::Dense => {
+                let v = ordered(shape);
+                (v.end(), v)
+            }
         };
         self.graph.locals.push(Local { elements, format });
         Operand {
@@ -477,11 +495,16 @@ impl<G: DeviceGen> Cx<'_, G> {
         }
     }
 
-    /// Does `o` hold one value per stick (no axis is the lanes of a stick)?
-    fn per_stick(o: &Operand) -> bool {
-        matches!(o.store, Store::Local(_) | Store::Param(_))
+    /// How `o` holds its values: one per stick when no axis is the lanes of a stick.
+    fn holding(o: &Operand) -> Holding {
+        if matches!(o.store, Store::Local(_) | Store::Param(_))
             && o.view.axes.iter().all(|a| a.stride != 1 || a.extent == 1)
             && o.view.axes.iter().any(|a| a.stride != 0)
+        {
+            Holding::PerStick
+        } else {
+            Holding::Dense
+        }
     }
 
     fn pointwise(&mut self, op: &Operation<'_>, func: OpFunc) -> Result<(), LiftError> {
@@ -504,20 +527,24 @@ impl<G: DeviceGen> Cx<'_, G> {
         // repeated along an outer axis reads the same stick at every position of it. Repeated
         // along the innermost axis it is a broadcast INTO a stick, which materializes as whole
         // sticks.
-        let per_stick = !dense.is_empty()
+        let holding = if !dense.is_empty()
             && dense.iter().all(|o| {
-                Self::per_stick(o)
+                Self::holding(o) == Holding::PerStick
                     && o.view
                         .axes
                         .last()
                         .is_none_or(|a| a.stride != 0 || a.extent == 1)
-            });
+            }) {
+            Holding::PerStick
+        } else {
+            Holding::Dense
+        };
         let like = dense
             .iter()
             .find(|o| o.view.axes.iter().any(|a| a.stride == 1 && a.extent > 1))
             .or(dense.first())
             .map(|o| o.view.clone());
-        let output = self.local_like(&shape, format, per_stick, like.as_ref());
+        let output = self.local_like(&shape, format, holding, like.as_ref());
         self.graph.nodes.push(Node {
             func,
             space: shape,
@@ -576,7 +603,12 @@ impl<G: DeviceGen> Cx<'_, G> {
             .collect();
         // A stick reduction leaves one value per stick, and so does any reduction of an input
         // that already holds one.
-        let result = self.local(&out_shape, format, stick || Self::per_stick(&input));
+        let holding = if stick {
+            Holding::PerStick
+        } else {
+            Self::holding(&input)
+        };
+        let result = self.local(&out_shape, format, holding);
         let mut out = result.clone();
         out.view.axes.insert(
             axis,
@@ -607,8 +639,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                     Combine::Max => OpFunc::Maximum,
                     Combine::Min => OpFunc::Minimum,
                 };
-                let per_stick = Self::per_stick(&result);
-                let o = self.local(&out_shape, format, per_stick);
+                let o = self.local(&out_shape, format, Self::holding(&result));
                 self.graph.nodes.push(Node {
                     func: combine_op,
                     space: out_shape.clone(),
@@ -622,7 +653,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         Ok(())
     }
 
-    fn matmul(&mut self, op: &Operation<'_>, batch: bool) -> Result<(), LiftError> {
+    fn matmul(&mut self, op: &Operation<'_>, form: Contraction) -> Result<(), LiftError> {
         let malformed = |what| LiftError::Malformed {
             op: op.op_type,
             what,
@@ -658,7 +689,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         let (m, k) = (a.view.axes[rank - 2].extent, a.view.axes[rank - 1].extent);
         let n = b.view.axes[rank - 1].extent;
         let batches: Vec<u64> = a.view.axes[..rank - 2].iter().map(|x| x.extent).collect();
-        if batch != !batches.is_empty() {
+        if (form == Contraction::Batched) != !batches.is_empty() {
             return Err(malformed("a batch matmul carries a batch axis"));
         }
         let format = Self::format(op)?;
@@ -671,7 +702,7 @@ impl<G: DeviceGen> Cx<'_, G> {
         } else {
             OpFunc::Matmul
         };
-        let product = self.local(&out_shape, format, false);
+        let product = self.local(&out_shape, format, Holding::Dense);
         self.graph.nodes.push(Node {
             func,
             space,
@@ -684,7 +715,7 @@ impl<G: DeviceGen> Cx<'_, G> {
             Val::Splat { value: 0.0, .. } | Val::Empty => product,
             acc => {
                 let rhs = self.operand(op, &acc, &out_shape, format)?;
-                let o = self.local(&out_shape, format, false);
+                let o = self.local(&out_shape, format, Holding::Dense);
                 self.graph.nodes.push(Node {
                     func: OpFunc::Add,
                     space: out_shape,
@@ -710,7 +741,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                 // which every shape op can.
                 Err(ViewError::NotContiguous { .. } | ViewError::Tiled) => {
                     let shape = o.view.shape();
-                    let copy = self.local(&shape, o.format, false);
+                    let copy = self.local(&shape, o.format, Holding::Dense);
                     self.graph.nodes.push(Node {
                         func: OpFunc::Identity,
                         space: shape,
@@ -926,7 +957,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                                 gather: Some(gather),
                                 ..base
                             };
-                            let out = self.local(&value.view.shape(), ifmt, false);
+                            let out = self.local(&value.view.shape(), ifmt, Holding::Dense);
                             self.graph.nodes.push(Node {
                                 func: OpFunc::Identity,
                                 space: value.view.shape(),
@@ -1456,7 +1487,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                             gather: Some(gather),
                             ..base
                         };
-                        let out = self.local(&value.view.shape(), value.format, false);
+                        let out = self.local(&value.view.shape(), value.format, Holding::Dense);
                         self.graph.nodes.push(Node {
                             func: OpFunc::Identity,
                             space: value.view.shape(),
@@ -1475,7 +1506,7 @@ impl<G: DeviceGen> Cx<'_, G> {
                             .first()
                             .map(|(b, _)| b.format)
                             .ok_or(malformed("a tile has rows"))?;
-                        let out = self.local(&shape, format, false);
+                        let out = self.local(&shape, format, Holding::Dense);
                         for (k, (base, gather)) in rows.into_iter().enumerate() {
                             let value = Operand {
                                 gather: Some(gather),
@@ -1583,8 +1614,8 @@ impl<G: DeviceGen> Cx<'_, G> {
                 self.view_op(op, |v| v.permute(&perm))?;
             }
             K::LinalgReduce => self.reduce(op)?,
-            K::LinalgMatmul => self.matmul(op, false)?,
-            K::LinalgBatchMatmul => self.matmul(op, true)?,
+            K::LinalgMatmul => self.matmul(op, Contraction::Single)?,
+            K::LinalgBatchMatmul => self.matmul(op, Contraction::Batched)?,
             K::ArithAddf => self.pointwise(op, OpFunc::Add)?,
             K::ArithSubf => self.pointwise(op, OpFunc::Sub)?,
             K::ArithMulf => self.pointwise(op, OpFunc::Mul)?,
