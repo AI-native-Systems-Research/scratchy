@@ -2216,8 +2216,17 @@ fn lower(
                     &mut decode_partials,
                     i,
                 )?;
-                let (cmds, rows) =
-                    sample_rows(p, step, cmds, bucket_m, w, profile, class, half_planes, as_stored)?;
+                let (cmds, rows) = sample_rows(
+                    p,
+                    step,
+                    cmds,
+                    bucket_m,
+                    w,
+                    profile,
+                    class,
+                    half_planes,
+                    as_stored,
+                )?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
                 // (a fold the tail joined) runs over the step's every row: the buffer holds them.
@@ -3557,8 +3566,17 @@ fn lower_one(
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes =
-                    codes_for(p, profile, gen_class, half_planes, as_stored, ix, bits_v, k_v, group);
+                let codes = codes_for(
+                    p,
+                    profile,
+                    gen_class,
+                    half_planes,
+                    as_stored,
+                    ix,
+                    bits_v,
+                    k_v,
+                    group,
+                );
                 affine_qmv_command(
                     p,
                     g,
@@ -3680,8 +3698,17 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes =
-                    codes_for(p, profile, gen_class, half_planes, as_stored, ix, bits_v, k_v, group);
+                let codes = codes_for(
+                    p,
+                    profile,
+                    gen_class,
+                    half_planes,
+                    as_stored,
+                    ix,
+                    bits_v,
+                    k_v,
+                    group,
+                );
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax(_))
                         && codes.signed()
@@ -12817,7 +12844,10 @@ mod tests {
         };
         // Past the wide band's one-threadgroup-a-core line, k a 64 multiple: the wide class's
         // W4A8 path, the one that votes planes.
-        let (n, k) = (2 * SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES, 2048);
+        let (n, k) = (
+            2 * SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES,
+            2048,
+        );
         let at = BakePoint {
             class: crate::tape::lowered::GenClass::M5Wide,
             ..bake_point(8, Some(&crate::targets::M5_10CORE))
@@ -12830,8 +12860,8 @@ mod tests {
                 .count()
         };
         // The control: alone in the backbone, the wide class stores its codes as planes.
-        let alone =
-            lower_subtile_tape_to_metal(&row_tape(plain(&[gemm(n, k)])), &tp(), at).expect("lowers");
+        let alone = lower_subtile_tape_to_metal(&row_tape(plain(&[gemm(n, k)])), &tp(), at)
+            .expect("lowers");
         assert!(
             planes(&alone) > 0,
             "the control: a backbone-only weight votes planes on the wide class"
@@ -12877,7 +12907,10 @@ mod tests {
                 crate::interpreter::metal::lowered::ActivationWidth::of_cols(width),
             )
         };
-        let (n, k) = (2 * SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES, 2048);
+        let (n, k) = (
+            2 * SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES,
+            2048,
+        );
         let at = BakePoint {
             class: crate::tape::lowered::GenClass::M5Wide,
             ..bake_point(8, Some(&crate::targets::M5_10CORE))
@@ -12893,14 +12926,17 @@ mod tests {
         // The weight map's tie, projected onto the tape: the matmul's linear family reads the
         // table's weight.
         let mut tied = row_tape(rows.clone());
-        tied.embed_table_readers = vec![TEST_SITE
-            .iter()
-            .find(|s| s.kind == WeightKind::Linear)
-            .expect("a linear source")
-            .ix];
+        tied.embed_table_readers = vec![
+            TEST_SITE
+                .iter()
+                .find(|s| s.kind == WeightKind::Linear)
+                .expect("a linear source")
+                .ix,
+        ];
         let tied = lower_subtile_tape_to_metal(&tied, &tp(), at).expect("lowers");
         assert_eq!(
-            planes(&tied), 0,
+            planes(&tied),
+            0,
             "the backbone consumes the table's as-stored vote for the weight the head shares"
         );
         // The control: the same tape untied votes planes — the gather alone does not reach the

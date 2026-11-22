@@ -822,7 +822,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             .then(|| {
                 (program.weights.ids()).find_map(|id| {
                     let path = program.weights.path(id);
-                    (path.len() == 1 && path[0] == scratchy_forward_compiler_macro::config::LM_HEAD_ROLE)
+                    (path.len() == 1
+                        && path[0] == scratchy_forward_compiler_macro::config::LM_HEAD_ROLE)
                         .then_some(id.0)
                 })
             })

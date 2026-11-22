@@ -670,8 +670,8 @@ pub fn lower_canonical(
     // would refuse the load.
     let mut embed_table_readers = Vec::new();
     if let Some(tied) = facts.tied_lm_head {
-        for (ix, id) in (backbone_weights.iter().chain(rolled.lm_weights.iter()))
-            .flat_map(|r| sources.reads(r))
+        for (ix, id) in
+            (backbone_weights.iter().chain(rolled.lm_weights.iter())).flat_map(|r| sources.reads(r))
         {
             if id == tied && !embed_table_readers.contains(&ix) {
                 embed_table_readers.push(ix);
