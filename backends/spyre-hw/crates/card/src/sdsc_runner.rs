@@ -103,7 +103,7 @@ pub type RankWeights<T> = Option<PerRank<T, CardWeights>>;
 
 /// What a session binds before prepare — the private bundle of [`SuperDscSession::new_inner`]'s
 /// staged inputs.
-struct Staged<'a, T: scratchy_spyre_bundle::collective::Tp> {
+struct Staged<T: scratchy_spyre_bundle::collective::Tp> {
     /// The resident weights, moved in by the OWNER (the decode session) — one set per card, rank
     /// `r`'s its own shard — and empty for every borrower, which reads the owner's bytes through the
     /// alias.
@@ -270,7 +270,7 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        staged: Staged<'_, T>,
+        staged: Staged<T>,
         borrowed: &[i64],
         spilled_tail: &[u32],
     ) -> Result<Self> {
@@ -289,7 +289,7 @@ impl<'a, 'c, T: scratchy_spyre_bundle::collective::Tp> SuperDscSession<'a, 'c, T
         cards: &'c PerRank<T, crate::runtime::CardRuntime<'a, T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
-        staged: Staged<'_, T>,
+        staged: Staged<T>,
         borrowed: &[i64],
         // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
         // spill is a load-time copy decision (a weight whose slot also holds an m-dependent

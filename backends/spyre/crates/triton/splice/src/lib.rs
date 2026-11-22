@@ -3337,9 +3337,12 @@ fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((out_total, a_total.unwrap_or(a.region.rows.len)))
 }
 
-/// A row's storage width: whole fp16 sticks.
+/// A row's storage width: whole fp16 sticks, the activation row law.
 fn stick_width(n: u32) -> u32 {
-    n.next_multiple_of(scratchy_spyre_bundle::rung::FP16_LANES)
+    scratchy_spyre_bundle::rung::row_pitch(
+        u64::from(n),
+        u64::from(scratchy_spyre_bundle::rung::FP16_LANES),
+    ) as u32
 }
 
 /// The fp16 elements one program's live tiles may hold together: the scratchpad's capacity.

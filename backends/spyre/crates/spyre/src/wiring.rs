@@ -422,13 +422,22 @@ impl RotaryKind {
 
 /// ⭐ THE PAGED STEP — what a paged forward's host fills each step, and the pool it fills it against.
 ///
+/// ONE BIND: which tensor, and the rows it gets — a computed activation owns its rows, a baked
+/// table is borrowed straight into the bind.
+pub type Bind = (
+    scratchy_spyre_bundle::place::PlaceId,
+    std::borrow::Cow<'static, [f32]>,
+);
+
 /// The attention reads its keys and values out of each layer's K and V POOLS (the cache tensors,
-/// head-major `[pages, nkvh, page_slots, hd]`), gathering the pages a request's block table names;
+/// laid as the build's pool lays a page, [`scratchy_triton_splice::PageOrder`]), gathering the
+/// pages a request's block table names;
 /// the KV writers scatter the step's rows into them first. spyre-inference's own operands carry the
 /// step (`crate::paged_step` builds each as their metadata builder does): the PAGE INDEX TABLE
 /// (`[walk, 32]` int32, block `i`'s page at column 0), the MASK STACK (`[walk, rows, page_slots]`
-/// additive, one tile per walked block), the KV WRITE INDEX (`nkvh` `[rows]` int32 indices, one per
-/// kv head), the QUERY ROW INDEX (`[rows]` int32) and `kv_row_pool` (`[pages, nkvh, 1]` int32); a
+/// additive, one tile per walked block), the KV WRITE INDEX (one `[rows]` int32 index per write
+/// entry, [`scratchy_triton_splice::PageOrder::write_entries`]), the QUERY ROW INDEX (`[rows]`
+/// int32); a
 /// DECODE BATCH's attention reads `rep_row_ids`, `chunk_page_ids` and `mask_by_chunk` instead
 /// ([`Self::paged_rows`], [`Self::batch`]). The pools themselves are never re-staged: the device writes them and they
 /// persist across steps.

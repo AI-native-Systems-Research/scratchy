@@ -654,29 +654,16 @@ pub(crate) fn stage_bound_weights(
             // materializes only itself.
             let t = bytes;
             {
-                // DEVICE stick padding — the shared `bump_sticks_to_splittable` rule: round to a
-                // whole 64-stick, then bump a prime/awkward stick count (granite lm_head
-                // 49216/64=769 ⇒ <8 cores) to a multiple of 8 (→ 49664). Zero-pad this GEMM
-                // weight's N columns to the SAME width so the staged host buffer equals the
-                // kernel RetileDescriptor's device_size; the shim's `prod(device_size)` staging
-                // guard then matches. The pad columns are ZERO logits the host never reads (the
-                // read uses the LOGICAL `vocab = n`). No-op for every already-splittable weight.
-                // TYPE-SAFE shared device width: `DeviceWidth` is the SOLE padding rule (the same
-                // law as the emitter's kernel0 manifest and the slot reservation), so the staged
-                // buffer width == the emitted device width by construction — no shim mismatch
-                // possible.
-                //
-                // ⭐ `for_pointwise`, NOT `for_output(1,·)`: this buffer is ONE per model — it must
-                // satisfy the OWNING session's manifest, and the owner is the prefill (m = the
-                // chunk width), never m=1. For every weight crossing the util floor at m=1 (all
-                // dense weights) the two laws are IDENTICAL — both bump. The pointwise floor
-                // (512) is the max any bucket reads; each bucket's gemm takes
-                // its own stick-prefix of the one buffer.
-                let n_dev =
-                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::DeviceWidth::for_pointwise(
-                        cols as u32,
-                    )
-                    .get() as usize;
+                // ⭐ THE KERNEL'S OWN WIDTH: a matmul states its output — and so its weight's
+                // `[n, k]` rows — in whole fp16 sticks (`rung::row_pitch`, the activation row law
+                // the splice's view and the placement share), so granite's 49155-wide lm_head is
+                // 49216 rows on device. The staged buffer is zero-padded to exactly that, the size
+                // the weight's retile descriptor walks; the pad rows feed only the logits' pad
+                // columns, which no draw reads.
+                let n_dev = scratchy_spyre_bundle::rung::row_pitch(
+                    cols as u64,
+                    u64::from(scratchy_spyre_bundle::rung::FP16_LANES),
+                ) as usize;
                 let n_padded = if n_dev != cols {
                     // In `[n, k]` the padded axis `n` is the OUTER one, so widening it is appending
                     // zero rows at the end -- `resize`, not a strided rebuild. (Transposed it was the
@@ -688,44 +675,7 @@ pub(crate) fn stage_bound_weights(
                 } else {
                     t
                 };
-                // ⭐ THE DENSE fp8 K-PAD (gemma-4-26b's GeGLU DOWN, k=2112 → 2176): the quantize
-                // chain and the packed fp8 retile both run at `fp8_k_pad(k)` — a whole 128-elem
-                // SEN143_FP8 stick, the convert's own law — so the staged buffer's INNER axis (the
-                // contraction k, `rows` in the manifest's `[k, n]` pair) must widen to match
-                // `prod(device_size)` or the retile's staging guard refuses. Unlike the N-pad above,
-                // the K axis is INNER in the on-disk `[n, k]` order: a `resize` would only append
-                // zeros after the LAST row, so this is a STRIDED REBUILD — each of the `n_dev` rows
-                // copies its `k` real elements and zero-fills its `k_pad − k` tail. The pad rows are
-                // ZERO, which the contraction makes inert (0·w contributes nothing); the amax never
-                // sees them (it reads the activation's logical width). Baked in the wiring because
-                // WHICH axis is k is a bake fact.
-                match wiring
-                    .fp8_k_pads
-                    .iter()
-                    .find(|&&(id, _)| id as usize == s_id)
-                {
-                    Some(&(_, k_pad)) => {
-                        let k = rows;
-                        if k_pad as usize <= k {
-                            return Err(werr(format!(
-                                "sendnn load_weights: fp8 K-pad for source {s_id} says k_pad={k_pad} \
-                                     but the manifest declares k={rows} — the pad must widen, never narrow \
-                                     (wiring/manifest desync)."
-                            )));
-                        }
-                        // Post-N-pad the buffer is `[n_dev, k]` row-major (k inner, `rows` = k).
-                        let mut padded = vec![0u8; n_dev * k_pad as usize * elem];
-                        let n_padded = n_padded.as_slice();
-                        for n_row in 0..n_dev {
-                            let src_off = n_row * k * elem;
-                            let dst_off = n_row * k_pad as usize * elem;
-                            padded[dst_off..dst_off + k * elem]
-                                .copy_from_slice(&n_padded[src_off..src_off + k * elem]);
-                        }
-                        (HostBytes::Owned(padded), vec![k_pad as usize, n_dev])
-                    }
-                    None => (n_padded, vec![rows, n_dev]),
-                }
+                (n_padded, vec![rows, n_dev])
             }
         } else {
             (bytes, vec![rows, cols])
