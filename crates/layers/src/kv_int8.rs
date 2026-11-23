@@ -43,16 +43,16 @@ pub const MAX_HEAD_DIM: u32 = 512;
 /// whole 32-lane simdgroups, two at the least.
 pub const MIN_HEAD_DIM: u32 = 64;
 
-/// The attention geometry a model's KV codec is decided from.
+/// What a model's KV cache holds a row of: what its codec is decided from.
 #[derive(Clone, Copy, Debug)]
-pub struct KvGeometry {
-    pub head_dim: u32,
-    /// The full-context layers' head_dim; `head_dim` on a uniform model.
-    pub global_head_dim: u32,
-    /// The KV row is a compressed latent (MLA), not per-head K and V.
-    pub latent: bool,
-    /// The model has a KV cache at all (encoders and vision towers don't).
-    pub has_kv_cache: bool,
+pub enum KvRows {
+    /// No KV cache (an encoder, a vision tower).
+    None,
+    /// A compressed latent (MLA), not per-head K and V.
+    Latent,
+    /// Per-head K and V: the base class's head width, and the full-context layers' (the same on
+    /// a uniform model).
+    Heads { head_dim: u32, global_head_dim: u32 },
 }
 
 /// Why a model keeps a dense KV cache.
@@ -79,22 +79,19 @@ impl std::fmt::Display for DenseReason {
     }
 }
 
-/// Int8 for a model of `geometry`, or why it stays dense. The one rule: the lowering injects the
-/// codec, the factory provisions it and the worker sizes its pool from the `KV_CODEC` this decides.
-pub fn codec_for(geometry: KvGeometry) -> Result<(), DenseReason> {
-    let KvGeometry {
-        head_dim,
-        global_head_dim,
-        latent,
-        has_kv_cache,
-    } = geometry;
+/// Int8 for a model whose KV cache holds `rows`, or why it stays dense. The one rule: the lowering
+/// injects the codec, the factory provisions it and the worker sizes its pool from the `KV_CODEC`
+/// this decides.
+pub fn codec_for(rows: KvRows) -> Result<(), DenseReason> {
+    let (head_dim, global_head_dim) = match rows {
+        KvRows::None => return Err(DenseReason::NoKvCache),
+        KvRows::Latent => return Err(DenseReason::LatentKv),
+        KvRows::Heads {
+            head_dim,
+            global_head_dim,
+        } => (head_dim, global_head_dim),
+    };
     let supported = |hd: u32| hd.is_power_of_two() && (MIN_HEAD_DIM..=MAX_HEAD_DIM).contains(&hd);
-    if !has_kv_cache {
-        return Err(DenseReason::NoKvCache);
-    }
-    if latent {
-        return Err(DenseReason::LatentKv);
-    }
     match [head_dim, global_head_dim]
         .into_iter()
         .find(|&hd| !supported(hd))
@@ -104,62 +101,9 @@ pub fn codec_for(geometry: KvGeometry) -> Result<(), DenseReason> {
     }
 }
 
-/// The bytes a row's scale takes: one `f32`.
-pub const SCALE_BYTES: usize = 4;
-
-/// The width of the fp16 scratch prefill attention stages int8 K/V into.
-pub const SCRATCH_ELEM_BYTES: usize = 2;
-
 /// The largest positive code and the most negative one.
 pub const MAX_CODE: f32 = 127.0;
 pub const MIN_CODE: f32 = -128.0;
-
-/// Bytes one token's K and V cost in a KV pool of `num_layers` layers of `num_kv_heads ×
-/// head_dim` stored as `codec`: dense, every layer's `dense_elem_bytes`-wide row; int8, every
-/// layer's codes and scales plus the one-layer fp16 scratch — what a target's provisioning
-/// allocates per token.
-pub fn kv_bytes_per_token(
-    codec: KvCodec,
-    num_layers: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    dense_elem_bytes: usize,
-) -> usize {
-    match codec {
-        KvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
-        KvCodec::Int8 => {
-            num_layers * 2 * num_kv_heads * (head_dim + SCALE_BYTES)
-                + scratch_bytes_per_token(num_kv_heads, head_dim)
-        }
-    }
-}
-
-/// What one block of `block_size` tokens takes in each store an int8 pool lays out: a layer's
-/// codes and its scales (one K or V each), and the one-layer fp16 scratch — as the target's
-/// provisioning lays them out, one source for it and for whoever must know each store's bytes
-/// (the runs a shared KV budget maps apart).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Int8BlockBytes {
-    pub codes: usize,
-    pub scales: usize,
-    pub scratch: usize,
-}
-
-impl Int8BlockBytes {
-    pub fn of(block_size: usize, num_kv_heads: usize, head_dim: usize) -> Self {
-        Self {
-            codes: block_size * num_kv_heads * head_dim,
-            scales: block_size * num_kv_heads * SCALE_BYTES,
-            scratch: block_size * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES,
-        }
-    }
-}
-
-/// Bytes one token costs in an int8 pool's one-layer fp16 scratch, K and V: what a model staging
-/// through another pool's scratch does not pay.
-pub fn scratch_bytes_per_token(num_kv_heads: usize, head_dim: usize) -> usize {
-    2 * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES
-}
 
 /// Element `e`'s sign before the transform: a fixed ±1 a hash of `e` decides, every target's.
 pub const fn sign(e: u32) -> f32 {
@@ -276,17 +220,16 @@ mod tests {
     /// The codec takes a power-of-two head no wider than its kernels hold, and per-head K and V.
     #[test]
     fn the_codec_takes_power_of_two_heads() {
-        let g = |head_dim, latent| KvGeometry {
+        let g = |head_dim| KvRows::Heads {
             head_dim,
             global_head_dim: head_dim,
-            latent,
-            has_kv_cache: true,
         };
-        assert_eq!(codec_for(g(128, false)), Ok(()));
-        assert_eq!(codec_for(g(512, false)), Ok(()));
-        assert_eq!(codec_for(g(96, false)), Err(DenseReason::HeadDim(96)));
-        assert_eq!(codec_for(g(32, false)), Err(DenseReason::HeadDim(32)));
-        assert_eq!(codec_for(g(1024, false)), Err(DenseReason::HeadDim(1024)));
-        assert_eq!(codec_for(g(128, true)), Err(DenseReason::LatentKv));
+        assert_eq!(codec_for(g(128)), Ok(()));
+        assert_eq!(codec_for(g(512)), Ok(()));
+        assert_eq!(codec_for(g(96)), Err(DenseReason::HeadDim(96)));
+        assert_eq!(codec_for(g(32)), Err(DenseReason::HeadDim(32)));
+        assert_eq!(codec_for(g(1024)), Err(DenseReason::HeadDim(1024)));
+        assert_eq!(codec_for(KvRows::Latent), Err(DenseReason::LatentKv));
+        assert_eq!(codec_for(KvRows::None), Err(DenseReason::NoKvCache));
     }
 }

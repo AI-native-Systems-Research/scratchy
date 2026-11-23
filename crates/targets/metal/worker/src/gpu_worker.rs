@@ -788,9 +788,11 @@ fn target_block_bytes(
             scratchy_target_metal::kv_int8::Int8BlockBytes::of(tokens, g.num_kv_heads, g.head_size)
         };
         let stores: usize = (geometry.iter().map(bytes))
-            .map(|b| 2 * (b.codes + b.scales))
+            .map(|b| 2 * (b.codes() + b.scales()))
             .sum();
-        let scratch = geometry.iter().map(|g| bytes(g).scratch).max().unwrap_or(0);
+        let scratch = (geometry.iter().map(|g| bytes(g).scratch()))
+            .max()
+            .unwrap_or(0);
         return stores + 2 * scratch;
     }
     if int8_kv(model) {
@@ -3107,7 +3109,7 @@ impl MetalWorker {
             }
             let (heads, head_dim) = (m.num_key_value_heads() as usize, m.head_dim() as usize);
             let b = scratchy_target_metal::kv_int8::Int8BlockBytes::of(bs.get(), heads, head_dim);
-            vec![b.codes, b.scales, b.scratch]
+            vec![b.codes(), b.scales(), b.scratch()]
         };
         let dense_target = !int8_kv(model);
         let mut store_bytes: Vec<usize> = match dense_target {

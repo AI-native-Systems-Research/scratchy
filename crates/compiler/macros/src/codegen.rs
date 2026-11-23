@@ -7447,18 +7447,20 @@ fn kv_codec_for(
     kv_layers: &KvCacheLayers,
     compress: bool,
 ) -> scratchy_forward_compiler::KvCodec {
-    use scratchy_ir::{DenseReason, KvGeometry, codec_for};
+    use scratchy_ir::{DenseReason, KvRows, codec_for};
     if !compress {
         return scratchy_forward_compiler::KvCodec::Dense;
     }
-    let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
-    let geometry = KvGeometry {
-        head_dim,
-        global_head_dim,
-        latent: bound("kv_lora_rank") > 0,
-        has_kv_cache: kv_layers.any(),
+    let latent = model.bounds.get("kv_lora_rank").is_some_and(|&r| r > 0);
+    let rows = match (kv_layers.any(), latent) {
+        (false, _) => KvRows::None,
+        (true, true) => KvRows::Latent,
+        (true, false) => KvRows::Heads {
+            head_dim,
+            global_head_dim,
+        },
     };
-    match codec_for(geometry) {
+    match codec_for(rows) {
         Ok(()) => scratchy_forward_compiler::KvCodec::Int8,
         Err(reason) => {
             if reason != DenseReason::NoKvCache {

@@ -6,12 +6,80 @@
 //! through `kv_stage` (`attention.metal`).
 
 use objc2_metal::MTLDevice;
-pub use scratchy_layers::kv_int8::{Int8BlockBytes, kv_bytes_per_token, scratch_bytes_per_token};
+use scratchy_layers::kv_int8::KvCodec;
 
 use scratchy_ir::model_facts::HeadGeometry;
 
 use crate::argmax::Buffer;
 use crate::interpreter::metal::runtime::{Int8KvBuffers, KvScratch};
+
+/// The bytes a row's scale takes: one `f32`.
+const SCALE_BYTES: usize = 4;
+
+/// The width of the fp16 scratch prefill attention stages int8 K/V into.
+const SCRATCH_ELEM_BYTES: usize = 2;
+
+/// Bytes one token's K and V cost in a KV pool of `num_layers` layers of `num_kv_heads ×
+/// head_dim` stored as `codec`: dense, every layer's `dense_elem_bytes`-wide row; int8, every
+/// layer's codes and scales plus the one-layer fp16 scratch — what
+/// [`build_int8_provision`] allocates per token.
+pub fn kv_bytes_per_token(
+    codec: KvCodec,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    dense_elem_bytes: usize,
+) -> usize {
+    match codec {
+        KvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
+        KvCodec::Int8 => {
+            num_layers * 2 * num_kv_heads * (head_dim + SCALE_BYTES)
+                + scratch_bytes_per_token(num_kv_heads, head_dim)
+        }
+    }
+}
+
+/// What one block of `block_size` tokens takes in each store an int8 pool lays out: a layer's
+/// codes and its scales (one K or V each), and the one-layer fp16 scratch — as
+/// [`build_int8_provision`] lays them out, one source for it
+/// and for whoever must know each store's bytes (the runs a shared KV budget maps apart).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Int8BlockBytes {
+    codes: usize,
+    scales: usize,
+    scratch: usize,
+}
+
+impl Int8BlockBytes {
+    pub fn of(block_size: usize, num_kv_heads: usize, head_dim: usize) -> Self {
+        Self {
+            codes: block_size * num_kv_heads * head_dim,
+            scales: block_size * num_kv_heads * SCALE_BYTES,
+            scratch: block_size * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES,
+        }
+    }
+
+    /// A layer's codes of K, or of V.
+    pub fn codes(self) -> usize {
+        self.codes
+    }
+
+    /// A layer's scales of K, or of V.
+    pub fn scales(self) -> usize {
+        self.scales
+    }
+
+    /// The one-layer fp16 scratch's K, or V.
+    pub fn scratch(self) -> usize {
+        self.scratch
+    }
+}
+
+/// Bytes one token costs in an int8 pool's one-layer fp16 scratch, K and V: what a model staging
+/// through another pool's scratch does not pay.
+pub fn scratch_bytes_per_token(num_kv_heads: usize, head_dim: usize) -> usize {
+    2 * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES
+}
 
 /// What one block of a layer of `class` takes in each store.
 fn block_bytes(class: &HeadGeometry) -> Int8BlockBytes {
@@ -66,7 +134,7 @@ pub fn build_int8_provision(
     // garbage code times scale 0 is 0).
     let scratch_block = coded
         .iter()
-        .map(|l| block_bytes(l).scratch)
+        .map(|l| block_bytes(l).scratch())
         .max()
         .unwrap_or(0);
     // A hosted scratch of this geometry is staged through, and none of this pool's own is laid
@@ -75,8 +143,8 @@ pub fn build_int8_provision(
     let scratch_bytes = num_blocks * scratch_block;
     let hosted = hosted.filter(|s| s.bytes == scratch_bytes && s.chunk_bytes == chunk_bytes);
     let own_scratch = if hosted.is_some() { 0 } else { 2 };
-    let codes = |l: &HeadGeometry| (block_bytes(l).codes, false);
-    let scales = |l: &HeadGeometry| (block_bytes(l).scales, true);
+    let codes = |l: &HeadGeometry| (block_bytes(l).codes(), false);
+    let scales = |l: &HeadGeometry| (block_bytes(l).scales(), true);
     let layout: Vec<(usize, bool)> = (coded.iter().map(codes))
         .chain(coded.iter().map(codes))
         .chain(coded.iter().map(scales))
@@ -92,19 +160,28 @@ pub fn build_int8_provision(
     );
     let stores = stores.expect("int8 KV stores");
     // The KvCodesK{layer} binding is layer-indexed, so layer L's store sits at index L; a layer
-    // that holds no KV gets a 16-byte placeholder that the tape never binds.
-    let mut next = (0..layout.len()).map(|i| stores.buffer(i));
-    let mut by_layer = || -> Vec<Buffer> {
+    // that holds no KV gets a 16-byte placeholder that the tape never binds. The layout holds
+    // `coded` stores of each kind in turn, a coded layer's at its rank among them.
+    let ranks: Vec<Option<usize>> = (layers.iter())
+        .scan(0, |rank, l| {
+            Some(l.map(|_| {
+                *rank += 1;
+                *rank - 1
+            }))
+        })
+        .collect();
+    let by_layer = |kind: usize| -> Vec<Buffer> {
         let shared = MTLResourceOptions::StorageModeShared;
-        let mut one = |l: &Option<HeadGeometry>| match l {
-            Some(_) => next.next().expect("a store per coded layer"),
+        let one = |rank: &Option<usize>| match rank {
+            Some(r) => stores.buffer(kind * coded.len() + r),
             None => device
                 .newBufferWithLength_options(16, shared)
                 .expect("int8 KV placeholder"),
         };
-        layers.iter().map(&mut one).collect()
+        ranks.iter().map(one).collect()
     };
-    let (codes_k, codes_v, scales_k, scales_v) = (by_layer(), by_layer(), by_layer(), by_layer());
+    let (codes_k, codes_v, scales_k, scales_v) =
+        (by_layer(0), by_layer(1), by_layer(2), by_layer(3));
     // Contiguous scratch data + a chunk-table of gpuAddresses at chunk offsets (the kernels
     // deref it).
     let n_chunks = num_blocks.div_ceil(blocks_per_chunk.max(1));
@@ -118,8 +195,8 @@ pub fn build_int8_provision(
     let scratch = match hosted {
         Some(s) => s.clone(),
         None => {
-            let k_data = next.next().expect("K scratch");
-            let v_data = next.next().expect("V scratch");
+            let k_data = stores.buffer(4 * coded.len());
+            let v_data = stores.buffer(4 * coded.len() + 1);
             KvScratch {
                 k_table: table(&k_data),
                 v_table: table(&v_data),
