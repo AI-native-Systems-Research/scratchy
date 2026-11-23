@@ -8787,8 +8787,7 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts =
-                fill_canonical_params(&model, 1, false, &every_layer(&model), None, None).0;
+            let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None, None).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
