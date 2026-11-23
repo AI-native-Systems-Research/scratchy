@@ -182,3 +182,75 @@ pub const fn combine_groups(head_dim: u32) -> u32 {
         COMBINE_MAX_SIMDGROUPS
     }
 }
+
+/// The keys of the rung's KV cap one threadgroup of the int8 decode takes: a hand-picked constant.
+pub const DECODE_SPLIT_KEYS: u32 = 256;
+
+/// At most this many threadgroups a KV head's keys spread over: a hand-picked constant.
+pub const DECODE_MAX_SPLITS: u32 = 16;
+
+/// The rows of the matrix units' fragments the int8 decode serves its query heads in.
+pub const DECODE_FRAGMENT_ROWS: u32 = 8;
+
+/// How the int8 decode (`attention_decode_gqa_int8`) and its combine
+/// (`attention_via_cache_v2_combine`) cut one class's work, every part a law of the class's
+/// geometry and the keys a query reads at most: [`Self::of`] is the one way to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Int8DecodeShape {
+    heads: u32,
+    splits: u32,
+    key_group: u32,
+    combine_groups: u32,
+}
+
+impl Int8DecodeShape {
+    /// The shape of a class of `head_dim` and GQA group `group` whose queries read at most `keys`
+    /// keys: a threadgroup serves the largest divisor of the group that fits
+    /// [`DECODE_FRAGMENT_ROWS`]; the keys spread over one threadgroup per [`DECODE_SPLIT_KEYS`],
+    /// at most [`DECODE_MAX_SPLITS`]; the key group is [`decode_key_group`]'s and the combine's
+    /// simdgroups [`combine_groups`]'.
+    pub const fn of(head_dim: u32, group: u32, keys: u32) -> Self {
+        let mut heads = 1;
+        let mut r = 2;
+        while r <= group && r <= DECODE_FRAGMENT_ROWS {
+            if group.is_multiple_of(r) {
+                heads = r;
+            }
+            r += 1;
+        }
+        let splits = keys.div_ceil(DECODE_SPLIT_KEYS);
+        let splits = if splits < 1 {
+            1
+        } else if splits > DECODE_MAX_SPLITS {
+            DECODE_MAX_SPLITS
+        } else {
+            splits
+        };
+        Self {
+            heads,
+            splits,
+            key_group: decode_key_group(head_dim),
+            combine_groups: combine_groups(head_dim),
+        }
+    }
+
+    /// The query heads one threadgroup serves (`ATTN_DECODE_HEADS`).
+    pub const fn heads(self) -> u32 {
+        self.heads
+    }
+
+    /// The threadgroups a KV head's keys spread over (`ATTN_SPLITS`).
+    pub const fn splits(self) -> u32 {
+        self.splits
+    }
+
+    /// The simdgroups sharing a key block (`ATTN_DECODE_SG`).
+    pub const fn key_group(self) -> u32 {
+        self.key_group
+    }
+
+    /// The combine's simdgroups (`ATTN_COMBINE_GROUPS`).
+    pub const fn combine_groups(self) -> u32 {
+        self.combine_groups
+    }
+}

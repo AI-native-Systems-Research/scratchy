@@ -782,10 +782,6 @@ fn kv_writer_codec(
     Some((super::kernel_constants::KvInt8Constants, bindings))
 }
 
-/// The slot `attention_decode_gqa_int8` binds its partials at, the op scratch's front, and
-/// `attention_via_cache_v2_combine` reads them from.
-const SPLIT_PARTIALS_SLOT: u8 = 16;
-
 /// The slots of a decode attention running its KV writer (`attention.metal`'s
 /// `ATTN_FOLD_ROT_DIM` / `ATTN_FOLD_PAIR_OFF`): the writer's rotation, set only on such a command.
 const ATTN_FOLD: (u16, u16) = (19, 20);
@@ -1412,91 +1408,102 @@ fn route_gdn(
     Ok(out)
 }
 
-/// The keys of the rung's KV cap one threadgroup of `attention_decode_gqa_int8` takes: a
-/// hand-picked constant.
-const ATTN_SPLIT_KEYS: u32 = 256;
+/// What a decode attention of the class masked `mask` reads of its cache
+/// ([`super::kernel_constants::DecodeCache`]), and the class's rotary table on a spans model.
+fn decode_cache(
+    p: &ModelFacts,
+    mask: AttnMask,
+    chunked: bool,
+    w: RowSources<'_>,
+) -> Result<(super::kernel_constants::DecodeCache, Option<SourceIx>), LoweringError> {
+    use super::kernel_constants::{DecodeCache, PairLanes, RopeOnRead};
+    let class = masked(p, mask)?;
+    let (window, is_global) = match mask {
+        AttnMask::Causal => (0, true),
+        AttnMask::SlidingWindow { .. } => (kernel_window(p)?, false),
+    };
+    let (rot_dim, pair_off, on, table) = rope_on_read_params(p, is_global);
+    let hd = class.head_dim().get();
+    let lanes = match pair_coresident_param(rot_dim, pair_off, on, hd) {
+        Some(_) => PairLanes::Coresident,
+        None => PairLanes::Shuffled,
+    };
+    let rope_on_read = (rot_dim.zip(pair_off)).map(|(rot_dim, pair_off)| RopeOnRead {
+        rot_dim,
+        pair_off,
+        lanes,
+    });
+    let cache = DecodeCache {
+        head_dim: super::ids::HeadDim(hd),
+        num_q_heads: super::ids::NumQHeads(q_heads(p)?),
+        num_kv_heads: super::ids::NumKvHeads(class.kv_heads().get()),
+        attn_scale: super::ids::AttnScale(attention(p)?.scale().get()),
+        block_size: super::ids::BlockSize(class.page().get()),
+        blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(chunked)),
+        window: super::ids::AttnWindow(window),
+        rope_on_read,
+    };
+    Ok((cache, w.rotary(table)?))
+}
 
-/// At most this many threadgroups a KV head's keys spread over: a hand-picked constant.
-const ATTN_MAX_SPLITS: u32 = 16;
-
-/// The rows of the matrix units' fragments `attention_decode_gqa_int8` serves its query heads in:
-/// a threadgroup takes the largest divisor of the GQA group that fits them.
-const DECODE_FRAGMENT_ROWS: u32 = 8;
-
-/// The threadgroups a KV head's keys spread over at the KV cap rung `block_cap`: the keys a query
-/// of a layer masked `mask` reads at most — the rung's, within its window.
-fn decode_splits(p: &ModelFacts, mask: AttnMask, block_cap: u32) -> Result<u32, LoweringError> {
-    let cap = block_cap.saturating_mul(masked(p, mask)?.page().get());
+/// The class masked `mask` and its int8 decode's cut at the KV cap rung `block_cap`, of the keys
+/// a query reads at most: the rung's, within the window.
+fn int8_decode_shape(
+    p: &ModelFacts,
+    mask: AttnMask,
+    block_cap: u32,
+) -> Result<
+    (
+        scratchy_ir::model_facts::HeadGeometry,
+        crate::kv_int8::Int8DecodeShape,
+    ),
+    LoweringError,
+> {
+    let class = masked(p, mask)?;
+    let cap = block_cap.saturating_mul(class.page().get());
     let keys = match mask {
         AttnMask::Causal => cap,
         AttnMask::SlidingWindow { window } => cap.min(window.get()),
     };
-    Ok(keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS))
+    let shape =
+        crate::kv_int8::Int8DecodeShape::of(class.head_dim().get(), class.gqa().get(), keys);
+    Ok((class, shape))
 }
 
-/// The int8 decode attention of the coded class (`attention_decode_gqa_int8`) and the combine of
-/// its splits' partials (`attention_via_cache_v2_combine`), from `dense`, the class's one-pass
-/// decode command: its geometry, rows and bindings. A threadgroup serves a group of
-/// [`DECODE_FRAGMENT_ROWS`]-fitting query heads of one KV head, each key's codes read once for
-/// them; the keys spread over the threadgroups the rung's KV cap calls for (`ATTN_SPLITS`), each
-/// storing its heads' partials at the op scratch's front, `[rows, num_q_heads, splits, 2 +
-/// head_dim]` floats, which the combine merges into the output — a sinks layer's (gpt-oss) sink
-/// column with them, the combine binding the sinks. A multi-row bucket's rows are tokens
-/// (`ATTN_ROW_QUERIES`, each reading its sequence's keys up to its own).
+/// The int8 decode attention of the class masked `mask` (`attention_decode_gqa_int8`) over layer
+/// `layer`'s store, query `q` into `out`, and the combine of its splits' partials
+/// (`attention_via_cache_v2_combine`). The cut is [`crate::kv_int8::Int8DecodeShape`]'s, of the
+/// keys a query reads at most at the KV cap rung `block_cap` — the rung's, within the window: a
+/// threadgroup serves a group of query heads of one KV head, each key's codes read once for
+/// them, storing its heads' partials, `[rows, num_q_heads, splits, 2 + head_dim]` floats, which
+/// the combine merges into the output — a sinks layer's (gpt-oss) sink column with them. A
+/// multi-row bucket's rows are tokens (`ATTN_ROW_QUERIES`, each reading its sequence's keys up to
+/// its own).
 fn int8_decode_commands(
     p: &ModelFacts,
-    dense: &LoweredCommand,
-    layer: u32,
-    mask: AttnMask,
-    sinks: Option<SourceIx>,
+    chunked: bool,
+    w: RowSources<'_>,
+    bucket_m: u32,
     block_cap: u32,
-    index: usize,
+    (q, out, layer): (u32, u32, u32),
+    mask: AttnMask,
 ) -> Result<[LoweredCommand; 2], LoweringError> {
-    use super::kernel_constants::AttentionViaCacheConstants as C;
-    let (class, q_heads) = (masked(p, mask)?, q_heads(p)?);
+    use super::kernel_bindings::{AttentionDecodeCombineBindingSet, AttentionDecodeInt8BindingSet};
+    use super::kernel_constants::{
+        AttentionDecodeCombineConstants, AttentionDecodeInt8Constants, SinkColumn,
+    };
+    let (class, shape) = int8_decode_shape(p, mask, block_cap)?;
     let hd = class.head_dim().get();
-    let group = class.gqa().get();
-    let rows = (1..=group.min(DECODE_FRAGMENT_ROWS))
-        .filter(|r| group.is_multiple_of(*r))
-        .fold(1, |_, r| r);
-    let splits = decode_splits(p, mask, block_cap)?;
-    let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
+    let (cache, rope_on_read) = decode_cache(p, mask, chunked, w)?;
+    let query_rows = QueryRows::for_bucket(bucket_m);
+    let (sinks, kv_layer) = (w.sinks(), super::ids::LayerId(layer));
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.act_dtype());
-    let (heads, sinks_const) = (C::HEADS.0, C::SINKS.0);
-    let shared: Vec<ConstantValue> = (dense.constants.iter())
-        .filter(|k| k.index != heads)
-        .copied()
-        .chain([
-            ConstantValue::uint(C::INT8, 1),
-            ConstantValue::uint(18, splits),
-            ConstantValue::uint(25, crate::kv_int8::combine_groups(hd)),
-        ])
-        .collect();
-    // The split's own: its heads and key groups, and no sink column — the combine's.
-    let split_constants = (shared.iter())
-        .filter(|k| k.index != sinks_const)
-        .copied()
-        .chain([
-            ConstantValue::uint(C::HEADS, rows),
-            ConstantValue::uint(24, crate::kv_int8::decode_key_group(hd)),
-        ])
-        .collect();
-    // A sinks dispatch's sink column (the row's sinks source, the dense command binds at its 16)
-    // joins in the combine, at its buffer 17: the split's 16 is the partials.
-    let is_sinks = |b: &&Binding| matches!(b, Binding::Source { ix, which: WeightTensor::Weight, .. } if Some(*ix) == sinks);
-    let (sinks, bindings): (Vec<Binding>, Vec<Binding>) = dense.bindings.iter().partition(is_sinks);
-    // Past the sinks, nothing may sit at the partials' slot: it would overlap them.
-    if bindings.iter().any(|b| b.index() == SPLIT_PARTIALS_SLOT) {
-        return Err(LoweringError::SplitPartialsSlotTaken {
-            index,
-            kernel: dense.kernel,
-            slot: SPLIT_PARTIALS_SLOT,
-        });
-    }
-    let int8 = Vec::from(super::kernel_bindings::Int8AttentionBindingSet {
-        kv_layer: super::ids::LayerId(layer),
+    let m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+        set_axis: None,
+        axis: crate::tape::lowered::MScaleAxis::X,
+        bucket_m: super::ids::BucketM(bucket_m),
     });
-    let (x, _, _) = dense.dispatch.threadgroups;
+    let q_heads = q_heads(p)?;
     let attention = LoweredCommand {
         kernel: KernelId::AttentionDecodeInt8,
         library: "attention",
@@ -1504,25 +1511,26 @@ fn int8_decode_commands(
             "attention_decode_gqa_int8_f16_specialized",
             "attention_decode_gqa_int8_bf16_specialized",
         ),
-        constants: baked(split_constants),
+        constants: AttentionDecodeInt8Constants {
+            cache,
+            query_rows,
+            shape,
+        }
+        .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (x, q_heads / rows, splits),
+            threadgroups: (bucket_m, q_heads / shape.heads(), shape.splits()),
             threads_per_threadgroup: (hd, 1, 1),
-            ..dense.dispatch
+            m_scaling,
         },
-        bindings: baked(
-            bindings
-                .iter()
-                .copied()
-                .chain(int8)
-                .chain([scratch])
-                .collect(),
-        ),
+        bindings: AttentionDecodeInt8BindingSet {
+            output: super::ids::ArenaSlotIdx(out),
+            q: super::ids::ArenaSlotIdx(q),
+            kv_layer,
+            rope_on_read,
+            query_rows,
+        }
+        .into_baked(),
     };
-    let output = (bindings.iter()).filter(|b| b.index() == 0).copied();
-    let sinks = sinks
-        .into_iter()
-        .map(|b| b.at(super::kernel_bindings::COMBINE_SINKS_SLOT));
     let combine = LoweredCommand {
         kernel: KernelId::AttentionDecodeCombine,
         library: "attention",
@@ -1530,13 +1538,27 @@ fn int8_decode_commands(
             "attention_via_cache_v2_combine_f16_specialized",
             "attention_via_cache_v2_combine_bf16_specialized",
         ),
-        constants: baked(shared),
+        constants: AttentionDecodeCombineConstants {
+            cache,
+            query_rows,
+            shape,
+            sinks: match sinks {
+                Some(_) => SinkColumn::Present,
+                None => SinkColumn::Absent,
+            },
+        }
+        .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (x, q_heads, 1),
-            threads_per_threadgroup: (32 * crate::kv_int8::combine_groups(hd), 1, 1),
-            ..dense.dispatch
+            threadgroups: (bucket_m, q_heads, 1),
+            threads_per_threadgroup: (32 * shape.combine_groups(), 1, 1),
+            m_scaling,
         },
-        bindings: baked(output.chain([scratch]).chain(sinks).collect()),
+        bindings: AttentionDecodeCombineBindingSet {
+            output: super::ids::ArenaSlotIdx(out),
+            kv_layer,
+            sinks,
+        }
+        .into_baked(),
     };
     Ok([attention, combine])
 }
@@ -1573,9 +1595,8 @@ fn record_decode_partials(
     let Some(mask) = packed_mask(step) else {
         return Ok(());
     };
-    let (class, q_heads) = (masked(p, mask)?, q_heads(p)?);
-    let splits = decode_splits(p, mask, at.block_cap)?;
-    let row_bytes = q_heads * splits * (class.head_dim().get() + 2) * 4;
+    let (class, shape) = int8_decode_shape(p, mask, at.block_cap)?;
+    let row_bytes = q_heads(p)? * shape.splits() * (class.head_dim().get() + 2) * 4;
     let steps = SplitSteps::of(c.gate.or(row_gate));
     *partials = partials.max(DecodePartials { row_bytes, steps });
     Ok(())
@@ -2444,7 +2465,10 @@ fn verify_lane_attention(
                 set_axis: None,
             }),
         },
-        bindings: baked(vec![out, scratch_at(SPLIT_PARTIALS_SLOT, packed_bytes)]),
+        bindings: baked(vec![
+            out,
+            scratch_at(super::kernel_bindings::DECODE_PARTIALS_SLOT, packed_bytes),
+        ]),
     };
     Some([pack, split, combine])
 }
@@ -5700,41 +5724,16 @@ fn lower_one(
         }
         // The decode attention of its class, reading the int8 store, and the combine of its
         // splits' partials.
-        I::AttnPackedKv(q, out, layer, pairing, class) => {
-            let decode = match class {
-                AttnMask::Causal => I::AttentionViaCache(*q, *out, *layer, *pairing),
-                AttnMask::SlidingWindow { .. } => {
-                    I::SlidingAttentionViaCache(*q, *out, *layer, *pairing)
-                }
-            };
-            let via_cache = lower_one(
-                p,
-                chunked,
-                &decode,
-                w,
-                bucket_m,
-                layer_offset,
-                splitk_scratch_bytes,
-                moe_scratch_bytes,
-                roped_k_scratch_bytes,
-                block_cap,
-                profile,
-                gen_class,
-                half_planes,
-                m_divisor,
-            )?;
-            let [TapeCommand::Dispatch(dense)] = via_cache.as_slice() else {
-                return Err(LoweringError::RopedAttentionShape { index: w.index });
-            };
+        I::AttnPackedKv(Slot(q), Slot(out), layer, _pairing, mask) => {
             let layer = layer.get() + layer_offset;
             return dispatched(int8_decode_commands(
                 p,
-                dense,
-                layer,
-                *class,
-                w.sinks(),
+                chunked,
+                w,
+                bucket_m,
                 block_cap,
-                w.index,
+                (*q, *out, layer),
+                *mask,
             )?);
         }
         I::Moe(block, step) => {
@@ -9763,7 +9762,8 @@ mod tests {
             assert!(bound(i), "binding {i}");
         }
         assert!(!bound(20) && !bound(22));
-        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
+        let splits =
+            (128 * a(&p).global().page().get()).div_ceil(crate::kv_int8::DECODE_SPLIT_KEYS);
         assert_eq!(split.dispatch.threadgroups.2, splits + 1);
         assert!(matches!(
             lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None)),
@@ -10362,7 +10362,8 @@ mod tests {
         // A threadgroup a (query-head group, split) of head_dim threads — the fixture's group of
         // 8 a KV head's — its combine one a query head of two simdgroups — head_dim 64's share
         // of every lane's elements.
-        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
+        let splits =
+            (128 * a(&p).global().page().get()).div_ceil(crate::kv_int8::DECODE_SPLIT_KEYS);
         assert_eq!(
             (
                 split.dispatch.threadgroups,
@@ -10565,43 +10566,6 @@ mod tests {
         );
     }
 
-    /// A dense decode command binding something other than the row's sinks at the partials' slot
-    /// is a lowering error, never a silent overlap with the partials: here a sinks binding the
-    /// split is not told is the row's.
-    #[test]
-    fn decode_int8_split_refuses_a_buffer_at_its_partials_slot() {
-        let tape = lower_subtile_tape_to_metal(
-            &sinks_tape(plain(&[
-                kv_writer(0, Causal, LLAMA_KV),
-                attention(MetalStep::AttentionViaCache, 0, Interleaved),
-            ])),
-            &tp(),
-            bake_point(1, None),
-        )
-        .expect("lower_subtile_tape_to_metal");
-        let dense = (tape.commands.iter())
-            .find(|c| c.lowered().kernel == KernelId::AttentionViaCache)
-            .expect("the dense decode")
-            .lowered();
-        assert!((dense.bindings.iter()).any(|b| matches!(
-            b,
-            Binding::Source {
-                ix: SINKS_IX,
-                binding_index: 16,
-                ..
-            }
-        )));
-        let lowered = int8_decode_commands(&int8_consts(), &dense, 0, Causal, None, 128, 7);
-        assert!(matches!(
-            lowered,
-            Err(LoweringError::SplitPartialsSlotTaken {
-                index: 7,
-                kernel: KernelId::AttentionViaCache,
-                slot: 16,
-            })
-        ));
-    }
-
     use crate::tape::lowered::RuntimeGate;
 
     /// The int8 commands a multi-token tape wraps around one layer's paged attention: stage K and
@@ -10712,7 +10676,8 @@ mod tests {
         );
         let dense = &tape.commands.get(1).lowered();
         // 128 blocks of 16 keys: eight threadgroups of `ATTN_SPLIT_KEYS`.
-        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
+        let splits =
+            (128 * a(&p).global().page().get()).div_ceil(crate::kv_int8::DECODE_SPLIT_KEYS);
         assert_eq!(splits, 8);
         assert_eq!(
             (
@@ -10744,9 +10709,20 @@ mod tests {
             .concat()
         );
         let partials = scratch_at(16, 0);
-        let int8 = Vec::from(super::super::kernel_bindings::Int8AttentionBindingSet {
-            kv_layer: crate::tape::ids::LayerId(0),
-        });
+        let layer = crate::tape::ids::LayerId(0);
+        let int8: Vec<Binding> = [
+            (RuntimeBindingKind::KvCodesK { layer }, 7),
+            (RuntimeBindingKind::KvCodesV { layer }, 8),
+            (RuntimeBindingKind::KvScalesK { layer }, 9),
+            (RuntimeBindingKind::KvScalesV { layer }, 10),
+            (RuntimeBindingKind::SlotMapping { layer }, 13),
+        ]
+        .into_iter()
+        .map(|(kind, binding_index)| Binding::Runtime {
+            kind,
+            binding_index,
+        })
+        .collect();
         assert_eq!(*gqa.bindings, [dense.bindings, &int8, &[partials]].concat());
         assert_eq!(
             (combine.function, combine.dispatch.threadgroups),
@@ -10905,7 +10881,8 @@ mod tests {
             &tape.commands.get(2).lowered(),
             &tape.commands.get(3).lowered(),
         );
-        let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
+        let splits =
+            (128 * a(&p).global().page().get()).div_ceil(crate::kv_int8::DECODE_SPLIT_KEYS);
         assert_eq!(splits, 8);
         assert_eq!(gqa.dispatch.threadgroups, (1, 4, splits));
         assert_eq!(gqa.dispatch.threads_per_threadgroup, (128, 1, 1));
@@ -11224,7 +11201,9 @@ mod tests {
         assert_eq!(constant(0), Some(ConstantValue::uint(0, 64)));
         assert_eq!(constant(2), Some(ConstantValue::uint(2, 4)));
         assert_eq!(constant(7), Some(ConstantValue::int(7, 1024)));
-        let window_splits = 1024u32.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
+        let window_splits = 1024u32
+            .div_ceil(crate::kv_int8::DECODE_SPLIT_KEYS)
+            .clamp(1, crate::kv_int8::DECODE_MAX_SPLITS);
         assert_eq!(sliding_split.dispatch.threadgroups.2, window_splits);
 
         let global_attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);

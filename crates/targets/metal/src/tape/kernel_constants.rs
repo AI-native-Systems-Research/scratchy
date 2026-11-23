@@ -429,6 +429,128 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
     }
 }
 
+/// How a decode lane holds the rope pairs it re-ropes on read (`ATTN_PAIR_CORESIDENT`, slot 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairLanes {
+    /// Each lane owns its pairs `{d, d + head_dim / 2}`: the rope is in-lane.
+    Coresident,
+    /// A lane's elements are a contiguous slice, its pairs met by shuffles.
+    Shuffled,
+}
+
+/// A spans model's rope on read (slots 8/9/10, and 12): the class's rotated dims, its pairs'
+/// offset and how a decode lane holds them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RopeOnRead {
+    pub rot_dim: RotDim,
+    pub pair_off: RopePairOff,
+    pub lanes: PairLanes,
+}
+
+/// What a decode attention reads of one class's paged cache (slots 0..=12): the class's
+/// geometry, its window, the pool's chunking, and the rope it re-applies on read.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeCache {
+    pub head_dim: HeadDim,
+    pub num_q_heads: NumQHeads,
+    pub num_kv_heads: NumKvHeads,
+    pub attn_scale: AttnScale,
+    pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
+    /// `ATTN_WINDOW` (slot 7): the class's sliding window, `0` for a full class.
+    pub window: AttnWindow,
+    pub rope_on_read: Option<RopeOnRead>,
+}
+
+impl DecodeCache {
+    fn push(self, v: &mut Vec<ConstantValue>) {
+        v.extend([
+            ConstantValue::uint(ConstSlot(0), self.head_dim.get()),
+            ConstantValue::uint(ConstSlot(1), self.num_q_heads.get()),
+            ConstantValue::uint(ConstSlot(2), self.num_kv_heads.get()),
+            ConstantValue::float(ConstSlot(3), self.attn_scale.get()),
+            ConstantValue::uint(ConstSlot(4), self.block_size.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
+            ConstantValue::uint(ConstSlot(6), self.blocks_per_chunk.get()),
+            ConstantValue::int(ConstSlot(7), self.window.get()),
+        ]);
+        if let Some(r) = self.rope_on_read {
+            push_rope_on_read_consts(v, Some(r.rot_dim), Some(r.pair_off), Some(1));
+            if r.lanes == PairLanes::Coresident {
+                v.push(ConstantValue::uint(ConstSlot(12), 1));
+            }
+        }
+    }
+}
+
+/// `ATTN_ROW_QUERIES` (slot 22), set for a bucket whose rows are tokens.
+fn push_query_rows(v: &mut Vec<ConstantValue>, rows: QueryRows) {
+    if rows == QueryRows::PerToken {
+        v.push(ConstantValue::uint(ConstSlot(22), 1));
+    }
+}
+
+/// `ATTN_KV_INT8` (13), `ATTN_SPLITS` (18) and `ATTN_COMBINE_GROUPS` (25): the int8 decode's and
+/// its combine's shared part of the shape.
+fn push_int8_split(v: &mut Vec<ConstantValue>, shape: crate::kv_int8::Int8DecodeShape) {
+    v.extend([
+        ConstantValue::uint(AttentionViaCacheConstants::INT8, 1),
+        ConstantValue::uint(ConstSlot(18), shape.splits()),
+        ConstantValue::uint(ConstSlot(25), shape.combine_groups()),
+    ]);
+}
+
+/// `KernelId::AttentionDecodeInt8` (`attention_decode_gqa_int8`): one split of a KV head's
+/// query-head group's int8 decode.
+pub struct AttentionDecodeInt8Constants {
+    pub cache: DecodeCache,
+    pub query_rows: QueryRows,
+    pub shape: crate::kv_int8::Int8DecodeShape,
+}
+
+impl From<AttentionDecodeInt8Constants> for Vec<ConstantValue> {
+    fn from(c: AttentionDecodeInt8Constants) -> Self {
+        let mut v = Vec::new();
+        c.cache.push(&mut v);
+        push_query_rows(&mut v, c.query_rows);
+        push_int8_split(&mut v, c.shape);
+        v.extend([
+            ConstantValue::uint(AttentionViaCacheConstants::HEADS, c.shape.heads()),
+            ConstantValue::uint(ConstSlot(24), c.shape.key_group()),
+        ]);
+        v
+    }
+}
+
+/// `KernelId::AttentionDecodeCombine` (`attention_via_cache_v2_combine`): the merge of an int8
+/// decode's splits, the sink column (`ATTN_SINKS`, slot 21) with them on a sinks layer.
+pub struct AttentionDecodeCombineConstants {
+    pub cache: DecodeCache,
+    pub query_rows: QueryRows,
+    pub shape: crate::kv_int8::Int8DecodeShape,
+    pub sinks: SinkColumn,
+}
+
+/// Whether a layer's softmax carries an attention-sinks column (gpt-oss).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SinkColumn {
+    Absent,
+    Present,
+}
+
+impl From<AttentionDecodeCombineConstants> for Vec<ConstantValue> {
+    fn from(c: AttentionDecodeCombineConstants) -> Self {
+        let mut v = Vec::new();
+        c.cache.push(&mut v);
+        if c.sinks == SinkColumn::Present {
+            v.push(ConstantValue::uint(AttentionViaCacheConstants::SINKS, 1));
+        }
+        push_query_rows(&mut v, c.query_rows);
+        push_int8_split(&mut v, c.shape);
+        v
+    }
+}
+
 /// `KernelId::KvStage` (`kv_stage_<dtype>`, attention.metal slots): the layer's KV geometry.
 pub struct KvStageConstants {
     pub head_dim: HeadDim,
