@@ -53,19 +53,21 @@ const SHOWN: usize = 2;
 
 // --------------------------------------------------------------------- load
 
-/// The runs the page shows outside Over time: each Mac's [`SHOWN`] newest, checked. Fails naming
-/// each bad file, so one build reports all of them rather than the first.
-fn load(site: &Site) -> Result<Vec<Run>, String> {
-    let mut runs = newest(read(site)?, SHOWN);
-    borrow_earlier(&mut runs);
-    Ok(runs)
+/// The run files, read once: every run for Over time, and each Mac's [`SHOWN`] newest for the
+/// rest of the page. Each set borrows earlier cells within itself ([`borrow_earlier`]).
+struct Loaded {
+    shown: Vec<Run>,
+    all: Vec<Run>,
 }
 
-/// Every run file, checked, for Over time: [`load`], and the older runs a newer one replaced.
-fn load_all(site: &Site) -> Result<Vec<Run>, String> {
-    let mut runs = read(site)?;
-    borrow_earlier(&mut runs);
-    Ok(runs)
+/// Every run file, checked and read once ([`Loaded`]). Fails naming each bad file, so one build
+/// reports all of them rather than the first.
+fn load(site: &Site) -> Result<Loaded, String> {
+    let mut all = read(site)?;
+    let mut shown = newest(all.clone(), SHOWN);
+    borrow_earlier(&mut shown);
+    borrow_earlier(&mut all);
+    Ok(Loaded { shown, all })
 }
 
 /// Each machine's `n` newest of `runs`, by when each ran, in the order given.
@@ -84,8 +86,8 @@ fn newest(mut runs: Vec<Run>, n: usize) -> Vec<Run> {
 }
 
 /// Every run file in [`DATA`]'s machine folders, parsed and marked, with each one's [`Run::file`]
-/// set. A file directly in [`DATA`], or one whose folder or name does not match its run, is an
-/// error naming it.
+/// set. A file directly in [`DATA`], a folder inside a Mac's folder, or a file whose folder or
+/// name does not match its run, is an error naming it.
 fn read(site: &Site) -> Result<Vec<Run>, String> {
     let data = site.root.join(DATA);
     let (mut files, mut errors) = (Vec::new(), Vec::new());
@@ -100,6 +102,13 @@ fn read(site: &Site) -> Result<Vec<Run>, String> {
         });
     }
     for folder in folders {
+        let nested = datafile::folders(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        for sub in nested {
+            errors.push(format!(
+                "{}: a Mac's folder holds its runs directly; move them into {DATA}/<machine>/",
+                sub.strip_prefix(&data).unwrap_or(&sub).display()
+            ));
+        }
         let listed = datafile::list(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
         for f in listed {
             match f {
@@ -2913,10 +2922,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     // The page's chart specs go to a side file, not its HTML: they are most of its bytes, and a
     // chart is drawn only once it nears the screen ([`crate::charts::keep_apart`]).
     crate::charts::keep_apart();
-    let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
-    let all_runs = load_all(site)?;
+    let Loaded { shown: runs, all: all_runs } = load(site)?;
     let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -3594,7 +3602,7 @@ mod tests {
     fn a_gzipped_run_loads() {
         let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
         let site = site_with("gzipped", &[name]);
-        let runs = super::load(&site).expect("the gzipped run");
+        let runs = super::load(&site).map(|l| l.shown).expect("the gzipped run");
         assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0].file,
@@ -3611,7 +3619,7 @@ mod tests {
         let plain = plain.with_extension("");
         std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
         std::fs::write(&plain, fixture_text(name)).unwrap();
-        let err = super::load(&site).err().expect("a plain JSON is refused");
+        let err = super::load(&site).map(|l| l.shown).err().expect("a plain JSON is refused");
         assert!(err.contains("2026-10-27T031941Z-f9739363.json:"), "{err}");
         assert!(err.contains("gzip"), "{err}");
     }
@@ -3629,7 +3637,7 @@ mod tests {
             .join(FIXTURES)
             .join(format!("{name}.gz"));
         std::fs::copy(fixture, gz).unwrap();
-        let err = super::load(&site)
+        let err = super::load(&site).map(|l| l.shown)
             .err()
             .expect("a run named .gz is refused");
         assert!(err.contains("2026-10-27T031941Z-f9739363.gz"), "{err}");
@@ -3661,7 +3669,7 @@ mod tests {
     #[test]
     fn newest_two_show() {
         let site = site_with("newest-two", &THREE_RUNS);
-        let runs = super::load(&site).expect("the runs");
+        let runs = super::load(&site).map(|l| l.shown).expect("the runs");
         assert_eq!(
             files_of(&runs),
             [published(THREE_RUNS[1]), published(THREE_RUNS[2])]
@@ -3672,7 +3680,7 @@ mod tests {
     #[test]
     fn over_time_reads_every_run() {
         let site = site_with("every-run", &THREE_RUNS);
-        let runs = super::load_all(&site).expect("the runs");
+        let runs = super::load(&site).map(|l| l.all).expect("the runs");
         assert_eq!(files_of(&runs), THREE_RUNS.map(published));
     }
 
@@ -3690,13 +3698,32 @@ mod tests {
             .join(FIXTURES)
             .join(format!("{name}.gz"));
         std::fs::copy(fixture, wrong).unwrap();
-        let err = super::load_all(&site)
+        let err = super::load(&site).map(|l| l.all)
             .err()
             .expect("the wrong folder is refused");
         assert!(
             err.contains("apple-m3-pro/2026-10-28T041936Z-dbe48cd2.json.gz: name it apple-m4-max/2026-10-28T041936Z-dbe48cd2.json.gz"),
             "{err}"
         );
+    }
+
+    /// A run one folder too deep, in a folder inside its Mac's folder, is refused, naming the folder.
+    #[test]
+    fn a_run_in_a_folder_inside_a_macs_folder_is_refused() {
+        let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        let site = site_with("nested", &[]);
+        let deep = site
+            .root
+            .join(super::DATA)
+            .join("apple-m3-pro/history/2026-10-27T031941Z-f9739363.json.gz");
+        std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURES)
+            .join(format!("{name}.gz"));
+        std::fs::copy(fixture, deep).unwrap();
+        let err = super::load(&site).map(|l| l.all).err().expect("a nested run is refused");
+        assert!(err.contains("apple-m3-pro/history"), "{err}");
+        assert!(err.contains("holds its runs directly"), "{err}");
     }
 
     /// A run directly in data/metal, outside any Mac's folder, is refused, naming it.
@@ -3712,7 +3739,7 @@ mod tests {
             site.root.join(super::DATA).join(format!("{name}.gz")),
         )
         .unwrap();
-        let err = super::load_all(&site).err().expect("a flat run is refused");
+        let err = super::load(&site).map(|l| l.all).err().expect("a flat run is refused");
         assert!(err.contains(&format!("{name}.gz")), "{err}");
         assert!(err.contains("its Mac's folder"), "{err}");
     }
@@ -3735,7 +3762,7 @@ mod tests {
             (site.root.join(super::DATA)).join("apple-m3-pro/2026-11-03T230545Z-f9dc285a.json.gz");
         std::fs::write(newer, gz.finish().unwrap()).unwrap();
         assert!(
-            !files_of(&super::load(&site).unwrap()).contains(&replaced),
+            !files_of(&super::load(&site).unwrap().shown).contains(&replaced),
             "the grid run is replaced"
         );
         let assets = crate::chrome::Published {
@@ -5075,7 +5102,7 @@ mod tests {
         let names = fixture_names();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let site = site_with("over-time", &names);
-        let runs = super::load_all(&site).expect("the fixtures");
+        let runs = super::load(&site).map(|l| l.all).expect("the fixtures");
         let machines = super::index(&runs);
         // The M3 Pro fixtures hold two runs of the current round's gpt-oss-20b, a week apart:
         // Over time draws them, not just the newest.

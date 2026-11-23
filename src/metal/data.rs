@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::numbers::{Engine, below_weights, median};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Run {
     #[serde(rename = "schema")]
     _schema: Schema,
@@ -147,7 +147,7 @@ impl Run {
 }
 
 /// The only schema this page reads.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(try_from = "u32")]
 pub struct Schema;
 
@@ -234,7 +234,7 @@ impl Utc {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Machine {
     pub chip: NonEmpty,
     pub cores_total: u32,
@@ -244,7 +244,7 @@ pub struct Machine {
     pub macos: NonEmpty,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Repo {
     pub sha: NonEmpty,
 }
@@ -256,13 +256,13 @@ impl Repo {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Skipped {
     pub stem: String,
     pub reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub scenarios: Vec<String>,
     pub cold_priming_launches: Option<u32>,
@@ -334,7 +334,7 @@ impl Class {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct EngineInfo {
     pub key: String,
     pub label: String,
@@ -348,7 +348,7 @@ impl Config {
     }
 }
 
-#[derive(Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct Scaling {
     /// The sweeps it ran (`grid`, `input`, ...).
     #[serde(default)]
@@ -431,20 +431,20 @@ impl TaskSizing {
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Limits {
     pub base_conc: Option<u32>,
 }
 
 /// What one engine served for a model.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Served {
     pub model: Option<String>,
     pub quantization: Option<String>,
 }
 
 /// Which version of a model's files a run used.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Files {
     pub revision: Option<String>,
 }
@@ -455,14 +455,14 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<bool>>, D::E
 }
 
 /// The shape every non-grid measurement uses.
-#[derive(Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct Base {
     pub input: Option<u32>,
     pub output: Option<u32>,
     pub conc: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Model {
     pub stem: String,
     pub model_id: String,
@@ -552,13 +552,13 @@ pub struct Model {
 /// The [`Model::borrowed`] key for scratchy's frozen launches.
 pub const BORROWED_FROZEN: &str = "scratchy frozen";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Footprint {
     pub build_seconds: Option<u32>,
     pub binary_bytes: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Ollama {
     pub tag: Option<String>,
     pub quantization: Option<String>,
