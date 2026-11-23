@@ -4,8 +4,9 @@ name: Metal round
 # quick run of scripts/bench_metal_matrix.sh (the metal-bench skill, step 7). On every comment
 # this reads them all again, keeps the newest accepted run per Mac, and keeps one status comment
 # up to date. Once every Mac in scripts/metal_round.py's MACHINES is in, it makes a branch from
-# the site branch, commits those runs, gzipped, into data/metal there in one commit, opens a PR to
-# the site branch for an admin to merge, and closes the issue: a closed issue is a finished round.
+# the site branch, adds those runs, gzipped, each at data/metal/<machine>/<name>.json.gz there, in
+# one commit that moves nothing, opens a PR to the site branch for an admin to merge, and closes the
+# issue: a closed issue is a finished round.
 #
 # issue_comment runs this file as it is on main. It also renders the protected site branch,
 # with no token.
@@ -107,14 +108,14 @@ jobs:
         env:
           GH_TOKEN: ''
         run: |
-          cp round/*.json.gz site/data/metal/
+          cp -R round/. site/data/metal/
           cargo run --locked --release --manifest-path site/Cargo.toml
 
       - if: steps.collect.outputs.commit == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: round
-          path: round/*.json.gz
+          path: round/
 
   commit:
     needs: collect
