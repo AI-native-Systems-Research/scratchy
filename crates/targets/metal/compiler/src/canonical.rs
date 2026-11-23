@@ -312,11 +312,14 @@ pub struct MetalStepFacts<'a> {
     pub embed_base: &'a str,
     /// The embedding's MLX-affine storage; `None` = dense.
     pub embed_quant: Option<(AffineGroupSize, AffineBits)>,
-    /// The role a tied lm_head reads (`LM_HEAD_ROLE`), when the model ties its logits to its
-    /// embedding table (`tie_word_embeddings`): the table's codes are the head's, so the family
-    /// reading the role votes the table's as-stored way (`MetalStepTape::embed_table_readers`).
-    /// A role, not a weight id: every canonical interns the family its rows read through — the
-    /// row-program band records no weight ids — so the family is the one key present everywhere.
+    /// The role a tied lm_head reads (`LM_HEAD_ROLE`), when the model ties its logits to the
+    /// embedding table its tape gathers: the table's codes are the head's, so the family reading
+    /// the role votes the table's as-stored way (`MetalStepTape::embed_table_readers`). The tie is
+    /// the load's (`FieldLoad::LinearTiedToEmbedding`) and follows the head's rename: a head
+    /// renamed onto a table of its own (Gemma 4's drafter: its gather reads its target's lent
+    /// table, its logits its own) shares no weight with the gather and states no tie. A role, not
+    /// a weight id: every canonical interns the family its rows read through — the row-program
+    /// band records no weight ids — so the family is the one key present everywhere.
     pub tied_lm_head: Option<&'a str>,
     pub mlp: MlpForm,
     /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own).

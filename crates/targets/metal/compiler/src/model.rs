@@ -812,19 +812,26 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         let weight_paths: Vec<Vec<String>> = (program.weights.ids())
             .map(|id| program.weights.path(id).to_vec())
             .collect();
-        // The role a tied lm_head reads, when the model ties its logits to its embedding table
-        // (`tie_word_embeddings`): the same role the codegen loader plan keys its tie on
-        // (`FieldLoad::LinearTiedToEmbedding`). The tape carries the family reading it
+        let embed_path = weight_paths.iter().find(|p| p.join("_").contains("embed"));
+        let embed_base = embed_path
+            .map(|p| p.join("_"))
+            .unwrap_or_else(|| "embed_tokens".into());
+        // The role a tied lm_head reads, when the model ties its logits to the embedding table
+        // its tape gathers (`tie_word_embeddings`): the same tie the codegen loader plan keys on
+        // (`FieldLoad::LinearTiedToEmbedding`), which follows the head's `weight_leaf_renames`
+        // entry. A head renamed onto a table of its own (Gemma 4's drafter: it embeds with its
+        // target's lent table, its logits its own) shares no weight with the gather, so its tape
+        // carries no tie. The tape carries the family reading it
         // (`MetalStepFacts::tied_lm_head` → `MetalStepTape::embed_table_readers`) so the bake
         // votes the table's codes one way.
-        let tied_lm_head = model
-            .tie_word_embeddings
-            .then_some(scratchy_forward_compiler_macro::config::LM_HEAD_ROLE);
-        let embed_base = weight_paths
-            .iter()
-            .map(|p| p.join("_"))
-            .find(|p| p.contains("embed"));
-        let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
+        let tied_lm_head = (model.tie_word_embeddings
+            && model
+                .arch
+                .weight_leaf_renames
+                .iter()
+                .find(|(from, _)| from == scratchy_forward_compiler_macro::config::LM_HEAD_ROLE)
+                .is_none_or(|(_, to)| embed_path.is_some_and(|p| p.last() == Some(to))))
+        .then_some(scratchy_forward_compiler_macro::config::LM_HEAD_ROLE);
         // Each DSL weight whose own subtree declares a `shared_expert`, by id: the bank a MoE op
         // reads is looked up by the weight it reads.
         let shared_expert_banks: std::collections::BTreeSet<u32> = (program.weights.ids())

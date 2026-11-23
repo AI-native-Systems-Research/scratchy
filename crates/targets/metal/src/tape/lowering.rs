@@ -227,14 +227,44 @@ pub fn lower_with_rows(
             .filter(|(half, ..)| *half == TapeHalf::LmHead)
             .map(|(.., ix, _)| ix),
     );
+    // The embedding tables the gathers read row-whole; and the tie's alias: a family the weight
+    // map ties to a table (`embed_table_readers`) is that table's weight under another name —
+    // the load resolves both to one tensor, so the vote law
+    // ([`one_weight_one_vote`]) holds them to one vote through `tied_to_table`, the tape's own
+    // statement of the tie consumed, not restated.
+    let mut tables: Vec<SourceIx> = Vec::new();
     for (row, sites) in steps.backbone.iter().zip(&steps.backbone_sources) {
         if matches!(row, StepRow::Step(MetalStep::AffineEmbed(..), _)) {
-            as_stored.extend(
-                sites
-                    .iter()
-                    .filter(|s| s.kind == WeightKind::AffineQuantEmbedding)
-                    .map(|s| s.ix),
-            );
+            for s in sites
+                .iter()
+                .filter(|s| s.kind == WeightKind::AffineQuantEmbedding)
+            {
+                as_stored.push(s.ix);
+                if !tables.contains(&s.ix) {
+                    tables.push(s.ix);
+                }
+            }
+        }
+    }
+    let tied_to_table: std::collections::HashMap<SourceIx, SourceIx> = match tables[..] {
+        [table] => steps
+            .embed_table_readers
+            .iter()
+            .map(|&reader| (reader, table))
+            .collect(),
+        // No table this tape gathers (nothing ties against one here), or a tape of several
+        // tables — no model states several: the tie aliases nothing this tape compares.
+        _ => std::collections::HashMap::new(),
+    };
+    // Each family's kind, from the tape's own sites: the vote law
+    // ([`one_weight_one_vote`]) holds a family's codes tensors — `codes_tensor` — and no other
+    // binding a codes-reading command carries (its norm gain, its biases). A family no site
+    // names (the rotary tables, the sinks) is never codes.
+    let mut kinds: std::collections::HashMap<SourceIx, WeightKind> =
+        std::collections::HashMap::new();
+    for site in steps.backbone_sources.iter().chain(&steps.lm_head_sources) {
+        for s in site {
+            kinds.entry(s.ix).or_insert_with(|| s.kind.clone());
         }
     }
     let as_stored = AsStoredCodes {
@@ -302,6 +332,7 @@ pub fn lower_with_rows(
         // its terminal rows — at every row.
         logits_rows: writes_logits(bb_logits, lh_logits).unwrap_or(LogitsRows::Bucket),
     };
+    one_weight_one_vote(tape.commands_expanded(), &tied_to_table, &kinds)?;
     Ok((tape, command_rows))
 }
 
@@ -554,6 +585,67 @@ impl<'a> AsStoredCodes<'a> {
     fn reads(&self, ix: SourceIx) -> bool {
         self.sources.contains(&ix)
     }
+}
+
+/// One weight, one vote — refused at the bake, not the load. Every command binding a source's
+/// codes tensor states in its baked constants how it reads it
+/// ([`AffineCodes::of_constants`]); this walk — the same one the load performs over the same
+/// constants (`ResolvedSources::resolve` → `MetalAllocator::bind_affine_codes`) — refuses a
+/// tape that states two ways for one `(source, tensor, layer)`, at the point they are baked: a
+/// model whose readers disagree fails to build, never a pool that dies at launch. `tied_to_table`
+/// aliases the tie the way the load's tensor resolution does (a family tied to the embedding
+/// table is that table's weight); `kinds` names each family's kind, and a codes vote holds only
+/// the family's codes tensors (`codes_tensor`) — never the other bindings a codes-reading
+/// command carries. What the vote *is* stays stated once, in [`codes_for`]; this holds every
+/// tape to it.
+fn one_weight_one_vote(
+    commands: impl IntoIterator<Item = GatedCommand>,
+    tied_to_table: &std::collections::HashMap<SourceIx, SourceIx>,
+    kinds: &std::collections::HashMap<SourceIx, WeightKind>,
+) -> Result<(), LoweringError> {
+    use super::kernel_constants::AffineCodes;
+    let mut votes: std::collections::HashMap<
+        (SourceIx, WeightTensor, LayerId),
+        (AffineCodes, &'static str),
+    > = std::collections::HashMap::new();
+    for c in commands {
+        // A GEMM reads its weight dense — the load treats it the same: no constants, as-written.
+        let dispatch = c.dispatch();
+        let constants = dispatch.map_or(&[][..], |d| d.constants);
+        let reader = dispatch.map_or("gemm", |d| d.function);
+        let codes = AffineCodes::of_constants(constants);
+        for b in c.command.bindings() {
+            let Binding::Source {
+                ix, which, layer, ..
+            } = b
+            else {
+                continue;
+            };
+            if !kinds
+                .get(&ix)
+                .is_some_and(|kind| super::lowered::codes_tensor(kind, which))
+            {
+                continue;
+            }
+            let ix = tied_to_table.get(&ix).copied().unwrap_or(ix);
+            match votes.entry((ix, which, layer)) {
+                std::collections::hash_map::Entry::Occupied(e) if e.get().0 != codes => {
+                    return Err(LoweringError::CodesDisagree {
+                        ix,
+                        which,
+                        layer,
+                        first: e.get().0,
+                        then: codes,
+                        readers: (e.get().1, reader),
+                    });
+                }
+                entry => {
+                    entry.or_insert((codes, reader));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the sampled rows slice at this bake point: a multi-row bucket whose matmul lowers to
@@ -12948,6 +13040,142 @@ mod tests {
         );
     }
 
+    /// One weight, one vote, refused at the bake: two commands binding one source's codes with
+    /// different constants do not lower. The disagreement that used to die at pool init
+    /// (`MetalAllocator::bind_affine_codes`'s `ReadersDisagree`) is a build error here — and the
+    /// agreeing controls pass, including two readers of different sources voting differently,
+    /// which is two weights and so two votes.
+    #[test]
+    fn the_bake_refuses_two_votes_for_one_weight() {
+        use crate::tape::kernel_constants::AffineCodes;
+        let reader = |codes: AffineCodes, k: Option<u32>, ix: u32| {
+            let mut constants: Vec<ConstantValue> = codes.constants().collect();
+            if let Some(k) = k {
+                // A planes reader names its input count at slot 0 (`AffineCodes::of_constants`).
+                constants.push(ConstantValue::uint(0, k));
+            }
+            GatedCommand {
+                command: TapeCommand::Dispatch(LoweredCommand {
+                    kernel: KernelId::AffineQmmW4a8,
+                    library: "",
+                    function: "",
+                    constants: baked(constants),
+                    dispatch: DispatchShape {
+                        threadgroups: (1, 1, 1),
+                        threads_per_threadgroup: (1, 1, 1),
+                        m_scaling: None,
+                    },
+                    bindings: baked(vec![Binding::Source {
+                        ix: SourceIx(ix),
+                        which: WeightTensor::Weight,
+                        layer: LayerId(0),
+                        binding_index: 0,
+                    }]),
+                }),
+                gate: None,
+            }
+        };
+        let planes = AffineCodes::Planes { k: 2048 };
+        let no_tie = <std::collections::HashMap<SourceIx, SourceIx>>::new();
+        let linear = |ixs: &[u32]| {
+            ixs.iter()
+                .map(|&ix| (SourceIx(ix), WeightKind::Linear))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        // The disagreement: one reader planes, one offset-8, the same source.
+        let err = one_weight_one_vote(
+            vec![
+                reader(planes, Some(2048), 0),
+                reader(AffineCodes::Offset8, None, 0),
+            ],
+            &no_tie,
+            &linear(&[0, 1, 7]),
+        )
+        .expect_err("two votes for one weight refuse");
+        assert!(
+            matches!(err, LoweringError::CodesDisagree { ix, .. } if ix == SourceIx(0)),
+            "{err}"
+        );
+        // The control: one vote, however many readers.
+        one_weight_one_vote(
+            vec![reader(planes, Some(2048), 0), reader(planes, Some(2048), 0)],
+            &no_tie,
+            &linear(&[0, 1, 7]),
+        )
+        .expect("one vote lowers");
+        // Two sources are two weights: each its own vote, no comparison across.
+        one_weight_one_vote(
+            vec![
+                reader(planes, Some(2048), 0),
+                reader(AffineCodes::Offset8, None, 1),
+            ],
+            &no_tie,
+            &linear(&[0, 1, 7]),
+        )
+        .expect("two weights vote separately");
+        // A codes-reading command's other bindings — its norm gain, an `RmsNorm` family's
+        // `Weight` — carry no vote: only a family's codes tensors compare.
+        let with_gain = |codes: AffineCodes, k: Option<u32>, gain_ix: u32| {
+            let mut c = reader(codes, k, 0);
+            let TapeCommand::Dispatch(ref mut d) = c.command else {
+                unreachable!()
+            };
+            d.bindings = baked(vec![
+                Binding::Source {
+                    ix: SourceIx(0),
+                    which: WeightTensor::Weight,
+                    layer: LayerId(0),
+                    binding_index: 0,
+                },
+                Binding::Source {
+                    ix: SourceIx(gain_ix),
+                    which: WeightTensor::Weight,
+                    layer: LayerId(0),
+                    binding_index: 1,
+                },
+            ]);
+            c
+        };
+        let kinds_with_gain = linear(&[0, 7])
+            .into_iter() // no sites name 9: never codes
+            .chain([(SourceIx(9), WeightKind::RmsNorm)])
+            .collect();
+        one_weight_one_vote(
+            vec![
+                with_gain(AffineCodes::Offset8, None, 9),
+                with_gain(AffineCodes::Offset8, None, 9),
+            ],
+            &no_tie,
+            &kinds_with_gain,
+        )
+        .expect("a norm gain carries no codes vote");
+        // The tie: a family tied to the embedding table is that table's weight, so a planes vote
+        // on it refuses against the table's as-stored gather even though the families differ.
+        let tie = std::collections::HashMap::from([(SourceIx(7), SourceIx(0))]);
+        let err = one_weight_one_vote(
+            vec![
+                reader(AffineCodes::Offset8, None, 0),
+                reader(planes, Some(2048), 7),
+            ],
+            &tie,
+            &linear(&[0, 1, 7]),
+        )
+        .expect_err("a tied family's vote is the table's");
+        assert!(
+            matches!(err, LoweringError::CodesDisagree { ix, .. } if ix == SourceIx(0)),
+            "{err}"
+        );
+        one_weight_one_vote(
+            vec![
+                reader(AffineCodes::Offset8, None, 0),
+                reader(AffineCodes::Offset8, None, 7),
+            ],
+            &tie,
+            &linear(&[0, 1, 7]),
+        )
+        .expect("a tied family agreeing with its table lowers");
+    }
+
     /// The small-M wide band follows MLX's gen-15 boundary
     /// (`affine_qmv_wide_ok`): every production bake profile from the M3 on —
     /// the Mid class bakes against an M4 profile, the M5 class its own —
@@ -13432,12 +13660,35 @@ mod tests {
             MetalStep::SiluMul(Slot(6), Slot(7), Slot(4), IntermediateSize(17408)),
             gemm(4, 3, 5120, 17408),
         ];
+        // One weight per projection, as a real layer states them: qkv (k=5120) and the out
+        // projection (k=6144) are distinct families, and one weight votes once
+        // (`one_weight_one_vote`) — so each row's site names its own Linear source, where the
+        // shared [`TEST_SITE`] would collapse every projection onto one weight read at three
+        // contraction widths.
+        let rows = plain(&steps);
+        let sites: Vec<Vec<RowSource>> = (0..rows.len())
+            .map(|row| {
+                let mut site = TEST_SITE.clone();
+                for s in &mut site {
+                    if s.kind == WeightKind::Linear {
+                        s.ix = SourceIx(10_000 + 10 * row as u32 + u32::from(s.ix.0 % 10));
+                    }
+                }
+                site
+            })
+            .collect();
         let lower = |bucket_m| {
             let at = BakePoint {
                 class: M5Wide,
                 ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
             };
-            lower_subtile_tape_to_metal(&row_tape(plain(&steps)), &tp(), at).expect("lowers")
+            let tape = MetalStepTape {
+                backbone_barriers: vec![Fence::Coherent; rows.len()],
+                backbone_sources: sites.clone(),
+                backbone: rows.clone(),
+                ..MetalStepTape::default()
+            };
+            lower_subtile_tape_to_metal(&tape, &tp(), at).expect("lowers")
         };
         for bucket_m in [64, 32] {
             let tape = lower(bucket_m);
