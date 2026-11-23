@@ -2089,7 +2089,7 @@ fn compute_num_blocks(
 
     // Each block holds block_size tokens of KV for all layers: the DENSE row, at the model's dtype —
     // KV per token per layer = 2 * num_kv_heads * head_dim * sizeof(dtype). A cache stored any other
-    // way (a float8 or TurboQuant codec) is its worker's own statement from the model's built codec
+    // way (a float8 or int8 codec) is its worker's own statement from the model's built codec
     // ([`Worker::kv_block_bytes`]), never a CLI string here.
     let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * dtype_elem_bytes;
     blocks_within(

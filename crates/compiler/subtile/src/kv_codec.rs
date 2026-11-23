@@ -471,7 +471,7 @@ impl Expander<'_> {
 /// `scales` is the codec fact's (`KvCodec::Fp8E4m3(scales)`); every quantize carries it.
 ///
 /// ⛔ NOT `KvEncode`. An encode runs AFTER its writer, under a runtime guard, packing the cache half
-/// the writer filled into a SEPARATE store the attention reads instead (TurboQuant). The float8
+/// the writer filled into a SEPARATE store the attention reads instead (int8). The float8
 /// cache IS the pool: its quantize runs BEFORE the writer, unguarded, over the writer's own value
 /// operand, and the writer stores what the quantize produced.
 ///
